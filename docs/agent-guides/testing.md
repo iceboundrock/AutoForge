@@ -1985,7 +1985,12 @@ model. They cover:
   gate rules out `GO`, and a stopped run keeps what it did and spent;
 - the oracle: the candidate's code gets the launch isolation of
   `validation.commands`, and the export-command sandbox under `required`; only
-  exit 0 is a pass, and what could not run is `not_run`;
+  exit 0 is a pass, what could not run is `not_run`, and that or a timeout is no
+  failure either: a count or a success that turns on it is `unknown`, so it reaches
+  `INCONCLUSIVE` and never a `NO_GO`;
+- elapsed time: a launch that ended a run without a save counts, by its own line's
+  stamps, through `score_run` and the ceilings, and an end that cannot be established
+  is `unknown` with the known part apart;
 - what is published: the report the protocol says to post holds every real run,
   every criterion's interval, what left the sample and every task;
 - what never happens: `collect` needs its opt-in and a recorded approval and

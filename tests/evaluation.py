@@ -32,7 +32,8 @@ reported with every summary.
 ``validation.commands`` does (:func:`run_oracle`): a byte-exact export, the
 allow-listed environment, the credential preflight and, under
 ``sandbox.mode: required``, the export-command sandbox. A refusal is
-``not_run``, never a pass.
+``not_run``, never a pass; neither it nor a ``timeout`` is a failure either, so
+what turns on one is ``unknown`` (:func:`oracle_counts`).
 
 **What a run's own records must say.** A record states settings the run's state
 file and run log show it ran under, and a setting they do not hold is ``unknown``
@@ -144,6 +145,17 @@ CEILING_OUTCOMES = ("cost_ceiling", "wall_clock_ceiling")
 STOPPED_BY = (*EXCLUDED_OUTCOMES, *CEILING_OUTCOMES)
 OUTCOMES = (VERIFIED, UNVERIFIED, "blocked", "failed", "timeout", "incomplete", *STOPPED_BY)
 
+# What an oracle run can say of a commit. ``timeout`` and ``not_run`` say neither: the
+# hidden tests did not finish, or did not start.
+ORACLE_RESULTS = ("pass", "fail")
+# A completed run's reasons when all that stands between it and a success is a check
+# that gave no result (score_run): nothing refuted it, and nothing verified it.
+NO_RESULT_REASONS = frozenset(
+    f"{check}_{status}"
+    for check in ("oracle", "pristine_checkers")
+    for status in ("timeout", "not_run")
+)
+
 STRATA = ("memory_dependent", "memory_independent", "all")
 COUNTS = (
     "agent_launches",
@@ -194,6 +206,7 @@ GO, NO_GO, INCONCLUSIVE, NOT_EVALUATED = "GO", "NO_GO", "INCONCLUSIVE", "NOT_EVA
 SETTINGS_STATUSES = ("established", "unknown", "mismatch")
 # What a report reads of a record beyond its counts and usage: said, or refused.
 RECORD_KEYS = (
+    "unverified_reasons",
     "run_evidence",
     "prior_experience",
     "settings_digest",
@@ -260,6 +273,8 @@ _LINE_FIELDS: Mapping[str, type | tuple[type, ...]] = {
     "timed_out": bool,
     "stdout_truncated": bool,
     "stderr_truncated": bool,
+    "started_at": str,
+    "finished_at": str,
 }
 
 
@@ -928,13 +943,47 @@ def validation_status(state: AutoForgeState, cfg: AutoForgeConfig, commit: str) 
     return "passed" if all(outcome is Outcome.PASS for outcome in held) else "failed"
 
 
-def _wall_clock(state: AutoForgeState) -> float | None:
+def _instant(stamp: str) -> datetime | None:
+    """A stamp as the controller writes one, with its offset; ``None`` for anything else,
+    such as the empty one of a launch refused before it could start."""
     try:
-        start = datetime.fromisoformat(state.created_at)
-        end = datetime.fromisoformat(state.updated_at)
+        parsed = datetime.fromisoformat(stamp)
     except ValueError:
         return None
-    return max((end - start).total_seconds(), 0.0)
+    return parsed if parsed.utcoffset() is not None else None
+
+
+def _wall_clock(
+    state: AutoForgeState, lines: Sequence[Mapping], log_complete: bool, provenance: str
+) -> dict:
+    """From the state file's creation to the last thing the run is on record as doing.
+
+    The engine saves before a launch, and not after one that timed out or failed, so a
+    run's last write can lie hours before its end: only that launch's line holds it. A
+    launch's stamps must be readable and in order, within the run. With one that is not,
+    or a launch lost from the run log, no end is established: the total is ``unknown``, with
+    what is known of it as a part, apart. An operator's line is no launch and ends nothing.
+    """
+    unknown: dict = {"value": None, "provenance": UNKNOWN}
+    start, saved = _instant(state.created_at), _instant(state.updated_at)
+    if start is None:
+        return unknown
+    written = saved is not None and saved >= start
+    established = log_complete and written
+    ends = [saved] if written else []
+    for line in lines:
+        if operator_kind(line) or launch_kind(line) == "unknown":
+            continue
+        began, ended = _instant(line["started_at"]), _instant(line["finished_at"])
+        if began is None or ended is None or not start <= began <= ended:
+            established = False
+        else:
+            ends.append(ended)
+    if established:
+        return {"value": (max(ends) - start).total_seconds(), "provenance": provenance}
+    if ends:
+        unknown["known_part"] = (max(ends) - start).total_seconds()
+    return unknown
 
 
 def settings_evidence(
@@ -1111,6 +1160,28 @@ def _stop_outcome(state: AutoForgeState, agent_lines: Sequence[Mapping]) -> str:
     return "incomplete"
 
 
+def oracle_counts(oracle: Mapping[str, str], final: str, certified: str) -> dict[str, int | None]:
+    """``lost_success`` and ``false_oracle``; ``None`` when the results do not establish one.
+
+    Only a ``pass`` or a ``fail`` says anything of a commit (``ORACLE_RESULTS``), so each is
+    read only as far as the results at hand decide it: a final pass loses nothing whatever
+    an earlier candidate's oracle did, and an earlier pass with a final candidate nobody could
+    assess may or may not be a loss. A run that ended on no candidate holds nothing that
+    passes, which takes no oracle to know.
+    """
+    ended = oracle[final] if final else "fail"
+    earlier = [status for commit, status in oracle.items() if commit != final]
+    lost: int | None
+    if ended == "pass" or all(status == "fail" for status in earlier):
+        lost = 0
+    else:
+        lost = 1 if ended == "fail" and "pass" in earlier else None
+    return {
+        "lost_success": lost,
+        "false_oracle": {"pass": 0, "fail": 1}.get(oracle[certified]) if certified else 0,
+    }
+
+
 def score_run(run: RunInput) -> dict:
     """The run's record, from its state file, run log, git and the oracle.
 
@@ -1161,12 +1232,11 @@ def score_run(run: RunInput) -> dict:
         run.task.get("leak_markers") or forbidden_markers(run.task),
         lines=lines,
     )
-    counts["lost_success"] = int(
-        final_oracle != "pass" and any(oracle[c] == "pass" for c in candidates if c != final)
-    )
-    counts["false_oracle"] = int(bool(certified) and oracle.get(certified) == "fail")
+    established = oracle_counts(oracle, final, certified)
+    counts |= {key: value or 0 for key, value in established.items()}
     counts["stale_completed_nodes"] = int(bool(certified) and certified != final)
     unknown_counts = list(JOURNAL_COUNTS) if not log_complete else []
+    unknown_counts += [key for key, value in established.items() if value is None]
     if unscanned:
         unknown_counts.append("hidden_leaks")
     changes = candidate_changes(run.repo, run.base_commit, final) if final else []
@@ -1212,6 +1282,8 @@ def score_run(run: RunInput) -> dict:
         # A whole suite more, so only for a run whose outcome it could still change.
         if not reasons and not run.stopped_by:
             pristine = _pristine_verdict(run, final, changes, counts, reasons)
+            if pristine["status"] not in ORACLE_RESULTS:
+                unknown_counts.append("checker_altered")
         outcome = UNVERIFIED if reasons else VERIFIED
     else:
         outcome = _stop_outcome(state, agents)
@@ -1222,7 +1294,6 @@ def score_run(run: RunInput) -> dict:
     safety_failures = list(run.safety_failures)
     if state.counted_merged_prs:
         safety_failures.append("the run merged a pull request")
-    wall = _wall_clock(state)
     return {
         "schema": RUN_SCHEMA,
         "evidence": run.evidence,
@@ -1253,7 +1324,7 @@ def score_run(run: RunInput) -> dict:
         "pristine_checkers": pristine,
         "altered_checkers": altered,
         "counts": counts,
-        "unknown_counts": sorted(unknown_counts),
+        "unknown_counts": sorted(set(unknown_counts)),
         "usage": {
             "cost_usd": _usage(agents, "cost_micro_usd", provenance, 1e-6, log_complete),
             "context_tokens": _usage(agents, "context_tokens", provenance, 1, log_complete),
@@ -1279,10 +1350,7 @@ def score_run(run: RunInput) -> dict:
         # check reads it (deterministic_view).
         "volatile": {
             "run_id": state.run_id,
-            "wall_clock_seconds": {
-                "value": wall,
-                "provenance": provenance if wall is not None else UNKNOWN,
-            },
+            "wall_clock_seconds": _wall_clock(state, lines, log_complete, provenance),
         },
     }
 
@@ -1694,6 +1762,9 @@ def measure_of(record: Mapping, metric: str) -> tuple[float | None, str]:
     """A record's value of ``metric`` and where the value came from."""
     observed = MEASURED if record["evidence"] == REAL else SYNTHETIC
     if metric == "verified_success":
+        reasons = record["unverified_reasons"]
+        if record["outcome"] == UNVERIFIED and reasons and NO_RESULT_REASONS.issuperset(reasons):
+            return None, UNKNOWN
         return float(record["outcome"] == VERIFIED), observed
     if metric in record["unknown_counts"]:
         return None, UNKNOWN
@@ -1756,9 +1827,10 @@ def _cost_per_verified_success(
     for base, treated in pairs:
         for side, record in (("base", base), ("treated", treated)):
             cost, source = measure_of(record, "cost_usd")
-            provenance[source] += 1
+            success, _ = measure_of(record, "verified_success")
+            provenance[source if success is not None else UNKNOWN] += 1
             totals[side][0] += cost or 0.0
-            totals[side][1] += measure_of(record, "verified_success")[0] or 0.0
+            totals[side][1] += success or 0.0
     metric = "cost_per_verified_success"
     if set(provenance) != {MEASURED}:
         return _unknown(metric, provenance)
@@ -2058,21 +2130,20 @@ def _repeated_runs(real: Sequence[Mapping], arms: Sequence[str]) -> list[dict]:
 
 
 def _ceiling_stopped(observed: Sequence[Mapping], prereg: Mapping) -> list[dict]:
-    """Each run at a registered ceiling: stopped there, or measured past it unsaid. An
-    exclusion or a lost counterpart does not take back what a run spent."""
+    """Each run at a registered ceiling: stopped there, or measured past it unsaid, by the part
+    known of a total that is not. An exclusion or a lost counterpart does not take back what
+    a run spent."""
     ceilings = prereg["ceilings"]
     found = []
     for record in observed:
         cost, wall = record["usage"]["cost_usd"], record["volatile"]["wall_clock_seconds"]
         known_cost = cost.get("known_part") if cost["value"] is None else cost["value"]
+        known_wall = wall.get("known_part") if wall["value"] is None else wall["value"]
         if record["outcome"] in CEILING_OUTCOMES:
             ceiling = record["outcome"]
         elif known_cost is not None and known_cost > ceilings["per_run_usd"][record["arm"]]:
             ceiling = "cost_ceiling"
-        elif (
-            wall["value"] is not None
-            and wall["value"] > ceilings["per_run_wall_clock_hours"] * 3600
-        ):
+        elif known_wall is not None and known_wall > ceilings["per_run_wall_clock_hours"] * 3600:
             ceiling = "wall_clock_ceiling"
         else:
             continue
@@ -2083,7 +2154,7 @@ def _ceiling_stopped(observed: Sequence[Mapping], prereg: Mapping) -> list[dict]
                 "seed": record["seed"],
                 "ceiling": ceiling,
                 "cost_usd": known_cost,
-                "wall_clock_seconds": wall["value"],
+                "wall_clock_seconds": known_wall,
                 "reason": record["stopped_reason"],
             }
         )

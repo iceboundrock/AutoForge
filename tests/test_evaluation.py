@@ -602,6 +602,47 @@ def test_unknown_usage_rules_out_go_and_says_which():
     assert verdicts["context_tokens"]["provenance"] == {ev.UNKNOWN: 72}
 
 
+@pytest.mark.parametrize(
+    "outcome, reasons, known",
+    [
+        (ev.VERIFIED, [], True),
+        (ev.UNVERIFIED, [], True),
+        (ev.UNVERIFIED, ["oracle_failed"], True),
+        (ev.UNVERIFIED, ["pristine_checkers_failed"], True),
+        (ev.UNVERIFIED, ["oracle_timeout", "no_certificate"], True),
+        (ev.UNVERIFIED, ["oracle_not_run", "validation_failed"], True),
+        ("blocked", ["oracle_not_run"], True),
+        (ev.UNVERIFIED, ["oracle_timeout"], False),
+        (ev.UNVERIFIED, ["oracle_not_run"], False),
+        (ev.UNVERIFIED, ["pristine_checkers_timeout"], False),
+        (ev.UNVERIFIED, ["pristine_checkers_not_run"], False),
+    ],
+)
+def test_a_success_is_unknown_only_where_a_check_with_no_result_is_all_that_stands_before_it(
+    outcome, reasons, known
+):
+    """Any other reason already says this run is no success, whatever the oracle would have
+    said, and so does any outcome but a completion."""
+    manifest, prereg = _manifest_with_memory(), ev.load_preregistration()
+    record = _record(manifest, prereg, manifest["tasks"][0], 1, TREATMENT, outcome=outcome)
+    record["unverified_reasons"] = reasons
+    value, provenance = ev.measure_of(record, "verified_success")
+    if known:
+        assert (value, provenance) == (float(outcome == ev.VERIFIED), ev.MEASURED)
+    else:
+        assert (value, provenance) == (None, ev.UNKNOWN)
+
+
+def test_a_cost_per_success_with_a_success_nobody_could_establish_is_unknown():
+    """Its denominator would be short by a run that may have succeeded."""
+    manifest, prereg, records = _world()
+    treated = _treated(records)
+    treated["outcome"], treated["unverified_reasons"] = ev.UNVERIFIED, ["oracle_timeout"]
+    verdicts = {c["metric"]: c for c in _decide(manifest, prereg, records)["non_regression"]}
+    held = verdicts["cost_per_verified_success"]
+    assert held["verdict"] == "unknown" and held["provenance"][ev.UNKNOWN] == 1
+
+
 @pytest.mark.parametrize("provenance", [ev.ESTIMATED, ev.SYNTHETIC])
 def test_an_estimate_never_passes_a_criterion(provenance):
     """A real outcome and an estimate are different things: an estimated cost is shown
@@ -980,6 +1021,12 @@ _PAST_A_CEILING = {
     ),
     "wall-clock": (
         lambda r: r["volatile"]["wall_clock_seconds"].update(value=8 * 3600 + 1),
+        "wall_clock_ceiling",
+    ),
+    "known-part-of-a-wall-clock": (
+        lambda r: r["volatile"]["wall_clock_seconds"].update(
+            value=None, provenance=ev.UNKNOWN, known_part=8 * 3600 + 1
+        ),
         "wall_clock_ceiling",
     ),
 }

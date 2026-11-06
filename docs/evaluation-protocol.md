@@ -188,16 +188,16 @@ review, on every arm alike.
 
 | Measure | Where it comes from | Today |
 |---|---|---|
-| `verified_success` | a certificate that still applies and `PASS` records under the configured policy for the exact final candidate, the oracle's pass on it and the pristine checkers' on its source, with no checker altered, no stale certificate and no leak | measured |
-| `lost_success` | an earlier candidate passed the oracle and the final one did not | measured |
-| `false_oracle` | the certified candidate fails the oracle | measured |
-| `checker_altered` | the candidate altered a checker (section 3.4) | measured |
+| `verified_success` | a certificate that still applies and `PASS` records under the configured policy for the exact final candidate, the oracle's pass on it and the pristine checkers' on its source, with no checker altered, no stale certificate and no leak | measured; `unknown` where a check with no result is all that stands before it |
+| `lost_success` | an earlier candidate passed the oracle and the final one failed it, or the run ended on no candidate | measured; `unknown` where an oracle with no result leaves it open |
+| `false_oracle` | the certified candidate fails the oracle | measured; `unknown` where the oracle gave no result on that candidate |
+| `checker_altered` | the candidate altered a checker (section 3.4) | measured; `unknown` where the pristine checkers gave no result |
 | `stale_completed_nodes` | what was certified is not what the PR holds | measured |
 | `review_fix_cycles` | accepted `FIX` launches | measured |
 | `repeated_failed_approaches` | a candidate whose tree already failed validation in this run | measured, a proxy |
 | `duplicate_exploration` | read-only tool calls repeated across a run's launches, from `progress.log` | a proxy; `unknown` where a provider shows no tool, or a launch's progress file is missing, unreadable, a link or cut at its bound |
 | `human_blocked_interventions` | applied `unblock`s, and a run that ended `BLOCKED` | measured |
-| `wall_clock_seconds` | the state file's creation to its last write | measured |
+| `wall_clock_seconds` | the state file's creation to the later of its last write and the last end the run log gives a launch | measured with every launch on record and its stamps valid; otherwise `unknown` with the part it knows shown apart |
 | `cost_usd`, `cost_per_verified_success` | `cost_micro_usd` of every agent launch, failed attempts and parallel ones included | measured on Claude Code with every launch on record; otherwise `unknown` with the part it knows shown apart |
 | `context_tokens` | no provider's run log reports them (#154) | `unknown` |
 | crash-recovery correctness | the deterministic scenario of section 8, on each arm | fixture |
@@ -208,6 +208,28 @@ completed ones; `blocked`, `failed`, `timeout`, `incomplete`, `cost_ceiling` and
 stay in the denominator as runs that did not succeed. `infra_failure`, `credentials_unavailable`,
 `service_unavailable` and `skipped` remove the pair, listed with its stated reason. Timeouts, costs,
 token uncertainty and a missing external service each stay visible, and none is folded into another.
+
+**An oracle with no result says nothing of its commit.** Only `pass` and `fail` are results. `not_run` is an
+oracle refused or unable to start, and `timeout` is hidden tests that did not finish within
+`execution.command_timeout_seconds`. A timeout may be a candidate that hangs or a host under load, and nothing
+it leaves tells them apart, so it is not read as a failure. Neither is ever a pass either: a final candidate with
+one is not verified (`oracle_timeout`, `oracle_not_run`). A value that turns on one is `unknown`, unless the
+results at hand decide it anyway. `lost_success` is a measured 0 with a final pass or with every earlier
+candidate failed, and a measured 1 with a final failure after an earlier pass; `false_oracle` is a measured 0
+with no certificate. `verified_success` stays a measured 0 while any other reason says the run was no success,
+and is `unknown` when such a status, of the oracle or of the pristine checkers, is all that stands before one;
+`checker_altered` is `unknown` when the pristine checkers gave no result. This is no exclusion: the pair stays
+in the sample, a criterion that reads the run is `unknown` and the run's evidence is incomplete, so the contrast
+is `INCONCLUSIVE` unless measured harm makes it `NO_GO`.
+
+**How long a run took comes from what it recorded last.** The engine saves before a launch and not after one
+that timed out or failed, so the state's last write can lie hours before the end of the launch that ended the
+run; that launch's `finished_at` in the run log holds the end. Each launch's stamps must have an offset and be in
+order, within the run; a launch refused before it could start has none. A stamp that fails this, a state file
+whose own stamps do, or a launch lost from the run log leaves no end established: the total is `unknown`,
+with what is known of it as a part, apart. An operator's line in the run log, such as a refused `unblock`, ends
+nothing. A run killed inside a launch is such a lost launch, and one killed between a save and a launch leaves
+nothing to find.
 
 **A record states what its run's own files show.** The controller records each run's routing and limits
 (`config_fingerprint`), its sandbox mode (`sandbox_pin`), its prompt version and, per launch, its provider,
@@ -312,9 +334,9 @@ per run. AutoForge enforces neither during a run: its only limits are per launch
 run past 8 hours, and records it with `--stopped-by cost_ceiling` or `--stopped-by wall_clock_ceiling`,
 with its state directory when it has one: what the run did and spent stays in the record. A planned run
 never started for a ceiling has no state directory, so nothing is known of its settings or its usage. Nor
-does a run measured past a ceiling need anyone to say so: it counts as having reached it. A ceiling reads
-every planned run of the contrast that has a record, on either arm, paired or not: an exclusion or a lost
-counterpart takes a run out of the statistics, not out of what it spent.
+does a run measured past a ceiling need anyone to say so: it counts as having reached it, by the part known of
+a total that is `unknown`. A ceiling reads every planned run of the contrast that has a record, on either arm,
+paired or not: an exclusion or a lost counterpart takes a run out of the statistics, not out of what it spent.
 
 **The decision for each contrast:**
 

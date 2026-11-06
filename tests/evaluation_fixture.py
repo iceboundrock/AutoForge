@@ -43,7 +43,7 @@ from autoforge.evidence import parse_candidate
 from autoforge.executor import select_environment
 from autoforge.providers import ScriptedProvider
 from autoforge.sandbox_bwrap import ProbeResult
-from autoforge.state import load_state
+from autoforge.state import load_state, utcnow_iso
 from autoforge.transitions import Phase
 from tests import evaluation
 from tests.conftest import (
@@ -173,7 +173,8 @@ def isolated_process(root: Path) -> Iterator[None]:
 
 
 class FixtureProvider(ScriptedProvider):
-    """A scripted agent that also reports a fixture's cost, as a provider's summary would."""
+    """A scripted agent that also reports a fixture's cost, as a provider's summary would, and
+    when it ran, as an executor would: a scripted agent's canned stamps predate any run."""
 
     def __init__(self, script) -> None:
         super().__init__(script)
@@ -181,7 +182,9 @@ class FixtureProvider(ScriptedProvider):
 
     def execute(self, req):
         self.next_cost = None
+        started = utcnow_iso()
         result = super().execute(req)
+        result.started_at, result.finished_at = started, utcnow_iso()
         if self.next_cost is not None:
             result.provider_summary["cost_micro_usd"] = self.next_cost
         return result

@@ -11,12 +11,14 @@ called: this is harness correctness, and the report says so.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,7 +26,9 @@ import pytest
 
 from autoforge.config import default_config, load_config_file
 from autoforge.config_fingerprint import ConfigFingerprint, RecordedConfiguration
+from autoforge.errors import ExecutionError
 from autoforge.executor import execute
+from autoforge.providers import ScriptedProvider
 from autoforge.read_context import ReadContext
 from autoforge.runlog import MAX_PROGRESS_LOG_BYTES, RunLogger
 from autoforge.sandbox_pin import SandboxPin
@@ -34,7 +38,7 @@ from tests import evaluation as ev
 from tests import evaluation_fixture as fx
 from tests.conftest import make_engine
 
-from .test_evaluation import _decide, _treated, _world
+from .test_evaluation import TREATMENT, _decide, _treated, _world
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -1018,6 +1022,10 @@ def test_what_the_pristine_checkers_say_decides_the_run(
     assert record["counts"]["checker_altered"] == altered
     assert record["unverified_reasons"] == reasons
     assert record["outcome"] == (ev.UNVERIFIED if reasons else ev.VERIFIED)
+    # What did not finish or could not start refutes nothing, and clears nothing.
+    no_result = status not in ev.ORACLE_RESULTS
+    assert ("checker_altered" in record["unknown_counts"]) == no_result
+    assert (ev.measure_of(record, "verified_success")[0] is None) == no_result
 
 
 def test_a_run_nobody_ran_the_pristine_checkers_on_is_not_verified(world):
@@ -1827,6 +1835,9 @@ def test_a_stopped_run_with_a_lost_launch_keeps_what_is_known_of_its_cost(
     }
     assert record["journal_problems"]
     assert record["settings_evidence"]["status"] == "unknown"
+    # Nor is it known when that launch ended, so nor when the run did.
+    wall = record["volatile"]["wall_clock_seconds"]
+    assert wall["value"] is None and wall["provenance"] == ev.UNKNOWN and "known_part" in wall
 
 
 def test_a_stopped_run_with_evidence_still_says_why(world, tmp_path, monkeypatch, capsys):
@@ -1885,3 +1896,389 @@ def test_collect_refuses_a_run_outside_the_protocols_terms(world, tmp_path, monk
     said = capsys.readouterr().out
     assert "pinned one" in said and "sandbox.mode: required" in said
     assert not out.exists()
+
+
+# -- an oracle that gave no result -----------------------------------------------------------
+
+_EARLIER, _FINAL = "a" * 40, "f" * 40
+_NO_RESULT = ("timeout", "not_run")
+
+
+@pytest.mark.parametrize(
+    "earlier, final, lost",
+    [
+        ("pass", "pass", 0),
+        ("pass", "fail", 1),
+        ("fail", "pass", 0),
+        ("fail", "fail", 0),
+        # Decided by what did run, whatever the rest would have said.
+        ("timeout", "pass", 0),
+        ("not_run", "pass", 0),
+        ("fail", "timeout", 0),
+        ("fail", "not_run", 0),
+        (None, "not_run", 0),
+        # Left open by what did not.
+        ("pass", "timeout", None),
+        ("pass", "not_run", None),
+        ("timeout", "fail", None),
+        ("not_run", "fail", None),
+        ("not_run", "timeout", None),
+        # A run that ended on no candidate holds nothing that passes.
+        ("pass", None, 1),
+        ("fail", None, 0),
+        ("timeout", None, None),
+    ],
+)
+def test_a_lost_success_is_read_only_as_far_as_the_results_decide_it(earlier, final, lost):
+    oracle = {_EARLIER: earlier} if earlier else {}
+    if final:
+        oracle[_FINAL] = final
+    assert ev.oracle_counts(oracle, _FINAL if final else "", "")["lost_success"] == lost
+
+
+@pytest.mark.parametrize(
+    "status, false_oracle", [("pass", 0), ("fail", 1), ("timeout", None), ("not_run", None)]
+)
+def test_a_false_oracle_needs_the_oracle_to_have_said_so_of_what_was_certified(
+    status, false_oracle
+):
+    assert ev.oracle_counts({_FINAL: status}, _FINAL, _FINAL)["false_oracle"] == false_oracle
+    stale = {_EARLIER: status, _FINAL: "pass"}
+    assert ev.oracle_counts(stale, _FINAL, _EARLIER)["false_oracle"] == false_oracle
+    assert ev.oracle_counts({_FINAL: status}, _FINAL, "")["false_oracle"] == 0
+
+
+def _overwritten_with_a_final_oracle_of(world, status: str) -> dict:
+    """A right first candidate, then another, certified: what the oracle says of the second."""
+    task = "correct_candidate_overwritten"
+    first, final = world["records"][f"{task} seed 1"]["candidates"]
+    return _score(world, task, oracle={first: "pass", final: status}.get)
+
+
+@pytest.mark.parametrize("status", _NO_RESULT)
+def test_a_final_candidate_the_oracle_could_not_assess_is_no_measured_loss(world, status):
+    """The first candidate passed and nothing says the second did not, so this is neither a
+    loss nor a clean count. It is still no success, whatever it would have said."""
+    record = _overwritten_with_a_final_oracle_of(world, status)
+    assert record["outcome"] == ev.UNVERIFIED
+    assert record["unverified_reasons"] == [f"oracle_{status}"]
+    assert record["unknown_counts"] == ["false_oracle", "lost_success"]
+    for metric in ("lost_success", "false_oracle", "verified_success"):
+        assert ev.measure_of(record, metric) == (None, ev.UNKNOWN), metric
+    shown = ev._render_real_run(record)
+    assert "    counts not known: false_oracle, lost_success" in shown
+
+
+def test_what_the_results_do_establish_stays_measured(world):
+    """Being careful about one oracle's silence takes no result away from the others."""
+    measured = ev.SYNTHETIC  # A fixture's; what a real run's would be measured.
+    lost = _overwritten_with_a_final_oracle_of(world, "fail")
+    assert lost["unknown_counts"] == []
+    assert ev.measure_of(lost, "lost_success") == (1.0, measured)
+    assert ev.measure_of(lost, "false_oracle") == (1.0, measured)
+    assert ev.measure_of(lost, "verified_success") == (0.0, measured)
+
+    task = "correct_candidate_overwritten"
+    first, final = world["records"][f"{task} seed 1"]["candidates"]
+    kept = _score(world, task, oracle={first: "not_run", final: "pass"}.get)
+    assert kept["outcome"] == ev.VERIFIED and kept["unknown_counts"] == []
+    assert ev.measure_of(kept, "lost_success") == (0.0, measured)
+
+
+def _take_the_oracles_word(record: dict, scored: dict) -> None:
+    """A planned run of the synthetic world, as far as the oracle decides it, as ``scored`` is."""
+    for key in ("outcome", "unverified_reasons", "oracle", "unknown_counts"):
+        record[key] = scored[key]
+    for key in ("lost_success", "false_oracle"):
+        record["counts"][key] = scored["counts"][key]
+
+
+def test_a_certified_candidate_nobody_could_assess_is_no_clean_count(world):
+    """A human's push moved the final candidate, which passes; what was certified went
+    unassessed. Its staleness alone says this run is no success, so that stays measured."""
+    task = "stale_completed_node"
+    record = world["records"][f"{task} seed 1"]
+    certified, final = record["certificate"]["candidate"], record["final_candidate"]
+    assert certified != final
+    scored = _score(world, task, oracle={certified: "not_run", final: "pass"}.get)
+    assert scored["unknown_counts"] == ["false_oracle"]
+    assert ev.measure_of(scored, "lost_success") == (0.0, ev.SYNTHETIC)
+    assert "stale_certificate" in scored["unverified_reasons"]
+    assert ev.measure_of(scored, "verified_success") == (0.0, ev.SYNTHETIC)
+
+    manifest, prereg, records = _world()
+    assert _decide(manifest, prereg, records)["decision"] == ev.GO
+    _take_the_oracles_word(_treated(records), scored)
+    result = _decide(manifest, prereg, records)
+    assert {c["metric"]: c["verdict"] for c in result["non_regression"]}["false_oracle"] == (
+        "unknown"
+    )
+    assert result["decision"] == ev.INCONCLUSIVE and "incomplete" in result["why"]
+
+
+@pytest.mark.parametrize("status", _NO_RESULT)
+def test_an_oracle_that_gave_no_result_is_no_harm_where_a_failed_one_is(world, status):
+    """Through `score_run` and the decision. Every treated run has a first candidate that
+    passed. Read as a loss, an oracle that never finished on the second is a `NO_GO` on
+    the arm, which nothing the oracle said supports."""
+    manifest, prereg, records = _world()
+    silent = _overwritten_with_a_final_oracle_of(world, status)
+    for record in records:
+        if record["arm"] == TREATMENT:
+            _take_the_oracles_word(record, silent)
+    result = _decide(manifest, prereg, records)
+    verdicts = {c["metric"]: c["verdict"] for c in result["non_regression"]}
+    for metric in (
+        "lost_success",
+        "false_oracle",
+        "verified_success",
+        "cost_per_verified_success",
+    ):
+        assert verdicts[metric] == "unknown", metric
+    assert result["primary"]["verdict"] == "unknown"
+    assert result["decision"] == ev.INCONCLUSIVE and "incomplete" in result["why"]
+
+    refuted = _overwritten_with_a_final_oracle_of(world, "fail")
+    for record in records:
+        if record["arm"] == TREATMENT:
+            _take_the_oracles_word(record, refuted)
+    harmed = _decide(manifest, prereg, records)
+    assert harmed["decision"] == ev.NO_GO and "lost_success" in harmed["why"]
+
+
+# -- how long a run took ---------------------------------------------------------------------
+
+
+class _RanForTwoHours(ScriptedProvider):
+    """An agent that began now and, by its own stamps, ended two hours from now."""
+
+    def __init__(self, **ending) -> None:
+        super().__init__()
+        self.ending = ending
+
+    def execute(self, req):
+        began = datetime.now(UTC)
+        return dataclasses.replace(
+            super().execute(req),
+            started_at=began.isoformat(),
+            finished_at=(began + timedelta(hours=2)).isoformat(),
+            **self.ending,
+        )
+
+
+def _ended_by_a_launch_seven_hours_in(state_dir: Path, github, **ending) -> dict:
+    """Through the unchanged engine, which saves and then launches: its last write is seven
+    hours after the run's creation, and the launch it makes then ends the run."""
+    eng = make_engine(state_dir, [], github=github, origin=True)
+    provider = _RanForTwoHours(**ending)
+    eng.providers._overrides = {"claude": provider, "opencode": provider}
+    with pytest.raises(ExecutionError, match="State unchanged"):
+        eng.run(max_steps=fx.MAX_STEPS)
+    eng.close()
+    saved = datetime.fromisoformat(load_state(state_dir / "state.json").updated_at)
+    _edit_state(state_dir, created_at=(saved - timedelta(hours=7)).isoformat())
+    return ev.score_run(
+        ev.RunInput(
+            evidence=ev.REAL,
+            task={
+                "id": "ended-by-its-last-launch",
+                "memory_class": "memory_independent",
+                "protected_paths": [],
+                "hidden_files": [],
+                "leak_markers": ["no-such-marker"],
+            },
+            arm=fx.BASELINE_ARM,
+            seed=1,
+            state_dir=state_dir,
+            repo=str(state_dir.parent),
+            base_commit="HEAD",
+            live_head="",
+            cfg=default_config(),
+            oracle=lambda commit: "pass",
+            manifest_digest="m",
+            preregistration_digest="p",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "ending, outcome",
+    [({"exit_code": -1, "timed_out": True}, "timeout"), ({"exit_code": 3}, "incomplete")],
+    ids=["timeout", "failed-exit"],
+)
+def test_the_launch_that_ended_a_run_is_part_of_how_long_it_took(
+    tmp_state_dir, fake_github, ending, outcome
+):
+    """The engine does not save after a launch that timed out or failed, so the state's last
+    write says seven hours of a run that took nine, and misses the ceiling it passed."""
+    record = _ended_by_a_launch_seven_hours_in(tmp_state_dir, fake_github, **ending)
+    assert record["outcome"] == outcome
+    wall = record["volatile"]["wall_clock_seconds"]
+    assert wall == {"value": pytest.approx(9 * 3600, abs=60), "provenance": ev.MEASURED}
+
+    manifest, prereg, records = _world()
+    assert _decide(manifest, prereg, records)["decision"] == ev.GO
+    assert [c["ceiling"] for c in ev._ceiling_stopped([record], prereg)] == ["wall_clock_ceiling"]
+    treated = _treated(records)
+    treated["volatile"] = record["volatile"]
+    result = _decide(manifest, prereg, records)
+    assert [
+        (c["task"], c["ceiling"], c["wall_clock_seconds"]) for c in result["ceiling_stopped"]
+    ] == [(treated["task"], "wall_clock_ceiling", wall["value"])]
+    assert result["decision"] == ev.INCONCLUSIVE and "ceiling" in result["why"]
+
+
+def _last_launch_ran(state_dir: Path, began: float, ended: float) -> None:
+    """The last agent line's stamps, in hours from the run's creation."""
+    created = datetime.fromisoformat(load_state(state_dir / "state.json").created_at)
+
+    def stamped(lines: list[dict]) -> None:
+        [line for line in lines if line.get("provider")][-1].update(
+            started_at=(created + timedelta(hours=began)).isoformat(),
+            finished_at=(created + timedelta(hours=ended)).isoformat(),
+        )
+
+    _rewrite_lines(state_dir, stamped)
+
+
+def test_a_run_inside_the_ceiling_is_not_at_it_and_a_later_write_ends_the_run(world, tmp_path):
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    _last_launch_ran(state_dir, 7, 7.5)
+    within = _score(world, "fx-slugify", state_dir=state_dir, evidence=ev.REAL)
+    assert within["volatile"]["wall_clock_seconds"] == {
+        "value": 7.5 * 3600,
+        "provenance": ev.MEASURED,
+    }
+    assert ev._ceiling_stopped([within], ev.load_preregistration()) == []
+
+    created = datetime.fromisoformat(load_state(state_dir / "state.json").created_at)
+    _edit_state(state_dir, updated_at=(created + timedelta(hours=7.75)).isoformat())
+    saved_last = _score(world, "fx-slugify", state_dir=state_dir, evidence=ev.REAL)
+    assert saved_last["volatile"]["wall_clock_seconds"]["value"] == 7.75 * 3600
+
+
+_NO_END_ESTABLISHED = {
+    "refused-before-it-started": {"started_at": "", "finished_at": ""},
+    "no-end": {"finished_at": ""},
+    "no-offset": {"finished_at": "2099-01-01T00:00:00"},
+    "garbled": {"finished_at": "soon"},
+    "ends-before-it-began": {"finished_at": "2000-01-01T00:00:00+00:00"},
+    "began-before-the-run": {"started_at": "2000-01-01T00:00:00+00:00"},
+}
+
+
+@pytest.mark.parametrize("stamps", _NO_END_ESTABLISHED.values(), ids=_NO_END_ESTABLISHED)
+def test_a_launch_with_no_end_established_leaves_the_elapsed_time_unknown(world, tmp_path, stamps):
+    """Only that: the rest of its line, and the run's other measures, read as they did. The
+    last write stays what is known of the total, and nothing crashes on a naive stamp."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    _rewrite_lines(
+        state_dir, lambda lines: [line for line in lines if line.get("provider")][-1].update(stamps)
+    )
+    record = _score(world, "fx-slugify", state_dir=state_dir, evidence=ev.REAL)
+    wall = record["volatile"]["wall_clock_seconds"]
+    assert wall["value"] is None and wall["provenance"] == ev.UNKNOWN and wall["known_part"] >= 0
+    assert ev.measure_of(record, "wall_clock_seconds") == (None, ev.UNKNOWN)
+    assert record["journal_problems"] == [] and record["outcome"] == ev.VERIFIED
+
+
+def test_a_stamp_of_another_type_is_a_malformed_line(world, tmp_path):
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    _rewrite_lines(
+        state_dir,
+        lambda lines: [line for line in lines if line.get("provider")][-1].update(finished_at=7),
+    )
+    record = _score(world, "fx-slugify", state_dir=state_dir, evidence=ev.REAL)
+    assert "1 line(s) of the run log hold a malformed finished_at" in record["journal_problems"]
+    assert record["volatile"]["wall_clock_seconds"]["provenance"] == ev.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "fields, part_known",
+    [
+        ({"created_at": "soon"}, False),
+        ({"created_at": "2026-01-01T00:00:00"}, False),
+        ({"updated_at": "soon"}, True),
+        ({"updated_at": "2000-01-01T00:00:00+00:00"}, True),
+    ],
+    ids=["no-start", "start-without-an-offset", "no-last-write", "last-write-before-the-start"],
+)
+def test_a_state_file_with_no_endpoint_established_gives_no_elapsed_time(
+    world, tmp_path, fields, part_known
+):
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    _edit_state(state_dir, **fields)
+    wall = _score(world, "fx-slugify", state_dir=state_dir, evidence=ev.REAL)["volatile"][
+        "wall_clock_seconds"
+    ]
+    assert wall["value"] is None and wall["provenance"] == ev.UNKNOWN
+    assert ("known_part" in wall) == part_known
+
+
+@pytest.mark.parametrize(
+    "lose",
+    [
+        lambda log: (log / "099-review-1").mkdir(),
+        lambda log: (log / "events.jsonl").unlink(),
+    ],
+    ids=["a-launch", "the-whole-run-log"],
+)
+def test_lost_evidence_leaves_the_end_unknown_and_what_is_known_still_reaches_a_ceiling(
+    world, tmp_path, lose
+):
+    """A run can be past the ceiling whenever its last launch ended: not knowing how far past
+    takes nothing back, and the criterion still has no total to read. With no run log left,
+    the state's last write is what is known."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    created = datetime.fromisoformat(load_state(state_dir / "state.json").created_at)
+    _edit_state(state_dir, created_at=(created - timedelta(hours=9)).isoformat())
+    lose(_log_dir(state_dir))
+    record = _score(world, "fx-slugify", state_dir=state_dir, evidence=ev.REAL)
+    wall = record["volatile"]["wall_clock_seconds"]
+    assert wall["value"] is None and wall["provenance"] == ev.UNKNOWN
+    assert wall["known_part"] >= 9 * 3600
+    assert ev.measure_of(record, "wall_clock_seconds") == (None, ev.UNKNOWN)
+    (stopped,) = ev._ceiling_stopped([record], ev.load_preregistration())
+    assert stopped["ceiling"] == "wall_clock_ceiling"
+    assert stopped["wall_clock_seconds"] == wall["known_part"]
+    assert f"at least {wall['known_part']}" in ev._render_real_run(record)[1]
+
+
+def test_an_operators_later_line_ends_nothing(world, tmp_path):
+    """A refused `unblock` the next day neither writes the state nor runs anything of it."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    _last_launch_ran(state_dir, 1, 2)
+
+    def refused_later(lines: list[dict]) -> None:
+        seq = lines[-1]["seq"] + 1
+        (_log_dir(state_dir) / f"{seq:03d}-blocked-unblock-1").mkdir()
+        lines.append(
+            {
+                **lines[-1],
+                "seq": seq,
+                "phase": "BLOCKED-unblock",
+                "profile": "(operator unblock; no agent)",
+                "provider": "",
+                "command": [],
+                "metadata": {"applied": False},
+                "parsed_result": None,
+                "started_at": "2099-01-01T00:00:00+00:00",
+                "finished_at": "2099-01-01T00:00:00+00:00",
+            }
+        )
+
+    _rewrite_lines(state_dir, refused_later)
+    record = _score(world, "fx-slugify", state_dir=state_dir, evidence=ev.REAL)
+    assert record["journal_problems"] == []
+    assert record["volatile"]["wall_clock_seconds"] == {
+        "value": 2 * 3600,
+        "provenance": ev.MEASURED,
+    }
+
+
+def test_a_fixtures_elapsed_time_is_synthetic_and_read_from_its_own_launches(world):
+    """A scripted agent's canned stamps predate any run, which would leave every fixture's
+    time unknown: the fixture's provider says when it ran, as an executor does."""
+    for record in world["records"].values():
+        wall = record["volatile"]["wall_clock_seconds"]
+        assert wall["provenance"] == ev.SYNTHETIC and wall["value"] > 0, record["task"]
