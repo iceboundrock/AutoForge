@@ -652,6 +652,6 @@ def test_a_replan_fence_answered_with_nothing_it_can_judge_publishes_nothing(tmp
 def test_the_stop_for_a_pr_the_run_did_not_open_names_only_the_takeover(tmp_path):
     gh = FakeGitHub()
     eng = make_engine(tmp_path / "state", [], github=gh)
-    text = eng._unjournaled_pr_text(PR)
+    text = eng._unjournaled_pr_text(PR, None)
     assert "--take-over" in text
     assert "marker to write" not in text and "names the marker" not in text

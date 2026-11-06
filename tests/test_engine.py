@@ -941,6 +941,33 @@ def test_analyze_entry_blocks_before_launching_on_a_pr_it_would_not_publish_to(
     assert fake_github.effect_writes == [] and eng.origin.head("autoforge/2") is None
 
 
+def test_a_pr_the_controller_did_not_open_naming_this_run_stops_with_the_fresh_run_route(
+    tmp_state_dir, fake_github
+):
+    """PR #460: this run's --take-over refuses a marker naming it, so the stop
+    after a launch names a fresh run for such a PR, not this run's takeover."""
+
+    def publishes_itself(req):
+        sha = commit_in(req.cwd)
+        fake_github.add_pr(
+            PR41,
+            head_sha=sha,
+            branch="mine",
+            body=implementation_pr_body(owner_run_id=eng.state.run_id),
+        )
+        return block(analyze_payload(sha))
+
+    eng = make_engine(tmp_state_dir, publishes_itself, github=fake_github, origin=True)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert "but the controller did not open it" in reason
+    assert "A fresh run for the issue can" in reason
+    assert "writes this run into its marker" not in reason
+    assert "If it is not the issue's implementation, close it, then 'unblock'" in reason
+    assert fake_github.effect_writes == []
+
+
 def test_analyze_marker_pr_the_agent_opened_itself_blocks_with_nothing_published(
     tmp_state_dir, fake_github
 ):
@@ -2037,8 +2064,11 @@ def test_a_fresh_run_never_adopts_a_marked_pr_it_has_no_record_of(
     assert f"but this run ({eng.state.run_id}) has no record of the PR" in reason
     if owner == "self":
         assert "which names this run as its owner" in reason
+        assert "A fresh run for the issue can" in reason
+        assert "writes this run into the marker" not in reason
     else:
         assert "which names no owner (it was opened before owners were recorded)" in reason
+        assert "which writes this run into the marker" in reason
     assert f"unblock --take-over {PR}" in reason
     assert eng.provider.calls == [] and eng.state.current_pr_url == ""
 

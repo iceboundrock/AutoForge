@@ -915,7 +915,9 @@ and `pr-owner`, before anything more is launched or written:
   lost. Its `ANALYZE_EXECUTE` entry finds the issue's open marked PR and
   does not bind it, whatever run the marker names, this one included. The
   controller cannot tell a PR its own crashed run left behind from one
-  another controller is still reviewing (#387).
+  another controller is still reviewing (#387). When the marker names this
+  run, `--take-over` refuses it too, and the reason names a fresh run's
+  `--take-over` instead.
 - **A run whose PR's marker no longer names it.** Another run took it
   over, the marker was removed or cannot be read, or the PR was opened
   before #414 and its marker names no run. Every run bound to a PR when

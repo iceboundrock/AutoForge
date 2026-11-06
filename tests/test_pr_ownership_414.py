@@ -603,6 +603,40 @@ def test_ac5_forged_owner_written_before_the_fresh_run_reaches_its_entry_blocks(
     assert b.provider.calls == [] and state_of(b).current_pr_url == ""
 
 
+def test_ac5_a_marker_naming_this_run_stops_with_the_route_that_works(tmp_path):
+    """PR #460: this run's own --take-over is refused for a marker that already
+    names it, so neither the entry's stop nor a plain unblock may send the
+    operator there. The route they do name, a fresh run, takes the PR over."""
+    gh = FakeGitHub()
+    a = owning_run(tmp_path, gh)
+    a.close()
+    b = second_run(tmp_path, gh, a, "never launched")
+    assert b.step().next_phase == "ANALYZE_EXECUTE"
+    forged = b.state.run_id
+    rewrite_owner(gh, PR, forged)
+    stopped = b.step()
+    assert stopped.next_phase == "BLOCKED", stopped.message
+    for text in (stopped.message, b.unblock(REASON).message):
+        assert "fresh run" in text, text
+        assert "writes this run into the marker" not in text, text
+        assert "stop the run that owns it" not in text, text
+    refused = b.unblock(REASON, take_over=PR)
+    assert not refused.unblocked
+    assert "already names this run" in refused.message
+    assert "fresh run" in refused.message
+    assert writes(gh, "write_pr_body") == [] and state_of(b).current_pr_url == ""
+    b.close()
+
+    c = second_run(tmp_path, gh, a, "never launched", name="c")
+    assert c.step().next_phase == "ANALYZE_EXECUTE"
+    assert_owner_stop(c.step(), forged)
+    outcome = take_over(c, PR, REASON)
+    assert outcome.unblocked, outcome.message
+    assert marker_owner(_stored_pr(gh, PR).body) == c.state.run_id
+    assert state_of(c).phase == Phase.REVIEW
+    assert c.provider.calls == []
+
+
 def test_ac5_an_unreadable_pr_body_never_lets_the_owner_launch(tmp_path):
     gh = FakeGitHub()
     a = owning_run(tmp_path, gh, reviewer(gh))

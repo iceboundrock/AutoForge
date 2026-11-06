@@ -123,7 +123,9 @@ controller writes:
 - exactly one this state has no record of: `BLOCKED` (`pr-owner`) without
   launching, whatever run its marker names, this one included. Finding a
   PR is not owning it, and another controller may still be driving it.
-  The reason names the PR, its owner and `unblock --take-over <PR>`. After
+  The reason names the PR, its owner and `unblock --take-over <PR>`, or,
+  when the marker names this run, which that command refuses, the same
+  command in a fresh run. After
   a launch of this entry such a PR is `BLOCKED` as unjournaled: the entry
   observation recorded none, so the controller did not open it (D9.4). The
   one-shot re-entry of a run persisted while an agent of the previous

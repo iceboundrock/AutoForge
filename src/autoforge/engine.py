@@ -6060,28 +6060,46 @@ class ControllerEngine:
         return None
 
     def _unowned_pr_text(self, url: str, owner: str | None) -> str:
-        """The refusal of a marked PR this run has no record of, and the takeover (#414)."""
+        """The refusal of a marked PR this run has no record of, and the way on (#414).
+
+        The takeover, unless the marker names this run: :meth:`_plan_takeover`
+        refuses that one, so the route is a fresh run's (PR #460).
+        """
         state = self._require_state()
         number = parse_issue_url(state.current_issue_url).number
-        take_over = self.cli_command(
-            "unblock", "--take-over", url, "--reason", "<why this run takes the PR over>"
-        )
         if owner == state.run_id:
             whose = "names this run as its owner"
-        elif owner is None:
-            whose = "names no owner (it was opened before owners were recorded)"
+            how = self._self_named_marker_route(url)
         else:
-            whose = f"names run {owner} as its owner"
-        how = (
-            "If no other run is to drive it and this one is to take it over, stop the run "
-            f"that owns it, then run '{take_over}', which writes this run into the marker"
-        )
+            whose = (
+                "names no owner (it was opened before owners were recorded)"
+                if owner is None
+                else f"names run {owner} as its owner"
+            )
+            take_over = self.cli_command(
+                "unblock", "--take-over", url, "--reason", "<why this run takes the PR over>"
+            )
+            how = (
+                "If no other run is to drive it and this one is to take it over, stop the run "
+                f"that owns it, then run '{take_over}', which writes this run into the marker"
+            )
         return (
             f"open PR {url} carries the implementation marker for issue #{number}, which "
             f"{whose}, but this run ({state.run_id}) has no record of the PR: finding a PR is "
             "not owning it, so the controller neither binds nor reviews it, and nothing was "
             "launched (ADR 0004 D9.4a). Another controller may still be driving it; if one "
             f"is, leave the issue to that run. {how}"
+        )
+
+    def _self_named_marker_route(self, url: str) -> str:
+        """The way on from a marker naming this run with no K11 journaled (D9.3)."""
+        take_over = self.cli_command(
+            "unblock", "--take-over", url, "--reason", "<why the fresh run takes the PR over>"
+        )
+        return (
+            "The marker is public text anyone with the login can write (ADR 0004 D9.3), so it "
+            "hands nothing over, and this run cannot take the PR over. A fresh run for the issue "
+            f"can: it gets its own id, and '{take_over}' there writes that id into the marker"
         )
 
     def _implementation_pr_candidate(self) -> tuple[PRInfo | None, str]:
@@ -6221,7 +6239,7 @@ class ControllerEngine:
                 return self._block(
                     Phase.ANALYZE_EXECUTE,
                     plan,
-                    self._unjournaled_pr_text(pr.url),
+                    self._unjournaled_pr_text(pr.url, self._marker_owner(pr)),
                     code=StopReasonCode.UNJOURNALED_WRITE,
                 )
             refusal = self._recovery_owner_refusal(pr)
@@ -6424,17 +6442,24 @@ class ControllerEngine:
             f"issue and hand it the PR with '{take_over}' there"
         )
 
-    def _unjournaled_pr_text(self, url: str) -> str:
+    def _unjournaled_pr_text(self, url: str, owner: str | None) -> str:
         state = self._require_state()
+        how = (
+            self._self_named_marker_route(url)
+            if owner == state.run_id
+            else (
+                "If that PR is the issue's implementation and this run is to drive it, take it "
+                "over with 'unblock --take-over' (D9.4a), which writes this run into its marker "
+                "and binds it"
+            )
+        )
         return (
             f"open PR {url} carries the implementation marker for issue "
             f"{state.current_issue_url}, but the controller did not open it: it appeared "
             "after this phase's entry recorded none, and the controller opens or adopts the "
             "issue's PR itself, from a plan it journals before anything is sent (ADR 0004 "
-            "D9.4). Nothing was pushed or created. If that PR is the issue's implementation "
-            "and this run is to drive it, take it over with 'unblock --take-over' (D9.4a), "
-            "which writes this run into its marker and binds it; otherwise close it, then "
-            "'unblock'"
+            f"D9.4). Nothing was pushed or created. {how}. If it is not the issue's "
+            "implementation, close it, then 'unblock'"
         )
 
     def _unjournaled_branch_text(self, branch: str, recorded: str | None, found: str | None) -> str:
@@ -7685,10 +7710,7 @@ class ControllerEngine:
             return UnblockDecision(
                 None,
                 f"{refused}: its implementation marker already names this run ({state.run_id}), "
-                "but this run has no record of writing it. The marker is public text anyone with "
-                "the login can write (ADR 0004 D9.3), so it hands nothing over. Start a fresh "
-                "run for the issue: it gets its own id, and its 'unblock --take-over' writes "
-                "that id into the marker",
+                f"but this run has no record of writing it. {self._self_named_marker_route(url)}",
                 pr=pr,
             )
         problem = published_payload_problem("PR body", body)
@@ -14729,7 +14751,7 @@ class ControllerEngine:
         if pr is not None:
             return _blocked(
                 StopReasonCode.UNJOURNALED_WRITE,
-                self._unjournaled_pr_text(parse_pr_url(pr.url).canonical),
+                self._unjournaled_pr_text(parse_pr_url(pr.url).canonical, self._marker_owner(pr)),
             )
         try:
             default_branch = self.github.get_repo(state.repository).default_branch

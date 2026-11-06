@@ -765,7 +765,8 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   and PR from the records, without launching the agent) or the strict
   marker listing of `ANALYZE_EXECUTE`'s entry must resolve to no marked PR
   (one marked PR this run has no record of is refused, naming `unblock
-  --take-over`, #414), and a conclusive GitHub failure of either read
+  --take-over`, in a fresh run if the marker names this run, #414), and a
+  conclusive GitHub failure of either read
   refuses exactly as it does with a PR bound; with a PR bound, the PR is
   re-read, its implementation marker must name this run (ADR 0004 D9.4a;
   otherwise the refusal names `unblock --take-over`; a PR no longer open is
