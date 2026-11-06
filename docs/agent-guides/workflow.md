@@ -880,10 +880,15 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   the bound one or the listing's one, a K11 already journaled and pending
   (a plain unblock finishes it), the run's own `ANALYZE_EXECUTE` plan or
   records of a phase other than `REVIEW` and `FIX` journaled, a marker that
-  already names this run
+  already names this run with no K11 journaled
   (bound: unblock without the flag; unbound: start a fresh run, since a
   marker this run did not write hands it nothing), and no marked PR. A
-  takeover in `conflict` is planned again on the body as it is then by a
+  settled takeover (`conflict` or `observed`) is decided on a fresh read of
+  its PR (ADR 0004 K11, "A settled K11"): a marker naming this run settles
+  it with nothing written, whichever form the operator ran; a PR no longer
+  open is routed by a plain unblock as if no K11 were journaled, or refused
+  with its route when the run is bound to nothing; a marker naming another
+  run or none on an open PR is planned again on the body as it is then by a
   second `--take-over` of the same PR. A bound run with a journaled
   `REVIEW` or `FIX` plan (one stopped mid-phase, as a run in flight when
   #414 was installed may be) keeps it: the K11 record is appended to the

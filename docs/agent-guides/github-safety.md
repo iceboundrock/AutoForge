@@ -1036,15 +1036,17 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a).
   and between `FIX` effects; on the merge gate's read in `READY_FOR_MERGE`
   and `MERGE` (a `MERGED` PR is refused only for another run's marker or a
   defect); with the merge gate closed, on the held run's read of the PR, by
-  the same rule; at `ANALYZE_EXECUTE`'s discovery and in the K3 plan's read of
-  the PR it adopts; in `unblock` (a PR no longer open is refused, as at the
+  the same rule; at `ANALYZE_EXECUTE`'s discovery, in the K3 plan's read of
+  the PR it adopts, and before a saved K1+K2 plan's push, on the open PRs
+  headed at its branch (another run's marker stops it); in `unblock` (a PR no longer open is refused, as at the
   merge gate, only for another run's marker or a defect, and is never taken
   over); and in a replan at preparation, before each write of its plan,
   and before the source is closed. Where no read of the phase follows the
   check before a launch or a write (the launch, a `FIX` effect after the
   first, a write of the replan's plan), it passes only an open PR, read as
   itself, whose marker names this run: a conclusive read failure refuses,
-  and so does a PR no longer open. A replan
+  and so does a PR no longer open. The read right before K4 also refuses
+  an answer that is another PR or carries no state. A replan
   refused this way is rejected for good, and its reason says to start a
   fresh run for the issue and take the PR over there.
 - **A fresh state never adopts a marked PR.** It blocks and names
@@ -1060,9 +1062,11 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a).
   is observed on `resume` with no second write; a write the read-back
   does not show is sent again by the next `resume`, within the attempt
   bound, against the same base body; a body changed since the command read
-  it is a conflict (`effect-conflict`) and is never written over. A plain
-  `unblock`, `resume`, `run --force` and `epic archive` never take a PR
-  over. A dry run writes nothing. A bound run whose `REVIEW` or `FIX` plan
+  it is a conflict (`effect-conflict`) and is never written over. A settled
+  record is decided on a fresh read of its PR (ADR 0004 K11, "A settled
+  K11"); that decision writes nothing. A plain `unblock`, `resume`,
+  `run --force` and `epic archive` never start a takeover. A dry run writes
+  nothing. A bound run whose `REVIEW` or `FIX` plan
   is journaled keeps it: the record is appended to the plan, the plan's
   phase sends it first and then completes the plan as journaled (PR #460
   R1-F1).

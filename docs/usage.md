@@ -951,9 +951,17 @@ command. To take the PR over:
    certificate of the run it took the PR from. A run handed back its own
    PR re-checks its open findings at the PR's current revision.
 4. If it reports a conflict (`effect-conflict`: the PR body changed since
-   step 2 read it), the controller wrote nothing over it. Inspect the body,
-   then run `--take-over` again; it plans the write over the body as it is
-   now.
+   step 2 read it, or the PR stopped qualifying), the controller wrote
+   nothing over it. Inspect the PR. What you do next depends on what you
+   find:
+   - The marker names another run or none: run `--take-over` again. It
+     plans the write over the body as it is now.
+   - The marker already names this run, because the write landed and the
+     body was edited afterwards: run a plain `unblock`. Nothing more is
+     written, and the run continues.
+   - The PR was merged or closed: run a plain `unblock`. A run bound to the
+     PR goes wherever a merged or closed PR sends it. A run not yet bound
+     is refused, and the reason says to reopen the PR or start a new run.
 
 If the write does not show on GitHub when it is read back, the run stays
 in `ANALYZE_EXECUTE` and the next `resume` sends it again, at most twice

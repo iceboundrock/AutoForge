@@ -16988,3 +16988,38 @@ def test_fix_acceptance_comment_write_that_never_landed_is_sent_again(tmp_state_
     assert out.next_phase == "REVIEW", out.message
     assert [w[0] for w in gh.effect_writes] == ["create_issue_comment"] * 2
     assert len(gh.comments[ISSUE]) == 1
+
+
+def _stopped_mid_plan(tmp_path, phase: Phase, owner: str | None):
+    """A run that stopped with its REVIEW or FIX plan half sent, then lost its PR.
+
+    FIX: the follow-up issue is created and the push still intended. REVIEW:
+    the round comment is still intended. Then the PR's marker names ``owner``
+    (``None``: a PR opened before #414 recorded owners). Returns the engine
+    of the next controller process, its GitHub and what was sent so far.
+    """
+    gh = FakeGitHub()
+    state_dir = tmp_path / "state"
+    if phase is Phase.FIX:
+        script = fixer(fixed("R1-F1"), new_follow_up("R1-F2"))
+        eng = _in_fix(state_dir, gh, script, findings=[_finding(1), _finding(1, 2)], origin=True)
+        _power_loss_at(eng, EffectKind.PUSH, Stage.ATTEMPTED, saved=False)
+    else:
+        eng = _in_review(state_dir, gh, [block(review_result(1, SHA_A))])
+        _power_loss_at(eng, EffectKind.REVIEW_COMMENT, Stage.ATTEMPTED, saved=False)
+    eng._save()
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    sent = list(gh.effect_writes)
+    gh.prs[PR].body = implementation_pr_body(owner_run_id=owner)
+    return _next_process(eng, gh), gh, sent
+
+
+def _next_process(eng, gh):
+    """A new controller process on the same state, GitHub and (if any) git remote."""
+    if getattr(eng, "origin", None) is not None:
+        return _resumed(eng, eng.paths.state_dir, gh, "never")
+    eng.close()
+    again = make_engine(eng.paths.state_dir, "never", github=gh)
+    again.load()
+    return again

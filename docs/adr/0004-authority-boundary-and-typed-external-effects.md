@@ -1375,15 +1375,36 @@ replaced, and its precondition is that exact body.
   - W5: a body equal to neither the payload nor the base, before or after
     an issue, is a `conflict` (`effect-conflict`). There is no rebase, so a
     concurrent edit is never written over. A target that stops qualifying
-    (closed, a second marked PR) is a conflict too. A plain `unblock` then
-    refuses and names the command; `unblock --take-over` of the same PR
-    plans a fresh K11 over the body as it is then.
+    (closed, a second marked PR) is a conflict too. What the PR is when the
+    operator unblocks then decides (PR #460 R2-F1); see "A settled K11"
+    below. On an open PR whose marker names another run or none, a plain
+    `unblock` refuses and names the command, and `unblock --take-over` of
+    the same PR plans a fresh K11 over the body as it is then.
   - W6: the record is `observed`, but the read-back that binds the PR
     refuses it. A marker another run wrote since blocks with `pr-owner`
     and names the command; any other refusal is `read-back-mismatch`.
-    Nothing is bound. A plain `unblock` reads it back again, sending
-    nothing; `unblock --take-over` of the same PR plans a fresh K11 over
-    the body as it is then.
+    Nothing is bound. On an open PR a plain `unblock` reads it back again,
+    sending nothing, and `unblock --take-over` of the same PR plans a fresh
+    K11 over the body as it is then, unless the marker names this run. See
+    "A settled K11" below.
+- **A settled K11** (`conflict` or `observed`; PR #460 R2-F1) is decided on
+  a fresh read of its PR, so no run is left with two refusals pointing at
+  each other:
+  - An open PR whose marker names this run needs no write. A plain `unblock`
+    or `--take-over` of that PR settles the record as `observed`, and the
+    phase binds or drops it on its own read. Authority comes from the
+    operator's journaled record plus that read, never from the marker text
+    alone (D9.3), so a marker naming this run with no K11 journaled is still
+    refused. No field remembers an owner. A second marked PR refuses, as K11
+    itself does.
+  - A PR no longer open is not taken over. A run bound to it is routed by a
+    plain `unblock` as if no K11 were journaled, and the record is dropped
+    if that route enters a phase, so a merge by hand is reconciled as it
+    always was; `--take-over` of it is refused and names the plain
+    `unblock`. A run bound to nothing has no phase to enter on it, and both
+    forms refuse and state the route: reopen it, or start a new run.
+  - An open PR whose marker names another run or none is unchanged: W5 and
+    W6 above.
 - **Refusals,** each with nothing written:
   - `--take-over` naming a PR other than the bound one, or than the one
     the listing finds;
@@ -1393,9 +1414,9 @@ replaced, and its precondition is that exact body.
   - the run's own `ANALYZE_EXECUTE` plan, or records of a phase other than
     `REVIEW` and `FIX`, journaled: those are finished first, never
     discarded by a takeover;
-  - a marker that already names this run: a bound run is told to unblock
-    without the flag; an unbound one to start a fresh run, since a marker
-    the run did not write hands it nothing (D9.3);
+  - a marker that already names this run with no K11 journaled: a bound run
+    is told to unblock without the flag; an unbound one to start a fresh
+    run, since a marker the run did not write hands it nothing (D9.3);
   - no marked PR, or a body without exactly one readable marker of the
     issue;
   - a run with a replan journal, which `unblock` never re-enters (D9.4a).
@@ -1410,9 +1431,11 @@ replaced, and its precondition is that exact body.
   completes as journaled, each record reconciled with GitHub first. The
   takeover rebinds nothing and marks nothing stale: the plan's own reads
   of the PR decide whether it is still current, as on any entry after a
-  stop. A conflicted takeover sends nothing of the plan; a plain
-  `unblock` refuses, and a second `--take-over` of the same PR replaces
-  the record. The unblock reopens none of the plan's records: a conflict
+  stop. A conflicted takeover sends nothing of the plan. It is decided as
+  "A settled K11" above: a plain `unblock` refuses and a second
+  `--take-over` of the same PR replaces the record only on an open PR
+  whose marker names another run or none. The unblock reopens none of the
+  plan's records: a conflict
   of the plan is reported by its phase once the takeover is through, and
   a plain `unblock` decides it then. A plan holds at most one K11, last;
   it does not count toward the plan's record or size bounds, and its

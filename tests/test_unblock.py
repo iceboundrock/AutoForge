@@ -52,6 +52,7 @@ from tests.conftest import (
     reviewed_head_in,
     scripted,
 )
+from tests.test_engine import _next_process, _stopped_mid_plan
 
 PR_B = "https://github.com/owner/repo/pull/43"
 REASON = "operator inspected the PR; the flaky check was rerun and is green"
@@ -451,53 +452,6 @@ def test_k11_never_writes_over_an_edit_its_own_claimant_listing_saw(tmp_state_di
     assert out.next_phase == "BLOCKED" and out.stop.code is StopReasonCode.EFFECT_CONFLICT
     assert "the PR body changed since the takeover read it" in eng.state.block_reason
     assert fake_github.effect_writes == [] and fake_github.prs[PR].body == edited
-
-
-def _stopped_mid_plan(tmp_path, phase: Phase, owner: str | None):
-    """A run that stopped with its REVIEW or FIX plan half sent, then lost its PR.
-
-    FIX: the follow-up issue is created and the push still intended. REVIEW:
-    the round comment is still intended. Then the PR's marker names ``owner``
-    (``None``: a PR opened before #414 recorded owners). Returns the engine
-    of the next controller process, its GitHub and what was sent so far.
-    """
-    from tests.test_engine import (
-        _finding,
-        _in_fix,
-        _in_review,
-        _power_loss_at,
-        fixed,
-        fixer,
-        new_follow_up,
-    )
-
-    gh = FakeGitHub()
-    state_dir = tmp_path / "state"
-    if phase is Phase.FIX:
-        script = fixer(fixed("R1-F1"), new_follow_up("R1-F2"))
-        eng = _in_fix(state_dir, gh, script, findings=[_finding(1), _finding(1, 2)], origin=True)
-        _power_loss_at(eng, EffectKind.PUSH, Stage.ATTEMPTED, saved=False)
-    else:
-        eng = _in_review(state_dir, gh, [block(review_result(1, SHA_A))])
-        _power_loss_at(eng, EffectKind.REVIEW_COMMENT, Stage.ATTEMPTED, saved=False)
-    eng._save()
-    with pytest.raises(KeyboardInterrupt):
-        eng.step()
-    sent = list(gh.effect_writes)
-    gh.prs[PR].body = implementation_pr_body(owner_run_id=owner)
-    return _next_process(eng, gh), gh, sent
-
-
-def _next_process(eng, gh):
-    """A new controller process on the same state, GitHub and (if any) git remote."""
-    from tests.test_engine import _resumed as resumed
-
-    if getattr(eng, "origin", None) is not None:
-        return resumed(eng, eng.paths.state_dir, gh, "never")
-    eng.close()
-    again = make_engine(eng.paths.state_dir, "never", github=gh)
-    again.load()
-    return again
 
 
 @pytest.mark.parametrize("phase", [Phase.FIX, Phase.REVIEW])

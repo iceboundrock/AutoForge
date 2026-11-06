@@ -35,8 +35,10 @@ takeover is a new controller write, effect K11 (`owner_takeover`): the
 unblock journals it, and the resume replaces only the marker's owner in
 the PR body, reads it back, binds the PR and continues in `REVIEW`. The
 write goes only over the exact body the unblock read; a body edited since
-is a conflict (`effect-conflict`), nothing is written over it, and a
-second `--take-over` plans the write over the body as it is then. A write
+is a conflict (`effect-conflict`), and nothing is written over it. A
+second `--take-over` plans the write over the body as it is then. If the
+marker already names this run or the PR is no longer open, a plain
+`unblock` decides from the PR as it is, writing nothing. A write
 the read-back does not show is sent again by the next `resume`, at most
 twice in all. Plain `unblock`, `resume`, `run --force` and `epic archive`
 never take a PR over. See "Taking over a PR another run owns" in
