@@ -14079,9 +14079,14 @@ class ControllerEngine:
             record.last_activity_at = result.last_activity_at
             if result.timed_out:
                 record.ended_by = result.timeout_limit or "timeout"
-            else:
+            elif result.stopped_on_failure:
                 # The adapter stopped a CLI that ran on after its run had failed (#394).
-                record.ended_by = "provider_failure" if result.stopped_on_failure else "exit"
+                record.ended_by = "provider_failure"
+            elif result.stopped_on_reply:
+                # It stopped a CLI that ran on after a reply decided its run (#439).
+                record.ended_by = "reply"
+            else:
+                record.ended_by = "exit"
             if result.loop is not None:
                 record.loop = result.loop.record()
                 record.loop_warnings = result.loop.warnings
@@ -14134,7 +14139,7 @@ class ControllerEngine:
                     _with_leftovers(f"agent '{profile.name}' {ended}", result.leftovers)
                     + f". stderr tail: {stderr[-2000:]}"
                 )
-            if result.provider_failure or result.exit_code != 0:
+            if result.provider_failure or result.failed_exit:
                 # A run that failed inside the provider's protocol, whatever
                 # the exit status, is handled exactly like a failed exit, and
                 # its reason is named rather than the status because it says
@@ -14414,6 +14419,8 @@ class ControllerEngine:
                     end = f"{_limit_reached(limits, result)}, killed"
                 elif result.provider_failure:
                     end = f"failed: {result.provider_failure}"
+                elif result.stopped_on_reply:
+                    end = "replied and was stopped while still running"
                 else:
                     end = f"exited {result.exit_code}"
                 if result.transient_failure and (result.provider_failure or result.exit_code):

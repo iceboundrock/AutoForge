@@ -50,7 +50,9 @@ Guarantees:
   ``wind_down_seconds``: the limit still falls due on time
   (:meth:`DuplexChild.limit_due`) and the deadline, the kill, comes that
   much later. :meth:`DuplexChild.pin_deadline` stops output from moving
-  either, for a caller winding the child down;
+  either, for a caller winding the child down. What the limit left unread
+  stays with the caller (:meth:`DuplexChild.unread_at_deadline`), without what
+  the group writes as it dies;
 - EOF is not the child's exit: a descendant holding stdout keeps EOF away,
   and one that keeps writing keeps every read busy.
   :meth:`DuplexChild.exited` says whether the child itself has exited,
@@ -351,6 +353,10 @@ class _RecordQueue:
     of waiting, so the reader thread keeps draining the pipe. The end item
     (:class:`Eof` or :class:`Overflow`) is returned after every queued item,
     and then on every later get. An :class:`Oversize` counts its head.
+
+    Sealed, it takes nothing more and so can no longer overflow: what it holds
+    and whether it overflowed are what had arrived by then, whatever the child
+    writes as it is killed.
     """
 
     def __init__(self, max_items: int, max_bytes: int) -> None:
@@ -359,6 +365,7 @@ class _RecordQueue:
         self._items: deque[Record | Oversize | Fragment] = deque()
         self._bytes = 0
         self._end: Eof | Overflow | None = None
+        self._sealed = False
         self._cond = threading.Condition()
 
     @property
@@ -372,10 +379,10 @@ class _RecordQueue:
             return isinstance(self._end, Overflow)
 
     def put(self, item: Record | Oversize | Fragment) -> bool:
-        """Queue ``item``; False once the queue has ended (overflow included)."""
+        """Queue ``item``; False once the queue has ended (overflow included) or is sealed."""
         size = _held_bytes(item)
         with self._cond:
-            if self._end is not None:
+            if self._end is not None or self._sealed:
                 return False
             if len(self._items) >= self._max_items or self._bytes + size > self._max_bytes:
                 self._end = Overflow()
@@ -406,6 +413,28 @@ class _RecordQueue:
                 if remaining <= 0:
                     return None
                 self._cond.wait(remaining)
+
+    def seal(self) -> None:
+        with self._cond:
+            self._sealed = True
+
+    def seal_if_read(self) -> bool:
+        """Seal it unless a record or an overflow still waits to be read; whether it did."""
+        with self._cond:
+            if self._items or isinstance(self._end, Overflow):
+                return False
+            self._sealed = True
+            return True
+
+    def take_unread(self) -> list[Record | Oversize | Fragment | Overflow]:
+        """What waits to be read, oldest first and an overflow last; never waits."""
+        with self._cond:
+            unread: list[Record | Oversize | Fragment | Overflow] = list(self._items)
+            self._items.clear()
+            self._bytes = 0
+            if isinstance(self._end, Overflow):
+                unread.append(self._end)
+            return unread
 
 
 def _held_bytes(item: Record | Oversize | Fragment) -> int:
@@ -786,6 +815,21 @@ class DuplexChild:
         assert rest is not None
         return rest
 
+    def unread_at_deadline(self) -> list[Record | Oversize | Fragment | Overflow]:
+        """What had reached the queue, and not been read, when a limit killed the child.
+
+        A read that meets the deadline does not look at the queue, and every
+        read after it says only that the deadline passed. For a caller whose
+        outcome depends on what stdout had carried by then (#439), this is the
+        rest of it, oldest first, ending in :class:`Overflow` if the queue had
+        overflowed by then; what the group wrote as it was killed is not in
+        it. Call it after a :class:`Timeout` with ``deadline_exceeded``; it
+        takes what it returns, so a second call returns nothing.
+        """
+        if self._queue is None:
+            raise ExecutionError("stdout is captured, not framed into records")
+        return self._queue.take_unread()
+
     def _deadline_reached(self) -> ReadOutcome:
         """A read met the deadline. The child is looked at first, as
         ``execute()``'s last look at it is at the deadline: one
@@ -891,15 +935,25 @@ class DuplexChild:
         self._child_killed = self._proc.poll() is None
         self._left = _terminate_group(self._pgid, self._proc, self._readers, self._contained)
 
-    def stop(self) -> bool:
+    def stop(self, *, once_read: bool = False) -> bool:
         """End the invocation now, for a reason of the caller's (#194's loop
         detector): the group is killed as on a timeout, through the same
         path and within the same bounds, and the result says ``stopped``.
         False, and nothing done, once the child has exited on its own or the
         group has been dealt with (a limit fired first): the caller then
-        settles it as usual. The caller follows a stop with :meth:`finish`."""
+        settles it as usual. The caller follows a stop with :meth:`finish`.
+
+        ``once_read`` is for a reason a record could still overtake (#439):
+        False, and nothing done, too, while a record or an overflow waits to
+        be read, which :meth:`read_line` returns without waiting. A stop that
+        goes ahead seals the queue first, so a record that had not reached it
+        by then counts as written during the stop: it is never read and cannot
+        overflow, and :attr:`DuplexResult.records_overflowed` says records were
+        lost before the stop."""
         with self._lifecycle_lock:
             if self._left is not None or self._proc.poll() is not None:
+                return False
+            if once_read and self._queue is not None and not self._queue.seal_if_read():
                 return False
             self._stopped = True
             self._limits.pin()
@@ -912,6 +966,8 @@ class DuplexChild:
             if self._left is not None:
                 return
             self._mark_timed_out()
+            if self._queue is not None:
+                self._queue.seal()
             self._kill()
 
     def _teardown(self, exit_by: float | None) -> None:

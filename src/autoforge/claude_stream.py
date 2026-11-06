@@ -113,6 +113,18 @@ per-line bound leaves its call open; and a call past :data:`MAX_OPEN_TOOLS`,
 or without an id, is never counted open. Only ``results`` equal to
 ``turns`` (every turn opened has ended) reads one way.
 
+A reply in hand (#439): given ``is_reply``, the driver's test of a ``result``
+text, :attr:`ClaudeStream.replied` says the run is decided on that text while
+the CLI still runs: every turn opened has its ``result``, the last is a
+success whose text the test accepts, and no tool call is open. That is a CLI
+between turns kept alive by something the agent left pending, the state the
+paragraph above reads ``results`` equal to ``turns`` as, with a reply that
+needs no further turn. A record that opens a turn ends it, until that turn's
+own ``result`` decides again; a notice between turns does not. A background
+agent's held-back results keep it false until they have arrived. A
+``tool_result`` skipped past the per-line bound leaves its call open and so
+keeps it false too: the run then waits for the CLI, as it did before #439.
+
 Loop detection (#194): given a :class:`~autoforge.loop_detect.LoopObserver`,
 each completed tool call is reported as an action fingerprinted from its
 name, the digest of its whole ``input`` (kept from the ``tool_use`` until
@@ -141,6 +153,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Callable
 from decimal import ROUND_HALF_UP, Decimal
 
 from .interaction import RequestKind
@@ -222,10 +235,14 @@ class ClaudeStream:
         cwd: str = "",
         emit: ProgressSink | None = None,
         loop: LoopObserver | None = None,
+        is_reply: Callable[[str], bool] | None = None,
     ) -> None:
         self._cwd = cwd
         self._emit = emit
         self._loop = loop
+        self._is_reply = is_reply
+        # The newest ``result`` text passed ``is_reply``, asked once per result.
+        self._text_is_reply = False
         self.text: str | None = None
         self.failure: str | None = None
         # Set with ``failure`` when the result that failed the run ended its
@@ -262,6 +279,16 @@ class ClaudeStream:
         self._tool_errors = 0
         self._retries = 0
         self._result: dict[str, str | int | bool] = {}
+
+    @property
+    def replied(self) -> bool:
+        """The run is decided on :attr:`text`, whatever the CLI does (module docstring, #439)."""
+        return (
+            self._text_is_reply
+            and self.failure is None
+            and self._results == self._turns
+            and not self._open_tools
+        )
 
     # -- driver interface ----------------------------------------------------
     def feed(self, data: bytes) -> None:
@@ -422,6 +449,7 @@ class ClaudeStream:
             self._protocol("the result event has no string 'result'")
         else:
             self.text = result
+            self._text_is_reply = self._is_reply is not None and self._is_reply(result)
 
     def _observe(self, kind: str, record: dict) -> None:
         if kind == "system":
