@@ -19,8 +19,9 @@
   be published in a marker. A replan refused for its owner keeps the code:
   the transaction is rejected as any other replan refusal is, but the stop
   is `pr-owner`, not `replan-refused`. `PROwnerError` carries it; the step
-  that meets the error blocks, so it ends a command only if a path outside
-  a step raises it. A K11 takeover that meets a changed body stops with
+  that meets the error blocks, and so does `run`'s read of a held
+  `READY_FOR_MERGE`, the one read made outside a step, so it ends a command
+  only if another path outside a step raises it. A K11 takeover that meets a changed body stops with
   `effect-conflict`, like any other effect conflict.
 - **Amends:** nothing. Every phase, edge, exit rule, budget, retry, effect
   and the state file are unchanged; seven `BLOCKED` reasons that told the

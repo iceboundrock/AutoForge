@@ -22,7 +22,12 @@ archive` no longer lets the next admission adopt the issue's PR.
 
 **Runs in flight at the upgrade stop once.** A PR opened before this
 change carries a marker that names no run, so each run bound to one blocks
-at its next step and needs one `--take-over`.
+at its next step and needs one `--take-over`. A run waiting at
+`READY_FOR_MERGE` with the merge gate closed stops at the next `resume` or
+`epic recheck`; after its `--take-over` its clean review is stale, so it is
+reviewed again. A run with a replan journal cannot be unblocked: if its replan
+is refused, start a fresh run for the issue, take the PR over there, and close
+any replacement PR the refusal names.
 
 To take a PR over: stop the other controller, run `autoforge unblock
 --take-over <PR URL> --reason "..."`, then `autoforge resume`. The

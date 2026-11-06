@@ -37,7 +37,7 @@ from tests.conftest import (
     new_follow_up,
     review_result,
 )
-from tests.test_engine import SHA_A, _finding, _in_fix, _in_review
+from tests.test_engine import SHA_A, SHA_B, _finding, _held, _in_fix, _in_merge, _in_review
 from tests.test_replan import _park_at_hard_threshold, _replan_agent
 
 OTHER_RUN = "af-20261031T040500Z-0a0b0c"
@@ -68,7 +68,17 @@ def _replan(tmp_path, gh: FakeGitHub) -> Lifecycle:
     return Lifecycle(eng, steps=2)  # REVIEW at the threshold, REPLAN_REEXECUTE
 
 
+def _held_then_moved(tmp_path, gh: FakeGitHub) -> Lifecycle:
+    gh.add_pr(head_sha=SHA_B)
+    eng = _in_merge(
+        tmp_path / "state", gh, [block(review_result(3, SHA_B))], phase=Phase.READY_FOR_MERGE
+    )
+    eng.config.safety.allow_merge = False  # the default
+    return Lifecycle(eng, steps=2)  # the closed gate's read to REVIEW, REVIEW of the new revision
+
+
 LIFECYCLES = {
+    "held-then-moved": _held_then_moved,
     "review-to-merge": _review_to_merge,
     "fix": _fix_with_two_effects,
     "replan": _replan,
@@ -432,3 +442,116 @@ def test_a_replan_whose_source_closed_since_its_checks_publishes_nothing(tmp_pat
     assert out.next_phase == "BLOCKED", out.message
     assert out.stop is not None and out.stop.code is StopReasonCode.REPLAN_REFUSED, out.stop
     assert "is CLOSED, so there is nothing left to replace" in out.message
+
+
+def test_a_replan_refused_for_a_source_naming_no_run_ends_the_run_and_points_to_a_fresh_one(
+    tmp_path,
+):
+    """The exception to "one '--take-over'" at the upgrade: a run with a replan
+    journal is never unblocked, so a source whose marker names no run, as one
+    opened before #414 does, ends the transaction. Nothing is published and the
+    reason sends the operator to a fresh run's takeover."""
+    gh = FakeGitHub()
+
+    def strip_owner(req):
+        gh.prs[PR].body = implementation_pr_body(owner_run_id=None)
+        gh.unbodied.discard(PR)
+
+    eng = _park_at_hard_threshold(tmp_path / "state", gh, _replan_agent(gh, during=strip_owner))
+    eng._save()
+    refs = _origin_refs(eng)
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and out.stop is not None, out.message
+    assert out.stop.code is StopReasonCode.PR_OWNER
+    assert "start a fresh run for the issue" in out.message and "--take-over" in out.message
+    assert not [w for w in gh.effect_writes if w[0] == "create_pull_request"]
+    assert _origin_refs(eng) == refs
+    assert not eng.unblock("try again").unblocked
+
+
+UNOWNED = pytest.mark.parametrize("owner", [OTHER_RUN, None], ids=["another-run", "no-run"])
+RECHECKS = {
+    "resume": lambda eng: eng.run(max_steps=5, recheck_held=True),
+    "step": lambda eng: [eng.step(allow_merge=False)],
+}
+
+
+def _held_with_marker(tmp_path, gh: FakeGitHub, owner: str | None, head: str = SHA_A):
+    gh.add_pr(head_sha=head, body=implementation_pr_body(owner_run_id=owner))
+    return _held(tmp_path / "state", gh, config_allows=False)
+
+
+@UNOWNED
+@pytest.mark.parametrize("head", [SHA_A, SHA_B], ids=["unmoved", "moved"])
+@pytest.mark.parametrize("how", sorted(RECHECKS))
+def test_a_held_run_whose_marker_does_not_name_it_blocks_at_the_closed_gate(
+    tmp_path, owner, head, how
+):
+    """#414's decision item 5: the held-run recheck checks the owner too. With
+    the merge gate closed, the default, the merge gate's own read is never
+    made, so this read is the only one the step has. Whatever the revision, a
+    run its marker does not name stops there with the takeover command, and
+    keeps its verdict and bound revision as they were: the move to REVIEW is
+    not recorded for a PR this run no longer drives."""
+    gh = FakeGitHub()
+    eng, _ = _held_with_marker(tmp_path, gh, owner, head)
+    outcomes = RECHECKS[how](eng)
+    assert [o.next_phase for o in outcomes] == ["BLOCKED"], [o.message for o in outcomes]
+    assert outcomes[0].stop is not None and outcomes[0].stop.code is StopReasonCode.PR_OWNER
+    saved = load_state(eng.paths.state_file)
+    assert saved.phase is Phase.BLOCKED
+    assert f"--take-over {PR}" in saved.block_reason
+    assert saved.last_review_result == "clean" and saved.current_head_sha == SHA_A
+    assert gh.effect_writes == [] and gh.merges == [] and eng.provider.calls == []
+
+
+def test_a_resume_refused_at_the_recheck_is_not_charged_as_a_step(tmp_path):
+    """As the recheck of an unmoved PR: only the step to REVIEW is charged (#447)."""
+    gh = FakeGitHub()
+    eng, _ = _held_with_marker(tmp_path, gh, OTHER_RUN)
+    before = eng.state.step_count
+    eng.run(max_steps=5, recheck_held=True)
+    assert load_state(eng.paths.state_file).step_count == before
+
+
+@UNOWNED
+def test_a_held_run_stopped_at_the_recheck_takes_its_pr_over_and_is_reviewed_again(tmp_path, owner):
+    """A run held when #414 was installed needs its one '--take-over' like any
+    other. Its clean review is stale afterwards: the PR may have moved while it
+    was not this run's, so REVIEW decides again before any merge."""
+    gh = FakeGitHub()
+    eng, _ = _held_with_marker(tmp_path, gh, owner)
+    eng.run(max_steps=5, recheck_held=True)
+    assert not eng.unblock("try again").unblocked
+    assert eng.unblock("the other run is stopped", take_over=PR).unblocked
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert gh.prs[PR].body == implementation_pr_body(owner_run_id=eng.state.run_id)
+    assert eng.state.last_review_result == "stale"
+
+
+@pytest.mark.parametrize("state", ["CLOSED", "MERGED"])
+def test_a_held_run_still_holds_a_pr_no_longer_open_whose_marker_names_no_run(tmp_path, state):
+    """A merge by hand of a PR opened before #414 leaves the run holding, as it
+    did (#447): a PR no longer open is driven no further, so a marker naming no
+    run does not stop it, as at the merge gate and in 'unblock'."""
+    gh = FakeGitHub()
+    eng, before = _held_with_marker(tmp_path, gh, None)
+    gh.prs[PR].state = state
+    assert eng.run(max_steps=5, recheck_held=True) == []
+    assert f"reports PR {PR} {state}" in eng.held_reason
+    assert eng.paths.state_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("state", ["CLOSED", "MERGED"])
+def test_a_held_run_blocks_on_a_pr_no_longer_open_another_run_owns(tmp_path, state):
+    """That run's to reconcile, as at the merge gate; and since only an open PR
+    is taken over, the reason offers no takeover."""
+    gh = FakeGitHub()
+    eng, _ = _held_with_marker(tmp_path, gh, OTHER_RUN)
+    gh.prs[PR].state = state
+    outcomes = eng.run(max_steps=5, recheck_held=True)
+    assert [o.next_phase for o in outcomes] == ["BLOCKED"], [o.message for o in outcomes]
+    assert outcomes[0].stop is not None and outcomes[0].stop.code is StopReasonCode.PR_OWNER
+    assert OTHER_RUN in eng.state.block_reason and "--take-over" not in eng.state.block_reason

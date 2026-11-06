@@ -1288,7 +1288,8 @@ class TakeOverRequest:
 
 # The phases whose every step starts by checking that the bound PR's
 # implementation marker names this run (#414, ADR 0004 D9.4a). READY_FOR_MERGE
-# and MERGE check it on the merge gate's read, the first read of their step.
+# and MERGE check it on their step's first read: the merge gate's, or with the
+# gate closed the held run's (:meth:`ControllerEngine._held_revision_moved`).
 _OWNER_CHECKED_PHASES = frozenset({Phase.REVIEW, Phase.FIX, Phase.REPLAN_REEXECUTE})
 
 # What an ``unblock`` flag asks for; ``None`` for a plain unblock.
@@ -4742,7 +4743,17 @@ class ControllerEngine:
                     break
                 held: _HeldRevisionMoved | None = None
                 if held_check:
-                    held = self._held_revision_moved()
+                    try:
+                        held = self._held_revision_moved()
+                    except PROwnerError as exc:
+                        # Outside any step, so not charged, as a hold is not.
+                        refused = self._block(
+                            Phase.READY_FOR_MERGE, None, str(exc), code=StopReasonCode.PR_OWNER
+                        )
+                        all_outcomes.append(refused)
+                        if on_outcome is not None:
+                            on_outcome(refused)
+                        break
                     if held is None:
                         break
                 outcome = self._step_once(dry_run=False, allow_merge=allow_merge, held=held)
@@ -9303,6 +9314,13 @@ class ControllerEngine:
         the phase and the state file unchanged.
 
         Each hold sets :attr:`held_reason` to why it held.
+
+        With the gate closed the merge gate's own read is never made, so this
+        read is where the run's ownership is judged (#414, ADR 0004 D9.4a): a
+        marker that does not name this run raises :class:`PROwnerError`,
+        whatever the revision, and the move is not recorded. A PR no longer
+        open is refused only for another run's marker or a defect, as at the
+        merge gate, so a merge by hand of a PR opened before #414 still holds.
         """
         state = self._require_state()
         url = state.current_pr_url
@@ -9341,13 +9359,18 @@ class ControllerEngine:
         )
         if pr.url and not parse_pr_url(pr.url).same_target(reviewed_ref):
             raise VerificationError(f"GitHub answered {url} with PR {pr.url}: {unchanged}")
+        sent = "the run's review and bound revision were left as they were and nothing was sent"
         if pr.state in ("CLOSED", "MERGED"):
+            foreign = self._foreign_owner_problem(pr)
+            if foreign:
+                raise PROwnerError(self._pr_owner_text(foreign, sent, pr_state=pr.state))
             return hold(f"GitHub reports PR {url} {pr.state}, so it is not compared")
         if pr.state != "OPEN":
             shown = repr(pr.state) if pr.state else "no state"
             raise VerificationError(
                 f"PR {url} reports {shown}, not OPEN, CLOSED or MERGED: {unchanged}"
             )
+        self._require_pr_owner(pr, sent)
         missing = [
             name for name, value in (("HEAD", pr.head_sha), ("base", pr.base_ref)) if not value
         ]
@@ -11509,8 +11532,9 @@ class ControllerEngine:
         nothing. ANALYZE_EXECUTE decides for itself (its entry's recovery,
         or a K11 takeover that binds the PR), as does a replan whose
         transaction is journaled (it checks its source before each write and
-        before closing it); READY_FOR_MERGE and MERGE check on the merge
-        gate's read, the first of their step. There, a PR that is not open,
+        before closing it); READY_FOR_MERGE and MERGE check on the first read
+        of their step, the merge gate's or, with the gate closed, the held
+        run's. There, a PR that is not open,
         a read answered with another PR and a read that fails conclusively
         are the phase's to handle, on its own read; an unavailable GitHub
         propagates with nothing saved.

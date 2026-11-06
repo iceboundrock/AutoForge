@@ -2350,7 +2350,10 @@ its author. Only the effect records and the entry observation prove origin.
     binding it makes then blocks the same way. A run stopped mid-`REVIEW`
     or mid-`FIX` with its plan journaled blocks the same way, and its one
     `--take-over` is appended to that plan, which then completes (K11
-    below; PR #460 R1-F1).
+    below; PR #460 R1-F1). A run held at `READY_FOR_MERGE` by the closed
+    merge gate takes no step until something reads it, so it blocks at the
+    next `resume`, `step` or `epic recheck`; its `--take-over` makes its
+    clean review stale, and `REVIEW` decides again.
   - **Where the check runs.** On a read the step already makes wherever
     one exists, and on one more read where it does not:
     - at the start of each step in `REVIEW`, `FIX` and
@@ -2364,6 +2367,11 @@ its author. Only the effect records and the entry observation prove origin.
     - on the merge gate's read in `READY_FOR_MERGE` and `MERGE`, where a
       `MERGED` PR is refused only for another run's marker or a defect,
       so a merge this run made is still counted;
+    - with the merge gate closed, on the held run's read of the PR, the
+      only read that step makes. The rule for a PR no longer open is the
+      merge gate's, so a merge by hand of a PR opened before #414 still
+      holds, and a refusal records no move to `REVIEW`. A scheduler's
+      worker does not read a run it settled there; `epic recheck` does;
     - at `ANALYZE_EXECUTE`'s discovery, and in the K3 plan's read of the
       PR it adopts before anything of the plan is sent, which refuses a
       marker naming another run or one that cannot be read;

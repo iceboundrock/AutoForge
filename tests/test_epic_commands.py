@@ -1430,6 +1430,38 @@ def test_a_recheck_whose_step_blocks_the_run_exits_1_with_its_typed_stop(epic):
         assert pickle.load(f).merges == []
 
 
+def test_a_recheck_of_an_issue_whose_pr_another_run_owns_blocks_the_run(epic):
+    """#414: 'epic recheck' makes the held run's read, so it checks the owner on
+    it too. The run stops with its typed stop and the takeover command, whether
+    or not the PR moved; the command exits 1 and reads nothing past the PR."""
+    e = epic()
+    b = e.b
+    b.issue(2, world=str(world(b, 2)))
+    assert e.run()[0] == 0
+    held = b.state(2)
+    assert held.phase is Phase.READY_FOR_MERGE
+    other = "af-20261031T040500Z-0a0b0c"
+    with open(world(b, 2), "rb") as f:
+        gh = pickle.load(f)
+    (pr,) = gh.prs.values()
+    pr.body = pr.body.replace(held.run_id, other)
+    with open(world(b, 2), "wb") as f:
+        pickle.dump(gh, f)
+
+    with _WorldEngines(b, 2) as engines:
+        code, out, _ = e.cli("epic", "recheck", EPIC, "2")
+    assert code == 1, out
+    blocked = b.state(2)
+    assert blocked.phase is Phase.BLOCKED and blocked.run_id == held.run_id
+    assert other in blocked.block_reason and "--take-over" in blocked.block_reason
+    assert blocked.last_review_result == "clean"
+    stop = next(line for line in out.splitlines() if line.startswith("stop: "))
+    assert stop.startswith("stop: blocked (reason pr-owner, from controller")
+    assert [call[0] for call in engines.calls] == ["get_pr"]
+    with open(world(b, 2), "rb") as f:
+        assert pickle.load(f).merges == []
+
+
 def test_recheck_refuses_an_issue_it_does_not_hold_at_ready_for_merge(epic):
     """No namespace, one bound under another EPIC, and an open claim are refused
     (exit 2) before any engine is built or GitHub is read."""

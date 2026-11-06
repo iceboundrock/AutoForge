@@ -1035,7 +1035,8 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a).
   an agent returns, before its result is applied; right before K4 is sent
   and between `FIX` effects; on the merge gate's read in `READY_FOR_MERGE`
   and `MERGE` (a `MERGED` PR is refused only for another run's marker or a
-  defect); at `ANALYZE_EXECUTE`'s discovery and in the K3 plan's read of
+  defect); with the merge gate closed, on the held run's read of the PR, by
+  the same rule; at `ANALYZE_EXECUTE`'s discovery and in the K3 plan's read of
   the PR it adopts; in `unblock` (a PR no longer open is refused, as at the
   merge gate, only for another run's marker or a defect, and is never taken
   over); and in a replan at preparation, before each write of its plan,

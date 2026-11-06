@@ -921,7 +921,9 @@ and `pr-owner`, before anything more is launched or written:
   before #414 and its marker names no run. Every run bound to a PR when
   you upgrade stops here once. It stops at its next step, before the agent's
   result is applied, before the review comment is posted, between `FIX`'s
-  writes, and at the merge gate. A plain `unblock` refuses it.
+  writes, and at the merge gate. A run waiting at `READY_FOR_MERGE` with the
+  merge gate closed stops at your next `resume` or `epic recheck`. A plain
+  `unblock` refuses it.
 
 The `BLOCKED` reason names the PR, the run its marker names, and the
 command. To take the PR over:

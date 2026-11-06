@@ -612,6 +612,24 @@ def test_a_plan_taken_back_after_its_pr_moved_is_routed_by_its_own_checks(tmp_pa
     assert eng.state.prior_findings and eng.provider.calls == []
 
 
+def test_a_review_plan_taken_back_after_its_pr_moved_posts_its_round_and_goes_stale(tmp_path):
+    """REVIEW's counterpart of the test above. The journaled round comment
+    names the revision it reviewed and is completed as on any entry after a
+    stop, even though the other run has pushed past it. The post-review re-read
+    finds the new HEAD, so the verdict is not applied: the round goes stale and
+    REVIEW runs at the new revision."""
+    eng, gh, sent = _stopped_mid_plan(tmp_path, Phase.REVIEW, OTHER_RUN)
+    eng.step()
+    gh.prs[PR].head_sha = SHA_B
+    assert eng.unblock(REASON, take_over=PR).unblocked
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert [w[0] for w in gh.effect_writes[len(sent) :]] == ["write_pr_body", "create_pr_comment"]
+    assert eng.state.last_review_result == "stale"
+    assert eng.state.current_head_sha == SHA_B and eng.state.reviewed_head_sha == SHA_A
+    assert eng.provider.calls == []
+
+
 def test_a_journaled_appended_takeover_is_completed_by_a_plain_unblock_only(tmp_path):
     """A run stopped again before its appended takeover was sent: a plain
     unblock re-enters the plan's phase to complete it, and a second

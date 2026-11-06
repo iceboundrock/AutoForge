@@ -102,7 +102,8 @@ establishes no revision is no hold: a state missing or none of `OPEN`,
 `CLOSED` and `MERGED`, an `OPEN` PR with no HEAD or no base, or GitHub
 naming another PR raises a `VerificationError` with the phase and the
 state file unchanged, as a failed read does, so `resume` exits 1 instead of
-printing the banner. Because `resume` may launch the reviewer from here,
+printing the banner. A marker that does not name the run blocks there with
+`pr-owner`, whether the PR moved or not, and records no move (#414). Because `resume` may launch the reviewer from here,
 it passes the recorded-configuration check of **Re-entering a phase**
 first, as `step` always did.
 
@@ -603,7 +604,8 @@ next entry could not find again.
   names it (#414, ADR 0004 D9.4a). `REVIEW`, `FIX` and `REPLAN_REEXECUTE`
   check it at the start of each step, before each launch, after the agent
   returns and before each write; `READY_FOR_MERGE` and `MERGE` on the
-  merge gate's read. Any other marker, or none, blocks (`pr-owner`) with
+  merge gate's read or, with the gate closed, the held run's. Any other
+  marker, or none, blocks (`pr-owner`) with
   nothing more sent, and the reason names `unblock --take-over`
   (github-safety.md, "The PR's owner").
 - `REVIEW` publishes nothing through its agent (#162): the controller
