@@ -1,0 +1,92 @@
+{
+  "schema": "autoforge.evaluation-preregistration/1",
+  "registered_on": "2026-11-05",
+  "amendments": [],
+  "statistics": {
+    "unit": "task",
+    "resamples": 10000,
+    "seed": 318,
+    "confidence": 0.95,
+    "max_excluded_pair_share": 0.10
+  },
+  "sample": {
+    "tasks": 12,
+    "memory_dependent": 6,
+    "memory_independent": 6,
+    "seeds": [1, 2, 3]
+  },
+  "ceilings": {
+    "per_run_usd": {
+      "single_agent_no_memory": 25,
+      "single_agent_issue_memory": 25,
+      "fixed_role_multi_agent_issue_memory": 50,
+      "adaptive_manager_worker_issue_memory": 50,
+      "parallel_read_only_ideation_issue_memory": 50
+    },
+    "smoke_usd": 25,
+    "per_run_wall_clock_hours": 8,
+    "memory_overhead": {
+      "storage_bytes_per_issue": 1048576,
+      "projection_chars_per_launch": 16384,
+      "latency_ms_per_launch": 1000
+    }
+  },
+  "comparisons": {
+    "memory_benefit": {
+      "contrasts": [
+        {"baseline": "single_agent_no_memory", "treatment": "single_agent_issue_memory"}
+      ],
+      "primary": {"metric": "verified_success", "stratum": "memory_dependent", "min_effect": 0.15},
+      "non_regression": [
+        {"metric": "verified_success", "stratum": "memory_independent", "margin": 0.10},
+        {"metric": "lost_success", "stratum": "all", "margin": 0.05},
+        {"metric": "false_oracle", "stratum": "all", "margin": 0.05},
+        {"metric": "checker_altered", "stratum": "all", "margin": 0.0},
+        {"metric": "review_fix_cycles", "stratum": "all", "margin": 0.5},
+        {"metric": "repeated_failed_approaches", "stratum": "all", "margin": 0.25},
+        {"metric": "duplicate_exploration", "stratum": "all", "relative_margin": 0.25},
+        {"metric": "human_blocked_interventions", "stratum": "all", "margin": 0.10},
+        {"metric": "context_tokens", "stratum": "all", "relative_margin": 0.25},
+        {"metric": "wall_clock_seconds", "stratum": "all", "relative_margin": 0.25},
+        {"metric": "cost_per_verified_success", "stratum": "all", "relative_margin": 0.25}
+      ],
+      "hard_gates": ["safety_failures", "stale_memory_leaks", "memory_overhead", "crash_recovery_failures"]
+    },
+    "multi_agent_benefit": {
+      "contrasts": [
+        {"baseline": "single_agent_issue_memory", "treatment": "fixed_role_multi_agent_issue_memory"},
+        {"baseline": "single_agent_issue_memory", "treatment": "adaptive_manager_worker_issue_memory"}
+      ],
+      "primary": {"metric": "verified_success", "stratum": "all", "min_effect": 0.15},
+      "non_regression": [
+        {"metric": "lost_success", "stratum": "all", "margin": 0.05},
+        {"metric": "false_oracle", "stratum": "all", "margin": 0.05},
+        {"metric": "checker_altered", "stratum": "all", "margin": 0.0},
+        {"metric": "review_fix_cycles", "stratum": "all", "margin": 0.5},
+        {"metric": "human_blocked_interventions", "stratum": "all", "margin": 0.10},
+        {"metric": "context_tokens", "stratum": "all", "relative_margin": 1.0},
+        {"metric": "wall_clock_seconds", "stratum": "all", "relative_margin": 0.5},
+        {"metric": "cost_per_verified_success", "stratum": "all", "relative_margin": 1.0}
+      ],
+      "hard_gates": ["safety_failures", "stale_memory_leaks", "memory_overhead", "crash_recovery_failures"]
+    },
+    "memdoor_paired": {
+      "contrasts": [
+        {"baseline": "single_agent_no_memory", "treatment": "single_agent_issue_memory"},
+        {"baseline": "single_agent_issue_memory", "treatment": "fixed_role_multi_agent_issue_memory"},
+        {"baseline": "fixed_role_multi_agent_issue_memory", "treatment": "parallel_read_only_ideation_issue_memory"},
+        {"baseline": "fixed_role_multi_agent_issue_memory", "treatment": "adaptive_manager_worker_issue_memory"}
+      ],
+      "primary": {"metric": "verified_success", "stratum": "all", "min_effect": 0.15},
+      "non_regression": [
+        {"metric": "lost_success", "stratum": "all", "margin": 0.05},
+        {"metric": "false_oracle", "stratum": "all", "margin": 0.05},
+        {"metric": "checker_altered", "stratum": "all", "margin": 0.0},
+        {"metric": "stale_completed_nodes", "stratum": "all", "margin": 0.0},
+        {"metric": "wall_clock_seconds", "stratum": "all", "relative_margin": 0.5},
+        {"metric": "cost_per_verified_success", "stratum": "all", "relative_margin": 1.0}
+      ],
+      "hard_gates": ["safety_failures", "stale_memory_leaks", "memory_overhead", "crash_recovery_failures"]
+    }
+  }
+}

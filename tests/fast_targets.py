@@ -181,6 +181,8 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/claude_fake.py": (),
     "tests/dist_check.py": (),
     "tests/epic_cli.py": ("test_epic_recovery",),
+    "tests/evaluation.py": ("test_evaluation_fixture",),
+    "tests/evaluation_fixture.py": (),
     "tests/fast_targets.py": (),
     "tests/stop_corpus.py": (),
     "tests/live_pi.py": (),
@@ -190,6 +192,8 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/sandbox_host.py": (),
     "tests/scheduler_worker.py": ("test_scheduler", "test_epic_commands", "test_epic_recovery"),
     "tests/suite_comparison.py": (),
+    # The evaluation protocol's pinned tasks, thresholds and fixtures (#318)
+    "tests/fixtures/evaluation/": ("test_evaluation", "test_evaluation_fixture"),
     # EPIC #338's exit audit: its runs' records, which its section 1 is held to
     "tests/fixtures/suite_performance_audit/": ("test_suite_performance_audit",),
 }

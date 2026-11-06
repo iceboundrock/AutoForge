@@ -1936,6 +1936,72 @@ checkout, the issue worktree and its HEAD:
 - `tests/test_doctor.py`: the `api_key` route's OK auth row reads the same
   after the redaction `autoforge doctor` prints it through
 
+### The evaluation harness (#318, docs/evaluation-protocol.md)
+
+`tests/test_evaluation.py` uses synthetic records and
+`tests/test_evaluation_fixture.py` the real engine on fakes; neither calls a
+model. They cover:
+
+- the pinned files: the manifest and pre-registration validate against each
+  other; a statement naming a hidden test or a pinned commit is refused;
+  each pin is what the history holds, skipped with its reason where no history
+  exists; every task was verified fair, at its base and its reference; the
+  protocol's digests, task table, thresholds, ceilings, control-plane list and
+  negative fixtures are the files';
+- what a Memory arm starts with: every task holds a lesson from at or before its
+  base, of about the size of its match's, naming no hidden test and copying no
+  line of the fix; only an arm with Memory is seeded, and a run that did not start
+  with its task's lesson leaves no result;
+- checkers: against the real manifest, each kind of change to a protected path or
+  an existing test file is `checker_altered`, what a good candidate does is not,
+  and the pristine suite finds what a text rule cannot, on any run that edited a
+  test: a skipped check or a failure nothing attributes leaves the count `unknown`
+  and the contrast `INCONCLUSIVE`, and a hidden test's own failure is no alteration;
+- what is held equal: every configuration section is classified, a new
+  top-level one is refused, a new key under an existing one reaches the digest
+  (ADR 0010's `validation.fast_commands` among them), and where a host keeps
+  things does not;
+- the decision: tasks are the resampling unit, so more seeds never narrow an
+  interval; only `measured` values can pass, so unknown tokens or an estimated
+  cost rule out `GO`; a fixture never reaches a decision; a missing arm is
+  `NOT_EVALUATED` and raises nothing; harm is `NO_GO` however large the benefit,
+  on an incomplete sample, on a run an exclusion or a lost baseline took out of its
+  pair, and whatever else is unknown; a failed run stays in the denominator, a pair
+  with no record, a ceiling reached on any planned run, paired or not, or too many
+  exclusions is `INCONCLUSIVE` before any primary effect is read, exclusions are
+  listed and bounded, and another digest, unequal settings, two records of one run
+  or a hidden test or pinned commit shown on any planned run leave no result; a
+  task's row reads a success as the criterion does, so an `unknown` one is stated
+  and gives no effect or spread;
+- the fixture baseline: byte-identical across two runs and in a process outside
+  pytest; the single-agent path, controller-owned effects, exact candidate
+  records, the certificate, a closed gate and no credential in a launch on every
+  run; each negative fixture scored for what it is; a crash after a landed effect
+  repeats nothing;
+- what a score reads: a narrower run than the configured set is no evidence, nor
+  is a record under another policy or a certificate that no longer applies; prose
+  in a run log changes nothing, and `not_configured` is no pass; a lost launch line,
+  an unreadable run log, another run's line, a malformed field or a step number that
+  is not its own leaves what it decides `unknown` and crashes nothing, a missing,
+  linked or truncated progress file leaves exploration `unknown`, a prompt, read
+  context, index or listed file that is gone or linked leaves a leak not ruled out,
+  a file changed at the same pathname establishes no setting, an unassessed safety
+  gate rules out `GO`, and a stopped run keeps what it did and spent;
+- the oracle: the candidate's code gets the launch isolation of
+  `validation.commands`, and the export-command sandbox under `required`; only
+  exit 0 is a pass, what could not run is `not_run`, and that or a timeout is no
+  failure either: a count or a success that turns on it is `unknown`, so it reaches
+  `INCONCLUSIVE` and never a `NO_GO`;
+- elapsed time: a launch that ended a run without a save counts, by its own line's
+  stamps, through `score_run` and the ceilings, and an end that cannot be established
+  is `unknown` with the known part apart;
+- what is published: the report the protocol says to post holds every real run,
+  every criterion's interval, what left the sample and every task;
+- what never happens: `collect` needs its opt-in and a recorded approval and
+  refuses a run outside the protocol's terms or one its own records show under
+  other settings, no workflow or `make` gate runs the harness, and it names no real
+  provider and no GitHub client.
+
 ### Packaging and the installed artifact (#256)
 
 `make check` tests the source tree through an editable install, which

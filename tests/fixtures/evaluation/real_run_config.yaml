@@ -1,0 +1,88 @@
+# The configuration every real evaluation run holds equal (docs/evaluation-protocol.md).
+#
+# Evidence: tests load this file and pin its digest in manifest.json. No real
+# run has used it: a real run is a separately approved act, and the smoke run
+# in the protocol's section 8 is the first that would. An amendment that
+# changes this file changes the digest, which every run record carries.
+#
+# Why Claude Code on every phase: it is the one provider whose run log reports
+# a cost today (`cost_micro_usd`). No provider's run log reports tokens yet
+# (#154). The review is therefore not cross-vendor, on every arm alike.
+#
+# The operator adds what is their host's, which the digest leaves out:
+# `state_dir`, `execution.worktree_dir`, `github.command` and
+# `sandbox.read_only_paths` (the virtual environment that provides `python3`).
+
+version: 1
+
+safety:
+  # Closed: every run stops at READY_FOR_MERGE. A benchmark merges nothing.
+  allow_merge: false
+  required_checks:
+    - "ci"
+
+sandbox:
+  # A hidden test's checker runs the candidate's code too, under this same
+  # mode: nothing repository-controlled runs outside the existing sandbox.
+  mode: required
+  validation_network: host
+  premerge_network: host
+
+execution:
+  default_idle_timeout_seconds: 900
+  default_max_runtime_seconds: 7200
+  # The longest a full suite may take on a slow host (ADR 0010's table).
+  command_timeout_seconds: 3600
+  max_correction_attempts: 1
+
+validation:
+  scope: candidate-tree
+  # FULL evidence: the repository's suite at the candidate (ADR 0010 D2). A run of
+  # a task adds that task's `--ignore=` arguments: `plan` prints its whole command.
+  commands:
+    - ["python3", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+
+profiles:
+  analyze_execute:
+    provider: claude
+    model: fable
+    effort: high
+  fix:
+    provider: claude
+    model: fable
+    effort: high
+  review_round_1:
+    provider: claude
+    model: fable
+    effort: high
+    options:
+      permission_mode: bypassPermissions
+      output_format: stream-json
+  review_round_2_5:
+    provider: claude
+    model: fable
+    effort: high
+    options:
+      permission_mode: bypassPermissions
+      output_format: stream-json
+  review_round_6_plus:
+    provider: claude
+    model: fable
+    effort: medium
+    options:
+      permission_mode: bypassPermissions
+      output_format: stream-json
+  replan_reexecute:
+    provider: claude
+    model: fable
+    effort: high
+    options:
+      permission_mode: bypassPermissions
+      output_format: stream-json
+  update_epic:
+    provider: claude
+    model: fable
+    effort: high
+    options:
+      permission_mode: bypassPermissions
+      output_format: stream-json

@@ -1,4 +1,4 @@
-.PHONY: test test-parallel test-fast test-sandbox test-sandbox-measured lint typecheck fmt fmt-check lock-check check check-matrix dist-check sync lock
+.PHONY: test test-parallel test-fast test-sandbox test-sandbox-measured eval-fixture lint typecheck fmt fmt-check lock-check check check-matrix dist-check sync lock
 
 # The interpreters the hosted CI matrix runs `pytest` on (`python-version:`
 # in .github/workflows/ci.yml). tests/test_ci_workflow.py fails when the two
@@ -62,6 +62,13 @@ test-sandbox:
 test-sandbox-measured:
 	uv run python -m tests.sandbox_host
 	AUTOFORGE_REQUIRE_SANDBOX_BACKEND=auto uv run pytest -rs $(SANDBOX_TESTS)
+
+# The evaluation baseline on fakes (docs/evaluation-protocol.md, #318): the real
+# engine, scripted agents, a local origin; no model, no credential, no GitHub. A
+# check of the harness, never evidence of a model's quality. Opt-in: `check` and
+# CI run its tests as part of the suite and never this report.
+eval-fixture:
+	uv run python -m tests.evaluation_fixture
 
 # Build the sdist and the wheel, install the wheel non-editably into a fresh
 # environment outside the source tree, and run the installed command and every

@@ -23,6 +23,7 @@ make test-fast    # the tests the changed paths map to, feedback only, not a gat
 make test-sandbox # the real-backend sandbox tests; fail (not skip) without a backend
 make test-sandbox-measured # what CI's `sandbox` job runs: measure, then require where capable
 make dist-check   # what CI's `dist` job runs: build, check, install and run the artifacts
+make eval-fixture # the evaluation baseline on fakes: checks the harness, says nothing of a model
 ```
 
 Run `make check` before declaring a change complete, and `make check-matrix`
@@ -78,6 +79,25 @@ detail; post it on #135 as the evidence of a run.
 deselection in a pytest process of its own, the route settings, the
 credential scan and the other checks, and rehearses the flow on both
 routes against the fake `pi`.
+
+## The evaluation harness
+
+[The evaluation protocol](evaluation-protocol.md) pre-registers how Issue
+Memory and multi-agent execution will be judged. `make eval-fixture`
+(`tests/evaluation_fixture.py`) runs the no-memory baseline through the
+unchanged engine with scripted agents, the in-memory GitHub and a local
+origin: seconds, no model, no credential, and two runs give a byte-identical
+report. It checks the harness and the single-agent path, and its report says
+it is no evidence of model quality. Its tests are ordinary tests of
+`make check`; the report itself is opt-in, and no CI job runs it.
+
+`tests/evaluation.py` decides over records of runs. It launches nothing: a
+real run is the ordinary `autoforge` command on a disposable repository, a
+separately approved act that nothing here starts, and `collect` scores one
+afterwards only with `AUTOFORGE_EVAL_REAL=1` and a recorded approval. A change
+to a threshold, a task or the pinned configuration changes the digests the
+protocol registers, in the same reviewed change, so tests fail until
+[its amendment log](evaluation-protocol.md#11-amendments) has it.
 
 ## The operator-comment byte-fidelity capture
 

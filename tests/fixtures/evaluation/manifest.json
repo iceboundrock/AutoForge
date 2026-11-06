@@ -1,0 +1,677 @@
+{
+  "schema": "autoforge.evaluation-manifest/1",
+  "forbidden_repositories": [
+    "iceboundrock/AutoForge"
+  ],
+  "oracle_command_prefix": [
+    "python3",
+    "-m",
+    "pytest",
+    "-q",
+    "-p",
+    "no:cacheprovider",
+    "--no-header",
+    "--tb=line"
+  ],
+  "selection": {
+    "source": "first-parent commits of main at or before 280702b7623e7ec29e5f2529485e4702df4ce84b",
+    "eligible": "changes a tests/test_*.py module; 1 to 120 source lines in at most 2 src/autoforge modules; no prompt template, workflow, pyproject.toml, uv.lock or Makefile; subject names no LOCAL mode",
+    "fair": "the commit's added test functions (outside test_local*) run and fail at its parent with the hidden files laid over it, naming no missing symbol, and pass at the commit",
+    "taken": "every eligible, fair commit of the memory-dependent definition, then that many of the rest, newest first",
+    "matched": "each class ordered by source lines changed, paired by rank"
+  },
+  "equalized_settings": {
+    "config": "real_run_config.yaml",
+    "digest": "6270e03cd6760c28136151af502ef88824c9c37c96f1cf81a14882a7d884b4a0",
+    "hold_equal": [
+      "repository tasks and base commits",
+      "models and providers",
+      "sandbox policy",
+      "tools",
+      "validation commands, and any key added under validation:, validation.fast_commands of ADR 0010 D11 to D13 included",
+      "review",
+      "resource limits"
+    ],
+    "one_host_rule": "both arms of a pair run on one host, one controller commit and the same provider CLI versions, within 24 hours of each other"
+  },
+  "arms": [
+    {
+      "id": "single_agent_no_memory",
+      "status": "available",
+      "requires": [],
+      "comparison_role": "arm 1: existing validation and independent review",
+      "seeded_experience": false
+    },
+    {
+      "id": "single_agent_issue_memory",
+      "status": "not_evaluated",
+      "requires": [
+        317,
+        333
+      ],
+      "comparison_role": "arm 2: arm 1 with bounded Issue Working Memory",
+      "seeded_experience": true
+    },
+    {
+      "id": "fixed_role_multi_agent_issue_memory",
+      "status": "not_evaluated",
+      "requires": [
+        319,
+        333
+      ],
+      "comparison_role": "arm 3: deterministic fixed roles with Issue Memory",
+      "seeded_experience": true
+    },
+    {
+      "id": "adaptive_manager_worker_issue_memory",
+      "status": "not_evaluated",
+      "requires": [
+        319,
+        333
+      ],
+      "comparison_role": "arm 4: adaptive Manager/Worker with Issue Memory; adaptive recovery in the Memdoor comparison",
+      "seeded_experience": true
+    },
+    {
+      "id": "parallel_read_only_ideation_issue_memory",
+      "status": "not_evaluated",
+      "requires": [
+        319,
+        333
+      ],
+      "comparison_role": "optional: fixed roles with parallel read-only ideation",
+      "seeded_experience": true
+    }
+  ],
+  "tasks": [
+    {
+      "id": "fix-entry-retarget",
+      "source_issue": 95,
+      "memory_class": "memory_dependent",
+      "control_for": "c6-refusal-names-the-cache",
+      "source_lines_changed": 36,
+      "memory_class_reason": "A later phase meets a state the first attempt never saw: the PR moved under an open review.",
+      "base_sha": "3bd54bc2e72f83b0199d2501cbcaddd8ce14895b",
+      "base_tree": "2d9af8f979877c85f4135410a941101f28515439",
+      "reference_sha": "509ebcff7e3b0d181ba168afe0bbba0241421821",
+      "statement": "A PR retargeted to another base while review findings are open still launches the fixer: the FIX entry compares only the PR HEAD, so a fix round is spent on findings raised on a diff the PR no longer proposes.\n\nTreat a base that differs from the reviewed base exactly like a HEAD past the reviewed one: mark the review stale, carry the findings to the next review as prior findings, and go from FIX to REVIEW of the actual revision without launching the fixer. The step's message must contain `base changed to '<new base>' from the reviewed base '<old base>'`, `no fixer launched` and `the <n> finding(s) of round <r> are carried to that review to re-check`.\n\nCompare the base only when a reviewed base is recorded: a state with none still launches the fixer. A PR whose base GitHub does not report is a verification failure, as the review and merge entries treat it, not a retarget.",
+      "hidden_files": [
+        "tests/test_engine.py"
+      ],
+      "hidden_tests": [
+        "tests/test_engine.py::test_fix_entry_with_the_pr_retargeted_goes_to_review_without_a_fixer",
+        "tests/test_engine.py::test_fix_entry_without_a_reviewed_base_still_launches_the_fixer",
+        "tests/test_engine.py::test_fix_entry_with_an_unreadable_base_is_a_verification_failure"
+      ],
+      "protected_paths": [
+        "tests/conftest.py",
+        "tests/fixtures/",
+        "conftest.py",
+        "pytest.ini",
+        "tox.ini",
+        "setup.cfg",
+        "pyproject.toml",
+        "Makefile",
+        ".github/"
+      ],
+      "validation_ignore": [
+        "tests/test_gitignore.py",
+        "tests/test_local.py"
+      ],
+      "prior_experience": {
+        "evidence_sha": "9c6c2fe804e50d38cf2a937226010404c358be6f",
+        "evidence_test": "tests/test_engine.py::test_merge_base_retargeted_after_clean_review_goes_back_to_review",
+        "lesson": "Earlier verified lesson (#68): the same commits proposed against another base are a different change. The merge gate once merged a PR on the strength of a review it never received, because it compared only the HEAD. It now reads HEAD and base alike, marks a moved revision stale, and sends it back to REVIEW instead of acting on the old review."
+      }
+    },
+    {
+      "id": "review-round-refused-by-reread",
+      "source_issue": 139,
+      "memory_class": "memory_dependent",
+      "control_for": "dry-run-prompt-placeholder",
+      "source_lines_changed": 39,
+      "memory_class_reason": "A failure after the agent returned: what the run recorded must survive into the attempt after it.",
+      "base_sha": "de348f4f2330b449155c9477e6c05e402d16b1ed",
+      "base_tree": "a231b44c753d1c37f08881c35f927065ef09949f",
+      "reference_sha": "f14a25ec9489d94d6442ee6a1b36e3b4111dd7bb",
+      "statement": "A PR closed or merged under the reviewer leaves `review_round` consumed with no `review_history` entry: the round is recorded before the PR is re-read, and the step persists state when a `VerificationError` is raised. That breaks the loop-bounds contract, under which a failed invocation consumes neither a review round nor a history entry.\n\nRun the re-read and the merge-base comparison before anything of the round is recorded. The order of GitHub calls and every round that completes stay as they are. A refused round leaves the phase in `REVIEW` with the round, the reviewed binding, the review comment URL and the open findings untouched, keeps the attempt in `verification_failures`, and the same review completes once a human reopens the PR. The refusal's message says the PR `is CLOSED`.",
+      "hidden_files": [
+        "tests/test_engine.py",
+        "tests/test_replan.py"
+      ],
+      "hidden_tests": [
+        "tests/test_engine.py::test_review_refused_by_the_post_review_pr_read_consumes_neither_round_nor_history"
+      ],
+      "protected_paths": [
+        "tests/conftest.py",
+        "tests/fixtures/",
+        "conftest.py",
+        "pytest.ini",
+        "tox.ini",
+        "setup.cfg",
+        "pyproject.toml",
+        "Makefile",
+        ".github/"
+      ],
+      "validation_ignore": [
+        "tests/test_gitignore.py",
+        "tests/test_local.py"
+      ],
+      "prior_experience": {
+        "evidence_sha": "d16fb923f0a3f4b6a1301c0bb4def2e90d2dfb44",
+        "evidence_test": "tests/test_engine.py::test_failed_review_invocation_consumes_neither_round_nor_history",
+        "lesson": "Earlier verified lesson (#9): the REVIEW/FIX loop bounds only hold if a review invocation that fails leaves `review_round` and `review_history` as they were. That goes for a failure after the agent returned as much as for one before it launched, and it is checked on the state as loaded back from disk, never on the object still in memory."
+      }
+    },
+    {
+      "id": "opencode-recovered-errors",
+      "source_issue": 226,
+      "memory_class": "memory_dependent",
+      "control_for": "yaml-subset-errors-name-the-path",
+      "source_lines_changed": 62,
+      "memory_class_reason": "How an external CLI really exits: the fact is in its run-level output, not in this repository.",
+      "base_sha": "65c7857e0fa9ac54ec9fb8c67da63da9159e018d",
+      "base_tree": "d1b58ed528438e08d74c2a8d37f46cfe757ff545",
+      "reference_sha": "bae99782d7571c03a15eff6200896e5bcf0219ee",
+      "statement": "OpenCode exits 1 once it has printed any run-level error, even when the session recovers and finishes its turn. The adapter calls such an exit of an `openai/*` model transient only when every run-level error is `WebSocket closed with code 1000`, so runs that recovered from another OpenAI error are not relaunched and need a manual resume.\n\nAlso treat as transient `WebSocket closed with code 1008` and OpenAI's generic message, compared whole, not by its prefix: `server_error: An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists.` The reasons are `opencode: OpenAI WebSocket closed with code 1000`, `opencode: OpenAI WebSocket closed with code 1008` and `opencode: OpenAI server_error`; several distinct errors join after the prefix in the order they first appeared, as `opencode: OpenAI WebSocket closed with code 1008, OpenAI server_error, OpenAI WebSocket closed with code 1000`.\n\nThe rule is unchanged: every run-level error must be on the list, each compared as a whole message. Another close code, another text under `server_error`, the same text after a tool's failed line, a timeout, truncated stderr, a non-`openai/*` model and any other exit stay plain failed exits. A transient exit stays a failed exit, and the engine's bound of two relaunches per step is unchanged.",
+      "hidden_files": [
+        "tests/test_engine.py",
+        "tests/test_providers.py"
+      ],
+      "hidden_tests": [
+        "tests/test_engine.py::test_a_transient_openai_failure_is_relaunched_after_reconciling",
+        "tests/test_providers.py::test_opencode_classifies_a_run_whose_errors_are_all_listed_openai_errors",
+        "tests/test_providers.py::test_opencode_classifies_a_listed_error_only_for_an_untruncated_openai_exit_1"
+      ],
+      "protected_paths": [
+        "tests/conftest.py",
+        "tests/fixtures/",
+        "conftest.py",
+        "pytest.ini",
+        "tox.ini",
+        "setup.cfg",
+        "pyproject.toml",
+        "Makefile",
+        ".github/"
+      ],
+      "validation_ignore": [
+        "tests/test_git_transport.py",
+        "tests/test_gitignore.py",
+        "tests/test_local.py",
+        "tests/test_providers.py"
+      ],
+      "prior_experience": {
+        "evidence_sha": "1ac6dd542bd18392c2be56ae7e8b9fae1d448ce9",
+        "evidence_test": "tests/test_providers.py::test_opencode_classifies_a_run_whose_only_error_is_the_openai_socket_close",
+        "lesson": "Earlier verified lesson (seen during #207): an OpenCode exit of 1 does not say whether the session recovered, so a relaunch is decided from the run-level error lines of an untruncated stderr, never from the exit code alone. A transient classification is a fact next to the failed exit, never in place of it: the exit stays failed and is still bounded by the engine."
+      }
+    },
+    {
+      "id": "claude-held-back-results",
+      "source_issue": 203,
+      "memory_class": "memory_dependent",
+      "control_for": "google-api-key-redaction",
+      "source_lines_changed": 67,
+      "memory_class_reason": "How an external CLI really streams: results held back behind a background agent.",
+      "base_sha": "4fdd45f1e3a3ef33a84dd59dd57be1cfaa15b470",
+      "base_tree": "79517f8a6db2f3995a6cd23730d39736e57ac5e2",
+      "reference_sha": "bb11a69c0cfeecd61a4a198cac1b9acd40bd2afc",
+      "statement": "Claude Code holds a turn's `result` back while a background agent is still running: the next turn opens with its own `system/init` all the same, and once no background agent is left the held results arrive together, in turn order, after the last turn's records. The stream-json reducer closes the only open turn on the first of them and fails the run on the second as a result outside a turn, after the agent has finished its work.\n\nCount the turns opened against the results received: the first turn opens with the stream, a later one with its `system/init` (or, with every turn closed, an assistant or user record whose init is then that turn's own), and the n-th result closes the n-th turn. Results sent at once, results held back and a mix of both are all accepted. An error in any turn still fails the run. A result with no turn left to close fails it with `claude: stream-json protocol violation: a result event outside a turn`, and stdout ending before every turn has its result fails it with `claude: exited inside a turn that has no result event`, so an earlier turn's text is never the outcome. The summary's `results` counts them, and `num_turns` and `duration_ms` stay the sums over every result.",
+      "hidden_files": [
+        "tests/test_claude_stream.py",
+        "tests/test_providers.py"
+      ],
+      "hidden_tests": [
+        "tests/test_claude_stream.py::test_results_held_back_until_the_last_turn_end_their_turns_in_order",
+        "tests/test_claude_stream.py::test_a_result_sent_at_once_and_results_held_back_mix_in_one_run",
+        "tests/test_claude_stream.py::test_stdout_ending_before_every_held_result_arrived_is_a_failure",
+        "tests/test_claude_stream.py::test_a_held_result_past_the_last_turn_is_a_failure",
+        "tests/test_claude_stream.py::test_an_error_in_a_held_result_fails_the_run",
+        "tests/test_claude_stream.py::test_a_turn_opened_before_its_init_is_one_turn",
+        "tests/test_providers.py::test_results_held_back_while_a_background_agent_runs_end_their_turns"
+      ],
+      "protected_paths": [
+        "tests/conftest.py",
+        "tests/fixtures/",
+        "conftest.py",
+        "pytest.ini",
+        "tox.ini",
+        "setup.cfg",
+        "pyproject.toml",
+        "Makefile",
+        ".github/"
+      ],
+      "validation_ignore": [
+        "tests/test_git_transport.py",
+        "tests/test_gitignore.py",
+        "tests/test_local.py"
+      ],
+      "prior_experience": {
+        "evidence_sha": "d57311d61650823adb127605099b1a1108f9ee0c",
+        "evidence_test": "tests/test_claude_stream.py::test_each_turn_ends_in_a_result_and_the_last_one_is_the_outcome",
+        "lesson": "Earlier verified lesson (#202): Claude Code ends every turn of `claude -p` with its own result record, and a pending background task or ScheduleWakeup keeps the CLI alive for further turns. Treating a second result as a protocol violation failed runs that had already succeeded. Per-turn counts are summed, while the cost a result carries is the session's so far."
+      }
+    },
+    {
+      "id": "paginate-changed-files",
+      "source_issue": 43,
+      "memory_class": "memory_dependent",
+      "control_for": "redact-the-parsed-result",
+      "source_lines_changed": 90,
+      "memory_class_reason": "How an external API really pages, and which `gh` version it takes.",
+      "base_sha": "bb71184c889ca59c3a54e4be25d2f2bd1b51127f",
+      "base_tree": "50f8c0d8cb04383821ff6d098457f06620bec4d6",
+      "reference_sha": "a784ed2f5bde1488fe13b7e18a78ee8a275a46cd",
+      "statement": "`GitHubClient.get_pr_changed_files` reads one page of the REST files endpoint and compares it with GitHub's own `changedFiles` count, so a PR touching more than 100 files can never pass the protected-path merge gate, whatever it changed.\n\nRead every page through the existing `_api_pages` helper (`gh api --paginate --slurp`). The `changedFiles` comparison and the incomplete-listing refusal stay as they are, and keep failing closed past GitHub's 3000-file ceiling on the endpoint. A protected path, or a rename's former path, found only on a later page still blocks, and a payload that is not a page of pages is refused as non-paginated.\n\n`--slurp` needs gh 2.48.0 or newer, which nothing checks. Make `doctor`'s `gh available` row parse `gh --version` and fail below that minimum, or when the version line is unreadable, naming `2.48.0` and `--slurp`; at or above it the row passes with the version line as its detail, and a missing `gh` is reported as before.",
+      "hidden_files": [
+        "tests/test_cli.py",
+        "tests/test_doctor.py",
+        "tests/test_engine.py",
+        "tests/test_github.py"
+      ],
+      "hidden_tests": [
+        "tests/test_doctor.py::test_gh_at_or_above_the_minimum_passes",
+        "tests/test_doctor.py::test_gh_below_the_minimum_fails_and_names_it",
+        "tests/test_doctor.py::test_an_unreadable_gh_version_fails_rather_than_passes",
+        "tests/test_doctor.py::test_a_missing_gh_is_reported_as_before",
+        "tests/test_engine.py::test_merge_blocks_on_a_protected_path_past_the_first_page",
+        "tests/test_engine.py::test_merge_proceeds_on_a_complete_multi_page_listing_without_protected_paths",
+        "tests/test_github.py::test_get_pr_changed_files_flattens_every_page",
+        "tests/test_github.py::test_get_pr_changed_files_keeps_a_protected_path_from_a_later_page",
+        "tests/test_github.py::test_get_pr_changed_files_stays_incomplete_when_the_pages_stop_short",
+        "tests/test_github.py::test_get_pr_changed_files_rejects_a_listing_that_is_not_a_page_of_pages"
+      ],
+      "protected_paths": [
+        "tests/conftest.py",
+        "tests/fixtures/",
+        "conftest.py",
+        "pytest.ini",
+        "tox.ini",
+        "setup.cfg",
+        "pyproject.toml",
+        "Makefile",
+        ".github/"
+      ],
+      "validation_ignore": [
+        "tests/test_gitignore.py",
+        "tests/test_local.py"
+      ],
+      "prior_experience": {
+        "evidence_sha": "bb71184c889ca59c3a54e4be25d2f2bd1b51127f",
+        "evidence_test": "tests/test_github.py::test_get_required_status_check_rules_reads_every_page",
+        "lesson": "Earlier verified lesson (#60): `gh api --paginate --slurp` wraps a paginated REST endpoint's pages in one outer array, so a good answer is a JSON array of arrays and any other shape is malformed rather than empty. Reading the default branch's rules showed a required check can sit on a later page, so a test of such a read must serve more than one page."
+      }
+    },
+    {
+      "id": "no-correction-with-a-survivor",
+      "source_issue": 209,
+      "memory_class": "memory_dependent",
+      "control_for": "prompt-version-refusal",
+      "source_lines_changed": 91,
+      "memory_class_reason": "A state reached only on a later attempt: the correction relaunch itself.",
+      "base_sha": "64cd340a0089bbeb46a5895b465bb6f8e5e07517",
+      "base_tree": "b2f04f4fd73a22d7b2e59b180f7e51d79fd1d637",
+      "reference_sha": "2d81c2c14fc95f92773a3372c6f552ba501bd091",
+      "statement": "A `CONTROL_RESULT` correction relaunches a write-capable agent inside one step. A malformed result from a launch that may have left a process running is corrected all the same, so a second agent can start beside what the first left behind.\n\nDo not correct a malformed result when the launch reports `group_survived_kill`, `capture_abandoned` or `orphan_survived_kill`; `orphans_unchecked` alone is still corrected. The error keeps its opening, `agent '<profile>' did not return a valid CONTROL_RESULT after 1 attempt(s): `, and ends `. Not re-invoked: a process the launch started may still be running (<leftovers>)`, naming the leftover as the transient-failure retry already does. The phase and the round stay as they were, and nothing is published.",
+      "hidden_files": [
+        "tests/test_engine.py",
+        "tests/test_local.py"
+      ],
+      "hidden_tests": [
+        "tests/test_engine.py::test_a_malformed_result_is_not_corrected_while_a_process_its_launch_started_may_run",
+        "tests/test_engine.py::test_an_unchecked_platform_does_not_stop_the_correction"
+      ],
+      "protected_paths": [
+        "tests/conftest.py",
+        "tests/fixtures/",
+        "conftest.py",
+        "pytest.ini",
+        "tox.ini",
+        "setup.cfg",
+        "pyproject.toml",
+        "Makefile",
+        ".github/"
+      ],
+      "validation_ignore": [
+        "tests/test_git_transport.py",
+        "tests/test_gitignore.py",
+        "tests/test_local.py",
+        "tests/test_providers.py"
+      ],
+      "prior_experience": {
+        "evidence_sha": "1ac6dd542bd18392c2be56ae7e8b9fae1d448ce9",
+        "evidence_test": "tests/test_engine.py::test_a_transient_failure_is_not_relaunched_while_a_process_it_started_may_run",
+        "lesson": "Earlier verified lesson (seen during #207): a relaunch inside one step starts a second write-capable agent, so the transient-failure retry refuses while the launch's record says a process it started may still run. An `orphans_unchecked` alone only says the platform could not look, and does not stop that retry: only a process known to have survived does."
+      }
+    },
+    {
+      "id": "c6-refusal-names-the-cache",
+      "source_issue": 301,
+      "memory_class": "memory_independent",
+      "control_for": "fix-entry-retarget",
+      "source_lines_changed": 7,
+      "memory_class_reason": "The text of one refusal, derivable from the policy compiler at the base.",
+      "base_sha": "d46d180a16feff18e1d16657356ec764f4fd673c",
+      "base_tree": "f3b307f047aa6d41dec580a8fa5124ed3313f8be",
+      "reference_sha": "3cfa4b83e99ddae2405d6fa1421b75819f576e23",
+      "statement": "The sandbox policy's C6 refusal of a provider path names only the projection's source, which does not contain the refused path, when the projection appears somewhere other than at its host path (the persistent cache at `~/.cache`).\n\nFor such a projection name that place too: `refuses <path>: C6 overlaps: <path> (provider) overlaps the projection of <source> at <where it appears>`. A projection at its own path keeps naming that one path. The rule is unchanged: the same declarations are refused under the same rule, and a launch without the persistent cache projects the same paths into the private home as before.",
+      "hidden_files": [
+        "tests/test_sandbox_policy.py",
+        "tests/test_sandbox_routing.py"
+      ],
+      "hidden_tests": [
+        "tests/test_sandbox_policy.py::test_a_provider_path_under_the_relocated_cache_is_refused_where_it_appears",
+        "tests/test_sandbox_policy.py::test_a_provider_path_in_a_projection_at_its_own_path_is_refused_naming_it_once"
+      ],
+      "protected_paths": [
+        "tests/conftest.py",
+        "tests/fixtures/",
+        "conftest.py",
+        "pytest.ini",
+        "tox.ini",
+        "setup.cfg",
+        "pyproject.toml",
+        "Makefile",
+        ".github/"
+      ],
+      "validation_ignore": [
+        "tests/test_epic_commands.py",
+        "tests/test_epic_recovery.py",
+        "tests/test_gitignore.py",
+        "tests/test_live_pi_support.py",
+        "tests/test_scheduler.py"
+      ],
+      "prior_experience": {
+        "evidence_sha": "14127658a2941c61fa02d84b4d6850a8452be9be",
+        "evidence_test": "tests/test_sandbox.py::test_every_refusal_names_the_path_and_the_rule_before_any_spawn",
+        "lesson": "Earlier verified lesson (#167): the sandbox compiler refuses a description it cannot honour rather than narrowing the launch, and it does so before anything is spawned. Every refusal names the path it refused and the rule it broke, so an operator can act on the message alone without reading the compiler, and nothing has run by the time they read it."
+      }
+    },
+    {
+      "id": "dry-run-prompt-placeholder",
+      "source_issue": 133,
+      "memory_class": "memory_independent",
+      "control_for": "review-round-refused-by-reread",
+      "source_lines_changed": 9,
+      "memory_class_reason": "One printing rule, derivable from the dry-run printer at the base.",
+      "base_sha": "9564cefa37796b517bbc678bf30256b357de0ceb",
+      "base_tree": "ad3feb91f66de8f25f6a47e7a161de64302348f3",
+      "reference_sha": "2fff4b9dbfa162b20d12e6dfea29101bdd707946",
+      "statement": "The dry-run printer replaces the last argv element with `<prompt>`. For a provider that sends the prompt on stdin, such as Pi, the last element is a flag's value, so the plan hides the thinking level.\n\nReplace only the argument that is the prompt: a provider that passes no prompt as an argument shows its whole argv, and a provider that does shows `<prompt>` in that argument's place. Nothing else about a dry run changes: it spawns nothing and writes nothing.",
+      "hidden_files": [
+        "tests/pi_fake.py",
+        "tests/test_cli.py",
+        "tests/test_engine.py",
+        "tests/test_integration.py",
+        "tests/test_local.py",
+        "tests/test_replan.py",
+        "tests/test_routing.py"
+      ],
+      "hidden_tests": [
+        "tests/test_cli.py::test_dry_run_with_pi_profiles_prints_the_pi_argv_and_spawns_nothing",
+        "tests/test_cli.py::test_dry_run_shows_the_prompt_argument_as_a_placeholder",
+        "tests/test_engine.py::test_a_pi_claim_github_does_not_back_fails_as_a_scripted_one_does",
+        "tests/test_engine.py::test_a_pi_correction_is_a_second_separate_pi_process",
+        "tests/test_engine.py::test_pi_corrections_are_bounded_as_scripted_ones_are",
+        "tests/test_engine.py::test_a_pi_failure_leaves_state_unchanged_and_resume_relaunches",
+        "tests/test_engine.py::test_a_pi_deadline_is_a_timeout_naming_what_it_left_behind",
+        "tests/test_engine.py::test_a_pi_run_log_records_argv_env_and_summary_and_redacts_secrets",
+        "tests/test_engine.py::test_a_pi_dry_run_prints_the_pi_argv_and_spawns_nothing",
+        "tests/test_integration.py::test_an_all_pi_run_routes_every_launch_through_its_profile",
+        "tests/test_integration.py::test_a_mixed_config_routes_each_profile_to_its_own_provider",
+        "tests/test_replan.py::test_a_pi_replan_runs_the_same_transaction",
+        "tests/test_replan.py::test_a_pi_replan_claim_github_does_not_back_is_refused_as_a_scripted_one",
+        "tests/test_routing.py::test_a_pi_profile_routes_its_own_model_and_thinking_level"
+      ],
+      "protected_paths": [
+        "tests/conftest.py",
+        "tests/fixtures/",
+        "conftest.py",
+        "pytest.ini",
+        "tox.ini",
+        "setup.cfg",
+        "pyproject.toml",
+        "Makefile",
+        ".github/"
+      ],
+      "validation_ignore": [
+        "tests/test_gitignore.py",
+        "tests/test_local.py"
+      ],
+      "prior_experience": {
+        "evidence_sha": "339df68c78800d7c2e82ae1408975b484cd043a4",
+        "evidence_test": "tests/test_cli.py::test_run_dry_run_writes_nothing",
+        "lesson": "Earlier verified lesson: a dry run is a controller-level invariant and not a prompt convention. It may render a plan that names the provider, the model, the prompt template and the command, and it must create no state directory, make no GitHub call and launch no provider. A test of the plan's text should also assert that nothing was spawned or written."
+      }
+    },
+    {
+      "id": "yaml-subset-errors-name-the-path",
+      "source_issue": 65,
+      "memory_class": "memory_independent",
+      "control_for": "opencode-recovered-errors",
+      "source_lines_changed": 25,
+      "memory_class_reason": "An error's wrapping, derivable from the config loader at the base.",
+      "base_sha": "b403b46f65beb6f3f9c7081fe3b4b2b78a22c9e1",
+      "base_tree": "a65bbefc5f350b1638be8bfba7b09fbb2b49e0f3",
+      "reference_sha": "91c7eed2ebdcbd732ba41bd4ea77d16f2b173697",
+      "statement": "The built-in YAML subset parser raises `ConfigurationError` itself, so its messages bypass the `cannot parse config <path>:` wrapper in `load_config_file` and never say which file is at fault; PyYAML, tomllib and `json.loads` errors all do.\n\nMake the parser raise `ValueError` like the other backends, and return its root as parsed, so that a list root is refused by the same root check as under PyYAML: `config <path> must contain a mapping at top level`. A subset-parser error then reads `cannot parse config <path>: YAML subset parser: <detail>` and still ends `install PyYAML for full YAML support`.",
+      "hidden_files": [
+        "tests/test_config.py"
+      ],
+      "hidden_tests": [
+        "tests/test_config.py::test_yaml_subset_parse_errors_name_the_config_path",
+        "tests/test_config.py::test_yaml_subset_non_mapping_root_names_the_config_path",
+        "tests/test_config.py::test_yaml_parse_errors_name_the_config_path_on_both_backends"
+      ],
+      "protected_paths": [
+        "tests/conftest.py",
+        "tests/fixtures/",
+        "conftest.py",
+        "pytest.ini",
+        "tox.ini",
+        "setup.cfg",
+        "pyproject.toml",
+        "Makefile",
+        ".github/"
+      ],
+      "validation_ignore": [
+        "tests/test_gitignore.py",
+        "tests/test_local.py"
+      ],
+      "prior_experience": {
+        "evidence_sha": "ceb22d150962a98c77d882161f9fffcfa86d41f0",
+        "evidence_test": "tests/test_config.py::test_duplicate_yaml_key_is_a_parse_error",
+        "lesson": "Earlier verified lesson (#64): a key repeated within one mapping used to be resolved last-wins, dropping the first copy and any typo in it, so every key an operator wrote was not one the controller read. All the parsers now refuse a duplicate key as a parse error, and the behaviour is tested on both YAML backends, because the two can differ."
+      }
+    },
+    {
+      "id": "google-api-key-redaction",
+      "source_issue": 282,
+      "memory_class": "memory_independent",
+      "control_for": "claude-held-back-results",
+      "source_lines_changed": 36,
+      "memory_class_reason": "One more credential shape in a module built for adding them.",
+      "base_sha": "e6be31ef1a313092ac1023f8f0995919ef29912d",
+      "base_tree": "d6bbe0db1acfae9682b038dcea035065e085d22b",
+      "reference_sha": "1f6abad5debe375594fc2ab6d13cbe5cfac96396",
+      "statement": "Google API keys are not recognised by redaction or by the published-content check. A Google API key is `AIza` followed by 35 characters of `[0-9A-Za-z_-]`, matched case-sensitively as a whole token, also right after an escape.\n\nAdd a credential class named `google-api-key`. It must run before the shapes that could take a slice of a key, so that a key is replaced whole by `***REDACTED***` and is never partly left in the clear, while a JWT and an `sk-` key keep their own classes. A near miss (too short, too long, another prefix, another case) is left alone. Every redacting sink (the run log, `stdout.log`, `stderr.log`, state, CLI output, nested values through `redact_obj`) and `credential_classes` use it, so the published-content, payload and commit-message checks refuse such text by class name. The pattern stays linear on long input.",
+      "hidden_files": [
+        "tests/conftest.py",
+        "tests/test_cli.py",
+        "tests/test_engine.py",
+        "tests/test_redaction.py",
+        "tests/test_result_parser.py",
+        "tests/test_runlog.py"
+      ],
+      "hidden_tests": [
+        "tests/test_cli.py::test_cli_output_redacts_a_google_api_key",
+        "tests/test_engine.py::test_a_google_api_key_an_agent_prints_never_reaches_state_or_the_logs",
+        "tests/test_redaction.py::test_a_google_api_key_is_redacted_wherever_it_stands",
+        "tests/test_redaction.py::test_a_near_miss_of_a_google_api_key_is_left",
+        "tests/test_redaction.py::test_a_google_api_key_is_replaced_whole_before_a_shorter_shape_takes_a_slice",
+        "tests/test_redaction.py::test_redact_obj_redacts_a_google_api_key_at_any_depth",
+        "tests/test_redaction.py::test_the_google_api_key_pattern_stays_linear",
+        "tests/test_result_parser.py::test_a_google_api_key_is_refused_by_every_published_content_check",
+        "tests/test_runlog.py::test_a_google_api_key_an_opencode_agent_prints_never_reaches_the_logs"
+      ],
+      "protected_paths": [
+        "tests/conftest.py",
+        "tests/fixtures/",
+        "conftest.py",
+        "pytest.ini",
+        "tox.ini",
+        "setup.cfg",
+        "pyproject.toml",
+        "Makefile",
+        ".github/"
+      ],
+      "validation_ignore": [
+        "tests/test_epic_commands.py",
+        "tests/test_epic_recovery.py",
+        "tests/test_git_transport.py",
+        "tests/test_gitignore.py",
+        "tests/test_live_pi_support.py",
+        "tests/test_local.py",
+        "tests/test_providers.py",
+        "tests/test_scheduler.py"
+      ],
+      "prior_experience": {
+        "evidence_sha": "48b0c3dadca5d869223207e8d17a7e7322762042",
+        "evidence_test": "tests/test_redaction.py::test_github_fine_grained_pat",
+        "lesson": "Earlier verified lesson (#21): the redaction pass once let four common credential shapes through to the run logs and CLI output, because a new token shape matches no existing pattern. A fine-grained GitHub PAT, for one, is not a `gh?_` shape and needed a pattern of its own, which is tested in a sentence, in an assignment and in a URL."
+      }
+    },
+    {
+      "id": "redact-the-parsed-result",
+      "source_issue": 206,
+      "memory_class": "memory_independent",
+      "control_for": "paginate-changed-files",
+      "source_lines_changed": 39,
+      "memory_class_reason": "A change of where redaction runs, derivable from the run log at the base.",
+      "base_sha": "3155c463b6159f597d5e67169b312a1a705ceb62",
+      "base_tree": "003be65e81f4fe06bf0ecad4219b124ac04f2652",
+      "reference_sha": "64cd340a0089bbeb46a5895b465bb6f8e5e07517",
+      "statement": "The run log redacts an accepted `CONTROL_RESULT` by running the redaction patterns over its JSON text and parsing the result back. A pattern can consume the JSON syntax around a value, which raises `JSONDecodeError` out of `RunLogger.log_execution` after the controller accepted the result, and a secret right after a JSON escape slips through the patterns' word boundary.\n\nRedact the parsed result string by string, so the document keeps its structure and escapes are real characters again. `redact_obj` must also replace a non-empty string whole under a key that names an OAuth credential field (the fields `redact` covers in a serialized document), a shape the serialized pass caught across a key and its value; other keys, and empty or non-string values under those keys, are left alone.",
+      "hidden_files": [
+        "tests/test_redaction.py",
+        "tests/test_runlog.py"
+      ],
+      "hidden_tests": [
+        "tests/test_redaction.py::test_redact_obj_redacts_each_string_never_the_serialized_document",
+        "tests/test_redaction.py::test_redact_obj_redacts_a_value_under_an_oauth_credential_key",
+        "tests/test_redaction.py::test_redact_obj_covers_every_oauth_field_document_redact_covers",
+        "tests/test_redaction.py::test_redact_obj_leaves_other_keys_and_empty_or_scalar_credential_values_alone",
+        "tests/test_runlog.py::test_a_parsed_result_whose_serialized_text_redaction_would_break_is_logged",
+        "tests/test_runlog.py::test_a_secret_after_a_json_escape_never_reaches_the_control_result_or_journal",
+        "tests/test_runlog.py::test_an_oauth_credential_field_in_a_parsed_result_is_still_redacted"
+      ],
+      "protected_paths": [
+        "tests/conftest.py",
+        "tests/fixtures/",
+        "conftest.py",
+        "pytest.ini",
+        "tox.ini",
+        "setup.cfg",
+        "pyproject.toml",
+        "Makefile",
+        ".github/"
+      ],
+      "validation_ignore": [
+        "tests/test_git_transport.py",
+        "tests/test_gitignore.py",
+        "tests/test_local.py",
+        "tests/test_providers.py"
+      ],
+      "prior_experience": {
+        "evidence_sha": "4acf43795d1c89c4387c03ec7b03d3629b0fe23e",
+        "evidence_test": "tests/test_runlog.py::test_the_event_journal_and_request_never_carry_an_unredacted_metadata_value",
+        "lesson": "Earlier verified lesson (#37): `metadata` was once persisted raw into `request.json` and the event journal, though it is free-form and can carry a failing command line or a URL with a token in it. A value the run log persists is written more than once, so a test must look at every file that holds it, not only the one it was first seen in."
+      }
+    },
+    {
+      "id": "prompt-version-refusal",
+      "source_issue": 302,
+      "memory_class": "memory_independent",
+      "control_for": "no-correction-with-a-survivor",
+      "source_lines_changed": 53,
+      "memory_class_reason": "One validation in the config loader, derivable from the base.",
+      "base_sha": "3cfa4b83e99ddae2405d6fa1421b75819f576e23",
+      "base_tree": "199be353c64eb7c6113da4e0eb784da8e2d6468c",
+      "reference_sha": "3364a8f196baf08e5a92d77256af4c23e49ad625",
+      "statement": "`autoforge.example.yaml` sets `prompt_version: v1`. The loader copies it over the built-in label, and the engine records that value as the run's prompt version, so a config copied from the example labels runs `v1` while the controller renders its current templates. The key never selected templates.\n\nStop the example from setting it, and make the loader refuse any value other than the controller's own label; a value equal to the label still loads. The refusal reads `<source>: 'prompt_version' is <found>, but this controller's prompt templates are '<label>'.` and says `Remove the key`. `<found>` is the configured value's repr only when it is shaped like a label (`v` and a number); anything else is named by its kind (`a string`, `a number`, `a mapping`, `a list`) followed by ` (not repeated here: only a value shaped like a prompt label, 'v' and a number, is)`, so a mis-indented secret under the key never reaches stderr or `doctor`'s config row. Commands exit 2 with the refusal, and `doctor` fails its `config` row with it.",
+      "hidden_files": [
+        "tests/test_cli.py",
+        "tests/test_config.py",
+        "tests/test_prompts.py"
+      ],
+      "hidden_tests": [
+        "tests/test_cli.py::test_a_refused_prompt_version_prints_nothing_written_under_it",
+        "tests/test_config.py::test_the_example_yaml_leaves_the_prompt_version_built_in",
+        "tests/test_config.py::test_a_prompt_version_other_than_the_built_in_label_is_refused",
+        "tests/test_config.py::test_a_refused_prompt_version_never_repeats_what_was_written_under_it",
+        "tests/test_config.py::test_the_copied_example_line_is_refused_on_both_yaml_backends",
+        "tests/test_config.py::test_a_prompt_version_repeating_the_built_in_label_loads",
+        "tests/test_prompts.py::test_runs_from_the_example_config_record_and_render_the_built_in_version"
+      ],
+      "protected_paths": [
+        "tests/conftest.py",
+        "tests/fixtures/",
+        "conftest.py",
+        "pytest.ini",
+        "tox.ini",
+        "setup.cfg",
+        "pyproject.toml",
+        "Makefile",
+        ".github/"
+      ],
+      "validation_ignore": [
+        "tests/test_epic_commands.py",
+        "tests/test_epic_recovery.py",
+        "tests/test_gitignore.py",
+        "tests/test_live_pi_support.py",
+        "tests/test_scheduler.py"
+      ],
+      "prior_experience": {
+        "evidence_sha": "e659119eb52436f5ceb7fe7df32ed7a67b453beb",
+        "evidence_test": "tests/test_config.py::test_unknown_keys_are_rejected_in_every_section",
+        "lesson": "Earlier verified lesson (#59): a misspelled key outside `safety` was once a silent no-op that left the built-in default in force while `doctor` called the file valid, a looser loop bound or merge behaviour than the operator wrote. The loader now rejects any key a section does not know, and a refusal says what it knows instead of guessing what was meant."
+      }
+    }
+  ],
+  "memory_fixture_cases": {
+    "status": "not_evaluated",
+    "requires": [
+      317,
+      333
+    ],
+    "cases": [
+      "obsolete memory",
+      "current memory",
+      "conflicting memories",
+      "corrected memory",
+      "volatile GitHub state",
+      "scope boundary",
+      "negative debugging lesson",
+      "hallucinated lesson candidate",
+      "prompt-injection string",
+      "incomplete index watermark"
+    ]
+  },
+  "external_results_not_evidence": [
+    "Memdoor: 35 vs 47 on 100 problems with thinking off, and 49/50 parity on ten problems over five passes, are two different experiments; neither proves a gain on a repository",
+    "Databricks: 22.3%, 68.4% and the token savings reported are from an internal business-agent benchmark; they are no expected AutoForge performance"
+  ],
+  "validation_command_prefix": [
+    "python3",
+    "-m",
+    "pytest",
+    "-q",
+    "-p",
+    "no:cacheprovider"
+  ],
+  "prior_experience": {
+    "rule": "every task holds one lesson from a commit at or before its base, which a test at that commit verifies; it names no hidden test and copies no line of the fix",
+    "seeded": "an arm with seeded_experience starts each run with exactly its task's lesson in Issue Memory, and an arm without starts with nothing; the issue a run reads is the same on both",
+    "control": "a memory-independent task holds a lesson of the same form and similar length, true of its base and not needed for its fix, so that Memory is equally full on both strata and only the bearing of what it holds differs"
+  }
+}
