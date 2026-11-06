@@ -1216,6 +1216,349 @@ def test_a_limit_that_falls_due_within_the_grace_after_eof_still_wins(
     assert res.provider_summary["failure"] == (f"{reason} (exit -1)" if closed else reason)
 
 
+def _reply(message: str = "done") -> str:
+    """A final reply: prose, then a CONTROL_RESULT block (#439)."""
+    from tests.conftest import block
+
+    return "All done.\n" + block({"phase": "FIX", "status": "success", "message": message})
+
+
+def _pending_after(text: str) -> list:
+    """The turn #439 lost: the agent left a background task pending and ended
+    its turn with ``text``. The CLI emits the turn's ``result`` at once and
+    stays alive for a turn that may never come."""
+    from tests import claude_fake
+
+    return [
+        claude_fake.init(),
+        claude_fake.tool_use(
+            "t1", "Bash", description="Wait for the suite", run_in_background=True
+        ),
+        claude_fake.tool_result("t1", "Command running in background with ID: b1"),
+        claude_fake.result(text, stop_reason="end_turn"),
+    ]
+
+
+def test_a_claude_kept_alive_after_its_reply_is_stopped_and_the_reply_stands(tmp_path, monkeypatch):
+    """#439: a reply that decides the run is not lost to the idle limit. A
+    grace after it the CLI is stopped with its whole group, the reply is
+    ``stdout`` and nothing failed or timed out; the -1 says only that it was
+    stopped."""
+    import time
+
+    from autoforge import executor, providers
+    from tests import claude_fake
+    from tests.test_executor import _gone, _kill_quietly
+
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    started = time.monotonic()
+    lines = [{"spawn_holder": 60}, *_pending_after(_reply()), {"sleep": 60}]
+    home, res = _claude_run(tmp_path, lines, timeout=30, idle=20)
+    elapsed = time.monotonic() - started
+    (pid,) = claude_fake.holders(home)
+    try:
+        assert elapsed < 10, elapsed  # the grace and the kill, never a limit
+        assert res.stopped_on_reply and res.exit_code == -1
+        assert res.ok and not res.failed_exit
+        assert not res.timed_out and res.timeout_limit == "" and res.loop is None
+        assert not res.stopped_on_failure
+        assert res.provider_failure is None and res.transient_failure is None
+        assert res.stdout == _reply()
+        summary = res.provider_summary
+        assert summary["failure"] == "" and summary["result_subtype"] == "success"
+        assert (summary["turns"], summary["results"], summary["open_tool_calls"]) == (1, 1, 0)
+        assert _gone(pid, within=5), "the helper outlived the stopped invocation"
+    finally:
+        _kill_quietly(pid)
+
+
+@pytest.mark.parametrize("status", [0, 3])
+def test_a_claude_that_exits_within_the_grace_after_its_reply_keeps_its_status(
+    tmp_path, monkeypatch, status
+):
+    """#439: the grace keeps the CLI's own exit and status, 0 or not, for a CLI
+    that ends by itself soon after the reply."""
+    from autoforge import providers
+
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 5.0)
+    lines = [*_pending_after(_reply()), {"sleep": 0.5}]
+    _, res = _claude_run(tmp_path, lines, exit_code=status)
+    assert res.exit_code == status and not res.stopped_on_reply and not res.timed_out
+    assert res.failed_exit is bool(status) and res.ok is not bool(status)
+    assert res.stdout == _reply() and res.provider_failure is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The suite is running; I'll report the result when it finishes.",
+        '<<<CONTROL_RESULT>>>\n{"phase": "FIX", "status": "success"}\n',
+        "<<<CONTROL_RESULT>>>\n{not json\n<<<END_CONTROL_RESULT>>>",
+        "<<<CONTROL_RESULT>>>\n[1]\n<<<END_CONTROL_RESULT>>>",
+    ],
+    ids=["prose", "no_end_marker", "not_json", "not_an_object"],
+)
+def test_a_reply_with_no_readable_block_leaves_the_cli_to_the_idle_limit(
+    tmp_path, monkeypatch, text
+):
+    """#439: an agent that ends its turn to wait for what it started is
+    still working: its CLI is waited for, as #343 found five of them. Only a
+    block says the reply is its last."""
+    from autoforge import executor, providers
+
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    lines = [*_pending_after(text), {"sleep": 60}]
+    _, res = _claude_run(tmp_path, lines, timeout=30, idle=1)
+    assert res.timed_out and res.timeout_limit == "idle" and res.exit_code == -1
+    assert not res.stopped_on_reply and res.stdout == text
+
+
+def test_a_reply_with_a_tool_call_open_leaves_the_cli_to_the_idle_limit(tmp_path, monkeypatch):
+    """#439: a call still open may be a background agent's, whose work the
+    reply does not end. The summary's count says why it was waited for."""
+    from autoforge import executor, providers
+    from tests import claude_fake
+
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    call = claude_fake.tool_use("a1", "Agent", description="Run the suite")
+    lines = [claude_fake.init(), call, claude_fake.result(_reply()), {"sleep": 60}]
+    _, res = _claude_run(tmp_path, lines, timeout=30, idle=1)
+    assert res.timed_out and res.timeout_limit == "idle" and not res.stopped_on_reply
+    assert res.provider_summary["open_tool_calls"] == 1
+
+
+def test_a_turn_that_opens_within_the_grace_is_waited_for_and_its_reply_has_a_grace_of_its_own(
+    tmp_path, monkeypatch
+):
+    """#439: a task that fires inside the grace starts a turn that may revise
+    the reply. It runs for longer than the first reply's grace with no stop,
+    and a CLI that then exits within the grace of the new reply keeps its own
+    status: the grace starts over with the turn's own ``result``."""
+    from autoforge import providers
+    from tests import claude_fake
+
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 1.5)
+    notice = claude_fake.line({"type": "system", "subtype": "task_notification"})
+    lines = [
+        *_pending_after(_reply("first")),
+        {"sleep": 0.1},
+        notice,
+        claude_fake.init(),
+        claude_fake.tool_use("t2", "Bash", description="Read the suite's report"),
+        {"sleep": 2.0},
+        claude_fake.tool_result("t2"),
+        claude_fake.result(_reply("revised")),
+        {"sleep": 0.5},
+    ]
+    _, res = _claude_run(tmp_path, lines, timeout=30, idle=20)
+    assert res.exit_code == 0 and not res.stopped_on_reply and not res.timed_out
+    assert res.stdout == _reply("revised")
+    assert res.provider_summary["turns"] == 2 and res.provider_summary["results"] == 2
+
+
+def test_a_later_turns_reply_is_the_one_a_stopped_cli_is_read_for(tmp_path, monkeypatch):
+    from autoforge import executor, providers
+    from tests import claude_fake
+
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 2.0)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    lines = [
+        *_pending_after(_reply("first")),
+        claude_fake.init(),
+        claude_fake.result(_reply("revised")),
+        {"sleep": 60},
+    ]
+    _, res = _claude_run(tmp_path, lines, timeout=30, idle=20)
+    assert res.stopped_on_reply and not res.timed_out
+    assert res.stdout == _reply("revised")
+
+
+def test_a_later_turn_with_no_block_takes_the_decision_back(tmp_path, monkeypatch):
+    """#439: the last ``result`` is the run's. A later turn that answers with
+    no block says the agent has gone back to waiting, as any such reply does."""
+    from autoforge import executor, providers
+    from tests import claude_fake
+
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 5.0)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    lines = [
+        *_pending_after(_reply("first")),
+        claude_fake.init(),
+        claude_fake.result("Still waiting for the suite."),
+        {"sleep": 60},
+    ]
+    _, res = _claude_run(tmp_path, lines, timeout=30, idle=1)
+    assert res.timed_out and res.timeout_limit == "idle" and not res.stopped_on_reply
+    assert res.stdout == "Still waiting for the suite."
+
+
+def test_a_later_turn_that_fails_is_the_runs_failure(tmp_path, monkeypatch):
+    """#439 leaves #394's rule alone: an error result in any turn fails the
+    run, a reply before it included, and the failure's grace applies."""
+    from autoforge import executor, providers
+    from tests import claude_fake
+
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 5.0)
+    monkeypatch.setattr(providers, "CLAUDE_FAILED_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    lines = [
+        *_pending_after(_reply("first")),
+        claude_fake.init(),
+        *_failed_turn("error_result"),
+        {"sleep": 60},
+    ]
+    _, res = _claude_run(tmp_path, lines, timeout=30, idle=20)
+    assert res.stopped_on_failure and not res.stopped_on_reply and res.stdout == ""
+    assert res.provider_failure == (
+        f"{_FAILED_TURNS['error_result']}; claude was still running 0.5s later and was stopped"
+    )
+
+
+def test_output_after_a_reply_does_not_move_its_grace(tmp_path, monkeypatch):
+    """#439: notices between turns and a helper's lines on the CLI's stdout are
+    no later turn, so a busy stdout stops no sooner and no later than a silent one."""
+    import time
+
+    from autoforge import executor, providers
+    from tests import claude_fake
+    from tests.test_executor import _gone, _kill_quietly
+
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    notice = claude_fake.line({"type": "system", "subtype": "task_notification"}) + "\n"
+    lines = [
+        *_pending_after(_reply()),
+        {"spawn_holder": 60, "then": notice, "every": 0.05},
+        {"sleep": 60},
+    ]
+    started = time.monotonic()
+    home, res = _claude_run(tmp_path, lines, timeout=30, idle=20)
+    elapsed = time.monotonic() - started
+    (pid,) = claude_fake.holders(home)
+    try:
+        assert elapsed < 10, elapsed
+        assert res.stopped_on_reply and not res.timed_out and res.stdout == _reply()
+        assert res.provider_summary["records_after_result"] > 0
+        assert _gone(pid, within=5), "the helper outlived the stopped invocation"
+    finally:
+        _kill_quietly(pid)
+
+
+def test_a_claude_that_closes_its_stdout_and_runs_on_after_its_reply_is_stopped(
+    tmp_path, monkeypatch
+):
+    """#439, as #394's R1-F1: EOF on stdout is not the CLI's exit, and without
+    this the driver would return there and ``finish()`` wait until a limit."""
+    import time
+
+    from autoforge import executor, providers
+    from tests import claude_fake
+    from tests.test_executor import _gone, _kill_quietly
+
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    started = time.monotonic()
+    lines = [*_pending_after(_reply()), {"close_stdout": True}, {"spawn_holder": 60}, {"sleep": 60}]
+    home, res = _claude_run(tmp_path, lines, timeout=30, idle=20)
+    elapsed = time.monotonic() - started
+    (pid,) = claude_fake.holders(home)
+    try:
+        assert elapsed < 10, elapsed
+        assert res.stopped_on_reply and res.exit_code == -1 and not res.timed_out
+        assert res.stdout == _reply() and res.provider_failure is None
+        assert _gone(pid, within=5), "the helper outlived the stopped invocation"
+    finally:
+        _kill_quietly(pid)
+
+
+def test_a_claude_that_closes_its_stdout_and_exits_soon_after_its_reply_keeps_its_status(
+    tmp_path, monkeypatch
+):
+    from autoforge import providers
+
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 5.0)
+    lines = [*_pending_after(_reply()), {"close_stdout": True}, {"sleep": 0.5}]
+    _, res = _claude_run(tmp_path, lines, exit_code=3)
+    assert res.exit_code == 3 and not res.stopped_on_reply and not res.timed_out
+    assert res.stdout == _reply() and res.provider_failure is None
+
+
+@pytest.mark.parametrize(("timeout", "idle"), [(2, None), (30, 2)], ids=["max_runtime", "idle"])
+@pytest.mark.parametrize("closes_stdout", [False, True], ids=["open", "closed"])
+def test_a_limit_that_falls_due_within_the_grace_after_a_reply_does_not_discard_it(
+    tmp_path, monkeypatch, timeout, idle, closes_stdout
+):
+    """#439: unlike a failure's (#394), a reply's grace is not outranked by a
+    limit. The limit only ends the CLI sooner, and the whole issue is a
+    timeout discarding a reply already in hand."""
+    import time
+
+    from autoforge import executor
+    from tests import claude_fake
+
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    closes = [{"close_stdout": True}] if closes_stdout else []
+    started = time.monotonic()
+    lines = [*_pending_after(_reply()), *closes, {"sleep": 60}]
+    home, res = _claude_run(tmp_path, lines, timeout=timeout, idle=idle)
+    assert time.monotonic() - started < 8  # the limit, well within the 10 s grace
+    assert claude_fake.launches(home) == 1
+    assert res.stopped_on_reply and res.exit_code == -1
+    assert not res.timed_out and res.timeout_limit == ""
+    assert res.stdout == _reply() and res.provider_failure is None
+
+
+def test_a_request_refused_during_a_run_stopped_after_its_reply_fails_nothing(
+    tmp_path, monkeypatch
+):
+    """#439 keeps #258's rule: a run that ends usable is left as it is, and the
+    stop's -1 does not make it a failed exit to name the refusal in."""
+    from autoforge import executor, providers
+    from tests import claude_fake
+
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    denial = {"tool_name": "Bash", "tool_use_id": "t9", "tool_input": {"description": "Deploy"}}
+    lines = [
+        claude_fake.init(),
+        claude_fake.result(_reply(), permission_denials=[denial]),
+        {"sleep": 60},
+    ]
+    _, res = _claude_run(tmp_path, lines, timeout=30, idle=20)
+    assert res.stopped_on_reply and res.provider_failure is None and res.interaction is None
+    assert res.provider_summary["refused_requests"] == 1
+
+
+def test_what_a_claude_stopped_after_its_reply_flushes_does_not_touch_the_reply(
+    tmp_path, monkeypatch
+):
+    """#439: once the CLI is stopped nothing more is read. A record it flushes
+    on the SIGTERM cannot revise the reply, and however much it writes past
+    the queue's bound, which only a stop leaves unread, the reply stands."""
+    from autoforge import executor, providers
+    from tests import claude_fake
+
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(providers, "CLAUDE_MAX_RECORD_BYTES", 8192)
+    monkeypatch.setattr(providers, "CLAUDE_MAX_PENDING_BYTES", 8192)
+    flushed = [
+        claude_fake.init(),
+        claude_fake.result("revised"),
+        *[claude_fake.thinking("x" * 1024) for _ in range(16)],
+    ]
+    sigterm = {"on_sigterm": {"lines": flushed, "stderr": "stopping on SIGTERM\n"}}
+    lines = [sigterm, *_pending_after(_reply()), {"sleep": 60}]
+    _, res = _claude_run(tmp_path, lines, timeout=30, idle=20)
+    assert res.stopped_on_reply and res.provider_failure is None
+    assert res.stdout == _reply()
+    assert res.provider_summary["records"] == len(_pending_after(_reply()))
+    assert "stopping on SIGTERM" in res.stderr
+
+
 def test_a_fake_claude_that_overruns_its_timeout_is_killed_and_timed_out(tmp_path):
     import time
 

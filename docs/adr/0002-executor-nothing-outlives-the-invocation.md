@@ -391,6 +391,45 @@ a CLI that closed its stdout and runs on is waited for and stopped the
 same way, where `finish()` would wait for it until a limit. The executor is
 unchanged and still knows nothing of why.
 
+**A third reason (#439, 2026-11-06).** A successful turn does not end
+`claude -p` either: its `result` comes at once, and a background task still
+pending keeps the CLI alive, silently, for a turn that may never come. The
+idle limit then fired and its timeout discarded a reply already in hand: in
+Lychee-Technology/ltseq#218, a 92-minute `ANALYZE_EXECUTE` whose final reply
+and commit were done, killed 30 minutes later, with `resume` set to rerun it
+all. So the Claude adapter stops a CLI still running
+`CLAUDE_REPLIED_EXIT_GRACE_SECONDS` (10 s) after a reply that decides the run:
+every turn has its `result`, the last is a success whose text holds a block
+that parses to a JSON object, and no tool call is open. The run completes on
+that reply (`ended_by: reply`), with the real exit status of -1.
+
+The issue left one choice open. A task that fires later could have started a
+turn that revised the reply, and stopping the CLI means nobody sees that
+revision. The alternative was to keep waiting and only stop the idle timeout
+from discarding the reply, which costs up to `idle_timeout_seconds` on every
+such run, on work the run no longer needs, and leaves the CLI running. We
+stop it: the agent is already told that the controller "may take that reply
+as your final one and does not wait for the work" (`prompts/common.md`), which
+this makes true. A reply with no block is not final, however long the CLI
+waits: an agent that ends its turn to wait for its test suite (three of #343's
+nine idle kills) must keep that turn. The cost that remains is a task that
+would have fired just after the grace.
+
+Three differences from a failure, each because a reply is what the run wants
+to keep. A turn that opens within the grace is waited for, and its own
+`result` decides again, with a grace of its own: a failure cannot be redeemed,
+a reply can be revised. A limit that falls due within the grace does not
+outrank the reply, because it ends the CLI just as the stop would and the
+timeout would discard what this change exists to keep. And the stopped CLI's
+-1 is no failed exit (`AgentExecutionResult.failed_exit`), so the engine goes
+on to parse and validate the reply as it would any other.
+
+Two runs keep the timeout they always had. A `tool_result` skipped past the
+per-line bound leaves its call open, so that run is still waited for. A turn
+that opens within the grace and then hangs has no reply of its own, and the
+earlier one is no longer the last. A `text` profile prints nothing until it
+exits, so it has no reply to stop for.
+
 Tests for §4d: `tests/test_executor.py` stops a child that keeps writing
 from its `on_chunk` hook (the result is `stopped`, not `timed_out`) and
 unhooks a raising `on_chunk` without unhooking `on_output`;

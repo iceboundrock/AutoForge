@@ -426,6 +426,25 @@ def test_a_scheduler_namespace_is_reached_from_the_common_dir(tmp_path):
     assert stop_corpus.find_state_dirs([common]) == [namespace.resolve()]
 
 
+def test_a_cli_stopped_after_its_reply_is_no_failed_launch_of_its_own(tmp_path):
+    """#439: its -1 says only that it was stopped. Without an error it is a
+    launch that worked; with one (a reply the engine refused) it failed as an
+    exit 0 with a malformed result does, with no typed cause."""
+    state_dir, state = _run(tmp_path, "stopped", Phase.REVIEW)
+    run_id = state.run_id
+    _journal(
+        state_dir,
+        run_id,
+        [
+            _agent(run_id, 1, exit_code=-1, ended_by="reply"),
+            _agent(run_id, 2, exit_code=-1, ended_by="reply", error="no CONTROL_RESULT"),
+        ],
+    )
+    report = _report(_summary(tmp_path), "stopped")
+    assert report["launches"] == {"agent": 2}
+    assert report["failed_launches"] == {"agent:unknown": 1}
+
+
 def _namespace(common: Path, n: int) -> Path:
     """``<common>/autoforge/scheduler/issues/<n>/state``, with the namespace's binding beside."""
     state_dir = common / "autoforge" / "scheduler" / "issues" / str(n) / "state"

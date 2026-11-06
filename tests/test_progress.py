@@ -416,11 +416,11 @@ class ClaudeThatCommits(ClaudeCodeProvider):
         return super().execute(req)
 
 
-def _engine_on_fake_claude(tmp_path, fake_github, lines):
+def _engine_on_fake_claude(tmp_path, fake_github, lines, **fake_args):
     state_dir = tmp_path / ".autoforge"
     eng = make_engine(state_dir, [], github=fake_github, origin=True)
     eng.step()  # INITIALIZING
-    _, fake = claude_fake.fake_claude(tmp_path, lines)
+    _, fake = claude_fake.fake_claude(tmp_path, lines, **fake_args)
     cfg_profile = eng.config.profiles["analyze_execute"]
     eng.config.profiles["analyze_execute"] = replace(
         cfg_profile, command=fake.command, options={**fake.options, "output_format": "stream-json"}
@@ -663,3 +663,79 @@ def test_a_failed_stream_whose_cli_runs_on_ends_the_step_with_its_failure(
     assert execution["timed_out"] is False and execution["timeout_limit"] == ""
     assert execution["exit_code"] == -1
     assert execution["provider_summary"]["failure"] == failure
+
+
+def test_a_valid_reply_whose_cli_runs_on_completes_the_step(tmp_path, fake_github, monkeypatch):
+    """#439, as the ANALYZE_EXECUTE of Lychee-Technology/ltseq#218 saw it: the
+    agent left a background task pending, wrote its final reply, and the CLI
+    stayed alive and silent. The phase now advances on that reply a grace
+    later, and ``execution.json`` says how the CLI ended and that no limit or
+    failure was involved, its -1 included."""
+    import time
+
+    from autoforge import executor, providers
+
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    script: list = [
+        claude_fake.init(),
+        claude_fake.tool_use(
+            "b1", "Bash", description="Wait for the suite", run_in_background=True
+        ),
+        claude_fake.tool_result("b1", "Command running in background"),
+        claude_fake.result(block(ANALYZE_OK), stop_reason="end_turn"),
+        {"sleep": 60},
+    ]
+    eng, state_dir = _engine_on_fake_claude(tmp_path, fake_github, script)
+    lines: list[str] = []
+    eng.progress_output = lines.append
+    started = time.monotonic()
+    assert eng.step().next_phase == "REVIEW"
+    assert time.monotonic() - started < 20
+    assert load_state(eng.paths.state_file).current_pr_url == PR
+    shown = [line.split("] ", 1)[1] for line in lines]
+    assert shown[1:] == [
+        "agent started (claude-fable-5-1)",
+        "Bash Wait for the suite",
+        "agent replied and was stopped while still running, 3 progress events",
+    ]
+    (progress_log,) = state_dir.rglob("progress.log")
+    execution = json.loads((progress_log.parent / "execution.json").read_text(encoding="utf-8"))
+    assert execution["ended_by"] == "reply" and execution["exit_code"] == -1
+    assert execution["timed_out"] is False and execution["timeout_limit"] == ""
+    assert execution["error"] == "" and execution["provider_summary"]["failure"] == ""
+    assert not (progress_log.parent / "error.txt").exists()
+    result = json.loads((progress_log.parent / "control-result.json").read_text(encoding="utf-8"))
+    assert result == analyze_payload(eng.origin.head("autoforge/2"))
+
+
+def test_a_stopped_cli_whose_reply_the_engine_refuses_is_corrected(
+    tmp_path, fake_github, monkeypatch
+):
+    """#439: the stop decides nothing about the reply. A block the adapter can
+    read and the engine refuses goes to a correction like any other, which
+    keeps the failed launch's record and advances on the next reply."""
+    from autoforge import executor, providers
+
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    wrong = block({"phase": "REVIEW", "status": "success"})
+    script: list = [claude_fake.init(), claude_fake.result(wrong), {"sleep": 60}]
+    corrected: list = [claude_fake.init(), claude_fake.result(block(ANALYZE_OK))]
+    eng, state_dir = _engine_on_fake_claude(tmp_path, fake_github, script, later=((corrected, 0),))
+    lines: list[str] = []
+    eng.progress_output = lines.append
+    assert eng.step().next_phase == "REVIEW"
+    assert claude_fake.launches(tmp_path / "fake-claude") == 2
+    ends = [line.split("] ", 1)[1] for line in lines if "progress events" in line]
+    assert ends[0].startswith("agent replied and was stopped while still running")
+    assert ends[1].startswith("agent exited 0")
+    first, second = sorted(
+        (
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in state_dir.rglob("execution.json")
+        ),
+        key=lambda execution: execution["started_at"],
+    )
+    assert first["ended_by"] == "reply" and "phase mismatch" in first["error"]
+    assert second["ended_by"] == "exit" and second["error"] == ""

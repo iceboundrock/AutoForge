@@ -329,6 +329,77 @@ def _later_turn(text: str, **over) -> tuple[dict, ...]:
     )
 
 
+def _replied_after(*records: dict | bytes) -> bool:
+    """:attr:`ClaudeStream.replied` after ``records``, a text with a block being a reply."""
+    stream = ClaudeStream(cwd=CWD, is_reply=lambda text: "<<<CONTROL_RESULT>>>" in text)
+    for record in records:
+        stream.feed(record if isinstance(record, bytes) else _line(record))
+    return stream.replied
+
+
+def test_a_reply_decides_the_run_with_every_turn_closed_and_no_call_open():
+    """#439: what the driver stops a CLI still running for."""
+    assert _replied_after(_result())
+    use, done = _assistant(_tool_use("t1", "Bash", description="x")), _tool_result("t1")
+    assert _replied_after(use, done, _result())
+    # A notice between turns belongs to no turn, the task's own included.
+    notice = {"type": "system", "subtype": "task_notification"}
+    assert _replied_after(_result(), notice, {"type": "command_lifecycle", "state": "started"})
+    # A later turn's reply decides as the first one's does.
+    assert _replied_after(_result(), *_later_turn(TEXT))
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        pytest.param((), id="no_result_yet"),
+        pytest.param((_result(result="Waiting for the suite."),), id="a_text_with_no_block"),
+        pytest.param(
+            (_assistant(_tool_use("t1", "Agent", description="x")), _result()),
+            id="a_call_still_open",
+        ),
+        pytest.param((_result(is_error=True),), id="an_error_result"),
+        pytest.param((_result(subtype="error_max_turns"),), id="a_failed_subtype"),
+        pytest.param((_result(result=None),), id="no_text"),
+        pytest.param(
+            (_result(), {"type": "system", "subtype": "init"}),
+            id="a_later_turn_opened_by_its_init",
+        ),
+        pytest.param(
+            (_result(), _assistant({"type": "text", "text": "and"})),
+            id="a_later_turn_opened_by_a_record",
+        ),
+        pytest.param(
+            (
+                {"type": "system", "subtype": "init"},
+                {"type": "system", "subtype": "init"},
+                _result(),
+            ),
+            id="a_turn_waiting_for_its_held_back_result",
+        ),
+        pytest.param((_result(), *_later_turn("Still waiting.")), id="a_later_turn_with_no_block"),
+        pytest.param((_result(), b"not json"), id="a_line_that_fails_the_run"),
+        pytest.param((_result(), _result()), id="a_result_outside_a_turn"),
+    ],
+)
+def test_nothing_else_decides_the_run_on_a_reply(records):
+    assert not _replied_after(*records)
+
+
+def test_no_text_is_a_reply_without_a_test_for_one():
+    stream, _ = _run(_result(), ended=False)
+    assert stream.text == TEXT and not stream.replied
+
+
+def test_a_result_text_is_tested_once_however_often_the_driver_asks():
+    """#439: the driver asks after every read, and a text can be megabytes."""
+    tested = []
+    stream = ClaudeStream(cwd=CWD, is_reply=lambda text: tested.append(text) or True)
+    stream.feed(_line(_result(result="first")))
+    assert stream.replied and stream.replied
+    assert tested == ["first"]
+
+
 def test_each_turn_ends_in_a_result_and_the_last_one_is_the_outcome():
     """A background task or a scheduled wakeup still pending when a turn
     ends keeps the CLI alive for another turn with its own result; text

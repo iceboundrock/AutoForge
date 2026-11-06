@@ -67,6 +67,16 @@ it. The rule that an unfinished phase still ends with a `failure` or
 started is still running. The wording is shared by every provider, and
 accurate for each, since each adapter hands the parser only the final text.
 
+The Claude adapter reads a `stream-json` reply once before the engine does
+(#439): `holds_control_result`, steps 1 to 5 above, tells it whether a CLI that
+runs on after the reply can be stopped. It reads no phase, status or field, so
+it advances nothing: the engine parses and validates that reply as it does any
+other, and refuses and corrects it the same way. Without such a block the CLI
+is left running, so a reply that says it is waiting on a task keeps its turn.
+No other adapter needs it: OpenCode and `text` output print their final text
+at exit, and the Pi adapter shuts its CLI down itself once the conversation
+settles.
+
 ### The correction quotes the refused reply (#393)
 
 A correction is a new agent session (Claude runs with

@@ -487,7 +487,11 @@ claude -p --output-format stream-json --verbose --model <model> --effort <effort
   task kept it alive for another turn) is stopped with everything it
   started, its stdout closed or not, and the step's error names the
   failure and the stop
-  (`execution.json`: `ended_by: provider_failure`), not a timeout. A record
+  (`execution.json`: `ended_by: provider_failure`), not a timeout. A
+  successful turn does not end the CLI either, so one still running 10 s
+  after a reply that holds a `CONTROL_RESULT` block, with no turn or tool call
+  left open, is stopped the same way and the step goes on with that reply
+  (`execution.json`: `ended_by: reply`, exit code -1, no error). A record
   larger than the per-line bound is counted and skipped unless it is the
   `result` record, which must arrive whole.
 - Under `stream-json`, a failure that is a turn ended by a model API error

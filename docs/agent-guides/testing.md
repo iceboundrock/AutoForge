@@ -1811,6 +1811,19 @@ Progress is observability, never part of an outcome. Keep covered:
   `tests/claude_fake.py`), the stop reaching a helper in its group; and
   through the engine the error and the end line name the failure, the
   phase is unchanged and `execution.json` says `ended_by: provider_failure`
+- a reply that decides the run while the CLI runs on (#439): a success with
+  a readable block, every turn closed and no call open stops the CLI and its
+  group a grace later, reported as completed on that reply
+  (`stopped_on_reply`), never a timeout, and a limit falling due within the
+  grace does not discard it; a CLI that exits within the grace keeps its own
+  status; the same past EOF; a reply with no readable block, or a call still
+  open, is left to the idle limit; a turn that opens within the grace is
+  waited for and its reply has a grace of its own, a later reply with no
+  block takes the decision back, and a later failure is #394's; output does
+  not move the grace, and what the stopped CLI flushes does not touch the
+  reply; through the engine the phase advances, `execution.json` says
+  `ended_by: reply` with exit code -1 and no error, and a reply the engine
+  refuses is corrected like any other
 - cleaning (`tests/test_progress.py`): escapes and controls stripped
   before redaction and redaction before the clip, so a token split by an
   escape or cut by the bound is never shown

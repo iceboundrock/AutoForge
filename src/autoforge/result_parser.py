@@ -318,19 +318,8 @@ def extract_last_block(stdout: str) -> str:
     return matches[-1].strip()
 
 
-def parse_control_result(
-    stdout: str,
-    expected_phase: Phase,
-    *,
-    update_epic_request: UpdateEpicRequest = UpdateEpicRequest.FULL,
-) -> dict:
-    """Extract + JSON-parse + validate the CONTROL_RESULT payload.
-
-    Returns the payload dict. Raises ControlResultError on extraction/JSON
-    problems and ControlResultValidationError on schema/phase problems.
-    ``update_epic_request`` selects the UPDATE_EPIC schema
-    (:class:`UpdateEpicRequest`).
-    """
+def _block_object(stdout: str) -> dict:
+    """The JSON object of the last complete block, within the whole-block bound."""
     raw = extract_last_block(stdout)
     if len(raw) > MAX_CONTROL_RESULT_CHARS:
         raise ControlResultValidationError(
@@ -346,6 +335,41 @@ def parse_control_result(
         raise ControlResultValidationError(
             f"CONTROL_RESULT must be a JSON object, got {type(payload).__name__}"
         )
+    return payload
+
+
+def holds_control_result(text: str) -> bool:
+    """Whether ``text`` is a reply the agent meant as its last (#439).
+
+    True when its last complete block is within the bound and a JSON object:
+    the part of :func:`parse_control_result` that says the agent wrote a
+    result, not whether that result is right. A wrong phase or a missing
+    field is for the engine to refuse and correct, and only a CLI that has
+    ended is corrected, so such a reply counts here.
+    """
+    try:
+        _block_object(text)
+    except (ControlResultError, ValueError, RecursionError):
+        # ValueError and RecursionError: the decoder's own integer and nesting
+        # limits, which are not JSONDecodeError.
+        return False
+    return True
+
+
+def parse_control_result(
+    stdout: str,
+    expected_phase: Phase,
+    *,
+    update_epic_request: UpdateEpicRequest = UpdateEpicRequest.FULL,
+) -> dict:
+    """Extract + JSON-parse + validate the CONTROL_RESULT payload.
+
+    Returns the payload dict. Raises ControlResultError on extraction/JSON
+    problems and ControlResultValidationError on schema/phase problems.
+    ``update_epic_request`` selects the UPDATE_EPIC schema
+    (:class:`UpdateEpicRequest`).
+    """
+    payload = _block_object(stdout)
     for key in ("phase", "status"):
         if key not in payload:
             raise ControlResultValidationError(f"CONTROL_RESULT missing required field {key!r}")

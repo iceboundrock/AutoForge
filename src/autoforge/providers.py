@@ -29,7 +29,10 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
     error result in any turn, a result outside a turn, a malformed line or
     a turn without its result is a
     :attr:`AgentExecutionResult.provider_failure`; a CLI still running
-    :data:`CLAUDE_FAILED_EXIT_GRACE_SECONDS` after it is stopped (#394).
+    :data:`CLAUDE_FAILED_EXIT_GRACE_SECONDS` after it is stopped (#394). So
+    is one still running :data:`CLAUDE_REPLIED_EXIT_GRACE_SECONDS` after a
+    reply holding a CONTROL_RESULT block with no turn or tool call left open,
+    and that reply stands (:attr:`AgentExecutionResult.stopped_on_reply`, #439).
   * ``options.output_format: text`` is the opt-out: the final text is
     printed once, at exit, and the run reports no progress and no activity
     while it runs.
@@ -299,6 +302,7 @@ from .loop_detect import LIMIT_LOOP, LoopMonitor, LoopReport
 from .pi_rpc import PiConversation, encodable
 from .progress import ProgressEvent, ProgressKind, ProgressSink, clean, guarded
 from .redaction import redact
+from .result_parser import holds_control_result
 from .sandbox import LaunchDescription, SandboxFacts
 from .sandbox_policy import (
     AuthItem,
@@ -420,6 +424,11 @@ class AgentExecutionResult:
     # failed the run (#394): ``provider_failure`` names that failure and the
     # stop, ``exit_code`` is -1, and nothing timed out.
     stopped_on_failure: bool = False
+    # The adapter stopped a CLI still running after a reply that decided the
+    # run (#439): ``stdout`` is that reply, read as any other, ``exit_code`` is
+    # -1 and says only that it was stopped (:attr:`failed_exit`), and nothing
+    # timed out.
+    stopped_on_reply: bool = False
     # A failed run the adapter recognised as a known transient failure of
     # the provider (#164): a short, fixed reason naming it, never text taken
     # from the output. It is a fact about this failure, not a decision: it
@@ -480,6 +489,12 @@ class AgentExecutionResult:
         return self.group_survived_kill or self.capture_abandoned or self.orphan_survived_kill
 
     @property
+    def failed_exit(self) -> bool:
+        """Whether the exit status says the run failed: any but 0, except the
+        -1 of a CLI stopped after its reply (:attr:`stopped_on_reply`)."""
+        return self.exit_code != 0 and not self.stopped_on_reply
+
+    @property
     def ok(self) -> bool:
         """Whether the invocation ran to a usable end.
 
@@ -492,7 +507,7 @@ class AgentExecutionResult:
         facts (``timed_out``, ``exit_code``, ``stdout_tail``) rather than
         this property.
         """
-        return not self.timed_out and self.exit_code == 0 and not self.stdout_truncated
+        return not self.timed_out and not self.failed_exit and not self.stdout_truncated
 
     @classmethod
     def from_execution(cls, res: ExecutionResult, profile: ProfileConfig) -> AgentExecutionResult:
@@ -646,7 +661,7 @@ def _name_refused(
         )
         result.transient_failure = None
         result.interaction = InteractionOutcome(Lifecycle.FAILED)
-    elif result.provider_failure or result.exit_code != 0:
+    elif result.provider_failure or result.failed_exit:
         failure = result.provider_failure or f"{name}: exited {result.exit_code}"
         result.provider_failure = (
             f"{failure}; during the run the agent asked for {asked}, which {cli} refused "
@@ -961,6 +976,14 @@ CLAUDE_EXIT_POLL_SECONDS = 0.25
 # another turn, whose work no later turn can redeem. A CLI whose failing
 # record was its last exits well within it and keeps its own status.
 CLAUDE_FAILED_EXIT_GRACE_SECONDS = 10.0
+# How long a CLI still running after a reply that decides the run is given to
+# exit on its own before the driver stops it (#439). ``claude -p`` emits a
+# turn's ``result`` at once, but a background task still pending keeps it alive
+# for a turn that may never come, silently, until the idle limit. The agent is
+# told the controller does not wait for such work (``prompts/common.md``). The
+# value is #394's, not a measurement of how long a CLI takes to exit after its
+# last ``result``: one that takes longer loses its own status, not its reply.
+CLAUDE_REPLIED_EXIT_GRACE_SECONDS = 10.0
 # What every launch adds so that no integration of the operator's or the
 # repository's configuration runs (#165): one may hold a GitHub token of its
 # own. ``--safe-mode`` keeps hooks, installed plugins, MCP servers, skills,
@@ -1409,17 +1432,23 @@ class ClaudeCodeProvider(AgentProvider):
         inside the stream is ``provider_failure`` and a timeout wins over it.
         Once the stream has failed the run, a CLI still running
         :data:`CLAUDE_FAILED_EXIT_GRACE_SECONDS` later is stopped (#394):
-        nothing it does after that can change the outcome. ``exit_code`` is
-        always the real process status, -1 when the CLI was killed. A
-        failure that is a turn ended by a transient model API error is also
-        a ``transient_failure`` (#395); ``text`` output carries no record to
-        tell it by.
+        nothing it does after that can change the outcome. Once the stream
+        holds a reply that decides the run (:attr:`ClaudeStream.replied`), a
+        CLI still running :data:`CLAUDE_REPLIED_EXIT_GRACE_SECONDS` later is
+        stopped too and the reply stands (#439), as it does when a limit falls
+        due within that grace: the timeout would otherwise discard it.
+        ``exit_code`` is always the real process status, -1 when the CLI was
+        killed. A failure that is a turn ended by a transient model API error
+        is also a ``transient_failure`` (#395); ``text`` output carries no
+        record to tell it by.
         """
         if self.output_format(req.profile) != "stream-json":
             return super().execute(req)
         emit = guarded(req.progress)
         monitor = _loop_monitor(req, emit)
-        stream = ClaudeStream(cwd=req.cwd, emit=emit, loop=_ClockedLoop(monitor))
+        stream = ClaudeStream(
+            cwd=req.cwd, emit=emit, loop=_ClockedLoop(monitor), is_reply=holds_control_result
+        )
         self.integration_preflight(req.env_allowlist)
         with self.integration_isolation() as isolation:
             env = {**(req.env or {}), **isolation}
@@ -1444,7 +1473,8 @@ class ClaudeCodeProvider(AgentProvider):
             with start_duplex(duplex) as child:
                 cut = _read_claude_stream(child, stream, monitor)
                 res = child.finish()
-        timed_out = cut in (_Cut.DEADLINE, _Cut.LOOP) or res.timed_out
+        replied = cut is _Cut.REPLIED
+        timed_out = not replied and (cut in (_Cut.DEADLINE, _Cut.LOOP) or res.timed_out)
         failure = stream.failure
         if cut is _Cut.FAILED:
             # A stream that failed at EOF said "exited": the CLI had only
@@ -1456,7 +1486,8 @@ class ClaudeCodeProvider(AgentProvider):
             )
         elif stream.exited_early:
             failure = f"{failure} (exit {res.exit_code})"
-        elif res.records_overflowed and failure is None:
+        elif res.records_overflowed and failure is None and not replied:
+            # Past a stop nothing reads the lines, and the reply is already in hand.
             failure = "claude: stream-json lines arrived faster than they were read"
         summary = stream.summary()
         summary["failure"] = failure or ""
@@ -1484,11 +1515,12 @@ class ClaudeCodeProvider(AgentProvider):
             orphans_unchecked=res.orphans_unchecked,
             provider_failure=None if timed_out else failure,
             stopped_on_failure=cut is _Cut.FAILED,
+            stopped_on_reply=replied,
             # A failure the stream recognised as a transient model API error
             # (#395) stays one when the CLI was stopped after it (#394).
             transient_failure=None if timed_out or failure is None else stream.transient,
             provider_summary=summary,
-            timeout_limit=res.timeout_limit,
+            timeout_limit="" if replied else res.timeout_limit,
             last_activity_at=res.last_activity_at,
             sandbox=res.sandbox,
         )
@@ -1507,6 +1539,8 @@ class _Cut(enum.Enum):
     LOOP = "loop"
     # Stopped once the stream had failed the run (#394): that failure.
     FAILED = "failed"
+    # Stopped, or reached by a limit, once a reply had decided the run (#439): that reply.
+    REPLIED = "replied"
 
 
 def _read_claude_stream(
@@ -1535,10 +1569,21 @@ def _read_claude_stream(
     grace nor the wait (R1-F1): a CLI that closed its stdout after the
     failure, or whose stream EOF fails for want of a result, is waited for
     and stopped the same way, where ``finish()`` would wait for it until a
-    limit. Only EOF on a stream that has not failed, or from a CLI that has
-    exited, ends the wait.
+    limit. Only EOF on a stream that has neither failed nor been decided by a
+    reply, or from a CLI that has exited, ends the wait.
+
+    A CLI still running :data:`CLAUDE_REPLIED_EXIT_GRACE_SECONDS` after the
+    stream first held a reply that decides the run is stopped the same way,
+    its output not moving the grace (#439). Unlike a failure, a reply can be
+    overtaken inside the grace: a turn that opens is waited for, as a turn
+    that may revise the reply, and its own ``result`` decides again with a
+    grace of its own. Past that grace the agent's pending work is not waited
+    for, which ``prompts/common.md`` tells it. A limit that falls due within
+    the grace does not outrank the reply either: it would end the CLI just
+    as a stop does, and a timeout would discard the reply.
     """
     failed_at: float | None = None
+    replied_at: float | None = None
     ended = False
     while True:
         item = child.read_line(timeout=CLAUDE_EXIT_POLL_SECONDS)
@@ -1555,28 +1600,34 @@ def _read_claude_stream(
             if not ended:
                 ended = True
                 stream.stream_ended()
-            if stream.failure is None or child.exited():
+            if child.exited() or not (stream.failure is not None or stream.replied):
                 return None
         elif item.deadline_exceeded:
-            return _Cut.DEADLINE
+            return _Cut.REPLIED if stream.replied else _Cut.DEADLINE
         if loop is not None and loop.verdict is not None and child.stop():
             return _Cut.LOOP
         if child.exited():
             child.finish()
-        elif stream.failure is not None:
-            now = time.monotonic()
-            if failed_at is None:
-                failed_at = now
-            stop_at = failed_at + CLAUDE_FAILED_EXIT_GRACE_SECONDS
-            if now >= stop_at and child.stop():
-                return _Cut.FAILED
-            if ended:
-                # Past EOF every read returns at once: wait for the CLI here,
-                # never past the grace or the deadline, which the next read
-                # enforces as it does before EOF.
-                time.sleep(
-                    max(0.0, min(CLAUDE_EXIT_POLL_SECONDS, stop_at - now, child.deadline() - now))
-                )
+            continue
+        now = time.monotonic()
+        if stream.failure is not None:
+            failed_at = now if failed_at is None else failed_at
+            stop_at, cut = failed_at + CLAUDE_FAILED_EXIT_GRACE_SECONDS, _Cut.FAILED
+        elif stream.replied:
+            replied_at = now if replied_at is None else replied_at
+            stop_at, cut = replied_at + CLAUDE_REPLIED_EXIT_GRACE_SECONDS, _Cut.REPLIED
+        else:
+            replied_at = None
+            continue
+        if now >= stop_at and child.stop():
+            return cut
+        if ended:
+            # Past EOF every read returns at once: wait for the CLI here,
+            # never past the grace or the deadline, which the next read
+            # enforces as it does before EOF.
+            time.sleep(
+                max(0.0, min(CLAUDE_EXIT_POLL_SECONDS, stop_at - now, child.deadline() - now))
+            )
 
 
 def opencode_isolation_env(config_dir: str) -> dict[str, str]:
