@@ -63,9 +63,10 @@ printed the block from a Bash command. `common.md`, `correction.md` and
 every phase template's schema line now say the final reply, and the common
 prompts say that command output, tool results and files are never read for
 it. The rule that an unfinished phase still ends with a `failure` or
-`blocked` block now says it covers a reply written while work the agent
-started is still running. The wording is shared by every provider, and
-accurate for each, since each adapter hands the parser only the final text.
+`blocked` block then also covered a reply written while work the agent
+started is still running (#440 replaced that sentence, below). The wording is
+shared by every provider, and accurate for each, since each adapter hands the
+parser only the final text.
 
 The Claude adapter reads a `stream-json` reply once before the engine does
 (#439): `holds_control_result`, steps 1 to 5 above, tells it whether a CLI that
@@ -76,6 +77,29 @@ is left running, so a reply that says it is waiting on a task keeps its turn.
 No other adapter needs it: OpenCode and `text` output print their final text
 at exit, and the Pi adapter shuts its CLI down itself once the conversation
 settles.
+
+### What an agent is told about work still running (#440)
+
+The sentence #393 added said the controller "does not wait for the work", which
+invites leaving a task running. In Lychee-Technology/ltseq#218 one background
+task that was never stopped kept the CLI alive for 30 minutes after the reply.
+Since a reply written with work still running costs something different on each
+provider, the prompt now says it in two places.
+
+`common.md` holds what is true of every provider: let what you started finish
+or stop it before the final reply, because any reply may be taken as final, and
+the group kill is a last resort. It does not say how the controller ends a run.
+
+What only one CLI does goes in a section its adapter names
+(`AgentProvider.prompt_section`), which the engine renders into `common.md`'s
+`{{PROVIDER_SECTION}}` for the profile that launch runs under. Today that is
+`ClaudeCodeProvider`'s `claude_background_work.md`: the end of a turn does not
+end the CLI while a task is pending, so stop every task, `Monitor` and background
+agent (`TaskStop`) and bound every wait. The instruction does not depend on the
+stop for a reply: with it the leftovers are lost, and without it (`text` output,
+a reply it cannot read) the run hangs until a limit. The stop stays the safety
+net. The controller still neither tracks a task nor reads a reply for whether
+one finished, so an agent that ignores the section costs what it cost before.
 
 ### The correction quotes the refused reply (#393)
 

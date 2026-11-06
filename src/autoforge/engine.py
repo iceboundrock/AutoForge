@@ -4275,7 +4275,11 @@ class ControllerEngine:
             raise StateTransitionError(f"phase {phase.value} has no agent prompt")
         if template not in TEMPLATE_FILES:
             raise StateTransitionError(f"unknown template {template}")
-        prompt = render_phase(template, self._prompt_variables(), common_template=COMMON_TEMPLATE)
+        prompt = render_phase(
+            template,
+            {**self._prompt_variables(), "PROVIDER_SECTION": self._provider_section(phase)},
+            common_template=COMMON_TEMPLATE,
+        )
         if correction_error is not None:
             correction = render(
                 load_template("correction.md"),
@@ -4288,6 +4292,17 @@ class ControllerEngine:
             )
             prompt = prompt + "\n\n---\n\n" + correction
         return prompt
+
+    def _provider_section(self, phase: Phase) -> str:
+        """What the agent launched for ``phase`` must be told of its own CLI (#440).
+
+        The adapter names the template, so the engine names no provider, and
+        the profile is the one :meth:`_invoke_phase` launches: a run can route
+        each phase and review round to a different provider.
+        """
+        profile = profile_for_phase(self.config, phase, self._require_state().review_round)
+        section = self.providers.get(profile).prompt_section
+        return render(load_template(section), {}) if section else ""
 
     # -- planning (pure, no side effects) ----------------------------------
     def plan_step(self) -> StepPlan:

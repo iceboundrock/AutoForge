@@ -589,6 +589,15 @@ High-priority coverage includes:
   transient relaunch, never in state or the read context, logged in
   `prompt.md` as sent when the reply ends in an empty assignment (the
   closing fence intact), and a block inside it never counts
+- what an agent is told about work still running (#440,
+  `tests/test_prompts.py`, the launch path in `tests/test_engine.py`): the shared
+  rule, in every provider's prompt, says to let what you started finish or stop
+  it before the final reply and no longer that the controller does not wait; a
+  Claude launch, in every phase and in a correction, also gets the section its
+  adapter names, inside the trusted header, saying what a pending task does and
+  to stop it with `TaskStop` and bound each wait; OpenCode, Pi and the SDK
+  providers get no trace of it; the section follows the profile of each launch,
+  review rounds included, and a dry run shows it
 - an agent failure that leaves the state unchanged (a timeout, a failed
   exit, a provider failure, a launch the executor refused, a malformed
   result not corrected, with or without a survivor) says `State unchanged`

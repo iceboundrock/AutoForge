@@ -661,13 +661,15 @@ def test_every_prompt_says_the_block_is_read_from_the_final_reply_only():
             "reply points to it." in flat
         ), name
         assert "Emit the block only once, as the very last thing in your final reply." in flat
-        # The rule for an unfinished phase also covers a reply written while
-        # work the agent started is still running (#393, the run on #160).
+        # A reply written while work the agent started is still running may be
+        # the last one (#393, the run on #160), which is true of every provider
+        # (#440); how the controller ends the run is not, and is not said here.
         assert (
-            "never omit it. That covers a reply you write while work you started (a test "
-            "run, a build, any background task) is still running, too: the controller may "
-            "take that reply as your final one and does not wait for the work, so let the "
-            "work finish before you write it." in flat
+            "never omit it. - Write your final reply only once nothing you started (a test "
+            "run, a build, any background task) is still running: let it finish, or stop "
+            "it, first. The controller may take any reply as your final one and give you no "
+            "later turn, so what the work would have shown you is lost, and a reply that "
+            "says you are still waiting for it is a reply without its block." in flat
         ), name
     flat = " ".join(prompts.load_template("correction.md").split())
     assert "end your final reply with exactly one valid CONTROL_RESULT" in flat
@@ -803,6 +805,156 @@ def test_common_prompts_state_that_nothing_outlives_the_invocation():
         assert "Nothing you start outlives your invocation" in text, template
         assert "terminated by the controller, at once or after a short grace" in text, template
         assert "never rely on a background process for a later phase" in text, template
+        # #440: the kill is no clean-up an agent may count on.
+        assert (
+            "That is a last resort, not a clean-up to leave to the controller: stop what you "
+            "start before you write your final reply" in text
+        ), template
+
+
+# Each agent phase with the profile its first launch runs under.
+PHASE_PROFILES = [
+    (Phase.ANALYZE_EXECUTE, "analyze_execute"),
+    (Phase.REVIEW, "review_round_1"),
+    (Phase.FIX, "fix"),
+    (Phase.REPLAN_REEXECUTE, "replan_reexecute"),
+    (Phase.UPDATE_EPIC, "update_epic"),
+]
+CLAUDE_SECTION = "## Background work under Claude Code"
+
+
+def _routed(state_dir, github, **routes):
+    """An engine whose named profiles run on the real adapter of each provider."""
+    from dataclasses import replace
+
+    from autoforge.config import default_config
+    from tests.conftest import make_engine
+
+    cfg = default_config()
+    for name, provider in routes.items():
+        cfg.profiles[name] = replace(cfg.profile(name), provider=provider)
+    eng = make_engine(state_dir, [], github=github, cfg=cfg)
+    eng.providers._overrides.clear()
+    return eng
+
+
+@pytest.mark.parametrize(("phase", "profile"), PHASE_PROFILES, ids=lambda v: getattr(v, "value", v))
+def test_a_claude_launch_is_told_what_a_pending_task_does(
+    tmp_state_dir, fake_github, phase, profile
+):
+    """#440: in every phase, in the trusted header and in a correction too,
+    which is a new session the same rule applies to."""
+    eng = _routed(tmp_state_dir, fake_github, **{profile: "claude"})
+    eng.state.phase = phase
+    for rendered in (
+        eng.render_prompt_for(phase),
+        eng.render_prompt_for(phase, "boom", ReplyExcerpt.of("the reply\n")),
+    ):
+        assert rendered.count(CLAUDE_SECTION) == 1
+        assert (
+            rendered.index("## Output protocol (mandatory)")
+            < rendered.index(CLAUDE_SECTION)
+            < rendered.index("## Context variables")
+            < rendered.index("\n\n---\n\n")
+        )
+        assert "{{" not in rendered
+
+
+@pytest.mark.parametrize("provider", ["opencode", "pi", "claude-sdk", "opencode-sdk", "scripted"])
+def test_no_other_provider_is_told_about_claude_code_tools(tmp_state_dir, fake_github, provider):
+    """#440: OpenCode and Pi have no turn that a pending task holds open and
+    no such tools, so their agents get the shared rule alone, with no trace
+    of the section."""
+    routes = {profile: provider for _, profile in PHASE_PROFILES}
+    eng = _routed(tmp_state_dir, fake_github, **routes)
+    for phase, _profile in PHASE_PROFILES:
+        eng.state.phase = phase
+        rendered = eng.render_prompt_for(phase)
+        for claude_only in ("Claude Code", "TaskStop", "`Monitor`", "PROVIDER_SECTION"):
+            assert claude_only not in rendered, (phase, claude_only)
+        assert "Write your final reply only once nothing you started" in rendered
+
+
+def test_the_section_follows_the_profile_each_launch_is_routed_to(tmp_state_dir, fake_github):
+    """#440: a run can route each phase and review round to another provider,
+    so the section is the launch's, not the run's."""
+    eng = _routed(
+        tmp_state_dir,
+        fake_github,
+        analyze_execute="opencode",
+        fix="claude",
+        review_round_1="opencode",
+        review_round_2_5="claude",
+        review_round_6_plus="pi",
+    )
+
+    def told(phase, completed_rounds=0):
+        eng.state.phase = phase
+        eng.state.review_round = completed_rounds
+        return CLAUDE_SECTION in eng.render_prompt_for(phase)
+
+    assert not told(Phase.ANALYZE_EXECUTE)
+    assert told(Phase.FIX)
+    assert not told(Phase.REVIEW, completed_rounds=0)
+    assert told(Phase.REVIEW, completed_rounds=1)
+    assert told(Phase.REVIEW, completed_rounds=4)
+    assert not told(Phase.REVIEW, completed_rounds=5)
+
+
+def test_a_dry_run_shows_the_section_the_launch_would_get(tmp_state_dir, fake_github):
+    """#440: the plan's prompt is the one the launch sends."""
+    eng = _routed(tmp_state_dir, fake_github, analyze_execute="claude")
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    assert CLAUDE_SECTION in eng.plan_step().prompt_full
+
+
+def test_the_claude_section_says_what_happens_and_what_to_do():
+    """#440: an agent ended its turn with a background task never stopped, and
+    the CLI stayed alive for 30 minutes after its reply
+    (Lychee-Technology/ltseq#218). The instruction holds however the
+    controller ends such a run: `ended_by: reply`, a limit under `text`
+    output or after a reply it cannot read, or a later turn."""
+    flat = " ".join(prompts.load_template("claude_background_work.md").split())
+    for phrase in (
+        # What actually happens.
+        "Ending your turn does not end your invocation.",
+        "the CLI stays alive to give you another turn when it fires",
+        'the clean-up under "Working rules" starts only after the CLI has exited',
+        "The controller stops the CLI shortly after a reply it can read, and what was pending "
+        "is lost, with no turn for you to act on it.",
+        "Or the run hangs until an agent limit ends it as a timeout, and your reply is not used.",
+        # What to do about it, and when.
+        "before you write the reply that carries the `CONTROL_RESULT` block",
+        "Stop, with `TaskStop`, every background task, `Monitor` and background agent you "
+        "started and have not seen finish.",
+        "A loop or watcher that waited for something that has since ended still counts.",
+        "Give each wait of yours a bound when you start it",
+        # A reply without the block is waited for (#439), under the limits.
+        "Ending a turn without the block, to wait for a task, is not a final reply",
+        "nothing the task prints counts as activity",
+        "a task that outlasts an agent limit ends the run as a timeout",
+    ):
+        assert phrase in flat, phrase
+    assert "## Working rules" in prompts.load_template("common.md")
+
+
+def test_only_claude_code_names_a_provider_section():
+    """#440: what an adapter names is a registered template that takes no
+    variable, so it renders the same for every launch of that provider."""
+    from autoforge.providers import _REGISTRY
+
+    named = {name: cls.prompt_section for name, cls in _REGISTRY.items() if cls.prompt_section}
+    assert named == {"claude": "claude_background_work.md"}
+    assert "claude_background_work.md" in prompts.TEMPLATE_FILES
+    assert not required_variables(prompts.load_template("claude_background_work.md"))
+
+
+def test_no_prompt_says_the_controller_does_not_wait_for_background_work():
+    """#440: a Claude CLI with a task pending is waited for until it is
+    stopped or a limit ends it, and the sentence invites leaving a task running."""
+    for name in prompts.TEMPLATE_FILES:
+        flat = " ".join(prompts.load_template(name).split())
+        assert "does not wait for the work" not in flat, name
 
 
 def test_common_prompt_warns_of_a_narrowed_view():
@@ -894,10 +1046,12 @@ def test_prompt_version_is_rendered_and_was_bumped_for_the_prompt_changes(engine
     #85 (nothing an agent starts outlives its invocation) moved it past v2;
     #393 (the block is read from the final reply only, and a correction
     quotes the reply it corrects) moved it past v12; #287 (UPDATE_EPIC
-    selects only a native sub-issue of the EPIC) moved it past v13."""
+    selects only a native sub-issue of the EPIC) moved it past v13; #440 (stop
+    what you started before the final reply, and Claude Code's section on what
+    a pending task does) moved it past v15."""
     from autoforge import __prompt_version__
 
-    assert __prompt_version__ not in ("v1", "v2", "v12", "v13")
+    assert __prompt_version__ not in ("v1", "v2", "v12", "v13", "v15")
     engine.state.phase = Phase.ANALYZE_EXECUTE
     rendered = engine.render_prompt_for(Phase.ANALYZE_EXECUTE)
     header = f"# AutoForge controller instructions (trusted): {__prompt_version__}"
@@ -936,6 +1090,7 @@ REMOTE_TEMPLATES = (
     "update_epic_rerequest.md",
     "correction.md",
     "worktree_state.md",
+    "claude_background_work.md",
 )
 
 
