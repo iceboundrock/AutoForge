@@ -1324,7 +1324,7 @@ replaced, and its precondition is that exact body.
 - **Decided by:** the operator, by command:
   `autoforge unblock --take-over <PR URL> --reason ...` on the taking run.
   Nothing else plans it: a plain `unblock`, `resume`, `run --force` and
-  `epic archive` never take a PR over (D9.4a).
+  `epic archive` never start a takeover (D9.4a).
 - **Consumer:** #414. `unblock` plans the record from its own read of the
   PR and saves it with `BLOCKED → ANALYZE_EXECUTE`, writing nothing to
   GitHub; the next step (`resume`) completes it in `ANALYZE_EXECUTE`,
@@ -1401,10 +1401,17 @@ replaced, and its precondition is that exact body.
     plain `unblock` as if no K11 were journaled, and the record is dropped
     if that route enters a phase, so a merge by hand is reconciled as it
     always was; `--take-over` of it is refused and names the plain
-    `unblock`. A run bound to nothing has no phase to enter on it, and both
-    forms refuse and state the route: reopen it, or start a new run.
+    `unblock`. The save of that transition drops the record with the rest of
+    the phase's journal, and the unblock's audit entry says so. A run bound
+    to nothing has no phase to enter on it, and both forms refuse and state
+    the route: reopen it, or start a new run.
   - An open PR whose marker names another run or none is unchanged: W5 and
-    W6 above.
+    W6 above. So is one with no readable marker of the issue on a bound run,
+    whose `--take-over` asks for the body to be repaired. A run bound to
+    nothing refuses both forms there, stating that route or a new run,
+    because its plain re-entry would find no marked PR at all (R3-F1).
+  - Any other flag is refused until a plain `unblock` has settled the record,
+    since the plan's own decisions come after the takeover.
 - **Refusals,** each with nothing written:
   - `--take-over` naming a PR other than the bound one, or than the one
     the listing finds;

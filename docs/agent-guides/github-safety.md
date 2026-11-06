@@ -1037,8 +1037,10 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a).
   and `MERGE` (a `MERGED` PR is refused only for another run's marker or a
   defect); with the merge gate closed, on the held run's read of the PR, by
   the same rule; at `ANALYZE_EXECUTE`'s discovery, in the K3 plan's read of
-  the PR it adopts, and before a saved K1+K2 plan's push, on the open PRs
-  headed at its branch (another run's marker stops it); in `unblock` (a PR no longer open is refused, as at the
+  the PR it adopts, and before a saved K1+K2 plan's push, on the PRs headed
+  at its branch (K2 requires none, so any of them stops the plan before it
+  moves the branch: `pr-owner` for an open PR whose marker names another run
+  or cannot be read, `unjournaled-write` otherwise); in `unblock` (a PR no longer open is refused, as at the
   merge gate, only for another run's marker or a defect, and is never taken
   over); and in a replan at preparation, before each write of its plan,
   and before the source is closed. Where no read of the phase follows the

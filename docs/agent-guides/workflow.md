@@ -900,7 +900,7 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   unblock (PR #460 R1-F1). A run with a replan journal is never
   unblocked, so a replan refused for its owner names a fresh run and
   `--take-over` there. Plain `unblock`, `resume`, `run --force` and `epic
-  archive` never take a PR over.
+  archive` never start a takeover.
 - **A fresh review instead of FIX** (`--rereview`, #428). Where the plain
   decision is `FIX` with the round's open findings (`OPEN` at the reviewed
   HEAD and base, no saved plan), a fixer relaunched by a plain unblock

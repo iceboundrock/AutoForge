@@ -41,7 +41,7 @@ marker already names this run or the PR is no longer open, a plain
 `unblock` decides from the PR as it is, writing nothing. A write
 the read-back does not show is sent again by the next `resume`, at most
 twice in all. Plain `unblock`, `resume`, `run --force` and `epic archive`
-never take a PR over. See "Taking over a PR another run owns" in
+never start a takeover. See "Taking over a PR another run owns" in
 `docs/usage.md`.
 
 `state.json` is protocol 14. No field changed: a protocol-13 file loads

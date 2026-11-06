@@ -954,8 +954,11 @@ command. To take the PR over:
    step 2 read it, or the PR stopped qualifying), the controller wrote
    nothing over it. Inspect the PR. What you do next depends on what you
    find:
-   - The marker names another run or none: run `--take-over` again. It
+   - The marker names another run or no run: run `--take-over` again. It
      plans the write over the body as it is now.
+   - The marker is gone or unreadable: repair the body so it carries the
+     issue's one marker, then run `--take-over` again. A run not yet bound
+     can instead start a new run, which decides from the PR as it is.
    - The marker already names this run, because the write landed and the
      body was edited afterwards: run a plain `unblock`. Nothing more is
      written, and the run continues.
@@ -968,7 +971,7 @@ in `ANALYZE_EXECUTE` and the next `resume` sends it again, at most twice
 in all. A plain `unblock` on a run whose takeover is recorded but not yet
 written re-enters `ANALYZE_EXECUTE` to finish it, and a second
 `--take-over` is refused. A plain `unblock`, `resume`, `run --force` and
-`epic archive` never take a PR over, and `unblock --take-over --dry-run`
+`epic archive` never start a takeover, and `unblock --take-over --dry-run`
 writes nothing.
 
 A run that stopped partway through a `REVIEW` or `FIX` step, with its

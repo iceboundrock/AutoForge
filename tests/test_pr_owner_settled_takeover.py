@@ -14,8 +14,10 @@ from dataclasses import replace
 
 import pytest
 
+from autoforge.claims import render_implementation_marker
 from autoforge.effects import EffectKind, Stage
 from autoforge.engine import ControllerEngine
+from autoforge.errors import GitHubError, GitHubUnavailableError
 from autoforge.stop_classification import StopReasonCode
 from autoforge.transitions import Phase
 from tests.conftest import (
@@ -27,7 +29,7 @@ from tests.conftest import (
     implementation_pr_body,
     make_engine,
 )
-from tests.test_engine import SHA_A, _in_ready, _next_process, _stopped_mid_plan
+from tests.test_engine import SHA_A, _in_ready, _next_process, _power_loss_at, _stopped_mid_plan
 from tests.test_pr_owner_sweep import _origin_refs
 from tests.test_replan import _park_at_hard_threshold, _replan_agent
 
@@ -185,6 +187,126 @@ def test_the_replanned_takeover_of_a_marker_naming_another_run_is_unchanged(tmp_
     assert gh.prs[PR].body == record.body
 
 
+@pytest.mark.parametrize("flag", ["approve", "decline", "rereview"])
+def test_another_flag_on_a_settled_takeover_says_the_takeover_comes_first(tmp_path, flag):
+    """R3-F5: never "this run has none", when the plan may hold exactly that action."""
+    eng, _gh = _appended_conflict(tmp_path, Phase.FIX, landed=True)
+    kwargs = {
+        "approve": {"approve_action": "A-0123456789abcdef"},
+        "decline": {"decline_action": "A-0123456789abcdef"},
+        "rereview": {"rereview": True},
+    }[flag]
+    out = eng.unblock(REASON, **kwargs)
+    assert not out.unblocked
+    assert "takeover journaled" in out.message and "this run has none" not in out.message
+    assert "this run has no such FIX" not in out.message
+
+
+def _bound_or_unbound(tmp_path, bound: bool):
+    return (
+        _alone_conflict(tmp_path, landed=True)
+        if bound
+        else _unbound_conflict(tmp_path, landed=True)
+    )
+
+
+@pytest.mark.parametrize("bound", [True, False], ids=["bound", "unbound"])
+def test_take_over_of_another_pr_never_settles_this_one(tmp_path, bound):
+    eng, gh = _bound_or_unbound(tmp_path, bound)
+    other = "https://github.com/owner/repo/pull/77"
+    gh.add_pr(url=other, head_sha=SHA_A, branch="elsewhere", body="No marker.")
+    history = list(eng.state.unblock_history)
+    out = eng.unblock(REASON, take_over=other)
+    assert not out.unblocked, out.message
+    assert eng.state.phase is Phase.BLOCKED and eng.state.unblock_history == history
+    record = eng.state.phase_effects().records[-1]
+    assert record.stage is Stage.CONFLICT and record.target["pr_url"] == PR
+
+
+def test_an_unbound_settled_read_answered_with_another_pr_is_refused(tmp_path):
+    eng, gh = _unbound_conflict(tmp_path, landed=True)
+    real = gh.get_pr
+    gh.get_pr = lambda url: replace(real(url), url="https://github.com/owner/repo/pull/99")
+    out = eng.unblock(REASON)
+    assert not out.unblocked and "another PR" in out.message
+    assert eng.state.phase is Phase.BLOCKED
+
+
+def test_an_unbound_settled_read_that_fails_is_refused_or_propagates(tmp_path):
+    eng, gh = _unbound_conflict(tmp_path, landed=True)
+    gh.get_pr_error = GitHubError("HTTP 403: forbidden")
+    out = eng.unblock(REASON)
+    assert not out.unblocked and "cannot be read" in out.message
+    gh.get_pr_error = GitHubUnavailableError("connection reset")
+    with pytest.raises(GitHubUnavailableError):
+        eng.unblock(REASON)
+    assert eng.state.phase is Phase.BLOCKED
+
+
+def test_a_takeover_attempted_before_it_conflicted_keeps_its_attempts_when_settled(tmp_path):
+    """The write landed, the process died before the read-back, and then the body was edited."""
+    eng, gh, _sent = _stopped_mid_plan(tmp_path, Phase.REVIEW, OTHER_RUN)
+    assert eng.step().stop.code is StopReasonCode.PR_OWNER
+    assert eng.unblock(REASON, take_over=PR).unblocked
+    record = eng.state.phase_effects().appended_takeover
+    state = eng.state.effect_records
+    state[record.position] = record.attempting().to_dict()
+    eng._save()
+    _edited(gh, record.body)
+    assert eng.step().stop.code is StopReasonCode.EFFECT_CONFLICT
+    assert eng.unblock(REASON).unblocked
+    settled = eng.state.phase_effects().appended_takeover
+    assert settled.stage is Stage.OBSERVED and settled.attempts == 1
+    assert _next_process(eng, gh).step().next_phase != "BLOCKED"
+
+
+def test_the_conflict_stop_names_the_plain_unblock_for_what_needs_no_new_takeover(tmp_path):
+    eng, gh, _sent = _stopped_mid_plan(tmp_path, Phase.REVIEW, OTHER_RUN)
+    eng.step()
+    assert eng.unblock(REASON, take_over=PR).unblocked
+    _edited(gh, implementation_pr_body(owner_run_id=OTHER_RUN))
+    out = eng.step()
+    assert "--take-over" in out.message and "'unblock' decides from the PR as it is" in out.message
+
+
+# -- An unbound takeover whose marker is gone: one refusal, one route (R3-F1). -----
+
+
+MARKERLESS = {
+    "absent": "No marker any more.",
+    "empty": "",
+    "other-issue": "Another issue.\n"
+    + render_implementation_marker("https://github.com/owner/repo/issues/9", OTHER_RUN),
+}
+
+
+@pytest.mark.parametrize("flag", ["plain", "take-over"])
+@pytest.mark.parametrize("stage", ["conflict", "observed"])
+@pytest.mark.parametrize("body", sorted(MARKERLESS))
+def test_an_unbound_takeover_whose_marker_is_gone_states_one_route(tmp_path, body, stage, flag):
+    eng, gh = _unbound_conflict(tmp_path, landed=False)
+    if stage == "observed":
+        (record,) = eng.state.phase_effects().records
+        eng.state.effect_records = [record.reopened().observing({"url": PR}).to_dict()]
+        eng._save()
+    gh.prs[PR].body = MARKERLESS[body]
+    gh.unbodied.discard(PR)
+    out = eng.unblock(REASON, **({"take_over": PR} if flag == "take-over" else {}))
+    assert not out.unblocked, out.message
+    assert eng.state.phase is Phase.BLOCKED and eng.provider.calls == []
+    assert "Repair the body" in out.message and "start a new run" in out.message
+    assert "will launch" not in out.message
+
+
+def test_an_unbound_takeover_whose_marker_is_repaired_is_taken_over_again(tmp_path):
+    eng, gh = _unbound_conflict(tmp_path, landed=False)
+    gh.prs[PR].body = "No marker any more."
+    assert not eng.unblock(REASON).unblocked
+    gh.prs[PR].body = implementation_pr_body(owner_run_id=None)
+    assert eng.unblock(REASON, take_over=PR).unblocked
+    assert eng.step().next_phase == "REVIEW"
+
+
 # -- A PR no longer open: routed as if no takeover were journaled. ----------------
 
 
@@ -242,11 +364,35 @@ def test_a_written_takeover_whose_pr_closed_before_its_read_back_does_not_loop(t
     eng.state.effect_records = [record.attempting().observing({"url": PR}).to_dict()]
     eng._save()
     gh.prs[PR].state = "MERGED"
-    out = eng.unblock(REASON) if eng.state.phase is Phase.BLOCKED else None
-    assert out is None
     assert eng.step(allow_merge=True).next_phase == "BLOCKED"
     assert eng.unblock(REASON).unblocked
     assert eng.state.phase is Phase.READY_FOR_MERGE and eng.state.effect_records == []
+
+
+def test_the_audit_record_of_an_unblock_says_a_takeover_was_dropped(tmp_path):
+    eng, gh = _alone_conflict(tmp_path, landed=True)
+    gh.prs[PR].state = "MERGED"
+    eng.state.block_reason = "something that names no takeover"
+    eng._save()
+    assert eng.unblock(REASON).unblocked
+    detail = eng.state.unblock_history[-1]["detail"]
+    assert "owner_takeover" in detail and "dropped" in detail
+
+
+@pytest.mark.parametrize("stage", ["conflict", "observed"])
+def test_an_unbound_takeover_of_a_merged_pr_refuses_another_flag_with_the_same_route(
+    tmp_path, stage
+):
+    eng, gh = _unbound_conflict(tmp_path, landed=False)
+    if stage == "observed":
+        (record,) = eng.state.phase_effects().records
+        eng.state.effect_records = [record.reopened().observing({"url": PR}).to_dict()]
+        eng._save()
+    gh.prs[PR].state = "MERGED"
+    other = "https://github.com/owner/repo/pull/77"
+    gh.add_pr(url=other, head_sha=SHA_A, branch="elsewhere", body="No marker.")
+    out = eng.unblock(REASON, take_over=other)
+    assert not out.unblocked and "Start a new run" in out.message
 
 
 @pytest.mark.parametrize("state", ["MERGED", "CLOSED"])
@@ -321,8 +467,8 @@ def test_a_saved_push_stops_for_a_pr_another_run_owns_on_its_branch(tmp_path, mo
     assert not [w for w in gh.effect_writes if w[0] == "create_pull_request"]
 
 
-def test_a_saved_push_reads_the_branch_of_this_repository_only(tmp_path, monkeypatch):
-    """A marked PR on another branch is not this push's to refuse: K2's own reconcile decides."""
+def test_a_saved_push_is_not_stopped_by_a_pr_on_another_branch(tmp_path, monkeypatch):
+    """A marked PR on another branch has no head this push moves: K2's reconcile decides."""
     gh = FakeGitHub()
     eng = _saved_k1_k2(tmp_path, gh, monkeypatch)
     head = eng.origin.head("autoforge/2")
@@ -334,8 +480,6 @@ def test_a_saved_push_reads_the_branch_of_this_repository_only(tmp_path, monkeyp
 
 
 def test_a_saved_push_whose_listing_fails_conclusively_sends_nothing(tmp_path, monkeypatch):
-    from autoforge.errors import GitHubError
-
     gh = FakeGitHub()
     eng = _saved_k1_k2(tmp_path, gh, monkeypatch)
     refs = _origin_refs(eng)
@@ -349,6 +493,64 @@ def test_a_saved_push_whose_listing_fails_conclusively_sends_nothing(tmp_path, m
     assert _origin_refs(eng) == refs
 
 
+def test_the_stop_of_a_saved_push_names_the_route_that_works(tmp_path, monkeypatch):
+    """R3-F2: closing the PR leaves K2's precondition unmet for good, so it is not offered."""
+    gh = FakeGitHub()
+    eng = _saved_k1_k2(tmp_path, gh, monkeypatch)
+    head = eng.origin.head("autoforge/2")
+    gh.add_pr(
+        head_sha=head, branch="autoforge/2", body=implementation_pr_body(owner_run_id=OTHER_RUN)
+    )
+    out = eng.step()
+    assert "close it" not in out.message
+    assert "start a fresh run" in out.message and f"--take-over {PR}" in out.message
+
+
+@pytest.mark.parametrize(
+    "state,owner",
+    [("OPEN", None), ("OPEN", "this-run"), ("OPEN", "no-marker"), ("CLOSED", OTHER_RUN)],
+    ids=["ownerless", "this-run", "no-marker", "closed"],
+)
+def test_a_saved_push_never_moves_a_branch_its_pr_create_would_refuse(
+    tmp_path, monkeypatch, state, owner
+):
+    """R3-F3: K2 requires no PR in any state on the branch, and K2 is sent only after K1, so
+    a PR there while K1 is pending is not this plan's, and K2 would refuse it after the push."""
+    gh = FakeGitHub()
+    eng = _saved_k1_k2(tmp_path, gh, monkeypatch)
+    head = eng.origin.head("autoforge/2")
+    if owner == "no-marker":
+        body = "A PR with no marker."
+    else:
+        named = eng.state.run_id if owner == "this-run" else owner
+        body = implementation_pr_body(owner_run_id=named)
+    gh.add_pr(head_sha=head, branch="autoforge/2", body=body, state=state)
+    refs = _origin_refs(eng)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop.code is StopReasonCode.UNJOURNALED_WRITE, out.message
+    assert "start a fresh run" in out.message and PR in out.message
+    assert _origin_refs(eng) == refs
+    assert not [w for w in gh.effect_writes if w[0] == "create_pull_request"]
+
+
+def test_the_read_before_the_push_stops_once_the_push_is_observed(tmp_path, monkeypatch):
+    """K2 alone is left: its own reconcile judges the branch, as before."""
+    gh = FakeGitHub()
+    eng = _saved_k1_k2(tmp_path, gh, monkeypatch)
+    _power_loss_at(eng, EffectKind.IMPLEMENTATION_PR, Stage.ATTEMPTED, saved=False)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    again = _next_process(eng, gh)
+    assert again.state.phase_effects().records[0].stage is Stage.OBSERVED
+    head = again.origin.head("autoforge/2")
+    gh.add_pr(
+        head_sha=head, branch="autoforge/2", body=implementation_pr_body(owner_run_id=OTHER_RUN)
+    )
+    out = again.step()
+    assert out.stop.code is StopReasonCode.EFFECT_CONFLICT, out.message
+
+
 # -- R2-F3: the K4 gate on a PR no longer open offers no takeover. ----------------
 
 
@@ -360,6 +562,24 @@ def test_the_review_comment_gate_offers_no_takeover_of_a_pr_no_longer_open(tmp_p
     assert out.next_phase == "BLOCKED" and out.stop.code is StopReasonCode.PR_OWNER, out.message
     assert "--take-over" not in out.message
     assert state in out.message
+
+
+@pytest.mark.parametrize("state", ["MERGED", "CLOSED"])
+def test_the_review_comment_gate_on_an_ownerless_pr_names_no_owner_and_the_unblock(tmp_path, state):
+    """R3-F4: no run owns it, and 'unblock' routes it."""
+    eng, gh, _sent = _stopped_mid_plan(tmp_path, Phase.REVIEW, None)
+    gh.prs[PR].state = state
+    out = eng.step()
+    assert "that run's" not in out.message and "the run that owns it" not in out.message
+    assert "'unblock' decides from the PR as it is" in out.message
+
+
+def test_the_review_comment_gate_leaves_a_pr_another_run_owns_to_that_run(tmp_path):
+    eng, gh, _sent = _stopped_mid_plan(tmp_path, Phase.REVIEW, OTHER_RUN)
+    gh.prs[PR].state = "MERGED"
+    out = eng.step()
+    assert out.stop.code is StopReasonCode.PR_OWNER
+    assert "that run's to reconcile" in out.message and "'unblock' decides" not in out.message
 
 
 @pytest.mark.parametrize("answer", ["another-pr", "no-state"])

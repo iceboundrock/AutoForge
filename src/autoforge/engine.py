@@ -1212,9 +1212,6 @@ class UnblockDecision:
     # K9 record with its approval recorded, ``decline`` the K9 record whose
     # unsent plan is dropped.
     action: str = ""
-    # A K11 with nothing left to send, on a PR no longer open (#414): it is
-    # dropped with the unblock, and the run is routed as if none were journaled.
-    drop_takeover: bool = False
     approve: EffectRecord | None = None
     decline: EffectRecord | None = None
     # Operator actions this unblock decides on (K10, #243): ``bind`` the
@@ -6415,6 +6412,18 @@ class ControllerEngine:
             )
         return pr, ""
 
+    def _saved_plan_route(self, url: str) -> str:
+        """The way out of a saved K1 plan stopped for a PR another run owns (PR #460 R3-F2)."""
+        take_over = self.cli_command(
+            "unblock", "--take-over", url, "--reason", "<why this run drives the PR>"
+        )
+        return (
+            "Leave the PR to the run that owns it. This plan cannot complete while that PR "
+            "carries its marker, closed or not; a plain 'unblock' meets the same stop. If no "
+            "other run is to drive the PR (stop that run first), start a fresh run for the "
+            f"issue and hand it the PR with '{take_over}' there"
+        )
+
     def _unjournaled_pr_text(self, url: str) -> str:
         state = self._require_state()
         return (
@@ -7223,13 +7232,6 @@ class ControllerEngine:
             )
         assert target is not None
         pr = decision.pr
-        if decision.drop_takeover:
-            settled = self._settled_takeover(state.phase_effects())
-            assert settled is not None
-            if settled.owner.phase in (Phase.REVIEW, Phase.FIX):
-                state.effect_records = state.effect_records[: settled.position]
-            else:
-                state.drop_phase_effects()
         if decision.takeover is not None and decision.takeover.owner.phase in (
             Phase.REVIEW,
             Phase.FIX,
@@ -7447,6 +7449,15 @@ class ControllerEngine:
                 f"Without the flag: {decision.detail}",
                 pr=decision.pr,
             )
+        settled = self._settled_takeover(self._require_state().phase_effects())
+        if settled is not None:
+            return UnblockDecision(
+                None,
+                f"unblock {request.flag} is not decided with a takeover journaled "
+                f"({settled.describe()}): unblock without the flag first, and use the flag then "
+                f"if it still applies. Without the flag: {decision.detail}",
+                pr=decision.pr,
+            )
         if isinstance(request, RereviewRequest):
             return UnblockDecision(
                 None,
@@ -7494,9 +7505,10 @@ class ControllerEngine:
         """No PR bound: ANALYZE_EXECUTE, once its entry probe is known to succeed.
 
         A marked open PR this run has no record of is refused, as the entry
-        refuses it (#414, ADR 0004 D9.4a), unless ``take_over`` names it and
-        its marker names this run: then it is bound and REVIEW entered, the
-        operator's takeover (:meth:`_take_over_decision`).
+        refuses it (#414, ADR 0004 D9.4a), unless ``take_over`` names it: then
+        a K11 is planned (:meth:`_take_over_decision`). A K11 already journaled
+        decides first: :meth:`_settled_takeover_decision` for one with nothing
+        left to send, and :meth:`_saved_takeover_decision` otherwise.
         """
         state = self._require_state()
         try:
@@ -7795,13 +7807,18 @@ class ControllerEngine:
         before this is reached, unless the operator named it, and a run bound
         to nothing has no phase to enter on it. ``None`` leaves the decision
         to the caller: a marker naming another run or none is a new takeover
-        of the body as it is now, and ``take_over`` of another PR is refused.
+        of the body as it is now, and ``take_over`` of another PR is refused,
+        unless the run is bound to nothing and its one PR no longer open.
+        A run bound to nothing whose PR no longer carries one readable marker
+        of the issue refuses both forms, since each would otherwise name the
+        other and neither could proceed (PR #460 R3-F1).
         """
         state = self._require_state()
         url = str(record.target["pr_url"])
-        if take_over is not None and not parse_pr_url(take_over.pr_url).same_target(
+        other = take_over is not None and not parse_pr_url(take_over.pr_url).same_target(
             parse_pr_url(url)
-        ):
+        )
+        if other and (state.current_pr_url or pr.is_open):
             return None
         if not pr.url or not parse_pr_url(pr.url).same_target(parse_pr_url(url)):
             return UnblockDecision(
@@ -7826,6 +7843,19 @@ class ControllerEngine:
                 pr=pr,
             )
         if self._pr_owner_problem(pr):
+            issue = parse_issue_url(state.current_issue_url)
+            if not state.current_pr_url and (
+                take_over_body(pr.body or "", issue.canonical, state.run_id) is None
+            ):
+                return UnblockDecision(
+                    None,
+                    f"open PR {url} no longer carries exactly one readable implementation marker "
+                    f"for issue #{issue.number}, so the takeover journaled for it "
+                    f"({record.describe()}) cannot be planned again. Repair the body so that it "
+                    "carries that marker, then take it over again; or start a new run, which "
+                    "decides from the PR as it is",
+                    pr=pr,
+                )
             return None
         _, problem = self._implementation_pr_candidate()
         if problem:
@@ -8030,9 +8060,17 @@ class ControllerEngine:
         if settled is not None:
             if not pr.is_open and take_over is None:
                 # The takeover has nothing to do on it: routed as if none were
-                # journaled, so a merge by hand is reconciled as it always is.
+                # journaled, so a merge by hand is reconciled as it always is. No
+                # route enters the phase that owns the record, so the save of
+                # the transition drops it, and the audit record says so.
                 routed = self._route_bound_pr(pr, ref, request)
-                return replace(routed, drop_takeover=routed.target is not None)
+                if routed.target is None:
+                    return routed
+                return replace(
+                    routed,
+                    detail=f"{routed.detail}. The takeover journaled for this PR "
+                    f"({settled.describe()}) has nothing left to do and is dropped",
+                )
             decided = self._settled_takeover_decision(settled, pr, take_over)
             if decided is not None:
                 return decided
@@ -11786,11 +11824,19 @@ class ControllerEngine:
         return ""
 
     def _pr_owner_text(
-        self, problem: str, sent: str, *, pr_state: str = "OPEN", pr_url: str = ""
+        self,
+        problem: str,
+        sent: str,
+        *,
+        pr_state: str = "OPEN",
+        pr_url: str = "",
+        unowned: bool = False,
     ) -> str:
         """A ``BLOCKED`` reason for ``problem``, what was ``sent``, and the way back (#414).
 
         ``pr_state`` is the PR's state as read: only an open PR is taken over.
+        ``unowned``: no other run claims a PR no longer open, so 'unblock'
+        routes it as it does any such PR (PR #460 R3-F4).
         """
         state = self._require_state()
         take_over = self.cli_command(
@@ -11805,6 +11851,13 @@ class ControllerEngine:
             f"0004 D9.4a), and this run is {state.run_id}, so it launches, posts, pushes and "
             f"merges nothing more on the PR; {sent}. Leave the PR to the run that owns it"
         )
+        if pr_state != "OPEN" and unowned:
+            return (
+                f"{problem}. A PR is driven only by the run its implementation marker names "
+                f"(ADR 0004 D9.4a), and this run is {state.run_id}; {sent}. The PR is {pr_state} "
+                "and no other run claims it, so it is not taken over: 'unblock' decides from "
+                "the PR as it is"
+            )
         if pr_state != "OPEN":
             return (
                 f"{stated}: the PR is {pr_state}, so it is not taken over, and what it did is "
@@ -11847,7 +11900,14 @@ class ControllerEngine:
         """Raise :class:`PROwnerError` unless this run may drive its bound PR ``pr`` (#414)."""
         problem = self._pr_owner_problem(pr)
         if problem:
-            raise PROwnerError(self._pr_owner_text(problem, sent, pr_state=pr.state or "OPEN"))
+            raise PROwnerError(
+                self._pr_owner_text(
+                    problem,
+                    sent,
+                    pr_state=pr.state or "OPEN",
+                    unowned=not self._foreign_owner_problem(pr),
+                )
+            )
 
     def _merge_base_of(self, pr: PRInfo) -> str:
         """The merge base of the PR's base branch and its HEAD, as GitHub reports it now.
@@ -14849,15 +14909,14 @@ class ControllerEngine:
                     StopReasonCode.PR_OWNER,
                     f"{foreign}. A PR is driven only by the run its implementation marker "
                     f"names (ADR 0004 D9.4a), and this run is {state.run_id}, so the plan that "
-                    "adopts it sends nothing more: no push and no write to the PR. Leave the PR "
-                    "to the run that owns it, and close it or start a fresh run once that run "
-                    "is done",
+                    "adopts it sends nothing more: no push and no write to the PR. "
+                    + self._saved_plan_route(adopt_url),
                 )
         if records[1].kind is EffectKind.IMPLEMENTATION_PR and push.pending:
-            # #414 (PR #460 R2-F2): a PR that appeared on the branch since the
-            # plan was saved is not this plan's, and the push would move its
-            # head. Its marker naming another run stops the plan here; any
-            # other PR is K2's to reconcile.
+            # #414 (PR #460 R2-F2, R3-F3): K2 is sent only after the push and
+            # requires no PR in any state on the branch, so a PR there now is
+            # not this plan's, and the push would move its head only for K2 to
+            # refuse it. The plan stops first, whoever that PR's marker names.
             try:
                 on_branch = self.github.list_prs_for_head(state.repository, branch)
             except GitHubUnavailableError:
@@ -14877,9 +14936,18 @@ class ControllerEngine:
                         f"{foreign}. A PR is driven only by the run its implementation marker "
                         f"names (ADR 0004 D9.4a), and this run is {state.run_id}, so the plan "
                         f"that pushes to its branch {branch!r} sends nothing more: no push and "
-                        "no PR. Leave the PR to the run that owns it, and close it or start a "
-                        "fresh run once that run is done",
+                        "no PR. " + self._saved_plan_route(found.url),
                     )
+            if on_branch:
+                urls = ", ".join(sorted(parse_pr_url(p.url).canonical for p in on_branch))
+                return _blocked(
+                    StopReasonCode.UNJOURNALED_WRITE,
+                    f"{urls} on branch {branch!r} appeared after this plan was saved, and the "
+                    "plan opens the issue's PR only on a branch with no PR (ADR 0004 K2), so it "
+                    "sends nothing more: no push and no PR. A plain 'unblock' meets the same "
+                    "stop while that PR is there, closed or not; start a fresh run for the "
+                    "issue, which decides from the PR as it is",
+                )
         for index, record in enumerate(records):
             if record.stage == Stage.CONFLICT:
                 return _blocked(StopReasonCode.EFFECT_CONFLICT, self._analyze_conflict_text(record))
