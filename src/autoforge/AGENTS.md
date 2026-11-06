@@ -181,7 +181,8 @@ stop_classification.py  typed stop classification (ADR 0011, #369): outcomes, re
                     that nothing deciding imports; pure, persists nothing
 prompts/            file-based templates ({{VAR}}): common.md (trust boundary), phase
                     templates, update_epic_rerequest.md, correction.md,
-                    worktree_state.md (#187); renderer in prompts/__init__.py
+                    worktree_state.md (#187), claude_background_work.md (#440, the
+                    section ClaudeCodeProvider names); renderer in prompts/__init__.py
 ```
 
 ## Rules for production code

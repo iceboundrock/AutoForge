@@ -2036,6 +2036,24 @@ def test_review_result_for_another_round_or_head_is_corrected_and_never_posted(
     assert s.last_review_comment_url == "" and s.effect_records == []
 
 
+def test_a_launch_and_its_correction_carry_the_section_their_provider_names(tmp_state_dir):
+    """#440: what the adapter names reaches the agent through the launch path,
+    and a provider that names nothing gets no trace of it."""
+    gh = FakeGitHub()
+    eng = _in_review(tmp_state_dir, gh, ["no block", block(review_payload(1, SHA_A, []))])
+    eng.provider.prompt_section = "claude_background_work.md"
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    launch, correction = eng.provider.calls
+    assert correction.correction
+    for req in (launch, correction):
+        assert req.prompt.count("## Background work under Claude Code") == 1
+
+    plain = _in_review(tmp_state_dir / "plain", FakeGitHub(), [block(review_payload(1, SHA_A, []))])
+    assert plain.step().next_phase == "READY_FOR_MERGE"
+    assert "Background work" not in plain.provider.calls[0].prompt
+    assert "PROVIDER_SECTION" not in plain.provider.calls[0].prompt
+
+
 def test_review_binds_head_fetched_before_review(tmp_state_dir):
     """State says SHA_A but GitHub says SHA_B: the review must target SHA_B."""
     gh = FakeGitHub()

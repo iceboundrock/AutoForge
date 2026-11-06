@@ -988,3 +988,14 @@ agent worktree, otherwise `prompts/worktree_state.md` rendered with the
 worktree's branch, `HEAD` and a bounded list of status codes and paths
 (#187). The instruction on what to do with those changes is in that
 template; the engine supplies only the facts.
+
+`common.md` is shared by every provider, so it says only what is true of each.
+What an agent must be told of its own CLI alone is a template its adapter names
+(`AgentProvider.prompt_section`), which the engine renders into
+`{{PROVIDER_SECTION}}` for the profile the launch runs under, or leaves empty
+(#440). The engine names no provider and a run that routes phases to different
+providers gets each section on the right launch. Claude Code's
+`claude_background_work.md` is the one section today: what a pending background
+task does to the CLI, and what to stop before the final reply
+([control-result-protocol.md](control-result-protocol.md)). The `claude-sdk`
+provider names none, since it cannot launch yet.

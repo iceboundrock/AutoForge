@@ -409,7 +409,8 @@ revision. The alternative was to keep waiting and only stop the idle timeout
 from discarding the reply, which costs up to `idle_timeout_seconds` on every
 such run, on work the run no longer needs, and leaves the CLI running. We
 stop it: the agent is already told that the controller "may take that reply
-as your final one and does not wait for the work" (`prompts/common.md`), which
+as your final one and does not wait for the work" (`prompts/common.md`, as it
+read then; #440 replaced the sentence, see below), which
 this makes true. A reply with no block is not final, however long the CLI
 waits: an agent that ends its turn to wait for its test suite (three of #343's
 nine idle kills) must keep that turn. The cost that remains is a task that
@@ -451,6 +452,16 @@ per-line bound leaves its call open, so that run is still waited for. A turn
 that opens within the grace and then hangs has no reply of its own, and the
 earlier one is no longer the last. A `text` profile prints nothing until it
 exits, so it has no reply to stop for.
+
+**What the agents are told since (#440, 2026-11-06).** The stop is the safety
+net, and the prompt should not rely on it. "Does not wait for the work" read as
+permission to leave a task running, and "terminated by the controller" as a
+clean-up an agent need not do itself. `common.md` now tells every agent to let
+what it started finish or stop it before the final reply, and calls the kill a
+last resort. A Claude launch also gets `prompts/claude_background_work.md`, which
+its adapter names: a pending task keeps the CLI alive, so stop it with `TaskStop`
+and bound every wait. The instruction is the same whether the CLI is stopped, and
+the task lost, or hangs until a limit.
 
 Tests for §4d: `tests/test_executor.py` stops a child that keeps writing
 from its `on_chunk` hook (the result is `stopped`, not `timed_out`) and
