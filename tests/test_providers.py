@@ -1535,9 +1535,9 @@ def test_a_request_refused_during_a_run_stopped_after_its_reply_fails_nothing(
 def test_what_a_claude_stopped_after_its_reply_flushes_does_not_touch_the_reply(
     tmp_path, monkeypatch
 ):
-    """#439: once the CLI is stopped nothing more is read. A record it flushes
+    """#439: once the CLI is stopped nothing more is queued. A record it flushes
     on the SIGTERM cannot revise the reply, and however much it writes past
-    the queue's bound, which only a stop leaves unread, the reply stands."""
+    the queue's bound, that is no overflow: the reply stands."""
     from autoforge import executor, providers
     from tests import claude_fake
 
@@ -1557,6 +1557,237 @@ def test_what_a_claude_stopped_after_its_reply_flushes_does_not_touch_the_reply(
     assert res.stdout == _reply()
     assert res.provider_summary["records"] == len(_pending_after(_reply()))
     assert "stopping on SIGTERM" in res.stderr
+
+
+def _reducer_held_at_the_reply(monkeypatch, until) -> None:
+    """#439's R1-F1: the reducer behind the reader. It waits at the first
+    ``result`` until ``until(child)`` says the stream has got that far ahead."""
+    import time
+
+    from autoforge import providers
+    from autoforge.claude_stream import ClaudeStream
+
+    children = []
+    real_start, real_feed = providers.start_duplex, ClaudeStream.feed
+
+    def start(req):
+        children.append(real_start(req))
+        return children[-1]
+
+    def feed(stream, data):
+        if stream.text is None and b'"type": "result"' in data:
+            give_up = time.monotonic() + 20
+            while not until(children[0]):
+                assert time.monotonic() < give_up, "the stream never got ahead of the reducer"
+                time.sleep(0.01)
+        real_feed(stream, data)
+
+    monkeypatch.setattr(providers, "start_duplex", start)
+    monkeypatch.setattr(ClaudeStream, "feed", feed)
+
+
+def _notice(pad: int = 0) -> str:
+    """A notice between turns, which belongs to no turn."""
+    from tests import claude_fake
+
+    return claude_fake.line({"type": "system", "subtype": "task_notification", "pad": "x" * pad})
+
+
+def _no_grace(monkeypatch) -> None:
+    """A reply's grace is over as soon as the reducer holds the reply."""
+    from autoforge import executor, providers
+
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(providers, "CLAUDE_FAILED_EXIT_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+
+
+def _small_queue(monkeypatch) -> None:
+    from autoforge import providers
+
+    monkeypatch.setattr(providers, "CLAUDE_MAX_RECORD_BYTES", 8192)
+    monkeypatch.setattr(providers, "CLAUDE_MAX_PENDING_BYTES", 8192)
+
+
+_OVERFLOW_FAILURE = (
+    "claude: stream-json protocol violation: stdout lines arrived faster than they were read"
+)
+
+
+@pytest.mark.parametrize("kind", sorted(_FAILED_TURNS))
+def test_a_later_failure_already_queued_when_a_replys_grace_ends_fails_the_run(
+    tmp_path, monkeypatch, kind
+):
+    """#439's R1-F1: the grace ran out with the reducer behind the reader. The
+    earlier reply is not accepted past a failure the controller already holds."""
+    from tests import claude_fake
+
+    _no_grace(monkeypatch)
+    later = [_notice(), claude_fake.init(), *_failed_turn(kind)]
+    _reducer_held_at_the_reply(monkeypatch, lambda child: len(child._queue._items) == len(later))
+    lines = [*_pending_after(_reply("first")), *later, {"sleep": 60}]
+    _, res = _claude_run(tmp_path, lines, timeout=30, idle=20)
+    assert res.stopped_on_failure and not res.stopped_on_reply and res.stdout == ""
+    assert res.provider_failure == (
+        f"{_FAILED_TURNS[kind]}; claude was still running 0.1s later and was stopped"
+    )
+
+
+def test_a_later_reply_already_queued_when_a_replys_grace_ends_is_the_one_that_stands(
+    tmp_path, monkeypatch
+):
+    from tests import claude_fake
+
+    _no_grace(monkeypatch)
+    later = [_notice(), claude_fake.init(), claude_fake.result(_reply("revised"))]
+    _reducer_held_at_the_reply(monkeypatch, lambda child: len(child._queue._items) == len(later))
+    lines = [*_pending_after(_reply("first")), *later, {"sleep": 60}]
+    _, res = _claude_run(tmp_path, lines, timeout=30, idle=20)
+    assert res.stopped_on_reply and not res.timed_out and res.stdout == _reply("revised")
+    assert (res.provider_summary["turns"], res.provider_summary["results"]) == (2, 2)
+
+
+@pytest.mark.parametrize(
+    "still_open", [True, False], ids=["a_turn_still_open", "a_turn_with_no_block"]
+)
+def test_a_later_turn_already_queued_when_a_replys_grace_ends_is_waited_for(
+    tmp_path, monkeypatch, still_open
+):
+    """#439's R1-F1: the turn is waited for as one that opens within the grace
+    is, and the earlier reply is no longer the last."""
+    from tests import claude_fake
+
+    _no_grace(monkeypatch)
+    if still_open:
+        turn = [claude_fake.init(), claude_fake.tool_use("t2", "Bash", description="x")]
+        text = _reply("first")
+    else:
+        text = "Still waiting for the suite."
+        turn = [claude_fake.init(), claude_fake.result(text)]
+    _reducer_held_at_the_reply(monkeypatch, lambda child: len(child._queue._items) == len(turn))
+    lines = [*_pending_after(_reply("first")), *turn, {"sleep": 60}]
+    _, res = _claude_run(tmp_path, lines, timeout=30, idle=1)
+    assert res.timed_out and res.timeout_limit == "idle" and not res.stopped_on_reply
+    assert res.stdout == text and res.provider_summary["turns"] == 2
+
+
+def test_lines_queued_before_a_replys_stop_are_read_and_lines_written_during_it_are_not(
+    tmp_path, monkeypatch
+):
+    """#439's R1-F1: both sides of the stop. Every notice queued before it is
+    reduced, and what the CLI flushes on the SIGTERM, past the queue's bound and
+    with a turn in it, is neither read nor an overflow: the reply stands."""
+    from tests import claude_fake
+
+    _no_grace(monkeypatch)
+    _small_queue(monkeypatch)
+    notices = [_notice()] * 3
+    flushed = [claude_fake.init(), claude_fake.result("revised"), *[_notice(1024)] * 16]
+    sigterm = {"on_sigterm": {"lines": flushed}}
+    _reducer_held_at_the_reply(monkeypatch, lambda child: len(child._queue._items) == len(notices))
+    pending = _pending_after(_reply())
+    lines = [sigterm, *pending, *notices, {"sleep": 60}]
+    _, res = _claude_run(tmp_path, lines, timeout=30, idle=20)
+    assert res.stopped_on_reply and res.provider_failure is None and res.stdout == _reply()
+    summary = res.provider_summary
+    assert summary["records"] == len(pending) + len(notices)
+    assert summary["records_after_result"] == len(notices) and summary["failure"] == ""
+
+
+def test_a_reply_does_not_stand_once_lines_were_lost_before_its_stop(tmp_path, monkeypatch):
+    """#439's R1-F1: the queue overflowed before the grace ended, and what it
+    dropped here is a failed later turn. Nothing can say the reply is still the
+    last word, so the run fails on the overflow, as any run does."""
+    from tests import claude_fake
+
+    _no_grace(monkeypatch)
+    _small_queue(monkeypatch)
+    _reducer_held_at_the_reply(monkeypatch, lambda child: child._queue.overflowed)
+    lines = [
+        *_pending_after(_reply()),
+        *[_notice(1024)] * 16,
+        claude_fake.init(),
+        *_failed_turn("error_result"),
+        {"sleep": 60},
+    ]
+    _, res = _claude_run(tmp_path, lines, timeout=30, idle=20)
+    assert not res.stopped_on_reply and not res.timed_out and res.exit_code == -1
+    assert res.provider_failure == _OVERFLOW_FAILURE and res.stdout == ""
+
+
+@pytest.mark.parametrize(
+    ("later", "stands", "text"),
+    [
+        pytest.param(lambda fake: [_notice(), _notice()], True, _reply("first"), id="notices"),
+        pytest.param(
+            lambda fake: [fake.init(), fake.result(_reply("revised"))],
+            True,
+            _reply("revised"),
+            id="a_later_reply",
+        ),
+        pytest.param(
+            lambda fake: [fake.init(), fake.tool_use("t2", "Bash", description="x")],
+            False,
+            _reply("first"),
+            id="a_later_turn_still_open",
+        ),
+        pytest.param(
+            lambda fake: [fake.init(), *_failed_turn("error_result")],
+            False,
+            "",
+            id="a_later_failure",
+        ),
+    ],
+)
+def test_a_limit_reads_what_was_queued_before_it_lets_a_reply_stand(
+    tmp_path, monkeypatch, later, stands, text
+):
+    """#439's R1-F1: the limit fell due with the reducer behind the reader. A
+    reply stands if it still decides the run on all that had arrived by then, and
+    a timeout is the outcome otherwise. What the kill makes the CLI flush counts
+    for nothing."""
+    import time
+
+    from autoforge import executor
+    from tests import claude_fake
+
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    queued = later(claude_fake)
+    _reducer_held_at_the_reply(
+        monkeypatch,
+        lambda child: (
+            len(child._queue._items) == len(queued) and time.monotonic() >= child.deadline()
+        ),
+    )
+    pending = _pending_after(_reply("first"))
+    flushed = [claude_fake.init(), claude_fake.result("flushed on the SIGTERM")]
+    lines = [{"on_sigterm": {"lines": flushed}}, *pending, *queued, {"sleep": 60}]
+    _, res = _claude_run(tmp_path, lines, timeout=30, idle=1)
+    assert res.stopped_on_reply is stands and res.timed_out is not stands
+    assert res.timeout_limit == ("" if stands else "idle")
+    assert res.stdout == text and res.provider_failure is None
+    assert res.provider_summary["records"] == len(pending) + len(queued)
+
+
+def test_a_limit_does_not_let_a_reply_stand_once_lines_were_lost_before_it(tmp_path, monkeypatch):
+    """#439's R1-F1: an overflow before the limit is a stream nobody read to its
+    end. The limit is the outcome, as it is for a failure, and the summary says why
+    the reply did not count."""
+    import time
+
+    from autoforge import executor
+
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    _small_queue(monkeypatch)
+    _reducer_held_at_the_reply(
+        monkeypatch,
+        lambda child: child._queue.overflowed and time.monotonic() >= child.deadline(),
+    )
+    lines = [*_pending_after(_reply()), *[_notice(1024)] * 16, {"sleep": 60}]
+    _, res = _claude_run(tmp_path, lines, timeout=30, idle=1)
+    assert res.timed_out and res.timeout_limit == "idle" and not res.stopped_on_reply
+    assert res.stdout == "" and res.provider_failure is None
+    assert res.provider_summary["failure"] == _OVERFLOW_FAILURE
 
 
 def test_a_fake_claude_that_overruns_its_timeout_is_killed_and_timed_out(tmp_path):

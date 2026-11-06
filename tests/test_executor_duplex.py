@@ -462,6 +462,119 @@ def test_stop_kills_the_group_and_the_result_says_stopped_not_timed_out():
     assert not (res.descendants_killed or res.group_survived_kill or res.capture_abandoned)
 
 
+# Writes ``argv[1]`` records and waits; a SIGTERM writes far more than any queue
+# below holds, the way a CLI flushes its last records when it is killed.
+_WRITES_AND_FLUSHES_ON_SIGTERM = (
+    "import signal, sys, time\n"
+    "def stop(*_):\n"
+    "    sys.stdout.buffer.write(b'late\\n' * 100); sys.stdout.flush(); sys.exit(0)\n"
+    "signal.signal(signal.SIGTERM, stop)\n"
+    "for i in range(int(sys.argv[1])):\n"
+    "    sys.stdout.buffer.write(b'r%d\\n' % i)\n"
+    "sys.stdout.flush()\n"
+    "time.sleep(60)\n"
+)
+
+
+def _flusher(records: int, **kw) -> DuplexRequest:
+    return DuplexRequest(
+        command=[PY, "-c", _WRITES_AND_FLUSHES_ON_SIGTERM, str(records)],
+        max_runtime_seconds=30,
+        max_pending_records=10,
+        **kw,
+    )
+
+
+def _await_queue(child, reached) -> None:
+    give_up = time.monotonic() + 10
+    while not reached(child._queue):
+        assert time.monotonic() < give_up, "the child's records never reached the queue"
+        time.sleep(0.01)
+
+
+def _await_deadline(child) -> None:
+    while time.monotonic() < child.deadline():
+        time.sleep(0.01)
+
+
+def test_a_stop_once_read_waits_for_every_record_queued(monkeypatch):
+    """#439's R1-F1: a stop whose reason a record could overtake goes ahead only
+    when none waits. What the child then flushes on the SIGTERM, ten times what
+    the queue holds, is neither queued nor an overflow."""
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    with start_duplex(_flusher(3)) as child:
+        _await_queue(child, lambda queue: len(queue._items) == 3)
+        for i in range(3):
+            assert child.stop(once_read=True) is False
+            assert not child.exited()
+            assert child.read_line(timeout=10) == Record(b"r%d" % i)
+        assert child.stop(once_read=True) is True
+        res = child.finish()
+    assert res.stopped and not res.timed_out and res.exit_code == -1
+    assert not res.records_overflowed
+    assert child.read_line(timeout=0) == Eof()
+
+
+def test_a_stop_once_read_never_goes_ahead_after_an_overflow(monkeypatch):
+    """#439's R1-F1: records were lost, read or not, and the caller goes on to
+    read the overflow, which ends the invocation as it always does."""
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    with start_duplex(_flusher(20)) as child:
+        _await_queue(child, lambda queue: queue.overflowed)
+        assert child.stop(once_read=True) is False
+        assert _drain(child) == [Record(b"r%d" % i) for i in range(10)] + [Overflow()]
+        assert child.stop(once_read=True) is False
+        res = child.finish()
+    assert res.records_overflowed and not res.stopped and res.exit_code == -1
+
+
+def test_a_plain_stop_does_not_wait_for_what_is_queued(monkeypatch):
+    """A loop's verdict and a failed run are not overtaken by a record."""
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    with start_duplex(_flusher(3)) as child:
+        _await_queue(child, lambda queue: len(queue._items) == 3)
+        assert child.stop() is True
+        assert child.finish().stopped
+
+
+def test_a_read_that_meets_the_deadline_leaves_what_was_queued_to_the_caller(monkeypatch):
+    """#439's R1-F1: what had arrived when the limit fell due, oldest first, and
+    not what the group writes as it is killed: no ``late`` record, no overflow."""
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    with start_duplex(_flusher(3, idle_timeout_seconds=0.5)) as child:
+        _await_queue(child, lambda queue: len(queue._items) == 3)
+        _await_deadline(child)
+        assert child.read_line(timeout=10) == Timeout(deadline_exceeded=True)
+        assert child.unread_at_deadline() == [Record(b"r%d" % i) for i in range(3)]
+        assert child.unread_at_deadline() == []
+        res = child.finish()
+    assert res.timed_out and res.timeout_limit == "idle" and not res.records_overflowed
+
+
+def test_what_a_deadline_leaves_unread_ends_in_an_overflow_from_before_it(monkeypatch):
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    with start_duplex(_flusher(20, idle_timeout_seconds=0.5)) as child:
+        _await_queue(child, lambda queue: queue.overflowed)
+        _await_deadline(child)
+        assert child.read_line(timeout=10) == Timeout(deadline_exceeded=True)
+        assert child.unread_at_deadline() == [
+            *[Record(b"r%d" % i) for i in range(10)],
+            Overflow(),
+        ]
+        assert child.finish().records_overflowed
+
+
+def test_a_captured_stdout_has_nothing_unread_to_ask_for():
+    script = "print('x', flush=True)"
+    with start_duplex(
+        DuplexRequest(
+            command=[PY, "-c", script], max_runtime_seconds=30, stdout_mode=StdoutMode.CAPTURE
+        )
+    ) as child:
+        with pytest.raises(ExecutionError, match="captured"):
+            child.unread_at_deadline()
+
+
 def test_stop_after_the_child_exited_is_a_no_op():
     script = "import sys\nprint('bye', flush=True)\nsys.exit(7)\n"
     with start_duplex(DuplexRequest(command=[PY, "-c", script], max_runtime_seconds=30)) as child:

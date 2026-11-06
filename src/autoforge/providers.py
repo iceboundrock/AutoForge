@@ -1436,7 +1436,9 @@ class ClaudeCodeProvider(AgentProvider):
         holds a reply that decides the run (:attr:`ClaudeStream.replied`), a
         CLI still running :data:`CLAUDE_REPLIED_EXIT_GRACE_SECONDS` later is
         stopped too and the reply stands (#439), as it does when a limit falls
-        due within that grace: the timeout would otherwise discard it.
+        due within that grace: the timeout would otherwise discard it. Neither
+        happens on a reply that lines already received overtake, or after
+        lines were lost to the queue's bound (:func:`_read_claude_stream`).
         ``exit_code`` is always the real process status, -1 when the CLI was
         killed. A failure that is a turn ended by a transient model API error
         is also a ``transient_failure`` (#395); ``text`` output carries no
@@ -1486,8 +1488,7 @@ class ClaudeCodeProvider(AgentProvider):
             )
         elif stream.exited_early:
             failure = f"{failure} (exit {res.exit_code})"
-        elif res.records_overflowed and failure is None and not replied:
-            # Past a stop nothing reads the lines, and the reply is already in hand.
+        elif res.records_overflowed and failure is None:
             failure = "claude: stream-json lines arrived faster than they were read"
         summary = stream.summary()
         summary["failure"] = failure or ""
@@ -1581,29 +1582,38 @@ def _read_claude_stream(
     for, which ``prompts/common.md`` tells it. A limit that falls due within
     the grace does not outrank the reply either: it would end the CLI just
     as a stop does, and a timeout would discard the reply.
+
+    The reducer can be behind the reader, so the lines that overtake a reply
+    can already be queued when its grace runs out or a limit falls due. So
+    the stop waits until every line queued has been read, each going through
+    the rules above, and an overflow among them fails the run as any overflow
+    does: the lines it dropped could have been a later turn or a failure. A
+    limit does not wait: what it left unread is read after the kill, and the
+    reply stands only if it still decides the run. Either way the queue is
+    sealed at that moment, so lines written while the CLI dies neither revise
+    the reply nor count as an overflow.
     """
     failed_at: float | None = None
     replied_at: float | None = None
     ended = False
     while True:
         item = child.read_line(timeout=CLAUDE_EXIT_POLL_SECONDS)
-        if isinstance(item, Record):
-            stream.feed(item.data)
-        elif isinstance(item, Oversize):
-            stream.oversize(item.limit)
-        elif isinstance(item, Fragment):
-            stream.framing_error("stdout ended inside an unterminated line")
-        elif isinstance(item, Overflow):
-            stream.framing_error("stdout lines arrived faster than they were read")
-            return None
-        elif isinstance(item, Eof):
+        if isinstance(item, Eof):
             if not ended:
                 ended = True
                 stream.stream_ended()
             if child.exited() or not (stream.failure is not None or stream.replied):
                 return None
-        elif item.deadline_exceeded:
-            return _Cut.REPLIED if stream.replied else _Cut.DEADLINE
+        elif isinstance(item, Timeout):
+            if item.deadline_exceeded:
+                if stream.replied:
+                    for unread in child.unread_at_deadline():
+                        _reduce(stream, unread)
+                return _Cut.REPLIED if stream.replied else _Cut.DEADLINE
+        else:
+            _reduce(stream, item)
+            if isinstance(item, Overflow):
+                return None
         if loop is not None and loop.verdict is not None and child.stop():
             return _Cut.LOOP
         if child.exited():
@@ -1619,7 +1629,7 @@ def _read_claude_stream(
         else:
             replied_at = None
             continue
-        if now >= stop_at and child.stop():
+        if now >= stop_at and child.stop(once_read=cut is _Cut.REPLIED):
             return cut
         if ended:
             # Past EOF every read returns at once: wait for the CLI here,
@@ -1628,6 +1638,18 @@ def _read_claude_stream(
             time.sleep(
                 max(0.0, min(CLAUDE_EXIT_POLL_SECONDS, stop_at - now, child.deadline() - now))
             )
+
+
+def _reduce(stream: ClaudeStream, item: Record | Oversize | Fragment | Overflow) -> None:
+    """Give ``stream`` one thing read from stdout, short of its end."""
+    if isinstance(item, Record):
+        stream.feed(item.data)
+    elif isinstance(item, Oversize):
+        stream.oversize(item.limit)
+    elif isinstance(item, Fragment):
+        stream.framing_error("stdout ended inside an unterminated line")
+    else:
+        stream.framing_error("stdout lines arrived faster than they were read")
 
 
 def opencode_isolation_env(config_dir: str) -> dict[str, str]:

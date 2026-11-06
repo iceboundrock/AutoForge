@@ -424,6 +424,23 @@ timeout would discard what this change exists to keep. And the stopped CLI's
 -1 is no failed exit (`AgentExecutionResult.failed_exit`), so the engine goes
 on to parse and validate the reply as it would any other.
 
+Accepting a reply must not outrun the stream. The reducer can be behind the
+reader, so when the grace ends or a limit falls due the queue can already hold
+a later turn or a failure, and past its bound such lines are gone. So the stop
+waits until every line queued has been read (`DuplexChild.stop(once_read=True)`)
+and a limit, which does not wait, reads what it left after the kill
+(`unread_at_deadline`). An overflow from before either costs the reply, which
+may be stale with nothing to say otherwise: the run fails on the overflow, or
+times out on the limit. The other side of the line is the
+stop itself, because the CLI flushes records on SIGTERM, possibly past the
+queue's bound, and those must neither revise the reply nor read as lost lines.
+The queue is sealed before the signal goes out, so `records_overflowed` then
+means lines were lost before it. A line still on its way to the queue at that
+moment counts as written during the stop, the same as a turn that opens just
+after the grace, which is the cost accepted above. The stop cannot wait on the
+queue for ever: a CLI writing too fast for it ever to empty overflows it or
+reaches a limit.
+
 Two runs keep the timeout they always had. A `tool_result` skipped past the
 per-line bound leaves its call open, so that run is still waited for. A turn
 that opens within the grace and then hangs has no reply of its own, and the

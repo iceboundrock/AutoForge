@@ -178,6 +178,11 @@ validates that result as it does any other, so a refused one is corrected.
 the engine's check reads, does not count it. A turn that opens within the
 grace is waited for, and a limit falling due within it does not outrank the
 reply ([ADR 0002 §4d](../adr/0002-executor-nothing-outlives-the-invocation.md)).
+Neither takes the reply past lines already received: the stop waits until the
+queue has been read (`DuplexChild.stop(once_read=True)`), a limit reads what it
+left (`DuplexChild.unread_at_deadline()`), and a later turn, a failure or an
+overflow among them decides instead. The queue is sealed as the group is
+signalled, so what the CLI writes while it dies counts for nothing.
 
 An adapter may also report a failed run as a known transient failure of its
 provider (`transient_failure`, a short fixed reason). It is a fact,

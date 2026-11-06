@@ -27,6 +27,13 @@ reply is the run's. A reply with no block is still waited for, so an agent that
 ends its turn to wait for its test suite keeps working under the idle limit, as
 before. `output_format: text` is unchanged. Nothing changes a default.
 
+Lines the controller received before the stop count first, however far behind
+it was in reading them. A later turn or failure among them overtakes the reply.
+A reply does not stand once the stream outran the controller's queue and lost
+lines, because what was lost could have been that turn: the step fails, or times
+out if a limit fell due. What the CLI writes while it is being stopped counts
+for nothing.
+
 ### An evaluation protocol for Issue Memory and multi-agent execution, registered before any real run (#318)
 
 [`docs/evaluation-protocol.md`](docs/evaluation-protocol.md) fixes, before

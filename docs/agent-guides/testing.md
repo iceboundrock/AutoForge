@@ -1821,7 +1821,14 @@ Progress is observability, never part of an outcome. Keep covered:
   waited for and its reply has a grace of its own, a later reply with no
   block takes the decision back, and a later failure is #394's; output does
   not move the grace, and what the stopped CLI flushes does not touch the
-  reply; through the engine the phase advances, `execution.json` says
+  reply, however much of it; with the reducer behind the reader, when the grace
+  ends a later reply, turn or failure already queued overtakes the reply, every
+  notice queued is read before the stop, and an overflow before the stop fails
+  the run, and a limit reads what it left, the reply standing only if it still
+  decides the run; the duplex handle's `stop(once_read=True)` goes ahead only
+  with nothing unread and never after an overflow, a queue sealed by it or by a
+  limit takes nothing more and cannot overflow, and a plain `stop()` does not
+  wait; through the engine the phase advances, `execution.json` says
   `ended_by: reply` with exit code -1 and no error, and a reply the engine
   refuses is corrected like any other
 - cleaning (`tests/test_progress.py`): escapes and controls stripped

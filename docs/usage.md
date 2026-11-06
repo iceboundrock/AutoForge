@@ -1273,7 +1273,10 @@ profile; see [Configuration: Agent limits](configuration.md#agent-limits).
   no error, and the end line says `agent replied and was stopped while still
   running`), and a limit that falls due in those 10 s does not discard the
   reply. Work the agent left pending is not waited for, and a later turn can
-  revise the reply only if it opens within them.
+  revise the reply only if it opens within them. Lines already received are
+  read first, so a later turn or failure among them overtakes the reply, and a
+  run that lost lines to the queue's bound before the stop fails as any such
+  run does (`stdout lines arrived faster than they were read`).
 
 When a limit fires, the error names it, the agent's last output and the
 configuration key that set it, for example `agent 'analyze_execute' made no
