@@ -8,7 +8,9 @@ starts only after the CLI has exited. A final reply written with something
 still pending ends in one of two ways. The controller stops the CLI shortly
 after a reply it can read, and what was pending is lost, with no turn for you
 to act on it. Or the run hangs until an agent limit ends it as a timeout, and
-your reply is not used.
+your reply is not used. A reply written while a background agent runs cannot
+be read yet: the CLI holds it back until no background agent is left, and any
+later turn's reply replaces it.
 
 So before you write the reply that carries the `CONTROL_RESULT` block:
 
@@ -22,6 +24,15 @@ So before you write the reply that carries the `CONTROL_RESULT` block:
   waiting.
 
 Ending a turn without the block, to wait for a task, is not a final reply:
-your next turn opens when the task fires. The CLI is silent until then and
-nothing the task prints counts as activity, so a task that outlasts an agent
-limit ends the run as a timeout.
+your next turn opens when the task fires. What happens until then depends on
+the task:
+
+- A background command, a `Monitor` and a scheduled wakeup are silent. The CLI
+  writes nothing until one fires, and what a command prints goes to its own
+  file, so none of it counts as activity, and one that outlasts an agent limit
+  ends the run as a timeout.
+- A background agent is not silent while it works. Its own messages reach the
+  CLI's output and each counts as activity, so being between turns does not by
+  itself run out the idle limit. A long tool call of the agent's writes nothing,
+  so the idle limit can still end the run during one, and no output moves the
+  limit on the run's total length.

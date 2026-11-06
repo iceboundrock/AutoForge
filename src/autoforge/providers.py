@@ -985,7 +985,7 @@ CLAUDE_FAILED_EXIT_GRACE_SECONDS = 10.0
 # exit on its own before the driver stops it (#439). ``claude -p`` emits a
 # turn's ``result`` at once, but a background task still pending keeps it alive
 # for a turn that may never come, silently, until the idle limit. The agent is
-# told the controller does not wait for such work (``prompts/common.md``). The
+# told to leave nothing pending (``prompts/claude_background_work.md``). The
 # value is #394's, not a measurement of how long a CLI takes to exit after its
 # last ``result``: one that takes longer loses its own status, not its reply.
 CLAUDE_REPLIED_EXIT_GRACE_SECONDS = 10.0

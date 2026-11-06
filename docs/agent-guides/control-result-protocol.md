@@ -95,7 +95,12 @@ What only one CLI does goes in a section its adapter names
 `{{PROVIDER_SECTION}}` for the profile that launch runs under. Today that is
 `ClaudeCodeProvider`'s `claude_background_work.md`: the end of a turn does not
 end the CLI while a task is pending, so stop every task, `Monitor` and background
-agent (`TaskStop`) and bound every wait. The instruction does not depend on the
+agent (`TaskStop`) and bound every wait. It tells the silent kinds from a
+background agent, which meet the limits differently: a background command, a
+`Monitor` or a wakeup writes nothing until it fires, while a background agent's
+own records reach the stream and restart the idle limit until a long call of its
+own stops them, and the CLI holds the reply of a turn that ends while one runs
+(`claude_stream.py`). The instruction does not depend on the
 stop for a reply: with it the leftovers are lost, and without it (`text` output,
 a reply it cannot read) the run hangs until a limit. The stop stays the safety
 net. The controller still neither tracks a task nor reads a reply for whether

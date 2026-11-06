@@ -931,11 +931,50 @@ def test_the_claude_section_says_what_happens_and_what_to_do():
         "Give each wait of yours a bound when you start it",
         # A reply without the block is waited for (#439), under the limits.
         "Ending a turn without the block, to wait for a task, is not a final reply",
-        "nothing the task prints counts as activity",
-        "a task that outlasts an agent limit ends the run as a timeout",
     ):
         assert phrase in flat, phrase
     assert "## Working rules" in prompts.load_template("common.md")
+
+
+def test_the_claude_section_tells_silent_work_from_a_background_agent():
+    """#440 R1-F1: a pending task meets the limits according to its kind. A
+    background command, a `Monitor` and a wakeup write nothing until they fire,
+    so nothing restarts the idle limit. A background agent's own records reach
+    the stream as it works (`claude_stream.py`), and every chunk restarts the
+    limit (`executor.py`), until a long call of its own stops them. It also
+    keeps `ClaudeStream.replied` false, so a reply written meanwhile is not one
+    to stop on."""
+    flat = " ".join(prompts.load_template("claude_background_work.md").split())
+    _, _, waiting = flat.partition("Ending a turn without the block")
+    silent, _, agent = waiting.partition("- A background agent is not silent while it works.")
+    assert agent, "the section has no entry of its own for a background agent"
+    for phrase in (
+        "A background command, a `Monitor` and a scheduled wakeup are silent.",
+        "The CLI writes nothing until one fires",
+        "what a command prints goes to its own file",
+        "none of it counts as activity",
+        "one that outlasts an agent limit ends the run as a timeout",
+    ):
+        assert phrase in silent, phrase
+    assert "background agent" not in silent
+    for phrase in (
+        "Its own messages reach the CLI's output and each counts as activity",
+        "being between turns does not by itself run out the idle limit",
+        "A long tool call of the agent's writes nothing",
+        "the idle limit can still end the run during one",
+        "no output moves the limit on the run's total length",
+    ):
+        assert phrase in agent, phrase
+    assert (
+        "A reply written while a background agent runs cannot be read yet: the CLI holds it "
+        "back until no background agent is left, and any later turn's reply replaces it."
+    ) in flat
+    # The claim that covered a background agent too, in the words it used.
+    for overbroad in ("The CLI is silent until then", "nothing the task prints counts"):
+        assert overbroad not in flat, overbroad
+    # Output is no reason to leave one running: the instruction names it still.
+    assert "every background task, `Monitor` and background agent" in flat
+    assert "Give each wait of yours a bound" in flat
 
 
 def test_only_claude_code_names_a_provider_section():
