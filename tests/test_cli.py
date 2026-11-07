@@ -61,6 +61,7 @@ from tests.conftest import (
     implement,
     is_shell_probe,
     make_engine,
+    no_credential_looking_names,
     publish_pr_head,
     review_result,
     state_tree,
@@ -5509,9 +5510,90 @@ def test_loading_an_ordinary_allowlist_warns_about_nothing(tmp_path, capsys, mon
     assert "warning" not in capsys.readouterr().err
 
 
-def test_a_one_character_prefix_refuses_the_command(tmp_path, capsys, monkeypatch):
+@pytest.mark.parametrize(
+    ("entry", "held", "word"),
+    [
+        ("MY_GITLABPAT", "UNRELATED", "its name contains PAT"),
+        ("TOKENIZED_ACCESS", "UNRELATED", "its name contains TOKEN"),
+        ("MY_*", "MY_GITLABPAT", "MY_GITLABPAT in this shell"),
+        ("T*", "TOKENIZED_ACCESS", "TOKENIZED_ACCESS in this shell"),
+    ],
+)
+def test_loading_warns_on_a_credential_word_inside_a_name(
+    tmp_path, capsys, monkeypatch, entry, held, word
+):
+    """#286: an entry by its text, a prefix by what the shell holds under it."""
     monkeypatch.chdir(tmp_path)
-    config = _config_with_execution(tmp_path, {"env_allowlist_extra": ["H*"]})
-    rc = cli.main(["--config", str(config), "--state-dir", str(tmp_path / "s"), "status"])
-    assert rc == 2
-    assert "one-character prefix" in capsys.readouterr().err
+    no_credential_looking_names(monkeypatch)
+    secret = "glpat-" + "Q" * 24
+    monkeypatch.setenv(held, secret)
+    config = _config_with_execution(tmp_path, {"command_env_allowlist_extra": [entry]})
+    cli.main(["--config", str(config), "--state-dir", str(tmp_path / "s"), "status"])
+    captured = capsys.readouterr()
+    assert f"execution.command_env_allowlist_extra entry {entry!r}" in captured.err
+    assert word in captured.err
+    assert secret not in captured.err + captured.out
+
+
+@pytest.mark.parametrize(
+    ("entry", "held"),
+    [
+        ("PATH", "UNRELATED"),
+        ("TOKENIZERS_PARALLELISM", "UNRELATED"),
+        ("P*", "PYTHONPATH"),
+        ("T*", "TOKENIZERS_PARALLELISM"),
+    ],
+)
+def test_loading_says_nothing_of_a_name_that_only_holds_the_letters(
+    tmp_path, capsys, monkeypatch, entry, held
+):
+    monkeypatch.chdir(tmp_path)
+    no_credential_looking_names(monkeypatch)
+    monkeypatch.setenv(held, "x")
+    config = _config_with_execution(tmp_path, {"command_env_allowlist_extra": [entry]})
+    cli.main(["--config", str(config), "--state-dir", str(tmp_path / "s"), "status"])
+    assert "warning" not in capsys.readouterr().err
+
+
+def test_loading_warns_on_what_a_provider_s_own_prefix_passes(tmp_path, capsys, monkeypatch):
+    """#286: no key lists it, and OpenCode gets it through ``OPENAI_*`` by default."""
+    monkeypatch.chdir(tmp_path)
+    secret = "ghp_" + "Q" * 36
+    monkeypatch.setenv("OPENAI_GITHUB_PAT", secret)
+    rc = cli.main(["--state-dir", str(tmp_path / "s"), "status"])
+    assert rc == 2  # no state yet: the command itself ran on
+    captured = capsys.readouterr()
+    assert (
+        "autoforge: warning: provider opencode's own entry 'OPENAI_*' passes what looks like a "
+        "credential (OPENAI_GITHUB_PAT in this shell) and reaches every opencode agent"
+    ) in captured.err
+    assert secret not in captured.err + captured.out
+
+
+def test_a_prefix_of_one_letter_loads_and_says_what_it_passes(tmp_path, capsys, monkeypatch):
+    """#286: ``H*`` is said to pass the token this shell holds under it, not refused."""
+    monkeypatch.chdir(tmp_path)
+    no_credential_looking_names(monkeypatch)
+    state = str(tmp_path / "s")
+    monkeypatch.setenv("HOMEBREW_GITHUB_API_TOKEN", "x")
+    config = _config_with_execution(tmp_path, {"env_allowlist_extra": ["H*", "R*"]})
+    assert cli.main(["--config", str(config), "--state-dir", state, "status"]) == 2
+    err = capsys.readouterr().err
+    assert "entry 'H*' passes what looks like a credential" in err
+    assert "HOMEBREW_GITHUB_API_TOKEN in this shell" in err
+    assert "'R*'" not in err
+
+
+def test_a_command_only_name_a_provider_passes_refuses_the_command(tmp_path, capsys, monkeypatch):
+    """#286: every command, before anything else it would do."""
+    monkeypatch.chdir(tmp_path)
+    secret = "postgres-" + "Q" * 24
+    monkeypatch.setenv("OPENAI_TEST_DATABASE_URL", secret)
+    config = _config_with_execution(
+        tmp_path, {"command_env_allowlist_extra": ["OPENAI_TEST_DATABASE_URL"]}
+    )
+    assert cli.main(["--config", str(config), "--state-dir", str(tmp_path / "s"), "status"]) == 2
+    captured = capsys.readouterr()
+    assert "entry 'OPENAI_TEST_DATABASE_URL' is for repository commands alone" in captured.err
+    assert "provider opencode's own 'OPENAI_*'" in captured.err
+    assert secret not in captured.err + captured.out

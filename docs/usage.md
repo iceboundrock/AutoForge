@@ -1684,7 +1684,9 @@ the invocation's `request.json`, with the names the controller sets
 from the same first two lists plus `command_env_allowlist_extra`, and get
 neither `agent_env_allowlist_extra` nor a provider's names, so a key you
 forward to an agent stays out of those commands, though not out of what the
-agent runs itself
+agent runs itself. A name listed for one class that something else would pass to
+the other refuses the config, a provider's own names included
+(`OPENAI_TEST_DATABASE_URL` for commands alone, with OpenCode routed)
 ([Configuration: agent environment](configuration.md#agent-environment)).
 Before and after each invocation, including before every
 relaunch within a step, the controller reads HEAD and the checked-out branch

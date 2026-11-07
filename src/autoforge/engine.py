@@ -14125,6 +14125,13 @@ class ControllerEngine:
         profile = profile_for_phase(self.config, phase, state.review_round)
         provider = self.providers.get(profile)
         provider.validate_profile(profile)
+        # What config load refuses, for this launch's provider: a name listed
+        # for repository commands alone would reach this agent (#286).
+        overlap = self.config.execution.environment_overlap(
+            {provider.name: provider.own_names(profile)}
+        )
+        if overlap:
+            raise ConfigurationError(f"refusing to launch: {overlap}")
         limits = self.config.agent_limits(profile)
         # The policy the agent's requests for a decision are held to (ADR 0007
         # D7.1); ``None`` for a provider through which nothing can ask.

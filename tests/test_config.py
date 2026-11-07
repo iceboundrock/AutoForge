@@ -15,7 +15,9 @@ from autoforge.child_env import FORBIDDEN_ENV_NAMES, FORBIDDEN_ENV_PREFIXES, for
 from autoforge.config import default_config, load_config_file, validate_required_profiles
 from autoforge.config_fingerprint import fingerprint_routing
 from autoforge.errors import ConfigurationError
+from autoforge.executor import select_environment
 from autoforge.profiles import REQUIRED_PROFILES
+from autoforge.providers import provider_for
 from autoforge.redaction import redact
 from autoforge.validation import parse_github_url, validate_epic_and_issue
 
@@ -1591,20 +1593,39 @@ def test_a_misspelled_class_list_is_refused_not_ignored(tmp_path, key):
 
 
 @pytest.mark.parametrize("key", ENV_ALLOWLIST_KEYS)
-@pytest.mark.parametrize("entry", ["H*", "M*", "z*", "_*"])
-def test_a_one_character_prefix_is_refused_at_load(tmp_path, key, entry):
-    with pytest.raises(ConfigurationError) as caught:
-        _execution_cfg(tmp_path, {key: ["PATH", entry]})
-    message = str(caught.value)
-    assert f"'execution.{key}'" in message and repr(entry) in message
-    assert "one-character prefix" in message
+@pytest.mark.parametrize("entry", ["R*", "H*", "M*", "z*", "_*"])
+def test_a_one_character_prefix_that_covers_no_forbidden_name_loads(tmp_path, key, entry):
+    cfg = _execution_cfg(tmp_path, {key: ["PATH", entry]})
+    assert entry in getattr(cfg.execution, key)
 
 
 @pytest.mark.parametrize("entry", ["GO*", "PY*", "UV_*", "CI_*", "R_*", "HO*", "LC_*"])
 def test_a_tool_s_short_prefix_is_accepted(tmp_path, entry):
-    """The refusal stops at one character: two already name real tools' variables."""
     cfg = _execution_cfg(tmp_path, {"env_allowlist_extra": [entry]})
     assert entry in cfg.execution.environment_names()
+
+
+@pytest.mark.parametrize(
+    ("entry", "variable"), [("G*", "GH_TOKEN"), ("S*", "SSH_ASKPASS"), ("X*", "XDG_RUNTIME_DIR")]
+)
+def test_a_one_character_prefix_that_covers_a_forbidden_name_stays_refused(
+    tmp_path, entry, variable
+):
+    with pytest.raises(ConfigurationError, match=f"covers {variable}"):
+        _execution_cfg(tmp_path, {"env_allowlist_extra": [entry]})
+
+
+def test_a_prefix_of_one_letter_forwards_a_tool_s_variables_and_warns_of_nothing_else(tmp_path):
+    """A list that forwards R's variables is a real one, written before #286 too."""
+    exe = _execution_cfg(tmp_path, {"env_allowlist_extra": ["R*"]}).execution
+    source = {"R_HOME": "/usr/lib/R", "R_LIBS": "/opt/r", "UNRELATED": "x"}
+    assert select_environment(exe.environment_names(), source) == {
+        "R_HOME": "/usr/lib/R",
+        "R_LIBS": "/opt/r",
+    }
+    assert exe.environment_warnings(source) == []
+    [warning] = exe.environment_warnings([*source, "R_GITHUB_PAT"])
+    assert "entry 'R*' passes what looks like a credential (R_GITHUB_PAT in this shell)" in warning
 
 
 @pytest.mark.parametrize("key", ENV_ALLOWLIST_KEYS)
@@ -1619,9 +1640,18 @@ def test_a_tool_s_short_prefix_is_accepted(tmp_path, entry):
         ("PAT", "PAT"),
         ("PAT_2", "PAT"),
         ("DEPLOY_PAT2", "PAT"),
+        ("MY_GITLABPAT", "PAT"),
+        ("my_gitlabpat", "PAT"),
+        ("GITLABPAT*", "PAT"),
+        ("SPAT", "PAT"),
+        ("PYTHONPATH_PAT", "PAT"),
         ("DEPLOY_TOKEN", "TOKEN"),
         ("MYTOKEN", "TOKEN"),
         ("MY_TOKEN_*", "TOKEN"),
+        ("TOKENIZED_ACCESS", "TOKEN"),
+        ("TOKENIZ*", "TOKEN"),
+        ("TOKENIZERS_ACCESS", "TOKEN"),
+        ("MAX_TOKENS_TOKEN", "TOKEN"),
         ("CLIENT_SECRET_FILE", "SECRET"),
         ("DB_PASSWORD", "PASSWORD"),
     ],
@@ -1643,10 +1673,18 @@ def test_a_credential_looking_entry_is_warned_about_by_name(tmp_path, key, entry
         "LD_LIBRARY_PATH",
         "PYTHONPATH",
         "CLASSPATH",
+        "PATH*",
         "PATCH_LEVEL",
+        "DISPATCH_MODE",
         "PATTERN_FILE",
-        "SPAT",
+        "COMPAT_MODE",
+        "SPATIALITE_HOME",
         "TOKENIZERS_PARALLELISM",
+        "tokenizers_parallelism",
+        "MAX_TOKENS",
+        "MAX_THINKING_TOKENS",
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
         "DEEPSEEK_API_KEY",
         "OPENROUTER_API_KEY",
         "GITLAB_HOST",
@@ -1661,6 +1699,7 @@ def test_a_name_that_only_resembles_a_credential_word_is_not_warned_about(tmp_pa
 def test_the_default_list_is_not_warned_about_whatever_the_shell_holds():
     held = ["GH_TOKEN", "GITHUB_PAT", "MY_GITHUB_PAT", "AWS_SECRET_ACCESS_KEY", "DB_PASSWORD"]
     assert default_config().execution.environment_warnings(held) == []
+    assert default_config().environment_warnings(held) == []
 
 
 def test_a_prefix_is_warned_about_only_for_what_this_shell_holds_under_it(tmp_path):
@@ -1671,6 +1710,314 @@ def test_a_prefix_is_warned_about_only_for_what_this_shell_holds_under_it(tmp_pa
     assert "execution.command_env_allowlist_extra entry 'MY_*'" in warning
     assert "MY_API_TOKEN, MY_GITHUB_PAT in this shell" in warning
     assert "every repository command" in warning and "MY_TOOL_HOME" not in warning
+
+
+@pytest.mark.parametrize(
+    ("entry", "held", "warned"),
+    [
+        ("MY_*", "MY_GITLABPAT", True),
+        ("MY_*", "MY_TOKENIZED_ACCESS", True),
+        ("MY_*", "MY_PATH", False),
+        ("MY_*", "MY_TOKENIZERS_PARALLELISM", False),
+        ("T*", "TOKENIZED_ACCESS", True),
+        ("T*", "TOKENIZERS_PARALLELISM", False),
+        ("P*", "PAT_2", True),
+        ("P*", "PATH", False),
+        ("P*", "PYTHONPATH", False),
+    ],
+)
+def test_a_prefix_is_read_against_the_names_the_same_way(tmp_path, entry, held, warned):
+    exe = _execution_cfg(tmp_path, {"env_allowlist_extra": [entry]}).execution
+    warnings = exe.environment_warnings([held])
+    assert bool(warnings) is warned
+    assert all(f"{held} in this shell" in warning for warning in warnings)
+
+
+def _routed_to(provider: str, **options) -> dict:
+    """Every default profile on ``provider``, which is what a run could launch."""
+    profile = {"provider": provider, "model": "openai/m", "options": options}
+    return dict.fromkeys(default_config().profiles, profile)
+
+
+def _routed_cfg(tmp_path, provider: str, execution: dict | None = None, **options):
+    p = tmp_path / "routed.json"
+    document = {"version": 1, "profiles": _routed_to(provider, **options)}
+    p.write_text(json.dumps({**document, "execution": execution or {}}), encoding="utf-8")
+    return load_config_file(p)
+
+
+@pytest.mark.parametrize(
+    ("held", "provider", "entry"),
+    [
+        ("OPENAI_GITHUB_PAT", "opencode", "OPENAI_*"),
+        ("OPENCODE_SECRET", "opencode", "OPENCODE_*"),
+        ("GEMINI_PASSWORD", "opencode", "GEMINI_*"),
+        ("GOOGLE_OAUTH_ACCESS_TOKEN", "opencode", "GOOGLE_*"),
+        ("CLAUDE_GITHUB_TOKEN", "claude", "CLAUDE_*"),
+    ],
+)
+def test_a_configured_provider_s_own_prefix_is_warned_about(held, provider, entry):
+    """#286: nothing lists these, and they reach the agents of the default routing."""
+    [warning] = default_config().environment_warnings([held, "UNRELATED"])
+    assert f"provider {provider}'s own entry {entry!r}" in warning
+    assert f"{held} in this shell" in warning and f"every {provider} agent" in warning
+    assert "UNRELATED" not in warning
+    assert redact(warning) == warning, "the redactor must leave the warning readable"
+
+
+def test_a_prefix_two_providers_add_is_said_of_each():
+    warnings = default_config().environment_warnings(["ANTHROPIC_GITHUB_PAT"])
+    assert [warning.split(" own entry")[0] for warning in warnings] == [
+        "provider claude's",
+        "provider opencode's",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("provider", "held"),
+    [
+        ("claude", ["OPENAI_GITHUB_PAT", "PI_GITHUB_TOKEN"]),
+        ("pi", ["OPENAI_GITHUB_PAT", "CLAUDE_GITHUB_TOKEN", "PI_GITHUB_TOKEN"]),
+        ("opencode", ["CLAUDE_GITHUB_TOKEN", "PI_GITHUB_TOKEN"]),
+        ("claude-sdk", ["ANTHROPIC_GITHUB_PAT", "CLAUDE_GITHUB_TOKEN"]),
+    ],
+)
+def test_a_provider_no_profile_routes_to_is_not_warned_about(tmp_path, provider, held):
+    assert _routed_cfg(tmp_path, provider).environment_warnings(held) == []
+
+
+def test_a_variable_a_cli_signs_in_with_passes_its_own_prefix_without_a_word(tmp_path):
+    """The documented alternative to a stored login, not a stray token: a warning
+    on every run of it would teach an operator to ignore this one."""
+    held = ["ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY"]
+    assert default_config().environment_warnings(held) == []
+    # Listed in a key, it reaches what that key reaches, repository commands included.
+    cfg = _execution_cfg(tmp_path, {"env_allowlist_extra": ["ANTHROPIC_AUTH_TOKEN"]})
+    [warning] = cfg.environment_warnings(held)
+    assert "execution.env_allowlist_extra entry 'ANTHROPIC_AUTH_TOKEN'" in warning
+
+
+def test_only_a_provider_s_own_sign_in_is_passed_over():
+    """Another credential under the same prefix is warned about, by name alone."""
+    [warning] = default_config().environment_warnings(
+        ["CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN"]
+    )
+    assert "(CLAUDE_CODE_OAUTH_REFRESH_TOKEN in this shell)" in warning
+
+
+def test_a_profile_whose_provider_cannot_say_is_passed_over_at_load(tmp_path):
+    """A config may carry a profile a run never reaches; ``validate_profile`` refuses it."""
+    p = tmp_path / "cfg.json"
+    document = {
+        "version": 1,
+        "execution": {"command_env_allowlist_extra": ["TEST_DATABASE_URL"]},
+        "profiles": {
+            "spare_unknown": {"provider": "no-such-provider", "model": "m"},
+            "spare_sdk": {"provider": "opencode-sdk", "model": "openai/m"},
+        },
+    }
+    p.write_text(json.dumps(document), encoding="utf-8")
+    cfg = load_config_file(p)
+    assert cfg.environment_overlap() == ""
+    assert cfg.environment_warnings(["OPENAI_API_KEY"]) == []
+
+
+@pytest.mark.parametrize(
+    ("provider", "entry", "own"),
+    [
+        # An exact name under a provider's prefix, the prefix itself, one
+        # narrower, and one broader, which passes some names the provider does.
+        ("opencode", "OPENAI_TEST_DATABASE_URL", "OPENAI_*"),
+        ("opencode", "OPENAI_*", "OPENAI_*"),
+        ("opencode", "OPENAI_TEST_*", "OPENAI_*"),
+        ("opencode", "OPEN*", "OPENCODE_*"),
+        ("opencode", "GOOGLE_TEST_DB", "GOOGLE_*"),
+        ("opencode", "GEMINI_TEST_DB", "GEMINI_*"),
+        ("opencode", "ANTHROPIC_TEST_DB", "ANTHROPIC_*"),
+        ("claude", "ANTHROPIC_TEST_DB", "ANTHROPIC_*"),
+        ("claude", "CLAUDE_TEST_*", "CLAUDE_*"),
+        ("claude", "A*", "ANTHROPIC_*"),
+        # Pi's names are exact: the same name, and a prefix over one.
+        ("pi", "PI_OFFLINE", "PI_OFFLINE"),
+        ("pi", "PI_*", "PI_CODING_AGENT_DIR"),
+        ("claude-sdk", "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
+    ],
+)
+def test_a_command_only_entry_a_provider_passes_is_refused_at_load(
+    tmp_path, monkeypatch, provider, entry, own
+):
+    """#286: the actual providers' names, whichever way the two overlap."""
+    secret = "postgres-" + "Z" * 24
+    monkeypatch.setenv("OPENAI_TEST_DATABASE_URL", secret)
+    with pytest.raises(ConfigurationError) as caught:
+        _routed_cfg(tmp_path, provider, {"command_env_allowlist_extra": [entry]})
+    message = str(caught.value)
+    assert f"entry {entry!r} is for repository commands alone" in message
+    assert f"provider {provider}'s own {own!r}" in message
+    assert "docs/configuration.md" in message and secret not in message
+
+
+def test_the_variable_an_sdk_profile_names_as_its_credential_counts_as_its_own(tmp_path):
+    with pytest.raises(ConfigurationError, match="provider opencode-sdk's own 'MY_API_KEY'"):
+        _routed_cfg(
+            tmp_path,
+            "opencode-sdk",
+            {"command_env_allowlist_extra": ["MY_API_KEY"]},
+            server_command="opencode",
+            credential_env="MY_API_KEY",
+        )
+
+
+@pytest.mark.parametrize(
+    ("provider", "entry"),
+    [
+        ("claude", "OPENAI_TEST_DATABASE_URL"),
+        ("claude", "O*"),
+        ("pi", "OPENAI_TEST_DATABASE_URL"),
+        ("pi", "PI_TEST_DATABASE_URL"),
+        ("opencode", "CLAUDE_TEST_DB"),
+        ("opencode", "TEST_DATABASE_URL"),
+    ],
+)
+def test_a_command_only_entry_no_routed_provider_passes_loads(tmp_path, provider, entry):
+    cfg = _routed_cfg(tmp_path, provider, {"command_env_allowlist_extra": [entry]})
+    assert entry in cfg.execution.command_environment_names()
+    assert entry not in cfg.execution.agent_environment_names()
+
+
+def test_the_defaults_route_to_opencode_so_its_prefix_refuses_a_command_only_name(tmp_path):
+    """``update_epic`` counts though no run requires it: a run reaches it and launches it."""
+    profiles = dict.fromkeys(REQUIRED_PROFILES, _routed_to("claude")["fix"])
+    p = tmp_path / "cfg.json"
+    document = {
+        "version": 1,
+        "profiles": profiles,
+        "execution": {"command_env_allowlist_extra": ["OPENAI_TEST_DATABASE_URL"]},
+    }
+    p.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="provider opencode's own 'OPENAI_\\*'"):
+        load_config_file(p)
+
+
+@pytest.mark.parametrize("provider", ["claude", "opencode", "pi", "claude-sdk"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "OPENAI_TEST_DATABASE_URL",
+        "ANTHROPIC_TEST_DB",
+        "CLAUDE_TEST_DB",
+        "GOOGLE_TEST_DB",
+        "PI_OFFLINE",
+        "ANTHROPIC_API_KEY",
+        "TEST_DATABASE_URL",
+    ],
+)
+def test_a_command_only_name_reaches_an_agent_exactly_when_the_config_is_refused(
+    monkeypatch, provider, name
+):
+    """#286's boundary against what each adapter really hands its CLI: an accepted
+    config keeps the name from the agent and gives it to the commands, and the
+    refusal never fires on a name that would not have reached the agent."""
+    monkeypatch.setenv(name, "x")
+    exe = default_config().execution
+    exe.command_env_allowlist_extra = [name]
+    adapter = provider_for(config.ProfileConfig(name="p", provider=provider))
+    reaches = name in adapter.launch_environment(exe.agent_environment_names())
+    problem = exe.environment_overlap({provider: adapter.own_names(None)})
+    assert bool(problem) is reaches
+    assert name in select_environment(exe.command_environment_names())
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        # Said outright: the operator gives it to both, and nothing is implied.
+        {
+            "command_env_allowlist_extra": ["OPENAI_TEST_DATABASE_URL"],
+            "agent_env_allowlist_extra": ["OPENAI_TEST_DATABASE_URL"],
+        },
+        {
+            "command_env_allowlist_extra": ["OPENAI_TEST_DATABASE_URL"],
+            "env_allowlist_extra": ["OPENAI_TEST_DATABASE_URL"],
+        },
+        {"command_env_allowlist_extra": ["OPENAI_*"], "agent_env_allowlist_extra": ["OPENAI_*"]},
+        # An agent's name under a provider's prefix reaches agents either way.
+        {"agent_env_allowlist_extra": ["OPENAI_API_KEY", "OPENAI_*"]},
+    ],
+)
+def test_a_name_listed_for_both_classes_is_not_ambiguous(tmp_path, execution):
+    assert _execution_cfg(tmp_path, execution).environment_overlap() == ""
+
+
+@pytest.mark.parametrize(
+    ("execution", "entry", "broader", "reach"),
+    [
+        (
+            {"command_env_allowlist_extra": ["MY_DB"], "env_allowlist_extra": ["MY_*"]},
+            "MY_DB",
+            "MY_*",
+            "every agent",
+        ),
+        (
+            {"command_env_allowlist_extra": ["MY_DB"], "agent_env_allowlist_extra": ["MY_*"]},
+            "MY_DB",
+            "MY_*",
+            "every agent",
+        ),
+        (
+            {"agent_env_allowlist_extra": ["MY_KEY"], "env_allowlist_extra": ["MY_*"]},
+            "MY_KEY",
+            "MY_*",
+            "every repository command",
+        ),
+        (
+            {"agent_env_allowlist_extra": ["MY_KEY"], "command_env_allowlist_extra": ["MY_*"]},
+            "MY_KEY",
+            "MY_*",
+            "every repository command",
+        ),
+        (
+            {"command_env_allowlist_extra": ["MY_TOOL_*"], "env_allowlist_extra": ["MY_*"]},
+            "MY_TOOL_*",
+            "MY_*",
+            "every agent",
+        ),
+        (
+            {"command_env_allowlist_extra": ["LC_TEST_LOCALE"]},
+            "LC_TEST_LOCALE",
+            "LC_*",
+            "every agent",
+        ),
+    ],
+)
+def test_a_class_entry_a_broader_entry_passes_to_the_other_class_is_refused(
+    tmp_path, execution, entry, broader, reach
+):
+    """#286: the lists add up, so a broader entry undoes what a class's says."""
+    with pytest.raises(ConfigurationError) as caught:
+        _execution_cfg(tmp_path, execution)
+    message = str(caught.value)
+    assert f"entry {entry!r} is for" in message
+    assert f"alone, but entry {broader!r} also passes it to {reach}" in message
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        # A narrower shared name is what the shared list says of itself, and
+        # the rest of the class's prefix stays the class's.
+        {"command_env_allowlist_extra": ["MY_*"], "env_allowlist_extra": ["MY_SHARED"]},
+        {"agent_env_allowlist_extra": ["MY_*"], "env_allowlist_extra": ["MY_TOOL_*"]},
+        {"command_env_allowlist_extra": ["L*"]},
+        {
+            "command_env_allowlist_extra": ["MY_DB"],
+            "agent_env_allowlist_extra": ["MY_KEY"],
+            "env_allowlist_extra": ["MY_SHARED"],
+        },
+    ],
+)
+def test_a_class_entry_nothing_broader_passes_loads(tmp_path, execution):
+    assert _execution_cfg(tmp_path, execution).environment_overlap() == ""
 
 
 def test_every_list_is_read_and_each_entry_said_once_per_list(tmp_path):

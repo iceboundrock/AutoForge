@@ -26,6 +26,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from autoforge.certificate import Revision, remote_certificate  # noqa: E402
+from autoforge.child_env import credential_looking_word  # noqa: E402
 from autoforge.config import default_config  # noqa: E402
 from autoforge.engine import ControllerEngine  # noqa: E402
 from autoforge.errors import (  # noqa: E402
@@ -66,7 +67,12 @@ from autoforge.github import (  # noqa: E402
     WorkflowRunJobs,
     WorkflowRuns,
 )
-from autoforge.providers import ProviderRegistry, ScriptedProvider  # noqa: E402
+from autoforge.providers import (  # noqa: E402
+    ClaudeCodeProvider,
+    OpenCodeProvider,
+    ProviderRegistry,
+    ScriptedProvider,
+)
 from autoforge.result_parser import BEGIN, END  # noqa: E402
 from autoforge.state import utcnow_iso  # noqa: E402
 from autoforge.validation import parse_issue_url  # noqa: E402
@@ -80,6 +86,11 @@ SHA_A = "a" * 40
 SHA_B = "b" * 40
 SHA_C = "c" * 40
 BRANCH = "autoforge/2-feature"
+# What a default routing's agent CLIs pass by prefix, whatever a key lists.
+PROVIDER_PREFIXES = tuple(
+    name.removesuffix("*")
+    for name in (*ClaudeCodeProvider.environment_names, *OpenCodeProvider.environment_names)
+)
 # A dummy Google API key (#282): ``AIza`` and 35 characters of the key's
 # alphabet, ``-`` and ``_`` among them. Built in pieces, so that no literal
 # key-shaped string stands in the repository for a secret scanner to flag;
@@ -2451,6 +2462,17 @@ def _one_shell_probe_per_answer(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_credential_looking_provider_name(monkeypatch):
+    """No warning on a name the shell running the suite holds under a provider's
+    prefix (#286), which every command says at load and ``doctor`` in a row:
+    an agent running the suite holds a ``CLAUDE_CODE_*`` token of its own. A test
+    of the warning sets the names it means."""
+    for name in list(os.environ):
+        if name.startswith(PROVIDER_PREFIXES) and credential_looking_word(name):
+            monkeypatch.delenv(name)
+
+
+@pytest.fixture(autouse=True)
 def _no_operator_opencode_data(monkeypatch, _isolation_root):
     """An OpenCode launch's organization check (#165) reads an empty data
     directory, not the developer's.
@@ -2798,6 +2820,15 @@ def assert_isolated_names(names) -> None:
         "ENV",
     ):
         assert name not in names, name
+
+
+def no_credential_looking_names(monkeypatch) -> None:
+    """Take every credential-looking name out of this process's environment, for
+    a test whose own broad prefix (``T*``) would read what the shell running it
+    holds under that letter (#286)."""
+    for name in list(os.environ):
+        if credential_looking_word(name):
+            monkeypatch.delenv(name)
 
 
 def launch_environment(eng, req) -> dict[str, str]:

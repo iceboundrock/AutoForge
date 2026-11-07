@@ -14947,6 +14947,28 @@ def test_a_name_listed_for_one_class_reaches_a_premerge_command_only_if_it_is_th
         assert "AF_FOR_AGENTS" not in probe.env_allowlist
 
 
+def test_an_agent_launch_is_refused_when_its_provider_passes_a_command_only_name(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """#286: a config that came through no load, with OpenCode's real names."""
+    monkeypatch.setenv("OPENAI_TEST_DATABASE_URL", "postgres-value")
+    cfg = default_config()
+    cfg.execution.command_env_allowlist_extra = ["OPENAI_TEST_DATABASE_URL"]
+    repo = git_repo(tmp_state_dir.parent)
+    _commit(repo, "a.txt", "1", "base")
+    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg, origin=True)
+    eng.step()
+    attempts = eng.state.attempt
+    eng.provider.environment_names = OpenCodeProvider.environment_names
+    with pytest.raises(ConfigurationError) as caught:
+        eng.step()
+    message = str(caught.value)
+    assert "refusing to launch" in message
+    assert "'OPENAI_TEST_DATABASE_URL' is for repository commands alone" in message
+    assert "'OPENAI_*'" in message and "postgres-value" not in message
+    assert eng.provider.calls == [] and eng.state.attempt == attempts
+
+
 def test_the_dry_run_plan_says_what_each_class_of_launch_is_given(tmp_state_dir, fake_github):
     cfg = default_config()
     cfg.execution.agent_env_allowlist_extra = ["FOR_AGENTS", "FOR_AGENTS_2"]

@@ -430,7 +430,8 @@ class Doctor:
         return CheckResult("launch environment", True, detail, required=False)
 
     def check_allowlist_entries(self) -> CheckResult:
-        """Warn on an allow-list entry that looks like it passes a credential (#286).
+        """Warn on an allow-list entry that looks like it passes a credential (#286),
+        a configured provider's own included.
 
         Never a failure: the rule goes by name, and what a name holds only
         the operator knows. Names only, as at config load.
@@ -438,14 +439,14 @@ class Doctor:
         name = "credential-looking allow-list entries"
         if self.config is None:
             return CheckResult.skip(name, "(config check failed)")
-        warnings = self.config.execution.environment_warnings(os.environ)
+        warnings = self.config.environment_warnings(os.environ)
         if warnings:
             return CheckResult(name, False, redact("; ".join(warnings)), required=False)
         return CheckResult(
             name,
             True,
-            "none: no entry names TOKEN, PAT, SECRET, PASSWORD or GITHUB, and no prefix passes "
-            "such a variable from this shell",
+            "none: no entry names TOKEN, PAT, SECRET, PASSWORD or GITHUB, and no prefix, a "
+            "configured provider's included, passes such a variable from this shell",
             required=False,
         )
 

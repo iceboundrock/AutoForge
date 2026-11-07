@@ -40,12 +40,12 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from . import __prompt_version__
-from .child_env import credential_looking_entry, refuse_forbidden_env
+from .child_env import credential_looking_entry, entry_covers, refuse_forbidden_env
 from .errors import ConfigurationError, SandboxPolicyError, ValidationDefinitionError
 from .evidence import SCOPE, check_definitions, check_scope
 from .executor import MAX_DEADLINE_SECONDS, is_env_pattern
@@ -232,6 +232,14 @@ ENV_ALLOWLIST_REACH = {
 }
 
 
+def _credential_warning(subject: str, what: str, reach: str) -> str:
+    """The line said of one allow-list entry that looks like it passes a credential."""
+    return (
+        f"{subject} {what} and reaches {reach}; AutoForge refuses only the names gh and git "
+        "read a credential from (docs/configuration.md, 'Agent environment')"
+    )
+
+
 @dataclass
 class LoopDetectionConfig:
     """``execution.loop_detection`` (#194): the mode and the thresholds.
@@ -313,6 +321,8 @@ class ExecutionConfig:
     # What one class of launch adds to those two (#286). Additive on purpose:
     # with the two above as what the classes share, any pair of environments
     # can be written, so no class needs a list that replaces the shared one.
+    # An entry something else would pass to the other class too is refused
+    # (:meth:`environment_overlap`).
     agent_env_allowlist_extra: list[str] = field(default_factory=list)
     command_env_allowlist_extra: list[str] = field(default_factory=list)
     # Where a REMOTE run's per-issue agent worktrees are created. Empty (the
@@ -352,12 +362,54 @@ class ExecutionConfig:
             for entry in getattr(self, key):
                 what = credential_looking_entry(entry, names)
                 if what:
-                    lines.append(
-                        f"execution.{key} entry {entry!r} {what} and reaches {reach}; "
-                        "AutoForge refuses only the names gh and git read a credential from "
-                        "(docs/configuration.md, 'Agent environment')"
-                    )
+                    subject = f"execution.{key} entry {entry!r}"
+                    lines.append(_credential_warning(subject, what, reach))
         return lines
+
+    def environment_overlap(self, providers: Mapping[str, Iterable[str]]) -> str:
+        """Why a name listed for one class of launch alone would reach the other; "" if none.
+
+        The lists add up, so a class's entry keeps nothing from the other class
+        when a broader entry there passes it too (``MY_DB`` for commands and
+        ``MY_*`` for every launch), and neither does a command's entry that a
+        provider's own name overlaps either way (``OPENAI_TEST_DB`` under
+        OpenCode's ``OPENAI_*``). ``providers`` maps a provider to the names it
+        adds to its agents. The same text in both classes is the operator saying
+        both; a narrower shared entry says so of what it covers, and leaves the
+        rest of a class's prefix to that class. Names only.
+        """
+        agents = self.agent_environment_names()
+        commands = self.command_environment_names()
+        both = "list the same entry for both classes"
+        for key, own, others, reach in (
+            ("command_env_allowlist_extra", "repository commands", agents, "every agent"),
+            ("agent_env_allowlist_extra", "agents", commands, "every repository command"),
+        ):
+            for entry in getattr(self, key):
+                if entry in others:
+                    continue
+                for broader in others:
+                    if entry_covers(broader, entry):
+                        return (
+                            f"execution.{key} entry {entry!r} is for {own} alone, but entry "
+                            f"{broader!r} also passes it to {reach}. Narrow {broader!r}, or "
+                            f"{both} (docs/configuration.md, 'Agent environment')"
+                        )
+        for entry in self.command_env_allowlist_extra:
+            if entry in agents:
+                continue
+            for provider, names in providers.items():
+                for name in names:
+                    if entry_covers(name, entry) or entry_covers(entry, name):
+                        return (
+                            f"execution.command_env_allowlist_extra entry {entry!r} is for "
+                            f"repository commands alone, but provider {provider}'s own {name!r} "
+                            "also passes such a variable to its agents, whatever this key says. "
+                            "Use a name no provider passes, route those profiles to another "
+                            f"provider, or {both} if agents may have it (docs/configuration.md, "
+                            "'Agent environment')"
+                        )
+        return ""
 
 
 # Paths whose contents define what the hosted checks actually run. See
@@ -798,6 +850,41 @@ class AutoForgeConfig:
         except KeyError:
             raise ConfigurationError(f"unknown execution profile {name!r}") from None
 
+    def environment_overlap(self) -> str:
+        """:meth:`ExecutionConfig.environment_overlap` for the providers of every
+        profile: any of them can launch, and which do is the run's routing."""
+        from .providers import configured_providers  # local import: providers depends on config
+
+        return self.execution.environment_overlap(
+            {p.name: names for p, names in configured_providers(self.profiles.values())}
+        )
+
+    def environment_warnings(self, environ_names: Iterable[str]) -> list[str]:
+        """:meth:`ExecutionConfig.environment_warnings`, and the same of what each
+        provider of a profile adds to its agents, which no key lists (#286).
+
+        A variable a CLI signs in with passes without a word
+        (:attr:`~autoforge.providers.AgentProvider.sign_in_names`), as a
+        provider's ``*_API_KEY`` does. Names only.
+        """
+        from .providers import configured_providers  # local import: providers depends on config
+
+        names = list(environ_names)
+        lines = self.execution.environment_warnings(names)
+        for provider, entries in configured_providers(self.profiles.values()):
+            held = [name for name in names if name not in provider.sign_in_names]
+            for entry in entries:
+                what = credential_looking_entry(entry, held)
+                if what:
+                    lines.append(
+                        _credential_warning(
+                            f"provider {provider.name}'s own entry {entry!r}",
+                            what,
+                            f"every {provider.name} agent",
+                        )
+                    )
+        return lines
+
     def agent_limits(self, profile: ProfileConfig) -> AgentLimits:
         """The limits ``profile``'s agent runs under, or ConfigurationError.
 
@@ -968,7 +1055,11 @@ def load_config_file(path: str | Path | None) -> AutoForgeConfig:
         raise ConfigurationError(f"cannot parse config {p}: {exc}") from exc
     if not isinstance(data, dict):
         raise ConfigurationError(f"config {p} must contain a mapping at top level")
-    return _merge_config(cfg, data, source=str(p))
+    merged = _merge_config(cfg, data, source=str(p))
+    problem = merged.environment_overlap()
+    if problem:
+        raise ConfigurationError(f"{p}: {problem}")
+    return merged
 
 
 def config_digest(cfg: AutoForgeConfig) -> str:

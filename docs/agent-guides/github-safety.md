@@ -1646,10 +1646,14 @@ never the boundary.
   any `execution` allow-list key or an adapter's
   `environment_names`, naming the variable and the rule and never a value.
   One check (`refuse_forbidden_env`), with no provider branch in the engine.
-  It refuses a one-character `*` prefix too (#286). A token under a name of
-  the operator's own passes it, and is warned about by its words at config
-  load and in `doctor` (`credential_looking_entry`), which is a heuristic and
-  no boundary.
+  A prefix is refused for what it covers, never for being short: `R*` can be
+  meant for `R_HOME`. A token under a name of the operator's own passes it, and
+  is warned about by its words at config load and in `doctor`
+  (`credential_looking_entry`, a provider's own prefix read like a key's),
+  which is a heuristic and no boundary. The class split is one (#286):
+  `ExecutionConfig.environment_overlap` refuses, at config load for every
+  profile's provider and before every agent launch for its own, a class's entry
+  that a broader entry or a provider's own names would pass to the other class.
 - **Variables the controller sets**, over the allow-listed environment, for
   one launch, from a directory it creates (`mkdtemp`, mode 0700) and removes
   when the launch ends:

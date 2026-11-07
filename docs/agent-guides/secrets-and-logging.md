@@ -237,8 +237,9 @@ What #165 adds reports names, never values:
   set by the controller, withheld from the current shell); the
   "GitHub remote" row redacts the URL it quotes;
 - the warning on a credential-looking allow-list entry (config load, `doctor`)
-  names the key, the entry and the variables of the shell it passes, and the
-  shell's values are not read;
+  names the key or provider, the entry and the variables of the shell it passes,
+  and the refusal of an entry that would reach the other class names the two
+  entries; the shell's values are not read;
 - each invocation's `request.json` records the names the controller set
   (`env_set`), never their values; the placeholder token and the temporary
   directory paths are not logged;

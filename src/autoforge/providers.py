@@ -217,7 +217,9 @@ environment (see executor.py): the engine passes the configured allow-list
 in :attr:`AgentRequest.env_allowlist` and each adapter adds the variables
 its own CLI reads (:attr:`AgentProvider.environment_names`), so the key of
 one provider is never handed to another. Neither list may name a GitHub or
-git credential route (:func:`autoforge.child_env.refuse_forbidden_env`),
+git credential route (:func:`autoforge.child_env.refuse_forbidden_env`), a
+name listed for repository commands alone may not be one an adapter's own
+names pass (:meth:`autoforge.config.ExecutionConfig.environment_overlap`),
 and the variables the controller sets for the launch
 (:attr:`AgentRequest.env`, #165) reach every process the adapter starts,
 with the adapter's own (:meth:`AgentProvider.integration_isolation`) over
@@ -258,7 +260,7 @@ import sqlite3
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -688,6 +690,10 @@ class AgentProvider:
     # authentication and configuration, added to the request's allow-list.
     # Names, never values: the executor selects them from the environment.
     environment_names: tuple[str, ...] = ()
+    # The credentials this CLI signs in to its model provider with, which its
+    # own names pass by design: the documented alternative to a stored login,
+    # so no warning is said of them on every run (#286).
+    sign_in_names: tuple[str, ...] = ()
     # The profile ``options`` keys this adapter reads. Any other key is a
     # configuration error naming the profile and this set, so a misspelled
     # knob cannot be a silent no-op. ``None`` leaves the keys unchecked; only
@@ -748,6 +754,10 @@ class AgentProvider:
         preflight, before a launch is charged, and :meth:`execute` calls it
         again before it launches. The base adapter has nothing to refuse.
         """
+
+    def own_names(self, profile: ProfileConfig | None) -> tuple[str, ...]:
+        """The variables this provider adds to the allow-list of ``profile``'s agents."""
+        return self.environment_names
 
     def launch_environment(self, env_allowlist: tuple[str, ...] | None) -> dict[str, str]:
         """The variables of the controller's environment a launch with
@@ -1227,6 +1237,7 @@ class ClaudeCodeProvider(AgentProvider):
     # model overrides the CLI reads; ``CLAUDE_CONFIG_DIR`` and the
     # ``CLAUDE_CODE_*`` feature switches.
     environment_names = ("ANTHROPIC_*", "CLAUDE_*")
+    sign_in_names = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
     option_keys = ("permission_mode", "output_format", "session_persistence")
     isolation_names = tuple(sorted(claude_isolation_env("", "")))
     path_names = ("CLAUDE_ENV_FILE", "CLAUDE_CODE_SHELL", "CLAUDE_CONFIG_DIR")
@@ -1845,6 +1856,8 @@ class OpenCodeProvider(AgentProvider):
     # routes to; a provider not listed here is added through
     # ``execution.agent_env_allowlist_extra``.
     environment_names = ("OPENCODE_*", "OPENAI_*", "ANTHROPIC_*", "GEMINI_*", "GOOGLE_*")
+    # Claude Code's, which ``ANTHROPIC_*`` passes here too when both are routed.
+    sign_in_names = ("ANTHROPIC_AUTH_TOKEN",)
     option_keys = ("output_format", "auto_approve")
     isolation_names = tuple(sorted(opencode_isolation_env("")))
     path_names = ("OPENCODE_CONFIG_DIR", "OPENCODE_DB")
@@ -2865,10 +2878,6 @@ class _SdkProvider(AgentProvider):
     def interaction_settings(self, profile: ProfileConfig) -> InteractionSettings | None:
         return interaction_settings(profile.options, f"profile {profile.name!r}")
 
-    def own_names(self, profile: ProfileConfig | None) -> tuple[str, ...]:
-        """The variables this provider adds to the allow-list: its credential."""
-        return self.environment_names
-
     # -- shared --------------------------------------------------------------
     def _refuse_launch(self) -> ConfigurationError:
         return ConfigurationError(
@@ -3119,6 +3128,26 @@ def provider_for(profile: ProfileConfig, runner: Runner | None = None) -> AgentP
     if cls is ScriptedProvider:
         return ScriptedProvider()
     return cls(runner=runner)
+
+
+def configured_providers(
+    profiles: Iterable[ProfileConfig],
+) -> list[tuple[AgentProvider, tuple[str, ...]]]:
+    """Each provider ``profiles`` route to, once, and the names it adds to their agents.
+
+    A profile whose provider cannot say (an unknown provider, options its
+    policy refuses) is passed over: a config may carry a profile a run never
+    reaches, and :func:`autoforge.config.validate_profile` refuses one it does.
+    """
+    found: dict[str, tuple[AgentProvider, list[str]]] = {}
+    for profile in profiles:
+        try:
+            provider = provider_for(profile)
+            names = provider.own_names(profile)
+        except ConfigurationError:
+            continue
+        found.setdefault(profile.provider, (provider, []))[1].extend(names)
+    return [(provider, tuple(dict.fromkeys(names))) for provider, names in found.values()]
 
 
 class ProviderRegistry:

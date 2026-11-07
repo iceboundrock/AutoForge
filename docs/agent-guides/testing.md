@@ -1104,10 +1104,16 @@ a stated reason it has none. The coverage that must keep working:
   that sets no class key keeps one list, and policy P holds the commands'
   names alone (`test_config.py`, `test_validation_evidence.py`,
   `test_review_certificate.py`)
-- a one-character prefix is refused, and a credential-looking entry warned about
-  by name with dummy names and no false positive on the default list or `PATH`:
-  at load (`test_config.py`, `test_cli.py`) and in a `WARN` row of `doctor`
-  (`test_doctor.py`)
+- a class's entry that a broader entry or a provider's real names would pass to
+  the other class refuses the config, whichever way the two overlap, and the
+  refusal fires exactly when the adapter would hand its CLI the name: at load
+  (`test_config.py`, `test_cli.py`), in `doctor`'s config row (`test_doctor.py`)
+  and before an agent launch (`test_engine.py`)
+- a credential-looking entry, or what a routed provider's own prefix passes, is
+  warned about by name with dummy names, never a value, and with no false positive
+  on the default list, `PATH` or `TOKENIZERS_PARALLELISM`: at load
+  (`test_config.py`, `test_cli.py`) and in a `WARN` row of `doctor`
+  (`test_doctor.py`); a short prefix that covers no forbidden name loads
 - with an operator environment that holds every route (tokens, `gh`
   configuration, a session bus, an SSH agent, askpass, git configuration
   from the environment, a global helper), a child gets none of them and

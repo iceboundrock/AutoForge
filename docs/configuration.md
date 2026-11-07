@@ -194,7 +194,7 @@ probe file it creates and removes there.
 | Section | What it controls | Where the behaviour is specified |
 |---|---|---|
 | top level | `version`, `state_dir` (default `.autoforge`), `prompt_version` (leave unset: it may only repeat the controller's built-in label, see [Validation](#validation-every-key-must-be-one-the-controller-reads)) | [State and recovery](agent-guides/state-and-recovery.md) |
-| `execution` | the default agent limits (`default_idle_timeout_seconds` 900, `default_max_runtime_seconds` unset), loop detection (`loop_detection`, mode `kill`; unset, `warn` on Pi and in `UPDATE_EPIC`), the wall-clock bound on controller-run commands (`command_timeout_seconds` 1800), `max_correction_attempts` (default 1), the launch environment allow-lists (`env_allowlist`, `env_allowlist_extra`, `agent_env_allowlist_extra`, `command_env_allowlist_extra`; a GitHub or git credential route is refused and a credential-looking name warned about, see [Agent environment](#agent-environment)), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
+| `execution` | the default agent limits (`default_idle_timeout_seconds` 900, `default_max_runtime_seconds` unset), loop detection (`loop_detection`, mode `kill`; unset, `warn` on Pi and in `UPDATE_EPIC`), the wall-clock bound on controller-run commands (`command_timeout_seconds` 1800), `max_correction_attempts` (default 1), the launch environment allow-lists (`env_allowlist`, `env_allowlist_extra`, `agent_env_allowlist_extra`, `command_env_allowlist_extra`; a GitHub or git credential route is refused, so is a name one class's key cannot keep from the other, and a credential-looking name is warned about, see [Agent environment](#agent-environment)), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
 | `safety` | the merge gate (`allow_merge`, default `false`), `protected_merge_paths` (default `.github/workflows/`), `required_checks` (default `ci`), `verify_check_definition` (default `true`); who authorizes a `FIX` acceptance comment (`acceptance_actions`: `off`, `approve` (default) or `auto`) | [GitHub safety](agent-guides/github-safety.md#merge-safety), [Running the remote workflow](usage.md#blocked-on-an-acceptance-action) |
 | `merge` | how the controller merges once the gate is open: `method` (default `squash`), `delete_branch` (default `false`; after a verified merge, delete the PR's head branch on GitHub only, never a local branch, see [Deleting the merged head branch](agent-guides/github-safety.md#deleting-the-merged-head-branch)), `max_verification_attempts` (default 5), `verification_commands` (argv lists, empty by default) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
 | `workflow` | loop bounds: `max_review_rounds` (20), `stagnation_identical_rounds` (2), `stagnation_unchanged_count_rounds` (3), `max_total_steps` (300); `epic_update_every` (1) | [Workflow](agent-guides/workflow.md#loop-bounds) |
@@ -702,9 +702,13 @@ below set on top:
 | `execution.agent_env_allowlist_extra` | every agent, of every profile and provider | empty |
 | `execution.command_env_allowlist_extra` | every `validation.commands` and `merge.verification_commands` entry | empty |
 
-An agent launch also gets the names its provider adapter adds; a repository
-command gets no provider's. A config that sets neither class key keeps one list
-for every launch, as it always did. To separate what you already list, keep
+An agent launch also gets the names its provider adapter adds, which no key
+can take away: `ANTHROPIC_*` and `CLAUDE_*` for Claude Code; `OPENCODE_*`,
+`OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*` and `GOOGLE_*` for OpenCode;
+`PI_CODING_AGENT_DIR`, `PI_OFFLINE`, `PI_SKIP_VERSION_CHECK` and `PI_TELEMETRY`
+for Pi; its one credential variable for an SDK provider. A repository command
+gets no provider's. A config that sets neither class key keeps one list for
+every launch, as it always did. To separate what you already list, keep
 what both classes need in the first two keys and move the rest:
 
 ```yaml
@@ -727,6 +731,28 @@ changes the validation policy
 ([What withdraws evidence](#candidate-validation)); moving one among the agents
 alone does not.
 
+**A class's entry stays out of the other class, or the config is refused.** The
+lists add up, so a class's entry keeps nothing from the other class if something
+else passes the same variable there. Config load fails, and an agent launch is
+refused, naming both entries and never a value, in two cases:
+
+- A broader `*` entry passes it to the other class: `MY_DB` in
+  `command_env_allowlist_extra` with `MY_*` in `env_allowlist_extra` or
+  `agent_env_allowlist_extra`, or `MY_KEY` in `agent_env_allowlist_extra` with
+  `MY_*` in `env_allowlist_extra` or `command_env_allowlist_extra`.
+- A provider passes a command's entry to its agents, whichever way the two
+  overlap. With OpenCode routed, `OPENAI_TEST_DATABASE_URL`, `OPENAI_TEST_*` and
+  `OPEN*` in `command_env_allowlist_extra` are refused, because of its
+  `OPENAI_*`. Every profile counts, the defaults included: `update_epic` is
+  OpenCode's unless you route it elsewhere.
+
+If both classes may have the variable, say so: the same entry in both class keys,
+or in `env_allowlist_extra`, loads. Otherwise use a name nothing else passes
+(`TEST_DATABASE_URL`), or route the profiles to a provider that does not pass it.
+A class's prefix over a narrower shared entry also loads (`MY_*` for commands,
+`MY_SHARED` in `env_allowlist_extra`): the shared key says that one name is for
+both, and the rest of the prefix stays the class's.
+
 **Names that cannot be allow-listed.** Config load fails, naming the entry
 and the rule and never a value, when any of these keys, or a provider
 adapter's own names, holds one of these or a `*` prefix that covers one (a
@@ -743,29 +769,41 @@ bare `*` included):
 | `NETRC` | where curl (8.16 and later), Python's `requests` and Go find the `.netrc` they take a password from |
 | `BASH_ENV`, `ENV`, `ZDOTDIR` | where a shell finds a startup file it runs before a command, which can export a credential |
 
-A `*` prefix of one character (`H*`) fails the same way: it names no tool,
-and passes whatever your shell holds under that letter
-(`HOMEBREW_GITHUB_API_TOKEN`). Two characters are accepted, because `GO*` and
-`PY*` name real tools.
+A `*` prefix is refused for what it covers, never for being short: `G*` fails
+because it covers `GH_TOKEN`, and `R*` loads, because it can be meant for `R_HOME`
+and `R_LIBS`. No length tells that from `H*` passing
+`HOMEBREW_GITHUB_API_TOKEN`, so such a prefix is warned about for what your shell
+holds under it, as below.
 
 **Names that look like a credential.** The rule above goes by name, so a token
 you forward under a name of your own (`MY_GITHUB_PAT`, say) is not refused, and
 reaches every launch its key reaches. A command warns on stderr when it loads
 the configuration, and `autoforge doctor` shows a `WARN` row
-("credential-looking allow-list entries"), naming the key and the entry and
-never a value, when either of these holds:
+("credential-looking allow-list entries"), naming the key or provider and the
+entry and never a value, when either of these holds:
 
-- the entry, or a prefix's text before the `*`, contains `TOKEN`, `SECRET`,
-  `PASSWORD` or `GITHUB`, or `PAT` as a word of its own, in any case
-  (`GITLAB_PAT` and `MY_TOKEN_*`, not `PATH`, `TOKENIZERS_PARALLELISM`);
+- the entry, or a prefix's text before the `*`, contains `TOKEN`, `PAT`,
+  `SECRET`, `PASSWORD` or `GITHUB`, anywhere in the name and in any case
+  (`MY_GITLABPAT`, `MY_TOKEN_*`, `TOKENIZED_ACCESS`);
 - a `*` prefix passes such a variable from the shell you run in (`MY_*` while
-  `MY_GITHUB_PAT` is set).
+  `MY_GITHUB_PAT` is set), a provider's own prefix included: with OpenCode routed,
+  `OPENAI_GITHUB_PAT` in your shell is warned about through its `OPENAI_*`, though
+  no key lists it.
+
+A few words hold those letters and say nothing of a credential, and are read past:
+`PATH`, `PATCH`, `PATTERN`, `COMPAT`, `SPATIAL`, `TOKENIZERS_PARALLELISM` and the
+token limits `MAX_TOKENS`, `MAX_OUTPUT_TOKENS`, `MAX_CONTEXT_TOKENS` and
+`MAX_THINKING_TOKENS`. The rest of the name still counts (`PYTHONPATH_TOKEN`).
 
 It is a warning, because only you know what a name holds, and nothing turns it
 off. A `*_API_KEY` is not one of the words: forwarding a provider's key to an
 agent is the documented way to give a provider its key, so such a name is your
-own to scope with `agent_env_allowlist_extra`. The words are a heuristic and
-recognise no token by its value: `MY_GH_KEY` passes without a word.
+own to scope with `agent_env_allowlist_extra`. For the same reason a variable a
+CLI signs in with draws no warning when a provider's own prefix passes it:
+`ANTHROPIC_AUTH_TOKEN` (Claude Code and OpenCode) and `CLAUDE_CODE_OAUTH_TOKEN`
+(Claude Code). Listed in a key, either is warned about like any other name. The
+words are a heuristic and recognise no token by its value: `MY_GH_KEY` passes
+without a word.
 
 Earlier versions forwarded `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK`, `GIT_SSH`,
 `GIT_SSH_COMMAND`, `GIT_CONFIG_GLOBAL`, `GH_TOKEN`, `GITHUB_TOKEN`,

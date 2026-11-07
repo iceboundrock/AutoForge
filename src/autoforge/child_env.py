@@ -25,8 +25,10 @@ of launch the same way.
 - **Names that only look like a credential** (:func:`credential_looking_entry`,
   #286). The rule above goes by name, so a token forwarded under a name of the
   operator's own passes it. Such an entry is warned about, not refused: a
-  warning can afford to be wrong. A one-character prefix (``H*``) is refused,
-  since it names no tool and passes whatever the shell holds under that letter.
+  warning can afford to be wrong. A short prefix is read the same way, by what
+  the shell holds under it: ``H*`` may pass ``HOMEBREW_GITHUB_API_TOKEN``, but
+  ``R*`` can be meant for ``R_HOME`` and ``R_LIBS``, and no length tells the
+  two apart.
 - **What the controller sets instead** (:func:`isolated_overrides`), over
   the allow-listed environment, for one launch:
 
@@ -176,12 +178,21 @@ FORBIDDEN_ENV_PREFIXES: dict[str, str] = {
 }
 
 # What makes a variable's name look like it holds a credential (#286), matched
-# upper-cased. ``PAT`` counts only as a word of its own, or ``PATH`` would match,
-# and ``TOKENIZERS_PARALLELISM`` is no token. A provider's ``*_API_KEY`` is
-# deliberately not here: forwarding one to an agent is the documented way to
-# give a provider its key, and a warning on every run of it would teach an
-# operator to ignore this one.
-_CREDENTIAL_LOOKING_RE = re.compile(r"TOKEN(?!IZ)|SECRET|PASSWORD|GITHUB|(?<![A-Z])PAT(?![A-Z])")
+# upper-cased anywhere in the name: an operator's own name needs no word
+# boundary (``MY_GITLABPAT``). A provider's ``*_API_KEY`` is deliberately not
+# here: forwarding one to an agent is the documented way to give a provider its
+# key, and a warning on every run of it would teach an operator to ignore this
+# one.
+_CREDENTIAL_LOOKING_RE = re.compile(r"TOKEN|PAT|SECRET|PASSWORD|GITHUB")
+# What holds one of those words and says nothing of a credential, taken out of
+# a name before it is read, so the rest of it still counts (``PYTHONPATH_TOKEN``).
+# Named one by one, and a guess at nothing else: ``TOKENIZED_ACCESS`` and
+# ``SPAT`` are warned about, since a warning can afford to be wrong. The token
+# limits are settings the agent CLIs read through their own prefixes.
+_NOT_CREDENTIAL_LOOKING_RE = re.compile(
+    r"PATH|PATCH|PATTERN|COMPAT|SPATIAL|TOKENIZERS_PARALLELISM"
+    r"|MAX_(?:OUTPUT_|CONTEXT_|THINKING_)?TOKENS"
+)
 
 # What the child's ``gh`` finds as its token. Not a credential, and not
 # shaped like one (the redactor leaves it alone); GitHub answers 401.
@@ -314,13 +325,6 @@ def refuse_forbidden_env(entries: Iterable[str], where: str) -> None:
     for entry in entries:
         hit = forbidden_env_entry(entry)
         if hit is None:
-            if entry.endswith("*") and len(entry) == 2:
-                raise ConfigurationError(
-                    f"{where}: environment entry {entry!r} is a one-character prefix: it names "
-                    "no tool and passes whatever this shell holds under that letter, a token "
-                    "under a name of your own included. Name the variables you need, or a "
-                    "longer prefix (docs/configuration.md, 'Agent environment')"
-                )
             continue
         variable, rule = hit
         what = f"is {rule}" if variable == entry else f"covers {variable}, which is {rule}"
@@ -332,9 +336,16 @@ def refuse_forbidden_env(entries: Iterable[str], where: str) -> None:
         )
 
 
+def entry_covers(broader: str, entry: str) -> bool:
+    """Whether allow-list entry ``broader`` passes every variable ``entry`` passes."""
+    if broader.endswith("*"):
+        return entry.removesuffix("*").startswith(broader[:-1])
+    return entry == broader
+
+
 def credential_looking_word(name: str) -> str:
     """The word that makes variable ``name`` look like a credential; "" if none."""
-    found = _CREDENTIAL_LOOKING_RE.search(name.upper())
+    found = _CREDENTIAL_LOOKING_RE.search(_NOT_CREDENTIAL_LOOKING_RE.sub(" ", name.upper()))
     return found.group() if found else ""
 
 
@@ -899,6 +910,7 @@ __all__ = [
     "child_shell",
     "credential_looking_entry",
     "credential_looking_word",
+    "entry_covers",
     "forbidden_env_entry",
     "git_config_problems",
     "isolated_overrides",

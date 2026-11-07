@@ -92,11 +92,13 @@ execution:
   # (what your tests read, kept from the agents). No GitHub or git credential
   # route may be listed in any of them (GH_TOKEN, GITHUB_TOKEN, GH_HOST,
   # GH_CONFIG_DIR, SSH_AUTH_SOCK, GIT_SSH*, GIT_ASKPASS, GIT_CONFIG_*,
-  # XDG_RUNTIME_DIR, BASH_ENV, ZDOTDIR and the like, or a `*` covering one),
-  # nor a one-character `*` prefix (`H*`): config load refuses it. An entry
-  # that looks like a credential (TOKEN, PAT, SECRET, PASSWORD, GITHUB, or a
-  # prefix passing such a variable from your shell) is warned about at load
-  # and in `doctor`. The controller sets an empty gh configuration, a git
+  # XDG_RUNTIME_DIR, BASH_ENV, ZDOTDIR and the like, or a `*` covering one):
+  # config load refuses it. It also refuses a class's entry that a broader
+  # entry, or a provider's own names (OpenCode's OPENAI_*), would pass to the
+  # other class; the same entry in both class keys is fine. An entry that looks
+  # like a credential (TOKEN, PAT, SECRET, PASSWORD, GITHUB, or a prefix,
+  # a provider's own included, passing such a variable from your shell) is
+  # warned about at load and in `doctor`. The controller sets an empty gh configuration, a git
   # identity copied from your global config, a reset of credential helpers
   # and a SHELL and zsh startup directory that load none of your startup
   # files on top, and makes every GitHub write itself; its own `git` / `gh`

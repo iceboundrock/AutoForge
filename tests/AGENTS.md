@@ -173,7 +173,9 @@ read it before adding tests for a listed area.
   runs with), OpenCode's data directory (where the organization check
   looks) and Claude Code's settings and global configuration (where its
   configuration check looks) at empty directories, so a test never reads
-  the operator's. The
+  the operator's, and take out any credential-looking name the shell holds
+  under a provider's prefix (a test of a broader prefix calls
+  `no_credential_looking_names`), so no warning (#286) reads it either. The
   probe runs the real `sh`, `bash` and `zsh`: a fake runner hands a request
   `is_shell_probe(req)` recognises to the real `execute`, as a fake runner
   does for nothing else, and a launch without a fake runner reuses the
