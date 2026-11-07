@@ -6,6 +6,7 @@ Resolve every finding from review round {{REVIEW_ROUND}} on the pull request
 below as commits in this worktree, and report one resolution per finding.
 You push nothing and create, edit or comment on no issue: the controller
 publishes the acceptance comment you ask for (when this run offers it),
+replaces this PR's description when you ask (when this run offers it),
 creates the follow-up issues you ask for, records the deferrals, pushes
 your commit to the PR branch and reads all of it back; the operator posts
 the operator actions you prepare, and the controller verifies them. Do not
@@ -29,12 +30,15 @@ before it is sent, in this order:
    that comment is on GitHub exactly as prepared; or, for the operator
    actions you ask for (see "Operator actions" below), it sends nothing at
    all until it has verified every one of them on its target issue;
-2. it creates each new follow-up issue you ask for, with your title and with
+2. it replaces this PR's description when you ask (see "PR description"
+   below), and sends nothing further until the description is on GitHub
+   exactly as prepared;
+3. it creates each new follow-up issue you ask for, with your title and with
    your body followed by its own reference to this PR and finding and the
    finding's follow-up marker;
-3. it appends the follow-up marker of each finding you defer to an issue
+4. it appends the follow-up marker of each finding you defer to an issue
    listed below to that issue's body;
-4. last, it pushes the exact commit you report to the PR branch, as a
+5. last, it pushes the exact commit you report to the PR branch, as a
    fast-forward checked against `{{REVIEWED_HEAD_SHA}}`.
 
 Before the first of these writes, the controller runs its configured
@@ -113,6 +117,12 @@ Operator comments the controller already verified for this PR:
 
 {{VERIFIED_OPERATOR_EVIDENCE}}
 
+## PR description
+
+{{PR_BODY_UPDATE}}
+
+## Evidence on other issues
+
 Content an acceptance criterion or a finding requires on *another* issue is
 evidenced only by an operator comment the controller verified. Never resolve
 such an obligation as `no_change_with_rationale` on an assertion: a ticked
@@ -164,6 +174,8 @@ existing comment.
      issue itself, and only when "Acceptance actions" above offers it.
    - `operator_acceptance`: the finding asks for text on other issues of
      this repository, and only when "Operator actions" above offers it.
+   - `pr_body_update`: the finding asks for a change to this PR's description
+     and needs no commit, and only when "PR description" above offers it.
 5. Run the relevant tests / lint / typecheck. Commit locally on the detached
    `HEAD`, with messages that reference the finding IDs. A commit message
    must not use a closing keyword (`close`, `fix`, `resolve` in any form)
@@ -179,9 +191,10 @@ existing comment.
 
 ## What published text may contain
 
-A new follow-up issue's `title` and `body`, an acceptance comment's `body`
-and an operator action's `body` are published on GitHub as you return them. Each is rejected, and
-you are asked to correct it, when it contains:
+A new follow-up issue's `title` and `body`, an acceptance comment's `body`,
+an operator action's `body` and a replacement PR description's `body` are
+published on GitHub as you return them. Each is rejected, and you are asked to
+correct it, when it contains:
 
 - an HTML comment opening a controller marker (`<!-- ai-` or
   `<!-- autoforge-`, in any spacing or case);
@@ -218,7 +231,10 @@ Emit exactly one block at the end of your final reply:
     {"finding_id": "R{{REVIEW_ROUND}}-F6", "resolution": "operator_acceptance",
      "rationale": "<why these notes resolve the finding>",
      "operator_acceptance": {"actions": [
-       {"kind": "related_issue_comment", "issue": 16, "body": "<Markdown body>"}]}}
+       {"kind": "related_issue_comment", "issue": 16, "body": "<Markdown body>"}]}},
+    {"finding_id": "R{{REVIEW_ROUND}}-F7", "resolution": "pr_body_update",
+     "rationale": "<why this description resolves the finding>",
+     "pr_body_update": {"body": "<the whole new description, Markdown>"}}
   ],
   "tests": ["<each test or check command you ran, with its outcome>"]
 }
@@ -242,7 +258,8 @@ Emit exactly one block at the end of your final reply:
   offers it. Only an `operator_acceptance` resolution carries an
   `operator_acceptance` object, only when "Operator actions" above offers
   it, and never in the same result as an `acceptance_action` (the F5 and F6
-  lines above are alternatives).
+  lines above are alternatives). Only a `pr_body_update` resolution carries a
+  `pr_body_update` object, only when "PR description" above offers it.
 - Bounds: a `rationale` is between {{MIN_RATIONALE_CHARS}} and
   {{MAX_FIX_RATIONALE_CHARS}} characters and may contain newlines and tabs but
   no other control character; `commit_sha`, when given, is a full

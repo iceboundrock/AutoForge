@@ -33,10 +33,12 @@ uv run autoforge status            # human summary
 uv run autoforge status --json     # machine-readable; `replan_journal` says whether the
                                    # raw `replan_transaction` beside it is readable,
                                    # `acceptance_actions` lists the acceptance actions,
-                                   # `operator_actions` the operator actions and
+                                   # `operator_actions` the operator actions,
+                                   # `pr_body_updates` the PR description updates and
                                    # `review_certificate_status` the review certificate
 uv run autoforge status --action A-0123456789abcdef   # the exact payload bytes of
-                                   # an acceptance action or an operator action (X-…)
+                                   # an acceptance action, an operator action (X-…)
+                                   # or a PR description update (B-…)
                                    # (exit 1 for an unknown id)
 
 uv run autoforge step              # exactly one phase step
@@ -900,6 +902,42 @@ handed `operator-evidence.md`, the operator comments verified for the round,
 and still judges whether they resolve the finding. `run` refuses to replace a
 `BLOCKED` or `FAILED` run that holds operator actions without `--force`; the
 comments stay on GitHub either way.
+
+### When a fix replaces the PR description
+
+A review can find that the code is right and the PR's description is not. The
+fixer has no GitHub credential, so it resolves such a finding as
+`pr_body_update` with the whole new description, and the controller replaces it
+(#423). The fixer gives only the text: the controller keeps `Closes #n` and its
+markers below it, and only ever edits the run's own PR. With
+`safety.pr_body_updates: auto`, the default, this happens during the `FIX` step,
+without a commit or a push when nothing else changed, and the next review round
+reads the new description at the same HEAD. With a commit too, the description
+is replaced first, and the commit is pushed only after it reads back exactly.
+
+The update applies only to the body the `FIX` step read when it began. A
+description edited after that is never written over or adopted:
+
+- **Edited while the fixer ran:** the run blocks (`effect-conflict`) with nothing
+  sent. `unblock` launches the fixer again over your text, or `unblock --rereview`
+  asks a fresh review to judge it.
+- **Edited after the plan was saved:** the run blocks (`effect-conflict`) naming
+  the action, the digest it expected and the payload's. Put the body back
+  (GitHub keeps its edit history) or set it to exactly the payload (`autoforge
+  status --action B-…`), then `unblock` and `resume`: no fixer runs. To keep your
+  edit, `unblock --decline-action B-…` runs the fixer again over it.
+
+An edit in the moment between the controller's last read and its write cannot be
+detected, because GitHub has no conditional update of a PR body; it is
+overwritten and stays in the PR's edit history.
+
+With `approve`, the step blocks (`acceptance-action`) with nothing sent, and
+`status` names the action, PR, findings, expected digest, payload and next
+commands. Then `unblock --approve-action B-…`, or set the body to exactly the
+payload yourself and `unblock`, or `unblock --decline-action B-…`; then `resume`.
+An unblock reason on its own moves nothing. `off` refuses the resolution: the
+fixer is told it is unavailable, and a finding only a new description can resolve
+makes it report `blocked`, as before.
 
 ### Taking over a PR another run owns
 

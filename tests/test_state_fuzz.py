@@ -403,13 +403,17 @@ WELL_FORMED_CHECKPOINTS = (
 
 _CHECKPOINT_REFUSALS = {
     # Protocol 13 has no such field: each is unknown (ADR 0009 D8 step 4).
+    "15": (
+        "state file has unknown field(s) 'local_pending_attempts', "
+        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '15'"
+    ),
     "14": (
         "state file has unknown field(s) 'local_pending_attempts', "
-        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '14'"
+        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '15'"
     ),
     "13": (
         "state file has unknown field(s) 'local_pending_attempts', "
-        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '14'"
+        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '15'"
     ),
     # An older label's LOCAL fields are dropped only when empty (D8 step 3).
     "12": (
@@ -442,6 +446,8 @@ def test_a_remote_state_carrying_a_well_formed_local_checkpoint_is_refused(
     tests/test_local.py::test_a_state_file_with_a_malformed_pending_checkpoint_is_refused
     """
     payload = dict(good_remote(), phase=phase.value, protocol_version=label)
+    if label != __protocol_version__:
+        del payload["pr_body_outcomes"]  # protocol 15's own field (#423)
     if phase is Phase.BLOCKED or phase is Phase.FAILED:
         payload["block_reason"] = "the run stopped on an unverified launch"
     state_dir = tmp_path / ".autoforge"

@@ -7,6 +7,12 @@
       "change": "The prompt label moves from `v15` to `v16`, which moves the settings digest and the digests that hold it",
       "why": "#440 changed the prompt: every agent is told to stop what it started before its final reply, and a Claude Code launch gets a section on what a pending background task does. Every arm runs Claude Code on one label, so what is compared does not move, and no threshold, task or other setting changes",
       "real_runs_before": "None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since"
+    },
+    {
+      "date": "2026-11-06",
+      "change": "The prompt label moves from `v16` to `v17` and the configuration gains `safety.pr_body_updates`, which moves the settings digest and the digests that hold it",
+      "why": "#423 changed the prompt and the setting: a FIX agent may ask the controller to replace the description of the run's own PR, on by default. Every arm runs one controller commit with one label and the same setting, so what is compared does not move, and no threshold, task or other setting changes",
+      "real_runs_before": "None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since"
     }
   ],
   "statistics": {

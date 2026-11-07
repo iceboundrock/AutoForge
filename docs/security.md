@@ -45,7 +45,8 @@ or under the outer sandbox.
   ([GitHub safety: agents hold no GitHub credential](agent-guides/github-safety.md#agents-hold-no-github-credential),
   [Configuration: agent environment](configuration.md#agent-environment))
 - **Every GitHub write is the controller's.** Pushes, the PR, review
-  comments, follow-up issues, EPIC updates and acceptance comments are
+  comments, follow-up issues, EPIC updates, acceptance comments and the
+  replacement of the run's own PR description are
   typed controller effects: journaled before they are sent, read back
   after, and reconciled with GitHub on resume instead of being repeated.
   Agents read GitHub through redacted, bounded files the controller wrote.

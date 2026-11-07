@@ -2136,6 +2136,28 @@ ACCEPTANCE_RATIONALE = (
 )
 
 
+PR_BODY_TEXT = (
+    "## Why\n\nThe manifest is rendered from the custom template, so the description of the "
+    "fallback no longer applies.\n\n## Validation\n\nRan `pytest`."
+)
+PR_BODY_RATIONALE = (
+    "The reviewed code already does what the issue asks; the PR description still describes "
+    "the behaviour it replaced."
+)
+
+
+def pr_body_update(
+    finding_id: str, text: str = PR_BODY_TEXT, rationale: str = PR_BODY_RATIONALE
+) -> dict:
+    """A request that the controller replace the run's PR description (K12, #423)."""
+    return {
+        "finding_id": finding_id,
+        "resolution": "pr_body_update",
+        "rationale": rationale,
+        "pr_body_update": {"body": text},
+    }
+
+
 def acceptance(
     finding_id: str, text: str = ACCEPTANCE_TEXT, rationale: str = ACCEPTANCE_RATIONALE
 ) -> dict:

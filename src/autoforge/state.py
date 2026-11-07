@@ -50,6 +50,7 @@ from .effects import (
     LAUNCH_LABELS,
     MAX_CONFLICT_REASON_CHARS,
     OPERATOR_ACTION_ID_RE,
+    PR_BODY_ACTION_ID_RE,
     PUBLISHING_PHASES,
     Binding,
     EffectKind,
@@ -61,12 +62,17 @@ from .evidence import EvidenceFields, RecordView, check_evidence
 from .loop_guard import validate_review_history
 from .provenance import ControllerIdentity, protocol_ranges, shown, shown_path
 from .replan_txn import LEGACY_JOURNAL_PROTOCOLS, legacy_journal_refusal
-from .result_parser import FINDING_ID_RE, MAX_FINDING_ID_CHARS, MAX_OPERATOR_ACTIONS_PER_FIX
+from .result_parser import (
+    FINDING_ID_RE,
+    MAX_FINDING_ID_CHARS,
+    MAX_FINDINGS_PER_REVIEW,
+    MAX_OPERATOR_ACTIONS_PER_FIX,
+)
 from .runlog import RUN_ID_RE, validate_run_id
 from .safefs import HardLinksUnavailable, ReadLimitExceeded, SafeRoot, entry_kind
 from .sandbox_pin import SandboxPin
 from .transitions import Phase, WorkflowMode
-from .validation import parse_comment_url, parse_issue_url, parse_pr_url
+from .validation import parse_comment_url, parse_issue_url, parse_pr_url, same_pr_url
 
 STATE_FILENAME = "state.json"
 LOGS_DIRNAME = "logs"
@@ -214,11 +220,17 @@ _PRE_PIN_PROTOCOL = "11"
 # save: it is loaded in every phase with them dropped, and relabelled.
 _PRE_LOCAL_REMOVAL_PROTOCOL = "12"
 # The label before the operator's takeover effect (K11, #414, ADR 0004
-# D9.4a). A protocol-13 file is this protocol's shape: no field changed, and
+# D9.4a). A protocol-13 file is protocol 14's shape: no field changed, and
 # its effect records hold no K11, which its controller could not plan. It is
 # loaded in every phase as it is, and relabelled; one that holds a K11
 # record is refused (:func:`_refuse_takeover_records`).
-_PREVIOUS_PROTOCOL = "13"
+_PRE_TAKEOVER_PROTOCOL = "13"
+# The label before a FIX could replace its own PR's description (K12, #423,
+# ADR 0004 D13.12). A protocol-14 file is this protocol's shape without the
+# PR body state: it is loaded in every phase with ``pr_body_outcomes: []``,
+# ``pr_body_source: null`` and ``pr_body_update: null``, and relabelled. An
+# older file that carries any of it is refused (:func:`_refuse_pr_body_state`).
+_PREVIOUS_PROTOCOL = "14"
 # Every label :meth:`AutoForgeState.from_dict` has a rule for: the current
 # one and each older one it migrates or refuses by its own rule. Any other
 # label is refused by :func:`protocol_support`'s classification before the
@@ -232,6 +244,7 @@ SUPPORTED_PROTOCOLS: frozenset[str] = frozenset(
         _PRE_OPERATOR_PROTOCOL,
         _PRE_PIN_PROTOCOL,
         _PRE_LOCAL_REMOVAL_PROTOCOL,
+        _PRE_TAKEOVER_PROTOCOL,
         _PREVIOUS_PROTOCOL,
         __protocol_version__,
     }
@@ -279,6 +292,11 @@ _OPERATOR_FIELDS = ("operator_comment_outcomes",)
 # The field protocol 12 added (#280): the sandbox mode the run is pinned to
 # (:mod:`autoforge.sandbox_pin`), ``{}`` when none is.
 _PIN_FIELDS = ("sandbox_pin",)
+# The field protocol 15 added (#423): the outcomes of this PR's K12 updates.
+# Protocol 15 also added the K12 effect kind, a FIX entry observation's
+# ``pr_body_sha256``, a FIX context resolution's ``pr_body_source`` and a
+# ``last_fix_resolutions`` entry's ``pr_body_update`` (:func:`_pr_body_state_in`).
+_PR_BODY_FIELDS = ("pr_body_outcomes",)
 # The twelve fields LOCAL mode wrote into every state file (ADR 0009 C2),
 # each with the value every REMOTE save wrote. Protocol 13 removed them with
 # LOCAL (#388, ADR 0009 D8): a file labelled 12 or older loads with each one
@@ -354,6 +372,35 @@ _OPERATOR_EVIDENCE_KEYS = (
     "evidence",
     "body_sha256",
     "payload_sha256",
+)
+# ``pr_body_outcomes`` (#423): what became of each K12 update of the current
+# PR. ``verified`` is a body read back byte for byte (``changed`` says whether
+# the plan differed from the body it found), ``declined`` an update the
+# operator declined, ``stale`` one the PR's revision left behind. Bounded like
+# ``acceptance_outcomes``, never dropping a decline of the round being fixed.
+PR_BODY_OUTCOMES = ("verified", "declined", "stale")
+MAX_PR_BODY_OUTCOMES = 64
+_PR_BODY_OUTCOME_KEYS = (
+    "action_id",
+    "round",
+    "finding_ids",
+    "outcome",
+    "at",
+    "base_sha256",
+    "body_sha256",
+    "changed",
+    "reason",
+)
+# A ``last_fix_resolutions`` entry's ``pr_body_update``: the receipt the next
+# reviewer is handed, what the controller verified and never a judgement of
+# the text. ``null`` on every other resolution.
+_PR_BODY_RECEIPT_KEYS = (
+    "action_id",
+    "pr_url",
+    "base_sha256",
+    "body_sha256",
+    "reviewed_head_sha",
+    "changed",
 )
 _HEX64_RE = re.compile(r"[0-9a-f]{64}")
 # The phases in which the persisted clean review is consumed by the merge
@@ -607,8 +654,9 @@ class AutoForgeState:
     # Resolutions reported by the last FIX round (verified by the controller).
     # A REMOTE entry also carries ``acceptance_comment_url``: the comment
     # the controller verified for an ``acceptance_action`` resolution, else
-    # "" (#211); and ``operator_evidence``: the operator comments verified
-    # for the finding in this round (#243), ``[]`` when none.
+    # "" (#211); ``operator_evidence``: the operator comments verified for the
+    # finding in this round (#243), ``[]`` when none; and ``pr_body_update``:
+    # the receipt of the K12 update that resolved it (#423), else null.
     last_fix_resolutions: list[dict] = field(default_factory=list)
     # The outcomes of the current PR's acceptance actions (#211), oldest
     # first: ``action_id``, ``round``, ``finding_id``, ``outcome``
@@ -618,6 +666,13 @@ class AutoForgeState:
     # prompt and by the FIX result check (a declined action is not
     # requested again in its round). Per PR, REMOTE only.
     acceptance_outcomes: list[dict] = field(default_factory=list)
+    # The outcomes of the current PR's K12 updates (#423), oldest first:
+    # ``action_id``, ``round``, ``finding_ids``, ``outcome`` (verified |
+    # declined | stale), ``at``, ``base_sha256``, ``body_sha256`` (the payload),
+    # ``changed`` and ``reason``. Read by ``status``, by the FIX prompt and by
+    # the FIX result check (a declined update is not requested again in its
+    # round). Per PR.
+    pr_body_outcomes: list[dict] = field(default_factory=list)
     # The outcomes of the current PR's operator actions (K10, #243), oldest
     # first: ``action_id``, ``round``, ``finding_id``, ``target`` (the issue
     # the comment is for), ``outcome`` (verified | declined | withdrawn |
@@ -915,6 +970,14 @@ class AutoForgeState:
         #   refused, unchanged, when one holds anything else
         #   (:func:`_drop_local_fields`). A protocol-13 or unlabelled file
         #   carrying one, even empty, is refused by the unknown-field check.
+        # - 14 -> 15: a FIX may replace the description of its own PR (K12,
+        #   #423). ``pr_body_outcomes``, a K12 effect record, a FIX entry
+        #   observation's ``pr_body_sha256``, a FIX context resolution's
+        #   ``pr_body_source`` and a ``last_fix_resolutions`` entry's
+        #   ``pr_body_update``. An older file has none of them and is loaded in
+        #   every phase with none (a FIX entry observed under protocol 14
+        #   therefore offers no update). An older file that carries any of
+        #   them is refused, never merged.
         written_by = str(data.get("controller_version", ""))
         legacy = isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS
         if legacy:
@@ -1032,6 +1095,7 @@ class AutoForgeState:
             _refuse_sandbox_pin(data, raw_protocol)
         elif raw_protocol not in (
             _PRE_LOCAL_REMOVAL_PROTOCOL,
+            _PRE_TAKEOVER_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1047,8 +1111,9 @@ class AutoForgeState:
             # Protocol 12, 13 and 14 write the same fields but LOCAL's
             # twelve, which step 3 below handles; protocol 14 adds an effect
             # kind (K11), which an older file is refused for carrying
-            # (:func:`_refuse_takeover_records`). Only a legacy label loads with no
-            # effect state (D13.2). Every
+            # (:func:`_refuse_takeover_records`), and protocol 15 the PR body
+            # state, required of its own files below. Only a legacy label
+            # loads with no effect state (D13.2). Every
             # protocol-7 save writes all four fields, so one that is absent
             # is a truncation or a hand edit, never "nothing planned": a
             # missing ``effect_records`` read as the empty default would let
@@ -1098,8 +1163,18 @@ class AutoForgeState:
                 "sandbox pin",
                 "not a run with none pinned",
             )
-        if raw_protocol != __protocol_version__:
-            # 13 -> 14 (#414): K11 is planned by this protocol only.
+        if raw_protocol == __protocol_version__:
+            # Every protocol-15 save writes it, ``[]`` included, so an absent
+            # one is a truncation or a hand edit: read as the empty default it
+            # would drop a declined update of the round and let it through.
+            _require_fields(
+                data, raw_protocol, _PR_BODY_FIELDS, "PR body update outcomes", "not a PR with none"
+            )
+        else:
+            # 14 -> 15 (#423): K12's state is written by this protocol only.
+            _refuse_pr_body_state(data, str(raw_protocol))
+        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
+            # 13 -> 14 (#414): K11 is planned from protocol 14 on.
             _refuse_takeover_records(data, str(raw_protocol))
         kwargs = dict(data)
         kwargs["phase"] = phase
@@ -1111,6 +1186,7 @@ class AutoForgeState:
             _PRE_OPERATOR_PROTOCOL,
             _PRE_PIN_PROTOCOL,
             _PRE_LOCAL_REMOVAL_PROTOCOL,
+            _PRE_TAKEOVER_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1120,12 +1196,17 @@ class AutoForgeState:
         if raw_protocol not in (
             _PRE_PIN_PROTOCOL,
             _PRE_LOCAL_REMOVAL_PROTOCOL,
+            _PRE_TAKEOVER_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
             # Before protocol 11 (#243): over the acceptance migration, so a
             # pre-8 file gains both.
             kwargs.update(_operator_migration(kwargs))
+        if raw_protocol != __protocol_version__:
+            # Before protocol 15 (#423): over the migrations above, so an older
+            # file gains every field a save of this protocol writes.
+            kwargs.update(_pr_body_migration(kwargs))
         if legacy:
             attempt = data.get("attempt", 0)
             if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt >= 1:
@@ -1134,9 +1215,9 @@ class AutoForgeState:
                 )
         # ADR 0009 D8's step 3, after every per-protocol rule above: LOCAL's
         # twelve fields leave a file labelled 12 or older, or refuse it. A
-        # protocol-13 or protocol-14 file is not asked: one that carries any
-        # of them is refused by the unknown-field check below.
-        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
+        # protocol-13, -14 or -15 file is not asked: one that carries any of
+        # them is refused by the unknown-field check below.
+        if raw_protocol not in (_PRE_TAKEOVER_PROTOCOL, _PREVIOUS_PROTOCOL, __protocol_version__):
             _drop_local_fields(kwargs, str(raw_protocol))
         # Unknown fields are corruption, not forward compatibility: at this
         # protocol version the controller knows every field it writes, so an
@@ -1227,6 +1308,7 @@ class AutoForgeState:
         _validate_unblock_history(state.unblock_history)
         # After the shapes it reads (last_fix_resolutions, unblock_history).
         _validate_acceptance_state(state)
+        _validate_pr_body_state(state)
         _validate_operator_state(state)
         _validate_config_fingerprint(state)
         _validate_sandbox_pin(state)
@@ -1352,16 +1434,36 @@ class AutoForgeState:
             kept.append(outcome)
         self.acceptance_outcomes = kept
 
+    def bound_pr_body_outcomes(self) -> None:
+        """Drop the oldest ``pr_body_outcomes`` past the bound, never an active decline (#423).
+
+        As :meth:`bound_acceptance_outcomes`: the round's declines are at most
+        :data:`MAX_DECLINES_PER_ROUND`, below the bound, so the bound holds.
+        """
+        excess = len(self.pr_body_outcomes) - MAX_PR_BODY_OUTCOMES
+        kept: list[dict] = []
+        for outcome in self.pr_body_outcomes:
+            active = outcome["outcome"] == "declined" and outcome["round"] == self.review_round
+            if excess > 0 and not active:
+                excess -= 1
+                continue
+            kept.append(outcome)
+        self.pr_body_outcomes = kept
+
     def round_declines(self) -> int:
-        """Declines of the round being fixed, K9's and K10's together (#243).
+        """Declines of the round being fixed, K9's, K10's and K12's together (#243, #423).
 
         The one bound on decline-driven relaunches
-        (:data:`MAX_DECLINES_PER_ROUND`) is shared by both kinds; a
+        (:data:`MAX_DECLINES_PER_ROUND`) is shared by the three kinds; a
         withdrawal is not a decline and is not counted.
         """
         return sum(
             1
-            for outcomes in (self.acceptance_outcomes, self.operator_comment_outcomes)
+            for outcomes in (
+                self.acceptance_outcomes,
+                self.operator_comment_outcomes,
+                self.pr_body_outcomes,
+            )
             for o in outcomes
             if o["outcome"] == "declined" and o["round"] == self.review_round
         )
@@ -1471,6 +1573,7 @@ class AutoForgeState:
         self.prior_findings = []
         self.last_fix_resolutions = []
         self.acceptance_outcomes = []
+        self.pr_body_outcomes = []
         self.operator_comment_outcomes = []
         self.review_history = []
         self.verification_failures = []
@@ -1675,6 +1778,72 @@ def _refuse_operator_state(data: dict, protocol: str) -> None:
             "operator-action state -- it is a hand edit or a foreign file, not an older "
             "controller's state"
         )
+
+
+def _pr_body_state_in(data: dict) -> list[str]:
+    """What of protocol 15's PR body state (#423) ``data`` carries, named.
+
+    The label decides, not the value: an older file that carries any of it at
+    all, even empty, was not written by the controller its label names.
+    """
+    found: list[str] = []
+    if "pr_body_outcomes" in data:
+        found.append("'pr_body_outcomes'")
+    records = data.get("effect_records")
+    if isinstance(records, list) and any(
+        isinstance(r, dict) and r.get("kind") == EffectKind.PR_BODY_UPDATE.value for r in records
+    ):
+        found.append("a 'pr_body_update' effect record")
+    observation = data.get("entry_observation")
+    if isinstance(observation, dict) and "pr_body_sha256" in observation:
+        found.append("'pr_body_sha256' in 'entry_observation'")
+    context = data.get("completion_context")
+    resolutions = context.get("resolutions") if isinstance(context, dict) else None
+    if isinstance(resolutions, list) and any(
+        isinstance(r, dict) and "pr_body_source" in r for r in resolutions
+    ):
+        found.append("'pr_body_source' in 'completion_context'")
+    last = data.get("last_fix_resolutions")
+    if isinstance(last, list) and any(isinstance(r, dict) and "pr_body_update" in r for r in last):
+        found.append("'pr_body_update' in 'last_fix_resolutions'")
+    return found
+
+
+def _refuse_pr_body_state(data: dict, protocol: str) -> None:
+    """A file labelled before protocol 15 never wrote PR body state (#423)."""
+    planted = _pr_body_state_in(data)
+    if planted:
+        raise StateError(
+            f"state file is labelled protocol_version {protocol!r}, which never wrote "
+            f"{', '.join(planted)}; refusing to load a file that carries protocol-15 PR body "
+            "state -- it is a hand edit or a foreign file, not an older controller's state"
+        )
+
+
+def _pr_body_migration(data: dict) -> dict:
+    """The fields of an older file as protocol 15 writes them (#423).
+
+    A FIX context resolution gains ``pr_body_source: null`` and a
+    ``last_fix_resolutions`` entry ``pr_body_update: null``: an older
+    controller never updated a PR body. Malformed values are passed through
+    for validation to refuse.
+    """
+    out: dict = {"pr_body_outcomes": []}
+    last = data.get("last_fix_resolutions")
+    if isinstance(last, list):
+        out["last_fix_resolutions"] = [
+            {**r, "pr_body_update": None} if isinstance(r, dict) else r for r in last
+        ]
+    context = data.get("completion_context")
+    if isinstance(context, dict) and isinstance(context.get("resolutions"), list):
+        out["completion_context"] = {
+            **context,
+            "resolutions": [
+                {**r, "pr_body_source": None} if isinstance(r, dict) else r
+                for r in context["resolutions"]
+            ],
+        }
+    return out
 
 
 def _operator_migration(data: dict) -> dict:
@@ -1958,7 +2127,7 @@ def _validate_operator_state(state: AutoForgeState) -> None:
                 raise StateError(f"{what} verifies action {action_id} on one comment twice")
             verified.add(key)
     declines: dict[int, int] = {}
-    for entry in (*state.acceptance_outcomes, *outcomes):
+    for entry in (*state.acceptance_outcomes, *state.pr_body_outcomes, *outcomes):
         if entry["outcome"] == "declined":
             declines[entry["round"]] = declines.get(entry["round"], 0) + 1
     for round_, count in declines.items():
@@ -1973,6 +2142,83 @@ def _validate_operator_state(state: AutoForgeState) -> None:
         if "operator_evidence" not in entry:
             raise StateError(f"{what} is missing")
         _validate_operator_evidence(state, entry["operator_evidence"], what)
+
+
+def _validate_pr_body_state(state: AutoForgeState) -> None:
+    """``pr_body_outcomes`` and ``pr_body_update`` (#423), strictly."""
+    outcomes = state.pr_body_outcomes
+    if not isinstance(outcomes, list) or not all(isinstance(o, dict) for o in outcomes):
+        raise StateError("state field 'pr_body_outcomes' must be a list of objects")
+    if len(outcomes) > MAX_PR_BODY_OUTCOMES:
+        raise StateError(
+            f"state field 'pr_body_outcomes' holds {len(outcomes)} entries, over "
+            f"{MAX_PR_BODY_OUTCOMES}"
+        )
+    for i, entry in enumerate(outcomes):
+        what = f"state field 'pr_body_outcomes'[{i}]"
+        if sorted(entry) != sorted(_PR_BODY_OUTCOME_KEYS):
+            raise StateError(f"{what} must hold exactly {', '.join(_PR_BODY_OUTCOME_KEYS)}")
+        _pr_body_action_id_field(entry["action_id"], f"{what}.action_id")
+        round_ = entry["round"]
+        if not isinstance(round_, int) or isinstance(round_, bool) or round_ < 1:
+            raise StateError(f"{what}.round must be an integer >= 1")
+        ids = entry["finding_ids"]
+        if not isinstance(ids, list) or not ids or len(ids) > MAX_FINDINGS_PER_REVIEW:
+            raise StateError(
+                f"{what}.finding_ids must name 1 to {MAX_FINDINGS_PER_REVIEW} findings"
+            )
+        for fid in ids:
+            match = (
+                FINDING_ID_RE.match(fid)
+                if isinstance(fid, str) and len(fid) <= MAX_FINDING_ID_CHARS
+                else None
+            )
+            if match is None or int(match.group("round")) != round_:
+                raise StateError(f"{what}.finding_ids must hold finding ids of its round")
+        if entry["outcome"] not in PR_BODY_OUTCOMES:
+            raise StateError(f"{what}.outcome must be one of {PR_BODY_OUTCOMES}")
+        if not isinstance(entry["at"], str) or not entry["at"]:
+            raise StateError(f"{what}.at must be a non-empty timestamp")
+        _digest_field(entry["base_sha256"], f"{what}.base_sha256", True)
+        _digest_field(entry["body_sha256"], f"{what}.body_sha256", True)
+        if entry["changed"] is not (entry["base_sha256"] != entry["body_sha256"]):
+            raise StateError(f"{what}.changed must say whether the two digests differ")
+        reason = entry["reason"]
+        if not isinstance(reason, str) or len(reason) > MAX_CONFLICT_REASON_CHARS:
+            raise StateError(
+                f"{what}.reason must be a string of at most {MAX_CONFLICT_REASON_CHARS} characters"
+            )
+    for i, entry in enumerate(state.last_fix_resolutions):
+        what = f"state field 'last_fix_resolutions'[{i}].pr_body_update"
+        if "pr_body_update" not in entry:
+            raise StateError(f"{what} is missing")
+        receipt = entry["pr_body_update"]
+        if (entry.get("resolution") == "pr_body_update") != (receipt is not None):
+            raise StateError(
+                f"{what} is set exactly when the finding is resolved by a PR body update"
+            )
+        if receipt is None:
+            continue
+        if not isinstance(receipt, dict) or sorted(receipt) != sorted(_PR_BODY_RECEIPT_KEYS):
+            raise StateError(f"{what} must hold exactly {', '.join(_PR_BODY_RECEIPT_KEYS)}")
+        _pr_body_action_id_field(receipt["action_id"], f"{what}.action_id")
+        _digest_field(receipt["base_sha256"], f"{what}.base_sha256", True)
+        _digest_field(receipt["body_sha256"], f"{what}.body_sha256", True)
+        if receipt["changed"] is not (receipt["base_sha256"] != receipt["body_sha256"]):
+            raise StateError(f"{what}.changed must say whether the two digests differ")
+        if not isinstance(receipt["reviewed_head_sha"], str) or not re.fullmatch(
+            r"[0-9a-f]{40}", receipt["reviewed_head_sha"]
+        ):
+            raise StateError(f"{what}.reviewed_head_sha must be a full commit SHA")
+        if not isinstance(receipt["pr_url"], str) or not same_pr_url(
+            receipt["pr_url"], state.current_pr_url
+        ):
+            raise StateError(f"{what}.pr_url must be the current PR")
+
+
+def _pr_body_action_id_field(value: object, what: str) -> None:
+    if not isinstance(value, str) or not PR_BODY_ACTION_ID_RE.match(value):
+        raise StateError(f"{what} must be an action id of the form B-<16 hex>")
 
 
 def _comment_url_field(state: AutoForgeState, value: object, what: str, required: bool) -> None:

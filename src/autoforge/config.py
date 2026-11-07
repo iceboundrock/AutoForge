@@ -323,6 +323,7 @@ DEFAULT_PROTECTED_MERGE_PATHS = (".github/workflows/",)
 SAFETY_KEYS = (
     "acceptance_actions",
     "allow_merge",
+    "pr_body_updates",
     "protected_merge_paths",
     "required_checks",
     "verify_check_definition",
@@ -335,6 +336,20 @@ DEFAULT_REQUIRED_CHECKS = ("ci",)
 # `safety.allow_merge` when no config file sets it.
 DEFAULT_ALLOW_MERGE_SOURCE = "built-in default"
 
+# `safety.pr_body_updates` (K12, #423): who authorizes the replacement of the
+# description of the run's own PR that a FIX agent may ask the controller for.
+# `off` refuses the resolution, `approve` holds it for the operator per action
+# id, `auto` publishes it during FIX. The default is `auto` because the same
+# agent text already becomes the same PR's description unattended at K2 and K7
+# (ADR 0004 K12): this is the owned PR only, with the controller's markers kept.
+PR_BODY_UPDATES_OFF = "off"
+PR_BODY_UPDATES_APPROVE = "approve"
+PR_BODY_UPDATES_AUTO = "auto"
+PR_BODY_UPDATE_POLICIES = (
+    PR_BODY_UPDATES_OFF,
+    PR_BODY_UPDATES_APPROVE,
+    PR_BODY_UPDATES_AUTO,
+)
 # `safety.acceptance_actions` (#211): whether a REMOTE fixer may resolve a
 # finding by asking the controller to publish an acceptance comment on the
 # run's own issue, and who authorizes that one write. `off` refuses the
@@ -407,6 +422,10 @@ class SafetyConfig:
     # value is recorded into the action when the FIX plan is saved, so a
     # later change never widens an authorization already persisted.
     acceptance_actions: str = ACCEPTANCE_ACTIONS_APPROVE
+    # Who authorizes a FIX agent's replacement of the description of the run's
+    # own PR (K12, #423). Recorded into the action when the FIX plan is saved,
+    # so a later change never widens an authorization already persisted.
+    pr_body_updates: str = PR_BODY_UPDATES_AUTO
 
     def protects(self, path: str) -> bool:
         """Whether ``path`` (a POSIX repo-relative path) is protected."""
@@ -1339,6 +1358,17 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                 f"{ACCEPTANCE_ACTION_POLICIES}, got {policy!r}"
             )
         base.safety.acceptance_actions = policy
+    if "pr_body_updates" in safety:
+        policy = safety["pr_body_updates"]
+        # As above: a bare `off` reads as false, and `true` names no policy.
+        if policy is False:
+            policy = PR_BODY_UPDATES_OFF
+        if not isinstance(policy, str) or policy not in PR_BODY_UPDATE_POLICIES:
+            raise ConfigurationError(
+                f"{source}: 'safety.pr_body_updates' must be one of "
+                f"{PR_BODY_UPDATE_POLICIES}, got {policy!r}"
+            )
+        base.safety.pr_body_updates = policy
     gh = _section(data, "github", source, GITHUB_KEYS)
     if "command" in gh:
         base.github.command = str(gh["command"])

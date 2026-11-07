@@ -35,6 +35,11 @@ High-priority coverage includes:
   an unblock `action`, a K9 record or an `acceptance_source` is refused,
   unchanged; each malformed outcome and recorded URL is refused; a new
   issue resets the outcomes
+- K12 state (#423, `tests/test_pr_body_update.py`): an older label carrying it
+  and a current file missing the field are refused, unchanged; a `FIX` entered
+  under protocol 14 offers no update; a saved plan whose payload, marker, target,
+  digests, authorization, `pr_body_source` or entry digest does not hold together
+  is refused at load; each malformed outcome and receipt is refused
 - operator-action state (#243, `tests/test_state.py`): every outcome
   round-trips under the current protocol; a protocol-10 file, a `FIX`
   plan included, loads in every phase migrated and is relabelled; an older
@@ -1428,6 +1433,17 @@ a stated reason it has none. The coverage that must keep working:
   generic per-kind effect tests run for K9, with its hold, approval and
   load rules; `status`, `status --json` and `status --action` show the
   action and its exact bytes
+- the PR body update (#423, ADR 0004 K12; `tests/test_pr_body_update.py`): the
+  offline repro of Forma PR #767 round 2 reaches `READY_FOR_MERGE` with no commit,
+  push or `BLOCKED`; a mixed fix replaces the description before it pushes; a body
+  already holding the payload sends no write and the next review can still raise
+  the finding; the parser's closed schema and bounds; every base that does not
+  qualify; a PR closed, merged, forked, moved or retargeted never written; an edit
+  during the fixer, after the plan and racing the write; refused and unknown write
+  outcomes, the attempt bound, and a failed read-back; `gh`'s sanitizer, with
+  digests of the exact bytes; each crash window completing from the journal with
+  one write and no fixer; `off`, `approve` and `auto`, approval, decline, and a
+  setting changed after the plan; K9 beside K12; dry-run, `status` and redaction
 - operator actions (#243, ADR 0004 K10; `tests/test_operator_actions.py`
   for the engine, unblock and `status --action`, K10 in
   `tests/test_effects.py`, the marker in `tests/test_claims.py`,

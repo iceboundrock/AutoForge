@@ -185,6 +185,7 @@ exhaustive by `test_every_error_class_is_mapped_explicitly`.
 | bounds | REPLAN_REEXECUTE's reducer | `blocked` | `replan-refused` |
 | bounds | UPDATE_EPIC's re-selection | `blocked` | `selection-rejected` |
 | K9 / K10 | FIX's prefix pass and drive | `blocked` | `acceptance-action`, `operator-actions` |
+| K12 (#423) | FIX's drive | `blocked` | `acceptance-action` while it awaits the operator, `effect-conflict` on a body or binding off the plan |
 | identity | entry reconciliations, plan completion, read-backs | `blocked` | `unjournaled-write`, `effect-conflict`, `claim-ambiguous`, `pr-owner` (#414), `default-branch`, `read-back-mismatch`, `fix-plan-refused`, `epic-roadmap` |
 | GitHub | a conclusive read that failed | `blocked` | `github-read-failed`, `github-checks-refused` (#291) |
 | merge gate | `READY_FOR_MERGE`, `MERGE` | `blocked` | `merge-inconclusive`, `pr-identity`, `pr-not-open`, `unreviewed-merge`, `merge-checks`, `merge-conflict`, `merge-not-ready`, `merge-write`, `premerge-verification`, `review-certificate`, `review-not-backed` |

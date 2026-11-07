@@ -3144,6 +3144,7 @@ def test_fix_the_controller_pushes_the_fixers_commit(tmp_state_dir):
             "commit_sha": "",
             "acceptance_comment_url": "",
             "operator_evidence": [],
+            "pr_body_update": None,
         }
     ]
     assert s.effect_records == [] and s.completion_context == {} and s.entry_observation == {}
@@ -3284,6 +3285,7 @@ def test_fix_entry_with_the_pr_retargeted_goes_to_review_without_a_fixer(tmp_sta
             "resolution": "fixed",
             "acceptance_comment_url": "",
             "operator_evidence": [],
+            "pr_body_update": None,
         }
     ]
     gh.prs[PR].base_ref = "release/1.x"
@@ -3367,6 +3369,7 @@ def test_fix_entry_with_the_base_rewritten_goes_to_review_without_a_fixer(tmp_st
             "resolution": "fixed",
             "acceptance_comment_url": "",
             "operator_evidence": [],
+            "pr_body_update": None,
         }
     ]
     gh.merge_base = MERGE_BASE_B
@@ -3803,6 +3806,7 @@ def test_fix_creates_the_follow_up_issue_the_fixer_asks_for(tmp_state_dir):
             "commit_sha": "",
             "acceptance_comment_url": "",
             "operator_evidence": [],
+            "pr_body_update": None,
         }
     ]
 
@@ -3882,6 +3886,7 @@ def test_fix_round_mixing_every_resolution_creates_appends_then_pushes(tmp_state
             "commit_sha": new[0],
             "acceptance_comment_url": "",
             "operator_evidence": [],
+            "pr_body_update": None,
         },
         {
             "finding_id": "R2-F2",
@@ -3891,6 +3896,7 @@ def test_fix_round_mixing_every_resolution_creates_appends_then_pushes(tmp_state
             "commit_sha": "",
             "acceptance_comment_url": "",
             "operator_evidence": [],
+            "pr_body_update": None,
         },
         {
             "finding_id": "R2-F3",
@@ -3900,6 +3906,7 @@ def test_fix_round_mixing_every_resolution_creates_appends_then_pushes(tmp_state
             "commit_sha": "",
             "acceptance_comment_url": "",
             "operator_evidence": [],
+            "pr_body_update": None,
         },
         {
             "finding_id": "R2-F4",
@@ -3909,6 +3916,7 @@ def test_fix_round_mixing_every_resolution_creates_appends_then_pushes(tmp_state
             "commit_sha": "",
             "acceptance_comment_url": "",
             "operator_evidence": [],
+            "pr_body_update": None,
         },
     ]
 
@@ -11013,6 +11021,7 @@ def _as_protocol_5(eng, *, attempt: int) -> None:
         "producer_validation_failure",
         "validation_override_seq",
         "operator_comment_outcomes",
+        "pr_body_outcomes",
         "sandbox_pin",
     ):
         data.pop(key, None)
@@ -11042,7 +11051,7 @@ def test_update_epic_legacy_reentry_adopts_the_agents_comment_and_asks_for_the_s
     assert "posted by an agent under the previous contract" in call.prompt
     assert _progress_posts(fake_github) == [] and len(fake_github.comments[EPIC]) == 1
     s = load_state(eng.paths.state_file)
-    assert s.current_issue_url == ISSUE3 and s.protocol_version == "14"
+    assert s.current_issue_url == ISSUE3 and s.protocol_version == "15"
     assert s.effect_records == []  # adopted with no record (D13.7)
 
 
@@ -16465,6 +16474,7 @@ def test_fix_acceptance_action_approved_is_published_then_the_fix_pushed(tmp_sta
             "commit_sha": "",
             "acceptance_comment_url": comment.url,
             "operator_evidence": [],
+            "pr_body_update": None,
         }
     ]
     [outcome] = s.acceptance_outcomes

@@ -75,6 +75,7 @@ from .redaction import MAX_GROWTH_FACTOR, redact
 from .replan_txn import MARKER_RE as REPLAN_MARKER_RE
 from .replan_txn import TRANSACTION_ID_RE, scan_replan_markers
 from .result_parser import (
+    AGENT_MARKER_OPEN_RE,
     FINDING_ID_RE,
     FIX_RESOLUTIONS,
     MAX_ACCEPTANCE_ACTIONS_PER_FIX,
@@ -89,6 +90,7 @@ from .result_parser import (
     Finding,
     ReviewResult,
     check_published_finding,
+    closes_other_issue,
     markdown_code_span,
     operator_markup_problem,
     published_markdown_problem,
@@ -98,6 +100,7 @@ from .result_parser import (
     validate_follow_up_title,
     validate_operator_comment_body,
     validate_pr_body,
+    validate_pr_body_update,
     validate_pr_title,
     validate_progress_text,
     validate_review_section,
@@ -122,7 +125,8 @@ MAX_TITLE_CHARS = 256
 # D2.4: the largest plan is FIX: one push, one follow-up effect per deferred
 # finding, and (#243) up to ``MAX_OPERATOR_ACTIONS_PER_FIX`` operator comments
 # for one more finding, so 49 K5/K6, 4 K10 and one K1 (54). A K9 plan (one
-# acceptance comment for one finding) is smaller.
+# acceptance comment for one finding) is smaller. K12 (#423) consumes a finding
+# of its own, so a plan holding it is within the same bound.
 MAX_EFFECTS_PER_PLAN = (MAX_FINDINGS_PER_REVIEW - 1) + MAX_OPERATOR_ACTIONS_PER_FIX + 1
 # The records a journal may hold: a REVIEW or FIX plan, and the operator's
 # takeover (K11, #414) appended to it as its last record (PR #460 R1-F1),
@@ -314,6 +318,55 @@ def replacement_pr_body(
     )
 
 
+def protected_pr_body_tail(body: str, issue_url: str, run_id: str) -> tuple[str, str]:
+    """K12 (#423): ``(tail, "")``, what a replacement of ``body`` must keep, or ``("", why)``.
+
+    The tail is the controller's: ``Closes #n``, the implementation marker
+    byte for byte, then every other controller marker the body holds, each
+    byte for byte and in its order (a replacement PR's transaction marker).
+    It is derived from the body the PR holds and from nothing an agent wrote,
+    so an agent can neither remove, repeat nor alter it.
+
+    ``why`` is set, and nothing may replace the body, unless the body carries
+    exactly one readable implementation marker, for this issue and naming this
+    run, and the ``Closes #n`` line of that issue. A closing reference to any
+    other issue refuses too: the controller will not drop it unasked, and the
+    agent's text may not restate it. So does a controller marker that never
+    closes, which cannot be kept byte for byte.
+    """
+    issue = parse_issue_url(issue_url)
+    found = scan(IMPLEMENTATION, body)
+    matches = list(IMPLEMENTATION.pattern.finditer(body))
+    if found.defects or len(found.claims) != 1 or len(matches) != 1:
+        return "", "it does not carry exactly one readable implementation marker"
+    claim = found.claims[0]
+    if claim.key != issue.identity:
+        return "", f"its implementation marker is for {claim.issue.canonical}, not this issue"
+    if claim.owner_run_id != run_id:
+        return "", "its implementation marker does not name this run"
+    closing = f"Closes #{issue.number}"
+    if not re.search(rf"(?m)^{re.escape(closing)}[ \t\r]*$", body):
+        return "", f"it does not carry the line {closing!r}"
+    if closes_other_issue(body, repository=issue.repository, issue_number=issue.number):
+        return "", "it holds a closing reference to another issue, which no replacement may drop"
+    marker = matches[0]
+    kept: list[str] = []
+    position = 0
+    while (opening := AGENT_MARKER_OPEN_RE.search(body, position)) is not None:
+        end = body.find("-->", opening.end())
+        if end < 0:
+            return "", "it holds a controller marker that never closes"
+        position = end + len("-->")
+        if opening.start() != marker.start():
+            kept.append(body[opening.start() : position])
+    return APPEND_SEPARATOR.join((closing, marker.group(0), *kept)), ""
+
+
+def pr_body_update_body(text: str, tail: str) -> str:
+    """K12's body: the agent's text, then the tail :func:`protected_pr_body_tail` derived."""
+    return f"{text}{APPEND_SEPARATOR}{tail}"
+
+
 def follow_up_reference(pr_url: str, finding_id: str) -> str:
     """The controller's line in a follow-up issue it creates: the PR and finding (#163)."""
     return f"Deferred from finding `{finding_id}` of {parse_pr_url(pr_url).canonical}."
@@ -454,6 +507,7 @@ class EffectKind(StrEnum):
     ACCEPTANCE_COMMENT = "acceptance_comment"  # K9 (#211)
     OPERATOR_COMMENT = "operator_comment"  # K10 (#243): operator-performed, never issued
     OWNER_TAKEOVER = "owner_takeover"  # K11 (#414): the operator's takeover of a PR
+    PR_BODY_UPDATE = "pr_body_update"  # K12 (#423): FIX replaces its own PR's description
 
 
 class Stage(StrEnum):
@@ -489,6 +543,7 @@ KIND_PHASES: Mapping[EffectKind, frozenset[Phase]] = {
     # ANALYZE_EXECUTE binds the PR it takes over; REVIEW and FIX take back the
     # PR they are bound to before their journaled plan completes (PR #460 R1-F1).
     EffectKind.OWNER_TAKEOVER: frozenset({Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX}),
+    EffectKind.PR_BODY_UPDATE: frozenset({Phase.FIX}),
 }
 
 # D13.3: the contract a launch ran under, recorded in every pre-launch save of
@@ -732,6 +787,21 @@ def _approved_action_id(value: object, what: str) -> None:
         _fail(what, "must be empty or an action id of the form A-<16 hex>")
 
 
+# K12 (#423): its own action id prefix and approval field, K9's authorization.
+PR_BODY_ACTION_ID_RE = re.compile(r"^B-[0-9a-f]{16}\Z")
+
+
+def _approved_pr_body_action_id(value: object, what: str) -> None:
+    text = _str(value, what, 32)
+    if text and not PR_BODY_ACTION_ID_RE.match(text):
+        _fail(what, "must be empty or an action id of the form B-<16 hex>")
+
+
+def _base_ref(value: object, what: str) -> None:
+    if not _str(value, what, MAX_OBSERVED_KEY_CHARS):
+        _fail(what, "must name the reviewed base branch")
+
+
 # K10 (#243): the action id prefix, distinct from K9's, so no K10 id ever
 # matches ``--approve-action``; why a target was allowed; and the evidence
 # class an observation records.
@@ -843,6 +913,21 @@ KIND_SPECS: Mapping[EffectKind, _KindSpec] = {
         payload={"body": _BODY},
         observed={"url": _pr_url},
         completion="body_equals_payload_marker_names_run",
+    ),
+    EffectKind.PR_BODY_UPDATE: _KindSpec(
+        identity={"pr_url": _pr_url, "marker": _marker_of(IMPLEMENTATION)},
+        target={"pr_url": _pr_url},
+        precondition={
+            "base_sha256": _digest,
+            "reviewed_head_sha": _sha,
+            "reviewed_base_ref": _base_ref,
+            "reviewed_merge_base_sha": _sha,
+            "authorization": _authorization,
+            "approved_action_id": _approved_pr_body_action_id,
+        },
+        payload={"body": _BODY},
+        observed={"url": _pr_url, "body_sha256": _digest},
+        completion="body_equals_payload_at_reviewed_binding",
     ),
     EffectKind.REVIEW_COMMENT: _KindSpec(
         identity={"pr_url": _pr_url, "marker": _marker_of(REVIEW)},
@@ -1196,9 +1281,12 @@ class EffectRecord:
                 f"effect record {self.position} ({self.kind.value} {self.action_id}) is "
                 "operator-performed; the controller never issues it"
             )
-        if self.kind == EffectKind.ACCEPTANCE_COMMENT and not self.authorized:
-            # The one write K9 makes needs its approval first (#211); the
-            # cross-check refuses the attempted record on load as well.
+        if (
+            self.kind in (EffectKind.ACCEPTANCE_COMMENT, EffectKind.PR_BODY_UPDATE)
+            and not self.authorized
+        ):
+            # The one write K9 or K12 makes needs its approval first (#211,
+            # #423); the cross-check refuses the attempted record on load too.
             raise StateError(f"effect record {self.position} is not authorized; not issued")
         return replace(self, stage=Stage.ATTEMPTED, attempts=self.attempts + 1)
 
@@ -1266,11 +1354,13 @@ class EffectRecord:
 
     @property
     def action_id(self) -> str:
-        """K9's ``A-`` or K10's ``X-`` action id, recomputed; "" for every other kind."""
+        """K9's ``A-``, K10's ``X-`` or K12's ``B-`` action id, recomputed; "" for another kind."""
         if self.kind == EffectKind.ACCEPTANCE_COMMENT:
             return acceptance_action_id(self.owner, self.identity, self.target, self.payload)
         if self.kind == EffectKind.OPERATOR_COMMENT:
             return operator_action_id(self.owner, self.identity, self.target, self.payload)
+        if self.kind == EffectKind.PR_BODY_UPDATE:
+            return pr_body_action_id(self.owner, self.identity, self.target, self.payload)
         return ""
 
     @property
@@ -1293,13 +1383,16 @@ class EffectRecord:
 
     @property
     def authorized(self) -> bool:
-        """K9: an approval of exactly this record's action id is recorded (#211)."""
+        """K9, K12: an approval of exactly this record's action id is recorded (#211, #423)."""
         approved = self.precondition.get("approved_action_id", "")
         return bool(approved) and approved == self.action_id
 
     def approving(self) -> EffectRecord:
-        """K9 approved by the operator: its recomputed action id recorded (#211)."""
-        if self.kind != EffectKind.ACCEPTANCE_COMMENT or self.stage != Stage.INTENDED:
+        """K9 or K12 approved by the operator: its recomputed action id recorded (#211, #423)."""
+        if (
+            self.kind not in (EffectKind.ACCEPTANCE_COMMENT, EffectKind.PR_BODY_UPDATE)
+            or self.stage != Stage.INTENDED
+        ):
             raise StateError(f"effect record {self.position} cannot be approved")
         record = replace(
             self, precondition={**self.precondition, "approved_action_id": self.action_id}
@@ -1490,6 +1583,60 @@ def _cross_owner_takeover(record: EffectRecord, what: str) -> None:
         _fail(what, "is observed on another PR than its target")
 
 
+def _cross_pr_body_update(record: EffectRecord, what: str) -> None:
+    """K12 (#423): the run's own PR, the agent's text, then exactly the controller's tail.
+
+    The body is split again rather than trusted, because a resumed write
+    publishes it with no agent result in between: the text gets the parser's
+    rules again, and what follows it may only be the closing block of the
+    identity's marker and further controller markers.
+    """
+    _same(record, what, (record.identity["pr_url"], record.target["pr_url"], "PR"))
+    if not _same_url(record.target["pr_url"], record.owner.pr_url, parse_pr_url):
+        _fail(what, "targets another PR than its owner's; K12 targets the run's own PR")
+    issue = parse_issue_url(record.owner.issue_url)
+    if not issue.same_repository(parse_pr_url(record.target["pr_url"]).repository):
+        _fail(what, "is in another repository than its owner's issue, which 'Closes #n' names")
+    claim = _marker_claim(IMPLEMENTATION, record.identity["marker"])
+    if claim.key != issue.identity:
+        _fail(what, "carries a marker for another issue than its owner's")
+    if claim.owner_run_id != record.owner.run_id:
+        _fail(what, "carries a marker that does not name its owner's run")
+    closing = f"Closes #{issue.number}{APPEND_SEPARATOR}{record.identity['marker']}"
+    text, separator, rest = record.body.partition(f"{APPEND_SEPARATOR}{closing}")
+    if not separator:
+        _fail(what, "has a payload body that does not hold the controller's closing block")
+    try:
+        if validate_pr_body_update(text) != text:
+            _fail(what, "has a replacement text that is not in the parser's stored form")
+    except ControlResultValidationError as exc:
+        _fail(what, f"has an invalid replacement text: {exc}")
+    while rest:
+        if not rest.startswith(APPEND_SEPARATOR):
+            _fail(what, "has a payload body with text after the controller's closing block")
+        rest = rest[len(APPEND_SEPARATOR) :]
+        end = rest.find("-->")
+        if AGENT_MARKER_OPEN_RE.match(rest) is None or end < 0:
+            _fail(what, "has a payload body with text after the controller's closing block")
+        rest = rest[end + len("-->") :]
+    found = scan(IMPLEMENTATION, record.body)
+    if found.defects or found.claims != (claim,):
+        _fail(what, "has a payload that does not carry exactly its identity's marker")
+    authorization = record.precondition["authorization"]
+    approved = record.precondition["approved_action_id"]
+    if approved and approved != record.action_id:
+        _fail(f"{what}.precondition.approved_action_id", "is not the record's action id")
+    if authorization == AUTHORIZATION_POLICY and not approved:
+        _fail(what, "is authorized by policy but records no approved action id")
+    if record.attempts and not approved:
+        _fail(what, "records an issued attempt without an approval of its action id")
+    if record.observed is not None:
+        if record.observed["url"] != record.target["pr_url"]:
+            _fail(what, "is observed on another PR than its target")
+        if record.observed["body_sha256"] != sha256_text(record.body):
+            _fail(what, "is observed with a body digest that is not its payload's")
+
+
 def _cross_review_comment(record: EffectRecord, what: str) -> None:
     _same(record, what, (record.identity["pr_url"], record.target["pr_url"], "PR"))
     if not _same_url(record.target["pr_url"], record.owner.pr_url, parse_pr_url):
@@ -1646,6 +1793,16 @@ def operator_action_id(owner: EffectOwner, identity: dict, target: dict, payload
     return "X-" + _action_digest(owner, identity, target, payload)
 
 
+def pr_body_action_id(owner: EffectOwner, identity: dict, target: dict, payload: dict) -> str:
+    """The id of one PR body update (K12, #423): ``B-`` and 16 hex digits.
+
+    Computed as :func:`acceptance_action_id` is, over the same four parts: it
+    names exactly these bytes on exactly this PR, for this run's FIX of it,
+    and is recomputed whenever it is shown or used, never read as authority.
+    """
+    return "B-" + _action_digest(owner, identity, target, payload)
+
+
 def _action_digest(owner: EffectOwner, identity: dict, target: dict, payload: dict) -> str:
     canonical = json.dumps(
         {
@@ -1796,6 +1953,7 @@ _CROSS_CHECKS: Mapping[EffectKind, Callable[[EffectRecord, str], None]] = {
     EffectKind.PROGRESS_COMMENT: _cross_progress_comment,
     EffectKind.ACCEPTANCE_COMMENT: _cross_acceptance_comment,
     EffectKind.OPERATOR_COMMENT: _cross_operator_comment,
+    EffectKind.PR_BODY_UPDATE: _cross_pr_body_update,
 }
 
 
@@ -1858,6 +2016,14 @@ def load_records(raw: object, binding: Binding) -> tuple[EffectRecord, ...]:
         # K10 is the plan's prefix (#243): nothing the controller sends
         # precedes an action the operator may still decline.
         _fail("effect_records", "plans an operator comment after another effect")
+    updates = [r.position for r in records if r.kind == EffectKind.PR_BODY_UPDATE]
+    if len(updates) > 1:
+        _fail("effect_records", "plans more than one PR body update")
+    if updates and updates[0] != len(acceptance) + len(operator):
+        # K12 right after the K9 or K10 prefix (#423): the one write that may
+        # still wait for an operator precedes every follow-up write and the
+        # push, so nothing that cannot be withdrawn goes out before it.
+        _fail("effect_records", "plans a PR body update after a follow-up write or the push")
     # By claim key, not marker text: GitHub names owners and repositories
     # case-insensitively, and the key folds that case.
     keys = [scan(OPERATOR_COMMENT, records[i].marker).claims[0].key for i in operator]
@@ -1953,7 +2119,11 @@ class EntryObservation:
     ``operator_targets`` (FIX only, #243) is the allowed set of K10 targets
     read at entry, or ``None`` when the run offers no operator action
     (``safety.acceptance_actions: off``, or an entry observed under protocol
-    10); it is stored only when set.
+    10); it is stored only when set. ``pr_body_sha256`` (FIX only, #423) is the
+    digest of the PR body as GitHub held it before the launch, when this entry
+    offers a K12 update of it, and "" when it does not; stored only when set.
+    It is what a replacement written from that body is bound to, so an edit
+    made while the fixer ran is never written over.
     """
 
     phase: Phase
@@ -1964,9 +2134,10 @@ class EntryObservation:
     objects: Mapping[str, str | None]
     prs: Mapping[str, str | None] = field(default_factory=dict)
     operator_targets: OperatorTargets | None = None
+    pr_body_sha256: str = ""
 
     _KEYS = ("phase", "issue_url", "pr_url", "refs", "base_sha", "objects")
-    _OPTIONAL_KEYS = ("prs", "operator_targets")
+    _OPTIONAL_KEYS = ("prs", "operator_targets", "pr_body_sha256")
 
     @classmethod
     def from_dict(cls, raw: object, binding: Binding) -> EntryObservation:
@@ -2022,6 +2193,12 @@ class EntryObservation:
                 pr_url and parse_pr_url(pr_url).number in targets.numbers
             ):
                 _fail(f"{what}.operator_targets", "allows the run's own issue or PR")
+        body_digest = ""
+        if "pr_body_sha256" in data:
+            if phase != Phase.FIX or not pr_url:
+                _fail(f"{what}.pr_body_sha256", "is recorded by a FIX entry of a PR only")
+            _digest(data["pr_body_sha256"], f"{what}.pr_body_sha256")
+            body_digest = data["pr_body_sha256"]
         return cls(
             phase,
             data["issue_url"],
@@ -2031,6 +2208,7 @@ class EntryObservation:
             dict(objects),
             dict(prs),
             targets,
+            body_digest,
         )
 
     def to_dict(self) -> dict:
@@ -2046,6 +2224,8 @@ class EntryObservation:
             data["prs"] = dict(self.prs)
         if self.operator_targets is not None:
             data["operator_targets"] = self.operator_targets.to_dict()
+        if self.pr_body_sha256:
+            data["pr_body_sha256"] = self.pr_body_sha256
         return data
 
 
@@ -2329,10 +2509,11 @@ class FixContext:
 
     ``follow_up_source`` names where a deferred finding's follow-up comes
     from (D4.6), ``acceptance_source`` the plan position of the K9 record
-    that publishes an ``acceptance_action`` finding's comment (#211), and
+    that publishes an ``acceptance_action`` finding's comment (#211),
     ``operator_sources`` the plan positions of the K10 records of an
-    ``operator_acceptance`` finding (#243); each is set exactly on the
-    resolutions of its kind.
+    ``operator_acceptance`` finding (#243), and ``pr_body_source`` the plan
+    position of the K12 record of a ``pr_body_update`` finding (#423); each is
+    set exactly on the resolutions of its kind.
     """
 
     issue_url: str
@@ -2349,6 +2530,7 @@ class FixContext:
         "follow_up_source",
         "acceptance_source",
         "operator_sources",
+        "pr_body_source",
     )
     _RESOLUTION_BOUND = (
         MAX_STORED_RATIONALE_CHARS
@@ -2358,7 +2540,8 @@ class FixContext:
         + 16
         + 16
         + (MAX_OPERATOR_ACTIONS_PER_FIX * 16)
-        + (7 * _KEY_OVERHEAD)
+        + 16
+        + (8 * _KEY_OVERHEAD)
     )
     STORED_BOUND = (
         2 * MAX_URL_CHARS + MAX_RESOLUTIONS_PER_FIX * _RESOLUTION_BOUND + (5 * _KEY_OVERHEAD)
@@ -2402,6 +2585,7 @@ class FixContext:
         cls._check_sources(resolutions, data["pr_url"], records, observation, what)
         cls._check_acceptance(resolutions, data["issue_url"], data["pr_url"], round_, records, what)
         cls._check_operator(resolutions, round_, records, observation, what)
+        cls._check_pr_body(resolutions, records, observation, what)
         return cls(data["issue_url"], data["pr_url"], round_, tuple(resolutions))
 
     @classmethod
@@ -2451,7 +2635,49 @@ class FixContext:
                 f"{what}.operator_sources",
                 "is set exactly when the finding is resolved by operator actions",
             )
+        body_source = data["pr_body_source"]
+        if body_source is not None:
+            _int(body_source, f"{what}.pr_body_source", 0, MAX_EFFECTS_PER_PLAN - 1)
+        if (resolution == "pr_body_update") != (body_source is not None):
+            _fail(
+                f"{what}.pr_body_source",
+                "is set exactly when the finding is resolved by a PR body update",
+            )
         return dict(data)
+
+    @staticmethod
+    def _check_pr_body(
+        resolutions: Sequence[dict],
+        records: Sequence[EffectRecord],
+        observation: EntryObservation | None,
+        what: str,
+    ) -> None:
+        """#423: each ``pr_body_update`` names the K12 record, and K12 is bound to the entry.
+
+        Several findings may share the one record; a record no finding names
+        is refused, and so is one whose base is not the body the FIX entry read
+        and offered to replace.
+        """
+        named: set[int] = set()
+        for resolution in resolutions:
+            source = resolution["pr_body_source"]
+            if source is None:
+                continue
+            label = f"{what} resolution for {resolution['finding_id']}"
+            if source >= len(records):
+                _fail(label, f"names plan position {source}, which the plan does not hold")
+            if records[source].kind != EffectKind.PR_BODY_UPDATE:
+                _fail(label, f"names effect {source}, which is not a PR body update")
+            named.add(source)
+        offered = observation.pr_body_sha256 if observation is not None else ""
+        for record in records:
+            if record.kind != EffectKind.PR_BODY_UPDATE:
+                continue
+            where = f"effect_records[{record.position}]"
+            if record.position not in named:
+                _fail(where, "is a PR body update no resolution of the context names")
+            if record.precondition["base_sha256"] != offered:
+                _fail(where, "is bound to another PR body than the one the FIX entry read")
 
     @staticmethod
     def _check_operator(
@@ -3144,6 +3370,60 @@ def decide_acceptance(
         )
         return Decision(Action.HOLD, reason=f"{record.describe()}: {issue_problem}; {sent}")
     return decision
+
+
+def decide_pr_body_update(record: EffectRecord, body_now: str, *, problem: str = "") -> Decision:
+    """K12 (#423) over the PR's exact body, the last read before any write.
+
+    ``problem`` says why the PR does not qualify now (closed, another target, a
+    fork, another holder of the marker, or a HEAD, base or merge base off the
+    reviewed binding); it is a conflict, written or not, and the engine routes
+    a moved revision to REVIEW. Otherwise:
+
+    - the body equals the payload: observed, whoever wrote it. The exact bytes
+      of a persisted plan are the plan's, so a lost reply, or an operator who
+      posted the payload instead of approving it, is settled by reading; a
+      plan whose payload equals its base sends nothing at all (the idempotent
+      case), which :attr:`EffectRecord.observed` alone cannot tell, so its
+      evidence compares the base digest with the body's;
+    - the body is still the base: the write is due, held until an approval of
+      this record's action id is recorded, and issued within the attempt
+      bound, so an issue that reached nothing is re-sent only over a body read
+      to be untouched, never blindly;
+    - anything else is a conflict naming the digests, never rebased or written
+      over: GitHub offers no conditional update of a body, and a human edit
+      outside the plan is not the controller's to adopt or discard.
+    """
+    terminal = _terminal(record)
+    if terminal is not None:
+        return terminal
+    if problem:
+        written = "the body is written, but " if body_now == record.body else ""
+        return Decision(Action.CONFLICT, reason=f"{record.describe()}: {written}{problem}")
+    if body_now == record.body:
+        return Decision(
+            Action.OBSERVE,
+            observed={"url": record.target["pr_url"], "body_sha256": sha256_text(body_now)},
+        )
+    digest = sha256_text(body_now)
+    if digest != record.precondition["base_sha256"]:
+        return Decision(
+            Action.CONFLICT,
+            reason=(
+                f"{record.describe()}: the PR body changed outside the plan: sha256 {digest}, "
+                f"where the plan expects {record.precondition['base_sha256']} or its payload "
+                f"{sha256_text(record.body)}; it is never written over or adopted"
+            ),
+        )
+    if not record.authorized:
+        return Decision(
+            Action.HOLD,
+            reason=(
+                f"{record.describe()}: action {record.action_id} awaits the operator's "
+                "approval; nothing was sent"
+            ),
+        )
+    return Decision(Action.ISSUE) if record.bound_left else _exhausted(record)
 
 
 @dataclass(frozen=True)

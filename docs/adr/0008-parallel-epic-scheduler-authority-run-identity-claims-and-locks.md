@@ -1216,6 +1216,7 @@ targets an object derived from its own issue:
 | K6 follow-up append | an issue handed over at entry as one of this PR's follow-ups |
 | K7 replacement PR | by the issue's replan transaction id |
 | K9 acceptance comment | the run's own issue |
+| K12 PR description (#423) | the bound PR, while its implementation marker names the run |
 | Replan close, its receipt and the compensating reopen | the issue's own source PR |
 
 K8 (the EPIC progress comment) and the roadmap splice run only in
