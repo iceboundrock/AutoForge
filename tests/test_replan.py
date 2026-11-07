@@ -3670,6 +3670,23 @@ def _url(number: int) -> str:
     return f"{PR}#issuecomment-{5000 + number}"
 
 
+def _notice(number: int, body: str, shown: int = 0) -> str:
+    """The line that ends a clipped body of round ``number``, with the newline before it."""
+    return (
+        f"\n[AutoForge omitted {len(body) - shown} of {len(body)} characters of this "
+        f"clipped comment; full text: {_url(number)}, also in pull-request.md of the "
+        "read context]"
+    )
+
+
+def _frames(bodies: list[str]) -> int:
+    """What the rounds take of the budget before any body: headers, notices, separators."""
+    return sum(
+        len(_header(number)) + len(_notice(number, body)) + len("\n\n")
+        for number, body in enumerate(bodies, 1)
+    )
+
+
 def _shown_chars(observation: str, number: int, body: str) -> int:
     """The characters of ``body`` an observation shows: its start, verbatim, then any notice."""
     text = observation.removeprefix(_header(number))
@@ -3677,12 +3694,16 @@ def _shown_chars(observation: str, number: int, body: str) -> int:
         return len(body)
     shown, notice = text.rsplit("\n", 1)
     assert body.startswith(shown)
-    assert notice == (
-        f"[AutoForge omitted {len(body) - len(shown)} of {len(body)} characters of this "
-        f"clipped comment; full text: {_url(number)}, also in pull-request.md of the "
-        "read context]"
-    )
+    assert "\n" + notice == _notice(number, body, len(shown))
     return len(shown)
+
+
+def _shown_per_round(data: HistoricalReviewData, bodies: list[str]) -> list[int]:
+    """What each round shows, for a history in which no round dropped out."""
+    return [
+        _shown_chars(observation, number, body)
+        for number, (observation, body) in enumerate(zip(data.observations, bodies, strict=True), 1)
+    ]
 
 
 def test_twelve_long_rounds_are_all_represented_within_the_budget():
@@ -3690,11 +3711,7 @@ def test_twelve_long_rounds_are_all_represented_within_the_budget():
     bodies = [f"round {number}: " + "x" * 4096 for number in range(1, 13)]
     data = _collect_comments(bodies)
     assert len(data.render_observations()) <= 24000
-    assert len(data.observations) == 12
-    shown = [
-        _shown_chars(observation, number, body)
-        for number, (observation, body) in enumerate(zip(data.observations, bodies, strict=True), 1)
-    ]
+    shown = _shown_per_round(data, bodies)
     assert min(shown) > 1500 and max(shown) < len(bodies[0])
     assert max(shown) - min(shown) < 12, "an equal share each, but for the division's remainder"
     assert data.recorded_finding_count == 12
@@ -3735,34 +3752,29 @@ def test_what_short_bodies_leave_goes_to_the_clipped_ones_newest_first():
     assert len(rendered) > 24000 - 2 * 200
 
 
-def test_sixteen_long_rounds_all_keep_a_body():
-    """What a floor of about 1,500 characters a round, frame included, leaves room for."""
-    bodies = [f"round {number}: " + "x" * 4096 for number in range(1, 17)]
+@pytest.mark.parametrize("count", [16, 20, 40])
+def test_every_round_of_a_long_history_shows_an_equal_part_of_its_comment(count):
+    """Twenty rounds is `hard_threshold`'s default. A floor of 1,200 characters a round
+    spent the budget on the newest fifteen and left the oldest five only their pointers."""
+    bodies = [f"round {number}: " + "x" * 4096 for number in range(1, count + 1)]
     data = _collect_comments(bodies)
     assert len(data.render_observations()) <= 24000
-    shown = [
-        _shown_chars(observation, number, body)
-        for number, (observation, body) in enumerate(zip(data.observations, bodies, strict=True), 1)
-    ]
-    assert len(shown) == 16 and min(shown) >= 1200
-
-
-def test_past_the_floor_the_newest_rounds_keep_their_share_and_the_oldest_their_pointer():
-    """Twenty rounds, `hard_threshold`'s default: an equal share would be under the
-    floor, so the newest rounds keep it and the oldest are left with where to read theirs."""
-    bodies = [f"round {number}: " + "x" * 4096 for number in range(1, 21)]
-    data = _collect_comments(bodies)
-    assert len(data.render_observations()) <= 24000
-    assert len(data.observations) == 20
-    shown = [
-        _shown_chars(observation, number, body)
-        for number, (observation, body) in enumerate(zip(data.observations, bodies, strict=True), 1)
-    ]
-    assert shown == sorted(shown), "the budget is filled newest first"
-    assert shown[-1] == 1200
-    assert shown[0] == 0
-    assert data.recorded_finding_count == 20
+    shown = _shown_per_round(data, bodies)
+    share = (24000 - _frames(bodies)) // count
+    assert share > 0
+    assert min(shown) == share and max(shown) < share + count
+    assert data.recorded_finding_count == count
     assert "fix 1" in data.render_findings()
+
+
+def test_a_character_each_is_enough_for_every_round_to_show_some_of_its_comment():
+    """Below that some round can only say where to read its comment, and the newest
+    rounds show what there is."""
+    bodies = ["x" * 4096] * 20
+    data = _collect_comments(bodies, max_comment_chars=_frames(bodies) + 20)
+    assert _shown_per_round(data, bodies) == [1] * 20
+    data = _collect_comments(bodies, max_comment_chars=_frames(bodies) + 19)
+    assert _shown_per_round(data, bodies) == [0] * 19 + [19]
 
 
 def test_only_rounds_with_a_comment_to_show_share_the_budget():
@@ -3783,13 +3795,15 @@ def test_only_rounds_with_a_comment_to_show_share_the_budget():
 @pytest.mark.parametrize(
     "rounds,chars", [(1, 30000), (2, 13000), (12, 4096), (20, 4096), (150, 400)]
 )
+@pytest.mark.parametrize("fill", ["x", "~"])
 def test_any_history_stays_within_the_budget_and_loses_its_oldest_rounds_first(
-    budget, rounds, chars
+    budget, rounds, chars, fill
 ):
     """Pointers alone can exceed the budget: `max_review_rounds` has no upper limit."""
-    bodies = ["x" * chars] * rounds
+    bodies = [fill * chars] * rounds
     data = _collect_comments(bodies, max_comment_chars=budget)
-    assert len("\n\n".join(data.observations)) <= budget
+    rendered = data.render_observations() if data.observations else ""
+    assert len(rendered) <= budget
     kept = len(data.observations)
     newest = range(rounds - kept + 1, rounds + 1)
     for number, observation in zip(newest, data.observations, strict=True):
@@ -3802,10 +3816,52 @@ def test_clipping_leaves_the_fence_escaping_as_it_was(run):
     """Bodies are cut before rendering escapes them, so a cut cannot leave a run behind."""
     data = _collect_comments([run] * 12)
     rendered = data.render_observations()
+    assert len(rendered) <= 24000
     assert not re.search(r"~{3,}", rendered)
     collected = "\n\n".join(data.observations)
     assert rendered == re.sub(r"~{3,}", lambda m: " ".join(m.group(0)), collected)
     assert rendered.count("[AutoForge omitted") == 12
+
+
+def test_the_budget_holds_for_what_the_escaping_renders():
+    """Measured before the escaping, these came to 23,998 characters and rendered to 44,299."""
+    bodies = ["~" * 4096] * 12
+    data = _collect_comments(bodies)
+    rendered = data.render_observations()
+    assert len(rendered) <= 24000
+    assert not re.search(r"~{3,}", rendered)
+    shown = _shown_per_round(data, bodies)
+    # A run of n tildes renders to 2n - 1 characters, so a share shows about half as many.
+    share = (24000 - _frames(bodies)) // 12
+    assert min(shown) == (share + 1) // 2
+    assert max(shown) - min(shown) < 12, "an equal share each, but for the division's remainder"
+
+
+def test_a_history_is_whole_only_if_it_fits_once_escaped():
+    room = 24000 - len(_header(1))
+    fits = ["x" * (room - 5) + "~~~"]  # the three tildes render to five characters
+    data = _collect_comments(fits)
+    assert data.observations == [_header(1) + fits[0]]
+    assert len(data.render_observations()) == 24000
+
+    over = ["x" * (room - 4) + "~~~"]  # as collected, this one is under the budget
+    assert len(_header(1) + over[0]) < 24000
+    data = _collect_comments(over)
+    assert _shown_chars(data.observations[0], 1, over[0]) < len(over[0])
+    assert len(data.render_observations()) <= 24000
+
+
+@pytest.mark.parametrize(
+    "allowance,shows", [(1, 1), (2, 2), (3, 2), (4, 2), (5, 3), (6, 3), (7, 4), (8, 4), (9, 5)]
+)
+def test_a_cut_shows_what_fits_once_escaped_and_no_more(allowance, shows):
+    """The third tilde of a run adds three characters and each later one two, so a
+    share can end short of a character, and then goes unused rather than over."""
+    bodies = ["~" * 1000]
+    budget = _frames(bodies) + allowance
+    data = _collect_comments(bodies, max_comment_chars=budget)
+    assert _shown_per_round(data, bodies) == [shows]
+    assert len(data.render_observations()) <= budget
 
 
 # =============================================================================

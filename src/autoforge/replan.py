@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from dataclasses import dataclass
 
 from .config import ReplanConfig
@@ -17,12 +18,6 @@ from .read_context import omission
 _TILDE_RUN_RE = re.compile(r"~{3,}")
 
 _OBSERVATION_SEPARATOR = "\n\n"
-
-# The least a review round's comment body is given when the bodies share the
-# budget. With its header and clip notice (about 300 characters) that is about
-# 1,500 of the budget, so sixteen rounds fit 24,000. With more, the newest rounds
-# keep this much and the oldest go without a body, not all with a sliver.
-_MIN_ROUND_BODY_CHARS = 1200
 
 
 @dataclass(frozen=True)
@@ -183,52 +178,70 @@ def _clip_notice(comment: CommentInfo, kept: int) -> str:
     )
 
 
+def _rendered_length(text: str) -> int:
+    """What ``text`` takes of the prompt: the fence escaping lengthens every run of tildes."""
+    return len(HistoricalReviewData._render_untrusted(text))
+
+
+def _longest_start_within(text: str, limit: int) -> int:
+    """How many characters of ``text`` render to at most ``limit``.
+
+    Rendering never shortens a text and one more character never renders shorter, so
+    the answer is searched for among the first ``limit`` characters. A share ending
+    inside a run can fall short of it: the run's third tilde adds three characters.
+    """
+    starts = range(1, min(len(text), limit) + 1)
+    return bisect_right(starts, limit, key=lambda n: _rendered_length(text[:n]))
+
+
 def _fit_round_comments(rounds: list[tuple[object, CommentInfo]], budget: int) -> list[str]:
     """Each round's comment as one observation, oldest first, ``budget`` characters in all.
 
-    Everything rendered counts against the budget: headers, separators and clip
-    notices. It is measured before the fence escaping, which can still lengthen a
-    body made of tilde runs.
+    The budget counts what the prompt will hold: headers, separators and clip
+    notices included, and all of it after the fence escaping, which nearly doubles
+    a body of tilde runs. The observations themselves stay unescaped, for
+    ``render_observations`` to escape.
 
     A history that fits is rendered whole. Otherwise each round first pays for its
     header and a notice, so that a round left without a body still says where its
-    comment is. The bodies then share what is left, newest first: each takes up to
-    an equal share, never less than ``_MIN_ROUND_BODY_CHARS`` while anything is
-    left, and what shorter bodies left over goes to the clipped ones, again newest
-    first. Only when the headers and notices alone do not fit do the oldest rounds
-    drop out entirely.
+    comment is. The bodies then take an equal share of what is left, however small,
+    so that every round shows some of its comment while there is a character for
+    each, and what shorter bodies left over goes to the clipped ones, newest first.
+    Only when the headers and notices alone do not fit do the oldest rounds drop out
+    entirely.
     """
     entries = [
         (f"Review round {number} comment ({comment.url}, untrusted data):\n", comment)
         for number, comment in rounds
     ]
     whole = [header + comment.body for header, comment in entries]
-    if len(_OBSERVATION_SEPARATOR.join(whole)) <= budget:
+    if _rendered_length(_OBSERVATION_SEPARATOR.join(whole)) <= budget:
         return whole
 
     remaining = budget
     fitting: list[tuple[str, CommentInfo]] = []
     for header, comment in reversed(entries):
-        frame = len(header) + len(_clip_notice(comment, 0)) + len(_OBSERVATION_SEPARATOR)
+        frame = _rendered_length(header + _clip_notice(comment, 0) + _OBSERVATION_SEPARATOR)
         if frame > remaining:
             break
         remaining -= frame
         fitting.append((header, comment))
+    if not fitting:
+        return []
 
-    share = max(_MIN_ROUND_BODY_CHARS, remaining // len(rounds))
-    kept = [0] * len(fitting)
-    for limit in (share, budget):
-        for index, (_, comment) in enumerate(fitting):
-            grown = min(limit, len(comment.body), kept[index] + remaining)
-            remaining -= grown - kept[index]
-            kept[index] = grown
+    lengths = [_rendered_length(comment.body) for _, comment in fitting]
+    allowed = [0] * len(fitting)
+    for limit in (remaining // len(fitting), budget):
+        for index, length in enumerate(lengths):
+            grown = min(limit, length, allowed[index] + remaining)
+            remaining -= grown - allowed[index]
+            allowed[index] = grown
 
-    observations = [
-        header
-        + comment.body[:shown]
-        + ("" if shown == len(comment.body) else _clip_notice(comment, shown))
-        for (header, comment), shown in zip(fitting, kept, strict=True)
-    ]
+    observations = []
+    for (header, comment), allowance in zip(fitting, allowed, strict=True):
+        shown = _longest_start_within(comment.body, allowance)
+        notice = "" if shown == len(comment.body) else _clip_notice(comment, shown)
+        observations.append(header + comment.body[:shown] + notice)
     return observations[::-1]
 
 
