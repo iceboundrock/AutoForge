@@ -5,6 +5,28 @@ so.
 
 ## Unreleased
 
+### A replacement agent sees every review round's comment, not only the oldest rounds' (#457)
+
+The review comment text in a `REPLAN_REEXECUTE` prompt came from one budget of
+24,000 characters, filled in round order, so on a long PR the newest rounds were
+the ones lost: a PR of 12 rounds showed rounds 1 to 7, with round 7 cut
+mid-sentence.
+
+Now the rounds share it. A history that fits is rendered as before. One that
+does not gives each round an equal share, however small (twenty long comments
+show about 880 characters each), and what short bodies leave goes to the clipped
+ones, newest first. A clipped body ends with a line that says how much was cut
+and where the full text is: the comment's URL, and `pull-request.md` of the read
+context. The oldest rounds drop out only when those lines alone overflow the
+budget.
+
+The 24,000 now counts everything the collector renders, headers and clip lines
+included, as the prompt holds it after the fence escaping, not only comment
+bodies. So bodies totalling just under it are clipped a little where they were
+whole before, and a body of tilde runs, which the escaping nearly doubles, shows
+about half as much as an ordinary one. Findings are rendered in full, as before.
+A replan already prepared keeps the text its journal recorded.
+
 ### A run drives only a PR whose marker names it; `unblock --take-over` hands one over (#414)
 
 A new state for an issue (a copied checkout, another `--state-dir`, an
