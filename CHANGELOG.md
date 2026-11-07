@@ -5,6 +5,26 @@ so.
 
 ## Unreleased
 
+### A procedure for the end-to-end demonstration, with none recorded yet (#261)
+
+[`docs/demo.md`](docs/demo.md) is the procedure behind Gate 3 of the Public
+Alpha. Gate 3 asks for one real run on a public repository, from an issue to
+a pull request a separate reviewer passed, published so that anyone can
+check what it claims. The page covers:
+
+- for each claim the write-up may make, the GitHub artifact and the trace
+  field that show it, and when a fix iteration may be claimed;
+- the containment a run needs while its agents read public text;
+- the `jq` commands that cut the published excerpts from `status --json` and
+  `events.jsonl`, leaving out local paths, prompts and agent output;
+- what the write-up holds, including the list of human actions;
+- how someone else reproduces the run on a fork.
+
+`tests/test_demo_guide.py` checks those commands against a scripted run with
+one fix iteration, so a renamed field fails a test rather than a published
+excerpt. No demonstration has been recorded, and nothing about a run of
+AutoForge changes.
+
 ### `status` says what a stop allows; `status --live` previews `unblock` (#374)
 
 `status` ends with a `Recovery` block, and `status --json` carries it as
