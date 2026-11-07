@@ -565,10 +565,11 @@ An amendment changes the files of section 1 and these digests in one reviewed ch
 **and states whether any real run had been made.** A record carries the digests it was made under, and a
 report refuses to decide over records of another, so criteria cannot move under results.
 
-- `manifest.json`: `c48935bdb7b4a6c4c88434b09ff4157eef4d39a2e5311c4a3aa9d146d5f5425a`
-- `preregistration.json`: `0c28918468a7aa37f3f787ea5c45881a36e440ea500617dc1c21ca93a65834d9`
-- `real_run_config.yaml`: `0d6b81feb25854df1ac6640770c56ebb04f8ed8637cb7d801faa7327516a1c5a`
+- `manifest.json`: `b3ec7000dc73ae8d6470fe5aae5b397aeafded5f26ad12f2411a69b78c30482a`
+- `preregistration.json`: `b91b82df76ebb6660b94406818b7116625ab81e0e15b11c9333fb54638f87970`
+- `real_run_config.yaml`: `6db28b126197b306b84766d7f311253bf20cfdcee639f9e84910948d06a5709c`
 
 | Date | Change | Why | Real runs before it |
 |---|---|---|---|
 | 2026-11-06 | The prompt label moves from `v15` to `v16`, which moves the settings digest and the digests that hold it. | #440 changed the prompt: every agent is told to stop what it started before its final reply, and a Claude Code launch gets a section on what a pending background task does. Every arm runs Claude Code on one label, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |
+| 2026-11-06 | The prompt label moves from `v16` to `v17` and the configuration gains `safety.pr_body_updates`, which moves the settings digest and the digests that hold it. | #423 changed the prompt and the setting: a FIX agent may ask the controller to replace the description of the run's own PR, on by default. Every arm runs one controller commit with one label and the same setting, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |

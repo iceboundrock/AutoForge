@@ -3955,6 +3955,7 @@ def _acceptance_context(source: int | None = 0, fid: str = "R1-F1") -> dict:
                 "follow_up_source": None,
                 "acceptance_source": source,
                 "operator_sources": None,
+                "pr_body_source": None,
             }
         ],
     }
@@ -4140,6 +4141,7 @@ def fix_resolution(
         "follow_up_source": follow_up,
         "acceptance_source": None,
         "operator_sources": operator,
+        "pr_body_source": None,
     }
 
 

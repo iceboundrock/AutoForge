@@ -112,6 +112,7 @@ FIX_RESOLUTIONS = (
     "no_change_with_rationale",
     "acceptance_action",
     "operator_acceptance",
+    "pr_body_update",
 )
 MIN_RATIONALE_CHARS = 40
 
@@ -226,6 +227,11 @@ ACCEPTANCE_ACTION_KEYS = ("kind", "body")
 ACCEPTANCE_TARGET_KEYS = ("url", "issue", "repository", "target", "method", "path", "command")
 MAX_ACCEPTANCE_BODY_CHARS = 60000
 MAX_ACCEPTANCE_ACTIONS_PER_FIX = 1
+# A ``pr_body_update`` resolution (K12, #423): the full replacement text of the
+# description of the run's own PR. A closed schema of one key, the text, under
+# the rules of a ``pr_body``: it names no PR, URL or method, and carries neither
+# the controller's ``Closes #n`` nor any marker, which the controller keeps.
+PR_BODY_UPDATE_KEYS = ("body",)
 # An ``operator_acceptance`` resolution (#243): 1 to
 # ``MAX_OPERATOR_ACTIONS_PER_FIX`` comments on *other* issues of the run's
 # repository that the operator posts and the controller only verifies (K10).
@@ -816,6 +822,18 @@ def _names_issue(m: re.Match[str], repository: str, issue_number: int) -> bool:
     return (m.group("number") or m.group("gh_number")) == number
 
 
+def closes_other_issue(text: str, *, repository: str, issue_number: int) -> bool:
+    """Whether ``text`` holds a closing reference to anything but that issue (#423).
+
+    GitHub reads the reference where it stands, so :data:`_CLOSING_REFERENCE_RE`
+    applies as it does to a commit message: code spans included, which fails
+    closed.
+    """
+    return any(
+        not _names_issue(m, repository, issue_number) for m in _CLOSING_REFERENCE_RE.finditer(text)
+    )
+
+
 def commit_message_problem(message: str, *, repository: str, issue_number: int) -> str | None:
     """Why commit ``message`` may not be published, or ``None`` (ADR 0004 D8.5).
 
@@ -934,6 +952,48 @@ def validate_pr_body(text: str, *, phase: str = "ANALYZE_EXECUTE") -> str:
     under the parser's rules.
     """
     return _pr_text(text, "pr_body", MAX_PR_BODY_CHARS, _multi_line, phase)
+
+
+def validate_pr_body_update(text: object, subject: str = "pr_body_update") -> str:
+    """``text`` as the agent's part of a K12 PR body (#423), or a rejection.
+
+    A ``pr_body``'s rules with the subject in the message: the text the
+    controller puts before ``Closes #n`` and the markers it keeps. The checks
+    :meth:`FindingResolution.from_payload` applies, so the agent's part of a
+    persisted K12 body can be re-validated. Surrounding whitespace is not part
+    of the stored form: it would make equal descriptions differ by bytes.
+    """
+    if not isinstance(text, str):
+        raise ControlResultValidationError(f"FIX: {subject} field 'body' must be a string")
+    return _pr_text(text.strip(), f"body of {subject}", MAX_PR_BODY_CHARS, _multi_line, "FIX")
+
+
+def _pr_body_update_text(raw: object, fid: str) -> str:
+    """The text of ``fid``'s ``pr_body_update`` object, or a rejection.
+
+    The object is a closed schema of one key. A key that would name a target
+    is refused by name, any other unknown key as unknown: nothing is ignored,
+    because an ignored ``url`` would read as a target the controller honoured.
+    """
+    if not isinstance(raw, dict):
+        raise ControlResultValidationError(
+            f"FIX: {fid} field 'pr_body_update' must be an object with body"
+        )
+    targets = sorted(k for k in raw if k in ACCEPTANCE_TARGET_KEYS)
+    if targets:
+        raise ControlResultValidationError(
+            f"FIX: {fid} pr_body_update carries {', '.join(repr(k) for k in targets)}; it names "
+            "no target, URL, method, path or command: the controller replaces the description "
+            "of the run's own PR. Remove the field and re-emit the CONTROL_RESULT."
+        )
+    unknown = sorted(str(k) for k in raw if k not in PR_BODY_UPDATE_KEYS)
+    if unknown:
+        raise ControlResultValidationError(
+            f"FIX: {fid} pr_body_update has unknown field(s) "
+            f"{', '.join(repr(k[:MAX_FINDING_ID_CHARS]) for k in unknown)}; it carries exactly "
+            "'body'"
+        )
+    return validate_pr_body_update(raw.get("body"), f"pr_body_update of {fid}")
 
 
 # Control characters a *multi-line* text field may still carry: a newline
@@ -1543,7 +1603,10 @@ class FindingResolution:
     and the rationale a ``no_change_with_rationale`` needs. An
     ``operator_acceptance`` resolution carries the comments the operator
     posts on other issues (``operator_actions``; the payload's
-    ``operator_acceptance`` object, #243) and a rationale too. ``commit_sha``
+    ``operator_acceptance`` object, #243) and a rationale too. A
+    ``pr_body_update`` resolution carries the full replacement text of the
+    description of the run's own PR (``pr_body_text``; the payload's
+    ``pr_body_update`` object, #423) and a rationale. ``commit_sha``
     is allowed on ``fixed`` only. ``to_dict`` keeps the persisted shape of
     ``state.last_fix_resolutions``.
     """
@@ -1557,6 +1620,7 @@ class FindingResolution:
     follow_up_body: str = ""
     acceptance_body: str = ""
     operator_actions: tuple[OperatorAction, ...] = ()
+    pr_body_text: str = ""
 
     @property
     def new_follow_up(self) -> bool:
@@ -1572,6 +1636,11 @@ class FindingResolution:
     def operator_acceptance(self) -> bool:
         """Comments the operator posts on other issues for this finding (#243)."""
         return self.resolution == "operator_acceptance"
+
+    @property
+    def pr_body_update(self) -> bool:
+        """A replacement of the description of the run's own PR for this finding (K12, #423)."""
+        return self.resolution == "pr_body_update"
 
     @classmethod
     def from_payload(cls, raw: object, index: int) -> FindingResolution:
@@ -1600,7 +1669,13 @@ class FindingResolution:
         commit_sha = _opt_sha(raw, "commit_sha", ph)
         action = raw.get("acceptance_action")
         operator = raw.get("operator_acceptance")
-        if res in ("no_change_with_rationale", "acceptance_action", "operator_acceptance"):
+        body_update = raw.get("pr_body_update")
+        if res in (
+            "no_change_with_rationale",
+            "acceptance_action",
+            "operator_acceptance",
+            "pr_body_update",
+        ):
             if len(rationale) < MIN_RATIONALE_CHARS:
                 raise ControlResultValidationError(
                     f"{ph}: {fid} uses {res} but the rationale is missing "
@@ -1613,6 +1688,10 @@ class FindingResolution:
         if res != "operator_acceptance" and operator is not None:
             raise ControlResultValidationError(
                 f"{ph}: {fid} carries an operator_acceptance but resolution is {res!r}"
+            )
+        if res != "pr_body_update" and body_update is not None:
+            raise ControlResultValidationError(
+                f"{ph}: {fid} carries a pr_body_update but resolution is {res!r}"
             )
         if res != "follow_up_created":
             if follow_up or new_issue is not None:
@@ -1655,6 +1734,14 @@ class FindingResolution:
                     "'operator_acceptance' object with 'actions'"
                 )
             operator_actions = _operator_actions(operator, fid)
+        pr_body_text = ""
+        if res == "pr_body_update":
+            if body_update is None:
+                raise ControlResultValidationError(
+                    f"{ph}: {fid} uses pr_body_update and must carry a 'pr_body_update' object "
+                    "with body"
+                )
+            pr_body_text = _pr_body_update_text(body_update, fid)
         return cls(
             finding_id=fid,
             resolution=res,
@@ -1665,6 +1752,7 @@ class FindingResolution:
             follow_up_body=body,
             acceptance_body=acceptance,
             operator_actions=operator_actions,
+            pr_body_text=pr_body_text,
         )
 
     def to_dict(self) -> dict:
@@ -1691,6 +1779,11 @@ class FixResult:
     head_sha: str
     resolutions: list[FindingResolution] = field(default_factory=list)
     tests: list[str] = field(default_factory=list)
+
+    @property
+    def pr_body_text(self) -> str:
+        """The one replacement description of this result, "" when it asks for none (#423)."""
+        return next((r.pr_body_text for r in self.resolutions if r.pr_body_update), "")
 
     @classmethod
     def from_payload(cls, p: dict) -> FixResult:
@@ -1725,6 +1818,18 @@ class FixResult:
                 f"{ph}: the operator_acceptance resolutions request {requested} actions; the "
                 f"controller accepts at most {MAX_OPERATOR_ACTIONS_PER_FIX} per FIX result. "
                 "Re-emit the CONTROL_RESULT with fewer."
+            )
+        # One replacement per result (#423): a description is one whole text,
+        # so two findings asking for it must ask for the same bytes. The
+        # controller never chooses between them or composes one from both.
+        bodies = {r.pr_body_text for r in resolutions if r.pr_body_update}
+        if len(bodies) > 1:
+            named = ", ".join(r.finding_id for r in resolutions if r.pr_body_update)
+            raise ControlResultValidationError(
+                f"{ph}: the pr_body_update resolutions of {named} carry different text; a FIX "
+                "result replaces the PR description once, so each must carry the same complete "
+                "body. Write one description that resolves them all and re-emit the "
+                "CONTROL_RESULT."
             )
         tests = _opt_str_list(p, "tests", ph)
         if len(tests) > MAX_TESTS_REPORTED:

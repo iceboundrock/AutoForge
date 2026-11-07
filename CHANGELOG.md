@@ -5,6 +5,35 @@ so.
 
 ## Unreleased
 
+### A fix can replace a stale PR description, with no commit and no `BLOCKED` (#423)
+
+A review could find that the code was right and the PR's description was not,
+and the fixer, which holds no GitHub credential, had no way to resolve that: the
+run blocked and someone edited the description by hand. A `FIX` agent can now
+resolve such a finding as `pr_body_update` with the whole new description. The
+controller replaces the description of the run's own PR, reads it back byte for
+byte, and returns to review; with nothing else to do it makes no commit and no
+push. It keeps `Closes #n` and its markers above the agent's text, where nothing
+the text leaves open can reach them, and the agent names no target. It replaces
+only a description the fixer was shown whole: a very long one, one the read
+context redacts or one it could not read is not offered.
+
+**The default is on.** `safety.pr_body_updates` is `auto`; set `approve` to decide
+each one (`unblock --approve-action B-...`), or `off` to keep the old behaviour.
+`status`, `status --json` (`pr_body_updates`) and `status --action B-...` show it.
+
+A description edited outside the plan is never written over or adopted, also
+after the controller verified its write: the run blocks before it pushes or
+records the fix, and says how to go on. An edit in the moment between the
+controller's last read and its write cannot be seen, because GitHub has no
+conditional update of a PR body; it is overwritten and stays in the PR's edit
+history.
+
+State protocol 15 and prompt `v17`. Older state files load and are relabelled on
+their next save, and a `FIX` already entered offers no update. A file an older
+controller is asked to read is refused by its label, so upgrade every controller
+of a run together. See [ADR 0004 K12](docs/adr/0004-authority-boundary-and-typed-external-effects.md).
+
 ### A replacement agent sees every review round's comment, not only the oldest rounds' (#457)
 
 The review comment text in a `REPLAN_REEXECUTE` prompt came from one budget of

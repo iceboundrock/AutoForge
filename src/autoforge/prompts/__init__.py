@@ -41,6 +41,7 @@ TEMPLATE_FILES = (
     # The FIX prompt's acceptance_action resolution (#211), rendered into
     # fix.md's {{ACCEPTANCE_ACTIONS}} when safety.acceptance_actions offers it.
     "acceptance_actions.md",
+    "pr_body_update.md",
     # The FIX prompt's operator_acceptance resolution (#243), rendered into
     # fix.md's {{OPERATOR_ACTIONS}} when the entry recorded allowed targets.
     "operator_acceptance.md",

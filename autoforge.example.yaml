@@ -194,6 +194,14 @@ safety:
   # each on GitHub. `off` refuses that resolution; `approve` and `auto` both
   # offer it.
   acceptance_actions: approve
+  # Who authorizes a FIX agent's replacement of the description of the run's
+  # own PR when a review finding says it is stale (#423). `auto` (the default)
+  # replaces it during FIX: the same agent's text already becomes that PR's
+  # description unattended when the PR is opened, and the controller keeps
+  # `Closes #n` and its markers. `approve` blocks for
+  # `autoforge unblock --approve-action B-...`; `off` refuses the resolution.
+  # Recorded with the action, so changing it later never widens one on disk.
+  pr_body_updates: auto
 
 merge:
   # How the CONTROLLER merges once the gate above is open. Agents never merge:

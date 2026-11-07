@@ -554,7 +554,7 @@ def test_a_state_a_newer_controller_wrote_since_the_admission_is_refused_unchang
     to_ready(w)
     args = w.admit()
     data = json.loads(w.ns.state_file.read_text(encoding="utf-8"))
-    data.update(protocol_version="15", phase="A_PHASE_OF_PROTOCOL_15")
+    data.update(protocol_version="16", phase="A_PHASE_OF_PROTOCOL_16")
     w.ns.state_file.write_text(json.dumps(data), encoding="utf-8")
     capsys.readouterr()
     before = w.tree()
@@ -562,7 +562,7 @@ def test_a_state_a_newer_controller_wrote_since_the_admission_is_refused_unchang
     assert w.run(args) == 2
     err = capsys.readouterr().err
     assert (
-        "unsupported protocol_version '15' (controller speaks '14'): a newer AutoForge wrote it"
+        "unsupported protocol_version '16' (controller speaks '15'): a newer AutoForge wrote it"
     ) in err
     assert f"imported from {os.path.abspath(autoforge.__file__)}" in err
     assert w.tree() == before and len(w.provider.calls) == calls

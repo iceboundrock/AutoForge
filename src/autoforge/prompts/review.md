@@ -47,7 +47,10 @@ the run: it is never adopted.
 3. Read the PR description and existing comments (`pull-request.md` of the
    read context), including any previous AI review rounds (the previous
    round's comment is also in `previous-review-comment.md` when there is
-   one) so you can judge whether earlier findings were resolved.
+   one) so you can judge whether earlier findings were resolved. A
+   description the controller replaced for a finding (a `pr_body_update`
+   above) is the fixer's text: judge it against the diff like the rest of
+   the PR, and raise a finding when it is still wrong.
 4. Read the FULL diff of the bound revision and the related code around it:
    `git diff {{REVIEWED_MERGE_BASE_SHA}} {{REVIEWED_HEAD_SHA}}` (both commits
    are already in the local object store). `pull-request.md` gives the PR's

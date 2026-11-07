@@ -544,9 +544,11 @@ def test_unknown_safety_keys_are_rejected_not_ignored(tmp_path, body):
     message = str(info.value)
     unknown = [k for k in ("allow_merges", "allowMerge", "protected_paths") if k in body]
     assert all(k in message for k in unknown)
-    assert "allow_merge, protected_merge_paths, required_checks, verify_check_definition" in (
-        message
-    )  # known keys named
+    known = (
+        "allow_merge, pr_body_updates, protected_merge_paths, required_checks, "
+        "verify_check_definition"
+    )
+    assert known in message  # known keys named
 
 
 def test_unknown_safety_key_rejected_in_yaml_too(tmp_path):
