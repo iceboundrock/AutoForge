@@ -21,6 +21,7 @@ from autoforge.read_context import (
     OperatorEvidence,
     ReadContext,
     bounded,
+    pr_body_view_problem,
     render_checks,
     render_checks_refused,
     render_comments,
@@ -366,3 +367,61 @@ def test_a_long_current_body_is_cut_with_a_marker():
     assert (
         f"[AutoForge omitted 9 of {MAX_COMMENT_CHARS + 9} characters of comment {COMMENT}]" in text
     )
+
+
+def _pr_with_body(body: str) -> PRInfo:
+    return PRInfo(
+        number=7,
+        url="https://github.com/owner/repo/pull/7",
+        state="OPEN",
+        head_sha="a" * 40,
+        head_ref="feature",
+        base_ref="main",
+        title="A change",
+        body=body,
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        ("A description.\n\n```\nits own fence\n```\n", ""),
+        ("x" * MAX_BODY_CHARS, ""),
+        ("x" * (MAX_BODY_CHARS + 1), f"the read context quotes {MAX_BODY_CHARS}"),
+        (f"A pasted {TOKEN} here.", "redacts part of it"),
+    ],
+    ids=["quoted", "at-the-bound", "over-the-bound", "redacted"],
+)
+def test_a_pr_body_is_shown_only_when_the_file_quotes_it_unchanged(body, reason):
+    """#423: the comparison is of the file as rendered, and its reason names no byte."""
+    problem = pr_body_view_problem(body, render_pr(_pr_with_body(body), []))
+    assert (reason in problem) if reason else problem == ""
+    assert TOKEN not in problem
+
+
+def test_a_pr_body_a_file_bound_cut_is_not_shown():
+    """Bounds the renderer does not know of count too: it is the file as written."""
+    body = "x" * 1000
+    context = ReadContext()
+    for n in range(3):
+        context.add(f"big-{n}.md", "fills the directory", "y" * MAX_FILE_CHARS)
+    context.add(
+        "rest.md", "fills the directory", "y" * (MAX_TOTAL_CHARS - 3 * MAX_FILE_CHARS - 500)
+    )
+    context.add("pull-request.md", "the PR", render_pr(_pr_with_body(body), []))
+    problem = pr_body_view_problem(body, context.files["pull-request.md"])
+    assert "cut it" in problem
+    assert pr_body_view_problem(body, render_pr(_pr_with_body(body), [])) == ""
+
+
+def test_a_comment_quoting_a_body_that_was_cut_does_not_pass_for_it():
+    """A copy short enough for a comment is short enough for the body's own quote."""
+    body = "x" * (MAX_COMMENT_CHARS + 1)
+    comment = CommentInfo(
+        id=1,
+        url="https://github.com/owner/repo/pull/7#issuecomment-1",
+        author="someone",
+        body=body,
+    )
+    cut = render_pr(_pr_with_body("x" * (MAX_BODY_CHARS + 1)), [comment])
+    assert pr_body_view_problem(body, cut)

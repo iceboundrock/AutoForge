@@ -818,6 +818,23 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   reimplement is the operator's decision). A PR that another PR answers
   for, or that cannot be read conclusively, refuses; a transient GitHub
   failure propagates and decides nothing.
+- **A PR body update awaiting the operator, or in conflict** (#423, ADR 0004
+  K12). `--approve-action B-...` -> `FIX`, with the approval on the record,
+  refused as stale when the PR left the reviewed revision and refused when the
+  body is off the plan; the write then happens with no fixer. `--decline-action
+  B-...` drops the plan and -> `FIX`, which launches the fixer afresh with the
+  decline in its prompt; the worktree keeps its commits. It is refused while a K9
+  or K10 ahead of the update is not `observed`, since the drop would forget a
+  comment on GitHub that no save holds: `FIX`'s prefix pass settles that record
+  first, or the operator declines it, which drops the update with the plan. A
+  plain `unblock` ->
+  `FIX` only when the body holds the exact payload, or the base under an
+  authorized record, and otherwise refuses: its reason is not evidence and a
+  human edit is not adopted. When the PR moved, a plain `unblock` -> `FIX` routes
+  the drift to `REVIEW`, the update recorded `stale`. A body edited after the
+  update was verified is read again here too: only the exact payload lets a plain
+  `unblock` -> `FIX`, and a decline is refused once a later write of the plan may
+  be out.
 - **An acceptance action awaiting the operator** (#211). A `FIX` plan's
   acceptance comment (K9, first in the plan) that is unapproved under
   `safety.acceptance_actions: approve` blocks the run with nothing sent.

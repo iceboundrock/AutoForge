@@ -22,9 +22,10 @@ Every kind of the closed set (ADR 0004 D5.1) has one operation here:
 :class:`PushOp` (K1), :class:`ImplementationPrOp` (K2), :class:`AdoptPrOp`
 (K3), :class:`ReviewCommentOp` (K4), :class:`FollowUpIssueOp` (K5),
 :class:`FollowUpAppendOp` (K6), :class:`ReplacementPrOp` (K7),
-:class:`ProgressCommentOp` (K8), :class:`AcceptanceCommentOp` (K9) and
-:class:`OperatorCommentOp` (K10). A K9
-write may also be *held* (``Action.HOLD``, #211): nothing is sent until the
+:class:`ProgressCommentOp` (K8), :class:`AcceptanceCommentOp` (K9),
+:class:`OperatorCommentOp` (K10), :class:`OwnerTakeoverOp` (K11) and
+:class:`PrBodyUpdateOp` (K12). A K9 or K12
+write may also be *held* (``Action.HOLD``, #211, #423): nothing is sent until the
 operator approves it, nothing is sent or adopted while the run's issue does
 not qualify, and :func:`drive` returns the record unchanged with the
 reason, also when the issue stopped qualifying between the write and its
@@ -85,6 +86,7 @@ from .effects import (
     decide_append,
     decide_create,
     decide_operator_comment,
+    decide_pr_body_update,
     decide_push,
     decide_replace,
 )
@@ -805,6 +807,82 @@ class OwnerTakeoverOp:
         self.github.write_pr_body(record.target["pr_url"], record.body)
 
 
+# -- K12: FIX replaces the description of the run's own PR (#423) ------------------------
+
+
+class PrBodyUpdateOp:
+    """K12 (#423, ADR 0004): the description of the run's bound PR, replaced once.
+
+    Target: the PR, open, in the owner issue's repository, not headed in a
+    fork, the one open PR carrying the issue's implementation marker (the
+    complete listing, D4.5), and at the reviewed HEAD, base and merge base.
+    Precondition: its exact body has the digest the FIX entry recorded. Payload:
+    the block the controller derived from that body, then the agent's text.
+    Completion: the exact body equals the payload (:func:`decide_pr_body_update`).
+
+    The read order is the point: the body (:func:`held_pr`, #328) is read last,
+    so the precondition is judged on the controller's last read before the
+    write. GitHub has no conditional update of a PR body, so an edit landing
+    between that read and the write is overwritten; no read can close that
+    window, and none claims to. Every edit before the read, and any after the
+    write that its read-back sees, is a conflict.
+    """
+
+    def __init__(self, github: GitHubClient) -> None:
+        self.github = github
+
+    def reconcile(self, record: EffectRecord) -> Decision:
+        settled = _settled(record)
+        if settled is not None:
+            return settled
+        pr_url = record.target["pr_url"]
+        issue = parse_issue_url(record.owner.issue_url)
+        repo = issue.repository
+        claim = scan(IMPLEMENTATION, record.marker).claims[0]
+        claimants = collect(IMPLEMENTATION, self.github.list_open_prs(repo), "open PR").claimants(
+            claim.key, f"issue {claim.issue.canonical}"
+        )
+        binding = record.precondition
+        merge_base = self.github.get_merge_base_sha(
+            repo, binding["reviewed_base_ref"], binding["reviewed_head_sha"]
+        )
+        pr = held_pr(self.github, pr_url)
+        if claimants.defects:
+            return _unreadable(record, f"open PRs of {repo}", claimants.defects)
+        others = sorted({h.obj.url for h in claimants.holders if not _same_pr(h.obj.url, pr_url)})
+        problem = ""
+        if others:
+            problem = (
+                f"{', '.join(others)} also carries the implementation marker for issue "
+                f"{claim.issue.canonical}; an issue has one implementation PR"
+            )
+        elif not _same_pr(pr.url or pr_url, pr_url) or not _same_repository(pr.repository, repo):
+            problem = f"the read of the PR answered with {pr.url}, another PR"
+        elif not pr.is_open:
+            problem = f"the PR is {pr.state}, and only an open PR's description is replaced"
+        elif not _same_repo_head(pr):
+            problem = f"the PR is headed in the fork {pr.head_repository}"
+        elif pr.head_sha.lower() != binding["reviewed_head_sha"]:
+            problem = (
+                f"PR HEAD is {pr.head_sha[:12]}, not the reviewed HEAD "
+                f"{binding['reviewed_head_sha'][:12]}"
+            )
+        elif pr.base_ref != binding["reviewed_base_ref"]:
+            problem = (
+                f"PR base is {pr.base_ref!r}, not the reviewed base "
+                f"{binding['reviewed_base_ref']!r}"
+            )
+        elif merge_base != binding["reviewed_merge_base_sha"]:
+            problem = (
+                f"PR merge base is {merge_base[:12]}, not the reviewed merge base "
+                f"{binding['reviewed_merge_base_sha'][:12]}"
+            )
+        return decide_pr_body_update(record, pr.body, problem=problem)
+
+    def issue(self, record: EffectRecord) -> None:
+        self.github.write_pr_body(record.target["pr_url"], record.body)
+
+
 # -- K4: the review round comment -----------------------------------------------------
 
 
@@ -1344,6 +1422,7 @@ _GITHUB_OPS: dict[EffectKind, Callable[[GitHubClient], EffectOperation]] = {
     EffectKind.ACCEPTANCE_COMMENT: AcceptanceCommentOp,
     # Read-only: its ``issue`` raises (#243).
     EffectKind.OPERATOR_COMMENT: OperatorCommentOp,
+    EffectKind.PR_BODY_UPDATE: PrBodyUpdateOp,
 }
 
 
@@ -1383,6 +1462,7 @@ __all__ = [
     "ImplementationPrOp",
     "OperatorCommentOp",
     "OperatorPerformedError",
+    "PrBodyUpdateOp",
     "ProgressCommentOp",
     "PushOp",
     "PushRefusedError",

@@ -9,6 +9,12 @@
       "real_runs_before": "None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since"
     },
     {
+      "date": "2026-11-06",
+      "change": "The prompt label moves from `v16` to `v17` and the configuration gains `safety.pr_body_updates`, which moves the settings digest and the digests that hold it",
+      "why": "#423 changed the prompt and the setting: a FIX agent may ask the controller to replace the description of the run's own PR, on by default. Every arm runs one controller commit with one label and the same setting, so what is compared does not move, and no threshold, task or other setting changes",
+      "real_runs_before": "None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since"
+    },
+    {
       "date": "2026-11-07",
       "change": "Two allow-list keys are added under `execution`, which moves the settings digest and the digests that hold it",
       "why": "#286 gives agent launches and repository commands an allow-list key each. `real_run_config.yaml` sets neither, so every launch of every arm gets the names it got before, and no threshold, task or other setting changes. `tests/evaluation.py` reads the repository commands' names, as the engine now does, so its copy of the validation policy stays the engine's",

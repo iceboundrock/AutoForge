@@ -62,6 +62,7 @@ from tests.conftest import (
     is_shell_probe,
     make_engine,
     no_credential_looking_names,
+    pr_body_update,
     publish_pr_head,
     review_result,
     state_tree,
@@ -769,19 +770,20 @@ def test_status_json_carries_none_of_the_local_fields_since_protocol_13(
     capsys.readouterr()
     assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
     printed = json.loads(capsys.readouterr().out)
-    assert printed["protocol_version"] == "14" and printed["mode"] == "REMOTE"
+    assert printed["protocol_version"] == "15" and printed["mode"] == "REMOTE"
     assert not set(LOCAL_STATE_FIELDS) & set(printed)
     state_file = tmp_path / ".autoforge" / "state.json"
     data = json.loads(state_file.read_text())
     assert not set(LOCAL_STATE_FIELDS) & set(data)
     data["protocol_version"] = "12"
+    del data["pr_body_outcomes"]  # protocol 15's own field (#423)
     data.update({name: type(empty)() for name, empty in LOCAL_STATE_FIELDS.items()})
     state_file.write_text(json.dumps(data))
     before = state_file.read_bytes()
     assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
     printed = json.loads(capsys.readouterr().out)
     assert not set(LOCAL_STATE_FIELDS) & set(printed)
-    assert printed["protocol_version"] == "14"
+    assert printed["protocol_version"] == "15"
     assert state_file.read_bytes() == before
 
 
@@ -2238,7 +2240,7 @@ def test_run_refuses_a_state_that_does_not_load_and_force_moves_it_aside_whole(
 
 
 def _newer_controllers_run(tmp_path, capsys) -> tuple[Path, bytes]:
-    """A run started in ``tmp_path/.autoforge``, then relabelled as protocol 14 wrote it.
+    """A run started in ``tmp_path/.autoforge``, then relabelled as protocol 16 wrote it.
 
     Its phase is one this controller does not have, so a refusal that read
     the phase before the label would misreport it. The run's logs stay.
@@ -2250,10 +2252,10 @@ def _newer_controllers_run(tmp_path, capsys) -> tuple[Path, bytes]:
     state_file = sd / "state.json"
     data = json.loads(state_file.read_text(encoding="utf-8"))
     data.update(
-        protocol_version="15",
-        phase="A_PHASE_OF_PROTOCOL_15",
+        protocol_version="16",
+        phase="A_PHASE_OF_PROTOCOL_16",
         controller_version="0.2.0",
-        run_id="af-written-by-protocol-15",
+        run_id="af-written-by-protocol-16",
     )
     state_file.write_text(json.dumps(data), encoding="utf-8")
     return sd, state_file.read_bytes()
@@ -2263,16 +2265,16 @@ def _assert_the_newer_run_is_named(err: str, state_file: Path, flags: str) -> No
     import autoforge
 
     assert (
-        f"autoforge: error: state file {state_file}: unsupported protocol_version '15' "
-        "(controller speaks '14'): a newer AutoForge wrote it\n"
+        f"autoforge: error: state file {state_file}: unsupported protocol_version '16' "
+        "(controller speaks '15'): a newer AutoForge wrote it\n"
     ) in err
     assert "AutoForge controller/state protocol mismatch" in err
-    assert f"  state:      {state_file} (protocol_version '15')" in err
-    assert "  recorded:   run af-written-by-protocol-15, written by autoforge 0.2.0" in err
+    assert f"  state:      {state_file} (protocol_version '16')" in err
+    assert "  recorded:   run af-written-by-protocol-16, written by autoforge 0.2.0" in err
     assert f"  import:     {os.path.abspath(autoforge.__file__)}\n" in err
     assert f"  python:     {sys.executable}\n" in err
     assert f"  cwd:        {os.getcwd()}\n" in err
-    assert f"<an autoforge that speaks protocol 15> {flags}status\n" in err
+    assert f"<an autoforge that speaks protocol 16> {flags}status\n" in err
     assert "unknown phase" not in err and "--force" not in err and "repair" not in err
     _assert_the_result_claims_only_what_holds(err)
 
@@ -2343,7 +2345,7 @@ def test_run_force_still_moves_a_newer_controllers_run_aside_whole(
     moved = [p for p in sd.glob("state.json.corrupt-*")]
     assert len(moved) == 1 and moved[0].read_bytes() == raw
     assert f"autoforge: moved unreadable state file aside: {moved[0]}" in err
-    assert load_state(sd / "state.json").run_id != "af-written-by-protocol-15"
+    assert load_state(sd / "state.json").run_id != "af-written-by-protocol-16"
 
 
 @pytest.mark.parametrize(
@@ -2361,7 +2363,7 @@ def test_a_state_a_newer_controller_replaced_after_the_first_load_is_refused_und
     sd, newer = _newer_controllers_run(tmp_path, capsys)
     state_file = sd / "state.json"
     data = json.loads(newer)
-    data.update(protocol_version="14", phase="ANALYZE_EXECUTE")
+    data.update(protocol_version="15", phase="ANALYZE_EXECUTE")
     state_file.write_text(json.dumps(data), encoding="utf-8")
     assert load_state(state_file).phase is Phase.ANALYZE_EXECUTE
     real = ControllerEngine.locked
@@ -2395,7 +2397,7 @@ def test_the_refusal_under_the_lock_claims_no_more_than_it_established(
     sd, newer = _newer_controllers_run(tmp_path, capsys)
     state_file = sd / "state.json"
     data = json.loads(newer)
-    data.update(protocol_version="14", phase="ANALYZE_EXECUTE")
+    data.update(protocol_version="15", phase="ANALYZE_EXECUTE")
     state_file.write_text(json.dumps(data), encoding="utf-8")
     lock_file = repository_lock_path(tmp_path)
     real = ControllerEngine.locked
@@ -2441,7 +2443,7 @@ def test_run_over_a_label_no_protocol_has_suggests_no_force(
         err = captured.err
         assert captured.out == ""
         assert (
-            f"unsupported protocol_version {label!r} (controller speaks '14'): no AutoForge "
+            f"unsupported protocol_version {label!r} (controller speaks '15'): no AutoForge "
             "protocol has that label\n"
         ) in err
         assert "AutoForge controller/state protocol mismatch" in err
@@ -2461,7 +2463,7 @@ def _a_newer_state_at(sd: Path) -> None:
     """A protocol-14 state at ``sd``, saved by this controller and relabelled."""
     sd.mkdir(parents=True, exist_ok=True)
     state = AutoForgeState(
-        run_id="af-written-by-protocol-15",
+        run_id="af-written-by-protocol-16",
         repository="owner/repo",
         epic_url=EPIC,
         current_issue_url=ISSUE,
@@ -2471,7 +2473,7 @@ def _a_newer_state_at(sd: Path) -> None:
     )
     save_state(state, sd / "state.json")
     data = json.loads((sd / "state.json").read_text(encoding="utf-8"))
-    data.update(protocol_version="15")
+    data.update(protocol_version="16")
     (sd / "state.json").write_text(json.dumps(data), encoding="utf-8")
 
 
@@ -2520,9 +2522,9 @@ def test_an_odd_state_dir_or_config_never_reaches_the_diagnostic_raw(
         assert line.isprintable(), line
         assert len(line) <= 2 * MAX_PATH_CHARS + 300, len(line)
         assert not line.startswith("autoforge: error: forged")
-    (command,) = [line for line in lines if "<an autoforge that speaks protocol 15>" in line]
+    (command,) = [line for line in lines if "<an autoforge that speaks protocol 16>" in line]
     assert command.strip() == (
-        "<an autoforge that speaks protocol 15> --config <the --config value this command was "
+        "<an autoforge that speaks protocol 16> --config <the --config value this command was "
         "given> --state-dir <the --state-dir value this command was given> status"
     )
     assert "put back the value you typed" in err
@@ -2805,7 +2807,7 @@ _LOCKING_COMMANDS = (
 
 @pytest.mark.parametrize("lock_file", ["absent", "existing"])
 @pytest.mark.parametrize(
-    "label", ["12", "13", "14", "15", None], ids=lambda label: f"label-{label}"
+    "label", ["12", "13", "14", "15", "16", None], ids=lambda label: f"label-{label}"
 )
 def test_a_local_state_in_the_locks_directory_is_refused_without_taking_the_lock(
     tmp_path, capsys, monkeypatch, fakes, label, lock_file
@@ -4289,6 +4291,108 @@ def test_unblock_acceptance_flags_exit_codes(
     assert fakes["gh"].effect_writes == []
 
 
+# -- the description of the run's own PR (#423) ------------------------------------------
+def _blocked_on_pr_body_update(tmp_path, monkeypatch, fakes) -> tuple[str, str, str]:
+    """A run whose FIX plan's description update awaits the operator: (state dir, id, body)."""
+    from dataclasses import replace
+
+    from autoforge.config import default_config
+    from autoforge.effects import EffectRecord, implementation_closing_block
+
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    gh = fakes["gh"]
+    cfg = default_config()
+    cfg.safety = replace(cfg.safety, pr_body_updates="approve")
+    eng = make_engine(sd, fixer(pr_body_update("R1-F1"), commit=False), github=gh, cfg=cfg)
+    eng.origin = fakes["origin"]
+    head = publish_pr_head(eng)
+    closing = implementation_closing_block(ISSUE, eng.state.run_id)
+    gh.add_pr(head_sha=head, body=f"Describes the old behaviour.\n\n{closing}\n")
+    eng.state.phase = Phase.FIX
+    eng.state.current_pr_url = eng.state.reviewed_pr_url = PR
+    eng.state.current_branch = BRANCH
+    eng.state.current_head_sha = eng.state.reviewed_head_sha = head
+    eng.state.reviewed_base_ref = "main"
+    eng.state.reviewed_merge_base_sha = eng.origin.merge_base("main", head)
+    eng.state.review_round = 1
+    eng.state.last_review_comment_url = comment_url(PR, 100)
+    eng.state.last_review_result = "needs_fix"
+    eng.state.open_findings = [
+        {
+            "id": "R1-F1",
+            "classification": "non-blocked",
+            "title": "the description is stale",
+            "location": "PR description",
+            "required_resolution": "describe the current behaviour",
+        }
+    ]
+    assert eng.step().next_phase == "BLOCKED"
+    record = EffectRecord.from_dict(load_state(sd / "state.json").effect_records[0])
+    eng.close()
+    return str(sd), record.action_id, record.payload["body"]
+
+
+def test_status_shows_the_pr_body_update_awaiting_approval(tmp_path, capsys, monkeypatch, fakes):
+    sd, action, body = _blocked_on_pr_body_update(tmp_path, monkeypatch, fakes)
+    capsys.readouterr()
+    assert action.startswith("B-")
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert f"PR body update {action} (FIX, review round 1)" in out
+    assert f"PR:            {PR}" in out
+    assert "finding:       R1-F1 the description is stale" in out
+    # This status reads no configuration file, so it sees the default: the
+    # record's authorization decides, and a changed setting cannot widen it.
+    assert "operator approval required (recorded with the plan; " in out
+    assert "safety.pr_body_updates is now auto)" in out
+    assert f"--approve-action {action}" in out and f"--decline-action {action}" in out
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    [entry] = json.loads(capsys.readouterr().out)["pr_body_updates"]
+    assert entry["action_id"] == action and entry["state"] == "awaiting_approval"
+    assert cli.main(["--state-dir", sd, "status", "--action", action]) == 0
+    assert capsys.readouterr().out == body
+
+
+def test_unblock_approves_the_pr_body_update_and_resume_sends_it(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    sd, action, body = _blocked_on_pr_body_update(tmp_path, monkeypatch, fakes)
+    gh = fakes["gh"]
+    capsys.readouterr()
+    rc = cli.main(["--state-dir", sd, "unblock", "--approve-action", action, "--reason", "ok"])
+    assert rc == 0, capsys.readouterr().out
+    assert gh.prs[PR].body != body
+    assert cli.main(["--state-dir", sd, "resume", "--max-steps", "1"]) == 0
+    capsys.readouterr()
+    assert gh.prs[PR].body == body
+    assert fakes["provider"].calls == []
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    [entry] = json.loads(capsys.readouterr().out)["pr_body_updates"]
+    assert entry["state"] == "verified"
+
+
+@pytest.mark.parametrize(
+    ("argv", "code", "stream", "needle"),
+    [
+        (["--approve-action", "B-123"], 2, "err", "B-<16 hex digits>"),
+        (["--approve-action", "B-" + "0" * 16], 1, "out", "names no"),
+        (["--decline-action", "B-" + "0" * 16], 1, "out", "names no"),
+    ],
+)
+def test_unblock_pr_body_flags_exit_codes(
+    tmp_path, capsys, monkeypatch, fakes, argv, code, stream, needle
+):
+    sd, _, _ = _blocked_on_pr_body_update(tmp_path, monkeypatch, fakes)
+    raw = (tmp_path / ".autoforge" / "state.json").read_text()
+    before = fakes["gh"].prs[PR].body
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "unblock", *argv, "--reason", "x"]) == code
+    assert needle in getattr(capsys.readouterr(), stream)
+    assert (tmp_path / ".autoforge" / "state.json").read_text() == raw
+    assert fakes["gh"].prs[PR].body == before
+
+
 def test_unblock_takes_one_acceptance_flag(tmp_path, capsys, monkeypatch, fakes):
     monkeypatch.chdir(tmp_path)
     flags = ["--approve-action", "A-" + "0" * 16, "--decline-action", "A-" + "1" * 16]
@@ -4939,6 +5043,7 @@ def test_an_old_state_file_without_a_recorded_configuration_loads_and_resumes(
         del data[key]  # protocol 10's own fields (#172)
     del data["operator_comment_outcomes"]  # protocol 11's own field (#243)
     del data["sandbox_pin"]  # protocol 12's own field (#280)
+    del data["pr_body_outcomes"]  # protocol 15's own field (#423)
     data["protocol_version"] = "8"
     with open(state_file, "w", encoding="utf-8") as handle:
         json.dump(data, handle)
@@ -4956,7 +5061,7 @@ def test_an_old_state_file_without_a_recorded_configuration_loads_and_resumes(
     assert f"--config {cfg} is recorded as the run's" in out.err
     assert "ANALYZE_EXECUTE -> REVIEW" in out.out
     saved = load_state(state_file)
-    assert saved.protocol_version == "14"
+    assert saved.protocol_version == "15"
     assert saved.config_fingerprint["source"] == "upgraded"
     assert saved.sandbox_pin["mode"] == "disabled" and saved.sandbox_pin["source"] == "upgraded"
     assert saved.config_fingerprint["profiles"]["analyze_execute"]["model"] == "opus"

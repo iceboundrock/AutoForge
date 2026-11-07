@@ -565,11 +565,12 @@ An amendment changes the files of section 1 and these digests in one reviewed ch
 **and states whether any real run had been made.** A record carries the digests it was made under, and a
 report refuses to decide over records of another, so criteria cannot move under results.
 
-- `manifest.json`: `2927ec848491f1b853d3dc5992a89d33e8f63fa5b307dcd40297825cd0e2ef5e`
-- `preregistration.json`: `7d5c224dbc935b2fb503c7eb8b4fc9632f26f7e893ee6a8d0b6342adc5996ceb`
-- `real_run_config.yaml`: `91bf8a981f4a9f14cabcee56e01184d396c8fd810de464776c4e6586e5e45d5c`
+- `manifest.json`: `e0b4a3609ac430c89168561fce3ca311dfa0256a16d9dfb5a3038a0be140f09f`
+- `preregistration.json`: `a23ffec705de0952d7c87d4c5da78396d6d859fce2ff0600c215f6b1ddb55daa`
+- `real_run_config.yaml`: `3acd558c9efee3be93b62da3cb692345e26d69e8344f679bb4038885ec7df4a7`
 
 | Date | Change | Why | Real runs before it |
 |---|---|---|---|
 | 2026-11-06 | The prompt label moves from `v15` to `v16`, which moves the settings digest and the digests that hold it. | #440 changed the prompt: every agent is told to stop what it started before its final reply, and a Claude Code launch gets a section on what a pending background task does. Every arm runs Claude Code on one label, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |
+| 2026-11-06 | The prompt label moves from `v16` to `v17` and the configuration gains `safety.pr_body_updates`, which moves the settings digest and the digests that hold it. | #423 changed the prompt and the setting: a FIX agent may ask the controller to replace the description of the run's own PR, on by default. Every arm runs one controller commit with one label and the same setting, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |
 | 2026-11-07 | Two allow-list keys are added under `execution`, which moves the settings digest and the digests that hold it. | #286 gives agent launches and repository commands an allow-list key each. `real_run_config.yaml` sets neither, so every launch of every arm gets the names it got before, and no threshold, task or other setting changes. `tests/evaluation.py` reads the repository commands' names, as the engine now does, so its copy of the validation policy stays the engine's. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |

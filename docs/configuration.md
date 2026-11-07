@@ -146,6 +146,16 @@ the file valid.
   inactive ruleset, a bypass actor) is a `FAIL` while
   `safety.allow_merge: true` and a `WARN` while it is false: only the
   merge gate relies on it (#259).
+- `safety.pr_body_updates` is `off`, `approve` or `auto` (the default; a bare
+  YAML `off`, read as false, means `off`); anything else is a configuration
+  error. It decides who authorizes a `FIX` agent's replacement of the description
+  of the run's own PR: nobody (`off`: the resolution is refused), the operator per
+  action id (`approve`: the run blocks until `autoforge unblock --approve-action
+  B-…`), or this setting (`auto`: replaced during the `FIX` step). It reaches no
+  other PR and no issue, and the controller keeps `Closes #n` and its markers. The
+  value is recorded with the action when the plan is saved, so changing it later
+  never widens an authorization already on disk. See [Running the remote workflow:
+  When a fix replaces the PR description](usage.md#when-a-fix-replaces-the-pr-description).
 - `safety.acceptance_actions` is `off`, `approve` (the default) or `auto`
   (a bare YAML `off`, read as false, means `off`); anything else is a
   configuration error. It decides who authorizes the one comment a `FIX`
@@ -195,7 +205,7 @@ probe file it creates and removes there.
 |---|---|---|
 | top level | `version`, `state_dir` (default `.autoforge`), `prompt_version` (leave unset: it may only repeat the controller's built-in label, see [Validation](#validation-every-key-must-be-one-the-controller-reads)) | [State and recovery](agent-guides/state-and-recovery.md) |
 | `execution` | the default agent limits (`default_idle_timeout_seconds` 900, `default_max_runtime_seconds` unset), loop detection (`loop_detection`, mode `kill`; unset, `warn` on Pi and in `UPDATE_EPIC`), the wall-clock bound on controller-run commands (`command_timeout_seconds` 1800), `max_correction_attempts` (default 1), the launch environment allow-lists (`env_allowlist`, `env_allowlist_extra`, `agent_env_allowlist_extra`, `command_env_allowlist_extra`; a GitHub or git credential route is refused, so is a name one class's key cannot keep from the other, and a credential-looking name is warned about, see [Agent environment](#agent-environment)), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
-| `safety` | the merge gate (`allow_merge`, default `false`), `protected_merge_paths` (default `.github/workflows/`), `required_checks` (default `ci`), `verify_check_definition` (default `true`); who authorizes a `FIX` acceptance comment (`acceptance_actions`: `off`, `approve` (default) or `auto`) | [GitHub safety](agent-guides/github-safety.md#merge-safety), [Running the remote workflow](usage.md#blocked-on-an-acceptance-action) |
+| `safety` | the merge gate (`allow_merge`, default `false`), `protected_merge_paths` (default `.github/workflows/`), `required_checks` (default `ci`), `verify_check_definition` (default `true`); who authorizes a `FIX` acceptance comment (`acceptance_actions`: `off`, `approve` (default) or `auto`), and a `FIX` replacement of the run's own PR description (`pr_body_updates`: `off`, `approve` or `auto` (default)) | [GitHub safety](agent-guides/github-safety.md#merge-safety), [Running the remote workflow](usage.md#blocked-on-an-acceptance-action) |
 | `merge` | how the controller merges once the gate is open: `method` (default `squash`), `delete_branch` (default `false`; after a verified merge, delete the PR's head branch on GitHub only, never a local branch, see [Deleting the merged head branch](agent-guides/github-safety.md#deleting-the-merged-head-branch)), `max_verification_attempts` (default 5), `verification_commands` (argv lists, empty by default) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
 | `workflow` | loop bounds: `max_review_rounds` (20), `stagnation_identical_rounds` (2), `stagnation_unchanged_count_rounds` (3), `max_total_steps` (300); `epic_update_every` (1) | [Workflow](agent-guides/workflow.md#loop-bounds) |
 | `review.replan` | replan policy: `enabled`, `soft_threshold` (12), `hard_threshold` (20), `stagnation_window` (3), `max_findings_per_round` (2), `max_replans_per_issue` (2) | [Workflow](agent-guides/workflow.md#loop-bounds), [Replan transaction](agent-guides/replan-transaction.md) |

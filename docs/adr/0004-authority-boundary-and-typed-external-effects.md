@@ -31,6 +31,10 @@
   it as K11 (`owner_takeover`), a journaled body write. No state field is
   added. Coordinated with ADR 0008 D9.5, D17.2 and D17.4, ADR 0011's
   `pr-owner` code, and ADR 0012 D3 and D10.
+- **Amended by #423:** effect kind K12 (`pr_body_update`), a `FIX` agent's
+  bounded request that the controller replace the description of the run's
+  own PR, its markers and closing reference kept by the controller, under
+  `safety.pr_body_updates` (D5.1, K12), with its own protocol bump (D13.12).
 - **Note:** [ADR 0009](0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md) removed LOCAL mode (#388): §2.1's LOCAL
   prompts and K10's LOCAL refusal no longer apply, and §2.13's refusal of a
   LOCAL state carrying effect state is replaced by ADR 0009 D4's refusal of
@@ -266,6 +270,7 @@ prompts make no GitHub call and are out of scope.
 | comment on the run's own issue as acceptance evidence (a finding or acceptance criterion asks for text posted on the issue) | no prompt before #211; `fix.md` "Acceptance actions" (the `acceptance_action` resolution) | controller-only | effect K9, authorized per D5.6 | #211 |
 | comment on another issue of the run's repository as acceptance evidence (a finding or acceptance criterion asks for a note on an issue the run's issue references, or on the EPIC) | no prompt before #243; `fix.md` "Operator actions" (the `operator_acceptance` resolution) | controller-only | operator-performed: effect K10, which the operator posts and the controller verifies and never issues (D2.1a) | #243 |
 | replace the owner in a PR's implementation marker (a takeover) | no prompt before #414; `unblock --take-over` | controller-only | effect K11, on the operator's command (D9.4a) | #414 |
+| replace the description of the run's own PR (a finding says it is stale) | no prompt before #423; `fix.md` "PR description" (the `pr_body_update` resolution) | controller-only | effect K12, under `safety.pr_body_updates` | #423 |
 | edit the progress comment in place | `update_epic.md` :35–37 | controller-only | removed (D5.2) | #160 |
 | `gh issue edit` on the EPIC | `update_epic.md` :62 (forbidden to agents) | controller-only | unchanged: the controller's roadmap splice | — |
 | source PR close, receipt, compensating reopen | `github.py` :1602, :1619, :1630 | controller-only | unchanged mechanism (D5.4) | — |
@@ -937,6 +942,13 @@ and the controller performs it. It is not a generic body edit: its
 payload is the body the command read with only the marker's owner
 replaced, and its precondition is that exact body.
 
+**Amended (#423).** A twelfth kind, K12 (the description of the run's own
+PR), is added under the same rule, with its own protocol bump (D13.12). It is
+the one kind that carries agent text into an existing body, and it is still not
+a generic edit: the target is derived and fixed to the bound PR, the text is
+bounded and policed, and everything the controller owns is kept byte for byte.
+A new object, or a new way to reach one, is a further amendment.
+
 #### K1. Push an exact candidate (the Git publication layer, §2.6)
 
 - **Consumers:** #161 (the implementation branch), #163 (the fix push),
@@ -1450,6 +1462,164 @@ replaced, and its precondition is that exact body.
 - **Residual:** as for K3, GitHub has no conditional body update. An edit
   that lands between the reconciliation's read and the write is
   overwritten. D9.4a's operator procedure stops the old controller first.
+
+#### K12. Replace the description of the run's own PR (#423)
+
+- **Why an amendment.** D1.1 lists a PR edit as controller-only as a typed
+  effect, and D5.1 closes the kinds. K3 and K11 edit an implementation PR's
+  body for their own purposes (they add a closing block, or swap the owner in
+  a marker), and neither carries agent text into an existing body. So
+  replacing a description was **not** inside the authority model, and this is
+  an amendment for this one operation. #306's proposal for comment effects
+  excludes PR body edits and authorizes nothing here.
+- **The operation.** A `FIX` agent resolves one or more findings as
+  `pr_body_update` with the text of the new description. It supplies no URL,
+  PR, issue, repository, target, method, path or command; any of them is
+  refused by name. The controller derives the target (the run's bound PR) and
+  everything below the text. REMOTE `FIX` only, never another phase or object.
+- **Identity:** the PR URL and the implementation marker, byte for byte as the
+  entry's body holds it.
+- **Target:** the bound PR: open, in the owner issue's repository, not headed
+  in a fork, and the one open PR carrying the issue's marker (the complete
+  listing, D4.5).
+- **Precondition:** `base_sha256`, the digest of the exact body the `FIX`
+  entry read (`EntryObservation.pr_body_sha256`, D4.4); the reviewed HEAD, base
+  and merge base; the authorization, below.
+- **Payload:** `Closes #n`, the marker and every other controller marker the base
+  holds, each byte for byte and in its order (`protected_pr_body_block`), then
+  the agent's text. The base qualifies only with exactly one readable
+  implementation marker, for this issue and naming this run; the `Closes #n`
+  line; no closing reference to another issue, which a replacement would drop;
+  and no controller marker that never closes. A base that does not qualify is
+  not offered: the prompt says so, and a request is a correction. The text
+  obeys the published-content policy (no marker, no closing reference, no
+  mention, no credential) and so does the composed body; `_cross_pr_body_update`
+  splits the persisted body again at load, because a resumed write publishes
+  it with no agent result in between.
+- **The controller's block comes first.** Its bytes are not enough if the Markdown
+  around them changes what they mean: an unclosed fence, HTML comment or `<pre>`
+  in the text runs on to whatever follows it, and an unclosed `<details>` folds
+  it away. CommonMark reads blocks forward, so a block already closed when the
+  text begins cannot be reached from it. Validating the agent's Markdown instead
+  would mean approximating a parser and refusing legitimate text; this takes no
+  judgement of the text at all. What the text leaves open affects only the text,
+  and the next review reads it. K2 and K7 compose their closing block after the
+  agent's text, and #423 leaves them as they are.
+- **Completion:** the exact body read back equals the payload at the reviewed
+  binding.
+- **Authorization.** `safety.pr_body_updates`: `off` refuses the resolution;
+  `approve` holds the record until `unblock --approve-action B-...`; `auto`, the
+  default, authorizes it by policy. The value is recorded on the record when
+  the plan is saved, so a later change never widens it. The action id is
+  recomputed from owner, identity, target and payload, as K9's (D5.6).
+  `auto` is the default on this reasoning: the same agent's text already
+  becomes the same PR's description unattended at K2 and K7, on the same trust
+  and under the same content policy; the target is derived and fixed to the
+  PR the run owns; and every protected byte is the controller's. The change is
+  on a PR that is still to be reviewed, and the next round reads it. It widens
+  nothing beyond the run's own PR. Agent text never authorizes anything.
+- **Base at entry, not at plan.** The digest is taken before the fixer is
+  launched, so an edit made while it ran is seen: the fixer wrote from the older
+  body. `_apply_fix` then blocks with `effect-conflict`, nothing planned, naming
+  both digests. A plain `unblock` launches the fixer afresh over the body as it
+  is, and `unblock --rereview` asks a fresh review to judge it. An entry that
+  recorded no digest (not qualified, the policy `off`, an empty review binding,
+  an exact read that failed conclusively, or a `FIX` entered under protocol 14)
+  offers nothing.
+- **The fixer must have read what it replaces.** The digest says what an update
+  would replace and proves nothing about what the fixer saw: the read context is
+  bounded and redacted, a read that fails makes its file a note saying so, and
+  `gh`'s print can differ from GitHub's bytes. Each launch therefore decides
+  again (`_add_pr_body_view`): the update is offered only when that launch's read
+  of the PR has the entry's digest and its `pull-request.md`, as written, quotes
+  those bytes unchanged (`pr_body_view_problem`). That one comparison covers a
+  body over the quoted bound, redacted text, the bounds on the file and on the
+  directory. A failed PR or comment read, a body edited since the entry and a
+  control character `gh` rewrites are refused the same way. The exact text is not
+  handed to the agent to fill the gap: it may hold what the sanitizer exists to
+  keep out. Under `approve` as under `auto`, the prompt says the resolution is not
+  available and why, a request is a correction, and nothing is planned or written;
+  the fixer can resolve the finding another way or report `blocked`.
+- **Several findings.** One record per result. Findings resolved this way carry
+  byte-identical text or the result is a correction: the controller neither
+  composes nor orders whole-body replacements. Each counts for its own finding,
+  and `pr_body_source` on each resolution names the one record.
+- **Plan order:** K9 or K10, K12, K5, K6, K1. K12 comes after the prefix because
+  those are what the operator can already have acted on, and before everything
+  else because it may wait for the operator or be declined, which must leave no
+  issue created and nothing pushed. The push is last, so a mixed fix publishes
+  its commit only after the description is verified; a conflict or a hold leaves
+  the candidate in the agent worktree, and the block names it. A metadata-only
+  `FIX` has no K1: `head_sha` equals the reviewed HEAD and no empty commit is
+  made. `validation.commands` run first, as for any plan.
+- **Reconciliation** (`decide_pr_body_update`, exact reads per #328, with the
+  body read last): the body equals the payload, `observed`, with no write, also
+  when it already held it before any write (`changed: false`) or when the
+  operator pasted it; the reviewed binding left, a conflict, and the route is
+  decided by what moved (below); a body that is neither base nor payload, a
+  conflict: "the PR body changed outside the plan", never rebased or written
+  over; base and not authorized, held; base and authorized, written once, up to
+  `MAX_EFFECT_ATTEMPTS`.
+- **The read-to-write race.** GitHub has no conditional update of a PR body, so
+  this is **not** a compare-and-swap. `PrBodyUpdateOp` reads the listing, the
+  merge base and then the exact body last, and writes immediately after. An edit
+  that lands in that window is overwritten, and GitHub's edit history keeps it.
+  Every edit before that read is a conflict, as is an edit its own read-back
+  sees. The window is the same one K3, K6 and K11 accept, and the two-step
+  check narrows but cannot close it. Nothing claims otherwise.
+- **Crash windows.** Journaled before the write (D4.1), so a resumed step reads
+  first (D4.2) and completes with no fixer launched (D4.6). An answer lost after
+  the write lands is observed by that read, with no second write. A lost answer
+  with no landing leaves the base, and is written once more within the bound.
+  A refusal from GitHub is not retried. A failed read-back fails closed.
+- **Verified is not forever.** An observed record is settled and never reconciled
+  again, and a human may edit the body after the save, also across a crash. So
+  `_complete_fix` reads the exact body again before each later write of the plan
+  and before it records the fix (`_pr_body_edit_outcome`). A body that no longer
+  holds the payload blocks with `effect-conflict`: nothing is written over it,
+  nothing more is sent, the fix is not recorded and the findings stay open. The
+  record stays observed, because the payload was on GitHub when it was read; the
+  check is repeated on every entry, so the journal needs no new transition. The
+  plan's own base is no exception here: the payload is the one state that lets the
+  plan finish, and that needs no second write. A failed read fails closed the same
+  way, and a transient one propagates for `resume`. An edit after the last of these
+  reads is not seen here: the next review reads the description as it stands.
+- **What moved.** A HEAD off the reviewed one (K12 precedes the controller's own
+  push), or a base or merge base off the binding, routes `FIX -> REVIEW` of the
+  actual revision through `_fix_drift`, and the update is recorded `stale`. A
+  verified K12 stays verified when a later record of the plan drifts: the body
+  is on GitHub, and the next review reads it as it is. A closed or merged PR is
+  the usual refusal.
+- **Recovery.** Awaiting approval: `status` and the block name the action, PR,
+  findings, expected digest, payload size and digest, the print command, and
+  every way on. `unblock --approve-action` re-reads and refuses on a stale
+  binding or a body off the plan, and records the approval; `resume` then
+  writes with no fixer. A plain `unblock` re-enters `FIX` only when the body
+  holds the exact payload, and otherwise refuses: **an unblock reason is not
+  evidence, and a human edit is not adopted.** Conflict on the body: restore the
+  base or set the exact payload, then `unblock`; to keep the edit,
+  `--decline-action`, which drops the plan and runs the fixer again over that
+  body with the decline in its prompt. A declined id is refused for the round,
+  and declines share K9's and K10's bound. A decline is also refused while a K9
+  or K10 ahead of the update is not `observed`, because the drop forgets those
+  records, and a comment that landed or was posted before a save has no other
+  record. The decision reads nothing for this: a read here would be a second
+  reconciliation of K9 and K10 that has to agree with the prefix pass, and each
+  of those records already has its own way on, including its own decline where it
+  has one, which drops the update with the plan. `--rereview` stays refused while a
+  plan is saved; declining is the way to a fresh `FIX`. Edited after it was
+  verified: set the exact payload, then `unblock`, and `FIX` finishes with no
+  second write and no fixer; or decline to keep the edit, recorded `declined`
+  rather than `verified`. A decline is refused once a later write of the plan
+  may be out, since dropping the plan would abandon it: the payload goes back,
+  `FIX` finishes, and the edit can then be made again for the next review to read.
+- **Evidence.** The resolution records a receipt: action id, PR, base and body
+  digests, the reviewed HEAD, and `changed`. `pr_body_outcomes` keeps what became
+  of each update (`verified`, `declined`, `stale`). A receipt proves bytes and
+  nothing else: the next reviewer is told so, reads the current description in
+  `pull-request.md` and judges it against the diff. A finding the description
+  still fails to resolve is raised again, so an idempotent update resolves
+  nothing by itself.
 
 **D5.2 (#160).** **Correcting a controller-authored object in place is not a
 kind.** Every payload is rendered from persisted bytes (D8.4), so the
@@ -2935,6 +3105,23 @@ moves with that decision. The migration rule follows D13.2, by label:
   unchanged, as a hand edit or a foreign file;
 - an older controller refuses a protocol-14 file by its label.
 
+**D13.12 (#423).** **K12 is its own protocol bump.** Under D13.1's rule it is
+made alone: protocol 14 → 15, with the prompt label moving from `v16` to `v17`.
+It adds the kind; the field `pr_body_outcomes`; `pr_body_source` on a `FIX`
+context resolution; `pr_body_update` on a `last_fix_resolutions` entry; and the
+optional `pr_body_sha256` on a `FIX` entry observation. The number is announced
+on #23 before the change merges, and the label moves with that decision. The
+migration rule follows D13.2, by label:
+
+- a file of an older label loads in every phase, with no outcomes, every
+  resolution's `pr_body_source` and `pr_body_update` null, and no entry digest,
+  so a `FIX` entered before the upgrade offers no update; it is relabelled 15 on
+  its next save;
+- a file labelled 14 or older carrying any of these, or a K12 record, is refused,
+  unchanged, as a hand edit or a foreign file;
+- a protocol-15 file missing `pr_body_outcomes` is refused: every save writes it;
+- an older controller refuses a protocol-15 file by its label.
+
 ## 3. What does not change
 
 - **`CONTROL_RESULT` stays untrusted, and read-back stays authoritative.** The
@@ -3040,6 +3227,7 @@ mechanisms are unchanged and has no child.
 | #211 | the D5.1 amendment, K9, D5.6, D5.7, D13.9; the K9 wiring; its D1.2 row |
 | #243 | the D1.1, D2.4, D4.7, D5.1, D5.7, D8.3 and §4 amendments, D2.1a, K10, D5.8, D5.9, D13.10; the K10 wiring; its D1.2 row |
 | #414 | the D5.1, D9.4 and §3 amendments, D9.4a, K11, D13.11; the owner checks and the K11 wiring; its D1.2 row |
+| #423 | the D5.1 amendment, K12, D13.12; `safety.pr_body_updates`; the K12 wiring; its D1.2 row |
 
 ## 6. Tests the implementing children must add
 
@@ -3272,6 +3460,41 @@ In addition:
     process killed after either observation save or before the completion
     save completes from the journal with one marked comment per target;
     and the bound and withdrawn variants.
+- **K12:** (`tests/test_pr_body_update.py`, with the CLI's in
+  `tests/test_cli.py`)
+  - the resolution's parser bounds and closed schema; the target, the marker
+    and the closing line come from the controller, and text that carries a
+    closing reference, a controller marker or a credential is refused;
+  - the PR description incident's reproduction: one stale-description finding,
+    no commit, one exact write, a clean review of the unchanged HEAD and
+    `READY_FOR_MERGE`, with no push and no `BLOCKED`; a mixed fix sends the
+    description before the push and loses neither;
+  - a body already equal to the payload is observed with no write and
+    `changed: false`, and the finding stays open to the next review;
+  - a missing, duplicated or altered marker, a broken binding, a removed
+    closing line, and a closed, merged, fork or moved PR refuse with nothing
+    written; a stale digest at plan time and a concurrent edit at any later
+    read conflict and never overwrite; a conclusive refusal is not retried,
+    and an unknown outcome is decided by a read within the attempt bound;
+  - a body with a literal `^` is read exactly, so the sanitizer is neither a
+    false conflict nor a false verification;
+  - a body the fixer could not read whole (over the quoted bound, redacted, cut
+    by a file bound, unreadable for a PR or comment failure, edited since the
+    entry, or rewritten by `gh`) is not offered under `auto` or `approve`, a
+    request is a correction, and nothing is written;
+  - text leaving a fence, an HTML comment or another HTML construct open is
+    published through the whole path with the controller's block ahead of it;
+  - a body edited after it was verified stops the plan before each later write
+    and before the fix is recorded, across a crash and within one process,
+    including after the push; only the exact payload lets it finish, with no
+    second write, and a decline is refused once a later write may be out;
+  - a process killed at each step of the journal finishes from the journal
+    with one write and no second fixer launch; an operator's approval, decline
+    and plain unblock each do what `status` says, and a reason is not evidence;
+  - `off` offers nothing and refuses the resolution, `approve` holds the exact
+    target and payload, and a configuration change neither widens nor narrows
+    a saved record; a dry run writes nothing; a tampered record and a label
+    older than 15 carrying K12 state are refused.
 
 ### 6.2 The EPIC #158 test-matrix ownership
 

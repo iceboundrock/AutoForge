@@ -310,6 +310,7 @@ def test_fix_prompt_contract():
         "commit_sha",
         "You publish nothing",
         "the controller\npublishes the acceptance comment you ask for (when this run offers it),\n"
+        "replaces this PR's description when you ask (when this run offers it),\n"
         "creates the follow-up issues you ask for",
         "it pushes the exact commit you report",
         "Stay on the detached `HEAD`",

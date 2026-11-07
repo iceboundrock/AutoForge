@@ -442,13 +442,14 @@ not a key of this phase any more.
 | `previous_head_sha` | required SHA; a cross-check only: the engine refuses a value other than the reviewed HEAD the open findings are bound to |
 | `head_sha` | required SHA; a cross-check only: the engine reads the worktree's `HEAD` itself and refuses a value that differs from it |
 | `resolutions` | required list, at most `MAX_RESOLUTIONS_PER_FIX`, distinct `finding_id`s; the engine refuses any set other than exactly the open findings |
-| `resolutions[].resolution` | `fixed`, `follow_up_created`, `no_change_with_rationale`, `acceptance_action` (#211) or `operator_acceptance` (#243) |
+| `resolutions[].resolution` | `fixed`, `follow_up_created`, `no_change_with_rationale`, `acceptance_action` (#211), `operator_acceptance` (#243) or `pr_body_update` (#423) |
 | `resolutions[].commit_sha` | optional SHA, on `fixed` only; the engine refuses one outside the commits after the reviewed HEAD up to `head_sha` |
 | `resolutions[].follow_up_issue_url` | on `follow_up_created` only, exclusive with `follow_up_issue`: an issue URL bounded by `MAX_URL_CHARS`; the engine refuses one it did not hand over and the current issue |
 | `resolutions[].follow_up_issue` | on `follow_up_created` only, exclusive with `follow_up_issue_url`: an object with `title` (one line, at most `MAX_FOLLOW_UP_TITLE_CHARS`, 256) and `body` (multi-line, at most `MAX_FOLLOW_UP_BODY_CHARS`, 60000), both non-blank |
 | `resolutions[].acceptance_action` | on `acceptance_action` only, and required there: exactly `{"kind": "issue_comment", "body": "<Markdown>"}`; `body` multi-line, non-blank, at most `MAX_ACCEPTANCE_BODY_CHARS` (60000); a `url`, `issue`, `repository`, `target`, `method`, `path` or `command` key is refused by name, any other key as unknown, any other kind as unsupported; at most `MAX_ACCEPTANCE_ACTIONS_PER_FIX` (1) per result |
 | `resolutions[].operator_acceptance` | on `operator_acceptance` only, and required there: exactly `{"actions": [...]}`, 1 to `MAX_OPERATOR_ACTIONS_PER_FIX` (4) actions, each exactly `{"kind": "related_issue_comment", "issue": <n>, "body": "<Markdown>"}`; `issue` a JSON integer from 1 to `MAX_OPERATOR_ISSUE_NUMBER`, never a URL or `#n`, and not twice in one finding; `body` multi-line, non-blank, at most `MAX_OPERATOR_COMMENT_CHARS` (16000), with no image or raw HTML outside code; a `url`, `repository`, `owner`, `repo`, `target`, `method`, `path` or `command` key is refused by name at either level, any other key as unknown, any other kind as unsupported; at most `MAX_OPERATOR_ACTIONS_PER_FIX` (4) across the result, never beside an `acceptance_action` |
-| `resolutions[].rationale` | at most `MAX_FIX_RATIONALE_CHARS`; at least `MIN_RATIONALE_CHARS` on `no_change_with_rationale`, `acceptance_action` and `operator_acceptance` |
+| `resolutions[].pr_body_update` | on `pr_body_update` only, and required there: exactly `{"body": "<Markdown>"}`; `body` multi-line, non-blank, at most `MAX_PR_BODY_CHARS` (60000), stripped before it is stored; a `url`, `pr`, `issue`, `repository`, `target`, `method`, `path` or `command` is refused by name, and every other key as unknown |
+| `resolutions[].rationale` | at most `MAX_FIX_RATIONALE_CHARS`; at least `MIN_RATIONALE_CHARS` on `no_change_with_rationale`, `acceptance_action`, `operator_acceptance` and `pr_body_update` |
 | `tests` | optional list of one-line strings, at most `MAX_TESTS_REPORTED` (50) entries of `MAX_TEST_CHARS` (500); recorded, never published |
 
 A new follow-up issue's `title` and `body` pass the published-content
@@ -504,6 +505,26 @@ claims no other external change. The recorded resolution carries the
 round's verified comments as `operator_evidence` (`[]` for every other
 resolution), and the next reviewer receives them as data
 (`operator-evidence.md`).
+
+A `pr_body_update` (#423, ADR 0004 K12) asks the controller to replace the
+description of the run's own PR with the text. The text obeys the rules of
+"Published content", so it holds no controller marker and no closing
+reference: the controller keeps those above it, where nothing the text leaves
+open can reach them. Findings resolved this way in
+one result carry byte-identical text, or the result is refused: there is one
+replacement per result, and nothing composes several. It needs no commit, and
+when every finding is resolved without one, `head_sha` equals the reviewed HEAD.
+The engine also refuses it under `safety.pr_body_updates: off`, when this `FIX`
+entry recorded no body it offers to replace, when this launch's `pull-request.md`
+does not quote that body whole and unchanged, at the shared decline bound, when
+the body the controller would compose breaks the published-content rules or
+GitHub's limit, and for an action id the operator declined for the round. A body
+changed since the entry read it is no correction, because the agent cannot know:
+the phase blocks with nothing planned. The recorded resolution carries a receipt
+as `pr_body_update` (`action_id`, `pr_url`, `base_sha256`, `body_sha256`,
+`reviewed_head_sha`, `changed`; null on every other resolution), which proves
+bytes only: the next reviewer reads the description in `pull-request.md` and
+judges it.
 
 ### REPLAN_REEXECUTE fields
 

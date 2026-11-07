@@ -510,7 +510,12 @@ the controller only verifies: the controller never posts one, under any
 setting. The prompt offers the `operator_acceptance` resolution only when
 the entry recorded allowed targets (below), lists the round's declined
 operator actions and the operator comments already verified for the
-round.
+round. It offers the `pr_body_update` resolution (#423, ADR 0004 K12) only when
+the entry recorded the body it may replace (below), and then adds the PR to the
+read context as `pull-request.md`. Each launch decides again on what it shows: the
+offer stands only when that read of the PR has the entry's digest and the file as
+written quotes those bytes unchanged (no bound cut them, the redactor left them
+alone, the reads succeeded, and `gh` printed them as they are).
 
 The journal is read first. A persisted completion context means the
 fixer's result was already accepted and its plan saved: the phase is
@@ -630,6 +635,14 @@ for it:
   GitHub answers as missing or as a pull request is a correction; any
   other conclusive failure (transferred, another repository, no
   permission) blocks the result; a transient one propagates
+- a `pr_body_update` is refused under `safety.pr_body_updates: off`, when
+  the entry recorded no digest of the body, when this launch's read context did
+  not show the fixer that body whole, at the same shared decline bound,
+  when the body the controller composes fails the published-content rules or
+  GitHub's limit, and when its action id is one the operator declined for this
+  round. Several in one result hold byte-identical text. The PR's body is read:
+  a conclusive failure blocks the result, a transient one propagates, and a body
+  that changed since the entry blocks with nothing planned, naming both digests
 - a finding whose follow-up issue the entry found is resolved as
   `follow_up_created` with exactly that issue
 - any other deferral either names an issue the entry handed over (a
@@ -1250,6 +1263,18 @@ path, so no setting makes the controller post one (ADR 0004 D2.1a).
 decides it with `unblock --take-over`, and the controller writes this run
 into the PR's implementation marker over exactly the body the command
 read (`OwnerTakeoverOp`, `decide_replace`), with no rebase.
+#423 adds K12, the description of the run's own PR: the agent supplies only the
+text, the controller derives the target and keeps `Closes #n` and its markers
+byte for byte, above the text so nothing the text leaves open can reach them, and
+`safety.pr_body_updates` authorizes it (`auto`, the default; `approve`, per action
+id; `off`). It is bound to the exact body the `FIX` entry read and to the reviewed
+HEAD, base and merge base, and reads them last before writing. GitHub has no
+conditional update of a PR body, so an edit landing between that read and the
+write is overwritten and stays in GitHub's edit history; every other edit is a
+conflict, never written over or adopted (`PrBodyUpdateOp`,
+`decide_pr_body_update`). That includes an edit after the body was verified: it is
+read again before each later write of the plan and before the fix is recorded
+(`_pr_body_edit_outcome`).
 
 - **Typed writes, never retried blind.** `GitHubClient` has one method per
   write the effects need (`create_issue_comment`, `create_pr_comment`,
@@ -1601,6 +1626,7 @@ operation the prompts used to name is in one class.
 | post the acceptance comment on the run's issue | controller-only | the controller, effect K9, once authorized (#211) |
 | post a comment on another issue of the run's repository as acceptance evidence | controller-only | the operator; the controller never posts it and verifies it as effect K10 (#243) |
 | replace the owner in the implementation PR's marker (a takeover) | controller-only | the controller, effect K11, on the operator's `unblock --take-over` (#414) |
+| replace the description of the run's own PR | controller-only | the controller, effect K12, under `safety.pr_body_updates` (#423); never another PR or any issue |
 | close, reopen or comment on the source PR of a replan | controller-only | the controller's replan transaction |
 | merge; disable auto-merge | controller-only | the controller, behind `safety.allow_merge` |
 | delete the merged PR's head branch on GitHub | controller-only | the controller, after a verified merge, behind `merge.delete_branch` (#283) |

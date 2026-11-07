@@ -335,7 +335,10 @@ waits for you to approve or decline that exact comment
 comment on another issue (one the run's issue references, or the EPIC),
 you post it yourself, bind an existing comment or withdraw it
 (`unblock --bind-evidence` / `--decline-action`); the controller never posts
-there, and verifies the comment on GitHub. When a run stops because the
+there, and verifies the comment on GitHub. A fixer may also ask the controller
+to replace the description of the run's own PR, which it does by default
+(`safety.pr_body_updates`); an edit made outside that plan stops the run and is
+never written over. When a run stops because the
 PR's implementation marker names another run, or none (`pr-owner`), stop
 the other controller, then `autoforge unblock --take-over <PR URL>` and
 `resume` hand the PR to this run. When `status` warns that GitHub

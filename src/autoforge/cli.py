@@ -23,7 +23,8 @@ Commands:
           --approve-action / --decline-action decide on an acceptance action
           a FIX plan awaits (#211); --bind-evidence binds an existing comment
           to an operator action and --decline-action (repeatable) declines
-          operator actions (#243); --rereview gives up the FIX of a review
+          operator actions (#243), and both decide on a PR body update (B-..., #423);
+          --rereview gives up the FIX of a review
           round's open findings for a fresh REVIEW round at the same HEAD (#428);
           --take-over hands the issue's open PR to this run (#414): it journals
           the controller's write of this run into the PR's implementation
@@ -35,7 +36,7 @@ Commands:
           decision goes to the run log and the transition to epic-rebinds.json before the
           one-field state save; --dry-run writes nothing
   status  show the persisted run summary (--json for machine output; --action
-          prints an acceptance or operator action's exact payload); reads the issue's
+          prints an acceptance, operator or PR body action's exact payload); reads the issue's
           native parent and warns, changing nothing, when it is not the recorded EPIC
   epic    the parallel EPIC scheduler (ADR 0008, #183), REMOTE only: run (with
           --dry-run and --force), resume, status (lock-free, --json), stop
@@ -76,8 +77,10 @@ from .effects import (
     MAX_EFFECT_ATTEMPTS,
     EffectKind,
     EffectRecord,
+    FixContext,
     Stage,
     sha256_text,
+    unverified_before,
 )
 from .engine import (
     ControllerEngine,
@@ -324,8 +327,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         metavar="ACTION_ID",
         help=(
-            "approve the acceptance action a FIX plan awaits (its id from 'autoforge status'); "
-            "'resume' then publishes exactly its payload on the run's issue"
+            "approve the acceptance action (A-...) or PR body update (B-...) a FIX plan awaits "
+            "(its id from 'autoforge status'); 'resume' then publishes exactly its payload"
         ),
     )
     action.add_argument(
@@ -334,7 +337,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="ACTION_ID",
         help=(
-            "decline the acceptance action (A-...) a FIX plan awaits, or one or more operator "
+            "decline the acceptance action (A-...) or PR body update (B-...) a FIX plan awaits, "
+            "or one or more operator "
             "actions (X-..., repeatable; the plan's other pending operator actions are "
             "withdrawn and its verified ones kept): the unsent plan is dropped and FIX "
             "launches the fixer again with the decline in its prompt"
@@ -439,8 +443,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         metavar="ACTION_ID",
         help=(
-            "print the exact payload of a pending acceptance (A-...) or operator (X-...) "
-            "action and nothing else (exit 1 when no such action is persisted)"
+            "print the exact payload of a pending acceptance (A-...), operator (X-...) or PR "
+            "body (B-...) action and nothing else (exit 1 when no such action is persisted)"
         ),
     )
 
@@ -2382,6 +2386,7 @@ def cmd_status(args) -> int:
             "replan_journal": _replan_journal_summary(txn),
             "acceptance_actions": _acceptance_actions(state),
             "operator_actions": _operator_actions(state),
+            "pr_body_updates": _pr_body_updates(state),
             "review_certificate_status": _review_certificate_status(state, certificate),
             "epic_parent_check": parent.document() if parent is not None else None,
             "unjournaled_review": review.document() if review is not None else None,
@@ -2401,7 +2406,11 @@ def cmd_status(args) -> int:
         # scheduler, as a worker names it: a standalone 'resume' refuses it.
         config = ("--config", args.config) if args.config else ()
         engine.continue_command = (*config, "epic", "resume", state.epic_url)
-    actions = _render_acceptance_actions(state, engine) + _render_operator_actions(state, engine)
+    actions = (
+        _render_acceptance_actions(state, engine)
+        + _render_operator_actions(state, engine)
+        + _render_pr_body_updates(state, engine)
+    )
     lines = parent.lines(engine) if parent is not None else []
     shown = review.lines() if review is not None else []
     print(
@@ -2673,6 +2682,11 @@ def _acceptance_records(state: AutoForgeState) -> list[EffectRecord]:
     return [r for r in state.phase_effects().records if r.kind is EffectKind.ACCEPTANCE_COMMENT]
 
 
+def _pr_body_records(state: AutoForgeState) -> list[EffectRecord]:
+    """The persisted K12 record of the current plan, if any (#423)."""
+    return [r for r in state.phase_effects().records if r.kind is EffectKind.PR_BODY_UPDATE]
+
+
 def _print_action_payload(state: AutoForgeState, action_id: str) -> int:
     """``status --action``: the exact payload bytes of a persisted action (#211, #243).
 
@@ -2682,7 +2696,11 @@ def _print_action_payload(state: AutoForgeState, action_id: str) -> int:
     persisted record has (a declined or stale action keeps no payload)
     exits 1 and prints nothing.
     """
-    for record in (*_acceptance_records(state), *_operator_records(state)):
+    for record in (
+        *_acceptance_records(state),
+        *_operator_records(state),
+        *_pr_body_records(state),
+    ):
         if record.action_id == action_id.strip():
             sys.stdout.write(record.body)
             sys.stdout.flush()
@@ -2761,6 +2779,155 @@ def _acceptance_actions(state: AutoForgeState) -> list[dict]:
             }
         )
     return out
+
+
+def _pr_body_label(record: EffectRecord) -> tuple[str, str]:
+    """``(state, label)`` of a persisted K12 record, as ``status`` names it (#423)."""
+    if record.stage is Stage.OBSERVED:
+        digest = (record.observed or {}).get("body_sha256", "-")
+        return "verified", f"verified: sha256 {digest}; read again before FIX completes"
+    if record.stage is Stage.CONFLICT:
+        return "conflict", f"conflict: {record.reason}"
+    if record.stage is Stage.ATTEMPTED:
+        return (
+            "written_unverified",
+            f"written, not yet verified ({record.attempts}/{MAX_EFFECT_ATTEMPTS})",
+        )
+    if not record.authorized:
+        return "awaiting_approval", "awaiting approval"
+    if record.precondition["authorization"] == AUTHORIZATION_POLICY:
+        return "authorized_by_policy", "authorized by policy, not yet written"
+    return "approved", "approved, not yet written"
+
+
+def _pr_body_finding_ids(state: AutoForgeState) -> list[str]:
+    """The findings the saved plan resolves by its PR body update (#423)."""
+    context = state.phase_effects().context
+    if not isinstance(context, FixContext):
+        return []
+    return [r["finding_id"] for r in context.resolutions if r["pr_body_source"] is not None]
+
+
+def _pr_body_updates(state: AutoForgeState) -> list[dict]:
+    """The derived ``pr_body_updates`` of ``status --json`` (#423).
+
+    One entry for the persisted K12 record of the current plan, then one per
+    ``pr_body_outcomes`` entry. ``state`` is awaiting_approval, approved,
+    authorized_by_policy, written_unverified, verified, conflict, declined or
+    stale; ``verified`` comes only from an observed record or a recorded
+    outcome, never from an acknowledgement.
+    """
+    out: list[dict] = []
+    for record in _pr_body_records(state):
+        status, label = _pr_body_label(record)
+        out.append(
+            {
+                "action_id": record.action_id,
+                "kind": "pr_body_update",
+                "pr": record.target["pr_url"],
+                "round": state.review_round,
+                "finding_ids": _pr_body_finding_ids(state),
+                "authorization": record.precondition["authorization"],
+                "state": status,
+                "label": label,
+                "expected_body_sha256": record.precondition["base_sha256"],
+                "payload_chars": len(record.body),
+                "payload_sha256": sha256_text(record.body),
+            }
+        )
+    for outcome in state.pr_body_outcomes:
+        out.append(
+            {
+                "action_id": outcome["action_id"],
+                "kind": "pr_body_update",
+                "pr": state.current_pr_url,
+                "round": outcome["round"],
+                "finding_ids": outcome["finding_ids"],
+                "state": outcome["outcome"],
+                "label": outcome["outcome"],
+                "expected_body_sha256": outcome["base_sha256"],
+                "payload_sha256": outcome["body_sha256"],
+                "changed": outcome["changed"],
+                "reason": outcome["reason"],
+                "at": outcome["at"],
+            }
+        )
+    return out
+
+
+def _render_pr_body_updates(state: AutoForgeState, engine: ControllerEngine) -> list[str]:
+    """The human ``PR body update`` blocks of ``status`` (#423); none without one."""
+    lines: list[str] = []
+    records = state.phase_effects().records
+    push = next((r for r in records if r.kind is EffectKind.PUSH), None)
+    titles = {f.get("id"): str(f.get("title", "")) for f in state.open_findings}
+    for record in _pr_body_records(state):
+        action = record.action_id
+        _, label = _pr_body_label(record)
+        expected = record.precondition["base_sha256"]
+        if record.precondition["authorization"] == AUTHORIZATION_POLICY:
+            authorization = "authorized by policy (safety.pr_body_updates: auto)"
+        else:
+            authorization = (
+                "operator approval required (recorded with the plan; "
+                f"safety.pr_body_updates is now {engine.config.safety.pr_body_updates})"
+            )
+        lines += [
+            f"PR body update {action} (FIX, review round {state.review_round})",
+            f"  PR:            {record.target['pr_url']}",
+            *(
+                f"  finding:       {fid} {titles.get(fid, '')}".rstrip()
+                for fid in _pr_body_finding_ids(state)
+            ),
+            f"  authorization: {authorization}",
+            f"  state:         {label}",
+            f"  expected body: sha256 {expected}",
+            f"  payload:       {len(record.body)} chars, sha256 "
+            f"{sha256_text(record.body)}  ({engine.cli_command('status', '--action', action)})",
+        ]
+        if record.stage is Stage.OBSERVED:
+            continue
+        if push is not None and push.stage is not Stage.OBSERVED:
+            branch = str(push.target["ref"]).removeprefix("refs/heads/")
+            lines += [
+                f"  held back:     push of {str(push.payload['sha'])[:12]} to {branch}, after "
+                "the body is verified",
+                f"  worktree:      {engine.agent_worktree_description()} holds the unpushed "
+                "candidate; do not reset it",
+            ]
+        why = '"..."'
+        plain = f"{engine.cli_command('unblock', '--reason')} {why}"
+        decline = f"{engine.cli_command('unblock', '--decline-action', action, '--reason')} {why}"
+        if record.stage is Stage.INTENDED and not record.authorized:
+            ahead = ", ".join(r.action_id for r in unverified_before(records, record))
+            lines += [
+                f"  next:          approve:  "
+                f"{engine.cli_command('unblock', '--approve-action', action, '--reason')} {why}"
+                f" ; {engine.resume_command()}",
+                "                 or set the PR body to exactly that payload, then: "
+                f"{plain} ; {engine.resume_command()}",
+                f"                 a decline is refused until {ahead} is verified"
+                if ahead
+                else f"                 or decline: {decline} (FIX runs again)",
+            ]
+        elif record.stage is Stage.CONFLICT:
+            lines += [
+                f"  next:          put the body back to the expected sha256, or set it to exactly "
+                f"the payload, then: {plain} ; {engine.resume_command()}",
+                f"                 or keep the body and decline: {decline} (FIX runs again)",
+            ]
+        else:
+            lines.append(f"  next:          {engine.resume_command()}")
+    for outcome in state.pr_body_outcomes:
+        lines += [
+            f"PR body update {outcome['action_id']} (review round {outcome['round']}, findings "
+            f"{', '.join(outcome['finding_ids'])})",
+            f"  state:         {outcome['outcome']}"
+            + (f": {outcome['reason']}" if outcome["reason"] else ""),
+            f"  body:          sha256 {outcome['body_sha256']}"
+            + ("" if outcome["changed"] else " (already held; nothing was written)"),
+        ]
+    return lines
 
 
 def _render_acceptance_actions(state: AutoForgeState, engine: ControllerEngine) -> list[str]:
