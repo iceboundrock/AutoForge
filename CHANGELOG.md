@@ -38,7 +38,13 @@ and the package name it in a later process, where they said `reason
 unknown` before. `unblock` clears it, and nothing that decides reads it.
 State protocol 15 → 16: an older file loads in every phase with no code
 (`unknown`, as before) and is relabelled on its next save; an older-labelled
-file carrying the field is refused.
+file carrying the field is refused. Where one code is named both before a
+plan is saved and by a saved plan's completion (`default-branch`,
+`fix-plan-refused`), the saved plan tells the two apart, never the reason's
+text: a saved plan's diagnosis says what of it is already on GitHub, keeps
+those writes under "do not touch" and names the repair after which `unblock`
+and `resume` complete the plan without launching an agent; only a stop with
+no plan saved is told that nothing was sent and that `unblock` starts afresh.
 
 `status --live` adds, for a `BLOCKED` run, the decision `unblock --dry-run`
 would print for the same state, read from GitHub, and any drift of the PR

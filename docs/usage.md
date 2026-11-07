@@ -1902,7 +1902,15 @@ in:
   `review-round-cap`: raise `workflow.max_review_rounds` first, since
   `unblock` refuses while the cap holds. `Reason:` stays text for a human
   and is never read for a code; a stop saved before protocol 16 has no
-  code, and its diagnosis is `unknown`;
+  code, and its diagnosis is `unknown`. A code named both before a plan is
+  saved and by a saved plan's completion (`default-branch`,
+  `fix-plan-refused`) is told apart by the saved plan, never by the reason:
+  with one, the diagnosis says what of the plan is already on GitHub and
+  what to repair, after which `unblock` and `resume` complete the plan
+  without launching an agent (before the repair the phase stops again); only
+  a stop with no plan saved is told that nothing was sent and that `unblock`
+  starts afresh. A saved FIX plan that defers a finding to the run's own
+  issue cannot complete, and its steps lead to a new run;
 - **proven:** what the controller recorded: the phase, the issue, the PR and
   the HEAD it last verified, the review round, a FIX candidate and its push,
   the effects already observed, and the bounds in force;
@@ -1926,7 +1934,9 @@ in:
   the round holds 16 declines;
 - **do not touch:** the agent worktree that holds an unpushed candidate, or
   may hold one no record names, the saved plan, comments already verified as
-  evidence;
+  evidence, and what the saved plan already wrote and verified (a pushed
+  branch, a follow-up issue it created or a marker it appended), which the
+  plan never writes again;
 - **next:** the exact commands, with the flags this command was given, in
   order, alternatives marked `or:`, each as `--json` holds it, a path's
   spaces included, except that a character that cannot be printed on one

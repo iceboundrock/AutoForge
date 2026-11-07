@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from autoforge import cli
+from autoforge.claims import render_follow_up_marker
 from autoforge.effects import EffectKind, Stage, sha256_text
 from autoforge.engine import ControllerEngine
 from autoforge.errors import ExecutionTimeoutError, GitHubError, GitHubUnavailableError
@@ -67,6 +68,7 @@ from tests.conftest import (
     GOOGLE_API_KEY,
     GOOGLE_KEY_BODY,
     ISSUE,
+    ISSUE3,
     MERGE_BASE,
     PR,
     SHA_A,
@@ -75,10 +77,13 @@ from tests.conftest import (
     acceptance,
     block,
     checks_refused,
+    deferred_to,
+    fixed,
     fixer,
     implement,
     implementation_pr_body,
     make_engine,
+    new_follow_up,
     pollute_operator_environment,
     pr_body_update,
     review_result,
@@ -88,15 +93,25 @@ from tests.conftest import (
 )
 from tests.test_engine import (
     ESCAPE_BODY,
+    ISSUE43,
     REASON_211,
     _accepting,
     _analyzed,
+    _bound_to_main,
+    _crash,
     _disqualify,
+    _finding,
+    _in_fix,
     _in_merge,
     _k9,
     _loop_agent,
+    _marked,
     _no_stagnation,
     _one_finding_per_round,
+    _power_loss_at,
+    _rename_main_to_trunk,
+    _reports_head,
+    _resumed,
 )
 from tests.test_operator_actions import (
     BOTH,
@@ -262,6 +277,108 @@ def _review_cap(tmp_state_dir):
     return eng
 
 
+def _default_branch_after_the_plan(tmp_state_dir, *, pushed: bool = True):
+    """PR #470 R6-F1: ANALYZE_EXECUTE saved its plan (the push, then the PR onto
+    'main'), and sent its push or nothing; then GitHub's default branch was renamed,
+    and the plan's completion in a later process blocks with code default-branch,
+    sending nothing more (``tests/test_engine.py``'s rename after the plan)."""
+    gh = FakeGitHub()
+    eng = make_engine(tmp_state_dir, implement, github=gh, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    if pushed:
+        gh.write_failures.append(
+            ("create_pull_request", GitHubUnavailableError("gh: HTTP 502"), False)
+        )
+        with pytest.raises(GitHubUnavailableError, match="'resume' reconciles it"):
+            eng.step()
+    else:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(ControllerEngine, "_complete_analyze", _crash)
+            with pytest.raises(KeyboardInterrupt):
+                eng.step()
+    _rename_main_to_trunk(eng, gh)
+    eng = _resumed(eng, tmp_state_dir, gh, "never")
+    assert eng.step().next_phase == "BLOCKED"
+    assert eng.state.stop_code == "default-branch"
+    return eng
+
+
+def _default_branch_before_the_plan(tmp_state_dir):
+    """The default branch renamed while the agent ran: its result is refused before any
+    plan is saved, with code default-branch (``tests/test_engine.py``)."""
+    gh = FakeGitHub()
+    eng = make_engine(tmp_state_dir, None, github=gh, origin=True)
+
+    def renames_meanwhile(req):
+        reply = implement(req)
+        _rename_main_to_trunk(eng, gh)
+        return reply
+
+    eng.provider._handler = scripted(renames_meanwhile, _reports_head)
+    assert _analyzed(eng).next_phase == "BLOCKED"
+    assert eng.state.stop_code == "default-branch"
+    return eng
+
+
+def _two_findings_in_fix(tmp_state_dir, gh, agent):
+    return _in_fix(tmp_state_dir, gh, agent, [_finding(1, 1), _finding(1, 2)], origin=True)
+
+
+def _fix_follow_up_closed_after_the_plan(tmp_state_dir):
+    """PR #470 R6-F1: the saved FIX plan created R1-F2's follow-up issue, and the
+    process died before the push; the issue was closed since, so the plan's completion
+    in a later process blocks with code fix-plan-refused before the push
+    (``tests/test_engine.py``'s replay of an observed follow-up)."""
+    gh = FakeGitHub()
+    eng = _two_findings_in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1"), new_follow_up("R1-F2")))
+    _power_loss_at(eng, EffectKind.FOLLOW_UP_ISSUE, Stage.OBSERVED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    assert [w[0] for w in gh.effect_writes] == ["create_issue"]
+    gh.issues[ISSUE43].state = "CLOSED"
+    eng = _resumed(eng, tmp_state_dir, gh, "never")
+    assert eng.step().next_phase == "BLOCKED"
+    assert eng.state.stop_code == "fix-plan-refused"
+    return eng
+
+
+def _fix_plan_deferring_to_its_own_issue(tmp_state_dir):
+    """PR #470 R6-F1: a saved FIX plan reusing the run's own issue as R1-F1's follow-up
+    (one saved without the entry's check, written into the journal as
+    ``tests/test_engine.py`` does): its completion refuses it whatever GitHub holds."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "follow-up", body=_marked("R1-F1"))
+    eng = _two_findings_in_fix(
+        tmp_state_dir, gh, fixer(deferred_to("R1-F1", ISSUE3), fixed("R1-F2"))
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(ControllerEngine, "_complete_fix", _crash)
+        with pytest.raises(KeyboardInterrupt):
+            eng.step()
+    eng.state.entry_observation["objects"][render_follow_up_marker(PR, "R1-F1")] = ISSUE
+    eng._save()
+    gh.issues[ISSUE3].body = "No marker any more."
+    gh.issues[ISSUE].body = _marked("R1-F1", "The issue being implemented.")
+    eng = _resumed(eng, tmp_state_dir, gh, "never")
+    assert eng.step().next_phase == "BLOCKED"
+    assert eng.state.stop_code == "fix-plan-refused"
+    return eng
+
+
+def _fix_refused_before_the_plan(tmp_state_dir):
+    """FIX's entry refuses to launch the fixer while the run's own issue carries a
+    finding's follow-up marker: code fix-plan-refused, and no plan is saved."""
+    gh = FakeGitHub()
+    eng = _two_findings_in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1"), fixed("R1-F2")))
+    _bound_to_main(eng)
+    eng.state.reviewed_pr_url = PR
+    eng.state.last_review_result = "needs_fix"
+    gh.issues[ISSUE].body = _marked("R1-F1", "The issue being implemented.")
+    assert eng.step().next_phase == "BLOCKED"
+    assert eng.state.stop_code == "fix-plan-refused"
+    return eng
+
+
 BLOCKED_SCENARIOS = {
     "k10-operator-actions": _k10_blocked,
     "k9-acceptance-action": _k9_blocked,
@@ -270,6 +387,12 @@ BLOCKED_SCENARIOS = {
     "ambiguous-prs": _ambiguous,
     "checks-refused-291": _checks_refused,
     "review-round-cap": _review_cap,
+    # One code, a stop before any plan and a saved plan's stop (PR #470 R6-F1).
+    "default-branch-before-the-plan": _default_branch_before_the_plan,
+    "default-branch-after-the-plan": _default_branch_after_the_plan,
+    "fix-plan-refused-before-the-plan": _fix_refused_before_the_plan,
+    "fix-plan-refused-after-a-write": _fix_follow_up_closed_after_the_plan,
+    "fix-plan-refused-own-issue": _fix_plan_deferring_to_its_own_issue,
 }
 
 
@@ -921,7 +1044,9 @@ def test_building_a_package_changes_nothing_of_the_state(tmp_state_dir):
 
 def test_the_package_module_reads_nothing_and_decides_nothing():
     """Pure: it imports no I/O, process, clock, GitHub or engine module, and only the
-    CLI imports it (``test_only_the_sinks_and_the_cli_import_the_classification``)."""
+    CLI imports it (``test_only_the_sinks_and_the_cli_import_the_classification``).
+    ``validation`` parses GitHub URLs and reads nothing: a saved FIX plan's deferral to
+    the run's own issue is told by issue identity, as FIX tells it (PR #470 R6-F1)."""
     tree = ast.parse((SRC / "recovery_package.py").read_text())
     imported = set()
     for node in ast.walk(tree):
@@ -941,6 +1066,7 @@ def test_the_package_module_reads_nothing_and_decides_nothing():
         ".state",
         ".stop_classification",
         ".transitions",
+        ".validation",
     }
 
 
@@ -1504,8 +1630,6 @@ def test_a_credential_in_a_refused_stop_code_never_reaches_status(
 def _k12_verified_then_edited(tmp_state_dir, *, later_write: bool = False):
     gh = FakeGitHub()
     if later_write:
-        from tests.conftest import fixed, new_follow_up
-
         eng = _mixed(
             tmp_state_dir,
             gh,
@@ -2499,3 +2623,251 @@ def test_a_path_that_cannot_be_printed_is_spelled_on_one_line_with_its_bytes(nam
     assert read.split(b"\0")[:-1] == [os.fsencode(a) for a in argv]
     printable = shlex.join(["autoforge", "--state-dir", "/tmp/a  b"])
     assert _command_line(printable) == printable
+
+
+# -- a saved plan's stop is replayed, never entered afresh (PR #470 R6-F1) ------------------
+
+#: What a diagnosis says only of a stop before any plan was saved.
+_FRESH = ("fresh entry", "afresh", "nothing was sent", "nothing was pushed", "nothing was created")
+
+
+def _no_fresh_promise(text: str) -> None:
+    lowered = text.lower()
+    assert not [p for p in _FRESH if p in lowered], text
+
+
+def _plain_and_resume(eng) -> list[tuple[str, bool]]:
+    prefix = _prefix(eng)
+    return [
+        (f"{prefix} status --live", False),
+        (f'{prefix} unblock --reason "..."', False),
+        (f"{prefix} resume", False),
+    ]
+
+
+@pytest.mark.parametrize("pushed", [True, False], ids=["push-sent", "nothing-sent"])
+def test_a_default_branch_stop_of_a_saved_plan_names_its_repair_and_replays_it(
+    tmp_state_dir, status_cli, capsys, pushed
+):
+    """A saved ANALYZE_EXECUTE plan opens its PR onto 'main', which is no longer the
+    default branch. The package, cached and live, says the plan stays saved and what of
+    it is on GitHub, asks for 'main' to be the default again, and promises no fresh
+    entry; the whole 'status' says the same. Run as displayed: 'unblock' before that
+    repair is accepted and the re-entry stops here again, sending nothing; after it, the
+    re-entry completes the plan without launching the agent or pushing again."""
+    eng = _default_branch_after_the_plan(tmp_state_dir, pushed=pushed)
+    gh = eng.github
+    candidate = _push_sha(eng)
+    branch_head = eng.origin.head("autoforge/2")
+    assert branch_head == (candidate if pushed else None)
+    writes = list(gh.effect_writes)
+    for flags in ((), ("--live",)):
+        package = _recovery(status_cli, eng, capsys, *flags)
+        diagnosis = package["diagnosis"]
+        assert (diagnosis["code"], diagnosis["freshness"]) == ("default-branch", "snapshot")
+        _no_fresh_promise(diagnosis["meaning"] + diagnosis["remedy"])
+        assert (
+            "the repository's default branch is no longer 'main', the branch the saved "
+            "ANALYZE_EXECUTE plan opens the implementation PR onto"
+        ) in diagnosis["meaning"]
+        assert "'unblock' keeps it" in diagnosis["meaning"]
+        if pushed:
+            assert (
+                "Of the plan, written and verified: push effect 0 on refs/heads/autoforge/2; "
+                "sent, its outcome not read back yet: implementation_pr effect 1"
+            ) in diagnosis["meaning"]
+        else:
+            assert "Nothing of the plan was sent yet" in diagnosis["meaning"]
+        assert diagnosis["remedy"].startswith(
+            "make 'main' the default branch of the repository again, then 'unblock'"
+        )
+        assert "completes the saved plan without launching the agent" in diagnosis["remedy"]
+        assert "but the re-entry stops here again" in diagnosis["remedy"]
+        sequence = _sequence(package)
+        assert sequence[:4] == [("", False), *_plain_and_resume(eng)]
+        assert package["next"][0]["text"] == diagnosis["remedy"]
+        [journal] = [c for c in package["preserve"] if c["key"] == "journal"]
+        assert "'unblock' and 'resume' complete it from the journal" in journal["text"]
+        written = [c for c in package["preserve"] if c["key"] == "written-0"]
+        if pushed:
+            [push] = written
+            assert (
+                f"refs/heads/autoforge/2 at {candidate}, pushed by the saved plan (push effect "
+                "0) and verified: do not delete, reset or force-push it"
+            ) in push["text"]
+        else:
+            assert written == []
+            [kept] = [c for c in package["preserve"] if c["key"] == "worktree"]
+            assert f"holds the unpushed candidate {candidate}" in kept["text"]
+    live = package["live"]
+    assert (live["decision"], live["target_phase"]) == ("would_reenter", "ANALYZE_EXECUTE")
+    assert "completes from its persisted plan without launching the agent" in live["detail"]
+    out, block, rest = _human_status(status_cli, eng, capsys)
+    _no_fresh_promise(out)
+    assert "    1. make 'main' the default branch of the repository again" in block
+
+    plain = f'{_prefix(eng)} unblock --reason "..."'
+    rc, out, err = _run_displayed(status_cli, eng, plain, capsys)
+    assert rc == 0 and "BLOCKED -> ANALYZE_EXECUTE" in out, err
+    eng.load()
+    assert eng.step().next_phase == "BLOCKED"
+    assert eng.state.stop_code == "default-branch"
+    assert gh.effect_writes == writes and eng.origin.head("autoforge/2") == branch_head
+    assert _recovery(status_cli, eng, capsys)["next"][0]["text"] == diagnosis["remedy"]
+
+    gh.default_branch = "main"
+    rc, out, err = _run_displayed(status_cli, eng, plain, capsys)
+    assert rc == 0 and "BLOCKED -> ANALYZE_EXECUTE" in out, err
+    eng.load()
+    outcome = eng.step()
+    assert outcome.next_phase == "REVIEW", outcome.message
+    assert eng.provider.calls == []
+    assert eng.origin.head("autoforge/2") == candidate == eng.state.current_head_sha
+    assert gh.prs[PR].base_ref == "main"
+
+
+def test_a_fix_plan_refused_after_its_follow_up_was_created_names_it_and_replays_the_plan(
+    tmp_state_dir, status_cli, capsys
+):
+    """The saved FIX plan created R1-F2's follow-up, which was closed before the push.
+    The package, cached and live, names that issue as written (never "nothing was
+    sent"), keeps it under do-not-touch, asks for it to be reopened, and promises no
+    fresh fixer; the whole 'status' says the same. Run as displayed: 'unblock' before
+    the repair is accepted and FIX stops here again, sending nothing; after it, FIX
+    completes the plan without launching the fixer and creates no second issue."""
+    eng = _fix_follow_up_closed_after_the_plan(tmp_state_dir)
+    gh = eng.github
+    candidate = _push_sha(eng)
+    reviewed = eng.state.reviewed_head_sha
+    for flags in ((), ("--live",)):
+        package = _recovery(status_cli, eng, capsys, *flags)
+        diagnosis = package["diagnosis"]
+        assert (diagnosis["code"], diagnosis["freshness"]) == ("fix-plan-refused", "snapshot")
+        _no_fresh_promise(diagnosis["meaning"] + diagnosis["remedy"])
+        assert diagnosis["meaning"].startswith(
+            "the open issues contradict the saved FIX plan of review round 1"
+        )
+        assert (
+            f"Of the plan, written and verified: follow_up_issue effect 0 on owner/repo "
+            f"({ISSUE43}). What is written stays on GitHub"
+        ) in diagnosis["meaning"]
+        assert "reopen, with its marker as written, each one it did" in diagnosis["remedy"]
+        assert "completes the saved plan without launching the fixer" in diagnosis["remedy"]
+        assert _sequence(package)[:4] == [("", False), *_plain_and_resume(eng)]
+        [issue] = [c for c in package["preserve"] if c["key"] == "written-0"]
+        assert (
+            f"issue {ISSUE43}, created by the saved plan as the follow-up of R1-F2 "
+            "(follow_up_issue effect 0) and verified: keep it open"
+        ) in issue["text"]
+        [kept] = [c for c in package["preserve"] if c["key"] == "worktree"]
+        assert f"holds the unpushed candidate {candidate}" in kept["text"]
+    live = package["live"]
+    assert (live["decision"], live["target_phase"]) == ("would_reenter", "FIX")
+    assert "completes from its persisted plan without launching the fixer" in live["detail"]
+    out, block, rest = _human_status(status_cli, eng, capsys)
+    _no_fresh_promise(out)
+    assert f"issue {ISSUE43}, created by the saved plan" in block
+
+    plain = f'{_prefix(eng)} unblock --reason "..."'
+    rc, out, err = _run_displayed(status_cli, eng, plain, capsys)
+    assert rc == 0 and "BLOCKED -> FIX" in out, err
+    eng.load()
+    assert eng.step().next_phase == "BLOCKED"
+    assert eng.state.stop_code == "fix-plan-refused"
+    assert [w[0] for w in gh.effect_writes] == ["create_issue"]
+    assert eng.origin.head(BRANCH) == reviewed and eng.provider.calls == []
+
+    gh.issues[ISSUE43].state = "OPEN"
+    rc, out, err = _run_displayed(status_cli, eng, plain, capsys)
+    assert rc == 0 and "BLOCKED -> FIX" in out, err
+    eng.load()
+    outcome = eng.step()
+    assert outcome.next_phase == "REVIEW", outcome.message
+    assert eng.provider.calls == []
+    assert [w[0] for w in gh.effect_writes] == ["create_issue"]
+    assert eng.origin.head(BRANCH) == candidate == gh.prs[PR].head_sha
+
+
+def test_a_saved_fix_plan_deferring_to_its_own_issue_routes_to_a_new_run(
+    tmp_state_dir, status_cli, capsys
+):
+    """A saved plan FIX refuses whatever GitHub holds: the package says it cannot
+    complete as saved, offers no unblock or resume, and leads to a new run. The plain
+    unblock it advises against is accepted, as 'status --live' previews, and FIX
+    refuses the plan again, launching nothing."""
+    eng = _fix_plan_deferring_to_its_own_issue(tmp_state_dir)
+    prefix = _prefix(eng)
+    for flags in ((), ("--live",)):
+        package = _recovery(status_cli, eng, capsys, *flags)
+        diagnosis = package["diagnosis"]
+        _no_fresh_promise(diagnosis["meaning"] + diagnosis["remedy"])
+        assert diagnosis["meaning"].startswith(
+            "the saved FIX plan of review round 1 defers R1-F1 to the run's own issue"
+        )
+        assert "Nothing of the plan was sent yet" in diagnosis["meaning"]
+        assert diagnosis["remedy"].endswith("and start a new run")
+        assert _sequence(package) == [
+            ("", False),
+            (f"{prefix} run --force --epic {EPIC} --issue {ISSUE}", False),
+        ]
+        assert "unblock-saved-plan" in _keys(package["forbidden"])
+        [journal] = [c for c in package["preserve"] if c["key"] == "journal"]
+        assert "it cannot complete as saved, so a new run replaces it" in journal["text"]
+        assert not [c for c in package["preserve"] if c["key"].startswith("written-")]
+    assert package["live"]["target_phase"] == "FIX"
+    out, block, rest = _human_status(status_cli, eng, capsys)
+    assert f"{prefix} unblock" not in out and f"{prefix} resume" not in out
+
+    rc, out, err = status_cli(eng, "unblock", "--reason", "trying anyway", capsys=capsys)
+    assert rc == 0 and "BLOCKED -> FIX" in out, err
+    eng.load()
+    assert eng.step().next_phase == "BLOCKED"
+    assert eng.state.stop_code == "fix-plan-refused"
+    assert eng.provider.calls == [] and eng.github.effect_writes == []
+
+
+def test_a_context_only_fix_plan_is_kept_and_named_as_saved(tmp_state_dir):
+    """A FIX plan whose resolutions write nothing is saved as its context alone: it is
+    a saved plan all the same, so its stop keeps the journal and names no fresh launch."""
+    eng = _fix_plan_deferring_to_its_own_issue(tmp_state_dir)
+    state = load_state(eng.paths.state_file)
+    state.effect_records = []
+    context = state.completion_context
+    context["resolutions"] = [r for r in context["resolutions"] if r["finding_id"] == "R1-F1"]
+    state.open_findings = [f for f in state.open_findings if f["id"] == "R1-F1"]
+    state.phase_effects()  # still a valid saved plan
+    package = build_package(
+        classify_state(state), state, commands=_commands_of(eng), policy=_POLICY
+    )
+    [journal] = [c for c in package.preserve if c.key == "journal"]
+    assert "(its completion context; no effect record)" in journal.text
+    assert package.diagnosis["meaning"].startswith("the saved FIX plan of review round 1")
+
+
+@pytest.mark.parametrize(
+    ("scenario", "launch"),
+    [
+        ("default-branch-before-the-plan", "ANALYZE_EXECUTE will launch the implementation agent"),
+        (
+            "fix-plan-refused-before-the-plan",
+            "FIX re-reads the HEAD, base and merge base before launching the fixer",
+        ),
+    ],
+)
+def test_a_stop_before_any_plan_keeps_its_fresh_launch_advice(
+    tmp_state_dir, status_cli, capsys, scenario, launch
+):
+    """The same codes before any plan was saved: nothing was sent and 'unblock' starts
+    afresh, as the table says and 'status --live' previews; no journal is kept."""
+    eng = BLOCKED_SCENARIOS[scenario](tmp_state_dir)
+    saved = load_state(eng.paths.state_file)
+    assert saved.effect_records == [] and saved.completion_context == {}
+    package = _recovery(status_cli, eng, capsys, "--live")
+    diagnosis = package["diagnosis"]
+    table = DIAGNOSES[StopReasonCode(diagnosis["code"])]
+    assert (diagnosis["meaning"], diagnosis["remedy"]) == (table.meaning, table.remedy)
+    assert "fresh entry" in table.remedy or "afresh" in table.remedy
+    assert package["next"][0]["text"] == table.remedy
+    assert _sequence(package)[1:4] == _plain_and_resume(eng)
+    assert not [c for c in package["preserve"] if c["key"] == "journal"]
+    assert launch in package["live"]["detail"]

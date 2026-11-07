@@ -43,17 +43,20 @@ is read, never changed.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
-from .claims import ACCEPTANCE, OPERATOR_COMMENT, scan
+from .claims import ACCEPTANCE, OPERATOR_COMMENT, render_follow_up_marker, scan
 from .effects import (
     AUTHORIZATION_POLICY,
+    FOLLOW_UP_SOURCE_ENTRY,
     MAX_EFFECT_ATTEMPTS,
+    AnalyzeContext,
     EffectKind,
     EffectRecord,
     FixContext,
+    PhaseEffects,
     Stage,
     sha256_text,
     unverified_before,
@@ -68,6 +71,7 @@ from .stop_classification import (
     StopReasonCode,
 )
 from .transitions import Phase
+from .validation import same_issue_url
 
 SCHEMA = "autoforge.recovery/1"
 
@@ -634,9 +638,11 @@ DIAGNOSES: dict[StopReasonCode, Diagnosis] = {
         "leave the PR to the run its marker names; or, if this run should drive it, take it "
         "over (the operator's decision, below)",
     ),
+    # With no ANALYZE_EXECUTE plan saved; with one, :func:`_default_branch_after_plan`.
     StopReasonCode.DEFAULT_BRANCH: Diagnosis(
         "the repository's default branch is not the one this phase's entry recorded, or a "
-        "write would have targeted it; the controller never writes to the default branch",
+        "write would have targeted it; the controller never writes to the default branch. "
+        "No ANALYZE_EXECUTE plan is saved, so nothing was pushed or created",
         "inspect the repository's default branch; 'unblock' starts a fresh entry that reads "
         "it again",
     ),
@@ -646,10 +652,16 @@ DIAGNOSES: dict[StopReasonCode, Diagnosis] = {
         "inspect the object the reason names on GitHub; the controller writes nothing over "
         f"it, so put it right or start a new run, {_UNBLOCK_AFTER}",
     ),
+    # With no FIX plan saved; with one, :func:`_fix_plan_contradicted` or
+    # :func:`_fix_plan_self_deferral`.
     StopReasonCode.FIX_PLAN_REFUSED: Diagnosis(
-        "the FIX plan could not be made from the fixer's accepted result: an object it would "
-        "write to (a follow-up issue, the PR) is not as the entry read it; nothing was sent",
-        "inspect the object the reason names; 'unblock' launches the fixer afresh",
+        "no FIX plan is saved: before the fixer was launched, or before its accepted result "
+        "was planned, an issue the plan would write to was not as the controller requires "
+        "(the run's own issue carrying a finding's follow-up marker, a follow-up issue closed "
+        "or in another repository, or one whose body cannot take the marker), or the plan "
+        "would not fit the state file; nothing was created, appended or pushed",
+        "inspect the issue the reason names and repair it; 'unblock' (it re-reads GitHub and "
+        "may refuse) re-enters FIX, whose next step launches the fixer afresh",
     ),
     StopReasonCode.EPIC_ROADMAP: Diagnosis(
         "the EPIC's roadmap markers cannot be read as one section (repeated, unbalanced or "
@@ -769,10 +781,177 @@ def diagnosis_in(code: StopReasonCode, state: AutoForgeState) -> Diagnosis:
     recorded in the replan journal, and by REVIEW's replan policy refusing a
     replacement before any transaction began, with no journal. Only the first
     is one ``unblock`` refuses (PR #470 R2-F3).
+
+    ``default-branch`` and ``fix-plan-refused`` are each named before a plan
+    is saved and by a saved plan's completion (PR #470 R6-F1). ``unblock``
+    keeps a saved plan, and the phase it re-enters completes that plan from
+    the journal without launching an agent, or stops on the same cause again:
+    so a saved plan's diagnosis gives its repair, says what of it is already
+    on GitHub, and promises no fresh entry or launch.
     """
     if code is StopReasonCode.REPLAN_REFUSED and not state.replan_transaction:
         return REPLAN_POLICY_REFUSED
+    if code is StopReasonCode.DEFAULT_BRANCH:
+        effects = state.phase_effects()
+        if _saved_analyze_plan(effects):
+            return _default_branch_after_plan(effects)
+    if code is StopReasonCode.FIX_PLAN_REFUSED:
+        effects = state.phase_effects()
+        if isinstance(effects.context, FixContext):
+            selves = self_deferrals(state, effects)
+            if selves:
+                return _fix_plan_self_deferral(effects, selves)
+            return _fix_plan_contradicted(effects)
     return diagnosis_of(code)
+
+
+def _saved_analyze_plan(effects: PhaseEffects) -> bool:
+    """Whether ``effects`` hold a saved ANALYZE_EXECUTE plan of the push and its PR."""
+    return isinstance(effects.context, AnalyzeContext) and any(
+        r.kind is EffectKind.PUSH for r in effects.records
+    )
+
+
+def _written(records: Sequence[EffectRecord]) -> str:
+    """What of a saved plan is already on GitHub, by record, or that nothing was sent yet.
+
+    The diagnosis of a saved plan's stop says it, never "nothing was sent": a
+    write the plan made before the stop stays on GitHub (PR #470 R6-F1).
+    """
+
+    def named(record: EffectRecord) -> str:
+        url = str((record.observed or {}).get("url", ""))
+        name = record.describe()
+        return f"{name} ({url})" if url and url not in name else name
+
+    observed = [named(r) for r in records if r.stage is Stage.OBSERVED]
+    attempted = [named(r) for r in records if r.stage is Stage.ATTEMPTED]
+    parts = []
+    if observed:
+        parts.append(f"written and verified: {', '.join(observed)}")
+    if attempted:
+        parts.append(f"sent, its outcome not read back yet: {', '.join(attempted)}")
+    if not parts:
+        return "Nothing of the plan was sent yet"
+    return (
+        f"Of the plan, {'; '.join(parts)}. What is written stays on GitHub, and the plan "
+        "never sends it again: it reconciles each record by its identity first"
+    )
+
+
+def _default_branch_after_plan(effects: PhaseEffects) -> Diagnosis:
+    """``default-branch`` named by a saved ANALYZE_EXECUTE plan's completion (PR #470 R6-F1).
+
+    The plan opens its PR onto the default branch its entry read; while that
+    branch is not the default, the completion sends nothing more of the plan,
+    the push included, and blocks. ``unblock`` keeps the plan, so its
+    re-entry completes it without a launch once the branch is the default
+    again, and stops here again until then.
+    """
+    planned = next(
+        (
+            str(r.target.get("base", ""))
+            for r in effects.records
+            if r.kind is EffectKind.IMPLEMENTATION_PR
+        ),
+        "",
+    )
+    if planned:
+        base = repr(planned)
+        what = (
+            f"no longer {base}, the branch the saved ANALYZE_EXECUTE plan opens the "
+            "implementation PR onto (ADR 0004 K2), so the controller sends nothing more of "
+            "that plan: no push and no PR create"
+        )
+    else:
+        base = "the branch the plan's entry read"
+        what = (
+            "not the one the saved ANALYZE_EXECUTE plan's entry read, so the controller "
+            "sends nothing more of that plan"
+        )
+    return Diagnosis(
+        f"the repository's default branch is {what}. The plan stays saved: 'unblock' keeps "
+        "it, and the re-entry completes it from the journal without launching the agent, or "
+        f"stops here again while {base} is not the default branch. "
+        f"{_written(effects.records)}",
+        f"make {base} the default branch of the repository again, {_UNBLOCK_AFTER}: "
+        "ANALYZE_EXECUTE then completes the saved plan without launching the agent. "
+        "'unblock' accepts before that too, and its preview says it would re-enter "
+        f"ANALYZE_EXECUTE, but the re-entry stops here again. If {base} is not to be the "
+        "default again, this plan cannot complete: the issue's PR is opened by hand, or a "
+        "new run replaces this one",
+    )
+
+
+def self_deferrals(state: AutoForgeState, effects: PhaseEffects) -> list[str]:
+    """The findings a saved FIX plan defers to the run's own issue, sorted (PR #470 R6-F1).
+
+    The issue each deferral names is the one its source names, as FIX's
+    completion reads it: the entry observation's for a reused follow-up, the
+    record's target for an append, the issue a create read back. FIX refuses
+    such a plan before anything else, whatever GitHub holds, so ``unblock``
+    cannot complete it.
+    """
+    context = effects.context
+    if not isinstance(context, FixContext):
+        return []
+    # Stored in its canonical form, which the load checks (the form FIX renders it in).
+    pr_url = context.pr_url
+    objects = effects.observation.objects if effects.observation is not None else {}
+    selves = []
+    for resolution in context.resolutions:
+        fid = str(resolution["finding_id"])
+        source = resolution["follow_up_source"]
+        url: object = None
+        if source == FOLLOW_UP_SOURCE_ENTRY:
+            url = objects.get(render_follow_up_marker(pr_url, fid))
+        elif isinstance(source, int) and 0 <= source < len(effects.records):
+            record = effects.records[source]
+            url = record.target.get("issue_url") or (record.observed or {}).get("url")
+        if url and same_issue_url(str(url), state.current_issue_url):
+            selves.append(fid)
+    return sorted(selves)
+
+
+def _fix_plan_round(effects: PhaseEffects) -> str:
+    context = effects.context
+    return f" of review round {context.round}" if isinstance(context, FixContext) else ""
+
+
+def _fix_plan_contradicted(effects: PhaseEffects) -> Diagnosis:
+    """``fix-plan-refused`` named by a saved FIX plan's completion (PR #470 R6-F1).
+
+    The open issues contradict the plan's resolutions: FIX blocks with the
+    plan kept, and ``unblock`` keeps it, so FIX completes it from the journal
+    without launching the fixer once the issues agree, and stops here again
+    until then. What the plan wrote before the stop stays on GitHub.
+    """
+    return Diagnosis(
+        f"the open issues contradict the saved FIX plan{_fix_plan_round(effects)}: each "
+        "finding it defers needs exactly one open issue carrying its follow-up marker (the "
+        "one the plan reused, created or appended to), and no other finding any. The "
+        "controller never adopts, chooses between or recreates a follow-up issue, so it sent "
+        "nothing more. The plan stays saved: 'unblock' keeps it, and FIX completes it from the "
+        "journal without launching the fixer, or stops here again while the issues contradict "
+        f"it. {_written(effects.records)}",
+        "inspect the issues the reason names: close or unmark each one the plan did not write, "
+        "and reopen, with its marker as written, each one it did (the plan's records name "
+        f"them), {_UNBLOCK_AFTER}: FIX completes the saved plan without launching the fixer, "
+        "sending nothing GitHub already holds",
+    )
+
+
+def _fix_plan_self_deferral(effects: PhaseEffects, selves: Sequence[str]) -> Diagnosis:
+    """``fix-plan-refused`` of a saved FIX plan deferring to the run's own issue (R6-F1)."""
+    return Diagnosis(
+        f"the saved FIX plan{_fix_plan_round(effects)} defers {', '.join(selves)} to the "
+        "run's own issue, which is never a follow-up of its own PR's findings. The plan was "
+        "saved without the check that refuses that, so it cannot complete as saved: "
+        "'unblock' keeps it, and FIX refuses it again before anything else, whatever GitHub "
+        f"holds. The round's fix is not recorded. {_written(effects.records)}",
+        "inspect the plan ('status --json' holds it) and the run's issue, remove the follow-up "
+        "marker from the run's issue, and start a new run",
+    )
 
 
 def diagnosis_of(code: StopReasonCode) -> Diagnosis:
@@ -944,6 +1123,13 @@ class _Builder:
         self.preserve: list[Claim] = []
         self.steps: list[Step] = []
         self.guide = ""
+        # A saved FIX plan that defers a finding to the run's own issue, on the stop
+        # its completion names for it: 'unblock' cannot complete it (PR #470 R6-F1).
+        self.self_deferral = (
+            stop.outcome is StopOutcome.BLOCKED
+            and stop.code is StopReasonCode.FIX_PLAN_REFUSED
+            and bool(self_deferrals(state, self.effects))
+        )
 
     # -- helpers --------------------------------------------------------------------------
     def snap(self, key: str, text: str) -> Claim:
@@ -1181,19 +1367,30 @@ class _Builder:
     def plan_preservation(self) -> None:
         """What a saved plan, or a FIX entry without one, asks the operator to leave as it is."""
         self.candidate_preservation()
-        if not self.records:
+        # A FIX plan whose resolutions write nothing is saved as its context alone.
+        if not self.records and not isinstance(self.effects.context, FixContext):
             return
         if self.stop.outcome is StopOutcome.FAILED:
             use = "kept for the record; a new run replaces it, and what it sent stays on GitHub"
+        elif self.self_deferral:
+            use = (
+                "kept for the record; it cannot complete as saved, so a new run replaces it, "
+                "and what it sent stays on GitHub"
+            )
         elif self.stop.outcome is StopOutcome.BLOCKED:
             use = "'unblock' and 'resume' complete it from the journal"
         else:
             use = "'resume' completes it from the journal"
+        held = (
+            f"{len(self.records)} effect record(s)"
+            if self.records
+            else "its completion context; no effect record"
+        )
         self.preserve.append(
             self.snap(
                 "journal",
-                f"the saved plan in the state file ({len(self.records)} effect record(s)): "
-                f"{use}; do not edit or remove the state file",
+                f"the saved plan in the state file ({held}): {use}; do not edit or remove the "
+                "state file",
             )
         )
         push = self.push_record()
@@ -1235,6 +1432,57 @@ class _Builder:
                         "handed it as evidence; do not edit or delete it",
                     )
                 )
+        if self.stop.outcome is StopOutcome.FAILED or self.self_deferral:
+            return
+        for record in self.records:
+            if record.stage is Stage.OBSERVED and record.kind not in _ACTION_KINDS:
+                self.preserve.append(self.written(record))
+
+    def written(self, record: EffectRecord) -> Claim:
+        """A write the saved plan made and verified, which its completion counts on (R6-F1).
+
+        The plan never sends an observed record again, and its completion reads
+        what the record wrote again (the follow-up issues before FIX records
+        the fix, the branch before the PR is opened onto it): one undone since
+        stops the run again, and nothing recreates it.
+        """
+        key = f"written-{record.position}"
+        url = str((record.observed or {}).get("url", ""))
+        context = self.effects.context
+        fids = ", ".join(
+            str(r["finding_id"])
+            for r in (context.resolutions if isinstance(context, FixContext) else ())
+            if r["follow_up_source"] == record.position
+        )
+        if record.kind is EffectKind.PUSH:
+            return self.snap(
+                key,
+                f"{record.target.get('ref', '-')} at {record.payload.get('sha', '-')}, pushed by "
+                f"the saved plan (push effect {record.position}) and verified: do not delete, "
+                "reset or force-push it; the plan never pushes it again",
+            )
+        if record.kind is EffectKind.FOLLOW_UP_ISSUE:
+            return self.snap(
+                key,
+                f"issue {url or '-'}, created by the saved plan as the follow-up of "
+                f"{fids or '-'} (follow_up_issue effect {record.position}) and verified: keep "
+                "it open, with its marker as written, until FIX completes; FIX reads the open "
+                "issues again first, and never creates it again",
+            )
+        if record.kind is EffectKind.FOLLOW_UP_APPEND:
+            return self.snap(
+                key,
+                f"the follow-up marker(s) of {fids or '-'} the saved plan appended to issue "
+                f"{record.target.get('issue_url', '-')} (follow_up_append effect "
+                f"{record.position}) and verified: keep the issue open and the markers in its "
+                "body until FIX completes; the plan never appends them again",
+            )
+        where = f" ({url})" if url and url not in record.describe() else ""
+        return self.snap(
+            key,
+            f"{record.describe()}{where}, written by the saved plan and verified: leave it as "
+            "written; the plan never sends it again",
+        )
 
     def worktree_note(self) -> None:
         """The worktree, when no unpushed candidate already names it."""
@@ -1440,6 +1688,22 @@ class _Builder:
             self.steps.append(Step("", "inspect the replan journal above and the PRs it names"))
             self.new_run_steps(failed=True)
             return
+        code = self.stop.code
+        if self.self_deferral:
+            # PR #470 R6-F1: FIX refuses this saved plan before anything else, so an
+            # applied 'unblock' only leads back here; a new run is the way on.
+            self.guide = GUIDE_BLOCKED
+            self.forbidden.append(
+                self.snap(
+                    "unblock-saved-plan",
+                    "a plain 'unblock' as the way on: it keeps the saved FIX plan and "
+                    "re-enters FIX, which refuses that plan again before sending anything, "
+                    "whatever GitHub holds",
+                )
+            )
+            self.steps.append(Step("", diagnosis_in(code, s).remedy))
+            self.new_run_steps(failed=True)
+            return
         if budget:
             self.forbidden.append(
                 self.conf(
@@ -1454,7 +1718,6 @@ class _Builder:
                     "reset the count)",
                 )
             )
-        code = self.stop.code
         capped = s.review_round >= self.policy.max_review_rounds
         if code is StopReasonCode.REVIEW_ROUND_CAP and capped:
             self.forbidden.append(
@@ -1465,6 +1728,11 @@ class _Builder:
                     "it refuses, since the next round could never start",
                 )
             )
+        # A saved plan's repair comes first: its completion checks the cause before it
+        # verifies any action the operator takes for a wait (PR #470 R6-F1).
+        repair = self.saved_plan_repair()
+        if repair:
+            self.steps.append(Step("", diagnosis_in(code, s).remedy))
         if self.operator_steps():
             self.new_run_steps()
             return
@@ -1503,7 +1771,7 @@ class _Builder:
             self.k12_maybe_edited_step()
         elif self.held_acceptance(None) is not None:
             self.issue_hold_maybe_step()
-        else:
+        elif not repair:
             self.steps.append(Step("", diagnosis_in(code, s).remedy))
         if code is StopReasonCode.GITHUB_CHECKS_REFUSED:
             self.steps.append(
@@ -1531,6 +1799,21 @@ class _Builder:
         self.steps.append(self.resume_step())
         self.code_alternatives(code)
         self.new_run_steps()
+
+    def saved_plan_repair(self) -> bool:
+        """Whether the stop is a saved plan's, whose repair ``unblock`` replays (R6-F1).
+
+        ``default-branch`` with a saved ANALYZE_EXECUTE plan, or
+        ``fix-plan-refused`` with a saved FIX plan: ``unblock`` keeps the plan,
+        and the re-entry completes it, launching nothing, once the cause is
+        repaired (:func:`diagnosis_in`).
+        """
+        code = self.stop.code
+        if code is StopReasonCode.DEFAULT_BRANCH:
+            return _saved_analyze_plan(self.effects)
+        return code is StopReasonCode.FIX_PLAN_REFUSED and isinstance(
+            self.effects.context, FixContext
+        )
 
     def code_alternatives(self, code: StopReasonCode) -> None:
         """Another way out that ``unblock`` takes for this code, where it applies."""
