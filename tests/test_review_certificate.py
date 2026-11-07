@@ -477,14 +477,16 @@ def _relabelled(data: dict, label: str) -> dict:
     """``data`` under ``label``: a protocol-12 file carries LOCAL's twelve fields empty."""
     if label == __protocol_version__:
         return {**data, "protocol_version": label}
-    # An older label never wrote protocol 15's field (#423).
-    data = {k: v for k, v in data.items() if k != "pr_body_outcomes"}
+    # An older label never wrote protocol 16's field (#374), and one before 15
+    # never wrote protocol 15's (#423).
+    newer = ("stop_code",) if label == "15" else ("pr_body_outcomes", "stop_code")
+    data = {k: v for k, v in data.items() if k not in newer}
     if label == "12":
         return {**data, **LOCAL_STATE_FIELDS, "protocol_version": "12"}
     return {**data, "protocol_version": label}
 
 
-@pytest.mark.parametrize("label", ["15", "12"])
+@pytest.mark.parametrize("label", ["16", "15", "12"])
 @pytest.mark.parametrize(
     ("plant", "needle"),
     [(_with_record, "end_fingerprint"), (_with_certificate, "review_certificate'.kind")],

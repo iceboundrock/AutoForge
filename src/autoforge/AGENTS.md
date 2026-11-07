@@ -178,15 +178,18 @@ runlog.py           per-invocation run logs, redacted
 errors.py           typed error taxonomy
 stop_classification.py  typed stop classification (ADR 0011, #369): outcomes, reason
                     codes, their source and the operator's routes, from a sink's code,
-                    a CONTROL_RESULT status, an error's class or a loaded state; advice
-                    that nothing deciding imports; pure, persists nothing
+                    a CONTROL_RESULT status, an error's class or a loaded state (with
+                    the code its sink saved, stop_code, #374); advice that nothing
+                    deciding imports; pure, persists nothing itself
 recovery_package.py status's recovery action package (#374): from a loaded state, its
                     classification, the configuration and, for 'status --live',
-                    unblock's dry-run decision: what is proven, pending (exact ids,
-                    targets, payload references), forbidden and not to be touched, and
-                    the next commands, each claim labelled snapshot, live,
-                    configuration or unknown; the labels status gives K9, K10 and K12
-                    records; only the CLI imports it; pure, persists nothing
+                    unblock's dry-run decision: the diagnosis of the saved stop code,
+                    what is proven, pending (exact ids, targets, payload references),
+                    forbidden and not to be touched, and the next commands as one
+                    sequence unblock accepts, each claim labelled snapshot, live,
+                    configuration or unknown, every quoted text redacted before it is
+                    bounded; the labels status gives K9, K10 and K12 records; only the
+                    CLI imports it; pure, persists nothing
 prompts/            file-based templates ({{VAR}}): common.md (trust boundary), phase
                     templates, update_epic_rerequest.md, correction.md,
                     worktree_state.md (#187), claude_background_work.md (#440, the

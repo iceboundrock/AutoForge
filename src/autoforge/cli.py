@@ -2398,8 +2398,9 @@ def cmd_status(args) -> int:
     certificate = _review_certificate_check(engine, state)
     parent = _epic_parent_check(engine, state)
     review = _unjournaled_review(engine, state)
-    # From the persisted phase alone (#369, ADR 0011): no reason code is
-    # persisted, so a BLOCKED or FAILED run's is UNKNOWN; `Reason:` is the text.
+    # From the persisted phase and the code its stop's sink saved (#369, #374,
+    # ADR 0011 D5 as amended); a stop saved before protocol 16 is UNKNOWN, and
+    # `Reason:` is the text, never read for a code.
     # Outside a git repository the view is unknown, and `--json` still works.
     stop = classify_state(state, scheduler=_scheduler_view(engine))
     if stop.scheduler and not engine.continue_command:
@@ -2540,9 +2541,18 @@ def _live_inspection(engine: ControllerEngine, state: AutoForgeState) -> LiveIns
     )
 
 
+#: The longest error message ``status --live`` quotes (after redaction).
+MAX_LIVE_ERROR_CHARS = 300
+
+
 def _bounded_error(exc: AutoForgeError) -> str:
-    """An error's class and its message on one line, bounded (redacted where printed)."""
-    text = " ".join(str(exc).split())[:300]
+    """An error's class and its message on one line, redacted, then bounded.
+
+    Redacted before the cut (PR #470 R1-F4): a credential whose shape needs
+    its full length, cut in two, would no longer match the redactor and be
+    left mostly visible. What is printed is redacted again.
+    """
+    text = " ".join(redact(str(exc)).split())[:MAX_LIVE_ERROR_CHARS]
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
@@ -3225,18 +3235,31 @@ def _render_operator_actions(state: AutoForgeState, engine: ControllerEngine) ->
         action = first.action_id
         kept = [r.action_id for r in records if r.stage is Stage.OBSERVED]
         declines = [a for r in pending for a in ("--decline-action", r.action_id)]
+        # An applied bind leaves BLOCKED at once (PR #470 R1-F2): every binding
+        # goes in one unblock, in place of the plain one, never before it.
+        pairs = "".join(
+            f" --bind-evidence {r.action_id} <comment URL>"
+            for r in pending
+            if r.stage is Stage.INTENDED and (r.binding is None or r.reason)
+        )
         lines += [
             f"  next:      read it:  {engine.cli_command('status', '--action', action)}",
             f"             post it:  {engine.cli_command('status', '--action', action)} | "
             f"gh issue comment {first.target['issue_url']} --body-file -",
-            "             or bind:  "
-            f"{engine.cli_command('unblock', '--bind-evidence', action)} <comment URL> "
-            f"--reason {why}",
             f"             then:     {engine.cli_command('unblock', '--reason')} {why} && "
             f"{engine.resume_command()}",
-            f"             withdraw: {engine.cli_command('unblock', *declines, '--reason')} {why}"
-            + (f"  (keeps {', '.join(kept)} verified)" if kept else ""),
         ]
+        if pairs:
+            lines += [
+                f"             or bind:  {engine.cli_command('unblock')}{pairs} --reason {why} && "
+                f"{engine.resume_command()}",
+                "                       (in place of 'then', after posting every action you do "
+                "not bind: one unblock binds them all, so drop the pair of each one you posted)",
+            ]
+        lines.append(
+            f"             withdraw: {engine.cli_command('unblock', *declines, '--reason')} {why}"
+            + (f"  (keeps {', '.join(kept)} verified)" if kept else "")
+        )
     for outcome in state.operator_comment_outcomes:
         label = (
             f"verified ({outcome['evidence']}): {outcome['comment_url']}"

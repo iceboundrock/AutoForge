@@ -8,7 +8,8 @@
     `stop:` lines (D1 to D6); the read-only corpus tool
     `tests/stop_corpus.py` (D7); the fixtures of D8.
   - *Not done here:* running the corpus protocol over the review report's
-    history (D7.5), and any persisted code (D5).
+    history (D7.5), and any persisted code (D5; #374 later amended D5 and
+    persists it).
 - **Decides:** #369 (REC-AR0), for #354, under EPIC #184.
 - **Amended by #414:** the `pr-owner` code, in the identity family (ADR
   0004 D9.4a). It is the stop of a run whose bound PR's implementation
@@ -23,6 +24,9 @@
   `READY_FOR_MERGE`, the one read made outside a step, so it ends a command
   only if another path outside a step raises it. A K11 takeover that meets a changed body stops with
   `effect-conflict`, like any other effect conflict.
+- **Amended by #374:** D5. The code a sink names is saved with the stop
+  (`stop_code`, protocol 16) for `status`'s recovery package, which a
+  later process builds; it stays advice that nothing deciding reads.
 - **Amends:** nothing. Every phase, edge, exit rule, budget, retry, effect
   and the state file are unchanged; seven `BLOCKED` reasons that told the
   operator to `resume`, which refuses a `BLOCKED` run, now say `unblock`.
@@ -158,8 +162,7 @@ not, for this baseline:
   advice.
 
 So `StepOutcome.stop` carries the code of the command that stopped, the
-CLI prints it, and the state file is unchanged
-(`test_nothing_of_a_classification_is_persisted`). A state loaded later
+CLI prints it, and the state file is unchanged. A state loaded later
 classifies its `BLOCKED` or `FAILED` with code `unknown` (`status`,
 `resume`): the code is lost across processes, by design. `block_reason`
 remains text for a human, and unknown or legacy text in it is never read as
@@ -169,6 +172,25 @@ a code (`test_a_persisted_reason_is_never_read_for_a_code`). The run log
 A consumer that needs the code across processes (#370, #374, #375) brings
 the persisted field and its protocol bump through #23 at that time, with
 the protocol number current then.
+
+**Amended by #374 (protocol 16).** #374's recovery package must say why a
+loaded stop stopped and what the operator does next, without reading the
+reason's text, so it brings the field. The two sinks that persist a stop,
+`ControllerEngine._block` and the agent-status sink, save the code they
+named as `stop_code` in the same save as the phase; `unblock` clears it with
+`block_reason`, and every other phase holds `""`. Only the code is saved: no
+source, evidence or route (`test_only_the_code_of_a_classification_is_persisted`).
+`classify_state` reads it for a `BLOCKED` or `FAILED` state (source `state`,
+its evidence saying the code is the sink's), and a code it does not know,
+or one no sink of that outcome names, is `unknown`: losing a code still
+makes it unknown, never another
+(`test_a_saved_code_classifies_only_as_the_code_it_is`). The three reasons
+above still hold. Routes follow the outcome, so the code changes none (D4).
+Nothing that decides a phase, a write or a permission reads it: the engine
+only writes it (`test_the_saved_stop_code_is_written_and_cleared_only_by_the_sinks_and_unblock`)
+and `unblock` takes no classification (`test_unblock_takes_no_classification`).
+A stop saved before protocol 16 loads with `""` and classifies `unknown`, as
+it did (`state-and-recovery.md`, protocol 15 → 16).
 
 ### D6. The inventory of stop sinks
 
@@ -305,7 +327,8 @@ uv run python -m tests.stop_corpus [--json] PATH [PATH ...]
    another; a line whose fields have unexpected types is counted as
    malformed, never converted.
 4. **What it cannot say**, printed with every summary: no persisted code
-   (D5), so a saved `BLOCKED` or `FAILED` is `unknown`; a failed launch that
+   before protocol 16 (D5, as amended by #374), so a `BLOCKED` or `FAILED`
+   saved before it is `unknown`; a failed launch that
    exited 0 (a malformed result, a failed verification) has no typed cause;
    a launch whose line names no producer it recognizes is kind `unknown`;
    a line is bookkeeping only by its profile's `(...; no agent)`, no
@@ -356,7 +379,8 @@ named):
 
 Phases, edges, `UNBLOCK_TARGETS`, budgets, review rounds, retries,
 corrections, effect records, candidate preservation, crash replay, ids,
-the state file and its protocol, the run log, the scheduler, the prompts
+the state file and its protocol (until #374's amendment of D5, which adds
+`stop_code` with protocol 16), the run log, the scheduler, the prompts
 and every default. The CLI adds one `stop:` line to what it already prints
 (stdout after a run's final line; stderr after an error), `status` a
 `Stop:` line for `BLOCKED` and `FAILED`, and `status --json` a derived
@@ -365,10 +389,9 @@ and every default. The CLI adds one `stop:` line to what it already prints
 ## 4. Open questions
 
 - **Persisting the code** (D5): when #370, #374 or #375 needs it across
-  processes, through #23. #374's recovery package does not: it labels a
-  loaded stop's code `unknown`, works from the typed records the state does
-  persist, and takes `unblock`'s own decision from GitHub with
-  `status --live`. ADR 0012 (#370) persists none either (its D10).
+  processes, through #23. #374's recovery package needs it to diagnose a
+  loaded stop, and persists it as D5's amendment says (protocol 16). ADR
+  0012 (#370) persists none of its own (its D10, as amended).
 - **Failed launches that exit 0**: the journal records only their error
   text. A typed `ended_by` for a malformed result or a refused run log would
   let the corpus tell them apart; it is a run-log change and not made here.

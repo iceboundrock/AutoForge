@@ -1880,23 +1880,40 @@ classification ([ADR 0011](adr/0011-typed-stop-classification-and-recovery-basel
 and the configuration the command loaded, and says, for the stop the run is
 in:
 
+- **diagnosis** (a `BLOCKED` or `FAILED` run): the stop's reason code, which
+  the controller sink that entered the stop saved with it (`stop_code`,
+  protocol 16), what that code means and what it asks of you, for example
+  `github-checks-refused`: GitHub refused this credential the PR's check
+  runs, so run AutoForge with a credential that may read them; or
+  `review-round-cap`: raise `workflow.max_review_rounds` first, since
+  `unblock` refuses while the cap holds. `Reason:` stays text for a human
+  and is never read for a code; a stop saved before protocol 16 has no
+  code, and its diagnosis is `unknown`;
 - **proven:** what the controller recorded: the phase, the issue, the PR and
   the HEAD it last verified, the review round, a FIX candidate and its push,
   the effects already observed, and the bounds in force;
-- **unknown:** what nothing typed says. The stop's reason code is always
-  here for a `BLOCKED` or `FAILED` run: no code is persisted (ADR 0011 D5),
-  so a later `status` cannot know it, and `Reason:` stays text for a human;
+- **unknown:** what nothing typed says: a stop saved with no code, the view
+  outside a git repository, and whether the agent worktree holds a FIX
+  candidate when FIX stopped before it saved its plan (the fixer's commit is
+  then in the worktree and in no record);
 - **pending:** each record of the saved plan not yet observed: its kind,
   action id, who performs it, its exact target, stage, authorization, and a
   reference to its payload (`status --action <id>`, its length and SHA-256);
 - **forbidden:** what would be refused or would lose work: `resume` on a
   `BLOCKED` run, `unblock` on any other, approving an operator action, an
   approval naming another id;
-- **do not touch:** the agent worktree that holds an unpushed candidate, the
-  saved plan, comments already verified as evidence;
+- **do not touch:** the agent worktree that holds an unpushed candidate, or
+  may hold one no record names, the saved plan, comments already verified as
+  evidence;
 - **next:** the exact commands, with the flags this command was given, in
   order, alternatives marked `or:`; and the section of the
-  [troubleshooting guide](troubleshooting.md) for the case.
+  [troubleshooting guide](troubleshooting.md) for the case. The steps are
+  one sequence that can be followed as written: an `unblock` that is
+  applied leaves `BLOCKED` at once, so they end at the `resume` that
+  continues the run. Operator actions to bind go in one `unblock`, after
+  every other one is posted. A later wait of the same plan (a PR
+  description update after operator actions, say) is the next stop's: run
+  `status` again when the run stops there.
 
 Every claim is labelled with its freshness: `snapshot` (the state as saved,
 at `snapshot_at`), `configuration` (the configuration loaded by this

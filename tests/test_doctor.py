@@ -270,9 +270,9 @@ def test_the_controller_row_names_the_imported_package_and_reads_no_state(tmp_pa
     row = results[0]
     assert row.ok and not row.required and not row.skipped
     assert row.detail == (
-        f"autoforge {autoforge.__version__} (protocol 15) imported from "
+        f"autoforge {autoforge.__version__} (protocol 16) imported from "
         f"{os.path.abspath(autoforge.__file__)}, python {sys.executable}; "
-        "reads state protocols 1-5 and 7-15"
+        "reads state protocols 1-5 and 7-16"
     )
     assert ((sd / "state.json").read_bytes(), (sd / "state.json").stat().st_mtime_ns) == before
 

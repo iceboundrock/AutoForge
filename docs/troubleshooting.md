@@ -76,8 +76,9 @@ that sets `state_dir`), or run from another directory.
   the review round, the reviewed HEAD and base, the open findings,
   `Reason:` (the block or failure reason), the last `Unblocked:` entry, any
   acceptance or operator actions with their next commands, the `Recovery`
-  block (what the stop proves, what is pending on which target, what is
-  forbidden, what not to touch and the next commands, each claim labelled
+  block (the stop's diagnosis, what it proves, what is pending on which
+  target, what is forbidden, what not to touch and the next commands, each
+  claim labelled
   `snapshot`, `configuration`, `live` or `unknown`:
   [The recovery package](usage.md#the-recovery-package-and-status---live)),
   the outer sandbox and its pin, and the validation evidence.
@@ -142,11 +143,14 @@ stop: blocked (reason review-round-cap, from controller: the controller entered 
 ```
 
 The code is advice and grants nothing: `unblock` re-reads GitHub whatever
-it says. It is not saved, so `resume` and `status` on a stopped run show
-`reason unknown, from state`, and `Reason:` keeps the text
+it says. It is saved with the stop (protocol 16), so `resume` and `status`
+on a stopped run show it too, `from state`; a run stopped by an older
+controller shows `reason unknown`. `Reason:` keeps the text, which is never
+read for a code
 ([ADR 0011](adr/0011-typed-stop-classification-and-recovery-baseline.md)).
 `status`'s `Recovery` block takes it from there without reading `Reason:`:
-the saved plan's pending actions with their exact ids and targets, what is
+the diagnosis (what the code means and what it asks of you), the saved
+plan's pending actions with their exact ids and targets, what is
 forbidden, what not to touch and the next commands, and with `--live`
 the decision `unblock` would take now
 ([The recovery package](usage.md#the-recovery-package-and-status---live)).

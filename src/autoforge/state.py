@@ -230,7 +230,14 @@ _PRE_TAKEOVER_PROTOCOL = "13"
 # PR body state: it is loaded in every phase with ``pr_body_outcomes: []``,
 # ``pr_body_source: null`` and ``pr_body_update: null``, and relabelled. An
 # older file that carries any of it is refused (:func:`_refuse_pr_body_state`).
-_PREVIOUS_PROTOCOL = "14"
+_PRE_PR_BODY_PROTOCOL = "14"
+# The label before a stop's reason code was saved with it (#374, ADR 0011 D5
+# as amended). A protocol-15 file is this protocol's shape without
+# ``stop_code``: it is loaded in every phase with ``stop_code: ""`` (a stop
+# saved with no code, which classifies ``unknown`` exactly as it did), and
+# relabelled. An older file that carries the field is refused
+# (:func:`_refuse_stop_code`).
+_PREVIOUS_PROTOCOL = "15"
 # Every label :meth:`AutoForgeState.from_dict` has a rule for: the current
 # one and each older one it migrates or refuses by its own rule. Any other
 # label is refused by :func:`protocol_support`'s classification before the
@@ -245,6 +252,7 @@ SUPPORTED_PROTOCOLS: frozenset[str] = frozenset(
         _PRE_PIN_PROTOCOL,
         _PRE_LOCAL_REMOVAL_PROTOCOL,
         _PRE_TAKEOVER_PROTOCOL,
+        _PRE_PR_BODY_PROTOCOL,
         _PREVIOUS_PROTOCOL,
         __protocol_version__,
     }
@@ -297,6 +305,15 @@ _PIN_FIELDS = ("sandbox_pin",)
 # ``pr_body_sha256``, a FIX context resolution's ``pr_body_source`` and a
 # ``last_fix_resolutions`` entry's ``pr_body_update`` (:func:`_pr_body_state_in`).
 _PR_BODY_FIELDS = ("pr_body_outcomes",)
+# The field protocol 16 added (#374): the reason code the sink that entered
+# BLOCKED or FAILED named (``stop_classification.StopReasonCode``'s value),
+# ``""`` in every other phase and for a stop saved before it.
+_STOP_FIELDS = ("stop_code",)
+# A persisted code's shape: a code is lower-case words joined by hyphens. Its
+# vocabulary is the classification's, which reads it (an unknown one
+# classifies ``unknown``, never another code); the state only bounds it.
+_STOP_CODE_RE = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
+_MAX_STOP_CODE_CHARS = 64
 # The twelve fields LOCAL mode wrote into every state file (ADR 0009 C2),
 # each with the value every REMOTE save wrote. Protocol 13 removed them with
 # LOCAL (#388, ADR 0009 D8): a file labelled 12 or older loads with each one
@@ -757,6 +774,14 @@ class AutoForgeState:
     # longer value in a file is accepted on load (an older controller wrote
     # it) and is never rewritten by the load.
     block_reason: str = ""
+    # The reason code the sink that entered BLOCKED or FAILED named (#374,
+    # ADR 0011 D5 as amended): a ``StopReasonCode`` value, ``unknown`` when
+    # the sink named none, ``""`` in every other phase and for a stop saved
+    # before protocol 16. Written with the phase by the engine's two stop
+    # sinks and cleared by ``unblock``; read only to classify the stop for
+    # ``status`` (advice, never a decision: nothing that decides a phase, a
+    # write or a permission reads it).
+    stop_code: str = ""
     # The operator's explicit exits from BLOCKED (``autoforge unblock``), oldest
     # first, one object per unblock that was applied: ``at`` (UTC timestamp),
     # ``reason`` (the operator's text), ``block_reason`` (the reason that was
@@ -978,6 +1003,11 @@ class AutoForgeState:
         #   every phase with none (a FIX entry observed under protocol 14
         #   therefore offers no update). An older file that carries any of
         #   them is refused, never merged.
+        # - 15 -> 16: a stop's reason code is saved with it (#374, ADR 0011
+        #   D5 as amended): ``stop_code``. An older file is loaded in every
+        #   phase with ``""``, a stop saved with no code, which classifies
+        #   ``unknown`` as it always did. An older file that carries the
+        #   field, even empty, is refused, never merged.
         written_by = str(data.get("controller_version", ""))
         legacy = isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS
         if legacy:
@@ -1096,6 +1126,7 @@ class AutoForgeState:
         elif raw_protocol not in (
             _PRE_LOCAL_REMOVAL_PROTOCOL,
             _PRE_TAKEOVER_PROTOCOL,
+            _PRE_PR_BODY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1111,8 +1142,9 @@ class AutoForgeState:
             # Protocol 12, 13 and 14 write the same fields but LOCAL's
             # twelve, which step 3 below handles; protocol 14 adds an effect
             # kind (K11), which an older file is refused for carrying
-            # (:func:`_refuse_takeover_records`), and protocol 15 the PR body
-            # state, required of its own files below. Only a legacy label
+            # (:func:`_refuse_takeover_records`), protocol 15 the PR body
+            # state and protocol 16 the stop code, each required of its own
+            # files below. Only a legacy label
             # loads with no effect state (D13.2). Every
             # protocol-7 save writes all four fields, so one that is absent
             # is a truncation or a hand edit, never "nothing planned": a
@@ -1163,7 +1195,7 @@ class AutoForgeState:
                 "sandbox pin",
                 "not a run with none pinned",
             )
-        if raw_protocol == __protocol_version__:
+        if raw_protocol in (_PREVIOUS_PROTOCOL, __protocol_version__):
             # Every protocol-15 save writes it, ``[]`` included, so an absent
             # one is a truncation or a hand edit: read as the empty default it
             # would drop a declined update of the round and let it through.
@@ -1171,11 +1203,20 @@ class AutoForgeState:
                 data, raw_protocol, _PR_BODY_FIELDS, "PR body update outcomes", "not a PR with none"
             )
         else:
-            # 14 -> 15 (#423): K12's state is written by this protocol only.
+            # 14 -> 15 (#423): K12's state is written from protocol 15 on.
             _refuse_pr_body_state(data, str(raw_protocol))
-        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol not in (_PRE_PR_BODY_PROTOCOL, _PREVIOUS_PROTOCOL, __protocol_version__):
             # 13 -> 14 (#414): K11 is planned from protocol 14 on.
             _refuse_takeover_records(data, str(raw_protocol))
+        if raw_protocol == __protocol_version__:
+            # Every protocol-16 save writes it, ``""`` included, so an absent
+            # one is a truncation or a hand edit, never "no code was saved".
+            _require_fields(
+                data, raw_protocol, _STOP_FIELDS, "stop code", "not a stop saved with none"
+            )
+        else:
+            # 15 -> 16 (#374): the stop code is written by this protocol only.
+            _refuse_stop_code(data, str(raw_protocol))
         kwargs = dict(data)
         kwargs["phase"] = phase
         kwargs["mode"] = mode
@@ -1187,6 +1228,7 @@ class AutoForgeState:
             _PRE_PIN_PROTOCOL,
             _PRE_LOCAL_REMOVAL_PROTOCOL,
             _PRE_TAKEOVER_PROTOCOL,
+            _PRE_PR_BODY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1197,16 +1239,21 @@ class AutoForgeState:
             _PRE_PIN_PROTOCOL,
             _PRE_LOCAL_REMOVAL_PROTOCOL,
             _PRE_TAKEOVER_PROTOCOL,
+            _PRE_PR_BODY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
             # Before protocol 11 (#243): over the acceptance migration, so a
             # pre-8 file gains both.
             kwargs.update(_operator_migration(kwargs))
-        if raw_protocol != __protocol_version__:
+        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
             # Before protocol 15 (#423): over the migrations above, so an older
             # file gains every field a save of this protocol writes.
             kwargs.update(_pr_body_migration(kwargs))
+        if raw_protocol != __protocol_version__:
+            # Before protocol 16 (#374): a stop saved with no code, which
+            # classifies ``unknown`` exactly as it did before.
+            kwargs["stop_code"] = ""
         if legacy:
             attempt = data.get("attempt", 0)
             if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt >= 1:
@@ -1215,9 +1262,14 @@ class AutoForgeState:
                 )
         # ADR 0009 D8's step 3, after every per-protocol rule above: LOCAL's
         # twelve fields leave a file labelled 12 or older, or refuse it. A
-        # protocol-13, -14 or -15 file is not asked: one that carries any of
-        # them is refused by the unknown-field check below.
-        if raw_protocol not in (_PRE_TAKEOVER_PROTOCOL, _PREVIOUS_PROTOCOL, __protocol_version__):
+        # protocol-13, -14, -15 or -16 file is not asked: one that carries any
+        # of them is refused by the unknown-field check below.
+        if raw_protocol not in (
+            _PRE_TAKEOVER_PROTOCOL,
+            _PRE_PR_BODY_PROTOCOL,
+            _PREVIOUS_PROTOCOL,
+            __protocol_version__,
+        ):
             _drop_local_fields(kwargs, str(raw_protocol))
         # Unknown fields are corruption, not forward compatibility: at this
         # protocol version the controller knows every field it writes, so an
@@ -1309,6 +1361,7 @@ class AutoForgeState:
         # After the shapes it reads (last_fix_resolutions, unblock_history).
         _validate_acceptance_state(state)
         _validate_pr_body_state(state)
+        _validate_stop_code(state)
         _validate_operator_state(state)
         _validate_config_fingerprint(state)
         _validate_sandbox_pin(state)
@@ -1807,6 +1860,39 @@ def _pr_body_state_in(data: dict) -> list[str]:
     if isinstance(last, list) and any(isinstance(r, dict) and "pr_body_update" in r for r in last):
         found.append("'pr_body_update' in 'last_fix_resolutions'")
     return found
+
+
+def _refuse_stop_code(data: dict, protocol: str) -> None:
+    """A file labelled before protocol 16 never wrote a stop code (#374)."""
+    if "stop_code" in data:
+        raise StateError(
+            f"state file is labelled protocol_version {protocol!r}, which never wrote "
+            "'stop_code'; refusing to load a file that carries protocol-16 stop state -- it "
+            "is a hand edit or a foreign file, not an older controller's state"
+        )
+
+
+def _validate_stop_code(state: AutoForgeState) -> None:
+    """``stop_code`` (#374): a code's shape, and only with the stop it was saved with.
+
+    A code is saved by the sink that entered ``BLOCKED`` or ``FAILED`` and
+    cleared when ``unblock`` leaves it, so one beside any other phase is not
+    a stop's. Which codes exist is the classification's to say: one it does
+    not know classifies ``unknown`` there, never another code.
+    """
+    code = state.stop_code
+    if not code:
+        return
+    if len(code) > _MAX_STOP_CODE_CHARS or not _STOP_CODE_RE.fullmatch(code):
+        raise StateError(
+            f"state field 'stop_code' must be a reason code (lower-case words joined by "
+            f"hyphens, at most {_MAX_STOP_CODE_CHARS} characters) or empty, got {code!r:.80}"
+        )
+    if state.phase not in (Phase.BLOCKED, Phase.FAILED):
+        raise StateError(
+            f"state field 'stop_code' is {code!r} in phase {state.phase.value}: a stop code is "
+            "saved only with BLOCKED or FAILED and cleared when the run leaves it"
+        )
 
 
 def _refuse_pr_body_state(data: dict, protocol: str) -> None:

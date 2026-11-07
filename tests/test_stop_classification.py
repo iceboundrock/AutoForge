@@ -3,7 +3,8 @@
 The pure contract (every table total, every error class mapped, the routes
 restating the exit rules and nothing more, the persisted phase and #126's
 pause, the scheduler's settlement), the boundary that keeps it advice
-(no deciding module imports it, nothing of it is persisted), and the
+(no deciding module imports it, and only a stop's code is persisted, which
+nothing that decides reads), and the
 fixtures ADR 0011 names: each a real engine run that stops, with its
 outcome, its typed code, the source that code came from and the operator's
 routes. The CLI's stop lines are tested in ``test_cli.py``.
@@ -54,6 +55,7 @@ from autoforge.stop_classification import (
     classify_exception,
     classify_state,
     reason_code,
+    saved_stop_code,
 )
 from autoforge.transitions import Phase, Settlement, issue_settlement
 from tests.conftest import (
@@ -295,13 +297,14 @@ def test_a_coded_reason_carries_its_code_and_plain_text_none():
 # -- a loaded state, #126 and the scheduler ------------------------------------------------
 
 
-def _state(phase: Phase, block_reason: str = "") -> AutoForgeState:
+def _state(phase: Phase, block_reason: str = "", stop_code: str = "") -> AutoForgeState:
     return AutoForgeState(
         repository="owner/repo",
         epic_url="https://github.com/owner/repo/issues/1",
         current_issue_url="https://github.com/owner/repo/issues/2",
         phase=phase,
         block_reason=block_reason,
+        stop_code=stop_code,
     )
 
 
@@ -518,20 +521,78 @@ def _stopping(status: str, message: str = "need decision") -> dict:
     return {"phase": "ANALYZE_EXECUTE", "status": status, "message": message}
 
 
-def test_nothing_of_a_classification_is_persisted(tmp_state_dir, fake_github):
-    """ADR 0011 D5: no state field, no protocol change; the outcome carries it."""
+def test_only_the_code_of_a_classification_is_persisted(tmp_state_dir, fake_github):
+    """ADR 0011 D5 as amended by #374: the sink that enters BLOCKED or FAILED
+    saves its code with the stop (``stop_code``), and nothing else of the
+    classification: no route, source or evidence. 'unblock' clears it."""
     assert "stop" in {f.name for f in fields(StepOutcome)}
-    assert not [f.name for f in fields(AutoForgeState) if "stop" in f.name]
+    assert [f.name for f in fields(AutoForgeState) if "stop" in f.name] == ["stop_code"]
     eng = make_engine(tmp_state_dir, [block(_stopping("blocked"))], github=fake_github, origin=True)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     eng._save()
     before = json.loads(eng.paths.state_file.read_text())
+    assert before["stop_code"] == ""
     out = eng.step()
     assert out.stop is not None and out.stop.code is C.AGENT_BLOCKED
     after = json.loads(eng.paths.state_file.read_text())
     assert set(after) == set(before)
     assert after["protocol_version"] == before["protocol_version"]
-    assert C.AGENT_BLOCKED.value not in eng.paths.state_file.read_text()
+    assert after["stop_code"] == C.AGENT_BLOCKED.value
+    for leaked in ("agent", "routes", "evidence", "live_facts_required"):
+        assert leaked not in after
+    found = classify_state(load_state(eng.paths.state_file))
+    assert (found.outcome, found.code) == (Out.BLOCKED, C.AGENT_BLOCKED)
+    assert found.source is ReasonSource.STATE
+    assert found.routes == OUTCOME_ROUTES[Out.BLOCKED]
+    fake_github.add_issue(eng.state.current_issue_url, "Feature")
+    assert eng.unblock("looked at it").unblocked
+    assert json.loads(eng.paths.state_file.read_text())["stop_code"] == ""
+
+
+@pytest.mark.parametrize(
+    ("phase", "saved", "expected"),
+    [
+        (Phase.BLOCKED, "", C.UNKNOWN),
+        (Phase.BLOCKED, "unknown", C.UNKNOWN),
+        (Phase.BLOCKED, "github-checks-refused", C.GITHUB_CHECKS_REFUSED),
+        (Phase.BLOCKED, "review-round-cap", C.REVIEW_ROUND_CAP),
+        (Phase.BLOCKED, "agent-blocked", C.AGENT_BLOCKED),
+        (Phase.BLOCKED, "a-code-of-a-newer-controller", C.UNKNOWN),
+        (Phase.BLOCKED, "done", C.UNKNOWN),
+        (Phase.BLOCKED, "agent-failure", C.UNKNOWN),
+        (Phase.FAILED, "agent-failure", C.AGENT_FAILURE),
+        (Phase.FAILED, "agent-blocked", C.UNKNOWN),
+        (Phase.FAILED, "", C.UNKNOWN),
+    ],
+)
+def test_a_saved_code_classifies_only_as_the_code_it_is(phase, saved, expected):
+    """A code this controller does not know, or one no sink of the outcome
+    names, is lost to UNKNOWN, never read as another; the routes follow the
+    outcome whatever the code (D4)."""
+    state = _state(phase, block_reason="review-round-cap", stop_code=saved)
+    assert saved_stop_code(state) is expected
+    found = classify_state(state)
+    assert found.code is expected and found.routes == OUTCOME_ROUTES[found.outcome]
+
+
+def test_the_saved_stop_code_is_written_and_cleared_only_by_the_sinks_and_unblock():
+    """#374: the engine writes ``stop_code`` at its two stop sinks and clears it in
+    ``unblock``, and never reads it, so no decision can depend on a saved code;
+    outside the state's own module only the classification and the recovery
+    package (which only the CLI imports) read it."""
+    tree = ast.parse((SRC / "engine.py").read_text())
+    uses = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "stop_code"
+    ]
+    assert len(uses) == 3 and all(isinstance(node.ctx, ast.Store) for node in uses)
+    readers = {
+        path.stem
+        for path in SRC.rglob("*.py")
+        if path.stem not in ("engine", "state") and "stop_code" in path.read_text()
+    }
+    assert readers == {"stop_classification", "recovery_package"}
 
 
 def test_unblock_takes_no_classification():

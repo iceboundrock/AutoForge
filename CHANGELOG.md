@@ -8,14 +8,25 @@ so.
 ### `status` says what a stop allows; `status --live` previews `unblock` (#374)
 
 `status` ends with a `Recovery` block, and `status --json` carries it as
-`recovery`: what the controller recorded, which saved action is pending on
+`recovery`: the stop's diagnosis (its reason code, what it means and what it
+asks of you), what the controller recorded, which saved action is pending on
 which exact target (its id and a reference to its payload), what is
-forbidden, what not to touch (an unpushed candidate's worktree, the saved
-plan, comments already verified), and the exact next commands with the flags
-you ran `status` with. Each claim says whether it comes from the state file,
-the configuration, GitHub now, or is unknown; the stop's reason code is
-always unknown here, since none is saved. It replaces nothing: every other
-field and line of `status` is as before.
+forbidden, what not to touch (an unpushed candidate's worktree, or one that
+may hold a FIX candidate no record names, the saved plan, comments already
+verified), and the exact next commands with the flags you ran `status` with,
+as one sequence `unblock` accepts in order: operator actions to bind go in
+one `unblock`, and a later wait of the same plan is left to the next stop.
+Each claim says whether it comes from the state file, the configuration,
+GitHub now, or is unknown. It replaces nothing: every other field and line
+of `status` is as before.
+
+The code comes from the state: the sink that enters `BLOCKED` or `FAILED`
+now saves its reason code with the stop (`stop_code`), so `status`, `resume`
+and the package name it in a later process, where they said `reason
+unknown` before. `unblock` clears it, and nothing that decides reads it.
+State protocol 15 → 16: an older file loads in every phase with no code
+(`unknown`, as before) and is relabelled on its next save; an older-labelled
+file carrying the field is refused.
 
 `status --live` adds, for a `BLOCKED` run, the decision `unblock --dry-run`
 would print for the same state, read from GitHub, and any drift of the PR

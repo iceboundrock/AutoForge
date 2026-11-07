@@ -507,7 +507,11 @@ status --live (#374)                  read back by a fresh CLI engine: K10, K9 a
                                       no launch; drift, a failed read redacted, a refused
                                       configuration; exact ids and payloads; stable JSON keys;
                                       a namespace's and an unknown view; the module's imports
-                                      and guide anchors)
+                                      and guide anchors; the diagnosis of a saved code from a
+                                      cached status, a code for every engine sink; the K10
+                                      sequence run as displayed, posting and binding; a FIX
+                                      candidate no record names; a credential across each
+                                      cut; a verified PR description edited since)
 the evaluation protocol (#318)        test_evaluation.py (the pins, what arms hold equal, the
                                       statistics and decision on synthetic records, what never
                                       runs in CI; the protocol held to its files),

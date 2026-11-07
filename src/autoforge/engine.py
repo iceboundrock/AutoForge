@@ -5109,8 +5109,11 @@ class ControllerEngine:
             message = bound_block_reason(
                 redact(str(payload.get("message", "") or f"agent reported {status}"))
             )
+            stop = agent_status(str(status), previous)
             state.phase = nxt
             state.block_reason = message
+            # #374: the code goes with the stop it names, for a later status.
+            state.stop_code = stop.code.value
             self._save()
             hint = ""
             if previous == Phase.FIX and nxt == Phase.BLOCKED:
@@ -5127,7 +5130,7 @@ class ControllerEngine:
                 plan=plan,
                 result=payload,
                 message=f"agent reported {status}: {message}{hint}",
-                stop=agent_status(str(status), previous),
+                stop=stop,
             )
 
         try:
@@ -7726,6 +7729,7 @@ class ControllerEngine:
             state.effect_records = [r.reopened().to_dict() for r in effects.records]
         state.validation_override_seq = watermark
         state.block_reason = ""
+        state.stop_code = ""
         state.phase = target
         state.attempt = 0
         self._save()
@@ -10234,8 +10238,10 @@ class ControllerEngine:
         ``code`` is the typed reason the sink names (#369, ADR 0011); a
         caller that hands on a verify or apply step's reason passes none, and
         the reason's own code is used (:func:`_blocked`), ``UNKNOWN`` for
-        plain text. It goes on the outcome only: nothing is persisted and
-        nothing decides on it, and the text is never parsed for one.
+        plain text. It goes on the outcome and is saved with the stop as
+        ``stop_code`` (#374, ADR 0011 D5 as amended), for a later ``status``
+        to classify it; nothing decides on it, and the text is never parsed
+        for one.
 
         The reason is redacted here, once, not at the call sites: many of
         them quote a `GitHubError` (`gh` stderr, which can echo an
@@ -10253,6 +10259,7 @@ class ControllerEngine:
         reason = bound_block_reason(redact(reason))
         state.phase = Phase.BLOCKED
         state.block_reason = reason
+        state.stop_code = stop.code.value
         self._save()
         return self._outcome(previous, plan=plan, message=reason, stop=stop)
 
