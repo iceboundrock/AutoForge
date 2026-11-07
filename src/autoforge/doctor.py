@@ -417,23 +417,53 @@ class Doctor:
         the credential-route names this shell holds that no launch receives.
         """
         cfg = self.config if self.config is not None else AutoForgeConfig()
-        names = cfg.execution.environment_names()
+        exe = cfg.execution
         withheld = sorted(name for name in os.environ if forbidden_env_entry(name))
         detail = (
-            f"allow-listed: {', '.join(names)} (plus each provider's own names); "
+            f"allow-listed: {', '.join(exe.environment_names())} (plus each provider's own names "
+            "for its agents); "
+            f"agents only: {', '.join(exe.agent_env_allowlist_extra) or '(none)'}; "
+            f"repository commands only: {', '.join(exe.command_env_allowlist_extra) or '(none)'}; "
             f"set by the controller: {describe_overrides()}; "
             f"withheld from this shell: {', '.join(withheld) or '(none present)'}"
         )
         return CheckResult("launch environment", True, detail, required=False)
 
+    def check_allowlist_entries(self) -> CheckResult:
+        """Warn on an allow-list entry that looks like it passes a credential (#286),
+        a configured provider's own included.
+
+        Never a failure: the rule goes by name, and what a name holds only
+        the operator knows. Names only, as at config load.
+        """
+        name = "credential-looking allow-list entries"
+        if self.config is None:
+            return CheckResult.skip(name, "(config check failed)")
+        warnings = self.config.environment_warnings(os.environ)
+        if warnings:
+            return CheckResult(name, False, redact("; ".join(warnings)), required=False)
+        return CheckResult(
+            name,
+            True,
+            "none: no entry names TOKEN, PAT, SECRET, PASSWORD or GITHUB, and no prefix, a "
+            "configured provider's included, passes such a variable from this shell",
+            required=False,
+        )
+
     def check_launch_credentials(self) -> CheckResult:
-        """The launch preflight, run here: no GitHub or git credential reaches a child."""
+        """The launch preflight, run here: no GitHub or git credential reaches a child.
+
+        Under each class's allow-list when they differ, since the login
+        shells it runs start in the environment that class would get.
+        """
         name = "no credential reaches a launch"
         cfg = self.config if self.config is not None else AutoForgeConfig()
+        exe = cfg.execution
         try:
-            identity = preflight(
-                self.cwd, self._runner, env_allowlist=cfg.execution.environment_names()
-            )
+            for names in dict.fromkeys(
+                (exe.agent_environment_names(), exe.command_environment_names())
+            ):
+                identity = preflight(self.cwd, self._runner, env_allowlist=names)
         except ConfigurationError as exc:
             return CheckResult(name, False, redact(str(exc)))
         return CheckResult(
@@ -1017,7 +1047,7 @@ class Doctor:
     def _pi_allowlist(self) -> tuple[str, ...]:
         """The environment a Pi agent is launched with, so the probes see what it would."""
         cfg = self.config if self.config is not None else AutoForgeConfig()
-        return PiProvider().launch_allowlist(cfg.execution.environment_names())
+        return PiProvider().launch_allowlist(cfg.execution.agent_environment_names())
 
     def _pi_probe(self, argv: list[str]) -> ExecutionResult | str:
         """Run one Pi probe as the launch would (its allow-list and the variables
@@ -1155,7 +1185,7 @@ class Doctor:
             f"({', '.join(p.name for p in profiles)})"
         )
         try:
-            ClaudeCodeProvider().integration_preflight(cfg.execution.environment_names())
+            ClaudeCodeProvider().integration_preflight(cfg.execution.agent_environment_names())
         except (ConfigurationError, ExecutionError) as exc:
             return CheckResult(name, False, redact(str(exc)))
         return CheckResult(
@@ -1179,7 +1209,7 @@ class Doctor:
             f"({', '.join(p.name for p in profiles)})"
         )
         provider = OpenCodeProvider()
-        allowlist = cfg.execution.environment_names()
+        allowlist = cfg.execution.agent_environment_names()
         try:
             provider.integration_preflight(allowlist)
             data_dir = provider.data_dir(allowlist)
@@ -1431,6 +1461,7 @@ class Doctor:
         results.append(self.check_git_repo())
         results.append(self.check_remote())
         results.append(self.check_agent_environment())
+        results.append(self.check_allowlist_entries())
         results.append(self.check_launch_credentials())
         results.append(self.check_required_checks(gh))
         results.append(self.check_checks_read(gh))

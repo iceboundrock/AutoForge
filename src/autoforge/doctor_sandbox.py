@@ -260,7 +260,7 @@ def _provider_probe(
     a link names the directory, which is what the CLI is given.
     """
     enforced = cfg.sandbox.enabled
-    allowlist = cfg.execution.environment_names()
+    allowlist = cfg.execution.agent_environment_names()
     env = {**provider.launch_environment(allowlist), **isolation}
     home = _engine._operator_home()
     try:

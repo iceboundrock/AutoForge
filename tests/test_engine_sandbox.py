@@ -27,6 +27,7 @@ from autoforge.errors import (
 )
 from autoforge.locking import SharedGitLock, shared_git_lock_path
 from autoforge.sandbox import Access, Bind, Mask, Overlay
+from autoforge.sandbox_policy import LaunchClass
 from autoforge.state import load_state
 from autoforge.transitions import Phase
 from tests.conftest import (
@@ -372,6 +373,24 @@ def test_a_scripted_refusal_from_the_compiler_is_a_launch_failure(tmp_state_dir,
         eng.step()
     assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
     assert fake_github.effect_writes == []
+
+
+def test_an_enforced_repository_command_is_described_under_its_own_class_s_names(
+    tmp_state_dir, fake_github, tmp_path_factory, monkeypatch
+):
+    """#286: a CA name whose file is not visible inside is unset by the description, so that
+    a name it holds is one the launch would carry. The agents' list is none of them."""
+    monkeypatch.setenv("SSL_CERT_FILE", "/nonexistent/for-commands.pem")
+    monkeypatch.setenv("SSL_CERT_DIR", "/nonexistent/for-agents")
+    cfg = _required()
+    cfg.execution.env_allowlist = ["PATH", "HOME"]
+    cfg.execution.command_env_allowlist_extra = ["SSL_CERT_FILE"]
+    cfg.execution.agent_env_allowlist_extra = ["SSL_CERT_DIR"]
+    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg, origin=True)
+    export = str(tmp_path_factory.mktemp("export"))
+    description = eng._command_sandbox(LaunchClass.EXPORT_COMMAND, export, {}, "host")
+    assert "SSL_CERT_FILE" in description.env_unset
+    assert "SSL_CERT_DIR" not in description.env_unset
 
 
 def test_the_dry_run_plan_names_the_sandbox_mode(tmp_state_dir, fake_github):

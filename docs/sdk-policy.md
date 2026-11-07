@@ -209,7 +209,9 @@ and nothing else.
 - **The key's source is checked.** `init.apiKeySource` must be
   `ANTHROPIC_API_KEY`. Status: verified on CLI 2.1.304, which reports
   `"ANTHROPIC_API_KEY"` with a key and `"none"` without one.
-- **The launch environment** is the configured allow-list, with:
+- **The launch environment** is the configured allow-list of an agent launch
+  (`execution.env_allowlist`, `env_allowlist_extra` and
+  `agent_env_allowlist_extra`), with:
   - every `*` prefix expanded against the *names* in the controller's
     environment, so the result holds exact names only;
   - every other provider's variables and every credential-shaped name

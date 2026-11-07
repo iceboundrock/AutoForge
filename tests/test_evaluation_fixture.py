@@ -469,6 +469,8 @@ def test_the_harness_reads_the_policy_the_engine_validates_under(tmp_path, mode,
     cfg.validation.commands = [["make", "check"]]
     cfg.sandbox.mode = mode
     cfg.sandbox.read_only_paths = paths
+    cfg.execution.agent_env_allowlist_extra = ["FOR_AGENTS"]
+    cfg.execution.command_env_allowlist_extra = ["FOR_COMMANDS"]
     eng = make_engine(tmp_path / "state", None, cfg=cfg)
     held = eng._validation_policy(LaunchClass.EXPORT_COMMAND)
     assert ev.configured_validation(cfg).policy == held
@@ -1655,7 +1657,7 @@ def test_the_oracle_gives_a_launch_the_controllers_isolation(tmp_path, monkeypat
     assert ev.run_oracle(repo, head, overlay, command, cfg, runner=runner).status == "pass"
     (request,) = seen
     assert request.contain_orphans is True and request.sandbox is None
-    assert request.env_allowlist == cfg.execution.environment_names()
+    assert request.env_allowlist == cfg.execution.command_environment_names()
     assert "GITHUB_TOKEN" not in request.env_allowlist
     assert fx.OPERATOR_CREDENTIAL not in (request.env or {}).values()
 

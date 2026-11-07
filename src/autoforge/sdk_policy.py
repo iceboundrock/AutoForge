@@ -218,9 +218,9 @@ def sdk_launch_allowlist(
 ) -> tuple[str, ...]:
     """The exact variable names an SDK launch inherits.
 
-    ``base`` is the configured allow-list (``execution.env_allowlist`` plus
-    ``env_allowlist_extra``); a ``*`` prefix in it is expanded against
-    ``environ_names`` (the names in the controller's environment, never a
+    ``base`` is the configured allow-list of an agent launch
+    (``ExecutionConfig.agent_environment_names``); a ``*`` prefix in it is
+    expanded against ``environ_names`` (the names in the controller's environment, never a
     value), so the result holds exact names only and no prefix can carry a
     credential through. Every :func:`foreign_name` is dropped, unless it is
     in ``passthrough`` and ``base`` lists it exactly; ``own`` (the

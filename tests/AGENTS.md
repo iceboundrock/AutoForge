@@ -173,7 +173,9 @@ read it before adding tests for a listed area.
   runs with), OpenCode's data directory (where the organization check
   looks) and Claude Code's settings and global configuration (where its
   configuration check looks) at empty directories, so a test never reads
-  the operator's. The
+  the operator's, and take out any credential-looking name the shell holds
+  under a provider's prefix (a test of a broader prefix calls
+  `no_credential_looking_names`), so no warning (#286) reads it either. The
   probe runs the real `sh`, `bash` and `zsh`: a fake runner hands a request
   `is_shell_probe(req)` recognises to the real `execute`, as a fake runner
   does for nothing else, and a launch without a fake runner reuses the
@@ -482,7 +484,9 @@ packaging, built artifacts (#256)     test_packaging.py (metadata, license, vers
                                       run); the PyPI workflow (#295): test_publish_workflow.py
 launch environment, no credential     test_child_env.py (engine and doctor: test_engine.py,
                                       test_integration.py, test_validation_evidence.py,
-                                      test_doctor.py)
+                                      test_doctor.py); per-class allow-lists and credential-
+                                      looking entries (#286): test_config.py, test_cli.py,
+                                      test_engine_sandbox.py and the modules above
 agent read context                    test_read_context.py (collection: test_engine.py,
                                       test_integration.py)
 typed stop classification (#369,      test_stop_classification.py (every table total, every error

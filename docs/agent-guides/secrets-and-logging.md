@@ -236,6 +236,10 @@ What #165 adds reports names, never values:
 - `doctor`'s "launch environment" row lists variable names only (allowed,
   set by the controller, withheld from the current shell); the
   "GitHub remote" row redacts the URL it quotes;
+- the warning on a credential-looking allow-list entry (config load, `doctor`)
+  names the key or provider, the entry and the variables of the shell it passes,
+  and the refusal of an entry that would reach the other class names the two
+  entries; the shell's values are not read;
 - each invocation's `request.json` records the names the controller set
   (`env_set`), never their values; the placeholder token and the temporary
   directory paths are not logged;
@@ -296,7 +300,7 @@ what its provider adapter declares (D7.1;
 - variables the allow-list passes anyway (`ANTHROPIC_API_KEY`,
   `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, an OpenCode
   `*_API_KEY`, Pi's `OPENAI_API_KEY` when `require_oauth: false` and
-  `execution.env_allowlist_extra` forwards it);
+  `execution.agent_env_allowlist_extra` or `env_allowlist_extra` forwards it);
 - one login file, read-only at that path, wherever it resolves: Claude
   Code's `~/.claude/.credentials.json` when no `CLAUDE_CONFIG_DIR` is set;
 - one dedicated directory, writable where it resolves, the variable naming

@@ -43,6 +43,7 @@ from autoforge.evidence import (
     parse_candidate,
     parse_record,
 )
+from autoforge.sandbox_policy import LaunchClass
 from autoforge.state import load_state
 from autoforge.transitions import Phase
 
@@ -568,6 +569,41 @@ def producing(tmp_state_dir, gh, agent, *commands):
     eng = make_engine(tmp_state_dir, agent, github=gh, cfg=cfg, origin=True)
     assert eng.step().next_phase == "ANALYZE_EXECUTE"
     return eng
+
+
+def test_a_name_listed_for_one_class_reaches_a_validator_only_if_it_is_the_commands(
+    tmp_state_dir, tmp_path_factory, monkeypatch
+):
+    """#286: from inside ``validation.commands``, in the export of the candidate."""
+    monkeypatch.setenv("AF_FOR_AGENTS", "agents")
+    monkeypatch.setenv("AF_FOR_COMMANDS", "commands")
+    record = tmp_path_factory.mktemp("probe") / "env.jsonl"
+    eng = producing(tmp_state_dir, FakeGitHub(), implement, env_probe_command(record))
+    eng.config.execution.agent_env_allowlist_extra = ["AF_FOR_AGENTS"]
+    eng.config.execution.command_env_allowlist_extra = ["AF_FOR_COMMANDS"]
+    assert eng.step().next_phase == "REVIEW"
+    [seen] = env_probe_records(record)
+    assert "AF_FOR_COMMANDS" in seen["names"] and "AF_FOR_AGENTS" not in seen["names"]
+
+
+def test_policy_p_holds_the_names_a_command_gets_and_no_agent_s(tmp_state_dir):
+    """#286: an agent's key can move without withdrawing evidence, and a list that names
+    no class leaves the digest of every record already made as it was."""
+    eng = make_engine(tmp_state_dir, None)
+
+    def policy() -> str:
+        return eng._validation_policy(LaunchClass.EXPORT_COMMAND).digest
+
+    before = policy()
+    eng.config.execution.agent_env_allowlist_extra = ["AF_FOR_AGENTS"]
+    assert policy() == before
+    eng.config.execution.command_env_allowlist_extra = ["AF_FOR_COMMANDS"]
+    changed = policy()
+    assert changed != before
+    # The same names reach a command either way, so the policy is the same one.
+    eng.config.execution.command_env_allowlist_extra = []
+    eng.config.execution.env_allowlist_extra = ["AF_FOR_COMMANDS"]
+    assert policy() == changed
 
 
 def watched_validation(monkeypatch, eng) -> list[tuple]:

@@ -8,12 +8,18 @@ import pytest
 
 import autoforge.doctor as doctor_module
 import autoforge.executor as executor_module
+from autoforge.config import default_config
 from autoforge.doctor import Doctor
 from autoforge.errors import ExecutionError
 from autoforge.executor import ExecutionResult, execute
 from autoforge.github import GH_WORKDIR_PREFIX
 from autoforge.redaction import redact
-from tests.conftest import DOTDOT_SPELLINGS, dotdot_config_paths, is_shell_probe
+from tests.conftest import (
+    DOTDOT_SPELLINGS,
+    dotdot_config_paths,
+    is_shell_probe,
+    no_credential_looking_names,
+)
 
 RULES_ENDPOINT = "repos/owner/repo/rules/branches/main"
 RULESET_ENDPOINT = "repos/owner/repo/rulesets/22792049"
@@ -1793,6 +1799,33 @@ def test_the_auth_probe_runs_under_the_launch_allowlist(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("key", "reaches"),
+    [("agent_env_allowlist_extra", True), ("command_env_allowlist_extra", False)],
+)
+def test_the_auth_probe_sees_what_only_an_agent_launch_is_given(
+    tmp_path, monkeypatch, key, reaches
+):
+    """#286: a key listed for repository commands alone makes no Pi report ready."""
+    from autoforge.executor import select_environment
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-shell-only")
+    requests = []
+    # OpenCode out of the routing: its own `OPENAI_*` would pass the key whatever
+    # the keys say, and refuse a config that lists it for commands alone.
+    profiles = default_config().profiles
+    opencode = [name for name, profile in profiles.items() if profile.provider == "opencode"]
+    config = _write_config(
+        tmp_path,
+        {name: _pi_profile() for name in opencode},
+        {"execution": {key: ["OPENAI_API_KEY"]}},
+    )
+    Doctor(config_path=config, cwd=str(tmp_path), runner=_pi_runner(requests=requests)).run_all()
+    assert requests
+    for req in requests:
+        assert ("OPENAI_API_KEY" in select_environment(req.env_allowlist)) is reaches
+
+
+@pytest.mark.parametrize(
     "auth, needle",
     [
         (
@@ -2192,6 +2225,169 @@ def test_doctor_fails_a_claude_whose_settings_set_a_variable_over_the_launch(tmp
     settings.write_text(json.dumps({"env": {"FOO": "bar"}}))
     rows = {r.name: r for r in Doctor(cwd=str(tmp_path), runner=_runner_factory()).run_all()}
     assert rows[CLAUDE_CONFIGURATION_ROW].ok
+
+
+ALLOWLIST_ROW = "credential-looking allow-list entries"
+
+
+def test_doctor_warns_on_a_credential_looking_allowlist_entry(tmp_path, monkeypatch):
+    """#286: a WARN row by name, with dummy names; never a failure and never a value."""
+    monkeypatch.setenv("MY_API_TOKEN", FAKE_TOKEN)
+    config = _write_config(
+        tmp_path,
+        {},
+        {
+            "execution": {
+                "env_allowlist_extra": ["MY_GITHUB_PAT"],
+                "command_env_allowlist_extra": ["MY_*"],
+            }
+        },
+    )
+    doctor = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory())
+    results = doctor.run_all()
+    row = {r.name: r for r in results}[ALLOWLIST_ROW]
+    assert not row.ok and not row.required and row.label == "WARN"
+    assert "execution.env_allowlist_extra entry 'MY_GITHUB_PAT'" in row.detail
+    assert "its name contains GITHUB" in row.detail
+    assert "execution.command_env_allowlist_extra entry 'MY_*'" in row.detail
+    assert "MY_API_TOKEN in this shell" in row.detail
+    assert FAKE_TOKEN not in _all_text(results)
+
+
+def test_doctor_says_when_no_allowlist_entry_looks_like_a_credential(tmp_path, monkeypatch):
+    monkeypatch.setenv("MY_API_TOKEN", FAKE_TOKEN)
+    results = Doctor(cwd=str(tmp_path), runner=_runner_factory()).run_all()
+    row = {r.name: r for r in results}[ALLOWLIST_ROW]
+    assert row.ok and not row.required and row.detail.startswith("none:")
+
+
+@pytest.mark.parametrize(
+    ("entry", "held", "word"),
+    [
+        ("MY_GITLABPAT", "UNRELATED", "its name contains PAT"),
+        ("TOKENIZED_ACCESS", "UNRELATED", "its name contains TOKEN"),
+        ("MY_*", "MY_GITLABPAT", "MY_GITLABPAT in this shell"),
+        ("T*", "TOKENIZED_ACCESS", "TOKENIZED_ACCESS in this shell"),
+    ],
+)
+def test_doctor_warns_on_a_credential_word_inside_a_name(tmp_path, monkeypatch, entry, held, word):
+    """#286: an entry by its text, a prefix by what the shell holds under it."""
+    no_credential_looking_names(monkeypatch)
+    monkeypatch.setenv(held, FAKE_TOKEN)
+    config = _write_config(tmp_path, {}, {"execution": {"env_allowlist_extra": [entry]}})
+    results = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory()).run_all()
+    row = {r.name: r for r in results}[ALLOWLIST_ROW]
+    assert not row.ok and not row.required and row.label == "WARN"
+    assert f"execution.env_allowlist_extra entry {entry!r}" in row.detail and word in row.detail
+    assert FAKE_TOKEN not in _all_text(results)
+
+
+@pytest.mark.parametrize(
+    ("entry", "held"),
+    [
+        ("PATH", "UNRELATED"),
+        ("TOKENIZERS_PARALLELISM", "UNRELATED"),
+        ("P*", "PYTHONPATH"),
+        ("T*", "TOKENIZERS_PARALLELISM"),
+    ],
+)
+def test_doctor_says_nothing_of_a_name_that_only_holds_the_letters(
+    tmp_path, monkeypatch, entry, held
+):
+    no_credential_looking_names(monkeypatch)
+    monkeypatch.setenv(held, "x")
+    config = _write_config(tmp_path, {}, {"execution": {"env_allowlist_extra": [entry]}})
+    results = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory()).run_all()
+    row = {r.name: r for r in results}[ALLOWLIST_ROW]
+    assert row.ok and row.detail.startswith("none:")
+
+
+def test_doctor_warns_on_what_a_provider_s_own_prefix_passes(tmp_path, monkeypatch):
+    """#286: with the default configuration, and no key that lists it."""
+    monkeypatch.setenv("OPENAI_GITHUB_PAT", FAKE_TOKEN)
+    results = Doctor(cwd=str(tmp_path), runner=_runner_factory()).run_all()
+    row = {r.name: r for r in results}[ALLOWLIST_ROW]
+    assert not row.ok and not row.required and row.label == "WARN"
+    assert "provider opencode's own entry 'OPENAI_*'" in row.detail
+    assert "OPENAI_GITHUB_PAT in this shell" in row.detail
+    assert FAKE_TOKEN not in _all_text(results)
+
+
+def test_doctor_is_silent_on_what_no_routed_provider_passes(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_GITHUB_PAT", FAKE_TOKEN)
+    claude = {"provider": "claude", "model": "m"}
+    config = _write_config(tmp_path, dict.fromkeys(default_config().profiles, claude))
+    results = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory()).run_all()
+    assert {r.name: r for r in results}[ALLOWLIST_ROW].ok
+
+
+def test_doctor_claims_nothing_of_the_allowlist_of_a_config_it_refused(tmp_path):
+    config = _write_config(tmp_path, {}, {"execution": {"env_allowlist_extra": ["GH_*"]}})
+    results = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory()).run_all()
+    rows = {r.name: r for r in results}
+    assert not rows["config"].ok and "covers GH_TOKEN" in rows["config"].detail
+    assert rows[ALLOWLIST_ROW].skipped
+
+
+def test_doctor_fails_a_command_only_name_a_routed_provider_passes(tmp_path, monkeypatch):
+    """#286: the row every run's refusal would be, naming the entries and never a value."""
+    monkeypatch.setenv("OPENAI_TEST_DATABASE_URL", FAKE_TOKEN)
+    config = _write_config(
+        tmp_path, {}, {"execution": {"command_env_allowlist_extra": ["OPENAI_TEST_DATABASE_URL"]}}
+    )
+    results = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory()).run_all()
+    rows = {r.name: r for r in results}
+    assert not rows["config"].ok
+    assert "'OPENAI_TEST_DATABASE_URL' is for repository commands alone" in rows["config"].detail
+    assert "provider opencode's own 'OPENAI_*'" in rows["config"].detail
+    assert FAKE_TOKEN not in _all_text(results)
+
+
+def test_doctor_lists_what_each_class_of_launch_adds(tmp_path):
+    config = _write_config(
+        tmp_path,
+        {},
+        {
+            "execution": {
+                "agent_env_allowlist_extra": ["FOR_AGENTS"],
+                "command_env_allowlist_extra": ["FOR_COMMANDS"],
+            }
+        },
+    )
+    results = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory()).run_all()
+    detail = {r.name: r for r in results}["launch environment"].detail
+    assert "agents only: FOR_AGENTS;" in detail
+    assert "repository commands only: FOR_COMMANDS;" in detail
+
+
+@pytest.mark.parametrize(
+    ("execution", "launches"),
+    [
+        ({}, 1),
+        ({"env_allowlist_extra": ["MY_TOOL_HOME"]}, 1),
+        ({"agent_env_allowlist_extra": ["FOR_AGENTS"]}, 2),
+        ({"command_env_allowlist_extra": ["FOR_COMMANDS"]}, 2),
+    ],
+)
+def test_doctor_runs_the_launch_preflight_under_each_class_s_list(
+    tmp_path, monkeypatch, execution, launches
+):
+    """The preflight's login shells start in the environment the launch would get."""
+    asked = []
+    real = doctor_module.preflight
+
+    def spying(cwd, runner=None, *, env_allowlist=None, **kwargs):
+        asked.append(env_allowlist)
+        return real(cwd, runner, env_allowlist=env_allowlist, **kwargs)
+
+    monkeypatch.setattr(doctor_module, "preflight", spying)
+    config = _write_config(tmp_path, {}, {"execution": execution})
+    doctor = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory())
+    assert doctor.check_config().ok
+    assert doctor.check_launch_credentials().ok
+    exe = doctor.config.execution
+    assert len(asked) == launches
+    assert set(asked) == {exe.agent_environment_names(), exe.command_environment_names()}
 
 
 def test_doctor_reports_the_agent_environment_by_name_only(tmp_path, monkeypatch):

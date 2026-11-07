@@ -910,7 +910,7 @@ def configured_validation(cfg: AutoForgeConfig) -> Configured:
         Policy(
             mode=cfg.sandbox.mode,
             template=template,
-            env_names=cfg.execution.environment_names(),
+            env_names=cfg.execution.command_environment_names(),
             timeout_seconds=cfg.execution.command_timeout_seconds,
             contain_orphans=True,
             method=MATERIALIZATION_METHOD,
@@ -1590,7 +1590,7 @@ def _oracle_sandbox(cfg: AutoForgeConfig, cwd: str, overrides, denied: tuple[str
         network=NetworkPosition(cfg.sandbox.validation_network),
         operator_paths=tuple(cfg.sandbox.read_only_paths),
     )
-    env = {**select_environment(cfg.execution.environment_names()), **overrides}
+    env = {**select_environment(cfg.execution.command_environment_names()), **overrides}
     return describe_launch(facts, None, env)
 
 
@@ -1615,7 +1615,7 @@ def run_oracle(
     With ``pristine`` (a store and a commit) the whole of ``tests/`` comes from that
     commit instead, so ``commit``'s source meets every checker as it is pinned.
     """
-    names = cfg.execution.environment_names()
+    names = cfg.execution.command_environment_names()
     try:
         with export_commit_tree(runner, repo, commit) as exported:
             if pristine is not None:

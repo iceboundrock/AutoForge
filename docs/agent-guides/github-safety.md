@@ -1669,9 +1669,17 @@ never the boundary.
   zsh's). None is in the default allow-list (`SHELL` no longer is either:
   the controller sets it), and
   config load refuses any of them, or a `*` prefix covering one, in
-  `execution.env_allowlist`, `env_allowlist_extra` or an adapter's
+  any `execution` allow-list key or an adapter's
   `environment_names`, naming the variable and the rule and never a value.
   One check (`refuse_forbidden_env`), with no provider branch in the engine.
+  A prefix is refused for what it covers, never for being short: `R*` can be
+  meant for `R_HOME`. A token under a name of the operator's own passes it, and
+  is warned about by its words at config load and in `doctor`
+  (`credential_looking_entry`, a provider's own prefix read like a key's),
+  which is a heuristic and no boundary. The class split is one (#286):
+  `ExecutionConfig.environment_overlap` refuses, at config load for every
+  profile's provider and before every agent launch for its own, a class's entry
+  that a broader entry or a provider's own names would pass to the other class.
 - **Variables the controller sets**, over the allow-listed environment, for
   one launch, from a directory it creates (`mkdtemp`, mode 0700) and removes
   when the launch ends:
@@ -2260,7 +2268,7 @@ the write), reading only controller state and GitHub, never an agent claim.
   and the PR GitHub returned, the HEAD, base ref and merge base just read,
   the review comment `last_review_comment_url` names, and PASS records that
   are still in state; and the configured `validation.commands` and policy P
-  (`sandbox.mode` and its template, the environment allow-list names,
+  (`sandbox.mode` and its template, the repository commands' allow-list names,
   `execution.command_timeout_seconds`; [Configuration](../configuration.md#candidate-validation))
   digest to the values it states. This runs before the #94 re-read
   of the review comment, before the readiness reads and before any
@@ -2385,9 +2393,9 @@ list, so a resume at the same HEAD does not rerun it and a changed command
 list or a new HEAD does; it is cleared when the run moves to the next issue.
 Each run is logged like an agent invocation. Dry-run runs nothing and lists
 the commands in the plan; `autoforge doctor` reports what is configured
-without running it. The commands run under the same allow-listed
-environment as an agent (`execution.env_allowlist`), not the operator's
-whole shell, with the same
+without running it. The commands run under the repository commands'
+allow-list (`ExecutionConfig.command_environment_names`, #286), not the
+operator's whole shell, with the same
 controller-set variables and preflight ("Agents hold no GitHub credential"
 above): a preflight refusal blocks the merge like a failing command.
 Under `sandbox.mode: required` each command runs in the outer sandbox with

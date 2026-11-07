@@ -1308,6 +1308,34 @@ def test_a_startup_file_that_ends_the_shell_could_not_be_checked(tmp_path, monke
     )
 
 
+def test_a_prefix_is_refused_for_what_it_covers_never_for_being_short():
+    """#286: ``R*`` can be meant for ``R_HOME``, and no length tells it from ``H*``."""
+    assert forbidden_env_entry("H*") is None
+    child_env.refuse_forbidden_env(["PATH", "H*", "R*", "HO*", "ANTHROPIC_*"], "somewhere")
+    # A prefix that covers a forbidden name keeps the rule that names it.
+    with pytest.raises(ConfigurationError, match="covers GH_TOKEN"):
+        child_env.refuse_forbidden_env(["G*"], "somewhere")
+
+
+@pytest.mark.parametrize(
+    ("broader", "entry", "covers"),
+    [
+        ("OPENAI_*", "OPENAI_TEST_DB", True),
+        ("OPENAI_*", "OPENAI_TEST_*", True),
+        ("OPENAI_*", "OPENAI_*", True),
+        ("OPEN*", "OPENAI_*", True),
+        ("OPENAI_*", "OPEN*", False),
+        ("OPENAI_*", "GEMINI_*", False),
+        ("OPENAI_*", "OPENAI", False),
+        ("OPENAI_TEST_DB", "OPENAI_TEST_DB", True),
+        ("OPENAI_TEST_DB", "OPENAI_TEST_DBX", False),
+        ("OPENAI_TEST_DB", "OPENAI_*", False),
+    ],
+)
+def test_entry_covers_is_whether_every_name_of_one_passes_the_other(broader, entry, covers):
+    assert child_env.entry_covers(broader, entry) is covers
+
+
 def test_the_probe_runs_each_launch_shell_as_a_login_shell_in_the_launch_environment(tmp_path):
     seen: list[ExecutionRequest] = []
 

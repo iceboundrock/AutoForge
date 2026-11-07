@@ -5,6 +5,43 @@ so.
 
 ## Unreleased
 
+### Agents and repository commands get an allow-list key each; credential-looking names are called out (#286)
+
+`execution.env_allowlist` and `env_allowlist_extra` reached every launch. A name
+added for a validation command reached every agent, and a provider key added for
+an agent reached the candidate's own code when validation and pre-merge commands
+ran it.
+
+Two new keys add a name for one class alone:
+`execution.agent_env_allowlist_extra` for agents, and
+`execution.command_env_allowlist_extra` for `validation.commands` and
+`merge.verification_commands`. A config that sets neither behaves as before, and
+its validation records stay valid. Nothing moves by itself: if you forward a
+provider key with `env_allowlist_extra`, it still reaches your commands until you
+move it to `agent_env_allowlist_extra`. Moving a name out of what commands get
+changes the validation policy, so the commands run again, and after a clean
+review the merge gate refuses until a new round runs. This separates launches,
+not code: an agent that runs the repository's tests through its own shell tool
+still hands them its environment.
+
+A provider's own names reach its agents whatever these keys say, so a name
+listed for commands alone would not stay there under a provider whose prefix
+covers it. Such a config is refused at load and before an agent launch
+(`OPENAI_TEST_DATABASE_URL` with OpenCode routed), and so is a class's entry a
+broader entry passes to the other class. Neither can be a config that worked
+before: both involve a new key. The same entry in both class keys loads.
+
+The refusal at config load goes by the names `gh` and git read, so a token under
+a name of your own passes it. A command now warns on stderr when it loads the
+configuration, and `doctor` has a `WARN` row "credential-looking allow-list
+entries", for an entry containing `TOKEN`, `PAT`, `SECRET`, `PASSWORD` or
+`GITHUB`, and for a `*` prefix that passes such a variable from your shell, a
+provider's own prefix included: `OPENAI_GITHUB_PAT` in your shell is now said to
+reach OpenCode. Names only, and nothing is refused. `PATH`,
+`TOKENIZERS_PARALLELISM`, a `*_API_KEY` and a variable a CLI signs in with draw no
+warning; [Agent environment](docs/configuration.md#agent-environment) has the
+list.
+
 ### A fix can replace a stale PR description, with no commit and no `BLOCKED` (#423)
 
 A review could find that the code was right and the PR's description was not,

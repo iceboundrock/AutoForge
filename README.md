@@ -153,7 +153,7 @@ Each line is a summary; the linked document is the precise statement.
   write itself; agents, validation commands and pre-merge commands get no
   GitHub or git credential through anything AutoForge controls: no token
   variable `gh` or git reads can be allow-listed (a token you forward under
-  another name is yours to keep out), `gh` finds no login, credential helpers,
+  another name is warned about, and is yours to keep out), `gh` finds no login, credential helpers,
   askpass and the SSH agent and keys are switched off where repository
   configuration cannot switch them back on, curl and wget read no
   configured header, a launch's shells read none of your zsh startup

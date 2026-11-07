@@ -85,11 +85,20 @@ execution:
   # (PATH, HOME, USER, LOGNAME, TERM, TMPDIR, TZ, LANG, LANGUAGE,
   # LC_*, XDG_*_HOME, GIT_AUTHOR_* / GIT_COMMITTER_*, the proxy and
   # CA-bundle variables) and must not be empty; `env_allowlist_extra` adds
-  # to whichever list is in force. No GitHub or git credential route may be
-  # listed in either (GH_TOKEN, GITHUB_TOKEN, GH_HOST, GH_CONFIG_DIR,
-  # SSH_AUTH_SOCK, GIT_SSH*, GIT_ASKPASS, GIT_CONFIG_*, XDG_RUNTIME_DIR,
-  # BASH_ENV, ZDOTDIR and the like, or a `*` covering one): config load
-  # refuses it. The controller sets an empty gh configuration, a git
+  # to whichever list is in force. Those two reach agents and commands alike;
+  # `agent_env_allowlist_extra` adds a name for agents alone (a provider's
+  # key, kept out of the commands below, not of what an agent itself runs) and
+  # `command_env_allowlist_extra` for validation and pre-merge commands alone
+  # (what your tests read, kept from the agents). No GitHub or git credential
+  # route may be listed in any of them (GH_TOKEN, GITHUB_TOKEN, GH_HOST,
+  # GH_CONFIG_DIR, SSH_AUTH_SOCK, GIT_SSH*, GIT_ASKPASS, GIT_CONFIG_*,
+  # XDG_RUNTIME_DIR, BASH_ENV, ZDOTDIR and the like, or a `*` covering one):
+  # config load refuses it. It also refuses a class's entry that a broader
+  # entry, or a provider's own names (OpenCode's OPENAI_*), would pass to the
+  # other class; the same entry in both class keys is fine. An entry that looks
+  # like a credential (TOKEN, PAT, SECRET, PASSWORD, GITHUB, or a prefix,
+  # a provider's own included, passing such a variable from your shell) is
+  # warned about at load and in `doctor`. The controller sets an empty gh configuration, a git
   # identity copied from your global config, a reset of credential helpers
   # and a SHELL and zsh startup directory that load none of your startup
   # files on top, and makes every GitHub write itself; its own `git` / `gh`
@@ -98,7 +107,10 @@ execution:
   # env_allowlist: [PATH, HOME, LANG, "LC_*"]
   env_allowlist_extra: []
   #  - HTTPS_PROXY
+  agent_env_allowlist_extra: []
   #  - OPENROUTER_API_KEY
+  command_env_allowlist_extra: []
+  #  - TEST_DATABASE_URL
   # Where a REMOTE run's per-issue agent worktrees live: one detached
   # `git worktree` per issue, created at the first agent launch for that
   # issue, reused by every later phase of it and never deleted by the
@@ -242,7 +254,8 @@ merge:
   # inconclusive. A pass is persisted per (HEAD, command list) so `resume`
   # does not repeat it, and is cleared when the run moves to another issue.
   # Dry-run runs nothing and lists the commands in the plan. The commands
-  # run under the allow-listed environment (`execution.env_allowlist`), not
+  # run under the repository commands' allow-list (`execution.env_allowlist`,
+  # `env_allowlist_extra`, `command_env_allowlist_extra`), not
   # the operator's whole shell, and get no GitHub or git credential, like an
   # agent. Empty (the default): nothing runs locally before a merge.
   verification_commands: []
@@ -254,7 +267,7 @@ merge:
 # one exact REMOTE candidate, a commit already in the shared object store and
 # the tree it names. Each command, in order, runs in a fresh byte-exact export
 # of that tree (no `.git`, no worktree, nothing fetched), under the
-# allow-listed environment, `execution.command_timeout_seconds` and, with
+# repository commands' allow-list, `execution.command_timeout_seconds` and, with
 # `sandbox.mode: required`, the outer sandbox; the set stops at the first
 # command that does not exit 0. Each run leaves a ValidationRecord in the
 # state file. ANALYZE_EXECUTE, FIX and REPLAN_REEXECUTE validate a candidate
@@ -267,7 +280,7 @@ validation:
   # At most 16 argv ARRAYS, each at most 32 non-blank elements of at most
   # 1,024 characters and 4,096 in all. Argv is stored and shown redacted but
   # digested as written: never put a secret in it (pass one through
-  # `execution.env_allowlist_extra`). Changing a command, the timeout, the
+  # `execution.command_env_allowlist_extra`). Changing a command, the timeout, the
   # allow-list or `sandbox.mode` makes earlier records not apply.
   commands: []
   #  - ["uv", "run", "--frozen", "pytest", "-q"]

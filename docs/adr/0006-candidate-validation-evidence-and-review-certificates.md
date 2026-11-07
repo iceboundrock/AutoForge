@@ -803,9 +803,10 @@ path-independent.** Its inputs:
   the per-launch description, the template is that description with each
   concrete path replaced by its role name. Under `disabled` it is a fixed
   "no outer sandbox" template;
-- the digest of the environment allow-list's names in force
-  (`execution.environment_names()`: `env_allowlist` plus
-  `env_allowlist_extra`);
+- the digest of the environment allow-list's names in force for repository
+  commands (`execution.command_environment_names()`: `env_allowlist`,
+  `env_allowlist_extra` and, since #286, `command_env_allowlist_extra`, which
+  is what a validator gets, so a name only agents get is outside P);
 - the timeout (`execution.command_timeout_seconds`);
 - `contain_orphans`;
 - the materialization method (REMOTE `byte-exact-v1`; LOCAL `in-place`).

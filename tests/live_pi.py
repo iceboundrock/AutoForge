@@ -136,7 +136,7 @@ DEFAULT_EFFORT = "low"
 # the credential reaches Pi only through Pi's own store.
 PROVIDER_KEY_NAMES = ("OPENAI_API_KEY", "DEEPSEEK_API_KEY")
 # A key the operator forwards on purpose (the `api_key` route only): its
-# name goes to `execution.env_allowlist_extra`, which every launch gets.
+# name goes to `execution.agent_env_allowlist_extra`, which every agent gets.
 FORWARD_VARIABLE = "AUTOFORGE_LIVE_PI_FORWARD_KEY"
 _KEY_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]*_API_KEY")
 # The review's limits: it reads two small files.
@@ -523,10 +523,10 @@ def _reviewer(settings: SmokeSettings) -> dict[str, object]:
 
 def _execution(settings: SmokeSettings) -> dict[str, object]:
     """No correction relaunch, so the review is one model call; a forwarded
-    key in ``execution.env_allowlist_extra``."""
+    key in ``execution.agent_env_allowlist_extra``."""
     execution: dict[str, object] = {"max_correction_attempts": 0}
     if settings.forward_key:
-        execution["env_allowlist_extra"] = [settings.forward_key]
+        execution["agent_env_allowlist_extra"] = [settings.forward_key]
     return execution
 
 
@@ -537,7 +537,7 @@ def write_remote_config(path: Path, settings: SmokeSettings, gh: Path, state_dir
     stand-in's, for every ``gh`` doctor or the controller runs; the state
     outside the checkout (``state_dir``), so that the checkout holds nothing
     AutoForge writes; and no correction relaunch, so the review is one
-    model call, with a forwarded key in ``execution.env_allowlist_extra``."""
+    model call, with a forwarded key in ``execution.agent_env_allowlist_extra``."""
     reviewer = _reviewer(settings)
     scripted = {"provider": "scripted"}
     data = {
@@ -666,7 +666,7 @@ def check_no_api_key(settings: SmokeSettings, report: SmokeReport) -> None:
         f"{FORWARD_VARIABLE} names {settings.forward_key}, which is not set",
     )
     report.facts["credential"] = (
-        f"{settings.forward_key} forwarded on purpose by execution.env_allowlist_extra "
+        f"{settings.forward_key} forwarded on purpose by execution.agent_env_allowlist_extra "
         "(its value is not shown; Pi prefers a stored credential when it holds one)"
     )
 
