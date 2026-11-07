@@ -52,7 +52,7 @@ from autoforge.state import (
 )
 from autoforge.transitions import Phase, WorkflowMode
 
-from .conftest import DECODER_LIMIT_RECORDS, LOCAL_STATE_FIELDS
+from .conftest import DECODER_LIMIT_RECORDS, GOOGLE_API_KEY, LOCAL_STATE_FIELDS
 
 # Protocol 10's own fields (#172): no older label wrote any of them.
 _VALIDATION_KEYS = (
@@ -5660,3 +5660,30 @@ def test_a_stop_code_beside_its_stop_loads_as_saved(tmp_path, phase, code):
     (``test_a_saved_code_classifies_only_as_the_code_it_is``)."""
     d = make_state(phase=phase, block_reason="x", stop_code=code).to_dict()
     assert load_state(_write(tmp_path / "state.json", d)).stop_code == code
+
+
+# Where a planted Google API key starts in the refused code's ``repr``: across the 80
+# characters the refusal once cut that ``repr`` to before anything redacted it, and across
+# the cut :func:`autoforge.provenance.shown` makes after redacting it (PR #470 R2-F1).
+_STOP_CODE_KEY_STARTS = range(30, 80)
+
+
+def _a_stop_code_carrying_a_key(start: int) -> str:
+    """A code of no reason code's shape, whose ``repr`` has the key at ``start``."""
+    code = "x" * (start - 2) + " " + GOOGLE_API_KEY + " and more after it" * 4
+    assert repr(code).index(GOOGLE_API_KEY) == start
+    return code
+
+
+@pytest.mark.parametrize("start", _STOP_CODE_KEY_STARTS)
+def test_a_refused_stop_code_quotes_no_part_of_a_credential_crossing_its_bound(tmp_path, start):
+    """PR #470 R2-F1: the refusal quotes the code redacted whole and only then bounded,
+    so a fixed-length credential crossing the bound is still recognised and none of it
+    is quoted; the refused file stays as it was. Cutting first left its prefix for
+    ``status`` to print, past every later redaction."""
+    d = make_state(phase=Phase.BLOCKED, block_reason="x").to_dict()
+    d["stop_code"] = _a_stop_code_carrying_a_key(start)
+    p = _write(tmp_path / "state.json", d)
+    message = _refused_unchanged(p, "'stop_code' must be a reason code")
+    assert "AIza" not in message, message
+    assert message.endswith(" [... cut]")

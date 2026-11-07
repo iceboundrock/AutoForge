@@ -314,6 +314,10 @@ _STOP_FIELDS = ("stop_code",)
 # classifies ``unknown``, never another code); the state only bounds it.
 _STOP_CODE_RE = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
 _MAX_STOP_CODE_CHARS = 64
+# How much of a refused code its refusal quotes: its ``repr``, redacted whole
+# first and only then cut (:func:`autoforge.provenance.shown`), so a credential
+# planted in the field and crossing the cut is still recognised (PR #470 R2-F1).
+_MAX_SHOWN_STOP_CODE_CHARS = 80
 # The twelve fields LOCAL mode wrote into every state file (ADR 0009 C2),
 # each with the value every REMOTE save wrote. Protocol 13 removed them with
 # LOCAL (#388, ADR 0009 D8): a file labelled 12 or older loads with each one
@@ -1879,6 +1883,11 @@ def _validate_stop_code(state: AutoForgeState) -> None:
     cleared when ``unblock`` leaves it, so one beside any other phase is not
     a stop's. Which codes exist is the classification's to say: one it does
     not know classifies ``unknown`` there, never another code.
+
+    A refusal quotes the code only through :func:`autoforge.provenance.shown`:
+    redacted whole, then bounded (PR #470 R2-F1). Cutting the ``repr`` first
+    would leave a fixed-length credential planted in the field unrecognised
+    by every later redaction, its prefix printed by ``status``.
     """
     code = state.stop_code
     if not code:
@@ -1886,12 +1895,14 @@ def _validate_stop_code(state: AutoForgeState) -> None:
     if len(code) > _MAX_STOP_CODE_CHARS or not _STOP_CODE_RE.fullmatch(code):
         raise StateError(
             f"state field 'stop_code' must be a reason code (lower-case words joined by "
-            f"hyphens, at most {_MAX_STOP_CODE_CHARS} characters) or empty, got {code!r:.80}"
+            f"hyphens, at most {_MAX_STOP_CODE_CHARS} characters) or empty, got "
+            f"{shown(repr(code), _MAX_SHOWN_STOP_CODE_CHARS)}"
         )
     if state.phase not in (Phase.BLOCKED, Phase.FAILED):
         raise StateError(
-            f"state field 'stop_code' is {code!r} in phase {state.phase.value}: a stop code is "
-            "saved only with BLOCKED or FAILED and cleared when the run leaves it"
+            f"state field 'stop_code' is {shown(repr(code), _MAX_SHOWN_STOP_CODE_CHARS)} in "
+            f"phase {state.phase.value}: a stop code is saved only with BLOCKED or FAILED and "
+            "cleared when the run leaves it"
         )
 
 

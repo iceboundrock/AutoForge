@@ -1316,6 +1316,39 @@ def test_the_bounds_redact_before_they_cut():
         _no_token_part(bounded)
 
 
+# Where the planted key starts in the refused code's ``repr``: across the 80 characters
+# the loader's refusal once cut that ``repr`` to before redacting it (PR #470 R2-F1).
+_STOP_CODE_KEY_STARTS = [42, 50, 60, 68]
+
+
+@pytest.mark.parametrize("start", _STOP_CODE_KEY_STARTS)
+@pytest.mark.parametrize(
+    "flags", [(), ("--json",), ("--live",), ("--live", "--json")], ids=" ".join
+)
+def test_a_credential_in_a_refused_stop_code_never_reaches_status(
+    tmp_state_dir, status_cli, capsys, start, flags
+):
+    """A hand-planted ``stop_code`` of no code's shape is refused at load by every status
+    variant, and the refusal on stderr quotes it redacted whole before it is bounded: a
+    fixed-length credential crossing the bound leaves none of its body. The refused state
+    is left byte for byte as it was, and nothing is read from GitHub."""
+    eng = _checks_refused(tmp_state_dir)
+    data = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
+    code = "x" * (start - 2) + " " + _TOKEN + " and more after it" * 4
+    assert repr(code).index(_TOKEN) == start
+    data["stop_code"] = code
+    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+    before = state_tree(tmp_state_dir)
+    calls = len(eng.github.calls)
+    rc, out, err = status_cli(eng, "status", *flags, capsys=capsys)
+    assert rc == 2 and out == "", out
+    assert "state field 'stop_code' must be a reason code" in err
+    assert "AIza" not in err, err
+    _no_token_part(out + err)
+    assert state_tree(tmp_state_dir) == before
+    assert len(eng.github.calls) == calls
+
+
 # -- a verified PR description edited since (PR #470 R1-F5) --------------------------------
 
 
