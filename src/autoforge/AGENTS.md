@@ -73,7 +73,8 @@ github.py           GitHubClient over `gh`, the only holder of a GitHub credenti
                     controller-owned merge and merged-head-branch deletion; every
                     `gh` runs in an empty directory of its own (`gh_workdir`, #283)
 child_env.py        what every agent and repository-command launch gets instead of a
-                    credential: forbidden env names, per-launch overrides (empty gh
+                    credential: forbidden env names, credential-looking allow-list
+                    entries (#286), per-launch overrides (empty gh
                     config, identity-only git config, command-scope resets, empty
                     curl and wget config, empty ZDOTDIR, a POSIX SHELL), the
                     preflight and its login-shell probe; provider-neutral, no

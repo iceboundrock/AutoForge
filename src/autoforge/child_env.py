@@ -19,10 +19,14 @@ of launch the same way.
   instead of ``~/.netrc``, and where a shell finds a startup file
   (``BASH_ENV``, ``ENV``, ``ZDOTDIR``).
   :func:`refuse_forbidden_env` refuses an allow-list entry that names one,
-  or a ``*`` prefix that covers one, at config load
-  (``execution.env_allowlist`` / ``env_allowlist_extra``) and for every
-  provider adapter's own names, naming the variable and the rule, never a
-  value.
+  or a ``*`` prefix that covers one, at config load (every ``execution``
+  allow-list key) and for every provider adapter's own names, naming the
+  variable and the rule, never a value.
+- **Names that only look like a credential** (:func:`credential_looking_entry`,
+  #286). The rule above goes by name, so a token forwarded under a name of the
+  operator's own passes it. Such an entry is warned about, not refused: a
+  warning can afford to be wrong. A one-character prefix (``H*``) is refused,
+  since it names no tool and passes whatever the shell holds under that letter.
 - **What the controller sets instead** (:func:`isolated_overrides`), over
   the allow-listed environment, for one launch:
 
@@ -171,6 +175,14 @@ FORBIDDEN_ENV_PREFIXES: dict[str, str] = {
     "GIT_CONFIG_VALUE_": _GIT_CONFIG,
 }
 
+# What makes a variable's name look like it holds a credential (#286), matched
+# upper-cased. ``PAT`` counts only as a word of its own, or ``PATH`` would match,
+# and ``TOKENIZERS_PARALLELISM`` is no token. A provider's ``*_API_KEY`` is
+# deliberately not here: forwarding one to an agent is the documented way to
+# give a provider its key, and a warning on every run of it would teach an
+# operator to ignore this one.
+_CREDENTIAL_LOOKING_RE = re.compile(r"TOKEN(?!IZ)|SECRET|PASSWORD|GITHUB|(?<![A-Z])PAT(?![A-Z])")
+
 # What the child's ``gh`` finds as its token. Not a credential, and not
 # shaped like one (the redactor leaves it alone); GitHub answers 401.
 GH_PLACEHOLDER_TOKEN = "autoforge-no-github-credential"
@@ -302,6 +314,13 @@ def refuse_forbidden_env(entries: Iterable[str], where: str) -> None:
     for entry in entries:
         hit = forbidden_env_entry(entry)
         if hit is None:
+            if entry.endswith("*") and len(entry) == 2:
+                raise ConfigurationError(
+                    f"{where}: environment entry {entry!r} is a one-character prefix: it names "
+                    "no tool and passes whatever this shell holds under that letter, a token "
+                    "under a name of your own included. Name the variables you need, or a "
+                    "longer prefix (docs/configuration.md, 'Agent environment')"
+                )
             continue
         variable, rule = hit
         what = f"is {rule}" if variable == entry else f"covers {variable}, which is {rule}"
@@ -311,6 +330,32 @@ def refuse_forbidden_env(entries: Iterable[str], where: str) -> None:
             "allow-listed; name the variables you need instead (docs/configuration.md, "
             "'Agent environment')"
         )
+
+
+def credential_looking_word(name: str) -> str:
+    """The word that makes variable ``name`` look like a credential; "" if none."""
+    found = _CREDENTIAL_LOOKING_RE.search(name.upper())
+    return found.group() if found else ""
+
+
+def credential_looking_entry(entry: str, environ_names: Iterable[str] = ()) -> str:
+    """What allow-list ``entry`` passes that looks like a credential; "" if nothing.
+
+    An entry is read by its own text, a prefix by what precedes the ``*``. A
+    prefix whose text says nothing (``MY_*``) is then read against
+    ``environ_names``, the names in the operator's shell: every prefix could
+    cover some such name, and only one that does here is worth saying so.
+    The result names variables, and never holds a value.
+    """
+    stem = entry.removesuffix("*")
+    word = credential_looking_word(stem)
+    if word:
+        return f"looks like a credential (its name contains {word})"
+    if entry.endswith("*"):
+        held = sorted(n for n in environ_names if n.startswith(stem) and credential_looking_word(n))
+        if held:
+            return f"passes what looks like a credential ({', '.join(held)} in this shell)"
+    return ""
 
 
 def child_shell(operator: str | None = None) -> str:
@@ -852,6 +897,8 @@ __all__ = [
     "LaunchIdentity",
     "child_overrides",
     "child_shell",
+    "credential_looking_entry",
+    "credential_looking_word",
     "forbidden_env_entry",
     "git_config_problems",
     "isolated_overrides",

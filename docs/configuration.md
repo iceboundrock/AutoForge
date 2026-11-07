@@ -194,7 +194,7 @@ probe file it creates and removes there.
 | Section | What it controls | Where the behaviour is specified |
 |---|---|---|
 | top level | `version`, `state_dir` (default `.autoforge`), `prompt_version` (leave unset: it may only repeat the controller's built-in label, see [Validation](#validation-every-key-must-be-one-the-controller-reads)) | [State and recovery](agent-guides/state-and-recovery.md) |
-| `execution` | the default agent limits (`default_idle_timeout_seconds` 900, `default_max_runtime_seconds` unset), loop detection (`loop_detection`, mode `kill`; unset, `warn` on Pi and in `UPDATE_EPIC`), the wall-clock bound on controller-run commands (`command_timeout_seconds` 1800), `max_correction_attempts` (default 1), the agent environment allow-list (`env_allowlist`, `env_allowlist_extra`; a GitHub or git credential route is refused, see [Agent environment](#agent-environment)), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
+| `execution` | the default agent limits (`default_idle_timeout_seconds` 900, `default_max_runtime_seconds` unset), loop detection (`loop_detection`, mode `kill`; unset, `warn` on Pi and in `UPDATE_EPIC`), the wall-clock bound on controller-run commands (`command_timeout_seconds` 1800), `max_correction_attempts` (default 1), the launch environment allow-lists (`env_allowlist`, `env_allowlist_extra`, `agent_env_allowlist_extra`, `command_env_allowlist_extra`; a GitHub or git credential route is refused and a credential-looking name warned about, see [Agent environment](#agent-environment)), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
 | `safety` | the merge gate (`allow_merge`, default `false`), `protected_merge_paths` (default `.github/workflows/`), `required_checks` (default `ci`), `verify_check_definition` (default `true`); who authorizes a `FIX` acceptance comment (`acceptance_actions`: `off`, `approve` (default) or `auto`) | [GitHub safety](agent-guides/github-safety.md#merge-safety), [Running the remote workflow](usage.md#blocked-on-an-acceptance-action) |
 | `merge` | how the controller merges once the gate is open: `method` (default `squash`), `delete_branch` (default `false`; after a verified merge, delete the PR's head branch on GitHub only, never a local branch, see [Deleting the merged head branch](agent-guides/github-safety.md#deleting-the-merged-head-branch)), `max_verification_attempts` (default 5), `verification_commands` (argv lists, empty by default) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
 | `workflow` | loop bounds: `max_review_rounds` (20), `stagnation_identical_rounds` (2), `stagnation_unchanged_count_rounds` (3), `max_total_steps` (300); `epic_update_every` (1) | [Workflow](agent-guides/workflow.md#loop-bounds) |
@@ -595,13 +595,14 @@ test. The profile's fields map as follows:
   runs `pi auth check` (below), and Pi is started only when it reports a
   ready OAuth sign-in for the model's provider. An API-key provider
   (DeepSeek) needs `false`; its key belongs in Pi's credential store, or
-  is forwarded with `execution.env_allowlist_extra`, a list every agent
+  is forwarded with `execution.agent_env_allowlist_extra`, a list every agent
   launch gets ([Pi operator guide](pi.md#deepseek-on-an-api-key)).
 
 `autoforge doctor` checks the Pi version and runs
 `pi auth check --model M --json --no-refresh` under the same environment
 allow-list an agent launch gets. Pi's own `OPENAI_API_KEY` therefore counts
-only if `execution.env_allowlist_extra` forwards it. "Ready" means Pi holds a
+only if `execution.agent_env_allowlist_extra` or `env_allowlist_extra`
+forwards it. "Ready" means Pi holds a
 credential for the model's provider. It does not prove that this model is
 available to that credential; the first real run does. To sign in, run `pi`
 and `/login openai` yourself; AutoForge never starts a login. A real Pi
@@ -691,14 +692,45 @@ forwarded for another provider therefore never reaches it.
 Agents, `validation.commands` and `merge.verification_commands` get no
 GitHub or git credential (#165): the controller makes every GitHub
 write itself and hands each agent the GitHub data its phase needs as files.
-Each launch's environment is the allow-list in force
-(`execution.env_allowlist` plus `execution.env_allowlist_extra`, plus the
-names a provider adapter adds), with the variables below set on top.
+Each launch's environment is its class's allow-list, with the variables
+below set on top:
+
+| Key | Reaches | Default |
+|---|---|---|
+| `execution.env_allowlist` | every agent and repository command | the list in `autoforge.example.yaml`; a value replaces it and must not be empty |
+| `execution.env_allowlist_extra` | every agent and repository command | empty |
+| `execution.agent_env_allowlist_extra` | every agent, of every profile and provider | empty |
+| `execution.command_env_allowlist_extra` | every `validation.commands` and `merge.verification_commands` entry | empty |
+
+An agent launch also gets the names its provider adapter adds; a repository
+command gets no provider's. A config that sets neither class key keeps one list
+for every launch, as it always did. To separate what you already list, keep
+what both classes need in the first two keys and move the rest:
+
+```yaml
+execution:
+  # Pi's key: never in the environment of a validation or pre-merge command.
+  agent_env_allowlist_extra: [DEEPSEEK_API_KEY]
+  # What the tests read: never in an agent's environment.
+  command_env_allowlist_extra: [TEST_DATABASE_URL]
+```
+
+This separates launches, not code. An agent that runs the repository's tests
+through its own shell tool hands them its environment, so a key forwarded to an
+agent is out of reach of the commands the controller runs, not of everything
+the candidate's code does while an agent runs it.
+
+The class keys only add. There is no key that replaces the shared list for
+one class, because none is needed: narrow `env_allowlist` to what both share
+and name each class's remainder. Moving a name in or out of what commands get
+changes the validation policy
+([What withdraws evidence](#candidate-validation)); moving one among the agents
+alone does not.
 
 **Names that cannot be allow-listed.** Config load fails, naming the entry
-and the rule and never a value, when either key, or a provider adapter's own
-names, holds one of these or a `*` prefix that covers one (a bare `*`
-included):
+and the rule and never a value, when any of these keys, or a provider
+adapter's own names, holds one of these or a `*` prefix that covers one (a
+bare `*` included):
 
 | Names | Rule |
 |---|---|
@@ -711,9 +743,29 @@ included):
 | `NETRC` | where curl (8.16 and later), Python's `requests` and Go find the `.netrc` they take a password from |
 | `BASH_ENV`, `ENV`, `ZDOTDIR` | where a shell finds a startup file it runs before a command, which can export a credential |
 
-The rule goes by name: a token you forward under a name of your own
-(`MY_GITHUB_PAT`, say) is not recognised, and reaches every launch if you
-list it or a prefix that covers it.
+A `*` prefix of one character (`H*`) fails the same way: it names no tool,
+and passes whatever your shell holds under that letter
+(`HOMEBREW_GITHUB_API_TOKEN`). Two characters are accepted, because `GO*` and
+`PY*` name real tools.
+
+**Names that look like a credential.** The rule above goes by name, so a token
+you forward under a name of your own (`MY_GITHUB_PAT`, say) is not refused, and
+reaches every launch its key reaches. A command warns on stderr when it loads
+the configuration, and `autoforge doctor` shows a `WARN` row
+("credential-looking allow-list entries"), naming the key and the entry and
+never a value, when either of these holds:
+
+- the entry, or a prefix's text before the `*`, contains `TOKEN`, `SECRET`,
+  `PASSWORD` or `GITHUB`, or `PAT` as a word of its own, in any case
+  (`GITLAB_PAT` and `MY_TOKEN_*`, not `PATH`, `TOKENIZERS_PARALLELISM`);
+- a `*` prefix passes such a variable from the shell you run in (`MY_*` while
+  `MY_GITHUB_PAT` is set).
+
+It is a warning, because only you know what a name holds, and nothing turns it
+off. A `*_API_KEY` is not one of the words: forwarding a provider's key to an
+agent is the documented way to give a provider its key, so such a name is your
+own to scope with `agent_env_allowlist_extra`. The words are a heuristic and
+recognise no token by its value: `MY_GH_KEY` passes without a word.
 
 Earlier versions forwarded `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK`, `GIT_SSH`,
 `GIT_SSH_COMMAND`, `GIT_CONFIG_GLOBAL`, `GH_TOKEN`, `GITHUB_TOKEN`,
@@ -783,7 +835,7 @@ repository's runs in a launch:
   (row "agent 'claude' configuration keeps the launch environment") name
   the file and the variables, never a value. Remove those entries; a
   variable Claude Code itself needs can be set in the shell that runs
-  `autoforge` instead and passed with `execution.env_allowlist_extra`
+  `autoforge` instead and passed with `execution.agent_env_allowlist_extra`
   (`CLAUDE_*` and `ANTHROPIC_*` pass already).
 - OpenCode is launched with `OPENCODE_CONFIG_DIR` set to an empty directory
   of its own, project configuration disabled
@@ -868,9 +920,9 @@ validation:
   commit must already be in the shared object store; nothing is fetched,
   and a commit that is not there is refused before anything runs. The set
   stops at the first command that does not pass, and every export is
-  discarded. The commands get the allow-listed environment
-  (`execution.env_allowlist`), no GitHub or git credential, the wall-clock
-  limit `execution.command_timeout_seconds`, and orphan containment; under
+  discarded. The commands get the repository commands' allow-list
+  ([Agent environment](#agent-environment)), no GitHub or git credential, the
+  wall-clock limit `execution.command_timeout_seconds`, and orphan containment; under
   `sandbox.mode: required` or its alias `preferred` they run inside the
   outer sandbox as the pre-merge export does (`sandbox.validation_network`
   sets their network), or are refused.
@@ -899,16 +951,19 @@ validation:
 - **No secrets in argv.** A command's argv is stored, logged and shown
   redacted, but its digest is over the argv as configured, and redaction
   claims no completeness. Pass a credential through the allow-listed
-  environment, as for an agent, never on the command line.
+  environment (`execution.command_env_allowlist_extra`), never on the command
+  line.
 - **What withdraws evidence.** A record applies to a later check only for
   the same candidate, the same definition (its argv and its position in
   the list) and the same policy P. P is `sandbox.mode`, the outer
   sandbox's path-independent template (under `disabled` a fixed "no
-  sandbox" one), the names in the environment allow-list, the timeout,
-  orphan containment and how the candidate is materialized. Changing any
-  of them, `execution.command_timeout_seconds` or
-  `execution.env_allowlist_extra` included, makes earlier records not
-  apply: the commands run again. Made after a clean review, the same change
+  sandbox" one), the names in the repository commands' allow-list, the
+  timeout, orphan containment and how the candidate is materialized. Changing
+  any of them, `execution.command_timeout_seconds`,
+  `execution.env_allowlist_extra` and `execution.command_env_allowlist_extra`
+  included, makes earlier records not apply: the commands run again (a name in
+  `execution.agent_env_allowlist_extra` alone is not among them). Made after a
+  clean review, the same change
   makes that round's review certificate not apply, so the merge gate
   refuses (`BLOCKED`, naming the policy or set digest) until the
   configuration is restored or a new round runs under it

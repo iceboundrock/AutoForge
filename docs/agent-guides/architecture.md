@@ -286,10 +286,11 @@ The process executor owns:
   unhooked for both streams the first time it raises
 
 It should remain independent of workflow semantics. Which names are
-allowed is policy: the engine reads it from `execution.env_allowlist` (plus
-`env_allowlist_extra`) and applies it to every agent launch,
-`validation.commands` entry and `merge.verification_commands` entry;
-the controller's own `git` / `gh` plumbing inherits the full environment.
+allowed is policy: the engine reads it per class of launch (#286), from
+`ExecutionConfig.agent_environment_names` for every agent launch and
+`command_environment_names` for every `validation.commands` entry and
+`merge.verification_commands` entry, both over `execution.env_allowlist` and
+`env_allowlist_extra`; the controller's own `git` / `gh` plumbing inherits the full environment.
 A request's `env` mapping is layered over the selected variables; the
 executor sets it without interpreting it. What goes into it is
 `child_env.py` (#165), provider-neutral and called by the engine for all

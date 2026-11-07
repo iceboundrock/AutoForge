@@ -565,10 +565,11 @@ An amendment changes the files of section 1 and these digests in one reviewed ch
 **and states whether any real run had been made.** A record carries the digests it was made under, and a
 report refuses to decide over records of another, so criteria cannot move under results.
 
-- `manifest.json`: `c48935bdb7b4a6c4c88434b09ff4157eef4d39a2e5311c4a3aa9d146d5f5425a`
-- `preregistration.json`: `0c28918468a7aa37f3f787ea5c45881a36e440ea500617dc1c21ca93a65834d9`
-- `real_run_config.yaml`: `0d6b81feb25854df1ac6640770c56ebb04f8ed8637cb7d801faa7327516a1c5a`
+- `manifest.json`: `2927ec848491f1b853d3dc5992a89d33e8f63fa5b307dcd40297825cd0e2ef5e`
+- `preregistration.json`: `7d5c224dbc935b2fb503c7eb8b4fc9632f26f7e893ee6a8d0b6342adc5996ceb`
+- `real_run_config.yaml`: `91bf8a981f4a9f14cabcee56e01184d396c8fd810de464776c4e6586e5e45d5c`
 
 | Date | Change | Why | Real runs before it |
 |---|---|---|---|
 | 2026-11-06 | The prompt label moves from `v15` to `v16`, which moves the settings digest and the digests that hold it. | #440 changed the prompt: every agent is told to stop what it started before its final reply, and a Claude Code launch gets a section on what a pending background task does. Every arm runs Claude Code on one label, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |
+| 2026-11-07 | Two allow-list keys are added under `execution`, which moves the settings digest and the digests that hold it. | #286 gives agent launches and repository commands an allow-list key each. `real_run_config.yaml` sets neither, so every launch of every arm gets the names it got before, and no threshold, task or other setting changes. `tests/evaluation.py` reads the repository commands' names, as the engine now does, so its copy of the validation policy stays the engine's. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |

@@ -209,6 +209,7 @@ CREDENTIAL_FREE_ROWS = (
     "cwd is a git repository",
     "GitHub remote",
     "launch environment",
+    "credential-looking allow-list entries",
     "no credential reaches a launch",
     "profile limits",
     "loop detection",

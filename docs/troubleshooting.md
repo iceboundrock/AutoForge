@@ -550,8 +550,9 @@ The messages below are AutoForge's own refusals, grouped by subject.
   with a token, a GitHub entry in `~/.netrc`, or the startup files of a
   login shell that change a variable such as `GH_TOKEN`). Nothing was recorded:
   remove the setting (`autoforge doctor` lists it too) and run the same
-  command again. A config that fails to load because `env_allowlist` names
-  a variable `gh` or git reads a credential from: delete that entry
+  command again. A config that fails to load because an allow-list key names
+  a variable `gh` or git reads a credential from, or holds a one-character
+  `*` prefix: delete that entry, or name the variables you need
   ([Configuration: agent environment](configuration.md#agent-environment)).
 - **"refusing to launch opencode: it would load the configuration of an
   organization connected to it":** OpenCode would load an organization's

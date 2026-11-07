@@ -5466,3 +5466,52 @@ def test_status_of_a_namespace_at_ready_for_merge_advises_a_merge_by_hand(
     assert cli.main(["--state-dir", str(standalone), "status", "--json"]) == 0
     stop = json.loads(capsys.readouterr().out)["stop"]
     assert (stop["view"], stop["routes"]) == ("standalone", ["merge", "merge_gate"])
+
+
+def _config_with_execution(tmp_path, execution: dict) -> Path:
+    path = tmp_path / "execution.json"
+    path.write_text(json.dumps({"version": 1, "execution": execution}), encoding="utf-8")
+    return path
+
+
+def test_loading_a_credential_looking_allowlist_entry_warns_on_stderr(
+    tmp_path, capsys, monkeypatch
+):
+    """#286: every command says so at load, by name, and goes on; never a value."""
+    monkeypatch.chdir(tmp_path)
+    secret = "ghp_" + "Q" * 36
+    monkeypatch.setenv("MY_API_TOKEN", secret)
+    monkeypatch.setenv("MY_TOOL_HOME", "/opt/tool")
+    config = _config_with_execution(
+        tmp_path,
+        {"env_allowlist_extra": ["MY_GITHUB_PAT"], "agent_env_allowlist_extra": ["MY_*"]},
+    )
+    rc = cli.main(["--config", str(config), "--state-dir", str(tmp_path / "s"), "status"])
+    assert rc == 2  # no state yet: the command itself ran on
+    captured = capsys.readouterr()
+    assert (
+        "autoforge: warning: execution.env_allowlist_extra entry 'MY_GITHUB_PAT' looks like "
+        "a credential (its name contains GITHUB) and reaches every agent and repository command"
+    ) in captured.err
+    assert (
+        "autoforge: warning: execution.agent_env_allowlist_extra entry 'MY_*' passes what "
+        "looks like a credential (MY_API_TOKEN in this shell) and reaches every agent"
+    ) in captured.err
+    assert secret not in captured.err + captured.out
+    assert "warning" not in captured.out and "MY_TOOL_HOME" not in captured.err
+
+
+def test_loading_an_ordinary_allowlist_warns_about_nothing(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MY_API_TOKEN", "x")
+    config = _config_with_execution(tmp_path, {"command_env_allowlist_extra": ["MY_TOOL_HOME"]})
+    cli.main(["--config", str(config), "--state-dir", str(tmp_path / "s"), "status"])
+    assert "warning" not in capsys.readouterr().err
+
+
+def test_a_one_character_prefix_refuses_the_command(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config = _config_with_execution(tmp_path, {"env_allowlist_extra": ["H*"]})
+    rc = cli.main(["--config", str(config), "--state-dir", str(tmp_path / "s"), "status"])
+    assert rc == 2
+    assert "one-character prefix" in capsys.readouterr().err

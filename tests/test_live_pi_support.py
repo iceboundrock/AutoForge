@@ -452,7 +452,7 @@ def test_the_remote_smoke_flow_passes_on_the_api_key_route_against_a_fake_pi(tmp
         "clean, the run is READY_FOR_MERGE (nothing is merged: the merge gate is closed)"
     )
     config = _config(tmp_path)
-    assert "local" not in config and "env_allowlist_extra" not in config["execution"]
+    assert "local" not in config and "agent_env_allowlist_extra" not in config["execution"]
     assert config["github"]["command"] == str(tmp_path / "smoke" / "fake-gh")
     assert config["state_dir"] == str(tmp_path / "smoke" / "state")
     for name in ("review_round_1", "review_round_2_5", "review_round_6_plus"):
@@ -505,9 +505,9 @@ def test_a_key_forwarded_on_purpose_reaches_the_remote_launch_and_is_found_on_gi
     text = report.render()
     assert report.passed(STEPS[1]) and report.passed(STEPS[3])
     assert report.facts["credential"].startswith(
-        "DEEPSEEK_API_KEY forwarded on purpose by execution.env_allowlist_extra"
+        "DEEPSEEK_API_KEY forwarded on purpose by execution.agent_env_allowlist_extra"
     )
-    assert _config(tmp_path)["execution"]["env_allowlist_extra"] == ["DEEPSEEK_API_KEY"]
+    assert _config(tmp_path)["execution"]["agent_env_allowlist_extra"] == ["DEEPSEEK_API_KEY"]
     [launch] = rehearsal.fake.launches()
     assert "DEEPSEEK_API_KEY" in launch["env"] and "OPENAI_API_KEY" not in launch["env"]
     ok, message = report.outcomes[STEPS[4]]

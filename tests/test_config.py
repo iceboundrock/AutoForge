@@ -16,6 +16,7 @@ from autoforge.config import default_config, load_config_file, validate_required
 from autoforge.config_fingerprint import fingerprint_routing
 from autoforge.errors import ConfigurationError
 from autoforge.profiles import REQUIRED_PROFILES
+from autoforge.redaction import redact
 from autoforge.validation import parse_github_url, validate_epic_and_issue
 
 
@@ -1423,6 +1424,14 @@ def test_agent_limits_describe_both_values():
 
 
 # -- agent environment allow-list and worktree location (#10) --------------------
+ENV_ALLOWLIST_KEYS = [
+    "env_allowlist",
+    "env_allowlist_extra",
+    "agent_env_allowlist_extra",
+    "command_env_allowlist_extra",
+]
+
+
 def _execution_cfg(tmp_path, execution: dict):
     p = tmp_path / "cfg.json"
     p.write_text(json.dumps({"version": 1, "execution": execution}), encoding="utf-8")
@@ -1467,7 +1476,7 @@ FORBIDDEN_ENTRIES = [
 ]
 
 
-@pytest.mark.parametrize("key", ["env_allowlist", "env_allowlist_extra"])
+@pytest.mark.parametrize("key", ENV_ALLOWLIST_KEYS)
 @pytest.mark.parametrize(("entry", "variable"), FORBIDDEN_ENTRIES)
 def test_a_github_or_git_credential_route_is_refused_at_load(
     tmp_path, monkeypatch, key, entry, variable
@@ -1484,7 +1493,7 @@ def test_a_github_or_git_credential_route_is_refused_at_load(
     assert "Z" * 36 not in message
 
 
-@pytest.mark.parametrize("key", ["env_allowlist", "env_allowlist_extra"])
+@pytest.mark.parametrize("key", ENV_ALLOWLIST_KEYS)
 def test_a_bare_star_is_refused_as_not_a_name(tmp_path, key):
     # `*` would cover every forbidden name; the pattern check refuses it first.
     with pytest.raises(ConfigurationError, match="not an environment variable name"):
@@ -1516,14 +1525,14 @@ def test_env_allowlist_replaces_the_default_and_extra_adds_to_it(tmp_path):
     assert names[-1] == "MY_TOOL_HOME" and names.count("PATH") == 1
 
 
-@pytest.mark.parametrize("key", ["env_allowlist", "env_allowlist_extra"])
+@pytest.mark.parametrize("key", ENV_ALLOWLIST_KEYS)
 @pytest.mark.parametrize("bad", ["A*B", "A-B", "1ABC", "A B", "*"])
 def test_an_invalid_environment_pattern_is_a_configuration_error(tmp_path, key, bad):
     with pytest.raises(ConfigurationError, match=f"{key}.*not an environment variable name"):
         _execution_cfg(tmp_path, {key: ["PATH", bad]})
 
 
-@pytest.mark.parametrize("key", ["env_allowlist", "env_allowlist_extra"])
+@pytest.mark.parametrize("key", ENV_ALLOWLIST_KEYS)
 @pytest.mark.parametrize("value", ["PATH", 1, {"a": 1}, ["PATH", 2], ["PATH", ""]])
 def test_an_environment_list_must_be_a_list_of_strings(tmp_path, key, value):
     with pytest.raises(ConfigurationError, match=key):
@@ -1534,7 +1543,152 @@ def test_an_empty_env_allowlist_is_rejected_not_an_empty_environment(tmp_path):
     with pytest.raises(ConfigurationError, match="env_allowlist.*at least one variable"):
         _execution_cfg(tmp_path, {"env_allowlist": []})
     # ...while an empty *extra* list is the default and fine.
-    assert _execution_cfg(tmp_path, {"env_allowlist_extra": []}).execution.environment_names()
+    for key in ("env_allowlist_extra", "agent_env_allowlist_extra", "command_env_allowlist_extra"):
+        assert _execution_cfg(tmp_path, {key: []}).execution.environment_names()
+
+
+# -- an allow-list per class of launch, and credential-looking entries (#286) ----
+def test_a_class_list_adds_to_what_its_class_gets_and_nothing_else(tmp_path):
+    exe = _execution_cfg(
+        tmp_path,
+        {
+            "env_allowlist_extra": ["SHARED_NAME"],
+            "agent_env_allowlist_extra": ["FOR_AGENTS", "PATH"],
+            "command_env_allowlist_extra": ["FOR_COMMANDS", "SHARED_NAME"],
+        },
+    ).execution
+    shared = (*config.DEFAULT_ENV_ALLOWLIST, "SHARED_NAME")
+    assert exe.environment_names() == shared
+    assert exe.agent_environment_names() == (*shared, "FOR_AGENTS")
+    assert exe.command_environment_names() == (*shared, "FOR_COMMANDS")
+
+
+def test_a_replaced_base_list_is_what_the_classes_share(tmp_path):
+    exe = _execution_cfg(
+        tmp_path,
+        {
+            "env_allowlist": ["PATH"],
+            "agent_env_allowlist_extra": ["HOME"],
+            "command_env_allowlist_extra": ["TMPDIR"],
+        },
+    ).execution
+    assert exe.agent_environment_names() == ("PATH", "HOME")
+    assert exe.command_environment_names() == ("PATH", "TMPDIR")
+
+
+def test_a_config_that_sets_no_class_list_keeps_one_list_for_every_launch():
+    """The backward-compatible default: a list written before #286 means what it meant."""
+    exe = default_config().execution
+    exe.env_allowlist_extra = ["MY_TOOL_HOME"]
+    assert exe.agent_environment_names() == exe.environment_names()
+    assert exe.command_environment_names() == exe.environment_names()
+
+
+@pytest.mark.parametrize("key", ["agent_env_allowlist", "commands_env_allowlist_extra"])
+def test_a_misspelled_class_list_is_refused_not_ignored(tmp_path, key):
+    with pytest.raises(ConfigurationError, match=key):
+        _execution_cfg(tmp_path, {key: ["MY_TOOL_HOME"]})
+
+
+@pytest.mark.parametrize("key", ENV_ALLOWLIST_KEYS)
+@pytest.mark.parametrize("entry", ["H*", "M*", "z*", "_*"])
+def test_a_one_character_prefix_is_refused_at_load(tmp_path, key, entry):
+    with pytest.raises(ConfigurationError) as caught:
+        _execution_cfg(tmp_path, {key: ["PATH", entry]})
+    message = str(caught.value)
+    assert f"'execution.{key}'" in message and repr(entry) in message
+    assert "one-character prefix" in message
+
+
+@pytest.mark.parametrize("entry", ["GO*", "PY*", "UV_*", "CI_*", "R_*", "HO*", "LC_*"])
+def test_a_tool_s_short_prefix_is_accepted(tmp_path, entry):
+    """The refusal stops at one character: two already name real tools' variables."""
+    cfg = _execution_cfg(tmp_path, {"env_allowlist_extra": [entry]})
+    assert entry in cfg.execution.environment_names()
+
+
+@pytest.mark.parametrize("key", ENV_ALLOWLIST_KEYS)
+@pytest.mark.parametrize(
+    ("entry", "word"),
+    [
+        ("GITHUB_PAT", "GITHUB"),
+        ("MY_GITHUB_PAT", "GITHUB"),
+        ("my_github_pat", "GITHUB"),
+        ("MY_GITHUB_*", "GITHUB"),
+        ("GITLAB_PAT", "PAT"),
+        ("PAT", "PAT"),
+        ("PAT_2", "PAT"),
+        ("DEPLOY_PAT2", "PAT"),
+        ("DEPLOY_TOKEN", "TOKEN"),
+        ("MYTOKEN", "TOKEN"),
+        ("MY_TOKEN_*", "TOKEN"),
+        ("CLIENT_SECRET_FILE", "SECRET"),
+        ("DB_PASSWORD", "PASSWORD"),
+    ],
+)
+def test_a_credential_looking_entry_is_warned_about_by_name(tmp_path, key, entry, word):
+    base = ["PATH"] if key == "env_allowlist" else []
+    exe = _execution_cfg(tmp_path, {key: [*base, entry]}).execution
+    [warning] = exe.environment_warnings([])
+    assert f"execution.{key} entry {entry!r}" in warning
+    assert f"its name contains {word}" in warning
+    assert config.ENV_ALLOWLIST_REACH[key] in warning
+    assert redact(warning) == warning, "the redactor must leave the warning readable"
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "PATH",
+        "LD_LIBRARY_PATH",
+        "PYTHONPATH",
+        "CLASSPATH",
+        "PATCH_LEVEL",
+        "PATTERN_FILE",
+        "SPAT",
+        "TOKENIZERS_PARALLELISM",
+        "DEEPSEEK_API_KEY",
+        "OPENROUTER_API_KEY",
+        "GITLAB_HOST",
+        "MY_TOOL_*",
+    ],
+)
+def test_a_name_that_only_resembles_a_credential_word_is_not_warned_about(tmp_path, entry):
+    exe = _execution_cfg(tmp_path, {"env_allowlist_extra": [entry]}).execution
+    assert exe.environment_warnings(["GITHUB_TOKEN", "UNRELATED_SECRET"]) == []
+
+
+def test_the_default_list_is_not_warned_about_whatever_the_shell_holds():
+    held = ["GH_TOKEN", "GITHUB_PAT", "MY_GITHUB_PAT", "AWS_SECRET_ACCESS_KEY", "DB_PASSWORD"]
+    assert default_config().execution.environment_warnings(held) == []
+
+
+def test_a_prefix_is_warned_about_only_for_what_this_shell_holds_under_it(tmp_path):
+    """``MY_*`` says nothing itself, and every prefix could cover some token."""
+    exe = _execution_cfg(tmp_path, {"command_env_allowlist_extra": ["MY_*"]}).execution
+    assert exe.environment_warnings(["MY_TOOL_HOME", "OTHER_TOKEN"]) == []
+    [warning] = exe.environment_warnings(["MY_TOOL_HOME", "MY_GITHUB_PAT", "MY_API_TOKEN"])
+    assert "execution.command_env_allowlist_extra entry 'MY_*'" in warning
+    assert "MY_API_TOKEN, MY_GITHUB_PAT in this shell" in warning
+    assert "every repository command" in warning and "MY_TOOL_HOME" not in warning
+
+
+def test_every_list_is_read_and_each_entry_said_once_per_list(tmp_path):
+    exe = _execution_cfg(
+        tmp_path,
+        {
+            "env_allowlist_extra": ["SHARED_TOKEN"],
+            "agent_env_allowlist_extra": ["AGENT_TOKEN"],
+            "command_env_allowlist_extra": ["COMMAND_TOKEN", "AGENT_TOKEN"],
+        },
+    ).execution
+    warnings = exe.environment_warnings([])
+    assert [w.split()[0] for w in warnings] == [
+        "execution.env_allowlist_extra",
+        "execution.agent_env_allowlist_extra",
+        "execution.command_env_allowlist_extra",
+        "execution.command_env_allowlist_extra",
+    ]
 
 
 def test_worktree_dir_is_optional_and_a_string(tmp_path):

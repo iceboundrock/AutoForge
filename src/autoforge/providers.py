@@ -350,9 +350,10 @@ class AgentRequest:
     max_runtime_seconds: int | None
     attempt: int = 1
     correction: bool = False
-    # The controller's environment allow-list (``execution.env_allowlist``
-    # plus ``env_allowlist_extra``); the provider adds its own names. ``None``
-    # inherits the whole environment and is never what the engine sends.
+    # The controller's allow-list for an agent launch
+    # (``ExecutionConfig.agent_environment_names``); the provider adds its own
+    # names. ``None`` inherits the whole environment and is never what the
+    # engine sends.
     env_allowlist: tuple[str, ...] | None = None
     # What the controller sets over the allow-listed environment for this
     # launch (#165, :func:`autoforge.child_env.isolated_overrides`): an empty
@@ -1352,7 +1353,7 @@ class ClaudeCodeProvider(AgentProvider):
                 "or git credential or let a shell startup file's functions and aliases run in "
                 f"them: {'; '.join(problems)}. Remove them from that env (Claude Code reads "
                 "the variables of the environment it is started in; set them there and allow "
-                "them through execution.env_allowlist_extra unless they name a credential), "
+                "them through execution.agent_env_allowlist_extra unless they name a credential), "
                 "or route these profiles to another provider (docs/configuration.md, "
                 "'Agent environment')"
             )
@@ -1842,7 +1843,7 @@ class OpenCodeProvider(AgentProvider):
     name = "opencode"
     # OpenCode's own settings plus the API keys of the model providers it
     # routes to; a provider not listed here is added through
-    # ``execution.env_allowlist_extra``.
+    # ``execution.agent_env_allowlist_extra``.
     environment_names = ("OPENCODE_*", "OPENAI_*", "ANTHROPIC_*", "GEMINI_*", "GOOGLE_*")
     option_keys = ("output_format", "auto_approve")
     isolation_names = tuple(sorted(opencode_isolation_env("")))
@@ -2266,7 +2267,7 @@ class PiProvider(AgentProvider):
     # names, never a prefix: Pi exports `PI_SESSION_*`, `PI_PROVIDER`,
     # `PI_MODEL` to its tool children, and a provider API key
     # (`OPENAI_API_KEY`, ...) reaches Pi only through
-    # `execution.env_allowlist_extra`, never by default.
+    # `execution.agent_env_allowlist_extra` or `env_allowlist_extra`, never by default.
     environment_names = (
         "PI_CODING_AGENT_DIR",
         "PI_OFFLINE",
@@ -2514,7 +2515,7 @@ class PiProvider(AgentProvider):
         return (
             f"profile {profile.name!r} requires Pi's ChatGPT sign-in (options.require_oauth), "
             f"but {', '.join(present)} is set and would reach Pi through the environment "
-            "allow-list; remove it from execution.env_allowlist_extra (or unset it), or set "
+            "allow-list; remove it from the execution allow-lists (or unset it), or set "
             "options.require_oauth: false to run on an API key"
         )
 
@@ -2750,7 +2751,7 @@ class PiProvider(AgentProvider):
             else:
                 remedy = (
                     f"give Pi a credential for {configured!r}; an API key reaches Pi only "
-                    "through execution.env_allowlist_extra"
+                    "through execution.agent_env_allowlist_extra"
                 )
             return False, f"{fields}: Pi has no credential for {configured!r}; {remedy}"
         if check.reason == "provider_not_found":

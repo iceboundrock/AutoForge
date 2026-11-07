@@ -1308,6 +1308,18 @@ def test_a_startup_file_that_ends_the_shell_could_not_be_checked(tmp_path, monke
     )
 
 
+def test_a_one_character_prefix_is_refused_wherever_the_rule_applies():
+    """#286: ``H*`` covers no forbidden name, and passes ``HOMEBREW_GITHUB_API_TOKEN``."""
+    assert forbidden_env_entry("H*") is None
+    with pytest.raises(ConfigurationError, match="'H\\*' is a one-character prefix"):
+        child_env.refuse_forbidden_env(["PATH", "H*"], "somewhere")
+    # A prefix that covers a forbidden name keeps the rule that names it.
+    with pytest.raises(ConfigurationError, match="covers GH_TOKEN"):
+        child_env.refuse_forbidden_env(["G*"], "somewhere")
+    # What a provider adds is held to it too, and none of today's is one.
+    child_env.refuse_forbidden_env(["ANTHROPIC_*", "HO*", "PATH"], "somewhere")
+
+
 def test_the_probe_runs_each_launch_shell_as_a_login_shell_in_the_launch_environment(tmp_path):
     seen: list[ExecutionRequest] = []
 

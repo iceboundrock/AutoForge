@@ -283,6 +283,10 @@ def _allow_list(cfg):
     cfg.execution.env_allowlist_extra.append("AUTOFORGE_CERTIFICATE_TEST")
 
 
+def _command_allow_list(cfg):
+    cfg.execution.command_env_allowlist_extra.append("AUTOFORGE_CERTIFICATE_TEST")
+
+
 def _definition_set(cfg):
     cfg.validation.commands.append(list(ALSO_PASSES))
 
@@ -294,9 +298,10 @@ def _definition_set(cfg):
         (_timeout, "the validation policy changed"),
         (_sandbox_mode, "the validation policy changed"),
         (_allow_list, "the validation policy changed"),
+        (_command_allow_list, "the validation policy changed"),
         (_definition_set, "the validation set changed"),
     ],
-    ids=["timeout", "sandbox mode", "allow-list", "definition set"],
+    ids=["timeout", "sandbox mode", "allow-list", "commands' allow-list", "definition set"],
 )
 def test_a_journal_completion_under_another_configuration_certifies_the_binding_and_blocks(
     tmp_state_dir, commands, change, named

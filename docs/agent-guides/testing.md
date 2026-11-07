@@ -1091,11 +1091,23 @@ Each route in the inventory of
 a stated reason it has none. The coverage that must keep working:
 
 - config load refuses every forbidden name and every `*` prefix covering
-  one, in `env_allowlist` and `env_allowlist_extra`, naming the entry and
+  one, in every `execution` allow-list key, naming the entry and
   the rule and never a value; an adapter's `environment_names` and its
   launch allow-list are refused the same way; the default list carries no
   forbidden name (`test_config.py`, `test_child_env.py`,
   `test_providers.py`)
+- a name listed for one class of launch reaches that class alone (#286),
+  seen from inside the launch: an agent (`test_engine.py`), a validator
+  (`test_validation_evidence.py`), a pre-merge command and its preflight's
+  login shells (`test_engine.py`), an enforced command's description
+  (`test_engine_sandbox.py`) and doctor's probes (`test_doctor.py`); a config
+  that sets no class key keeps one list, and policy P holds the commands'
+  names alone (`test_config.py`, `test_validation_evidence.py`,
+  `test_review_certificate.py`)
+- a one-character prefix is refused, and a credential-looking entry warned about
+  by name with dummy names and no false positive on the default list or `PATH`:
+  at load (`test_config.py`, `test_cli.py`) and in a `WARN` row of `doctor`
+  (`test_doctor.py`)
 - with an operator environment that holds every route (tokens, `gh`
   configuration, a session bus, an SSH agent, askpass, git configuration
   from the environment, a global helper), a child gets none of them and

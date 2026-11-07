@@ -40,12 +40,12 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from . import __prompt_version__
-from .child_env import refuse_forbidden_env
+from .child_env import credential_looking_entry, refuse_forbidden_env
 from .errors import ConfigurationError, SandboxPolicyError, ValidationDefinitionError
 from .evidence import SCOPE, check_definitions, check_scope
 from .executor import MAX_DEADLINE_SECONDS, is_env_pattern
@@ -135,6 +135,8 @@ EXECUTION_KEYS = (
     "max_correction_attempts",
     "env_allowlist",
     "env_allowlist_extra",
+    "agent_env_allowlist_extra",
+    "command_env_allowlist_extra",
     "worktree_dir",
     "loop_detection",
 )
@@ -184,7 +186,9 @@ MAX_LOOP_REPEATS = 100_000
 # launch never carries an Anthropic key it has no use for. A trailing ``*``
 # is a prefix. Anything else the operator's shell holds -- a cloud
 # credential, a database password, another project's token -- is not
-# inherited; ``env_allowlist_extra`` adds a name without restating this list.
+# inherited; ``env_allowlist_extra`` adds a name without restating this list,
+# and ``agent_env_allowlist_extra`` / ``command_env_allowlist_extra`` add one
+# for that class of launch alone (#286).
 DEFAULT_ENV_ALLOWLIST: tuple[str, ...] = (
     "PATH",
     "HOME",
@@ -216,6 +220,16 @@ DEFAULT_ENV_ALLOWLIST: tuple[str, ...] = (
     "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE",
 )
+
+
+# Each ``execution`` allow-list key and the launches it reaches, for what the
+# controller says about an entry (:meth:`ExecutionConfig.environment_warnings`).
+ENV_ALLOWLIST_REACH = {
+    "env_allowlist": "every agent and repository command",
+    "env_allowlist_extra": "every agent and repository command",
+    "agent_env_allowlist_extra": "every agent",
+    "command_env_allowlist_extra": "every repository command",
+}
 
 
 @dataclass
@@ -296,6 +310,11 @@ class ExecutionConfig:
     # adds to whichever list is in force). See ``DEFAULT_ENV_ALLOWLIST``.
     env_allowlist: list[str] = field(default_factory=lambda: list(DEFAULT_ENV_ALLOWLIST))
     env_allowlist_extra: list[str] = field(default_factory=list)
+    # What one class of launch adds to those two (#286). Additive on purpose:
+    # with the two above as what the classes share, any pair of environments
+    # can be written, so no class needs a list that replaces the shared one.
+    agent_env_allowlist_extra: list[str] = field(default_factory=list)
+    command_env_allowlist_extra: list[str] = field(default_factory=list)
     # Where a REMOTE run's per-issue agent worktrees are created. Empty (the
     # default): ``<git common dir>/autoforge/worktrees``, outside every
     # working tree of the checkout; otherwise a directory, relative to the
@@ -305,8 +324,40 @@ class ExecutionConfig:
     loop_detection: LoopDetectionConfig = field(default_factory=LoopDetectionConfig)
 
     def environment_names(self) -> tuple[str, ...]:
-        """The allow-list in force: the base list plus the additions, deduplicated."""
+        """What every launch shares: the base list plus the additions, deduplicated.
+
+        No launch runs under this alone: each asks for its class's names.
+        """
         return tuple(dict.fromkeys([*self.env_allowlist, *self.env_allowlist_extra]))
+
+    def agent_environment_names(self) -> tuple[str, ...]:
+        """The allow-list of an agent launch (its provider adds its own names)."""
+        return tuple(dict.fromkeys([*self.environment_names(), *self.agent_env_allowlist_extra]))
+
+    def command_environment_names(self) -> tuple[str, ...]:
+        """The allow-list of ``validation.commands`` and ``merge.verification_commands``."""
+        return tuple(dict.fromkeys([*self.environment_names(), *self.command_env_allowlist_extra]))
+
+    def environment_warnings(self, environ_names: Iterable[str]) -> list[str]:
+        """One line per allow-list entry that looks like it passes a credential (#286).
+
+        ``environ_names`` are the names in the operator's shell, never a
+        value. An entry the refusal at load let through is here because that
+        refusal goes by the names ``gh`` and git read, and a token under a
+        name of the operator's own is none of them.
+        """
+        names = list(environ_names)
+        lines = []
+        for key, reach in ENV_ALLOWLIST_REACH.items():
+            for entry in getattr(self, key):
+                what = credential_looking_entry(entry, names)
+                if what:
+                    lines.append(
+                        f"execution.{key} entry {entry!r} {what} and reaches {reach}; "
+                        "AutoForge refuses only the names gh and git read a credential from "
+                        "(docs/configuration.md, 'Agent environment')"
+                    )
+        return lines
 
 
 # Paths whose contents define what the hosted checks actually run. See
@@ -1282,7 +1333,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         base.execution.max_correction_attempts = _as_int(
             exe["max_correction_attempts"], source, "execution.max_correction_attempts"
         )
-    for key in ("env_allowlist", "env_allowlist_extra"):
+    for key in ENV_ALLOWLIST_REACH:
         if key in exe:
             names = _as_str_list(exe[key], source, f"execution.{key}")
             for name in names:

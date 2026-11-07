@@ -70,18 +70,20 @@ level Pi would clamp ([Provider and model](#provider-model-and-thinking-level)).
   before an environment variable. No variable is forwarded, so the key
   reaches no other agent.
 - **As `DEEPSEEK_API_KEY`, forwarded on purpose.** No provider key reaches
-  Pi by default. Listing the name in `execution.env_allowlist_extra`
+  Pi by default. Listing the name in `execution.agent_env_allowlist_extra`
   forwards it from the shell that runs `autoforge`:
 
   ```yaml
   execution:
-    env_allowlist_extra: [DEEPSEEK_API_KEY]
+    agent_env_allowlist_extra: [DEEPSEEK_API_KEY]
   ```
 
-  That list is **global**: it reaches every agent launch, of every
+  That list stays out of `validation.commands` and
+  `merge.verification_commands`, but it reaches every agent launch, of every
   profile and every provider (Claude Code and OpenCode too), and through
   Pi's `bash` tool every command Pi runs. It is **not a per-profile
-  credential boundary**, which is why the store is preferred.
+  credential boundary**, which is why the store is preferred. Under
+  `execution.env_allowlist_extra`, it would reach those commands too.
 
 **Under the outer sandbox.** With `sandbox.mode: required`, or `preferred`
 (its alias), the sandbox hides your home and refuses an agent directory
@@ -216,7 +218,7 @@ carries the same profile, commented, for `review_round_2_5`.
   environment; the key is consulted only when nothing is stored.
 - **AutoForge does not hand Pi a provider key.** No `OPENAI_*`,
   `DEEPSEEK_*`, `ANTHROPIC_*`, `GEMINI_*` or `GOOGLE_*` variable reaches Pi
-  unless you list it in `execution.env_allowlist_extra`, a list every
+  unless you list it in `execution.agent_env_allowlist_extra`, a list every
   agent launch gets ([Pi policy](pi-policy.md) §8).
 - **`require_oauth: true`** (the default) makes it a rule. `doctor`'s auth
   row fails, and every launch is refused before anything starts, when
@@ -224,7 +226,7 @@ carries the same profile, commented, for `review_round_2_5`.
   and starts Pi only on a `ready` result with `authType oauth` for the
   model's provider. To run on an API key instead, set
   `require_oauth: false` and keep the key in Pi's credential store, or
-  forward it with `execution.env_allowlist_extra`
+  forward it with `execution.agent_env_allowlist_extra`
   ([DeepSeek on an API key](#deepseek-on-an-api-key)).
 - **They are different products.** The ChatGPT subscription and the OpenAI
   API are separate products with their own terms, usage limits and model
@@ -247,7 +249,7 @@ whole shell, and none prints Pi's output.
 | `agent 'pi' available (...)` | FAIL: not found, exited, or the version is unreadable | Pi is not installed under the profile's `command`, or does not answer `--version` as 1.x does. Install it ([Install](#install-pi-yourself)), or point `command` at it. |
 | | FAIL: `pi >= 1.0.0 is required` | Upgrade Pi. |
 | `agent 'pi' auth ready (...)` | OK: `status ready`, `authType oauth`, or `authType api_key` with `require_oauth: false` | Pi holds a credential: the sign-in, or an API key ([DeepSeek on an API key](#deepseek-on-an-api-key)). The detail adds that the credential is proven for the provider only, and that whether it may use this model "cannot be checked read-only": model access is unproven until a run ([Subscription or API key](#subscription-or-api-key)). |
-| | FAIL: `OPENAI_API_KEY is set and would reach Pi through the environment allow-list` | The key is forwarded by `execution.env_allowlist_extra` while the profile has `require_oauth`. Remove it there, or set `require_oauth: false`. Pi was not asked. |
+| | FAIL: `OPENAI_API_KEY is set and would reach Pi through the environment allow-list` | The key is forwarded by `execution.agent_env_allowlist_extra` or `env_allowlist_extra` while the profile has `require_oauth`. Remove it there, or set `require_oauth: false`. Pi was not asked. |
 | | FAIL: `status ready`, `authType api_key` | Pi has an API key, not a sign-in, for the provider. Sign in ([Sign in](#sign-in-yourself)), or set `require_oauth: false`. |
 | | FAIL: `reason credentials_not_configured` | Pi has no credential for the provider. Sign in ([Sign in](#sign-in-yourself)), or for an API-key provider give Pi the key or forward it ([DeepSeek on an API key](#deepseek-on-an-api-key)), in the agent directory the launch uses (`PI_CODING_AGENT_DIR`, or `~/.pi/agent`). |
 | | FAIL: `reason provider_not_found` | The provider prefix of `model` is not one of Pi's providers. Fix `model` ([Provider and model](#provider-model-and-thinking-level)). |
@@ -378,8 +380,8 @@ AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=oauth uv run pytest -m live \
 To forward the key instead of keeping it in Pi's store, export it and add
 `AUTOFORGE_LIVE_PI_FORWARD_KEY=DEEPSEEK_API_KEY` (the `api_key` route
 only): the test's configuration then lists that name in
-`execution.env_allowlist_extra`, and the report names the route, never the
-value.
+`execution.agent_env_allowlist_extra`, and the report names the route, never
+the value.
 
 The test costs one small REVIEW of the account's quota (a few-line diff, at
 thinking level `low`). `AUTOFORGE_LIVE_PI_MODEL` and

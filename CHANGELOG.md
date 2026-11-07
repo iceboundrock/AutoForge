@@ -5,6 +5,37 @@ so.
 
 ## Unreleased
 
+### Agents and repository commands get an allow-list key each; credential-looking names are called out (#286)
+
+`execution.env_allowlist` and `env_allowlist_extra` reached every launch. A name
+added for a validation command reached every agent, and a provider key added for
+an agent reached the candidate's own code when validation and pre-merge commands
+ran it.
+
+Two new keys add a name for one class alone:
+`execution.agent_env_allowlist_extra` for agents, and
+`execution.command_env_allowlist_extra` for `validation.commands` and
+`merge.verification_commands`. A config that sets neither behaves as before, and
+its validation records stay valid. Nothing moves by itself: if you forward a
+provider key with `env_allowlist_extra`, it still reaches your commands until you
+move it to `agent_env_allowlist_extra`. Moving a name out of what commands get
+changes the validation policy, so the commands run again, and after a clean
+review the merge gate refuses until a new round runs. This separates launches,
+not code: an agent that runs the repository's tests through its own shell tool
+still hands them its environment.
+
+The refusal at config load goes by the names `gh` and git read, so a token under
+a name of your own passes it. A command now warns on stderr when it loads the
+configuration, and `doctor` has a `WARN` row "credential-looking allow-list
+entries", for an entry containing
+`TOKEN`, `SECRET`, `PASSWORD`, `GITHUB` or the word `PAT`, and for a `*` prefix
+that passes such a variable from your shell. Names only, and nothing is refused.
+A `*_API_KEY` draws no warning.
+
+**One config that used to load now fails:** a one-character `*` prefix such as
+`H*` is refused at load, in every allow-list key. Name the variables you need or
+a longer prefix.
+
 ### A replacement agent sees every review round's comment, not only the oldest rounds' (#457)
 
 The review comment text in a `REPLAN_REEXECUTE` prompt came from one budget of

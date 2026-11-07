@@ -213,7 +213,7 @@ on the host network
     variables are not needed.
   - No `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*` or `GOOGLE_*` reaches Pi
     by default. A key reaches it only through
-    `execution.env_allowlist_extra`.
+    `execution.agent_env_allowlist_extra` or `env_allowlist_extra`.
 - The adapter does not set `PI_OFFLINE` or `PI_TELEMETRY` itself.
   `--offline` covers the first. Install telemetry is interactive-only, and
   an operator who also wants the OpenRouter/NVIDIA/Cloudflare attribution
@@ -253,8 +253,8 @@ run share the operator's UID. A model-generated command can read
 its own sign-in. It gets no GitHub or git credential through anything
 AutoForge controls (#165): no `GH_TOKEN` or other variable `gh` or git
 reads a credential from can be allow-listed (a token the operator forwards
-under a name of their own, `MY_GITHUB_PAT` say, is not recognised and
-reaches every launch if it is listed), and Pi and its auth preflight get,
+under a name of their own, `MY_GITHUB_PAT` say, is only warned about and
+reaches every launch its key reaches if it is listed), and Pi and its auth preflight get,
 like every agent, an empty `gh` configuration, a placeholder `GH_TOKEN`, an
 identity-only git configuration and git settings that disable credential
 helpers, askpass and the SSH agent and keys. A deliberate read of the

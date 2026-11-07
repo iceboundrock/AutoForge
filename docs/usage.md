@@ -1673,13 +1673,20 @@ contains neither `.autoforge/`, the lock, nor the operator's uncommitted
 work, and a `git clean -fdx` there cannot reach controller state. It starts
 from an allow-listed environment: `execution.env_allowlist` (a documented
 default of PATH, HOME, locale, temporary directory, XDG directories, git
-author settings and the proxy and CA variables) plus `env_allowlist_extra`,
+author settings and the proxy and CA variables) plus `env_allowlist_extra`
+and `agent_env_allowlist_extra`,
 plus the names the provider adapter declares for its own CLI (`ANTHROPIC_*`
 and `CLAUDE_*` for Claude Code; `OPENCODE_*`, `OPENAI_*`, `ANTHROPIC_*`,
 `GEMINI_*`, `GOOGLE_*` for OpenCode); nothing else in the operator's
 environment is inherited, and the names (never the values) are recorded in
 the invocation's `request.json`, with the names the controller sets
-(`env_set`). Before and after each invocation, including before every
+(`env_set`). `validation.commands` and `merge.verification_commands` start
+from the same first two lists plus `command_env_allowlist_extra`, and get
+neither `agent_env_allowlist_extra` nor a provider's names, so a key you
+forward to an agent stays out of those commands, though not out of what the
+agent runs itself
+([Configuration: agent environment](configuration.md#agent-environment)).
+Before and after each invocation, including before every
 relaunch within a step, the controller reads HEAD and the checked-out branch
 of its own checkout; a change enters `BLOCKED` with the drift in the reason,
 nothing is rolled back, and `unblock` reconciles the agent's GitHub work. Under
@@ -1698,8 +1705,9 @@ The agent holds no GitHub or git credential (#165). The controller pushes,
 opens the PR, posts the review comment, creates follow-up issues and
 updates the EPIC itself; the agent writes the text and commits locally. No
 variable `gh` or git reads a credential from can be allow-listed (a token
-you forward under a name of your own, `MY_GITHUB_PAT` say, is not
-recognised and reaches every launch: do not list one), and each launch
+you forward under a name of your own, `MY_GITHUB_PAT` say, is only warned
+about, at config load and in `doctor`, and reaches every launch its key
+reaches: do not list one), and each launch
 gets an empty `gh` configuration, a placeholder `GH_TOKEN`, a git
 configuration holding only your author identity, and git settings no
 repository configuration can override that disable credential helpers,
@@ -2066,15 +2074,16 @@ To continue under this command's configuration instead, repeat it with --accept-
   The old worktree keeps whatever the agent left there.
 
 Everything else in the configuration may change between commands without a
-refusal: the loop bounds and step budget, the merge gate, `env_allowlist`,
-the `sandbox` section, and a profile's `command`, `extra_args` and `options`.
+refusal: the loop bounds and step budget, the merge gate, the environment
+allow-lists, the `sandbox` section, and a profile's `command`, `extra_args` and `options`.
 The one exception is a weaker `sandbox.mode`: every run is pinned to the
 mode it was created under, and the same commands refuse a
 weaker one, with the same `--accept-config-change`
 ([Outer sandbox](#outer-sandbox)); a refusal that has both lists both. The
 record holds none of them, and no value that could carry a secret. The
 validation evidence does depend on some of them: `validation.commands`,
-the allow-list, `execution.command_timeout_seconds` and the `sandbox`
+the repository commands' allow-list, `execution.command_timeout_seconds` and
+the `sandbox`
 section are what candidate validation runs under, so editing one after a
 clean review is not refused here but makes the merge gate refuse
 ([Candidate validation evidence](#candidate-validation-evidence)).
@@ -2170,8 +2179,8 @@ refusal is `BLOCKED` with nothing merged or counted:
   `autoforge unblock` decides `REVIEW`; the new round validates the head and
   its clean result issues the certificate the gate needs.
 - **The validation set or policy changed since the clean review**: editing
-  `validation.commands`, the timeout, the environment allow-list or the
-  sandbox mode (or, with the sandbox on, `sandbox.validation_network` or
+  `validation.commands`, the timeout, the repository commands' allow-list or
+  the sandbox mode (or, with the sandbox on, `sandbox.validation_network` or
   `sandbox.read_only_paths`) changes the set or policy digest the
   certificate states, and the reason names which.
   Restore the configuration and `unblock`: the certificate applies again,

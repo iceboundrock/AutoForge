@@ -1508,7 +1508,7 @@ def provider_written_directories(cfg: AutoForgeConfig) -> dict[str, str]:
     its defaults could launch.
     """
     home = _operator_home()
-    allowlist = cfg.execution.environment_names()
+    allowlist = cfg.execution.agent_environment_names()
     writers: dict[tuple[str, str], dict[str, list[str]]] = {}
 
     def ask(profile: ProfileConfig, names: list[str]) -> None:
@@ -2726,7 +2726,10 @@ class ControllerEngine:
             network=NetworkPosition(network),
             operator_paths=tuple(self.config.sandbox.read_only_paths),
         )
-        env = {**select_environment(self.config.execution.environment_names()), **overrides}
+        env = {
+            **select_environment(self.config.execution.command_environment_names()),
+            **overrides,
+        }
         return describe_launch(facts, None, env)
 
     def _remote_facts(
@@ -2924,7 +2927,8 @@ class ControllerEngine:
 
         No git runs here: a plan may be made outside any repository.
         """
-        names = self.config.execution.environment_names()
+        names = self.config.execution.agent_environment_names()
+        commands = self.config.execution.command_environment_names()
         return [
             f"agent working directory: {self.agent_worktree_description()} (a detached git "
             "worktree of this checkout, one per issue, created at the first agent launch "
@@ -2936,6 +2940,10 @@ class ControllerEngine:
             "without keys or agent, empty curl and wget configuration files, the "
             "operator's author identity), and the provider keeps its CLI's integrations "
             "(MCP servers, plugins, hooks) off",
+            f"repository command environment: {len(commands)} allow-listed name(s) for "
+            "validation.commands and merge.verification_commands, without "
+            "execution.agent_env_allowlist_extra or a provider's names; the same variables "
+            "set by the controller",
             "before every launch the git configuration it would read and ~/.netrc are checked "
             "for a credential (a repository or worktree credential helper, a URL with a "
             "credential, an HTTP header); one refuses the launch",
@@ -5061,7 +5069,7 @@ class ControllerEngine:
         return Policy(
             mode=cfg.sandbox.mode,
             template=template,
-            env_names=cfg.execution.environment_names(),
+            env_names=cfg.execution.command_environment_names(),
             timeout_seconds=cfg.execution.command_timeout_seconds,
             contain_orphans=True,
             method=MATERIALIZATION_METHOD,
@@ -5413,14 +5421,13 @@ class ControllerEngine:
         argv = list(definition.argv)
         label = f"{state.phase.value}-candidate-validation"
         metadata = {"validation_command": argv, "candidate_commit": candidate.commit}
-        # The candidate's own code: the allow-listed environment, the
-        # credential preflight and the controller-set variables (#165), and
-        # under `required` the export alone (ADR 0005 D3.1), as the pre-merge
-        # export runs.
+        # The candidate's own code: the repository commands' allow-listed
+        # environment (#286), the credential preflight and the controller-set
+        # variables (#165), and under `required` the export alone (ADR 0005
+        # D3.1), as the pre-merge export runs.
+        names = self.config.execution.command_environment_names()
         try:
-            identity = preflight(
-                cwd, self._runner, env_allowlist=self.config.execution.environment_names()
-            )
+            identity = preflight(cwd, self._runner, env_allowlist=names)
         except ConfigurationError as exc:
             raise _ValidatorNotLaunched(f"the launch was refused: {exc}") from exc
         refused: SandboxLaunchRefusedError | None = None
@@ -5431,7 +5438,7 @@ class ControllerEngine:
                     command=argv,
                     cwd=cwd,
                     timeout_seconds=self.config.execution.command_timeout_seconds,
-                    env_allowlist=self.config.execution.environment_names(),
+                    env_allowlist=names,
                     env=overrides,
                     contain_orphans=True,
                 )
@@ -10603,13 +10610,12 @@ class ControllerEngine:
     def _run_premerge_command(self, phase: Phase, pr: PRInfo, argv: list[str], cwd: str) -> str:
         """One ``merge.verification_commands`` entry in the exported tree; "" on exit 0."""
         state = self._require_state()
-        # Repository-defined commands run under the same allow-listed
-        # environment, credential preflight and controller-set variables as
+        # Repository-defined commands run under their own allow-list (#286)
+        # and the same credential preflight and controller-set variables as
         # an agent (#165): they are the PR's code, not the operator's.
+        names = self.config.execution.command_environment_names()
         try:
-            identity = preflight(
-                cwd, self._runner, env_allowlist=self.config.execution.environment_names()
-            )
+            identity = preflight(cwd, self._runner, env_allowlist=names)
         except ConfigurationError as exc:
             return (
                 f"pre-merge verification command not run for the reviewed HEAD "
@@ -10621,7 +10627,7 @@ class ControllerEngine:
                 command=list(argv),
                 cwd=cwd,
                 timeout_seconds=self.config.execution.command_timeout_seconds,
-                env_allowlist=self.config.execution.environment_names(),
+                env_allowlist=names,
                 env=overrides,
                 contain_orphans=True,
             )
@@ -14131,7 +14137,7 @@ class ControllerEngine:
         self._launch_cwd = cwd
         # Names only, never values: what the agent may inherit from the
         # controller's environment (the provider adds its own CLI's names).
-        env_allowlist = self.config.execution.environment_names()
+        env_allowlist = self.config.execution.agent_environment_names()
         # The logger is opened -- and the run directory proved to take a
         # new entry, the event journal proved appendable -- *before* the
         # agent is launched, not at the first write after it returns. The

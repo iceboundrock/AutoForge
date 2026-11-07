@@ -14886,6 +14886,78 @@ def test_validation_and_premerge_commands_run_under_the_allowlist(tmp_state_dir,
     assert probes and all(r.env_allowlist == names for r in probes)
 
 
+def test_a_name_listed_for_one_class_reaches_an_agent_launch_only_if_it_is_the_agents(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """#286: what an agent's CLI is handed, and what its run log says it was."""
+    from tests.conftest import launch_environment
+
+    monkeypatch.setenv("AF_FOR_AGENTS", "agents")
+    monkeypatch.setenv("AF_FOR_COMMANDS", "commands")
+    cfg = default_config()
+    cfg.execution.agent_env_allowlist_extra = ["AF_FOR_AGENTS"]
+    cfg.execution.command_env_allowlist_extra = ["AF_FOR_COMMANDS"]
+    repo = git_repo(tmp_state_dir.parent)
+    _commit(repo, "a.txt", "1", "base")
+    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg, origin=True)
+    eng.step()
+    seen = {}
+
+    def agent(req):
+        seen.update(launch_environment(eng, req))
+        return implement(req)
+
+    eng.provider._handler = agent
+    assert eng.step().next_phase == "REVIEW"
+    assert seen["AF_FOR_AGENTS"] == "agents" and "AF_FOR_COMMANDS" not in seen
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    step_dir = max(p for p in run_dir.iterdir() if p.is_dir())
+    recorded = json.loads((step_dir / "request.json").read_text())["metadata"]["env_allowlist"]
+    assert "AF_FOR_AGENTS" in recorded and "AF_FOR_COMMANDS" not in recorded
+
+
+def test_a_name_listed_for_one_class_reaches_a_premerge_command_only_if_it_is_the_commands(
+    tmp_state_dir, fake_github, tmp_path_factory, monkeypatch
+):
+    """#286: from inside the command, and in the preflight's login shells."""
+    from tests.conftest import env_probe_command, env_probe_records
+
+    monkeypatch.setenv("AF_FOR_AGENTS", "agents")
+    monkeypatch.setenv("AF_FOR_COMMANDS", "commands")
+    record = tmp_path_factory.mktemp("probe") / "env.jsonl"
+    eng, _ = _in_merge_on_commit(tmp_state_dir, fake_github, [env_probe_command(record)])
+    eng.config.execution.agent_env_allowlist_extra = ["AF_FOR_AGENTS"]
+    eng.config.execution.command_env_allowlist_extra = ["AF_FOR_COMMANDS"]
+    certify_review(eng)  # the clean review ran under this configuration (#175)
+    probes = []
+    real = eng._runner or execute
+
+    def runner(req):
+        if is_shell_probe(req):
+            probes.append(req)
+        return real(req)
+
+    eng._runner = runner
+    assert eng.step(allow_merge=True).next_phase == "UPDATE_EPIC"
+    [seen] = env_probe_records(record)
+    assert "AF_FOR_COMMANDS" in seen["names"] and "AF_FOR_AGENTS" not in seen["names"]
+    assert probes
+    for probe in probes:
+        assert "AF_FOR_COMMANDS" in probe.env_allowlist
+        assert "AF_FOR_AGENTS" not in probe.env_allowlist
+
+
+def test_the_dry_run_plan_says_what_each_class_of_launch_is_given(tmp_state_dir, fake_github):
+    cfg = default_config()
+    cfg.execution.agent_env_allowlist_extra = ["FOR_AGENTS", "FOR_AGENTS_2"]
+    cfg.execution.command_env_allowlist_extra = ["FOR_COMMANDS"]
+    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg)
+    notes = "\n".join(eng._isolation_plan_notes())
+    shared = len(cfg.execution.environment_names())
+    assert f"agent environment: {shared + 2} allow-listed name(s)" in notes
+    assert f"repository command environment: {shared + 1} allow-listed name(s)" in notes
+
+
 def _drift_engine(tmp_state_dir, fake_github, mutate, fail=False):
     """ANALYZE_EXECUTE whose agent moves the *operator's* checkout while it runs."""
     repo = git_repo(tmp_state_dir.parent)

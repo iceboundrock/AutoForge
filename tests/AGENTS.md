@@ -482,7 +482,9 @@ packaging, built artifacts (#256)     test_packaging.py (metadata, license, vers
                                       run); the PyPI workflow (#295): test_publish_workflow.py
 launch environment, no credential     test_child_env.py (engine and doctor: test_engine.py,
                                       test_integration.py, test_validation_evidence.py,
-                                      test_doctor.py)
+                                      test_doctor.py); per-class allow-lists and credential-
+                                      looking entries (#286): test_config.py, test_cli.py,
+                                      test_engine_sandbox.py and the modules above
 agent read context                    test_read_context.py (collection: test_engine.py,
                                       test_integration.py)
 typed stop classification (#369,      test_stop_classification.py (every table total, every error

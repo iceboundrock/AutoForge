@@ -623,11 +623,17 @@ def _load_cfg(args) -> AutoForgeConfig:
     :func:`autoforge.engine.config_file_placement_problem`). The check is
     given the path as the loader was, never normalized: a ``..`` after a
     link names another file once collapsed.
+
+    An allow-list entry that looks like it passes a credential is said on
+    stderr and refuses nothing (#286; ``doctor`` has a row for it). Names
+    only: the shell's values are not read.
     """
     cfg = load_config_file(args.config)
     problem = config_file_placement_problem(cfg, args.config or "")
     if problem:
         raise ConfigurationError(f"{problem}. Nothing was run, launched or written.")
+    for warning in cfg.execution.environment_warnings(os.environ):
+        print(redact(f"autoforge: warning: {warning}"), file=sys.stderr)
     return cfg
 
 

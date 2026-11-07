@@ -72,10 +72,11 @@ runtime state belonging to one operator.
 - In REMOTE mode the controller launches every agent in a per-issue
   `git worktree` it creates itself (`<git common dir>/autoforge/worktrees/<n>`
   by default), never in the checkout it is run from; the agent inherits an
-  allow-listed environment (`execution.env_allowlist`), not the operator's
+  allow-listed environment (`execution.env_allowlist`, `env_allowlist_extra`
+  and `agent_env_allowlist_extra`), not the operator's
   whole shell, that carries no GitHub or git credential (no variable `gh`
   or git reads a credential from can be listed, though a token under a name
-  of the operator's own is not recognised; the controller sets an empty
+  of the operator's own is only warned about; the controller sets an empty
   `gh` configuration, disables git credential helpers, askpass and the SSH
   agent, gives curl and wget an empty configuration and its shells none of
   the operator's zsh startup files, keeps the agent CLI's MCP servers,

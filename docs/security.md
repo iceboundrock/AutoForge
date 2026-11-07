@@ -248,20 +248,27 @@ repository's default `GITHUB_TOKEN` permissions to read-only.
 
 ### Other limits
 
-- **One allow-list for every launch.** `execution.env_allowlist` and
+- **The allow-lists are yours to scope.** `execution.env_allowlist` and
   `env_allowlist_extra` apply to every agent and every repository command
-  alike: a variable you add for a validation command reaches the agents
-  too, and one you add for an agent reaches the code under review. Names
-  `gh` and git read a credential from are refused, but a token you keep
-  under a name of your own (`MY_GITHUB_PAT`) is not recognised and is
-  passed if you list it. Each provider adds its own names: `ANTHROPIC_*`
-  and `CLAUDE_*` for Claude Code; `OPENCODE_*`, `OPENAI_*`, `ANTHROPIC_*`,
-  `GEMINI_*` and `GOOGLE_*` for OpenCode.
+  alike: a variable you add there for a validation command reaches the
+  agents too, and one you add for an agent reaches the code those commands
+  run. Use `agent_env_allowlist_extra` and `command_env_allowlist_extra` for
+  what one class needs. That separates launches, not code: an agent that runs
+  the repository's tests through its own shell tool hands them its environment,
+  a key you forward to it included. Names `gh` and git read a credential from are refused,
+  but a token you keep under a name of your own (`MY_GITHUB_PAT`) is only
+  warned about, at config load and in `doctor`, and is passed if you list
+  it. The warning goes by words in a name, so it misses a token under a name
+  without one (`MY_GH_KEY`). An enforced sandbox does not stop a listed
+  variable: the launch still receives it. Each provider adds its own names to
+  its agents: `ANTHROPIC_*` and `CLAUDE_*` for Claude Code; `OPENCODE_*`,
+  `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*` and `GOOGLE_*` for OpenCode.
   ([Configuration: agent environment](configuration.md#agent-environment))
 - **Repository commands are the PR's code.** `validation.commands` and
   `merge.verification_commands` come from your configuration, but what
   they run (tests, build scripts) is the candidate's own code, with your
-  user, the allow-listed environment and, by default, the host network.
+  user, the repository commands' allow-listed environment and, by default,
+  the host network.
 - **The committed tree is not filtered.** Only commit messages are checked;
   review and you own what a PR changes.
 - **Same-user state.** An agent under `disabled` can change the
@@ -316,7 +323,7 @@ release carries yet.
 | [#283](https://github.com/iceboundrock/AutoForge/issues/283) | High | *Fixed in `0.1.0a0`.* Every `gh` the controller starts runs in an empty directory of its own with `GIT_DIR` naming that directory, so any git it runs finds no repository, and none relies on its working directory to name one; `merge.delete_branch: true` no longer passes `--delete-branch` (which deletes the local branch too, checking out and pulling another first, in the directory `gh` runs in): after a verified merge the controller deletes the PR's head branch on GitHub only, once, through `DELETE repos/<owner>/<repo>/git/refs/heads/<branch>`, never for a fork's head, the base or the default branch, nor once the branch moved past the merged HEAD | `merge.delete_branch: false` (the default) still deletes nothing; `gh auth git-credential`, the credential helper of the controller's own fetch and push, still runs in the private git directory the controller made for that transfer ([how](agent-guides/github-safety.md#controller-owned-effects), [the deletion](agent-guides/github-safety.md#deleting-the-merged-head-branch)) |
 | [#284](https://github.com/iceboundrock/AutoForge/issues/284) | High | *Fixed in `0.1.0a0`.* A recognised token directly after an ANSI escape sequence (`ESC[0m`, which OpenCode's saved `stderr.log` carries), a backslash escape written out (`\n`, `\t`, `\uXXXX`) or any other character that cannot be part of it is redacted in the run logs, state and the CLI's output, and refused in published text | Redaction is still a baseline ([why](#redaction-is-a-baseline)): treat run logs as sensitive and never commit or share them ([how](#keep-autoforges-files-out-of-git)) |
 | [#285](https://github.com/iceboundrock/AutoForge/issues/285) | Medium | Other credential shapes are not recognised: AWS access keys, private-key blocks, `gsk_`, `xai-`, `npm_`, `glpat-`, `hf_`, and a key of no known shape under a prefixed name such as `GEMINI_API_KEY` | As for #282 |
-| [#286](https://github.com/iceboundrock/AutoForge/issues/286) | Medium | One allow-list serves every launch, and it refuses only the names `gh` and git read a credential from ([why](#other-limits)) | List no variable you would not give to the agents and to the code under review alike |
+| [#286](https://github.com/iceboundrock/AutoForge/issues/286) | Medium | *Fixed after `0.1.0a0`.* Agents and repository commands each have an allow-list key of their own, and an entry that looks like a credential is warned about at config load and in `doctor`; a one-character prefix is refused. Only the names `gh` and git read a credential from are refused outright ([why](#other-limits)) | Move what one class needs out of `env_allowlist_extra`, and read the warning: a listed token still reaches the launches its key reaches |
 | [#287](https://github.com/iceboundrock/AutoForge/issues/287) | Medium | *Fixed after `0.1.0a0`.* In a sequential EPIC run, `UPDATE_EPIC`'s next issue must be a native sub-issue of the EPIC with no sub-issues of its own, as `autoforge epic run` admits; any other selection, an issue the EPIC body only mentions included, is refused and asked again once, then `BLOCKED`. In `0.1.0a0` it could be any open issue of the repository, on a public repository possibly one a stranger opened | On `0.1.0a0`, prefer `autoforge epic run`. On `main`, an issue becomes selectable once someone adds it as a sub-issue of the EPIC: add only issues you would hand to an agent ([why](#prompt-injection-and-public-repositories-in-particular)) |
 | [#289](https://github.com/iceboundrock/AutoForge/issues/289) | Medium | *Fixed in `0.1.0a0`.* The merge gate refuses an empty check rollup, and one in which no check succeeded, under every configuration, `safety.verify_check_definition: false` and an empty `safety.required_checks` included; `doctor` names a GitHub Free plan restriction as the plan, never as a token permission, and its required-check row fails while `safety.allow_merge: true` and the requirement cannot be verified (the plan, a token without access, not found, a transient failure, or a hidden bypass list with no word on this token) | A branch rule is still what makes a check *required*: with the gate open, keep both settings at their defaults and a CI check required ([why](#check-runs-on-a-private-repository)) |
 | [#291](https://github.com/iceboundrock/AutoForge/issues/291) | Medium | *Fixed in `0.1.0a0`.* With a fine-grained token on a private repository whose pull requests have checks, REVIEW and FIX now run without the check results (the reviewer is told they are unknown), the merge gate blocks with a reason naming the credential and its remedy, and `doctor`'s "pull request check runs readable" row reports it | With the merge gate open, use `gh auth login` or a classic token with `repo` there ([why](#check-runs-on-a-private-repository)) |
@@ -613,4 +620,5 @@ sandbox directories) are under `.git/autoforge/`, which git never tracks.
    it was built from. The distribution is `autoforge-cli`; the `autoforge`
    distribution on PyPI is an unrelated project.
 9. **Run `autoforge doctor` first,** and read the launch environment, the
-   credential preflight and the sandbox rows.
+   credential-looking allow-list entries, the credential preflight and the
+   sandbox rows.
