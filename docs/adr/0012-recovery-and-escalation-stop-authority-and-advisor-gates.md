@@ -61,7 +61,8 @@ What a stop is and allows at `0ba238e` is typed and tested:
   (`test_only_the_sinks_and_the_cli_import_the_classification`,
   `test_the_engine_only_names_codes_and_never_reads_a_route`,
   `test_unblock_takes_no_classification`). No code is persisted (ADR 0011
-  D5), so a code exists only in the process that computed it.
+  D5), so a code exists only in the process that computed it. *(Amended by
+  #374: the code is now saved with the stop, protocol 16; see D10.)*
 - **`BLOCKED` has operator edges only, and `FAILED` none.** `unblock` is the
   one exit from `BLOCKED` that keeps the run. It is a controller decision
   from live GitHub, not an operator override: the operator supplies a reason
@@ -454,7 +455,14 @@ bundle.
 
 - **No persisted field here.** A later one is coordinated on #23 with the
   protocol number current when its pull request is ready, never a reserved
-  one (`state-and-recovery.md`, "Numbering a new protocol").
+  one (`state-and-recovery.md`, "Numbering a new protocol"). **Amended by
+  #374:** #374's recovery package needs the stop's code across processes,
+  so the sink that enters `BLOCKED` or `FAILED` saves it as `stop_code`
+  (protocol 16, ADR 0011 D5 as amended). It is the code and nothing else of
+  the classification, `unblock` clears it, and nothing that decides a phase,
+  a write or a permission reads it: `status` classifies the stop with it and
+  the package says what it means. No stop matrix row, authority or gate of
+  this record changes.
 - **Writes.** A new cross-object write kind is approved separately, by #306
   and #307 as #370 assigns, and lands as an ADR 0004 amendment with its own
   protocol bump, as K9 and K10 did. **Amended by #414:** #414's decision
@@ -479,7 +487,7 @@ bundle.
 | LOCAL gains no `unblock` by implication | `test_a_local_state_is_refused_never_given_an_unblock`, `test_the_one_workflow_mode_is_remote` |
 | a classification is never an authorization, and text is never a code | `test_only_the_sinks_and_the_cli_import_the_classification`, `test_the_engine_only_names_codes_and_never_reads_a_route`, `test_an_error_message_is_never_read`, `test_a_persisted_reason_is_never_read_for_a_code` |
 | no pause, and no new settlement | `test_no_state_awaits_input_until_126_lands`, `test_every_phase_has_exactly_one_settlement` |
-| no stop code is persisted | `test_nothing_of_a_classification_is_persisted` |
+| only a stop's code is persisted (#374), and nothing that decides reads it | `test_only_the_code_of_a_classification_is_persisted`, `test_unblock_takes_no_classification`, `test_the_saved_stop_code_is_written_and_cleared_only_by_the_sinks_and_unblock` |
 | the run log is never a recovery input | `test_runlog_recovers_sequence_from_step_names_never_from_the_journal` |
 | no agent launch holds a credential route | `test_an_agent_finds_no_credential_route_the_controller_finds_every_one` |
 | transient retries are bounded | `test_transient_retries_are_bounded_per_step_across_corrections`, `test_transient_read_failure_is_bounded_then_blocked` |
@@ -498,4 +506,4 @@ unchanged.
   before a go.
 - **The persisted code.** It is needed only by a consumer in another
   process: a reopened D (D6), or #374 and #375 if they need it. It comes
-  through #23 at that time.
+  through #23 at that time. *#374 brought it (protocol 16, D10 as amended).*

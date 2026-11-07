@@ -611,9 +611,10 @@ def test_a_k11_record_is_refused_under_a_protocol_before_14(tmp_state_dir, fake_
     eng = _blocked(tmp_state_dir, fake_github)
     assert eng.unblock(REASON, take_over=PR).unblocked
     data = json.loads(eng.paths.state_file.read_text())
-    assert data["protocol_version"] == "15"
+    assert data["protocol_version"] == "16"
     data["protocol_version"] = "13"
     del data["pr_body_outcomes"]  # protocol 15's own field (#423)
+    del data["stop_code"]  # protocol 16's own field (#374)
     older = eng.paths.state_file.with_name("older.json")
     older.write_text(json.dumps(data))
     with pytest.raises(StateError, match="cannot carry an 'owner_takeover' effect record"):

@@ -57,8 +57,9 @@ descriptor-relative, links unfollowed, within its size bound
   is no launch, so it is in no launch total and no failure rate.
 
 **What it cannot say** (printed with every summary, :data:`LIMITATIONS`):
-no reason code is persisted (ADR 0011 D5), so a saved BLOCKED or FAILED
-classifies ``unknown`` and the free text of ``block_reason`` and of a
+a BLOCKED or FAILED saved before protocol 16 has no reason code (ADR 0011
+D5, as amended by #374, saves it since), so it classifies ``unknown``, and
+the free text of ``block_reason`` and of a
 launch's ``error`` is never read; a run whose state is gone or does not
 load, and a run log that was moved, deleted, torn or holds a line of an
 unexpected type, leave that run's history incomplete (each such run is
@@ -139,8 +140,9 @@ NO_STATE = StopClassification(
 )
 
 LIMITATIONS = (
-    "no reason code is persisted: a saved BLOCKED or FAILED classifies 'unknown', and no "
-    "block_reason or error text is read",
+    "a BLOCKED or FAILED saved before protocol 16 has no reason code and classifies "
+    "'unknown' (a later one carries the code its sink saved), and no block_reason or error "
+    "text is read",
     "a failed agent launch that exited 0 (a malformed result, a failed verification, a "
     "refused run log) has no typed cause in the journal: 'unknown'",
     "a launch is an agent's or a controller command's by the producer its line names (an "

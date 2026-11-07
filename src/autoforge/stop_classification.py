@@ -25,10 +25,12 @@ reason: a controller sink that named its code (``ControllerEngine._block``),
 the validated ``status`` of a ``CONTROL_RESULT``, the class of a raised
 :class:`~autoforge.errors.AutoForgeError` (and the one typed attribute the
 engine sets on a run log's refusal after a launch's attempt was saved), or
-a loaded state's phase and settlement. No code is persisted (ADR 0011 D5): a state loaded later
-classifies its ``BLOCKED`` or ``FAILED`` with :attr:`StopReasonCode.UNKNOWN`,
-and ``block_reason`` stays text for a human. Where nothing typed says why,
-the code is ``UNKNOWN``, and an ``UNKNOWN`` never adds a route.
+a loaded state's phase and settlement, with the code the sink saved with a
+``BLOCKED`` or ``FAILED`` (``stop_code``, #374, ADR 0011 D5 as amended). A
+stop saved before protocol 16 has none and classifies with
+:attr:`StopReasonCode.UNKNOWN`, and ``block_reason`` stays text for a human,
+never read for a code. Where nothing typed says why, the code is
+``UNKNOWN``, and no code adds, removes or reorders a route.
 
 Pure: no I/O, no clock, no GitHub, no state write.
 """
@@ -83,7 +85,8 @@ class ReasonSource(Enum):
     AGENT = "agent"
     #: The class of the typed error that ended the command.
     EXCEPTION = "exception"
-    #: A loaded state's phase and settlement; no reason code is persisted.
+    #: A loaded state's phase and settlement, and the code its stop's sink saved
+    #: with it (``stop_code``; ``unknown`` for a stop saved before protocol 16).
     STATE = "state"
 
 
@@ -591,17 +594,40 @@ _SETTLED_PHASE: dict[Phase, tuple[StopOutcome, StopReasonCode]] = {
 }
 
 
+def saved_stop_code(state: AutoForgeState) -> StopReasonCode:
+    """The code the sink that entered a loaded ``BLOCKED`` or ``FAILED`` saved (#374).
+
+    ``stop_code`` as the engine's stop sink wrote it. ``UNKNOWN`` for a stop
+    saved before protocol 16 (``""``), for a code this controller does not
+    know, and for one no sink of the outcome names (an intentional stop's
+    code, or the agent's ``failure`` beside a ``BLOCKED``): losing a code can
+    make it unknown, never another one. ``block_reason`` is never read.
+    """
+    try:
+        code = StopReasonCode(state.stop_code)
+    except ValueError:
+        return StopReasonCode.UNKNOWN
+    if REASON_FAMILY[code] is ReasonFamily.INTENTIONAL:
+        return StopReasonCode.UNKNOWN
+    if state.phase is Phase.BLOCKED and code is StopReasonCode.AGENT_FAILURE:
+        return StopReasonCode.UNKNOWN
+    if state.phase is Phase.FAILED and code is not StopReasonCode.AGENT_FAILURE:
+        return StopReasonCode.UNKNOWN
+    return code
+
+
 def classify_state(
     state: AutoForgeState,
     *,
     scheduler: bool | None = False,
     paused: Callable[[AutoForgeState], bool] = durable_pause,
 ) -> StopClassification:
-    """The stop a strictly loaded state is, from its phase and settlement alone.
+    """The stop a strictly loaded state is, from its phase, settlement and saved code.
 
-    ``block_reason`` is never read: no code is persisted, so a ``BLOCKED``
-    or ``FAILED`` state classifies with :attr:`StopReasonCode.UNKNOWN`,
-    which changes no route. ``scheduler`` takes the parallel EPIC
+    ``block_reason`` is never read. A ``BLOCKED`` or ``FAILED`` state
+    classifies with the code its sink saved (:func:`saved_stop_code`;
+    ``UNKNOWN`` before protocol 16), which changes no route: the routes
+    follow the outcome. ``scheduler`` takes the parallel EPIC
     scheduler's view (ADR 0008 D15.1): a hand-off phase is the scheduler's
     to settle and an unsettled one is continued by ``epic resume``; a
     standalone run continues both with ``resume``. ``None`` is a view not
@@ -617,6 +643,10 @@ def classify_state(
         outcome, code = _O.AWAITING_INPUT, _C.AWAITING_INPUT
     elif settlement is Settlement.TERMINAL:
         outcome, code = _SETTLED_PHASE[phase]
+        if phase in (Phase.BLOCKED, Phase.FAILED):
+            code = saved_stop_code(state)
+            if code is not StopReasonCode.UNKNOWN:
+                evidence += ", with the code its stop's sink saved"
     elif settlement is Settlement.READY_FOR_MERGE:
         outcome, code = _O.READY_FOR_MERGE, _C.READY_FOR_MERGE
     elif settlement is Settlement.HANDOFF and scheduler:

@@ -34,8 +34,12 @@ uv run autoforge status --json     # machine-readable; `replan_journal` says whe
                                    # raw `replan_transaction` beside it is readable,
                                    # `acceptance_actions` lists the acceptance actions,
                                    # `operator_actions` the operator actions,
-                                   # `pr_body_updates` the PR description updates and
-                                   # `review_certificate_status` the review certificate
+                                   # `pr_body_updates` the PR description updates,
+                                   # `review_certificate_status` the review certificate and
+                                   # `recovery` the recovery package
+uv run autoforge status --live     # a BLOCKED run: also read from GitHub the decision
+                                   # 'unblock --dry-run' would print (with --json too);
+                                   # takes no lock and writes nothing
 uv run autoforge status --action A-0123456789abcdef   # the exact payload bytes of
                                    # an acceptance action, an operator action (X-…)
                                    # or a PR description update (B-…)
@@ -679,11 +683,13 @@ like a credential, so the marker cannot be appended to it (remove it, then
 `unblock`); after the plan was saved, a follow-up issue (reused, or one
 the controller already created or appended to) that is no longer the one
 open issue carrying its finding's marker, or an open issue carrying the
-marker of a finding the plan resolved without a deferral (reopen the
-controller's issue, or close or unmark the one it did not write, then
-`unblock`); a PR whose head repository GitHub no longer reports, or whose
-head moved to a fork or another branch, after the plan was saved; and a
-write that conflicts after the plan was saved (reopen the follow-up issue
+marker of a finding the plan resolved without a deferral (keep open, or
+reopen, with its marker, the issue the plan names for each deferred
+finding, the one it reused as much as one it wrote, and close or unmark
+any other issue carrying such a marker, then `unblock`); a PR whose head
+repository GitHub no longer reports, or whose head moved to a fork or
+another branch, after the plan was saved; and a write that conflicts
+after the plan was saved (reopen the follow-up issue
 the controller created, put the issue body back, or leave the PR branch at
 the reviewed HEAD or the planned commit, then `unblock`: the plan
 completes without running the fixer again). A FIX acceptance action that
@@ -764,7 +770,9 @@ the target issue, the PR, the round and the finding, who authorizes it, its
 state (`awaiting approval`, `approved, not yet published`, `published, not
 yet verified`, `verified: <url>` or `verification failed: …`), the payload's
 size and SHA-256, the push held back and the agent worktree that alone holds
-the unpushed commit (do not reset or remove it), and the next steps. Read the
+the unpushed commit (do not reset or remove it). Its `next:` sends you to the
+`Recovery` block below it, whose steps are the ones this stop allows, in order
+([The recovery package](#the-recovery-package-and-status---live)). Read the
 exact comment with `autoforge status --action A-…`, then either:
 
 - **approve it:** `autoforge unblock --approve-action A-… --reason "..."`,
@@ -823,8 +831,9 @@ finding F …)` block with one `X-…` line per action (`pending (not yet
 verified)`, `evidence bound, not yet verified: <url>`, `verified (exact):
 <url>`, `verified (operator-bound; …): <url>` or `verification failed: …`),
 why each target is allowed, the payload's size and SHA-256, the push held
-back, the agent worktree that holds the unpushed commit (do not reset or
-remove it), and the next commands. For each action, either:
+back, and the agent worktree that holds the unpushed commit (do not reset or
+remove it). Its `next:` sends you to the `Recovery` block below it, which
+names the commands this stop allows, in order. For each action, either:
 
 - **post it:** `autoforge status --action X-… | gh issue comment <target>
   --body-file -` posts exactly the payload (its `ai-operator-comment`
@@ -888,7 +897,12 @@ is dropped: an action already verified stays verified, the named ones are
 declined, the others are withdrawn, and `resume` runs the fixer again with
 your reason in its prompt. A declined action is never requested again
 unchanged, and verified work is never requested again. Declines count with
-acceptance-action declines toward the same 16 per review round. An action in
+acceptance-action declines toward the same 16 per review round, one per
+action named, and an `unblock` that would pass 16 is refused whole: when the
+round has room for fewer declines than actions pending, the stop's reason
+and `status` name only as many as it has room for, and the others are
+withdrawn with them (a withdrawn action is not declined, and the fixer may
+request it again). With no room left no withdrawal is possible. An action in
 conflict is repaired, never declined. Every pending action's target is read
 first, named or not: a target transferred, in another repository or no
 longer readable refuses the decline, naming it, while one that is not found
@@ -924,8 +938,13 @@ description edited after that is never written over or adopted:
 - **Edited after the plan was saved:** the run blocks (`effect-conflict`) naming
   the action, the digest it expected and the payload's. Put the body back
   (GitHub keeps its edit history) or set it to exactly the payload (`autoforge
-  status --action B-…`), then `unblock` and `resume`: no fixer runs. To keep your
-  edit, `unblock --decline-action B-…` runs the fixer again over it.
+  status --action B-…`), then `unblock` and `resume`: no fixer runs. Under
+  `approve`, an update not yet approved still needs its approval when you put
+  the body back: `unblock --approve-action B-…` in place of the plain `unblock`.
+  Only the exact payload is taken without one, and under `off` that is the only
+  way, since `unblock` records no approval then; the stop's reason and a plain
+  `unblock`'s refusal name the base only with that approval. To keep your edit,
+  `unblock --decline-action B-…` runs the fixer again over it.
 - **Edited after the controller verified its write:** the description is read
   again before each later write of the plan and before the fix is recorded, so a
   mixed fix does not push over your edit. The run blocks (`effect-conflict`). Set
@@ -946,19 +965,20 @@ detected, because GitHub has no conditional update of a PR body; it is
 overwritten and stays in the PR's edit history.
 
 With `approve`, the step blocks (`acceptance-action`) with nothing sent, and
-`status` names the action, PR, findings, expected digest, payload and next
-commands. Then `unblock --approve-action B-…`, or set the body to exactly the
-payload yourself and `unblock`, or `unblock --decline-action B-…`; then `resume`.
+`status` names the action, PR, findings, expected digest and payload, and its
+`Recovery` block the next commands. Then `unblock --approve-action B-…`, or set
+the body to exactly the payload yourself and `unblock`, or `unblock
+--decline-action B-…`; then `resume`.
 An unblock reason on its own moves nothing. `off` refuses the resolution: the
 fixer is told it is unavailable, and a finding only a new description can resolve
 makes it report `blocked`, as before.
 
 A decline drops the whole plan, so `unblock --decline-action B-…` is refused while
 an acceptance or operator action ahead of the update is not verified: a comment
-already posted would lose its evidence. `status` shows that action's next steps. A
-plain `unblock` and `resume` save a comment that is there, and you can decline the
-update if the run stops at it again. Declining that action instead, where `status`
-offers it, drops the update with the plan.
+already posted would lose its evidence. `status`'s `Recovery` block shows that
+action's next steps. A plain `unblock` and `resume` save a comment that is there,
+and you can decline the update if the run stops at it again. Declining that
+action instead, where `status` offers it, drops the update with the plan.
 
 ### Taking over a PR another run owns
 
@@ -1866,7 +1886,117 @@ and "State unchanged", agent failures and kills, provider errors, an
 interrupted process, `resume` versus `unblock`, stopping a run safely, lock
 contention, what a change on GitHub does to a run, the exit codes, and the
 recovery scenarios with the tests that hold them. The sections below are
-the reference it links to for four mechanisms.
+the reference it links to for five mechanisms.
+
+### The recovery package and `status --live`
+
+`status` ends with a `Recovery` block, and `status --json` carries the same
+as `recovery` (#374). It is built from the state file, the stop's
+classification ([ADR 0011](adr/0011-typed-stop-classification-and-recovery-baseline.md))
+and the configuration the command loaded, and says, for the stop the run is
+in:
+
+- **diagnosis** (a `BLOCKED` or `FAILED` run): the stop's reason code, which
+  the controller sink that entered the stop saved with it (`stop_code`,
+  protocol 16), what that code means and what it asks of you, for example
+  `github-checks-refused`: GitHub refused this credential the PR's check
+  runs, so run AutoForge with a credential that may read them; or
+  `review-round-cap`: raise `workflow.max_review_rounds` first, since
+  `unblock` refuses while the cap holds. `Reason:` stays text for a human
+  and is never read for a code; a stop saved before protocol 16 has no
+  code, and its diagnosis is `unknown`. A code named both before a plan is
+  saved and by a saved plan's completion (`default-branch`,
+  `fix-plan-refused`) is told apart by the saved plan, never by the reason:
+  with one, the diagnosis says what of the plan is already on GitHub and
+  what to repair, after which `unblock` and `resume` complete the plan
+  without launching an agent (before the repair the phase stops again); only
+  a stop with no plan saved is told that nothing was sent and that `unblock`
+  starts afresh. A saved FIX plan that defers a finding to the run's own
+  issue cannot complete, and its steps lead to a new run;
+- **proven:** what the controller recorded: the phase, the issue, the PR and
+  the HEAD it last verified, the review round, a FIX candidate and its push,
+  the effects already observed, and the bounds in force;
+- **unknown:** what nothing typed says: a stop saved with no code, the view
+  outside a git repository, and whether the agent worktree holds a FIX
+  candidate when FIX stopped before it saved its plan (the fixer's commit is
+  then in the worktree and in no record);
+- **pending:** each record of the saved plan not yet observed: its kind,
+  action id, who performs it, its exact target, stage, authorization, what
+  it still requires, and a reference to its payload (`status --action <id>`,
+  its length and SHA-256). An approval already recorded, yours or the
+  policy's, is reported as satisfied, never asked for again; an acceptance
+  comment also needs the run's issue open in the run's repository;
+- **forbidden:** what would be refused or would lose work: `resume` on a
+  `BLOCKED` run, `unblock` on any other, approving an operator action, an
+  approval naming another id, an approval while its setting
+  (`safety.acceptance_actions` or `safety.pr_body_updates`) is `off`, an
+  approval or a decline of an acceptance comment already authorized, and a
+  decline of operator actions while one of them is in conflict (repair it
+  first: the plain `unblock` that follows clears the saved conflict) or once
+  the round holds 16 declines;
+- **do not touch:** the agent worktree that holds an unpushed candidate, or
+  may hold one no record names, the saved plan, comments already verified as
+  evidence, what the saved plan already wrote and verified (a pushed
+  branch, a follow-up issue it created or a marker it appended), which the
+  plan never writes again, and each follow-up issue a FIX plan reused at its
+  entry, which it requires open with its marker as much as one it wrote. A
+  saved FIX plan stopped by `fix-plan-refused` names, for each finding, the
+  one issue that must stay open carrying its marker, or that none may yet,
+  and advises closing or unmarking only an issue it names for none;
+- **next:** the exact commands, with the flags this command was given, in
+  order, alternatives marked `or:`, each as `--json` holds it, a path's
+  spaces included, except that a character that cannot be printed on one
+  line (a path holding a line break, say) is spelled as a `$'\ooo'` part,
+  which bash, zsh and ksh read back to the same bytes (dash does not); and
+  the section of the [troubleshooting guide](troubleshooting.md) for the
+  case. This is the one
+  place `status` names a command that leaves or continues the stop (an
+  `unblock`, a `resume`, a payload to post or a comment to bind): the
+  `Acceptance action`, `Operator actions` and `PR body update` blocks above it
+  describe each action and send you here, so no line of the output offers a
+  command this stop refuses. `Reason:` is the text saved with the stop, and
+  `status` says so under it; where it names a command and the configuration
+  has changed since (a key set to `off`, say), follow this block, which reads
+  the configuration loaded now. The steps are one sequence that can be
+  followed as written: an `unblock` that is applied leaves `BLOCKED` at
+  once, so they end at the `resume` that continues the run. Operator actions to bind go in one `unblock`, after
+  every other one is posted. A later wait of the same plan (a PR
+  description update after operator actions, say) is the next stop's: run
+  `status` again when the run stops there. Under `off`, an action that awaits
+  approval is done by hand instead (the exact payload posted, or set as the
+  description), and setting the key to `approve` is the alternative. An
+  authorized acceptance comment that waits because the run's issue is closed
+  or left the repository asks for the issue first: an `unblock` before
+  re-enters `FIX`, which stops on the same hold, and `status --live` does not
+  read the issue, so whether it qualifies now is `unknown`.
+
+Every claim is labelled with its freshness: `snapshot` (the state as saved,
+at `snapshot_at`), `configuration` (the configuration loaded by this
+command), `live` (read from GitHub by this command, at `observed_at`) or
+`unknown`. Without `--live` nothing is re-read for the package, so its
+claims are as old as the state file, and two runs of `status` over one
+state print the same.
+
+`status --live`, with or without `--json`, adds for a `BLOCKED` run the
+decision a plain `unblock --dry-run` would print. It makes the same two
+checks in the same order: the recorded configuration and sandbox pin, then
+the inspection of GitHub `unblock` decides from, so the two cannot disagree
+on one state and one GitHub. It shows the phase `unblock` would re-enter or
+why it would stay `BLOCKED`, the PR as GitHub returns it, and any drift: a
+PR, HEAD or base that differs from the one the state recorded. It needs
+GitHub access, takes no lock (it works while another controller or the
+scheduler holds one), writes nothing and launches nothing. A configuration
+`unblock` would refuse, or a transient read that fails, is reported as not
+decided, and `status` still exits 0. For a run that is not `BLOCKED` it
+reads nothing for the package.
+
+The package is advice. Every command it names checks again what it acts on
+and may refuse: a "would re-enter" is neither a transition nor a
+permission, and `unblock` decides again from its own reads. Nothing that
+decides a phase, a write or a permission reads it, and no model is
+involved. The `recovery` keys are stable (`schema`
+`autoforge.recovery/1`), and every other field of `status --json` is as it
+was. A state the loader refuses, a LOCAL one included, gets no package.
 
 ### A run a newer controller wrote
 

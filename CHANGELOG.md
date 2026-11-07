@@ -5,6 +5,59 @@ so.
 
 ## Unreleased
 
+### `status` says what a stop allows; `status --live` previews `unblock` (#374)
+
+`status` ends with a `Recovery` block, and `status --json` carries it as
+`recovery`: the stop's diagnosis (its reason code, what it means and what it
+asks of you), what the controller recorded, which saved action is pending on
+which exact target (its id and a reference to its payload), what is
+forbidden, what not to touch (an unpushed candidate's worktree, or one that
+may hold a FIX candidate no record names, the saved plan, comments already
+verified), and the exact next commands with the flags you ran `status` with,
+as one sequence `unblock` accepts in order: operator actions to bind go in
+one `unblock`, a later wait of the same plan is left to the next stop, and a
+withdrawal of operator actions names no more of them than the round's 16
+declines leave room for (the stop's reason too). The human block prints each
+command as `--json` holds it, a path's repeated spaces included.
+Each claim says whether it comes from the state file, the configuration,
+GitHub now, or is unknown. Every other field of `status --json` is as
+before. In the human output the `Recovery` block is the one place that names
+an `unblock`, a `resume`, a payload to post or a comment to bind: the
+`Acceptance action`, `Operator actions` and `PR body update` blocks still
+describe each action, and their `next:` now sends you there instead of
+printing commands of their own, which could offer what the stop refuses (an
+approval under `off`, a withdrawal of operator actions while one is in
+conflict, a `resume` of a `BLOCKED` run). A PR description update never
+approved that meets an edited description now blocks with a reason, and a
+plain `unblock` refuses with a text, that name its base only with the
+approval of exactly its id, and not at all under `off`.
+
+The code comes from the state: the sink that enters `BLOCKED` or `FAILED`
+now saves its reason code with the stop (`stop_code`), so `status`, `resume`
+and the package name it in a later process, where they said `reason
+unknown` before. `unblock` clears it, and nothing that decides reads it.
+State protocol 15 → 16: an older file loads in every phase with no code
+(`unknown`, as before) and is relabelled on its next save; an older-labelled
+file carrying the field is refused. Where one code is named both before a
+plan is saved and by a saved plan's completion (`default-branch`,
+`fix-plan-refused`), the saved plan tells the two apart, never the reason's
+text: a saved plan's diagnosis says what of it is already on GitHub, keeps
+those writes under "do not touch" and names the repair after which `unblock`
+and `resume` complete the plan without launching an agent; only a stop with
+no plan saved is told that nothing was sent and that `unblock` starts afresh.
+A FIX plan's repair names, for each finding, the one issue that must stay
+open carrying its follow-up marker (a follow-up the plan reused at FIX's
+entry as much as one it created, kept under "do not touch" too), or that
+none may yet, and has you close or unmark only an issue it names for none;
+the reason `FIX` saves with the stop says the same.
+
+`status --live` adds, for a `BLOCKED` run, the decision `unblock --dry-run`
+would print for the same state, read from GitHub, and any drift of the PR
+from what the state recorded. It takes no lock and writes nothing. A
+`would re-enter` there is a preview: `unblock` reads GitHub again and decides
+then. See
+[The recovery package and `status --live`](docs/usage.md#the-recovery-package-and-status---live).
+
 ### Agents and repository commands get an allow-list key each; credential-looking names are called out (#286)
 
 `execution.env_allowlist` and `env_allowlist_extra` reached every launch. A name

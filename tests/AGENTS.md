@@ -498,6 +498,22 @@ ADR 0011)                             class mapped, routes from the outcome alon
 recovery and escalation (#370,        test_stop_classification.py (ADR 0012's stop matrix takes
 ADR 0012)                             every outcome that needs recovery, its gate A table every
                                       reason family and code, and every test it names exists)
+the recovery action package and       test_recovery_package.py (the scenario table on real stops
+status --live (#374)                  read back by a fresh CLI engine: K10, K9 approve and
+                                      decline, PR #314's false conflict beside an authentic one,
+                                      two marked PRs, #291, a timeout, the review-round cap,
+                                      LOCAL, FAILED; the live preview equal to unblock
+                                      --dry-run's in every BLOCKED scenario; no write, no lock,
+                                      no launch; drift, a failed read redacted, a refused
+                                      configuration; exact ids and payloads; stable JSON keys;
+                                      a namespace's and an unknown view; the module's imports
+                                      and guide anchors; the diagnosis of a saved code from a
+                                      cached status, a code for every engine sink; the K10
+                                      sequence run as displayed, posting and binding; a FIX
+                                      candidate no record names; a credential across each
+                                      cut; a verified PR description edited since; the whole
+                                      human status naming only the package's commands, in
+                                      every scenario and with the saved reason, PR #470 R4-F1)
 the evaluation protocol (#318)        test_evaluation.py (the pins, what arms hold equal, the
                                       statistics and decision on synthetic records, what never
                                       runs in CI; the protocol held to its files),
