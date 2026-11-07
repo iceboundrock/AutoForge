@@ -49,6 +49,7 @@ from autoforge.recovery_package import (
     Policy,
     _command_line,
     build_package,
+    fix_follow_up_terms,
 )
 from autoforge.redaction import redact
 from autoforge.run_namespace import issue_namespace
@@ -342,6 +343,34 @@ def _fix_follow_up_closed_after_the_plan(tmp_state_dir):
     return eng
 
 
+#: An open issue nobody planned, carrying R1-F1's follow-up marker (PR #470 R7-F1).
+STRAY = "https://github.com/owner/repo/issues/5"
+
+
+def _fix_reused_follow_up_closed_after_the_plan(tmp_state_dir):
+    """PR #470 R7-F1: FIX's entry found R1-F2's follow-up open (issue 3), and the saved
+    plan reuses it ('entry'), writing nothing to it; the process died before the push.
+    Since then issue 3 was closed and an issue nobody planned took the marker of R1-F1,
+    which the plan resolved as fixed, so the plan's completion in a later process blocks
+    with code fix-plan-refused before the push."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "follow-up", body=_marked("R1-F2"))
+    eng = _two_findings_in_fix(
+        tmp_state_dir, gh, fixer(fixed("R1-F1"), deferred_to("R1-F2", ISSUE3))
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(ControllerEngine, "_complete_fix", _crash)
+        with pytest.raises(KeyboardInterrupt):
+            eng.step()
+    assert gh.effect_writes == []
+    gh.issues[ISSUE3].state = "CLOSED"
+    gh.add_issue(STRAY, "stray", body=_marked("R1-F1"))
+    eng = _resumed(eng, tmp_state_dir, gh, "never")
+    assert eng.step().next_phase == "BLOCKED"
+    assert eng.state.stop_code == "fix-plan-refused"
+    return eng
+
+
 def _fix_plan_deferring_to_its_own_issue(tmp_state_dir):
     """PR #470 R6-F1: a saved FIX plan reusing the run's own issue as R1-F1's follow-up
     (one saved without the entry's check, written into the journal as
@@ -392,6 +421,7 @@ BLOCKED_SCENARIOS = {
     "default-branch-after-the-plan": _default_branch_after_the_plan,
     "fix-plan-refused-before-the-plan": _fix_refused_before_the_plan,
     "fix-plan-refused-after-a-write": _fix_follow_up_closed_after_the_plan,
+    "fix-plan-refused-reused-follow-up": _fix_reused_follow_up_closed_after_the_plan,
     "fix-plan-refused-own-issue": _fix_plan_deferring_to_its_own_issue,
 }
 
@@ -2751,7 +2781,12 @@ def test_a_fix_plan_refused_after_its_follow_up_was_created_names_it_and_replays
             f"Of the plan, written and verified: follow_up_issue effect 0 on owner/repo "
             f"({ISSUE43}). What is written stays on GitHub"
         ) in diagnosis["meaning"]
-        assert "reopen, with its marker as written, each one it did" in diagnosis["remedy"]
+        assert (
+            "Keep each follow-up issue it requires open and carrying its finding's follow-up "
+            "marker, reopening one that was closed and putting back a marker that was "
+            f"removed: R1-F2: {ISSUE43}, created by the saved plan (follow_up_issue effect 0). "
+            "No open issue may carry the follow-up marker of R1-F1 (resolved as fixed)"
+        ) in diagnosis["remedy"]
         assert "completes the saved plan without launching the fixer" in diagnosis["remedy"]
         assert _sequence(package)[:4] == [("", False), *_plain_and_resume(eng)]
         [issue] = [c for c in package["preserve"] if c["key"] == "written-0"]
@@ -2786,6 +2821,179 @@ def test_a_fix_plan_refused_after_its_follow_up_was_created_names_it_and_replays
     assert eng.provider.calls == []
     assert [w[0] for w in gh.effect_writes] == ["create_issue"]
     assert eng.origin.head(BRANCH) == candidate == gh.prs[PR].head_sha
+
+
+def test_a_fix_plan_refused_over_a_reused_follow_up_keeps_it_and_replays_the_plan(
+    tmp_state_dir, status_cli, capsys
+):
+    """PR #470 R7-F1: the saved FIX plan reuses issue 3, which FIX's entry found carrying
+    R1-F2's marker and which the controller never wrote; issue 3 was closed, and a stray
+    issue took R1-F1's marker. The package, cached and live, and the whole 'status' name
+    issue 3 as the follow-up the plan requires, to keep open with its marker and reopen,
+    keep it under do-not-touch, and advise removing only what the plan names for no
+    finding: never "close what the plan did not write". Run against the engine: removing
+    the stray alone leaves FIX stopping here again, and the repair as displayed (issue 3
+    reopened, the stray closed) completes the plan without launching the fixer, writing
+    nothing to GitHub but the push."""
+    eng = _fix_reused_follow_up_closed_after_the_plan(tmp_state_dir)
+    gh = eng.github
+    candidate = _push_sha(eng)
+    reviewed = eng.state.reviewed_head_sha
+    keep = (
+        "Keep each follow-up issue it requires open and carrying its finding's follow-up "
+        "marker, reopening one that was closed and putting back a marker that was removed: "
+        f"R1-F2: {ISSUE3}, reused: FIX's entry found it open carrying the marker, and the plan "
+        "writes nothing to it and creates no other. No open issue may carry the follow-up "
+        "marker of R1-F1 (resolved as fixed). Close, or remove that marker from, any other "
+        "open issue carrying the follow-up marker of one of those findings: the plan names it "
+        "for none of them"
+    )
+    for flags in ((), ("--live",)):
+        package = _recovery(status_cli, eng, capsys, *flags)
+        diagnosis = package["diagnosis"]
+        assert (diagnosis["code"], diagnosis["freshness"]) == ("fix-plan-refused", "snapshot")
+        _no_fresh_promise(diagnosis["meaning"] + diagnosis["remedy"])
+        assert diagnosis["meaning"].startswith(
+            "the open issues contradict the saved FIX plan of review round 1"
+        )
+        assert "Nothing of the plan was sent yet" in diagnosis["meaning"]
+        assert keep in diagnosis["remedy"]
+        assert "did not write" not in diagnosis["remedy"]
+        assert diagnosis["remedy"].endswith(
+            "Then 'unblock' (it re-reads GitHub and may refuse): FIX completes the saved plan "
+            "without launching the fixer, sending nothing GitHub already holds"
+        )
+        assert package["next"][0]["text"] == diagnosis["remedy"]
+        assert _sequence(package)[:4] == [("", False), *_plain_and_resume(eng)]
+        [reused] = [c for c in package["preserve"] if c["key"] == "reused-R1-F2"]
+        assert reused["text"].startswith(
+            f"issue {ISSUE3}, the follow-up of R1-F2 the saved plan reuses (FIX's entry found "
+            "it open carrying the finding's marker; the plan writes nothing to it): keep it "
+            "open, with that marker in its body, until FIX completes"
+        )
+        assert (reused["freshness"], reused["observed_at"]) == ("snapshot", package["snapshot_at"])
+        assert not [c for c in package["preserve"] if c["key"].startswith("written-")]
+        assert not [c for c in package["preserve"] if STRAY in c["text"]]
+        [kept] = [c for c in package["preserve"] if c["key"] == "worktree"]
+        assert f"holds the unpushed candidate {candidate}" in kept["text"]
+    live = package["live"]
+    assert (live["decision"], live["target_phase"]) == ("would_reenter", "FIX")
+    assert "completes from its persisted plan without launching the fixer" in live["detail"]
+    out, block, rest = _human_status(status_cli, eng, capsys)
+    _no_fresh_promise(out)
+    # The advice before R7-F1, which had the operator close issue 3 or leave it closed.
+    for advice in ("each one the plan did not write", "issue(s) it did not write"):
+        assert advice not in out
+    assert (
+        "    1. inspect the issues the reason names and make them agree with the saved plan. "
+        + keep
+    ) in block
+    assert f"[snapshot] issue {ISSUE3}, the follow-up of R1-F2 the saved plan reuses" in block
+    # The saved reason names both issues and the same repair.
+    assert f"{STRAY} carries the follow-up marker of R1-F1" in rest
+    assert f"(its follow-up is {ISSUE3})" in rest
+    assert "(one it reused as much as one it wrote)" in rest
+
+    plain = f'{_prefix(eng)} unblock --reason "..."'
+    gh.issues[STRAY].state = "CLOSED"  # half the repair: issue 3 stays closed
+    rc, out, err = _run_displayed(status_cli, eng, plain, capsys)
+    assert rc == 0 and "BLOCKED -> FIX" in out, err
+    eng.load()
+    assert eng.step().next_phase == "BLOCKED"
+    assert eng.state.stop_code == "fix-plan-refused"
+    assert gh.effect_writes == [] and eng.provider.calls == []
+    assert eng.origin.head(BRANCH) == reviewed
+    assert keep in _recovery(status_cli, eng, capsys)["next"][0]["text"]
+
+    gh.issues[ISSUE3].state = "OPEN"  # the rest: the reused follow-up, marker as it was
+    rc, out, err = _run_displayed(status_cli, eng, plain, capsys)
+    assert rc == 0 and "BLOCKED -> FIX" in out, err
+    eng.load()
+    outcome = eng.step()
+    assert outcome.next_phase == "REVIEW", outcome.message
+    assert eng.provider.calls == [] and gh.effect_writes == []
+    assert eng.origin.head(BRANCH) == candidate == gh.prs[PR].head_sha
+    assert gh.issues[ISSUE3].body == _marked("R1-F2")
+
+
+def test_a_fix_plan_refused_over_a_reused_follow_up_that_was_unmarked(
+    tmp_state_dir, status_cli, capsys
+):
+    """PR #470 R7-F1: issue 3 stays open but lost R1-F2's marker. The displayed repair
+    puts the marker back on issue 3, never on a new issue, and FIX completes the plan."""
+    eng = _fix_reused_follow_up_closed_after_the_plan(tmp_state_dir)
+    gh = eng.github
+    candidate = _push_sha(eng)
+    gh.issues[STRAY].state = "CLOSED"
+    gh.issues[ISSUE3].state = "OPEN"
+    gh.issues[ISSUE3].body = "No marker any more."
+    plain = f'{_prefix(eng)} unblock --reason "..."'
+    rc, out, err = _run_displayed(status_cli, eng, plain, capsys)
+    assert rc == 0, err
+    eng.load()
+    assert eng.step().next_phase == "BLOCKED"
+    remedy = _recovery(status_cli, eng, capsys, "--live")["diagnosis"]["remedy"]
+    assert f"putting back a marker that was removed: R1-F2: {ISSUE3}, reused" in remedy
+    gh.issues[ISSUE3].body = _marked("R1-F2")
+    rc, out, err = _run_displayed(status_cli, eng, plain, capsys)
+    assert rc == 0, err
+    eng.load()
+    outcome = eng.step()
+    assert outcome.next_phase == "REVIEW", outcome.message
+    assert eng.provider.calls == [] and gh.effect_writes == []
+    assert eng.origin.head(BRANCH) == candidate
+
+
+def test_a_fix_plans_follow_up_terms_follow_each_record_stage(tmp_state_dir):
+    """PR #470 R7-F1: what the repair requires of each finding follows FIX's own check:
+    a record not sent yet means no open issue may carry the marker, one observed names
+    the issue it created or appended to, and one sent and not read back is left to its
+    reconciliation; a finding resolved without a deferral never has one."""
+    gh = FakeGitHub()
+    # A follow-up of an earlier round, which the fixer may name: the plan appends to it.
+    gh.add_issue(ISSUE3, "deferred in round 1", body=_marked("R1-F5"))
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(new_follow_up("R1-F1"), deferred_to("R1-F2", ISSUE3), fixed("R1-F3")),
+        [_finding(1, 1), _finding(1, 2), _finding(1, 3)],
+        origin=True,
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(ControllerEngine, "_complete_fix", _crash)
+        with pytest.raises(KeyboardInterrupt):
+            eng.step()
+    effects = load_state(eng.paths.state_file).phase_effects()
+    position = {r.kind: r.position for r in effects.records}
+    create = f"follow_up_issue effect {position[EffectKind.FOLLOW_UP_ISSUE]}"
+    append = f"follow_up_append effect {position[EffectKind.FOLLOW_UP_APPEND]}"
+    terms = fix_follow_up_terms(effects)
+    assert terms.required == () and terms.unsettled == ()
+    assert terms.none == (
+        ("R1-F1", f"the plan's {create}, not sent yet, creates it"),
+        ("R1-F2", f"the plan's {append}, not sent yet, appends it"),
+        ("R1-F3", "resolved as fixed"),
+    )
+    eng = _resumed(eng, tmp_state_dir, gh, "never")
+    _power_loss_at(eng, EffectKind.FOLLOW_UP_APPEND, Stage.ATTEMPTED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    terms = fix_follow_up_terms(load_state(eng.paths.state_file).phase_effects())
+    assert terms.required == (("R1-F1", ISSUE43, f"created by the saved plan ({create})"),)
+    assert terms.unsettled == (
+        ("R1-F2", f"the plan's {append}, sent, its outcome not read back yet"),
+    )
+    assert terms.none == (("R1-F3", "resolved as fixed"),) and terms.reused == ()
+    eng = _resumed(eng, tmp_state_dir, gh, "never")
+    _power_loss_at(eng, EffectKind.FOLLOW_UP_APPEND, Stage.OBSERVED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    terms = fix_follow_up_terms(load_state(eng.paths.state_file).phase_effects())
+    assert terms.required == (
+        ("R1-F1", ISSUE43, f"created by the saved plan ({create})"),
+        ("R1-F2", ISSUE3, f"the saved plan appended the marker to it ({append})"),
+    )
+    assert terms.unsettled == () and terms.none == (("R1-F3", "resolved as fixed"),)
 
 
 def test_a_saved_fix_plan_deferring_to_its_own_issue_routes_to_a_new_run(

@@ -683,11 +683,13 @@ like a credential, so the marker cannot be appended to it (remove it, then
 `unblock`); after the plan was saved, a follow-up issue (reused, or one
 the controller already created or appended to) that is no longer the one
 open issue carrying its finding's marker, or an open issue carrying the
-marker of a finding the plan resolved without a deferral (reopen the
-controller's issue, or close or unmark the one it did not write, then
-`unblock`); a PR whose head repository GitHub no longer reports, or whose
-head moved to a fork or another branch, after the plan was saved; and a
-write that conflicts after the plan was saved (reopen the follow-up issue
+marker of a finding the plan resolved without a deferral (keep open, or
+reopen, with its marker, the issue the plan names for each deferred
+finding, the one it reused as much as one it wrote, and close or unmark
+any other issue carrying such a marker, then `unblock`); a PR whose head
+repository GitHub no longer reports, or whose head moved to a fork or
+another branch, after the plan was saved; and a write that conflicts
+after the plan was saved (reopen the follow-up issue
 the controller created, put the issue body back, or leave the PR branch at
 the reviewed HEAD or the planned commit, then `unblock`: the plan
 completes without running the fixer again). A FIX acceptance action that
@@ -1934,9 +1936,13 @@ in:
   the round holds 16 declines;
 - **do not touch:** the agent worktree that holds an unpushed candidate, or
   may hold one no record names, the saved plan, comments already verified as
-  evidence, and what the saved plan already wrote and verified (a pushed
+  evidence, what the saved plan already wrote and verified (a pushed
   branch, a follow-up issue it created or a marker it appended), which the
-  plan never writes again;
+  plan never writes again, and each follow-up issue a FIX plan reused at its
+  entry, which it requires open with its marker as much as one it wrote. A
+  saved FIX plan stopped by `fix-plan-refused` names, for each finding, the
+  one issue that must stay open carrying its marker, or that none may yet,
+  and advises closing or unmarking only an issue it names for none;
 - **next:** the exact commands, with the flags this command was given, in
   order, alternatives marked `or:`, each as `--json` holds it, a path's
   spaces included, except that a character that cannot be printed on one

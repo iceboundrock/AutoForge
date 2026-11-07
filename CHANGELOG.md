@@ -45,6 +45,11 @@ text: a saved plan's diagnosis says what of it is already on GitHub, keeps
 those writes under "do not touch" and names the repair after which `unblock`
 and `resume` complete the plan without launching an agent; only a stop with
 no plan saved is told that nothing was sent and that `unblock` starts afresh.
+A FIX plan's repair names, for each finding, the one issue that must stay
+open carrying its follow-up marker (a follow-up the plan reused at FIX's
+entry as much as one it created, kept under "do not touch" too), or that
+none may yet, and has you close or unmark only an issue it names for none;
+the reason `FIX` saves with the stop says the same.
 
 `status --live` adds, for a `BLOCKED` run, the decision `unblock --dry-run`
 would print for the same state, read from GitHub, and any drift of the PR

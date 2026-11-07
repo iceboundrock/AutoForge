@@ -918,13 +918,133 @@ def _fix_plan_round(effects: PhaseEffects) -> str:
     return f" of review round {context.round}" if isinstance(context, FixContext) else ""
 
 
+@dataclass(frozen=True)
+class FollowUpTerms:
+    """What a saved FIX plan's completion requires of its findings' follow-up markers (R7-F1).
+
+    FIX holds the open issues to the plan, never to who wrote them
+    (``engine.py``'s ``_fix_disposition_problem``): ``required`` maps a deferred
+    finding whose follow-up is settled to the one open issue that must carry
+    its marker, with how the plan came by it: reused at FIX's entry (an issue
+    the controller did not write, which the plan names all the same), or
+    created or appended to by a record observed. ``none`` holds each finding
+    no open issue may carry the marker of yet, with why: resolved without a
+    deferral, or deferred by a record not sent yet, which writes it.
+    ``unsettled`` holds a finding whose record was sent and not read back
+    (or is in conflict): its reconciliation reads the marker first, and the
+    check leaves it alone. ``reused`` repeats, as ``(finding id, issue)``,
+    the follow-ups of ``required`` the plan reused at FIX's entry.
+    """
+
+    required: tuple[tuple[str, str, str], ...] = ()
+    none: tuple[tuple[str, str], ...] = ()
+    unsettled: tuple[tuple[str, str], ...] = ()
+    reused: tuple[tuple[str, str], ...] = ()
+
+
+def fix_follow_up_terms(effects: PhaseEffects) -> FollowUpTerms:
+    """The :class:`FollowUpTerms` of the saved FIX plan ``effects`` hold (PR #470 R7-F1).
+
+    Each follow-up is named as FIX's completion names it: a reused one by the
+    entry observation, a created or appended one by what its record read back
+    (the target's issue for an append not read back with one).
+    """
+    context = effects.context
+    if not isinstance(context, FixContext):
+        return FollowUpTerms()
+    objects = effects.observation.objects if effects.observation is not None else {}
+    required: list[tuple[str, str, str]] = []
+    none: list[tuple[str, str]] = []
+    unsettled: list[tuple[str, str]] = []
+    reused: list[tuple[str, str]] = []
+    for resolution in context.resolutions:
+        fid = str(resolution["finding_id"])
+        source = resolution["follow_up_source"]
+        if source is None:
+            none.append((fid, f"resolved as {resolution['resolution']}"))
+            continue
+        if source == FOLLOW_UP_SOURCE_ENTRY:
+            url = str(objects.get(render_follow_up_marker(context.pr_url, fid)) or "-")
+            required.append(
+                (
+                    fid,
+                    url,
+                    "reused: FIX's entry found it open carrying the marker, and the plan writes "
+                    "nothing to it and creates no other",
+                )
+            )
+            reused.append((fid, url))
+            continue
+        if not isinstance(source, int) or not 0 <= source < len(effects.records):
+            continue  # the load refuses such a plan; nothing to say of it here
+        record = effects.records[source]
+        name = f"{record.kind.value} effect {record.position}"
+        if record.stage is Stage.INTENDED:
+            writes = "creates" if record.kind is EffectKind.FOLLOW_UP_ISSUE else "appends"
+            none.append((fid, f"the plan's {name}, not sent yet, {writes} it"))
+        elif record.stage is Stage.OBSERVED:
+            issue = (record.observed or {}).get("url") or record.target.get("issue_url")
+            how = (
+                f"created by the saved plan ({name})"
+                if record.kind is EffectKind.FOLLOW_UP_ISSUE
+                else f"the saved plan appended the marker to it ({name})"
+            )
+            required.append((fid, str(issue or "-"), how))
+        else:
+            sent = (
+                "in conflict"
+                if record.stage is Stage.CONFLICT
+                else "sent, its outcome not read back yet"
+            )
+            unsettled.append((fid, f"the plan's {name}, {sent}"))
+    return FollowUpTerms(tuple(required), tuple(none), tuple(unsettled), tuple(reused))
+
+
+def _follow_up_repair(terms: FollowUpTerms) -> str:
+    """The repair of open issues that contradict a saved FIX plan, by its terms (R7-F1).
+
+    Removal is advised only for an issue the plan names for no finding: a
+    follow-up it reused is kept and repaired like one it wrote.
+    """
+    parts = ["inspect the issues the reason names and make them agree with the saved plan"]
+    if terms.required:
+        each = "; ".join(f"{fid}: {url}, {how}" for fid, url, how in terms.required)
+        parts.append(
+            "Keep each follow-up issue it requires open and carrying its finding's follow-up "
+            "marker, reopening one that was closed and putting back a marker that was "
+            f"removed: {each}"
+        )
+    if terms.none:
+        each = "; ".join(f"{fid} ({why})" for fid, why in terms.none)
+        parts.append(f"No open issue may carry the follow-up marker of {each}")
+    if terms.required or terms.none:
+        parts.append(
+            "Close, or remove that marker from, any other open issue carrying the follow-up "
+            "marker of one of those findings: the plan names it for none of them, and the "
+            "controller never adopts it"
+        )
+    if terms.unsettled:
+        each = "; ".join(f"{fid} ({why})" for fid, why in terms.unsettled)
+        parts.append(
+            f"Leave the issues carrying the follow-up marker of {each} as they are: FIX "
+            "reconciles that record by its marker before it sends anything"
+        )
+    return (
+        ". ".join(parts) + ". Then 'unblock' (it re-reads GitHub and may refuse): FIX completes "
+        "the saved plan without launching the fixer, sending nothing GitHub already holds"
+    )
+
+
 def _fix_plan_contradicted(effects: PhaseEffects) -> Diagnosis:
     """``fix-plan-refused`` named by a saved FIX plan's completion (PR #470 R6-F1).
 
     The open issues contradict the plan's resolutions: FIX blocks with the
     plan kept, and ``unblock`` keeps it, so FIX completes it from the journal
     without launching the fixer once the issues agree, and stops here again
-    until then. What the plan wrote before the stop stays on GitHub.
+    until then. What the plan wrote before the stop stays on GitHub. The
+    repair keeps every follow-up the plan names, the ones it reused at FIX's
+    entry included, and removes only an issue it names for no finding
+    (:func:`fix_follow_up_terms`, R7-F1).
     """
     return Diagnosis(
         f"the open issues contradict the saved FIX plan{_fix_plan_round(effects)}: each "
@@ -934,10 +1054,7 @@ def _fix_plan_contradicted(effects: PhaseEffects) -> Diagnosis:
         "nothing more. The plan stays saved: 'unblock' keeps it, and FIX completes it from the "
         "journal without launching the fixer, or stops here again while the issues contradict "
         f"it. {_written(effects.records)}",
-        "inspect the issues the reason names: close or unmark each one the plan did not write, "
-        "and reopen, with its marker as written, each one it did (the plan's records name "
-        f"them), {_UNBLOCK_AFTER}: FIX completes the saved plan without launching the fixer, "
-        "sending nothing GitHub already holds",
+        _follow_up_repair(fix_follow_up_terms(effects)),
     )
 
 
@@ -1437,6 +1554,24 @@ class _Builder:
         for record in self.records:
             if record.stage is Stage.OBSERVED and record.kind not in _ACTION_KINDS:
                 self.preserve.append(self.written(record))
+        for fid, url in fix_follow_up_terms(self.effects).reused:
+            self.preserve.append(self.reused(fid, url))
+
+    def reused(self, finding_id: str, url: str) -> Claim:
+        """A follow-up the saved FIX plan reused at FIX's entry (PR #470 R7-F1).
+
+        The controller did not write it, but the plan names it as the one open
+        issue carrying the finding's marker, as it names one it created: its
+        completion reads the open issues again and stops while it is closed or
+        unmarked, and nothing recreates or replaces it.
+        """
+        return self.snap(
+            f"reused-{finding_id}",
+            f"issue {url}, the follow-up of {finding_id} the saved plan reuses (FIX's entry "
+            "found it open carrying the finding's marker; the plan writes nothing to it): keep "
+            "it open, with that marker in its body, until FIX completes; FIX reads the open "
+            "issues again first, and never adopts, creates or appends to another for it",
+        )
 
     def written(self, record: EffectRecord) -> Claim:
         """A write the saved plan made and verified, which its completion counts on (R6-F1).

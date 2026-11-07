@@ -17465,8 +17465,10 @@ class ControllerEngine:
             f"{problem}. The open issues contradict the FIX plan, in which each deferred "
             "finding has exactly one open issue carrying its marker (the one it reused, created "
             "or appended to) and no other finding has any; the controller never adopts, "
-            f"chooses between or recreates follow-up issues, and {sent}. Close or unmark the "
-            "issue(s) it did not write, or reopen the one it did, then 'unblock'",
+            f"chooses between or recreates follow-up issues, and {sent}. Keep open, or reopen, "
+            "with its marker, the issue the plan names for each deferred finding (one it reused "
+            "as much as one it wrote), close or unmark any other issue carrying such a marker, "
+            "then 'unblock'",
         )
 
     def _fix_self_deferral_problem(
