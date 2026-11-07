@@ -4745,8 +4745,9 @@ def test_status_of_a_namespace_names_the_scheduler_to_continue(
     tmp_path, capsys, monkeypatch, fakes
 ):
     """A scheduler namespace's run is continued by 'epic resume', which its
-    status names in the operator and acceptance hints: a standalone 'resume'
-    refuses that state directory (ADR 0008 D17.3)."""
+    status names in the steps of its Recovery block, where the action blocks send
+    the operator (PR #470 R4-F1): a standalone 'resume' refuses that state
+    directory (ADR 0008 D17.3)."""
     standalone, ids = _blocked_on_operator(tmp_path, monkeypatch, fakes)
     sd = _namespace_state_dir(tmp_path, 2)
     sd.mkdir(parents=True)
@@ -4754,7 +4755,7 @@ def test_status_of_a_namespace_names_the_scheduler_to_continue(
     capsys.readouterr()
     assert cli.main(["--state-dir", str(sd), "status"]) == 0
     out = capsys.readouterr().out
-    assert f"&& autoforge epic resume {EPIC}" in out
+    assert f"\n    6. autoforge epic resume {EPIC}  (continue the run)\n" in out
     assert f"--state-dir {sd} unblock --decline-action {ids[T16]}" in out
     assert f"--state-dir {sd} resume" not in out
 

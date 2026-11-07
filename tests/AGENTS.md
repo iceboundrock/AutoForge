@@ -511,7 +511,9 @@ status --live (#374)                  read back by a fresh CLI engine: K10, K9 a
                                       cached status, a code for every engine sink; the K10
                                       sequence run as displayed, posting and binding; a FIX
                                       candidate no record names; a credential across each
-                                      cut; a verified PR description edited since)
+                                      cut; a verified PR description edited since; the whole
+                                      human status naming only the package's commands, in
+                                      every scenario and with the saved reason, PR #470 R4-F1)
 the evaluation protocol (#318)        test_evaluation.py (the pins, what arms hold equal, the
                                       statistics and decision on synthetic records, what never
                                       runs in CI; the protocol held to its files),

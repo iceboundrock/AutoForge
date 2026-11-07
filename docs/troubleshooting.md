@@ -75,7 +75,8 @@ that sets `state_dir`), or run from another directory.
   PR and branch, the configuration the run is on (`Config:`), the `Phase:`,
   the review round, the reviewed HEAD and base, the open findings,
   `Reason:` (the block or failure reason), the last `Unblocked:` entry, any
-  acceptance or operator actions with their next commands, the `Recovery`
+  acceptance, operator or PR description actions (each sends you to the
+  `Recovery` block for its next commands), the `Recovery`
   block (the stop's diagnosis, what it proves, what is pending on which
   target, what is forbidden, what not to touch and the next commands, each
   claim labelled

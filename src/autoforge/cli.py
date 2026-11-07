@@ -88,7 +88,6 @@ from .effects import (
     FixContext,
     Stage,
     sha256_text,
-    unverified_before,
 )
 from .engine import (
     ControllerEngine,
@@ -2959,8 +2958,34 @@ def _pr_body_updates(state: AutoForgeState) -> list[dict]:
     return out
 
 
+#: The ``next:`` of an acceptance, operator or PR body action block of ``status``
+#: whose action is not yet verified (PR #470 R4-F1). The ``Recovery`` block that
+#: follows is the one part of the human output that names a command which leaves
+#: or continues the stop (an ``unblock``, a ``resume``, a post or a bind): its steps
+#: are those this stop allows, in the order ``unblock`` accepts them, for the phase,
+#: the plan, the stage and authorization of each record and the configuration
+#: loaded. A block that spelled its own would say less and could contradict it (an
+#: approval under ``off``, a decline of operator actions in conflict, a ``resume``
+#: of a BLOCKED run). A record of the current plan exists only in FIX, BLOCKED or
+#: FAILED, so the Recovery block is always printed beside the block.
+SEE_RECOVERY = (
+    "the steps under 'Recovery' below: only the commands this stop allows, in the order "
+    "'unblock' accepts them"
+)
+#: Under ``Reason:`` of a stopped run whose Recovery block is printed: the reason is
+#: the text saved with the stop, and a command it names is as of then (PR #470 R4-F1).
+REASON_NOTE = (
+    "saved with the stop, under the configuration of then; the steps under 'Recovery' "
+    "below are those this stop allows now"
+)
+
+
 def _render_pr_body_updates(state: AutoForgeState, engine: ControllerEngine) -> list[str]:
-    """The human ``PR body update`` blocks of ``status`` (#423); none without one."""
+    """The human ``PR body update`` blocks of ``status`` (#423); none without one.
+
+    A block describes its action; its next steps are the Recovery block's
+    (:data:`SEE_RECOVERY`).
+    """
     lines: list[str] = []
     records = state.phase_effects().records
     push = next((r for r in records if r.kind is EffectKind.PUSH), None)
@@ -2972,9 +2997,16 @@ def _render_pr_body_updates(state: AutoForgeState, engine: ControllerEngine) -> 
         if record.precondition["authorization"] == AUTHORIZATION_POLICY:
             authorization = "authorized by policy (safety.pr_body_updates: auto)"
         else:
+            setting = engine.config.safety.pr_body_updates
+            # Under 'off' unblock records no approval (PR #470 R2-F2, R4-F1).
+            refused = (
+                ", under which 'unblock' records none"
+                if setting == PR_BODY_UPDATES_OFF and not record.authorized
+                else ""
+            )
             authorization = (
                 "operator approval required (recorded with the plan; "
-                f"safety.pr_body_updates is now {engine.config.safety.pr_body_updates})"
+                f"safety.pr_body_updates is now {setting}{refused})"
             )
         lines += [
             f"PR body update {action} (FIX, review round {state.review_round})",
@@ -2999,29 +3031,7 @@ def _render_pr_body_updates(state: AutoForgeState, engine: ControllerEngine) -> 
                 f"  worktree:      {engine.agent_worktree_description()} holds the unpushed "
                 "candidate; do not reset it",
             ]
-        why = '"..."'
-        plain = f"{engine.cli_command('unblock', '--reason')} {why}"
-        decline = f"{engine.cli_command('unblock', '--decline-action', action, '--reason')} {why}"
-        if record.stage is Stage.INTENDED and not record.authorized:
-            ahead = ", ".join(r.action_id for r in unverified_before(records, record))
-            lines += [
-                f"  next:          approve:  "
-                f"{engine.cli_command('unblock', '--approve-action', action, '--reason')} {why}"
-                f" ; {engine.resume_command()}",
-                "                 or set the PR body to exactly that payload, then: "
-                f"{plain} ; {engine.resume_command()}",
-                f"                 a decline is refused until {ahead} is verified"
-                if ahead
-                else f"                 or decline: {decline} (FIX runs again)",
-            ]
-        elif record.stage is Stage.CONFLICT:
-            lines += [
-                f"  next:          put the body back to the expected sha256, or set it to exactly "
-                f"the payload, then: {plain} ; {engine.resume_command()}",
-                f"                 or keep the body and decline: {decline} (FIX runs again)",
-            ]
-        else:
-            lines.append(f"  next:          {engine.resume_command()}")
+        lines.append(f"  next:          {SEE_RECOVERY}")
     for outcome in state.pr_body_outcomes:
         lines += [
             f"PR body update {outcome['action_id']} (review round {outcome['round']}, findings "
@@ -3035,7 +3045,10 @@ def _render_pr_body_updates(state: AutoForgeState, engine: ControllerEngine) -> 
 
 
 def _render_acceptance_actions(state: AutoForgeState, engine: ControllerEngine) -> list[str]:
-    """The human ``Acceptance action`` blocks of ``status`` (#211); none without one."""
+    """The human ``Acceptance action`` blocks of ``status`` (#211); none without one.
+
+    Next steps: :data:`SEE_RECOVERY`.
+    """
     from .claims import ACCEPTANCE, scan
 
     lines: list[str] = []
@@ -3056,9 +3069,15 @@ def _render_acceptance_actions(state: AutoForgeState, engine: ControllerEngine) 
         if record.precondition["authorization"] == AUTHORIZATION_POLICY:
             authorization = "authorized by policy (safety.acceptance_actions: auto)"
         else:
+            setting = engine.config.safety.acceptance_actions
+            # Under 'off' unblock records no approval (PR #470 R3-F1, R4-F1).
+            refused = (
+                ", under which 'unblock' records none"
+                if setting == ACCEPTANCE_ACTIONS_OFF and not record.authorized
+                else ""
+            )
             authorization = (
-                "operator approval required (safety.acceptance_actions: "
-                f"{engine.config.safety.acceptance_actions})"
+                f"operator approval required (safety.acceptance_actions: {setting}{refused})"
             )
         lines += [
             f"Acceptance action {action} (FIX, review round {claim.round}, finding "
@@ -3082,25 +3101,7 @@ def _render_acceptance_actions(state: AutoForgeState, engine: ControllerEngine) 
                 f"  worktree:      {engine.agent_worktree_description()} holds the unpushed "
                 "candidate; do not reset it",
             ]
-        if record.stage is Stage.INTENDED and not record.authorized:
-            why = '"..."'
-            lines += [
-                f"  next:          approve:  "
-                f"{engine.cli_command('unblock', '--approve-action', action, '--reason')} {why}"
-                f" ; {engine.resume_command()}",
-                "                 or post exactly that payload yourself, then: "
-                f"{engine.cli_command('unblock', '--reason')} {why} ; {engine.resume_command()}",
-                "                 or decline: "
-                f"{engine.cli_command('unblock', '--decline-action', action, '--reason')} {why}"
-                " (FIX runs again)",
-            ]
-        elif record.stage is Stage.CONFLICT:
-            lines.append(
-                "  next:          repair or remove the comment(s) named above, then "
-                f'{engine.cli_command("unblock", "--reason")} "..."'
-            )
-        else:
-            lines.append(f"  next:          {engine.resume_command()}")
+        lines.append(f"  next:          {SEE_RECOVERY}")
     for outcome in state.acceptance_outcomes:
         label = (
             f"verified: {outcome['comment_url']}"
@@ -3184,12 +3185,14 @@ def _operator_actions(state: AutoForgeState) -> list[dict]:
 
 
 def _render_operator_actions(state: AutoForgeState, engine: ControllerEngine) -> list[str]:
-    """The human ``Operator actions`` blocks of ``status`` (#243); none without one."""
+    """The human ``Operator actions`` blocks of ``status`` (#243); none without one.
+
+    Next steps: :data:`SEE_RECOVERY`.
+    """
     from .claims import OPERATOR_COMMENT, scan
 
     records = _operator_records(state)
     lines: list[str] = []
-    why = '"..."'
     findings: dict[str, list[EffectRecord]] = {}
     for record in records:
         fid = scan(OPERATOR_COMMENT, record.marker).claims[0].finding_id
@@ -3212,12 +3215,18 @@ def _render_operator_actions(state: AutoForgeState, engine: ControllerEngine) ->
             allowed = "; ".join(
                 allowed_text.get(str(b), str(b)) for b in record.precondition["allowed_by"]
             )
+            # A record in conflict is repaired, never bound over (PR #470 R4-F1).
+            evidence = (
+                "; in conflict, so repaired, never bound over"
+                if record.stage is Stage.CONFLICT
+                else ", or an existing comment you bind"
+            )
             lines += [
                 f"      allowed:   {allowed} (issue body sha256 "
                 f"{record.precondition['issue_body_sha256']})",
                 f"      payload:   {len(record.body)} chars, sha256 {sha256_text(record.body)}",
                 "      evidence:  exactly one comment on the target with this action's marker "
-                "and exactly these bytes, or an existing comment you bind",
+                f"and exactly these bytes{evidence}",
             ]
     pending = [r for r in records if r.stage is not Stage.OBSERVED]
     if pending:
@@ -3239,35 +3248,7 @@ def _render_operator_actions(state: AutoForgeState, engine: ControllerEngine) ->
         )
         if others:
             lines.append(f"             {others} follow-up write(s) are held back as well")
-        first = pending[0]
-        action = first.action_id
-        kept = [r.action_id for r in records if r.stage is Stage.OBSERVED]
-        declines = [a for r in pending for a in ("--decline-action", r.action_id)]
-        # An applied bind leaves BLOCKED at once (PR #470 R1-F2): every binding
-        # goes in one unblock, in place of the plain one, never before it.
-        pairs = "".join(
-            f" --bind-evidence {r.action_id} <comment URL>"
-            for r in pending
-            if r.stage is Stage.INTENDED and (r.binding is None or r.reason)
-        )
-        lines += [
-            f"  next:      read it:  {engine.cli_command('status', '--action', action)}",
-            f"             post it:  {engine.cli_command('status', '--action', action)} | "
-            f"gh issue comment {first.target['issue_url']} --body-file -",
-            f"             then:     {engine.cli_command('unblock', '--reason')} {why} && "
-            f"{engine.resume_command()}",
-        ]
-        if pairs:
-            lines += [
-                f"             or bind:  {engine.cli_command('unblock')}{pairs} --reason {why} && "
-                f"{engine.resume_command()}",
-                "                       (in place of 'then', after posting every action you do "
-                "not bind: one unblock binds them all, so drop the pair of each one you posted)",
-            ]
-        lines.append(
-            f"             withdraw: {engine.cli_command('unblock', *declines, '--reason')} {why}"
-            + (f"  (keeps {', '.join(kept)} verified)" if kept else "")
-        )
+        lines.append(f"  next:      {SEE_RECOVERY}")
     for outcome in state.operator_comment_outcomes:
         label = (
             f"verified ({outcome['evidence']}): {outcome['comment_url']}"
@@ -3366,6 +3347,10 @@ def _render_status(
     lines += _render_replan_journal(txn)
     if state.block_reason:
         lines.append(f"Reason:     {state.block_reason}")
+        if recovery and state.phase in (Phase.BLOCKED, Phase.FAILED):
+            # The text was rendered when the run stopped, under the configuration
+            # of then; the Recovery block reads the one loaded now (PR #470 R4-F1).
+            lines.append(f"            ({REASON_NOTE})")
     if stop is not None and stop.outcome in (StopOutcome.BLOCKED, StopOutcome.FAILED):
         lines.append(f"Stop:       {stop.line().removeprefix('stop: ')}")
     lines += review or []

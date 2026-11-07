@@ -1594,11 +1594,13 @@ def test_an_edited_description_cannot_be_declined_once_a_later_write_is_out(
 # -- a description update put in conflict, approved or not (PR #470 R2-F2) ---------------------
 
 
-def _k12_conflicted(tmp_state_dir, policy: str):
+def _k12_conflicted(tmp_state_dir, policy: str, *, off_before_the_stop: bool = False):
     """K12 in conflict through an edit after its plan was saved: the process dies once the
     plan is on disk, a human edits the description, and the resumed FIX finds it neither
     the plan's base nor its payload. Under ``approve`` the update was never approved;
-    under ``auto`` the policy recorded with the plan authorized it."""
+    under ``auto`` the policy recorded with the plan authorized it. With
+    ``off_before_the_stop`` the operator set ``safety.pr_body_updates: off`` before the
+    resumed FIX stopped."""
     gh = FakeGitHub()
     eng = _updating(
         tmp_state_dir, gh, scripted(fixer(pr_body_update("R1-F1"), commit=False)), policy=policy
@@ -1616,6 +1618,8 @@ def _k12_conflicted(tmp_state_dir, policy: str):
     with pytest.raises(KeyboardInterrupt):
         eng.step()
     gh.prs[PR].body = _base(eng.state.run_id, A_HUMAN_EDIT)
+    if off_before_the_stop:
+        _pr_body_off(eng)
     eng.load()
     out = eng.step()
     assert out.next_phase == "BLOCKED", out.message
@@ -2020,3 +2024,292 @@ def test_an_authorized_acceptance_with_no_saved_code_is_offered_conditionally(tm
     assert f"reopen {ISSUE} if it is closed" in step.text
     assert not [s for s in package.next if f"-action {action}" in s.command]
     assert not [c for c in package.unknown if c.key == f"eligible-{action}"]
+
+
+# -- the whole human output agrees with the package (PR #470 R4-F1) -------------------------
+
+
+def _k12_saved_in_fix(tmp_state_dir):
+    """FIX saved its plan, a K12 awaiting approval, and the process died before it
+    blocked: the run is in FIX, which 'unblock' refuses, so only 'resume' continues it."""
+    gh = FakeGitHub()
+    eng = _updating(
+        tmp_state_dir, gh, scripted(fixer(pr_body_update("R1-F1"), commit=False)), policy="approve"
+    )
+    save = eng._save
+
+    def dying(*args, **kwargs):
+        save(*args, **kwargs)
+        records = load_state(eng.paths.state_file).effect_records
+        if any(r["kind"] == EffectKind.PR_BODY_UPDATE.value for r in records):
+            eng._save = save
+            raise KeyboardInterrupt
+
+    eng._save = dying
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    state = load_state(eng.paths.state_file)
+    assert state.phase is Phase.FIX
+    assert not _k12(eng).authorized and _k12(eng).stage is Stage.INTENDED
+    return eng
+
+
+def _k10_failed(tmp_state_dir):
+    """A FAILED run that kept its FIX plan (operator actions pending): 'unblock' and
+    'resume' both refuse FAILED, and only a new run goes on."""
+    eng = _k10_blocked(tmp_state_dir)
+    state = load_state(eng.paths.state_file)
+    state.phase = Phase.FAILED
+    state.stop_code = ""
+    save_state(state, eng.paths.state_file)
+    return eng
+
+
+def _k9_off(tmp_state_dir):
+    eng = _k9_blocked(tmp_state_dir)
+    _acceptance_off(eng)
+    return eng
+
+
+def _k12_off(tmp_state_dir):
+    eng = _k12_blocked(tmp_state_dir)
+    _pr_body_off(eng)
+    return eng
+
+
+def _k12_conflict_off(tmp_state_dir):
+    eng = _k12_conflicted(tmp_state_dir, "approve")
+    _pr_body_off(eng)
+    return eng
+
+
+#: Every stop that holds an acceptance, operator or PR body action, and the scenario
+#: table's others: what a whole 'status' prints must agree with its package.
+HUMAN_SCENARIOS = {
+    **BLOCKED_SCENARIOS,
+    "k9-acceptance-actions-off": _k9_off,
+    "k9-held-by-its-issue": lambda d: _k9_held_by_issue(d, "policy", "CLOSED"),
+    "k10-one-in-conflict": _k10_conflicted,
+    "k10-kept-by-a-failed-run": _k10_failed,
+    "k10-then-k12": _k10_then_k12,
+    "k12-pr-body-updates-off": _k12_off,
+    "k12-unapproved-conflict": lambda d: _k12_conflicted(d, "approve"),
+    "k12-authorized-conflict": lambda d: _k12_conflicted(d, "auto"),
+    "k12-unapproved-conflict-off": _k12_conflict_off,
+    "k12-verified-then-edited": _k12_verified_then_edited,
+    "k12-saved-in-a-fix-that-died": _k12_saved_in_fix,
+}
+#: The scenarios whose saved reason is not of the stop as 'status' reads it: the
+#: configuration changed after the stop, or the phase did (a FAILED run that kept a
+#: plan its BLOCKED stop named). 'status' says the reason is as of the stop.
+STALE_REASONS = {
+    "k9-acceptance-actions-off",
+    "k10-kept-by-a-failed-run",
+    "k12-pr-body-updates-off",
+    "k12-unapproved-conflict-off",
+}
+
+
+def _human_status(status_cli, eng, capsys) -> tuple[str, str, str]:
+    """``status``'s whole human output, its Recovery block, and everything but that block."""
+    rc, out, err = status_cli(eng, "status", capsys=capsys)
+    assert rc == 0, err
+    start = out.index("\nRecovery (")
+    end = out.index("\nOuter sandbox:", start)
+    return out, out[start:end], out[:start] + out[end:]
+
+
+def _displayed_commands(block: str) -> list[str]:
+    """The command of each step the human Recovery block numbers or offers with 'or:'.
+
+    A step prints ``<command>  (<text>)``, or its text alone when no command performs
+    it; neither part holds two spaces in a row, since each is put on one line.
+    """
+    commands = []
+    for line in block.splitlines():
+        step = re.match(r"(?:    \d+\. |      or: )(.*)$", line)
+        if step and "  (" in step.group(1):
+            commands.append(step.group(1).split("  (", 1)[0])
+    return commands
+
+
+def _offered_unblocks(text: str) -> list[str]:
+    """Every 'unblock' ``text`` spells for the operator to type, up to its reason: as
+    'status' spells it (``--reason "..."``) or as a reason saved with a stop does
+    (``--reason '<why>'``), with whatever global flags."""
+    return re.findall(
+        r"autoforge(?: --[\w-]+ \S+)* unblock .*?--reason (?:\"\.\.\.\"|'<why>')", text
+    )
+
+
+@pytest.mark.parametrize("scenario", sorted(HUMAN_SCENARIOS))
+def test_the_whole_human_status_names_only_the_packages_commands(
+    tmp_state_dir, status_cli, capsys, scenario
+):
+    """The Recovery block is the one part of the human output that names a command which
+    leaves or continues the stop: an action block describes its action and sends the
+    operator there, so no line before it can offer what the package forbids (an
+    approval under 'off', a decline of operator actions in conflict, a restored base
+    and a plain unblock for an update never approved, a 'resume' of a BLOCKED run, an
+    'unblock' of a run in FIX or FAILED). The human block's commands are exactly the
+    package's, and no command anywhere in the output is one the package forbids."""
+    eng = HUMAN_SCENARIOS[scenario](tmp_state_dir)
+    prefix = _prefix(eng)
+    package = _recovery(status_cli, eng, capsys)
+    out, block, rest = _human_status(status_cli, eng, capsys)
+    for command in (f"{prefix} unblock", f"{prefix} resume", f"{prefix} run ", "gh issue comment"):
+        assert command not in rest, (command, rest)
+    assert " epic resume " not in rest and " epic archive " not in rest
+    waiting = [
+        p["action_id"]
+        for p in package["pending"]
+        if p["action_id"] and p["kind"] != "push" and p["stage"] != "observed"
+    ]
+    if waiting:
+        assert f"next:          {cli.SEE_RECOVERY}" in rest or (
+            f"next:      {cli.SEE_RECOVERY}" in rest
+        )
+    assert _displayed_commands(block) == _commands(package)
+    reason = next((line for line in out.splitlines() if line.startswith("Reason:")), "")
+    if reason and package["outcome"] in ("blocked", "failed"):
+        assert f"{reason}\n            ({cli.REASON_NOTE})\n" in out
+    # The saved reason's commands, too, unless it predates what 'status' reads now.
+    offered = _offered_unblocks(out.replace(reason, "") if scenario in STALE_REASONS else out)
+    for claim in package["forbidden"]:
+        for flag, action in re.findall(
+            r"'unblock (--approve-action|--decline-action|--bind-evidence) ([A-Z]-[0-9a-f]{16})'",
+            claim["text"],
+        ):
+            assert not [c for c in offered if f"{flag} {action}" in c], (claim, offered)
+    if "decline-operator-actions" in _keys(package["forbidden"]):
+        operator = [p["action_id"] for p in package["pending"] if p["kind"] == "operator_comment"]
+        assert not [c for c in offered for a in operator if f"--decline-action {a}" in c]
+    if package["outcome"] != "blocked":
+        assert not offered, offered
+
+
+def test_acceptance_actions_off_the_whole_status_offers_no_approval(
+    tmp_state_dir, status_cli, capsys
+):
+    """R4-F1's first probe: under 'off' no line of 'status' offers the approval 'unblock'
+    refuses; the action block says why none is recorded, and sends the operator to the
+    Recovery block, whose first way is the payload posted by hand."""
+    eng = _k9_off(tmp_state_dir)
+    action = _k9(eng).action_id
+    prefix = _prefix(eng)
+    out, block, rest = _human_status(status_cli, eng, capsys)
+    assert f"{prefix} unblock --approve-action" not in out
+    assert (
+        "authorization: operator approval required (safety.acceptance_actions: off, under "
+        "which 'unblock' records none)"
+    ) in rest
+    # The reason was saved under 'approve', before the key changed: status says so.
+    [reason] = [line for line in out.splitlines() if line.startswith("Reason:")]
+    assert f"{reason}\n            ({cli.REASON_NOTE})\n" in out
+    assert f"next:          {cli.SEE_RECOVERY}" in rest
+    assert f"{prefix} status --action {action} | gh issue comment {ISSUE} --body-file -" in block
+    rc, out, err = status_cli(
+        eng, "unblock", "--dry-run", "--approve-action", action, "--reason", "x", capsys=capsys
+    )
+    assert "would stay BLOCKED" in out and "cannot be approved while" in out, out + err
+
+
+def test_operator_actions_in_conflict_the_whole_status_offers_no_withdrawal(
+    tmp_state_dir, status_cli, capsys
+):
+    """R4-F1's second probe: with one operator action in conflict no line of 'status'
+    offers the withdrawal 'unblock' refuses, nor a binding of the action in conflict;
+    its block says it is repaired, never bound over."""
+    eng = _k10_conflicted(tmp_state_dir)
+    x16, x158 = _k10(eng, T16), _k10(eng, T158)
+    prefix = _prefix(eng)
+    out, block, rest = _human_status(status_cli, eng, capsys)
+    assert f"{prefix} unblock --decline-action" not in out
+    # Nor the reason saved with the stop, which names the repair instead.
+    assert not [c for c in _offered_unblocks(out) if "--decline-action" in c]
+    assert not [c for c in _offered_unblocks(out) if f"--bind-evidence {x16.action_id}" in c]
+    [reason] = [line for line in out.splitlines() if line.startswith("Reason:")]
+    assert f"No withdrawal is possible while {x16.action_id} is in conflict" in reason
+    assert f"--bind-evidence {x158.action_id} <comment URL>" in reason
+    entry = rest[rest.index(f"  {x16.action_id}  comment on {T16}") :]
+    entry = entry[: entry.index(f"  {x158.action_id}  comment on {T158}")]
+    assert "and exactly these bytes; in conflict, so repaired, never bound over" in entry
+    assert "an existing comment you bind" not in entry
+    assert f"next:      {cli.SEE_RECOVERY}" in rest
+    declines = ("--decline-action", x16.action_id, "--decline-action", x158.action_id)
+    rc, out, err = status_cli(
+        eng, "unblock", "--dry-run", *declines, "--reason", "x", capsys=capsys
+    )
+    assert "would stay BLOCKED" in out and "repaired, never declined" in out, out + err
+
+
+def test_an_unapproved_update_in_conflict_the_whole_status_never_restores_then_unblocks(
+    tmp_state_dir, status_cli, capsys
+):
+    """R4-F1's third probe: for an update never approved, no line of 'status' (the
+    action block, the reason saved with the stop, the Recovery block) says to put the
+    description back to its base and then run a plain unblock, which refuses until
+    the approval: the base is named only with the approval of exactly this id, and
+    a plain unblock's own refusal says the same. Restored to the base, a plain unblock
+    stays BLOCKED, awaiting that approval."""
+    eng = _k12_conflicted(tmp_state_dir, "approve")
+    action = _k12(eng).action_id
+    base = _k12(eng).precondition["base_sha256"]
+    prefix = _prefix(eng)
+    out, block, rest = _human_status(status_cli, eng, capsys)
+    assert "put the body back to the expected sha256" not in out
+    assert f"next:          {cli.SEE_RECOVERY}" in rest
+    assert f"{prefix} unblock" not in rest[: rest.index("\nReason:")]
+    restores = [
+        line for line in out.splitlines() if re.search(rf"back to (exactly )?sha256 {base}", line)
+    ]
+    assert len(restores) == 2 and all(f"--approve-action {action}" in r for r in restores)
+    [reason] = [line for line in out.splitlines() if line.startswith("Reason:")]
+    assert "Next: set the body to exactly the payload" in reason
+    assert "its base included, is refused. Or put the body back to exactly sha256" in reason
+    [restore] = [line for line in block.splitlines() if f"back to sha256 {base}" in line]
+    assert restore.startswith(
+        f'      or: {prefix} unblock --approve-action {action} --reason "..."  ('
+    )
+    rc, out, err = status_cli(eng, "unblock", "--dry-run", "--reason", "x", capsys=capsys)
+    assert "would stay BLOCKED" in out and "set the body to exactly the payload" in out
+    assert f"or put the body back to exactly sha256 {base}" in out
+    assert f"--approve-action {action}" in out, out + err
+    eng.github.prs[PR].body = _base(eng.state.run_id)
+    rc, out, err = status_cli(eng, "unblock", "--dry-run", "--reason", "x", capsys=capsys)
+    assert "would stay BLOCKED" in out and f"action {action} awaits approval" in out, out + err
+
+
+def test_an_update_never_approved_names_no_approval_in_its_reason_under_off(tmp_state_dir):
+    """Stopped on the conflict while safety.pr_body_updates is off, the reason saved with
+    the stop and a plain unblock's refusal name the payload and the decline, and neither
+    the approval 'unblock' would refuse nor a way back to the base, which needs it."""
+    eng = _k12_conflicted(tmp_state_dir, "approve", off_before_the_stop=True)
+    action = _k12(eng).action_id
+    reason = load_state(eng.paths.state_file).block_reason
+    refused = eng.unblock("x")
+    assert not refused.unblocked
+    for text in (reason, refused.message):
+        assert "set the body to exactly the payload" in text
+        assert f"--decline-action {action}" in text
+        assert "--approve-action" not in text and "put the body back" not in text
+
+
+def test_a_k10_stops_reason_names_the_sequence_unblock_accepts(tmp_state_dir):
+    """The reason saved with an operator-actions stop names the package's sequence (PR #470
+    R1-F2, R4-F1): a plain unblock once every action is posted, or in its place one unblock
+    that binds every comment bound (one bind per action, each followed by an unblock,
+    would leave the second refused); withdrawing them all is the other way."""
+    eng = _k10_blocked(tmp_state_dir)
+    x16, x158 = _k10(eng, T16).action_id, _k10(eng, T158).action_id
+    reason = load_state(eng.paths.state_file).block_reason
+    binds = re.findall(r"autoforge unblock (?:--bind-evidence [^ ]+ <comment URL> )+", reason)
+    assert binds == [
+        f"autoforge unblock --bind-evidence {x16} <comment URL> --bind-evidence {x158} "
+        "<comment URL> "
+    ]
+    assert "Once every action is posted" in reason and "in place of that unblock" in reason
+    assert (
+        f"To withdraw them instead: autoforge unblock --decline-action {x16} "
+        f"--decline-action {x158} --reason '<why>'"
+    ) in reason

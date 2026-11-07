@@ -8,6 +8,7 @@ writes sent, never an internal call.
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 from dataclasses import replace
@@ -43,7 +44,7 @@ from autoforge.github import MAX_BODY_CHARS
 from autoforge.read_context import MAX_BODY_CHARS as MAX_QUOTED_BODY_CHARS
 from autoforge.result_parser import MAX_PR_BODY_CHARS, FixResult
 from autoforge.state import MAX_DECLINES_PER_ROUND, load_state
-from autoforge.stop_classification import StopReasonCode
+from autoforge.stop_classification import StopReasonCode, classify_state
 from autoforge.transitions import Phase
 from tests.conftest import (
     BRANCH,
@@ -141,6 +142,17 @@ def _resumed(eng, tmp_state_dir, gh: FakeGitHub, script="never", policy: str | N
     eng2.origin = eng.origin
     eng2.load()
     return eng2
+
+
+def _status_text(state, eng) -> str:
+    """The PR body update block and the Recovery block after it, as ``status`` prints them.
+
+    The block describes the update and sends the operator to the Recovery block for
+    the next steps, which names only those the stop allows (PR #470 R4-F1).
+    """
+    stop = classify_state(state, scheduler=False)
+    package = cli._recovery_package(eng, argparse.Namespace(config=None), state, stop, None)
+    return "\n".join(cli._render_pr_body_updates(state, eng) + package.lines())
 
 
 def _power_loss_at(eng, kind: EffectKind, stage: Stage, *, saved: bool) -> None:
@@ -1868,7 +1880,8 @@ def test_status_names_the_pending_action_and_prints_exactly_its_payload(tmp_stat
     run = eng.state.run_id
     state = load_state(eng.paths.state_file)
     record = _k12(eng)
-    lines = "\n".join(cli._render_pr_body_updates(state, eng))
+    block = "\n".join(cli._render_pr_body_updates(state, eng))
+    lines = _status_text(state, eng)
     for needle in (
         f"PR body update {record.action_id}",
         PR,
@@ -1876,12 +1889,15 @@ def test_status_names_the_pending_action_and_prints_exactly_its_payload(tmp_stat
         FINDING["title"],
         f"expected body: sha256 {sha256_text(_base(run))}",
         sha256_text(_payload(run)),
-        "--approve-action",
-        "--decline-action",
         "held back",
         "awaiting approval",
+        f"next:          {cli.SEE_RECOVERY}",
     ):
-        assert needle in lines, needle
+        assert needle in block, needle
+    # The commands are the Recovery block's alone (PR #470 R4-F1).
+    assert eng.cli_command("unblock") not in block
+    for flag in ("--approve-action", "--decline-action"):
+        assert eng.cli_command("unblock", flag, record.action_id, "--reason") in lines, flag
     [entry] = cli._pr_body_updates(state)
     assert entry["state"] == "awaiting_approval" and entry["finding_ids"] == ["R1-F2"]
     assert entry["pr"] == PR and entry["expected_body_sha256"] == sha256_text(_base(run))
@@ -2538,14 +2554,15 @@ def test_status_offers_the_decline_of_the_description_once_nothing_is_ahead_of_i
     k10 = _record_of(eng, EffectKind.OPERATOR_COMMENT)
     action = _k12(eng).action_id
     declining = eng.cli_command("unblock", "--decline-action", action, "--reason")
-    lines = "\n".join(cli._render_pr_body_updates(load_state(eng.paths.state_file), eng))
+    refused = f"'unblock --decline-action {action}' until {k10.action_id} is verified"
+    lines = _status_text(load_state(eng.paths.state_file), eng)
     assert declining not in lines
-    assert f"refused until {k10.action_id} is verified" in lines
+    assert f"[snapshot] {refused}: it is refused" in lines
     gh.add_comment(NOTE_TARGET, 7, _note_payload())
     assert eng.unblock(REASON).unblocked
     assert eng.step().next_phase == "BLOCKED"
-    lines = "\n".join(cli._render_pr_body_updates(load_state(eng.paths.state_file), eng))
-    assert declining in lines and "refused until" not in lines
+    lines = _status_text(load_state(eng.paths.state_file), eng)
+    assert declining in lines and refused not in lines
 
 
 def test_a_head_moved_between_the_description_and_the_push_keeps_the_verified_outcome(
@@ -2591,9 +2608,12 @@ def test_status_names_a_conflict_with_its_remedy(tmp_state_dir):
     eng2 = _resumed(eng, tmp_state_dir, gh)
     assert eng2.step().next_phase == "BLOCKED"
     state = load_state(eng2.paths.state_file)
-    lines = "\n".join(cli._render_pr_body_updates(state, eng2))
-    assert "conflict:" in lines and "put the body back to the expected sha256" in lines
-    assert "keep the body and decline" in lines
+    base = _k12(eng2).precondition["base_sha256"]
+    lines = _status_text(state, eng2)
+    assert "state:         conflict:" in lines
+    # Authorized by the policy saved with the plan: back to the base, or the payload.
+    assert f"put the PR description back to sha256 {base}, or set it to exactly" in lines
+    assert "keep the description as it is and decline the update" in lines
     assert cli._pr_body_updates(state)[0]["state"] == "conflict"
 
 

@@ -9253,11 +9253,19 @@ class ControllerEngine:
             )
         decline = self.cli_command("unblock", "--decline-action", action, "--reason")
         if found.action is Action.CONFLICT:
+            if record.authorized:
+                ways = f"put the body back to sha256 {expected}, set it to exactly the payload, "
+                ways += f"{payload}, or"
+            else:
+                # Never approved: a body put back to its base still awaits the
+                # approval a plain unblock cannot give (PR #470 R2-F2, R4-F1).
+                ways = f"set the body to exactly the payload, {payload};"
+                approval = self._pr_body_approval_way(record, "or")
+                ways += f" {approval}; or" if approval else " or"
             return UnblockDecision(
                 None,
                 f"action {action}: {found.reason}. An unblock reason is not evidence and the "
-                f"edit is not adopted: put the body back to sha256 {expected}, set it to exactly "
-                f"the payload, {payload}, or keep the edit and decline the action ({decline} "
+                f"edit is not adopted: {ways} keep the edit and decline the action ({decline} "
                 "'<why>'), which runs FIX again over the body as it is",
                 pr=pr,
             )
@@ -17312,19 +17320,51 @@ class ControllerEngine:
         action = record.action_id
         decline = self.cli_command("unblock", "--decline-action", action, "--reason")
         plain = self.cli_command("unblock", "--reason")
+        exact = (
+            f"exactly the payload, sha256 {sha256_text(record.body)} "
+            f"({self.cli_command('status', '--action', action)})"
+        )
+        if record.authorized:
+            ways = (
+                f"put the body back to exactly sha256 {record.precondition['base_sha256']} "
+                f"(GitHub keeps its edit history), or set it to {exact}, then {plain} '<why>': "
+                "the record is reconciled again within its attempt bound with no fixer launched."
+            )
+        else:
+            # Never approved: over its base too, a plain unblock is refused until the
+            # approval, so the base is named only with it (PR #470 R2-F2, R4-F1).
+            ways = (
+                f"set the body to {exact}, then {plain} '<why>': FIX adopts it with no fixer "
+                "launched. The update was never approved, so a plain unblock over any other body, "
+                "its base included, is refused."
+            )
+            approval = self._pr_body_approval_way(record, "Or")
+            if approval:
+                ways += f" {approval}."
         return _blocked(
             StopReasonCode.EFFECT_CONFLICT,
             f"{record.reason}. FIX of review round {state.review_round} resolved "
             f"{self._pr_body_findings_text()} by asking the controller to replace the description "
             f"of PR {record.target['pr_url']} (action {action}); the controller never writes over "
             "or adopts a body its plan did not expect, the fix is not recorded and the findings "
-            f"stay open. Next: put the body back to exactly sha256 "
-            f"{record.precondition['base_sha256']} (GitHub keeps its edit history), or set it to "
-            f"exactly the payload, sha256 {sha256_text(record.body)} "
-            f"({self.cli_command('status', '--action', action)}), then {plain} '<why>': the "
-            f"record is reconciled again within its attempt bound with no fixer launched. To keep "
-            f"the body as it is: {decline} '<why>', which drops the plan and runs FIX again over "
-            "that body",
+            f"stay open. Next: {ways} To keep the body as it is: {decline} '<why>', which drops "
+            "the plan and runs FIX again over that body",
+        )
+
+    def _pr_body_approval_way(self, record: EffectRecord, lead: str) -> str:
+        """``<lead> put the body back to its base and approve exactly`` ``record``'s id.
+
+        The way back to the plan's base for an update never approved, ``""``
+        under ``safety.pr_body_updates: off``, where ``unblock`` records no
+        approval (PR #470 R2-F2, R4-F1).
+        """
+        if self.config.safety.pr_body_updates == PR_BODY_UPDATES_OFF:
+            return ""
+        approve = self.cli_command("unblock", "--approve-action", record.action_id, "--reason")
+        return (
+            f"{lead} put the body back to exactly sha256 {record.precondition['base_sha256']} "
+            "(GitHub keeps its edit history) and approve exactly this action in place of a "
+            f"plain unblock ({approve} '<why>')"
         )
 
     def _fix_source_url(
@@ -17878,9 +17918,15 @@ class ControllerEngine:
 
         Names each operator action not verified (id, target, finding,
         state and why), the ones verified so far, what is held back, and the
-        commands: print and post a payload, bind an existing comment,
-        unblock and resume, or decline. Agent text appears only as the
-        finding's title, which the review result bounded to one line.
+        commands: print and post a payload, then one unblock (or, in its
+        place, one that binds every comment bound) and resume, or decline.
+        They are the ones ``unblock`` accepts, as ``status``'s recovery package
+        names them (PR #470 R1-F2, R3-F2, R4-F1): an applied bind leaves
+        BLOCKED at once, so the bindings go in the one unblock; an action in
+        conflict is repaired, never bound over; and no decline is named while
+        one is in conflict, since ``unblock`` refuses every decline then. Agent
+        text appears only as the finding's title, which the review result
+        bounded to one line.
         """
         state = self._require_state()
         why = "<why>"
@@ -17902,14 +17948,16 @@ class ControllerEngine:
                 what = "verification failed"
             elif record.binding is not None:
                 what = "evidence bound, not verified"
+            repair = (
+                "; it is in conflict, which is repaired, never bound over"
+                if record.stage is Stage.CONFLICT
+                else ""
+            )
             lines.append(
                 f"{record.action_id} (comment on {record.target['issue_url']} for "
                 f"{claim.finding_id} {title!r}; {len(record.body)} characters, sha256 "
                 f"{sha256_text(record.body)}): {what}: {reason}; print it with "
-                f"{self.cli_command('status', '--action', record.action_id)}, or bind an "
-                "existing comment with "
-                f"{self.cli_command('unblock', '--bind-evidence', record.action_id)} "
-                f"<comment URL> --reason {why!r}"
+                f"{self.cli_command('status', '--action', record.action_id)}{repair}"
             )
         done = [
             f"{r.action_id} ({(r.observed or {}).get('url')}, {(r.observed or {}).get('evidence')})"
@@ -17932,20 +17980,45 @@ class ControllerEngine:
         if others:
             held += f"; {others} follow-up write(s) are held back as well"
         pending = [r.action_id for r, _ in open_]
+        resume = self.resume_command()
         plain = f"{self.cli_command('unblock', '--reason')} {why!r}"
-        decline = (
-            f"{self.cli_command('unblock', *[a for p in pending for a in ('--decline-action', p)])}"
-            f" --reason {why!r}"
+        # A comment already bound, and not found wrong by FIX, is left in place.
+        pairs = "".join(
+            f" --bind-evidence {r.action_id} <comment URL>"
+            for r, _ in open_
+            if r.stage is Stage.INTENDED and (r.binding is None or r.reason)
         )
+        bind = (
+            "; or, in place of that unblock, bind comments already on the targets as the "
+            "evidence of the actions you did not post, all in one command (a bind that is "
+            f"applied leaves BLOCKED at once, so a second unblock would be refused): "
+            f"{self.cli_command('unblock')}{pairs} --reason {why!r} && {resume}"
+            if pairs
+            else ""
+        )
+        conflicts = [
+            r.action_id
+            for r in records
+            if r.kind is EffectKind.OPERATOR_COMMENT and r.stage is Stage.CONFLICT
+        ]
+        if conflicts:
+            withdraw = (
+                f"No withdrawal is possible while {', '.join(conflicts)} is in conflict: "
+                "'unblock' refuses every decline of these actions then, so repair it first"
+            )
+        else:
+            decline = self.cli_command(
+                "unblock", *[a for p in pending for a in ("--decline-action", p)]
+            )
+            withdraw = f"To withdraw them instead: {decline} --reason {why!r}"
         verified = f" Verified so far: {', '.join(done)}." if done else ""
         return bound_block_reason(
             f"FIX of review round {state.review_round} awaits {len(open_)} operator action(s) "
             f"on other issues of {state.repository}, which the operator posts and the "
-            f"controller only verifies; {held}. {' | '.join(lines)}.{verified} After posting "
-            "exactly a payload, or binding a comment, run "
-            f"{plain} && {self.resume_command()}: the unblock reads every pending target and "
-            "re-enters FIX only on progress; a reason, a checkbox or an unbound comment is "
-            f"never evidence. To withdraw them instead: {decline}"
+            f"controller only verifies; {held}. {' | '.join(lines)}.{verified} Once every "
+            f"action is posted (or its bound comment is in place), run {plain} && {resume}: "
+            "the unblock reads every pending target and re-enters FIX only on progress; a "
+            f"reason, a checkbox or an unbound comment is never evidence{bind}. {withdraw}"
         )
 
     def _operator_evidence(self, finding_id: str, records: Sequence[EffectRecord]) -> list[dict]:

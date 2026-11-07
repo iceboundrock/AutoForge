@@ -768,7 +768,9 @@ the target issue, the PR, the round and the finding, who authorizes it, its
 state (`awaiting approval`, `approved, not yet published`, `published, not
 yet verified`, `verified: <url>` or `verification failed: …`), the payload's
 size and SHA-256, the push held back and the agent worktree that alone holds
-the unpushed commit (do not reset or remove it), and the next steps. Read the
+the unpushed commit (do not reset or remove it). Its `next:` sends you to the
+`Recovery` block below it, whose steps are the ones this stop allows, in order
+([The recovery package](#the-recovery-package-and-status---live)). Read the
 exact comment with `autoforge status --action A-…`, then either:
 
 - **approve it:** `autoforge unblock --approve-action A-… --reason "..."`,
@@ -827,8 +829,9 @@ finding F …)` block with one `X-…` line per action (`pending (not yet
 verified)`, `evidence bound, not yet verified: <url>`, `verified (exact):
 <url>`, `verified (operator-bound; …): <url>` or `verification failed: …`),
 why each target is allowed, the payload's size and SHA-256, the push held
-back, the agent worktree that holds the unpushed commit (do not reset or
-remove it), and the next commands. For each action, either:
+back, and the agent worktree that holds the unpushed commit (do not reset or
+remove it). Its `next:` sends you to the `Recovery` block below it, which
+names the commands this stop allows, in order. For each action, either:
 
 - **post it:** `autoforge status --action X-… | gh issue comment <target>
   --body-file -` posts exactly the payload (its `ai-operator-comment`
@@ -932,8 +935,9 @@ description edited after that is never written over or adopted:
   `approve`, an update not yet approved still needs its approval when you put
   the body back: `unblock --approve-action B-…` in place of the plain `unblock`.
   Only the exact payload is taken without one, and under `off` that is the only
-  way, since `unblock` records no approval then. To keep your edit, `unblock
-  --decline-action B-…` runs the fixer again over it.
+  way, since `unblock` records no approval then; the stop's reason and a plain
+  `unblock`'s refusal name the base only with that approval. To keep your edit,
+  `unblock --decline-action B-…` runs the fixer again over it.
 - **Edited after the controller verified its write:** the description is read
   again before each later write of the plan and before the fix is recorded, so a
   mixed fix does not push over your edit. The run blocks (`effect-conflict`). Set
@@ -954,19 +958,20 @@ detected, because GitHub has no conditional update of a PR body; it is
 overwritten and stays in the PR's edit history.
 
 With `approve`, the step blocks (`acceptance-action`) with nothing sent, and
-`status` names the action, PR, findings, expected digest, payload and next
-commands. Then `unblock --approve-action B-…`, or set the body to exactly the
-payload yourself and `unblock`, or `unblock --decline-action B-…`; then `resume`.
+`status` names the action, PR, findings, expected digest and payload, and its
+`Recovery` block the next commands. Then `unblock --approve-action B-…`, or set
+the body to exactly the payload yourself and `unblock`, or `unblock
+--decline-action B-…`; then `resume`.
 An unblock reason on its own moves nothing. `off` refuses the resolution: the
 fixer is told it is unavailable, and a finding only a new description can resolve
 makes it report `blocked`, as before.
 
 A decline drops the whole plan, so `unblock --decline-action B-…` is refused while
 an acceptance or operator action ahead of the update is not verified: a comment
-already posted would lose its evidence. `status` shows that action's next steps. A
-plain `unblock` and `resume` save a comment that is there, and you can decline the
-update if the run stops at it again. Declining that action instead, where `status`
-offers it, drops the update with the plan.
+already posted would lose its evidence. `status`'s `Recovery` block shows that
+action's next steps. A plain `unblock` and `resume` save a comment that is there,
+and you can decline the update if the run stops at it again. Declining that
+action instead, where `status` offers it, drops the update with the plan.
 
 ### Taking over a PR another run owns
 
@@ -1918,10 +1923,17 @@ in:
   evidence;
 - **next:** the exact commands, with the flags this command was given, in
   order, alternatives marked `or:`; and the section of the
-  [troubleshooting guide](troubleshooting.md) for the case. The steps are
-  one sequence that can be followed as written: an `unblock` that is
-  applied leaves `BLOCKED` at once, so they end at the `resume` that
-  continues the run. Operator actions to bind go in one `unblock`, after
+  [troubleshooting guide](troubleshooting.md) for the case. This is the one
+  place `status` names a command that leaves or continues the stop (an
+  `unblock`, a `resume`, a payload to post or a comment to bind): the
+  `Acceptance action`, `Operator actions` and `PR body update` blocks above it
+  describe each action and send you here, so no line of the output offers a
+  command this stop refuses. `Reason:` is the text saved with the stop, and
+  `status` says so under it; where it names a command and the configuration
+  has changed since (a key set to `off`, say), follow this block, which reads
+  the configuration loaded now. The steps are one sequence that can be
+  followed as written: an `unblock` that is applied leaves `BLOCKED` at
+  once, so they end at the `resume` that continues the run. Operator actions to bind go in one `unblock`, after
   every other one is posted. A later wait of the same plan (a PR
   description update after operator actions, say) is the next stop's: run
   `status` again when the run stops there. Under `off`, an action that awaits

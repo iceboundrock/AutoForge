@@ -17,8 +17,17 @@ verified), and the exact next commands with the flags you ran `status` with,
 as one sequence `unblock` accepts in order: operator actions to bind go in
 one `unblock`, and a later wait of the same plan is left to the next stop.
 Each claim says whether it comes from the state file, the configuration,
-GitHub now, or is unknown. It replaces nothing: every other field and line
-of `status` is as before.
+GitHub now, or is unknown. Every other field of `status --json` is as
+before. In the human output the `Recovery` block is the one place that names
+an `unblock`, a `resume`, a payload to post or a comment to bind: the
+`Acceptance action`, `Operator actions` and `PR body update` blocks still
+describe each action, and their `next:` now sends you there instead of
+printing commands of their own, which could offer what the stop refuses (an
+approval under `off`, a withdrawal of operator actions while one is in
+conflict, a `resume` of a `BLOCKED` run). A PR description update never
+approved that meets an edited description now blocks with a reason, and a
+plain `unblock` refuses with a text, that name its base only with the
+approval of exactly its id, and not at all under `off`.
 
 The code comes from the state: the sink that enters `BLOCKED` or `FAILED`
 now saves its reason code with the stop (`stop_code`), so `status`, `resume`
