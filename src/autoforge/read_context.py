@@ -132,6 +132,25 @@ def render_pr(pr: PRInfo, comments: list[CommentInfo] | None, title: str = "Pull
     return "\n".join(lines)
 
 
+def pr_body_view_problem(body: str, rendered: str) -> str:
+    """Why ``rendered``, a file as written, does not quote ``body`` whole and unchanged, or "".
+
+    Decided on the file, not predicted from the bounds: one comparison covers the
+    body's own bound, the redactor and the bounds on the file and the directory.
+    A K12 update replaces all of ``body``, so its author must have read all of it
+    (#423). Quoted comments cannot pass for it: a copy of a body that was cut does
+    not fit a comment's smaller bound, and one the redactor changed is redacted
+    there too. The reason names no byte of the body.
+    """
+    if fenced_untrusted_block(body, "untrusted") in rendered:
+        return ""
+    if redact(body) != body:
+        return "the read context redacts part of it"
+    if len(body) > MAX_BODY_CHARS:
+        return f"it holds {len(body)} characters, and the read context quotes {MAX_BODY_CHARS}"
+    return "a bound on the read context's files cut it"
+
+
 def render_checks(pr: PRInfo) -> str:
     """The check summary GitHub reports for the PR's current head."""
     lines = [

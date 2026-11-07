@@ -827,7 +827,10 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   `FIX` only when the body holds the exact payload, or the base under an
   authorized record, and otherwise refuses: its reason is not evidence and a
   human edit is not adopted. When the PR moved, a plain `unblock` -> `FIX` routes
-  the drift to `REVIEW`, the update recorded `stale`.
+  the drift to `REVIEW`, the update recorded `stale`. A body edited after the
+  update was verified is read again here too: only the exact payload lets a plain
+  `unblock` -> `FIX`, and a decline is refused once a later write of the plan may
+  be out.
 - **An acceptance action awaiting the operator** (#211). A `FIX` plan's
   acceptance comment (K9, first in the plan) that is unapproved under
   `safety.acceptance_actions: approve` blocks the run with nothing sent.

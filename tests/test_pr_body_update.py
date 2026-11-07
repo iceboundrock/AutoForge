@@ -27,7 +27,7 @@ from autoforge.effects import (
     decide_pr_body_update,
     implementation_closing_block,
     pr_body_update_body,
-    protected_pr_body_tail,
+    protected_pr_body_block,
     sha256_text,
 )
 from autoforge.engine import render_implementation_marker
@@ -39,6 +39,7 @@ from autoforge.errors import (
     VerificationError,
 )
 from autoforge.github import MAX_BODY_CHARS
+from autoforge.read_context import MAX_BODY_CHARS as MAX_QUOTED_BODY_CHARS
 from autoforge.result_parser import MAX_PR_BODY_CHARS, FixResult
 from autoforge.state import MAX_DECLINES_PER_ROUND, load_state
 from autoforge.stop_classification import StopReasonCode
@@ -90,8 +91,8 @@ def _base(run_id: str, preface: str = PREFACE) -> str:
 
 
 def _payload(run_id: str, text: str = PR_BODY_TEXT) -> str:
-    """The exact bytes the controller composes for ``text``."""
-    return f"{text}\n\n{implementation_closing_block(ISSUE, run_id)}"
+    """The exact bytes the controller composes for ``text``: its block, then the text."""
+    return f"{implementation_closing_block(ISSUE, run_id)}\n\n{text}"
 
 
 def _updating(
@@ -468,30 +469,30 @@ _REFUSED_BASES = {
 
 
 @pytest.mark.parametrize("name", list(_REFUSED_BASES))
-def test_a_body_without_exactly_the_closing_block_is_refused_by_the_tail(name):
-    tail, why = protected_pr_body_tail(
+def test_a_body_without_exactly_the_closing_block_is_refused_by_the_block(name):
+    block_, why = protected_pr_body_block(
         _REFUSED_BASES[name]("af-this-run-1"), ISSUE, "af-this-run-1"
     )
-    assert tail == "" and why
+    assert block_ == "" and why
 
 
-def test_the_tail_keeps_the_markers_bytes_and_tolerates_a_web_edits_line_endings():
+def test_the_block_keeps_the_markers_bytes_and_tolerates_a_web_edits_line_endings():
     run = "af-this-run-1"
-    tail, why = protected_pr_body_tail(
+    block_, why = protected_pr_body_block(
         f"Text\r\n\r\nCloses #2\r\n\r\n{_marker(run)}\r\n", ISSUE, run
     )
-    assert why == "" and tail == f"Closes #2\n\n{_marker(run)}"
-    assert pr_body_update_body("Text", tail) == f"Text\n\nCloses #2\n\n{_marker(run)}"
+    assert why == "" and block_ == f"Closes #2\n\n{_marker(run)}"
+    assert pr_body_update_body("Text", block_) == f"Closes #2\n\n{_marker(run)}\n\nText"
 
 
 def test_a_second_controller_marker_is_kept_byte_for_byte_after_the_implementation_marker():
     """Any other controller marker the body holds is the controller's to keep, in order."""
     run = "af-this-run-1"
     other = '<!-- ai-replacement: {"txn": "a  b"} -->'
-    tail, why = protected_pr_body_tail(
+    block_, why = protected_pr_body_block(
         f"Text\n\n{other}\n\nCloses #2\n\n{_marker(run)}", ISSUE, run
     )
-    assert why == "" and tail == f"Closes #2\n\n{_marker(run)}\n\n{other}"
+    assert why == "" and block_ == f"Closes #2\n\n{_marker(run)}\n\n{other}"
 
 
 def test_a_marker_of_another_issue_beside_the_runs_own_stops_before_any_agent(tmp_state_dir):
@@ -900,26 +901,26 @@ def test_a_read_back_that_fails_conclusively_blocks_and_writes_nothing_more(tmp_
 # -- `gh` rewrites what it prints -----------------------------------------------------------------
 
 
-@pytest.mark.parametrize("control", ["\x07", "\x1b[31m", "\x7f"], ids=["bel", "esc", "del"])
-def test_a_base_gh_would_rewrite_is_read_exactly_and_the_digests_are_of_githubs_bytes(
-    tmp_state_dir, control
+@pytest.mark.parametrize("text", ["A literal ^G inside.", "With \x7f inside."], ids=["^G", "del"])
+def test_a_base_gh_prints_as_it_is_is_read_exactly_and_the_digests_are_of_githubs_bytes(
+    tmp_state_dir, text
 ):
-    """A human's edit holds a control character. `gh` prints it as caret notation; the
-    controller's digest and comparison use the exact read, so the plan binds the real
-    bytes and no false conflict or wrong digest appears."""
+    """A `^` makes the print suspect, so the controller's digest and comparison use the
+    exact read; a body that read shows to be the print is offered, and the plan binds the
+    real bytes with no false conflict. A rewritten one is not offered (the view's table)."""
     gh = FakeGitHub()
     gh.gh_sanitizes = True
     eng = _updating(
         tmp_state_dir,
         gh,
         scripted(fixer(pr_body_update("R1-F1"), commit=False)),
-        body=lambda r: _base(r, f"With {control} inside."),
+        body=lambda r: _base(r, text),
     )
     run = eng.state.run_id
     out = eng.step()
     assert out.next_phase == "REVIEW", out.message
     [outcome] = load_state(eng.paths.state_file).pr_body_outcomes
-    assert outcome["base_sha256"] == sha256_text(_base(run, f"With {control} inside."))
+    assert outcome["base_sha256"] == sha256_text(_base(run, text))
     assert _body_writes(gh) == [_payload(run)] and gh.prs[PR].body == _payload(run)
 
 
@@ -1037,6 +1038,592 @@ def test_a_second_invocation_after_the_phase_saved_sends_nothing(tmp_state_dir):
     eng2 = _resumed(eng, tmp_state_dir, gh, scripted(clean))
     assert eng2.step().next_phase == "READY_FOR_MERGE"
     assert len(_body_writes(gh)) == 1
+
+
+# -- a description verified, then edited (PR #467 R1-F1) -----------------------------------------
+
+
+def _mixed(tmp_state_dir, gh: FakeGitHub, *resolutions, findings: int = 2):
+    resolutions = resolutions or (fixed("R1-F1"), pr_body_update("R1-F2"))
+    return _updating(tmp_state_dir, gh, scripted(fixer(*resolutions)), findings=findings)
+
+
+def _edit_once_saved(eng, gh: FakeGitHub, kind: EffectKind, body: str) -> None:
+    """A human edits the description right after a ``kind`` record is saved as observed."""
+    persist = eng._persist_effect
+
+    def editing(record):
+        persist(record)
+        if record.kind is kind and record.stage is Stage.OBSERVED:
+            gh.prs[PR].body = body
+
+    eng._persist_effect = editing
+
+
+def test_an_edit_after_the_observation_save_stops_a_resumed_mixed_fix_before_the_push(
+    tmp_state_dir,
+):
+    """The description was verified and saved, the process died, a human edited it. The
+    resume neither pushes nor records the fix nor writes over the edit; a reason does not
+    move it; with the payload back the plan finishes, with no fixer and no second write."""
+    gh = FakeGitHub()
+    eng = _mixed(tmp_state_dir, gh)
+    reviewed = eng.state.reviewed_head_sha
+    run = eng.state.run_id
+    _power_loss_at(eng, EffectKind.PR_BODY_UPDATE, Stage.OBSERVED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    assert _body_writes(gh) == [_payload(run)] and eng.origin.head(BRANCH) == reviewed
+    edited = _payload(run, A_HUMAN_EDIT)
+    gh.prs[PR].body = edited
+
+    eng2 = _resumed(eng, tmp_state_dir, gh)
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop.code is StopReasonCode.EFFECT_CONFLICT
+    assert eng.origin.head(BRANCH) == reviewed and gh.prs[PR].head_sha == reviewed
+    assert _body_writes(gh) == [_payload(run)] and gh.prs[PR].body == edited
+    s = load_state(eng2.paths.state_file)
+    assert [f["id"] for f in s.open_findings] == ["R1-F1", "R1-F2"]
+    assert s.last_fix_resolutions == [] and s.pr_body_outcomes == []
+    assert s.effect_records, "the plan stays saved, with the candidate it pushes"
+    record = _k12(eng2)
+    assert record.stage is Stage.OBSERVED, "the journal stays true: the payload was verified"
+    for needle in (
+        "changed after the controller verified it",
+        sha256_text(edited),
+        sha256_text(_payload(run)),
+        f"--decline-action {record.action_id}",
+        f"--action {record.action_id}",
+        "was not sent",
+    ):
+        assert needle in s.block_reason, needle
+
+    refused = eng2.unblock("it looks fine to me")
+    assert not refused.unblocked and "not evidence and the edit is not adopted" in refused.message
+    refused = eng2.unblock("approve it", approve_action=record.action_id)
+    assert not refused.unblocked and sha256_text(edited) in refused.message
+
+    gh.prs[PR].body = _payload(run)
+    done = eng2.unblock("the payload is back")
+    assert done.unblocked and done.phase == "FIX", done.message
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert eng2.provider.calls == [] and _body_writes(gh) == [_payload(run)]
+    assert eng.origin.head(BRANCH) == gh.prs[PR].head_sha != reviewed
+    s = load_state(eng2.paths.state_file)
+    assert [r["resolution"] for r in s.last_fix_resolutions] == ["fixed", "pr_body_update"]
+    assert [o["outcome"] for o in s.pr_body_outcomes] == ["verified"]
+
+
+def test_an_edit_after_a_description_only_observation_never_reaches_review(tmp_state_dir):
+    """Nothing is left to send, so only the read before the fix is recorded can see it."""
+    gh = FakeGitHub()
+    eng = _updating(tmp_state_dir, gh, scripted(fixer(pr_body_update("R1-F1"), commit=False)))
+    run = eng.state.run_id
+    _power_loss_at(eng, EffectKind.PR_BODY_UPDATE, Stage.OBSERVED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    gh.prs[PR].body = _base(run)  # even the plan's own base is not its payload
+
+    eng2 = _resumed(eng, tmp_state_dir, gh)
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop.code is StopReasonCode.EFFECT_CONFLICT
+    assert "the plan pushes nothing" in out.message
+    assert _body_writes(gh) == [_payload(run)] and gh.prs[PR].body == _base(run)
+    s = load_state(eng2.paths.state_file)
+    assert s.last_fix_resolutions == [] and s.open_findings
+
+
+def test_an_edit_between_the_description_and_a_follow_up_sends_neither_it_nor_the_push(
+    tmp_state_dir,
+):
+    """In one process too: each later write of the plan reads the body first."""
+    gh = FakeGitHub()
+    eng = _mixed(
+        tmp_state_dir,
+        gh,
+        fixed("R1-F1"),
+        pr_body_update("R1-F2"),
+        new_follow_up("R1-F3"),
+        findings=3,
+    )
+    reviewed = eng.state.reviewed_head_sha
+    edited = _payload(eng.state.run_id, A_HUMAN_EDIT)
+    _edit_once_saved(eng, gh, EffectKind.PR_BODY_UPDATE, edited)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert _other_writes(gh) == [] and eng.origin.head(BRANCH) == reviewed
+    assert len(_body_writes(gh)) == 1 and gh.prs[PR].body == edited
+
+
+def test_an_edit_after_a_follow_up_went_out_cannot_be_declined_and_holds_the_push(tmp_state_dir):
+    """A decline would abandon the issue already created, so the block offers none and the
+    flag is refused. With the payload back the plan pushes, creating nothing twice."""
+    gh = FakeGitHub()
+    eng = _mixed(
+        tmp_state_dir,
+        gh,
+        fixed("R1-F1"),
+        pr_body_update("R1-F2"),
+        new_follow_up("R1-F3"),
+        findings=3,
+    )
+    reviewed = eng.state.reviewed_head_sha
+    run = eng.state.run_id
+    edited = _payload(run, A_HUMAN_EDIT)
+    _edit_once_saved(eng, gh, EffectKind.FOLLOW_UP_ISSUE, edited)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert _other_writes(gh) == ["create_issue"] and eng.origin.head(BRANCH) == reviewed
+    assert gh.prs[PR].body == edited
+    reason = load_state(eng.paths.state_file).block_reason
+    assert "--decline-action" not in reason and "can no longer be declined" in reason
+
+    action = _k12(eng).action_id
+    refused = eng.unblock(REASON)
+    assert not refused.unblocked and "--decline-action" not in refused.message
+    refused = eng.unblock(REASON, decline_action=[action])
+    assert not refused.unblocked and "would abandon" in refused.message
+    assert load_state(eng.paths.state_file).effect_records
+
+    gh.prs[PR].body = _payload(run)
+    assert eng.unblock("the payload is back").unblocked
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert _other_writes(gh) == ["create_issue"] and eng.origin.head(BRANCH) != reviewed
+    assert _body_writes(gh) == [_payload(run)]
+
+
+def test_an_edit_after_the_push_blocks_the_record_of_the_fix_and_pushes_nothing_more(tmp_state_dir):
+    """The candidate is on the branch and cannot be taken back, and the fix still is not
+    recorded over a description the plan did not write. Its head is the plan's own push,
+    never drift, so nothing routes to REVIEW until the payload is back."""
+    gh = FakeGitHub()
+    eng = _mixed(tmp_state_dir, gh)
+    reviewed = eng.state.reviewed_head_sha
+    run = eng.state.run_id
+    edited = _payload(run, A_HUMAN_EDIT)
+    _edit_once_saved(eng, gh, EffectKind.PUSH, edited)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop.code is StopReasonCode.EFFECT_CONFLICT
+    candidate = eng.origin.head(BRANCH)
+    assert candidate != reviewed and f"{candidate[:12]} is pushed" in out.message
+    s = load_state(eng.paths.state_file)
+    assert s.last_fix_resolutions == [] and s.open_findings and s.effect_records
+
+    action = _k12(eng).action_id
+    assert not eng.unblock(REASON).unblocked
+    refused = eng.unblock(REASON, decline_action=[action])
+    assert not refused.unblocked and "would abandon" in refused.message
+
+    gh.prs[PR].body = _payload(run)
+    done = eng.unblock("the payload is back")
+    assert done.unblocked and done.phase == "FIX", done.message
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert eng.origin.head(BRANCH) == candidate and eng.provider.calls[1:] == []
+    assert _body_writes(gh) == [_payload(run)]
+    assert [r["resolution"] for r in load_state(eng.paths.state_file).last_fix_resolutions] == [
+        "fixed",
+        "pr_body_update",
+    ]
+
+
+def test_an_operator_who_keeps_an_edit_made_after_verification_declines_and_the_fixer_runs_over_it(
+    tmp_state_dir,
+):
+    gh = FakeGitHub()
+    eng = _updating(tmp_state_dir, gh, scripted(fixer(pr_body_update("R1-F1"), commit=False)))
+    run = eng.state.run_id
+    _power_loss_at(eng, EffectKind.PR_BODY_UPDATE, Stage.OBSERVED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    edited = _payload(run, A_HUMAN_EDIT)
+    gh.prs[PR].body = edited
+    prompts = []
+
+    def afresh(req):
+        prompts.append(req.prompt)
+        return fixer(pr_body_update("R1-F1", "A better text."), commit=False)(req)
+
+    eng2 = _resumed(eng, tmp_state_dir, gh, scripted(afresh))
+    assert eng2.step().next_phase == "BLOCKED"
+    action = _k12(eng2).action_id
+    done = eng2.unblock("keep the edit", decline_action=[action])
+    assert done.unblocked and done.phase == "FIX", done.message
+    s = load_state(eng2.paths.state_file)
+    assert s.effect_records == [] and s.pr_body_outcomes[-1]["outcome"] == "declined"
+    assert s.pr_body_outcomes[-1]["reason"] == "keep the edit"
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert action in prompts[0] and "keep the edit" in prompts[0]
+    assert A_HUMAN_EDIT in (read_context_of(prompts[0]) / "pull-request.md").read_text()
+    assert _body_writes(gh) == [_payload(run), _payload(run, "A better text.")]
+    [_, verified] = load_state(eng2.paths.state_file).pr_body_outcomes
+    assert verified["outcome"] == "verified" and verified["base_sha256"] == sha256_text(edited)
+
+
+def test_a_body_only_the_print_of_the_verified_payload_is_an_edit(tmp_state_dir):
+    """The re-read is exact too: `gh` cannot tell a control character from the literal
+    caret it prints for it, and the exact read can."""
+    gh = FakeGitHub()
+    gh.gh_sanitizes = True
+    text = "A literal ^G in the description."
+    eng = _updating(tmp_state_dir, gh, scripted(fixer(pr_body_update("R1-F1", text), commit=False)))
+    run = eng.state.run_id
+    _power_loss_at(eng, EffectKind.PR_BODY_UPDATE, Stage.OBSERVED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    gh.prs[PR].body = _payload(run, text.replace("^G", "\x07"))
+    eng2 = _resumed(eng, tmp_state_dir, gh)
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop.code is StopReasonCode.EFFECT_CONFLICT
+
+
+def test_a_re_read_that_cannot_decide_pushes_nothing(tmp_state_dir):
+    """A conclusive failure blocks and a transient one propagates for 'resume': neither is
+    read as the body still holding the payload, and the candidate stays unpushed."""
+    gh = FakeGitHub()
+    gh.gh_sanitizes = True
+    text = "A literal ^G in the description."
+    eng = _mixed(tmp_state_dir, gh, fixed("R1-F1"), pr_body_update("R1-F2", text))
+    reviewed = eng.state.reviewed_head_sha
+    _power_loss_at(eng, EffectKind.PR_BODY_UPDATE, Stage.OBSERVED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+
+    gh.exact_read_error = GitHubUnavailableError("gh: HTTP 502")
+    eng2 = _resumed(eng, tmp_state_dir, gh)
+    with pytest.raises(GitHubUnavailableError):
+        eng2.step()
+    assert eng.origin.head(BRANCH) == reviewed
+
+    gh.exact_read_error = GitHubError("HTTP 403 on the exact read")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop.code is StopReasonCode.GITHUB_READ_FAILED
+    assert eng.origin.head(BRANCH) == reviewed
+    refused = eng2.unblock(REASON)
+    assert not refused.unblocked and "could not be read" in refused.message
+
+    gh.exact_read_error = None
+    assert eng2.unblock(REASON).unblocked
+    assert eng2.step().next_phase == "REVIEW"
+    assert eng.origin.head(BRANCH) != reviewed and len(_body_writes(gh)) == 1
+
+
+def test_a_plain_unblock_over_an_edit_on_a_moved_pr_routes_the_drift_to_review(tmp_state_dir):
+    """A push the plan did not make: the findings no longer describe the PR, so the edit
+    is no reason to hold it. Any flag is refused as stale, and nothing is written."""
+    gh = FakeGitHub()
+    eng = _updating(tmp_state_dir, gh, scripted(fixer(pr_body_update("R1-F1"), commit=False)))
+    run = eng.state.run_id
+    _power_loss_at(eng, EffectKind.PR_BODY_UPDATE, Stage.OBSERVED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    edited = _payload(run, A_HUMAN_EDIT)
+    gh.prs[PR].body = edited
+    eng2 = _resumed(eng, tmp_state_dir, gh)
+    assert eng2.step().next_phase == "BLOCKED"
+    action = _k12(eng2).action_id
+    gh.prs[PR].head_sha = "d" * 40
+    refused = eng2.unblock(REASON, decline_action=[action])
+    assert not refused.unblocked and "refused as stale" in refused.message
+    done = eng2.unblock(REASON)
+    assert done.unblocked and done.phase == "FIX", done.message
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert _body_writes(gh) == [_payload(run)] and gh.prs[PR].body == edited
+    s = load_state(eng2.paths.state_file)
+    assert s.last_fix_resolutions == [] and s.effect_records == []
+
+
+def test_a_dry_run_and_status_say_a_verified_update_is_read_again(tmp_state_dir):
+    gh = FakeGitHub()
+    eng = _mixed(tmp_state_dir, gh)
+    _power_loss_at(eng, EffectKind.PR_BODY_UPDATE, Stage.OBSERVED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    eng2 = _resumed(eng, tmp_state_dir, gh)
+    action = _k12(eng2).action_id
+    notes = "\n".join(eng2.step(dry_run=True).plan.notes)
+    assert f"PR body update {action} is verified: would read the PR's exact body again" in notes
+    state = load_state(eng2.paths.state_file)
+    assert "read again before FIX completes" in "\n".join(cli._render_pr_body_updates(state, eng2))
+
+
+# -- what the fixer was shown of the description (PR #467 R1-F2) ----------------------------------
+
+
+def _at_the_launch(eng, gh: FakeGitHub, change) -> None:
+    """``change(gh)`` holds while the launch's read context is read, and only then."""
+    collect = eng._collect_read_context
+
+    def collecting(phase):
+        undo = change(gh)
+        try:
+            return collect(phase)
+        finally:
+            if undo is not None:
+                undo()
+
+    eng._collect_read_context = collecting
+
+
+def _failing_pr_read(error: GitHubError):
+    def change(gh: FakeGitHub):
+        gh.get_pr_error = error
+
+        def undo():
+            gh.get_pr_error = None
+
+        return undo
+
+    return change
+
+
+def _failing_comment_read(gh: FakeGitHub):
+    gh.comments_error = GitHubError("HTTP 500 on the comments")
+
+    def undo():
+        gh.comments_error = None
+
+    return undo
+
+
+def _edited_before_the_launch(gh: FakeGitHub):
+    gh.prs[PR].body = gh.prs[PR].body.replace(PREFACE, A_HUMAN_EDIT)
+
+
+A_CREDENTIAL = "ghp_" + "a1B2" * 9
+
+_NOT_SHOWN = {
+    "cut-by-the-body-bound": {
+        "preface": "x" * MAX_QUOTED_BODY_CHARS,
+        "needle": f"the read context quotes {MAX_QUOTED_BODY_CHARS}",
+    },
+    "redacted": {
+        "preface": f"The token {A_CREDENTIAL} was pasted here.",
+        "needle": "the read context redacts part of it",
+    },
+    "gh-rewrites-a-control-character": {
+        "preface": "With \x07 inside.",
+        "sanitizes": True,
+        "needle": "a control character `gh` does not print",
+    },
+    "pr-read-failed": {
+        "launch": _failing_pr_read(GitHubError("HTTP 500 on the PR")),
+        "needle": "could not be read for this launch",
+    },
+    "pr-read-unavailable": {
+        "launch": _failing_pr_read(GitHubUnavailableError("gh: HTTP 502")),
+        "needle": "could not be read for this launch",
+    },
+    "comment-read-failed": {
+        "launch": _failing_comment_read,
+        "needle": "could not be read for this launch",
+    },
+    "edited-since-the-entry": {
+        "launch": _edited_before_the_launch,
+        "needle": "it was edited since",
+    },
+}
+
+
+@pytest.mark.parametrize("policy", ["auto", "approve"])
+@pytest.mark.parametrize("name", list(_NOT_SHOWN))
+def test_a_description_the_fixer_could_not_read_whole_is_never_replaced(
+    tmp_state_dir, name, policy
+):
+    """The digest of an unseen body authorizes nothing. The prompt says the resolution is
+    not available and why, a request is a correction naming the reason, nothing is held or
+    planned, and the fixer can still resolve the finding another way."""
+    case = _NOT_SHOWN[name]
+    gh = FakeGitHub()
+    gh.gh_sanitizes = case.get("sanitizes", False)
+    prompts = []
+
+    def recording(step):
+        def handler(req):
+            prompts.append(req.prompt)
+            return step(req)
+
+        return handler
+
+    eng = _updating(
+        tmp_state_dir,
+        gh,
+        scripted(
+            recording(fixer(pr_body_update("R1-F1"), commit=False)),
+            recording(fixer(no_change("R1-F1"), commit=False)),
+        ),
+        policy=policy,
+        body=lambda r: _base(r, case.get("preface", PREFACE)),
+    )
+    if "launch" in case:
+        _at_the_launch(eng, gh, case["launch"])
+    run = eng.state.run_id
+    before = _base(run, case.get("preface", PREFACE))
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert _body_writes(gh) == []
+    if name == "edited-since-the-entry":
+        before = _base(run, A_HUMAN_EDIT)
+    assert gh.prs[PR].body == before
+
+    first, second = prompts
+    assert "not available in this FIX entry" in first and case["needle"] in first
+    assert "This run authorizes it by policy" not in first
+    assert "could not show you the whole description" in second and case["needle"] in second
+    s = load_state(eng.paths.state_file)
+    assert s.pr_body_outcomes == []
+    assert [r["resolution"] for r in s.last_fix_resolutions] == ["no_change_with_rationale"]
+    assert A_CREDENTIAL not in first + second
+
+
+def test_a_description_a_bound_on_the_files_cut_is_not_offered(tmp_state_dir, monkeypatch):
+    """Not the body's own bound: the file's, which the renderer does not know of."""
+    monkeypatch.setattr("autoforge.read_context.MAX_FILE_CHARS", 200)
+    gh = FakeGitHub()
+    eng = _updating(
+        tmp_state_dir,
+        gh,
+        scripted(
+            fixer(pr_body_update("R1-F1"), commit=False),
+            fixer(no_change("R1-F1"), commit=False),
+        ),
+    )
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert _body_writes(gh) == []
+    first = eng.provider.calls[0].prompt
+    assert "a bound on the read context's files cut it" in first
+    assert "[AutoForge omitted" in (read_context_of(first) / "pull-request.md").read_text()
+
+
+def test_a_description_at_exactly_the_quoted_bound_is_offered_and_replaced(tmp_state_dir):
+    gh = FakeGitHub()
+    eng = _updating(tmp_state_dir, gh, scripted(fixer(pr_body_update("R1-F1"), commit=False)))
+    run = eng.state.run_id
+    preface = "x" * (MAX_QUOTED_BODY_CHARS - len(_base(run, "")))
+    gh.prs[PR].body = _base(run, preface)
+    assert len(gh.prs[PR].body) == MAX_QUOTED_BODY_CHARS
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert _body_writes(gh) == [_payload(run)]
+    view = (read_context_of(eng.provider.calls[0].prompt) / "pull-request.md").read_text()
+    assert "[AutoForge omitted" not in view and preface in view
+
+
+def test_a_relaunch_decides_again_on_what_it_shows(tmp_state_dir):
+    """Each launch has its own view: a read that failed for the first offers nothing to it
+    and does not count against the next, which reads the body whole."""
+    gh = FakeGitHub()
+    eng = _updating(
+        tmp_state_dir,
+        gh,
+        scripted(
+            fixer(pr_body_update("R1-F1"), commit=False),
+            fixer(pr_body_update("R1-F1"), commit=False),
+        ),
+    )
+    fails = [_failing_pr_read(GitHubError("HTTP 500 on the PR"))]
+    _at_the_launch(eng, gh, lambda g: fails.pop()(g) if fails else None)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    first, second = (c.prompt for c in eng.provider.calls)
+    assert "not available in this FIX entry" in first
+    assert "not available in this FIX entry" not in second
+    assert _body_writes(gh) == [_payload(eng.state.run_id)]
+
+
+# -- Markdown the text leaves open (PR #467 R1-F3) ------------------------------------------------
+
+
+_LEFT_OPEN = {
+    "backtick-fence": "A description.\n\n```python\nprint('never closed')",
+    "tilde-fence": "A description.\n\n~~~\nnever closed",
+    "html-comment": "A description.\n\n<!-- never closed",
+    "pre": "A description.\n\n<pre>\nnever closed",
+    "script": "A description.\n\n<script>\nnever closed",
+    "style": "A description.\n\n<style>\nnever closed",
+    "textarea": "A description.\n\n<textarea>\nnever closed",
+    "details": "A description.\n\n<details>\n<summary>More</summary>\n\nnever closed",
+    "table": "A description.\n\n<table>\n<tr><td>never closed",
+    "cdata": "A description.\n\n<![CDATA[ never closed",
+    "processing-instruction": "A description.\n\n<?php never closed",
+    "declaration": "A description.\n\n<!DOCTYPE never closed",
+    "only-a-fence": "```",
+}
+
+
+@pytest.mark.parametrize("name", list(_LEFT_OPEN))
+def test_markdown_the_text_leaves_open_cannot_reach_the_controllers_block(tmp_state_dir, name):
+    """The full path: the fixer's text is accepted, planned, journaled, written and read
+    back, and every byte before it is the controller's. CommonMark reads blocks forward,
+    so each block is closed before the text starts, whatever the text leaves open."""
+    text = _LEFT_OPEN[name]
+    gh = FakeGitHub()
+    eng = _updating(tmp_state_dir, gh, scripted(fixer(pr_body_update("R1-F1", text), commit=False)))
+    run = eng.state.run_id
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    block_ = implementation_closing_block(ISSUE, run)
+    assert gh.prs[PR].body == f"{block_}\n\n{text}"
+    assert block_ == f"Closes #2\n\n{_marker(run)}"
+    assert _body_writes(gh) == [gh.prs[PR].body]
+    assert protected_pr_body_block(gh.prs[PR].body, ISSUE, run) == (block_, "")
+
+
+def test_a_later_marker_stays_in_the_block_above_text_left_open(tmp_state_dir):
+    """Every controller marker the base holds keeps ahead of the text, in its order."""
+    other = '<!-- ai-replacement: {"txn": "a  b"} -->'
+    gh = FakeGitHub()
+    text = "```\nnever closed"
+    eng = _updating(
+        tmp_state_dir,
+        gh,
+        scripted(fixer(pr_body_update("R1-F1", text), commit=False)),
+        body=lambda r: f"{_base(r)}\n{other}\n",
+    )
+    run = eng.state.run_id
+    assert eng.step().next_phase == "REVIEW"
+    assert gh.prs[PR].body == f"Closes #2\n\n{_marker(run)}\n\n{other}\n\n{text}"
+
+
+def test_a_body_whose_old_text_swallowed_the_block_can_be_replaced_and_the_next_round_too(
+    tmp_state_dir,
+):
+    """A body as ANALYZE_EXECUTE composes it, its block already inside the text's fence,
+    still qualifies by its bytes and comes out with the block in front. The result is a
+    base like any other: the next round's update of it composes the same way."""
+    gh = FakeGitHub()
+    eng = _updating(
+        tmp_state_dir,
+        gh,
+        scripted(
+            fixer(pr_body_update("R1-F1", "```\nopen"), commit=False),
+            fixer(pr_body_update("R2-F1"), commit=False),
+        ),
+        body=lambda r: _base(r, "```\nopen before"),
+    )
+    run = eng.state.run_id
+    assert eng.step().next_phase == "REVIEW"
+    assert gh.prs[PR].body == _payload(run, "```\nopen")
+
+    eng.state.phase = Phase.FIX
+    eng.state.review_round = 2
+    eng.state.last_review_result = "needs_fix"
+    eng.state.last_review_comment_url = comment_url(PR, 101)
+    eng.state.open_findings = [_finding(1, 2)]
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert gh.prs[PR].body == _payload(run)
+    assert _body_writes(gh) == [_payload(run, "```\nopen"), _payload(run)]
 
 
 # -- policy and approval ------------------------------------------------------------------------
@@ -1456,22 +2043,31 @@ def _second_record(data, run):
 
 
 _TAMPERED = {
-    "marker-dropped": (_body(lambda r: "Text\n\nCloses #2"), "closing block"),
-    "closing-dropped": (_body(lambda r: f"Text\n\n{_marker(r)}"), "closing block"),
-    "text-after-the-block": (
-        _body(lambda r: f"Text\n\nCloses #2\n\n{_marker(r)}\n\nmore"),
-        "text after the controller's closing block",
+    "marker-dropped": (_body(lambda r: "Closes #2\n\nText"), "closing block"),
+    "closing-dropped": (_body(lambda r: f"{_marker(r)}\n\nText"), "closing block"),
+    "text-before-the-block": (
+        _body(lambda r: f"Text\n\nCloses #2\n\n{_marker(r)}"),
+        "does not open with the controller's closing block",
+    ),
+    "no-text": (_body(lambda r: f"Closes #2\n\n{_marker(r)}"), "no replacement text"),
+    "text-glued-to-the-block": (
+        _body(lambda r: f"Closes #2\n\n{_marker(r)}Text"),
+        "no replacement text",
+    ),
+    "unclosed-kept-marker": (
+        _body(lambda r: f"Closes #2\n\n{_marker(r)}\n\n<!-- ai-unknown\n\nText"),
+        "never closes",
     ),
     "marker-in-the-text": (
-        _body(lambda r: f"Text {_marker('af-other-1')}\n\nCloses #2\n\n{_marker(r)}"),
+        _body(lambda r: f"Closes #2\n\n{_marker(r)}\n\nText {_marker('af-other-1')}"),
         "invalid replacement text",
     ),
     "closing-reference-in-the-text": (
-        _body(lambda r: f"Closes #9\n\nCloses #2\n\n{_marker(r)}"),
+        _body(lambda r: f"Closes #2\n\n{_marker(r)}\n\nCloses #9"),
         "invalid replacement text",
     ),
     "text-not-stored-form": (
-        _body(lambda r: f"  Text  \n\nCloses #2\n\n{_marker(r)}"),
+        _body(lambda r: f"Closes #2\n\n{_marker(r)}\n\n  Text  "),
         "stored form",
     ),
     "another-target": (

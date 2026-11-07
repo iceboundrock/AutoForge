@@ -1443,7 +1443,15 @@ a stated reason it has none. The coverage that must keep working:
   outcomes, the attempt bound, and a failed read-back; `gh`'s sanitizer, with
   digests of the exact bytes; each crash window completing from the journal with
   one write and no fixer; `off`, `approve` and `auto`, approval, decline, and a
-  setting changed after the plan; K9 beside K12; dry-run, `status` and redaction
+  setting changed after the plan; K9 beside K12; dry-run, `status` and redaction;
+  a body the fixer could not read whole (over the quoted bound, redacted, cut by
+  a file bound, a failed PR or comment read, edited since the entry, rewritten by
+  `gh`) never written, and each launch deciding again on what it shows; text
+  leaving a fence or an HTML construct open published with the controller's block
+  ahead of it; a body edited after it was verified stopping the plan before each
+  later write and before the fix is recorded, across a crash and in one process,
+  after the push included, with no second write and no decline once a later write
+  may be out
 - operator actions (#243, ADR 0004 K10; `tests/test_operator_actions.py`
   for the engine, unblock and `status --action`, K10 in
   `tests/test_effects.py`, the marker in `tests/test_claims.py`,

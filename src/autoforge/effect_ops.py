@@ -817,7 +817,7 @@ class PrBodyUpdateOp:
     fork, the one open PR carrying the issue's implementation marker (the
     complete listing, D4.5), and at the reviewed HEAD, base and merge base.
     Precondition: its exact body has the digest the FIX entry recorded. Payload:
-    the agent's text and the tail the controller derived from that body.
+    the block the controller derived from that body, then the agent's text.
     Completion: the exact body equals the payload (:func:`decide_pr_body_update`).
 
     The read order is the point: the body (:func:`held_pr`, #328) is read last,

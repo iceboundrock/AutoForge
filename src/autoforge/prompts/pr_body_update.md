@@ -6,12 +6,13 @@ what the description says. It is never a way to defer a finding, and never a
 claim that any code, test or other external change was made.
 
 You write the whole new description, as it should read. The current one is
-`pull-request.md` of the read context. The controller derives everything else:
-the target is always this PR, and it keeps its own closing reference to issue
-#{{ISSUE_NUMBER}} and its own markers below your text, byte for byte. So do not
-write them: your text holds no marker and no closing reference, and the request
-names no URL, PR, issue, repository, target, method, path or command. A result
-carrying any of them is refused.
+`pull-request.md` of the read context, whole and as GitHub holds it: this
+resolution is offered only when that file can show it so. The controller derives
+everything else: the target is always this PR, and it keeps its own closing
+reference to issue #{{ISSUE_NUMBER}} and its own markers above your text, byte
+for byte. So do not write them: your text holds no marker and no closing
+reference, and the request names no URL, PR, issue, repository, target, method,
+path or command. A result carrying any of them is refused.
 
 {{PR_BODY_AUTHORIZATION}}
 

@@ -1485,9 +1485,9 @@ A new object, or a new way to reach one, is a further amendment.
 - **Precondition:** `base_sha256`, the digest of the exact body the `FIX`
   entry read (`EntryObservation.pr_body_sha256`, D4.4); the reviewed HEAD, base
   and merge base; the authorization, below.
-- **Payload:** the agent's text, then `Closes #n`, the marker and every other
-  controller marker the base holds, each byte for byte and in its order
-  (`protected_pr_body_tail`). The base qualifies only with exactly one readable
+- **Payload:** `Closes #n`, the marker and every other controller marker the base
+  holds, each byte for byte and in its order (`protected_pr_body_block`), then
+  the agent's text. The base qualifies only with exactly one readable
   implementation marker, for this issue and naming this run; the `Closes #n`
   line; no closing reference to another issue, which a replacement would drop;
   and no controller marker that never closes. A base that does not qualify is
@@ -1496,6 +1496,15 @@ A new object, or a new way to reach one, is a further amendment.
   mention, no credential) and so does the composed body; `_cross_pr_body_update`
   splits the persisted body again at load, because a resumed write publishes
   it with no agent result in between.
+- **The controller's block comes first.** Its bytes are not enough if the Markdown
+  around them changes what they mean: an unclosed fence, HTML comment or `<pre>`
+  in the text runs on to whatever follows it, and an unclosed `<details>` folds
+  it away. CommonMark reads blocks forward, so a block already closed when the
+  text begins cannot be reached from it. Validating the agent's Markdown instead
+  would mean approximating a parser and refusing legitimate text; this takes no
+  judgement of the text at all. What the text leaves open affects only the text,
+  and the next review reads it. K2 and K7 compose their closing block after the
+  agent's text, and #423 leaves them as they are.
 - **Completion:** the exact body read back equals the payload at the reviewed
   binding.
 - **Authorization.** `safety.pr_body_updates`: `off` refuses the resolution;
@@ -1517,6 +1526,20 @@ A new object, or a new way to reach one, is a further amendment.
   recorded no digest (not qualified, the policy `off`, an empty review binding,
   an exact read that failed conclusively, or a `FIX` entered under protocol 14)
   offers nothing.
+- **The fixer must have read what it replaces.** The digest says what an update
+  would replace and proves nothing about what the fixer saw: the read context is
+  bounded and redacted, a read that fails makes its file a note saying so, and
+  `gh`'s print can differ from GitHub's bytes. Each launch therefore decides
+  again (`_add_pr_body_view`): the update is offered only when that launch's read
+  of the PR has the entry's digest and its `pull-request.md`, as written, quotes
+  those bytes unchanged (`pr_body_view_problem`). That one comparison covers a
+  body over the quoted bound, redacted text, the bounds on the file and on the
+  directory. A failed PR or comment read, a body edited since the entry and a
+  control character `gh` rewrites are refused the same way. The exact text is not
+  handed to the agent to fill the gap: it may hold what the sanitizer exists to
+  keep out. Under `approve` as under `auto`, the prompt says the resolution is not
+  available and why, a request is a correction, and nothing is planned or written;
+  the fixer can resolve the finding another way or report `blocked`.
 - **Several findings.** One record per result. Findings resolved this way carry
   byte-identical text or the result is a correction: the controller neither
   composes nor orders whole-body replacements. Each counts for its own finding,
@@ -1549,6 +1572,18 @@ A new object, or a new way to reach one, is a further amendment.
   the write lands is observed by that read, with no second write. A lost answer
   with no landing leaves the base, and is written once more within the bound.
   A refusal from GitHub is not retried. A failed read-back fails closed.
+- **Verified is not forever.** An observed record is settled and never reconciled
+  again, and a human may edit the body after the save, also across a crash. So
+  `_complete_fix` reads the exact body again before each later write of the plan
+  and before it records the fix (`_pr_body_edit_outcome`). A body that no longer
+  holds the payload blocks with `effect-conflict`: nothing is written over it,
+  nothing more is sent, the fix is not recorded and the findings stay open. The
+  record stays observed, because the payload was on GitHub when it was read; the
+  check is repeated on every entry, so the journal needs no new transition. The
+  plan's own base is no exception here: the payload is the one state that lets the
+  plan finish, and that needs no second write. A failed read fails closed the same
+  way, and a transient one propagates for `resume`. An edit after the last of these
+  reads is not seen here: the next review reads the description as it stands.
 - **What moved.** A HEAD off the reviewed one (K12 precedes the controller's own
   push), or a base or merge base off the binding, routes `FIX -> REVIEW` of the
   actual revision through `_fix_drift`, and the update is recorded `stale`. A
@@ -1566,7 +1601,12 @@ A new object, or a new way to reach one, is a further amendment.
   `--decline-action`, which drops the plan and runs the fixer again over that
   body with the decline in its prompt. A declined id is refused for the round,
   and declines share K9's and K10's bound. `--rereview` stays refused while a
-  plan is saved; declining is the way to a fresh `FIX`.
+  plan is saved; declining is the way to a fresh `FIX`. Edited after it was
+  verified: set the exact payload, then `unblock`, and `FIX` finishes with no
+  second write and no fixer; or decline to keep the edit, recorded `declined`
+  rather than `verified`. A decline is refused once a later write of the plan
+  may be out, since dropping the plan would abandon it: the payload goes back,
+  `FIX` finishes, and the edit can then be made again for the next review to read.
 - **Evidence.** The resolution records a receipt: action id, PR, base and body
   digests, the reviewed HEAD, and `changed`. `pr_body_outcomes` keeps what became
   of each update (`verified`, `declined`, `stale`). A receipt proves bytes and
@@ -3430,8 +3470,18 @@ In addition:
     written; a stale digest at plan time and a concurrent edit at any later
     read conflict and never overwrite; a conclusive refusal is not retried,
     and an unknown outcome is decided by a read within the attempt bound;
-  - a body `gh` would rewrite is read exactly, so the sanitizer is neither a
+  - a body with a literal `^` is read exactly, so the sanitizer is neither a
     false conflict nor a false verification;
+  - a body the fixer could not read whole (over the quoted bound, redacted, cut
+    by a file bound, unreadable for a PR or comment failure, edited since the
+    entry, or rewritten by `gh`) is not offered under `auto` or `approve`, a
+    request is a correction, and nothing is written;
+  - text leaving a fence, an HTML comment or another HTML construct open is
+    published through the whole path with the controller's block ahead of it;
+  - a body edited after it was verified stops the plan before each later write
+    and before the fix is recorded, across a crash and within one process,
+    including after the push; only the exact payload lets it finish, with no
+    second write, and a decline is refused once a later write may be out;
   - a process killed at each step of the journal finishes from the journal
     with one write and no second fixer launch; an operator's approval, decline
     and plain unblock each do what `status` says, and a reason is not evidence;

@@ -263,7 +263,7 @@ from .effects import (
     pr_body_action_id,
     pr_body_update_body,
     progress_comment_body,
-    protected_pr_body_tail,
+    protected_pr_body_block,
     replacement_pr_body,
     review_comment_body,
     review_comment_problem,
@@ -432,6 +432,7 @@ from .read_context import (
     MAX_LISTED_ISSUES,
     OperatorEvidence,
     ReadContext,
+    pr_body_view_problem,
     render_checks,
     render_checks_refused,
     render_comment,
@@ -638,6 +639,7 @@ PR_BODY_UPDATE_UNAVAILABLE = (
     "refuses it. When a finding can only be resolved by changing the PR description, report "
     '`"status": "blocked"` with a `"message"` saying so.'
 )
+PR_BODY_VIEW_NOT_WRITTEN = "no read context was written for this launch"
 
 
 # Launches of one REMOTE validation definition after a launch or setup
@@ -1793,6 +1795,11 @@ class ControllerEngine:
         # D10.2): the absolute path of its per-launch directory, set only
         # while `_invoke_phase` renders that launch's prompt.
         self._read_context_dir: str | None = None
+        # Why the read context of this process's last FIX launch does not show
+        # the PR body a K12 update would replace, "" when it shows it whole
+        # (#423, PR #467 R1-F2). Not persisted: a result is only ever checked
+        # in the process that launched for it, right after that launch.
+        self._pr_body_view_problem = PR_BODY_VIEW_NOT_WRITTEN
         # The ``{{WORKTREE_STATE}}`` of the write-phase launch being rendered
         # (#187): what the worktree holds uncommitted, "" when it is clean or
         # could not be read, set only while `_invoke_phase` renders that
@@ -3613,6 +3620,13 @@ class ControllerEngine:
                     "complete revision"
                 )
             )
+        if self._read_context_dir and self._pr_body_view_problem:
+            return PR_BODY_UPDATE_UNAVAILABLE.format(
+                why=(
+                    "`pull-request.md` of this launch does not show you the whole description "
+                    f"as GitHub holds it: {self._pr_body_view_problem}"
+                )
+            )
         if policy == PR_BODY_UPDATES_AUTO:
             authorization = (
                 "This run authorizes it by policy (`safety.pr_body_updates: auto`): the "
@@ -4032,12 +4046,11 @@ class ControllerEngine:
             context.add("pull-request.md", "the pull request, its body and comments", pr_text)
             if checks is not None:
                 context.add("checks.md", "the check summary of the PR's head commit", checks)
-        if phase == Phase.FIX and pr_url and self._pr_body_offered():
-            # #423: a pr_body_update replaces the whole description, so the
-            # fixer needs to read it. Offered or not, it is never the base the
-            # write is bound to: that is the digest the entry recorded.
-            pr_text, _ = self._read_pr_files(pr_url, "Pull request", checks=False)
-            context.add("pull-request.md", "the pull request, its body and comments", pr_text)
+        if phase == Phase.FIX and pr_url:
+            offered = self._pr_body_offered()
+            self._pr_body_view_problem = (
+                self._add_pr_body_view(context, pr_url, offered) if offered else ""
+            )
         if phase == Phase.REVIEW and s.last_review_comment_url:
             context.add(
                 "previous-review-comment.md",
@@ -4083,6 +4096,37 @@ class ControllerEngine:
                     self._read_epic_sub_issues(s.epic_url),
                 )
         return context
+
+    def _add_pr_body_view(self, context: ReadContext, url: str, offered: str) -> str:
+        """Add ``pull-request.md`` for a K12 offer; why it does not show the body, or "".
+
+        A ``pr_body_update`` discards the whole description, so its author must
+        have read all of it (#423, PR #467 R1-F2). The digest the entry recorded
+        says what the update would replace, and proves nothing about what the
+        fixer was shown: the file is bounded and redacted, a failed read makes
+        it a note saying so, and `gh`'s print may differ from GitHub's bytes. So
+        the offer of this launch stands only when this read is of the recorded
+        bytes and the file as written quotes them unchanged. The exact text
+        never reaches an agent (:func:`held_pr`), so a body only that read can
+        show is one this launch cannot offer. Otherwise the file stays a
+        convenience, never evidence: it is never read back, and the write stays
+        bound to the digest, read again before the plan and before the write.
+        """
+        name = "pull-request.md"
+        description = "the pull request, its body and comments"
+        try:
+            pr = self.github.get_pr(url)
+            thread = self.github.get_pr_comments(url)
+        except GitHubError as exc:
+            context.add(name, description, unreadable("Pull request", url, exc))
+            return "the pull request could not be read for this launch"
+        context.add(name, description, render_pr(pr, thread, "Pull request"))
+        if sha256_text(pr.body) != offered:
+            return (
+                "what this launch read is not the description this FIX entry recorded: it was "
+                "edited since, or it holds a control character `gh` does not print"
+            )
+        return pr_body_view_problem(pr.body, context.files[name])
 
     def _read_operator_evidence(self) -> str:
         """``operator-evidence.md`` (#243): this PR's operator actions, as quoted data.
@@ -6993,8 +7037,10 @@ class ControllerEngine:
         Refused (a correction) while ``safety.pr_body_updates`` is ``off``;
         when this FIX entry recorded no body it offers to replace (it did not
         qualify when the fixer was launched, or the entry was observed under
-        protocol 14); once the round holds the most declines the controller
-        records; when the body the controller would compose fails the
+        protocol 14); when this launch's read context could not show the fixer
+        the whole of that body (:meth:`_add_pr_body_view`); once the round holds
+        the most declines the controller records; when the body the controller
+        would compose fails the
         published-content policy as a whole or GitHub's limit; and when its
         action id is one the operator declined for this round. A body that
         changed since the entry read it is no correction: the agent wrote from
@@ -7017,6 +7063,13 @@ class ControllerEngine:
                 f"FIX: {named} resolved as pr_body_update, which this FIX entry does not offer "
                 "(the prompt says why); resolve it another way, or report status 'blocked' with "
                 "a message"
+            )
+        if self._pr_body_view_problem:
+            raise ControlResultValidationError(
+                f"FIX: {named} resolved as pr_body_update, but this launch could not show you the "
+                f"whole description ({self._pr_body_view_problem}), and the controller replaces "
+                "only a description its author could read; resolve it another way, or report "
+                "status 'blocked' with a message"
             )
         shared = state.round_declines()
         if shared >= MAX_DECLINES_PER_ROUND:
@@ -7055,7 +7108,7 @@ class ControllerEngine:
         """The K12 record replacing ``body`` by ``text``, or why it cannot be (#423).
 
         The target is the run's bound PR, derived here and never from the
-        result; what follows the text is derived from ``body``, the PR's exact
+        result; what precedes the text is derived from ``body``, the PR's exact
         bytes. The authorization is the policy at plan time, recorded with the
         record so a later configuration change never widens it: ``auto`` is the
         policy's, with the record's own action id approved; anything else waits
@@ -7065,10 +7118,10 @@ class ControllerEngine:
         state = self._require_state()
         issue_url = parse_issue_url(state.current_issue_url).canonical
         pr_url = parse_pr_url(owner.pr_url).canonical
-        tail, problem = protected_pr_body_tail(body, issue_url, state.run_id)
+        block, problem = protected_pr_body_block(body, issue_url, state.run_id)
         if problem:
             return f"the body of PR {pr_url} may not be replaced: {problem}"
-        composed = pr_body_update_body(text, tail)
+        composed = pr_body_update_body(text, block)
         problem = published_payload_problem("replacement PR description", composed) or ""
         if problem:
             return problem
@@ -7079,7 +7132,7 @@ class ControllerEngine:
                 "and re-emit the CONTROL_RESULT"
             )
         marker = IMPLEMENTATION.pattern.search(body)
-        assert marker is not None  # protected_pr_body_tail found exactly one
+        assert marker is not None  # protected_pr_body_block found exactly one
         identity = {"pr_url": pr_url, "marker": marker.group(0)}
         target = {"pr_url": pr_url}
         payload = {"body": composed}
@@ -7595,7 +7648,9 @@ class ControllerEngine:
             state.bound_acceptance_outcomes()
         if decision.pr_body_decline is not None:
             # #423: K12 precedes every write of the plan but the K9 or K10
-            # prefix, so dropping the plan discards no follow-up and no push.
+            # prefix, so dropping the plan discards no follow-up and no push (a
+            # decline of an update verified and then edited is refused once a
+            # later write is out, PR #467 R1-F1).
             # A prefix comment already on GitHub stays verified, and FIX runs
             # afresh with the decline in its prompt over the worktree as it is.
             records = state.phase_effects().records
@@ -9086,6 +9141,9 @@ class ControllerEngine:
         - a decline of that id drops the plan and re-enters FIX afresh, also
           when the body changed outside the plan, which is how an operator
           keeps a hand edit; unless the PR moved or the body holds the payload.
+
+        An update already verified is read again, never assumed to still hold
+        (:meth:`_pr_body_verified_unblock`).
         """
         if request is not None and (record is None or record.action_id != request.action_id):
             pending = record.action_id if record is not None else "none"
@@ -9100,14 +9158,7 @@ class ControllerEngine:
         assert record is not None
         action = record.action_id
         if record.stage is Stage.OBSERVED:
-            if request is None:
-                return None
-            return UnblockDecision(
-                None,
-                f"unblock {request.flag} is refused: the PR body already holds the payload of "
-                f"action {action}, verified. Unblock without the flag: FIX completes its plan",
-                pr=pr,
-            )
+            return self._pr_body_verified_unblock(request, record, pr, canonical)
         drift, unreadable = self._acceptance_drift(pr)
         if unreadable:
             return UnblockDecision(None, unreadable, pr=pr)
@@ -9124,9 +9175,7 @@ class ControllerEngine:
         op = PrBodyUpdateOp(self.github)
         reopened = record.reopened()
         expected = record.precondition["base_sha256"]
-        payload = (
-            f"sha256 {sha256_text(record.body)} ({self.cli_command('status', '--action', action)})"
-        )
+        payload = self._pr_body_payload_text(record)
         if request is not None and request.verb == "approve":
             if record.authorized:
                 return UnblockDecision(
@@ -9169,26 +9218,7 @@ class ControllerEngine:
                     "payload. Change the body first, or unblock without the flag to adopt it",
                     pr=pr,
                 )
-            declined = self._require_state().round_declines()
-            if declined >= MAX_DECLINES_PER_ROUND:
-                return UnblockDecision(
-                    None,
-                    f"action {action} cannot be declined: review round "
-                    f"{self._require_state().review_round} already records {declined} declined "
-                    "actions, the most the controller keeps for one round. Approve it, or set "
-                    f"the PR body to exactly its payload, {payload}, and unblock",
-                    pr=pr,
-                )
-            return UnblockDecision(
-                Phase.FIX,
-                f"PR {canonical} is OPEN at the reviewed HEAD, base and merge base and action "
-                f"{action} is declined; its plan is dropped and FIX launches the fixer afresh "
-                "over the PR body as it is now, with the decline in its prompt (the worktree "
-                "and its commits are kept)",
-                pr=pr,
-                action=f"declined {action}",
-                pr_body_decline=record,
-            )
+            return self._pr_body_decline_decision(record, pr, canonical, "Approve it, or set")
         if found.action is Action.OBSERVE:
             return UnblockDecision(
                 Phase.FIX,
@@ -9218,6 +9248,127 @@ class ControllerEngine:
                 pr=pr,
             )
         return None
+
+    def _pr_body_payload_text(self, record: EffectRecord) -> str:
+        """A K12 payload as an operator's text names it: its digest and how to print it."""
+        status = self.cli_command("status", "--action", record.action_id)
+        return f"sha256 {sha256_text(record.body)} ({status})"
+
+    def _pr_body_decline_decision(
+        self, record: EffectRecord, pr: PRInfo, canonical: str, instead: str
+    ) -> UnblockDecision:
+        """A decline of ``record`` that holds: its plan dropped, FIX launched afresh (#423).
+
+        Unless the round holds the most declines the controller records; then
+        the refusal offers ``instead``, a clause ending where the payload's
+        text goes on.
+        """
+        state = self._require_state()
+        action = record.action_id
+        declined = state.round_declines()
+        if declined >= MAX_DECLINES_PER_ROUND:
+            return UnblockDecision(
+                None,
+                f"action {action} cannot be declined: review round {state.review_round} already "
+                f"records {declined} declined actions, the most the controller keeps for one "
+                f"round. {instead} the PR body to exactly its payload, "
+                f"{self._pr_body_payload_text(record)}, and unblock",
+                pr=pr,
+            )
+        return UnblockDecision(
+            Phase.FIX,
+            f"PR {canonical} is OPEN at the reviewed HEAD, base and merge base and action "
+            f"{action} is declined; its plan is dropped and FIX launches the fixer afresh "
+            "over the PR body as it is now, with the decline in its prompt (the worktree "
+            "and its commits are kept)",
+            pr=pr,
+            action=f"declined {action}",
+            pr_body_decline=record,
+        )
+
+    def _pr_body_verified_unblock(
+        self, request: AcceptanceRequest | None, record: EffectRecord, pr: PRInfo, canonical: str
+    ) -> UnblockDecision | None:
+        """The unblock of a K12 update already verified: its body is read again (PR #467 R1-F1).
+
+        ``None`` lets the plan's ordinary row decide: a plain unblock over a body
+        that still holds the payload, or over a PR that moved, whose drift FIX
+        routes to REVIEW with nothing sent. Any flag over a body that still holds
+        it, or over a PR that moved, is refused. A body that changed since it was
+        verified is not adopted and an unblock reason is not evidence, so a plain
+        unblock and an approval stay BLOCKED until it holds the payload again. A
+        decline drops the plan, which is how an operator keeps a hand edit,
+        unless a later write of the plan went out: dropping it then would abandon
+        them, so the only way on is to restore the payload and let FIX finish.
+        """
+        state = self._require_state()
+        action = record.action_id
+        try:
+            body = held_pr(self.github, record.target["pr_url"]).body
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return UnblockDecision(
+                None,
+                f"the body of PR {canonical} could not be read: {exc}. This is not a transient "
+                "GitHub failure, so re-checking would not help; fix the cause first",
+                pr=pr,
+            )
+        if body == record.body:
+            if request is None:
+                return None
+            return UnblockDecision(
+                None,
+                f"unblock {request.flag} is refused: the PR body already holds the payload of "
+                f"action {action}, verified. Unblock without the flag: FIX completes its plan",
+                pr=pr,
+            )
+        records = state.phase_effects().records
+        heads = {state.reviewed_head_sha.lower()}
+        heads.update(str(r.payload["sha"]) for r in records if r.kind is EffectKind.PUSH)
+        moved = (
+            f"PR HEAD is {pr.head_sha[:12]}, which the plan did not put there"
+            if pr.head_sha.lower() not in heads
+            else (self._fix_unbound(pr, "nothing was sent") or ("",))[0]
+        )
+        if moved:
+            if request is None:
+                return None
+            return UnblockDecision(
+                None,
+                f"unblock {request.flag} is refused as stale: {moved}. Unblock without the flag: "
+                "FIX re-reads the PR and routes the drift to REVIEW, sending nothing",
+                pr=pr,
+            )
+        edited = (
+            f"the PR body changed after the controller verified action {action}: sha256 "
+            f"{sha256_text(body)}, where its payload is {self._pr_body_payload_text(record)}"
+        )
+        later = self._pr_body_later_writes(records, record)
+        if request is None or request.verb == "approve":
+            decline = self.cli_command("unblock", "--decline-action", action, "--reason")
+            keep = (
+                ""
+                if later
+                else f", or keep the edit and decline the action ({decline} '<why>'), which runs "
+                "FIX again over the body as it is"
+            )
+            return UnblockDecision(
+                None,
+                f"{edited}. An unblock reason is not evidence and the edit is not adopted: set "
+                f"the body back to exactly that payload, then unblock{keep}",
+                pr=pr,
+            )
+        if later:
+            return UnblockDecision(
+                None,
+                f"action {action} cannot be declined: {edited}, and a later write of its plan "
+                "is out, which a decline would abandon. Set the body back to exactly that "
+                "payload, then unblock: FIX completes the plan, and the next review reads the "
+                "description as it stands by then",
+                pr=pr,
+            )
+        return self._pr_body_decline_decision(record, pr, canonical, "Set")
 
     def _operator_unblock(
         self,
@@ -12058,6 +12209,12 @@ class ControllerEngine:
                         else "and otherwise block with nothing sent"
                     )
                 )
+            if record.kind is EffectKind.PR_BODY_UPDATE and record.stage is Stage.OBSERVED:
+                notes.append(
+                    f"PR body update {record.action_id} is verified: would read the PR's exact "
+                    "body again before each later write and before recording the fix, and block "
+                    "with nothing more sent if it no longer holds the payload"
+                )
         if isinstance(effects.context, FixContext):
             notes.append(
                 f"would complete FIX of review round {effects.context.round} from the persisted "
@@ -12931,7 +13088,7 @@ class ControllerEngine:
         fixer ran is a mismatch, never written over. ``""`` (no update offered)
         under ``safety.pr_body_updates: off``, when the review bound no complete
         revision (an older state file), when the body cannot be read exactly,
-        or when it does not qualify (:func:`protected_pr_body_tail`). A
+        or when it does not qualify (:func:`protected_pr_body_block`). A
         transient failure propagates: nothing was launched yet.
         """
         state = self._require_state()
@@ -12948,7 +13105,7 @@ class ControllerEngine:
         except GitHubError:
             return ""
         issue = parse_issue_url(state.current_issue_url).canonical
-        _, problem = protected_pr_body_tail(held.body, issue, state.run_id)
+        _, problem = protected_pr_body_block(held.body, issue, state.run_id)
         return "" if problem else sha256_text(held.body)
 
     def _operator_targets_at_entry(self) -> OperatorTargets | None:
@@ -17282,7 +17439,11 @@ class ControllerEngine:
         and after any follow-up write the PR and the open issues are read
         and held to the same rules again before the push (the commit point)
         is issued (R3-F2); a push refused because the branch moved is the
-        same drift. Then every resolution is read back against the open
+        same drift. A PR body update verified earlier in the plan is read again
+        before each later write, and before the fix is recorded: a body that no
+        longer holds its payload blocks, overwriting nothing and sending
+        nothing more (:meth:`_pr_body_edit_outcome`, PR #467 R1-F1). Then every
+        resolution is read back against the open
         issues, and the PR as headed at the candidate, its base and merge
         base as still bound, and its head branch as still the plan's target.
         A conflict or a conclusive failure blocks with the records as
@@ -17345,6 +17506,9 @@ class ControllerEngine:
                 problem = self._fix_disposition_problem(context, records, observation)
                 if problem:
                     return self._fix_disposition_block(problem, unpushed)
+            outcome = self._pr_body_edit_outcome(records, f"{record.describe()} was not sent")
+            if outcome is not None:
+                return outcome
             try:
                 if record.kind is EffectKind.PUSH:
                     default_branch = self.github.get_repo(state.repository).default_branch
@@ -17445,6 +17609,12 @@ class ControllerEngine:
                 f"after the push of {candidate}; GitHub has not caught up within "
                 f"{sum(PUSHED_HEAD_WAIT_SECONDS):g}s, and 'resume' reads it back again"
             )
+        outcome = self._pr_body_edit_outcome(
+            records,
+            f"{candidate[:12]} is pushed" if push is not None else "the plan pushes nothing",
+        )
+        if outcome is not None:
+            return outcome
         state.last_fix_resolutions = [
             {
                 "finding_id": r["finding_id"],
@@ -17517,6 +17687,78 @@ class ControllerEngine:
             f"FIX of review round {context.round}: {len(context.resolutions)} resolution(s), "
             f"{created} follow-up issue(s) created, {appended} marker append(s){accepted}, "
             f"{moved}; FIX -> {nxt.value} (round {state.review_round + 1})"
+        )
+
+    @staticmethod
+    def _pr_body_later_writes(records: Sequence[EffectRecord], record: EffectRecord) -> bool:
+        """Whether a write the plan orders after ``record`` may be out (PR #467 R1-F1)."""
+        return any(
+            r.attempts or r.stage is not Stage.INTENDED for r in records[record.position + 1 :]
+        )
+
+    def _pr_body_edit_outcome(
+        self, records: Sequence[EffectRecord], sent: str
+    ) -> tuple[Phase, str] | None:
+        """A block when the plan's verified PR body update no longer holds, else ``None``.
+
+        An observed record is settled and never reconciled again, and GitHub does
+        not stand still behind it: a human may edit the body after the save, also
+        across a crash (PR #467 R1-F1). So the exact body is read again before
+        each later write and before the fix is recorded. The record stays
+        observed, since the payload was on GitHub when it was read; a body that
+        no longer holds it is a conflict on every entry until it holds it again,
+        never written over, adopted or built on. ``sent`` says where the plan
+        stands. ``None`` when the plan holds no verified update, as while its
+        own write is still due. An unavailable GitHub propagates for 'resume',
+        with nothing sent.
+        """
+        record = next(
+            (
+                r
+                for r in records
+                if r.kind is EffectKind.PR_BODY_UPDATE and r.stage is Stage.OBSERVED
+            ),
+            None,
+        )
+        if record is None:
+            return None
+        state = self._require_state()
+        try:
+            body = held_pr(self.github, record.target["pr_url"]).body
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return _blocked(
+                StopReasonCode.GITHUB_READ_FAILED,
+                f"the body of PR {record.target['pr_url']} could not be read to confirm it still "
+                f"holds action {record.action_id}: {exc}. This is not a transient failure "
+                f"(authentication, permissions, or malformed data); {sent}. Fix the cause, then "
+                "'unblock'",
+            )
+        if body == record.body:
+            return None
+        action = record.action_id
+        plain = self.cli_command("unblock", "--reason")
+        if self._pr_body_later_writes(records, record):
+            keep = (
+                "A later write of the plan is out, so it can no longer be declined: edit the "
+                "description once FIX has completed, and the next review reads it as it stands"
+            )
+        else:
+            decline = self.cli_command("unblock", "--decline-action", action, "--reason")
+            keep = (
+                f"To keep the body as it is: {decline} '<why>', which drops the plan and runs FIX "
+                "again over that body"
+            )
+        return _blocked(
+            StopReasonCode.EFFECT_CONFLICT,
+            f"{record.describe()}: the PR body changed after the controller verified it: sha256 "
+            f"{sha256_text(body)}, where action {action} wrote "
+            f"{self._pr_body_payload_text(record)}. The controller never writes over or adopts a "
+            f"body its plan did not expect; {sent}, the fix of review round {state.review_round} "
+            f"is not recorded and the findings stay open. Next: set the body back to exactly that "
+            f"payload (GitHub keeps its edit history), then {plain} '<why>': FIX completes the "
+            f"plan with no fixer launched. {keep}",
         )
 
     def _operator_prefix(self, records: list[EffectRecord]) -> tuple[Phase, str] | None:
@@ -17805,13 +18047,15 @@ class ControllerEngine:
 
         An observed record is ``verified`` whatever became of the plan: the
         body is on GitHub, although the fix it was part of may not be recorded.
-        ``outcome`` is what became of one that was not.
+        ``outcome`` is what became of one that was not, and of one the operator
+        declined after editing the body it verified (PR #467 R1-F1): that payload
+        is gone from GitHub, and the fixer must hear of the decline.
         """
         state = self._require_state()
         for record in records:
             if record.kind is not EffectKind.PR_BODY_UPDATE:
                 continue
-            observed = record.stage is Stage.OBSERVED
+            observed = record.stage is Stage.OBSERVED and outcome != "declined"
             body = sha256_text(record.body)
             base = str(record.precondition["base_sha256"])
             state.pr_body_outcomes.append(

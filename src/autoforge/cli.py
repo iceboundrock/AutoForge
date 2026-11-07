@@ -2777,7 +2777,8 @@ def _acceptance_actions(state: AutoForgeState) -> list[dict]:
 def _pr_body_label(record: EffectRecord) -> tuple[str, str]:
     """``(state, label)`` of a persisted K12 record, as ``status`` names it (#423)."""
     if record.stage is Stage.OBSERVED:
-        return "verified", f"verified: sha256 {(record.observed or {}).get('body_sha256', '-')}"
+        digest = (record.observed or {}).get("body_sha256", "-")
+        return "verified", f"verified: sha256 {digest}; read again before FIX completes"
     if record.stage is Stage.CONFLICT:
         return "conflict", f"conflict: {record.reason}"
     if record.stage is Stage.ATTEMPTED:

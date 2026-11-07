@@ -509,12 +509,14 @@ resolution), and the next reviewer receives them as data
 A `pr_body_update` (#423, ADR 0004 K12) asks the controller to replace the
 description of the run's own PR with the text. The text obeys the rules of
 "Published content", so it holds no controller marker and no closing
-reference: the controller keeps those below it. Findings resolved this way in
+reference: the controller keeps those above it, where nothing the text leaves
+open can reach them. Findings resolved this way in
 one result carry byte-identical text, or the result is refused: there is one
 replacement per result, and nothing composes several. It needs no commit, and
 when every finding is resolved without one, `head_sha` equals the reviewed HEAD.
 The engine also refuses it under `safety.pr_body_updates: off`, when this `FIX`
-entry recorded no body it offers to replace, at the shared decline bound, when
+entry recorded no body it offers to replace, when this launch's `pull-request.md`
+does not quote that body whole and unchanged, at the shared decline bound, when
 the body the controller would compose breaks the published-content rules or
 GitHub's limit, and for an action id the operator declined for the round. A body
 changed since the entry read it is no correction, because the agent cannot know:

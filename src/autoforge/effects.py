@@ -318,10 +318,10 @@ def replacement_pr_body(
     )
 
 
-def protected_pr_body_tail(body: str, issue_url: str, run_id: str) -> tuple[str, str]:
-    """K12 (#423): ``(tail, "")``, what a replacement of ``body`` must keep, or ``("", why)``.
+def protected_pr_body_block(body: str, issue_url: str, run_id: str) -> tuple[str, str]:
+    """K12 (#423): ``(block, "")``, what a replacement of ``body`` must keep, or ``("", why)``.
 
-    The tail is the controller's: ``Closes #n``, the implementation marker
+    The block is the controller's: ``Closes #n``, the implementation marker
     byte for byte, then every other controller marker the body holds, each
     byte for byte and in its order (a replacement PR's transaction marker).
     It is derived from the body the PR holds and from nothing an agent wrote,
@@ -362,9 +362,17 @@ def protected_pr_body_tail(body: str, issue_url: str, run_id: str) -> tuple[str,
     return APPEND_SEPARATOR.join((closing, marker.group(0), *kept)), ""
 
 
-def pr_body_update_body(text: str, tail: str) -> str:
-    """K12's body: the agent's text, then the tail :func:`protected_pr_body_tail` derived."""
-    return f"{text}{APPEND_SEPARATOR}{tail}"
+def pr_body_update_body(text: str, block: str) -> str:
+    """K12's body: the block :func:`protected_pr_body_block` derived, then the agent's text.
+
+    The block comes first because Markdown is read forward (PR #467 R1-F3): an
+    unclosed fence, HTML comment or ``<pre>`` runs on to whatever follows it, and
+    an unclosed ``<details>`` folds it away, so a closing line and marker below
+    the text would be at the mercy of the text. Above it, each is a block already
+    closed when the text begins, and nothing the text holds can reach back. That
+    takes no judgement of the agent's Markdown, and leaves it nothing to get past.
+    """
+    return f"{block}{APPEND_SEPARATOR}{text}"
 
 
 def follow_up_reference(pr_url: str, finding_id: str) -> str:
@@ -1584,12 +1592,13 @@ def _cross_owner_takeover(record: EffectRecord, what: str) -> None:
 
 
 def _cross_pr_body_update(record: EffectRecord, what: str) -> None:
-    """K12 (#423): the run's own PR, the agent's text, then exactly the controller's tail.
+    """K12 (#423): the run's own PR, exactly the controller's block, then the agent's text.
 
     The body is split again rather than trusted, because a resumed write
-    publishes it with no agent result in between: the text gets the parser's
-    rules again, and what follows it may only be the closing block of the
-    identity's marker and further controller markers.
+    publishes it with no agent result in between: it must open with the closing
+    block of the identity's marker, further controller markers may follow, and
+    the rest is the text, which gets the parser's rules again. The text holds no
+    marker, so where the markers end is not in doubt.
     """
     _same(record, what, (record.identity["pr_url"], record.target["pr_url"], "PR"))
     if not _same_url(record.target["pr_url"], record.owner.pr_url, parse_pr_url):
@@ -1603,22 +1612,25 @@ def _cross_pr_body_update(record: EffectRecord, what: str) -> None:
     if claim.owner_run_id != record.owner.run_id:
         _fail(what, "carries a marker that does not name its owner's run")
     closing = f"Closes #{issue.number}{APPEND_SEPARATOR}{record.identity['marker']}"
-    text, separator, rest = record.body.partition(f"{APPEND_SEPARATOR}{closing}")
-    if not separator:
-        _fail(what, "has a payload body that does not hold the controller's closing block")
+    if not record.body.startswith(closing):
+        _fail(what, "has a payload body that does not open with the controller's closing block")
+    rest = record.body[len(closing) :]
+    while rest.startswith(APPEND_SEPARATOR):
+        opening = AGENT_MARKER_OPEN_RE.match(rest, len(APPEND_SEPARATOR))
+        if opening is None:
+            break
+        end = rest.find("-->", opening.end())
+        if end < 0:
+            _fail(what, "has a controller marker that never closes before the replacement text")
+        rest = rest[end + len("-->") :]
+    if not rest.startswith(APPEND_SEPARATOR):
+        _fail(what, "has a payload body with no replacement text after the controller's block")
+    text = rest[len(APPEND_SEPARATOR) :]
     try:
         if validate_pr_body_update(text) != text:
             _fail(what, "has a replacement text that is not in the parser's stored form")
     except ControlResultValidationError as exc:
         _fail(what, f"has an invalid replacement text: {exc}")
-    while rest:
-        if not rest.startswith(APPEND_SEPARATOR):
-            _fail(what, "has a payload body with text after the controller's closing block")
-        rest = rest[len(APPEND_SEPARATOR) :]
-        end = rest.find("-->")
-        if AGENT_MARKER_OPEN_RE.match(rest) is None or end < 0:
-            _fail(what, "has a payload body with text after the controller's closing block")
-        rest = rest[end + len("-->") :]
     found = scan(IMPLEMENTATION, record.body)
     if found.defects or found.claims != (claim,):
         _fail(what, "has a payload that does not carry exactly its identity's marker")

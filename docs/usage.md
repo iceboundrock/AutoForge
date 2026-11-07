@@ -909,7 +909,7 @@ A review can find that the code is right and the PR's description is not. The
 fixer has no GitHub credential, so it resolves such a finding as
 `pr_body_update` with the whole new description, and the controller replaces it
 (#423). The fixer gives only the text: the controller keeps `Closes #n` and its
-markers below it, and only ever edits the run's own PR. With
+markers above it, and only ever edits the run's own PR. With
 `safety.pr_body_updates: auto`, the default, this happens during the `FIX` step,
 without a commit or a push when nothing else changed, and the next review round
 reads the new description at the same HEAD. With a commit too, the description
@@ -926,6 +926,20 @@ description edited after that is never written over or adopted:
   (GitHub keeps its edit history) or set it to exactly the payload (`autoforge
   status --action B-…`), then `unblock` and `resume`: no fixer runs. To keep your
   edit, `unblock --decline-action B-…` runs the fixer again over it.
+- **Edited after the controller verified its write:** the description is read
+  again before each later write of the plan and before the fix is recorded, so a
+  mixed fix does not push over your edit. The run blocks (`effect-conflict`). Set
+  the body to exactly the payload, then `unblock` and `resume`: the plan finishes
+  with no second write and no fixer. To keep your edit, `unblock --decline-action
+  B-…`, unless a follow-up issue or the push already went out: then put the payload
+  back, let the plan finish, and make your edit again for the next review to read.
+
+The fixer must also have read what it replaces. The update is not offered, and a
+request for it is refused with nothing written, when the launch's read context
+could not show the whole description as GitHub holds it: over 64,000 characters,
+text the read context redacts, a control character `gh` rewrites, or a read that
+failed. The fixer then resolves the finding another way or reports `blocked`, and
+you can shorten or clean the description, or edit it yourself, and `unblock`.
 
 An edit in the moment between the controller's last read and its write cannot be
 detected, because GitHub has no conditional update of a PR body; it is
