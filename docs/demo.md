@@ -141,8 +141,8 @@ the built-in routing.
 
 Then run `doctor` and record the versions as
 [Getting started, step 5](getting-started.md#5-check-the-environment-doctor)
-says: the output of `doctor` (saved as `doctor.txt` below) and
-`versions.txt`. Add the
+says: the output of `doctor`, saved as `trace/doctor.txt`, and
+`trace/versions.txt`. Add the
 OS and architecture (`cat /etc/os-release`, `uname -srm`). The `uv tool list`
 line names the Python.
 
@@ -157,8 +157,17 @@ autoforge --config autoforge.yaml run --epic "$epic" --issue "$issue"
 autoforge --config autoforge.yaml status
 ```
 
-Keep the run's terminal output (`terminal.txt` below), from the command to
-the `READY_FOR_MERGE` banner or the `BLOCKED` line. Then:
+Run every command of the run, and those of
+[Collect the trace](#collect-the-trace), from the clone's top directory. A
+command finds the run in its state directory, which is `.autoforge/` in the
+directory it runs from unless the configuration's `state_dir` or a
+`--state-dir` names another. A relative one is relative to that directory
+too. If you gave `run` a `--state-dir`, give it to every later command.
+
+Keep the run's terminal output, from the command to the `READY_FOR_MERGE`
+banner or the `BLOCKED` line, as `terminal.txt` in the run's trace
+directory: `trace/run-1/` for the first run
+([Collect the trace](#collect-the-trace)). Then:
 
 - **Leave GitHub and the checkout alone while the run is active.** Do not
   comment on the issue or the pull request, push to `autoforge/<issue>` or
@@ -167,30 +176,66 @@ the `READY_FOR_MERGE` banner or the `BLOCKED` line. Then:
 - **Publish a stop as it happened.** Leave a `BLOCKED` run as
   [Troubleshooting](troubleshooting.md#blocked-the-controller-will-not-decide-alone)
   says, and list each `unblock`, `resume` and change you made as a human
-  action. If you start over with `run --force`, the write-up says so and
-  covers both runs.
+  action.
+- **Collect a run before you start over.** A new `run` replaces the one in
+  the state directory: `run --force` does at any phase, and a plain `run`
+  does without asking once the old one is `BLOCKED`, `FAILED` or `DONE`
+  (one that holds operator actions needs `--force`). It replaces
+  `state.json`, and with it the old run's review history and counts, so
+  `status` shows only the new run from then on
+  ([Starting over](troubleshooting.md#starting-over)). Before you start
+  over:
+  1. [Collect the trace](#collect-the-trace) of the run into
+     `trace/run-1/`. It keeps the run's ID, its whole `status.json` and its
+     two excerpts there, beside its `terminal.txt`.
+  2. Keep its log directory, `<state dir>/logs/<run-id>/`. The new run
+     leaves it in place, and it is the only record of that run's launches.
+     Do not publish it.
+
+  Then collect the new run into `trace/run-2/`. The new run does not adopt
+  the old run's open pull request. Close that pull request first for a
+  fresh implementation, or take it over
+  ([Taking over a PR another run owns](usage.md#taking-over-a-pr-another-run-owns));
+  otherwise the new run blocks (`pr-owner`). Starting over, and what became
+  of the old pull request, are human actions. The write-up reports each run
+  apart, with its own excerpts, timings and outcome.
 - **Collect the trace before you merge.** The merge, if you make one, is a
   human action.
 
 ## Collect the trace
 
-The excerpts are read from the state directory (`.autoforge/` in the
-checkout, unless `state_dir` or `--state-dir` names another) and need `jq`.
-Never publish `state.json`, the output of `status --json`, `events.jsonl` or
-a launch's log directory whole. Together they hold local paths, every prompt
-and every agent's output
+Collect each run into a trace directory of its own, from the directory the
+run was started in ([The run](#the-run)). Set `state` to the run's state
+directory: `.autoforge` as below, or what the configuration's `state_dir`
+or the run's `--state-dir` named. Set `out` to the run's trace directory:
+`trace/run-1`, then `trace/run-2` for a run that replaced it.
+
+```bash
+state=.autoforge
+out=trace/run-1
+mkdir -p "$out"
+```
+
+The commands below need `jq`. They pass `state` to `status` as
+`--state-dir` and read the run log from the same directory, so both
+excerpts come from the same run whatever the configuration says.
+
+Never publish `state.json`, the output of `status --json` (`status.json`
+below), `events.jsonl` or a launch's log directory whole. Together they
+hold local paths, every prompt and every agent's output
 ([Find the run and read its state](troubleshooting.md#find-the-run-and-read-its-state)).
-The two excerpts keep only the fields a claim needs.
+The two excerpts keep only the fields a claim needs. The rest of the trace
+directory stays with you.
 
 **The state at the end:**
 
 ```bash
-autoforge --config autoforge.yaml status --json > status.json
+autoforge --config autoforge.yaml --state-dir "$state" status --json > "$out/status.json"
 jq '{run_id, repository, epic_url, issue: .current_issue_url, pr: .current_pr_url,
      phase, review_round, step_count, created_at, updated_at,
      reviews: [.review_history[] | {round, reviewed_head_sha, result,
                finding_count, review_comment_url, timestamp}],
-     unblocks: .unblock_history}' status.json > status-excerpt.json
+     unblocks: .unblock_history}' "$out/status.json" > "$out/status-excerpt.json"
 ```
 
 The span from `created_at` to `updated_at` is the run's wall-clock time,
@@ -201,7 +246,7 @@ review round of the pull request.
 launch, per command the controller ran itself and per operator action:
 
 ```bash
-run=$(jq -r .run_id status.json)
+run=$(jq -r .run_id "$out/status.json")
 jq -c 'def t: if (. // "") == "" then null
               else sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601 end;
   {seq, phase, attempt, correction, review_round, profile, provider, model, effort,
@@ -210,7 +255,7 @@ jq -c 'def t: if (. // "") == "" then null
              | if any(. == null) then null else .[1] - .[0] end),
    exit_code, timed_out, ended_by,
    cost_micro_usd: .provider_summary.cost_micro_usd}' \
-  ".autoforge/logs/$run/events.jsonl" > events-excerpt.jsonl
+  "$state/logs/$run/events.jsonl" > "$out/events-excerpt.jsonl"
 ```
 
 How to read a line:
@@ -240,18 +285,22 @@ The excerpts leave out, on purpose: `cwd` and `log_dir` (local paths),
 `command`, `metadata`, `error`, and `parsed_result`, each agent's whole
 result. What an agent's result published is on GitHub.
 
-**Redact, then read every excerpt yourself.** The excerpts hold no prompt
-and no agent output. They can still hold the text of an `unblock --reason`,
-and the terminal and `doctor` output hold more. Apply the clean-room list
+### Redact, then read every excerpt yourself
+
+The excerpts hold no prompt and no agent output. They can still hold the
+text of an `unblock --reason`, and the terminal and `doctor` output hold
+more. Apply the clean-room list
 ([What to capture](clean-room.md#what-to-capture), "Redact before you post")
 to everything you publish. A search helps, but it does not replace reading:
 
 ```bash
 grep -nE "$HOME|ghp_|gho_|github_pat_|sk-" \
-  status-excerpt.json events-excerpt.jsonl terminal.txt doctor.txt
+  "$out/status-excerpt.json" "$out/events-excerpt.jsonl" "$out/terminal.txt" \
+  trace/doctor.txt trace/versions.txt
 ```
 
-Search the same files for your user name and e-mail address too.
+Search the same files for your user name and e-mail address too, and do
+the same for each run you collected.
 
 ## The write-up
 
@@ -275,7 +324,8 @@ links, or as a section of this page. It holds:
 6. **Phases and timings:** a table built from the events excerpt (phase,
    round, profile and model, start, duration, outcome). Add the total
    wall-clock time, the number of review rounds, and every failure, retry,
-   correction or recovery as it happened.
+   correction or recovery as it happened. A run you replaced gets its own
+   table, from its own trace directory, with its outcome.
 7. **The fix iteration:** claimed with its evidence from both columns of
    [the claims table](#what-the-write-up-may-claim), or "the review was
    clean in round 1".
@@ -295,6 +345,7 @@ and why. The list includes at least:
 - setting the interaction limit;
 - installing and configuring AutoForge, running `doctor` and the dry run;
 - starting the run, and each `resume` and `unblock` with its reason;
+- starting over, and what became of the old run's pull request;
 - any change made on GitHub while the run was active;
 - collecting and redacting the trace;
 - the merge, if there was one.
@@ -302,6 +353,24 @@ and why. The list includes at least:
 Everything else on the pull request (its commits, its description, the
 review comments) the controller published. A human edit to any of it is
 listed here, and is never presented as AutoForge's output.
+
+## Link it from #261
+
+The write-up is not the last step. #261 asks for one more deliverable: a
+comment on [#261](https://github.com/iceboundrock/AutoForge/issues/261)
+that links everything a reader needs to check the run. Once the write-up
+and everything it links are public, post that comment with:
+
+- the demo repository, its EPIC and the issue;
+- the pull request;
+- the published configuration;
+- the write-up;
+- the AutoForge commit the run installed, all 40 hexadecimal digits, and
+  for a release candidate its version too.
+
+If you published more than one run (a run you replaced, or a staged second
+run), link each with its own pull request and outcome. Then add each run
+to [Recorded runs](#recorded-runs) in a pull request to AutoForge.
 
 ## Reproduce it
 
