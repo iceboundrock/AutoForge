@@ -953,6 +953,13 @@ An unblock reason on its own moves nothing. `off` refuses the resolution: the
 fixer is told it is unavailable, and a finding only a new description can resolve
 makes it report `blocked`, as before.
 
+A decline drops the whole plan, so `unblock --decline-action B-…` is refused while
+an acceptance or operator action ahead of the update is not verified: a comment
+already posted would lose its evidence. `status` shows that action's next steps. A
+plain `unblock` and `resume` save a comment that is there, and you can decline the
+update if the run stops at it again. Declining that action instead, where `status`
+offers it, drops the update with the plan.
+
 ### Taking over a PR another run owns
 
 Each implementation PR the controller opens or adopts names its run in its

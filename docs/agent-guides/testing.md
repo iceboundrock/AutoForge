@@ -1451,7 +1451,10 @@ a stated reason it has none. The coverage that must keep working:
   ahead of it; a body edited after it was verified stopping the plan before each
   later write and before the fix is recorded, across a crash and in one process,
   after the push included, with no second write and no decline once a later write
-  may be out
+  may be out; a decline refused with the journal byte for byte while a K9 or K10
+  ahead of the update is not observed (a K9 comment a crash left unsaved, a K10
+  comment posted but not verified, nothing posted, a conflict, a target that cannot
+  be read), and the comment's URL kept once the prefix pass has saved it
 - operator actions (#243, ADR 0004 K10; `tests/test_operator_actions.py`
   for the engine, unblock and `status --action`, K10 in
   `tests/test_effects.py`, the marker in `tests/test_claims.py`,

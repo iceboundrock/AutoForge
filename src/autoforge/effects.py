@@ -1422,6 +1422,11 @@ class EffectRecord:
 APPEND_KINDS = frozenset({EffectKind.ADOPT_PR, EffectKind.FOLLOW_UP_APPEND})
 
 
+def unverified_before(records: Sequence[EffectRecord], record: EffectRecord) -> list[EffectRecord]:
+    """What the plan ``records`` orders before ``record`` and has not observed."""
+    return [r for r in records[: record.position] if r.stage is not Stage.OBSERVED]
+
+
 def bounded_reason(reason: str) -> str:
     """A conflict reason as it may be persisted: redacted, then clipped at the bound."""
     text = redact(reason or "conflict").strip() or "conflict"

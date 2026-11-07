@@ -26,11 +26,12 @@ from autoforge.effects import (
     Stage,
     decide_pr_body_update,
     implementation_closing_block,
+    operator_comment_body,
     pr_body_update_body,
     protected_pr_body_block,
     sha256_text,
 )
-from autoforge.engine import render_implementation_marker
+from autoforge.engine import render_follow_up_marker, render_implementation_marker
 from autoforge.errors import (
     ControlResultValidationError,
     GitHubError,
@@ -2327,6 +2328,224 @@ def test_a_decline_of_the_description_keeps_a_verified_comment_and_runs_the_fixe
     assert eng.step().next_phase == "REVIEW"
     assert action in eng.provider.calls[1].prompt
     assert _body_writes(gh) == []
+
+
+# -- a decline of the description waits for what the plan orders before it (PR #467 R2-F1) --------
+
+
+NOTE_TARGET = "https://github.com/owner/repo/issues/16"
+NOTE = "Coordination note for #16: the description now says what shipped."
+NOTE_RATIONALE = "The issue asks for a coordination note on #16, which only the operator can post."
+SECOND_FIXER = fixer(no_change("R1-F1"), no_change("R1-F2"), commit=False)
+
+
+def _note_request(fid: str = "R1-F1") -> dict:
+    return {
+        "finding_id": fid,
+        "resolution": "operator_acceptance",
+        "rationale": NOTE_RATIONALE,
+        "operator_acceptance": {
+            "actions": [{"kind": "related_issue_comment", "issue": 16, "body": NOTE}]
+        },
+    }
+
+
+def _note_payload() -> str:
+    return operator_comment_body(NOTE, ISSUE, PR, 1, "R1-F1", NOTE_TARGET)
+
+
+def _with_note(tmp_state_dir, gh: FakeGitHub, first=None):
+    """A run with a K10 on #16 ahead of a K12 awaiting approval, stopped at the K10.
+
+    ``first`` is the first fixer's handler, by default one that asks for both.
+    """
+    eng = _updating(
+        tmp_state_dir,
+        gh,
+        scripted(
+            first or fixer(_note_request(), pr_body_update("R1-F2"), commit=False), SECOND_FIXER
+        ),
+        policy="approve",
+        findings=2,
+    )
+    gh.add_issue(ISSUE, "Ship the feature", body="Acceptance: a coordination note on #16.")
+    gh.add_issue(NOTE_TARGET, "Scheduler")
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop.code is StopReasonCode.OPERATOR_ACTIONS
+    assert gh.effect_writes == []
+    return eng
+
+
+def _record_of(eng, kind: EffectKind) -> EffectRecord:
+    records = [EffectRecord.from_dict(r) for r in load_state(eng.paths.state_file).effect_records]
+    [record] = [r for r in records if r.kind is kind]
+    return record
+
+
+def _assert_refused_and_nothing_saved(eng, action: str, ahead: str) -> str:
+    """The decline of ``action`` names ``ahead``, keeps the journal as it was and writes nothing."""
+    saved = eng.paths.state_file.read_bytes()
+    writes = list(eng.github.effect_writes)
+    previewed = eng.unblock(REASON, decline_action=[action], dry_run=True)
+    assert "would stay BLOCKED" in previewed.message and ahead in previewed.message
+    refused = eng.unblock(REASON, decline_action=[action])
+    assert not refused.unblocked, refused.message
+    assert "cannot be declined yet" in refused.message and ahead in refused.message
+    assert eng.paths.state_file.read_bytes() == saved
+    assert eng.github.effect_writes == writes
+    return refused.message
+
+
+def test_a_decline_of_the_description_never_forgets_a_comment_a_crash_left_unsaved(tmp_state_dir):
+    """The K9 comment landed and the crash lost its observation; a block that reconciles nothing
+    then lets the operator name K12. Refused with the journal as it was, and once FIX has adopted
+    the comment, with no second write, the decline holds and the comment's URL is kept."""
+    gh = FakeGitHub()
+    eng = _updating(
+        tmp_state_dir,
+        gh,
+        scripted(fixer(acceptance("R1-F1"), pr_body_update("R1-F2"), commit=False)),
+        policy="approve",
+        findings=2,
+    )
+    eng.config.safety = replace(eng.config.safety, acceptance_actions="auto")
+    _power_loss_at(eng, EffectKind.ACCEPTANCE_COMMENT, Stage.OBSERVED, saved=False)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    [posted] = gh.comments[ISSUE]
+    gh.add_issue(OTHER_ISSUE, "Unplanned", body=render_follow_up_marker(PR, "R1-F2"))
+    eng2 = _resumed(eng, tmp_state_dir, gh, scripted(SECOND_FIXER))
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert "carries the follow-up marker of R1-F2" in out.message
+    k9 = _record_of(eng2, EffectKind.ACCEPTANCE_COMMENT)
+    assert k9.stage is Stage.ATTEMPTED
+    action = _k12(eng2).action_id
+
+    _assert_refused_and_nothing_saved(eng2, action, k9.action_id)
+
+    gh.add_issue(OTHER_ISSUE, "Unplanned", state="CLOSED")
+    assert eng2.unblock(REASON).unblocked
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert _record_of(eng2, EffectKind.ACCEPTANCE_COMMENT).stage is Stage.OBSERVED
+    assert eng2.unblock("not this text", decline_action=[action]).unblocked
+    s = load_state(eng2.paths.state_file)
+    assert s.effect_records == []
+    assert [(o["action_id"], o["outcome"], o["comment_url"]) for o in s.acceptance_outcomes] == [
+        (k9.action_id, "verified", posted.url)
+    ]
+    assert [o["outcome"] for o in s.pr_body_outcomes] == ["declined"]
+    assert [w[0] for w in gh.effect_writes] == ["create_issue_comment"]
+    assert eng2.step().next_phase == "REVIEW"
+    assert action in eng2.provider.calls[0].prompt
+
+
+def test_a_decline_of_the_description_never_withdraws_a_posted_operator_comment(tmp_state_dir):
+    """The exact K10 comment went up while the plan was held. Refused, as declining that K10
+    itself is; once a plain unblock saved the comment, the decline holds and keeps its URL."""
+    gh = FakeGitHub()
+    eng = _with_note(tmp_state_dir, gh)
+    k10 = _record_of(eng, EffectKind.OPERATOR_COMMENT)
+    action = _k12(eng).action_id
+    posted = gh.add_comment(NOTE_TARGET, 7, _note_payload())
+
+    _assert_refused_and_nothing_saved(eng, action, k10.action_id)
+    assert _record_of(eng, EffectKind.OPERATOR_COMMENT).stage is Stage.INTENDED
+
+    assert eng.unblock(REASON).unblocked
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop.code is StopReasonCode.ACCEPTANCE_ACTION
+    assert eng.unblock("not this text", decline_action=[action]).unblocked
+    s = load_state(eng.paths.state_file)
+    assert s.effect_records == []
+    assert [
+        (o["action_id"], o["outcome"], o["comment_url"]) for o in s.operator_comment_outcomes
+    ] == [(k10.action_id, "verified", posted.url)]
+    assert [o["outcome"] for o in s.pr_body_outcomes] == ["declined"]
+    assert eng.step().next_phase == "REVIEW"
+    assert gh.effect_writes == []
+
+
+def test_a_decline_of_the_description_keeps_an_operator_action_whose_target_cannot_be_read(
+    tmp_state_dir,
+):
+    """Inconclusive: what is on the target is unknown, so nothing of the plan is given up."""
+    gh = FakeGitHub()
+    eng = _with_note(tmp_state_dir, gh)
+    k10 = _record_of(eng, EffectKind.OPERATOR_COMMENT)
+    gh.comments_error = GitHubError("HTTP 403: the comments of #16 cannot be read")
+    _assert_refused_and_nothing_saved(eng, _k12(eng).action_id, k10.action_id)
+
+
+def test_a_decline_of_the_description_keeps_an_operator_action_in_conflict(tmp_state_dir):
+    """Conflicting: a comment carrying the K10's marker with other bytes is repaired first."""
+    gh = FakeGitHub()
+    plan = fixer(_note_request(), pr_body_update("R1-F2"), commit=False)
+
+    def posting_other_bytes(req):
+        gh.add_comment(NOTE_TARGET, 7, _note_payload().replace(NOTE, "A note someone changed."))
+        return plan(req)
+
+    eng = _with_note(tmp_state_dir, gh, first=posting_other_bytes)
+    k10 = _record_of(eng, EffectKind.OPERATOR_COMMENT)
+    assert k10.stage is Stage.CONFLICT
+    _assert_refused_and_nothing_saved(eng, _k12(eng).action_id, k10.action_id)
+    assert load_state(eng.paths.state_file).operator_comment_outcomes == []
+
+
+def test_a_refused_decline_names_the_way_on_and_declining_the_operator_action_takes_it(
+    tmp_state_dir,
+):
+    """Nothing posted: the K10 still decides first, and its own decline drops the whole plan."""
+    gh = FakeGitHub()
+    eng = _with_note(tmp_state_dir, gh)
+    k10 = _record_of(eng, EffectKind.OPERATOR_COMMENT)
+    message = _assert_refused_and_nothing_saved(eng, _k12(eng).action_id, k10.action_id)
+    assert eng.cli_command("status") in message
+    assert eng.cli_command("unblock", "--reason") in message
+    assert eng.unblock("not on #16", decline_action=[k10.action_id]).unblocked
+    s = load_state(eng.paths.state_file)
+    assert s.effect_records == []
+    assert [o["outcome"] for o in s.operator_comment_outcomes] == ["declined"]
+
+
+@pytest.mark.parametrize("posted", [False, True], ids=["nothing-posted", "exact-payload-posted"])
+def test_a_decline_of_the_description_waits_for_an_acceptance_action_awaiting_approval(
+    tmp_state_dir, posted
+):
+    gh = FakeGitHub()
+    eng = _with_acceptance(
+        tmp_state_dir,
+        gh,
+        fixer(acceptance("R1-F1"), pr_body_update("R1-F2"), commit=False),
+        policy="approve",
+        findings=2,
+    )
+    assert eng.step().next_phase == "BLOCKED"
+    k9 = _record_of(eng, EffectKind.ACCEPTANCE_COMMENT)
+    if posted:
+        gh.add_comment(ISSUE, 7, k9.body)
+    _assert_refused_and_nothing_saved(eng, _k12(eng).action_id, k9.action_id)
+    assert load_state(eng.paths.state_file).acceptance_outcomes == []
+
+
+def test_status_offers_the_decline_of_the_description_once_nothing_is_ahead_of_it(tmp_state_dir):
+    gh = FakeGitHub()
+    eng = _with_note(tmp_state_dir, gh)
+    k10 = _record_of(eng, EffectKind.OPERATOR_COMMENT)
+    action = _k12(eng).action_id
+    declining = eng.cli_command("unblock", "--decline-action", action, "--reason")
+    lines = "\n".join(cli._render_pr_body_updates(load_state(eng.paths.state_file), eng))
+    assert declining not in lines
+    assert f"refused until {k10.action_id} is verified" in lines
+    gh.add_comment(NOTE_TARGET, 7, _note_payload())
+    assert eng.unblock(REASON).unblocked
+    assert eng.step().next_phase == "BLOCKED"
+    lines = "\n".join(cli._render_pr_body_updates(load_state(eng.paths.state_file), eng))
+    assert declining in lines and "refused until" not in lines
 
 
 def test_a_head_moved_between_the_description_and_the_push_keeps_the_verified_outcome(

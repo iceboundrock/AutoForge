@@ -1600,7 +1600,13 @@ A new object, or a new way to reach one, is a further amendment.
   base or set the exact payload, then `unblock`; to keep the edit,
   `--decline-action`, which drops the plan and runs the fixer again over that
   body with the decline in its prompt. A declined id is refused for the round,
-  and declines share K9's and K10's bound. `--rereview` stays refused while a
+  and declines share K9's and K10's bound. A decline is also refused while a K9
+  or K10 ahead of the update is not `observed`, because the drop forgets those
+  records, and a comment that landed or was posted before a save has no other
+  record. The decision reads nothing for this: a read here would be a second
+  reconciliation of K9 and K10 that has to agree with the prefix pass, and each
+  of those records already has its own way on, including its own decline where it
+  has one, which drops the update with the plan. `--rereview` stays refused while a
   plan is saved; declining is the way to a fresh `FIX`. Edited after it was
   verified: set the exact payload, then `unblock`, and `FIX` finishes with no
   second write and no fixer; or decline to keep the edit, recorded `declined`

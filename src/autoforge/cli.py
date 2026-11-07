@@ -80,6 +80,7 @@ from .effects import (
     FixContext,
     Stage,
     sha256_text,
+    unverified_before,
 )
 from .engine import (
     ControllerEngine,
@@ -2892,13 +2893,16 @@ def _render_pr_body_updates(state: AutoForgeState, engine: ControllerEngine) -> 
         plain = f"{engine.cli_command('unblock', '--reason')} {why}"
         decline = f"{engine.cli_command('unblock', '--decline-action', action, '--reason')} {why}"
         if record.stage is Stage.INTENDED and not record.authorized:
+            ahead = ", ".join(r.action_id for r in unverified_before(records, record))
             lines += [
                 f"  next:          approve:  "
                 f"{engine.cli_command('unblock', '--approve-action', action, '--reason')} {why}"
                 f" ; {engine.resume_command()}",
                 "                 or set the PR body to exactly that payload, then: "
                 f"{plain} ; {engine.resume_command()}",
-                f"                 or decline: {decline} (FIX runs again)",
+                f"                 a decline is refused until {ahead} is verified"
+                if ahead
+                else f"                 or decline: {decline} (FIX runs again)",
             ]
         elif record.stage is Stage.CONFLICT:
             lines += [

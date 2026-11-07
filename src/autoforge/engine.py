@@ -269,6 +269,7 @@ from .effects import (
     review_comment_problem,
     sha256_text,
     take_over_body,
+    unverified_before,
 )
 from .epic_graph import read_children
 from .epic_rebind import COMMAND as REBIND_COMMAND
@@ -7650,23 +7651,14 @@ class ControllerEngine:
             # #423: K12 precedes every write of the plan but the K9 or K10
             # prefix, so dropping the plan discards no follow-up and no push (a
             # decline of an update verified and then edited is refused once a
-            # later write is out, PR #467 R1-F1).
-            # A prefix comment already on GitHub stays verified, and FIX runs
-            # afresh with the decline in its prompt over the worktree as it is.
+            # later write is out, PR #467 R1-F1). The decision holds the whole
+            # prefix observed (R2-F1), so each of its comments stays verified,
+            # and FIX runs afresh with the decline in its prompt over the
+            # worktree as it is.
             records = state.phase_effects().records
             self._record_pr_body_outcomes(records, "declined", reason, at=entry["at"])
-            dropped = f"dropped with the decline of {decision.pr_body_decline.action_id}"
-            self._record_acceptance_outcomes(records, "stale", dropped)
-            for record in records:
-                if record.kind is EffectKind.OPERATOR_COMMENT:
-                    observed = record.stage is Stage.OBSERVED
-                    self._append_operator_outcome(
-                        record,
-                        "verified" if observed else "withdrawn",
-                        "" if observed else dropped,
-                        entry["at"],
-                    )
-            state.bound_operator_comment_outcomes()
+            self._record_acceptance_outcomes(records, "verified", "")
+            self._record_operator_outcomes(records, {}, "")
             state.drop_phase_effects()
         for bound in decision.bind:
             # #243: the operator's evidence binding, saved with the unblock;
@@ -8573,10 +8565,13 @@ class ControllerEngine:
             )
             # #423: decided here once it is the record the plan waits on; an
             # earlier K9 or K10 still pending decides first, above and below.
+            # A request naming it comes here at once: an approval drops nothing,
+            # and a decline is refused until that prefix is verified (PR #467
+            # R2-F1).
             if names_update or (
                 request is None
                 and update is not None
-                and all(r.stage is Stage.OBSERVED for r in effects.records[: update.position])
+                and not unverified_before(effects.records, update)
             ):
                 decided = self._pr_body_unblock(
                     request if isinstance(request, AcceptanceRequest) else None,
@@ -9140,7 +9135,8 @@ class ControllerEngine:
           changed outside the plan;
         - a decline of that id drops the plan and re-enters FIX afresh, also
           when the body changed outside the plan, which is how an operator
-          keeps a hand edit; unless the PR moved or the body holds the payload.
+          keeps a hand edit; unless the PR moved, the body holds the payload, or
+          a K9 or K10 ahead of it is not verified (:meth:`_pr_body_decline_decision`).
 
         An update already verified is read again, never assumed to still hold
         (:meth:`_pr_body_verified_unblock`).
@@ -9259,12 +9255,35 @@ class ControllerEngine:
     ) -> UnblockDecision:
         """A decline of ``record`` that holds: its plan dropped, FIX launched afresh (#423).
 
-        Unless the round holds the most declines the controller records; then
-        the refusal offers ``instead``, a clause ending where the payload's
-        text goes on.
+        Dropping the plan forgets the records ahead of ``record``, so each must
+        be observed first (PR #467 R2-F1). A K9 sent or awaiting its approval and
+        a K10 still pending may each have a comment on GitHub that no save holds,
+        and only reconciling them can tell, which FIX's prefix pass does and saves.
+        That is the same refusal for a comment there, none there, a conflict and a
+        target that cannot be read, with no read here to get wrong, and each of
+        those records keeps its own way on, its own decline included.
+
+        Refused too when the round holds the most declines the controller
+        records; that refusal offers ``instead``, a clause ending where the
+        payload's text goes on.
         """
         state = self._require_state()
         action = record.action_id
+        unverified = unverified_before(state.phase_effects().records, record)
+        if unverified:
+            names = ", ".join(f"{r.describe()} ({r.action_id})" for r in unverified)
+            status = self.cli_command("status")
+            plain = self.cli_command("unblock", "--reason")
+            return UnblockDecision(
+                None,
+                f"action {action} cannot be declined yet: {names} comes before it in the plan "
+                "and is not verified. A decline drops the plan, and a comment already on GitHub "
+                "would then lose its evidence, so nothing was declined and nothing is saved. "
+                f"Settle that first: {status} names its next steps, and declining it, where "
+                f"offered, drops this update with the plan; {plain} '<why>' then "
+                f"{self.resume_command()} saves a comment that is already there",
+                pr=pr,
+            )
         declined = state.round_declines()
         if declined >= MAX_DECLINES_PER_ROUND:
             return UnblockDecision(
