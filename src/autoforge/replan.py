@@ -6,14 +6,23 @@ import re
 from dataclasses import dataclass
 
 from .config import ReplanConfig
-from .github import GitHubClient
+from .github import CommentInfo, GitHubClient
 from .loop_guard import RESULT_NEEDS_FIX, truncated_evidence_rounds
+from .read_context import omission
 
 # Any run of three or more tildes can close (or open) a tilde code fence, so
 # the escape must break *runs*, not the literal fence string: replacing only
 # "~~~~" is non-overlapping and left-to-right, which lets "~~~~~~~" re-form a
 # closing fence out of the untouched tail.
 _TILDE_RUN_RE = re.compile(r"~{3,}")
+
+_OBSERVATION_SEPARATOR = "\n\n"
+
+# The least a review round's comment body is given when the bodies share the
+# budget. With its header and clip notice (about 300 characters) that is about
+# 1,500 of the budget, so sixteen rounds fit 24,000. With more, the newest rounds
+# keep this much and the oldest go without a body, not all with a sliver.
+_MIN_ROUND_BODY_CHARS = 1200
 
 
 @dataclass(frozen=True)
@@ -155,12 +164,72 @@ class HistoricalReviewData:
     def render_observations(self) -> str:
         if not self.observations:
             return "(none)"
-        return self._render_untrusted("\n\n".join(self.observations))
+        return self._render_untrusted(_OBSERVATION_SEPARATOR.join(self.observations))
 
     def render_verification_failures(self) -> str:
         if not self.verification_failures:
             return "(none)"
         return self._render_untrusted("\n".join(self.verification_failures))
+
+
+def _clip_notice(comment: CommentInfo, kept: int) -> str:
+    """The line that ends a clipped body: how much was cut, where the whole text is."""
+    return "\n" + omission(
+        f"this clipped comment; full text: {comment.url}, also in pull-request.md "
+        "of the read context",
+        kept,
+        len(comment.body),
+        "characters",
+    )
+
+
+def _fit_round_comments(rounds: list[tuple[object, CommentInfo]], budget: int) -> list[str]:
+    """Each round's comment as one observation, oldest first, ``budget`` characters in all.
+
+    Everything rendered counts against the budget: headers, separators and clip
+    notices. It is measured before the fence escaping, which can still lengthen a
+    body made of tilde runs.
+
+    A history that fits is rendered whole. Otherwise each round first pays for its
+    header and a notice, so that a round left without a body still says where its
+    comment is. The bodies then share what is left, newest first: each takes up to
+    an equal share, never less than ``_MIN_ROUND_BODY_CHARS`` while anything is
+    left, and what shorter bodies left over goes to the clipped ones, again newest
+    first. Only when the headers and notices alone do not fit do the oldest rounds
+    drop out entirely.
+    """
+    entries = [
+        (f"Review round {number} comment ({comment.url}, untrusted data):\n", comment)
+        for number, comment in rounds
+    ]
+    whole = [header + comment.body for header, comment in entries]
+    if len(_OBSERVATION_SEPARATOR.join(whole)) <= budget:
+        return whole
+
+    remaining = budget
+    fitting: list[tuple[str, CommentInfo]] = []
+    for header, comment in reversed(entries):
+        frame = len(header) + len(_clip_notice(comment, 0)) + len(_OBSERVATION_SEPARATOR)
+        if frame > remaining:
+            break
+        remaining -= frame
+        fitting.append((header, comment))
+
+    share = max(_MIN_ROUND_BODY_CHARS, remaining // len(rounds))
+    kept = [0] * len(fitting)
+    for limit in (share, budget):
+        for index, (_, comment) in enumerate(fitting):
+            grown = min(limit, len(comment.body), kept[index] + remaining)
+            remaining -= grown - kept[index]
+            kept[index] = grown
+
+    observations = [
+        header
+        + comment.body[:shown]
+        + ("" if shown == len(comment.body) else _clip_notice(comment, shown))
+        for (header, comment), shown in zip(fitting, kept, strict=True)
+    ]
+    return observations[::-1]
 
 
 class HistoricalReviewCollector:
@@ -182,9 +251,8 @@ class HistoricalReviewCollector:
         verification_failures: list[str],
     ) -> HistoricalReviewData:
         findings: list[dict] = []
-        observations: list[str] = []
+        rounds: list[tuple[object, CommentInfo]] = []
         comments = {c.url: c for c in self.github.get_pr_comments(previous_pr_url)}
-        remaining = self.max_comment_chars
         for record in review_history:
             if record.get("result") != RESULT_NEEDS_FIX:
                 continue
@@ -194,15 +262,11 @@ class HistoricalReviewCollector:
                     findings.append({"round": round_number, **finding})
             comment_url = record.get("review_comment_url", "")
             comment = comments.get(comment_url)
-            if comment is not None and comment.body and remaining > 0:
-                body = comment.body[:remaining]
-                observations.append(
-                    f"Review round {round_number} comment ({comment.url}, untrusted data):\n{body}"
-                )
-                remaining -= len(body)
+            if comment is not None and comment.body:
+                rounds.append((round_number, comment))
         return HistoricalReviewData(
             findings,
-            observations,
+            _fit_round_comments(rounds, self.max_comment_chars),
             list(verification_failures),
             len(findings),
         )
