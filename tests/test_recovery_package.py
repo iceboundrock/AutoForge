@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -88,13 +89,24 @@ from tests.test_engine import (
     REASON_211,
     _accepting,
     _analyzed,
+    _disqualify,
     _in_merge,
     _k9,
     _loop_agent,
     _no_stagnation,
     _one_finding_per_round,
 )
-from tests.test_operator_actions import BOTH, ISSUE_BODY, T16, T158, _k10, _operating
+from tests.test_operator_actions import (
+    BOTH,
+    ISSUE_BODY,
+    NOTE16,
+    T16,
+    T158,
+    _k10,
+    _operating,
+    _post,
+    payload,
+)
 from tests.test_pr_body_update import (
     A_HUMAN_EDIT,
     _base,
@@ -365,6 +377,9 @@ def test_k9_approval_or_decline_names_exactly_the_saved_id(
         "operator",
         ISSUE,
     )
+    # Approval or the payload, and the issue's eligibility either way (PR #470 R3-F3).
+    assert k9["required"].startswith("an approval of exactly this action id (none is recorded)")
+    assert "the issue open in the run's repository owner/repo" in k9["required"]
     commands = _commands(package)
     assert f'{prefix} unblock --approve-action {action} --reason "..."' in commands
     assert f'{prefix} unblock --decline-action {action} --reason "..."' in commands
@@ -381,6 +396,12 @@ def test_k9_approval_or_decline_names_exactly_the_saved_id(
     assert "unblock" in _keys(package["forbidden"])
     actions = [(p["action_id"], p["state"]) for p in package["pending"] if p["action_id"]]
     assert actions == ([(action, "approved")] if decision == "approve" else [])
+    if decision == "approve":
+        # The approval given is reported satisfied, never asked for again (R3-F3).
+        [k9] = [p for p in package["pending"] if p["action_id"]]
+        assert k9["required"].startswith(
+            "no further approval: one of exactly this action id is recorded"
+        )
 
 
 def test_k12_a_description_update_awaits_approval_of_exactly_its_id(
@@ -408,6 +429,16 @@ def test_k12_a_description_update_awaits_approval_of_exactly_its_id(
     assert f'{prefix} unblock --decline-action {action} --reason "..."' in commands
     assert f"stale-{action}" in _keys(package["forbidden"])
     assert package["guide"] == GUIDE_PR_BODY
+    assert k12["required"].startswith("an approval of exactly this action id (none is recorded)")
+    assert eng.unblock("approved", approve_action=action).unblocked
+    package = _recovery(status_cli, eng, capsys)
+    [k12] = [p for p in package["pending"] if p["action_id"]]
+    assert k12["state"] == "approved"
+    # Satisfied, never asked for again (PR #470 R3-F3).
+    assert k12["required"] == (
+        "no further approval: one of exactly this action id is recorded; the description "
+        f"must still be at sha256 {record.precondition['base_sha256']}"
+    )
 
 
 @pytest.mark.parametrize("conflict", ["false", "authentic"])
@@ -757,7 +788,11 @@ def test_a_pause_defers_to_its_interaction_owner(tmp_state_dir):
 # -- what the package is --------------------------------------------------------------------
 
 _POLICY = Policy(
-    max_total_steps=300, max_review_rounds=20, allow_merge=False, pr_body_approvals=True
+    max_total_steps=300,
+    max_review_rounds=20,
+    allow_merge=False,
+    pr_body_approvals=True,
+    acceptance_approvals=True,
 )
 
 
@@ -994,7 +1029,11 @@ def test_an_exhausted_review_loop_is_diagnosed_from_cached_status_with_its_remed
 
     state = load_state(eng.paths.state_file)
     raised = Policy(
-        max_total_steps=300, max_review_rounds=5, allow_merge=False, pr_body_approvals=True
+        max_total_steps=300,
+        max_review_rounds=5,
+        allow_merge=False,
+        pr_body_approvals=True,
+        acceptance_approvals=True,
     )
     package = build_package(
         classify_state(state), state, commands=_commands_of(eng), policy=raised
@@ -1681,7 +1720,8 @@ def test_no_approval_is_offered_while_pr_body_updates_is_off(
 ):
     """'unblock' records no approval of a description update under ``off``: the package
     names none and forbids it, and the payload set by hand, then a plain unblock, is
-    the way on (or the decline), as the engine accepts."""
+    the way on (or the decline, or the configuration change that makes the approval
+    possible, PR #470 R3-F1), as the engine accepts."""
     if stage == "conflict":
         eng = _k12_conflicted(tmp_state_dir, "approve")
     else:
@@ -1702,8 +1742,11 @@ def test_no_approval_is_offered_while_pr_body_updates_is_off(
         ("", False),
         (f'{prefix} unblock --reason "..."', False),
         (f"{prefix} resume", False),
+        (f"{prefix} status", True),
         (f'{prefix} unblock --decline-action {action} --reason "..."', True),
     ]
+    configure = package["next"][4]["text"]
+    assert "set safety.pr_body_updates to 'approve' in the configuration" in configure
     if stage == "conflict":
         eng.github.prs[PR].body = _base(eng.state.run_id)
     rc, out, err = status_cli(
@@ -1729,3 +1772,251 @@ def test_a_verified_update_with_no_saved_code_is_offered_conditionally(tmp_state
     assert not [p for p in package.pending if p.action_id == action]
     [step] = [s for s in package.next if "if 'status --live' says" in s.text]
     assert f"--decline-action {action}" in step.text
+
+
+# -- an acceptance action under 'off' (PR #470 R3-F1) ------------------------------------------
+
+
+def _acceptance_off(eng) -> None:
+    """The operator sets ``safety.acceptance_actions: off`` after the plan was saved."""
+    eng.config.safety = replace(eng.config.safety, acceptance_actions="off")
+
+
+@pytest.mark.parametrize("way", ["post", "decline", "configure"])
+def test_no_acceptance_approval_is_offered_while_acceptance_actions_is_off(
+    tmp_state_dir, status_cli, capsys, way
+):
+    """'unblock' records no approval of an acceptance action under ``off``: the package
+    names none and forbids it. Each way it displays instead runs against the engine:
+    the payload posted by the displayed pipe, then the plain unblock, completes the
+    plan with no comment of the controller's; the decline drops it; and the
+    configuration change makes 'status' name the approval, which then applies."""
+    eng = _k9_blocked(tmp_state_dir)
+    _acceptance_off(eng)
+    record = _k9(eng)
+    action = record.action_id
+    prefix = _prefix(eng)
+    package = _recovery(status_cli, eng, capsys)
+    [pending] = [p for p in package["pending"] if p["action_id"] == action]
+    assert pending["state"] == "awaiting_approval"
+    assert not [c for c in _commands(package) if "--approve-action" in c]
+    [forbidden] = [c for c in package["forbidden"] if c["key"] == f"approve-{action}"]
+    assert "safety.acceptance_actions is off" in forbidden["text"]
+    assert forbidden["freshness"] == "configuration"
+    read = f"{prefix} status --action {action}"
+    plain = f'{prefix} unblock --reason "..."'
+    decline = f'{prefix} unblock --decline-action {action} --reason "..."'
+    sequence = [c for c in _sequence(package) if not c[0].startswith(f"{prefix} run ")]
+    assert sequence == [
+        (read, False),
+        (f"{read} | gh issue comment {ISSUE} --body-file -", False),
+        (plain, False),
+        (f"{prefix} resume", False),
+        (f"{prefix} status", True),
+        (decline, True),
+    ]
+    configure = package["next"][4]["text"]
+    assert "set safety.acceptance_actions to 'approve' in the configuration" in configure
+    rc, out, err = status_cli(
+        eng, "unblock", "--dry-run", "--approve-action", action, "--reason", "x", capsys=capsys
+    )
+    assert "would stay BLOCKED" in out and "cannot be approved while" in out, out + err
+    if way == "post":
+        rc, out, _ = _run_displayed(status_cli, eng, read, capsys)
+        posted = eng.github.add_comment(ISSUE, 600, out)  # what the displayed pipe posts
+        rc, out, err = _run_displayed(status_cli, eng, plain, capsys)
+        assert rc == 0 and "BLOCKED -> FIX" in out, err
+        eng.load()
+        assert eng.step().next_phase == "REVIEW"
+        assert eng.github.comments[ISSUE] == [posted] and eng.github.effect_writes == []
+    elif way == "decline":
+        rc, out, err = _run_displayed(status_cli, eng, decline, capsys)
+        assert rc == 0 and "BLOCKED -> FIX" in out, err
+        assert load_state(eng.paths.state_file).effect_records == []
+    else:
+        eng.config.safety = replace(eng.config.safety, acceptance_actions="approve")
+        approve = f'{prefix} unblock --approve-action {action} --reason "..."'
+        package = _recovery(status_cli, eng, capsys)
+        assert approve in _commands(package)
+        assert f"approve-{action}" not in _keys(package["forbidden"])
+        rc, out, err = _run_displayed(status_cli, eng, approve, capsys)
+        assert rc == 0 and "BLOCKED -> FIX" in out, err
+        eng.load()
+        assert eng.step().next_phase == "REVIEW"
+        [comment] = eng.github.comments[ISSUE]
+        assert comment.body == record.body
+
+
+# -- operator actions with one in conflict (PR #470 R3-F2) -----------------------------------
+
+
+def _k10_conflicted(tmp_state_dir):
+    """K10 for #16 and #158, #16's posted with other bytes before the plan was saved."""
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(BOTH))
+    _post(gh, T16, 9016, payload(T16, NOTE16) + " ")
+    assert eng.step().next_phase == "BLOCKED"
+    assert _k10(eng, T16).stage is Stage.CONFLICT
+    return eng
+
+
+@pytest.mark.parametrize("repair", ["exact", "removed"])
+def test_conflicted_operator_actions_are_offered_no_decline(
+    tmp_state_dir, status_cli, capsys, repair
+):
+    """'unblock' refuses every decline of the plan's operator actions while one is in
+    conflict, even once its comment is repaired or removed, so the package names none
+    and forbids it. The repair it displays runs against the engine: the conflict
+    repaired to the exact payload and the other action posted, the plain unblock
+    completes the plan; removed, the plain unblock clears the saved conflict, the run
+    stops on the actions again, and that stop's package offers the decline, which
+    applies."""
+    eng = _k10_conflicted(tmp_state_dir)
+    x16, x158 = _k10(eng, T16), _k10(eng, T158)
+    prefix = _prefix(eng)
+    package = _recovery(status_cli, eng, capsys)
+    assert not [c for c in _commands(package) if "--decline-action" in c]
+    [forbidden] = [c for c in package["forbidden"] if c["key"] == "decline-operator-actions"]
+    assert x16.action_id in forbidden["text"] and "repaired, never declined" in forbidden["text"]
+    assert f"bind-{x16.action_id}" in _keys(package["forbidden"])
+    pipe158 = f"{prefix} status --action {x158.action_id} | gh issue comment {T158} --body-file -"
+    plain = f'{prefix} unblock --reason "..."'
+    assert pipe158 in _commands(package) and plain in _commands(package)
+    [comment] = eng.github.comments[T16]
+    if repair == "exact":
+        eng.github.comments[T16] = [replace(comment, body=x16.body)]
+    else:
+        eng.github.comments[T16] = []
+    declines = ("--decline-action", x16.action_id, "--decline-action", x158.action_id)
+    rc, out, err = status_cli(
+        eng, "unblock", "--dry-run", *declines, "--reason", "x", capsys=capsys
+    )
+    assert "would stay BLOCKED" in out and "repaired, never declined" in out, out + err
+    if repair == "exact":
+        rc, out, _ = _run_displayed(
+            status_cli, eng, f"{prefix} status --action {x158.action_id}", capsys
+        )
+        eng.github.add_comment(T158, 9158, out)  # what the displayed pipe posts
+        rc, out, err = _run_displayed(status_cli, eng, plain, capsys)
+        assert rc == 0 and "BLOCKED -> FIX" in out, err
+        eng.load()
+        assert eng.step().next_phase == "REVIEW"
+        return
+    rc, out, err = _run_displayed(status_cli, eng, plain, capsys)
+    assert rc == 0 and "BLOCKED -> FIX" in out, err
+    eng.load()
+    assert eng.step().next_phase == "BLOCKED"
+    package = _recovery(status_cli, eng, capsys)
+    assert "decline-operator-actions" not in _keys(package["forbidden"])
+    decline = (
+        f"{prefix} unblock --decline-action {x16.action_id} --decline-action "
+        f'{x158.action_id} --reason "..."'
+    )
+    assert decline in _commands(package)
+    rc, out, err = _run_displayed(status_cli, eng, decline, capsys)
+    assert rc == 0 and "BLOCKED -> FIX" in out, err
+
+
+# -- an authorized acceptance action its issue holds (PR #470 R3-F3) --------------------------
+
+
+def _k9_held_by_issue(tmp_state_dir, authorization: str, how: str):
+    """An authorized K9 held because the run's issue no longer qualifies: by the policy
+    (``auto``), or by the operator's approval given before the issue stopped qualifying."""
+    gh = FakeGitHub()
+    if authorization == "policy":
+        eng = _accepting(tmp_state_dir, gh, fixer(acceptance("R1-F1")), policy="auto")
+    else:
+        eng = _k9_blocked(tmp_state_dir)
+        gh = eng.github
+        assert eng.unblock(REASON_211, approve_action=_k9(eng).action_id).unblocked
+    why = _disqualify(gh, how)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert why in load_state(eng.paths.state_file).block_reason
+    record = _k9(eng)
+    assert record.authorized and record.stage is Stage.INTENDED
+    return eng
+
+
+@pytest.mark.parametrize("live", [False, True])
+@pytest.mark.parametrize(
+    ("authorization", "how"), [("policy", "CLOSED"), ("operator", "OPEN-ELSEWHERE")]
+)
+def test_an_authorized_acceptance_held_by_its_issue_names_eligibility_not_approval(
+    tmp_state_dir, status_cli, capsys, authorization, how, live
+):
+    """Its authorization is satisfied, so the package asks for none and forbids an
+    approval or a decline, which 'unblock' refuses; what it asks for is the issue's
+    eligibility, before the plain unblock, since a FIX re-entered before stops on the
+    same hold. Cached or live alike: the live preview re-enters FIX on the saved plan
+    without reading the issue, so whether it qualifies now stays unknown. Run as
+    displayed, with the issue qualifying again, the plan completes."""
+    eng = _k9_held_by_issue(tmp_state_dir, authorization, how)
+    record = _k9(eng)
+    action = record.action_id
+    prefix = _prefix(eng)
+    flags = ("--live",) if live else ()
+    package = _recovery(status_cli, eng, capsys, *flags)
+    assert (package["outcome"], package["code"]) == ("blocked", "acceptance-action")
+    [pending] = [p for p in package["pending"] if p["action_id"] == action]
+    granted = (
+        "no approval: the policy recorded with the plan authorized it"
+        if authorization == "policy"
+        else "no further approval: one of exactly this action id is recorded"
+    )
+    assert pending["state"] == ("authorized_by_policy" if authorization == "policy" else "approved")
+    assert pending["required"].startswith(granted)
+    assert "none is recorded" not in pending["required"]
+    assert "the issue open in the run's repository owner/repo" in pending["required"]
+    forbidden = {c["key"]: c for c in package["forbidden"]}
+    for verb in ("approve", "decline"):
+        assert granted in forbidden[f"{verb}-{action}"]["text"]
+    [held] = [c for c in package["proven"] if c["key"] == f"held-{action}"]
+    assert ISSUE in held["text"] and held["freshness"] == "snapshot"
+    [eligible] = [c for c in package["unknown"] if c["key"] == f"eligible-{action}"]
+    assert eligible["freshness"] == "unknown" and "without reading the issue" in eligible["text"]
+    assert not [c for c in _commands(package) if f"-action {action}" in c]
+    plain = f'{prefix} unblock --reason "..."'
+    sequence = [c for c in _sequence(package) if not c[0].startswith(f"{prefix} run ")]
+    assert sequence == [("", False), (plain, False), (f"{prefix} resume", False)]
+    first = package["next"][0]["text"]
+    assert f"reopen {ISSUE} if it is closed, or move it back into owner/repo" in first
+    assert "once" in package["next"][1]["text"] and "same hold" in package["next"][1]["text"]
+    if live:
+        # The preview's ordinary saved-plan decision: no sign of the issue either way.
+        assert (package["live"]["decision"], package["live"]["target_phase"]) == (
+            "would_reenter",
+            "FIX",
+        )
+    for verb in ("approve", "decline"):
+        rc, out, err = status_cli(
+            eng, "unblock", "--dry-run", f"--{verb}-action", action, "--reason", "x", capsys=capsys
+        )
+        assert "would stay BLOCKED" in out and "awaiting: none" in out, out + err
+    eng.github.issues[ISSUE] = replace(
+        eng.github.issues[ISSUE], state="OPEN", repository="owner/repo"
+    )
+    rc, out, err = _run_displayed(status_cli, eng, plain, capsys)
+    assert rc == 0 and "BLOCKED -> FIX" in out, err
+    eng.load()
+    assert eng.step().next_phase == "REVIEW"
+    [comment] = eng.github.comments[ISSUE]
+    assert comment.body == record.body
+
+
+def test_an_authorized_acceptance_with_no_saved_code_is_offered_conditionally(tmp_state_dir):
+    """Before protocol 16 nothing says the issue is why it stopped: the step is conditional
+    on the reason, and no approval or decline is named for an action already authorized."""
+    eng = _k9_held_by_issue(tmp_state_dir, "policy", "CLOSED")
+    state = load_state(eng.paths.state_file)
+    state.stop_code = ""
+    package = build_package(
+        classify_state(state), state, commands=_commands_of(eng), policy=_POLICY
+    )
+    action = _k9(eng).action_id
+    [step] = [s for s in package.next if "if the reason says" in s.text]
+    assert f"{ISSUE} is closed or not in the run's repository" in step.text
+    assert f"reopen {ISSUE} if it is closed" in step.text
+    assert not [s for s in package.next if f"-action {action}" in s.command]
+    assert not [c for c in package.unknown if c.key == f"eligible-{action}"]

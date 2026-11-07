@@ -1901,11 +1901,18 @@ in:
   candidate when FIX stopped before it saved its plan (the fixer's commit is
   then in the worktree and in no record);
 - **pending:** each record of the saved plan not yet observed: its kind,
-  action id, who performs it, its exact target, stage, authorization, and a
-  reference to its payload (`status --action <id>`, its length and SHA-256);
+  action id, who performs it, its exact target, stage, authorization, what
+  it still requires, and a reference to its payload (`status --action <id>`,
+  its length and SHA-256). An approval already recorded, yours or the
+  policy's, is reported as satisfied, never asked for again; an acceptance
+  comment also needs the run's issue open in the run's repository;
 - **forbidden:** what would be refused or would lose work: `resume` on a
   `BLOCKED` run, `unblock` on any other, approving an operator action, an
-  approval naming another id;
+  approval naming another id, an approval while its setting
+  (`safety.acceptance_actions` or `safety.pr_body_updates`) is `off`, an
+  approval or a decline of an acceptance comment already authorized, and a
+  decline of operator actions while one of them is in conflict (repair it
+  first: the plain `unblock` that follows clears the saved conflict);
 - **do not touch:** the agent worktree that holds an unpushed candidate, or
   may hold one no record names, the saved plan, comments already verified as
   evidence;
@@ -1917,7 +1924,13 @@ in:
   continues the run. Operator actions to bind go in one `unblock`, after
   every other one is posted. A later wait of the same plan (a PR
   description update after operator actions, say) is the next stop's: run
-  `status` again when the run stops there.
+  `status` again when the run stops there. Under `off`, an action that awaits
+  approval is done by hand instead (the exact payload posted, or set as the
+  description), and setting the key to `approve` is the alternative. An
+  authorized acceptance comment that waits because the run's issue is closed
+  or left the repository asks for the issue first: an `unblock` before
+  re-enters `FIX`, which stops on the same hold, and `status --live` does not
+  read the issue, so whether it qualifies now is `unknown`.
 
 Every claim is labelled with its freshness: `snapshot` (the state as saved,
 at `snapshot_at`), `configuration` (the configuration loaded by this

@@ -236,6 +236,9 @@ class Policy:
     # update under it: ``safety.pr_body_updates`` is not ``off``, which ``unblock``
     # refuses every such approval under (PR #470 R2-F2).
     pr_body_approvals: bool
+    # The same of an acceptance action: ``safety.acceptance_actions`` is not
+    # ``off`` (PR #470 R3-F1).
+    acceptance_approvals: bool
 
 
 @dataclass(frozen=True)
@@ -395,6 +398,13 @@ def _one_line(text: str) -> str:
     return " ".join(str(text).split())
 
 
+def _granted(record: EffectRecord) -> str:
+    """What already authorizes a K9 or K12 record :attr:`EffectRecord.authorized` holds."""
+    if record.precondition.get("authorization") == AUTHORIZATION_POLICY:
+        return "no approval: the policy recorded with the plan authorized it"
+    return "no further approval: one of exactly this action id is recorded"
+
+
 def _target_of(record: EffectRecord) -> str:
     """The object a record writes to, as :meth:`EffectRecord.describe` names it."""
     for key in ("epic_url", "pr_url", "issue_url", "ref", "repository"):
@@ -550,7 +560,9 @@ DIAGNOSES: dict[StopReasonCode, Diagnosis] = {
     ),
     StopReasonCode.ACCEPTANCE_ACTION: Diagnosis(
         "the saved FIX plan waits for the operator: an acceptance comment (A-...) or a PR "
-        "description update (B-...) awaits approval, or what it wrote no longer holds",
+        "description update (B-...) awaits approval, an authorized acceptance comment waits "
+        "for the run's issue to be open in the run's repository again, or what it wrote no "
+        "longer holds",
         "the action's own steps below",
     ),
     StopReasonCode.OPERATOR_ACTIONS: Diagnosis(
@@ -1242,22 +1254,28 @@ class _Builder:
             state, label = acceptance_label(record)
             finding = scan(ACCEPTANCE, record.marker).claims[0].finding_id
             authorization = str(record.precondition.get("authorization", ""))
+            # Whether an approval is recorded, never the mode alone: an approval the
+            # operator gave is as satisfied as the policy's (PR #470 R3-F3).
+            eligible = (
+                f"the issue open in the run's repository {self.state.repository or '-'}: the "
+                "controller publishes the comment, or adopts its exact payload, only while it is"
+            )
             required = (
-                "an approval of exactly this action id, then the controller posts the payload"
-                if authorization != AUTHORIZATION_POLICY
-                else "nothing of the operator: the policy recorded with the plan authorized it"
+                f"{_granted(record)}; {eligible}"
+                if record.authorized
+                else "an approval of exactly this action id (none is recorded) or its exact "
+                f"payload posted on the issue, and {eligible}"
             )
             target = str(record.target.get("issue_url", "-"))
         elif kind is EffectKind.PR_BODY_UPDATE:
             state, label = pr_body_label(record)
             authorization = str(record.precondition.get("authorization", ""))
+            base = record.precondition.get("base_sha256", "-")
             required = (
-                "an approval of exactly this action id, then the controller writes the payload "
-                f"over the description at sha256 {record.precondition.get('base_sha256', '-')}"
-                if authorization != AUTHORIZATION_POLICY
-                else "nothing of the operator: the policy recorded with the plan authorized it; "
-                f"the description must still be at sha256 "
-                f"{record.precondition.get('base_sha256', '-')}"
+                f"{_granted(record)}; the description must still be at sha256 {base}"
+                if record.authorized
+                else "an approval of exactly this action id (none is recorded), then the "
+                f"controller writes the payload over the description at sha256 {base}"
             )
             target = str(record.target.get("pr_url", "-"))
             if record.stage is Stage.OBSERVED:
@@ -1443,6 +1461,8 @@ class _Builder:
             )
         elif self.k12_edited() is None:
             self.k12_maybe_edited_step()
+        elif self.held_acceptance(None) is not None:
+            self.issue_hold_maybe_step()
         else:
             self.steps.append(Step("", diagnosis_in(code, s).remedy))
         if code is StopReasonCode.GITHUB_CHECKS_REFUSED:
@@ -1537,6 +1557,35 @@ class _Builder:
             None,
         )
 
+    def issue_held(self, record: EffectRecord) -> bool | None:
+        """Whether the run stopped on an authorized K9 its issue holds (PR #470 R3-F3).
+
+        FIX holds an acceptance comment that is authorized (by the policy, or
+        by an approval of exactly its id) only while the run's issue does not
+        qualify: it is closed, or not in the run's repository
+        (:func:`~autoforge.effects.decide_acceptance`), and it blocks with
+        ``acceptance-action`` then. So the saved code, on the plan's first
+        record not observed, proves that hold as of the stop; which of the two
+        conditions it was, and whether it still holds, nothing typed says.
+        ``True`` when the code says so, ``None`` when no code was saved (a
+        stop before protocol 16), ``False`` otherwise.
+        """
+        if (
+            record.kind is not EffectKind.ACCEPTANCE_COMMENT
+            or not record.authorized
+            or record.stage not in (Stage.INTENDED, Stage.ATTEMPTED)
+            or self.stop.outcome is not StopOutcome.BLOCKED
+            or unverified_before(self.records, record)
+        ):
+            return False
+        if self.stop.code is StopReasonCode.UNKNOWN:
+            return None
+        return self.stop.code is StopReasonCode.ACCEPTANCE_ACTION
+
+    def held_acceptance(self, held: bool | None) -> EffectRecord | None:
+        """The plan's K9 whose :meth:`issue_held` is ``held``, or ``None``."""
+        return next((r for r in self.records if self.issue_held(r) is held), None)
+
     def waits(self, record: EffectRecord) -> bool:
         """Whether ``record`` waits for the operator before the plan can go on."""
         if record.kind is EffectKind.OPERATOR_COMMENT:
@@ -1546,6 +1595,8 @@ class _Builder:
                 return True
             if record.stage is Stage.INTENDED and not record.authorized:
                 return True
+        if record.kind is EffectKind.ACCEPTANCE_COMMENT:
+            return self.issue_held(record) is True
         if record.kind is EffectKind.PR_BODY_UPDATE and record.stage is Stage.OBSERVED:
             return self.k12_edited(record) is True
         return False
@@ -1616,25 +1667,60 @@ class _Builder:
                     "record's id, and an id the record does not hold is refused",
                 )
             )
+        approvable = (
+            (Stage.INTENDED, Stage.CONFLICT)
+            if record.kind is EffectKind.PR_BODY_UPDATE
+            else (Stage.INTENDED,)
+        )
         if (
-            record.kind is EffectKind.PR_BODY_UPDATE
-            and not record.authorized
-            and record.stage in (Stage.INTENDED, Stage.CONFLICT)
-            and not self.policy.pr_body_approvals
+            not record.authorized
+            and record.stage in approvable
+            and not self.approvals_allowed(record)
         ):
+            # 'unblock' refuses the approval under 'off' (PR #470 R2-F2, R3-F1).
+            what = (
+                "a PR description update"
+                if record.kind is EffectKind.PR_BODY_UPDATE
+                else "an acceptance action"
+            )
             self.forbidden.append(
                 self.conf(
                     f"approve-{action}",
-                    f"'unblock --approve-action {action}': safety.pr_body_updates is off, and "
-                    "'unblock' records no approval of a PR description update while it is",
+                    f"'unblock --approve-action {action}': {self.approval_setting(record)} is "
+                    f"off, and 'unblock' records no approval of {what} while it is",
                 )
             )
+        if self.issue_held(record) is True:
+            # Authorized: 'unblock' finds no acceptance action awaiting the
+            # operator, and refuses an approval or a decline of it (PR #470 R3-F3).
+            for verb in ("approve", "decline"):
+                self.forbidden.append(
+                    self.snap(
+                        f"{verb}-{action}",
+                        f"'unblock --{verb}-action {action}': it needs {_granted(record)}, so "
+                        "'unblock' finds no acceptance action awaiting the operator and refuses "
+                        "it",
+                    )
+                )
         if record.kind is EffectKind.PR_BODY_UPDATE:
             refusal = self.pr_body_decline_refusal(record)
             if refusal:
                 self.forbidden.append(
                     self.snap(f"decline-{action}", f"'unblock --decline-action {action}' {refusal}")
                 )
+
+    def approvals_allowed(self, record: EffectRecord) -> bool:
+        """Whether ``unblock`` records an approval of ``record``'s kind under this configuration."""
+        if record.kind is EffectKind.PR_BODY_UPDATE:
+            return self.policy.pr_body_approvals
+        return self.policy.acceptance_approvals
+
+    @staticmethod
+    def approval_setting(record: EffectRecord) -> str:
+        """The configuration key that gates an approval of ``record``'s kind."""
+        if record.kind is EffectKind.PR_BODY_UPDATE:
+            return "safety.pr_body_updates"
+        return "safety.acceptance_actions"
 
     def declines_left(self) -> bool:
         """Whether the round holds fewer declines than ``unblock`` records for one."""
@@ -1728,7 +1814,23 @@ class _Builder:
                 )
             )
         self.steps.append(self.resume_step())
-        if self.declines_left():
+        conflicts = [r.action_id for r in records if r.stage is Stage.CONFLICT]
+        if conflicts:
+            # 'unblock' refuses every decline of the plan's operator actions while
+            # one is in conflict, repaired on GitHub or not (PR #470 R3-F2).
+            names = ", ".join(conflicts)
+            self.forbidden.append(
+                self.snap(
+                    "decline-operator-actions",
+                    f"'unblock --decline-action' of any operator action of the plan: {names} "
+                    "is in conflict, which is repaired, never declined; 'unblock' refuses "
+                    "every decline while the saved record is in conflict, even once its comment "
+                    "is repaired or removed. The plain unblock of the next steps clears that "
+                    "record once the conflict no longer reproduces, and a later stop on these "
+                    "actions offers the decline again",
+                )
+            )
+        elif self.declines_left():
             declines = [a for r in records for a in ("--decline-action", r.action_id)]
             self.steps.append(
                 Step(
@@ -1741,18 +1843,24 @@ class _Builder:
                 )
             )
 
-    def approval_steps(self, record: EffectRecord, do_it_yourself: str) -> None:
+    def approval_steps(self, record: EffectRecord, do_it_yourself: str, by_hand: str = "") -> None:
+        """An approval of exactly ``record``'s id, or ``do_it_yourself`` and a plain unblock.
+
+        ``by_hand`` is the command that does it yourself, "" when none is
+        exact. Under ``off`` the approval is neither named nor possible
+        (PR #470 R2-F2, R3-F1): doing it yourself is the way on, and the
+        configuration change that makes the approval possible again is the
+        alternative, which names no approval before ``status`` can.
+        """
         action = record.action_id
-        self.steps.append(
-            Step(self.cli("status", "--action", action), f"read the exact payload of {action}")
-        )
-        if record.kind is EffectKind.PR_BODY_UPDATE and not self.policy.pr_body_approvals:
-            # 'unblock' refuses the approval while the setting is off (PR #470 R2-F2).
+        read = self.cli("status", "--action", action)
+        self.steps.append(Step(read, f"read the exact payload of {action}"))
+        setting = self.approval_setting(record)
+        if not self.approvals_allowed(record):
             self.steps.append(
                 Step(
-                    "",
-                    f"{do_it_yourself} yourself: safety.pr_body_updates is off, so it cannot "
-                    "be approved",
+                    by_hand,
+                    f"{do_it_yourself} yourself: {setting} is off, so it cannot be approved",
                 )
             )
             self.steps.append(
@@ -1765,11 +1873,27 @@ class _Builder:
                 )
             )
             self.steps.append(self.resume_step())
+            self.steps.append(
+                Step(
+                    self.cli("status"),
+                    f"or, in place of the steps above, set {setting} to 'approve' in the "
+                    f"configuration first: 'status' then names the approval of exactly {action}",
+                    alternative=True,
+                )
+            )
             return
+        eligible = (
+            f", while {record.target.get('issue_url', '-')} is open in the run's repository "
+            "('unblock' refuses the approval otherwise)"
+            if record.kind is EffectKind.ACCEPTANCE_COMMENT
+            else ""
+        )
         self.steps.append(
             Step(
                 f"{self.cli('unblock', '--approve-action', action, '--reason')} {_WHY}",
-                self.unblock_text("approve exactly this action; 'resume' then publishes it"),
+                self.unblock_text(
+                    f"approve exactly this action{eligible}; 'resume' then publishes it"
+                ),
             )
         )
         self.steps.append(
@@ -1796,7 +1920,16 @@ class _Builder:
             self.steps.append(Step(self.plain_unblock(), self.unblock_text("then a plain unblock")))
             self.steps.append(self.resume_step())
             return
-        self.approval_steps(record, "post exactly that payload on the run's issue")
+        if record.authorized:
+            self.issue_hold_steps(record)
+            return
+        issue = record.target["issue_url"]
+        self.approval_steps(
+            record,
+            f"post exactly that payload on {issue}",
+            f"{self.cli('status', '--action', record.action_id)} | gh issue comment {issue} "
+            "--body-file -",
+        )
         if self.declines_left():
             self.steps.append(
                 Step(
@@ -1809,6 +1942,77 @@ class _Builder:
                     alternative=True,
                 )
             )
+
+    def eligibility_text(self, record: EffectRecord) -> str:
+        """What makes the run's issue qualify for ``record`` again, and why it must."""
+        issue = record.target["issue_url"]
+        repository = self.state.repository or "the run's repository"
+        return (
+            f"reopen {issue} if it is closed, or move it back into {repository} if it left "
+            f"it (the reason says which): FIX publishes {record.action_id}'s comment, or "
+            "adopts its exact payload already there, only while the issue is open in "
+            f"{repository}"
+        )
+
+    def issue_hold_steps(self, record: EffectRecord) -> None:
+        """An authorized K9 held by its issue's eligibility (PR #470 R3-F3).
+
+        Nothing of the operator's authorization is missing, and nothing
+        approves or declines it: what is missing is the issue's eligibility,
+        and a plain unblock before the issue qualifies again re-enters FIX,
+        which stops on the same hold. Neither the snapshot nor the live
+        preview (which re-enters FIX on the saved plan without reading the
+        issue) says whether it qualifies now, so that is unknown.
+        """
+        action = record.action_id
+        issue = record.target["issue_url"]
+        repository = self.state.repository or "the run's repository"
+        self.proven.append(
+            self.snap(
+                f"held-{action}",
+                f"the run stopped on {action}, which needs {_granted(record)}; FIX holds an "
+                f"authorized acceptance comment only while the run's issue {issue} is closed "
+                f"or not in {repository}",
+            )
+        )
+        self.unknown.append(
+            Claim(
+                f"eligible-{action}",
+                f"whether {issue} is open in {repository} now: the state records no typed "
+                "reason for which condition held it, and 'status --live' previews 'unblock', "
+                "which re-enters FIX on the saved plan without reading the issue",
+                Freshness.UNKNOWN,
+                None,
+            )
+        )
+        self.steps.append(Step("", self.eligibility_text(record)))
+        self.steps.append(
+            Step(
+                self.plain_unblock(),
+                self.unblock_text(
+                    f"once {issue} is open in {repository} again: FIX publishes or adopts the "
+                    "comment and completes the plan with no fixer launched; before that, the "
+                    "FIX it re-enters stops again on the same hold"
+                ),
+            )
+        )
+        self.steps.append(self.resume_step())
+
+    def issue_hold_maybe_step(self) -> None:
+        """An authorized K9 first in the plan, a stop saved with no code: maybe its issue."""
+        record = self.held_acceptance(None)
+        assert record is not None
+        issue = record.target["issue_url"]
+        self.steps.append(
+            Step(
+                "",
+                f"no code says why the run stopped; if the reason says {issue} is closed or "
+                f"not in the run's repository, {record.action_id} is authorized "
+                f"and held by that alone: {self.eligibility_text(record)}, before the "
+                "unblock below (a FIX it re-enters before stops again on the same hold). "
+                "Otherwise read the reason and the run's log",
+            )
+        )
 
     def pr_body_steps(self, record: EffectRecord) -> None:
         action = record.action_id
@@ -1893,6 +2097,15 @@ class _Builder:
         )
         self.steps.append(self.resume_step())
         if not self.policy.pr_body_approvals:
+            self.steps.append(
+                Step(
+                    self.cli("status"),
+                    "or, in place of the steps above, set safety.pr_body_updates to 'approve' in "
+                    "the configuration first: 'status' then names the approval of exactly "
+                    f"{action} over the description put back to sha256 {base}",
+                    alternative=True,
+                )
+            )
             return
         self.steps.append(
             Step(
