@@ -518,6 +518,7 @@ DIAGNOSES: dict[StopReasonCode, Diagnosis] = {
         f"those bounds, {_UNBLOCK_AFTER}: it re-enters FIX with the open findings, and "
         "'unblock --rereview' asks for a fresh review round instead",
     ),
+    # With a replan journal recorded; without one, :data:`REPLAN_POLICY_REFUSED`.
     StopReasonCode.REPLAN_REFUSED: Diagnosis(
         "the replacement of the PR (REPLAN_REEXECUTE) was refused, and the refusal is recorded "
         "in the replan journal",
@@ -692,6 +693,36 @@ DIAGNOSES: dict[StopReasonCode, Diagnosis] = {
 }
 
 
+#: ``replan-refused`` with no replan journal (PR #470 R2-F3): REVIEW's replan
+#: policy refused a replacement before any transaction began, so there is no
+#: journal for ``unblock`` to refuse over, and it decides as for any stop of the
+#: review loop.
+REPLAN_POLICY_REFUSED = Diagnosis(
+    "after a review round with findings the replan policy (review.replan) called for "
+    "replacing the PR and refused it: the issue used review.replan.max_replans_per_issue "
+    "replacements, a round's findings were saved incomplete, or the decision could not bind "
+    "the PR. No replan transaction began: no journal is recorded, nothing was closed or "
+    "replaced, and the run stays on its PR",
+    "inspect the open findings and the PR; to let the loop go on, run 'unblock' (it re-reads "
+    "GitHub and may refuse): it re-enters FIX with the open findings, and the policy decides "
+    "again after the next review round, so it refuses again while its cause holds; or leave "
+    "the PR to a human",
+)
+
+
+def diagnosis_in(code: StopReasonCode, state: AutoForgeState) -> Diagnosis:
+    """:func:`diagnosis_of` ``code``, where the state tells one code's two stops apart.
+
+    ``replan-refused`` is named by REPLAN_REEXECUTE refusing a transaction it
+    recorded in the replan journal, and by REVIEW's replan policy refusing a
+    replacement before any transaction began, with no journal. Only the first
+    is one ``unblock`` refuses (PR #470 R2-F3).
+    """
+    if code is StopReasonCode.REPLAN_REFUSED and not state.replan_transaction:
+        return REPLAN_POLICY_REFUSED
+    return diagnosis_of(code)
+
+
 def diagnosis_of(code: StopReasonCode) -> Diagnosis:
     """The :class:`Diagnosis` of ``code``, or a family's when the table holds none."""
     found = DIAGNOSES.get(code)
@@ -763,7 +794,7 @@ def _diagnosis_document(
     if stop.outcome not in (StopOutcome.BLOCKED, StopOutcome.FAILED):
         return {}
     known = stop.code is not StopReasonCode.UNKNOWN
-    found = diagnosis_of(stop.code)
+    found = diagnosis_in(stop.code, state)
     if known:
         saved = "saved with the stop by the controller sink that entered it"
     elif state.stop_code:
@@ -1413,7 +1444,7 @@ class _Builder:
         elif self.k12_edited() is None:
             self.k12_maybe_edited_step()
         else:
-            self.steps.append(Step("", diagnosis_of(code).remedy))
+            self.steps.append(Step("", diagnosis_in(code, s).remedy))
         if code is StopReasonCode.GITHUB_CHECKS_REFUSED:
             self.steps.append(
                 Step(
@@ -1910,7 +1941,7 @@ class _Builder:
         self.pending_actions()
         self.plan_preservation()
         self.worktree_note()
-        self.steps.append(Step("", diagnosis_of(self.stop.code).remedy))
+        self.steps.append(Step("", diagnosis_in(self.stop.code, self.state).remedy))
         self.new_run_steps(failed=True)
 
     def in_progress(self) -> None:

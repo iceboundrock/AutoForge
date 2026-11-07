@@ -41,6 +41,7 @@ from autoforge.recovery_package import (
     GUIDE_STOPPED,
     GUIDE_WAITS,
     MAX_TEXT_CHARS,
+    REPLAN_POLICY_REFUSED,
     Commands,
     Policy,
     build_package,
@@ -58,10 +59,12 @@ from autoforge.stop_classification import (
 )
 from autoforge.transitions import Phase
 from tests.conftest import (
+    BRANCH,
     EPIC,
     GOOGLE_API_KEY,
     GOOGLE_KEY_BODY,
     ISSUE,
+    MERGE_BASE,
     PR,
     SHA_A,
     SHA_B,
@@ -75,6 +78,7 @@ from tests.conftest import (
     make_engine,
     pollute_operator_environment,
     pr_body_update,
+    review_result,
     scripted,
     state_tree,
     unloadable_state,
@@ -1035,6 +1039,105 @@ def test_every_code_an_engine_stop_sink_names_has_a_diagnosis():
     for code, diagnosis in DIAGNOSES.items():
         assert diagnosis.meaning and diagnosis.remedy, code
         assert "the reason names" not in diagnosis.meaning, code
+
+
+# -- replan-refused, with a journal or without one (PR #470 R2-F3) ------------------------------
+
+
+def _replan_policy_refused(tmp_state_dir):
+    """``tests/test_replan.py::test_replan_limit_blocks_through_engine``: the issue used
+    every replan it may, and the next round with findings blocks in REVIEW, before any
+    replan transaction begins."""
+    from autoforge.loop_guard import RESULT_NEEDS_FIX, review_record
+
+    gh = FakeGitHub()
+    finding = {
+        "id": "R2-F1",
+        "classification": "non-blocked",
+        "required_resolution": "add a regression test",
+    }
+
+    def reviewer(req):
+        assert req.phase == "REVIEW"
+        return block(review_result(2, SHA_A, [finding]))
+
+    eng = make_engine(tmp_state_dir, reviewer, github=gh)
+    eng.config.review.replan.soft_threshold = 2
+    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+    eng.state.phase = Phase.REVIEW
+    eng.state.current_pr_url = PR
+    eng.state.current_head_sha = SHA_A
+    eng.state.review_round = 1
+    eng.state.escalation_count = eng.config.review.replan.max_replans_per_issue
+    eng.state.review_history = [
+        review_record(1, SHA_A, RESULT_NEEDS_FIX, [dict(finding, id="R1-F1")])
+    ]
+    eng._save()
+    assert eng.step().next_phase == "BLOCKED"
+    assert "replan_limit_exceeded" in eng.state.block_reason
+    assert (eng.state.stop_code, eng.state.replan_transaction) == ("replan-refused", {})
+    return eng
+
+
+def test_a_replan_policy_refusal_with_no_journal_is_not_diagnosed_as_one(
+    tmp_state_dir, status_cli, capsys
+):
+    """The policy refused the replacement before any transaction began: the diagnosis
+    names no journal, nothing forbids the plain unblock a journal would refuse, and the
+    steps lead to it. Run as displayed, it re-enters FIX as 'status --live' previews."""
+    eng = _replan_policy_refused(tmp_state_dir)
+    prefix = _prefix(eng)
+    package = _recovery(status_cli, eng, capsys, "--live")
+    diagnosis = package["diagnosis"]
+    assert (diagnosis["code"], diagnosis["family"]) == ("replan-refused", "bound")
+    assert diagnosis["meaning"] == REPLAN_POLICY_REFUSED.meaning
+    assert diagnosis["remedy"] == REPLAN_POLICY_REFUSED.remedy
+    text = diagnosis["meaning"] + diagnosis["remedy"]
+    assert "recorded in the replan journal" not in text and "'unblock' refuses" not in text
+    assert "unblock-replan" not in _keys(package["forbidden"])
+    assert "replan-journal" not in _keys(package["preserve"])
+    assert package["guide"] == GUIDE_BLOCKED
+    assert (package["live"]["decision"], package["live"]["target_phase"]) == (
+        "would_reenter",
+        "FIX",
+    )
+    sequence = _sequence(package)
+    assert sequence[:4] == [
+        ("", False),
+        (f"{prefix} status --live", False),
+        (f'{prefix} unblock --reason "..."', False),
+        (f"{prefix} resume", False),
+    ]
+    assert package["next"][0]["text"] == REPLAN_POLICY_REFUSED.remedy
+    rc, out, err = _run_displayed(status_cli, eng, sequence[2][0], capsys)
+    assert rc == 0 and "BLOCKED -> FIX" in out, err
+
+
+def test_a_replan_refusal_with_its_journal_keeps_the_journals_diagnosis(tmp_state_dir):
+    """The same code with a rejected transaction on record: the journal's diagnosis, and
+    the plain unblock it refuses is forbidden."""
+    from autoforge.replan_txn import ReplanStage, ReplanTransaction
+
+    eng = _replan_policy_refused(tmp_state_dir)
+    state = load_state(eng.paths.state_file)
+    state.replan_transaction = ReplanTransaction(
+        stage=ReplanStage.REJECTED,
+        issue_url=ISSUE,
+        decision_pr_url=PR,
+        decision_head_sha=SHA_A,
+        decision_branch=BRANCH,
+        decision_base_ref="main",
+        decision_merge_base_sha=MERGE_BASE,
+        escalation={"trigger": "hard_review_round_threshold"},
+        rejection_reason="refused by verification",
+    ).to_dict()
+    package = build_package(
+        classify_state(state), state, commands=_commands_of(eng), policy=_POLICY
+    )
+    assert package.diagnosis["meaning"] == DIAGNOSES[StopReasonCode.REPLAN_REFUSED].meaning
+    assert "recorded in the replan journal" in package.diagnosis["meaning"]
+    assert "unblock-replan" in [c.key for c in package.forbidden]
+    assert package.guide == GUIDE_REPLAN
 
 
 def test_an_agents_blocked_fix_offers_a_rereview_and_protects_its_unsaved_candidate(

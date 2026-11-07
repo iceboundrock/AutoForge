@@ -713,6 +713,14 @@ The messages below are AutoForge's own refusals, grouped by subject.
   running the agent again; before that it runs the agent again on the same
   base. A transient GitHub failure inside the transaction leaves it
   resumable the same way.
+- **The replan policy refused a replan, and no transaction is on record**
+  (`replan-refused`, with `replan_limit_exceeded` or `replan_evidence_truncated`
+  in the reason): after a review round the policy called for a replacement
+  and refused it before any transaction began. Nothing was closed or replaced,
+  and the run stays on its PR. `unblock` re-enters `FIX` with the open findings
+  as for any review-loop stop, and the policy decides again after the next
+  round, so it refuses again while its cause holds. Inspect the findings and
+  the PR, or leave the PR to a human.
 - **The run is `BLOCKED` with a replan transaction on record** (a rejected
   replacement or source, or a journal the controller could not read): this
   run is over. `resume` exits 1 as for any `BLOCKED` run, `unblock` refuses
