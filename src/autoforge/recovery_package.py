@@ -342,7 +342,7 @@ class RecoveryPackage:
                     number += 1
                     head = f"    {number}."
                 text = _one_line(step.text)
-                body = f"{_one_line(step.command)}  ({text})" if step.command else text
+                body = f"{_command_line(step.command)}  ({text})" if step.command else text
                 out.append(f"{head} {body}")
         out += _live_lines(self.live)
         if self.guide:
@@ -394,8 +394,48 @@ def _clip(text: str) -> str:
 
 
 def _one_line(text: str) -> str:
-    """``text`` on one line, for the human block."""
-    return " ".join(str(text).split())
+    """``text`` on one line, for the human block: each character that is not printable
+    (a line break, a tab, any other control or separator but the space) becomes a space.
+
+    Spaces are kept as they are, never collapsed: a text names paths and commands
+    whose runs of spaces are part of them (PR #470 R5-F2). A step's own command is
+    rendered by :func:`_command_line`, which keeps every character.
+    """
+    return "".join(c if c.isprintable() else " " for c in str(text))
+
+
+def _command_line(command: str) -> str:
+    """``command`` for the human block, on one line, the arguments' bytes unchanged.
+
+    A command whose every character is printable is shown exactly as built:
+    spaces inside a quoted path are part of the argument (PR #470 R5-F2). Each
+    character that is not (a path holding a line break, a tab or an escape) is
+    written as a dollar-single-quoted part, ``$'\\ooo'`` per UTF-8 byte (a path
+    Python read as surrogate escapes keeps its original bytes), closing and
+    reopening the quote around it. The shell joins the parts into the same
+    argument, so the line stays one line and puts nothing raw on the terminal.
+    That quoting is POSIX.1-2024's, which bash, zsh and ksh read (dash does not);
+    ``--json`` holds the command as built.
+    """
+    if command.isprintable():
+        return command
+    out: list[str] = []
+    quote = ""
+    for char in command:
+        if char.isprintable():
+            if char == quote:
+                quote = ""
+            elif not quote and char in "'\"":
+                quote = char
+            out.append(char)
+            continue
+        try:
+            data = char.encode("utf-8", "surrogateescape")
+        except UnicodeEncodeError:
+            data = char.encode("utf-8", "surrogatepass")
+        octal = "".join(f"\\{byte:03o}" for byte in data)
+        out.append(f"{quote}$'{octal}'{quote}")
+    return "".join(out)
 
 
 def _granted(record: EffectRecord) -> str:
@@ -1722,9 +1762,13 @@ class _Builder:
             return "safety.pr_body_updates"
         return "safety.acceptance_actions"
 
-    def declines_left(self) -> bool:
-        """Whether the round holds fewer declines than ``unblock`` records for one."""
-        return self.state.round_declines() < MAX_DECLINES_PER_ROUND
+    def declines_left(self) -> int:
+        """How many more declines ``unblock`` records in the round: 0 when none.
+
+        Every id one ``unblock --decline-action`` names counts, and a command
+        naming more than this is refused whole (PR #470 R5-F1).
+        """
+        return self.state.decline_room()
 
     def pr_body_decline_refusal(self, record: EffectRecord) -> str:
         """Why ``unblock`` refuses to decline ``record`` now, or "" (#423, PR #467)."""
@@ -1739,11 +1783,16 @@ class _Builder:
                 "plan would abandon that write"
             )
         if not self.declines_left():
-            return (
-                f"in review round {self.state.review_round}: it already records "
-                f"{self.state.round_declines()} declined actions, the most the controller keeps"
-            )
+            return f"while {self.declines_full()}: it is refused"
         return ""
+
+    def declines_full(self) -> str:
+        """That the round being fixed holds as many declines as ``unblock`` records."""
+        return (
+            f"review round {self.state.review_round} already records "
+            f"{self.state.round_declines()} declined actions (acceptance, operator and PR "
+            "description actions together), the most the controller keeps for one round"
+        )
 
     def operator_action_steps(self, records: list[EffectRecord]) -> None:
         """K10: post (or bind) every pending action, then one unblock (PR #470 R1-F2).
@@ -1830,15 +1879,36 @@ class _Builder:
                     "actions offers the decline again",
                 )
             )
-        elif self.declines_left():
-            declines = [a for r in records for a in ("--decline-action", r.action_id)]
+        elif not self.declines_left():
+            self.forbidden.append(
+                self.snap(
+                    "decline-operator-actions",
+                    f"'unblock --decline-action' of any operator action of the plan: "
+                    f"{self.declines_full()}, so 'unblock' refuses every decline; post the "
+                    "payloads or bind evidence instead",
+                )
+            )
+        else:
+            # Each id named counts against the round's bound, and the pending
+            # actions not named are withdrawn with them, uncounted: so name no
+            # more than the round has room for (PR #470 R5-F1).
+            room = self.declines_left()
+            named, withdrawn = records[:room], records[room:]
+            declines = [a for r in named for a in ("--decline-action", r.action_id)]
+            how = "FIX runs the fixer again; then 'resume'"
+            if withdrawn:
+                how = (
+                    f"review round {self.state.review_round} records "
+                    f"{self.state.round_declines()} declined actions and 'unblock' records at "
+                    f"most {MAX_DECLINES_PER_ROUND}, so this declines only "
+                    f"{', '.join(r.action_id for r in named)} and withdraws "
+                    f"{', '.join(r.action_id for r in withdrawn)} with it, uncounted and not "
+                    f"declined (the fixer may ask for a withdrawn action again); {how}"
+                )
             self.steps.append(
                 Step(
                     f"{self.cli('unblock', *declines, '--reason')} {_WHY}",
-                    self.unblock_text(
-                        "or withdraw them all in place of the steps above: FIX runs the fixer "
-                        "again; then 'resume'"
-                    ),
+                    self.unblock_text(f"or withdraw them all in place of the steps above: {how}"),
                     alternative=True,
                 )
             )
@@ -2129,15 +2199,19 @@ class _Builder:
             if self.pr_body_decline_refusal(record)
             else (
                 f", or keep the edit and decline it ("
-                f"{self.cli('unblock', '--decline-action', action, '--reason')} {_WHY})"
+                f"{_command_line(self.cli('unblock', '--decline-action', action, '--reason'))} "
+                f"{_WHY})"
             )
         )
+        # The commands are in the text, which the human block puts on one line:
+        # spelled as a step's command is, so their bytes survive (PR #470 R5-F2).
+        payload = _command_line(self.cli("status", "--action", action))
         self.steps.append(
             Step(
                 "",
                 "no code says why the run stopped; if 'status --live' says the PR description "
                 f"changed after the controller verified {action}: set it back to exactly its "
-                f"payload ({self.cli('status', '--action', action)}) and unblock{decline}. "
+                f"payload ({payload}) and unblock{decline}. "
                 "Otherwise read the reason and the run's log",
             )
         )

@@ -15,7 +15,10 @@ forbidden, what not to touch (an unpushed candidate's worktree, or one that
 may hold a FIX candidate no record names, the saved plan, comments already
 verified), and the exact next commands with the flags you ran `status` with,
 as one sequence `unblock` accepts in order: operator actions to bind go in
-one `unblock`, and a later wait of the same plan is left to the next stop.
+one `unblock`, a later wait of the same plan is left to the next stop, and a
+withdrawal of operator actions names no more of them than the round's 16
+declines leave room for (the stop's reason too). The human block prints each
+command as `--json` holds it, a path's repeated spaces included.
 Each claim says whether it comes from the state file, the configuration,
 GitHub now, or is unknown. Every other field of `status --json` is as
 before. In the human output the `Recovery` block is the one place that names

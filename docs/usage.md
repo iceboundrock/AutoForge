@@ -895,7 +895,12 @@ is dropped: an action already verified stays verified, the named ones are
 declined, the others are withdrawn, and `resume` runs the fixer again with
 your reason in its prompt. A declined action is never requested again
 unchanged, and verified work is never requested again. Declines count with
-acceptance-action declines toward the same 16 per review round. An action in
+acceptance-action declines toward the same 16 per review round, one per
+action named, and an `unblock` that would pass 16 is refused whole: when the
+round has room for fewer declines than actions pending, the stop's reason
+and `status` name only as many as it has room for, and the others are
+withdrawn with them (a withdrawn action is not declined, and the fixer may
+request it again). With no room left no withdrawal is possible. An action in
 conflict is repaired, never declined. Every pending action's target is read
 first, named or not: a target transferred, in another repository or no
 longer readable refuses the decline, naming it, while one that is not found
@@ -1917,13 +1922,18 @@ in:
   (`safety.acceptance_actions` or `safety.pr_body_updates`) is `off`, an
   approval or a decline of an acceptance comment already authorized, and a
   decline of operator actions while one of them is in conflict (repair it
-  first: the plain `unblock` that follows clears the saved conflict);
+  first: the plain `unblock` that follows clears the saved conflict) or once
+  the round holds 16 declines;
 - **do not touch:** the agent worktree that holds an unpushed candidate, or
   may hold one no record names, the saved plan, comments already verified as
   evidence;
 - **next:** the exact commands, with the flags this command was given, in
-  order, alternatives marked `or:`; and the section of the
-  [troubleshooting guide](troubleshooting.md) for the case. This is the one
+  order, alternatives marked `or:`, each as `--json` holds it, a path's
+  spaces included, except that a character that cannot be printed on one
+  line (a path holding a line break, say) is spelled as a `$'\ooo'` part,
+  which bash, zsh and ksh read back to the same bytes (dash does not); and
+  the section of the [troubleshooting guide](troubleshooting.md) for the
+  case. This is the one
   place `status` names a command that leaves or continues the stop (an
   `unblock`, a `resume`, a payload to post or a comment to bind): the
   `Acceptance action`, `Operator actions` and `PR body update` blocks above it

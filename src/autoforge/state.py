@@ -1525,6 +1525,15 @@ class AutoForgeState:
             if o["outcome"] == "declined" and o["round"] == self.review_round
         )
 
+    def decline_room(self) -> int:
+        """How many more declines ``unblock`` records in the round being fixed (PR #470 R5-F1).
+
+        :data:`MAX_DECLINES_PER_ROUND` less :meth:`round_declines`, never
+        below 0. Each action an ``unblock --decline-action`` names counts, so
+        a command naming more ids than this is refused whole.
+        """
+        return max(0, MAX_DECLINES_PER_ROUND - self.round_declines())
+
     def bound_operator_comment_outcomes(self) -> None:
         """Drop the oldest ``operator_comment_outcomes`` past the bound, never this round's.
 

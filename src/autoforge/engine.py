@@ -17921,12 +17921,14 @@ class ControllerEngine:
         commands: print and post a payload, then one unblock (or, in its
         place, one that binds every comment bound) and resume, or decline.
         They are the ones ``unblock`` accepts, as ``status``'s recovery package
-        names them (PR #470 R1-F2, R3-F2, R4-F1): an applied bind leaves
+        names them (PR #470 R1-F2, R3-F2, R4-F1, R5-F1): an applied bind leaves
         BLOCKED at once, so the bindings go in the one unblock; an action in
-        conflict is repaired, never bound over; and no decline is named while
-        one is in conflict, since ``unblock`` refuses every decline then. Agent
-        text appears only as the finding's title, which the review result
-        bounded to one line.
+        conflict is repaired, never bound over; no decline is named while
+        one is in conflict, since ``unblock`` refuses every decline then; and
+        the decline names no more ids than the round's bound has room for,
+        since ``unblock`` refuses a command that would pass it. Agent text
+        appears only as the finding's title, which the review result bounded
+        to one line.
         """
         state = self._require_state()
         why = "<why>"
@@ -18001,16 +18003,36 @@ class ControllerEngine:
             for r in records
             if r.kind is EffectKind.OPERATOR_COMMENT and r.stage is Stage.CONFLICT
         ]
+        room = state.decline_room()
         if conflicts:
             withdraw = (
                 f"No withdrawal is possible while {', '.join(conflicts)} is in conflict: "
                 "'unblock' refuses every decline of these actions then, so repair it first"
             )
+        elif not room:
+            withdraw = (
+                f"No withdrawal is possible: review round {state.review_round} already records "
+                f"{state.round_declines()} declined actions (acceptance, operator and PR "
+                "description actions together), the most the controller keeps for one round, "
+                "so 'unblock' refuses every decline"
+            )
         else:
+            # Each id named counts against the round's bound and the pending
+            # ones not named are withdrawn with them, uncounted, so the command
+            # names no more than the round has room for (PR #470 R5-F1).
+            named, unnamed = pending[:room], pending[room:]
             decline = self.cli_command(
-                "unblock", *[a for p in pending for a in ("--decline-action", p)]
+                "unblock", *[a for p in named for a in ("--decline-action", p)]
             )
             withdraw = f"To withdraw them instead: {decline} --reason {why!r}"
+            if unnamed:
+                withdraw += (
+                    f" (review round {state.review_round} records {state.round_declines()} "
+                    f"declined actions and 'unblock' records at most {MAX_DECLINES_PER_ROUND}, "
+                    f"so this declines only {', '.join(named)} and withdraws "
+                    f"{', '.join(unnamed)} with it, uncounted and not declined; the fixer may "
+                    "ask for a withdrawn action again)"
+                )
         verified = f" Verified so far: {', '.join(done)}." if done else ""
         return bound_block_reason(
             f"FIX of review round {state.review_round} awaits {len(open_)} operator action(s) "

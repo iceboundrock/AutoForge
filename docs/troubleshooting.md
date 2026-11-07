@@ -218,7 +218,9 @@ next. Another `unblock` would exit 2, since the run is no longer `BLOCKED`.
     `unblock --bind-evidence X-… <comment URL> --reason "..."` (one pair
     per bound action, repeatable), then `resume`;
   - to withdraw them instead: `unblock --decline-action X-… --reason "..."`
-    (repeatable), then `resume`, which runs the fixer again.
+    (repeatable, up to the 16 declines a review round records; `status`
+    names no more than are left, and the others are withdrawn with them),
+    then `resume`, which runs the fixer again.
 
   See [BLOCKED on operator actions](usage.md#blocked-on-operator-actions).
 

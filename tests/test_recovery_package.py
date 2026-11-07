@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -45,12 +46,13 @@ from autoforge.recovery_package import (
     REPLAN_POLICY_REFUSED,
     Commands,
     Policy,
+    _command_line,
     build_package,
 )
 from autoforge.redaction import redact
 from autoforge.run_namespace import issue_namespace
 from autoforge.sandbox_pin import SOURCE_CREATED, SandboxPin
-from autoforge.state import load_state, save_state
+from autoforge.state import MAX_DECLINES_PER_ROUND, load_state, save_state
 from autoforge.stop_classification import (
     ReasonSource,
     StopClassification,
@@ -2083,6 +2085,48 @@ def _k12_conflict_off(tmp_state_dir):
     return eng
 
 
+def _declines(count: int) -> list[dict]:
+    """``count`` acceptance-action declines of review round 1, as 'unblock' records them."""
+    return [
+        {
+            "action_id": f"A-{n:016x}",
+            "round": 1,
+            "finding_id": "R1-F1",
+            "outcome": "declined",
+            "at": "2026-10-21T00:00:00Z",
+            "comment_url": "",
+            "reason": "",
+        }
+        for n in range(count)
+    ]
+
+
+def _k10_at_the_decline_bound(tmp_state_dir):
+    """K10 for #16 and #158 in a round that already records 15 declines: one more fits
+    under the bound of 16, two do not (PR #470 R5-F1)."""
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(BOTH))
+    eng.state.acceptance_outcomes = _declines(MAX_DECLINES_PER_ROUND - 1)
+    assert eng.step().next_phase == "BLOCKED"
+    assert eng.state.decline_room() == 1
+    return eng
+
+
+def _k10_with_no_decline_left(tmp_state_dir):
+    """The K10 of :func:`_k10_at_the_decline_bound` with #16's payload posted and the
+    round's 16th decline recorded since (an edited state: 'unblock' drops the plan with
+    every decline): FIX verifies #16 and stops again on #158 with no room to decline."""
+    eng = _k10_at_the_decline_bound(tmp_state_dir)
+    eng.github.add_comment(T16, 7016, _k10(eng, T16).body)
+    eng.state.acceptance_outcomes = _declines(MAX_DECLINES_PER_ROUND)
+    eng._save()
+    assert eng.unblock("posted #16").unblocked
+    assert eng.step().next_phase == "BLOCKED"
+    assert eng.state.decline_room() == 0
+    assert _k10(eng, T16).stage is Stage.OBSERVED
+    return eng
+
+
 #: Every stop that holds an acceptance, operator or PR body action, and the scenario
 #: table's others: what a whole 'status' prints must agree with its package.
 HUMAN_SCENARIOS = {
@@ -2090,6 +2134,8 @@ HUMAN_SCENARIOS = {
     "k9-acceptance-actions-off": _k9_off,
     "k9-held-by-its-issue": lambda d: _k9_held_by_issue(d, "policy", "CLOSED"),
     "k10-one-in-conflict": _k10_conflicted,
+    "k10-at-the-decline-bound": _k10_at_the_decline_bound,
+    "k10-with-no-decline-left": _k10_with_no_decline_left,
     "k10-kept-by-a-failed-run": _k10_failed,
     "k10-then-k12": _k10_then_k12,
     "k12-pr-body-updates-off": _k12_off,
@@ -2123,7 +2169,9 @@ def _displayed_commands(block: str) -> list[str]:
     """The command of each step the human Recovery block numbers or offers with 'or:'.
 
     A step prints ``<command>  (<text>)``, or its text alone when no command performs
-    it; neither part holds two spaces in a row, since each is put on one line.
+    it. The command is split off at the first two spaces before a parenthesis: a
+    command keeps the spaces of its quoted paths (PR #470 R5-F2), and no path of
+    these scenarios holds that sequence.
     """
     commands = []
     for line in block.splitlines():
@@ -2313,3 +2361,141 @@ def test_a_k10_stops_reason_names_the_sequence_unblock_accepts(tmp_state_dir):
         f"To withdraw them instead: autoforge unblock --decline-action {x16} "
         f"--decline-action {x158} --reason '<why>'"
     ) in reason
+
+
+# -- a withdrawal within the round's decline bound (PR #470 R5-F1) -------------------------
+
+
+def test_a_withdrawal_at_the_decline_bound_names_only_the_declines_it_has_room_for(
+    tmp_state_dir, status_cli, capsys
+):
+    """With 15 declines recorded and two operator actions pending, 'unblock' refuses a
+    command naming both (17 would pass 16), so neither the Recovery block nor the reason
+    saved with the stop offers it: both name #16's action alone and say #158's is
+    withdrawn with it. The command, run exactly as the whole human output displays it,
+    is applied: #16's action is declined, #158's withdrawn, and the round holds 16."""
+    eng = _k10_at_the_decline_bound(tmp_state_dir)
+    x16, x158 = _k10(eng, T16).action_id, _k10(eng, T158).action_id
+    prefix = _prefix(eng)
+    package = _recovery(status_cli, eng, capsys)
+    decline = f'{prefix} unblock --decline-action {x16} --reason "..."'
+    [step] = [s for s in package["next"] if "--decline-action" in s["command"]]
+    assert step["command"] == decline and step["alternative"]
+    assert (
+        f"review round 1 records 15 declined actions and 'unblock' records at most 16, so "
+        f"this declines only {x16} and withdraws {x158} with it, uncounted and not declined"
+    ) in step["text"]
+    out, block, rest = _human_status(status_cli, eng, capsys)
+    assert _displayed_commands(block) == _commands(package)
+    assert f"      or: {decline}  (or withdraw them all in place of the steps above: " in block
+    [reason] = [line for line in out.splitlines() if line.startswith("Reason:")]
+    assert (
+        f"To withdraw them instead: autoforge unblock --decline-action {x16} --reason '<why>' "
+        f"(review round 1 records 15 declined actions and 'unblock' records at most 16, so "
+        f"this declines only {x16} and withdraws {x158} with it, uncounted and not declined; "
+        "the fixer may ask for a withdrawn action again)"
+    ) in reason
+    offered = [c for c in _offered_unblocks(out) if "--decline-action" in c]
+    assert len(offered) == 2 and not [c for c in offered if f"--decline-action {x158}" in c]
+    both = ("--decline-action", x16, "--decline-action", x158)
+    rc, out, err = status_cli(eng, "unblock", "--dry-run", *both, "--reason", "x", capsys=capsys)
+    assert "would stay BLOCKED" in out and "2 more would pass 16" in out, out + err
+    rc, out, err = _run_displayed(status_cli, eng, decline, capsys)
+    assert rc == 0 and "BLOCKED -> FIX" in out, err
+    s = load_state(eng.paths.state_file)
+    assert [(o["action_id"], o["outcome"]) for o in s.operator_comment_outcomes] == [
+        (x16, "declined"),
+        (x158, "withdrawn"),
+    ]
+    assert s.round_declines() == MAX_DECLINES_PER_ROUND and s.effect_records == []
+
+
+def test_no_withdrawal_is_offered_once_the_round_holds_its_declines(
+    tmp_state_dir, status_cli, capsys
+):
+    """With the round's 16 declines recorded, 'unblock' refuses any decline: the package
+    forbids it and names none, and the reason FIX saved says no withdrawal is possible."""
+    eng = _k10_with_no_decline_left(tmp_state_dir)
+    x158 = _k10(eng, T158).action_id
+    package = _recovery(status_cli, eng, capsys)
+    assert not [c for c in _commands(package) if "--decline-action" in c]
+    [forbidden] = [c for c in package["forbidden"] if c["key"] == "decline-operator-actions"]
+    assert "review round 1 already records 16 declined actions" in forbidden["text"]
+    out, block, rest = _human_status(status_cli, eng, capsys)
+    assert not [c for c in _offered_unblocks(out) if "--decline-action" in c]
+    [reason] = [line for line in out.splitlines() if line.startswith("Reason:")]
+    assert (
+        "No withdrawal is possible: review round 1 already records 16 declined actions"
+    ) in reason
+    rc, out, err = status_cli(
+        eng, "unblock", "--dry-run", "--decline-action", x158, "--reason", "x", capsys=capsys
+    )
+    assert "would stay BLOCKED" in out and "would pass 16" in out, out + err
+
+
+# -- commands print byte for byte (PR #470 R5-F2) ------------------------------------------
+
+
+def test_repeated_spaces_in_the_state_and_configuration_paths_survive_the_whole_output(
+    tmp_path, status_cli, capsys
+):
+    """A state directory and a configuration file whose names hold runs of spaces: every
+    command the whole human output displays is the one '--json' holds, byte for byte, and
+    names those paths unchanged, never with the spaces collapsed (which would target
+    another directory). The displayed commands find the run by the state directory they
+    name, not by the one this test's own invocation gives."""
+    state_dir = tmp_path / "state  with  spaces"
+    config = tmp_path / "conf   dir" / "autoforge  config.yaml"
+    config.parent.mkdir()
+    config.write_text("# read through the scenario's configuration\n")
+    eng = _k10_blocked(state_dir)
+    x16 = _k10(eng, T16)
+    flags = ("--config", str(config))
+    rc, out, err = status_cli(eng, *flags, "status", "--json", capsys=capsys)
+    assert rc == 0, err
+    package = json.loads(out)["recovery"]
+    prefix = shlex.join(["autoforge", *flags, "--state-dir", str(state_dir)])
+    commands = _commands(package)
+    assert commands and all(c.startswith(f"{prefix} ") for c in commands), commands
+    rc, out, err = status_cli(eng, *flags, "status", capsys=capsys)
+    assert rc == 0, err
+    start = out.index("\nRecovery (")
+    block = out[start : out.index("\nOuter sandbox:", start)]
+    assert _displayed_commands(block) == commands
+    assert "state with spaces" not in out and "conf dir" not in out
+    assert "autoforge config.yaml" not in out
+    for command in _displayed_commands(block):
+        words = shlex.split(command)
+        assert words[1:5] == [*flags, "--state-dir", str(state_dir)], command
+    [read] = [c for c in commands if c == f"{prefix} status --action {x16.action_id}"]
+    rc, out, err = status_cli(
+        eng, *shlex.split(read)[1:], capsys=capsys, state_dir=tmp_path / "no run here"
+    )
+    assert rc == 0 and out == x16.body, err
+
+
+_UNPRINTABLE = [
+    "state\tdir",
+    "state\ndir",
+    "it's\r\nhere",
+    "esc\x1b[31mred",
+    "line\u2028sep",
+    "byte\udcffhere",
+]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash to read the line back")
+@pytest.mark.parametrize("name", _UNPRINTABLE)
+def test_a_path_that_cannot_be_printed_is_spelled_on_one_line_with_its_bytes(name):
+    """A path holding a character that cannot be printed on one line (a line break, a
+    tab, an escape, a byte Python read as a surrogate) is shown as a dollar-single-quoted
+    part: the line is one printable line, and the shell reads back the path's bytes."""
+    argv = ["autoforge", "--state-dir", f"/tmp/{name}  x", "unblock", "--reason", "..."]
+    line = _command_line(shlex.join(argv))
+    assert line.isprintable(), line
+    read = subprocess.run(
+        ["bash", "-c", f"printf '%s\\0' {line}"], capture_output=True, check=True
+    ).stdout
+    assert read.split(b"\0")[:-1] == [os.fsencode(a) for a in argv]
+    printable = shlex.join(["autoforge", "--state-dir", "/tmp/a  b"])
+    assert _command_line(printable) == printable
