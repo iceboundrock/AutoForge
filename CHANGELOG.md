@@ -5,6 +5,25 @@ so.
 
 ## Unreleased
 
+### `status` says what a stop allows; `status --live` previews `unblock` (#374)
+
+`status` ends with a `Recovery` block, and `status --json` carries it as
+`recovery`: what the controller recorded, which saved action is pending on
+which exact target (its id and a reference to its payload), what is
+forbidden, what not to touch (an unpushed candidate's worktree, the saved
+plan, comments already verified), and the exact next commands with the flags
+you ran `status` with. Each claim says whether it comes from the state file,
+the configuration, GitHub now, or is unknown; the stop's reason code is
+always unknown here, since none is saved. It replaces nothing: every other
+field and line of `status` is as before.
+
+`status --live` adds, for a `BLOCKED` run, the decision `unblock --dry-run`
+would print for the same state, read from GitHub, and any drift of the PR
+from what the state recorded. It takes no lock and writes nothing. A
+`would re-enter` there is a preview: `unblock` reads GitHub again and decides
+then. See
+[The recovery package and `status --live`](docs/usage.md#the-recovery-package-and-status---live).
+
 ### Agents and repository commands get an allow-list key each; credential-looking names are called out (#286)
 
 `execution.env_allowlist` and `env_allowlist_extra` reached every launch. A name

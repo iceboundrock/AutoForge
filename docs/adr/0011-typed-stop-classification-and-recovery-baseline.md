@@ -365,7 +365,10 @@ and every default. The CLI adds one `stop:` line to what it already prints
 ## 4. Open questions
 
 - **Persisting the code** (D5): when #370, #374 or #375 needs it across
-  processes, through #23.
+  processes, through #23. #374's recovery package does not: it labels a
+  loaded stop's code `unknown`, works from the typed records the state does
+  persist, and takes `unblock`'s own decision from GitHub with
+  `status --live`. ADR 0012 (#370) persists none either (its D10).
 - **Failed launches that exit 0**: the journal records only their error
   text. A typed `ended_by` for a malformed result or a refused run log would
   let the corpus tell them apart; it is a run-log change and not made here.

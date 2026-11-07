@@ -70,17 +70,22 @@ configuration's `state_dir` names another. `no state file at <path>` almost
 always means a command without the run's `--state-dir` (or `--config`, when
 that sets `state_dir`), or run from another directory.
 
-- **`autoforge status`** prints the run as saved, and reads nothing from
-  GitHub: the issue, PR and branch, the configuration the run is on
-  (`Config:`), the `Phase:`, the review round, the reviewed HEAD and base,
-  the open findings, `Reason:` (the block or failure reason), the last
-  `Unblocked:` entry, any acceptance or operator actions with their next
-  commands, the outer sandbox and its pin, and the validation evidence.
+- **`autoforge status`** prints the run as saved (it reads GitHub only for
+  the issue's native parent and an unjournaled review comment): the issue,
+  PR and branch, the configuration the run is on (`Config:`), the `Phase:`,
+  the review round, the reviewed HEAD and base, the open findings,
+  `Reason:` (the block or failure reason), the last `Unblocked:` entry, any
+  acceptance or operator actions with their next commands, the `Recovery`
+  block (what the stop proves, what is pending on which target, what is
+  forbidden, what not to touch and the next commands, each claim labelled
+  `snapshot`, `configuration`, `live` or `unknown`:
+  [The recovery package](usage.md#the-recovery-package-and-status---live)),
+  the outer sandbox and its pin, and the validation evidence.
 - **`autoforge status --json`** prints the same state as one JSON document,
   with derived fields beside the raw ones: `replan_journal`,
   `acceptance_actions`, `operator_actions`, `pr_body_updates`,
   `review_certificate_status`,
-  `stop` and `outer_sandbox`. Both outputs are redacted.
+  `stop`, `recovery` and `outer_sandbox`. Both outputs are redacted.
 - **`<state dir>/logs/<run-id>/`** holds one directory per agent launch,
   `<seq>-<phase>-<attempt>/`, and `events.jsonl`, one line per launch and
   per operator action (an `unblock`, an accepted configuration change). In
@@ -99,10 +104,12 @@ that sets `state_dir`), or run from another directory.
   (or under `execution.worktree_dir`), is where every agent of the issue
   worked: `git -C <worktree> status` and `git -C <worktree> log` show what
   the last one left.
-- **Two dry runs preview without writing.** `resume --dry-run --max-steps 1`
+- **Three previews write nothing.** `resume --dry-run --max-steps 1`
   shows the next step's phase, profile, limits and worktree, and runs no
   `gh`; `unblock --dry-run --reason "..."` reads GitHub and says which phase
-  `unblock` would re-enter, or why it would refuse.
+  `unblock` would re-enter, or why it would refuse; `status --live` puts
+  that same decision into the recovery package, beside what the state
+  recorded, with any drift between the two.
 
 Never edit `state.json`. A hand edit can make the controller misread a run
 it then acts on, and nothing AutoForge suggests requires one.
@@ -138,6 +145,11 @@ The code is advice and grants nothing: `unblock` re-reads GitHub whatever
 it says. It is not saved, so `resume` and `status` on a stopped run show
 `reason unknown, from state`, and `Reason:` keeps the text
 ([ADR 0011](adr/0011-typed-stop-classification-and-recovery-baseline.md)).
+`status`'s `Recovery` block takes it from there without reading `Reason:`:
+the saved plan's pending actions with their exact ids and targets, what is
+forbidden, what not to touch and the next commands, and with `--live`
+the decision `unblock` would take now
+([The recovery package](usage.md#the-recovery-package-and-status---live)).
 
 ## BLOCKED: the controller will not decide alone
 
@@ -725,7 +737,7 @@ have [their own table](usage.md#recovery-and-exit-codes).
 | `resume` | stopped at `READY_FOR_MERGE` (the banner) or `DONE`, or `--max-steps` spent; a dry run | the run is or ends `BLOCKED` or `FAILED` (a run already `BLOCKED` or `FAILED` is refused with 1, never 2); an error that left the phase unchanged | a configuration error (the sandbox's capability and the config file's placement included); a configuration that differs from the recorded one, or a weaker `sandbox.mode`, without `--accept-config-change`; no state, or one that does not load; the lock held; an issue a scheduler owns, or a `--state-dir` inside the scheduler's root |
 | `unblock` | a phase was re-entered (then `resume`); a dry run, whatever it would decide | refused: the run stays `BLOCKED`; an action id that names no waiting action; a GitHub failure | the run is not `BLOCKED`; a malformed action id; a configuration error; a configuration that differs, without `--accept-config-change`; no state, or one that does not load; the lock held; an issue a scheduler owns |
 | `rebind-epic` | rebound (then `resume`); already bound to `--to` by that very rebind; a dry run that would rebind | a GitHub read failed, the old EPIC's comment listing included (nothing changed; the dry run's too) | refused, with every reason (the dry run's `would refuse` too): a phase other than `READY_FOR_MERGE` or `BLOCKED`, the run's own PR counted, persisted state tied to the recorded EPIC, a progress comment for the issue (or an unreadable progress marker) on the recorded EPIC, a stale `--from`, `--issue` or `--run-id`, a `--to` already recorded that repeats no journaled rebind, a journal that does not parse, `--to` not the issue's open native parent, an issue that changed while it was read; a malformed request; no state, or one that does not load; the lock held (the dry run reports it too); a `--state-dir` of another repository or of none; an issue a scheduler owns, or a `--state-dir` inside the scheduler's root |
-| `status` | printed (a failed read of the issue's native parent included) | `--action` names no saved action | a configuration error; no state, or one that does not load |
+| `status` | printed (a failed read of the issue's native parent included, and with `--live` a read that failed or a configuration `unblock` would refuse) | `--action` names no saved action | a configuration error, `--action` with `--live` included; no state, or one that does not load |
 | `doctor` | every required check passed (a `WARN` or a skipped check does not fail) | a required check failed | a usage error only |
 
 `Ctrl-C` ends any of them with Python's status for an interrupt, 130. The
