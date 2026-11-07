@@ -470,14 +470,22 @@ def _imports(path: Path) -> set[str]:
 def test_only_the_sinks_and_the_cli_import_the_classification():
     """No module that decides a transition, a retry, a write, a permission or a
     budget can read a classification: only the engine (which names a sink's
-    code) and the CLI (which prints it) import the module."""
+    code), the CLI (which prints it) and the recovery package (#374, which
+    renders it for ``status``, and which only the CLI imports) import the
+    module."""
     importers = {
         path.stem
         for path in SRC.rglob("*.py")
         if path.stem != "stop_classification"
         and {"stop_classification", "autoforge.stop_classification"} & _imports(path)
     }
-    assert importers == {"engine", "cli"}
+    assert importers == {"engine", "cli", "recovery_package"}
+    package_importers = {
+        path.stem
+        for path in SRC.rglob("*.py")
+        if {"recovery_package", "autoforge.recovery_package"} & _imports(path)
+    }
+    assert package_importers == {"cli"}
     own = _imports(SRC / "stop_classification.py")
     stdlib = {"__future__", "collections.abc", "dataclasses", "enum", "typing"}
     assert own - stdlib == {"errors", "transitions", "state"}  # state: typing only
@@ -527,7 +535,7 @@ def test_nothing_of_a_classification_is_persisted(tmp_state_dir, fake_github):
 
 
 def test_unblock_takes_no_classification():
-    for name in ("unblock", "_unblock_decision"):
+    for name in ("unblock", "_unblock_decision", "unblock_preview"):
         params = inspect.signature(getattr(ControllerEngine, name)).parameters
         assert not [p for p in params if "stop" in p or "code" in p], name
 

@@ -37,7 +37,9 @@ Commands:
           one-field state save; --dry-run writes nothing
   status  show the persisted run summary (--json for machine output; --action
           prints an acceptance, operator or PR body action's exact payload); reads the issue's
-          native parent and warns, changing nothing, when it is not the recorded EPIC
+          native parent and warns, changing nothing, when it is not the recorded EPIC; its
+          recovery package (#374) says what the stop proves, waits on, forbids and keeps,
+          and the next commands, and --live adds a BLOCKED run's unblock dry-run decision
   epic    the parallel EPIC scheduler (ADR 0008, #183), REMOTE only: run (with
           --dry-run and --force), resume, status (lock-free, --json), stop
           (lock-free, --now), archive, and recheck, which reads the PR of an
@@ -57,6 +59,7 @@ import json
 import os
 import re
 import select
+import shlex
 import sys
 import time
 import unicodedata
@@ -74,7 +77,6 @@ from .config_fingerprint import RecordedConfiguration
 from .doctor import CheckResult, run_doctor
 from .effects import (
     AUTHORIZATION_POLICY,
-    MAX_EFFECT_ATTEMPTS,
     EffectKind,
     EffectRecord,
     FixContext,
@@ -155,6 +157,16 @@ from .ownership import (
     standalone_ownership_predicate,
 )
 from .provenance import ControllerIdentity, mismatch_lines, protocol_ranges, refusal_headline
+from .recovery_package import (
+    Commands,
+    LiveInspection,
+    Policy,
+    RecoveryPackage,
+    acceptance_label,
+    build_package,
+    operator_label,
+    pr_body_label,
+)
 from .redaction import redact, redact_argv, redact_dict, redact_obj
 from .replan_txn import ReplanTransaction
 from .review_provenance import ProvenanceReport, unjournaled_review_report
@@ -166,7 +178,7 @@ from .sandbox_policy import absolute_spelling
 from .scheduler import EpicScheduler, SchedulerInputs
 from .scheduler_stop import StopMode
 from .sdk_policy import MAX_ANSWER_CHARS
-from .state import SUPPORTED_PROTOCOLS, AutoForgeState
+from .state import SUPPORTED_PROTOCOLS, AutoForgeState, utcnow_iso
 from .stop_classification import (
     StopClassification,
     StopOutcome,
@@ -445,6 +457,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "print the exact payload of a pending acceptance (A-...), operator (X-...) or PR "
             "body (B-...) action and nothing else (exit 1 when no such action is persisted)"
+        ),
+    )
+    st.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "for a BLOCKED run, also read from GitHub the decision a plain 'unblock --dry-run' "
+            "would print, and compare it with the state (#374): needs GitHub access, takes no "
+            "lock and writes nothing; a preview, never a transition or an authorization"
         ),
     )
 
@@ -2361,7 +2382,12 @@ def cmd_epic_recheck(args) -> int:
 def cmd_status(args) -> int:
     engine = _engine_for(args)
     state = engine.load()  # StateError when missing/corrupt
+    live_requested = bool(getattr(args, "live", False))
     if getattr(args, "action", ""):
+        if live_requested:
+            raise ConfigurationError(
+                "status --action prints a persisted payload and reads no GitHub; it takes no --live"
+            )
         return _print_action_payload(state, args.action)
     # One load of the journal feeds every output mode, so what `--json`
     # derives and what the human summary prints cannot disagree.
@@ -2376,13 +2402,22 @@ def cmd_status(args) -> int:
     # persisted, so a BLOCKED or FAILED run's is UNKNOWN; `Reason:` is the text.
     # Outside a git repository the view is unknown, and `--json` still works.
     stop = classify_state(state, scheduler=_scheduler_view(engine))
+    if stop.scheduler and not engine.continue_command:
+        # A scheduler namespace's run (ADR 0008 D17.3) is continued by the
+        # scheduler, as a worker names it: a standalone 'resume' refuses it.
+        config = ("--config", args.config) if args.config else ()
+        engine.continue_command = (*config, "epic", "resume", state.epic_url)
+    # The snapshot is taken before the live read, which reads only (#374).
+    persisted = state.to_dict()
+    live = _live_inspection(engine, state) if live_requested else None
+    package = _recovery_package(engine, args, state, stop, live)
     if args.as_json:
         # to_dict() carries "mode" and every persisted field; protocol 13
         # removed LOCAL's twelve fields from it (#388, ADR 0009 D8, D10).
         # `replan_journal` and `acceptance_actions` are derived beside the
         # raw fields, never merged into them.
         document = {
-            **state.to_dict(),
+            **persisted,
             "replan_journal": _replan_journal_summary(txn),
             "acceptance_actions": _acceptance_actions(state),
             "operator_actions": _operator_actions(state),
@@ -2391,6 +2426,7 @@ def cmd_status(args) -> int:
             "epic_parent_check": parent.document() if parent is not None else None,
             "unjournaled_review": review.document() if review is not None else None,
             "stop": stop.as_dict(),
+            "recovery": package.as_dict(),
             "outer_sandbox": {
                 "mode": engine.config.sandbox.mode,
                 "summary": sandbox_mode_summary(engine.config.sandbox),
@@ -2401,11 +2437,6 @@ def cmd_status(args) -> int:
     evidence = _render_outer_sandbox(state, engine.config) + _render_validation_evidence(
         state, engine.config, certificate
     )
-    if engine.state_dir_in_scheduler_root() and not engine.continue_command:
-        # A scheduler namespace's run (ADR 0008 D17.3) is continued by the
-        # scheduler, as a worker names it: a standalone 'resume' refuses it.
-        config = ("--config", args.config) if args.config else ()
-        engine.continue_command = (*config, "epic", "resume", state.epic_url)
     actions = (
         _render_acceptance_actions(state, engine)
         + _render_operator_actions(state, engine)
@@ -2416,11 +2447,103 @@ def cmd_status(args) -> int:
     print(
         redact(
             _render_status(
-                state, txn, actions, evidence, parent_check=lines, stop=stop, review=shown
+                state,
+                txn,
+                actions,
+                evidence,
+                parent_check=lines,
+                stop=stop,
+                review=shown,
+                recovery=package.lines() if package.outcome is not StopOutcome.DONE else [],
             )
         )
     )
     return 0
+
+
+def _recovery_package(
+    engine: ControllerEngine,
+    args,
+    state: AutoForgeState,
+    stop: StopClassification,
+    live: LiveInspection | None,
+) -> RecoveryPackage:
+    """``status``'s recovery package (#374): the commands spelled as this process was run."""
+    config = ("--config", args.config) if args.config else ()
+
+    def scheduler(*words: str) -> str:
+        return shlex.join(["autoforge", *config, *words])
+
+    commands = Commands(
+        cli=engine.cli_command,
+        scheduler=scheduler,
+        # An unknown view names neither 'resume' nor 'epic resume' (ADR 0011 D6).
+        resume=engine.resume_command() if stop.scheduler is not None else "",
+        worktree=engine.agent_worktree_description(),
+    )
+    workflow = engine.config.workflow
+    policy = Policy(
+        max_total_steps=workflow.max_total_steps,
+        max_review_rounds=workflow.max_review_rounds,
+        allow_merge=engine.config.safety.allow_merge,
+    )
+    return build_package(stop, state, commands=commands, policy=policy, live=live)
+
+
+def _live_inspection(engine: ControllerEngine, state: AutoForgeState) -> LiveInspection:
+    """``status --live``: what a plain ``unblock --dry-run`` would print, read now (#374).
+
+    The same two checks, in the same order: the recorded-configuration and
+    sandbox-pin gate in its dry run (a refusal is reported, not raised, so
+    ``status`` still prints), then :meth:`ControllerEngine.unblock_preview`,
+    the decision ``unblock`` itself takes. A run that is not BLOCKED reads
+    nothing. No lock is taken (as for ``unblock --dry-run``) and nothing is
+    written. A conclusive read failure is ``unblock``'s own refusal, so it is
+    the decision; one that decides nothing (a transient failure, which
+    ``unblock`` propagates too) is reported with its class.
+    """
+    now = utcnow_iso()
+    if state.phase is not Phase.BLOCKED:
+        return LiveInspection(observed_at=None, applies=False)
+    try:
+        notice = engine.check_run_configuration(
+            ("unblock", "--reason", "<why>"), accept_change=False, dry_run=True
+        )
+    except AutoForgeError as exc:
+        text = _bounded_error(exc)
+        return LiveInspection(
+            observed_at=now,
+            applies=True,
+            configuration=text,
+            problem=f"not decided: 'unblock' refuses this command's configuration: {text}",
+        )
+    try:
+        decision = engine.unblock_preview()
+    except AutoForgeError as exc:
+        return LiveInspection(
+            observed_at=now,
+            applies=True,
+            configuration=notice,
+            problem=f"not decided: reading GitHub failed ({_bounded_error(exc)})",
+        )
+    pr = decision.pr
+    return LiveInspection(
+        observed_at=now,
+        applies=True,
+        target_phase=decision.target.value if decision.target is not None else "",
+        detail=decision.detail,
+        pr_url=pr.url if pr is not None else "",
+        pr_state=pr.state if pr is not None else "",
+        pr_head_sha=pr.head_sha if pr is not None else "",
+        pr_base_ref=pr.base_ref if pr is not None else "",
+        configuration=notice,
+    )
+
+
+def _bounded_error(exc: AutoForgeError) -> str:
+    """An error's class and its message on one line, bounded (redacted where printed)."""
+    text = " ".join(str(exc).split())[:300]
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
 def _unjournaled_review(engine: ControllerEngine, state: AutoForgeState) -> ProvenanceReport | None:
@@ -2708,24 +2831,6 @@ def _print_action_payload(state: AutoForgeState, action_id: str) -> int:
     return 1
 
 
-def _acceptance_label(record: EffectRecord) -> tuple[str, str]:
-    """``(state, label)`` of a persisted K9 record, as ``status`` names it (#211)."""
-    if record.stage is Stage.OBSERVED:
-        return "verified", f"verified: {(record.observed or {}).get('url', '-')}"
-    if record.stage is Stage.CONFLICT:
-        return "verification_failed", f"verification failed: {record.reason}"
-    if record.stage is Stage.ATTEMPTED:
-        return (
-            "published_unverified",
-            f"published, not yet verified ({record.attempts}/{MAX_EFFECT_ATTEMPTS})",
-        )
-    if not record.authorized:
-        return "awaiting_approval", "awaiting approval"
-    if record.precondition["authorization"] == AUTHORIZATION_POLICY:
-        return "authorized_by_policy", "authorized by policy, not yet published"
-    return "approved", "approved, not yet published"
-
-
 def _acceptance_actions(state: AutoForgeState) -> list[dict]:
     """The derived ``acceptance_actions`` of ``status --json`` (#211).
 
@@ -2741,7 +2846,7 @@ def _acceptance_actions(state: AutoForgeState) -> list[dict]:
     out: list[dict] = []
     for record in _acceptance_records(state):
         claim = scan(ACCEPTANCE, record.marker).claims[0]
-        status, label = _acceptance_label(record)
+        status, label = acceptance_label(record)
         out.append(
             {
                 "action_id": record.action_id,
@@ -2781,25 +2886,6 @@ def _acceptance_actions(state: AutoForgeState) -> list[dict]:
     return out
 
 
-def _pr_body_label(record: EffectRecord) -> tuple[str, str]:
-    """``(state, label)`` of a persisted K12 record, as ``status`` names it (#423)."""
-    if record.stage is Stage.OBSERVED:
-        digest = (record.observed or {}).get("body_sha256", "-")
-        return "verified", f"verified: sha256 {digest}; read again before FIX completes"
-    if record.stage is Stage.CONFLICT:
-        return "conflict", f"conflict: {record.reason}"
-    if record.stage is Stage.ATTEMPTED:
-        return (
-            "written_unverified",
-            f"written, not yet verified ({record.attempts}/{MAX_EFFECT_ATTEMPTS})",
-        )
-    if not record.authorized:
-        return "awaiting_approval", "awaiting approval"
-    if record.precondition["authorization"] == AUTHORIZATION_POLICY:
-        return "authorized_by_policy", "authorized by policy, not yet written"
-    return "approved", "approved, not yet written"
-
-
 def _pr_body_finding_ids(state: AutoForgeState) -> list[str]:
     """The findings the saved plan resolves by its PR body update (#423)."""
     context = state.phase_effects().context
@@ -2819,7 +2905,7 @@ def _pr_body_updates(state: AutoForgeState) -> list[dict]:
     """
     out: list[dict] = []
     for record in _pr_body_records(state):
-        status, label = _pr_body_label(record)
+        status, label = pr_body_label(record)
         out.append(
             {
                 "action_id": record.action_id,
@@ -2863,7 +2949,7 @@ def _render_pr_body_updates(state: AutoForgeState, engine: ControllerEngine) -> 
     titles = {f.get("id"): str(f.get("title", "")) for f in state.open_findings}
     for record in _pr_body_records(state):
         action = record.action_id
-        _, label = _pr_body_label(record)
+        _, label = pr_body_label(record)
         expected = record.precondition["base_sha256"]
         if record.precondition["authorization"] == AUTHORIZATION_POLICY:
             authorization = "authorized by policy (safety.pr_body_updates: auto)"
@@ -2940,7 +3026,7 @@ def _render_acceptance_actions(state: AutoForgeState, engine: ControllerEngine) 
     for record in _acceptance_records(state):
         claim = scan(ACCEPTANCE, record.marker).claims[0]
         action = record.action_id
-        _, label = _acceptance_label(record)
+        _, label = acceptance_label(record)
         title = next(
             (
                 str(f.get("title", ""))
@@ -3021,38 +3107,6 @@ def _operator_records(state: AutoForgeState) -> list[EffectRecord]:
     return [r for r in state.phase_effects().records if r.kind is EffectKind.OPERATOR_COMMENT]
 
 
-def _operator_label(record: EffectRecord) -> tuple[str, str]:
-    """``(state, label)`` of a persisted K10 record, as ``status`` names it (#243).
-
-    "pending" means not yet verified, never "not posted": ``status`` reads
-    nothing from GitHub. ``verification_failed`` is a conflict, or what
-    FIX's last verification of a pending action found wrong (a changed or
-    deleted bound comment, a target that cannot be read or no longer
-    qualifies), kept on the record as its reason (PR #254 R3-F3).
-    """
-    if record.stage is Stage.OBSERVED:
-        observed = record.observed or {}
-        how = (
-            "exact"
-            if observed.get("evidence") == "exact"
-            else "operator-bound; adequacy not verified by the controller"
-        )
-        return "verified", f"verified ({how}): {observed.get('url', '-')}"
-    if record.stage is Stage.CONFLICT:
-        return "verification_failed", f"verification failed: {record.reason}"
-    if record.reason:
-        return (
-            "verification_failed",
-            f"verification failed at FIX's last check: {record.reason}",
-        )
-    if record.binding is not None:
-        return (
-            "evidence_bound",
-            f"evidence bound, not yet verified: {record.binding['comment_url']}",
-        )
-    return "pending", "pending (not yet verified)"
-
-
 def _operator_actions(state: AutoForgeState) -> list[dict]:
     """The derived ``operator_actions`` of ``status --json`` (#243).
 
@@ -3067,7 +3121,7 @@ def _operator_actions(state: AutoForgeState) -> list[dict]:
     out: list[dict] = []
     for record in _operator_records(state):
         claim = scan(OPERATOR_COMMENT, record.marker).claims[0]
-        status, _ = _operator_label(record)
+        status, _ = operator_label(record)
         observed = record.observed or {}
         out.append(
             {
@@ -3133,7 +3187,7 @@ def _render_operator_actions(state: AutoForgeState, engine: ControllerEngine) ->
         )
         for record in mine:
             action = record.action_id
-            _, label = _operator_label(record)
+            _, label = operator_label(record)
             lines.append(f"  {action}  comment on {record.target['issue_url']}  {label}")
             if record.stage is Stage.OBSERVED:
                 continue
@@ -3229,13 +3283,15 @@ def _render_status(
     parent_check: list[str] | None = None,
     stop: StopClassification | None = None,
     review: list[str] | None = None,
+    recovery: list[str] | None = None,
 ) -> str:
     """Human status for a GitHub run (unredacted; the caller redacts).
 
     ``parent_check`` is the read-only comparison of the recorded EPIC with
     the issue's native parent (#435), printed under the EPIC line;
     ``review`` the report of an unjournaled review comment (#416), printed
-    under the stop.
+    under the stop; ``recovery`` the recovery package (#374), printed after
+    the actions and the last unblock.
     """
 
     def _num(url: str) -> str:
@@ -3290,6 +3346,7 @@ def _render_status(
             f"Unblocked:  {len(state.unblock_history)} time(s); last at {last.get('at', '-')} "
             f"-> {last.get('phase', '-')}{action}: {last.get('reason', '-')}"
         )
+    lines += recovery or []
     lines += evidence or []
     lines += [
         "",

@@ -7511,6 +7511,28 @@ class ControllerEngine:
         with self._execution_lock():
             return self._unblock_once(reason, dry_run=False, request=request)
 
+    def unblock_preview(self) -> UnblockDecision:
+        """The decision a plain ``unblock --dry-run`` reports, for ``status --live`` (#374).
+
+        The same phase check and the same :meth:`_unblock_decision`, with no
+        flag, so the two cannot disagree on one state and one GitHub. Reads
+        only: no lock, no state write, no run-log record, and a transient
+        GitHub failure propagates as it does for ``unblock``. A preview,
+        never a transition: ``unblock`` decides again from its own reads.
+        """
+        self._require_blocked()
+        return self._unblock_decision(None)
+
+    def _require_blocked(self) -> AutoForgeState:
+        """The loaded state, which ``unblock`` and its preview act on only when BLOCKED."""
+        state = self._require_state()
+        if state.phase != Phase.BLOCKED:
+            raise StateTransitionError(
+                f"run {state.run_id} is in phase {state.phase.value}, not BLOCKED; unblock "
+                "applies only to BLOCKED runs"
+            )
+        return state
+
     def _unblock_once(
         self,
         reason: str,
@@ -7518,12 +7540,7 @@ class ControllerEngine:
         dry_run: bool,
         request: UnblockRequest = None,
     ) -> UnblockOutcome:
-        state = self._require_state()
-        if state.phase != Phase.BLOCKED:
-            raise StateTransitionError(
-                f"run {state.run_id} is in phase {state.phase.value}, not BLOCKED; unblock "
-                "applies only to BLOCKED runs"
-            )
+        state = self._require_blocked()
         decision = self._unblock_decision(request)
         if dry_run:
             if decision.target is None:

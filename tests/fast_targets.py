@@ -157,6 +157,7 @@ COVERAGE: Mapping[str, Entry] = {
         "test_ownership",
         "test_doctor",
     ),
+    "src/autoforge/recovery_package.py": ("test_cli",),  # status's recovery package (#374)
     "src/autoforge/replan_txn.py": ("test_cli",),
     "src/autoforge/review_provenance.py": ("test_cli",),  # status's D9.6 report (#416)
     "src/autoforge/roadmap.py": ("test_engine",),

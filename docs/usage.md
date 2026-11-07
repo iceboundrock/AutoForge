@@ -34,8 +34,12 @@ uv run autoforge status --json     # machine-readable; `replan_journal` says whe
                                    # raw `replan_transaction` beside it is readable,
                                    # `acceptance_actions` lists the acceptance actions,
                                    # `operator_actions` the operator actions,
-                                   # `pr_body_updates` the PR description updates and
-                                   # `review_certificate_status` the review certificate
+                                   # `pr_body_updates` the PR description updates,
+                                   # `review_certificate_status` the review certificate and
+                                   # `recovery` the recovery package
+uv run autoforge status --live     # a BLOCKED run: also read from GitHub the decision
+                                   # 'unblock --dry-run' would print (with --json too);
+                                   # takes no lock and writes nothing
 uv run autoforge status --action A-0123456789abcdef   # the exact payload bytes of
                                    # an acceptance action, an operator action (X-…)
                                    # or a PR description update (B-…)
@@ -1866,7 +1870,61 @@ and "State unchanged", agent failures and kills, provider errors, an
 interrupted process, `resume` versus `unblock`, stopping a run safely, lock
 contention, what a change on GitHub does to a run, the exit codes, and the
 recovery scenarios with the tests that hold them. The sections below are
-the reference it links to for four mechanisms.
+the reference it links to for five mechanisms.
+
+### The recovery package and `status --live`
+
+`status` ends with a `Recovery` block, and `status --json` carries the same
+as `recovery` (#374). It is built from the state file, the stop's
+classification ([ADR 0011](adr/0011-typed-stop-classification-and-recovery-baseline.md))
+and the configuration the command loaded, and says, for the stop the run is
+in:
+
+- **proven:** what the controller recorded: the phase, the issue, the PR and
+  the HEAD it last verified, the review round, a FIX candidate and its push,
+  the effects already observed, and the bounds in force;
+- **unknown:** what nothing typed says. The stop's reason code is always
+  here for a `BLOCKED` or `FAILED` run: no code is persisted (ADR 0011 D5),
+  so a later `status` cannot know it, and `Reason:` stays text for a human;
+- **pending:** each record of the saved plan not yet observed: its kind,
+  action id, who performs it, its exact target, stage, authorization, and a
+  reference to its payload (`status --action <id>`, its length and SHA-256);
+- **forbidden:** what would be refused or would lose work: `resume` on a
+  `BLOCKED` run, `unblock` on any other, approving an operator action, an
+  approval naming another id;
+- **do not touch:** the agent worktree that holds an unpushed candidate, the
+  saved plan, comments already verified as evidence;
+- **next:** the exact commands, with the flags this command was given, in
+  order, alternatives marked `or:`; and the section of the
+  [troubleshooting guide](troubleshooting.md) for the case.
+
+Every claim is labelled with its freshness: `snapshot` (the state as saved,
+at `snapshot_at`), `configuration` (the configuration loaded by this
+command), `live` (read from GitHub by this command, at `observed_at`) or
+`unknown`. Without `--live` nothing is re-read for the package, so its
+claims are as old as the state file, and two runs of `status` over one
+state print the same.
+
+`status --live`, with or without `--json`, adds for a `BLOCKED` run the
+decision a plain `unblock --dry-run` would print. It makes the same two
+checks in the same order: the recorded configuration and sandbox pin, then
+the inspection of GitHub `unblock` decides from, so the two cannot disagree
+on one state and one GitHub. It shows the phase `unblock` would re-enter or
+why it would stay `BLOCKED`, the PR as GitHub returns it, and any drift: a
+PR, HEAD or base that differs from the one the state recorded. It needs
+GitHub access, takes no lock (it works while another controller or the
+scheduler holds one), writes nothing and launches nothing. A configuration
+`unblock` would refuse, or a transient read that fails, is reported as not
+decided, and `status` still exits 0. For a run that is not `BLOCKED` it
+reads nothing for the package.
+
+The package is advice. Every command it names checks again what it acts on
+and may refuse: a "would re-enter" is neither a transition nor a
+permission, and `unblock` decides again from its own reads. Nothing that
+decides a phase, a write or a permission reads it, and no model is
+involved. The `recovery` keys are stable (`schema`
+`autoforge.recovery/1`), and every other field of `status --json` is as it
+was. A state the loader refuses, a LOCAL one included, gets no package.
 
 ### A run a newer controller wrote
 

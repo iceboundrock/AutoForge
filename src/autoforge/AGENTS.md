@@ -180,6 +180,13 @@ stop_classification.py  typed stop classification (ADR 0011, #369): outcomes, re
                     codes, their source and the operator's routes, from a sink's code,
                     a CONTROL_RESULT status, an error's class or a loaded state; advice
                     that nothing deciding imports; pure, persists nothing
+recovery_package.py status's recovery action package (#374): from a loaded state, its
+                    classification, the configuration and, for 'status --live',
+                    unblock's dry-run decision: what is proven, pending (exact ids,
+                    targets, payload references), forbidden and not to be touched, and
+                    the next commands, each claim labelled snapshot, live,
+                    configuration or unknown; the labels status gives K9, K10 and K12
+                    records; only the CLI imports it; pure, persists nothing
 prompts/            file-based templates ({{VAR}}): common.md (trust boundary), phase
                     templates, update_epic_rerequest.md, correction.md,
                     worktree_state.md (#187), claude_background_work.md (#440, the
@@ -290,8 +297,11 @@ agent_worktree.py, git_workspace.py, engine.py
 result_parser.py, prompts/*.md                    -> docs/agent-guides/control-result-protocol.md
 stop_classification.py, engine.py (_block and
 _blocked codes, the agent-status sink),
-cli.py (stop lines), errors.py (a new class)      -> docs/adr/0011-typed-stop-classification-
-                                                     and-recovery-baseline.md
+cli.py (stop lines), errors.py (a new class),
+recovery_package.py, engine.py (unblock_preview) -> docs/adr/0011-typed-stop-classification-
+                                                     and-recovery-baseline.md (+ docs/adr/0012-
+                                                     recovery-and-escalation-stop-authority-
+                                                     and-advisor-gates.md for the package)
 redaction.py, runlog.py, doctor.py (env rows),
 error messages                                    -> docs/agent-guides/secrets-and-logging.md
 ```
