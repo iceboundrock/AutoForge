@@ -227,11 +227,15 @@ class Commands:
 
 @dataclass(frozen=True)
 class Policy:
-    """The bounds and gate of the configuration this command loaded."""
+    """The bounds and gates of the configuration this command loaded."""
 
     max_total_steps: int
     max_review_rounds: int
     allow_merge: bool
+    # Whether ``unblock --approve-action`` records an approval of a PR description
+    # update under it: ``safety.pr_body_updates`` is not ``off``, which ``unblock``
+    # refuses every such approval under (PR #470 R2-F2).
+    pr_body_approvals: bool
 
 
 @dataclass(frozen=True)
@@ -1581,6 +1585,19 @@ class _Builder:
                     "record's id, and an id the record does not hold is refused",
                 )
             )
+        if (
+            record.kind is EffectKind.PR_BODY_UPDATE
+            and not record.authorized
+            and record.stage in (Stage.INTENDED, Stage.CONFLICT)
+            and not self.policy.pr_body_approvals
+        ):
+            self.forbidden.append(
+                self.conf(
+                    f"approve-{action}",
+                    f"'unblock --approve-action {action}': safety.pr_body_updates is off, and "
+                    "'unblock' records no approval of a PR description update while it is",
+                )
+            )
         if record.kind is EffectKind.PR_BODY_UPDATE:
             refusal = self.pr_body_decline_refusal(record)
             if refusal:
@@ -1698,6 +1715,26 @@ class _Builder:
         self.steps.append(
             Step(self.cli("status", "--action", action), f"read the exact payload of {action}")
         )
+        if record.kind is EffectKind.PR_BODY_UPDATE and not self.policy.pr_body_approvals:
+            # 'unblock' refuses the approval while the setting is off (PR #470 R2-F2).
+            self.steps.append(
+                Step(
+                    "",
+                    f"{do_it_yourself} yourself: safety.pr_body_updates is off, so it cannot "
+                    "be approved",
+                )
+            )
+            self.steps.append(
+                Step(
+                    self.plain_unblock(),
+                    self.unblock_text(
+                        "then a plain unblock: FIX adopts it and completes the plan with no "
+                        "fixer launched"
+                    ),
+                )
+            )
+            self.steps.append(self.resume_step())
+            return
         self.steps.append(
             Step(
                 f"{self.cli('unblock', '--approve-action', action, '--reason')} {_WHY}",
@@ -1770,7 +1807,7 @@ class _Builder:
                 )
             )
             self.steps.append(self.resume_step())
-        elif record.stage is Stage.CONFLICT:
+        elif record.stage is Stage.CONFLICT and record.authorized:
             self.steps.append(Step(payload, f"read the exact payload of {action}"))
             self.steps.append(
                 Step(
@@ -1782,6 +1819,8 @@ class _Builder:
             )
             self.steps.append(Step(self.plain_unblock(), self.unblock_text("then a plain unblock")))
             self.steps.append(self.resume_step())
+        elif record.stage is Stage.CONFLICT:
+            self.unapproved_conflict_steps(record)
         else:
             self.approval_steps(record, "set the PR description to exactly that payload")
         if not self.pr_body_decline_refusal(record):
@@ -1795,6 +1834,46 @@ class _Builder:
                     alternative=True,
                 )
             )
+
+    def unapproved_conflict_steps(self, record: EffectRecord) -> None:
+        """K12 in conflict before any approval of it was recorded (PR #470 R2-F2).
+
+        A description put back to the plan's base leaves the update awaiting
+        approval, which a plain ``unblock`` refuses: only the exact payload is
+        adopted without one. So the plain path is the payload's, and the base's
+        is the approval of exactly this id, offered only where ``unblock``
+        records one (not under ``safety.pr_body_updates: off``).
+        """
+        action = record.action_id
+        base = record.precondition.get("base_sha256", "-")
+        self.steps.append(
+            Step(self.cli("status", "--action", action), f"read the exact payload of {action}")
+        )
+        self.steps.append(Step("", "set the PR description to exactly that payload"))
+        self.steps.append(
+            Step(
+                self.plain_unblock(),
+                self.unblock_text(
+                    "then a plain unblock: FIX adopts it and completes the plan with no fixer "
+                    "launched (over any other description it stays BLOCKED: the update was "
+                    "never approved)"
+                ),
+            )
+        )
+        self.steps.append(self.resume_step())
+        if not self.policy.pr_body_approvals:
+            return
+        self.steps.append(
+            Step(
+                f"{self.cli('unblock', '--approve-action', action, '--reason')} {_WHY}",
+                self.unblock_text(
+                    f"or, in place of the steps above, put the PR description back to sha256 "
+                    f"{base} and then approve exactly this action: FIX writes the payload over "
+                    "that description and completes the plan; then 'resume'"
+                ),
+                alternative=True,
+            )
+        )
 
     def k12_maybe_edited_step(self) -> None:
         """A verified update, a stop saved with no code: what a live read would tell."""

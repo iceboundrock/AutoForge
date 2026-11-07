@@ -72,7 +72,12 @@ from typing import TextIO
 from . import __version__
 from .certificate import NOT_A_PERMISSION
 from .certificate import describe as describe_certificate
-from .config import MAX_PARALLEL_BOUNDS, AutoForgeConfig, load_config_file
+from .config import (
+    MAX_PARALLEL_BOUNDS,
+    PR_BODY_UPDATES_OFF,
+    AutoForgeConfig,
+    load_config_file,
+)
 from .config_fingerprint import RecordedConfiguration
 from .doctor import CheckResult, run_doctor
 from .effects import (
@@ -2487,6 +2492,7 @@ def _recovery_package(
         max_total_steps=workflow.max_total_steps,
         max_review_rounds=workflow.max_review_rounds,
         allow_merge=engine.config.safety.allow_merge,
+        pr_body_approvals=engine.config.safety.pr_body_updates != PR_BODY_UPDATES_OFF,
     )
     return build_package(stop, state, commands=commands, policy=policy, live=live)
 

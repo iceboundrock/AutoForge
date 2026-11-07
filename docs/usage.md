@@ -928,8 +928,12 @@ description edited after that is never written over or adopted:
 - **Edited after the plan was saved:** the run blocks (`effect-conflict`) naming
   the action, the digest it expected and the payload's. Put the body back
   (GitHub keeps its edit history) or set it to exactly the payload (`autoforge
-  status --action B-…`), then `unblock` and `resume`: no fixer runs. To keep your
-  edit, `unblock --decline-action B-…` runs the fixer again over it.
+  status --action B-…`), then `unblock` and `resume`: no fixer runs. Under
+  `approve`, an update not yet approved still needs its approval when you put
+  the body back: `unblock --approve-action B-…` in place of the plain `unblock`.
+  Only the exact payload is taken without one, and under `off` that is the only
+  way, since `unblock` records no approval then. To keep your edit, `unblock
+  --decline-action B-…` runs the fixer again over it.
 - **Edited after the controller verified its write:** the description is read
   again before each later write of the plan and before the fix is recorded, so a
   mixed fix does not push over your edit. The run blocks (`effect-conflict`). Set

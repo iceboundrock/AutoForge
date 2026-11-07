@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from autoforge import cli
-from autoforge.effects import EffectKind, sha256_text
+from autoforge.effects import EffectKind, Stage, sha256_text
 from autoforge.engine import ControllerEngine
 from autoforge.errors import ExecutionTimeoutError, GitHubError, GitHubUnavailableError
 from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
@@ -93,6 +93,7 @@ from tests.test_engine import (
 from tests.test_operator_actions import BOTH, ISSUE_BODY, T16, T158, _k10, _operating
 from tests.test_pr_body_update import (
     A_HUMAN_EDIT,
+    _base,
     _edit_once_saved,
     _k12,
     _mixed,
@@ -751,7 +752,9 @@ def test_a_pause_defers_to_its_interaction_owner(tmp_state_dir):
 
 # -- what the package is --------------------------------------------------------------------
 
-_POLICY = Policy(max_total_steps=300, max_review_rounds=20, allow_merge=False)
+_POLICY = Policy(
+    max_total_steps=300, max_review_rounds=20, allow_merge=False, pr_body_approvals=True
+)
 
 
 def _commands_of(eng, resume: str | None = None) -> Commands:
@@ -986,7 +989,9 @@ def test_an_exhausted_review_loop_is_diagnosed_from_cached_status_with_its_remed
     assert "would stay BLOCKED" in out and "Raise 'workflow.max_review_rounds'" in out
 
     state = load_state(eng.paths.state_file)
-    raised = Policy(max_total_steps=300, max_review_rounds=5, allow_merge=False)
+    raised = Policy(
+        max_total_steps=300, max_review_rounds=5, allow_merge=False, pr_body_approvals=True
+    )
     package = build_package(
         classify_state(state), state, commands=_commands_of(eng), policy=raised
     ).as_dict()
@@ -1442,6 +1447,170 @@ def test_an_edited_description_cannot_be_declined_once_a_later_write_is_out(
     )
     assert rc == 0, err
     assert "would stay BLOCKED" in out and f"action {action} cannot be declined" in out
+
+
+# -- a description update put in conflict, approved or not (PR #470 R2-F2) ---------------------
+
+
+def _k12_conflicted(tmp_state_dir, policy: str):
+    """K12 in conflict through an edit after its plan was saved: the process dies once the
+    plan is on disk, a human edits the description, and the resumed FIX finds it neither
+    the plan's base nor its payload. Under ``approve`` the update was never approved;
+    under ``auto`` the policy recorded with the plan authorized it."""
+    gh = FakeGitHub()
+    eng = _updating(
+        tmp_state_dir, gh, scripted(fixer(pr_body_update("R1-F1"), commit=False)), policy=policy
+    )
+    save = eng._save
+
+    def dying(*args, **kwargs):
+        save(*args, **kwargs)
+        records = load_state(eng.paths.state_file).effect_records
+        if any(r["kind"] == EffectKind.PR_BODY_UPDATE.value for r in records):
+            eng._save = save
+            raise KeyboardInterrupt
+
+    eng._save = dying
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    gh.prs[PR].body = _base(eng.state.run_id, A_HUMAN_EDIT)
+    eng.load()
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    record = _k12(eng)
+    assert record.stage is Stage.CONFLICT
+    assert record.authorized is (policy == "auto")
+    return eng
+
+
+def _pr_body_off(eng) -> None:
+    """The operator sets ``safety.pr_body_updates: off`` after the plan was saved."""
+    from dataclasses import replace
+
+    eng.config.safety = replace(eng.config.safety, pr_body_updates="off")
+
+
+def test_an_unapproved_update_in_conflict_offers_its_payload_or_its_base_and_approval(
+    tmp_state_dir, status_cli, capsys
+):
+    """Never approved, so a description put back to the base still awaits approval and a
+    plain unblock over it is refused. The plain path is the payload's; the base's is
+    the approval of exactly this id, in place of it. Run as displayed: back to the base,
+    the approval re-enters FIX, which writes the payload and completes the plan."""
+    eng = _k12_conflicted(tmp_state_dir, "approve")
+    action = _k12(eng).action_id
+    base = _k12(eng).precondition["base_sha256"]
+    prefix = _prefix(eng)
+    package = _recovery(status_cli, eng, capsys)
+    assert package["diagnosis"]["code"] == "effect-conflict"
+    sequence = [c for c in _sequence(package) if not c[0].startswith(f"{prefix} run ")]
+    assert sequence == [
+        (f"{prefix} status --action {action}", False),
+        ("", False),
+        (f'{prefix} unblock --reason "..."', False),
+        (f"{prefix} resume", False),
+        (f'{prefix} unblock --approve-action {action} --reason "..."', True),
+        (f'{prefix} unblock --decline-action {action} --reason "..."', True),
+    ]
+    steps = package["next"]
+    assert steps[1]["text"] == "set the PR description to exactly that payload"
+    assert f"put the PR description back to sha256 {base} and then approve" in steps[4]["text"]
+    assert not [s for s in steps if base in s["text"] and not s["alternative"]]
+    run = eng.state.run_id
+    eng.github.prs[PR].body = _base(run)
+    rc, out, err = _run_displayed(status_cli, eng, sequence[2][0], capsys)
+    assert rc != 0 or "BLOCKED -> FIX" not in out, out
+    assert f"action {action} awaits approval" in out + err
+    rc, out, err = _run_displayed(status_cli, eng, sequence[4][0], capsys)
+    assert rc == 0 and "BLOCKED -> FIX" in out, err
+    eng.load()
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.github.prs[PR].body == _payload(run)
+
+
+def test_an_unapproved_update_in_conflict_set_to_its_payload_completes_as_displayed(
+    tmp_state_dir, status_cli, capsys
+):
+    eng = _k12_conflicted(tmp_state_dir, "approve")
+    package = _recovery(status_cli, eng, capsys)
+    [read, _, plain, _] = [s["command"] for s in package["next"] if not s["alternative"]]
+    rc, out, _ = _run_displayed(status_cli, eng, read, capsys)
+    eng.github.prs[PR].body = out  # set to exactly the payload
+    writes = list(eng.github.effect_writes)
+    rc, out, err = _run_displayed(status_cli, eng, plain, capsys)
+    assert rc == 0 and "BLOCKED -> FIX" in out, err
+    eng.load()
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.github.effect_writes == writes  # adopted, never written again
+
+
+def test_an_authorized_update_in_conflict_restored_to_its_base_completes_as_displayed(
+    tmp_state_dir, status_cli, capsys
+):
+    """Authorized by the policy saved with the plan: put back to the base, the plain
+    unblock re-enters FIX, which writes the payload; no approval is named."""
+    eng = _k12_conflicted(tmp_state_dir, "auto")
+    action = _k12(eng).action_id
+    base = _k12(eng).precondition["base_sha256"]
+    prefix = _prefix(eng)
+    package = _recovery(status_cli, eng, capsys)
+    sequence = [c for c in _sequence(package) if not c[0].startswith(f"{prefix} run ")]
+    assert sequence == [
+        (f"{prefix} status --action {action}", False),
+        ("", False),
+        (f'{prefix} unblock --reason "..."', False),
+        (f"{prefix} resume", False),
+        (f'{prefix} unblock --decline-action {action} --reason "..."', True),
+    ]
+    assert base in package["next"][1]["text"]
+    run = eng.state.run_id
+    eng.github.prs[PR].body = _base(run)
+    rc, out, err = _run_displayed(status_cli, eng, sequence[2][0], capsys)
+    assert rc == 0 and "BLOCKED -> FIX" in out, err
+    eng.load()
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.github.prs[PR].body == _payload(run)
+
+
+@pytest.mark.parametrize("stage", ["awaiting_approval", "conflict"])
+def test_no_approval_is_offered_while_pr_body_updates_is_off(
+    tmp_state_dir, status_cli, capsys, stage
+):
+    """'unblock' records no approval of a description update under ``off``: the package
+    names none and forbids it, and the payload set by hand, then a plain unblock, is
+    the way on (or the decline), as the engine accepts."""
+    if stage == "conflict":
+        eng = _k12_conflicted(tmp_state_dir, "approve")
+    else:
+        eng = _k12_blocked(tmp_state_dir)
+    _pr_body_off(eng)
+    action = _k12(eng).action_id
+    prefix = _prefix(eng)
+    package = _recovery(status_cli, eng, capsys)
+    [pending] = [p for p in package["pending"] if p["action_id"] == action]
+    assert pending["state"] == stage
+    assert not [c for c in _commands(package) if "--approve-action" in c]
+    [forbidden] = [c for c in package["forbidden"] if c["key"] == f"approve-{action}"]
+    assert "safety.pr_body_updates is off" in forbidden["text"]
+    assert forbidden["freshness"] == "configuration"
+    sequence = [c for c in _sequence(package) if not c[0].startswith(f"{prefix} run ")]
+    assert sequence == [
+        (f"{prefix} status --action {action}", False),
+        ("", False),
+        (f'{prefix} unblock --reason "..."', False),
+        (f"{prefix} resume", False),
+        (f'{prefix} unblock --decline-action {action} --reason "..."', True),
+    ]
+    if stage == "conflict":
+        eng.github.prs[PR].body = _base(eng.state.run_id)
+    rc, out, err = status_cli(
+        eng, "unblock", "--dry-run", "--approve-action", action, "--reason", "x", capsys=capsys
+    )
+    assert "would stay BLOCKED" in out and "cannot be approved while" in out, out + err
+    rc, out, _ = _run_displayed(status_cli, eng, sequence[0][0], capsys)
+    eng.github.prs[PR].body = out
+    rc, out, err = _run_displayed(status_cli, eng, sequence[2][0], capsys)
+    assert rc == 0 and "BLOCKED -> FIX" in out, err
 
 
 def test_a_verified_update_with_no_saved_code_is_offered_conditionally(tmp_state_dir):
