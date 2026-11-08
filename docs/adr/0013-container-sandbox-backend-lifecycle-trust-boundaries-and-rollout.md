@@ -22,8 +22,9 @@
 
   §7 holds the tests the changes add. No other decision was reopened.
 
-  Three corrections followed the acceptance. Each makes explicit what an
-  accepted decision already requires, and none adds a choice of its own:
+  Three corrections followed the acceptance. Each spells out what an
+  accepted decision needs in order to be implementable, and none reopens
+  one. The maintainer's acceptance predates them:
   - **The bind sources exist before the container.** A runtime configures
     a bind only when it creates a container. So the host-side work moves
     out of the stage step: a seed step that journals nothing builds and
