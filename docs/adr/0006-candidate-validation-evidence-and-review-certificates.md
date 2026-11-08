@@ -17,7 +17,7 @@
 - **Decides:** #170, for EPIC #158 (Wave 2B).
 - **Amends:** ADR 0001 §5.10, with a dated note recording the LOCAL
   convergence rule (D7.4). No other ADR's text changes.
-- **Amended by #267 (proposed, 2026-11-08):** D6.3, D8.1 and D8.2, for the
+- **Amended by #267 (accepted with required changes, 2026-11-08):** D6.3, D8.1 and D8.2, for the
   container backend only ([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D2, D7, D16). Each takes
   effect when #273 makes that backend selectable. ADR 0013 §5.4 maps
   every other decision of this record, D6.1 included, as preserved.
@@ -693,8 +693,10 @@ own prover runs it, from the image, at the controller's version
 (ADR 0013 D7). That is AutoForge's code, not the controller process, and
 no git process or configuration takes part. Its verdict reaches the
 controller on the prover's exec output, and a mismatch is a
-materialization failure, as here. The host-side proof of the staging root
-still runs first.
+materialization failure, as here. Where the runtime binds the staging root,
+the host-side proof of the staging root still runs first. Where it copies
+the seed in instead, no tree is staged on the host, and this in-container
+walk is the only tree proof. ADR 0013 D2 states why that is acceptable.
 
 **D6.4 (#171).** **Isolation, and why validation cannot modify C.**
 

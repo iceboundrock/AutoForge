@@ -35,7 +35,7 @@
   bounded request that the controller replace the description of the run's
   own PR, its markers and closing reference kept by the controller, under
   `safety.pr_body_updates` (D5.1, K12), with its own protocol bump (D13.12).
-- **Amended by #267 (proposed, 2026-11-08):** D1.1's sentence naming the
+- **Amended by #267 (accepted with required changes, 2026-11-08):** D1.1's sentence naming the
   candidate, for the container backend only ([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D5). It
   takes effect when #273 makes that backend selectable. ADR 0013 §5.2
   maps every other decision of this record as preserved.

@@ -1,11 +1,30 @@
 # ADR 0013. Container sandbox backend: the lifecycle contract, trust boundaries and rollout
 
-- **Status:** proposed. This is a design record, and nothing in it is
-  implemented. #267's first acceptance criterion asks for an approved
-  record. Approval is a maintainer's, given on #267, and this change cannot
-  supply it. Written at `main` `32178d8` (2026-11-08), where every
-  reference below was read. #267 was planned at `711ff09` and reconciled at
-  `388ecb3`; §1.4 lists what has changed since then.
+- **Status:** accepted with required changes, which makes the acceptance
+  conditional. The maintainer accepted this record and its dated
+  amendments on 2026-11-08
+  ([#267's acceptance comment](https://github.com/iceboundrock/AutoForge/issues/267#issuecomment-6726955695)),
+  as proposed at `427c797`. The acceptance holds only if four required
+  changes are made in the record before it merges. This revision makes
+  them, and a later review checks that it carries them:
+  - **A.** Every phase binds its revision before the launch, in the
+    launch's git input (D4). Verify refuses an artifact that disagrees
+    with that binding (D5).
+  - **B.** The seed is checked on its own: `index-pack --strict`,
+    connectivity against its shallow boundaries, a size and object-count
+    bound (D4). The seeded repository is checked after the stager (D2).
+  - **C.** No repository filter or hook runs in staging, on the host or in
+    the stager. Submodules, LFS and sparse checkouts each get a stated
+    support level (D2).
+  - **D.** The tree proof and the seed pack are two artifacts. The copy-in
+    form's only tree proof is the one inside the container, and D2 states
+    why that is acceptable.
+
+  §7 holds the tests the changes add. No other decision was reopened.
+  This is a design record, and nothing in it is implemented. Written at
+  `main` `32178d8` (2026-11-08), where every reference below was read.
+  #267 was planned at `711ff09` and reconciled at `388ecb3`; §1.4 lists
+  what has changed since then.
   - *Implemented with it:* nothing. No configuration key, state field,
     protocol number, launch class, prompt, default or behaviour changes.
     Five tests in `tests/test_container_backend_record.py` keep the record
@@ -235,13 +254,19 @@ A container launch sees exactly two inputs derived from the repository.
 - **`/source`** is a controller-prepared, read-only snapshot of one exact
   commit. `materialize()` (`materialize.py`) writes it byte-exact and
   proves it with its hash-back proof, into a controller-owned staging root
-  (D12). It is present only where D12 proves a bind.
+  (D12). It is present only where D12 proves a bind: the *bind form*.
+  #292's `materialize()` criterion applies to this form only. The *copy-in
+  form* stages no tree on the host.
 - **`/workspace`** is a private writable volume, one per launch.
   - For an agent, it holds a self-contained git repository: the stager
     runs `git init`, strictly indexes the seed pack, and checks out the
-    seed commit on a detached `HEAD` (ADR 0005 D6.2).
+    seed commit on a detached `HEAD` (ADR 0005 D6.2), under the rules
+    below.
   - For an export command, it holds a writable copy of the seed commit's
-    tree with no `.git` (ADR 0006 D6.5).
+    tree with no `.git` (ADR 0006 D6.5). In the bind form the stager
+    copies it from `/source`, the materialized tree that the host proved.
+    In the copy-in form the stager writes it from the seed pack, under the
+    rules below. In both forms the prover then proves the copy.
 
 **Never bound,** on any runtime: the operator's checkout, live or dirty;
 any worktree; the git common dir or any part of it; `$HOME`; any `.git`
@@ -252,13 +277,90 @@ provider's operator configuration root.
 change after it was proved. So the prover, AutoForge's own code running
 D6.3's walk of ADR 0006, proves `/workspace`'s tree (its `.git` aside, for
 an agent) against the seed commit's tree id inside the container, before
-any agent or repository command runs there. It runs as its own exec after the stager. Nothing of the agent has
-run in that container by then, and its verdict reaches the controller on
-that exec's output. A mismatch is a setup failure (D17), never a result.
+any agent or repository command runs there. It does so in both forms.
+
+- The controller hands the prover that tree id, read from the shared
+  store. The id never comes from the pack or the manifest.
+- The prover runs as its own exec after the stager. Nothing of the agent
+  has run in that container by then.
+- Its verdict reaches the controller on that exec's output. A mismatch is
+  a setup failure (D17), never a result.
+
 For an export command, this proof is what keeps ADR 0006's claim, "the
 validator saw C", true in a container. A host-side proof of the bind
 source alone would not: the command runs in a copy of it (ADR 0006 D6.3 as
 amended).
+
+**The tree proof and the seed pack are two artifacts.**
+
+- **The tree** says which exact tree a launch gets. In the bind form it is
+  the materialized tree in the staging root, which the host proves with
+  `materialize()`'s hash-back walk (ADR 0006 D6.3) before hand-off. The
+  in-container proof above follows it.
+- **The seed pack and its manifest** carry the history the agent's
+  repository needs (D11). The pack's own checks (D4) prove its objects and
+  their connectivity. They prove no tree on disk, so the pack never
+  replaces a tree proof.
+- **In the copy-in form** no tree is staged on the host. The in-container
+  proof is the only tree proof, and that is acceptable for these reasons:
+  - **No host proof is lost.** A host-side proof guards a host path that
+    is used after it was proved. In the copy-in form no host path is
+    bound. The bytes reach `/workspace` only from the pack, which the host
+    built from the shared store and checked (D4). A host-side tree proof
+    would prove a directory that no launch reads.
+  - **It is the tree that matters.** The tree that matters is the one the
+    command runs in, and only an in-container walk can see it. ADR 0006
+    D6.3 as amended says the same of the bind form.
+  - **No trusted party is added.** The prover is AutoForge's code, from the
+    content-addressed image (D7), at the controller's version. It runs
+    before any agent or repository code in that container, and checks a
+    tree id that the controller supplies. The only parties that could
+    falsify its verdict are the image and the runtime, and the bind form's
+    in-container proof already trusts both.
+
+**The seeded repository is checked after the stager.** The seed pack holds
+objects only, so the checks of a repository's refs, alternates, remotes,
+hooks and configuration apply to `/workspace/.git` as the stager left it.
+The prover makes them, beside its tree proof and before any agent runs:
+
+- the only ref is `HEAD`, detached at the seed commit (or at the carried
+  commit, for a relaunch: D4), with no reflog;
+- `.git/shallow` names exactly the manifest's boundaries;
+- there is no alternates file and no remote;
+- there is no hook;
+- the configuration holds only the keys the stager writes.
+
+A repository that fails one of these is a setup failure (D17). An export
+command's workspace has no `.git`, and the prover checks that none is
+there.
+
+**No repository filter or hook runs in staging,** on the host or in the
+stager.
+
+- **On the host.** The host builds the seed pack from objects, and
+  `materialize()` writes the tree from blobs. Neither checks anything out,
+  so no attribute, filter or hook of the repository applies there.
+- **In the stager.** The stager's git runs with no system or global
+  configuration and no hooks, and with LFS smudging off. For the checkout,
+  every path's `filter`, `ident`, `text`, `eol` and
+  `working-tree-encoding` attributes are unset, so each file is written
+  with its blob's bytes. A `$GIT_DIR/info/attributes` written for the
+  checkout and removed afterwards is one way to do this, because it
+  overrides the tree's `.gitattributes`. #271 chooses the way, and its
+  tests prove it.
+- **The result.** Neither the image's git configuration nor the
+  repository's own attributes can rewrite bytes before the prover runs. A
+  rewrite that got through anyway would fail the tree proof.
+
+**What staging supports.** Each case below gets a diagnostic that says
+which it is. The diagnostic goes in the launch's facts, and in the agent's
+prompt where the agent is affected:
+
+| Case | Support | What a launch gets |
+|---|---|---|
+| a submodule (a gitlink) | supported as an empty directory | an empty directory at the gitlink path, as `materialize()` gives today; the submodule's commit is never fetched, read or staged |
+| Git LFS | unsupported for content | the pointer files, byte for byte; no LFS object is fetched or smudged, the image's git-lfs included |
+| a sparse checkout | unsupported | the seed commit's whole tree; no sparse pattern is read or applied, and a tree over the seed's bound is refused by D4's bound, which names its setting |
 
 *Rejected.*
 
@@ -343,8 +445,9 @@ a commit the container names.
     bound.
 - **`ANALYZE_EXECUTE` and `REPLAN_REEXECUTE`:** the base the controller
   verified: the start commit, or the default branch head for a
-  replacement.
-- **`UPDATE_EPIC`:** the default branch head.
+  replacement. It is bound in the launch's git input (below), before the
+  stage step.
+- **`UPDATE_EPIC`:** the default branch head, bound in the same way.
 - **An export command** (`validation.commands`, `merge.verification_commands`):
   the commit it validates, from the shared store, with no history (D2).
   At `REVIEW`'s entry that is the bound HEAD, whoever pushed it. ADR 0006
@@ -356,6 +459,36 @@ a commit the container names.
   the seed. Uncommitted changes are never carried. `REVIEW` exports
   nothing, so it never has a carried commit, and a relaunch of the same
   round seeds from the same bound HEAD.
+  - The stager checks out the carried commit. Where this record says the
+    stager checks out the seed commit, or the prover proves its tree, it
+    means the carried commit for such a relaunch.
+
+**The launch's git input: every phase binds its revision before the
+launch.** Before the stage step of every launch, #269 produces one
+immutable input. It holds:
+
+- the phase, and the launch's identity (the run key, the issue and the
+  launch id of D6);
+- the repository's identity: its owner and name, and its object format;
+- the expected seed commit, chosen by the rules above;
+- the seed's lower boundary: the bound merge base for `REVIEW` and `FIX`,
+  and the base for the other phases. An export command has none;
+- the carried commit, if there is one;
+- the digest of the seed manifest that #292 built from the rest.
+
+The binding has these consequences:
+
+- **No later switch.** Once the input exists, nothing switches the launch
+  to a newer default-branch head, PR head or candidate. `ANALYZE_EXECUTE`,
+  `REPLAN_REEXECUTE` and `UPDATE_EPIC` bind their base or default-branch
+  head here, as `REVIEW` and `FIX` bind theirs at their entry. A default
+  branch that moves during the launch changes nothing in it.
+- **The stage step.** It hands off only a seed whose manifest has the
+  input's digest.
+- **The verify step** (D5) refuses an artifact whose manifest disagrees
+  with the input.
+- **Names and state.** This record fixes the input's content. The type's
+  name is #269's. Its persisted part is D19's "seed's identity".
 
 **How the bound revision enters the seed.** #292 builds the seed from the
 shared store, through `local_git_request`'s hardening, and only after the
@@ -370,16 +503,40 @@ fetch above has succeeded. For `REVIEW` and `FIX` it holds:
   gives the PR's diff;
 - the trees and blobs of all of these.
 
-The manifest names the seed commit and the merge base. Before the seed is
-built, the controller checks two things in the shared store: the bound
-HEAD and the merge base are present as commits, and the merge base is an
-ancestor of the HEAD. If either check fails, the launch is refused before
-anything is journaled or created, as a failed fetch is today. Nothing is
-launched, and `resume` fetches again. The stager checks out the seed
-commit on a detached `HEAD`, and the prover proves that commit's tree
-(D2). The reviewer's prompt names the same HEAD and merge base that the
-manifest names. A different commit at either end would be a different
-review.
+In every phase, the manifest names the launch's identity, the
+repository's object format, the seed commit, its lower boundary (the
+merge base, for `REVIEW` and `FIX`), every shallow boundary, and the
+carried commit if there is one. Before the seed is built, the controller
+checks two things in the shared store: the bound HEAD and the merge base
+are present as commits, and the merge base is an ancestor of the HEAD.
+If either check fails, the launch is refused before anything is journaled
+or created, as a failed fetch is today. Nothing is launched, and `resume`
+fetches again. The stager checks out the seed commit on a detached
+`HEAD`, and the prover proves that commit's tree (D2). The reviewer's
+prompt names the same HEAD and merge base that the manifest names. A
+different commit at either end would be a different review.
+
+**The seed is checked on its own,** in every phase, before hand-off and
+before any journal entry of the launch. A `REVIEW` seed can now be another
+actor's push, so the run's own history does not bound its size. The host,
+through `local_git_request`'s hardening, makes three checks:
+
+- **The pack.** It runs `index-pack --strict` over the seed pack, into a
+  controller-owned temporary directory and never into the shared store.
+- **Connectivity, against the manifest's shallow boundaries.**
+  - The seed commit, and the carried commit if any, are present.
+  - The closure above the boundaries is complete: every commit, tree and
+    blob reachable from them without crossing a boundary is in the pack.
+  - The pack holds exactly the commits D11 names, no more and no fewer.
+- **Its bounds.** The pack has a size bound and an object-count bound,
+  both operator settings (D19). A history setting (D11) can make a seed
+  larger, and the refusal then names that setting.
+
+A seed that fails any of these is refused as a setup failure (D17). It is
+refused before any journal entry, so nothing is created and no clean-up
+follows. The pack holds objects only. The checks of refs, alternates,
+remotes, hooks and configuration therefore apply to the seeded repository
+after the stager, not to the pack (D2).
 
 The controller exports at every end of a change-producing launch that it
 runs: success, failure, timeout or stop. After a controller crash,
@@ -420,8 +577,9 @@ backends:
 
 The artifact is untrusted data: one pack, bounded in size, plus a manifest.
 
-- **The manifest is a claim.** It names the claimed `HEAD`, the seed
-  commit and the object format.
+- **The manifest is a claim.** It names the claimed `HEAD`, the launch's
+  identity, the seed commit, its lower boundary, the carried commit if
+  any, and the object format.
 - **The exporter** runs in a fresh container with the volume mounted
   read-only and `--network none`, after the launch container is removed
   (D6). It packs the objects reachable from the workspace's `HEAD` and not
@@ -440,12 +598,16 @@ The artifact is untrusted data: one pack, bounded in size, plus a manifest.
     D7.3).
   - ADR 0004 D7.5 re-hashes it.
   - It descends from the seed.
+  - The manifest agrees with the launch's git input (D4): the same
+    launch, seed commit, lower boundary, carried commit and object format.
+    The host takes each expected value from the input it bound before the
+    stage step, never from the container.
   - The phase's existing candidate rules accept it.
 - **Failure.** A pack that fails `--strict`, an artifact over its bound, a
-  manifest that does not parse or names another seed, or a claimed `HEAD`
-  that is not a commit descending from the seed: each is a candidate
-  refusal under the phase's existing rules. It is never retried, and
-  nothing is published, as with ADR 0005 D6.5's failure.
+  manifest that does not parse or disagrees with the launch's git input,
+  or a claimed `HEAD` that is not a commit descending from the seed: each
+  is a candidate refusal under the phase's existing rules. It is never
+  retried, and nothing is published, as with ADR 0005 D6.5's failure.
 - **What the host never does.** It never mounts the volume. It never runs
   git with the container's repository as its repository, and never reads
   that repository's configuration or hooks. It never applies a diff, and
@@ -929,11 +1091,11 @@ engine sequences and journals. Executor requests are not wrapped.
 |---|---|---|---|---|---|---|
 | plan | the engine's facts, completed by the provider's declaration, as `SandboxPlan.describe` does today; pure | the role-level request: launch class, roles, the provider's declaration, limits, network position | a compiled launch, typed and immutable (bwrap: today's `LaunchDescription`; container: a container description) | none | no | a policy refusal (`SandboxPolicyError`), before anything exists |
 | create | the engine | the compiled launch and its owner (run key, issue, phase, launch id, nonce) | a handle | the runtime CLI | yes, the entry is written before the call | an ambiguous outcome is reconciled by label and nonce before any re-issue, never blindly retried (ADR 0004 D4.3's rule, applied to a local object) |
-| stage | the engine | the handle, the seed (#292), the read context, the credential projection (#290) | the prover's verdict | the runtime CLI; the stager's and prover's execs | the staging root and the projection get entries of their own, each before it is made | a setup failure (D17); both parts of the cleanup run, with no export |
+| stage | the engine | the handle, the launch's git input (#269), the seed (#292) whose manifest has the input's digest, the read context, the credential projection (#290) | the prover's verdict on the tree and the seeded repository (D2) | the runtime CLI; the stager's and prover's execs | the staging root and the projection get entries of their own, each before it is made | a setup failure (D17); both parts of the cleanup run, with no export |
 | run | the executor, through the provider | the handle, the command, its environment | `ExecutionResult` with `SandboxFacts` | the attached runtime client is the executor's child | no | ADR 0002 as today; `close()` ends the container's PID namespace |
 | cleanup, its release | the engine, right after the run step on every path | the handle | the launch container, the projection and the staging root removed (also the volume when there is nothing to export), or left for reconciliation | the runtime CLI | yes, intent first; each entry closes after its verified removal | idempotent; bounded retry |
 | export | the engine, for a change-producing launch after the release | the handle's volume | the artifact in the launch's export directory; nothing for `REVIEW`, `UPDATE_EPIC` and export commands | the exporter container: its own watcher, the export deadline, its client under the executor's timeout (D6) | yes: the exporter's own entry and nonce before its create; its removal journaled, the entry closed after it; the artifact is untrusted | an exporter that fails to start is retried within bounds, each attempt with a new entry; then, or for a bad artifact, a candidate refusal |
-| verify | the engine (#269) | the artifact and the seed | the imported candidate, or a refusal | the controller's hardened git | the binding is state (D19) | never retried; publishes nothing |
+| verify | the engine (#269) | the artifact and the launch's git input (D4) | the imported candidate, or a refusal | the controller's hardened git | the binding is state (D19) | never retried; publishes nothing |
 | cleanup, its final part | the engine, after the verify step's outcome is saved, or once the export is skipped | the handle | the volume and the export directory removed, or left for reconciliation | the runtime CLI | yes, intent first; the entry closes after removal | idempotent; bounded retry |
 | reconcile | the engine, at `step`, `resume`, `unblock` and worker start | the run key and the journal | entries closed, or `BLOCKED` | the runtime CLI; `safefs` for the host directories | closes entries | remove-only, exporters and host directories included (D6) |
 | probe | the gate and `doctor` | — | a `ProbeResult` naming the missing capability | one minimal launch of the same shape | no | once per controller process |
@@ -944,6 +1106,9 @@ Export and verify are D6.5's import and D6.3's read, which #269 wraps as
 the bwrap candidate source. Nothing a bwrap launch does changes.
 
 **Order, and the volume's lifetime.** The steps run in the table's order.
+Before the create step, #269 produces the launch's git input, and #292
+builds the seed and checks it (D4). A failure there is a setup failure,
+refused before any journal entry, so nothing needs reconciling.
 The cleanup step has two parts so that the export reads a volume that
 still exists. Its release, right after the run step, removes what holds
 the credential. Its final part runs only after the verify step's outcome
@@ -1153,11 +1318,12 @@ would hide two different sets of guarantees.
 |---|---|---|---|
 | the host is not capable | gate | `SandboxCapabilityError` | refused; nothing saved (ADR 0005 D12.2) |
 | a policy refusal | plan | `SandboxPolicyError`, raised as `SandboxLaunchRefusedError` | a launch refusal |
-| create, stage or prover failure; the image missing | before the command runs | `SandboxLaunchRefusedError` | a setup failure (ADR 0005 D10.8): charged after the gate, never an agent result |
+| the seed failing its checks: `index-pack --strict`, its connectivity, its size or object-count bound (D4) | before the create step | `SandboxLaunchRefusedError` | a setup failure, refused before any journal entry: nothing is created and nothing needs reconciling |
+| create, stage or prover failure, the seeded repository failing its checks (D2) included; the image missing | before the command runs | `SandboxLaunchRefusedError` | a setup failure (ADR 0005 D10.8): charged after the gate, never an agent result |
 | the command never started | run | `SandboxLaunchRefusedError` | the same; a command's own exit status is never the discriminator |
 | the command ended by something the executor did not send: an OOM kill inside, a container killed from outside, PID 1's deadline | run | the command's abnormal end | the existing failure path |
 | a limit or a stop | run | as today (`ExecutionTimeoutError`) | as today; `close()` ends the namespace |
-| the export fails (its exporter still failing to start after its bounded retries, ending at its deadline, or overrunning the artifact's bound), or the artifact is malformed or inconsistent with its manifest | export, verify | a candidate refusal (`ObjectImportError`) | as today's import failure; the volume is removed only after this outcome is saved |
+| the export fails (its exporter still failing to start after its bounded retries, ending at its deadline, or overrunning the artifact's bound), or the artifact is malformed, inconsistent with its manifest, or its manifest disagrees with the launch's git input (D4) | export, verify | a candidate refusal (`ObjectImportError`) | as today's import failure; the volume is removed only after this outcome is saved |
 | an ambiguous create, of the launch container, the volume or an exporter | create, export | — | reconciled by label and nonce first; then a refusal |
 | a clean-up failure, in either part | cleanup | reported | the entry stays for reconciliation |
 | ownership that cannot be proven | reconcile | `BLOCKED` | names the object; never removed |
@@ -1219,6 +1385,7 @@ are proposals that their child may rename without reopening anything here.
 | `sandbox.container.transfer` | #271 | `auto` or `copy` (D12) |
 | `sandbox.container.image` | #271 | the base image by digest, CLI versions, MCP servers and Skills (D7) |
 | `sandbox.container.history_depth`, `history_tags` | #292 | D11 |
+| `sandbox.container.seed_max_bytes`, `seed_max_objects` | #292 | the seed's size and object-count bounds (D4); #292 states their defaults |
 
 The loader also enforces these rules:
 
@@ -1257,7 +1424,11 @@ is ready.
   are the run's to remove, and which block the run because no entry
   matches them (D6).
 - **#269:** the candidate-source binding: the exported candidate bound to
-  the run, the phase entry's carried commit, and the seed's identity.
+  the run, the phase entry's carried commit, and the seed's identity. The
+  seed's identity is the persisted part of the launch's git input (D4).
+  It holds the phase, the launch, the repository's identity, the seed
+  commit, its lower boundary and the manifest's digest, saved before the
+  stage step, so a `resume` checks the artifact against the same binding.
 
 The runtime's objects (containers, volumes, images) are not state; the
 runtime holds them. The run log gains additive facts (D16) and stays
@@ -1295,14 +1466,17 @@ sequenceDiagram
     E->>E: gate: the probe, cached per process (D16)
     E->>E: reconcile this run's leftovers (D6)
     E->>G: REVIEW and FIX: the bound HEAD and merge base fetched and checked in the shared store (D4)
-    E->>G: seed pack and manifest from the shared store
+    E->>E: the launch's git input (D4): phase, launch, repository, seed commit, lower boundary, carried commit
+    E->>G: seed pack and manifest from the shared store, filters never applied
+    E->>G: the seed's checks: index-pack --strict, connectivity to its boundaries, its bounds (a failure is refused here)
+    E->>E: the manifest's digest completes the git input
     E->>J: entries for the volume and the launch container: run key, issue, phase, launch id, nonce, names (atomic)
     E->>R: create the volume and the container (labels and nonce, no restart policy)
     R-->>E: created (ambiguous: reconcile by label and nonce)
     E->>R: start PID 1 on the liveness stream, whose write end stays with the engine
     E->>J: entries for the staging root and the credential projection
     E->>R: stage: copy in or bind the seed, the read context, the credential projection
-    R->>C: stager exec, then prover exec: /workspace proved against the seed tree
+    R->>C: stager exec (no filter, attribute rewrite or hook), then prover exec: /workspace proved against the seed tree id the engine supplies, and /workspace/.git checked
     C-->>E: the prover's verdict (a mismatch is a setup failure)
     E->>X: run: the provider's prepared launch
     X->>R: attached exec as the agent UID (own stdio, never the liveness stream)
@@ -1319,7 +1493,7 @@ sequenceDiagram
     E->>J: exporter removal intent
     E->>R: remove the exporter
     E->>J: the exporter's entry closed
-    E->>G: verify: index-pack --strict under L1, D7.5 re-hash, ancestry from the seed
+    E->>G: verify: index-pack --strict under L1, D7.5 re-hash, ancestry from the seed, the manifest against the git input
     G-->>E: the candidate, or a refusal, saved in state
     E->>J: final clean-up intent
     E->>R: remove the volume, and the export directory (idempotent)
@@ -1491,7 +1665,7 @@ sections. The tests named in the header check this.
 | D5.6, D5.7 | **superseded** | LOCAL gates, ADR 0009 |
 | D6.1 | **preserved** | checked, and no amendment is needed: the container path imports the candidate strictly into the shared store before anything materializes it (D5), so D6.1's precondition holds as written |
 | D6.2 | **preserved** | the writer writes the staging root, or the seed's source |
-| D6.3 | **amended** | [D6.3's note](0006-candidate-validation-evidence-and-review-certificates.md#26-remote-materialization-a-byte-exact-export-with-a-hash-back-proof-item-6): the proof must also hold at hand-off inside the container (D2) |
+| D6.3 | **amended** | [D6.3's note](0006-candidate-validation-evidence-and-review-certificates.md#26-remote-materialization-a-byte-exact-export-with-a-hash-back-proof-item-6): the proof must also hold at hand-off inside the container; in the copy-in form, which stages no tree on the host, that is the only tree proof (D2) |
 | D6.4, D6.5, D6.6 | **preserved** | the store is not visible to a container validator; what validators see is unchanged |
 | D7.1, D7.2, D7.3, D7.4 | **superseded** | the LOCAL convergence rule, ADR 0009 |
 | D8.1, D8.2 | **amended** | [D8.1's and D8.2's notes](0006-candidate-validation-evidence-and-review-certificates.md#28-execution-policy-p-and-sandbox-facts-item-8): P gains the backend, the runtime's product, the image id and the staging method; records copy the backend-qualified facts |
@@ -1537,18 +1711,21 @@ sections. The tests named in the header check this.
 The order below gives every child acceptance criteria it can complete on
 its own. #292 no longer waits on #271's probe, which removes the
 #292↔#271 cycle. #292 produces both staging forms backend-neutrally and
-tests them without a runtime, and #271 chooses between them. Each issue's
-body still has to be brought into line with this table. That is an edit on
-GitHub, which this change does not make.
+tests them without a runtime, and #271 chooses between them. Bringing each
+issue's body into line with this table is an edit on GitHub, which this
+change does not make. The maintainer's acceptance on #267 reports that each
+child's body now carries an "ADR 0013 alignment (2026-11-08)" section.
+This record does not restate those bodies, and where one disagrees with
+this table, the table wins (§2).
 
 | Order | Child | Delivers (decisions) | Completes without |
 |---|---|---|---|
 | 1 | #268 | the backend-neutral lifecycle interface; bwrap behind it, unchanged; backend-qualified `SandboxFacts` (D13, D16's facts) | any runtime |
-| 2 | #292 | the seed pack and manifest, built from the bound revision with its merge base and boundary parents, and the materialized staging root, each proved; the history settings (D2, D4's seed contents, D11, D12's staging) | #271: tested on the bwrap path and with fakes |
-| 2 | #269 | the candidate source: bwrap's, unchanged, and the artifact import with its refusals; `REVIEW` and `FIX` seeding from the revision bound to the round or the entry, another actor's push included; the carried commit; the export bound (D4, D5) | a runtime: tested with packs built in temporary repositories |
+| 2 | #292 | the seed pack and manifest, built from the bound revision with its merge base and boundary parents; the seed's own checks and bounds; the materialized staging root and its proof, for the bind form; staging on the host with no checkout, filter or hook; the history settings (D2, D4's seed contents and checks, D11, D12's staging) | #271: tested on the bwrap path and with fakes |
+| 2 | #269 | the candidate source: bwrap's, unchanged, and the artifact import with its refusals; the launch's git input for every phase, and verify's comparison of the manifest with it; `REVIEW` and `FIX` seeding from the revision bound to the round or the entry, another actor's push included; the carried commit; the export bound (D4, D5) | a runtime and #292: tested with packs and manifests built in temporary repositories |
 | 2 | #270 | the container security policy, the network mapping, the credential-delivery mechanisms and the threat-model text (D9, D10, D14's mechanisms, D18) | #290: tested with fake credentials |
 | 3 | #290 | each provider's mapping and refresh story (D14) | #271: specified against #270's mechanisms |
-| 4 | #271 | the container module, the image contract and build, runtime detection, the shared-filesystem probe, the helpers, the container prompts, and validation in a container: the prover's hand-off proof, P's and the records' container inputs (D2's container side, D7, D8's detection, D12, D15; ADR 0006 D6.3, D8.1 and D8.2 as amended) | #272: `container` stays refused at load |
+| 4 | #271 | the container module, the image contract and build, runtime detection, the shared-filesystem probe, the helpers, the container prompts, and validation in a container: the stager's checkout with no filter, attribute rewrite or hook, the prover's hand-off proof (the only tree proof in the copy-in form) and its checks of the seeded repository, the submodule, LFS and sparse-checkout diagnostics, P's and the records' container inputs (D2's container side, D7, D8's detection, D12, D15; ADR 0006 D6.3, D8.1 and D8.2 as amended) | #272: `container` stays refused at load |
 | 5 | #272 | the journal, labels, death-watch transport, in-container deadline, the exporter's entry and supervision, the release and the final clean-up around the export, reconciliation, and the measured bound (D6) | #273 |
 | 6 | #273 | `sandbox.backend`, the pin's schema, `doctor` and dry-run reporting, the refusals (D8, D10's refusal, D16, D19) | #274 |
 | 7 | #275 | rootless Podman: its adapter differences, and #272's lifecycle tests on Podman (D8, D16) | #274 |
@@ -1581,6 +1758,37 @@ itself as skipped otherwise, never as passed.
   - A force-pushed or rebased head that does not descend from the run's
     last candidate gets a seed of its own revision, and none of the
     earlier candidate's commits that it does not reach.
+  - **The seed's own checks.** Each of these is refused as a setup
+    failure, and a fake backend records no journal entry and no create:
+    - a pack with a corrupt object, which fails `index-pack --strict`;
+    - a pack missing a tree or blob above a shallow boundary;
+    - a pack missing the seed commit or the carried commit;
+    - a pack with a commit D11 does not name;
+    - a pack over its size bound;
+    - a pack over its object-count bound.
+
+    A history setting that makes the seed exceed its bound gets a refusal
+    that names the setting.
+  - **Hostile input on the host path.** The tree holds a `.gitattributes`
+    that names a filter driver, `ident`, `eol=crlf` and `text`. The driver
+    is configured in the operator's global git configuration, with a
+    command that writes a sentinel file and rewrites bytes. The tree also
+    holds an LFS pointer, with git-lfs installed, and a gitlink. Then:
+    - the materialized tree's bytes equal the blobs' bytes, and the seed
+      pack's blobs are the same;
+    - the sentinel is never written;
+    - the LFS pointer stays a pointer;
+    - the gitlink is an empty directory.
+  - **A partial-clone shared store** (a regression test of the existing
+    shared-store path). The store has a promisor remote and lacks a blob
+    the seed needs. The test asks whether `local_git_request` fetches the
+    missing object lazily.
+    - The expected outcome is a typed refusal. The promisor remote, a
+      fake that records every connection, sees none, and the store's
+      files are byte-identical before and after.
+    - If the implementation shows a lazy fetch, that is a defect of the
+      existing shared-store path. It is filed as its own issue, and #292
+      does not take it on.
 - **#269.** A pack with an extra commit that does not descend from the
   seed, one over its bound, a manifest naming another seed, a claimed
   `HEAD` that is not a commit, and a pack that fails `--strict` are each a
@@ -1608,6 +1816,17 @@ itself as skipped otherwise, never as passed.
     `resume` fetches again.
   - **A relaunch of the same `REVIEW` round** seeds from the same bound
     HEAD and has no carried commit.
+  - **The launch's git input, in every phase.** For `ANALYZE_EXECUTE`,
+    `REPLAN_REEXECUTE`, `UPDATE_EPIC`, `REVIEW`, `FIX`, an export command
+    and a relaunch with a carried commit, the input exists before the
+    stage step and holds each of its fields.
+    - A default branch that moves after the input exists leaves an
+      `ANALYZE_EXECUTE` or `UPDATE_EPIC` launch on its bound base.
+    - With a fake backend, a seed whose manifest was swapped after the
+      input was produced is refused at the stage step, before the stager
+      runs.
+    - An artifact whose manifest names another launch, seed commit, lower
+      boundary, carried commit or object format is a candidate refusal.
 - **#270.** Real runtime: the agent's UID is a subordinate one, with no
   capabilities, no writable root and no host session-keyring key. The
   host loopback nonce listener and a host abstract socket are unreachable
@@ -1618,6 +1837,30 @@ itself as skipped otherwise, never as passed.
   client configuration, and a refused non-local endpoint. Real runtime: the
   nonce bind proof both ways, and `transfer: copy`. The image key changes
   with each input and not otherwise. No repository build file is read.
+  - **Hostile input on the stager path.** Real runtime, in both forms,
+    for an agent and for an export command. The image's system git
+    configuration defines a filter driver that writes a sentinel file and
+    rewrites bytes. The seed commit's `.gitattributes` names that driver,
+    `ident`, `eol=crlf` and `text`, and the tree holds an LFS pointer,
+    with git-lfs in the image, and a gitlink. Then:
+    - `/workspace` holds the blobs' bytes;
+    - the sentinel is never written;
+    - the prover's proof passes;
+    - the pointer stays a pointer, and the gitlink is an empty directory;
+    - the launch's facts carry the support table's diagnostic for each
+      case (D2).
+  - **The seeded repository's checks.** A fault-injected stager leaves one
+    of these behind: an extra ref, a reflog, an alternates file, a remote,
+    a hook, a configuration key it does not write, or a `.git/shallow`
+    that differs from the manifest. Each is a setup failure, and no agent
+    runs.
+  - **The tree proof in each form.** A byte changed in `/workspace`
+    between the stager and the prover fails the proof in both forms.
+    - The copy-in form stages no tree on the host.
+    - An export command's workspace is a copy of `/source` in the bind
+      form, and is written from the pack in the copy-in form.
+    - The prover's expected tree id is the one the engine passes. A
+      manifest that names another commit does not change it.
 - **#272.** Real runtime: a `SIGKILL`ed stand-in parent leaves no
   container after the stated bound. A blocked watch ends at the deadline.
   Each crash window below is reconciled at the next `step`, `resume`,

@@ -37,7 +37,7 @@
   state's run owns, and the operator takes it over with `unblock
   --take-over` in the namespace's state directory (D17.3), which the
   controller performs as ADR 0004's K11.
-- **Amended by #267 (proposed, 2026-11-08):** D13.4, for the container
+- **Amended by #267 (accepted with required changes, 2026-11-08):** D13.4, for the container
   backend only ([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D6). It takes effect when #273 makes
   that backend selectable. ADR 0013 §5.5 maps every other decision of
   this record as preserved.

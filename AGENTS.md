@@ -219,10 +219,11 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        recovery and escalation: the stop and authority
                                        matrices, no-go for an advisor's shadow diagnosis
                                        and for autonomous recovery, no pre-BLOCK pause;
-                                       the container sandbox backend (proposed, nothing
-                                       implemented): the lifecycle seam, the death-watch
-                                       that replaces --die-with-parent, rootless only,
-                                       bind or copy-in per runtime, the invariant map)
+                                       the container sandbox backend (accepted with
+                                       required changes, nothing implemented): the
+                                       lifecycle seam, the death-watch that replaces
+                                       --die-with-parent, rootless only, bind or
+                                       copy-in per runtime, the invariant map)
 docs/README.md                         human-oriented documentation index, by intent
 docs/non-code-rules.md                 writing and publishing rules for every non-code artifact
 docs/getting-started.md                operator guide: a first run from nothing, step by step, and the

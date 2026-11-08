@@ -24,7 +24,7 @@
   projections, cross-provider parity). The number is assigned when the
   record merges: if another ADR merges first, this record takes the next
   free number, and its index entries move with it.
-- **Amended by #267 (proposed, 2026-11-08):** for the container backend
+- **Amended by #267 (accepted with required changes, 2026-11-08):** for the container backend
   only, [ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) amends D1.2, D2.1 (G3 and G6), D4.1, D5.1,
   D6.1, D6.3, D6.5, D8.4, D9.1, D10.2, D10.3, D10.5, D10.6, D12.3, D13.1,
   D14.1, D15.4, D17.1, §3 and §9, in §11. Each entry takes effect when

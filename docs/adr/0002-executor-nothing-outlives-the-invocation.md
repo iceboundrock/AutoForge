@@ -2,8 +2,9 @@
 
 - **Status:** accepted, implemented for #85; amended by #132 (§4b), #193 (§4c),
   #194 (§4d) and #167 (§4e); amended for the container backend by #267
-  (§4f, proposed with [ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md); in effect once #273 makes that
-  backend selectable)
+  (§4f, accepted with required changes together with
+  [ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md), whose status line names
+  them; in effect once #273 makes that backend selectable)
 - **Decides:** #85 (follow-up of PR #84's review and #53)
 - **Where:** `src/autoforge/executor.py` (`execute()`, `_terminate_group()`,
   `_Containment`), `src/autoforge/executor_duplex.py`,
