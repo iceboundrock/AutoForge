@@ -8,7 +8,8 @@ check behind two gates of the Public Alpha
 ([#255](https://github.com/iceboundrock/AutoForge/issues/255)): Gate 1
 (fresh installation) and Gate 2 (first successful run). It is repeated at
 each release candidate, and Gate 2 needs a run by someone other than the
-maintainer.
+maintainer. Gate 3, a run published as evidence, has its own
+procedure: [End-to-end demonstration](demo.md).
 
 `make dist-check` runs the half that needs no credential on every commit
 ([Development](development.md#the-built-distributions), step 7): installing

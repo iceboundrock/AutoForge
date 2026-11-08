@@ -224,6 +224,9 @@ docs/non-code-rules.md                 writing and publishing rules for every no
 docs/getting-started.md                operator guide: a first run from nothing, step by step, and the
                                        common first-run failures
 docs/clean-room.md                     the clean-room first-run procedure (Gates 1 and 2 of #255)
+docs/demo.md                           the end-to-end demonstration procedure (Gate 3 of #255): what a
+                                       write-up may claim and the evidence for each, containment, the
+                                       trace excerpts, reproduction; no demonstration recorded yet
 docs/usage.md                          operator guide: remote commands, stop phases, unblock, recovery
 docs/troubleshooting.md                operator guide: a stopped, failed or refused run by symptom,
                                        resume / unblock / a new run, safe stops, lock contention,
