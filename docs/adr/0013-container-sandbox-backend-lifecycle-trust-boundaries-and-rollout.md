@@ -2023,12 +2023,12 @@ itself as skipped otherwise, never as passed.
       manifest that names another commit does not change it.
 - **#272.** Real runtime: a `SIGKILL`ed stand-in parent leaves no
   container after the stated bound. A blocked watch ends at the deadline.
-  Each crash window below is reconciled at the next `step`, `resume`,
-  `unblock` and worker start, leaves nothing, and exports or imports
-  nothing:
-  - after the seed step and before the journal write, where nothing of
-    the launch exists, and only a temporary directory that no container
-    sees may be left behind;
+  A crash after the seed step and before the journal write leaves no
+  entry and no runtime object, and reconciliation finds nothing of the
+  launch. Only the seed step's temporary directory, which no container
+  sees, may remain. Each crash window below is reconciled at the next
+  `step`, `resume`, `unblock` and worker start, leaves nothing, and
+  exports or imports nothing:
   - between the journal write and the staging root's creation, where
     each entry is closed with no object;
   - while the staging root is written or proved, and after it is written
