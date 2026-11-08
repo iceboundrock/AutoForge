@@ -37,6 +37,10 @@
   state's run owns, and the operator takes it over with `unblock
   --take-over` in the namespace's state directory (D17.3), which the
   controller performs as ADR 0004's K11.
+- **Amended by #267 (proposed, 2026-11-08):** D13.4, for the container
+  backend only ([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D6). It takes effect when #273 makes
+  that backend selectable. ADR 0013 §5.5 maps every other decision of
+  this record as preserved.
 - **Where:** placement is decided per decision and collected in §5.
   Existing code this record builds on: `src/autoforge/locking.py`,
   `engine.py`, `state.py`, `transitions.py`, `cli.py`, `executor.py`,
@@ -1256,6 +1260,17 @@ here.**
 - A worker that hangs keeps L2 and L0. Nothing new starts for that issue,
   and no second orchestrator starts. The hang is visible to the operator
   (D9.6) and is never taken over by a timeout.
+
+*Amended by #267 (2026-11-08), for the container backend only
+([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D6; in effect once #273 makes that backend
+selectable).* Under bwrap, a sandboxed agent dies with its worker. Under
+the container backend, a container may outlive a worker killed with
+`SIGKILL`: for its death-watch's detection delay, or, if the watch fails,
+until its in-container deadline. It holds no GitHub credential, so it
+cannot perform an external effect, and its output is never imported.
+When the next generation's engine starts on the issue, it removes the
+container by label and nonce. The scheduler still never `SIGKILL`s a
+worker.
 
 ### 2.14 Crash and recovery classification (decision 14)
 

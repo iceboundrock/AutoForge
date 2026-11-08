@@ -1,7 +1,9 @@
 # ADR 0002. Executor: nothing an agent starts outlives its invocation
 
 - **Status:** accepted, implemented for #85; amended by #132 (§4b), #193 (§4c),
-  #194 (§4d) and #167 (§4e)
+  #194 (§4d) and #167 (§4e); amended for the container backend by #267
+  (§4f, proposed with [ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md); in effect once #273 makes that
+  backend selectable)
 - **Decides:** #85 (follow-up of PR #84's review and #53)
 - **Where:** `src/autoforge/executor.py` (`execute()`, `_terminate_group()`,
   `_Containment`), `src/autoforge/executor_duplex.py`,
@@ -102,6 +104,8 @@ process the previous agent left behind.
 - The agents are told (`common.md`, `local_common.md`): nothing they start
   outlives their invocation; stop what you start, never rely on a background
   process for a later phase. The prompt version moves to `v3`.
+
+*Amended by #267 (2026-11-08), for the container backend only: [§4f](#4f-amendment-container-backends-267-2026-11-08).*
 
 ## 4. Consequences
 
@@ -547,6 +551,68 @@ failure is a refusal while exit 1 is not, the facts are recorded, and a
 refusal releases the containment and every descriptor.
 `tests/test_runlog.py` checks that the facts reach `execution.json` and
 `events.jsonl`, redacted.
+
+*Amended by #267 (2026-11-08), for the container backend only: [§4f](#4f-amendment-container-backends-267-2026-11-08).*
+
+## 4f. Amendment: container backends (#267, 2026-11-08)
+
+Proposed with
+[ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md).
+It takes effect only once #273 makes `sandbox.backend: container`
+selectable. Until then every sandboxed launch is bwrap's, and §4e holds as
+written. Nothing changes for bwrap.
+
+A container belongs to its runtime, not to the controller: to Docker's
+daemon through containerd-shim, or to Podman's conmon. The executor's
+child is the runtime's attached client, and killing the client does not
+stop the container. That fact comes from the runtimes' documented designs
+(ADR 0013 §1.3), and #272 measures it. For a launch under the container
+backend:
+
+- **The outer process is the client.** It is spawned as any command is:
+  `start_new_session`, the same pipes, limits, stop and containment, and
+  `_terminate_group` for its group. §3 to §4d apply to it unchanged. The
+  container's processes are in the container's own PID namespace, not in
+  the client's group, and the subreaper never sees them.
+- **The end of the invocation ends the container.** The executor calls the
+  prepared launch's `close()` on every path: a normal exit, a limit, a
+  stop, `KeyboardInterrupt`, or an exception inside the guard. `close()`
+  ends the container's PID namespace before the invocation returns, so §3,
+  "nothing an agent starts outlives its invocation", holds on every path
+  the controller runs, as it does under bwrap. What was left inside goes
+  with the kernel's teardown, with no grace and uncounted, as §4e says for
+  bwrap.
+- **Controller death does not kill the container at once.** No
+  `--die-with-parent` equivalent exists, so ADR 0013 D6 replaces it.
+  - PID 1 is AutoForge's watcher. It exits when a liveness stream that only
+    the controller holds reaches end of file, and it also ends the
+    container at the launch's runtime ceiling.
+  - The next `step`, `resume`, `unblock` or worker start reconciles what is
+    left, by label and nonce.
+  - The accepted residual: after the controller is killed, a container runs
+    for the watch's detection delay. If the watch fails, it runs until its
+    deadline. That is the one case where something an agent started
+    outlives its invocation, and it is bounded.
+  - `--rm`, `rm -f`, `--init` and start-up clean-up are not claimed to end
+    a container at once.
+- **Containment's adoption of the backend's dead is bwrap's.**
+  `_Containment.adopts_group` exists because a killed `bwrap`'s inner
+  process is re-parented to the controller. A container's process never
+  is.
+- **A setup failure stays a launch refusal,** never an agent result
+  (ADR 0005 D10.8). The client's exit status alone is not the
+  discriminator, since a command's own status can take any value
+  (ADR 0013 D17).
+
+**The bound.** For the invocation, it is unchanged: the deadline plus the
+exit grace plus two kill graces, plus the time `close()` takes to end the
+container, which #272 measures. After the controller's death, it is
+ADR 0013 D6's bound.
+
+Tests for §4f are #272's (ADR 0013 §7). A container is gone after every
+exit path above. A `SIGKILL`ed stand-in parent's container is gone within
+the stated bound. A watch that never sees end of file still ends at the
+deadline.
 
 ## 5. Tests
 

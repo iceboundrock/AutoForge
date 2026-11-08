@@ -170,6 +170,13 @@ Linux host can use `required`: that is a property of the host, established
 by a real minimal launch, never by a version number
 ([ADR 0005 D14.1](adr/0005-outer-sandbox-and-host-resource-capability-model.md#214-platform-capability-levels-item-14)).
 
+One backend exists, Bubblewrap, and everything in this section is about
+it. A container backend, running agents and repository commands in a
+rootless Docker Engine or Podman container, is designed in
+[ADR 0013](adr/0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md)
+and not implemented: there is no `sandbox.backend` key, and no launch uses
+a container runtime.
+
 The outer sandbox is experimental: it is opt-in enforcement on a host that
 can enforce it, and it becomes supported only once a `make test-sandbox`
 run on a capable host is recorded at the release candidate
