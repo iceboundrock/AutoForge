@@ -25,11 +25,11 @@
   record merges: if another ADR merges first, this record takes the next
   free number, and its index entries move with it.
 - **Amended by #267 (accepted with required changes, 2026-11-08):** for the container backend
-  only, [ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) amends D1.2, D2.1 (G3 and G6), D4.1, D5.1,
-  D6.1, D6.3, D6.5, D8.4, D9.1, D10.2, D10.3, D10.5, D10.6, D12.3, D13.1,
-  D14.1, D15.4, D17.1, §3 and §9, in §11. Each entry takes effect when
-  #273 makes that backend selectable; until then every enforced launch
-  is bwrap's and the decision holds as written.
+  only, [ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) amends D1.2, D2.1 (G3 and G6), D4.1,
+  D4.2 (C7), D5.1, D6.1, D6.3, D6.5, D8.4, D9.1, D10.2, D10.3, D10.5,
+  D10.6, D12.3, D13.1, D14.1, D15.4, D17.1, §3 and §9, in §11. Each
+  entry takes effect when #273 makes that backend selectable; until then
+  every enforced launch is bwrap's and the decision holds as written.
 - **Superseded in part by:** [ADR 0009](0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md), which removed LOCAL
   mode (#388): §1.3 and §2.3 to §2.6 (the LOCAL launch classes, the
   resource table's LOCAL column, the shared cache), §2.8, §2.9, D12.3,
@@ -566,6 +566,8 @@ contents.
   declared sandbox path lies inside the private home: a `file-ro` or
   `dir-rw` auth item (D7.1), a provider config root (D8.3), and an
   operator-declared path under the operator's home (D15.4).
+
+*Amended by #267 (2026-11-08), for the container backend only, in C7: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
 
 **D4.3 (#167).** **Forbidden sources.** Besides the engine's denied roots,
 the compiler refuses, for every projection:
@@ -1877,7 +1879,7 @@ Each decision has exactly one implementing child, or is documentation only.
 | #169 | D1.2, D4.4, D7.3, D8.5, D9.3, D12.2, D12.4, D13.5, D14.1, D15.4 |
 | documentation only | D1.1, D7.4, D15.1, D16.1, D17.1 |
 | #280 (amendments) | D12.3, D15.3, D17.1 |
-| #267 (amendments for the container backend, §11; implemented by ADR 0013's children) | D1.2, D2.1, D4.1, D5.1, D6.1, D6.3, D6.5, D8.4, D9.1, D10.2, D10.3, D10.5, D10.6, D12.3, D13.1, D14.1, D15.4, D17.1 |
+| #267 (amendments for the container backend, §11; implemented by ADR 0013's children) | D1.2, D2.1, D4.1, D4.2, D5.1, D6.1, D6.3, D6.5, D8.4, D9.1, D10.2, D10.3, D10.5, D10.6, D12.3, D13.1, D14.1, D15.4, D17.1 |
 
 ### 7.1 Where this record differs from a child issue's body
 
@@ -2118,8 +2120,41 @@ preserved.
   - The network position is D9.1's entry below.
 - **D4.1.** A container launch's root is the image AutoForge built from
   pinned inputs (ADR 0013 D7), not an empty tmpfs. The allow-list principle
-  holds: no host path is visible except the read-only staging root, on
-  runtimes where a bind is proven (ADR 0013 D2, D12).
+  holds: no host path is visible except the launch's read-only bind
+  sources, on runtimes where a bind is proven. They are the staging root,
+  and a credential file where ADR 0013 D14 delivers one (ADR 0013 D2,
+  D12).
+- **D4.2, its C7.** One relocation joins C7's closed set. The launch's
+  staging root, `<git common dir>/autoforge/sandbox/<key>/stage/<launch id>`
+  (D8.4 below), appears at `/source` instead of at its host path, on a
+  runtime where the bind is proven (ADR 0013 D12). The exception is
+  narrow:
+  - the engine alone supplies it, never a provider or an operator;
+  - its source is the launch's own staging root, which the controller
+    created and wrote, and nothing else;
+  - its target is the fixed path `/source`, and its access is read-only.
+
+  Every other rule of D4.2 applies to it unchanged:
+  - **C1:** its source is resolved and absolute.
+  - **C2:** it is a controller-owned source, so it resolves to itself,
+    with no link below the controller's anchor.
+  - **C3:** it is a directory.
+  - **C4 and C5:** it lies inside `<git common dir>/autoforge`, a denied
+    root. So it is projected only as a carve-out, inside the issue's
+    sandbox directory, which C5 names and which holds it as one of
+    D8.4's objects.
+  - **C6:** no other projection's source equals, contains or lies inside
+    it. In addition, `/source` neither equals, contains nor lies inside
+    the target of any other mount of the launch.
+
+  D4.3's forbidden sources apply to it as to every projection. Every
+  other projection keeps C7 as written: it appears at its host path, or
+  at one of the private-home paths C7 lists. A credential file that
+  ADR 0013 D14 delivers on a bind runtime is a `file-ro` item in the
+  private home, which C7 already admits. The container backend's compiler
+  (ADR 0013 D13) admits `/source`. The compiler bwrap launches use gains
+  nothing, and still refuses every relocation whose target lies outside
+  the private home.
 - **D5.1.** Container launches are mapped by ADR 0013 D2, D9, D10 and D15,
   not by this table. No common dir, worktree, admin dir or host install
   root is projected. §2.5's cache rule is kept, as a per-issue volume:
