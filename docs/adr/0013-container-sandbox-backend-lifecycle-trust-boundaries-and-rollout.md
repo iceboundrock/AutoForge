@@ -278,21 +278,23 @@ amended).
 | Object | Lifetime | Owner | Created | Removed |
 |---|---|---|---|---|
 | image | content-keyed and cached across runs; reused while its key is unchanged | AutoForge's build (#271) | on a cache miss, in a build container (D7) | never by a run; `doctor` lists it with its size; the operator prunes it |
-| launch container | one launch: one run step and its helpers | the controller | the create step | the cleanup step, or reconciliation (D6) |
-| exporter container | one export | the controller | the export step | right after it |
-| `/workspace` volume | one launch | the controller | the create step | cleanup, once the export is imported or refused |
+| launch container | one launch: one run step and its helpers | the controller | the create step, after its journal entry | the release, right after the run step; or reconciliation (D6) |
+| exporter container | one export of a change-producing launch | the controller | the export step, after its own journal entry | right after the export ends, journaled; or reconciliation (D6) |
+| `/workspace` volume | one launch; for a change-producing launch, until the verify step's outcome is saved | the controller | the create step, after its journal entry | the final clean-up: for a change-producing launch only once the candidate is bound or refused, otherwise at the release; or reconciliation (D6) |
 | per-issue cache volume | the issue: launches that produce a change share it (ADR 0005 §2.5) | the controller creates it; the operator removes it | at the issue's first change-producing launch | never by AutoForge (ADR 0005 D8.4) |
-| staging root (`/source`) | one launch | the controller (#292) | the stage step | cleanup (it is controller-written only) |
-| projected model credential | one launch | the controller (#290, #270) | the stage step | cleanup, or reconciliation |
-| agent session data | one launch, inside the container's private home | nobody beyond the launch | by the agent CLI | with the container (#278 owns any later need, D14) |
-| candidate artifact | until the strict import ends; then the shared store holds the candidate and the state binds it | the controller (#269) | the export step | after the import |
+| staging root (`/source`) | one launch | the controller (#292) | the stage step | the release (it is controller-written only); or reconciliation |
+| projected model credential | one launch | the controller (#290, #270) | the stage step, after its journal entry | the release, right after the run step; or reconciliation |
+| agent session data | one launch, inside the container's private home | nobody beyond the launch | by the agent CLI | with the launch container (#278 owns any later need, D14) |
+| candidate artifact | until the verify step's outcome is saved; then the shared store holds the candidate and the state binds it | the controller (#269) | the export step, in the launch's export directory (ADR 0005 D8.4 as amended) | the final clean-up, after the verify step; or reconciliation, never imported |
 | provider login and refresh state | long-lived, on the host | the operator | the operator's login | never by AutoForge (D14) |
 | controller GitHub credential | long-lived, on the host | the operator, through `gh` | — | never by AutoForge; never in a container |
 
 *Rationale.* Each container-side object lives for one launch. That makes
 the environment rebuildable: a launch never depends on what an earlier one
-left behind, except through artifacts the controller verified. Two objects
-outlive a launch. The image is a pure function of its inputs (D7). The
+left behind, except through artifacts the controller verified. Within a
+change-producing launch the volume is the one object kept past the run
+step, because the export reads it. The objects that hold the credential
+go first. Two objects outlive a launch. The image is a pure function of its inputs (D7). The
 cache follows ADR 0005's rule: only launches that produce a change share
 it, and each one's output is reviewed.
 
@@ -303,23 +305,81 @@ it, and each one's output is reviewed.
   state into the next role.
 - **A volume per issue for `/workspace`.** See D4.
 
-### D4. Seeding: FIX from the last verified candidate (decision 4; #269)
+### D4. Seeding: from the revision the controller verified and bound (decision 4; #269)
 
-A launch's seed commit:
+A launch's seed commit is always a commit the controller verified and
+bound to the phase entry before the launch, taken from the shared object
+store. It is never an earlier container's workspace or volume, and never
+a commit the container names.
 
-- **`FIX` and `REVIEW`:** the last verified candidate. That is the commit
-  the controller strictly imported and bound to the run, which is the PR
-  head it pushed and read back. Never an earlier container's workspace or
-  volume.
+- **`REVIEW`:** the HEAD bound to the review round. Before the reviewer
+  launches, the controller reads the PR's HEAD, its base branch and their
+  merge base from GitHub. It fetches the HEAD and the merge base into the
+  shared object store through its own transport, and binds all three to
+  the round (`github-safety.md`, "Before REVIEW"; `workflow.md`, "Bind
+  reviews to PR HEAD SHA"). The seed commit is that bound HEAD, and the
+  seed's lower end is that bound merge base.
+  - The bound HEAD is usually the candidate the controller imported and
+    pushed itself. It can also be a commit another actor put on the PR
+    branch: an operator's push, a force-push, a rebase, or the base merged
+    into the branch. In every case the round reviews the bound HEAD, and
+    the seed carries that HEAD, not the run's last own candidate.
+  - The seed is built from the binding, after the fetch, and the PR is not
+    read again. If the PR moves while the reviewer works, the round is
+    stale under the existing rules (`REVIEW -> REVIEW`). The next round
+    binds the new HEAD and gets a new seed. No seed is updated in place.
+- **`FIX`:** the verified candidate bound to its own entry, which is the
+  reviewed HEAD of the round whose findings it resolves. The `FIX` entry
+  checks that the PR still has that HEAD, base and merge base, and
+  fetches the HEAD into the shared store before the launch. The seed's
+  lower end is that round's bound merge base.
+  - Usually the reviewed HEAD is the controller's last imported and pushed
+    candidate. When the round reviewed another actor's push, it is that
+    push.
+  - A PR head past the reviewed HEAD, a retargeted base or a moved merge
+    base routes `FIX -> REVIEW` with no fixer launched, as today
+    (`workflow.md`). No container is created and no seed is built. A
+    `FIX` launch therefore never seeds from a head that no review round
+    bound.
 - **`ANALYZE_EXECUTE` and `REPLAN_REEXECUTE`:** the base the controller
   verified: the start commit, or the default branch head for a
   replacement.
 - **`UPDATE_EPIC`:** the default branch head.
+- **An export command** (`validation.commands`, `merge.verification_commands`):
+  the commit it validates, from the shared store, with no history (D2).
+  At `REVIEW`'s entry that is the bound HEAD, whoever pushed it. ADR 0006
+  D5.5 runs the validation it is missing.
 - **A relaunch of the same phase entry** (after a timeout, a stop, or a
   failure that `resume` relaunches): the seed plus the entry's *carried
   commit*. That is the `HEAD` the controller exported and strictly imported
   at the end of an earlier launch of the same entry, when it descends from
-  the seed. Uncommitted changes are never carried.
+  the seed. Uncommitted changes are never carried. `REVIEW` exports
+  nothing, so it never has a carried commit, and a relaunch of the same
+  round seeds from the same bound HEAD.
+
+**How the bound revision enters the seed.** #292 builds the seed from the
+shared store, through `local_git_request`'s hardening, and only after the
+fetch above has succeeded. For `REVIEW` and `FIX` it holds:
+
+- the seed commit (the bound HEAD) and the bound merge base;
+- every commit reachable from the bound HEAD and not from the merge base;
+- as shallow boundaries, the merge base and each parent of one of those
+  commits that lies outside the range. A merge of the base branch into
+  the PR branch can add parents like that. The agent then has every
+  commit's parent tree, and `git diff` from the merge base to the HEAD
+  gives the PR's diff;
+- the trees and blobs of all of these.
+
+The manifest names the seed commit and the merge base. Before the seed is
+built, the controller checks two things in the shared store: the bound
+HEAD and the merge base are present as commits, and the merge base is an
+ancestor of the HEAD. If either check fails, the launch is refused before
+anything is journaled or created, as a failed fetch is today. Nothing is
+launched, and `resume` fetches again. The stager checks out the seed
+commit on a detached `HEAD`, and the prover proves that commit's tree
+(D2). The reviewer's prompt names the same HEAD and merge base that the
+manifest names. A different commit at either end would be a different
+review.
 
 The controller exports at every end of a change-producing launch that it
 runs: success, failure, timeout or stop. After a controller crash,
@@ -334,6 +394,12 @@ at the end of each launch.
 
 *Rejected.*
 
+- **Seeding `REVIEW` from the run's last own candidate.** When another
+  actor moved the PR, the round would review a commit it does not name,
+  and a clean verdict would bind a HEAD the reviewer never saw.
+- **Seeding from a PR head read again at the stage step.** The seed and
+  the round's binding could then name different commits. The binding is
+  read once, and the seed follows it.
 - **Reusing a volume across launches,** even of one role. The next launch
   would start from an unverified workspace, with an agent-writable
   `.git/config`, hooks and untracked files. Across roles that breaks
@@ -357,12 +423,16 @@ The artifact is untrusted data: one pack, bounded in size, plus a manifest.
 - **The manifest is a claim.** It names the claimed `HEAD`, the seed
   commit and the object format.
 - **The exporter** runs in a fresh container with the volume mounted
-  read-only and `--network none`. It packs the objects reachable from the
-  workspace's `HEAD` and not from the seed. The artifact leaves through the
-  exporter's output or the runtime's copy-out, into a controller-owned
-  scratch directory. Its output is untrusted. A tampered exporter gives the
-  agent nothing it does not already have, which is the choice of what to
-  commit.
+  read-only and `--network none`, after the launch container is removed
+  (D6). It packs the objects reachable from the workspace's `HEAD` and not
+  from the seed. The artifact leaves through the exporter's output or the
+  runtime's copy-out, into the launch's export directory, which only the
+  controller writes (ADR 0005 D8.4 as amended). Its output is untrusted. A
+  tampered exporter gives the agent nothing it does not already have,
+  which is the choice of what to commit.
+  - The exporter is a runtime object of the launch like any other. It is
+    journaled before it is created, labelled, supervised within a bound,
+    and reconciled (D6).
 - **The host's checks.** The claimed commit is the candidate only when all
   of these hold:
   - `index-pack --strict` has put it in the shared store. It runs under L1
@@ -402,9 +472,16 @@ This is the contract a daemon-owned container can meet. It replaces
 
 1. **Names and labels.** Every container and volume a launch creates has a
    run-scoped name and these labels: the run key (ADR 0008's `RunKey`),
-   the issue, the phase, the launch id, the object's kind, and a
-   per-launch nonce. The controller first writes a journal entry holding
-   all of them, atomically. Only then does it create anything (D19).
+   the issue, the phase, the launch id, the object's kind, and a nonce.
+   The controller first writes a journal entry holding all of them,
+   atomically. Only then does it create anything (D19).
+   - This covers every container of the launch: the launch container and
+     each exporter. An exporter gets an entry and a nonce of its own,
+     written before its create, so a crash between its create and its
+     removal leaves an object that reconciliation can prove is the run's.
+   - The credential projection has an entry of its own, and so do the
+     launch's host directories (the staging root and the export
+     directory). Each entry names the launch it belongs to.
 2. **Ownership.** An object belongs to the run only when its labels and
    nonce match a journal entry. Nothing is stopped or removed otherwise.
 3. **The death-watch.** The container's PID 1 is AutoForge's watcher.
@@ -428,25 +505,61 @@ This is the contract a daemon-owned container can meet. It replaces
      backend requires it to be finite for every agent profile, and refuses
      at load a configuration that leaves it unset (D19).
    - Export commands use `execution.command_timeout_seconds`.
+   - An exporter is supervised in the same way. Its PID 1 is the same
+     watcher on a liveness stream that only the controller holds. Its
+     deadline is a fixed export bound that #269 states and the facts
+     record. The controller's call that runs it goes through the executor
+     with that bound as its timeout, and its `close()` ends the exporter's
+     PID namespace on every path (ADR 0002 §4f). The artifact's size bound
+     is enforced while the stream is read. An artifact over the bound ends
+     the exporter, and the launch's export is a candidate refusal (D5).
 5. **Every exit path the controller runs:** success, failure, timeout,
-   stop, `Ctrl-C`, or an exception inside the executor's guard.
-   - The run step's `close()` ends the container's PID namespace before
-     the invocation returns. That keeps ADR 0002 §3 on each of those paths
-     (ADR 0002 §4f).
-   - The engine then removes the container, the volume and the credential
-     projection. It journals that intent first.
+   stop, `Ctrl-C`, or an exception inside the executor's guard. The steps
+   after the run step come in this order, and each removal journals its
+   intent first and closes its entry only after a verified removal:
+   - **Close.** The run step's `close()` ends the launch container's PID
+     namespace before the invocation returns. That keeps ADR 0002 §3 on
+     each of those paths (ADR 0002 §4f).
+   - **Release.** The engine removes the launch container, the credential
+     projection and the staging root. Nothing after the run step needs
+     them, and the launch container's record holds the projected
+     environment (D14). The volume is not removed here for a
+     change-producing launch.
+   - **Export,** only for a change-producing launch that ended by success,
+     failure, timeout or stop (D4). It is skipped on `Ctrl-C` and after an
+     exception inside the guard. The engine writes the exporter's entry,
+     creates and runs it (item 4), then removes it. If the exporter fails
+     to start, the engine retries within bounds, each attempt under a new
+     entry and nonce, and after that the export is a candidate refusal.
+   - **Verify** (D5). The engine imports the artifact strictly, or refuses
+     it, and saves the outcome (D19).
+   - **Final clean-up.** Only after the verify step's outcome is saved, or
+     once the export is skipped, does the engine remove the volume and the
+     export directory. A launch with nothing to export (`REVIEW`,
+     `UPDATE_EPIC`, an export command) removes its volume at the release.
    - Clean-up is idempotent and retried within bounds. A clean-up that
      still fails leaves its entry for reconciliation, and it is reported.
+   - A change-producing launch's volume therefore exists from the create
+     step until the candidate is bound or refused, or the export is
+     skipped. No removal of it is issued while an export of it may still
+     run or be retried.
 6. **Reconciliation.** It runs at every `step`, `resume` and `unblock`, and
    when a scheduler worker starts on an issue, before any launch.
    - It lists the runtime's objects that carry this run's run-key label,
-     and removes each one that matches a journal entry.
+     and removes each one that matches a journal entry. Exporters are
+     included. A running one is stopped first. After the controller's
+     death its watcher has normally ended it already.
+   - It removes the staging root and the export directory that an open
+     entry names. A partial or complete artifact left in the export
+     directory is deleted, never imported.
    - An object with this run's labels but no matching entry or nonce is
      reported, and the run enters `BLOCKED` naming it. Nothing is guessed
      or force-removed.
-   - An entry whose objects are already gone is closed.
+   - An entry whose objects are already gone is closed. That covers an
+     entry written before a create that never happened.
    - Reconciliation never starts a container, and never exports or imports
-     anything (D4).
+     anything (D4). A volume that a crash left before its export is
+     removed without one, and that launch's work is lost.
 7. **No restart policy is ever set.** `--rm` may be passed as well, but
    nothing relies on it.
 8. **Proof under `required`.** The probe and `doctor` start a stand-in
@@ -719,11 +832,13 @@ The owner's guidance (2026-10-23): use as few resources as possible, as
 long as AutoForge still runs correctly. Its recommended default is
 confirmed.
 
-- **The seed holds** the commits the phase's prompt names by SHA (the
-  base, the merge base, the candidate) and the objects between them, with
-  the oldest of them as a shallow boundary. Usually that is the base
-  commit at depth 1 plus the verified candidate's own commits, and for a
-  relaunch also the carried commit (D4).
+- **The seed holds** the commits the phase's prompt names by SHA and the
+  objects between them. Its lower end is a shallow boundary: the base for
+  `ANALYZE_EXECUTE`, `REPLAN_REEXECUTE` and `UPDATE_EPIC`, and the round's
+  bound merge base for `REVIEW` and `FIX`. Any parent outside the range is
+  a boundary too (D4 says how the bound revision enters the seed). Usually
+  that is the base commit at depth 1 plus the reviewed HEAD's own commits,
+  and for a relaunch also the carried commit (D4).
 - **It holds no** tags, other branches, remote, reflogs, stash, notes or
   replacement refs. `HEAD` is detached at the seed commit.
 - **More history** comes only from explicit operator settings:
@@ -740,10 +855,11 @@ confirmed.
 
 *Against ADR 0005 D6.7.* D6.7 accepts exposing the operator's unpushed
 work under bwrap. The container path exposes less. The base is a
-default-branch head the controller verified or the run's recorded base,
-and the candidate's commits are the run's own, pushed by K1 before `FIX` or
-`REVIEW` sees them. Nothing unpushed reaches a container, so D6.7's
-acceptance is not needed there.
+default-branch head the controller verified or the run's recorded base.
+The commits `FIX` and `REVIEW` see are the bound PR head's, which are on
+GitHub already: the run's own, pushed by K1, or another actor's push that
+the controller fetched from the PR. Nothing unpushed reaches a container,
+so D6.7's acceptance is not needed there.
 
 *Rejected.*
 
@@ -763,8 +879,9 @@ proven capability, not as one global default.
   - `/source` is a read-only bind of the launch's staging root,
     `<git common dir>/autoforge/sandbox/<key>/stage/<launch id>`
     (ADR 0005 D8.4 as amended). The controller creates it through
-    `safefs`, under L1, and removes it after the launch. It holds the
-    materialized tree and the seed pack with its manifest.
+    `safefs`, under L1, and removes it at the release, right after the
+    run step (D6). It holds the materialized tree and the seed pack with
+    its manifest.
   - The staged tree is proved again before hand-off (#292), and once more
     inside the container (D2).
 - **Copy-in and copy-out everywhere else:** a daemon inside a VM, a
@@ -812,18 +929,28 @@ engine sequences and journals. Executor requests are not wrapped.
 |---|---|---|---|---|---|---|
 | plan | the engine's facts, completed by the provider's declaration, as `SandboxPlan.describe` does today; pure | the role-level request: launch class, roles, the provider's declaration, limits, network position | a compiled launch, typed and immutable (bwrap: today's `LaunchDescription`; container: a container description) | none | no | a policy refusal (`SandboxPolicyError`), before anything exists |
 | create | the engine | the compiled launch and its owner (run key, issue, phase, launch id, nonce) | a handle | the runtime CLI | yes, the entry is written before the call | an ambiguous outcome is reconciled by label and nonce before any re-issue, never blindly retried (ADR 0004 D4.3's rule, applied to a local object) |
-| stage | the engine | the handle, the seed (#292), the read context, the credential projection (#290) | the prover's verdict | the runtime CLI; the stager's and prover's execs | the projection gets its own entry | a setup failure (D17); the handle is cleaned up |
+| stage | the engine | the handle, the seed (#292), the read context, the credential projection (#290) | the prover's verdict | the runtime CLI; the stager's and prover's execs | the staging root and the projection get entries of their own, each before it is made | a setup failure (D17); both parts of the cleanup run, with no export |
 | run | the executor, through the provider | the handle, the command, its environment | `ExecutionResult` with `SandboxFacts` | the attached runtime client is the executor's child | no | ADR 0002 as today; `close()` ends the container's PID namespace |
-| export | the engine | the handle | the artifact in a controller-owned scratch directory; nothing for `REVIEW` and `UPDATE_EPIC` | the exporter container | no; its output is untrusted | a candidate refusal |
+| cleanup, its release | the engine, right after the run step on every path | the handle | the launch container, the projection and the staging root removed (also the volume when there is nothing to export), or left for reconciliation | the runtime CLI | yes, intent first; each entry closes after its verified removal | idempotent; bounded retry |
+| export | the engine, for a change-producing launch after the release | the handle's volume | the artifact in the launch's export directory; nothing for `REVIEW`, `UPDATE_EPIC` and export commands | the exporter container: its own watcher, the export deadline, its client under the executor's timeout (D6) | yes: the exporter's own entry and nonce before its create; its removal journaled, the entry closed after it; the artifact is untrusted | an exporter that fails to start is retried within bounds, each attempt with a new entry; then, or for a bad artifact, a candidate refusal |
 | verify | the engine (#269) | the artifact and the seed | the imported candidate, or a refusal | the controller's hardened git | the binding is state (D19) | never retried; publishes nothing |
-| cleanup | the engine | the handle | removed, or left for reconciliation | the runtime CLI | yes, intent first; the entry closes after removal | idempotent; bounded retry |
-| reconcile | the engine, at `step`, `resume`, `unblock` and worker start | the run key and the journal | entries closed, or `BLOCKED` | the runtime CLI | closes entries | remove-only (D6) |
+| cleanup, its final part | the engine, after the verify step's outcome is saved, or once the export is skipped | the handle | the volume and the export directory removed, or left for reconciliation | the runtime CLI | yes, intent first; the entry closes after removal | idempotent; bounded retry |
+| reconcile | the engine, at `step`, `resume`, `unblock` and worker start | the run key and the journal | entries closed, or `BLOCKED` | the runtime CLI; `safefs` for the host directories | closes entries | remove-only, exporters and host directories included (D6) |
 | probe | the gate and `doctor` | — | a `ProbeResult` naming the missing capability | one minimal launch of the same shape | no | once per controller process |
 
 **bwrap under this interface.** Plan is `compile_launch` as it is. Create,
 stage, cleanup and reconcile do nothing. Run is `sandbox_bwrap.prepare()`.
 Export and verify are D6.5's import and D6.3's read, which #269 wraps as
 the bwrap candidate source. Nothing a bwrap launch does changes.
+
+**Order, and the volume's lifetime.** The steps run in the table's order.
+The cleanup step has two parts so that the export reads a volume that
+still exists. Its release, right after the run step, removes what holds
+the credential. Its final part runs only after the verify step's outcome
+is saved, and it removes the volume. Every container a launch creates,
+exporters included, has a journal entry before its create. A crash in
+any window between those entries leaves objects that reconciliation can
+prove are the run's (D6, §7).
 
 **What the run step must do.** Its prepared launch is spawned by the
 executor exactly as a `BwrapLaunch` is: an argv, an environment, the
@@ -876,7 +1003,7 @@ environment can be rebuilt (身份留在宿主机、执行环境可以重建).
 | What | Lives | Owner | Lifetime | Reaches a container as |
 |---|---|---|---|---|
 | provider login and refresh state | on the host: an environment key, or a dedicated provider directory (ADR 0005 D7.1) | the operator, who logs in once; refresh stays on the host | long-lived | never whole; only what the next row projects |
-| projected model credential, one launch | made per launch from the login | the controller (#290 per provider; #270 the mechanism) | one launch; removed at clean-up, or by reconciliation after a crash | an environment variable, its value never on an argv; or a read-only file in the container's private home, where a bind is proven |
+| projected model credential, one launch | made per launch from the login | the controller (#290 per provider; #270 the mechanism) | one launch; removed at the release, right after the run step, or by reconciliation after a crash | an environment variable, its value never on an argv; or a read-only file in the container's private home, where a bind is proven |
 | agent conversation and session data | inside the container's private home | nobody beyond the launch | one launch | — |
 | git candidate artifacts | the volume, then the exported pack | the controller (#269) | until the strict import | out only, through the export |
 | controller GitHub write credential | `gh`'s configuration on the host | the operator; the controller uses it | long-lived | never |
@@ -936,7 +1063,7 @@ forwarding, `initializeCommand` on the host, and repository-controlled
   private home on bind runtimes. Nothing else in the MVP.
 - **#290 maps each provider** (Claude Code, OpenCode 2.x, Pi; no Codex) to
   one of those mechanisms, with its refresh story under the rules above.
-- **#272 removes projections at clean-up and in reconciliation.**
+- **#272 removes projections at the release and in reconciliation.**
 
 ### D15. Launch classes, and what runs where (#271)
 
@@ -1030,9 +1157,9 @@ would hide two different sets of guarantees.
 | the command never started | run | `SandboxLaunchRefusedError` | the same; a command's own exit status is never the discriminator |
 | the command ended by something the executor did not send: an OOM kill inside, a container killed from outside, PID 1's deadline | run | the command's abnormal end | the existing failure path |
 | a limit or a stop | run | as today (`ExecutionTimeoutError`) | as today; `close()` ends the namespace |
-| the export fails, or the artifact is malformed, over its bound or inconsistent with its manifest | export, verify | a candidate refusal (`ObjectImportError`) | as today's import failure |
-| an ambiguous create | create | — | reconciled by label and nonce first; then a refusal |
-| a clean-up failure | cleanup | reported | the entry stays for reconciliation |
+| the export fails (its exporter still failing to start after its bounded retries, ending at its deadline, or overrunning the artifact's bound), or the artifact is malformed or inconsistent with its manifest | export, verify | a candidate refusal (`ObjectImportError`) | as today's import failure; the volume is removed only after this outcome is saved |
+| an ambiguous create, of the launch container, the volume or an exporter | create, export | — | reconciled by label and nonce first; then a refusal |
+| a clean-up failure, in either part | cleanup | reported | the entry stays for reconciliation |
 | ownership that cannot be proven | reconcile | `BLOCKED` | names the object; never removed |
 | a different backend or runtime than the pin | entry | `ConfigurationError` | refused; nothing written |
 
@@ -1121,7 +1248,9 @@ is ready.
   the endpoint kind. Its parser reads schema 1 as `bwrap`.
 - **#272:** the lifecycle journal. It has one entry per created object
   (names, labels, nonce, kind, stage), written atomically before the
-  create and closed after a verified removal. It goes in `state.json` or
+  create and closed after a verified removal. The kinds are the launch
+  container, the volume, each exporter, the credential projection, the
+  staging root and the export directory, and each entry names its launch. It goes in `state.json` or
   in a file of its own under the run's state directory; #272 chooses, on
   #23. Either way it is controller intent, never a liveness signal.
   Reconciliation reads it for one decision only: which labelled objects
@@ -1165,11 +1294,13 @@ sequenceDiagram
     participant G as Controller git (host)
     E->>E: gate: the probe, cached per process (D16)
     E->>E: reconcile this run's leftovers (D6)
+    E->>G: REVIEW and FIX: the bound HEAD and merge base fetched and checked in the shared store (D4)
     E->>G: seed pack and manifest from the shared store
-    E->>J: an entry with the run key, issue, phase, launch id, nonce and names (atomic)
+    E->>J: entries for the volume and the launch container: run key, issue, phase, launch id, nonce, names (atomic)
     E->>R: create the volume and the container (labels and nonce, no restart policy)
     R-->>E: created (ambiguous: reconcile by label and nonce)
     E->>R: start PID 1 on the liveness stream, whose write end stays with the engine
+    E->>J: entries for the staging root and the credential projection
     E->>R: stage: copy in or bind the seed, the read context, the credential projection
     R->>C: stager exec, then prover exec: /workspace proved against the seed tree
     C-->>E: the prover's verdict (a mismatch is a setup failure)
@@ -1178,13 +1309,21 @@ sequenceDiagram
     R->>C: agent runs, commits on its detached HEAD
     C-->>X: CONTROL_RESULT on stdout, exit status
     X->>R: close(): end the container's PID namespace
-    E->>R: export: a fresh exporter container, volume read-only, --network none
-    R-->>E: artifact (bounded pack and manifest) into controller scratch
+    E->>J: release intent
+    E->>R: release: remove the launch container, the projection and the staging root, but keep the volume
+    E->>J: those entries closed
+    Note over E,R: change-producing launches only, after success, failure, timeout or stop
+    E->>J: the exporter's own entry: labels, a new nonce, its launch
+    E->>R: create and run the exporter: volume read-only, --network none, its own watcher, the export deadline
+    R-->>E: artifact (bounded pack and manifest) into the launch's export directory
+    E->>J: exporter removal intent
+    E->>R: remove the exporter
+    E->>J: the exporter's entry closed
     E->>G: verify: index-pack --strict under L1, D7.5 re-hash, ancestry from the seed
-    G-->>E: the candidate, or a refusal
-    E->>J: cleanup intent
-    E->>R: remove the containers, the volume and the projection (idempotent)
-    E->>J: entry closed
+    G-->>E: the candidate, or a refusal, saved in state
+    E->>J: final clean-up intent
+    E->>R: remove the volume, and the export directory (idempotent)
+    E->>J: entries closed
 ```
 
 ### 3.2 Controller death, the death-watch, and reconciliation
@@ -1206,7 +1345,8 @@ sequenceDiagram
     N->>N: reads its journal entries
     N->>R: list objects labelled with this run key
     alt labels and nonce match an entry
-        N->>R: remove the container, volume and projection
+        N->>R: remove the container (an exporter included), volume and projection
+        N->>N: remove the staging root and export directory, the artifact never imported
         N->>N: close the entry
     else this run's labels, no matching entry or nonce
         N->>N: BLOCKED, naming the object (never force-removed)
@@ -1228,7 +1368,7 @@ sequenceDiagram
     E->>H: derive this launch's projection, never read for logging
     E->>C1: projection: an env value (never on an argv) or a read-only file (bind runtimes)
     Note over C1: the agent runs, with session data only in C1's private home
-    E->>C1: cleanup: remove C1 and its projection
+    E->>C1: release: remove C1 and its projection
     Note over C1: session data, home and projection are gone
     E->>H: derive a new projection for launch 2
     E->>C2: a new projection, never a restored home, helper, SSH agent, GitHub token or database copy
@@ -1314,7 +1454,7 @@ sections. The tests named in the header check this.
 | D6.7 | **preserved** | the container path exposes less (D11) |
 | D7.1, D7.2, D7.3, D7.4 | **preserved** | D14: D7.2 stands, so copy-in runtimes deliver only `env` credentials |
 | D8.1, D8.2, D8.3 | **preserved** | a private home per launch inside the container; path-valued names rewritten to container paths |
-| D8.4 | **amended** | [§11](0005-outer-sandbox-and-host-resource-capability-model.md#11-amendment-the-container-backend-267-2026-11-08): the staging root and the per-launch runtime objects are removed by the controller; the cache volume keeps the never-delete rule |
+| D8.4 | **amended** | [§11](0005-outer-sandbox-and-host-resource-capability-model.md#11-amendment-the-container-backend-267-2026-11-08): the staging root, the export directory and the per-launch runtime objects are removed by the controller, the volume only after the verify step; the cache volume keeps the never-delete rule |
 | D8.5 | **preserved** | #273 adds volumes and images to the list |
 | D9.1 | **amended** | [§11](0005-outer-sandbox-and-host-resource-capability-model.md#11-amendment-the-container-backend-267-2026-11-08): the container's own network namespace (D9) |
 | D9.2, D9.3 | **preserved** | mapped to `--network none` and kept as rows (D9) |
@@ -1404,12 +1544,12 @@ GitHub, which this change does not make.
 | Order | Child | Delivers (decisions) | Completes without |
 |---|---|---|---|
 | 1 | #268 | the backend-neutral lifecycle interface; bwrap behind it, unchanged; backend-qualified `SandboxFacts` (D13, D16's facts) | any runtime |
-| 2 | #292 | the seed pack and manifest, and the materialized staging root, each proved; the history settings (D2, D11, D12's staging) | #271: tested on the bwrap path and with fakes |
-| 2 | #269 | the candidate source: bwrap's, unchanged, and the artifact import with its refusals; FIX seeding; the carried commit (D4, D5) | a runtime: tested with packs built in temporary repositories |
+| 2 | #292 | the seed pack and manifest, built from the bound revision with its merge base and boundary parents, and the materialized staging root, each proved; the history settings (D2, D4's seed contents, D11, D12's staging) | #271: tested on the bwrap path and with fakes |
+| 2 | #269 | the candidate source: bwrap's, unchanged, and the artifact import with its refusals; `REVIEW` and `FIX` seeding from the revision bound to the round or the entry, another actor's push included; the carried commit; the export bound (D4, D5) | a runtime: tested with packs built in temporary repositories |
 | 2 | #270 | the container security policy, the network mapping, the credential-delivery mechanisms and the threat-model text (D9, D10, D14's mechanisms, D18) | #290: tested with fake credentials |
 | 3 | #290 | each provider's mapping and refresh story (D14) | #271: specified against #270's mechanisms |
 | 4 | #271 | the container module, the image contract and build, runtime detection, the shared-filesystem probe, the helpers, the container prompts, and validation in a container: the prover's hand-off proof, P's and the records' container inputs (D2's container side, D7, D8's detection, D12, D15; ADR 0006 D6.3, D8.1 and D8.2 as amended) | #272: `container` stays refused at load |
-| 5 | #272 | the journal, labels, death-watch transport, in-container deadline, clean-up, reconciliation, and the measured bound (D6) | #273 |
+| 5 | #272 | the journal, labels, death-watch transport, in-container deadline, the exporter's entry and supervision, the release and the final clean-up around the export, reconciliation, and the measured bound (D6) | #273 |
 | 6 | #273 | `sandbox.backend`, the pin's schema, `doctor` and dry-run reporting, the refusals (D8, D10's refusal, D16, D19) | #274 |
 | 7 | #275 | rootless Podman: its adapter differences, and #272's lifecycle tests on Podman (D8, D16) | #274 |
 | 8 | #274 | the end-to-end proof on rootless Docker and rootless Podman: the MVP gate (D20) | — |
@@ -1425,11 +1565,22 @@ itself as skipped otherwise, never as passed.
 - **#268.** The interface with bwrap behind it changes no byte of a bwrap
   launch: the existing executor, sandbox and parity suites run unchanged.
   A fake backend shows the engine calling the steps in order, journaling
-  before create and cleanup, and calling `close()` on every exit path,
-  `KeyboardInterrupt` and an exception inside the guard included.
+  before every create (the exporter's included) and every removal, never
+  removing the volume before the verify step's outcome is saved, and
+  calling `close()` on every exit path, `KeyboardInterrupt` and an
+  exception inside the guard included.
 - **#292.** The seed carries exactly the commits D11 names. With the
   settings unset it has no tag, no other ref and no reflog. The staging
   root fails its proof after a byte is changed on the host.
+  - For a `REVIEW` or `FIX` seed, the manifest names the bound HEAD and
+    the bound merge base. Inside the seed, `git diff` from the merge base
+    to the HEAD equals the host's diff of the same two commits.
+  - A PR branch that merged its base has the merge base and each parent
+    outside the range as shallow boundaries, and no commit's parent tree
+    is missing.
+  - A force-pushed or rebased head that does not descend from the run's
+    last candidate gets a seed of its own revision, and none of the
+    earlier candidate's commits that it does not reach.
 - **#269.** A pack with an extra commit that does not descend from the
   seed, one over its bound, a manifest naming another seed, a claimed
   `HEAD` that is not a commit, and a pack that fails `--strict` are each a
@@ -1437,6 +1588,26 @@ itself as skipped otherwise, never as passed.
   candidate that D7.5 re-hashes. FIX seeds from the bound candidate and
   never from a volume. A relaunch carries the committed `HEAD` and not
   uncommitted files.
+  - **Seeding after another actor's push.** An operator pushes to the PR
+    branch after the controller's own push. The next `REVIEW` seeds from
+    the operator's commit, which the round bound and the controller
+    fetched, and not from the run's last imported candidate. The `FIX`
+    that follows seeds from that same reviewed HEAD.
+  - **Drift before `FIX`.** A PR head past the reviewed HEAD at `FIX`'s
+    entry goes `FIX -> REVIEW`. No container is created and no seed is
+    built, and the re-review seeds from the new HEAD.
+  - **Drift during `REVIEW`.** A PR that moves while the reviewer runs
+    leaves the seed at the bound HEAD. The round is stale
+    (`REVIEW -> REVIEW`), and the next round seeds from its own binding.
+    No seed changes in place.
+  - **A base rewritten under its name** moves the merge base. The
+    re-review's seed has the new merge base as its lower end.
+  - **A bound revision missing from the store.** A bound HEAD that is not
+    a commit there, or a merge base that is not its ancestor there,
+    refuses the launch before any journal entry or create. A later
+    `resume` fetches again.
+  - **A relaunch of the same `REVIEW` round** seeds from the same bound
+    HEAD and has no carried commit.
 - **#270.** Real runtime: the agent's UID is a subordinate one, with no
   capabilities, no writable root and no host session-keyring key. The
   host loopback nonce listener and a host abstract socket are unreachable
@@ -1449,11 +1620,41 @@ itself as skipped otherwise, never as passed.
   with each input and not otherwise. No repository build file is read.
 - **#272.** Real runtime: a `SIGKILL`ed stand-in parent leaves no
   container after the stated bound. A blocked watch ends at the deadline.
-  Each crash window, between the journal entry and the create, between
-  the create and the start, after the run and before the export, and
-  during clean-up, is reconciled at the next `step`, `resume`, `unblock`
-  and worker start, and leaves nothing. A labelled object with an unknown
-  nonce blocks and is not removed. Reconciliation run twice is a no-op.
+  Each crash window below is reconciled at the next `step`, `resume`,
+  `unblock` and worker start, leaves nothing, and exports or imports
+  nothing:
+  - between the journal entry and the create;
+  - between the create and the start;
+  - after the run and during the release;
+  - after the release and before the exporter's entry;
+  - **the exporter's creation:** between its entry and its create, where
+    the entry is closed with no object, and an ambiguous create, where the
+    exporter is found by label and nonce and removed;
+  - **the exporter's execution:** while it runs, where its watcher ends it
+    within the stated bound, and the partial artifact in the export
+    directory is deleted, never imported;
+  - **the exporter's removal:** after it ends and before the removal
+    intent, during the removal, and after the removal before its entry
+    closes;
+  - after the artifact is written and before the verify step's outcome is
+    saved, where the volume and the artifact are removed and the
+    candidate is never bound;
+  - during the final clean-up.
+
+  Fake runtime:
+  - On every exit path of the run step (success, failure, timeout, stop,
+    `Ctrl-C`, an exception inside the guard), no removal of the volume is
+    issued before the verify step's outcome is saved, or before the
+    export is skipped.
+  - The exporter reads a volume whose launch container has already been
+    removed.
+  - An exporter that fails to start is retried within bounds, each attempt
+    under a new entry and nonce, and then the export is a candidate
+    refusal.
+  - An exporter that reaches its deadline, or overruns the artifact's
+    bound, is ended and removed, and the export is a candidate refusal.
+  - A labelled object with an unknown nonce, an exporter included, blocks
+    and is not removed. Reconciliation run twice is a no-op.
 - **#273.** A `container` with `disabled` and a `read_only_paths` with
   `container` are refused at load. A rootful runtime is refused with state
   byte-identical. A schema-1 pin loads as bwrap. A different backend or

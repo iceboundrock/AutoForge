@@ -2151,20 +2151,28 @@ preserved.
   retried, nothing published, a candidate refusal under the phase's rules.
   The input changes from a host private object directory to an untrusted
   pack and manifest that the container produced (ADR 0013 D5).
-- **D8.4.** Two kinds of object are added:
+- **D8.4.** Three kinds of object are added:
   - the per-launch staging root,
     `<git common dir>/autoforge/sandbox/<key>/stage/<launch id>`. Only the
     controller writes it, the launch sees it read-only, and the controller
-    removes it after the launch, as the pre-merge export is removed;
-  - the runtime's per-launch objects: the containers, the `/workspace`
-    volume and the credential projection. The controller removes them
-    through the runtime after the launch, journaled (ADR 0013 D3, D6).
+    removes it after the run step, as the pre-merge export is removed;
+  - the per-launch export directory,
+    `<git common dir>/autoforge/sandbox/<key>/export/<launch id>`. It holds
+    the artifact the controller reads from the exporter's output, a single
+    file of fixed name that no container sees. The controller removes it
+    after the verify step, and reconciliation removes a leftover one
+    without importing it;
+  - the runtime's per-launch objects: the launch container, each exporter,
+    the `/workspace` volume and the credential projection. The controller
+    removes them through the runtime, journaled. The volume goes only
+    after the verify step's outcome is saved (ADR 0013 D3, D6).
 
   "Never deleted by AutoForge" still holds for the per-issue cache volume
   and for every directory the table above lists. The rationale against
   deleting, that the controller would walk and delete agent-written trees,
-  does not arise. The staging root is never written by an agent, and the
-  runtime removes a volume without the controller walking it.
+  does not arise. The staging root and the export directory are never
+  written by an agent. The runtime removes a volume without the controller
+  walking it.
 - **D9.1.** A container launch has a network namespace of its own on the
   runtime's rootless bridge, never the host's. Host loopback and host
   abstract sockets must be unreachable, which the probe proves (ADR 0013
