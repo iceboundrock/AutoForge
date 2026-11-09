@@ -82,10 +82,13 @@
     ADR 0008 D11.2 stays preserved: no lock is acquired while L1 is held,
     and a probe lock is never waited on (D6, item 9, and §5.5).
 
-  Two more corrections followed review round 5. They postdate the four
-  acceptances, and the maintainer has not accepted them yet. The first
-  reopens no decision. The second is one more dated amendment, of ADR
-  0008 D10.5:
+  Two more corrections followed review round 5. The maintainer accepted
+  them on 2026-11-09, as proposed at `f72657f`, on the same terms:
+  required changes A to D still apply, and no other decision was reopened
+  ([#267's fifth acceptance comment](https://github.com/iceboundrock/AutoForge/issues/267#issuecomment-6733400396)).
+  The first reopens no decision. The second is one more dated amendment,
+  of ADR 0008 D10.5, which the maintainer accepted explicitly because it
+  changes an existing contract:
   - **What closes an entry is read fresh, from the store it names.** The
     process caches the probe's result only, for the runtime report it was
     proved on. The runtime check itself is never cached. Every command's
@@ -99,11 +102,27 @@
   - **`doctor` takes probe locks under the container backend.** ADR 0008
     D10.5 says `doctor` takes no lock, but its probe and its sweep take a
     probe lock and L1 (D6, item 9). A dated amendment (2026-11-09) allows
-    exactly those two, for the container backend only. `doctor` still
-    never takes L0 or L2, so it never fails on, waits for or excludes an
-    orchestrator. Under bwrap and outside a checkout, `doctor` still
-    takes no lock, and neither do `status`, `epic status`, `epic stop` or
-    any dry run (§5.5).
+    exactly those two, for the container backend only. A probe lock is
+    taken only with `LOCK_NB` and never waited on. `doctor` still never
+    takes or waits on L0 or L2, so an active orchestrator never makes it
+    fail, `doctor` never excludes one, and it reconciles no run. Its
+    probe and its sweep can wait for L1, though, behind one controller
+    critical section, a fetch among them, within ADR 0008 D11.3's bound.
+    Past that bound, the probe fails and names the lock, and `doctor`'s
+    other rows are still reported. Under bwrap and outside
+    a checkout, `doctor` still takes no lock, and neither do `status`,
+    `epic status`, `epic stop` or any dry run (§5.5).
+
+  The fifth acceptance required one wording fix. Until this revision, the
+  summaries of the D10.5 amendment here, in D6 item 9 and in D16 said
+  that `doctor` never waits for an orchestrator. That contradicted the
+  amendment's own text in ADR 0008, which says `doctor` can wait for L1.
+  Each now states the amendment's narrower contract, as the bullet above
+  does: `doctor` never takes or waits on L0 or L2, and it can wait for L1
+  within D11.3's bound. The round-5 coordination note on #273 repeats the
+  old summary, and its next bullet says `doctor` can wait. Where it
+  differs from this record, this record decides (§2). A later review
+  checks that the record carries the fix.
 
   This is a design record, and nothing in it is implemented. Written at
   `main` `32178d8` (2026-11-08), where every reference below was read.
@@ -268,8 +287,12 @@ measured it amends this record.
   (§5) found more decisions the container backend contradicts as written:
   ADR 0004 D1.1's sentence naming the candidate; ADR 0005 D4.1, D4.2's
   C7, D5.1, D8.4, D10.2, D10.3, D10.5, D12.3, D13.1, D15.4 and D17.1;
-  ADR 0006 D6.3, D8.1 and D8.2; and ADR 0008 D13.4. ADR 0008 is otherwise
-  preserved, and so is ADR 0004.
+  ADR 0006 D6.3, D8.1 and D8.2; and ADR 0008 D13.4. Review round 5 found
+  one more: ADR 0008 D10.5, which says `doctor` takes no lock, while the
+  container backend's probe and sweep in `doctor` take a probe lock and
+  L1 (D6, item 9). ADR 0008's other decisions are preserved, except
+  D17.5, which ADR 0009 superseded (§5.5). ADR 0004's other decisions are
+  all preserved (§5.2).
 
 ### 1.5 Terms
 
@@ -1058,14 +1081,14 @@ This is the contract a daemon-owned container can meet. It replaces
      still holding no object, for a later sweep, and the sweep reports it.
    - **`doctor`'s locks.** `doctor`'s probe and its sweep take exactly
      these two locks, a probe lock and L1, and no other. `doctor` never
-     takes L0 or L2, so it never fails on, waits for or excludes an
-     orchestrator, and it reconciles no run (D16). ADR 0008 D10.5 says
-     that `doctor` takes no lock, so it is amended for the container
-     backend only, to allow exactly these two (§5.5). The cost is that
-     `doctor` can wait for L1 behind one controller critical section, a
-     fetch among them, within D11.3's bound. Past it, the probe fails as
-     above and names the lock, and `doctor`'s other rows are still
-     reported. Under bwrap, and outside a checkout (below), `doctor`
+     takes or waits on L0 or L2, so an active orchestrator never makes it
+     fail, `doctor` never excludes one, and it reconciles no run (D16).
+     ADR 0008 D10.5 says that `doctor` takes no lock, so it is amended
+     for the container backend only, to allow exactly these two (§5.5).
+     `doctor` never waits on a probe lock, but its probe and its sweep
+     can wait for L1, behind one controller critical section, a fetch
+     among them, within D11.3's bound. Past it, the probe fails as above
+     and names the lock, and `doctor`'s other rows are still reported. Under bwrap, and outside a checkout (below), `doctor`
      takes no lock.
    - **Outside a checkout** there is no probe directory. `doctor` then runs
      only the runtime check (D16), and says that the probe needs a
@@ -1859,16 +1882,21 @@ probe result only when the fresh report is the one the probe was proved
 on, and otherwise runs the probe again (D6, item 10).
 
 `doctor` runs the runtime check and then the probe, with its sweep. It
-takes no L0 and no L2, so it reconciles no run, and it never waits for or
-excludes an orchestrator. Its probe and its sweep take only a probe lock
-and L1, which ADR 0008 D10.5 as amended allows (D6, item 9; §5.5). It
-reports each run's labelled objects that await that run's reconciliation,
-and each probe-labelled object that no journal of the checkout names. It
-also reports each probe directory that its sweep kept, with the runtime
-the journal names and the setting under which a sweep reaches it. When
-the runtime check fails, `doctor` sweeps nothing and lists no runtime. It
-still reads the probe directories, which needs no runtime, and reports
-each one with the runtime its journal names.
+never takes or waits on L0 or L2. So it reconciles no run, an active
+orchestrator never makes it fail, and it never excludes one. Its probe
+and its sweep take only a probe lock, never waited on, and L1, which ADR
+0008 D10.5 as amended allows (D6, item 9; §5.5). They can therefore wait
+for L1 behind one controller critical section, within ADR 0008 D11.3's
+bound. Past that bound, the probe fails and names the lock, and
+`doctor`'s other rows are still reported.
+
+`doctor` reports each run's labelled objects that await that run's
+reconciliation, and each probe-labelled object that no journal of the
+checkout names. It also reports each probe directory that its sweep
+kept, with the runtime the journal names and the setting under which a
+sweep reaches it. When the runtime check fails, `doctor` sweeps nothing
+and lists no runtime. It still reads the probe directories, which needs
+no runtime, and reports each one with the runtime its journal names.
 
 **The facts are qualified by backend** (ADR 0005 D1.2 as amended).
 `SandboxFacts` gains:
@@ -2313,7 +2341,7 @@ sections. The tests named in the header check this.
 | D8.5 | **preserved** | a container reaches nothing under `<common>/autoforge` at all |
 | D9.1, D9.2, D9.3, D9.4, D9.5, D9.6, D9.7, D9.8 | **preserved** | a worker's engine reconciles at its start (D6) |
 | D10.1, D10.2, D10.3, D10.4, D10.6 | **preserved** | no launch, and no container, inherits a lock descriptor; a probe lock's descriptor is close-on-exec too, so no runtime process the probe starts holds it (D6, item 9) |
-| D10.5 | **amended** | [D10.5's note](0008-parallel-epic-scheduler-authority-run-identity-claims-and-locks.md#210-repository-orchestration-ownership-decision-10): under the container backend, `doctor`'s probe and its sweep take a probe lock, only with `LOCK_NB` and never waited on, and L1 for a probe directory's creation and removal, within D11.3's bound. `doctor` never takes L0 or L2. `status`, `epic status`, `epic stop` and every dry run take no lock, and neither does `doctor` under bwrap or outside a checkout (D6, item 9; D16) |
+| D10.5 | **amended** | [D10.5's note](0008-parallel-epic-scheduler-authority-run-identity-claims-and-locks.md#210-repository-orchestration-ownership-decision-10): under the container backend, `doctor`'s probe and its sweep take a probe lock, only with `LOCK_NB` and never waited on, and L1 for a probe directory's creation and removal, within D11.3's bound. `doctor` never takes or waits on L0 or L2. It can wait for L1 behind one controller critical section, and past D11.3's bound its probe fails and names the lock. `status`, `epic status`, `epic stop` and every dry run take no lock, and neither does `doctor` under bwrap or outside a checkout (D6, item 9; D16) |
 | D11.1, D11.2, D11.3, D11.4 | **preserved** | the order holds as written. A probe lock (D6, item 9) is ADR 0013's own, outside D11.1's domains. It is taken only with `LOCK_NB`, never while L1 is held, and nothing waits on it. L1 is entered while one is held only to remove that probe's lock file and directory, and acquires nothing there. So the order is L0, L2, a probe lock, then L1, L1 stays the only blocking acquisition, its holder acquires nothing, and no wait-for cycle can form. A probe on a filesystem whose `flock` is not local is refused, by D11.4's list |
 | D12.1, D12.2, D12.3, D12.5 | **preserved** | under D12.3, the container path's new common-dir writes take L1: creating the staging root, importing the pack, and creating or removing a probe's directory with its lock file. Each is one critical section that acquires nothing, and no runtime call runs under it. What the lock's holder alone writes inside a probe's directory, its journal and its staging root, changes no shared parent and takes none (D6, item 9) |
 | D12.4 | **preserved** | enforced, no residual |
@@ -2869,8 +2897,9 @@ itself as skipped otherwise, never as passed.
   and twice around every pass that closes entries. That is a few more
   read-only `info` calls per launch, which #271 measures.
 - **`doctor` can wait for L1** under the container backend, behind one
-  controller critical section, within ADR 0008 D11.3's bound. Under bwrap
-  it still takes no lock (ADR 0008 D10.5 as amended).
+  controller critical section, within ADR 0008 D11.3's bound. It never
+  takes or waits on L0 or L2, so an active orchestrator never makes it
+  fail. Under bwrap it still takes no lock (ADR 0008 D10.5 as amended).
 - **Repository tests that need nested containers or user namespaces** may
   fail inside: the agent has no capabilities. #270 measures this, and
   until then it is not claimed either way.

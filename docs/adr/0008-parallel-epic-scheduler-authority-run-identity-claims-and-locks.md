@@ -39,9 +39,10 @@
   controller performs as ADR 0004's K11.
 - **Amended by #267, for the container backend only ([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D6):**
   D13.4 (2026-11-08, accepted with required changes) and D10.5
-  (2026-11-09, `doctor`'s probe locks; ADR 0013's Status line says
-  whether it is accepted). Each takes effect when #273 makes that backend
-  selectable. ADR 0013 §5.5 maps every other decision of this record.
+  (2026-11-09, `doctor`'s probe locks, accepted on 2026-11-09 on the same
+  terms; ADR 0013's Status line cites the acceptance). Each takes effect
+  when #273 makes that backend selectable. ADR 0013 §5.5 maps every other
+  decision of this record.
 - **Where:** placement is decided per decision and collected in §5.
   Existing code this record builds on: `src/autoforge/locking.py`,
   `engine.py`, `state.py`, `transitions.py`, `cli.py`, `executor.py`,
