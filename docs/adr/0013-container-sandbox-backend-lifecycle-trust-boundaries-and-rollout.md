@@ -37,9 +37,9 @@
   - **With `history_tags` on, the manifest binds the seed's tags,** and the
     prover accepts exactly those (D2, D4, D11).
 
-  Two more corrections followed review round 3. The maintainer accepted
-  them on 2026-11-09, on the same terms: required changes A to D still
-  apply, and no decision was reopened
+  The corrections that followed review round 3 are these three. The
+  maintainer accepted them on 2026-11-09, on the same terms: required
+  changes A to D still apply, and no decision was reopened
   ([#267's third acceptance comment](https://github.com/iceboundrock/AutoForge/issues/267#issuecomment-6729991033)):
   - **The stager and the prover run offline in a container of their
     own.** An exec session shares its container's network namespace, and
@@ -62,7 +62,7 @@
 
   Two more corrections followed review round 4. They postdate the three
   acceptances, and the maintainer has not accepted them yet. Neither
-  reopens or amends a decision. Each makes round 3's probe journal safe to
+  reopens or amends a decision. Each makes round 3's journals safe to
   implement:
   - **A journal is bound to the runtime that holds its objects.** A probe
     journal names the runtime's product and its store, as the runtime
