@@ -323,9 +323,9 @@ provider's operator configuration root.
 **A read-only bind does not make content immutable.** The host path can
 change after it was proved. So the prover, AutoForge's own code running
 D6.3's walk of ADR 0006, proves `/workspace`'s tree (its `.git` aside, for
-an agent) against the seed commit's tree id inside the container runtime,
-before any agent or repository command runs on it. It does so in both
-forms.
+an agent) against the seed commit's tree id inside a container of the
+launch, the stager container below, before any agent or repository
+command runs on that tree. It does so in both forms.
 
 - The controller hands the prover that tree id, read from the shared
   store. The id never comes from the pack or the manifest.
@@ -1073,9 +1073,9 @@ therefore hide one run's leftovers from its own reconciliation.
   this record was written, with no container involved). Docker's `exec`
   documents none. The launch container of an agent, or of an export
   command on `*_network: host`, is on the bridge. So the stager and the
-  prover cannot be offline as execs in it.
-  They run in the stager container, and each exporter in its own. Each of
-  these helper containers is created with `--network none` (D6, D13).
+  prover cannot be offline as execs in it. They run in the stager
+  container, and each exporter in its own. Each of these helper containers
+  is created with `--network none` (D6, D13).
   - The projection is configured only at the launch container's create
     (D14), so no helper sees it either.
   - The stager reads repository content before the prover has checked
@@ -1087,7 +1087,6 @@ therefore hide one run's leftovers from its own reconciliation.
     created and removed around the stage step.
   - The capability: a container created with `--network none` has no
     interface but loopback, and no route (D16, item 7).
-
 - **A capability under `required`.** From inside a container on the
   bridge, two things must be unreachable: a host loopback listener (a
   nonce TCP listener the probe opens on `127.0.0.1` and `::1`) and a host
@@ -2225,6 +2224,17 @@ itself as skipped otherwise, never as passed.
   host loopback nonce listener and a host abstract socket are unreachable
   from the bridge, and `--network none` has no route. Every fake credential
   sentinel outside the projection is absent.
+- **#290.** With fake credentials and fake provider CLIs, for Claude Code,
+  OpenCode 2.x and Pi:
+  - each provider's login maps to exactly one of #270's mechanisms, and on
+    a copy-in runtime only to the environment variable;
+  - the credential's value is on no argv, and in no log, fact, diagnostic
+    or helper container;
+  - a login that rotates its refresh token on use is refused projection
+    unless its return path is in place, and that path's test shows the
+    host's login still usable after a launch refreshed it;
+  - a relaunch gets a new projection, and nothing of the earlier launch's
+    home.
 - **#271.** Fake runtime: detection order and its absence of fall-through,
   identity from the runtime's own report and not its name, the empty
   client configuration, and a refused non-local endpoint. Real runtime: the
@@ -2339,10 +2349,11 @@ itself as skipped otherwise, never as passed.
     and nonce and removes it;
   - while a probe container runs, with the prober `SIGKILL`ed, where the
     watcher ends the container at the stream's end of file, or at the
-    probe's deadline once the stand-in parent's own deadline has passed;
+    probe's deadline once the stand-in parent's own deadline has passed,
+    and the sweep removes the stopped container;
   - during the probe's own removal of its objects and its directory.
 
-  A sweep never touches a probe whose journal a live process holds locked:
+  A sweep never touches a probe whose lock a live process holds:
   a `doctor` running beside a gate's probe, and the reverse. A
   probe-labelled object that no journal of the checkout names is reported
   and left in place. A second sweep is a no-op. No run's reconciliation
@@ -2395,12 +2406,20 @@ itself as skipped otherwise, never as passed.
   Podman's `exec` takes no network option, so the test of the helpers'
   network also shows that their offline position is the stager
   container's and the exporter's, never an exec's.
-- **#274.** One scripted REMOTE loop per runtime, end to end, with the
-  exact candidate and base SHAs recorded, failures observed from outside,
-  and the redaction checked. Each loop also kills the controller with
-  `SIGKILL` during a launch and resumes it. The container is gone within
-  #272's bound, the resume's reconciliation removes what is left, a second
-  resume finds nothing, and the loop completes.
+- **#274.** One scripted REMOTE loop per runtime, end to end, in a
+  disposable repository: `ANALYZE_EXECUTE`, `REVIEW`, a `FIX` where
+  findings remain and its re-review, up to `READY_FOR_MERGE`. It never
+  merges. The exact candidate and base SHAs are recorded, failures are
+  observed from outside, and the redaction is checked.
+  - Each loop also kills the controller with `SIGKILL` during a launch and
+    resumes it. The container is gone within #272's bound, the resume's
+    reconciliation removes what is left, a second resume finds nothing,
+    and the loop completes.
+  - On a host with both runtimes, a run created under one is refused under
+    the other, with nothing written. #267's decision 8 gives this test to
+    #274.
+  - Whether to measure analysis quality with and without more history
+    (D11) is #274's to decide, as #267's owner comment says.
 
 ## 8. What does not change
 
