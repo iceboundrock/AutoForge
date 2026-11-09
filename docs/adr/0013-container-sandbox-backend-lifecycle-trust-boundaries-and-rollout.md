@@ -1008,7 +1008,10 @@ This is the contract a daemon-owned container can meet. It replaces
      order is therefore L0, then L2, then a probe lock, then L1. L1 is
      still the only blocking acquisition, and its holder still acquires
      nothing, so ADR 0008 D11.2's argument holds as written: no wait-for
-     cycle can form (§5.5).
+     cycle can form (§5.5). An L1 wait that runs past its bound (ADR 0008
+     D11.3) fails step 1 as a directory that cannot be prepared, so the
+     probe fails with nothing made. In a removal, it leaves the directory,
+     still holding no object, for a later sweep, and the sweep reports it.
    - **Outside a checkout** there is no probe directory. `doctor` then runs
      only the runtime check (D16), and says that the probe needs a
      checkout.
