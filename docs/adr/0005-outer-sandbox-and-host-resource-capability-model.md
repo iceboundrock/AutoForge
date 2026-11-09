@@ -24,6 +24,12 @@
   projections, cross-provider parity). The number is assigned when the
   record merges: if another ADR merges first, this record takes the next
   free number, and its index entries move with it.
+- **Amended by #267 (accepted with required changes, 2026-11-08):** for the container backend
+  only, [ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) amends D1.2, D2.1 (G3 and G6), D4.1,
+  D4.2 (C7), D5.1, D6.1, D6.3, D6.5, D8.4, D9.1, D10.2, D10.3, D10.5,
+  D10.6, D12.3, D13.1, D14.1, D15.4, D17.1, §3 and §9, in §11. Each
+  entry takes effect when #273 makes that backend selectable; until then
+  every enforced launch is bwrap's and the decision holds as written.
 - **Superseded in part by:** [ADR 0009](0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md), which removed LOCAL
   mode (#388): §1.3 and §2.3 to §2.6 (the LOCAL launch classes, the
   resource table's LOCAL column, the shared cache), §2.8, §2.9, D12.3,
@@ -334,6 +340,8 @@ second claim is false until this wave lands on a capable host.
 *Rejected.* **One word for all of it** ("isolation"). It hides which of
 the three a given guarantee rests on.
 
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
+
 ### 2.2 Threat model (item 2)
 
 **D2.1 (#168).** The threat model below is recorded in
@@ -441,6 +449,8 @@ each residual names the decision that leaves it.
 - **Treating projected model credentials as protected.** Tools run in the
   provider's own process tree and can read what the provider reads.
 
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
+
 ### 2.3 Which launches the sandbox covers (item 3)
 
 **D3.1 (#168).** **Every launch AutoForge makes outside itself, under one
@@ -487,6 +497,8 @@ complete only until the next install.
 *Rejected.* **A deny-list over a bound `/`** (or over the operator's home).
 Each omission is a hole, and nobody can test for the hole they did not
 think of.
+
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
 
 **D4.2 (#167).** **Canonicalization rules every projection obeys,** applied
 by the compiler before anything is spawned. A refusal is a typed error from
@@ -554,6 +566,8 @@ contents.
   declared sandbox path lies inside the private home: a `file-ro` or
   `dir-rw` auth item (D7.1), a provider config root (D8.3), and an
   operator-declared path under the operator's home (D15.4).
+
+*Amended by #267 (2026-11-08), for the container backend only, in C7: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
 
 **D4.3 (#167).** **Forbidden sources.** Besides the engine's denied roots,
 the compiler refuses, for every projection:
@@ -704,6 +718,8 @@ engine.
   poisoning: an agent of issue N would write what the operator's next build,
   and issue N+1's agents, execute.
 
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
+
 ### 2.6 The git worktree surface (item 6)
 
 **Candidates**, judged on §1.2's evidence. The surface must support three
@@ -745,6 +761,8 @@ publication under #160 and #161.
   store: new objects land in the private object directory, and a deletion
   leaves an overlay whiteout there (both measured). Nothing relies on what
   maintenance does inside.
+
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
 
 **D6.2 (#168).** **The agent commits on the worktree's detached `HEAD`,** as
 ADR 0004 D1.1 and #161 already require. A phase that ever needs to name a
@@ -794,6 +812,8 @@ address above, and "the candidate is a commit in the shared object store"
 becomes "after the controller's strict import (D6.5), the candidate is a
 commit in the shared object store". The same holds for #163's and #164's
 candidates.
+
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
 
 **D6.4 (#168).** **The worktree is bound to its admin dir through the
 registry, and no agent-writable pointer is followed.** `_ensure_agent_worktree`
@@ -876,6 +896,8 @@ never follows an agent-written alternate.**
   `index-pack` writes objects under ids it computes from their bytes, and
   D7.5 still re-hashes every commit a decision reads, because under
   `disabled` agents write the shared store directly.
+
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
 
 **D6.6 (#168).** **Pointer files are pinned read-only** (defence in depth):
 the worktree's `.git` file, and the admin dir's `commondir` and `gitdir`,
@@ -1137,6 +1159,8 @@ lifecycle rule for everything the controller creates locally.
 - **Automatic cleanup.** It would make the controller delete agent-written
   trees, and the operator owns local lifecycle.
 
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
+
 **D8.5 (#169).** **`doctor` lists the sandbox directories and their sizes,**
 so that an operator sees what never-deleted caches and object directories
 hold.
@@ -1161,6 +1185,8 @@ with abstract Unix sockets scoped.** The backend never passes
   part of the capability (D14.1): a host without it cannot enforce.
 - The remaining exposure is documented: loopback TCP services, the local
   DNS stub, and general egress. "Network sandboxed" is never claimed.
+
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
 
 **D9.2 (#168).** **An opt-in isolated network for repository-defined
 commands only.** The operator may request an isolated network for LOCAL
@@ -1223,6 +1249,8 @@ daemon, service, broker or long-lived owner, and "one contained invocation
 per controller process" (ADR 0002 §4b) still holds; the capability probe
 (D14.1) never overlaps an invocation.
 
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
+
 **D10.3 (#167).** **Teardown inside the namespace is the kernel's, and it
 has no grace.** When the main command exits, the kernel SIGKILLs everything
 left in the namespace at once (measured). That is accepted. ADR 0002's exit
@@ -1243,6 +1271,8 @@ nothing shared from inside (D6.1).
 *Rejected.* **An in-sandbox init that sends SIGTERM and waits a grace.** It
 is a new program in the trust path, running where the agent can reach it,
 to preserve a nicety the workflow does not rely on.
+
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
 
 **D10.4 (#167).** **Execution facts.** In-sandbox leftovers are not counted:
 `bwrap` returns the main command's status within the command's own runtime,
@@ -1269,6 +1299,8 @@ closes stdin first and gives the exit grace before any signal, as today
 (ADR 0002 §4a), so a command that shuts down on end of input still does so
 cleanly.
 
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
+
 **D10.6 (#167).** **Controller death kills the sandbox.** `--die-with-parent`
 is `PR_SET_PDEATHSIG`, which fires when the *thread* that forked exits. The
 invariant: the executor spawns a sandboxed launch only from a thread that
@@ -1277,6 +1309,8 @@ waits for its result, or calls `start_duplex()` and holds the handle until
 `finish()`. A spawn from a short-lived worker thread is forbidden, and a
 test pins the invariant. This is new: today an agent outlives a controller
 killed with SIGKILL.
+
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
 
 **D10.7 (#168).** **Duplex and SDK helpers.** Pi RPC, Claude's
 stream-json and the SDK helpers run through `bwrap`'s stdio unchanged. An
@@ -1399,6 +1433,8 @@ LOCAL's `preferred`, which is weaker than `required`; REMOTE's `preferred` is
 `required` (D12.2). A stronger mode moves the pin up with the command's next
 save. The pin holds configuration, never enforcement (D16.1).
 
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
+
 **D12.4 (#169).** **What each surface shows.**
 
 - **Dry run:** the compiled policy by launch class and role (paths where
@@ -1484,6 +1520,8 @@ kernel's `#!` argument rules in the controller. A recreated link shows only
 its own contents, a path the operator's layout already names, and the
 lookup inside stays the kernel's.
 
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
+
 **D13.2 (#168).** **The engine supplies controller facts as data,** with no
 provider branch: the launch class, the workspace, the worktree's admin dir,
 the private object directory, the cache, the export directory, the read
@@ -1549,6 +1587,8 @@ like) inside the sandbox in `doctor`.
 | Linux without one of them: user namespaces disabled by sysctl or by LSM policy, a nested container that refuses a new `/proc`, a kernel before 6.12 or with Landlock disabled, a filesystem that cannot be an overlay's upper layer | unsupported: `required` refuses; `preferred` follows D12.2 |
 | macOS | unsupported in Wave 2A; no evidence of an equivalent boundary, and no parity is promised |
 | Windows | not a first-class AutoForge platform (POSIX `flock`, a Linux-only subreaper); no backend issue |
+
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
 
 **D14.2 (#167).** **The backend refuses everywhere else.** On a platform
 that is not Linux, or where `bwrap` is missing, a request carrying a launch
@@ -1673,6 +1713,8 @@ what a build needs without opening a write channel out of the sandbox.
 - **No operator paths.** Every toolchain outside `/usr` would be
   unreachable, and operators would switch the sandbox off.
 
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
+
 ### 2.16 Sandbox metadata is never workflow authority (item 16)
 
 **D16.1 (documentation only).** Sandbox facts are recorded in
@@ -1717,6 +1759,8 @@ a protocol-12 file without it
 fact added later (#273) goes into the same record under a new pin schema
 whose parser still reads schema 1.
 
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
+
 ## 3. Process lifecycle
 
 For both the one-shot path (`execute()`: Claude text, OpenCode, Pi's
@@ -1735,6 +1779,8 @@ RPC, Claude stream-json, SDK helpers), under an enforced launch:
 
 Under `required`, a host that is not capable never gets this far: the gate
 refuses before the spawn (D12.2).
+
+*Amended by #267 (2026-11-08), for the container backend only: the controller-death row ([§11](#11-amendment-the-container-backend-267-2026-11-08)).*
 
 ## 4. Platform behaviour
 
@@ -1833,6 +1879,7 @@ Each decision has exactly one implementing child, or is documentation only.
 | #169 | D1.2, D4.4, D7.3, D8.5, D9.3, D12.2, D12.4, D13.5, D14.1, D15.4 |
 | documentation only | D1.1, D7.4, D15.1, D16.1, D17.1 |
 | #280 (amendments) | D12.3, D15.3, D17.1 |
+| #267 (amendments for the container backend, §11; implemented by ADR 0013's children) | D1.2, D2.1, D4.1, D4.2, D5.1, D6.1, D6.3, D6.5, D8.4, D9.1, D10.2, D10.3, D10.5, D10.6, D12.3, D13.1, D14.1, D15.4, D17.1 |
 
 ### 7.1 Where this record differs from a child issue's body
 
@@ -1991,6 +2038,8 @@ repositories only. No real credential, login or provider call.
 - No macOS or Windows backend.
 - No class or function names imposed on the implementation.
 
+*Amended by #267 (2026-11-08), for the container backend only: [§11](#11-amendment-the-container-backend-267-2026-11-08).*
+
 ## 10. Consequences
 
 - **On a capable Linux host with `required`,** the absolute-path cases that
@@ -2042,3 +2091,190 @@ repositories only. No real credential, login or provider call.
   "Runtime model" (the isolation terms, #169). If implementation
   contradicts a decision here, the implementing child amends this record,
   with a recorded rationale.
+
+## 11. Amendment: the container backend (#267, 2026-11-08)
+
+Proposed with
+[ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md),
+which decides #267's container backend for EPIC #266. Each entry below
+applies to launches under `sandbox.backend: container` only. It takes
+effect when #273 makes that backend selectable. Until then every enforced
+launch is bwrap's and the decision holds as written. Nothing changes for a
+bwrap launch. ADR 0013 §5 maps every other decision of this record, as
+preserved.
+
+- **D1.2.** "Sandboxed" stays a fact about one launch, and it now names the
+  backend that enforced the launch: an enforced bwrap launch and an
+  enforced container launch make different guarantees (ADR 0013 D16, D18).
+  No plan line, `status` line, `doctor` row, record or document says
+  "sandboxed" without naming the backend.
+- **D2.1.** The threat model gains the container's (ADR 0013 D18).
+  - G1, G2, G4 and G5 hold, and G1 and G5 more strongly: the common dir and
+    every host path but the read-only staging root are absent.
+  - G3: no host process is visible or can be signalled. The runtime's
+    client, the executor's child, is outside the container and out of
+    reach.
+  - G6: nothing outlives the invocation on any path the controller runs.
+    After the controller's death, a container survives for ADR 0013 D6's
+    bound.
+  - The network position is D9.1's entry below.
+- **D4.1.** A container launch's root is the image AutoForge built from
+  pinned inputs (ADR 0013 D7), not an empty tmpfs. The allow-list principle
+  holds: no host path is visible except the launch's read-only bind
+  sources, on runtimes where a bind is proven. They are the staging root,
+  and a credential file where ADR 0013 D14 delivers one (ADR 0013 D2,
+  D12).
+- **D4.2, its C7.** One relocation joins C7's closed set. The launch's
+  staging root, `<git common dir>/autoforge/sandbox/<key>/stage/<launch id>`
+  (D8.4 below), appears at `/source` instead of at its host path, on a
+  runtime where the bind is proven (ADR 0013 D12). The exception is
+  narrow:
+  - the engine alone supplies it, never a provider or an operator;
+  - its source is the launch's own staging root, which the controller
+    created and wrote, and nothing else;
+  - its target is the fixed path `/source`, and its access is read-only.
+
+  Every other rule of D4.2 applies to it unchanged:
+  - **C1:** its source is resolved and absolute.
+  - **C2:** it is a controller-owned source, so it resolves to itself,
+    with no link below the controller's anchor.
+  - **C3:** it is a directory.
+  - **C4 and C5:** it lies inside `<git common dir>/autoforge`, a denied
+    root. So it is projected only as a carve-out, inside the issue's
+    sandbox directory, which C5 names and which holds it as one of
+    D8.4's objects.
+  - **C6:** no other projection's source equals, contains or lies inside
+    it. In addition, `/source` neither equals, contains nor lies inside
+    the target of any other mount of the launch.
+
+  A probe's minimal launch (ADR 0013 D16) binds its own staging root at
+  `/source` under the same rules, with the probe's directory (D8.4 below)
+  in place of the issue's sandbox directory.
+
+  D4.3's forbidden sources apply to it as to every projection. Every
+  other projection keeps C7 as written: it appears at its host path, or
+  at one of the private-home paths C7 lists. A credential file that
+  ADR 0013 D14 delivers on a bind runtime is a `file-ro` item in the
+  private home, which C7 already admits. The container backend's compiler
+  (ADR 0013 D13) admits `/source`. The compiler bwrap launches use gains
+  nothing, and still refuses every relocation whose target lies outside
+  the private home.
+- **D5.1.** Container launches are mapped by ADR 0013 D2, D9, D10 and D15,
+  not by this table. No common dir, worktree, admin dir or host install
+  root is projected. §2.5's cache rule is kept, as a per-issue volume:
+  launches that produce a change share it, and `REVIEW` and export
+  commands get none.
+- **D6.1.** The choice between a host-linked worktree and a private
+  repository is made per backend.
+  - bwrap keeps Design A.
+  - The container backend uses a self-contained private repository per
+    launch, inside the container, seeded from a pack the controller builds
+    from the shared store (ADR 0013 D2, D11). It has no alternate.
+
+  §2.6 rejected C, a satellite clone, for protecting unpushed-object
+  confidentiality only, at the cost of a second clone, a fetch path and a
+  changed worktree lifecycle. None of that weighs against the container
+  backend:
+  - the confidentiality is what keeps a container from needing the host's
+    store at all;
+  - D11's minimal seed bounds the clone's cost;
+  - the "fetch path" is the controller's own pack from its own store,
+    never a network fetch;
+  - no host worktree is created, so no worktree lifecycle changes. The
+    repository goes with its volume.
+- **D6.3.** A container launch's candidate is its exported artifact's
+  commit after the strict import (ADR 0013 D5). There is no host worktree
+  `HEAD` to read. bwrap launches keep this decision as written, #223's
+  amendment included.
+- **D6.5.** The strictness is kept, and so is the failure rule: never
+  retried, nothing published, a candidate refusal under the phase's rules.
+  The input changes from a host private object directory to an untrusted
+  pack and manifest that the container produced (ADR 0013 D5).
+- **D8.4.** Four kinds of object are added:
+  - the per-launch staging root,
+    `<git common dir>/autoforge/sandbox/<key>/stage/<launch id>`. Only the
+    controller writes it, the launch sees it read-only, and the controller
+    removes it after the run step, as the pre-merge export is removed;
+  - the per-launch export directory,
+    `<git common dir>/autoforge/sandbox/<key>/export/<launch id>`. It holds
+    the artifact the controller reads from the exporter's output, a single
+    file of fixed name that no container sees. The controller removes it
+    after the verify step, and reconciliation removes a leftover one
+    without importing it;
+  - the runtime's per-launch objects: the launch container, the stager
+    container, each exporter, the `/workspace` volume and the credential
+    projection. The controller removes them through the runtime,
+    journaled. The volume goes only after the verify step's outcome is
+    saved (ADR 0013 D3, D6);
+  - the per-probe directory,
+    `<git common dir>/autoforge/sandbox/probe/<probe id>`. It holds a
+    probe's lock file, its journal and its staging root, and no agent
+    writes it. The process that ran the probe removes it with the probe's
+    runtime objects. A later sweep on the runtime the journal names
+    removes a dead prober's, and keeps and reports one bound to another
+    runtime (ADR 0013 D6).
+
+  "Never deleted by AutoForge" still holds for the per-issue cache volume
+  and for every directory the table above lists. The rationale against
+  deleting, that the controller would walk and delete agent-written trees,
+  does not arise. The staging root, the export directory and a probe's
+  directory are never written by an agent. The runtime removes a volume without the controller
+  walking it.
+- **D9.1.** A container launch has a network namespace of its own on the
+  runtime's rootless bridge, never the host's. Host loopback and host
+  abstract sockets must be unreachable, which the probe proves (ADR 0013
+  D9). The Landlock abstract-socket scope is not the mechanism there.
+  General egress remains, and "network sandboxed" is still never claimed.
+- **D10.2.** The runtime owns a container's processes, through Docker's
+  daemon and containerd-shim, or Podman's conmon. The executor's child is
+  the runtime's attached client, for exactly one invocation. AutoForge
+  adds no owner of its own.
+- **D10.3.** A container's PID 1 is an in-sandbox program that AutoForge
+  adds: ADR 0013 D6's watcher. It runs under a non-root UID of its own,
+  which the agent cannot signal. It is not the init the rejected
+  alternative describes: it sends no SIGTERM and waits no grace. When it
+  exits, the teardown inside is the kernel's, as here, with no grace.
+- **D10.5.** The executor's group kill reaches only the client. The
+  prepared launch's `close()` ends the container's PID namespace on every
+  path (ADR 0002 §4f).
+- **D10.6.** Replaced, for the container backend, by ADR 0013 D6: the
+  death-watch, the in-container deadline, the journal, the labels and
+  reconciliation, with its accepted residual. A survival that only the next
+  reconciliation bounds is not accepted under `required`. No
+  immediate-death claim is made for `--rm`, `rm -f`, `--init` or start-up
+  clean-up.
+- **D12.3** (as amended by #280). The pin also records the backend and,
+  for the container backend, the runtime's product and the kind of
+  endpoint. A command that would run under a different backend or runtime
+  is refused, `--accept-config-change` included (ADR 0013 D8).
+- **D13.1.** Under the container backend a provider declares the CLI it
+  needs from the image, by name and pinned version (ADR 0013 D7), not host
+  executables and install roots. It still never emits a runtime flag. Its
+  auth items follow ADR 0013 D14.
+- **D14.1.** Capability is still established by a real minimal launch of
+  the same shape, with the container's own requirements and table
+  (ADR 0013 D16). The table above is bwrap's.
+  - Unlike bwrap's, the container's probe writes outside a temporary
+    directory: it creates runtime objects, and a probe directory under
+    the common dir (D8.4 above). Each object has a journal entry before it
+    is made and is removed afterwards. The journal is written only after
+    the prober holds its lock, and it is bound to the runtime that holds
+    the objects. A crashed prober's are removed by the next probe's sweep
+    or `doctor`'s, on that runtime only (ADR 0013 D6).
+  - A read-only runtime check comes first. A run's reconciliation runs
+    between it and the rest of the probe, so a new probe failure does not
+    keep an earlier launch's leftovers in place (ADR 0013 D16).
+- **D15.4.** `sandbox.read_only_paths` is refused under the container
+  backend, which binds no host path. Toolchains come from the base image
+  (ADR 0013 D7).
+- **D17.1** (as amended by #280). The container backend adds three
+  persisted fields: the pin's new schema (#273), the lifecycle journal
+  (#272) and the candidate-source binding (#269). Each goes through #23's
+  consolidated request, and none is numbered here (ADR 0013 D19).
+- **§3, the controller-death row.** A container launch does not end with
+  "nothing survives". The watcher's liveness stream reaches end of file and
+  PID 1 exits, or the in-container deadline ends the container. The next
+  command's reconciliation removes what is left (ADR 0013 D6).
+- **§9.** For the container backend, a container runtime dependency, and
+  in Docker's case its daemon, are accepted (ADR 0013 D1, D10). Egress
+  mediation stays a non-goal (#294).

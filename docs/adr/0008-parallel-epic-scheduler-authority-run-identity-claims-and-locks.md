@@ -37,6 +37,12 @@
   state's run owns, and the operator takes it over with `unblock
   --take-over` in the namespace's state directory (D17.3), which the
   controller performs as ADR 0004's K11.
+- **Amended by #267, for the container backend only ([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D6):**
+  D13.4 (2026-11-08, accepted with required changes) and D10.5
+  (2026-11-09, `doctor`'s probe locks, accepted on 2026-11-09 on the same
+  terms; ADR 0013's Status line cites the acceptance). Each takes effect
+  when #273 makes that backend selectable. ADR 0013 §5.5 maps every other
+  decision of this record.
 - **Where:** placement is decided per decision and collected in §5.
   Existing code this record builds on: `src/autoforge/locking.py`,
   `engine.py`, `state.py`, `transitions.py`, `cli.py`, `executor.py`,
@@ -1033,6 +1039,24 @@ descriptor is shared.
 **D10.5 (documentation only).** **Unlocked commands stay unlocked.**
 `status`, `doctor`, `epic status`, `epic stop` and dry runs take no lock.
 
+*Amended by #267 (2026-11-09), for the container backend only
+([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D6, item 9; in effect once #273 makes that
+backend selectable).* `doctor` runs the container backend's probe and
+its sweep of dead probes, and both take two locks:
+- a probe lock, on `doctor`'s own probe directory and on a dead
+  prober's, taken only with `LOCK_NB` and never waited on;
+- L1, with D11.3's bounded wait, for the one critical section that
+  creates a probe directory with its lock file and the one that removes
+  them (D12.3).
+
+`doctor` takes those and no other lock. It never takes L0 or L2, so it
+never fails because an orchestrator is active, never excludes one, and
+reconciles no run. It can wait for L1 behind one controller critical
+section, a fetch among them, within D11.3's bound; past it, its probe
+fails and names the lock, and its other checks are still reported.
+`status`, `epic status`, `epic stop` and every dry run still take no
+lock, and so does `doctor` under bwrap and outside a checkout.
+
 **D10.6 (documentation only).** **Only an inherited descriptor proves a
 worker.** No environment variable (in particular nothing like
 `AUTOFORGE_I_AM_THE_SCHEDULER=1`), PID file or claim authorizes one. The
@@ -1256,6 +1280,17 @@ here.**
 - A worker that hangs keeps L2 and L0. Nothing new starts for that issue,
   and no second orchestrator starts. The hang is visible to the operator
   (D9.6) and is never taken over by a timeout.
+
+*Amended by #267 (2026-11-08), for the container backend only
+([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D6; in effect once #273 makes that backend
+selectable).* Under bwrap, a sandboxed agent dies with its worker. Under
+the container backend, a container may outlive a worker killed with
+`SIGKILL`: for its death-watch's detection delay, or, if the watch fails,
+until its in-container deadline. It holds no GitHub credential, so it
+cannot perform an external effect, and its output is never imported.
+When the next generation's engine starts on the issue, it removes the
+container by label and nonce. The scheduler still never `SIGKILL`s a
+worker.
 
 ### 2.14 Crash and recovery classification (decision 14)
 

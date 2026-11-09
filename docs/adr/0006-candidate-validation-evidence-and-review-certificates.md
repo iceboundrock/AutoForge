@@ -17,6 +17,10 @@
 - **Decides:** #170, for EPIC #158 (Wave 2B).
 - **Amends:** ADR 0001 §5.10, with a dated note recording the LOCAL
   convergence rule (D7.4). No other ADR's text changes.
+- **Amended by #267 (accepted with required changes, 2026-11-08):** D6.3, D8.1 and D8.2, for the
+  container backend only ([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D2, D7, D16). Each takes
+  effect when #273 makes that backend selectable. ADR 0013 §5.4 maps
+  every other decision of this record, D6.1 included, as preserved.
 - **Narrows:** ADR 0005 D16.1 and the rejected alternative of its D17.1, for
   validation records only (D8.2, D8.3). ADR 0005's text is not edited; this
   record is where the narrowing is stated.
@@ -679,6 +683,22 @@ configuration takes part. A mismatch (filesystem case folding, a full disk,
 a writer bug, a legacy entry mode, §1.2) is a materialization failure:
 inconclusive, never a record (D10.5).
 
+*Amended by #267 (2026-11-08), for the container backend only
+([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D2; in effect once #273 makes that backend
+selectable).* A container validator does not run in the directory this
+walk proved. It runs in a writable copy of the staged tree, in the
+launch's volume. So the same walk also runs on that copy, the tree the
+command will run in, before the command's container starts. It runs in
+the launch's stager container, which mounts the same volume, is offline,
+and runs no repository code (ADR 0013 D2, D13). AutoForge's own prover
+runs it, from the image, at the controller's version (ADR 0013 D7). That is AutoForge's code, not the controller process, and
+no git process or configuration takes part. Its verdict reaches the
+controller on the prover's exec output, and a mismatch is a
+materialization failure, as here. Where the runtime binds the staging root,
+the host-side proof of the staging root still runs first. Where it copies
+the seed in instead, no tree is staged on the host, and this in-container
+walk is the only tree proof. ADR 0013 D2 states why that is acceptable.
+
 **D6.4 (#171).** **Isolation, and why validation cannot modify C.**
 
 - Validators run in a disposable export, with the export writable and
@@ -819,6 +839,16 @@ therefore changes P, and the merge gate refuses until the configuration is
 restored or a new round runs (D14.1). So does the certificate issuance of a
 round that completes from #162's journal after the edit (D12.6).
 
+*Amended by #267 (2026-11-08), for the container backend only
+([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D7, D16; in effect once #273 makes that backend
+selectable).* For a container launch, P's inputs also include the
+backend, the runtime's product, the image id and the staging method
+(`bind` or `copy`). The materialization method names the container,
+because the tree is proved inside it (D6.3 as amended). A bwrap launch's
+P is computed exactly as above, so no existing record's digest changes. A
+record made under one backend therefore never applies under the other,
+and a changed image withdraws evidence.
+
 **D8.2 (#172).** **Each record stores** `policy_digest`, the mode and the
 timeout, and the **enforcement facts** copied from the in-memory
 `ExecutionResult.sandbox` (`SandboxFacts`) the executor returned for that
@@ -828,6 +858,13 @@ nothing else of `SandboxFacts` is copied (not `tmpfs`, `unset_env` or
 `setup_failure`). They are displayed (D9.1, `status`), and read by no
 decision except D8.3's second rule. A launch with no description records
 `enforced: false` and no backend.
+
+*Amended by #267 (2026-11-08), for the container backend only
+([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D16; in effect once #273 makes that backend
+selectable).* The enforcement facts a record copies are the
+backend-qualified ones. For a container launch they also include the
+runtime's product and version, the image id and the staging method, each
+a string bounded as D10.3 requires.
 
 **D8.3 (#172).** **Applicability.**
 

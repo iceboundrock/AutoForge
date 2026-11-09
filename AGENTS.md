@@ -218,7 +218,12 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        routes, never an authorization, no persisted code;
                                        recovery and escalation: the stop and authority
                                        matrices, no-go for an advisor's shadow diagnosis
-                                       and for autonomous recovery, no pre-BLOCK pause)
+                                       and for autonomous recovery, no pre-BLOCK pause;
+                                       the container sandbox backend (accepted with
+                                       required changes, nothing implemented): the
+                                       lifecycle seam, the death-watch that replaces
+                                       --die-with-parent, rootless only, bind or
+                                       copy-in per runtime, the invariant map)
 docs/README.md                         human-oriented documentation index, by intent
 docs/non-code-rules.md                 writing and publishing rules for every non-code artifact
 docs/getting-started.md                operator guide: a first run from nothing, step by step, and the
@@ -314,6 +319,13 @@ matches none of them needs only this file and the scoped `AGENTS.md`.
   before `BLOCKED`, a new route out of `BLOCKED` or `FAILED`), read
   `docs/adr/0012-recovery-and-escalation-stop-authority-and-advisor-gates.md`
   in addition to ADR 0011.
+- If adding or changing an outer-sandbox backend, or anything of the
+  container backend (`sandbox.backend`, its lifecycle steps, journal and
+  reconciliation, the image, runtime detection, a container launch's seed
+  or exported artifact), read
+  `docs/adr/0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md`
+  in addition to
+  `docs/adr/0005-outer-sandbox-and-host-resource-capability-model.md`.
 - If adding or changing tests, or changing behaviour in a high-priority
   coverage area, read `tests/AGENTS.md` and `docs/agent-guides/testing.md`.
 - If changing `tests/evaluation.py`, `tests/evaluation_fixture.py` or

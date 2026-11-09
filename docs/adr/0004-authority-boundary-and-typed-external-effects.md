@@ -35,6 +35,10 @@
   bounded request that the controller replace the description of the run's
   own PR, its markers and closing reference kept by the controller, under
   `safety.pr_body_updates` (D5.1, K12), with its own protocol bump (D13.12).
+- **Amended by #267 (accepted with required changes, 2026-11-08):** D1.1's sentence naming the
+  candidate, for the container backend only ([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D5). It
+  takes effect when #273 makes that backend selectable. ADR 0013 §5.2
+  maps every other decision of this record as preserved.
 - **Note:** [ADR 0009](0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md) removed LOCAL mode (#388): §2.1's LOCAL
   prompts and K10's LOCAL refusal no longer apply, and §2.13's refusal of a
   LOCAL state carrying effect state is replaced by ADR 0009 D4's refusal of
@@ -246,6 +250,16 @@ git directory. No Wave 1 phase needs one.
   git directory, which lives under the common dir, and somewhere to write
   objects, such as the private object directory and strict import that §4
   names.
+
+*Amended by #267 (2026-11-08), for the container backend only
+([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D5; in effect once #273 makes that backend
+selectable).* The four classes stand. A container launch has no worktree
+on the host. The agent commits on a detached `HEAD` in a private
+repository inside its container. The candidate is the commit of the
+artifact the controller exported and strictly imported into the shared
+store, not a worktree's `HEAD`. Verification and recovery still address
+it as a SHA plus the controller-named remote branch, never through a
+local ref.
 
 **D1.2 (#165).** The classification is provider-neutral: it names
 operations, not tools. #165 records it in `docs/agent-guides/github-safety.md`,
