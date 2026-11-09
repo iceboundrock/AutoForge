@@ -37,9 +37,10 @@
   - **With `history_tags` on, the manifest binds the seed's tags,** and the
     prover accepts exactly those (D2, D4, D11).
 
-  Two more corrections followed review round 3. They postdate both
-  acceptances, and the maintainer has not accepted them yet. Neither
-  reopens a decision:
+  Two more corrections followed review round 3. The maintainer accepted
+  them on 2026-11-09, on the same terms: required changes A to D still
+  apply, and no decision was reopened
+  ([#267's third acceptance comment](https://github.com/iceboundrock/AutoForge/issues/267#issuecomment-6729991033)):
   - **The stager and the prover run offline in a container of their
     own.** An exec session shares its container's network namespace, and
     an agent's launch container is on the bridge. So D9's `--network none`
@@ -54,8 +55,30 @@
     dead prober's objects (D6). At a command's entry a read-only runtime
     check runs first, then reconciliation, then the probe. So a new probe
     failure, such as a missing image, no longer keeps a crashed launch's
-    leftovers in place. A refusal still leaves `state.json` byte-identical,
-    because the lifecycle journal is a file of its own (D16, D19).
+    leftovers in place.
+  - **The lifecycle journal is a file of its own,** beside `state.json`. A
+    refusal at the probe therefore still leaves `state.json`
+    byte-identical (D16, D19). #272 names the file and its format, on #23.
+
+  Two more corrections followed review round 4. They postdate the three
+  acceptances, and the maintainer has not accepted them yet. Neither
+  reopens or amends a decision. Each makes round 3's probe journal safe to
+  implement:
+  - **A journal is bound to the runtime that holds its objects.** A probe
+    journal names the runtime's product and its store, as the runtime
+    check reported them. A sweep acts only on a journal bound to the
+    runtime its own command proved. It keeps and reports any other
+    journal, and never reads another store's listing as "nothing left"
+    (D6, item 9). The run's lifecycle journal carries the same binding,
+    and the runtime check refuses a store other than its open entries'
+    (D6, D16).
+  - **The probe lock is taken outside L1, and the journal follows it.** The
+    probe's directory and its lock file are created under L1. The `flock`
+    is taken after L1 is released, without waiting, and is checked. Only
+    then is the journal written, and every object comes after the journal.
+    A sweep therefore never removes a live prober's object or journal.
+    ADR 0008 D11.2 stays preserved: no lock is acquired while L1 is held,
+    and a probe lock is never waited on (D6, item 9, and §5.5).
 
   This is a design record, and nothing in it is implemented. Written at
   `main` `32178d8` (2026-11-08), where every reference below was read.
@@ -827,6 +850,12 @@ This is the contract a daemon-owned container can meet. It replaces
    - An entry whose objects are already gone is closed. That covers an
      entry written before a create that never happened, and a staging
      root that was never written.
+   - Each entry names the runtime it was written under: the runtime's
+     product and its store, as the runtime check reported them (D16).
+     Reconciliation lists only that runtime. The runtime check refuses a
+     command whose runtime reports another store than the run's open
+     entries name, before reconciliation and with nothing written (D16).
+     So an object in another store is never taken for one that is gone.
    - Reconciliation never starts a container, and never exports or imports
      anything (D4). A volume that a crash left before its export is
      removed without one, and that launch's work is lost.
@@ -842,25 +871,70 @@ This is the contract a daemon-owned container can meet. It replaces
    minimal launch. It can also run where no run exists, in `doctor`, or in
    a gate before a run has a journal. So a probe belongs to the process
    that runs it, and it has a journal of its own.
-   - **The probe journal.** Before it creates anything else, the probing
-     process creates the probe's directory,
-     `<git common dir>/autoforge/sandbox/probe/<probe id>`, through
-     `safefs`, with a lock file in it, and takes an exclusive `flock` on
-     that file. All three happen under L1. It holds the lock for as long
-     as the probe runs. Only then does it write the probe's journal beside
-     the lock file, atomically, with an entry (names, labels, nonce) for
-     every object the probe will create, the probe's own staging root in
-     that directory included. The lock is on a file of its own because an
-     atomic replacement of the journal would drop a lock held on it. The
-     kernel releases the lock when the process ends, however it ends, so a
-     held lock means a live prober. This is the OS-level file locking of
+   - **The probe directory, its lock and its journal,** in this order.
+     The probing process creates no runtime object and no staging root
+     before step 3, and it never acquires a lock while it holds L1:
+     1. **Under L1,** in one critical section that acquires nothing, as
+        ADR 0008 D12.1's sandbox directories are made. `safefs` creates
+        `<git common dir>/autoforge/sandbox/probe/` if it is absent, the
+        probe's directory `probe/<probe id>` (a random id, never reused),
+        and in it an empty lock file, created exclusively
+        (`O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC`) and kept open. Then
+        L1 is released.
+     2. **Outside L1,** it takes an exclusive `flock` on that descriptor
+        without waiting (`LOCK_EX | LOCK_NB`). Holding it, it checks three
+        things: the lock file's path still names the inode it locked, the
+        inode has one link, and the filesystem's `flock` is a local kernel
+        lock (ADR 0008 D11.4's list). A lock that is refused, or a path or
+        link check that fails, means a sweep took the directory first
+        (below). The prober then closes the descriptor and starts again
+        from step 1, under a new probe id, within a bound #272 states.
+        Past the bound, the probe fails and names the contention. On a
+        filesystem whose `flock` is not local, the prober removes the
+        directory as its own end does, and the probe fails and names the
+        filesystem. No object of the probe exists yet in either case.
+     3. **The journal.** Only then does it write the journal beside the
+        lock file, atomically. The journal is bound to a runtime (below)
+        and has an entry (names, labels, nonce) for every object the probe
+        will create, the probe's own staging root in that directory
+        included. Only after that does the probe create anything.
+
+     The prober holds the lock until its directory is gone. The lock is on
+     a file of its own because an atomic replacement of the journal would
+     drop a lock held on it. The descriptor is close-on-exec, so no
+     runtime process the probe starts can inherit it and keep the lock
+     held after the prober dies. The kernel releases the lock when the
+     process ends, however it ends. This is the OS-level file locking of
      AGENTS.md's runtime model, not a heartbeat.
+   - **What that order guarantees.**
+     - Only a prober that holds its lock and has checked it writes a
+       journal, and it removes the journal before it releases the lock. So
+       a sweep that takes a directory's lock and finds a journal has proved
+       that prober dead.
+     - A directory with no journal holds no object, because every object
+       is made after the journal and removed before it.
+     - A sweep can still take a lock in step 2's window, between the lock
+       file's creation and its `flock`, while the prober is alive. It then
+       removes only an empty lock file and a directory. The prober finds
+       this at step 2 and starts again.
+     - So no sweep removes an object or a journal of a live prober.
+   - **Bound to its runtime.** The journal's header names the runtime that
+     will hold the probe's objects: the runtime's product and its store,
+     as the runtime check reported them (D16), at the local endpoint
+     (D13). #271 names the fields of the store, for example Docker's
+     engine id and Podman's graph root, from each runtime's own `info`. A
+     probe creates objects only on that runtime.
    - **Labels.** A probe's objects carry the probe's kind, its probe id
      and their nonce, and no run key. No run's reconciliation lists them,
      and the sweep below lists nothing else.
-   - **Its own end.** On every path the probe runs, it removes its objects,
-     each removal journaled first and verified, then its directory, the
-     journal last.
+   - **Its own end.** On every path the probe runs, in this order:
+     - it removes each of its objects, journaling each removal first and
+       closing the entry after the removal is verified;
+     - then it removes the staging root, and then the journal;
+     - then, under L1, the lock file and the directory;
+     - last, it closes the lock's descriptor.
+
+     So the lock is held until nothing of the probe is left.
    - **Its containers.** A probe container is started only with the
      watcher as PID 1, on a stream the prober holds, and with the probe's
      own short deadline. Item 8's stand-in parent ends at the same
@@ -869,24 +943,72 @@ This is the contract a daemon-owned container can meet. It replaces
      watcher, and `--rm` never fires for it. The sweep is what removes
      it.
    - **The sweep.** Before a probe creates anything, and in `doctor`, the
-     process sweeps the checkout's probe directories. It tries each one's
-     lock, without waiting.
-     - A directory whose lock it takes is a dead prober's. The sweep
-       removes each object whose labels and nonce match an entry of its
-       journal, stopping a running one first, then the directory. A
-       directory with no journal yet holds no object, since the journal
-       comes before every object, and is removed as it is.
-     - A directory whose lock is held belongs to a live prober, `doctor`'s
-       or a gate's, and is skipped.
-     - A directory with no lock file is one whose prober died while making
-       it. The sweep removes it under L1, so it never meets a live
-       prober's half-made directory.
-     - A probe-labelled object that no journal of the checkout names is
+     process sweeps the checkout's probe directories on one runtime: the
+     one its own runtime check proved (D16). For a gate that is the run's
+     pinned runtime, and for `doctor` the one D8 detects. A process whose
+     runtime check failed sweeps nothing. The sweep never waits on a probe
+     lock. For each directory:
+     - **The lock.** It opens the lock file without following a link and
+       tries the lock without waiting (`LOCK_EX | LOCK_NB`). A held lock
+       belongs to a live prober, `doctor`'s or a gate's, or to another
+       sweep that owns the directory now. The directory is skipped.
+     - **The check.** Having taken the lock, it makes step 2's check. If
+       the path no longer names the locked inode, another sweep removed
+       the directory while this one was opening it, and the directory is
+       skipped. On a filesystem whose `flock` is not local, the sweep
+       removes nothing there and reports it. While the sweep holds the
+       lock, it is the directory's only owner, and a second sweeper skips
+       the directory.
+     - **No journal.** The directory holds no object, at most the
+       unfinished temporary file of a journal's atomic write. The sweep
+       removes that file, then the lock file and the directory under L1,
+       as the probe's own end does, then its descriptor.
+     - **A journal bound to the swept runtime.** The prober is dead. The
+       sweep lists that runtime's objects by the probe's labels and removes
+       each one whose labels and nonce match an entry, stopping a running
+       one first. Each removal is journaled first. An entry whose object
+       that runtime does not list is closed. The sweep then removes the
+       directory as the probe's own end does.
+     - **A journal not bound to the swept runtime.** This covers a journal
+       bound to another product or to another store of the same product,
+       and a journal that cannot be read, has an unknown format or names
+       no runtime. The sweep lists nothing and removes nothing. It keeps
+       the journal and the directory byte-identical and releases the lock.
+       Another store's listing would not show the journal's objects, and
+       would be read as "nothing left", which would strand them as objects
+       no journal names. `doctor` reports the directory, the runtime it is bound to,
+       and the setting (`sandbox.container.runtime`) under which a sweep
+       reaches it. The directory blocks no run and no probe. A sweep on
+       its own runtime removes it later. If that runtime never comes back,
+       it stays, reported.
+     - **No lock file.** Step 1 creates a directory with its lock file,
+       and the end removes both, each in one section under L1. So under
+       L1 a directory with no lock file is not a live prober's: a process
+       died inside one of those sections. Under L1 the sweep checks again
+       that the lock file is absent, and removes the directory if nothing
+       else is in it. Otherwise it reports it and leaves it.
+     - **Unknown objects.** A probe-labelled object on the swept runtime
+       that no journal of the checkout bound to that runtime names is
        reported by `doctor` and never removed. It is another checkout's
        probe, or one whose journal was removed by hand. It belongs to no
        run, so it blocks none.
-     - The sweep is idempotent. #272 makes it safe against a second
-       sweeper and against a journal removed while it waits.
+     - The sweep is idempotent. A sweep that dies while it holds a dead
+       prober's lock leaves the directory to the next sweep, which takes
+       it over.
+   - **Locks and their order.** A probe lock is taken only with `LOCK_NB`:
+     by a prober on its own directory, and by a sweep on a dead one's. It
+     is never taken while L1 is held, and nothing ever waits on it. L1 is
+     taken for step 1's creation and for the removal of a lock file and
+     its directory, each one critical section that acquires nothing. The
+     removal is entered while the remover holds that directory's probe
+     lock, which is the only way the two are ever held together. Only
+     those two sections change the shared parent `probe/`. The journal and
+     the staging root inside the directory are written by the lock's
+     holder alone, and take no L1. No runtime call runs under L1. The
+     order is therefore L0, then L2, then a probe lock, then L1. L1 is
+     still the only blocking acquisition, and its holder still acquires
+     nothing, so ADR 0008 D11.2's argument holds as written: no wait-for
+     cycle can form (§5.5).
    - **Outside a checkout** there is no probe directory. `doctor` then runs
      only the runtime check (D16), and says that the probe needs a
      checkout.
@@ -1332,8 +1454,8 @@ engine sequences and journals. Executor requests are not wrapped.
 | export | the engine, for a change-producing launch after the release | the handle's volume | the artifact in the launch's export directory; nothing for `REVIEW`, `UPDATE_EPIC` and export commands | the exporter container: its own watcher, the export deadline, its client under the executor's timeout (D6) | yes: the exporter's own entry and nonce before its create; its removal journaled, the entry closed after it; the artifact is untrusted | an exporter that fails to start is retried within bounds, each attempt with a new entry; then, or for a bad artifact, a candidate refusal |
 | verify | the engine (#269) | the artifact and the launch's git input (D4) | the imported candidate, or a refusal | the controller's hardened git | the binding is state (D19) | never retried; publishes nothing |
 | cleanup, its final part | the engine, after the verify step's outcome is saved, or once the export is skipped | the handle | the volume and the export directory removed, or left for reconciliation | the runtime CLI | yes, intent first; the entry closes after removal | idempotent; bounded retry |
-| reconcile | the engine, at `step`, `resume`, `unblock` and worker start, after the runtime check and before the probe (D16) | the run key and the journal | entries closed, or `BLOCKED` | the runtime CLI; `safefs` for the host directories | closes entries | remove-only, helper containers and host directories included (D6); never a probe's objects |
-| probe | the gate and `doctor`, at a command's entry (D16) | — | a `ProbeResult` naming the missing capability | first the runtime check, read-only; then, after the entry's reconciliation where there is one, one minimal launch of the same shape | the runtime check makes nothing; every object of the minimal launch has an entry first, in the probe's own journal, which the probing process holds locked (D6, item 9) | once per controller process. A crashed prober's objects are removed by the next probe's sweep or `doctor`'s |
+| reconcile | the engine, at `step`, `resume`, `unblock` and worker start, after the runtime check and before the probe (D16) | the run key, the journal, and the runtime the check proved, which is the one the open entries name (D6) | entries closed, or `BLOCKED` | the runtime CLI; `safefs` for the host directories | closes entries | remove-only, helper containers and host directories included (D6); never a probe's objects |
+| probe | the gate and `doctor`, at a command's entry (D16) | — | a `ProbeResult` naming the missing capability | first the runtime check, read-only; then, after the entry's reconciliation where there is one, one minimal launch of the same shape | the runtime check makes nothing; every object of the minimal launch has an entry first, in the probe's own journal, which the probing process holds locked, written after the lock and bound to the runtime the check proved (D6, item 9) | once per controller process. A crashed prober's objects are removed by the next sweep on the runtime its journal names, the next probe's or `doctor`'s |
 
 **bwrap under this interface.** Plan is `compile_launch` as it is. Seed,
 create, stage, cleanup and reconcile do nothing. Run is
@@ -1523,9 +1645,11 @@ applies here too: no workspace volume, model authentication only.
 A container host is capable when one real minimal launch proves it, of the
 same shape as a real launch (ADR 0005 D14.1's principle). Each requirement
 below is named by the probe when it is missing. Items 1 and 2, with the
-pin's runtime (D8) and the local endpoint (D13), are the *runtime check*:
-the runtime's own report, read-only, creating nothing. The rest needs the
-minimal launch, whose objects the probe's journal owns (D6, item 9):
+pin's runtime (D8), the local endpoint (D13) and the runtime's store, are
+the *runtime check*: the runtime's own report, read-only, creating
+nothing. The store is what the runtime reports in its own `info`, the
+fields #271 names (D6, item 9). The rest needs the minimal launch, whose
+objects the probe's journal owns (D6, item 9):
 
 1. a container runtime (Docker Engine or Podman), with its CLI on the
    controller's `PATH` and a local endpoint the operator owns;
@@ -1576,12 +1700,13 @@ order, before any launch:
    backend is refused, with nothing written.
 2. **The runtime check.** It must find a rootless runtime (D10), the one
    the pin names (D8), or for a run not pinned yet the one D8 detects, at
-   the local endpoint (D13). A failure refuses the
-   step with nothing written: `state.json` and the journal stay
-   byte-identical, and every open entry waits for a later command.
-   Reconciliation is not attempted then. A listing from another runtime or
-   endpoint would not show this run's objects, and would be read as
-   "nothing left".
+   the local endpoint (D13). Where the run's journal has open entries, the
+   runtime must also report the store those entries name (D6, item 6). A
+   failure refuses the step with nothing written: `state.json` and the
+   journal stay byte-identical, and every open entry waits for a later
+   command. Reconciliation is not attempted then. A listing from another
+   runtime, endpoint or store would not show this run's objects, and would
+   be read as "nothing left".
 3. **Reconciliation** (D6, item 6). It needs no more than the runtime
    check proves: it lists, stops and removes, and never creates or starts
    a container. It writes only the lifecycle journal, a file of its own
@@ -1589,10 +1714,10 @@ order, before any launch:
    the run then enters `BLOCKED` naming it, the command stops there, and
    no probe runs.
 4. **The probe:** the capability items 3 to 10 above, after its sweep of
-   the checkout's dead probes (D6, item 9). A refusal here leaves
-   `state.json` byte-identical, as ADR 0005 D12.2 requires. What
-   reconciliation removed stays removed, and only the journal records
-   it.
+   the checkout's dead probes on the runtime step 2 proved (D6, item 9).
+   A refusal here leaves `state.json` byte-identical, as ADR 0005 D12.2
+   requires. What reconciliation removed stays removed, and only the
+   journal records it.
 5. **The step**, and its launches' own steps (D13).
 
 The pin check and the runtime check refuse as D8 and D10 say. The
@@ -1604,7 +1729,12 @@ still reconciles.
 `doctor` runs the runtime check and then the probe, with its sweep. It
 reconciles no run, because it holds no run's lock. It reports each run's
 labelled objects that await that run's reconciliation, and each
-probe-labelled object that no journal of the checkout names.
+probe-labelled object that no journal of the checkout names. It also
+reports each probe directory that its sweep kept, with the runtime the
+journal names and the setting under which a sweep reaches it. When the
+runtime check fails, `doctor` sweeps nothing and lists no runtime. It
+still reads the probe directories, which needs no runtime, and reports
+each one with the runtime its journal names.
 
 **The facts are qualified by backend** (ADR 0005 D1.2 as amended).
 `SandboxFacts` gains:
@@ -1625,7 +1755,7 @@ would hide two different sets of guarantees.
 
 | Failure | Step | Class (`errors.py`) | Outcome |
 |---|---|---|---|
-| the runtime check failing: no runtime, a rootful one, another runtime than the pin, a non-local endpoint | entry, before reconciliation (D16) | `SandboxCapabilityError`; `ConfigurationError` for another runtime than the pin | refused with nothing written: `state.json` and the journal byte-identical, and the open entries kept for a later command |
+| the runtime check failing: no runtime, a rootful one, another runtime than the pin, a non-local endpoint, a store other than the one the run's open entries name | entry, before reconciliation (D16) | `SandboxCapabilityError`; `ConfigurationError` for another runtime than the pin, or another store than the open entries' | refused with nothing written: `state.json` and the journal byte-identical, and the open entries kept for a later command |
 | the probe failing: a capability item past the runtime check, a missing image included | gate, after reconciliation (D16) | `SandboxCapabilityError` | refused; `state.json` byte-identical (ADR 0005 D12.2); reconciliation's removals stay done, recorded in the journal only |
 | a policy refusal | plan | `SandboxPolicyError`, raised as `SandboxLaunchRefusedError` | a launch refusal |
 | the seed failing its checks: `index-pack --strict`, its connectivity (its tag set included), its size or object-count bound (D4) | seed, before any journal entry | `SandboxLaunchRefusedError` | a setup failure, refused before any journal entry: nothing is created and nothing needs reconciling |
@@ -1635,7 +1765,10 @@ would hide two different sets of guarantees.
 | a limit or a stop | run | as today (`ExecutionTimeoutError`) | as today; `close()` ends the namespace |
 | the export fails (its exporter still failing to start after its bounded retries, ending at its deadline, or overrunning the artifact's bound), or the artifact is malformed, inconsistent with its manifest, or its manifest disagrees with the launch's git input (D4) | export, verify | a candidate refusal (`ObjectImportError`) | as today's import failure; the volume is removed only after this outcome is saved |
 | an ambiguous create, of the launch container, the stager container, the volume or an exporter | create, export | — | reconciled by label and nonce first; then a refusal |
-| an ambiguous create of a probe's object, or a probe that crashed | probe | — | its journal's entries are swept by the next probe or `doctor` (D6, item 9); the gate refuses only on the capability it measured |
+| an ambiguous create of a probe's object, or a probe that crashed | probe | — | its journal's entries are swept by the next probe or `doctor` on the runtime the journal names (D6, item 9); the gate refuses only on the capability it measured |
+| a probe directory taken by a sweep before its prober's `flock` | probe | — | the prober starts again under a new probe id, within #272's bound; past it, `SandboxCapabilityError` naming the contention. Nothing of the probe existed yet |
+| a probe directory on a filesystem whose `flock` is not a local kernel lock | probe, sweep | `SandboxCapabilityError` for the probe; reported by the sweep | refused before the journal; the sweep removes nothing there |
+| a dead probe's journal bound to another runtime or store, or unreadable, or of an unknown format | sweep, `doctor` | reported | kept byte-identical; nothing listed or removed; a sweep on its own runtime removes it; it blocks no run and no probe |
 | a probe-labelled object that no journal of the checkout names | sweep, `doctor` | reported | never removed; it blocks no run |
 | a clean-up failure, in either part | cleanup | reported | the entry stays for reconciliation |
 | ownership that cannot be proven | reconcile | `BLOCKED` | names the object; never removed |
@@ -1727,7 +1860,8 @@ is ready.
 - **#273:** the pin's new schema: the backend, the runtime's product and
   the endpoint kind. Its parser reads schema 1 as `bwrap`.
 - **#272:** the lifecycle journal. It has one entry per created object
-  (names, labels, nonce, kind, stage), written atomically before the
+  (names, labels, nonce, kind, stage, and the runtime it was written
+  under: the product and the store, D6), written atomically before the
   create and closed after a verified removal. The kinds are the launch
   container, the stager container, the volume, each exporter, the
   credential projection, the staging root and the export directory, and
@@ -1752,11 +1886,13 @@ is ready.
   same binding.
 
 **Not state: a probe's journal** (D6, item 9). It lives in the probe's
-directory, `<git common dir>/autoforge/sandbox/probe/<probe id>`, belongs
-to no run, and nothing reads it but the sweep. Like the lock files under
-`<git common dir>/autoforge`, it is a runtime artifact of the checkout,
-gone once its probe or a sweep is done. It carries a format field of its
-own, enters no state file, and needs no protocol number.
+directory, `<git common dir>/autoforge/sandbox/probe/<probe id>`, beside
+its lock file. It belongs to no run, and nothing reads it but the sweep
+and `doctor`. Like the lock files under `<git common dir>/autoforge`, it
+is a runtime artifact of the checkout, gone once its probe or a sweep on
+its runtime is done. Its header carries a format field of its own and the
+runtime it is bound to. It enters no state file and needs no protocol
+number.
 
 The runtime's objects (containers, volumes, images) are not state; the
 runtime holds them. The run log gains additive facts (D16) and stays
@@ -1793,9 +1929,9 @@ sequenceDiagram
     participant C as Launch container (PID 1 watcher)
     participant G as Controller git (host)
     Note over E,R: entry: the pin check, then the runtime check, read-only (a failure refuses with nothing written)
-    E->>R: runtime check: version and info, rootless, the pinned runtime, the local endpoint
-    E->>R: reconcile this run's leftovers by label and nonce (D6), writing only the journal
-    E->>E: gate: the probe, after its sweep of dead probes, cached per process (D16)
+    E->>R: runtime check: version and info, rootless, the pinned runtime, the local endpoint, the store the open entries name
+    E->>R: reconcile this run's leftovers by label and nonce on that runtime (D6), writing only the journal
+    E->>E: gate: the probe, after its sweep of dead probes bound to that runtime, cached per process (D16)
     E->>G: REVIEW and FIX: the bound HEAD and merge base fetched and checked in the shared store (D4)
     Note over E,G: seed step: nothing of the launch is journaled yet
     E->>E: the launch's git input (D4): phase, launch, repository, seed commit, lower boundary, carried commit
@@ -1866,7 +2002,7 @@ sequenceDiagram
         N->>N: BLOCKED, naming the object (never force-removed)
     end
     Note over N: Reconciliation never exports, imports or starts a container (D4, D6)
-    Note over N: A probe's objects carry no run key: the next probe's sweep removes a dead prober's (D6, item 9)
+    Note over N: A probe's objects carry no run key: the next sweep on the runtime its journal names removes a dead prober's (D6, item 9)
 ```
 
 ### 3.3 Identity: projecting, destroying and re-creating
@@ -2037,9 +2173,9 @@ sections. The tests named in the header check this.
 | D8.1, D8.2, D8.3, D8.4 | **preserved** | live ownership is unchanged |
 | D8.5 | **preserved** | a container reaches nothing under `<common>/autoforge` at all |
 | D9.1, D9.2, D9.3, D9.4, D9.5, D9.6, D9.7, D9.8 | **preserved** | a worker's engine reconciles at its start (D6) |
-| D10.1, D10.2, D10.3, D10.4, D10.5, D10.6 | **preserved** | no launch, and no container, inherits a lock descriptor |
-| D11.1, D11.2, D11.3, D11.4 | **preserved** | the lock order is unchanged |
-| D12.1, D12.2, D12.3, D12.5 | **preserved** | under D12.3, the container path's new common-dir writes (creating the staging root, importing the pack) take L1 |
+| D10.1, D10.2, D10.3, D10.4, D10.5, D10.6 | **preserved** | no launch, and no container, inherits a lock descriptor; a probe lock's descriptor is close-on-exec too, so no runtime process the probe starts holds it (D6, item 9) |
+| D11.1, D11.2, D11.3, D11.4 | **preserved** | the order holds as written. A probe lock (D6, item 9) is ADR 0013's own, outside D11.1's domains. It is taken only with `LOCK_NB`, never while L1 is held, and nothing waits on it. L1 is entered while one is held only to remove that probe's lock file and directory, and acquires nothing there. So the order is L0, L2, a probe lock, then L1, L1 stays the only blocking acquisition, its holder acquires nothing, and no wait-for cycle can form. A probe on a filesystem whose `flock` is not local is refused, by D11.4's list |
+| D12.1, D12.2, D12.3, D12.5 | **preserved** | under D12.3, the container path's new common-dir writes take L1: creating the staging root, importing the pack, and creating or removing a probe's directory with its lock file. Each is one critical section that acquires nothing, and no runtime call runs under it. What the lock's holder alone writes inside a probe's directory, its journal and its staging root, changes no shared parent and takes none (D6, item 9) |
 | D12.4 | **preserved** | enforced, no residual |
 | D13.1, D13.2, D13.3 | **preserved** | no fence is needed before controller effects |
 | D13.4 | **amended** | [D13.4's note](0008-parallel-epic-scheduler-authority-run-identity-claims-and-locks.md#213-stale-worker-fencing-before-controller-effects-decision-13): a container may outlive a worker killed with `SIGKILL`, within D6's bound |
@@ -2075,9 +2211,9 @@ issue, which names what changed.
 | 2 | #269 | the candidate source: bwrap's, unchanged, and the artifact import with its refusals; the launch's git input for every phase, produced in the seed step, whose manifest digest binds the seed's commits and its tag set; verify's comparison of the manifest with it; `REVIEW` and `FIX` seeding from the revision bound to the round or the entry, another actor's push included; the carried commit; the export bound (D4, D5) | a runtime and #292: tested with packs and manifests built in temporary repositories |
 | 2 | #270 | the container security policy, the network mapping, the credential-delivery mechanisms, each configured at the container's create, and the threat-model text with the closed set of bind sources (D9, D10, D12's bind sources, D14's mechanisms, D18) | #290: tested with fake credentials |
 | 3 | #290 | each provider's mapping and refresh story (D14) | #271: specified against #270's mechanisms |
-| 4 | #271 | the container module, the image contract and build, runtime detection, the shared-filesystem probe, through the probe's own journal, the helpers, the container prompts, and validation in a container: every mount configured at the container's create, nothing bound into a running one; the compiler's `/source` relocation (ADR 0005 D4.2's C7 as amended); the stager container (the stager and the prover offline in a helper container with no projection, D9) and its staging bound; the copy-ins at the stage step; the stager's checkout with no filter, attribute rewrite or hook, and its tag refs; the prover's hand-off proof (the only tree proof in the copy-in form) and its checks of the seeded repository against the ref set the engine passes, the submodule, LFS and sparse-checkout diagnostics, P's and the records' container inputs (D2's container side, D7, D8's detection, D9's helper position, D12, D15; ADR 0005 D4.2 and ADR 0006 D6.3, D8.1 and D8.2 as amended) | #272: `container` stays refused at load |
-| 5 | #272 | the journal, a file of its own beside `state.json`, and its one atomic write for the bind sources, the volume and both containers before any of them is made; labels, death-watch transport, in-container deadline; the helper containers' entries and supervision, the stager container's and each exporter's; the release and the final clean-up around the export; reconciliation; the probe journal, its lock and its sweep; and the measured bound (D6, D19) | #273 |
-| 6 | #273 | `sandbox.backend`, the pin's schema, `doctor` and dry-run reporting, the refusals, and the order at a command's entry that places them: the pin check and the runtime check before reconciliation, the probe after it; `doctor`'s reports of runs' leftovers and of probe objects no journal names (D8, D10's refusal, D16, D19) | #274 |
+| 4 | #271 | the container module, the image contract and build, runtime detection and identity, the store fields of the runtime check (D16), the shared-filesystem probe, through the probe's own journal, the helpers, the container prompts, and validation in a container: every mount configured at the container's create, nothing bound into a running one; the compiler's `/source` relocation (ADR 0005 D4.2's C7 as amended); the stager container (the stager and the prover offline in a helper container with no projection, D9) and its staging bound; the copy-ins at the stage step; the stager's checkout with no filter, attribute rewrite or hook, and its tag refs; the prover's hand-off proof (the only tree proof in the copy-in form) and its checks of the seeded repository against the ref set the engine passes, the submodule, LFS and sparse-checkout diagnostics, P's and the records' container inputs (D2's container side, D7, D8's detection, D9's helper position, D12, D15; ADR 0005 D4.2 and ADR 0006 D6.3, D8.1 and D8.2 as amended) | #272: `container` stays refused at load |
+| 5 | #272 | the journal, a file of its own beside `state.json`, and its one atomic write for the bind sources, the volume and both containers before any of them is made; labels, death-watch transport, in-container deadline; the helper containers' entries and supervision, the stager container's and each exporter's; the release and the final clean-up around the export; reconciliation; each entry's runtime binding; the probe journal, its lock and its sweep in D6 item 9's order (the lock outside L1, the journal after the lock, the binding to its runtime, kept and reported when that runtime is not the swept one); and the measured bound (D6, D19) | #273 |
+| 6 | #273 | `sandbox.backend`, the pin's schema, `doctor` and dry-run reporting, the refusals, and the order at a command's entry that places them: the pin check and the runtime check before reconciliation, with its refusal of a store other than the open entries', the probe after it; `doctor`'s reports of runs' leftovers, of probe objects no journal names, and of probe directories kept for another runtime (D8, D10's refusal, D16, D17, D19) | #274 |
 | 7 | #275 | rootless Podman: its adapter differences, among them an `exec` with no network option of its own, which the helper containers answer (D9); the real-runtime tests of #270, #271 and #272 on Podman, the helpers' network and the probe's crash windows included (D8, D9, D16) | #274 |
 | 8 | #274 | the end-to-end proof on rootless Docker and rootless Podman: the MVP gate (D20) | — |
 | later | #294, #276, #277, #278 | egress mediation; remote execution sandboxes; session continuity | — |
@@ -2236,7 +2372,9 @@ itself as skipped otherwise, never as passed.
   - a relaunch gets a new projection, and nothing of the earlier launch's
     home.
 - **#271.** Fake runtime: detection order and its absence of fall-through,
-  identity from the runtime's own report and not its name, the empty
+  identity from the runtime's own report and not its name, the store's
+  fields from each runtime's own `info` (a moved store reported as
+  another), the empty
   client configuration, and a refused non-local endpoint. Real runtime: the
   nonce bind proof both ways, and `transfer: copy`. The image key changes
   with each input and not otherwise. No repository build file is read.
@@ -2337,11 +2475,16 @@ itself as skipped otherwise, never as passed.
   - during the final clean-up.
 
   **A probe's windows** (D6, item 9), for the gate's probe and for
-  `doctor`'s in a checkout with no run, each reconciled by the next sweep,
-  which leaves nothing of the probe:
-  - between the probe directory's creation and its lock file's, and
-    between the lock and the journal's write, where only the directory is
-    removed, under L1 in the first case;
+  `doctor`'s in a checkout with no run, each reconciled by the next sweep
+  on the same runtime, which leaves nothing of the probe:
+  - inside step 1's section under L1, between the directory's creation and
+    its lock file's, where the sweep, under L1, finds no lock file and
+    removes the directory;
+  - after step 1 and before the `flock`, and between the `flock` and the
+    journal's write, where the directory has no journal and the sweep
+    removes it with its lock file;
+  - during the journal's atomic write, where its temporary file goes with
+    the directory;
   - between the journal's write and the first create, where the entries
     name no object and only the directory is removed;
   - between a probe container's create and its start, where no watcher
@@ -2351,13 +2494,71 @@ itself as skipped otherwise, never as passed.
     watcher ends the container at the stream's end of file, or at the
     probe's deadline once the stand-in parent's own deadline has passed,
     and the sweep removes the stopped container;
-  - during the probe's own removal of its objects and its directory.
+  - during the probe's own removal of its objects, of its staging root and
+    of its journal, and inside its last section under L1.
 
   A sweep never touches a probe whose lock a live process holds:
   a `doctor` running beside a gate's probe, and the reverse. A
   probe-labelled object that no journal of the checkout names is reported
   and left in place. A second sweep is a no-op. No run's reconciliation
   lists a probe's object.
+
+  **The lock file before its `flock`, with a live prober.** A fake prober
+  is held after step 1 has released L1, before its `flock`. Two sweepers
+  run at once:
+  - one takes the lock, finds no journal, and removes the lock file and
+    the directory. The other's lock attempt is refused, or its check finds
+    the path gone, and it skips the directory;
+  - the prober's `flock` is then refused, or its check fails. It starts
+    again under a new probe id, and its probe completes;
+  - no object or journal of the live prober is ever removed, and no object
+    exists for the abandoned id.
+
+  In the other order the prober locks first, and both sweepers skip it. A
+  prober that keeps losing that race fails after #272's bound and names
+  the contention.
+
+  **Concurrent sweepers on a dead probe.** Two sweepers meet a dead
+  prober's directory that has a journal. One takes the lock and removes
+  the objects, and the other skips the directory. When the first is killed
+  while it holds the lock, a third sweeper takes the directory over and
+  finishes. Each object is removed once, and the directory goes last.
+
+  **The lock order.** With the existing lock-order guard
+  (`assert_shared_git_lock_free`) in force, on the prober's path and on
+  the sweep's:
+  - no probe lock is taken while L1 is held;
+  - L1 is held only for the directory's creation with its lock file and
+    for their removal, never across a runtime call;
+  - no probe lock is ever waited on;
+  - a runtime process the probe started, a fake that outlives the
+    `SIGKILL`ed prober, does not hold the probe lock, and the next sweep
+    takes it.
+
+  **Not a local lock.** A probe directory on a filesystem whose `flock` is
+  not a local kernel lock (a stubbed `fstatfs`) refuses the probe before
+  its journal, and the sweep removes nothing there.
+
+  **Two runtimes, two stores.** A fake Docker and a fake Podman, each with
+  a store of its own:
+  - A Docker prober is killed after a probe container's create. `doctor`
+    with Podman selected lists nothing in Docker's store and removes
+    nothing. The directory and its journal stay byte-identical, the
+    container stays in Docker's store, and `doctor` reports the directory
+    as bound to Docker, naming `sandbox.container.runtime`. With Docker
+    selected, the next sweep removes the container, then the directory.
+  - The same holds when the selection changes through the setting,
+    through detection (Podman installed after the Docker probe), and for a
+    gate's sweep in a run pinned to Podman.
+  - With Docker's fake removed from `PATH`, `doctor` with Docker selected
+    fails its runtime check, sweeps nothing and changes nothing. With
+    Podman selected, it reports the directory as awaiting Docker.
+  - A Podman whose store moved (another graph root) is another store. A
+    journal bound to the old one is kept and reported in the same way.
+  - A journal with no runtime binding, one that cannot be read and one of
+    an unknown format are each kept and reported, and never removed.
+  - Neither runtime's sweep reports the other's probe objects as objects
+    that no journal names.
 
   Fake runtime:
   - On every exit path of the run step (success, failure, timeout, stop,
@@ -2395,12 +2596,21 @@ itself as skipped otherwise, never as passed.
       journal are byte-identical, and the leftovers stay. Once the runtime
       is back, the next command's reconciliation removes them;
     - with a leftover whose nonce no entry holds, the run enters
-      `BLOCKED` naming it, and no probe runs.
+      `BLOCKED` naming it, and no probe runs;
+    - with the run's open entries bound to one store and the runtime now
+      reporting another (a fake Podman whose graph root moved), the
+      command is refused before reconciliation. `state.json` and the
+      journal are byte-identical, and the objects in the first store stay.
+      Once that store is back, the next command's reconciliation removes
+      them.
   - **`doctor` with no run.** In a checkout with no run, `doctor` sweeps a
     dead probe's objects, runs its own probe, and leaves nothing behind.
     It reports, and does not remove, a probe-labelled object that no
     journal of the checkout names, and a run's labelled objects that
-    await that run's reconciliation.
+    await that run's reconciliation. It reports a probe directory that its
+    sweep kept for another runtime, with that runtime and the setting.
+    With no runtime at all, it sweeps nothing and still reports each
+    probe directory with the runtime its journal names.
 - **#275.** The real-runtime tests of #270, #271 and #272 run on rootless
   Podman, #271's helpers' network and #272's probe windows included.
   Podman's `exec` takes no network option, so the test of the helpers'

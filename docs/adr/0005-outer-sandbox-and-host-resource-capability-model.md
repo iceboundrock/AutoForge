@@ -2208,10 +2208,11 @@ preserved.
     saved (ADR 0013 D3, D6);
   - the per-probe directory,
     `<git common dir>/autoforge/sandbox/probe/<probe id>`. It holds a
-    probe's journal and its staging root, and no agent writes it. The
-    process that ran the probe removes it with the probe's runtime
-    objects, and a later probe's sweep removes a dead prober's
-    (ADR 0013 D6).
+    probe's lock file, its journal and its staging root, and no agent
+    writes it. The process that ran the probe removes it with the probe's
+    runtime objects. A later sweep on the runtime the journal names
+    removes a dead prober's, and keeps and reports one bound to another
+    runtime (ADR 0013 D6).
 
   "Never deleted by AutoForge" still holds for the per-issue cache volume
   and for every directory the table above lists. The rationale against
@@ -2256,8 +2257,10 @@ preserved.
   - Unlike bwrap's, the container's probe writes outside a temporary
     directory: it creates runtime objects, and a probe directory under
     the common dir (D8.4 above). Each object has a journal entry before it
-    is made and is removed afterwards. A crashed prober's are removed by
-    the next probe's sweep or `doctor`'s (ADR 0013 D6).
+    is made and is removed afterwards. The journal is written only after
+    the prober holds its lock, and it is bound to the runtime that holds
+    the objects. A crashed prober's are removed by the next probe's sweep
+    or `doctor`'s, on that runtime only (ADR 0013 D6).
   - A read-only runtime check comes first. A run's reconciliation runs
     between it and the rest of the probe, so a new probe failure does not
     keep an earlier launch's leftovers in place (ADR 0013 D16).
