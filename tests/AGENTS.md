@@ -501,8 +501,9 @@ ADR 0012)                             every outcome that needs recovery, its gat
 container sandbox backend (#267,      test_container_backend_record.py (the invariant map takes
 ADR 0013)                             every decision of ADRs 0002, 0004, 0005, 0006 and 0008
                                       once, each amended one carries a dated #267 amendment and
-                                      no other does, no protocol number is claimed, the links
-                                      resolve, every ADR has an index row)
+                                      no other does, ADR 0013's list of its amendments names
+                                      what the map marks amended, no protocol number is
+                                      claimed, the links resolve, every ADR has an index row)
 the recovery action package and       test_recovery_package.py (the scenario table on real stops
 status --live (#374)                  read back by a fresh CLI engine: K10, K9 approve and
                                       decline, PR #314's false conflict beside an authentic one,

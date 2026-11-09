@@ -8,8 +8,8 @@ silently: a decision added to one of those records later, or an amendment
 pointer added or dropped, would leave the map wrong with nothing to notice.
 These tests read the records only. Whether a decision is rightly marked is
 review's business; that the map is complete, consistent with the records'
-own amendment notes, numbers no protocol, and links where it says it does
-is theirs.
+own amendment notes and with ADR 0013's own list of its amendments, numbers
+no protocol, and links where it says it does is theirs.
 """
 
 from __future__ import annotations
@@ -29,7 +29,9 @@ INDEX = ROOT / "docs" / "README.md"
 # §5's subsections of ADR 0013, and the record each one maps.
 MAPPED = {"5.1": "0002", "5.2": "0004", "5.3": "0005", "5.4": "0006", "5.5": "0008"}
 STATUSES = {"**preserved**", "**amended**", "**superseded**"}
-MARKER = "Amended by #267 (2026-11-08)"
+# #267's amendments carry the day each was written: 2026-11-08 for all but
+# ADR 0008 D10.5's, which is dated 2026-11-09.
+MARKER = re.compile(r"Amended by #267 \(2026-11-0[89]\)")
 
 DECISION = re.compile(r"^(?:- )?\*\*(D\d+\.\d+[a-z]?)\b")
 KIND = re.compile(r"^#### (K\d+)\. ")
@@ -41,6 +43,7 @@ LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 FENCE = re.compile(r"^\s*(```|~~~)")
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 PROTOCOL = re.compile(r"\bprotocol (?:number )?(\d+)", re.IGNORECASE)
+NAMED = re.compile(r"(?<![\w.§])(D\d+\.\d+[a-z]?|§\d+[a-z]?)(?!\w|\.\d)")
 
 
 def _record(number: str) -> Path:
@@ -202,13 +205,57 @@ def test_adr_0013_amended_decisions_carry_a_dated_amendment_and_no_others():
             assert targets, (number, idents)
             assert [_broken(ADR_0013, t) for t in targets if _broken(ADR_0013, t)] == []
             for ident in idents:
-                assert MARKER in _block(number, ident), (number, ident)
+                assert MARKER.search(_block(number, ident)), (number, ident)
         # A section holds its decisions' amendments, so only a section the
         # map names is held to its own status; a guarantee lives in D2.1.
         checked = [i for i in _starts(number) if i.startswith(("D", "K")) or i in status_of]
         for ident in checked:
-            if MARKER in _block(number, ident) and not ident.startswith("G"):
+            if MARKER.search(_block(number, ident)) and not ident.startswith("G"):
                 assert status_of.get(ident) == "**amended**", (number, ident)
+
+
+def _inventory() -> dict[str, set[str]]:
+    """ADR 0013's own list of what it amends (its header's **Amends** entry),
+    by record: each item's decisions and sections, without the section that
+    holds the amendment ("through a new §11")."""
+    lines = _lines(ADR_0013)
+    (start,) = [i for i, line in enumerate(lines) if line.startswith("- **Amends**")]
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("- **"))
+    items: dict[str, list[str]] = {}
+    current = None
+    for line in lines[start + 1 : end]:
+        item = re.match(r"^  - \[ADR (\d{4})\]\(", line)
+        if item:
+            current = item[1]
+            items[current] = []
+        elif not line.strip():
+            current = None
+        if current:
+            items[current].append(line)
+    named: dict[str, set[str]] = {}
+    for number, text in items.items():
+        joined = re.sub(r"through a new §\d+[a-z]?", "", " ".join(text))
+        named[number] = set(NAMED.findall(joined))
+    return named
+
+
+def test_adr_0013_amendment_inventory_matches_the_map():
+    """The header's list of amended decisions is the one a reader checks
+    first, and it drifts apart from §5 silently: per record, it names
+    exactly what §5 marks amended (a guarantee of ADR 0005 is named through
+    D2.1, which holds it)."""
+    inventory = _inventory()
+    assert set(inventory) == set(MAPPED.values())
+    for number, rows in _map().items():
+        amended = {
+            ident
+            for idents, status, _ in rows
+            if status == "**amended**"
+            for ident in idents
+            if not ident.startswith("G")
+        }
+        assert amended, number
+        assert sorted(inventory[number] ^ amended) == [], f"ADR {number}"
 
 
 def test_adr_0013_claims_no_state_protocol_number():
