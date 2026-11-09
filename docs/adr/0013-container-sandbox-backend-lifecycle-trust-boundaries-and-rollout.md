@@ -1726,8 +1726,8 @@ order, before any launch:
 The pin check and the runtime check refuse as D8 and D10 say. The
 runtime's report and the probe's result are cached for the controller
 process, as ADR 0005 D12.2 caches the capability. A later entry in the same
-process still compares the cached report with its own run's pin, and
-still reconciles.
+process still compares the cached report with its own run's pin and with
+the store its open entries name, and still reconciles.
 
 `doctor` runs the runtime check and then the probe, with its sweep. It
 reconciles no run, because it holds no run's lock. It reports each run's
