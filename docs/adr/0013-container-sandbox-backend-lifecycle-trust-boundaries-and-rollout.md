@@ -24,7 +24,8 @@
 
   Three corrections followed the acceptance. Each spells out what an
   accepted decision needs in order to be implementable, and none reopens
-  one. The maintainer's acceptance predates them:
+  one. The maintainer accepted them on 2026-11-08, on the same terms
+  ([#267's second acceptance comment](https://github.com/iceboundrock/AutoForge/issues/267#issuecomment-6728978305)):
   - **The bind sources exist before the container.** A runtime configures
     a bind only when it creates a container. So the host-side work moves
     out of the stage step: a seed step that journals nothing builds and
@@ -35,6 +36,26 @@
     others (§11 there).
   - **With `history_tags` on, the manifest binds the seed's tags,** and the
     prover accepts exactly those (D2, D4, D11).
+
+  Two more corrections followed review round 3. They postdate both
+  acceptances, and the maintainer has not accepted them yet. Neither
+  reopens a decision:
+  - **The stager and the prover run offline in a container of their
+    own.** An exec session shares its container's network namespace, and
+    an agent's launch container is on the bridge. So D9's `--network none`
+    for these two helpers could not hold while they ran as execs in that
+    container. They now run in the launch's *stager container*, a helper
+    container like the exporter. It is created with `--network none` and
+    no projection, and the launch container starts only after it is
+    removed (D9, D13). D9's helper network policy is unchanged.
+  - **A probe's objects are journaled, and recovery runs before the
+    probe.** A probe journal, which the probing process holds locked, owns
+    every object a probe creates, `doctor`'s included. A sweep removes a
+    dead prober's objects (D6). At a command's entry a read-only runtime
+    check runs first, then reconciliation, then the probe. So a new probe
+    failure, such as a missing image, no longer keeps a crashed launch's
+    leftovers in place. A refusal still leaves `state.json` byte-identical,
+    because the lifecycle journal is a file of its own (D16, D19).
 
   This is a design record, and nothing in it is implemented. Written at
   `main` `32178d8` (2026-11-08), where every reference below was read.
@@ -210,6 +231,16 @@ measured it amends this record.
 - **Helpers:** AutoForge's own programs inside the image: the *watcher*
   (PID 1, D6), the *stager* (builds `/workspace`), the *prover* (D2), and
   the *exporter* (D5).
+- **Launch container:** the container a launch's run step runs in, the
+  agent or the repository command (D13).
+- **Helper container:** a container of a launch that runs only helpers,
+  with `--network none` and no projected credential (D9, D14). There are
+  two kinds. The *stager container* runs the stager and the prover before
+  the launch container starts. Each *exporter* runs after the launch
+  container is removed (D5, D6).
+- **Probe:** the real minimal launch that establishes a host's capability
+  (D16). Its objects belong to the process that runs it, not to a run
+  (D6).
 - **Seed:** what a launch's `/workspace` is built from. It is a bounded
   pack with a manifest, and on bind runtimes also a materialized tree
   (D2, D11, D12).
@@ -292,15 +323,24 @@ provider's operator configuration root.
 **A read-only bind does not make content immutable.** The host path can
 change after it was proved. So the prover, AutoForge's own code running
 D6.3's walk of ADR 0006, proves `/workspace`'s tree (its `.git` aside, for
-an agent) against the seed commit's tree id inside the container, before
-any agent or repository command runs there. It does so in both forms.
+an agent) against the seed commit's tree id inside the container runtime,
+before any agent or repository command runs on it. It does so in both
+forms.
 
 - The controller hands the prover that tree id, read from the shared
   store. The id never comes from the pack or the manifest.
-- The prover runs as its own exec after the stager. Nothing of the agent
-  has run in that container by then.
-- Its verdict reaches the controller on that exec's output. A mismatch is
-  a setup failure (D17), never a result.
+- The stager and the prover run in the launch's *stager container*
+  (D13). It is a helper container: the volume is mounted, its network is
+  `--network none` and it holds no projection (D9, D14). No agent or
+  repository command ever runs in it. The prover runs as its own exec
+  there, after the stager.
+- The launch container, where the agent or the command runs, starts only
+  after the stager container has ended and been removed. No process of
+  staging runs beside the agent or the command. Between the prover's
+  verdict and that start, no container of the launch is running, and the
+  host never mounts the volume (D5).
+- The prover's verdict reaches the controller on its exec's output. A
+  mismatch is a setup failure (D17), never a result.
 
 For an export command, this proof is what keeps ADR 0006's claim, "the
 validator saw C", true in a container. A host-side proof of the bind
@@ -311,8 +351,8 @@ amended).
 
 - **The tree** says which exact tree a launch gets. In the bind form it is
   the materialized tree in the staging root, which the host proves with
-  `materialize()`'s hash-back walk (ADR 0006 D6.3) before the container
-  that binds it is created (D13). The in-container proof above follows
+  `materialize()`'s hash-back walk (ADR 0006 D6.3) before the containers
+  that bind it are created (D13). The in-container proof above follows
   it.
 - **The seed pack and its manifest** carry the history the agent's
   repository needs (D11). The pack's own checks (D4) prove its objects and
@@ -329,9 +369,10 @@ amended).
     command runs in, and only an in-container walk can see it. ADR 0006
     D6.3 as amended says the same of the bind form.
   - **No trusted party is added.** The prover is AutoForge's code, from the
-    content-addressed image (D7), at the controller's version. It runs
-    before any agent or repository code in that container, and checks a
-    tree id that the controller supplies. The only parties that could
+    content-addressed image (D7), at the controller's version. It runs in
+    the stager container, which no agent or repository code enters,
+    before the launch container starts. It checks a tree id that the
+    controller supplies. The only parties that could
     falsify its verdict are the image and the runtime, and the bind form's
     in-container proof already trusts both.
 
@@ -405,12 +446,13 @@ prompt where the agent is affected:
 | Object | Lifetime | Owner | Created | Removed |
 |---|---|---|---|---|
 | image | content-keyed and cached across runs; reused while its key is unchanged | AutoForge's build (#271) | on a cache miss, in a build container (D7) | never by a run; `doctor` lists it with its size; the operator prunes it |
-| launch container | one launch: one run step and its helpers | the controller | the create step, after its journal entry | the release, right after the run step; or reconciliation (D6) |
+| launch container | one launch: its run step | the controller | the create step, after its journal entry; started only once the stager container is removed (D13) | the release, right after the run step; or reconciliation (D6) |
+| stager container | one launch's staging: the stager and the prover | the controller | the create step, after its journal entry, with `--network none` and no projection | the stage step, right after the prover's verdict and before the launch container starts, journaled; or the release, after a failed stage; or reconciliation (D6) |
 | exporter container | one export of a change-producing launch | the controller | the export step, after its own journal entry | right after the export ends, journaled; or reconciliation (D6) |
 | `/workspace` volume | one launch; for a change-producing launch, until the verify step's outcome is saved | the controller | the create step, after its journal entry | the final clean-up: for a change-producing launch only once the candidate is bound or refused, otherwise at the release; or reconciliation (D6) |
 | per-issue cache volume | the issue: launches that produce a change share it (ADR 0005 §2.5) | the controller creates it; the operator removes it | at the issue's first change-producing launch | never by AutoForge (ADR 0005 D8.4) |
-| staging root (`/source`), the bind form only | one launch | the controller (#292) | the create step, after its journal entry and before the container's create, which binds it (D13) | the release (it is controller-written only); or reconciliation |
-| projected model credential | one launch | the controller (#290, #270) | the create step, after its journal entry: an environment value or a read-only file bind, both configured in the container's create (D14) | the release, right after the run step; or reconciliation |
+| staging root (`/source`), the bind form only | one launch | the controller (#292) | the create step, after its journal entry and before the creates of the stager container and the launch container, which both bind it (D13) | the release (it is controller-written only); or reconciliation |
+| projected model credential | one launch | the controller (#290, #270) | the create step, after its journal entry: an environment value or a read-only file bind, both configured in the launch container's create, never in a helper container's (D14) | the release, right after the run step; or reconciliation |
 | agent session data | one launch, inside the container's private home | nobody beyond the launch | by the agent CLI | with the launch container (#278 owns any later need, D14) |
 | candidate artifact | until the verify step's outcome is saved; then the shared store holds the candidate and the state binds it | the controller (#269) | the export step, in the launch's export directory (ADR 0005 D8.4 as amended) | the final clean-up, after the verify step; or reconciliation, never imported |
 | provider login and refresh state | long-lived, on the host | the operator | the operator's login | never by AutoForge (D14) |
@@ -617,8 +659,9 @@ The artifact is untrusted data: one pack, bounded in size, plus a manifest.
 - **The manifest is a claim.** It names the claimed `HEAD`, the launch's
   identity, the seed commit, its lower boundary, the carried commit if
   any, and the object format.
-- **The exporter** runs in a fresh container with the volume mounted
-  read-only and `--network none`, after the launch container is removed
+- **The exporter** runs in a fresh helper container with the volume
+  mounted read-only and `--network none`, after the launch container is
+  removed
   (D6). It packs the objects reachable from the workspace's `HEAD` and not
   from the seed. The artifact leaves through the exporter's output or the
   runtime's copy-out, into the launch's export directory, which only the
@@ -675,23 +718,27 @@ This is the contract a daemon-owned container can meet. It replaces
    The controller first writes a journal entry holding all of them,
    atomically. Only then does it create anything (D19).
    - This covers every container of the launch: the launch container and
-     each exporter. An exporter gets an entry and a nonce of its own,
-     written before its create, so a crash between its create and its
-     removal leaves an object that reconciliation can prove is the run's.
+     its helper containers, the stager container (D13) and each exporter.
+     An exporter gets an entry and a nonce of its own, written before its
+     create, so a crash between its create and its removal leaves an
+     object that reconciliation can prove is the run's.
    - The credential projection has an entry of its own, and so do the
      launch's host directories (the staging root and the export
      directory). Each entry names the launch it belongs to.
-   - A runtime configures a container's binds and volumes only when it
-     creates the container. An exec into a running container cannot add
-     one. So the entries of everything the create configures are written
-     together, in one atomic write after the seed step: the staging
-     root (bind form), the credential projection (which D14 also
-     configures at the create), the volume and the launch container. The
-     staging root is then written and proved, and only after that are the
-     volume and the container created (D13). Nothing is bound into a
-     running container.
+   - A runtime configures a container's binds, volumes and network only
+     when it creates the container. An exec into a running container can
+     neither add a mount nor change the network. So the entries of
+     everything the create step makes are written together, in one atomic
+     write after the seed step: the staging root (bind form), the
+     credential projection (which D14 configures at the launch container's
+     create), the volume, the stager container and the launch container.
+     The staging root is then written and proved, and only after that are
+     the volume and the two containers created (D13). Nothing is bound
+     into a running container.
 2. **Ownership.** An object belongs to the run only when its labels and
-   nonce match a journal entry. Nothing is stopped or removed otherwise.
+   nonce match a journal entry. Nothing is stopped or removed otherwise. A
+   probe's objects belong to its probe in the same way, through the
+   probe's own journal (item 9).
 3. **The death-watch.** The container's PID 1 is AutoForge's watcher.
    - It runs under a non-root UID that is distinct from the agent's, with
      every capability dropped.
@@ -713,26 +760,35 @@ This is the contract a daemon-owned container can meet. It replaces
      backend requires it to be finite for every agent profile, and refuses
      at load a configuration that leaves it unset (D19).
    - Export commands use `execution.command_timeout_seconds`.
-   - An exporter is supervised in the same way. Its PID 1 is the same
-     watcher on a liveness stream that only the controller holds. Its
-     deadline is a fixed export bound that #269 states and the facts
-     record. The controller's call that runs it goes through the executor
-     with that bound as its timeout, and its `close()` ends the exporter's
-     PID namespace on every path (ADR 0002 §4f). The artifact's size bound
-     is enforced while the stream is read. An artifact over the bound ends
-     the exporter, and the launch's export is a candidate refusal (D5).
+   - A helper container, the stager container or an exporter, is
+     supervised in the same way. Its PID 1 is the same watcher, on a
+     liveness stream of its own that only the controller holds. Its
+     deadline is a fixed bound that the facts record: the staging bound,
+     which #271 states, for the stager container, and the export bound,
+     which #269 states, for an exporter. The controller's calls that run
+     its helpers go through the executor with that bound as their timeout,
+     and their `close()` ends the helper container's PID namespace on every
+     path (ADR 0002 §4f). For an exporter, the artifact's size bound is
+     enforced while the stream is read. An artifact over the bound ends the
+     exporter, and the launch's export is a candidate refusal (D5).
 5. **Every exit path the controller runs:** success, failure, timeout,
-   stop, `Ctrl-C`, or an exception inside the executor's guard. The steps
-   after the run step come in this order, and each removal journals its
-   intent first and closes its entry only after a verified removal:
+   stop, `Ctrl-C`, or an exception inside the executor's guard. Each
+   removal journals its intent first and closes its entry only after a
+   verified removal.
+   - **The stager container goes before the run step.** The stage step
+     removes it as soon as the prover's verdict is read, and only then
+     starts the launch container (D13). If the stage step fails, or is
+     interrupted, the release removes it with the rest.
+
+   The steps after the run step come in this order:
    - **Close.** The run step's `close()` ends the launch container's PID
      namespace before the invocation returns. That keeps ADR 0002 §3 on
      each of those paths (ADR 0002 §4f).
-   - **Release.** The engine removes the launch container, the credential
-     projection and the staging root. Nothing after the run step needs
-     them, and the launch container's record holds the projected
-     environment (D14). The volume is not removed here for a
-     change-producing launch.
+   - **Release.** The engine removes the launch container, the stager
+     container if it is still there, the credential projection and the
+     staging root. Nothing after the run step needs them, and the launch
+     container's record holds the projected environment (D14). The volume
+     is not removed here for a change-producing launch.
    - **Export,** only for a change-producing launch that ended by success,
      failure, timeout or stop (D4). It is skipped on `Ctrl-C` and after an
      exception inside the guard. The engine writes the exporter's entry,
@@ -754,9 +810,14 @@ This is the contract a daemon-owned container can meet. It replaces
 6. **Reconciliation.** It runs at every `step`, `resume` and `unblock`, and
    when a scheduler worker starts on an issue, before any launch.
    - It lists the runtime's objects that carry this run's run-key label,
-     and removes each one that matches a journal entry. Exporters are
-     included. A running one is stopped first. After the controller's
-     death its watcher has normally ended it already.
+     and removes each one that matches a journal entry. Helper containers
+     are included: the stager container and each exporter. A running one
+     is stopped first. After the controller's death its watcher has
+     normally ended it already.
+   - It runs after the runtime check and before the probe (D16), so a new
+     probe failure never keeps it from removing what an earlier launch
+     left. A probe's objects carry no run key, so it never lists them
+     (item 9).
    - It removes the staging root and the export directory that an open
      entry names. A partial or complete artifact left in the export
      directory is deleted, never imported.
@@ -776,6 +837,59 @@ This is the contract a daemon-owned container can meet. It replaces
    how long the runtime takes to report the container gone. #272 measures
    and states the bound. A host that does not meet it is refused under
    `required` before anything of the step is saved or launched.
+9. **A probe's objects.** A probe creates runtime objects and a host
+   directory too: item 8's stand-in launch, D12's nonce proof and D16's
+   minimal launch. It can also run where no run exists, in `doctor`, or in
+   a gate before a run has a journal. So a probe belongs to the process
+   that runs it, and it has a journal of its own.
+   - **The probe journal.** Before it creates anything else, the probing
+     process creates the probe's directory,
+     `<git common dir>/autoforge/sandbox/probe/<probe id>`, through
+     `safefs`, with a lock file in it, and takes an exclusive `flock` on
+     that file. All three happen under L1. It holds the lock for as long
+     as the probe runs. Only then does it write the probe's journal beside
+     the lock file, atomically, with an entry (names, labels, nonce) for
+     every object the probe will create, the probe's own staging root in
+     that directory included. The lock is on a file of its own because an
+     atomic replacement of the journal would drop a lock held on it. The
+     kernel releases the lock when the process ends, however it ends, so a
+     held lock means a live prober. This is the OS-level file locking of
+     AGENTS.md's runtime model, not a heartbeat.
+   - **Labels.** A probe's objects carry the probe's kind, its probe id
+     and their nonce, and no run key. No run's reconciliation lists them,
+     and the sweep below lists nothing else.
+   - **Its own end.** On every path the probe runs, it removes its objects,
+     each removal journaled first and verified, then its directory, the
+     journal last.
+   - **Its containers.** A probe container is started only with the
+     watcher as PID 1, on a stream the prober holds, and with the probe's
+     own short deadline. Item 8's stand-in parent ends at the same
+     deadline by itself, so neither outlives the probe's bound after a
+     crash. A container that was created and never started has no
+     watcher, and `--rm` never fires for it. The sweep is what removes
+     it.
+   - **The sweep.** Before a probe creates anything, and in `doctor`, the
+     process sweeps the checkout's probe directories. It tries each one's
+     lock, without waiting.
+     - A directory whose lock it takes is a dead prober's. The sweep
+       removes each object whose labels and nonce match an entry of its
+       journal, stopping a running one first, then the directory. A
+       directory with no journal yet holds no object, since the journal
+       comes before every object, and is removed as it is.
+     - A directory whose lock is held belongs to a live prober, `doctor`'s
+       or a gate's, and is skipped.
+     - A directory with no lock file is one whose prober died while making
+       it. The sweep removes it under L1, so it never meets a live
+       prober's half-made directory.
+     - A probe-labelled object that no journal of the checkout names is
+       reported by `doctor` and never removed. It is another checkout's
+       probe, or one whose journal was removed by hand. It belongs to no
+       run, so it blocks none.
+     - The sweep is idempotent. #272 makes it safe against a second
+       sweeper and against a journal removed while it waits.
+   - **Outside a checkout** there is no probe directory. `doctor` then runs
+     only the runtime check (D16), and says that the probe needs a
+     checkout.
 
 **The residual, as the owner accepted it on 2026-10-23.** After a
 `SIGKILL` of the controller, an OOM kill or a crash, a container keeps
@@ -947,8 +1061,32 @@ therefore hide one run's leftovers from its own reconciliation.
 | agent | the host network namespace, with host abstract sockets scoped out (ADR 0005 D9.1) | the runtime's rootless bridge network, in the container's own namespace; never `--network host` |
 | export command, `*_network: host` (the default) | the host network namespace | the bridge |
 | export command, `*_network: isolated` (ADR 0005 D9.2) | `--unshare-net` | `--network none` |
-| stager, prover, exporter | — | `--network none` |
+| stager and prover | — | `--network none`, in the stager container (D13) |
+| exporter | — | `--network none`, in its own container (D5) |
 | image build | — | network access, in its build container (D7) |
+
+- **The helpers run offline in containers of their own.** A container's
+  network namespace is fixed when the container is created. An exec
+  session joins its container's namespace, and neither runtime gives an
+  exec another one. Podman 5.4.2's `exec` has no `--network` option, and
+  its parser refuses one (`Error: unknown flag: --network`, checked where
+  this record was written, with no container involved). Docker's `exec`
+  documents none. The launch container of an agent, or of an export
+  command on `*_network: host`, is on the bridge. So the stager and the
+  prover cannot be offline as execs in it.
+  They run in the stager container, and each exporter in its own. Each of
+  these helper containers is created with `--network none` (D6, D13).
+  - The projection is configured only at the launch container's create
+    (D14), so no helper sees it either.
+  - The stager reads repository content before the prover has checked
+    anything, and the exporter reads what the agent wrote. Neither needs
+    the network. Offline, a helper that hostile content subverts reaches
+    no network and holds no credential. And the exporter's position keeps
+    the agent's network from outlasting the run step.
+  - The cost is one more container per launch, the stager container,
+    created and removed around the stage step.
+  - The capability: a container created with `--network none` has no
+    interface but loopback, and no route (D16, item 7).
 
 - **A capability under `required`.** From inside a container on the
   bridge, two things must be unreachable: a host loopback listener (a
@@ -983,6 +1121,15 @@ model API.
   abstract-socket exposure.
 - **`--network none` for agents.** No agent could reach its model API.
 - **An egress allow-list in the MVP.** That is #294.
+- **The stager and the prover as execs in the launch container.** They
+  would share its bridge and its projection, which the table excludes.
+- **Moving the launch container onto the bridge after staging,** with the
+  runtime's `network connect`. That changes a created container's network.
+  Neither runtime's behaviour for it was measured here, and this record
+  does not depend on it.
+- **`unshare --net` for the helpers inside the launch container.** It
+  needs `CAP_SYS_ADMIN` in the container's user namespace, and D10 drops
+  every capability.
 
 ### D10. Rootless only (decision 10; #270 the policy, #273 the refusal)
 
@@ -1111,11 +1258,12 @@ proven capability, not as one global default.
     read context's own directory, in the controller's state, is never
     bound.
   - The controller creates the staging root through `safefs`, under L1,
-    after its journal entry and before the container's create, because
-    the runtime configures the bind there (D13). It removes the root at
-    the release, right after the run step (D6).
-  - The staged tree is proved before the create (#292), and once more
-    inside the container (D2).
+    after its journal entry and before the creates of the stager container
+    and the launch container, because the runtime configures each bind
+    there (D13). Both containers bind it. It removes the root at the
+    release, right after the run step (D6).
+  - The staged tree is proved before the creates (#292), and once more
+    inside the stager container (D2).
   - The staging root appears at `/source`, not at its host path. That is
     a relocation, which ADR 0005 D4.2's C7 admits as amended there (§11).
     Every other rule of D4.2 and D4.3 applies to it unchanged.
@@ -1124,21 +1272,26 @@ proven capability, not as one global default.
   execution sandboxes (#276, #277).
   - Only the seed pack, its manifest and the read context are copied in,
     because the seed carries the exact tree. No separate `/source` is
-    sent. The copy-in is the stage step's, into the container the create
-    step made (D13). The stager writes the tree inside, and the prover
-    proves it (D2).
+    sent. The copy-ins are the stage step's (D13). The seed pack and its
+    manifest go into the stager container, where the stager writes the
+    tree and the prover proves it (D2). The read context goes into the
+    launch container once it has started, before the run step. #271
+    chooses the transport of each: the runtime's copy, or a helper's
+    standard input.
   - None of these hosts is in the MVP (D16). Copy-in is designed so that
     supporting one later reopens nothing here.
 - **The bind sources are a closed set.** A launch in the bind form binds
-  the staging root at `/source`, read-only. Where #290 maps a provider to
-  D14's file mechanism, it also binds that credential file, read-only, at
-  its path in the private home, which C7 already admits. Each is
-  journaled, and exists, before the create. Nothing else is bound into a
-  launch's containers, the exporter binds nothing, and the copy-in form
-  binds nothing.
-- **Proof, not names.** #271's probe writes a nonce file into a fresh
-  staging root and checks, from inside a container with it bound, that it
-  reads the same nonce. "Local", "remote", a `docker` basename or a context
+  the staging root at `/source`, read-only, into its stager container and
+  its launch container. Where #290 maps a provider to D14's file
+  mechanism, the launch container alone also binds that credential file,
+  read-only, at its path in the private home, which C7 already admits.
+  Each is journaled, and exists, before the creates. Nothing else is bound
+  into a launch's containers, the exporter binds nothing, and the copy-in
+  form binds nothing.
+- **Proof, not names.** #271's probe writes a nonce file into the probe's
+  own staging root (D6, item 9) and checks, from inside a container that
+  binds it at `/source` as a launch binds its own, that it reads the same
+  nonce. "Local", "remote", a `docker` basename or a context
   name is never taken as proof. The result is cached for the controller
   process, as the capability is.
 - **The operator's override goes one way.** `sandbox.container.transfer:
@@ -1172,25 +1325,29 @@ engine sequences and journals. Executor requests are not wrapped.
 | Step | Called by | Takes | Gives | Process | Journaled | Failure and retry |
 |---|---|---|---|---|---|---|
 | plan | the engine's facts, completed by the provider's declaration, as `SandboxPlan.describe` does today; pure | the role-level request: launch class, roles, the provider's declaration, limits, network position | a compiled launch, typed and immutable (bwrap: today's `LaunchDescription`; container: a container description) | none | no | a policy refusal (`SandboxPolicyError`), before anything exists |
-| seed | the engine, after the gate and reconciliation | the phase's bound revision, the history settings (D11) | the launch's git input (#269); the seed pack and manifest (#292), checked (D4), in a controller-owned temporary directory | the controller's hardened git | no entry: nothing of the launch exists yet, and nothing a container sees is written; the seed's identity is saved as state at its end (D19) | a setup failure (D17), refused before any journal entry: nothing is created and nothing needs reconciling |
-| create | the engine | the compiled launch, its owner (run key, issue, phase, launch id, nonce), the prepared seed, the read context, the credential projection (#290) | a handle to a started container, all of whose mounts its create configured, with PID 1 on the liveness stream | in order: `safefs` and `materialize()` write the staging root, check its seed's digest against the input's and prove its tree (bind form); the runtime CLI creates the volume, then the container with its binds, volumes and projection, then starts it | yes: one atomic write holds the entries of the staging root (bind form), the projection, the volume and the container, before any of them is made | a setup failure (D17): both parts of the cleanup remove what was made, with no export. An ambiguous create is reconciled by label and nonce before any re-issue, never blindly retried (ADR 0004 D4.3's rule, applied to a local object) |
-| stage | the engine | the handle, the tree id and ref set the engine takes from the shared store and its own manifest (D2) | the prover's verdict on the tree and the seeded repository (D2) | the runtime CLI: in the copy-in form, the copy of the seed and its manifest, after the digest check (D4), and of the read context into the container; then the stager's and the prover's execs | no new entry: what it writes lives in the container and the volume, whose entries exist | a setup failure (D17); both parts of the cleanup run, with no export |
+| seed | the engine, after the runtime check, reconciliation and the probe (D16) | the phase's bound revision, the history settings (D11) | the launch's git input (#269); the seed pack and manifest (#292), checked (D4), in a controller-owned temporary directory | the controller's hardened git | no entry: nothing of the launch exists yet, and nothing a container sees is written; the seed's identity is saved as state at its end (D19) | a setup failure (D17), refused before any journal entry: nothing is created and nothing needs reconciling |
+| create | the engine | the compiled launch, its owner (run key, issue, phase, launch id, a nonce per object), the prepared seed, the read context, the credential projection (#290) | handles to two created containers, neither started, each with every mount and its network configured by its create: the stager container (`--network none`, the volume, `/source` in the bind form, no projection) and the launch container (the launch's network position, D9; the volume; `/source` in the bind form; the projection) | in order: `safefs` and `materialize()` write the staging root, check its seed's digest against the input's and prove its tree (bind form); the runtime CLI creates the volume, then the stager container, then the launch container | yes: one atomic write holds the entries of the staging root (bind form), the projection, the volume, the stager container and the launch container, before any of them is made | a setup failure (D17): both parts of the cleanup remove what was made, with no export. An ambiguous create is reconciled by label and nonce before any re-issue, never blindly retried (ADR 0004 D4.3's rule, applied to a local object) |
+| stage | the engine | the handles, the tree id and ref set the engine takes from the shared store and its own manifest (D2) | the prover's verdict on the tree and the seeded repository (D2); then the launch container started, with PID 1 on its liveness stream | the runtime CLI, in order: the stager container started, its watcher on a liveness stream of its own; in the copy-in form, the seed and its manifest copied into it, after the digest check (D4); the stager's exec, then the prover's; the stager container removed; the launch container started; in the copy-in form, the read context copied into it | the stager container's removal: intent first, its entry closed after it. Nothing else new: what staging writes lives in the volume, whose entry exists | a setup failure (D17); both parts of the cleanup run, with no export. The launch container never starts after a failed stage |
 | run | the executor, through the provider | the handle, the command, its environment | `ExecutionResult` with `SandboxFacts` | the attached runtime client is the executor's child | no | ADR 0002 as today; `close()` ends the container's PID namespace |
-| cleanup, its release | the engine, right after the run step on every path | the handle | the launch container, the projection and the staging root removed (also the volume when there is nothing to export), or left for reconciliation | the runtime CLI | yes, intent first; each entry closes after its verified removal | idempotent; bounded retry |
+| cleanup, its release | the engine, right after the run step on every path | the handle | the launch container, the projection and the staging root removed, and the stager container when a failed stage left it (also the volume when there is nothing to export), or left for reconciliation | the runtime CLI | yes, intent first; each entry closes after its verified removal | idempotent; bounded retry |
 | export | the engine, for a change-producing launch after the release | the handle's volume | the artifact in the launch's export directory; nothing for `REVIEW`, `UPDATE_EPIC` and export commands | the exporter container: its own watcher, the export deadline, its client under the executor's timeout (D6) | yes: the exporter's own entry and nonce before its create; its removal journaled, the entry closed after it; the artifact is untrusted | an exporter that fails to start is retried within bounds, each attempt with a new entry; then, or for a bad artifact, a candidate refusal |
 | verify | the engine (#269) | the artifact and the launch's git input (D4) | the imported candidate, or a refusal | the controller's hardened git | the binding is state (D19) | never retried; publishes nothing |
 | cleanup, its final part | the engine, after the verify step's outcome is saved, or once the export is skipped | the handle | the volume and the export directory removed, or left for reconciliation | the runtime CLI | yes, intent first; the entry closes after removal | idempotent; bounded retry |
-| reconcile | the engine, at `step`, `resume`, `unblock` and worker start | the run key and the journal | entries closed, or `BLOCKED` | the runtime CLI; `safefs` for the host directories | closes entries | remove-only, exporters and host directories included (D6) |
-| probe | the gate and `doctor` | — | a `ProbeResult` naming the missing capability | one minimal launch of the same shape | no | once per controller process |
+| reconcile | the engine, at `step`, `resume`, `unblock` and worker start, after the runtime check and before the probe (D16) | the run key and the journal | entries closed, or `BLOCKED` | the runtime CLI; `safefs` for the host directories | closes entries | remove-only, helper containers and host directories included (D6); never a probe's objects |
+| probe | the gate and `doctor`, at a command's entry (D16) | — | a `ProbeResult` naming the missing capability | first the runtime check, read-only; then, after the entry's reconciliation where there is one, one minimal launch of the same shape | the runtime check makes nothing; every object of the minimal launch has an entry first, in the probe's own journal, which the probing process holds locked (D6, item 9) | once per controller process. A crashed prober's objects are removed by the next probe's sweep or `doctor`'s |
 
 **bwrap under this interface.** Plan is `compile_launch` as it is. Seed,
 create, stage, cleanup and reconcile do nothing. Run is
 `sandbox_bwrap.prepare()`.
 Export and verify are D6.5's import and D6.3's read, which #269 wraps as
-the bwrap candidate source. Nothing a bwrap launch does changes.
+the bwrap candidate source. The probe is bwrap's own (ADR 0005 D14.1). It
+writes nothing outside a temporary directory it removes, so it needs no
+journal. Nothing a bwrap launch does changes.
 
-**Order, and the volume's lifetime.** The steps run in the table's order.
-In the seed step, #269 produces the launch's git input, and #292
+**Order, and the volume's lifetime.** Reconcile and probe come first, at
+the command's entry, in the order D16 gives: the runtime check,
+reconciliation, then the rest of the probe. A launch's own steps then run
+in the table's order, from seed to the final clean-up. In the seed step, #269 produces the launch's git input, and #292
 builds the seed and checks it (D4). A failure there is a setup failure,
 refused before any journal entry, so nothing needs reconciling. The
 seed step's temporary directory is created as `materialize()` and the
@@ -1200,19 +1357,25 @@ a crash it can be left in the system temporary directory, where no
 container sees it and nothing reads it.
 
 The create step comes next because a runtime configures a container's
-binds and volumes only when it creates the container, and an exec into a
-running container cannot add one. So every bind source is journaled,
-written and proved before the container's create, and the create
-configures all of the container's mounts at once. The stage step then
-works only inside the started container: the copy-in, the stager and the
-prover. In the copy-in form nothing is bound, and the stage step's
-copy-in is the only way the seed reaches the container.
+binds, volumes and network only when it creates the container. An exec
+into a running container can neither add a mount nor change the network.
+So every bind source is journaled, written and proved before any
+container's create, and each create configures all of its container's
+mounts and its network at once.
+
+That is also why staging has a container of its own. The stager and the
+prover must be offline (D9), and the launch container's network is fixed
+at its create. The stage step works only inside the started stager
+container: the seed's copy-in, the stager and the prover. It then removes
+the stager container, and only after that starts the launch container.
+In the copy-in form nothing is bound, and the stage step's copy-ins are
+the only way the seed and the read context reach the containers.
 
 The cleanup step has two parts so that the export reads a volume that
 still exists. Its release, right after the run step, removes what holds
 the credential. Its final part runs only after the verify step's outcome
 is saved, and it removes the volume. Every container a launch creates,
-exporters included, has a journal entry before its create. A crash in
+its helper containers included, has a journal entry before its create. A crash in
 any window between those entries leaves objects that reconciliation can
 prove are the run's (D6, §7).
 
@@ -1277,6 +1440,9 @@ environment can be rebuilt (身份留在宿主机、执行环境可以重建).
 - **A replacement container gets a new projection** from the host's login.
   It never gets a restored home, a credential helper, an SSH agent, a
   GitHub token, or a copy of a database taken mid-transaction.
+- **Only the launch container gets the projection,** at its create. No
+  helper container, the stager container or an exporter, receives a
+  projected value or file (D9).
 - **A login that rotates its refresh token on use** must not have that
   token projected. The exception is a rotated result that comes back to
   the host's login through a controller-owned path, which #290 designs
@@ -1338,7 +1504,7 @@ Under the container backend:
 | every agent launch: Claude Code (text and stream-json), OpenCode, Pi RPC and its auth preflight, and the SDK helpers when they land | the controller |
 | every repository-defined command: `validation.commands` and `merge.verification_commands` | its git: fetch, push, materialize, the seed pack, the strict import |
 | `doctor`'s sandboxed `--version` of each provider | its `gh`: every GitHub read and write, effect and read-back |
-| AutoForge's helpers: the watcher, stager, prover and exporter | the runtime CLI calls of the lifecycle (D13), and `doctor`'s read-only version checks of the runtime |
+| AutoForge's helpers: the watcher as every container's PID 1; the stager and the prover in the stager container; the exporter in its own | the runtime CLI calls of the lifecycle (D13), and `doctor`'s read-only version checks of the runtime |
 | the image build, in its build container | — |
 
 **No host fallback.** Every code modification, compilation, dependency
@@ -1357,7 +1523,10 @@ applies here too: no workspace volume, model authentication only.
 
 A container host is capable when one real minimal launch proves it, of the
 same shape as a real launch (ADR 0005 D14.1's principle). Each requirement
-below is named by the probe when it is missing:
+below is named by the probe when it is missing. Items 1 and 2, with the
+pin's runtime (D8) and the local endpoint (D13), are the *runtime check*:
+the runtime's own report, read-only, creating nothing. The rest needs the
+minimal launch, whose objects the probe's journal owns (D6, item 9):
 
 1. a container runtime (Docker Engine or Podman), with its CLI on the
    controller's `PATH` and a local endpoint the operator owns;
@@ -1372,13 +1541,14 @@ below is named by the probe when it is missing:
 6. the volume writable by the agent UID, and the staging method decided
    (D12);
 7. the network position (D9): a host loopback listener and a host abstract
-   socket unreachable from the bridge, and no route under `--network none`;
+   socket unreachable from the bridge; and under `--network none`, the
+   helper containers' position, no interface but loopback and no route;
 8. the death-watch: a `SIGKILL`ed stand-in parent, and the container gone
    within #272's stated bound;
 9. the in-container deadline: a container whose stream stays open ends at
    its deadline;
-10. labels: the probe's container is found by its label and nonce, and
-    removed.
+10. labels and ownership: the probe's objects are found by their labels
+    and nonce, and removed, through the probe's own journal (D6, item 9).
 
 | Host | Level |
 |---|---|
@@ -1394,7 +1564,48 @@ below is named by the probe when it is missing:
 
 **The gate** is ADR 0005 D12.2's. Under `required`, the capability is
 established before anything of the step is saved, charged or spawned. The
-result is cached for the controller process. A dry run runs no probe.
+result is cached for the controller process. A dry run runs no probe and
+no reconciliation. It shows the run's open journal entries.
+
+**The order at a command's entry.** Recovery must not wait on a capability
+it does not need. A crashed launch's leftovers are removed even when a new
+probe failure, such as a missing image, refuses the step. So every `step`,
+`resume` and `unblock`, and a worker's start on an issue, runs these in
+order, before any launch:
+
+1. **The pin check** (D8), on configuration and state alone. A different
+   backend is refused, with nothing written.
+2. **The runtime check.** It must find a rootless runtime (D10), the one
+   the pin names (D8), or for a run not pinned yet the one D8 detects, at
+   the local endpoint (D13). A failure refuses the
+   step with nothing written: `state.json` and the journal stay
+   byte-identical, and every open entry waits for a later command.
+   Reconciliation is not attempted then. A listing from another runtime or
+   endpoint would not show this run's objects, and would be read as
+   "nothing left".
+3. **Reconciliation** (D6, item 6). It needs no more than the runtime
+   check proves: it lists, stops and removes, and never creates or starts
+   a container. It writes only the lifecycle journal, a file of its own
+   (D19). The exception is an object whose ownership it cannot prove:
+   the run then enters `BLOCKED` naming it, the command stops there, and
+   no probe runs.
+4. **The probe:** the capability items 3 to 10 above, after its sweep of
+   the checkout's dead probes (D6, item 9). A refusal here leaves
+   `state.json` byte-identical, as ADR 0005 D12.2 requires. What
+   reconciliation removed stays removed, and only the journal records
+   it.
+5. **The step**, and its launches' own steps (D13).
+
+The pin check and the runtime check refuse as D8 and D10 say. The
+runtime's report and the probe's result are cached for the controller
+process, as ADR 0005 D12.2 caches the capability. A later entry in the same
+process still compares the cached report with its own run's pin, and
+still reconciles.
+
+`doctor` runs the runtime check and then the probe, with its sweep. It
+reconciles no run, because it holds no run's lock. It reports each run's
+labelled objects that await that run's reconciliation, and each
+probe-labelled object that no journal of the checkout names.
 
 **The facts are qualified by backend** (ADR 0005 D1.2 as amended).
 `SandboxFacts` gains:
@@ -1415,7 +1626,8 @@ would hide two different sets of guarantees.
 
 | Failure | Step | Class (`errors.py`) | Outcome |
 |---|---|---|---|
-| the host is not capable | gate | `SandboxCapabilityError` | refused; nothing saved (ADR 0005 D12.2) |
+| the runtime check failing: no runtime, a rootful one, another runtime than the pin, a non-local endpoint | entry, before reconciliation (D16) | `SandboxCapabilityError`; `ConfigurationError` for another runtime than the pin | refused with nothing written: `state.json` and the journal byte-identical, and the open entries kept for a later command |
+| the probe failing: a capability item past the runtime check, a missing image included | gate, after reconciliation (D16) | `SandboxCapabilityError` | refused; `state.json` byte-identical (ADR 0005 D12.2); reconciliation's removals stay done, recorded in the journal only |
 | a policy refusal | plan | `SandboxPolicyError`, raised as `SandboxLaunchRefusedError` | a launch refusal |
 | the seed failing its checks: `index-pack --strict`, its connectivity (its tag set included), its size or object-count bound (D4) | seed, before any journal entry | `SandboxLaunchRefusedError` | a setup failure, refused before any journal entry: nothing is created and nothing needs reconciling |
 | create, stage or prover failure: the staging root failing its write, its seed's digest check or its tree proof, a create or start failing, the seeded repository failing its checks (D2), the image missing | create, stage | `SandboxLaunchRefusedError` | a setup failure (ADR 0005 D10.8): charged after the gate, never an agent result |
@@ -1423,10 +1635,12 @@ would hide two different sets of guarantees.
 | the command ended by something the executor did not send: an OOM kill inside, a container killed from outside, PID 1's deadline | run | the command's abnormal end | the existing failure path |
 | a limit or a stop | run | as today (`ExecutionTimeoutError`) | as today; `close()` ends the namespace |
 | the export fails (its exporter still failing to start after its bounded retries, ending at its deadline, or overrunning the artifact's bound), or the artifact is malformed, inconsistent with its manifest, or its manifest disagrees with the launch's git input (D4) | export, verify | a candidate refusal (`ObjectImportError`) | as today's import failure; the volume is removed only after this outcome is saved |
-| an ambiguous create, of the launch container, the volume or an exporter | create, export | — | reconciled by label and nonce first; then a refusal |
+| an ambiguous create, of the launch container, the stager container, the volume or an exporter | create, export | — | reconciled by label and nonce first; then a refusal |
+| an ambiguous create of a probe's object, or a probe that crashed | probe | — | its journal's entries are swept by the next probe or `doctor` (D6, item 9); the gate refuses only on the capability it measured |
+| a probe-labelled object that no journal of the checkout names | sweep, `doctor` | reported | never removed; it blocks no run |
 | a clean-up failure, in either part | cleanup | reported | the entry stays for reconciliation |
 | ownership that cannot be proven | reconcile | `BLOCKED` | names the object; never removed |
-| a different backend or runtime than the pin | entry | `ConfigurationError` | refused; nothing written |
+| a different backend than the pin | entry, the pin check (D16) | `ConfigurationError` | refused; nothing written |
 
 A child that adds a stop sink or a reason code does so through ADR 0011's
 process. This record assigns none. A listing error during reconciliation is
@@ -1464,7 +1678,7 @@ guarantees, against G1 to G6:
 | root | rootless only (D10); a non-root agent UID mapped to a subordinate UID; no capabilities | a kernel, runc or crun exploit lands as the operator's UID, which is outside the threat model, as kernel and `bwrap` exploits are |
 | the filesystem | no host path but the bind sources (D12); the root filesystem read-only; per-launch volumes | the image's content and the base image's provenance are the operator's to choose |
 | the network | its own namespace; host loopback and abstract sockets unreachable | general egress and DNS (#294) |
-| secrets | a projection per launch; no GitHub credential anywhere; values never on an argv | every tool in the container can read the projected model credential (ADR 0005 D7.4); an environment value persists in the runtime record until removal (D14) |
+| secrets | a projection per launch, on the launch container only, never on a helper container (D14); no GitHub credential anywhere; values never on an argv | every tool in the container can read the projected model credential (ADR 0005 D7.4); an environment value persists in the runtime record until removal (D14) |
 | repository hooks | the repository's hooks, filters and configuration run only inside, under the agent's own git; the host never runs git over the container's repository (D5); no repository container configuration is read (D7) | none on the host |
 
 **Out of scope, as in ADR 0005:** kernel and runtime exploits, a malicious
@@ -1516,13 +1730,19 @@ is ready.
 - **#272:** the lifecycle journal. It has one entry per created object
   (names, labels, nonce, kind, stage), written atomically before the
   create and closed after a verified removal. The kinds are the launch
-  container, the volume, each exporter, the credential projection, the
-  staging root and the export directory, and each entry names its launch. It goes in `state.json` or
-  in a file of its own under the run's state directory; #272 chooses, on
-  #23. Either way it is controller intent, never a liveness signal.
-  Reconciliation reads it for one decision only: which labelled objects
-  are the run's to remove, and which block the run because no entry
-  matches them (D6).
+  container, the stager container, the volume, each exporter, the
+  credential projection, the staging root and the export directory, and
+  each entry names its launch.
+  - It is a file of its own under the run's state directory, never part
+    of `state.json`. Reconciliation writes it before the probe (D16), and
+    a refusal at the probe must still leave `state.json` byte-identical
+    (ADR 0005 D12.2). It also keeps the many writes of a launch's
+    lifecycle out of the state file. An earlier revision of this record
+    left the choice between `state.json` and a file of its own to #272.
+    This one makes it, and #272 names the file and its format, on #23.
+  - It is controller intent, never a liveness signal. Reconciliation reads
+    it for one decision only: which labelled objects are the run's to
+    remove, and which block the run because no entry matches them (D6).
 - **#269:** the candidate-source binding: the exported candidate bound to
   the run, the phase entry's carried commit, and the seed's identity. The
   seed's identity is the persisted part of the launch's git input (D4).
@@ -1531,6 +1751,13 @@ is ready.
   the end of the seed step, before the launch's first journal entry and so
   before the stage step, and a `resume` checks the artifact against the
   same binding.
+
+**Not state: a probe's journal** (D6, item 9). It lives in the probe's
+directory, `<git common dir>/autoforge/sandbox/probe/<probe id>`, belongs
+to no run, and nothing reads it but the sweep. Like the lock files under
+`<git common dir>/autoforge`, it is a runtime artifact of the checkout,
+gone once its probe or a sweep is done. It carries a format field of its
+own, enters no state file, and needs no protocol number.
 
 The runtime's objects (containers, volumes, images) are not state; the
 runtime holds them. The run log gains additive facts (D16) and stays
@@ -1563,26 +1790,35 @@ sequenceDiagram
     participant J as Journal (state dir)
     participant X as Executor (host)
     participant R as Runtime CLI (host)
-    participant C as Container (PID 1 watcher)
+    participant S as Stager container (PID 1 watcher)
+    participant C as Launch container (PID 1 watcher)
     participant G as Controller git (host)
-    E->>E: gate: the probe, cached per process (D16)
-    E->>E: reconcile this run's leftovers (D6)
+    Note over E,R: entry: the pin check, then the runtime check, read-only (a failure refuses with nothing written)
+    E->>R: runtime check: version and info, rootless, the pinned runtime, the local endpoint
+    E->>R: reconcile this run's leftovers by label and nonce (D6), writing only the journal
+    E->>E: gate: the probe, after its sweep of dead probes, cached per process (D16)
     E->>G: REVIEW and FIX: the bound HEAD and merge base fetched and checked in the shared store (D4)
     Note over E,G: seed step: nothing of the launch is journaled yet
     E->>E: the launch's git input (D4): phase, launch, repository, seed commit, lower boundary, carried commit
     E->>G: seed pack and manifest (tag refs only with history_tags on) into a temporary directory, filters never applied
     E->>G: the seed's checks: index-pack --strict, connectivity to its boundaries, its bounds (a failure is refused here)
     E->>E: the manifest's digest completes the git input, saved as the seed's identity
-    Note over E,R: create step: every bind source exists before the container's create
-    E->>J: one atomic write: entries for the staging root (bind form), the projection, the volume and the launch container, with run key, issue, phase, launch id, nonce, names
+    Note over E,R: create step: every bind source exists before any container's create
+    E->>J: one atomic write: entries for the staging root (bind form), the projection, the volume, the stager container and the launch container, with run key, issue, phase, launch id, a nonce each, names
     E->>G: bind form: the staging root written (the seed, its digest checked against the input, and the read context), its tree materialized and proved
-    E->>R: create the volume, then the container with every mount: /source read-only (bind form), /workspace, the projection (labels and nonce, no restart policy)
+    E->>R: create the volume, then the stager container: --network none, /workspace, /source read-only (bind form), no projection
+    E->>R: create the launch container: its network (D9), /workspace, /source read-only (bind form), the projection. Labels and nonces, no restart policy, neither container started
     R-->>E: created (ambiguous: reconcile by label and nonce)
-    E->>R: start PID 1 on the liveness stream, whose write end stays with the engine
-    Note over E,C: stage step: inside the started container only
-    E->>R: copy-in form only: the seed (its digest checked against the input) and the read context copied in
-    R->>C: stager exec (no filter, attribute rewrite or hook), then prover exec: /workspace proved against the seed tree id, and /workspace/.git against the ref set, both supplied by the engine
-    C-->>E: the prover's verdict (a mismatch is a setup failure)
+    Note over E,S: stage step: inside the stager container only
+    E->>R: start the stager container: PID 1 on a liveness stream of its own, the staging deadline
+    E->>R: copy-in form only: the seed (its digest checked against the input) copied into the stager container
+    R->>S: stager exec (no filter, attribute rewrite or hook), then prover exec: /workspace proved against the seed tree id, and /workspace/.git against the ref set, both supplied by the engine
+    S-->>E: the prover's verdict (a mismatch is a setup failure)
+    E->>J: stager container removal intent
+    E->>R: remove the stager container
+    E->>J: its entry closed
+    E->>R: start the launch container: PID 1 on the liveness stream, whose write end stays with the engine
+    E->>R: copy-in form only: the read context copied into the launch container
     E->>X: run: the provider's prepared launch
     X->>R: attached exec as the agent UID (own stdio, never the liveness stream)
     R->>C: agent runs, commits on its detached HEAD
@@ -1624,13 +1860,14 @@ sequenceDiagram
     N->>N: reads its journal entries
     N->>R: list objects labelled with this run key
     alt labels and nonce match an entry
-        N->>R: remove the container (an exporter included), volume and projection
+        N->>R: remove the container (a helper container included), volume and projection
         N->>N: remove the staging root and export directory, the artifact never imported
         N->>N: close the entry
     else this run's labels, no matching entry or nonce
         N->>N: BLOCKED, naming the object (never force-removed)
     end
     Note over N: Reconciliation never exports, imports or starts a container (D4, D6)
+    Note over N: A probe's objects carry no run key: the next probe's sweep removes a dead prober's (D6, item 9)
 ```
 
 ### 3.3 Identity: projecting, destroying and re-creating
@@ -1656,9 +1893,10 @@ sequenceDiagram
 
 ## 4. Docker Engine, Podman, and remote execution sandboxes
 
-None of the rows below was measured for this record. The facts are each
-runtime's documented design and #267's planning comments. The last column
-says what follows for AutoForge.
+None of the rows below was measured on a container for this record. The
+facts are each runtime's documented design and #267's planning comments.
+One was checked without a container: Podman 5.4.2's `exec` parser refuses
+`--network` (D9). The last column says what follows for AutoForge.
 
 | | Docker Engine (rootless) | Podman (rootless) | Remote execution sandbox (#276, #277) |
 |---|---|---|---|
@@ -1669,7 +1907,8 @@ says what follows for AutoForge.
 | Bind of a host path | where the daemon shares the filesystem; proven by nonce (D12) | the same | never; copy-in only |
 | Network | RootlessKit | pasta or slirp4netns | the service's |
 | In the MVP | yes (#271 to #273) | yes (#275) | no |
-| What follows here | D6's journal and death-watch, D10's rootless check, D12's proof | the same contract; detected first when both are present (D8) | copy-in (D12) and D6's contract hold, and a new trusted party needs its own record |
+| Exec with a network of its own | not offered | not offered; `exec` refuses `--network` (5.4.2, D9) | the service's |
+| What follows here | D6's journal and death-watch, D10's rootless check, D12's proof, D9's helper containers | the same contract; detected first when both are present (D8) | copy-in (D12) and D6's contract hold, and a new trusted party needs its own record |
 
 ## 5. The invariant map
 
@@ -1734,7 +1973,7 @@ sections. The tests named in the header check this.
 | D6.7 | **preserved** | the container path exposes less (D11) |
 | D7.1, D7.2, D7.3, D7.4 | **preserved** | D14: D7.2 stands, so copy-in runtimes deliver only `env` credentials |
 | D8.1, D8.2, D8.3 | **preserved** | a private home per launch inside the container; path-valued names rewritten to container paths |
-| D8.4 | **amended** | [§11](0005-outer-sandbox-and-host-resource-capability-model.md#11-amendment-the-container-backend-267-2026-11-08): the staging root, the export directory and the per-launch runtime objects are removed by the controller, the volume only after the verify step; the cache volume keeps the never-delete rule |
+| D8.4 | **amended** | [§11](0005-outer-sandbox-and-host-resource-capability-model.md#11-amendment-the-container-backend-267-2026-11-08): the staging root, the export directory and the per-launch runtime objects are removed by the controller, the volume only after the verify step; a probe's directory and objects by its prober, or by the next sweep (D6, item 9); the cache volume keeps the never-delete rule |
 | D8.5 | **preserved** | #273 adds volumes and images to the list |
 | D9.1 | **amended** | [§11](0005-outer-sandbox-and-host-resource-capability-model.md#11-amendment-the-container-backend-267-2026-11-08): the container's own network namespace (D9) |
 | D9.2, D9.3 | **preserved** | mapped to `--network none` and kept as rows (D9) |
@@ -1743,12 +1982,12 @@ sections. The tests named in the header check this.
 | D10.4 | **preserved** | additive, backend-qualified facts (D16) |
 | D10.7, D10.8 | **preserved** | duplex through the exec session; a setup failure is a refusal (D17) |
 | D11.1 | **preserved** | a provider-native sandbox may fail inside a container (#270 measures it), and it is never the boundary |
-| D12.1, D12.2 | **preserved** | the mode and the gate are unchanged; the gate runs the selected backend's probe |
+| D12.1, D12.2 | **preserved** | the mode and the gate are unchanged; the gate runs the selected backend's probe. Reconciliation runs between the read-only runtime check and the rest of the probe, and writes only the lifecycle journal, a file of its own, so a refusal still leaves `state.json` byte-identical (D16, D19) |
 | D12.3 | **amended** | [§11](0005-outer-sandbox-and-host-resource-capability-model.md#11-amendment-the-container-backend-267-2026-11-08): the pin also holds the backend and the runtime (D8) |
 | D12.4 | **preserved** | #273 adds the container's rows |
 | D13.1 | **amended** | [§11](0005-outer-sandbox-and-host-resource-capability-model.md#11-amendment-the-container-backend-267-2026-11-08): providers declare an image-provided CLI (D7, D13) |
 | D13.2, D13.3, D13.4, D13.5 | **preserved** | the same placement; a new module is the only place that knows a runtime flag (D13) |
-| D14.1 | **amended** | [§11](0005-outer-sandbox-and-host-resource-capability-model.md#11-amendment-the-container-backend-267-2026-11-08): the container's own probe and table (D16) |
+| D14.1 | **amended** | [§11](0005-outer-sandbox-and-host-resource-capability-model.md#11-amendment-the-container-backend-267-2026-11-08): the container's own probe and table (D16); the probe's runtime objects and directory are journaled before they are made, and a crashed prober's are swept (D6, item 9) |
 | D14.2 | **preserved** | a backend that cannot run refuses |
 | D15.1, D15.2, D15.3 | **preserved** | an absent `sandbox.backend` means bwrap; a backend switch is refused through D12.3 as amended |
 | D15.4 | **amended** | [§11](0005-outer-sandbox-and-host-resource-capability-model.md#11-amendment-the-container-backend-267-2026-11-08): refused under the container backend (D7) |
@@ -1826,19 +2065,21 @@ operator posts and the controller verifies: what the child delivers, what
 it depends on, and what it completes without, as given here. A summary on
 #266 is not such a note for any other child. Where a child's body and
 this table disagree, the table still decides (§2), but that rule is not
-evidence of alignment either.
+evidence of alignment either. When a later revision changes a child's row,
+an earlier note on that child is supplemented by a new one on the same
+issue, which names what changed.
 
 | Order | Child | Delivers (decisions) | Completes without |
 |---|---|---|---|
-| 1 | #268 | the backend-neutral lifecycle interface, its steps in D13's order: the seed step before any journal entry, every bind source journaled and made before the container's create, the stage step only inside the started container; bwrap behind it, unchanged; backend-qualified `SandboxFacts` (D13, D16's facts) | any runtime |
-| 2 | #292 | the seed pack and manifest, built from the bound revision with its merge base and boundary parents; the seed's own checks and bounds; the seed built and checked in the seed step, in a temporary directory, before any journal entry; the materialized staging root and its proof, for the bind form, written after its journal entry and before the container's create; staging on the host with no checkout, filter or hook; the history settings, and with `history_tags` on the tag set the manifest names (D2, D4's seed contents and checks, D11, D12's staging) | #271: tested on the bwrap path and with fakes |
+| 1 | #268 | the backend-neutral lifecycle interface and the engine's sequence of it: at a command's entry the runtime check, reconciliation and the probe, in D16's order; the seed step before any journal entry; every bind source journaled and made before any container's create; the stager container and the launch container each created with all its mounts and its network; the stage step only inside the stager container, which is removed before the launch container starts; bwrap behind it, unchanged; backend-qualified `SandboxFacts` (D13, D16's order and facts) | any runtime |
+| 2 | #292 | the seed pack and manifest, built from the bound revision with its merge base and boundary parents; the seed's own checks and bounds; the seed built and checked in the seed step, in a temporary directory, before any journal entry; the materialized staging root and its proof, for the bind form, written after its journal entry and before any container's create; staging on the host with no checkout, filter or hook; the history settings, and with `history_tags` on the tag set the manifest names (D2, D4's seed contents and checks, D11, D12's staging) | #271: tested on the bwrap path and with fakes |
 | 2 | #269 | the candidate source: bwrap's, unchanged, and the artifact import with its refusals; the launch's git input for every phase, produced in the seed step, whose manifest digest binds the seed's commits and its tag set; verify's comparison of the manifest with it; `REVIEW` and `FIX` seeding from the revision bound to the round or the entry, another actor's push included; the carried commit; the export bound (D4, D5) | a runtime and #292: tested with packs and manifests built in temporary repositories |
 | 2 | #270 | the container security policy, the network mapping, the credential-delivery mechanisms, each configured at the container's create, and the threat-model text with the closed set of bind sources (D9, D10, D12's bind sources, D14's mechanisms, D18) | #290: tested with fake credentials |
 | 3 | #290 | each provider's mapping and refresh story (D14) | #271: specified against #270's mechanisms |
-| 4 | #271 | the container module, the image contract and build, runtime detection, the shared-filesystem probe, the helpers, the container prompts, and validation in a container: every mount configured at the container's create, nothing bound into a running one; the compiler's `/source` relocation (ADR 0005 D4.2's C7 as amended); the copy-in at the stage step; the stager's checkout with no filter, attribute rewrite or hook, and its tag refs; the prover's hand-off proof (the only tree proof in the copy-in form) and its checks of the seeded repository against the ref set the engine passes, the submodule, LFS and sparse-checkout diagnostics, P's and the records' container inputs (D2's container side, D7, D8's detection, D12, D15; ADR 0005 D4.2 and ADR 0006 D6.3, D8.1 and D8.2 as amended) | #272: `container` stays refused at load |
-| 5 | #272 | the journal, its one atomic write for the bind sources, the volume and the container before any of them is made, labels, death-watch transport, in-container deadline, the exporter's entry and supervision, the release and the final clean-up around the export, reconciliation, and the measured bound (D6) | #273 |
-| 6 | #273 | `sandbox.backend`, the pin's schema, `doctor` and dry-run reporting, the refusals (D8, D10's refusal, D16, D19) | #274 |
-| 7 | #275 | rootless Podman: its adapter differences, and #272's lifecycle tests on Podman (D8, D16) | #274 |
+| 4 | #271 | the container module, the image contract and build, runtime detection, the shared-filesystem probe, through the probe's own journal, the helpers, the container prompts, and validation in a container: every mount configured at the container's create, nothing bound into a running one; the compiler's `/source` relocation (ADR 0005 D4.2's C7 as amended); the stager container (the stager and the prover offline in a helper container with no projection, D9) and its staging bound; the copy-ins at the stage step; the stager's checkout with no filter, attribute rewrite or hook, and its tag refs; the prover's hand-off proof (the only tree proof in the copy-in form) and its checks of the seeded repository against the ref set the engine passes, the submodule, LFS and sparse-checkout diagnostics, P's and the records' container inputs (D2's container side, D7, D8's detection, D9's helper position, D12, D15; ADR 0005 D4.2 and ADR 0006 D6.3, D8.1 and D8.2 as amended) | #272: `container` stays refused at load |
+| 5 | #272 | the journal, a file of its own beside `state.json`, and its one atomic write for the bind sources, the volume and both containers before any of them is made; labels, death-watch transport, in-container deadline; the helper containers' entries and supervision, the stager container's and each exporter's; the release and the final clean-up around the export; reconciliation; the probe journal, its lock and its sweep; and the measured bound (D6, D19) | #273 |
+| 6 | #273 | `sandbox.backend`, the pin's schema, `doctor` and dry-run reporting, the refusals, and the order at a command's entry that places them: the pin check and the runtime check before reconciliation, the probe after it; `doctor`'s reports of runs' leftovers and of probe objects no journal names (D8, D10's refusal, D16, D19) | #274 |
+| 7 | #275 | rootless Podman: its adapter differences, among them an `exec` with no network option of its own, which the helper containers answer (D9); the real-runtime tests of #270, #271 and #272 on Podman, the helpers' network and the probe's crash windows included (D8, D9, D16) | #274 |
 | 8 | #274 | the end-to-end proof on rootless Docker and rootless Podman: the MVP gate (D20) | — |
 | later | #294, #276, #277, #278 | egress mediation; remote execution sandboxes; session continuity | — |
 
@@ -1856,18 +2097,26 @@ itself as skipped otherwise, never as passed.
   removing the volume before the verify step's outcome is saved, and
   calling `close()` on every exit path, `KeyboardInterrupt` and an
   exception inside the guard included.
-  - **The order of the first steps.** A fake runtime that accepts a bind or
-    a volume only in its create call, as Docker and Podman do, records:
-    - no journal entry and no runtime call before the seed step has
-      finished, and none at all when it fails;
-    - the entries of the staging root, the projection, the volume and the
-      container in one write, before the staging root is written;
-    - the staging root written and proved before the volume's create, and
-      the volume's create before the container's;
-    - every bind and volume in the container's create call, and no exec,
-      copy or other call afterwards that adds one;
-    - the start after the create, and the stage step's copy-in (copy-in
-      form only), stager and prover only after the start.
+  - **The order of the first steps.** A fake runtime that accepts a bind,
+    a volume or a network only in its create call, as Docker and Podman
+    do, records:
+    - at a command's entry, the runtime check, then reconciliation, then
+      the probe, and nothing of a launch before them;
+    - no journal entry and no runtime call of the launch before the seed
+      step has finished, and none at all when it fails;
+    - the entries of the staging root, the projection, the volume, the
+      stager container and the launch container in one write, before the
+      staging root is written;
+    - the staging root written and proved before the volume's create, the
+      volume's create before the stager container's, and that before the
+      launch container's;
+    - every bind, volume and network in each container's create call, and
+      no exec, copy or other call afterwards that adds or changes one;
+    - the stager container created with `--network none` and no
+      projection, and only the launch container with the projection;
+    - the stager container's start, the seed's copy-in (copy-in form
+      only), the stager's exec and the prover's, and the stager
+      container's removal, all before the launch container's start.
 - **#292.** The seed carries exactly the commits D11 names. With the
   settings unset it has no tag, no other ref and no reflog. The staging
   root fails its proof after a byte is changed on the host.
@@ -2015,6 +2264,21 @@ itself as skipped otherwise, never as passed.
     `/source` target, as today.
   - **Binds at the create.** Real runtime: the staging root bound at the
     create is the one the prover reads. Nothing is bound after the start.
+  - **The helpers' network.** Real runtime, on rootless Docker and on
+    rootless Podman (#275), for an agent launch and for an export command
+    on `*_network: host`, whose launch containers are on the bridge. The
+    test runs inside the stager's exec and the prover's exec in the
+    stager container, and inside the exporter. In each:
+    - the only network interface is loopback, and there is no route;
+    - a nonce listener on a LAN address of the host sees no connection,
+      and neither does the host loopback nonce listener;
+    - the fake credential's sentinel is in neither the environment nor
+      the file system.
+
+    From the agent's exec in the launch container, the same LAN listener
+    is reached, which is D9's stated residual, and the host loopback
+    listener is not. So the test shows the network each step actually
+    has, not the one its configuration names.
   - **The tree proof in each form.** A byte changed in `/workspace`
     between the stager and the prover fails the proof in both forms.
     - The copy-in form stages no tree on the host.
@@ -2035,12 +2299,17 @@ itself as skipped otherwise, never as passed.
   - while the staging root is written or proved, and after it is written
     and before the volume's create, where the staging root is removed and
     was never bound;
-  - between the volume's create and the container's create;
-  - between the create and the start;
+  - between the volume's create and the stager container's, and between
+    the stager container's create and the launch container's;
+  - between the creates and the stager container's start, where neither
+    container ever ran, so no watcher ended either and `--rm` never fired;
   - during the stage step, a copy-in, the stager or the prover running,
-    where the watcher ends the container within the stated bound and the
-    container, the volume, the projection and the staging root are
-    removed;
+    where the stager container's watcher ends it within the stated bound,
+    and both containers, the volume, the projection and the staging root
+    are removed;
+  - after the prover's verdict and during the stager container's removal;
+  - after that removal and before the launch container's start, where the
+    launch container never ran;
   - after the run and during the release;
   - after the release and before the exporter's entry;
   - **the exporter's creation:** between its entry and its create, where
@@ -2057,6 +2326,28 @@ itself as skipped otherwise, never as passed.
     candidate is never bound;
   - during the final clean-up.
 
+  **A probe's windows** (D6, item 9), for the gate's probe and for
+  `doctor`'s in a checkout with no run, each reconciled by the next sweep,
+  which leaves nothing of the probe:
+  - between the probe directory's creation and its lock file's, and
+    between the lock and the journal's write, where only the directory is
+    removed, under L1 in the first case;
+  - between the journal's write and the first create, where the entries
+    name no object and only the directory is removed;
+  - between a probe container's create and its start, where no watcher
+    ran and `--rm` never fires, and the sweep finds the container by label
+    and nonce and removes it;
+  - while a probe container runs, with the prober `SIGKILL`ed, where the
+    watcher ends the container at the stream's end of file, or at the
+    probe's deadline once the stand-in parent's own deadline has passed;
+  - during the probe's own removal of its objects and its directory.
+
+  A sweep never touches a probe whose journal a live process holds locked:
+  a `doctor` running beside a gate's probe, and the reverse. A
+  probe-labelled object that no journal of the checkout names is reported
+  and left in place. A second sweep is a no-op. No run's reconciliation
+  lists a probe's object.
+
   Fake runtime:
   - On every exit path of the run step (success, failure, timeout, stop,
     `Ctrl-C`, an exception inside the guard), no removal of the volume is
@@ -2064,6 +2355,8 @@ itself as skipped otherwise, never as passed.
     export is skipped.
   - The exporter reads a volume whose launch container has already been
     removed.
+  - The launch container never starts while the stager container exists,
+    and never after a failed stage.
   - An exporter that fails to start is retried within bounds, each attempt
     under a new entry and nonce, and then the export is a candidate
     refusal.
@@ -2075,12 +2368,39 @@ itself as skipped otherwise, never as passed.
   `container` are refused at load. A rootful runtime is refused with state
   byte-identical. A schema-1 pin loads as bwrap. A different backend or
   runtime is refused with nothing written, `--accept-config-change`
-  included. The dry run launches nothing, the probe included. Every
-  surface names the backend.
-- **#275.** #272's real-runtime tests run on Podman.
+  included. The dry run launches nothing, the probe and reconciliation
+  included, and shows the open journal entries. Every surface names the
+  backend.
+  - **Recovery before a failing probe.** A launch of the run crashed and
+    left its launch container, its volume and its staging root. Then:
+    - with the image removed, the next `resume` runs the runtime check,
+      removes the leftovers by label and nonce, and is refused at the
+      probe, naming the image. `state.json` is byte-identical to its bytes
+      before the command, and the journal records only the removals;
+    - with a death-watch proof that fails (D16, item 8), the outcome is
+      the same;
+    - with the runtime missing, rootful, or another runtime than the pin,
+      the command is refused before reconciliation. `state.json` and the
+      journal are byte-identical, and the leftovers stay. Once the runtime
+      is back, the next command's reconciliation removes them;
+    - with a leftover whose nonce no entry holds, the run enters
+      `BLOCKED` naming it, and no probe runs.
+  - **`doctor` with no run.** In a checkout with no run, `doctor` sweeps a
+    dead probe's objects, runs its own probe, and leaves nothing behind.
+    It reports, and does not remove, a probe-labelled object that no
+    journal of the checkout names, and a run's labelled objects that
+    await that run's reconciliation.
+- **#275.** The real-runtime tests of #270, #271 and #272 run on rootless
+  Podman, #271's helpers' network and #272's probe windows included.
+  Podman's `exec` takes no network option, so the test of the helpers'
+  network also shows that their offline position is the stager
+  container's and the exporter's, never an exec's.
 - **#274.** One scripted REMOTE loop per runtime, end to end, with the
   exact candidate and base SHAs recorded, failures observed from outside,
-  and the redaction checked.
+  and the redaction checked. Each loop also kills the controller with
+  `SIGKILL` during a launch and resumes it. The container is gone within
+  #272's bound, the resume's reconciliation removes what is left, a second
+  resume finds nothing, and the loop completes.
 
 ## 8. What does not change
 
@@ -2121,6 +2441,9 @@ itself as skipped otherwise, never as passed.
   crosses launches, and a crashed launch's committed work is lost (D4).
 - **A killed controller's container survives for a bounded time** (D6).
   Docs and diagnostics say so and never claim immediate death.
+- **Each launch starts one more container,** the stager container, so that
+  staging runs offline and without the credential (D9). That costs a
+  container's create, start and removal per launch, which #271 measures.
 - **Repository tests that need nested containers or user namespaces** may
   fail inside: the agent has no capabilities. #270 measures this, and
   until then it is not claimed either way.

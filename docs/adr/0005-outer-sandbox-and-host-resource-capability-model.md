@@ -2147,6 +2147,10 @@ preserved.
     it. In addition, `/source` neither equals, contains nor lies inside
     the target of any other mount of the launch.
 
+  A probe's minimal launch (ADR 0013 D16) binds its own staging root at
+  `/source` under the same rules, with the probe's directory (D8.4 below)
+  in place of the issue's sandbox directory.
+
   D4.3's forbidden sources apply to it as to every projection. Every
   other projection keeps C7 as written: it appears at its host path, or
   at one of the private-home paths C7 lists. A credential file that
@@ -2186,7 +2190,7 @@ preserved.
   retried, nothing published, a candidate refusal under the phase's rules.
   The input changes from a host private object directory to an untrusted
   pack and manifest that the container produced (ADR 0013 D5).
-- **D8.4.** Three kinds of object are added:
+- **D8.4.** Four kinds of object are added:
   - the per-launch staging root,
     `<git common dir>/autoforge/sandbox/<key>/stage/<launch id>`. Only the
     controller writes it, the launch sees it read-only, and the controller
@@ -2197,16 +2201,23 @@ preserved.
     file of fixed name that no container sees. The controller removes it
     after the verify step, and reconciliation removes a leftover one
     without importing it;
-  - the runtime's per-launch objects: the launch container, each exporter,
-    the `/workspace` volume and the credential projection. The controller
-    removes them through the runtime, journaled. The volume goes only
-    after the verify step's outcome is saved (ADR 0013 D3, D6).
+  - the runtime's per-launch objects: the launch container, the stager
+    container, each exporter, the `/workspace` volume and the credential
+    projection. The controller removes them through the runtime,
+    journaled. The volume goes only after the verify step's outcome is
+    saved (ADR 0013 D3, D6);
+  - the per-probe directory,
+    `<git common dir>/autoforge/sandbox/probe/<probe id>`. It holds a
+    probe's journal and its staging root, and no agent writes it. The
+    process that ran the probe removes it with the probe's runtime
+    objects, and a later probe's sweep removes a dead prober's
+    (ADR 0013 D6).
 
   "Never deleted by AutoForge" still holds for the per-issue cache volume
   and for every directory the table above lists. The rationale against
   deleting, that the controller would walk and delete agent-written trees,
-  does not arise. The staging root and the export directory are never
-  written by an agent. The runtime removes a volume without the controller
+  does not arise. The staging root, the export directory and a probe's
+  directory are never written by an agent. The runtime removes a volume without the controller
   walking it.
 - **D9.1.** A container launch has a network namespace of its own on the
   runtime's rootless bridge, never the host's. Host loopback and host
@@ -2242,6 +2253,14 @@ preserved.
 - **D14.1.** Capability is still established by a real minimal launch of
   the same shape, with the container's own requirements and table
   (ADR 0013 D16). The table above is bwrap's.
+  - Unlike bwrap's, the container's probe writes outside a temporary
+    directory: it creates runtime objects, and a probe directory under
+    the common dir (D8.4 above). Each object has a journal entry before it
+    is made and is removed afterwards. A crashed prober's are removed by
+    the next probe's sweep or `doctor`'s (ADR 0013 D6).
+  - A read-only runtime check comes first. A run's reconciliation runs
+    between it and the rest of the probe, so a new probe failure does not
+    keep an earlier launch's leftovers in place (ADR 0013 D16).
 - **D15.4.** `sandbox.read_only_paths` is refused under the container
   backend, which binds no host path. Toolchains come from the base image
   (ADR 0013 D7).

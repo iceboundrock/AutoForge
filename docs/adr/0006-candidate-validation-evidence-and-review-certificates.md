@@ -686,11 +686,12 @@ inconclusive, never a record (D10.5).
 *Amended by #267 (2026-11-08), for the container backend only
 ([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D2; in effect once #273 makes that backend
 selectable).* A container validator does not run in the directory this
-walk proved. It runs in a writable copy of the staged tree, inside its
-container. So the same walk also runs there, on the tree the command will
-run in, before any repository code has run in that container. AutoForge's
-own prover runs it, from the image, at the controller's version
-(ADR 0013 D7). That is AutoForge's code, not the controller process, and
+walk proved. It runs in a writable copy of the staged tree, in the
+launch's volume. So the same walk also runs on that copy, the tree the
+command will run in, before the command's container starts. It runs in
+the launch's stager container, which mounts the same volume, is offline,
+and runs no repository code (ADR 0013 D2, D13). AutoForge's own prover
+runs it, from the image, at the controller's version (ADR 0013 D7). That is AutoForge's code, not the controller process, and
 no git process or configuration takes part. Its verdict reaches the
 controller on the prover's exec output, and a mismatch is a
 materialization failure, as here. Where the runtime binds the staging root,
