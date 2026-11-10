@@ -112,6 +112,7 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/effect_ops.py": (*LOOP, "test_replan", "test_merge_branch"),
     "src/autoforge/effects.py": LOOP,
     "src/autoforge/evidence.py": (*LOOP, "test_unblock"),
+    "src/autoforge/git_input.py": ("test_sandbox_lifecycle", "test_candidate_source"),
     "src/autoforge/git_transport.py": (*LOOP, "test_replan", "test_validation_gates"),
     "src/autoforge/git_workspace.py": LOOP,
     "src/autoforge/interaction.py": LOOP,
@@ -129,6 +130,8 @@ COVERAGE: Mapping[str, Entry] = {
     # -- the package: one feature each ----------------------------------------
     "src/autoforge/AGENTS.md": ("test_packaging",),  # package data or deliberately not
     "src/autoforge/CLAUDE.md": ("test_packaging",),
+    "src/autoforge/candidate_artifact.py": ("test_candidate_source", "test_sandbox_lifecycle"),
+    "src/autoforge/candidate_source.py": ("test_sandbox_lifecycle", "test_engine_sandbox"),
     "src/autoforge/claude_stream.py": ("test_providers",),
     "src/autoforge/cli.py": (),
     "src/autoforge/config_fingerprint.py": ("test_cli",),

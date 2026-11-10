@@ -651,6 +651,10 @@ GIT_WRITES = {
 GUARDED = {
     ("git_transport.py", "fetch"): "fetch",
     ("agent_worktree.py", "import_private_objects"): "index-pack",
+    ("candidate_artifact.py", "_publish"): "index-pack",
+    # The quarantine's own index of an exported pack: written beside the pack
+    # in the controller's temporary directory, nothing in the common dir (#269).
+    ("candidate_artifact.py", "_index_in_quarantine"): "index-pack",
     ("engine.py", "_ensure_agent_worktree_unlocked"): "worktree",
     # A private GIT_DIR and no local ref: nothing in the common dir (D12.1).
     ("git_transport.py", "push"): "push",

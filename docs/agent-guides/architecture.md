@@ -663,8 +663,61 @@ test pins it):
   is a protocol, `LifecycleJournal`; until #272 stores one, the engine's
   is `NO_JOURNAL`, which refuses every write, so a backend that makes an
   object is refused before it makes one. The verify step is a protocol
-  too, `CandidateSource` (`verify()`, then `save()`); until #269's exists,
-  the engine's is `NO_CANDIDATE_SOURCE`, which refuses every artifact.
+  too, `CandidateSource` (`verify()`, then `save()`); the engine's is
+  #269's `ArtifactCandidateSource` (below). At the end of the seed step,
+  for a backend that seeds (not bwrap, whose `NO_SEED` binds nothing),
+  `establish()` completes the launch's git input with the seed manifest's
+  digest, which must be the one the seed step names, and hands it to the
+  engine to save (`on_seed`), before any journal entry; the seed is then
+  handed on only while its manifest still has that digest, checked before
+  the create step and again before the stage step, so a seed swapped
+  after the input was bound never reaches a container.
+
+**The candidate source and the launch's git input (ADR 0013 D4, D5;
+#269)**, in three modules:
+
+- **`git_input.py`** (plain data, executor layer): `LaunchGitInput`, one
+  launch's bound revision, typed and immutable: the phase, the launch's
+  identity (run key, issue, launch id), the repository and its object
+  format, the expected seed commit, its lower boundary (the bound merge
+  base for `REVIEW` and `FIX`, the base otherwise, none for an export
+  command), the carried commit and, once the seed is built, the seed
+  manifest's digest (`with_seed_manifest()`, once). Its `entry` is what
+  every relaunch of one phase entry shares (run, issue, phase, seed,
+  lower, and the engine's `entry_label`: the review round, the execution
+  attempt or the replan transaction, so that two entries binding the same
+  revision never share a carried commit); its `identity()` is ADR 0013
+  D19's persisted "seed's identity".
+  `LaunchInputs.git_input` carries it to the seed step, which builds the
+  seed from it and chooses no revision of its own.
+- **`candidate_artifact.py`** (git, no workflow): what an exported
+  artifact is (exactly `manifest.json` and `candidate.pack`, regular
+  files, opened without following a link), the export bound
+  (`EXPORT_DEADLINE_SECONDS`, `MAX_ARTIFACT_PACK_BYTES`,
+  `MAX_ARTIFACT_OBJECTS`), and `import_artifact()`, the strict import of
+  ADR 0005 D6.5 generalized to a pack someone else wrote: the manifest
+  size-checked, parsed strictly and compared field by field with the git
+  input; the pack's size and header checked against the bound and the
+  manifest before a byte is copied; the pack copied in bounded chunks into
+  a controller-owned quarantine, hashed as it is copied, and indexed there
+  with `index-pack --strict` against the shared store; then, with the
+  quarantine as an alternate, the claimed `HEAD` a commit descending from
+  the seed, every commit of the pack between the seed and that `HEAD`, and
+  every object of the pack reachable from it above the seed; then the
+  objects the store lacks published by `index-pack --stdin --strict`,
+  streamed from the quarantined file (`ExecutionRequest.stdin_path`),
+  under L1, the only write; then the candidate re-hashed from the store
+  alone (ADR 0004 D7.5). Re-running it on the same artifact gives the same
+  candidate or the same refusal, whatever point an earlier run reached.
+  `bound_revision_problem()` checks, before any journal entry, that the
+  shared store can seed the input.
+- **`candidate_source.py`** (engine layer): `bound_git_input()`, the
+  per-phase rule; `CandidateReceipts`, the run's receipts
+  (`candidates/<entry>.json` beside `state.json`, never part of it): each
+  launch's seed identity, saved by the seed step, and its verify outcome,
+  saved before the volume is removed; the carried commit is the entry's
+  last imported candidate. `ArtifactCandidateSource` is the verify step;
+  `WorktreeHead` and `ImportedArtifact` are the two candidate reads.
 
 The engine reaches its backend only through `engine.launch_backend()`.
 The engine's gate runs `enter()` (`_sandbox_entry`), and every enforced
@@ -674,16 +727,24 @@ compiled by that backend (`sandbox_policy.describe_launch(...,
 backend=...)`) and its environment made by that lifecycle; then the
 release, and for a change-producing launch the export, the verify step's
 outcome, its save and only then the final clean-up (`_verify_export`).
-An export that failed is the verify step's refusal (ADR 0013 D17). The
-outcome stands in for bwrap's strict import: a refusal is the candidate
-read's refusal (`_import_problem`), never a candidate, and an accepted
-outcome names the candidate's commit, the only one the candidate read
-then accepts (`_read_candidate`): a worktree `HEAD` that is any other
-commit is refused under the same rule, so no commit the verify step did
-not accept is checked, validated or published (until #269's candidate
-source replaces the worktree read). bwrap exports nothing, so its
-candidate is still the worktree's `HEAD`, imported and read after the
-launch as before. Repository-defined commands are compiled by the same
+An export that failed is the verify step's refusal (ADR 0013 D17). For a
+backend that seeds, `_through_lifecycle` first binds the launch's git
+input (`_launch_git_input`) from what the phase's entry already bound
+(`_bound_revision`: the round's HEAD and merge base for `REVIEW`, the
+reviewed HEAD and its merge base for `FIX`, the entry's fetched base for
+`ANALYZE_EXECUTE` and `REPLAN_REEXECUTE`, the default branch head the
+`UPDATE_EPIC` entry binds once), plus the entry's carried commit from the
+receipts, and refuses the launch before anything of it exists when the
+shared store cannot seed it. Nothing reads GitHub again for it. The
+engine reads every candidate through one abstraction
+(`_candidate_read`): after a launch whose export the verify step judged,
+`ImportedArtifact`, the commit that step imported and no other (the
+worktree is not read: that launch's agent never wrote it); otherwise
+`WorktreeHead`, bwrap's and `disabled`'s worktree `HEAD` after the strict
+import, unchanged. A refusal is the candidate read's refusal
+(`_import_problem`), never a candidate. bwrap seeds and exports nothing,
+so for it no git input is bound, nothing is saved, and its candidate is
+the worktree's `HEAD`, imported and read after the launch as before. Repository-defined commands are compiled by the same
 backend (`_command_sandbox`) but not sequenced yet: under bwrap they need
 nothing, a backend that needs an environment refuses one no lifecycle
 made, and a container's validation is #271's. `SandboxFacts` is qualified by backend (D16):

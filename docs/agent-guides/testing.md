@@ -923,14 +923,74 @@ exactly when `tests/sandbox_host.py` measures the host capable
   container removed before its volume; an
   artifact refused by the verify step, or with no candidate source, never
   a candidate; of an agent's two commits, only the one the verify step
-  accepted published, and the other (the worktree's `HEAD`, reported)
-  refused on every launch with nothing pushed or created; an uncertain
+  accepted is the candidate (the worktree is not read), and a report of
+  the other is corrected on every launch with nothing pushed or created;
+  an uncertain
   release that fails the step and is reconciled
   at the next entry; an exporter not verified removed that is never
   verified; the release after `Ctrl-C`, and `Ctrl-C` kept when the release
   is uncertain; a refused runtime check with the state byte-identical;
   nothing under `disabled`; and the same order in a scheduler worker's
   namespace.
+  For the candidate source and the launch's git input (#269): the input
+  completed with the seed's digest and saved at the end of the seed step,
+  before any journal entry, in both staging forms; a seed manifest swapped
+  after that (other commits, or another tag set) refused before the
+  staging root is written (bind form) or before the copy-in (copy-in
+  form), the stager never run; a seed step naming another manifest, or a
+  seed for a launch with no git input, refused before any journal entry.
+  Through the engine: `ANALYZE_EXECUTE` seeded from the base its entry
+  fetched and `REVIEW` from the round's HEAD and merge base, each input
+  saved in the receipts; a default branch moved after the entry's read
+  leaving the seed and the prompt on the bound base; `UPDATE_EPIC`
+  binding the default branch head once per entry and `REPLAN_REEXECUTE`
+  its transaction's base; an operator's push after the controller's seeding
+  the next `REVIEW`, and the `FIX` after it seeding from that reviewed
+  HEAD; a HEAD past the reviewed one at `FIX`'s entry going `FIX ->
+  REVIEW` with no seed and no journal entry, and the re-review seeding
+  from the new HEAD; a push during `REVIEW` leaving the seed at the bound
+  HEAD and the round stale; a relaunch of the same `REVIEW` round on the
+  same HEAD with no carried commit; a merge base that is not an ancestor
+  of the bound HEAD refusing the launch before any journal entry. With a
+  backend whose exporter packs a real artifact, the engine's own
+  candidate source imports and publishes it, a correction relaunch of the
+  same entry carries the commit the first launch's import accepted (never
+  an uncommitted file), and an artifact naming another launch is refused
+  with nothing published.
+- `tests/test_candidate_artifact.py` (#269) runs real git on a store and
+  an agent repository in `tmp_path`, with no runtime: a valid artifact
+  imported under L1 (the one write, `index-pack --stdin` streamed from
+  the quarantined file) and re-hashed; a re-import publishing nothing; a
+  seed with an empty pack; a relaunch above a carried commit. Each of
+  these is refused with nothing published and no ref moved: an extra
+  commit that does not descend from the seed (alone or merged in), an
+  object the candidate does not reach, a claimed `HEAD` that is not a
+  commit or is below the seed, a pack that fails `--strict`, a corrupt
+  pack, a pack missing an object, a thin pack, a pack over the size or
+  object-count bound (the over-size one sparse, refused with no
+  quarantine, no read past its size and a small memory peak), a pack its
+  manifest does not describe, a bad header, a manifest that disagrees with
+  the git input in any field, one that does not parse, names refs or
+  paths or is oversized, a directory or file reached through a link, a
+  FIFO, a planted extra entry, a missing pack, a candidate that does not
+  read as its own bytes, and a lock not obtained. Crash windows: before
+  L1, during `index-pack` and after publication, each followed by a
+  re-import giving the same candidate. The bound revision's store checks
+  (seed, merge base, carried commit, ancestry), read without the
+  container's objects.
+- `tests/test_candidate_source.py` (#269): each phase's rule
+  (`bound_git_input`), the receipts (bound once, an outcome saved
+  idempotently, the carried commit the last verified launch's import, a
+  bounded number of launches, a file that does not parse or is a link
+  refused), the verify step over real artifacts (accepted and saved, a
+  crash before the save verifying again to the same outcome, a refusal
+  saved and never carried, a handle of another launch, no git input), a
+  relaunch carrying the committed `HEAD` and no uncommitted file, and the
+  two candidate reads.
+- `tests/test_git_input.py` (#269): the git input's invariants, its
+  entry, its persisted identity read back strictly, and the seed
+  manifest's digest (a swapped manifest, a link, a FIFO and an oversized
+  file refused).
 
 The existing executor and duplex suites are the no-description regression:
 they run unchanged.

@@ -22,7 +22,16 @@ engine bound to the lifecycle (``SandboxPlan``):
    nothing of the launch exists yet. The plan then hands the compiled
    launch to :meth:`LaunchLifecycle.establish`, which runs
 2. *seed*: before any journal entry, so a failure there leaves nothing to
-   reconcile;
+   reconcile. The backend builds the seed from the launch's git input
+   (:class:`~autoforge.git_input.LaunchGitInput`, which the engine bound
+   before the launch and which names the revision); the step's end binds
+   the seed's manifest digest into that input, once, and hands the
+   completed input to the engine to save (``on_seed``), still before any
+   journal entry (ADR 0013 D4, D19). From then on the seed is handed on
+   only while its manifest still has that digest: checked before the
+   create step (the bind form writes the staging root there) and again
+   before the stage step (the copy-in form copies it there), so a seed
+   swapped after the input was bound never reaches a container;
 3. *create*: the objects checked against D13's rules, then one journal
    write that names them all, then each made in :data:`CREATE_ORDER`
    (every bind source before any container, the volume before the stager
@@ -40,8 +49,8 @@ engine bound to the lifecycle (``SandboxPlan``):
    volume too when there is nothing to export;
 7. *export*, for a change-producing launch: the exporter's own entry before
    its create, its removal journaled after;
-8. *verify* is the caller's (#269); once its outcome is saved,
-   :meth:`LaunchLifecycle.saved` runs
+8. *verify* is the caller's (#269, :mod:`autoforge.candidate_source`);
+   once its outcome is saved, :meth:`LaunchLifecycle.saved` runs
 9. *the final clean-up*: the volume and the export directory. Never before
    that outcome is saved: a launch that ends between its run and that save
    keeps its volume for reconciliation.
@@ -78,18 +87,21 @@ it makes one.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Protocol, TypeVar
 
 from .errors import SandboxCleanupUncertainError, SandboxLaunchRefusedError
+from .git_input import GitInputError, LaunchGitInput, seed_manifest_digest, seed_problem
 from .sandbox import LaunchDescription
 from .sandbox_backend import (
     CONTAINER_KINDS,
     CREATE_ORDER,
     EXPORT_KINDS,
     NETWORK_NONE,
+    NO_SEED,
     Artifact,
     LaunchHandle,
     LaunchInputs,
@@ -215,18 +227,19 @@ class CandidateSource(Protocol):
 
 
 class _NoCandidateSource:
-    """No candidate source verifies an exported artifact yet (#269).
+    """A verify step that refuses every artifact: for a caller with no candidate source.
 
-    It refuses every artifact, so an exported volume is never read as a
-    candidate; a refusal leaves nothing to import and so needs nothing of the
-    volume kept, and there is no binding to save.
+    An exported volume is never read as a candidate through it; a refusal
+    leaves nothing to import and so needs nothing of the volume kept, and
+    there is no binding to save. The engine's own is
+    :class:`autoforge.candidate_source.ArtifactCandidateSource` (#269).
     """
 
     def verify(self, artifact: Artifact, handle: LaunchHandle) -> Verified:
         return Verified(
             refusal=(
-                "no candidate source verifies an exported artifact yet (#269), so the "
-                "launch's export is refused, never read as its candidate"
+                "no candidate source verifies this launch's exported artifact, so its "
+                "export is refused, never read as its candidate"
             )
         )
 
@@ -427,8 +440,12 @@ class LaunchLifecycle:
         runtime: RuntimeReport,
         *,
         change_producing: bool,
+        on_seed: Callable[[LaunchGitInput], None] | None = None,
     ) -> None:
         self._backend = backend
+        # Saves the launch's completed git input at the end of its seed step,
+        # before any journal entry (ADR 0013 D19); never for a seedless launch.
+        self._on_seed = on_seed
         self._journal = journal
         self._inputs = inputs
         self._owner = inputs.owner
@@ -546,6 +563,8 @@ class LaunchLifecycle:
         self._planned = launch
         try:
             seed = self._seed = self._backend.seed(self._inputs, launch)
+            self._bind(seed)
+            self._check_seed(seed, "to the create step")
             self._create(launch, seed)
             self._stage(seed)
         except BaseException:
@@ -554,6 +573,48 @@ class LaunchLifecycle:
         self._environment = "ready"
         self._handle = LaunchHandle(self._inputs, seed, tuple(self._open))
         return self._handle
+
+    def _bind(self, seed: Seed) -> None:
+        """The seed step's end: the git input completed with the seed's manifest digest.
+
+        A backend that seeds nothing (:data:`NO_SEED`, bwrap) binds nothing
+        and saves nothing. Otherwise the launch must carry a git input, and
+        the seed's manifest, read again from the seed's directory, must hash
+        to the identity the seed step names; the completed input replaces
+        the bare one for every later step, and ``on_seed`` saves it, all
+        before any journal entry.
+        """
+        if seed == NO_SEED:
+            return
+        git_input = self._inputs.git_input
+        if git_input is None:
+            raise _refused(
+                "its backend built a seed, and the launch carries no git input that binds one"
+            )
+        try:
+            digest = seed_manifest_digest(seed.directory)
+        except OSError as exc:
+            raise _refused(f"its seed's manifest cannot be read ({exc})") from exc
+        if digest != seed.identity:
+            raise _refused(
+                f"its seed step names the manifest {seed.identity!r}, and the manifest it wrote "
+                f"is {digest}"
+            )
+        try:
+            completed = git_input.with_seed_manifest(digest)
+        except GitInputError as exc:
+            raise _refused(str(exc)) from exc
+        self._inputs = dataclasses.replace(self._inputs, git_input=completed)
+        if self._on_seed is not None:
+            self._on_seed(completed)
+
+    def _check_seed(self, seed: Seed, where: str) -> None:
+        """The seed is handed on only while its manifest is the one the git input binds (D4)."""
+        if seed == NO_SEED:
+            return
+        problem = seed_problem(seed.directory, self._inputs.git_input)
+        if problem:
+            raise _refused(f"its seed is not handed on {where}: {problem}")
 
     def _create(self, launch: LaunchDescription, seed: Seed) -> None:
         """One journal write for every object, then each made in D13's order."""
@@ -573,6 +634,7 @@ class LaunchLifecycle:
         launch = self._find(ObjectKind.LAUNCH_CONTAINER)
         if stager is None or launch is None:
             return
+        self._check_seed(seed, "to the stager container")
         self._backend.stage(stager, seed)
         self._remove((stager,))
         if stager in self._open:

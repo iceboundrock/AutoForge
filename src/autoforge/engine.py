@@ -145,6 +145,15 @@ from .agent_worktree import (
     registered_worktree_roots,
     uncommitted_entries,
 )
+from .candidate_artifact import bound_revision_problem
+from .candidate_source import (
+    ArtifactCandidateSource,
+    CandidateRead,
+    CandidateReceipts,
+    ImportedArtifact,
+    WorktreeHead,
+    bound_git_input,
+)
 from .certificate import (
     CertificateIssuanceError,
     Configured,
@@ -370,6 +379,7 @@ from .executor import (
     execute,
     select_environment,
 )
+from .git_input import BoundRevision, LaunchGitInput
 from .git_transport import (
     NO_AUTO_MAINTENANCE,
     CommitRecord,
@@ -519,7 +529,7 @@ from .run_binding import EpicBinding, bind_run_epic, check_run_urls
 from .run_namespace import IssueNamespace, check_standalone_state_dir, inside_scheduler_root
 from .runlog import ExecutionRecord, RunLogger, StepLog
 from .safefs import SafeRoot
-from .sandbox import LaunchDescription, NetworkPosition, SandboxFacts
+from .sandbox import BackendKind, LaunchDescription, NetworkPosition, SandboxFacts
 from .sandbox_backend import (
     Capability,
     LaunchInputs,
@@ -530,7 +540,6 @@ from .sandbox_backend import (
     default_backend,
 )
 from .sandbox_lifecycle import (
-    NO_CANDIDATE_SOURCE,
     NO_JOURNAL,
     CandidateSource,
     LaunchLifecycle,
@@ -1783,6 +1792,12 @@ class ControllerEngine:
         # (ADR 0013 D13), ``None`` when it exported none: then the candidate
         # is the worktree's ``HEAD``, imported as above (bwrap's).
         self._export_verified: Verified | None = None
+        # The default branch head the current UPDATE_EPIC entry bound for a
+        # backend that seeds its launches (ADR 0013 D4), "" before its first
+        # launch: every relaunch of the entry reuses it, and the next entry
+        # binds its own. Never persisted: UPDATE_EPIC exports nothing, so no
+        # candidate depends on it, and a resumed entry binds again.
+        self._update_epic_base = ""
         # Whether this step's REVIEW entry wrote or reused the
         # ``review_evidence`` binding the reviewer's prompt is rendered from
         # (ADR 0006 D5.5, D5.7, D9.1); reset at every REVIEW entry, so a plan
@@ -2685,14 +2700,148 @@ class ControllerEngine:
         return NO_JOURNAL
 
     def _candidate_source(self) -> CandidateSource:
-        """The verify step for an exported artifact, and its save (ADR 0013 D13): #269's.
+        """The verify step for an exported artifact, and its save (ADR 0013 D5, D13; #269).
 
-        None exists yet, so every exported artifact is refused
-        (:data:`NO_CANDIDATE_SOURCE`) and never read as a candidate. bwrap
-        exports nothing: its candidate is the worktree's ``HEAD``, imported
-        strictly after the launch (ADR 0005 D6.5).
+        The strict, bounded import of the artifact against the launch's git
+        input, into the shared store under L1, the candidate re-hashed by
+        the controller's transport (ADR 0004 D7.5), and the outcome saved
+        in the run's candidate receipts before the volume is removed
+        (:class:`~autoforge.candidate_source.ArtifactCandidateSource`).
+        bwrap exports nothing, so this is never asked: its candidate is the
+        worktree's ``HEAD``, imported strictly after the launch (ADR 0005
+        D6.5).
         """
-        return NO_CANDIDATE_SOURCE
+        return ArtifactCandidateSource(
+            self.workspace().git_dirs()[-1],
+            self._runner,
+            read_commit=self._git_transport().read_local_commit,
+            receipts=self._candidate_receipts(),
+            git_lock=self._shared_git_lock,
+        )
+
+    def _candidate_receipts(self) -> CandidateReceipts:
+        """The run's candidate receipts, beside ``state.json`` (ADR 0013 D19; #269)."""
+        return CandidateReceipts(self.state_root())
+
+    def _bound_revision(self, phase: Phase) -> BoundRevision | None:
+        """The revision ``phase``'s entry bound, or ``None`` when it bound none (ADR 0013 D4).
+
+        ``REVIEW``: the PR HEAD and merge base bound to the round
+        (:meth:`_bind_review_head`), whoever pushed that HEAD. ``FIX``: the
+        reviewed HEAD bound to its entry and that round's merge base.
+        ``ANALYZE_EXECUTE`` and ``REPLAN_REEXECUTE``: the base their entry
+        read, fetched and recorded. ``UPDATE_EPIC``: the default branch head
+        its entry bound (:meth:`_bind_update_epic_base`). Each is read from
+        what the entry already holds and never from GitHub again, so a
+        default branch or PR head that moves after it changes nothing.
+        """
+        state = self._require_state()
+        if phase is Phase.REVIEW:
+            seed, lower = state.current_head_sha, state.current_merge_base_sha
+        elif phase is Phase.FIX:
+            seed, lower = state.reviewed_head_sha, state.reviewed_merge_base_sha
+        elif phase is Phase.ANALYZE_EXECUTE:
+            entry = self._analyze_entry
+            seed = lower = entry.base_sha if entry is not None else ""
+        elif phase is Phase.REPLAN_REEXECUTE:
+            replan = self._replan_entry
+            seed = lower = replan.base_sha if replan is not None else ""
+        elif phase is Phase.UPDATE_EPIC:
+            seed = lower = self._update_epic_base
+        else:
+            return None
+        if not seed or not lower:
+            return None
+        return BoundRevision(seed, lower)
+
+    def _bind_update_epic_base(self) -> None:
+        """Bind the default branch head for this UPDATE_EPIC entry, once (ADR 0013 D4).
+
+        Read from GitHub and fetched into the shared store at the entry's
+        first launch under a backend that seeds; every later launch of the
+        entry reuses it. A fetch that fails refuses the launch before
+        anything of it exists; 'resume' fetches again.
+        """
+        if self._update_epic_base:
+            return
+        state = self._require_state()
+        default_branch = self.github.get_repo(state.repository).default_branch
+        head = self.github.get_branch_head_sha(state.repository, default_branch)
+        try:
+            self._git_transport().fetch([head])
+        except GitTransportError as exc:
+            raise SandboxLaunchRefusedError(
+                f"the UPDATE_EPIC launch was not created: the default branch head {head} could "
+                f"not be fetched into the shared object store ({exc}); 'resume' fetches again"
+            ) from exc
+        self._update_epic_base = head
+
+    def _entry_label(self, phase: Phase) -> str:
+        """The engine's name for the current entry of ``phase`` (ADR 0013 D4; #269).
+
+        It tells apart two entries that bind the same revision, so that no
+        entry carries a commit an earlier one imported: a second ``FIX``
+        round at a HEAD the first did not move, a re-review of the same
+        HEAD (``unblock --rereview``), a fresh implementation attempt from
+        the same base. Every relaunch of one entry has the same label.
+        """
+        state = self._require_state()
+        if phase is Phase.REVIEW:
+            return f"review-round-{state.review_round + 1}"
+        if phase is Phase.FIX:
+            return f"fix-round-{state.review_round}"
+        if phase is Phase.REPLAN_REEXECUTE and self._replan_entry is not None:
+            return f"replan-{self._replan_entry.transaction_id}"
+        return f"{phase.value.lower().replace('_', '-')}-{state.execution_attempt}"
+
+    def _launch_git_input(self, phase: Phase, owner: LaunchOwner) -> LaunchGitInput:
+        """The launch's git input, bound before anything of the launch exists (ADR 0013 D4).
+
+        From the revision the phase's entry bound (:meth:`_bound_revision`),
+        plus, for a relaunch of the same entry in a phase that exports, the
+        carried commit: the candidate the entry's last verified launch
+        imported. The shared store must hold the seed, the lower boundary
+        and the carried commit as commits, the lower boundary an ancestor of
+        the seed and the carried commit a descendant; otherwise the launch
+        is refused (:class:`SandboxLaunchRefusedError`) before any journal
+        entry or create, and a later 'resume' fetches again. Only for a
+        backend that seeds: bwrap's worktree is its seed.
+        """
+        state = self._require_state()
+        common = self.workspace().git_dirs()[-1]
+        if phase is Phase.UPDATE_EPIC:
+            self._bind_update_epic_base()
+        revision = self._bound_revision(phase)
+        try:
+            object_format = read_object_format(self._runner or execute, str(common))
+        except MaterializationError as exc:
+            raise SandboxLaunchRefusedError(
+                f"the {phase.value} launch was not created: the shared store's object format "
+                f"could not be read ({exc})"
+            ) from exc
+
+        def bind(carried: str = "") -> LaunchGitInput:
+            return bound_git_input(
+                phase.value,
+                owner,
+                repository=state.repository,
+                object_format=object_format,
+                revision=revision,
+                carried=carried,
+                entry_label=self._entry_label(phase),
+            )
+
+        git_input = bind()
+        carried = self._candidate_receipts().carried(git_input.entry)
+        if carried and carried != git_input.seed:
+            git_input = bind(carried)
+        problem = bound_revision_problem(common, git_input, self._runner)
+        if problem:
+            raise SandboxLaunchRefusedError(
+                f"the {phase.value} launch was not created: {problem}. Nothing of it was "
+                "journaled or created; 'resume' fetches the bound revision again"
+            )
+        return git_input
 
     def _sandbox_entry(self) -> None:
         """At a command's entry, before any launch: the runtime check, then
@@ -2928,47 +3077,40 @@ class ControllerEngine:
             ) from exc
         return anchor / relbase
 
-    def _read_candidate(self, cwd: str) -> Candidate:
-        """The worktree's ``HEAD`` as the controller reads it (ADR 0005 D6.3).
+    def _candidate_read(self, cwd: str) -> CandidateRead:
+        """Where the latest launch's candidate is read from (ADR 0013 D5; #269).
 
-        Addressed through the common dir, never through the worktree; the
-        strict import after the launch already ran (:meth:`_invoke_phase`),
-        and when it failed, there is no candidate: its reason is the
-        refusal, under the phase's existing rule for an unreadable ``HEAD``.
-
-        After a launch whose export the verify step judged (ADR 0013 D13),
-        the candidate is the commit that step accepted and no other: the
-        worktree's ``HEAD`` is one only when it is exactly that commit, so a
-        commit the verify step did not accept is never checked, validated
-        or published. Any other ``HEAD`` is refused under the same rule,
-        until #269's candidate source replaces this read. bwrap exports
-        nothing (no outcome), so its candidate read is unchanged.
+        A launch whose export the verify step judged (a backend that
+        exports): the commit that step imported, and no other
+        (:class:`~autoforge.candidate_source.ImportedArtifact`); the worktree
+        is not read, since that launch's agent never wrote it. Otherwise
+        (bwrap, ``disabled``): the worktree's ``HEAD`` through the common
+        dir, after the strict import that already ran (ADR 0005 D6.3, D6.5;
+        :class:`~autoforge.candidate_source.WorktreeHead`), unchanged.
         """
-        if self._import_problem:
-            return Candidate(False, "", self._import_problem)
-        worktree = Path(cwd)
-        candidate = read_candidate(
-            self.workspace().git_dirs()[-1], self._agent_admin_dir(worktree), cwd, self._runner
-        )
         verified = self._export_verified
-        if verified is None:
-            return candidate
-        if not verified.accepted:
-            # Already the import problem after every launch (_invoke_phase);
-            # never a candidate even if read before it was set.
-            return Candidate(False, "", verified.problem)
-        if candidate.head and candidate.head == verified.candidate:
-            return candidate
-        if candidate.attached:
-            found = "attached to a local branch"
-        else:
-            found = candidate.head or candidate.problem or "no commit the shared store holds"
-        return Candidate(
-            candidate.attached,
-            "",
-            f"the worktree's HEAD ({found}) is not the commit the verify step accepted from "
-            f"the launch's export ({verified.candidate}); only that commit is a candidate",
-        )
+        if verified is not None:
+            return ImportedArtifact(verified)
+        worktree = Path(cwd)
+
+        def read_head() -> Candidate:
+            return read_candidate(
+                self.workspace().git_dirs()[-1],
+                self._agent_admin_dir(worktree),
+                cwd,
+                self._runner,
+            )
+
+        return WorktreeHead(self._import_problem, read_head)
+
+    def _read_candidate(self, cwd: str) -> Candidate:
+        """The latest launch's candidate, through its candidate source (:meth:`_candidate_read`).
+
+        When the strict import or the verify step failed there is no
+        candidate: its reason is the refusal, under the phase's existing
+        rule for an unreadable ``HEAD``.
+        """
+        return self._candidate_read(cwd).read()
 
     def _checkout_anchor(self) -> tuple[str, str]:
         """HEAD and branch of the checkout the controller is run from."""
@@ -13549,6 +13691,7 @@ class ControllerEngine:
         """
         state = self._require_state()
         self._adopted_progress_comment_url = ""
+        self._update_epic_base = ""
         self._epic_roadmap_at_entry = None
         self._epic_section_shown = None
         context = self._update_epic_context()
@@ -15483,12 +15626,27 @@ class ControllerEngine:
         issue = parse_issue_url(state.current_issue_url).number if state.current_issue_url else 0
         launch_id = f"{phase.value}-{state.attempt}"
         owner = LaunchOwner(run=state.run_id, issue=issue, phase=phase.value, launch=launch_id)
-        inputs = LaunchInputs(owner, workspace=facts.workspace, read_context=facts.read_context)
         backend = launch_backend()
         runtime = self._sandbox_runtime or backend.runtime_check()
+        # The launch's git input (ADR 0013 D4), for a backend that seeds:
+        # bound here, before anything of the launch exists, and never read
+        # again for it. bwrap seeds nothing: its worktree is its seed.
+        seeds = backend.kind is not BackendKind.BWRAP
+        git_input = self._launch_git_input(phase, owner) if seeds else None
+        inputs = LaunchInputs(
+            owner,
+            workspace=facts.workspace,
+            read_context=facts.read_context,
+            git_input=git_input,
+        )
         change = phase in WORKTREE_STATE_PHASES
         with LaunchLifecycle(
-            backend, self._lifecycle_journal(), inputs, runtime, change_producing=change
+            backend,
+            self._lifecycle_journal(),
+            inputs,
+            runtime,
+            change_producing=change,
+            on_seed=self._candidate_receipts().bind if seeds else None,
         ) as lifecycle:
             req.sandbox = SandboxPlan(facts, backend, lifecycle)
             result = lifecycle.launch(launch)
