@@ -374,6 +374,94 @@ def test_an_object_the_candidate_does_not_reach_is_refused(repos, work, tmp_path
     assert not repos.has(blob)
 
 
+AUTHOR = "author A U Thor <author@example.com> 1700000000 +0000"
+COMMITTER = "committer A U Thor <author@example.com> 1700000000 +0000"
+
+
+def raw_commit(repo: Path, tree: str, parents: list[str], message: str) -> str:
+    """A commit object written into ``repo`` alone, whatever its parents are or where."""
+    lines = [f"tree {tree}", *(f"parent {parent}" for parent in parents), AUTHOR, COMMITTER]
+    body = "\n".join(lines) + f"\n\n{message}\n"
+    return git(repo, "hash-object", "-t", "commit", "-w", "--stdin", input=body.encode())
+
+
+def host_only_blob(repos: Repos, text: bytes = b"another branch's secret\n") -> str:
+    """A blob only the shared store holds: no launch was given it."""
+    blob = git(repos.store, "hash-object", "-w", "--stdin", input=text)
+    assert not isolated_git_run("-C", str(repos.agent), "cat-file", "-e", blob).returncode == 0
+    return blob
+
+
+def test_a_tree_naming_a_blob_only_the_host_store_holds_is_refused(repos, tmp_path):
+    """The pack holds a new commit and its tree; the tree names a blob only the shared
+    store has. ``--strict`` resolves the link there, and the closure refuses it."""
+    secret = host_only_blob(repos)
+    readme = git(repos.agent, "rev-parse", f"{repos.seed}:README.md")
+    tree = git(
+        repos.agent, "mktree", "--missing",
+        input=f"100644 blob {readme}\tREADME.md\n100644 blob {secret}\tsecret.txt\n".encode(),
+    )  # fmt: skip
+    head = raw_commit(repos.agent, tree, [repos.seed], "Name a blob I was never given (#269)")
+    pack = pack_objects(repos, [head, tree])
+    assert count_of(pack) == 2
+    git_input = _input(repos)
+    directory = write_artifact(tmp_path / "out", git_input, head, pack)
+    assert_refused(
+        repos, directory, git_input, f"reaches object {secret}, which neither its pack carries"
+    )
+    assert not repos.has(head) and not repos.has(tree)
+
+
+def test_an_unrelated_merge_parent_only_the_host_store_holds_is_refused(repos, tmp_path):
+    """The candidate merges a commit of another branch of the shared store, which
+    the pack omits: the parent and its tree are not the launch's to name."""
+    secret = host_only_blob(repos)
+    tree = git(repos.store, "mktree", input=f"100644 blob {secret}\tsecret.txt\n".encode())
+    other = raw_commit(repos.store, tree, [], "Another branch's root (#9)")
+    seed_tree = git(repos.agent, "rev-parse", f"{repos.seed}^{{tree}}")
+    merged = raw_commit(repos.agent, seed_tree, [repos.seed, other], "Merge it in (#269)")
+    pack = pack_objects(repos, [merged])
+    git_input = _input(repos)
+    directory = write_artifact(tmp_path / "out", git_input, merged, pack)
+    assert_refused(repos, directory, git_input, "which neither its pack carries nor the seed")
+    assert not repos.has(merged)
+
+
+def test_a_host_only_commit_claimed_with_an_empty_pack_is_refused(repos, tmp_path):
+    """Another run's commit, descending from the seed, is in the shared store; an
+    artifact claiming it with no pack never makes it this launch's candidate."""
+    seed_tree = git(repos.store, "rev-parse", f"{repos.seed}^{{tree}}")
+    other = raw_commit(repos.store, seed_tree, [repos.seed], "Another run's work (#9)")
+    pack = pack_of(repos, [repos.seed, f"^{repos.seed}"])
+    assert count_of(pack) == 0
+    git_input = _input(repos)
+    directory = write_artifact(tmp_path / "out", git_input, other, pack)
+    assert_refused(repos, directory, git_input, f"reaches object {other}, which neither")
+
+
+def test_a_relaunch_may_omit_what_its_carried_commit_already_holds(repos, tmp_path):
+    """The carried commit was given to the container: its objects need no re-sending,
+    and an object only the store holds still does."""
+    carried = commit(repos.agent, "first.py")
+    publish_to_store(repos, carried)
+    relaunch = _input(repos, launch="ANALYZE_EXECUTE-2", carried=carried)
+    head = commit(repos.agent, "second.py")
+    imported = run_import(
+        repos,
+        write_artifact(tmp_path / "ok", relaunch, head, pack_of(repos, [head, f"^{carried}"])),
+        relaunch,
+    )
+    assert imported.candidate == head
+    secret = host_only_blob(repos)
+    tree = git(
+        repos.agent, "mktree", "--missing",
+        input=f"100644 blob {secret}\tsecret.txt\n".encode(),
+    )  # fmt: skip
+    evil = raw_commit(repos.agent, tree, [carried], "Name a blob I was never given (#269)")
+    directory = write_artifact(tmp_path / "evil", relaunch, evil, pack_objects(repos, [evil, tree]))
+    assert_refused(repos, directory, relaunch, "nor the seed and the carried commit reaches")
+
+
 def test_a_claimed_head_that_is_not_a_commit_is_refused(repos, work, tmp_path):
     head, pack = work
     tree = git(repos.agent, "rev-parse", f"{head}^{{tree}}")

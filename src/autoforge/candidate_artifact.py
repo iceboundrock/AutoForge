@@ -50,7 +50,14 @@ never retried, nothing published):
    candidate is a commit and descends from the seed; every commit of the
    pack descends from the seed and is an ancestor of the candidate; every
    object of the pack is reachable from the candidate and not from the
-   seed. A pack carrying anything else is refused.
+   seed. A pack carrying anything else is refused. And the closure: every
+   object the candidate reaches above the seed (and above the carried
+   commit of a relaunch), commits and their parents included, is in the
+   pack. Step 5 lets a link resolve in the shared store, which holds
+   objects no launch was given (another branch's blob, another run's
+   commit, an unrelated merge parent); an artifact that names one without
+   carrying it is refused, so the candidate never exposes an object the
+   container was not given.
 7. Publication: the objects the shared store lacks are published by
    ``index-pack --stdin --strict`` of the quarantined copy, streamed from
    the file, under the shared-Git lock (L1, ADR 0008 D12.1) with automatic
@@ -643,19 +650,14 @@ def _import_quarantined(
                 f"its pack holds commit {stray[0]}, which is not between the seed "
                 f"{git_input.seed} and its HEAD {candidate}"
             )
-    if in_pack:
-        reach = git(
-            ["rev-list", "--objects", candidate, "--not", git_input.seed],
-            "listing the objects its HEAD reaches",
-            env=alternate,
+    above_seed = _reached(git, candidate, [git_input.seed], alternate)
+    stray = sorted(set(in_pack) - above_seed)
+    if stray:
+        raise _refused(
+            f"its pack holds {in_pack[stray[0]]} {stray[0]}, which its HEAD does not "
+            "reach above the seed"
         )
-        reachable = {line.split(" ", 1)[0] for line in reach.stdout.splitlines() if line}
-        stray = sorted(set(in_pack) - reachable)
-        if stray:
-            raise _refused(
-                f"its pack holds {in_pack[stray[0]]} {stray[0]}, which its HEAD does not "
-                "reach above the seed"
-            )
+    _check_closure(git, candidate, git_input, in_pack, above_seed, alternate)
     missing = _missing(git, list(in_pack) or [candidate])
     published = False
     if missing and in_pack:
@@ -676,6 +678,63 @@ def _import_quarantined(
         objects=len(in_pack),
         published=published,
     )
+
+
+def _reached(
+    git: Callable[..., ExecutionResult],
+    candidate: str,
+    boundary: list[str],
+    alternate: dict[str, str],
+) -> set[str]:
+    """Every object ``candidate`` reaches above ``boundary``: ``rev-list --objects``.
+
+    The same walk an exporter's ``pack-objects --revs`` makes: the commits
+    of ``candidate`` that no boundary commit reaches, and every object their
+    trees name, except what the trees of the boundary commits they stand on
+    already hold. Read with the quarantine as an alternate, so a pack's
+    objects are found; a walk whose output is over the executor's bound is
+    refused, never read in part.
+    """
+    reach = git(
+        ["rev-list", "--objects", candidate, "--not", *boundary],
+        "listing the objects its HEAD reaches",
+        env=alternate,
+    )
+    return {line.split(" ", 1)[0] for line in reach.stdout.splitlines() if line}
+
+
+def _check_closure(
+    git: Callable[..., ExecutionResult],
+    candidate: str,
+    git_input: LaunchGitInput,
+    in_pack: dict[str, str],
+    above_seed: set[str],
+    alternate: dict[str, str],
+) -> None:
+    """The candidate's closure is the authorized revisions plus the pack, and nothing else.
+
+    What the container was given is the seed (and the carried commit of a
+    relaunch); what it gives back is the pack. So every object the
+    candidate reaches above those, commits and their parents included, must
+    be in the pack. ``index-pack --strict`` lets a link resolve in the
+    shared store, which also holds objects no launch was given (another
+    branch's blob, another run's commit, a merge parent the seed never
+    reached): such an object never completes a candidate, so an artifact
+    that names one without carrying it is refused, and nothing is
+    published. A candidate with an empty pack is therefore only the seed
+    itself, or the carried commit.
+    """
+    needed = above_seed
+    if git_input.carried:
+        needed = _reached(git, candidate, [git_input.seed, git_input.carried], alternate)
+    outside = sorted(needed - set(in_pack))
+    if outside:
+        given = "the seed and the carried commit" if git_input.carried else "the seed"
+        raise _refused(
+            f"its HEAD {candidate} reaches object {outside[0]}, which neither its pack carries "
+            f"nor {given} reaches: an object the shared store holds for another reason never "
+            "completes a candidate"
+        )
 
 
 def _index_in_quarantine(git: Callable[..., ExecutionResult], pack: Path) -> None:
