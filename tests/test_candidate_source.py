@@ -15,6 +15,7 @@ import pytest
 from autoforge.agent_worktree import Candidate
 from autoforge.candidate_source import (
     MAX_RECEIPT_LAUNCHES,
+    MAX_REFUSAL_CHARS,
     NOT_EXPORTED,
     RECEIPTS_DIR,
     ArtifactCandidateSource,
@@ -25,9 +26,11 @@ from autoforge.candidate_source import (
     bound_git_input,
     export_leaf,
     export_location,
+    receipt_refusal,
 )
 from autoforge.errors import SandboxLaunchRefusedError, StateError
 from autoforge.git_input import BoundRevision, LaunchGitInput
+from autoforge.redaction import redact
 from autoforge.safefs import SafeRoot
 from autoforge.sandbox_backend import (
     Artifact,
@@ -560,6 +563,144 @@ def test_a_failed_export_is_saved_as_the_launchs_refusal(repos, receipts, tmp_pa
         (saved,) = CandidateReceipts(root).launches(git_input.entry)
     assert saved.git_input == git_input and saved.verified and saved.refusal == outcome.refusal
     assert ImportedArtifact(outcome).read().problem == outcome.refusal
+
+
+# -- a refusal is redacted before it is saved (R4-F1) -------------------------------------
+
+# A GitHub token of no repeated run, so that any fragment of it is recognisable;
+# the pattern takes one from 12 characters on, so a cut keeping 10 leaves a head
+# no pattern matches.
+_SECRET = "ghp_aB3dE5fG7hJ9kL1mN2pQ4rS6tU8vW0xY2zA4"
+_KEPT_BY_A_CUT = 10
+_VALUE = "zq9Xv2LmT4pQ8rS1wE6y"
+
+
+def _receipt_files(tmp_path: Path) -> str:
+    """Every receipt file's bytes as the state directory holds them."""
+    return "".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((tmp_path / "state" / RECEIPTS_DIR).glob("*.json"))
+    )
+
+
+def _assert_no_fragment(secret: str, text: str) -> None:
+    for n in range(4, len(secret) + 1):
+        assert secret[:n] not in text and secret[-n:] not in text, (n, secret)
+
+
+def _straddling(prefix_chars: int) -> str:
+    """Filler, then :data:`_SECRET` placed so that a refusal whose text before this
+    one is ``prefix_chars`` long holds it across :data:`MAX_REFUSAL_CHARS`."""
+    filler = ("exporter: layer copy failed; " * 200)[: MAX_REFUSAL_CHARS - prefix_chars]
+    # A separator before the token, so that it starts one wherever the filler is cut.
+    return filler[: -_KEPT_BY_A_CUT - 1] + " " + _SECRET + " and the runtime gave up"
+
+
+def _save_and_read(source, outcome, git_input, tmp_path):
+    source.save(outcome)
+    source.save(outcome)  # the save repeated after a crash changes nothing
+    with SafeRoot.open(tmp_path / "state") as root:  # read back as a new process would
+        (saved,) = CandidateReceipts(root).launches(git_input.entry)
+    return saved
+
+
+@pytest.mark.parametrize(
+    ("leak", "value"),
+    [
+        (f"Authorization: Bearer {_VALUE}", _VALUE),
+        (f"GH_TOKEN={_VALUE}", _VALUE),
+        (f"pull https://x-access-token:{_VALUE}@github.com/owner/repo failed", _VALUE),
+        (f"credential {_SECRET} rejected", _SECRET),
+    ],
+    ids=["authorization-header", "env-assignment", "url-userinfo", "github-token"],
+)
+def test_a_credential_in_an_exporters_failure_never_reaches_the_receipt(
+    repos, receipts, tmp_path, leak, value
+):
+    """The exporter's failure is not the controller's text: the receipt, written in
+    the clear, keeps it redacted. The verify step's outcome is unchanged (the
+    engine's own sinks redact what they write of it)."""
+    git_input = _artifact_input(repos)
+    owner = _owner("ANALYZE_EXECUTE", git_input.launch)
+    directory = str(_export_dir(repos, owner.launch))
+    exported = Exported(
+        failure=f"runtime: export of the volume failed: {leak}",
+        origin=_journaled(owner, directory),
+    )
+    source = _source(repos, receipts)
+    outcome = source.verify(exported, _handle(git_input, owner, directory))
+    assert value in outcome.refusal
+    saved = _save_and_read(source, outcome, git_input, tmp_path)
+    assert saved.verified and not saved.accepted
+    assert saved.refusal == receipt_refusal(outcome.refusal)
+    assert saved.refusal.startswith("the launch's export failed: runtime: export of the volume")
+    assert "***REDACTED***" in saved.refusal
+    _assert_no_fragment(value, _receipt_files(tmp_path))
+    assert receipts.carried(git_input.entry) == ""
+
+
+@pytest.mark.parametrize("where", ["artifact", "journaled"])
+def test_a_credential_in_an_artifact_origin_diagnostic_never_reaches_the_receipt(
+    repos, work, receipts, tmp_path, where
+):
+    """A refused origin is quoted by its path: the artifact's directory, or the
+    export directory the lifecycle journaled. Either can carry a credential's
+    shape, and the receipt keeps it redacted; the artifact is still never read."""
+    head, pack = work
+    git_input = _artifact_input(repos)
+    owner = _owner("ANALYZE_EXECUTE", git_input.launch)
+    export_dir = _export_dir(repos, owner.launch)
+    export_dir.mkdir()
+    planted = str(tmp_path / f"planted-{_SECRET}")
+    if where == "artifact":
+        exported = Exported(Artifact(planted), origin=_journaled(owner, str(export_dir)))
+        match = "not in the launch's export directory"
+    else:
+        exported = Exported(Artifact(str(export_dir)), origin=_journaled(owner, planted))
+        match = "not the one the controller chose for it"
+    source = _source(repos, receipts)
+    outcome = source.verify(exported, _handle(git_input, owner, str(export_dir)))
+    assert match in outcome.refusal and _SECRET in outcome.refusal and not repos.has(head)
+    saved = _save_and_read(source, outcome, git_input, tmp_path)
+    assert saved.refusal == receipt_refusal(outcome.refusal)
+    assert match in saved.refusal and "planted-***REDACTED***" in saved.refusal
+    _assert_no_fragment(_SECRET, _receipt_files(tmp_path))
+
+
+@pytest.mark.parametrize("diagnostic", ["exporter", "origin"])
+def test_a_credential_across_the_refusal_bound_leaves_no_fragment(
+    repos, work, receipts, tmp_path, diagnostic
+):
+    """The refusal is redacted whole before it is cut to MAX_REFUSAL_CHARS: cut
+    first, the token's first characters would be too few for its pattern and be
+    kept in the clear."""
+    head, pack = work
+    git_input = _artifact_input(repos)
+    owner = _owner("ANALYZE_EXECUTE", git_input.launch)
+    export_dir = _export_dir(repos, owner.launch)
+    if diagnostic == "exporter":
+        before = "the launch's export failed: "
+        exported = Exported(
+            failure=_straddling(len(before)), origin=_journaled(owner, str(export_dir))
+        )
+    else:
+        export_dir.mkdir()
+        before = "the launch's exported artifact is refused: it is in /"
+        planted = "/" + _straddling(len(before)).replace(" ", "-")
+        exported = Exported(Artifact(planted), origin=_journaled(owner, str(export_dir)))
+    source = _source(repos, receipts)
+    outcome = source.verify(exported, _handle(git_input, owner, str(export_dir)))
+    assert outcome.refusal.startswith(before)
+    start = outcome.refusal.index(_SECRET)
+    assert start < MAX_REFUSAL_CHARS < start + len(_SECRET)
+    assert start + _KEPT_BY_A_CUT == MAX_REFUSAL_CHARS
+    # Cut first, the head the cut keeps is no token: what the order prevents.
+    assert _SECRET[:_KEPT_BY_A_CUT] in redact(outcome.refusal[:MAX_REFUSAL_CHARS])
+    saved = _save_and_read(source, outcome, git_input, tmp_path)
+    assert saved.refusal == redact(outcome.refusal)[:MAX_REFUSAL_CHARS]
+    assert len(saved.refusal) <= MAX_REFUSAL_CHARS and saved.refusal.startswith(before)
+    _assert_no_fragment(_SECRET, _receipt_files(tmp_path))
+    assert not repos.has(head)
 
 
 def test_a_save_of_another_outcome_than_the_verified_one_is_refused(

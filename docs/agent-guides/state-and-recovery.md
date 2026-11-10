@@ -817,7 +817,8 @@ requirement named (#120). Its layout:
                         # replace, never dropping the latest accepted launch. A launch's
                         # git input is saved at the end of its seed step, before its first
                         # journal entry; its verify outcome (a failed export's refusal
-                        # included) before its volume is removed. A relaunch of the entry
+                        # included) before its volume is removed, a refusal redacted and
+                        # then cut to 2,000 characters. A relaunch of the entry
                         # carries the latest accepted launch's imported candidate. Parsed
                         # strictly: one that does not parse refuses the launch, never
                         # reads as "none"

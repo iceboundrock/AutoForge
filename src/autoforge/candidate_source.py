@@ -76,7 +76,12 @@ that ``state.json``'s protocol does not change (its fields are announced on
 order: the git input's identity, saved at the end of the seed step before
 any journal entry of the launch, and then the verify step's outcome. A
 write replaces the file atomically. A file that does not parse is refused,
-never read as "no receipt".
+never read as "no receipt". A refusal can quote what the controller does not
+write (an exporter's failure, a runtime's message, the paths an artifact's
+origin named, the import's diagnostics), so a receipt keeps it redacted
+whole and only then cut to :data:`MAX_REFUSAL_CHARS` (:func:`receipt_refusal`),
+as every writer of persisted text does
+(``docs/agent-guides/secrets-and-logging.md``).
 """
 
 from __future__ import annotations
@@ -100,6 +105,7 @@ from .git_input import (
     GitInputError,
     LaunchGitInput,
 )
+from .redaction import redact
 from .safefs import SafeRoot
 from .sandbox_backend import LaunchHandle, LaunchOwner, ObjectKind
 from .sandbox_lifecycle import Exported, Verified
@@ -190,6 +196,18 @@ def bound_git_input(
 
 
 # -- the receipts ---------------------------------------------------------------------
+
+
+def receipt_refusal(problem: str) -> str:
+    """``problem`` as a receipt keeps it: redacted whole, then cut to :data:`MAX_REFUSAL_CHARS`.
+
+    In that order: the cut is by character count and knows nothing about
+    secrets, so a credential it cut in half would no longer match its
+    pattern and its head would be kept in the clear. Redaction can lengthen
+    the text (:data:`~autoforge.redaction.MAX_GROWTH_FACTOR`); the cut after
+    it holds the bound all the same.
+    """
+    return redact(problem)[:MAX_REFUSAL_CHARS]
 
 
 @dataclass(frozen=True)
@@ -309,14 +327,17 @@ class CandidateReceipts:
         The launch's binding is saved first if its seed step saved none.
         Saving the same outcome again changes nothing, so a save repeated
         after a crash is idempotent; another outcome for the same launch
-        replaces it, and that launch becomes the entry's latest.
+        replaces it, and that launch becomes the entry's latest. A refusal
+        is saved redacted, then bounded (:func:`receipt_refusal`): the
+        receipt is written in the clear, and the refusal can quote an
+        exporter's or a runtime's output.
         """
         launches = self.launches(git_input.entry)
         receipt = LaunchReceipt(
             git_input,
             verified=True,
             candidate=outcome.candidate if outcome.accepted else "",
-            refusal="" if outcome.accepted else outcome.problem[:MAX_REFUSAL_CHARS],
+            refusal="" if outcome.accepted else receipt_refusal(outcome.problem),
         )
         if receipt in launches:
             return
@@ -349,7 +370,8 @@ class ArtifactCandidateSource:
     strictly against the git input the launch's handle carries, never
     against what the artifact says. It returns the candidate or a refusal,
     and never raises for the artifact's content. :meth:`save` records the
-    outcome against that git input in the receipts, a refusal included.
+    outcome against that git input in the receipts, a refusal included
+    (redacted, then bounded: :func:`receipt_refusal`).
 
     ``common`` is the common dir and ``export_root`` the launch's export
     directories' parent, relative to it
