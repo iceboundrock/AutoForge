@@ -243,6 +243,13 @@ class LaunchDescription:
     dev: DevPolicy = DevPolicy.MINIMAL
     sys: SysPolicy = SysPolicy.READ_ONLY
     covered: tuple[str, ...] = ()
+    # Which backend planned the launch and, once a lifecycle made its
+    # environment, that environment's handle (ADR 0013 D13): an
+    # ``autoforge.sandbox_backend.LaunchBinding``, opaque here, with which the
+    # run step prepares the launch (``sandbox_backend.prepare``). Not part of
+    # what the launch is: no backend reads it as a mount, a variable or a
+    # policy, and two descriptions that differ only here are equal.
+    binding: object = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         targets: set[str] = set()

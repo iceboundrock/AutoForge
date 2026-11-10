@@ -56,7 +56,7 @@ import posixpath
 import re
 import shutil
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .child_env import OVERRIDE_PATH_NAMES
@@ -72,7 +72,7 @@ from .sandbox import (
     SandboxFacts,
     SandboxRequest,
 )
-from .sandbox_backend import default_backend
+from .sandbox_backend import LaunchEnvironment, SandboxBackend, bind, default_backend
 
 # Where the controller-owned sandbox directories live (D8.4): under
 # ``<git common dir>/autoforge/sandbox/<key>``, the key being the worktree's
@@ -206,17 +206,33 @@ class LaunchFacts:
 
 @dataclass(frozen=True)
 class SandboxPlan:
-    """What the engine hands a provider for one agent launch: the facts.
+    """What the engine hands a provider for one agent launch: the facts, and their backend.
 
     The provider adds its declaration for each process it starts (the
     agent, Pi's auth preflight) and gets the description to launch it with.
+    ``backend`` is the one whose plan step compiles it, and that prepares it
+    at the run step; ``environment`` is the engine's lifecycle for the
+    launch (ADR 0013 D13), which makes the launch's environment once the
+    plan step compiled it, so that a launch the policy refuses makes
+    nothing. Without one (``None``), the launch has no environment of its
+    own to make, as bwrap's has not.
     """
 
     facts: LaunchFacts
+    backend: SandboxBackend = field(default_factory=default_backend)
+    environment: LaunchEnvironment | None = None
 
     def describe(self, needs: ProviderRequirements, env: Mapping[str, str]) -> LaunchDescription:
-        """The description of one process of the launch (:func:`describe_launch`)."""
-        return describe_launch(self.facts, needs, env)
+        """The description of one process of the launch (:func:`describe_launch`).
+
+        The plan step first, pure; then the lifecycle's seed, create and
+        stage steps for what it compiled; the description carries the
+        backend and the handle of that environment to the executor.
+        """
+        description = describe_launch(self.facts, needs, env, backend=self.backend)
+        if self.environment is None:
+            return description
+        return bind(description, self.backend, self.environment.establish(description))
 
 
 def _inside(path: str, root: str) -> bool:
@@ -835,22 +851,29 @@ def _outermost(paths: list[str]) -> list[str]:
 
 
 def describe_launch(
-    facts: LaunchFacts, needs: ProviderRequirements | None, env: Mapping[str, str]
+    facts: LaunchFacts,
+    needs: ProviderRequirements | None,
+    env: Mapping[str, str],
+    *,
+    backend: SandboxBackend | None = None,
 ) -> LaunchDescription:
     """Compile one launch's description and rewrite its environment (D8.2).
 
     ``env`` is the environment the launch would get without a sandbox (the
     allow-listed variables and the controller's overrides). A request the
     compiler refuses is a :class:`SandboxLaunchRefusedError` naming the path
-    and the rule, raised before anything is spawned. The compiler is the
-    backend's plan step (ADR 0013 D13): bwrap's is
-    :func:`~autoforge.sandbox.compile_launch`.
+    and the rule, raised before anything is spawned. The compiler is
+    ``backend``'s plan step (ADR 0013 D13; bwrap's is
+    :func:`~autoforge.sandbox.compile_launch`), and the description is bound
+    to that backend, which alone prepares it; the engine names its own,
+    and the default is :func:`~autoforge.sandbox_backend.default_backend`.
     """
+    planner = backend if backend is not None else default_backend()
     try:
-        description = default_backend().plan(sandbox_request(facts, needs))
+        description = planner.plan(sandbox_request(facts, needs))
     except SandboxPolicyError as exc:
         raise policy_refusal(exc, facts) from exc
-    return rewrite_environment(description, env, needs)
+    return bind(rewrite_environment(description, env, needs), planner)
 
 
 def policy_refusal(exc: SandboxPolicyError, facts: LaunchFacts) -> SandboxLaunchRefusedError:

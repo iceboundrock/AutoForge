@@ -1432,6 +1432,18 @@ verification command blocks the merge gate (`BLOCKED`). `SandboxTamperError`
 is a `VerificationError` for a private object directory that holds what no
 object store does (above); the step enters `BLOCKED`.
 
+The backend seam (ADR 0013, #268) adds `SandboxCleanupUncertainError`, an
+`ExecutionError`: a backend's object of a launch that a removal could not
+verify gone (D17). Its journal entry stays open, and the launch's result is
+not used, since what may still exist could change what the controller
+reads: after the release nothing is exported, and after the export the
+artifact is never verified. It is not retried within the step; the phase
+is unchanged, and the next command's entry reconciles the open entries
+before anything else. An exception already ending the launch (`Ctrl-C`, a
+refusal) propagates instead, with a note naming the objects, which the run
+log's record of the launch quotes. No backend that makes an object can run
+until #272's journal exists, so today only a test's fake backend raises it.
+
 `StateProtocolError` (#265) is a `StateError` for a state file whose
 `protocol_version` this controller has no rule for (newer, or no
 protocol's), raised by the loader before the file's phase or fields are

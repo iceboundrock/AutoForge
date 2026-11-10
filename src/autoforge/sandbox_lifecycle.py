@@ -13,41 +13,57 @@ object is verified gone), then the probe, which the caller caches for the
 runtime report it was proved on. The pin check comes before all three and
 is the engine's own (#280).
 
-**One launch** (:class:`LaunchLifecycle`), in D13's order:
+**One launch** (:class:`LaunchLifecycle`), in D13's order. The caller's
+launch (:meth:`LaunchLifecycle.launch`) is the provider's, whose plan the
+engine bound to the lifecycle (``SandboxPlan``):
 
-1. *seed*: before any journal entry, so a failure there leaves nothing to
+1. *plan*: the provider completes the engine's facts with its declaration
+   and the backend compiles them, pure; a policy refusal raises there, and
+   nothing of the launch exists yet. The plan then hands the compiled
+   launch to :meth:`LaunchLifecycle.establish`, which runs
+2. *seed*: before any journal entry, so a failure there leaves nothing to
    reconcile;
-2. *create*: the objects checked against D13's rules, then one journal
+3. *create*: the objects checked against D13's rules, then one journal
    write that names them all, then each made in :data:`CREATE_ORDER`
    (every bind source before any container, the volume before the stager
    container, that before the launch container);
-3. *stage*: inside the stager container only; its removal journaled, then
+4. *stage*: inside the stager container only; its removal journaled, then
    verified, before the launch container starts, which never happens after
-   a failed stage;
-4. *run*: the caller's launch through the executor, whose prepared launch
-   is closed on every path; then
-5. *the release*, right after the run step on every path, ``Ctrl-C`` and an
+   a failed stage. :meth:`~LaunchLifecycle.establish` returns the
+   :class:`~autoforge.sandbox_backend.LaunchHandle` of what was made, which
+   the compiled launch carries to the executor;
+5. *run*: the executor prepares the command in that handle's environment,
+   by the backend that planned it, and closes its prepared launch on every
+   path; then
+6. *the release*, right after the launch on every path, ``Ctrl-C`` and an
    exception included: what holds the credential is removed, and the
    volume too when there is nothing to export;
-6. *export*, for a change-producing launch: the exporter's own entry before
+7. *export*, for a change-producing launch: the exporter's own entry before
    its create, its removal journaled after;
-7. *verify* is the caller's (#269); once its outcome is saved,
+8. *verify* is the caller's (#269); once its outcome is saved,
    :meth:`LaunchLifecycle.saved` runs
-8. *the final clean-up*: the volume and the export directory. Never before
+9. *the final clean-up*: the volume and the export directory. Never before
    that outcome is saved: a launch that ends between its run and that save
    keeps its volume for reconciliation.
 
 Every removal is journaled first, and its entry is closed only after the
 backend verified it. A removal that cannot be verified is
-:attr:`~autoforge.sandbox_backend.Removal.UNCERTAIN`: reported in
-:attr:`LaunchLifecycle.uncertain`, the entry left open for reconciliation,
-never reported as done. A failure of a step up to the run refuses the
-launch (:class:`~autoforge.errors.SandboxLaunchRefusedError`), and both
-parts of the clean-up then remove what was made; nothing is ever run
-without the sandbox instead.
+:attr:`~autoforge.sandbox_backend.Removal.UNCERTAIN`: its entry is left open
+for reconciliation, it is never reported as done, and it is surfaced as
+:class:`~autoforge.errors.SandboxCleanupUncertainError` where it happened,
+so the caller never reads it as an ordinary launch: after the release, the
+launch's result is not returned and nothing is exported (the launch
+container may still write the volume); after the export, the artifact is
+not returned and never verified (the exporter may still write it); after
+the final clean-up, the step fails. When another exception is already
+ending the launch, that one propagates, with a note naming them. A failure
+of a step up to the run refuses the launch
+(:class:`~autoforge.errors.SandboxLaunchRefusedError`), and both parts of
+the clean-up then remove what was made; nothing is ever run without the
+sandbox instead.
 
-For bwrap every step but the run does nothing, writes nothing and makes
-nothing: its launches are what they were.
+For bwrap every step but the plan and the run does nothing, writes nothing
+and makes nothing: its launches are what they were.
 
 The journal is :class:`LifecycleJournal`. Its file, format, entries,
 runtime binding and the reconciliation logic are #272's; until it lands,
@@ -63,13 +79,16 @@ from dataclasses import dataclass
 from types import TracebackType
 from typing import Protocol, TypeVar
 
-from .errors import SandboxLaunchRefusedError
+from .errors import SandboxCleanupUncertainError, SandboxLaunchRefusedError
+from .sandbox import LaunchDescription
 from .sandbox_backend import (
     CONTAINER_KINDS,
     CREATE_ORDER,
     EXPORT_KINDS,
     NETWORK_NONE,
     Artifact,
+    LaunchHandle,
+    LaunchInputs,
     LaunchOwner,
     LifecycleObject,
     ObjectKind,
@@ -136,6 +155,82 @@ class _NoJournal:
 
 
 NO_JOURNAL: LifecycleJournal = _NoJournal()
+
+
+# -- the verify step (D13; #269) ----------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Exported:
+    """The export step's outcome: the artifact, untrusted, or why the export failed."""
+
+    artifact: Artifact | None = None
+    failure: str = ""
+
+
+@dataclass(frozen=True)
+class Verified:
+    """The verify step's outcome: the candidate it imported, or why it refused the artifact.
+
+    ``candidate`` is the commit the controller imported from the artifact;
+    ``refusal`` the reason there is none. An outcome is a candidate only
+    with a commit and no refusal (:attr:`accepted`).
+    """
+
+    candidate: str = ""
+    refusal: str = ""
+
+    @property
+    def accepted(self) -> bool:
+        return bool(self.candidate) and not self.refusal
+
+    @property
+    def problem(self) -> str:
+        """Why there is no candidate, as the candidate read refuses it; "" when accepted."""
+        if self.accepted:
+            return ""
+        return self.refusal or "the verify step named no candidate"
+
+
+class CandidateSource(Protocol):
+    """The controller's verify step for an exported artifact, and its save (D13, D19; #269).
+
+    The engine calls :meth:`verify` with the artifact (untrusted) and the
+    launch's handle, then :meth:`save` with the outcome, and only after
+    :meth:`save` returned does the final clean-up remove the volume. #269's
+    candidate source imports strictly and binds the outcome in state.
+    """
+
+    def verify(self, artifact: Artifact, handle: LaunchHandle) -> Verified:
+        """The artifact checked and imported, or refused; never trusted as it is."""
+        ...
+
+    def save(self, outcome: Verified) -> None:
+        """Make ``outcome`` durable before the volume it was read from is removed."""
+        ...
+
+
+class _NoCandidateSource:
+    """No candidate source verifies an exported artifact yet (#269).
+
+    It refuses every artifact, so an exported volume is never read as a
+    candidate; a refusal leaves nothing to import and so needs nothing of the
+    volume kept, and there is no binding to save.
+    """
+
+    def verify(self, artifact: Artifact, handle: LaunchHandle) -> Verified:
+        return Verified(
+            refusal=(
+                "no candidate source verifies an exported artifact yet (#269), so the "
+                "launch's export is refused, never read as its candidate"
+            )
+        )
+
+    def save(self, outcome: Verified) -> None:
+        return None
+
+
+NO_CANDIDATE_SOURCE: CandidateSource = _NoCandidateSource()
 
 
 # -- at a command's entry (D16) ---------------------------------------------------
@@ -278,37 +373,51 @@ def _in_order(objects: Iterable[LifecycleObject]) -> tuple[LifecycleObject, ...]
     return tuple(sorted(objects, key=lambda obj: CREATE_ORDER.index(obj.kind)))
 
 
+def _named(objects: Iterable[LifecycleObject]) -> tuple[str, ...]:
+    return tuple(f"{obj.kind.value} {obj.name}" for obj in objects)
+
+
 class LaunchLifecycle:
     """One launch's steps, in D13's order, journaled; a context manager.
 
-    ``with LaunchLifecycle(...) as lifecycle:`` then :meth:`seed`,
-    :meth:`create`, :meth:`stage`, :meth:`run`, and for a change-producing
-    launch :meth:`export` and, once the verify step's outcome is saved,
-    :meth:`saved`. Leaving the ``with`` block on any path runs the release
-    if the run step did not, and the final clean-up when it is allowed;
-    it never raises for a removal, and the original exception, ``Ctrl-C``
-    included, is the one that propagates. A step called out of order is
-    refused.
+    ``with LaunchLifecycle(...) as lifecycle:``, the engine binds the
+    provider's plan to it (``SandboxPlan(facts, backend, lifecycle)``), then
+    :meth:`launch` with the provider's launch, whose plan calls
+    :meth:`establish` once it compiled; then :meth:`export` and, for an
+    artifact, once the verify step's outcome is saved, :meth:`saved`.
+    Leaving the ``with`` block on any path runs the release if the launch
+    did not, and the final clean-up when it is allowed; the original
+    exception, ``Ctrl-C`` included, is the one that propagates. A step
+    called out of order is refused. An uncertain removal is surfaced as
+    :class:`~autoforge.errors.SandboxCleanupUncertainError` (module
+    docstring).
     """
 
     def __init__(
         self,
         backend: SandboxBackend,
         journal: LifecycleJournal,
-        owner: LaunchOwner,
+        inputs: LaunchInputs,
         runtime: RuntimeReport,
         *,
         change_producing: bool,
     ) -> None:
         self._backend = backend
         self._journal = journal
-        self._owner = owner
+        self._inputs = inputs
+        self._owner = inputs.owner
         self._runtime = runtime
         self._change_producing = change_producing
         self._step = "start"
+        # True only while the provider's launch runs (:meth:`launch`).
+        self._launching = False
         self._seed: Seed | None = None
         self._open: list[LifecycleObject] = []
-        self._ran = False
+        # The environment: "" not yet, "making", "ready" (the launch
+        # container started, so the command may have run), or "failed".
+        self._environment = ""
+        self._planned: LaunchDescription | None = None
+        self._handle: LaunchHandle | None = None
         self._released = False
         self._export_skipped = False
         self._saved = False
@@ -316,6 +425,8 @@ class LaunchLifecycle:
         # Every object whose removal could not be verified: its entry stays
         # open for reconciliation (ADR 0013 D17).
         self.uncertain: list[LifecycleObject] = []
+        # Those already surfaced to the caller, by an error or a note.
+        self._surfaced: list[LifecycleObject] = []
 
     # -- the context ------------------------------------------------------------
     def __enter__(self) -> LaunchLifecycle:
@@ -338,11 +449,25 @@ class LaunchLifecycle:
                     self._backend.discard_seed(seed)
                 except Exception:  # noqa: BLE001 - a leftover temporary directory only
                     pass
+        pending = self._unsurfaced()
+        if not pending:
+            return
+        if exc is None:
+            self._surface(pending, "the launch's clean-up")
+        else:
+            # Never masked: the exception that ends the launch propagates.
+            self._surfaced.extend(pending)
+            exc.add_note(_uncertain_text(pending, "the launch's clean-up"))
 
     @property
     def open_objects(self) -> tuple[LifecycleObject, ...]:
         """The launch's objects whose entries are still open."""
         return tuple(self._open)
+
+    @property
+    def handle(self) -> LaunchHandle | None:
+        """What :meth:`establish` made for the launch; ``None`` before."""
+        return self._handle
 
     # -- the steps --------------------------------------------------------------
     def _advance(self, step: str, after: str) -> None:
@@ -350,17 +475,63 @@ class LaunchLifecycle:
             raise _refused(f"the {step} step comes after the {after} step, not after {self._step}")
         self._step = step
 
-    def seed(self) -> Seed:
-        """The seed step, before any journal entry; a failure leaves nothing to reconcile."""
-        self._advance("seed", "start")
-        self._seed = self._backend.seed(self._owner)
-        return self._seed
+    def launch(self, run: Callable[[], T]) -> T:
+        """The provider's launch: its plan, the environment it establishes, the run step.
 
-    def create(self) -> None:
+        The release follows it on every path. A release that cannot verify
+        what it removed is :class:`~autoforge.errors.SandboxCleanupUncertainError`
+        in place of the launch's result.
+        """
+        self._advance("launch", "start")
+        self._launching = True
+        try:
+            result = run()
+        finally:
+            self._launching = False
+            self._release()
+        self._raise_if_uncertain("the release after the run step")
+        return result
+
+    def establish(self, launch: LaunchDescription) -> LaunchHandle:
+        """The seed, create and stage steps for the compiled ``launch``; their handle.
+
+        Called by the plan the engine bound to this lifecycle, once it
+        compiled the launch: so after the plan step, and never for a launch
+        the policy refused. Only during :meth:`launch`. A later process of
+        the same launch (Pi's auth check, then Pi) is planned too and runs in
+        the environment already made, which must serve its network position;
+        how a container's launch serves a second process after the first
+        one's ``close()`` is #271's to decide. An environment that failed is
+        never made again.
+        """
+        if not self._launching:
+            raise _refused(f"a launch's environment is made during its launch, not {self._step}")
+        if self._environment == "ready":
+            assert self._handle is not None and self._planned is not None
+            if launch.network != self._planned.network:
+                raise _refused(
+                    f"a process of the launch needs the {launch.network.value} network, and "
+                    f"its environment was created with {self._planned.network.value}"
+                )
+            return self._handle
+        if self._environment:
+            raise _refused("its environment could not be made, and is not made again")
+        self._environment = "making"
+        self._planned = launch
+        try:
+            seed = self._seed = self._backend.seed(self._inputs, launch)
+            self._create(launch, seed)
+            self._stage(seed)
+        except BaseException:
+            self._environment = "failed"
+            raise
+        self._environment = "ready"
+        self._handle = LaunchHandle(self._inputs, seed, tuple(self._open))
+        return self._handle
+
+    def _create(self, launch: LaunchDescription, seed: Seed) -> None:
         """One journal write for every object, then each made in D13's order."""
-        self._advance("create", "seed")
-        assert self._seed is not None
-        objects = tuple(self._backend.objects(self._owner, self._seed))
+        objects = tuple(self._backend.objects(self._inputs, seed, launch))
         _check_create(objects, self._owner)
         objects = _in_order(objects)
         if not objects:
@@ -368,17 +539,15 @@ class LaunchLifecycle:
         self._journal.record_creates(self._runtime, objects)
         self._open = list(objects)
         for obj in objects:
-            self._backend.make(obj, self._seed)
+            self._backend.make(obj, seed, launch)
 
-    def stage(self) -> None:
+    def _stage(self, seed: Seed) -> None:
         """The stager container's work, its journaled removal, then the launch container's start."""
-        self._advance("stage", "create")
-        assert self._seed is not None
         stager = self._find(ObjectKind.STAGER_CONTAINER)
         launch = self._find(ObjectKind.LAUNCH_CONTAINER)
         if stager is None or launch is None:
             return
-        self._backend.stage(stager, self._seed)
+        self._backend.stage(stager, seed)
         self._remove((stager,))
         if stager in self._open:
             raise _refused(
@@ -387,24 +556,22 @@ class LaunchLifecycle:
             )
         self._backend.start(launch)
 
-    def run(self, launch: Callable[[], T]) -> T:
-        """The run step; the release follows it on every path."""
-        self._advance("run", "stage")
-        self._ran = True
-        try:
-            return launch()
-        finally:
-            self._release()
-
-    def export(self) -> Artifact | None:
+    def export(self) -> Exported | None:
         """The export step; ``None`` when nothing is exported, which skips verify.
 
         The exporter's entry is written before its create, and its removal
-        journaled after it ran, whatever the export's outcome.
+        journaled after it ran, whatever the export's outcome. An exporter
+        not verified removed may still write the artifact: neither the
+        artifact nor the export's failure is returned, and
+        :class:`~autoforge.errors.SandboxCleanupUncertainError` is raised,
+        so nothing verifies it and the volume stays.
         """
-        self._advance("export", "run")
-        exporter = self._backend.exporter(self._owner) if self._change_producing else ()
-        if not exporter:
+        self._advance("export", "launch")
+        handle = self._handle if self._environment == "ready" else None
+        exporter = (
+            self._backend.exporter(handle) if self._change_producing and handle is not None else ()
+        )
+        if not exporter or handle is None:
             self._export_skipped = True
             return None
         # The exporter mounts the volume (read-only) and its export directory,
@@ -414,15 +581,20 @@ class LaunchLifecycle:
         self._journal.record_creates(self._runtime, exporter)
         self._open.extend(exporter)
         try:
-            return self._backend.export(exporter)
+            outcome = Exported(self._backend.export(exporter, handle))
+        except SandboxLaunchRefusedError as exc:
+            outcome = Exported(failure=str(exc))
         finally:
             self._remove(tuple(obj for obj in exporter if obj.kind is ObjectKind.EXPORTER))
+        self._raise_if_uncertain("the export")
+        return outcome
 
     def saved(self) -> None:
         """The verify step's outcome is saved: the final clean-up runs now.
 
-        Only after the export step, which ran, failed or was skipped: the
-        volume is never removed before what verify read from it is saved.
+        Only after an export that returned an outcome: the volume is never
+        removed before what verify read from it is saved, nor while an
+        exporter may still be running.
         """
         if self._step != "export":
             raise _refused(
@@ -430,14 +602,15 @@ class LaunchLifecycle:
             )
         self._saved = True
         self._finish()
+        self._raise_if_uncertain("the final clean-up")
 
     # -- the clean-up -----------------------------------------------------------
     def _find(self, kind: ObjectKind) -> LifecycleObject | None:
         return next((obj for obj in self._open if obj.kind is kind), None)
 
     def _awaits_verify(self) -> bool:
-        """A change-producing launch that ran, whose export was not skipped."""
-        return self._change_producing and self._ran and not self._export_skipped
+        """A change-producing launch whose command may have run, whose export was not skipped."""
+        return self._change_producing and self._environment == "ready" and not self._export_skipped
 
     def _may_finish(self) -> bool:
         return self._saved or not self._awaits_verify()
@@ -494,3 +667,25 @@ class LaunchLifecycle:
 
     def _uncertain(self, objects: tuple[LifecycleObject, ...]) -> None:
         self.uncertain.extend(obj for obj in objects if obj not in self.uncertain)
+
+    def _unsurfaced(self) -> list[LifecycleObject]:
+        return [obj for obj in self.uncertain if obj not in self._surfaced]
+
+    def _raise_if_uncertain(self, where: str) -> None:
+        pending = self._unsurfaced()
+        if pending:
+            self._surface(pending, where)
+
+    def _surface(self, pending: list[LifecycleObject], where: str) -> None:
+        self._surfaced.extend(pending)
+        raise SandboxCleanupUncertainError(_uncertain_text(pending, where), _named(pending))
+
+
+def _uncertain_text(objects: list[LifecycleObject], where: str) -> str:
+    one = len(objects) == 1
+    entries = "its journal entry stays" if one else "their journal entries stay"
+    return (
+        f"{where} could not verify that {', '.join(_named(objects))} "
+        f"{'is' if one else 'are'} gone: {entries} open for the next command's "
+        "reconciliation, and nothing of the launch is read as done"
+    )

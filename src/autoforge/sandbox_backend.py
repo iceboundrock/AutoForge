@@ -4,16 +4,27 @@ A bwrap launch is one process whose death ends the sandbox; a container is
 not. So the seam between the controller and a backend is a *lifecycle*,
 not only "prepare a command". This module is that seam's executor-layer
 half: the backend-neutral interface (:class:`SandboxBackend`), the data it
-passes (:class:`RuntimeReport`, :class:`LifecycleObject`, :class:`Seed`,
+passes (:class:`RuntimeReport`, :class:`LaunchInputs`,
+:class:`LifecycleObject`, :class:`Seed`, :class:`LaunchHandle`,
 :class:`Artifact`, :class:`Removal`), the run step's prepared launch
 (:class:`PreparedLaunch`), and bwrap behind it (:class:`BwrapBackend`).
 The engine-layer half, which sequences the steps and journals them, is
 :mod:`autoforge.sandbox_lifecycle`.
 
+One launch's steps hand each other explicit data, all of it the same
+launch's, on the same backend: the plan's compiled launch and the
+launch's inputs go to the seed and the create step, the seed to the
+create and the stage step, and the :class:`LaunchHandle` of what they
+made to the run step's :meth:`SandboxBackend.prepare`, so that the command
+runs in exactly the environment created and staged for it. The compiled
+launch carries that :class:`LaunchBinding` (the backend that planned it
+and the handle) to the executor, whose request is not wrapped.
+
 The steps, in D13's order, and what bwrap does in each:
 
-- **plan** (pure): the role-level request compiled into a typed, immutable
-  launch. bwrap: :func:`~autoforge.sandbox.compile_launch`, as it is.
+- **plan** (pure): the role-level request, completed by the provider's
+  declaration, compiled into a typed, immutable launch. bwrap:
+  :func:`~autoforge.sandbox.compile_launch`, as it is.
 - **seed**: the launch's git input and its checked seed, in a
   controller-owned temporary directory, before any journal entry (#269,
   #292). bwrap: nothing.
@@ -24,8 +35,9 @@ The steps, in D13's order, and what bwrap does in each:
 - **stage**: inside the stager container only; then the stager container
   is removed and the launch container started. bwrap: nothing.
 - **run**: the provider's prepared launch, spawned by the executor
-  (:func:`prepare`). This is the existing prepare seam, kept: executor
-  requests are not wrapped. bwrap: :func:`autoforge.sandbox_bwrap.prepare`.
+  (:func:`prepare`), in the environment the launch's handle names. This is
+  the existing prepare seam, kept: executor requests are not wrapped.
+  bwrap: :func:`autoforge.sandbox_bwrap.prepare`.
 - **release**, right after the run step on every path: what holds the
   credential is removed (and the volume, when there is nothing to export).
   bwrap: nothing.
@@ -53,7 +65,7 @@ launch refusal; a **setup failure** of any step up to the run is
 a **command failure** is the command's own end, as today; and an
 **uncertain** removal is :attr:`Removal.UNCERTAIN`, reported and left for
 reconciliation, never "done". None of them ever runs a launch without the
-sandbox: a launch no backend can prepare is refused (:func:`backend_for`).
+sandbox: a launch no backend can prepare is refused (:func:`prepare`).
 
 Executor layer: no workflow semantics, no journal, no state. A
 :class:`LaunchOwner` is the labels an object carries, plain data. Only
@@ -63,6 +75,7 @@ executor and ``doctor`` reach bwrap through it (a test pins that).
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -164,6 +177,21 @@ class LaunchOwner:
     launch: str
 
 
+@dataclass(frozen=True)
+class LaunchInputs:
+    """What one launch's steps take besides its plan (ADR 0013 D13): plain data, no workflow.
+
+    ``owner`` is the labels its objects carry; ``workspace`` the issue
+    worktree the launch works in; ``read_context`` the controller-written
+    read context, "" for none. #269 adds the launch's git input (the bound
+    revision), #290 the credential projection's items.
+    """
+
+    owner: LaunchOwner
+    workspace: str
+    read_context: str = ""
+
+
 class ObjectKind(enum.Enum):
     """What a lifecycle object is (ADR 0013 D13, D6)."""
 
@@ -247,6 +275,56 @@ class Artifact:
     directory: str
 
 
+@dataclass(frozen=True)
+class LaunchHandle:
+    """What the create and stage steps made for one launch, as its later steps need it (D13).
+
+    ``objects`` are the launch's objects still in place once its
+    environment is ready (the launch container, started; the volume; what
+    it mounts), each with the name and nonce its journal entry holds. The
+    run step's :meth:`SandboxBackend.prepare` runs the command in the launch
+    container named here and nowhere else. bwrap's handle names no object.
+    """
+
+    inputs: LaunchInputs
+    seed: Seed
+    objects: tuple[LifecycleObject, ...] = ()
+
+    def find(self, kind: ObjectKind) -> LifecycleObject | None:
+        """The launch's object of ``kind``, or ``None``."""
+        return next((obj for obj in self.objects if obj.kind is kind), None)
+
+
+@dataclass(frozen=True)
+class LaunchBinding:
+    """Which backend planned a compiled launch, and the handle of its environment (D13).
+
+    Set by the plan step (:func:`bind`) on the launch it compiled, and again
+    by ``SandboxPlan.describe`` once the engine's lifecycle made the launch's
+    environment; carried to the executor on the launch itself, so the
+    request is not wrapped.
+    ``handle`` is ``None`` for a launch no lifecycle made an environment for
+    (a repository-defined command): a backend that needs one refuses it.
+    """
+
+    backend: SandboxBackend
+    handle: LaunchHandle | None = None
+
+
+class LaunchEnvironment(Protocol):
+    """What makes a planned launch's environment: the engine's lifecycle (D13).
+
+    The plan a provider completes (``SandboxPlan.describe``) calls
+    :meth:`establish` with the launch it just compiled, so that the seed,
+    create and stage steps come after the plan step, and a launch the
+    policy refuses makes nothing.
+    """
+
+    def establish(self, launch: LaunchDescription) -> LaunchHandle:
+        """The seed, create and stage steps for ``launch``; the handle of what they made."""
+        ...
+
+
 class SandboxBackend(Protocol):
     """One backend's operations, which the engine sequences and journals (ADR 0013 D13).
 
@@ -283,7 +361,7 @@ class SandboxBackend(Protocol):
         """The compiled launch, typed and immutable; pure. A policy refusal raises."""
         ...
 
-    def seed(self, owner: LaunchOwner) -> Seed:
+    def seed(self, inputs: LaunchInputs, launch: LaunchDescription) -> Seed:
         """The launch's checked seed, in a temporary directory; no runtime call."""
         ...
 
@@ -291,11 +369,17 @@ class SandboxBackend(Protocol):
         """Remove the seed's temporary directory. Idempotent."""
         ...
 
-    def objects(self, owner: LaunchOwner, seed: Seed) -> tuple[LifecycleObject, ...]:
-        """The objects the create step will make, each with its nonce; makes nothing."""
+    def objects(
+        self, inputs: LaunchInputs, seed: Seed, launch: LaunchDescription
+    ) -> tuple[LifecycleObject, ...]:
+        """The objects the create step will make for ``launch``, each with its nonce.
+
+        Makes nothing. The launch container's network and mounts follow the
+        compiled launch, and every object carries ``inputs.owner``.
+        """
         ...
 
-    def make(self, obj: LifecycleObject, seed: Seed) -> None:
+    def make(self, obj: LifecycleObject, seed: Seed, launch: LaunchDescription) -> None:
         """Make one object the create step journaled, with every mount and its network."""
         ...
 
@@ -314,20 +398,30 @@ class SandboxBackend(Protocol):
     def prepare(
         self,
         launch: LaunchDescription,
+        handle: LaunchHandle | None,
         command: list[str],
         *,
         cwd: str | None,
         env: Mapping[str, str],
     ) -> PreparedLaunch:
-        """The run step: ``command`` prepared to run inside ``launch``, or a refusal."""
+        """The run step: ``command`` prepared to run inside ``launch``, or a refusal.
+
+        In the launch container ``handle`` names, created and staged for
+        this launch; ``None`` when no lifecycle made one, which a backend
+        that needs an environment refuses.
+        """
         ...
 
-    def exporter(self, owner: LaunchOwner) -> tuple[LifecycleObject, ...]:
+    def exporter(self, handle: LaunchHandle) -> tuple[LifecycleObject, ...]:
         """The exporter and its export directory; empty when nothing is exported."""
         ...
 
-    def export(self, objects: tuple[LifecycleObject, ...]) -> Artifact:
-        """Create and run the exporter the engine journaled; the artifact, untrusted."""
+    def export(self, objects: tuple[LifecycleObject, ...], handle: LaunchHandle) -> Artifact:
+        """Create and run the exporter the engine journaled; the artifact, untrusted.
+
+        An export that fails raises :class:`SandboxLaunchRefusedError`: the
+        engine saves it as the verify step's refusal (D17).
+        """
         ...
 
     def remove(self, obj: LifecycleObject) -> Removal:
@@ -373,16 +467,18 @@ class BwrapBackend:
     def plan(self, request: SandboxRequest) -> LaunchDescription:
         return compile_launch(request)
 
-    def seed(self, owner: LaunchOwner) -> Seed:
+    def seed(self, inputs: LaunchInputs, launch: LaunchDescription) -> Seed:
         return NO_SEED
 
     def discard_seed(self, seed: Seed) -> None:
         return None
 
-    def objects(self, owner: LaunchOwner, seed: Seed) -> tuple[LifecycleObject, ...]:
+    def objects(
+        self, inputs: LaunchInputs, seed: Seed, launch: LaunchDescription
+    ) -> tuple[LifecycleObject, ...]:
         return ()
 
-    def make(self, obj: LifecycleObject, seed: Seed) -> None:
+    def make(self, obj: LifecycleObject, seed: Seed, launch: LaunchDescription) -> None:
         raise _no_object(obj)
 
     def stage(self, stager: LifecycleObject, seed: Seed) -> None:
@@ -394,17 +490,21 @@ class BwrapBackend:
     def prepare(
         self,
         launch: LaunchDescription,
+        handle: LaunchHandle | None,
         command: list[str],
         *,
         cwd: str | None,
         env: Mapping[str, str],
     ) -> PreparedLaunch:
+        # bwrap makes its namespace at the spawn: a handle names nothing it made.
+        if handle is not None and handle.objects:
+            raise _no_object(handle.objects[0])
         return sandbox_bwrap.prepare(launch, command, cwd=cwd, env=env)
 
-    def exporter(self, owner: LaunchOwner) -> tuple[LifecycleObject, ...]:
+    def exporter(self, handle: LaunchHandle) -> tuple[LifecycleObject, ...]:
         return ()
 
-    def export(self, objects: tuple[LifecycleObject, ...]) -> Artifact:
+    def export(self, objects: tuple[LifecycleObject, ...], handle: LaunchHandle) -> Artifact:
         raise SandboxLaunchRefusedError(
             "the bwrap backend exports nothing: its candidate is the worktree's HEAD "
             "(ADR 0005 D6.3)"
@@ -417,9 +517,10 @@ class BwrapBackend:
 
 BWRAP = BwrapBackend()
 
-# Which backend prepares a launch, by the launch's type: the plan step's
-# output says which backend compiled it. Exact types only, so a type no
-# backend registered is refused, never handed to bwrap.
+# Which backend prepares a launch that no plan step bound (a description
+# built by hand, as the backend's own tests do), by its exact type: only
+# bwrap, which needs no other step, so a type no backend registered is
+# refused, never handed to bwrap.
 _BY_LAUNCH: dict[type, SandboxBackend] = {LaunchDescription: BWRAP}
 
 
@@ -429,7 +530,7 @@ def default_backend() -> SandboxBackend:
 
 
 def backend_for(launch: object) -> SandboxBackend:
-    """The backend that prepares ``launch``; a launch no backend knows is refused.
+    """The backend that prepares an unbound ``launch``; one no backend knows is refused.
 
     Never a fallback: a launch meant to be enforced is refused rather than
     run without the sandbox, or under a backend that did not plan it.
@@ -443,6 +544,13 @@ def backend_for(launch: object) -> SandboxBackend:
     return backend
 
 
+def bind(
+    launch: LaunchDescription, backend: SandboxBackend, handle: LaunchHandle | None = None
+) -> LaunchDescription:
+    """``launch`` bound to the backend that planned it and, once made, its environment."""
+    return dataclasses.replace(launch, binding=LaunchBinding(backend, handle))
+
+
 def prepare(
     launch: LaunchDescription,
     command: list[str],
@@ -450,5 +558,18 @@ def prepare(
     cwd: str | None,
     env: Mapping[str, str],
 ) -> PreparedLaunch:
-    """The run step's prepare seam: ``command`` inside ``launch``, by the launch's backend."""
-    return backend_for(launch).prepare(launch, command, cwd=cwd, env=env)
+    """The run step's prepare seam: ``command`` inside ``launch``.
+
+    By the backend that planned the launch, in the environment its handle
+    names (:class:`LaunchBinding`); a launch no plan step bound, by its
+    type (:func:`backend_for`).
+    """
+    binding = launch.binding
+    if binding is None:
+        return backend_for(launch).prepare(launch, None, command, cwd=cwd, env=env)
+    if not isinstance(binding, LaunchBinding):
+        raise SandboxLaunchRefusedError(
+            f"the launch is bound to a {type(binding).__name__}, which names no sandbox backend, "
+            "so it is refused; it never runs without the sandbox"
+        )
+    return binding.backend.prepare(launch, binding.handle, command, cwd=cwd, env=env)

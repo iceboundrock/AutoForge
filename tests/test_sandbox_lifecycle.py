@@ -4,29 +4,44 @@ No runtime is needed. :class:`FakeRuntime` is a container runtime that, as
 Docker and Podman do, accepts a bind, a volume or a network only in a
 container's create call; every other call it has names a container and
 nothing it could add to it. :class:`FakeBackend` is a container-shaped
-backend over it (both staging forms, ``bind`` and ``copy``), and
-:class:`FakeJournal` records what the engine journals. They share one
-event list, so a test reads the order across all three. The engine's own
-use of the sequence is at the end of this module.
+backend over it (both staging forms, ``bind`` and ``copy``), whose run step
+prepares a command to run in the launch container its handle names;
+:class:`FakeJournal` records what the engine journals, and
+:class:`FakeSource` is the controller's verify step and its save. They share
+one event list, so a test reads the order across all of them. The engine's
+own use of the sequence is at the end of this module, after a launch
+through a real provider adapter and the real executor.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 import autoforge.engine as engine_module
-from autoforge.config import default_config
+from autoforge.config import ProfileConfig, default_config
 from autoforge.engine import ControllerEngine
-from autoforge.errors import ControlResultValidationError, SandboxLaunchRefusedError
+from autoforge.errors import (
+    ControlResultValidationError,
+    SandboxCleanupUncertainError,
+    SandboxLaunchRefusedError,
+    SandboxPolicyError,
+)
+from autoforge.executor import ExecutionRequest, execute
+from autoforge.providers import AgentRequest, OpenCodeProvider, ProviderRequirements
 from autoforge.run_namespace import issue_namespace
-from autoforge.sandbox import BackendKind, LaunchDescription
+from autoforge.sandbox import BackendKind, LaunchDescription, NetworkPosition, SandboxFacts
 from autoforge.sandbox_backend import (
     BWRAP,
     NETWORK_NONE,
     Artifact,
+    LaunchHandle,
+    LaunchInputs,
     LaunchOwner,
     LifecycleObject,
     ObjectKind,
@@ -35,14 +50,37 @@ from autoforge.sandbox_backend import (
     RuntimeReport,
     Seed,
 )
-from autoforge.sandbox_lifecycle import NO_JOURNAL, LaunchLifecycle, enter, reconcile
+from autoforge.sandbox_lifecycle import (
+    NO_CANDIDATE_SOURCE,
+    NO_JOURNAL,
+    Exported,
+    LaunchLifecycle,
+    Verified,
+    enter,
+    reconcile,
+)
+from autoforge.sandbox_policy import LaunchClass, LaunchFacts, SandboxPlan
 from autoforge.state import load_state
 from autoforge.transitions import Phase
 from tests.conftest import EPIC, ISSUE, git_repo, implement, make_engine
 
 OWNER = LaunchOwner(run="run-1", issue=268, phase="ANALYZE_EXECUTE", launch="ANALYZE_EXECUTE-1")
+INPUTS = LaunchInputs(OWNER, workspace="/work/268", read_context="/state/read-context/1")
 RUNTIME = RuntimeReport(
     BackendKind.CONTAINER, "podman", "5.2.0", True, "unix:///run/user/1000/podman.sock", "store-1"
+)
+# What the plan step compiled, as a provider's ``SandboxPlan.describe`` hands it on.
+PLANNED = LaunchDescription(mounts=())
+_linux_only = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="the executor's containment is Linux-only here"
+)
+
+# The fake runtime's ``exec``: it runs the command as running in the
+# container argv names, and says so in the command's environment.
+RUNTIME_EXEC = (
+    "import os, sys\n"
+    "os.environ['FAKE_CONTAINER'], os.environ['FAKE_NONCE'] = sys.argv[1], sys.argv[2]\n"
+    "os.execv(sys.argv[3], sys.argv[3:])\n"
 )
 
 
@@ -50,8 +88,8 @@ class FakeRuntime:
     """A rootless runtime's CLI as the lifecycle sees it: what was called, in order.
 
     A bind, a volume and a network exist only as arguments of
-    :meth:`create_container`; ``start``, ``exec``, ``cp`` and ``rm`` take a
-    container's name and nothing they could configure it with.
+    :meth:`create_container`; ``start``, ``exec``, ``cp``, ``kill`` and ``rm``
+    take a container's name and nothing they could configure it with.
     """
 
     def __init__(self, events: list[tuple]) -> None:
@@ -78,17 +116,77 @@ class FakeRuntime:
     def cp(self, name: str, what: str) -> None:
         self.events.append(("runtime", "cp", name, what))
 
+    def kill(self, name: str) -> None:
+        self.events.append(("runtime", "kill", name))
+        if name in self.containers:
+            self.containers[name]["running"] = False
+
     def rm(self, name: str) -> None:
         self.events.append(("runtime", "rm", name))
         self.containers.pop(name, None)
         self.volumes.discard(name)
 
 
+CONTAINER_FACTS = SandboxFacts(
+    enforced=True,
+    backend="container",
+    teardown="removed with the container's PID namespace, uncounted",
+    network="bridge",
+    runtime="podman",
+    runtime_version="5.2.0",
+    rootless=True,
+    staging="bind",
+)
+
+
+class ContainerLaunch:
+    """The fake backend's prepared launch: the command, run in one container by name.
+
+    Its argv is the fake runtime's ``exec`` into the container the handle
+    names; the spawn finds that container running; ``close()`` ends its PID
+    namespace (ADR 0013 D13), as killing the attached client would not.
+    """
+
+    def __init__(self, backend: FakeBackend, container: LifecycleObject, command, env) -> None:
+        self.backend = backend
+        self.container = container
+        self.argv = [sys.executable, "-c", RUNTIME_EXEC, container.name, container.nonce, *command]
+        self.spawn_env = dict(env)
+        self.pass_fds: tuple[int, ...] = ()
+        self.preexec_fn = _nothing
+
+    def spawned(self) -> None:
+        running = self.backend.runtime.containers[self.container.name]["running"]
+        self.backend.events.append(("executor", "spawned", self.container.name, running))
+
+    def spawn_error(self, exc: BaseException) -> SandboxLaunchRefusedError:
+        return SandboxLaunchRefusedError(f"fake: the exec failed ({exc})")
+
+    def collect(self) -> None:
+        return None
+
+    def outcome(self, *, returncode, ended_by_executor, stderr) -> SandboxFacts:
+        return CONTAINER_FACTS
+
+    def close(self) -> None:
+        self.backend.runtime.kill(self.container.name)
+
+
+def _nothing() -> None:
+    return None
+
+
+def _network(launch: LaunchDescription) -> str:
+    """The launch container's network for the compiled launch's position (D9)."""
+    return "bridge" if launch.network is NetworkPosition.HOST else NETWORK_NONE
+
+
 class FakeBackend:
     """A container-shaped backend over :class:`FakeRuntime` (the bind or the copy-in form).
 
-    ``fail`` names one operation that raises a setup failure;
-    ``uncertain`` the kinds whose removal it cannot verify.
+    ``fail`` names one operation that raises a setup failure; ``uncertain``
+    the kinds whose removal it cannot verify; ``deny_plan`` makes the plan
+    step refuse, as the policy compiler does.
     """
 
     def __init__(
@@ -106,7 +204,10 @@ class FakeBackend:
         self.fail = fail
         self.uncertain = uncertain
         self.has_exporter = exporter
+        self.deny_plan = False
         self.made: list[str] = []
+        self.seeded: list[tuple[LaunchInputs, LaunchDescription]] = []
+        self.prepared: list[tuple[LaunchHandle | None, list[str]]] = []
         self.objects_override: tuple[LifecycleObject, ...] | None = None
 
     def _maybe_fail(self, what: str) -> None:
@@ -135,22 +236,28 @@ class FakeBackend:
         return ProbeResult(True, "", "fake")
 
     def plan(self, request) -> LaunchDescription:
-        return LaunchDescription(mounts=())
+        self.events.append(("host", "plan"))
+        if self.deny_plan:
+            raise SandboxPolicyError("/home/operator/.ssh", "a forbidden source", "fake")
+        return LaunchDescription(mounts=(), network=request.network)
 
-    def seed(self, owner: LaunchOwner) -> Seed:
+    def seed(self, inputs: LaunchInputs, launch: LaunchDescription) -> Seed:
         self.events.append(("host", "seed"))
+        self.seeded.append((inputs, launch))
         self._maybe_fail("seed")
         return Seed("sha256:manifest", "/tmp/seed")
 
     def discard_seed(self, seed: Seed) -> None:
         self.events.append(("host", "discard seed"))
 
-    def objects(self, owner: LaunchOwner, seed: Seed) -> tuple[LifecycleObject, ...]:
+    def objects(
+        self, inputs: LaunchInputs, seed: Seed, launch: LaunchDescription
+    ) -> tuple[LifecycleObject, ...]:
         if self.objects_override is not None:
             return self.objects_override
-        return container_objects(owner, self.staging)
+        return container_objects(inputs.owner, self.staging, _network(launch))
 
-    def make(self, obj: LifecycleObject, seed: Seed) -> None:
+    def make(self, obj: LifecycleObject, seed: Seed, launch: LaunchDescription) -> None:
         assert seed.identity == "sha256:manifest"
         if obj.kind is ObjectKind.STAGING_ROOT:
             self.events.append(("host", "write staging root", obj.name))
@@ -181,12 +288,18 @@ class FakeBackend:
         if self.staging == "copy":
             self.runtime.cp(container.name, "read context")
 
-    def prepare(self, launch, command, *, cwd, env):  # the executor's; unused here
-        raise AssertionError("the run step's prepare is the executor's")
+    def prepare(self, launch, handle, command, *, cwd, env):
+        self.prepared.append((handle, list(command)))
+        container = handle.find(ObjectKind.LAUNCH_CONTAINER) if handle is not None else None
+        if container is None:
+            raise SandboxLaunchRefusedError("fake: no launch container was made for this launch")
+        self.events.append(("executor", "prepare", container.name))
+        return ContainerLaunch(self, container, command, env)
 
-    def exporter(self, owner: LaunchOwner) -> tuple[LifecycleObject, ...]:
+    def exporter(self, handle: LaunchHandle) -> tuple[LifecycleObject, ...]:
         if not self.has_exporter:
             return ()
+        owner = handle.inputs.owner
         return (
             LifecycleObject(
                 owner, ObjectKind.EXPORTER, "exporter", "n-exp", NETWORK_NONE, ("vol", "out")
@@ -194,8 +307,9 @@ class FakeBackend:
             LifecycleObject(owner, ObjectKind.EXPORT_DIR, "out", "n-out"),
         )
 
-    def export(self, objects: tuple[LifecycleObject, ...]) -> Artifact:
+    def export(self, objects: tuple[LifecycleObject, ...], handle: LaunchHandle) -> Artifact:
         (exporter,) = (obj for obj in objects if obj.kind is ObjectKind.EXPORTER)
+        assert handle.find(ObjectKind.VOLUME) is not None
         self.runtime.create_container(
             exporter.name, network=exporter.network, mounts=exporter.mounts
         )
@@ -216,7 +330,9 @@ class FakeBackend:
         return Removal.REMOVED
 
 
-def container_objects(owner: LaunchOwner, staging: str) -> tuple[LifecycleObject, ...]:
+def container_objects(
+    owner: LaunchOwner, staging: str, network: str = "bridge"
+) -> tuple[LifecycleObject, ...]:
     """D13's create objects; in the bind form the staging root is ``/source`` in both containers."""
     source = ("staging",) if staging == "bind" else ()
     objects = [
@@ -227,7 +343,7 @@ def container_objects(owner: LaunchOwner, staging: str) -> tuple[LifecycleObject
             ObjectKind.LAUNCH_CONTAINER,
             "launch",
             "n-launch",
-            "bridge",
+            network,
             (*source, "vol", "projection"),
         ),
         LifecycleObject(
@@ -246,6 +362,7 @@ class FakeJournal:
     def __init__(self, events: list[tuple], entries: tuple[LifecycleObject, ...] = ()) -> None:
         self.events = events
         self.entries = list(entries)
+        self.created: list[LifecycleObject] = []
         self.refuse = ""
 
     def open_entries(self) -> tuple[LifecycleObject, ...]:
@@ -255,6 +372,7 @@ class FakeJournal:
         assert runtime == RUNTIME
         self.events.append(("journal", "creates", tuple(obj.name for obj in objects)))
         self.entries.extend(objects)
+        self.created.extend(objects)
 
     def record_removals(self, objects) -> None:
         if self.refuse == "removals":
@@ -267,6 +385,29 @@ class FakeJournal:
             self.entries.remove(obj)
 
 
+class FakeSource:
+    """The controller's verify step and its save: the worktree's HEAD, or ``verdict``."""
+
+    def __init__(self, events: list[tuple], verdict: Verified | None = None) -> None:
+        self.events = events
+        self.verdict = verdict
+
+    def verify(self, artifact: Artifact, handle: LaunchHandle) -> Verified:
+        self.events.append(("engine", "verify", artifact.directory, handle.inputs.owner.launch))
+        if self.verdict is not None:
+            return self.verdict
+        head = subprocess.run(
+            ["git", "-C", handle.inputs.workspace, "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        return Verified(candidate=head)
+
+    def save(self, outcome: Verified) -> None:
+        self.events.append(("engine", "save", outcome.accepted))
+
+
 def _index(events: list[tuple], *event) -> int:
     return events.index(tuple(event))
 
@@ -276,26 +417,35 @@ def _first(events: list[tuple], predicate) -> int:
 
 
 def _lifecycle(backend, journal, *, change: bool = True) -> LaunchLifecycle:
-    return LaunchLifecycle(backend, journal, OWNER, RUNTIME, change_producing=change)
+    return LaunchLifecycle(backend, journal, INPUTS, RUNTIME, change_producing=change)
 
 
-def _launch(events: list[tuple]):
-    def run() -> str:
-        events.append(("executor", "run"))
+def _container(handle: LaunchHandle) -> str:
+    found = handle.find(ObjectKind.LAUNCH_CONTAINER)
+    return found.name if found is not None else ""
+
+
+def _launch(lifecycle: LaunchLifecycle, events: list[tuple], *, interruption=None):
+    """The provider's launch as its ``SandboxPlan.describe`` makes it: the plan
+    compiled (:data:`PLANNED`), the environment established for it, then the run."""
+
+    def provider() -> str:
+        handle = lifecycle.establish(PLANNED)
+        events.append(("executor", "run", _container(handle)))
+        if interruption is not None:
+            raise interruption("the run step was interrupted")
         return "result"
 
-    return run
+    return lifecycle.launch(provider)
 
 
 def _full(backend, journal, events, *, change: bool = True) -> LaunchLifecycle:
     """Every step, a verify the test stands in for, and its outcome saved."""
     with _lifecycle(backend, journal, change=change) as lifecycle:
-        lifecycle.seed()
-        lifecycle.create()
-        lifecycle.stage()
-        assert lifecycle.run(_launch(events)) == "result"
-        artifact = lifecycle.export()
-        events.append(("engine", "verify", artifact))
+        assert _launch(lifecycle, events) == "result"
+        exported = lifecycle.export()
+        assert exported is not None
+        events.append(("engine", "verify", exported.artifact))
         events.append(("engine", "verify outcome saved"))
         lifecycle.saved()
     return lifecycle
@@ -382,6 +532,8 @@ def test_a_launch_runs_d13s_steps_in_order(staging):
     seeded = _index(events, "host", "seed")
     # No journal entry and no runtime call before the seed step has finished.
     assert all(event[0] == "host" for event in events[: seeded + 1])
+    # The seed step took the launch's inputs and the plan's compiled launch.
+    assert backend.seeded == [(INPUTS, PLANNED)]
     # One write names every object, before the staging root is written.
     names = ("staging", "projection", "vol", "stager", "launch")
     names = names if staging == "bind" else names[1:]
@@ -435,8 +587,9 @@ def test_a_launch_runs_d13s_steps_in_order(staging):
         assert launch_start < _index(events, "runtime", "cp", "launch", "read context")
     else:
         assert not any(event[1] == "cp" for event in events)
-    # The run, then the release: what holds the credential goes; the volume stays.
-    run = _index(events, "executor", "run")
+    # The run, in the launch container the handle names; then the release:
+    # what holds the credential goes, the volume stays.
+    run = _index(events, "executor", "run", "launch")
     released = ("launch", "projection", *source)
     release_intent = _index(events, "journal", "removals", tuple(sorted(released, key=names.index)))
     assert launch_start < run < release_intent < _index(events, "runtime", "rm", "launch")
@@ -462,6 +615,21 @@ def test_a_launch_runs_d13s_steps_in_order(staging):
     assert journal.entries == [] and lifecycle.uncertain == []
     assert backend.runtime.containers == {} and backend.runtime.volumes == set()
     assert events[-1] == ("host", "discard seed")
+
+
+def test_the_handle_names_the_objects_made_for_the_launch_and_still_in_place():
+    events: list[tuple] = []
+    backend = FakeBackend(events)
+    with _lifecycle(backend, FakeJournal(events)) as lifecycle:
+        handles: list[LaunchHandle] = []
+        lifecycle.launch(lambda: handles.append(lifecycle.establish(PLANNED)))
+        lifecycle.export()
+    (handle,) = handles
+    assert handle is lifecycle.handle
+    assert handle.inputs == INPUTS and handle.seed == Seed("sha256:manifest", "/tmp/seed")
+    # The stager container was removed before the launch container started.
+    assert {obj.name for obj in handle.objects} == {"staging", "projection", "vol", "launch"}
+    assert all(obj.owner == OWNER for obj in handle.objects)
 
 
 def test_every_removal_is_journaled_first_and_closed_only_after_it():
@@ -490,8 +658,7 @@ def test_a_failed_seed_leaves_no_journal_entry_and_no_runtime_call():
     journal = FakeJournal(events)
     with pytest.raises(SandboxLaunchRefusedError, match="seed failed"):
         with _lifecycle(FakeBackend(events, fail="seed"), journal) as lifecycle:
-            lifecycle.seed()
-            lifecycle.create()
+            _launch(lifecycle, events)
     assert events == [("host", "seed"), ("fail", "seed")]
     assert journal.entries == []
 
@@ -513,11 +680,8 @@ def test_a_refusal_at_a_step_before_the_run_removes_what_was_made_and_runs_nothi
     journal = FakeJournal(events)
     with pytest.raises(SandboxLaunchRefusedError, match="failed"):
         with _lifecycle(backend, journal) as lifecycle:
-            lifecycle.seed()
-            lifecycle.create()
-            lifecycle.stage()
-            lifecycle.run(_launch(events))
-    assert ("executor", "run") not in events
+            _launch(lifecycle, events)
+    assert not any(event[:2] == ("executor", "run") for event in events)
     # The launch container never starts after a failed stage.
     assert ("runtime", "start", "launch") not in events
     # Both parts of the clean-up ran, with no export: every entry closed, the
@@ -529,23 +693,57 @@ def test_a_refusal_at_a_step_before_the_run_removes_what_was_made_and_runs_nothi
     assert backend.runtime.containers == {} and backend.runtime.volumes == set()
 
 
+def test_an_environment_that_failed_is_never_made_again():
+    events: list[tuple] = []
+    backend = FakeBackend(events, fail="volume")
+    journal = FakeJournal(events)
+
+    def provider() -> None:
+        with pytest.raises(SandboxLaunchRefusedError, match="volume failed"):
+            lifecycle.establish(PLANNED)
+        # A provider that plans again after a refusal gets a refusal, not a second create.
+        lifecycle.establish(PLANNED)
+
+    with pytest.raises(SandboxLaunchRefusedError, match="not made again"):
+        with _lifecycle(backend, journal) as lifecycle:
+            lifecycle.launch(provider)
+    assert [event for event in events if event[:2] == ("journal", "creates")] == [
+        ("journal", "creates", ("staging", "projection", "vol", "stager", "launch"))
+    ]
+    assert journal.entries == []
+
+
+def test_a_later_process_of_the_launch_runs_in_the_environment_already_made():
+    """Pi's auth check, then Pi: each is planned, and both run in one environment."""
+    events: list[tuple] = []
+    backend = FakeBackend(events)
+    journal = FakeJournal(events)
+    with _lifecycle(backend, journal, change=False) as lifecycle:
+
+        def provider() -> tuple[LaunchHandle, LaunchHandle]:
+            return lifecycle.establish(PLANNED), lifecycle.establish(PLANNED)
+
+        first, second = lifecycle.launch(provider)
+    assert first is second
+    assert len([event for event in events if event[:2] == ("journal", "creates")]) == 1
+    assert backend.seeded == [(INPUTS, PLANNED)]
+
+    events.clear()
+    other = LaunchDescription(mounts=(), network=NetworkPosition.ISOLATED)
+    with pytest.raises(SandboxLaunchRefusedError, match="created with host"):
+        with _lifecycle(FakeBackend(events), FakeJournal(events), change=False) as lifecycle:
+            lifecycle.launch(lambda: (lifecycle.establish(PLANNED), lifecycle.establish(other)))
+
+
 @pytest.mark.parametrize("interruption", [KeyboardInterrupt, RuntimeError])
 def test_the_release_follows_the_run_on_every_path(interruption):
     events: list[tuple] = []
     backend = FakeBackend(events)
     journal = FakeJournal(events)
-
-    def run() -> None:
-        events.append(("executor", "run"))
-        raise interruption("the run step was interrupted")
-
     with pytest.raises(interruption):
         with _lifecycle(backend, journal) as lifecycle:
-            lifecycle.seed()
-            lifecycle.create()
-            lifecycle.stage()
-            lifecycle.run(run)
-    run_at = _index(events, "executor", "run")
+            _launch(lifecycle, events, interruption=interruption)
+    run_at = _index(events, "executor", "run", "launch")
     assert _index(events, "journal", "removals", ("staging", "projection", "launch")) > run_at
     # A change-producing launch that never reached a saved verify outcome keeps
     # its volume, journaled, for reconciliation.
@@ -559,27 +757,22 @@ def test_the_volume_is_never_removed_before_verifys_outcome_is_saved():
     backend = FakeBackend(events)
     journal = FakeJournal(events)
     with _lifecycle(backend, journal) as lifecycle:
-        lifecycle.seed()
-        lifecycle.create()
-        lifecycle.stage()
-        lifecycle.run(_launch(events))
-        assert lifecycle.export() == Artifact("/tmp/out")
+        _launch(lifecycle, events)
+        assert lifecycle.export() == Exported(Artifact("/tmp/out"))
         # The engine leaves before it saved verify's outcome.
     assert backend.runtime.volumes == {"vol"}
     assert {obj.name for obj in journal.entries} == {"vol", "out"}
 
 
-def test_a_failed_export_keeps_the_volume_until_the_refusal_is_saved():
+def test_a_failed_export_is_an_outcome_and_keeps_the_volume_until_it_is_saved():
     events: list[tuple] = []
     backend = FakeBackend(events, fail="export")
     journal = FakeJournal(events)
     with _lifecycle(backend, journal) as lifecycle:
-        lifecycle.seed()
-        lifecycle.create()
-        lifecycle.stage()
-        lifecycle.run(_launch(events))
-        with pytest.raises(SandboxLaunchRefusedError, match="export failed"):
-            lifecycle.export()
+        _launch(lifecycle, events)
+        exported = lifecycle.export()
+        assert exported is not None and exported.artifact is None
+        assert "export failed" in exported.failure
         # The exporter itself is gone, its removal journaled; the volume stays.
         assert ("runtime", "rm", "exporter") in events
         assert backend.runtime.volumes == {"vol"}
@@ -594,10 +787,7 @@ def test_a_launch_with_nothing_to_export_removes_its_volume_at_the_release():
     backend = FakeBackend(events)
     journal = FakeJournal(events)
     with _lifecycle(backend, journal, change=False) as lifecycle:
-        lifecycle.seed()
-        lifecycle.create()
-        lifecycle.stage()
-        lifecycle.run(_launch(events))
+        _launch(lifecycle, events)
         assert ("runtime", "rm", "vol") in events
         assert lifecycle.export() is None
     assert not any(event[:3] == ("runtime", "create", "exporter") for event in events)
@@ -609,48 +799,94 @@ def test_a_backend_with_no_exporter_skips_the_export_and_then_cleans_up():
     backend = FakeBackend(events, exporter=False)
     journal = FakeJournal(events)
     with _lifecycle(backend, journal) as lifecycle:
-        lifecycle.seed()
-        lifecycle.create()
-        lifecycle.stage()
-        lifecycle.run(_launch(events))
+        _launch(lifecycle, events)
         assert lifecycle.export() is None
     assert journal.entries == [] and backend.runtime.volumes == set()
 
 
-def test_an_uncertain_removal_is_reported_and_its_entry_stays_open():
+def test_a_launch_whose_environment_was_never_made_exports_nothing():
+    events: list[tuple] = []
+    backend = FakeBackend(events)
+    journal = FakeJournal(events)
+    with _lifecycle(backend, journal) as lifecycle:
+        assert lifecycle.launch(lambda: "no plan") == "no plan"
+        assert lifecycle.export() is None
+    assert events == [] and journal.entries == []
+
+
+# -- an uncertain clean-up (D17) is never read as done ------------------------------
+
+
+def test_an_uncertain_release_replaces_the_result_and_nothing_is_exported():
     events: list[tuple] = []
     backend = FakeBackend(events, uncertain=frozenset({ObjectKind.PROJECTION}))
     journal = FakeJournal(events)
-    lifecycle = _full(backend, journal, events)
-    (projection,) = (obj for obj in journal.entries)
-    assert projection.kind is ObjectKind.PROJECTION
-    assert lifecycle.uncertain == [projection]
-    assert lifecycle.open_objects == (projection,)
+    with pytest.raises(SandboxCleanupUncertainError, match="release") as raised:
+        with _lifecycle(backend, journal) as lifecycle:
+            _launch(lifecycle, events)
+    assert raised.value.objects == ("credential projection projection",)
+    # The launch container may still be there: nothing reads the volume, which
+    # stays journaled with the projection for reconciliation.
+    assert not any(event[:3] == ("journal", "creates", ("exporter", "out")) for event in events)
+    assert {obj.name for obj in journal.entries} == {"projection", "vol"}
+    assert lifecycle.uncertain == [o for o in journal.entries if o.name == "projection"]
     assert not any(e[:2] == ("journal", "close") and "projection" in e[2] for e in events)
 
 
-def test_a_removal_that_raises_is_uncertain_not_done():
+def test_an_exporter_not_verified_removed_returns_no_artifact():
+    events: list[tuple] = []
+    backend = FakeBackend(events, uncertain=frozenset({ObjectKind.EXPORTER}))
+    journal = FakeJournal(events)
+    with pytest.raises(SandboxCleanupUncertainError, match="export") as raised:
+        with _lifecycle(backend, journal) as lifecycle:
+            _launch(lifecycle, events)
+            lifecycle.export()
+            pytest.fail("an artifact an exporter may still write was returned")
+    assert raised.value.objects == ("exporter container exporter",)
+    # Nothing saved, so the volume and the export directory stay too.
+    assert {obj.name for obj in journal.entries} == {"vol", "exporter", "out"}
+    assert backend.runtime.volumes == {"vol"}
+
+
+def test_an_uncertain_final_clean_up_fails_the_launch_and_keeps_its_entry():
     events: list[tuple] = []
     backend = FakeBackend(events, fail="remove volume")
     journal = FakeJournal(events)
-    lifecycle = _full(backend, journal, events)
-    assert [obj.name for obj in lifecycle.uncertain] == ["vol"]
+    with pytest.raises(SandboxCleanupUncertainError, match="final clean-up") as raised:
+        _full(backend, journal, events)
+    assert raised.value.objects == ("volume vol",)
     assert [obj.name for obj in journal.entries] == ["vol"]
+
+
+def test_an_uncertain_removal_never_masks_the_exception_ending_the_launch():
+    events: list[tuple] = []
+    backend = FakeBackend(events, uncertain=frozenset({ObjectKind.PROJECTION}))
+    journal = FakeJournal(events)
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with _lifecycle(backend, journal) as lifecycle:
+            _launch(lifecycle, events, interruption=KeyboardInterrupt)
+    (note,) = raised.value.__notes__
+    assert "credential projection projection" in note and "reconciliation" in note
+    assert {obj.name for obj in journal.entries} == {"projection", "vol"}
 
 
 def test_a_journal_that_refuses_a_removal_intent_removes_nothing():
     events: list[tuple] = []
     backend = FakeBackend(events)
     journal = FakeJournal(events)
-    with _lifecycle(backend, journal, change=False) as lifecycle:
-        lifecycle.seed()
-        lifecycle.create()
-        lifecycle.stage()
-        journal.refuse = "removals"
-        lifecycle.run(_launch(events))
+    with pytest.raises(SandboxCleanupUncertainError) as raised:
+        with _lifecycle(backend, journal, change=False) as lifecycle:
+
+            def provider() -> None:
+                lifecycle.establish(PLANNED)
+                events.append(("executor", "run"))
+                journal.refuse = "removals"
+
+            lifecycle.launch(provider)
     after_run = events[_index(events, "executor", "run") :]
     assert not any(event[1] in ("rm", "rm uncertain") for event in after_run)
     assert {obj.name for obj in lifecycle.uncertain} == {"staging", "projection", "vol", "launch"}
+    assert len(raised.value.objects) == 4
 
 
 def test_a_stager_container_not_verified_removed_never_lets_the_launch_container_start():
@@ -659,9 +895,7 @@ def test_a_stager_container_not_verified_removed_never_lets_the_launch_container
     journal = FakeJournal(events)
     with pytest.raises(SandboxLaunchRefusedError, match="never starts"):
         with _lifecycle(backend, journal) as lifecycle:
-            lifecycle.seed()
-            lifecycle.create()
-            lifecycle.stage()
+            _launch(lifecycle, events)
     assert ("runtime", "start", "launch") not in events
     assert [obj.name for obj in lifecycle.uncertain] == ["stager"]
 
@@ -727,8 +961,7 @@ def test_the_create_step_refuses_objects_that_break_d13_before_journaling_any(ob
     journal = FakeJournal(events)
     with pytest.raises(SandboxLaunchRefusedError, match=why):
         with _lifecycle(backend, journal) as lifecycle:
-            lifecycle.seed()
-            lifecycle.create()
+            _launch(lifecycle, events)
     assert journal.entries == [] and backend.made == []
     assert not any(event[0] in ("journal", "runtime") for event in events)
 
@@ -736,16 +969,20 @@ def test_the_create_step_refuses_objects_that_break_d13_before_journaling_any(ob
 def test_a_step_out_of_order_is_refused():
     events: list[tuple] = []
     with _lifecycle(FakeBackend(events), FakeJournal(events)) as lifecycle:
-        with pytest.raises(SandboxLaunchRefusedError, match="comes after the stage step"):
-            lifecycle.run(_launch(events))
-        lifecycle.seed()
-        with pytest.raises(SandboxLaunchRefusedError, match="comes after the create step"):
-            lifecycle.stage()
+        with pytest.raises(SandboxLaunchRefusedError, match="during its launch, not start"):
+            lifecycle.establish(PLANNED)
+        with pytest.raises(SandboxLaunchRefusedError, match="comes after the launch step"):
+            lifecycle.export()
         with pytest.raises(
-            SandboxLaunchRefusedError, match="after the export step, not after seed"
+            SandboxLaunchRefusedError, match="after the export step, not after start"
         ):
             lifecycle.saved()
-    assert ("executor", "run") not in events
+    assert events == []
+    # Once the launch returned, its environment is released: none is made or handed out.
+    with _lifecycle(FakeBackend(events), FakeJournal(events)) as lifecycle:
+        _launch(lifecycle, events)
+        with pytest.raises(SandboxLaunchRefusedError, match="during its launch, not launch"):
+            lifecycle.establish(PLANNED)
 
 
 def test_verifys_outcome_is_saved_only_after_the_export_step():
@@ -753,11 +990,8 @@ def test_verifys_outcome_is_saved_only_after_the_export_step():
     backend = FakeBackend(events)
     journal = FakeJournal(events)
     with _lifecycle(backend, journal) as lifecycle:
-        lifecycle.seed()
-        lifecycle.create()
-        lifecycle.stage()
-        lifecycle.run(_launch(events))
-        with pytest.raises(SandboxLaunchRefusedError, match="not after run"):
+        _launch(lifecycle, events)
+        with pytest.raises(SandboxLaunchRefusedError, match="not after launch"):
             lifecycle.saved()
     # The export never ran, so the volume is still there, journaled.
     assert backend.runtime.volumes == {"vol"}
@@ -769,8 +1003,7 @@ def test_without_a_journal_a_backend_that_makes_an_object_is_refused_before_it_m
     backend = FakeBackend(events)
     with pytest.raises(SandboxLaunchRefusedError, match="no lifecycle journal exists"):
         with _lifecycle(backend, NO_JOURNAL) as lifecycle:
-            lifecycle.seed()
-            lifecycle.create()
+            _launch(lifecycle, events)
     assert backend.made == []
     assert not any(event[0] == "runtime" for event in events)
 
@@ -780,18 +1013,173 @@ def test_bwrap_does_nothing_but_the_run(change):
     """Seed, create, stage, the clean-up and reconcile do nothing for bwrap (D13)."""
     events: list[tuple] = []
     with LaunchLifecycle(
-        BWRAP, NO_JOURNAL, OWNER, BWRAP.runtime_check(), change_producing=change
+        BWRAP, NO_JOURNAL, INPUTS, BWRAP.runtime_check(), change_producing=change
     ) as lc:
-        assert lc.seed() == Seed()
-        lc.create()
-        lc.stage()
-        assert lc.run(_launch(events)) == "result"
+        assert _launch(lc, events) == "result"
+        assert lc.handle == LaunchHandle(INPUTS, Seed())
         assert lc.export() is None
         lc.saved()
-    assert events == [("executor", "run")]
+    assert events == [("executor", "run", "")]
     assert lc.uncertain == [] and lc.open_objects == ()
     entry = enter(BWRAP, NO_JOURNAL, lambda runtime: ProbeResult(True, "", "x"))
     assert entry.runtime.backend is BackendKind.BWRAP and entry.still_open == ()
+
+
+# -- the plan step first: a provider's SandboxPlan (D13) ----------------------------
+
+
+def _facts(tmp_path: Path) -> LaunchFacts:
+    """A REMOTE agent's facts, as the engine's are; only paths, nothing is read."""
+    base = str(tmp_path)
+    return LaunchFacts(
+        launch_class=LaunchClass.REMOTE_AGENT,
+        workspace=f"{base}/work",
+        home=f"{base}/home",
+        controller_env={},
+        git_entry=f"{base}/work/.git",
+        git_dir=f"{base}/common/worktrees/work",
+        common_dir=f"{base}/common",
+        private_objects=f"{base}/sandbox/objects",
+        overlay_work=f"{base}/sandbox/overlay-work",
+        read_context=f"{base}/read-context",
+    )
+
+
+def test_the_plan_compiles_before_the_environment_is_made_and_binds_it(tmp_path):
+    events: list[tuple] = []
+    backend = FakeBackend(events)
+    journal = FakeJournal(events)
+    with _lifecycle(backend, journal, change=False) as lifecycle:
+        plan = SandboxPlan(_facts(tmp_path), backend, lifecycle)
+        description = lifecycle.launch(lambda: plan.describe(ProviderRequirements(), {}))
+    assert events[:3] == [
+        ("host", "plan"),
+        ("host", "seed"),
+        ("journal", "creates", ("staging", "projection", "vol", "stager", "launch")),
+    ]
+    binding = description.binding
+    assert binding.backend is backend and binding.handle is lifecycle.handle
+    assert _container(binding.handle) == "launch"
+    # The seed step got what the plan compiled.
+    ((inputs, planned),) = backend.seeded
+    assert inputs == INPUTS and planned == description
+
+
+def test_a_plan_the_policy_refuses_makes_and_starts_nothing(tmp_path):
+    events: list[tuple] = []
+    backend = FakeBackend(events)
+    backend.deny_plan = True
+    journal = FakeJournal(events)
+    with pytest.raises(SandboxLaunchRefusedError, match="a forbidden source"):
+        with _lifecycle(backend, journal) as lifecycle:
+            plan = SandboxPlan(_facts(tmp_path), backend, lifecycle)
+            lifecycle.launch(lambda: plan.describe(ProviderRequirements(), {}))
+    assert events == [("host", "plan")]
+    assert backend.seeded == [] and backend.made == [] and journal.entries == []
+
+
+def test_a_plan_without_a_lifecycle_binds_its_backend_and_no_environment(tmp_path):
+    events: list[tuple] = []
+    backend = FakeBackend(events)
+    description = SandboxPlan(_facts(tmp_path), backend).describe(ProviderRequirements(), {})
+    assert description.binding.backend is backend and description.binding.handle is None
+    assert events == [("host", "plan")]
+    # The default plan is bwrap's, as every existing caller builds one.
+    assert SandboxPlan(_facts(tmp_path)).backend is BWRAP
+
+
+# -- a real provider adapter and the real executor, on the fake backend ------------
+
+
+def _cli(tmp_path: Path) -> Path:
+    """A fake ``opencode`` that reports where it ran: its container, nonce and argv."""
+    tool = tmp_path / "tools" / "opencode"
+    tool.parent.mkdir(parents=True)
+    tool.write_text(
+        f"#!{sys.executable}\nimport json, os, sys\nsys.stdin.read()\n"
+        "print(json.dumps({'container': os.environ.get('FAKE_CONTAINER'),"
+        " 'nonce': os.environ.get('FAKE_NONCE'), 'argv': sys.argv[1:]}))\n"
+    )
+    tool.chmod(0o755)
+    return tool
+
+
+@_linux_only
+def test_a_providers_command_runs_in_the_container_created_and_staged_for_its_launch(
+    tmp_path, monkeypatch
+):
+    """OpenCode's adapter completes the plan, the lifecycle makes the environment,
+    and the executor runs the adapter's command in exactly that launch container,
+    prepared by the backend that planned it (ADR 0013 D13)."""
+    events: list[tuple] = []
+    backend = FakeBackend(events)
+    journal = FakeJournal(events)
+    cli = _cli(tmp_path)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    profile = ProfileConfig(
+        name="review", provider="opencode", model="openai/gpt-x", effort="", command=str(cli)
+    )
+    with _lifecycle(backend, journal, change=False) as lifecycle:
+        req = AgentRequest(
+            phase="REVIEW",
+            prompt="review the change",
+            cwd=str(work),
+            profile=profile,
+            idle_timeout_seconds=None,
+            max_runtime_seconds=60,
+            env_allowlist=default_config().execution.environment_names(),
+            env={},
+            sandbox=SandboxPlan(_facts(tmp_path), backend, lifecycle),
+        )
+        result = lifecycle.launch(lambda: OpenCodeProvider().execute(req))
+    assert result.exit_code == 0, result.stderr
+    report = json.loads(result.stdout.strip().splitlines()[-1])
+    (launch,) = [obj for obj in journal.created if obj.kind is ObjectKind.LAUNCH_CONTAINER]
+    # The command ran in the launch container this launch created and staged.
+    assert (report["container"], report["nonce"]) == (launch.name, launch.nonce)
+    assert report["argv"][:2] == ["run", "--standalone"]
+    ((handle, command),) = backend.prepared
+    assert handle is lifecycle.handle and handle.find(ObjectKind.LAUNCH_CONTAINER) == launch
+    assert command[0] == str(cli)
+    assert result.sandbox == CONTAINER_FACTS
+    # Plan, seed, create, stage, then the prepare and the spawn into a running
+    # container, closed before the release.
+    order = [
+        _index(events, "host", "plan"),
+        _index(events, "host", "seed"),
+        _index(events, "journal", "creates", ("staging", "projection", "vol", "stager", "launch")),
+        _index(events, "runtime", "rm", "stager"),
+        _index(events, "runtime", "start", "launch"),
+        _index(events, "executor", "prepare", "launch"),
+        _index(events, "executor", "spawned", "launch", True),
+        _index(events, "runtime", "kill", "launch"),
+        _index(events, "journal", "removals", ("staging", "projection", "vol", "launch")),
+    ]
+    assert order == sorted(order)
+    assert journal.entries == [] and backend.runtime.containers == {}
+
+
+@_linux_only
+def test_a_launch_no_lifecycle_made_an_environment_for_is_refused_by_a_backend_that_needs_one(
+    tmp_path,
+):
+    events: list[tuple] = []
+    backend = FakeBackend(events)
+    marker = tmp_path / "ran"
+    description = SandboxPlan(_facts(tmp_path), backend).describe(ProviderRequirements(), {})
+    with pytest.raises(SandboxLaunchRefusedError, match="no launch container was made"):
+        execute(
+            ExecutionRequest(
+                command=[sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"],
+                timeout_seconds=30,
+                sandbox=description,
+            )
+        )
+    assert not marker.exists()
+    assert [handle for handle, _command in backend.prepared] == [None]
 
 
 # -- the engine's sequence (ADR 0013 §7) --------------------------------------------
@@ -805,7 +1193,8 @@ def _required():
 
 @pytest.fixture
 def through_fake(monkeypatch):
-    """The engine's backend is a :class:`FakeBackend` and its journal a :class:`FakeJournal`.
+    """The engine's backend is a :class:`FakeBackend`, its journal a :class:`FakeJournal`
+    and its verify step a :class:`FakeSource` that accepts the worktree's ``HEAD``.
 
     The probe the engine caches (``probe_sandbox``) records itself too, and
     so does every agent the scripted provider runs.
@@ -813,15 +1202,17 @@ def through_fake(monkeypatch):
     events: list[tuple] = []
     backend = FakeBackend(events)
     journal = FakeJournal(events)
+    source = FakeSource(events)
     monkeypatch.setattr(engine_module, "launch_backend", lambda: backend)
     monkeypatch.setattr(ControllerEngine, "_lifecycle_journal", lambda self: journal)
+    monkeypatch.setattr(ControllerEngine, "_candidate_source", lambda self: source)
 
     def probe() -> ProbeResult:
         events.append(("engine", "probe"))
         return ProbeResult(True, "", "fake")
 
     monkeypatch.setattr(engine_module, "probe_sandbox", probe)
-    return events, backend, journal
+    return events, backend, journal, source
 
 
 def _recording(events: list[tuple]):
@@ -835,7 +1226,7 @@ def _recording(events: list[tuple]):
 def test_the_engine_enters_then_runs_a_launch_through_every_step_in_order(
     tmp_state_dir, fake_github, through_fake
 ):
-    events, backend, journal = through_fake
+    events, backend, journal, _source = through_fake
     eng = make_engine(
         tmp_state_dir, _recording(events), github=fake_github, cfg=_required(), origin=True
     )
@@ -846,44 +1237,133 @@ def test_the_engine_enters_then_runs_a_launch_through_every_step_in_order(
     # At the command's entry: the runtime check, reconciliation, the probe, and
     # nothing of a launch before them.
     assert events[:3] == [("runtime", "check"), ("runtime", "reconcile", ()), ("engine", "probe")]
-    seeded = _index(events, "host", "seed")
-    assert seeded == 3
-    created = _index(
-        events, "journal", "creates", ("staging", "projection", "vol", "stager", "launch")
+    # The plan step, then the seed step, before any journal entry.
+    assert events[3:5] == [("host", "plan"), ("host", "seed")]
+    # The provider's description is the one the fake planned, bound to it and to
+    # the launch container its lifecycle created.
+    binding = eng.provider.descriptions[-1].binding
+    assert binding.backend is backend
+    assert _container(binding.handle) == "launch"
+    launch = binding.handle.inputs.owner.launch
+    assert launch.startswith("ANALYZE_EXECUTE-")
+    order = [
+        _index(events, "journal", "creates", ("staging", "projection", "vol", "stager", "launch")),
+        _index(events, "runtime", "rm", "stager"),
+        _index(events, "runtime", "start", "launch"),
+        _index(events, "agent", "ANALYZE_EXECUTE"),
+        _index(events, "journal", "removals", ("staging", "projection", "launch")),
+        _index(events, "journal", "creates", ("exporter", "out")),
+        _index(events, "runtime", "rm", "exporter"),
+        _index(events, "engine", "verify", "/tmp/out", launch),
+        _index(events, "engine", "save", True),
+        _index(events, "journal", "removals", ("vol", "out")),
+        _index(events, "runtime", "rm", "vol"),
+    ]
+    assert order == sorted(order)
+    assert journal.entries == [] and backend.runtime.volumes == set()
+
+
+def test_the_engine_plans_before_it_seeds_and_a_denied_plan_makes_nothing(
+    tmp_state_dir, fake_github, through_fake
+):
+    events, backend, journal, _source = through_fake
+    backend.deny_plan = True
+    eng = make_engine(
+        tmp_state_dir, _recording(events), github=fake_github, cfg=_required(), origin=True
     )
-    launch_start = _index(events, "runtime", "start", "launch")
-    agent = _index(events, "agent", "ANALYZE_EXECUTE")
-    release = _index(events, "journal", "removals", ("staging", "projection", "launch"))
-    assert (
-        seeded
-        < created
-        < _index(events, "runtime", "rm", "stager")
-        < launch_start
-        < agent
-        < release
+    eng.step()
+    with pytest.raises(SandboxLaunchRefusedError, match="a forbidden source"):
+        eng.step()
+    assert events == [
+        ("runtime", "check"),
+        ("runtime", "reconcile", ()),
+        ("engine", "probe"),
+        ("host", "plan"),
+    ]
+    assert backend.seeded == [] and backend.made == [] and journal.entries == []
+    assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
+
+
+@pytest.mark.parametrize("source", ["none", "refusing"])
+def test_an_artifact_the_verify_step_refuses_is_never_a_candidate(
+    tmp_state_dir, fake_github, through_fake, monkeypatch, source
+):
+    """Without #269's candidate source, or with one that refuses: the refusal is
+    saved, the final clean-up follows it, and the candidate read refuses."""
+    events, backend, journal, _source = through_fake
+    if source == "none":
+        monkeypatch.setattr(ControllerEngine, "_candidate_source", lambda self: NO_CANDIDATE_SOURCE)
+    else:
+        _source.verdict = Verified(refusal="the artifact's manifest disagrees with its input")
+    eng = make_engine(
+        tmp_state_dir, _recording(events), github=fake_github, cfg=_required(), origin=True
     )
-    # Export and verify are #269's to wire: the change-producing launch's volume
-    # is kept, journaled, never removed before a verify outcome is saved.
-    assert [obj.name for obj in journal.entries] == ["vol"]
-    assert ("runtime", "rm", "vol") not in events
-    # The next command's entry reconciles it, before its probe.
-    backend.has_exporter = False
-    events.clear()
+    eng.step()
     with pytest.raises(ControlResultValidationError):
-        eng.step()  # REVIEW's agent answers nothing; the entry has run by then
+        eng.step()
+    assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
+    agents = [i for i, event in enumerate(events) if event == ("agent", "ANALYZE_EXECUTE")]
+    finals = [
+        i for i, event in enumerate(events) if event == ("journal", "removals", ("vol", "out"))
+    ]
+    # Every launch, corrections included, exported and was cleaned up after it.
+    assert len(agents) == len(finals) > 0
+    assert all(a < f for a, f in zip(agents, finals, strict=True))
+    if source == "refusing":
+        assert ("engine", "save", False) in events
+    assert journal.entries == [] and backend.runtime.volumes == set()
+
+
+def test_an_uncertain_release_fails_the_step_and_the_next_entry_reconciles_it(
+    tmp_state_dir, fake_github, through_fake
+):
+    events, backend, journal, _source = through_fake
+    backend.uncertain = frozenset({ObjectKind.PROJECTION})
+    eng = make_engine(
+        tmp_state_dir, _recording(events), github=fake_github, cfg=_required(), origin=True
+    )
+    eng.step()
+    with pytest.raises(SandboxCleanupUncertainError) as raised:
+        eng.step()
+    assert raised.value.objects == ("credential projection projection",)
+    # Nothing exported or verified; the projection and the volume stay open.
+    assert not any(event[:2] == ("engine", "verify") for event in events)
+    assert ("journal", "creates", ("exporter", "out")) not in events
+    assert {obj.name for obj in journal.entries} == {"projection", "vol"}
+    assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
+    # The next command's entry reconciles both, before its probe and its launch.
+    backend.uncertain = frozenset()
+    events.clear()
+    assert eng.step().next_phase == "REVIEW"
     assert events[:5] == [
         ("runtime", "check"),
-        ("journal", "removals", ("vol",)),
-        ("runtime", "reconcile", ("vol",)),
+        ("journal", "removals", ("projection", "vol")),
+        ("runtime", "reconcile", ("projection", "vol")),
+        ("runtime", "rm", "projection"),
         ("runtime", "rm", "vol"),
-        ("journal", "close", ("vol",)),
     ]
-    assert ("engine", "probe") not in events  # cached for the same runtime report
     assert journal.entries == []
 
 
+def test_an_exporter_not_verified_removed_is_never_verified(
+    tmp_state_dir, fake_github, through_fake
+):
+    events, backend, journal, _source = through_fake
+    backend.uncertain = frozenset({ObjectKind.EXPORTER})
+    eng = make_engine(
+        tmp_state_dir, _recording(events), github=fake_github, cfg=_required(), origin=True
+    )
+    eng.step()
+    with pytest.raises(SandboxCleanupUncertainError) as raised:
+        eng.step()
+    assert raised.value.objects == ("exporter container exporter",)
+    assert not any(event[:2] in (("engine", "verify"), ("engine", "save")) for event in events)
+    assert {obj.name for obj in journal.entries} == {"vol", "exporter", "out"}
+    assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
+
+
 def test_the_engine_releases_after_an_interrupted_launch(tmp_state_dir, fake_github, through_fake):
-    events, backend, journal = through_fake
+    events, backend, journal, _source = through_fake
 
     def interrupted(req):
         events.append(("agent", req.phase))
@@ -897,6 +1377,24 @@ def test_the_engine_releases_after_an_interrupted_launch(tmp_state_dir, fake_git
     assert _index(events, "journal", "removals", ("staging", "projection", "launch")) > agent
     assert backend.runtime.containers == {}
     assert [obj.name for obj in journal.entries] == ["vol"]
+
+
+def test_an_interrupted_launch_with_an_uncertain_release_is_still_ctrl_c(
+    tmp_state_dir, fake_github, through_fake
+):
+    events, backend, journal, _source = through_fake
+    backend.uncertain = frozenset({ObjectKind.PROJECTION})
+
+    def interrupted(req):
+        events.append(("agent", req.phase))
+        raise KeyboardInterrupt
+
+    eng = make_engine(tmp_state_dir, interrupted, github=fake_github, cfg=_required(), origin=True)
+    eng.step()
+    with pytest.raises(KeyboardInterrupt) as raised:
+        eng.step()
+    assert any("credential projection projection" in note for note in raised.value.__notes__)
+    assert {obj.name for obj in journal.entries} == {"projection", "vol"}
 
 
 def test_the_engine_refuses_a_launch_whose_objects_no_journal_records(
@@ -922,7 +1420,7 @@ def test_the_engine_refuses_a_launch_whose_objects_no_journal_records(
 def test_a_refused_runtime_check_leaves_the_run_byte_identical(
     tmp_state_dir, fake_github, through_fake
 ):
-    events, backend, journal = through_fake
+    events, backend, journal, _source = through_fake
     eng = make_engine(
         tmp_state_dir, _recording(events), github=fake_github, cfg=_required(), origin=True
     )
@@ -937,7 +1435,7 @@ def test_a_refused_runtime_check_leaves_the_run_byte_identical(
 
 
 def test_under_disabled_the_backend_is_never_consulted(tmp_state_dir, fake_github, through_fake):
-    events, _backend, _journal = through_fake
+    events, _backend, _journal, _source = through_fake
     eng = make_engine(tmp_state_dir, _recording(events), github=fake_github, origin=True)
     eng.step()
     assert eng.step().next_phase == "REVIEW"
@@ -947,7 +1445,7 @@ def test_under_disabled_the_backend_is_never_consulted(tmp_state_dir, fake_githu
 def test_a_scheduler_workers_engine_runs_the_same_sequence(tmp_path, fake_github, through_fake):
     """A worker runs the engine itself on its issue's namespace (ADR 0008 D9.2):
     its entry and its launch take the same steps, in the same order."""
-    events, _backend, journal = through_fake
+    events, _backend, journal, _source = through_fake
     repo = git_repo(tmp_path / "repo")
     common = Path(os.path.realpath(repo / ".git"))
     eng = make_engine(
@@ -964,14 +1462,20 @@ def test_a_scheduler_workers_engine_runs_the_same_sequence(tmp_path, fake_github
     eng.step()
     out = eng.step()
     assert out.next_phase == "REVIEW", out.message
-    assert events[:5] == [
+    assert events[:6] == [
         ("runtime", "check"),
         ("runtime", "reconcile", ()),
         ("engine", "probe"),
+        ("host", "plan"),
         ("host", "seed"),
         ("journal", "creates", ("staging", "projection", "vol", "stager", "launch")),
     ]
-    assert _index(events, "agent", "ANALYZE_EXECUTE") < _index(
-        events, "journal", "removals", ("staging", "projection", "launch")
-    )
-    assert [obj.name for obj in journal.entries] == ["vol"]
+    order = [
+        _index(events, "agent", "ANALYZE_EXECUTE"),
+        _index(events, "journal", "removals", ("staging", "projection", "launch")),
+        _first(events, lambda e: e[:2] == ("engine", "verify")),
+        _index(events, "engine", "save", True),
+        _index(events, "journal", "removals", ("vol", "out")),
+    ]
+    assert order == sorted(order)
+    assert journal.entries == []

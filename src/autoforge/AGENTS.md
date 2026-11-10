@@ -56,15 +56,20 @@ sandbox_bwrap.py    the Linux backend: the only place that knows a `bwrap` flag;
                     typed capability probe (#167, #169)
 sandbox_backend.py  the backend seam (ADR 0013 D13): the backend-neutral lifecycle
                     interface (runtime check, reconcile, probe; plan, seed, create,
-                    stage, the run step's prepared launch, export, removal), its
-                    objects and their removal outcomes, bwrap behind it unchanged; the
-                    only module that imports sandbox_bwrap; executor layer, no
-                    journal, no workflow (#268)
+                    stage, the run step's prepared launch, export, removal), the
+                    per-launch data its steps hand on (inputs, seed, the handle of
+                    what was made, the binding a compiled launch carries to the
+                    executor), its objects and their removal outcomes, bwrap behind
+                    it unchanged; the only module that imports sandbox_bwrap;
+                    executor layer, no journal, no workflow (#268)
 sandbox_lifecycle.py  the engine's sequence of that interface: a command's entry
                     (runtime check, reconciliation, probe) and one launch's steps in
-                    D13's order, journaled before every create and removal, the
-                    release on every path, the volume kept until verify's outcome is
-                    saved; the journal protocol (#272 stores it); no workflow (#268)
+                    D13's order (plan, then the environment it establishes),
+                    journaled before every create and removal, the release on every
+                    path, the volume kept until verify's outcome is saved, an
+                    uncertain removal raised as SandboxCleanupUncertainError; the
+                    journal and verify-step protocols (#272, #269 implement them);
+                    no workflow (#268)
 sandbox_policy.py   which host resources a launch gets by launch class (ADR 0005 §2.5):
                     LaunchFacts from the engine, ProviderRequirements from an adapter,
                     the SandboxPlan, the path-valued environment rewrite (D8.2),

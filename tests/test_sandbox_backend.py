@@ -6,9 +6,11 @@
   ``tests/test_sandbox_bwrap.py``, ``tests/test_sandbox_routing.py`` and
   ``tests/test_sandbox_parity.py``.
 - The executor and the duplex executor on a fake backend's prepared launch
-  (the run step): the exact argv, stdin and environment, streaming, a stop,
-  the refusals before and after the spawn, and ``close()`` on every exit
-  path, ``Ctrl-C`` and an exception inside the launch guard included.
+  (the run step): the launch is prepared by the backend it is bound to, with
+  the handle it is bound to, never by its type; the exact argv, stdin and
+  environment, streaming, a stop, the refusals before and after the spawn,
+  and ``close()`` on every exit path, ``Ctrl-C`` and an exception inside the
+  launch guard included.
 - Backend-qualified :class:`~autoforge.sandbox.SandboxFacts`.
 
 The order of the other steps, and the engine's use of them, are
@@ -18,6 +20,7 @@ The order of the other steps, and the engine's use of them, are
 from __future__ import annotations
 
 import ast
+import dataclasses
 import json
 import os
 import sys
@@ -43,16 +46,27 @@ from autoforge.sandbox_backend import (
     BWRAP,
     BWRAP_RUNTIME,
     NO_SEED,
+    LaunchBinding,
+    LaunchHandle,
+    LaunchInputs,
     LaunchOwner,
     LifecycleObject,
     ObjectKind,
     Removal,
     backend_for,
+    bind,
     default_backend,
 )
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "autoforge"
 OWNER = LaunchOwner(run="run-1", issue=268, phase="REVIEW", launch="REVIEW-1")
+INPUTS = LaunchInputs(OWNER, workspace="/work/268")
+# The handle of the environment a lifecycle made for the launch.
+HANDLE = LaunchHandle(
+    INPUTS,
+    NO_SEED,
+    (LifecycleObject(OWNER, ObjectKind.LAUNCH_CONTAINER, "launch", "n-launch", "bridge"),),
+)
 _linux_only = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="pass_fds and /proc are Linux-only here"
 )
@@ -75,7 +89,7 @@ CONTAINER_FACTS = SandboxFacts(
 
 
 class FakeDescription(LaunchDescription):
-    """A launch only the fake backend prepares: the plan's type names its backend."""
+    """A launch type no backend registered: only its binding says who prepares it."""
 
 
 class FakeLaunch:
@@ -139,13 +153,15 @@ class FakeBackend:
 
     def __init__(self) -> None:
         self.prepared: list[tuple] = []
+        self.handles: list[LaunchHandle | None] = []
         self.launches: list[FakeLaunch] = []
         self.calls: list[str] = []
         self.refuse = False
         self.fail: BaseException | None = None
 
-    def prepare(self, launch, command, *, cwd, env):
+    def prepare(self, launch, handle, command, *, cwd, env):
         self.prepared.append((type(launch), list(command), cwd, dict(env)))
+        self.handles.append(handle)
         if self.refuse:
             raise SandboxLaunchRefusedError("fake: the runtime refused the launch")
         made = FakeLaunch(command, cwd, env, self.calls, self.fail)
@@ -154,14 +170,13 @@ class FakeBackend:
 
 
 @pytest.fixture
-def fake_backend(monkeypatch) -> FakeBackend:
-    backend = FakeBackend()
-    monkeypatch.setitem(sandbox_backend._BY_LAUNCH, FakeDescription, backend)
-    return backend
+def fake_backend() -> FakeBackend:
+    return FakeBackend()
 
 
-def _description() -> FakeDescription:
-    return FakeDescription(mounts=())
+def _description(backend: FakeBackend) -> LaunchDescription:
+    """A launch the fake backend planned, bound to it and to its environment's handle."""
+    return bind(FakeDescription(mounts=()), backend, HANDLE)  # type: ignore[arg-type]
 
 
 def _py(script: str) -> list[str]:
@@ -199,7 +214,7 @@ def test_only_the_seam_imports_the_bwrap_backend():
 def test_the_seam_knows_no_workflow():
     allowed = {
         "sandbox_backend.py": {"errors", "sandbox", "sandbox_bwrap"},
-        "sandbox_lifecycle.py": {"errors", "sandbox_backend"},
+        "sandbox_lifecycle.py": {"errors", "sandbox", "sandbox_backend"},
     }
     for name, modules in allowed.items():
         tree = ast.parse((SRC / name).read_text())
@@ -236,11 +251,16 @@ def test_bwraps_run_step_and_probe_are_the_backends_own(monkeypatch, tmp_path):
     description = LaunchDescription(mounts=())
     env = {"PATH": "/usr/bin"}
     assert sandbox_backend.prepare(description, ["true"], cwd="/tmp", env=env) is sentinel
+    # Bound by bwrap's plan, with the empty handle of its lifecycle: the same call.
+    bound = bind(description, BWRAP, LaunchHandle(INPUTS, NO_SEED))
+    assert sandbox_backend.prepare(bound, ["true"], cwd="/tmp", env=env) is sentinel
     assert BWRAP.probe(home=str(tmp_path), environ={"HOME": "x"}) is sentinel
     assert calls == [
         ("prepare", description, ["true"], "/tmp", env),
+        ("prepare", description, ["true"], "/tmp", env),
         ("probe", str(tmp_path), {"HOME": "x"}),
     ]
+    assert calls[1][1].binding == LaunchBinding(BWRAP, LaunchHandle(INPUTS, NO_SEED))
 
 
 def test_bwraps_plan_is_the_compiler_as_it_is(tmp_path):
@@ -252,17 +272,21 @@ def test_bwraps_plan_is_the_compiler_as_it_is(tmp_path):
 
 def test_bwrap_seeds_creates_stages_cleans_up_and_reconciles_nothing():
     obj = LifecycleObject(OWNER, ObjectKind.VOLUME, "vol", "n-vol")
+    planned = LaunchDescription(mounts=())
+    empty = LaunchHandle(INPUTS, NO_SEED)
     assert BWRAP.runtime_check() == BWRAP_RUNTIME
-    assert BWRAP.seed(OWNER) == NO_SEED
-    assert BWRAP.objects(OWNER, NO_SEED) == ()
-    assert BWRAP.exporter(OWNER) == ()
+    assert BWRAP.seed(INPUTS, planned) == NO_SEED
+    assert BWRAP.objects(INPUTS, NO_SEED, planned) == ()
+    assert BWRAP.exporter(empty) == ()
     assert BWRAP.reconcile((obj,), BWRAP_RUNTIME) == ()
     BWRAP.discard_seed(NO_SEED)
     for step in (
-        lambda: BWRAP.make(obj, NO_SEED),
+        lambda: BWRAP.make(obj, NO_SEED, planned),
         lambda: BWRAP.stage(obj, NO_SEED),
         lambda: BWRAP.start(obj),
-        lambda: BWRAP.export((obj,)),
+        lambda: BWRAP.export((obj,), empty),
+        # A handle naming an object is another backend's environment.
+        lambda: BWRAP.prepare(planned, HANDLE, ["true"], cwd=None, env={}),
     ):
         with pytest.raises(SandboxLaunchRefusedError, match="bwrap"):
             step()
@@ -294,13 +318,15 @@ def test_the_executor_hands_the_backend_the_command_its_cwd_and_the_selected_env
             env={"X": "y"},
             stdin_data=b"hello\nworld\n",
             timeout_seconds=30,
-            sandbox=_description(),
+            sandbox=_description(fake_backend),
         )
     )
-    # Exactly the command, its cwd and the environment the executor selected.
+    # Exactly the command, its cwd and the environment the executor selected,
+    # with the handle the launch is bound to.
     assert fake_backend.prepared == [
         (FakeDescription, command, str(tmp_path), {"PATH": os.environ["PATH"], "X": "y"})
     ]
+    assert fake_backend.handles == [HANDLE]
     assert result.exit_code == 0, result.stderr
     report = json.loads(result.stdout)
     assert report == {
@@ -333,7 +359,7 @@ def test_a_fake_backends_launch_streams_through_the_duplex_executor(fake_backend
         command=_py(echo),
         env_allowlist=("PATH",),
         max_runtime_seconds=30,
-        sandbox=_description(),
+        sandbox=_description(fake_backend),
     )
     with start_duplex(request) as child:
         assert child.read_line(10) == Record(b"stdin-is-liveness False")
@@ -363,7 +389,7 @@ def test_a_stop_ends_a_fake_backends_launch_as_the_executors_own(fake_backend):
                 env_allowlist=("PATH",),
                 timeout_seconds=30,
                 stop=stop,
-                sandbox=_description(),
+                sandbox=_description(fake_backend),
             )
         )
     finally:
@@ -381,9 +407,13 @@ def test_a_backend_that_refuses_to_prepare_spawns_nothing(tmp_path, fake_backend
     command = _py(f"open({str(marker)!r}, 'w').close()")
     with pytest.raises(SandboxLaunchRefusedError, match="refused the launch"):
         if duplex:
-            start_duplex(DuplexRequest(command=command, sandbox=_description()))
+            start_duplex(DuplexRequest(command=command, sandbox=_description(fake_backend)))
         else:
-            execute(ExecutionRequest(command=command, timeout_seconds=30, sandbox=_description()))
+            execute(
+                ExecutionRequest(
+                    command=command, timeout_seconds=30, sandbox=_description(fake_backend)
+                )
+            )
     assert not marker.exists() and fake_backend.calls == []
 
 
@@ -405,12 +435,41 @@ def test_a_launch_no_backend_prepares_is_refused_and_never_run(tmp_path, duplex)
     assert not marker.exists()
 
 
+def test_a_bound_launch_is_prepared_by_the_backend_that_planned_it_never_by_its_type(
+    monkeypatch,
+):
+    """A ``LaunchDescription`` is bwrap's type; bound to another backend, that
+    backend prepares it, in the environment its handle names (ADR 0013 D13)."""
+    monkeypatch.setattr(
+        sandbox_bwrap, "prepare", lambda *a, **k: pytest.fail("bwrap prepared it by its type")
+    )
+    planner, other = FakeBackend(), FakeBackend()
+    launch = sandbox_backend.prepare(
+        bind(LaunchDescription(mounts=()), planner, HANDLE),  # type: ignore[arg-type]
+        ["true"],
+        cwd="/work",
+        env={"PATH": "/usr/bin"},
+    )
+    assert planner.launches == [launch] and planner.handles == [HANDLE]
+    assert planner.prepared == [(LaunchDescription, ["true"], "/work", {"PATH": "/usr/bin"})]
+    assert other.prepared == []
+    launch.close()
+
+
+def test_a_launch_bound_to_no_backend_is_refused():
+    stray = dataclasses.replace(LaunchDescription(mounts=()), binding="bwrap, please")
+    with pytest.raises(SandboxLaunchRefusedError, match="names no sandbox backend"):
+        sandbox_backend.prepare(stray, ["true"], cwd=None, env={})
+
+
 @_linux_only
 def test_a_setup_failure_after_the_spawn_is_a_refusal_and_the_launch_is_closed(fake_backend):
     fake_backend.fail = SandboxLaunchRefusedError("fake: the container never started the command")
     with pytest.raises(SandboxLaunchRefusedError, match="never started"):
         execute(
-            ExecutionRequest(command=_py("print('x')"), timeout_seconds=30, sandbox=_description())
+            ExecutionRequest(
+                command=_py("print('x')"), timeout_seconds=30, sandbox=_description(fake_backend)
+            )
         )
     assert fake_backend.calls == ["spawned", "outcome", "close"]
 
@@ -422,7 +481,9 @@ def test_the_prepared_launch_is_closed_on_every_exit_path_of_execute(fake_backen
     fake_backend.fail = interruption("inside the guard")
     with pytest.raises(interruption, match="inside the guard"):
         execute(
-            ExecutionRequest(command=_py("print('x')"), timeout_seconds=30, sandbox=_description())
+            ExecutionRequest(
+                command=_py("print('x')"), timeout_seconds=30, sandbox=_description(fake_backend)
+            )
         )
     assert fake_backend.calls == ["spawned", "outcome", "close"]
 
@@ -435,7 +496,7 @@ def test_the_prepared_launch_is_closed_on_every_exit_path_of_a_duplex_launch(
     request = DuplexRequest(
         command=_py("import sys\nfor line in sys.stdin: print(line, flush=True)"),
         max_runtime_seconds=30,
-        sandbox=_description(),
+        sandbox=_description(fake_backend),
     )
     with pytest.raises(interruption):
         with start_duplex(request) as child:

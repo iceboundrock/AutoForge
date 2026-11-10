@@ -519,6 +519,8 @@ EXCEPTION_CLASSES: dict[type[errors.AutoForgeError], tuple[StopOutcome, StopReas
     errors.InteractionRequiredError: (_O.RESUMABLE_ERROR, _C.INTERACTION_REQUIRED),
     errors.ChildStdinClosedError: (_O.RESUMABLE_ERROR, _C.EXECUTION_FAILED),
     errors.SandboxLaunchRefusedError: (_O.RESUMABLE_ERROR, _C.SANDBOX_LAUNCH_REFUSED),
+    # The launch ran, its result is not used, and the next entry reconciles.
+    errors.SandboxCleanupUncertainError: (_O.RESUMABLE_ERROR, _C.EXECUTION_FAILED),
     errors.ControlResultError: (_O.RESUMABLE_ERROR, _C.CONTROL_RESULT_INVALID),
     errors.ControlResultValidationError: (_O.RESUMABLE_ERROR, _C.CONTROL_RESULT_INVALID),
     errors.GitHubError: (_O.RESUMABLE_ERROR, _C.GITHUB_ERROR),
