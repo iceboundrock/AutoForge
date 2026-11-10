@@ -66,9 +66,11 @@ Safety properties:
   not, and neither is time spent waiting on anyone else;
 - on request (``sandbox``), the command runs inside the outer sandbox a
   :class:`~autoforge.sandbox.LaunchDescription` describes (ADR 0005): the
-  Linux backend (:mod:`autoforge.sandbox_bwrap`) is spawned in its place,
-  with the same session, pipes, limits, containment and group kill, and a
-  host that cannot establish the sandbox refuses the launch
+  backend that prepares it (:func:`autoforge.sandbox_backend.prepare`, the
+  run step of ADR 0013 D13's seam; the Linux backend,
+  :mod:`autoforge.sandbox_bwrap`, today) is spawned in its place, with the
+  same session, pipes, limits, containment and group kill, and a host that
+  cannot establish the sandbox refuses the launch
   (:class:`~autoforge.errors.SandboxLaunchRefusedError`) instead of running
   it without one. A request without a description takes exactly the path
   it took before (ADR 0002 §4e).
@@ -92,10 +94,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import IO
 
-from . import sandbox_bwrap
+from . import sandbox_backend
 from .errors import ExecutionError, ExecutionTimeoutError, SandboxLaunchRefusedError
 from .sandbox import LaunchDescription, SandboxFacts
-from .sandbox_bwrap import BwrapLaunch
+from .sandbox_backend import PreparedLaunch
 
 _KILL_GRACE_SECONDS = 5.0
 # After the child has exited on its own, how long its pipes may stay open
@@ -1349,7 +1351,7 @@ def _spawn(
     cwd: str | None,
     env: dict[str, str],
     stdin: int,
-    launch: BwrapLaunch | None = None,
+    launch: PreparedLaunch | None = None,
 ) -> subprocess.Popen[bytes]:
     """Start ``command`` in a session of its own with stdout and stderr piped.
 
@@ -1379,17 +1381,17 @@ def _spawn(
 
 
 def _spawn_sandboxed(
-    launch: BwrapLaunch, *, cwd: str | None, stdin: int
+    launch: PreparedLaunch, *, cwd: str | None, stdin: int
 ) -> subprocess.Popen[bytes]:
     """Start the sandbox backend in place of the command, as :func:`_spawn` does.
 
-    The same session and pipes, plus the descriptors only ``bwrap`` reads
-    (its options, its status stream) and the launch's own process scope,
-    applied between fork and exec (:class:`BwrapLaunch`). The
-    fork happens on this thread, which is the thread ``--die-with-parent``
-    watches, so the caller must outlive the invocation (ADR 0005 D10.6). A
-    failure of that scope, or a backend gone since it was prepared, is a
-    :class:`SandboxLaunchRefusedError`.
+    The same session and pipes, plus the descriptors only the backend reads
+    (bwrap's options and its status stream) and the launch's own process
+    scope, applied between fork and exec (:class:`~autoforge.sandbox_backend.PreparedLaunch`).
+    The fork happens on this thread, which is the thread bwrap's
+    ``--die-with-parent`` watches, so the caller must outlive the
+    invocation (ADR 0005 D10.6). A failure of that scope, or a backend gone
+    since it was prepared, is a :class:`SandboxLaunchRefusedError`.
     """
     try:
         return subprocess.Popen(  # noqa: S603 - argv list, no shell
@@ -1422,15 +1424,17 @@ def _prepare_sandbox(
     cwd: str | None,
     env_allowlist: tuple[str, ...] | None,
     env: Mapping[str, str] | None,
-) -> BwrapLaunch:
+) -> PreparedLaunch:
     """The backend's launch for ``command`` inside ``description``, or a refusal.
 
     The command's environment is selected as for any launch
     (:func:`_child_environment`) and handed to the backend, which applies the
     description's overrides over it. Done before an invocation's containment
-    begins, since the backend may read its own version first.
+    begins, since the backend may read its own version first. The backend is
+    the one that prepares ``description`` (ADR 0013 D13's run step); a
+    description no backend prepares is refused, never run without one.
     """
-    return sandbox_bwrap.prepare(
+    return sandbox_backend.prepare(
         description, command, cwd=cwd, env=_child_environment(env_allowlist, env)
     )
 
@@ -1479,7 +1483,7 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
     :class:`SandboxLaunchRefusedError`, and nothing the backend wrote is
     returned as the command's; a backend ended by a signal the executor did
     not send is the command's abnormal end, as for any command
-    (:meth:`BwrapLaunch.outcome`).
+    (:meth:`~autoforge.sandbox_backend.PreparedLaunch.outcome`).
     """
     if not req.command:
         raise ExecutionError("empty command")
@@ -1523,7 +1527,7 @@ def check_limit(name: str, value: float | None) -> None:
 def _execute(
     req: ExecutionRequest,
     contained: _Containment | None,
-    launch: BwrapLaunch | None = None,
+    launch: PreparedLaunch | None = None,
 ) -> ExecutionResult:
     started = _now()
     ceiling = req.timeout_seconds if req.timeout_seconds > 0 else None

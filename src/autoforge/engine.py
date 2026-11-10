@@ -132,7 +132,7 @@ from functools import partial
 from pathlib import Path
 from typing import NoReturn, TypeVar
 
-from . import __prompt_version__, sandbox_bwrap
+from . import __prompt_version__
 from .agent_worktree import (
     Candidate,
     ObjectImportError,
@@ -520,7 +520,24 @@ from .run_namespace import IssueNamespace, check_standalone_state_dir, inside_sc
 from .runlog import ExecutionRecord, RunLogger, StepLog
 from .safefs import SafeRoot
 from .sandbox import LaunchDescription, NetworkPosition, SandboxFacts
-from .sandbox_bwrap import Capability, ProbeResult
+from .sandbox_backend import (
+    Capability,
+    LaunchInputs,
+    LaunchOwner,
+    ProbeResult,
+    RuntimeReport,
+    SandboxBackend,
+    default_backend,
+)
+from .sandbox_lifecycle import (
+    NO_CANDIDATE_SOURCE,
+    NO_JOURNAL,
+    CandidateSource,
+    LaunchLifecycle,
+    LifecycleJournal,
+    Verified,
+    enter,
+)
 from .sandbox_pin import MODE_KEY, SandboxPin
 from .sandbox_pin import SOURCE_ACCEPTED as PIN_ACCEPTED
 from .sandbox_pin import SOURCE_STRENGTHENED as PIN_STRENGTHENED
@@ -1464,14 +1481,25 @@ def _operator_home() -> str:
 LOGICAL_ISOLATION_ONLY = "logical isolation only"
 
 
+def launch_backend() -> SandboxBackend:
+    """The backend this controller's enforced launches use (ADR 0013 D13, #268).
+
+    bwrap, the only one until #273 makes a backend selectable. Module-level
+    so that a test can stand a fake backend in for it; the engine reaches
+    its backend only through this, at a command's entry and at each launch.
+    """
+    return default_backend()
+
+
 def probe_sandbox() -> ProbeResult:
     """This host's capability, by one real minimal launch (ADR 0005 D14.1).
 
     Module-level so that a test can stand in for the host; the engine asks
-    once per instance (:meth:`ControllerEngine.sandbox_capability`), and
-    ``doctor`` asks for itself.
+    once per instance for the runtime report it was proved on
+    (:meth:`ControllerEngine.sandbox_capability`), and ``doctor`` asks for
+    itself. The backend's own probe (:meth:`SandboxBackend.probe`).
     """
-    return sandbox_bwrap.probe(home=_operator_home(), environ=os.environ)
+    return launch_backend().probe(home=_operator_home(), environ=os.environ)
 
 
 def sandbox_mode_summary(sandbox: SandboxConfig) -> str:
@@ -1751,6 +1779,10 @@ class ControllerEngine:
         # The HEAD that import covered, "" for none: a validated candidate's
         # provenance says whether it came through the strict import (#173).
         self._imported_head = ""
+        # The verify step's outcome for the latest launch's exported artifact
+        # (ADR 0013 D13), ``None`` when it exported none: then the candidate
+        # is the worktree's ``HEAD``, imported as above (bwrap's).
+        self._export_verified: Verified | None = None
         # Whether this step's REVIEW entry wrote or reused the
         # ``review_evidence`` binding the reviewer's prompt is rendered from
         # (ADR 0006 D5.5, D5.7, D9.1); reset at every REVIEW entry, so a plan
@@ -1828,8 +1860,13 @@ class ControllerEngine:
         self.interaction_resolver: Resolver | None = None
         # The host's sandbox capability, probed at the first gate that needs
         # it and kept for this engine's process, never across processes
-        # (ADR 0005 D12.2).
+        # (ADR 0005 D12.2), and only for the runtime report it was proved on
+        # (ADR 0013 D16): a fresh report that differs probes again.
         self._sandbox_probe: ProbeResult | None = None
+        self._sandbox_probe_runtime: RuntimeReport | None = None
+        # What the runtime check at this command's last entry proved; read
+        # afresh at every entry, never from a cache (ADR 0013 D16).
+        self._sandbox_runtime: RuntimeReport | None = None
         # The CLI's global flags as this process was started with them
         # (``--config``, ``--state-dir``), set by the CLI and repeated by
         # :meth:`resume_command` (#189). Paths only, never a configuration
@@ -2625,10 +2662,54 @@ class ControllerEngine:
 
     # -- the outer sandbox's mode and gate (ADR 0005 D12.2, D13.5, #169) -------
     def sandbox_capability(self) -> ProbeResult:
-        """Whether this host can enforce a launch, probed once for this engine (D14.1)."""
-        if self._sandbox_probe is None:
+        """Whether this host can enforce a launch, probed once for this engine (D14.1).
+
+        Kept for the runtime report it was proved on (ADR 0013 D16): after a
+        command's entry whose fresh report differs, the host is probed
+        again. bwrap's report never changes, so it is probed once.
+        """
+        runtime = self._sandbox_runtime
+        if runtime is None:
+            runtime = self._sandbox_runtime = launch_backend().runtime_check()
+        if self._sandbox_probe is None or self._sandbox_probe_runtime != runtime:
             self._sandbox_probe = probe_sandbox()
+            self._sandbox_probe_runtime = runtime
         return self._sandbox_probe
+
+    def _lifecycle_journal(self) -> LifecycleJournal:
+        """The run's lifecycle journal (ADR 0013 D6): none exists yet (#272).
+
+        bwrap makes no object, so it never writes one; a backend that would
+        is refused before it makes anything (:data:`NO_JOURNAL`).
+        """
+        return NO_JOURNAL
+
+    def _candidate_source(self) -> CandidateSource:
+        """The verify step for an exported artifact, and its save (ADR 0013 D13): #269's.
+
+        None exists yet, so every exported artifact is refused
+        (:data:`NO_CANDIDATE_SOURCE`) and never read as a candidate. bwrap
+        exports nothing: its candidate is the worktree's ``HEAD``, imported
+        strictly after the launch (ADR 0005 D6.5).
+        """
+        return NO_CANDIDATE_SOURCE
+
+    def _sandbox_entry(self) -> None:
+        """At a command's entry, before any launch: the runtime check, then
+        reconciliation, then the probe (ADR 0013 D16).
+
+        The runtime check is read afresh every time, and a refusal of it
+        leaves everything as it was, nothing reconciled; the probe's result
+        is reused for the report it was proved on. bwrap's runtime check
+        reads nothing and it has nothing to reconcile, so for it this is the
+        probe of ADR 0005 D12.2 alone.
+        """
+
+        def probe(runtime: RuntimeReport) -> ProbeResult:
+            self._sandbox_runtime = runtime
+            return self.sandbox_capability()
+
+        enter(launch_backend(), self._lifecycle_journal(), probe)
 
     def _sandbox_enforced(self) -> bool:
         """Whether a launch now is enforced; raise when the mode refuses it (D12.2).
@@ -2658,7 +2739,10 @@ class ControllerEngine:
         cannot enforce refuses the step here, and state
         stays byte-identical. Under ``disabled`` it probes nothing. An
         operator read-only path that overlaps what no launch may see is
-        refused here too, whatever the host (D15.4).
+        refused here too, whatever the host (D15.4). After that check, which
+        reads only configuration, comes the command's entry
+        (:meth:`_sandbox_entry`): the runtime check, reconciliation and the
+        probe, in ADR 0013 D16's order.
         """
         if not self.config.sandbox.enabled:
             return
@@ -2667,6 +2751,7 @@ class ControllerEngine:
             raise ConfigurationError(
                 f"{problem}. Nothing was launched, saved or charged; remove or narrow the entry."
             )
+        self._sandbox_entry()
         self._sandbox_enforced()
 
     def _operator_path_problem(self) -> str:
@@ -2720,17 +2805,19 @@ class ControllerEngine:
     # -- the outer sandbox's facts (ADR 0005 D13.2, #168) ---------------------
     def _agent_sandbox(
         self, phase: Phase, cwd: str, overrides: Mapping[str, str], read_context: str
-    ) -> SandboxPlan | None:
+    ) -> LaunchFacts | None:
         """The engine's facts for one agent launch; ``None`` when it is not enforced.
 
         The sandbox directories are created here, through the controller's
         filesystem boundary, at the first enforced launch that needs them. A
-        directory that cannot be prepared refuses the launch.
+        directory that cannot be prepared refuses the launch. The facts reach
+        the provider in a :class:`SandboxPlan` bound to the launch's
+        lifecycle (:meth:`_through_lifecycle`).
         """
         if not self._sandbox_enforced():
             return None
         change = phase in WORKTREE_STATE_PHASES
-        return SandboxPlan(self._remote_facts(cwd, overrides, read_context, cache=change))
+        return self._remote_facts(cwd, overrides, read_context, cache=change)
 
     def _command_sandbox(
         self, launch_class: LaunchClass, cwd: str, overrides: Mapping[str, str], network: str
@@ -2758,7 +2845,7 @@ class ControllerEngine:
             **select_environment(self.config.execution.command_environment_names()),
             **overrides,
         }
-        return describe_launch(facts, None, env)
+        return describe_launch(facts, None, env, backend=launch_backend())
 
     def _remote_facts(
         self, cwd: str, overrides: Mapping[str, str], read_context: str, *, cache: bool
@@ -2848,12 +2935,39 @@ class ControllerEngine:
         strict import after the launch already ran (:meth:`_invoke_phase`),
         and when it failed, there is no candidate: its reason is the
         refusal, under the phase's existing rule for an unreadable ``HEAD``.
+
+        After a launch whose export the verify step judged (ADR 0013 D13),
+        the candidate is the commit that step accepted and no other: the
+        worktree's ``HEAD`` is one only when it is exactly that commit, so a
+        commit the verify step did not accept is never checked, validated
+        or published. Any other ``HEAD`` is refused under the same rule,
+        until #269's candidate source replaces this read. bwrap exports
+        nothing (no outcome), so its candidate read is unchanged.
         """
         if self._import_problem:
             return Candidate(False, "", self._import_problem)
         worktree = Path(cwd)
-        return read_candidate(
+        candidate = read_candidate(
             self.workspace().git_dirs()[-1], self._agent_admin_dir(worktree), cwd, self._runner
+        )
+        verified = self._export_verified
+        if verified is None:
+            return candidate
+        if not verified.accepted:
+            # Already the import problem after every launch (_invoke_phase);
+            # never a candidate even if read before it was set.
+            return Candidate(False, "", verified.problem)
+        if candidate.head and candidate.head == verified.candidate:
+            return candidate
+        if candidate.attached:
+            found = "attached to a local branch"
+        else:
+            found = candidate.head or candidate.problem or "no commit the shared store holds"
+        return Candidate(
+            candidate.attached,
+            "",
+            f"the worktree's HEAD ({found}) is not the commit the verify step accepted from "
+            f"the launch's export ({verified.candidate}); only that commit is a candidate",
         )
 
     def _checkout_anchor(self) -> tuple[str, str]:
@@ -14988,16 +15102,25 @@ class ControllerEngine:
                 record.metadata["correction_reply"] = previous_reply.metadata()
             result: AgentExecutionResult | None = None
             self._import_problem = ""
+            self._export_verified = None
             try:
                 with isolated_overrides(identity) as overrides:
                     req.env = overrides
                     # ADR 0005: under `sandbox.mode: required` every process
                     # of the launch runs inside the outer sandbox, or is
                     # refused here or at the spawn; it never runs without it.
-                    req.sandbox = self._agent_sandbox(phase, cwd, overrides, read_context)
-                    result = self._launch(provider, req, limits, step_log, phase)
+                    result = self._through_lifecycle(
+                        self._agent_sandbox(phase, cwd, overrides, read_context),
+                        phase,
+                        req,
+                        partial(self._launch, provider, req, limits, step_log, phase),
+                    )
             except ExecutionError as exc:
-                record.error = f"{type(exc).__name__}: {exc}"
+                # A note is what a launch's clean-up could not verify while
+                # this error was ending it (ADR 0013 D17).
+                record.error = "; ".join(
+                    [f"{type(exc).__name__}: {exc}", *getattr(exc, "__notes__", ())]
+                )
                 record.sandbox = _refusal_facts(exc)
                 if broker is not None:
                     record.interaction = broker.record()
@@ -15115,10 +15238,19 @@ class ControllerEngine:
                     + f". stderr tail: {stderr[-2000:]}"
                 )
             try:
-                # ADR 0005 D6.5: the agent's new objects are imported
-                # strictly before its result is checked; tampering is
-                # recorded here and blocks the run.
-                self._import_problem = self._import_after_launch(Path(cwd))
+                if self._export_verified is None:
+                    # ADR 0005 D6.5: the agent's new objects are imported
+                    # strictly before its result is checked; tampering is
+                    # recorded here and blocks the run.
+                    self._import_problem = self._import_after_launch(Path(cwd))
+                else:
+                    # ADR 0013 D13: the launch exported its candidate, and the
+                    # verify step's outcome stands in for that import: a
+                    # refusal is the candidate read's, never a candidate, and
+                    # the candidate read accepts no commit but the one it
+                    # accepted (:meth:`_read_candidate`).
+                    self._imported_head = self._export_verified.candidate
+                    self._import_problem = self._export_verified.problem
                 # Only the tail of a truncated stdout is searched: the block
                 # is the last thing the agent writes, so the kept tail holds
                 # a whole one; a block before the cut is stale or spans it.
@@ -15315,6 +15447,77 @@ class ControllerEngine:
             except ConfigurationError:
                 pass
         return phase.value
+
+    def _through_lifecycle(
+        self,
+        facts: LaunchFacts | None,
+        phase: Phase,
+        req: AgentRequest,
+        launch: Callable[[], AgentExecutionResult],
+    ) -> AgentExecutionResult:
+        """One agent launch through its backend's lifecycle (ADR 0013 D13); unenforced: as is.
+
+        The provider gets a :class:`SandboxPlan` bound to the launch's
+        :class:`LaunchLifecycle` and the backend's: its plan step compiles
+        first, pure, so a launch the policy refuses makes nothing; the plan
+        then has the lifecycle seed, create and stage, and the compiled
+        launch carries the handle of what they made to the executor, whose
+        prepared launch it closes on every path. The release follows the
+        launch on every path, ``Ctrl-C`` included. For a change-producing
+        launch come the export, the verify step's outcome, its save, and
+        only then the final clean-up (:meth:`_verify_export`). A failure of a
+        step up to the run refuses the launch
+        (:class:`SandboxLaunchRefusedError`) with what was made removed, and
+        it is never run without the sandbox instead; an object a removal
+        could not verify gone is :class:`SandboxCleanupUncertainError` in
+        place of the result, its entry left for reconciliation.
+
+        For bwrap every step but the plan and the run does nothing, and it
+        exports nothing: its candidate is the worktree's ``HEAD``, imported
+        and read after the launch as before.
+        """
+        if facts is None:
+            req.sandbox = None
+            return launch()
+        state = self._require_state()
+        issue = parse_issue_url(state.current_issue_url).number if state.current_issue_url else 0
+        launch_id = f"{phase.value}-{state.attempt}"
+        owner = LaunchOwner(run=state.run_id, issue=issue, phase=phase.value, launch=launch_id)
+        inputs = LaunchInputs(owner, workspace=facts.workspace, read_context=facts.read_context)
+        backend = launch_backend()
+        runtime = self._sandbox_runtime or backend.runtime_check()
+        change = phase in WORKTREE_STATE_PHASES
+        with LaunchLifecycle(
+            backend, self._lifecycle_journal(), inputs, runtime, change_producing=change
+        ) as lifecycle:
+            req.sandbox = SandboxPlan(facts, backend, lifecycle)
+            result = lifecycle.launch(launch)
+            self._export_verified = self._verify_export(lifecycle)
+        return result
+
+    def _verify_export(self, lifecycle: LaunchLifecycle) -> Verified | None:
+        """The export, the verify step, its save, then the final clean-up (ADR 0013 D13).
+
+        ``None`` when the launch exported nothing (bwrap, or a launch that is
+        not change-producing). An export that failed is the verify step's
+        refusal (D17). The outcome is saved before the volume it was read
+        from is removed; a verify step that raises saves nothing, and the
+        volume stays for reconciliation. An exporter that may still be
+        running raises in :meth:`LaunchLifecycle.export`, before anything
+        verifies what it wrote.
+        """
+        exported = lifecycle.export()
+        if exported is None:
+            return None
+        source = self._candidate_source()
+        handle = lifecycle.handle
+        if exported.artifact is None or handle is None:
+            verified = Verified(refusal=f"the launch's export failed: {exported.failure}")
+        else:
+            verified = source.verify(exported.artifact, handle)
+        source.save(verified)
+        lifecycle.saved()
+        return verified
 
     def _launch(
         self,

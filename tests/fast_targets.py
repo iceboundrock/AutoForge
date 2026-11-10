@@ -164,7 +164,9 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/run_binding.py": ("test_cli", "test_state_root"),  # run's EPIC (#293)
     "src/autoforge/run_namespace.py": ("test_engine",),
     "src/autoforge/sandbox.py": ("test_sandbox_gate", "test_engine"),
+    "src/autoforge/sandbox_backend.py": ("test_engine_sandbox", "test_sandbox_gate"),
     "src/autoforge/sandbox_bwrap.py": ("test_engine_sandbox",),
+    "src/autoforge/sandbox_lifecycle.py": ("test_sandbox_gate", "test_engine_sandbox"),
     "src/autoforge/sandbox_pin.py": ("test_cli", "test_state", "test_worker", "test_engine"),
     "src/autoforge/sandbox_policy.py": ("test_engine_sandbox", "test_engine"),
     "src/autoforge/scheduler.py": ("test_worker",),

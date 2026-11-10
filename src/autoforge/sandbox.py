@@ -9,8 +9,9 @@ environment overrides for path-valued names, the network position and the
 backend-neutral, and it knows nothing of a workflow, a provider or GitHub:
 a projection is a path and an access mode, never "the worktree" or "the
 read context". The Linux backend that enforces it is
-:mod:`autoforge.sandbox_bwrap`; :mod:`autoforge.executor` and
-:mod:`autoforge.executor_duplex` take one on a request.
+:mod:`autoforge.sandbox_bwrap`, behind the backend seam
+(:mod:`autoforge.sandbox_backend`, ADR 0013 D13); :mod:`autoforge.executor`
+and :mod:`autoforge.executor_duplex` take one on a request.
 
 The *policy compiler* (:func:`compile_launch`) turns the controller's facts
 and the declared requirements, both plain data (:class:`SandboxRequest`),
@@ -60,7 +61,9 @@ Which paths a launch class gets (ADR 0005 §2.5) is the engine's (#168).
 operator-declared read-only path when the configuration is loaded (D15.4).
 
 :class:`SandboxFacts` is what an enforced or refused launch records:
-bounded, with no environment value. The controller never reads it (D16.1).
+bounded, with no environment value, and qualified by the backend that
+enforced it (:class:`BackendIdentity`, ADR 0013 D16). The controller never
+reads it (D16.1).
 """
 
 from __future__ import annotations
@@ -240,6 +243,13 @@ class LaunchDescription:
     dev: DevPolicy = DevPolicy.MINIMAL
     sys: SysPolicy = SysPolicy.READ_ONLY
     covered: tuple[str, ...] = ()
+    # Which backend planned the launch and, once a lifecycle made its
+    # environment, that environment's handle (ADR 0013 D13): an
+    # ``autoforge.sandbox_backend.LaunchBinding``, opaque here, with which the
+    # run step prepares the launch (``sandbox_backend.prepare``). Not part of
+    # what the launch is: no backend reads it as a mount, a variable or a
+    # policy, and two descriptions that differ only here are equal.
+    binding: object = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         targets: set[str] = set()
@@ -374,6 +384,56 @@ def _lookup(entries: list[Mount], path: str) -> tuple[bool, str | None]:
 TEARDOWN_UNCOUNTED = "removed by namespace teardown, uncounted"
 
 
+class BackendKind(enum.Enum):
+    """Which backend enforces a launch (ADR 0013 D16; ADR 0005 D1.2 as amended).
+
+    The value is what :attr:`SandboxFacts.backend` says. bwrap's is the name
+    its facts have always carried (``sandbox_bwrap.BACKEND``), so a bwrap
+    record is unchanged by the kind.
+    """
+
+    # Bubblewrap: one process whose death ends the sandbox (ADR 0005).
+    BWRAP = "bubblewrap"
+    # A rootless container runtime (ADR 0013): implemented by #271, never
+    # selectable before #273.
+    CONTAINER = "container"
+
+
+# How a surface names a container runtime's product (ADR 0013 D8).
+_RUNTIME_PRODUCTS = {"docker": "Docker Engine", "podman": "Podman"}
+
+
+@dataclass(frozen=True)
+class BackendIdentity:
+    """The backend that enforced a launch, as every surface must name it (ADR 0013 D16).
+
+    ``kind`` and ``version`` are the backend's; the rest is a container's
+    alone, empty for bwrap: the runtime's product (``docker`` or
+    ``podman``) and version, whether it is rootless (``None`` when not
+    known), the image id, the staging method (``bind`` or ``copy``) and the
+    watch fact. Never a bare "sandboxed": two backends give two different
+    sets of guarantees.
+    """
+
+    kind: BackendKind
+    version: str = ""
+    runtime: str = ""
+    runtime_version: str = ""
+    rootless: bool | None = None
+    image_id: str = ""
+    staging: str = ""
+    watch: str = ""
+
+    def describe(self) -> str:
+        """``enforced by bubblewrap 0.11.0``; ``enforced by a rootless Podman container``."""
+        if self.kind is BackendKind.BWRAP:
+            name = self.kind.value
+            return f"enforced by {name} {self.version}" if self.version else f"enforced by {name}"
+        product = _RUNTIME_PRODUCTS.get(self.runtime, self.runtime or "unnamed runtime")
+        rootless = {True: "rootless ", False: "rootful ", None: ""}[self.rootless]
+        return f"enforced by a {rootless}{product} container"
+
+
 def _bounded(text: str, limit: int = _MAX_FACT_TEXT) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
@@ -391,6 +451,15 @@ class SandboxFacts:
     kernel's default; ``unset_env`` names the variables the description
     unset, names only. Nothing here is an environment value, and nothing
     here is read by the controller (D16.1).
+
+    The facts are qualified by backend (ADR 0013 D16): ``backend`` names it
+    (:class:`BackendKind`'s value), and a container's facts add its runtime's
+    product, version and whether it is rootless, the image id, the staging
+    method and the watch fact; ``teardown`` is then the container's own
+    fact, never bwrap's :data:`TEARDOWN_UNCOUNTED`. :attr:`identity` reads
+    them back as one :class:`BackendIdentity`. A field a bwrap launch
+    leaves empty is not written by :meth:`record`, so a bwrap record is
+    what it was before the seam (#268).
     """
 
     enforced: bool
@@ -401,6 +470,12 @@ class SandboxFacts:
     tmpfs: tuple[tuple[str, int | None], ...] = ()
     unset_env: tuple[str, ...] = ()
     setup_failure: str = ""
+    runtime: str = ""
+    runtime_version: str = ""
+    rootless: bool | None = None
+    image_id: str = ""
+    staging: str = ""
+    watch: str = ""
 
     def __post_init__(self) -> None:
         names = tuple(_bounded(name, _MAX_FACT_NAME) for name in self.unset_env)
@@ -412,10 +487,30 @@ class SandboxFacts:
         object.__setattr__(
             self, "tmpfs", tuple((_bounded(p, 512), s) for p, s in self.tmpfs[:_MAX_FACT_NAMES])
         )
+        for name in ("runtime", "runtime_version", "image_id", "staging"):
+            object.__setattr__(self, name, _bounded(getattr(self, name), _MAX_FACT_NAME))
+        object.__setattr__(self, "watch", _bounded(self.watch))
+
+    @property
+    def identity(self) -> BackendIdentity | None:
+        """The backend these facts name; ``None`` when they name none (a policy refusal)."""
+        kind = next((kind for kind in BackendKind if kind.value == self.backend), None)
+        if kind is None:
+            return None
+        return BackendIdentity(
+            kind,
+            version=self.backend_version,
+            runtime=self.runtime,
+            runtime_version=self.runtime_version,
+            rootless=self.rootless,
+            image_id=self.image_id,
+            staging=self.staging,
+            watch=self.watch,
+        )
 
     def record(self) -> dict[str, object]:
         """The facts as the run log writes them (``execution.json``, ``events.jsonl``)."""
-        return {
+        out: dict[str, object] = {
             "enforced": self.enforced,
             "backend": self.backend,
             "backend_version": self.backend_version,
@@ -427,6 +522,13 @@ class SandboxFacts:
             "unset_env": list(self.unset_env),
             "setup_failure": self.setup_failure,
         }
+        # A container's identity (ADR 0013 D16); bwrap sets none of it.
+        for name in ("runtime", "runtime_version", "image_id", "staging", "watch"):
+            if getattr(self, name):
+                out[name] = getattr(self, name)
+        if self.rootless is not None:
+            out["rootless"] = self.rootless
+        return out
 
 
 # ---------------------------------------------------------------- the request

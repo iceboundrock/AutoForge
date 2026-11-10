@@ -54,6 +54,23 @@ sandbox.py          outer sandbox: the backend-neutral launch description, the p
 sandbox_bwrap.py    the Linux backend: the only place that knows a `bwrap` flag; the
                     launch's keyring and Landlock scope, setup-failure detection, the
                     typed capability probe (#167, #169)
+sandbox_backend.py  the backend seam (ADR 0013 D13): the backend-neutral lifecycle
+                    interface (runtime check, reconcile, probe; plan, seed, create,
+                    stage, the run step's prepared launch, export, removal), the
+                    per-launch data its steps hand on (inputs, seed, the handle of
+                    what was made, the binding a compiled launch carries to the
+                    executor), its objects and their removal outcomes, bwrap behind
+                    it unchanged; the only module that imports sandbox_bwrap;
+                    executor layer, no journal, no workflow (#268)
+sandbox_lifecycle.py  the engine's sequence of that interface: a command's entry
+                    (runtime check, reconciliation, probe) and one launch's steps in
+                    D13's order (plan, then the environment it establishes),
+                    journaled before every create and removal, each container removed
+                    before what it mounts, the release on every path, the volume kept
+                    until verify's outcome is saved, an
+                    uncertain removal raised as SandboxCleanupUncertainError; the
+                    journal and verify-step protocols (#272, #269 implement them);
+                    no workflow (#268)
 sandbox_policy.py   which host resources a launch gets by launch class (ADR 0005 §2.5):
                     LaunchFacts from the engine, ProviderRequirements from an adapter,
                     the SandboxPlan, the path-valued environment rewrite (D8.2),
@@ -205,8 +222,11 @@ prompts/            file-based templates ({{VAR}}): common.md (trust boundary), 
   provider wire-protocol names outside the provider layer (`providers.py`
   plus the protocol modules it owns, `pi_rpc.py` and `claude_stream.py`);
   no workflow semantics or JSON in `executor.py` or `executor_duplex.py`,
-  and none in `sandbox.py` or `sandbox_bwrap.py` either; no `bwrap` flag
-  outside `sandbox_bwrap.py`; no provider branch or process in
+  and none in `sandbox.py`, `sandbox_bwrap.py`, `sandbox_backend.py` or
+  `sandbox_lifecycle.py` either; no `bwrap` flag outside `sandbox_bwrap.py`,
+  and no import of it outside `sandbox_backend.py`: the engine, the
+  executors and `doctor` reach a backend through the seam (#268); no
+  provider branch or process in
   `sandbox_policy.py` (an adapter declares `sandbox_requirements` as data
   and never emits a mount, and `sandboxed()` is the one place an
   adapter's launch is described); a REMOTE agent's candidate (what the controller verifies,
@@ -287,6 +307,9 @@ sandbox.py, sandbox_bwrap.py                      -> docs/agent-guides/architect
                                                      (Executor) + docs/adr/0005-outer-
                                                      sandbox-and-host-resource-capability-
                                                      model.md and ADR 0002 §4e
+sandbox_backend.py, sandbox_lifecycle.py          -> the same, + docs/adr/0013-container-
+                                                     sandbox-backend-lifecycle-trust-
+                                                     boundaries-and-rollout.md (D13, D16)
 sandbox_policy.py, providers.py
 (sandbox_requirements), engine.py (launch
 routing, sandbox directories, the pre-launch

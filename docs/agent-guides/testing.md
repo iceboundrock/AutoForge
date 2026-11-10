@@ -856,6 +856,81 @@ exactly when `tests/sandbox_host.py` measures the host capable
   - a missing bind source and an exec failure as refusals.
 - `tests/test_runlog.py` checks that the facts reach `execution.json` and
   `events.jsonl`, redacted, and only for a sandboxed launch.
+- `tests/test_sandbox_backend.py` (the backend seam, ADR 0013 D13, #268)
+  needs no runtime. Only `sandbox_backend.py` imports `sandbox_bwrap.py`,
+  and the seam's modules import no workflow. bwrap's run step and probe
+  are `sandbox_bwrap`'s own and its plan is the compiler; its other steps
+  do nothing, and it never reports an object removed. A launch bound to a
+  backend is prepared by that backend with its handle, never by its type,
+  and one bound to no backend is refused. On a fake backend the launch is
+  bound to, the executor and the duplex executor hand it exactly the
+  command, its cwd and the selected
+  environment (nothing outside the allow-list); the command reads its
+  stdin byte for byte and streams records, while a liveness descriptor
+  of the backend's is never its stdin and receives nothing; a stop ends
+  it as the executor's own; a refusal to prepare and a launch type no
+  backend registered spawn nothing; a setup failure after the spawn is a
+  refusal; and `close()` runs on every exit path, `KeyboardInterrupt` and
+  an exception inside the launch guard included. `SandboxFacts` names its
+  backend, a bwrap record keeps exactly its keys, and a container's facts
+  carry its runtime, rootlessness, image, staging and watch fact.
+- `tests/test_sandbox_lifecycle.py` sequences a fake container backend
+  over a fake runtime that accepts a bind, a volume or a network only in a
+  container's create call and, as Docker and Podman do, refuses to remove
+  a volume a container still references, running or not; with a fake
+  journal and a fake verify step and its save; one event list orders all
+  four. At a command's entry: the
+  runtime check, reconciliation, then the probe, and a refused runtime
+  check writes and reconciles nothing. For
+  one launch, in both staging forms: the seed step given the launch's
+  inputs and its compiled launch; no journal entry and no runtime call
+  before the seed step ends, and none when it fails; one journal write
+  naming every object before the staging root is written; the staging
+  root proved before the volume's create, that before the stager
+  container's, that before the launch container's; every mount and
+  network in a create call and in no later call; the stager container
+  offline and without the projection; its start, copy-in, stager and
+  prover, and its journaled removal, before the launch container starts;
+  every create and removal journaled first; every removal taking each
+  container before what it mounts, reconciliation's included, so a launch
+  with nothing to export removes its volume at the release and succeeds;
+  a launch container or stager container not verified removed keeping
+  the volume it mounts, with no removal of it issued, while the
+  projection still goes; the release after the run on
+  every path; the exporter's own entry before its create; the volume
+  removed only after verify's outcome is saved; a failed export an
+  outcome that keeps the volume until it is saved. A refusal at each step
+  before the run removes what was made and starts nothing, and an
+  environment that failed is never made again; a later process of the
+  launch runs in the environment already made; an uncertain release, an
+  exporter not verified removed and an uncertain final clean-up each raise
+  `SandboxCleanupUncertainError` with the entry left open (no export after
+  the first, no artifact returned after the second), and never mask an
+  exception already ending the launch; D13's rules refuse bad objects
+  before any journal write; without a journal a backend that makes an
+  object is refused before it makes one; bwrap does nothing but the plan
+  and the run. A `SandboxPlan` compiles before the environment is made and
+  binds the backend and the handle; a plan the policy refuses makes and
+  starts nothing. OpenCode's adapter and the real executor run its command
+  in exactly the launch container created and staged for the launch,
+  prepared by the backend that planned it; a backend that needs an
+  environment refuses a launch no lifecycle made one for. Through the
+  engine: the entry's order; the plan before the seed, and a denied plan
+  that makes nothing; a launch's steps around the agent through the
+  export, the verify step, its save and the final clean-up, and the
+  provider's description bound to the fake and its launch container; a
+  REVIEW launch, which exports nothing, completing with its launch
+  container removed before its volume; an
+  artifact refused by the verify step, or with no candidate source, never
+  a candidate; of an agent's two commits, only the one the verify step
+  accepted published, and the other (the worktree's `HEAD`, reported)
+  refused on every launch with nothing pushed or created; an uncertain
+  release that fails the step and is reconciled
+  at the next entry; an exporter not verified removed that is never
+  verified; the release after `Ctrl-C`, and `Ctrl-C` kept when the release
+  is uncertain; a refused runtime check with the state byte-identical;
+  nothing under `disabled`; and the same order in a scheduler worker's
+  namespace.
 
 The existing executor and duplex suites are the no-description regression:
 they run unchanged.

@@ -373,6 +373,27 @@ class SandboxLaunchRefusedError(ExecutionError):
         self.facts = facts
 
 
+class SandboxCleanupUncertainError(ExecutionError):
+    """A sandbox backend's object of a launch could not be verified removed (ADR 0013 D13, D17).
+
+    Raised by the engine's sequence of a backend's lifecycle
+    (``autoforge.sandbox_lifecycle``) once a removal could not prove its
+    object gone: the release after the run step, the exporter's removal
+    after the export, or the final clean-up. The object's journal entry
+    stays open for the next command's reconciliation, and the launch's
+    result is not used: what may still exist (a launch container holding
+    the credential, an exporter that can still write the artifact) could
+    change what the controller would read, so no export or verify follows
+    it. ``objects`` names each as "<kind> <name>". When another exception
+    is already ending the launch (``Ctrl-C``, a refusal), that exception
+    propagates instead, with a note naming the same objects.
+    """
+
+    def __init__(self, message: str, objects: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.objects = objects
+
+
 class ControlResultError(AutoForgeError):
     """CONTROL_RESULT block missing, ambiguous, or not valid JSON."""
 
