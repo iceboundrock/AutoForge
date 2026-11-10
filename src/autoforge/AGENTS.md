@@ -65,8 +65,9 @@ sandbox_backend.py  the backend seam (ADR 0013 D13): the backend-neutral lifecyc
 sandbox_lifecycle.py  the engine's sequence of that interface: a command's entry
                     (runtime check, reconciliation, probe) and one launch's steps in
                     D13's order (plan, then the environment it establishes),
-                    journaled before every create and removal, the release on every
-                    path, the volume kept until verify's outcome is saved, an
+                    journaled before every create and removal, each container removed
+                    before what it mounts, the release on every path, the volume kept
+                    until verify's outcome is saved, an
                     uncertain removal raised as SandboxCleanupUncertainError; the
                     journal and verify-step protocols (#272, #269 implement them);
                     no workflow (#268)

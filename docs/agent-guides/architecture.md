@@ -647,7 +647,13 @@ test pins it):
   an object of the launch), writes one journal entry per object in one
   write, then makes them in D13's order; every removal is journaled first
   and closed only once verified, and a change-producing launch keeps its
-  volume until `saved()`. A removal that cannot be verified keeps its
+  volume until `saved()`. Every removal, reconciliation's included, takes
+  each container before any object it mounts (`REMOVAL_ORDER`): a runtime
+  refuses to remove a volume a container still references, even a
+  stopped one. A volume whose container was not verified gone is not
+  removed at all and is uncertain; a bind source (the projection, the
+  staging root) is removed regardless, so the credential leaves the host.
+  A removal that cannot be verified keeps its
   entry open and is `SandboxCleanupUncertainError` where it happened: in
   place of the launch's result after the release (nothing is exported
   then: the launch container may still write the volume), in place of the

@@ -3,7 +3,8 @@
 No runtime is needed. :class:`FakeRuntime` is a container runtime that, as
 Docker and Podman do, accepts a bind, a volume or a network only in a
 container's create call; every other call it has names a container and
-nothing it could add to it. :class:`FakeBackend` is a container-shaped
+nothing it could add to it; and it refuses to remove a volume that a
+container still references, running or not. :class:`FakeBackend` is a container-shaped
 backend over it (both staging forms, ``bind`` and ``copy``), whose run step
 prepares a command to run in the launch container its handle names;
 :class:`FakeJournal` records what the engine journals, and
@@ -62,7 +63,18 @@ from autoforge.sandbox_lifecycle import (
 from autoforge.sandbox_policy import LaunchClass, LaunchFacts, SandboxPlan
 from autoforge.state import load_state
 from autoforge.transitions import Phase
-from tests.conftest import EPIC, ISSUE, commit_in, git_out, git_repo, implement, make_engine
+from tests.conftest import (
+    EPIC,
+    ISSUE,
+    PR,
+    block,
+    commit_in,
+    git_out,
+    git_repo,
+    implement,
+    make_engine,
+    review_result,
+)
 
 OWNER = LaunchOwner(run="run-1", issue=268, phase="ANALYZE_EXECUTE", launch="ANALYZE_EXECUTE-1")
 INPUTS = LaunchInputs(OWNER, workspace="/work/268", read_context="/state/read-context/1")
@@ -89,7 +101,9 @@ class FakeRuntime:
 
     A bind, a volume and a network exist only as arguments of
     :meth:`create_container`; ``start``, ``exec``, ``cp``, ``kill`` and ``rm``
-    take a container's name and nothing they could configure it with.
+    take a container's name and nothing they could configure it with. As
+    Docker and Podman do, ``rm`` refuses a volume that a container still
+    references, even a stopped one (:class:`VolumeInUse`), and removes nothing.
     """
 
     def __init__(self, events: list[tuple]) -> None:
@@ -122,9 +136,17 @@ class FakeRuntime:
             self.containers[name]["running"] = False
 
     def rm(self, name: str) -> None:
+        users = sorted(c for c, spec in self.containers.items() if name in spec["mounts"])
+        if name in self.volumes and users:
+            self.events.append(("runtime", "rm refused", name, tuple(users)))
+            raise VolumeInUse(f"fake: volume {name} is in use by {', '.join(users)}")
         self.events.append(("runtime", "rm", name))
         self.containers.pop(name, None)
         self.volumes.discard(name)
+
+
+class VolumeInUse(RuntimeError):
+    """The fake runtime's refusal to remove a volume a container references."""
 
 
 CONTAINER_FACTS = SandboxFacts(
@@ -227,9 +249,14 @@ class FakeBackend:
     def reconcile(self, entries, runtime):
         self.events.append(("runtime", "reconcile", tuple(e.name for e in entries)))
         assert runtime == RUNTIME
+        gone = []
         for entry in entries:
-            self.runtime.rm(entry.name)
-        return entries
+            try:
+                self.runtime.rm(entry.name)
+            except VolumeInUse:
+                continue
+            gone.append(entry)
+        return tuple(gone)
 
     def probe(self, *, home, environ) -> ProbeResult:
         self.events.append(("runtime", "probe"))
@@ -501,14 +528,19 @@ def test_reconciliation_closes_only_the_entries_verified_gone():
     entries = container_objects(OWNER, "bind")
     journal = FakeJournal(events, entries)
 
+    handed: list[LifecycleObject] = []
+
     class Partial(FakeBackend):
         def reconcile(self, entries, runtime):
+            handed.extend(entries)
             return entries[:1]
 
     still_open = reconcile(Partial(events), journal, RUNTIME)
-    assert still_open == entries[1:]
-    assert ("journal", "close", (entries[0].name,)) in events
-    assert journal.entries == list(entries[1:])
+    # The backend gets them in removal order: each container before what it mounts.
+    assert [obj.name for obj in handed] == ["launch", "stager", "projection", "staging", "vol"]
+    assert still_open == tuple(handed[1:])
+    assert ("journal", "close", ("launch",)) in events
+    assert journal.entries == [obj for obj in entries if obj.name != "launch"]
 
 
 def test_reconciliation_closes_nothing_the_journal_does_not_name():
@@ -596,8 +628,7 @@ def test_a_launch_runs_d13s_steps_in_order(staging):
     # The run, in the launch container the handle names; then the release:
     # what holds the credential goes, the volume stays.
     run = _index(events, "executor", "run", "launch")
-    released = ("launch", "projection", *source)
-    release_intent = _index(events, "journal", "removals", tuple(sorted(released, key=names.index)))
+    release_intent = _index(events, "journal", "removals", ("launch", "projection", *source))
     assert launch_start < run < release_intent < _index(events, "runtime", "rm", "launch")
     # The export: the exporter's own entry before its create, its removal journaled.
     exporter_entry = _index(events, "journal", "creates", ("exporter", "out"))
@@ -750,7 +781,7 @@ def test_the_release_follows_the_run_on_every_path(interruption):
         with _lifecycle(backend, journal) as lifecycle:
             _launch(lifecycle, events, interruption=interruption)
     run_at = _index(events, "executor", "run", "launch")
-    assert _index(events, "journal", "removals", ("staging", "projection", "launch")) > run_at
+    assert _index(events, "journal", "removals", ("launch", "projection", "staging")) > run_at
     # A change-producing launch that never reached a saved verify outcome keeps
     # its volume, journaled, for reconciliation.
     assert lifecycle.open_objects == tuple(o for o in journal.entries if o.name == "vol")
@@ -800,6 +831,76 @@ def test_a_launch_with_nothing_to_export_removes_its_volume_at_the_release():
     assert journal.entries == []
 
 
+def test_the_fake_runtime_refuses_to_remove_a_volume_a_container_references():
+    """As Docker and Podman do, even once the container has stopped (R3-F1)."""
+    events: list[tuple] = []
+    runtime = FakeRuntime(events)
+    runtime.create_volume("vol")
+    runtime.create_container("launch", network="bridge", mounts=("vol",))
+    runtime.start("launch")
+    runtime.kill("launch")
+    with pytest.raises(VolumeInUse, match="in use by launch"):
+        runtime.rm("vol")
+    assert runtime.volumes == {"vol"} and ("runtime", "rm", "vol") not in events
+    runtime.rm("launch")
+    runtime.rm("vol")
+    assert runtime.containers == {} and runtime.volumes == set()
+
+
+@pytest.mark.parametrize("staging", ["bind", "copy"])
+def test_a_launch_with_nothing_to_export_removes_each_container_before_its_volume(staging):
+    """REVIEW and UPDATE_EPIC: the release removes the volume too, after the
+    launch container that mounts it, so the launch succeeds (R3-F1)."""
+    events: list[tuple] = []
+    backend = FakeBackend(events, staging=staging)
+    journal = FakeJournal(events)
+    with _lifecycle(backend, journal, change=False) as lifecycle:
+        assert _launch(lifecycle, events) == "result"
+        assert lifecycle.export() is None
+    source = ("staging",) if staging == "bind" else ()
+    intent = _index(events, "journal", "removals", ("launch", "projection", *source, "vol"))
+    launch_rm = _index(events, "runtime", "rm", "launch")
+    vol_rm = _index(events, "runtime", "rm", "vol")
+    closed = _index(events, "journal", "close", ("launch", "projection", *source, "vol"))
+    assert _index(events, "executor", "run", "launch") < intent < launch_rm < vol_rm < closed
+    assert not any(event[1] == "rm refused" for event in events)
+    assert journal.entries == [] and lifecycle.uncertain == []
+    assert backend.runtime.containers == {} and backend.runtime.volumes == set()
+
+
+def _removed_after_their_containers(events: list[tuple]) -> None:
+    """Every object a container mounts is removed only after that container."""
+    mounted_by: dict[str, set[str]] = {}
+    for event in events:
+        if event[:2] == ("runtime", "create"):
+            for source in event[4]:
+                mounted_by.setdefault(source, set()).add(event[2])
+    removed: list[str] = [event[2] for event in events if event[1] == "rm"]
+    for name in removed:
+        for container in mounted_by.get(name, ()):
+            assert container in removed, f"{name} removed while {container} was never removed"
+            assert removed.index(container) < removed.index(name), (
+                f"{name} removed before {container}, which mounts it"
+            )
+
+
+@pytest.mark.parametrize("staging", ["bind", "copy"])
+@pytest.mark.parametrize("change", [True, False])
+def test_every_removal_takes_each_container_before_what_it_mounts(staging, change):
+    events: list[tuple] = []
+    backend = FakeBackend(events, staging=staging)
+    journal = FakeJournal(events)
+    if change:
+        _full(backend, journal, events)
+    else:
+        with _lifecycle(backend, journal, change=False) as lifecycle:
+            _launch(lifecycle, events)
+            lifecycle.export()
+    _removed_after_their_containers(events)
+    assert not any(event[1] == "rm refused" for event in events)
+    assert journal.entries == [] and backend.runtime.volumes == set()
+
+
 def test_a_backend_with_no_exporter_skips_the_export_and_then_cleans_up():
     events: list[tuple] = []
     backend = FakeBackend(events, exporter=False)
@@ -837,6 +938,23 @@ def test_an_uncertain_release_replaces_the_result_and_nothing_is_exported():
     assert {obj.name for obj in journal.entries} == {"projection", "vol"}
     assert lifecycle.uncertain == [o for o in journal.entries if o.name == "projection"]
     assert not any(e[:2] == ("journal", "close") and "projection" in e[2] for e in events)
+
+
+def test_a_launch_container_not_verified_removed_keeps_the_volume_it_mounts():
+    """No removal of the volume is issued while its container may exist; the
+    credential projection and the staging root still leave the host (R3-F1)."""
+    events: list[tuple] = []
+    backend = FakeBackend(events, uncertain=frozenset({ObjectKind.LAUNCH_CONTAINER}))
+    journal = FakeJournal(events)
+    with pytest.raises(SandboxCleanupUncertainError, match="release") as raised:
+        with _lifecycle(backend, journal, change=False) as lifecycle:
+            _launch(lifecycle, events)
+            pytest.fail("a launch whose release is uncertain returned its result")
+    assert raised.value.objects == ("launch container launch", "volume vol")
+    assert not any(event[1] in ("rm", "rm refused") and event[2] == "vol" for event in events)
+    assert ("host", "rm", "projection") in events and ("host", "rm", "staging") in events
+    assert {obj.name for obj in journal.entries} == {"launch", "vol"}
+    assert backend.runtime.volumes == {"vol"}
 
 
 def test_an_exporter_not_verified_removed_returns_no_artifact():
@@ -903,7 +1021,11 @@ def test_a_stager_container_not_verified_removed_never_lets_the_launch_container
         with _lifecycle(backend, journal) as lifecycle:
             _launch(lifecycle, events)
     assert ("runtime", "start", "launch") not in events
-    assert [obj.name for obj in lifecycle.uncertain] == ["stager"]
+    # The stager container may still exist and it mounts the volume, so no
+    # removal of the volume is issued: both stay open, uncertain.
+    assert [obj.name for obj in lifecycle.uncertain] == ["stager", "vol"]
+    assert not any(event[1] in ("rm", "rm refused") and event[2] == "vol" for event in events)
+    assert {obj.name for obj in journal.entries} == {"stager", "vol"}
 
 
 def _bent(**changes) -> tuple[LifecycleObject, ...]:
@@ -1162,10 +1284,14 @@ def test_a_providers_command_runs_in_the_container_created_and_staged_for_its_la
         _index(events, "executor", "prepare", "launch"),
         _index(events, "executor", "spawned", "launch", True),
         _index(events, "runtime", "kill", "launch"),
-        _index(events, "journal", "removals", ("staging", "projection", "vol", "launch")),
+        _index(events, "journal", "removals", ("launch", "projection", "staging", "vol")),
+        _index(events, "runtime", "rm", "launch"),
+        _index(events, "runtime", "rm", "vol"),
     ]
     assert order == sorted(order)
-    assert journal.entries == [] and backend.runtime.containers == {}
+    assert not any(event[1] == "rm refused" for event in events)
+    assert journal.entries == [] and lifecycle.uncertain == []
+    assert backend.runtime.containers == {} and backend.runtime.volumes == set()
 
 
 @_linux_only
@@ -1257,7 +1383,7 @@ def test_the_engine_enters_then_runs_a_launch_through_every_step_in_order(
         _index(events, "runtime", "rm", "stager"),
         _index(events, "runtime", "start", "launch"),
         _index(events, "agent", "ANALYZE_EXECUTE"),
-        _index(events, "journal", "removals", ("staging", "projection", "launch")),
+        _index(events, "journal", "removals", ("launch", "projection", "staging")),
         _index(events, "journal", "creates", ("exporter", "out")),
         _index(events, "runtime", "rm", "exporter"),
         _index(events, "engine", "verify", "/tmp/out", launch),
@@ -1267,6 +1393,42 @@ def test_the_engine_enters_then_runs_a_launch_through_every_step_in_order(
     ]
     assert order == sorted(order)
     assert journal.entries == [] and backend.runtime.volumes == set()
+
+
+def test_the_engine_completes_a_launch_with_nothing_to_export(
+    tmp_state_dir, fake_github, through_fake
+):
+    """REVIEW is not change-producing: its release removes the volume after the
+    launch container that mounts it, and the step completes (R3-F1)."""
+    events, backend, journal, _source = through_fake
+
+    def agent(req) -> str:
+        events.append(("agent", req.phase))
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        return block(review_result(1, fake_github.prs[PR].head_sha))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    eng.step()
+    assert eng.step().next_phase == "REVIEW"
+    events.clear()
+    out = eng.step()
+    assert out.next_phase == "READY_FOR_MERGE", out.message
+    order = [
+        _index(events, "journal", "creates", ("staging", "projection", "vol", "stager", "launch")),
+        _index(events, "agent", "REVIEW"),
+        _index(events, "journal", "removals", ("launch", "projection", "staging", "vol")),
+        _index(events, "runtime", "rm", "launch"),
+        _index(events, "runtime", "rm", "vol"),
+        _index(events, "journal", "close", ("launch", "projection", "staging", "vol")),
+    ]
+    assert order == sorted(order)
+    assert not any(
+        event[:2] in (("engine", "verify"), ("runtime", "rm refused")) for event in events
+    )
+    assert ("journal", "creates", ("exporter", "out")) not in events
+    assert journal.entries == [] and backend.runtime.containers == {}
+    assert backend.runtime.volumes == set()
 
 
 def test_the_engine_plans_before_it_seeds_and_a_denied_plan_makes_nothing(
@@ -1424,7 +1586,7 @@ def test_the_engine_releases_after_an_interrupted_launch(tmp_state_dir, fake_git
     with pytest.raises(KeyboardInterrupt):
         eng.step()
     agent = _index(events, "agent", "ANALYZE_EXECUTE")
-    assert _index(events, "journal", "removals", ("staging", "projection", "launch")) > agent
+    assert _index(events, "journal", "removals", ("launch", "projection", "staging")) > agent
     assert backend.runtime.containers == {}
     assert [obj.name for obj in journal.entries] == ["vol"]
 
@@ -1522,7 +1684,7 @@ def test_a_scheduler_workers_engine_runs_the_same_sequence(tmp_path, fake_github
     ]
     order = [
         _index(events, "agent", "ANALYZE_EXECUTE"),
-        _index(events, "journal", "removals", ("staging", "projection", "launch")),
+        _index(events, "journal", "removals", ("launch", "projection", "staging")),
         _first(events, lambda e: e[:2] == ("engine", "verify")),
         _index(events, "engine", "save", True),
         _index(events, "journal", "removals", ("vol", "out")),

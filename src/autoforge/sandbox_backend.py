@@ -349,6 +349,8 @@ class SandboxBackend(Protocol):
 
         Remove-only: it lists, stops and removes, and never creates or
         starts anything. An entry it cannot prove gone stays open.
+        ``entries`` come in the engine's removal order, each container
+        before any object it mounts, which is the order to remove them in.
         """
         ...
 
@@ -425,7 +427,11 @@ class SandboxBackend(Protocol):
         ...
 
     def remove(self, obj: LifecycleObject) -> Removal:
-        """Remove one object; :attr:`Removal.REMOVED` only when it is verified gone."""
+        """Remove one object; :attr:`Removal.REMOVED` only when it is verified gone.
+
+        The engine asks for every container before any object it mounts,
+        and never for a volume that a container it could not remove mounts.
+        """
         ...
 
 

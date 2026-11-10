@@ -876,8 +876,10 @@ exactly when `tests/sandbox_host.py` measures the host capable
   carry its runtime, rootlessness, image, staging and watch fact.
 - `tests/test_sandbox_lifecycle.py` sequences a fake container backend
   over a fake runtime that accepts a bind, a volume or a network only in a
-  container's create call, with a fake journal and a fake verify step and
-  its save; one event list orders all four. At a command's entry: the
+  container's create call and, as Docker and Podman do, refuses to remove
+  a volume a container still references, running or not; with a fake
+  journal and a fake verify step and its save; one event list orders all
+  four. At a command's entry: the
   runtime check, reconciliation, then the probe, and a refused runtime
   check writes and reconciles nothing. For
   one launch, in both staging forms: the seed step given the launch's
@@ -889,7 +891,12 @@ exactly when `tests/sandbox_host.py` measures the host capable
   network in a create call and in no later call; the stager container
   offline and without the projection; its start, copy-in, stager and
   prover, and its journaled removal, before the launch container starts;
-  every create and removal journaled first; the release after the run on
+  every create and removal journaled first; every removal taking each
+  container before what it mounts, reconciliation's included, so a launch
+  with nothing to export removes its volume at the release and succeeds;
+  a launch container or stager container not verified removed keeping
+  the volume it mounts, with no removal of it issued, while the
+  projection still goes; the release after the run on
   every path; the exporter's own entry before its create; the volume
   removed only after verify's outcome is saved; a failed export an
   outcome that keeps the volume until it is saved. A refusal at each step
@@ -911,7 +918,9 @@ exactly when `tests/sandbox_host.py` measures the host capable
   engine: the entry's order; the plan before the seed, and a denied plan
   that makes nothing; a launch's steps around the agent through the
   export, the verify step, its save and the final clean-up, and the
-  provider's description bound to the fake and its launch container; an
+  provider's description bound to the fake and its launch container; a
+  REVIEW launch, which exports nothing, completing with its launch
+  container removed before its volume; an
   artifact refused by the verify step, or with no candidate source, never
   a candidate; of an agent's two commits, only the one the verify step
   accepted published, and the other (the worktree's `HEAD`, reported)

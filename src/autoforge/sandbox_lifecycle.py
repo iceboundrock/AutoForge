@@ -47,7 +47,11 @@ engine bound to the lifecycle (``SandboxPlan``):
    keeps its volume for reconciliation.
 
 Every removal is journaled first, and its entry is closed only after the
-backend verified it. A removal that cannot be verified is
+backend verified it. Each goes in :data:`REMOVAL_ORDER`: every container
+before any object it mounts, since a runtime refuses to remove a volume a
+container still references, stopped or not. A volume that one of the
+launch's containers may still hold is not removed at all, and is uncertain
+too. A removal that cannot be verified is
 :attr:`~autoforge.sandbox_backend.Removal.UNCERTAIN`: its entry is left open
 for reconciliation, it is never reported as done, and it is surfaced as
 :class:`~autoforge.errors.SandboxCleanupUncertainError` where it happened,
@@ -269,10 +273,11 @@ def reconcile(
     """Remove the journal's open entries through ``backend``; return those still open.
 
     Remove-only, intents first; an entry closes only when the backend
-    verified its object gone. What ownership it cannot prove, and the
-    ``BLOCKED`` that follows, is #272's.
+    verified its object gone. The backend gets the entries in
+    :data:`REMOVAL_ORDER`, each container before what it mounts. What
+    ownership it cannot prove, and the ``BLOCKED`` that follows, is #272's.
     """
-    entries = journal.open_entries()
+    entries = _removal_order(journal.open_entries())
     if entries:
         journal.record_removals(entries)
     gone = backend.reconcile(entries, runtime)
@@ -371,6 +376,27 @@ def _check_mounts(objects: tuple[LifecycleObject, ...], sources: set[str]) -> No
 
 def _in_order(objects: Iterable[LifecycleObject]) -> tuple[LifecycleObject, ...]:
     return tuple(sorted(objects, key=lambda obj: CREATE_ORDER.index(obj.kind)))
+
+
+# The order every removal follows, reconciliation's included: each container
+# before any object it mounts. A runtime refuses to remove a volume that a
+# container still references, even a stopped one, so a container goes first.
+# Then the credential projection, the first of the rest, so the credential
+# leaves the host first; then the staging root, the volume and the export
+# directory: the release's order in ADR 0013 D6 item 5.
+REMOVAL_ORDER = (
+    ObjectKind.EXPORTER,
+    ObjectKind.LAUNCH_CONTAINER,
+    ObjectKind.STAGER_CONTAINER,
+    ObjectKind.PROJECTION,
+    ObjectKind.STAGING_ROOT,
+    ObjectKind.VOLUME,
+    ObjectKind.EXPORT_DIR,
+)
+
+
+def _removal_order(objects: Iterable[LifecycleObject]) -> tuple[LifecycleObject, ...]:
+    return tuple(sorted(objects, key=lambda obj: REMOVAL_ORDER.index(obj.kind)))
 
 
 def _named(objects: Iterable[LifecycleObject]) -> tuple[str, ...]:
@@ -633,12 +659,17 @@ class LaunchLifecycle:
     def _remove(self, objects: tuple[LifecycleObject, ...]) -> None:
         """Journal the intent, remove each, close what was verified gone; never raises.
 
-        A journal that refuses the intent removes nothing; a removal that
-        fails or cannot be verified, and an entry the journal will not
-        close, is uncertain and stays open.
+        In :data:`REMOVAL_ORDER`: every container before any object it
+        mounts. A volume that a container of the launch still mounts once
+        that container's removal was tried, because it was not verified
+        gone, is not removed: the runtime would refuse it, and an exporter
+        may still read it. A journal that refuses the intent removes
+        nothing. Each of these, a removal that fails or cannot be verified,
+        and an entry the journal will not close, is uncertain and stays open.
         """
         if not objects:
             return
+        objects = _removal_order(objects)
         try:
             self._journal.record_removals(objects)
         except Exception:  # noqa: BLE001 - reported, the entries stay open
@@ -646,6 +677,9 @@ class LaunchLifecycle:
             return
         gone: list[LifecycleObject] = []
         for obj in objects:
+            if self._still_mounted(obj, gone):
+                self._uncertain((obj,))
+                continue
             try:
                 outcome = self._backend.remove(obj)
             except Exception:  # noqa: BLE001 - reported, the entry stays open
@@ -664,6 +698,19 @@ class LaunchLifecycle:
         self._open = [obj for obj in self._open if obj not in gone]
         # A removal retried by the final part and verified now is no longer uncertain.
         self.uncertain = [obj for obj in self.uncertain if obj not in gone]
+
+    def _still_mounted(self, obj: LifecycleObject, gone: list[LifecycleObject]) -> bool:
+        """A volume that a container of the launch, not verified gone, mounts.
+
+        A bind source (the staging root, the projection, the export
+        directory) is the controller's own host path, which no runtime holds
+        by reference, so its removal goes ahead: the credential leaves the
+        host even when its container's removal is uncertain.
+        """
+        return obj.kind is ObjectKind.VOLUME and any(
+            other.kind in CONTAINER_KINDS and obj.name in other.mounts and other not in gone
+            for other in self._open
+        )
 
     def _uncertain(self, objects: tuple[LifecycleObject, ...]) -> None:
         self.uncertain.extend(obj for obj in objects if obj not in self.uncertain)
