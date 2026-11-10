@@ -48,9 +48,16 @@ engine bound to the lifecycle (``SandboxPlan``):
    exception included: what holds the credential is removed, and the
    volume too when there is nothing to export;
 7. *export*, for a change-producing launch: the exporter's own entry before
-   its create, its removal journaled after;
-8. *verify* is the caller's (#269, :mod:`autoforge.candidate_source`);
-   once its outcome is saved, :meth:`LaunchLifecycle.saved` runs
+   its create, its removal journaled after. Its export directory must be
+   the one the engine chose for the launch (``LaunchInputs.export_dir``),
+   and the outcome names that journaled object (``Exported.origin``): the
+   verify step reads an artifact from nowhere else (#269);
+8. *verify* is the caller's (#269, :mod:`autoforge.candidate_source`), a
+   failed export included; once its outcome is saved,
+   :meth:`LaunchLifecycle.saved` runs. A launch that an exception ended
+   may still be exported, by the caller, once
+   :attr:`LaunchLifecycle.released_safely` holds (the engine does so for
+   an ``ExecutionError`` after the run, never for ``Ctrl-C``)
 9. *the final clean-up*: the volume and the export directory. Never before
    that outcome is saved: a launch that ends between its run and that save
    keeps its volume for reconciliation.
@@ -178,10 +185,16 @@ NO_JOURNAL: LifecycleJournal = _NoJournal()
 
 @dataclass(frozen=True)
 class Exported:
-    """The export step's outcome: the artifact, untrusted, or why the export failed."""
+    """The export step's outcome: the artifact, untrusted, or why the export failed.
+
+    ``origin`` is the export directory the lifecycle journaled for the
+    launch before its exporter ran (``None`` only for an outcome no
+    lifecycle made): the verify step accepts an artifact only from it (#269).
+    """
 
     artifact: Artifact | None = None
     failure: str = ""
+    origin: LifecycleObject | None = None
 
 
 @dataclass(frozen=True)
@@ -211,14 +224,18 @@ class Verified:
 class CandidateSource(Protocol):
     """The controller's verify step for an exported artifact, and its save (D13, D19; #269).
 
-    The engine calls :meth:`verify` with the artifact (untrusted) and the
-    launch's handle, then :meth:`save` with the outcome, and only after
-    :meth:`save` returned does the final clean-up remove the volume. #269's
-    candidate source imports strictly and binds the outcome in state.
+    The engine calls :meth:`verify` with the export step's outcome (its
+    artifact untrusted, or why the export failed) and the launch's handle,
+    then :meth:`save` with the outcome, and only after :meth:`save` returned
+    does the final clean-up remove the volume. #269's candidate source
+    imports strictly and binds the outcome, a refusal included, in state.
     """
 
-    def verify(self, artifact: Artifact, handle: LaunchHandle) -> Verified:
-        """The artifact checked and imported, or refused; never trusted as it is."""
+    def verify(self, exported: Exported, handle: LaunchHandle) -> Verified:
+        """The artifact checked and imported, or refused; never trusted as it is.
+
+        A failed export is a refusal (D17).
+        """
         ...
 
     def save(self, outcome: Verified) -> None:
@@ -235,7 +252,7 @@ class _NoCandidateSource:
     :class:`autoforge.candidate_source.ArtifactCandidateSource` (#269).
     """
 
-    def verify(self, artifact: Artifact, handle: LaunchHandle) -> Verified:
+    def verify(self, exported: Exported, handle: LaunchHandle) -> Verified:
         return Verified(
             refusal=(
                 "no candidate source verifies this launch's exported artifact, so its "
@@ -338,9 +355,10 @@ def _check_create(objects: tuple[LifecycleObject, ...], owner: LaunchOwner) -> N
 
 
 def _check_export(
-    objects: tuple[LifecycleObject, ...], owner: LaunchOwner, sources: set[str]
-) -> None:
-    """The export step's objects: one exporter, offline, mounting no projection."""
+    objects: tuple[LifecycleObject, ...], owner: LaunchOwner, sources: set[str], export_dir: str
+) -> LifecycleObject:
+    """The export step's objects: one exporter, offline, mounting no projection, and
+    one export directory, the one the engine chose for the launch; that one is returned."""
     _check_owned(objects, owner, EXPORT_KINDS)
     exporters = [obj for obj in objects if obj.kind is ObjectKind.EXPORTER]
     if len(exporters) != 1:
@@ -348,9 +366,19 @@ def _check_export(
     (exporter,) = exporters
     if exporter.network != NETWORK_NONE:
         raise _refused(f"the exporter {exporter.name} is not created offline")
+    directories = [obj for obj in objects if obj.kind is ObjectKind.EXPORT_DIR]
+    if not export_dir:
+        raise _refused("the launch names no export directory, so nothing is exported into one")
+    if len(directories) != 1 or directories[0].name != export_dir:
+        named = directories[0].name if len(directories) == 1 else f"{len(directories)} of them"
+        raise _refused(
+            f"an export fills exactly the export directory the controller chose for the launch "
+            f"({export_dir}), not {named}"
+        )
     _check_mounts(
         objects, sources | {obj.name for obj in objects if obj.kind not in CONTAINER_KINDS}
     )
+    return directories[0]
 
 
 def _check_owned(
@@ -512,6 +540,21 @@ class LaunchLifecycle:
         """What :meth:`establish` made for the launch; ``None`` before."""
         return self._handle
 
+    @property
+    def released_safely(self) -> bool:
+        """Whether the launch's run ended and its release verified every removal.
+
+        Only then may the export step run after a launch that ended by an
+        exception (#269): nothing of the launch but its volume is left, and
+        no launch container that could still write the volume may exist.
+        """
+        return (
+            self._step == "launch"
+            and not self._launching
+            and self._released
+            and not (self.uncertain)
+        )
+
     # -- the steps --------------------------------------------------------------
     def _advance(self, step: str, after: str) -> None:
         if self._step != after:
@@ -665,13 +708,13 @@ class LaunchLifecycle:
         # The exporter mounts the volume (read-only) and its export directory,
         # never the projection, even one whose removal was uncertain.
         volumes = {obj.name for obj in self._open if obj.kind is ObjectKind.VOLUME}
-        _check_export(exporter, self._owner, volumes)
+        origin = _check_export(exporter, self._owner, volumes, self._inputs.export_dir)
         self._journal.record_creates(self._runtime, exporter)
         self._open.extend(exporter)
         try:
-            outcome = Exported(self._backend.export(exporter, handle))
+            outcome = Exported(self._backend.export(exporter, handle), origin=origin)
         except SandboxLaunchRefusedError as exc:
-            outcome = Exported(failure=str(exc))
+            outcome = Exported(failure=str(exc), origin=origin)
         finally:
             self._remove(tuple(obj for obj in exporter if obj.kind is ObjectKind.EXPORTER))
         self._raise_if_uncertain("the export")

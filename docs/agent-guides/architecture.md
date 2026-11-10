@@ -684,10 +684,12 @@ test pins it):
   command), the carried commit and, once the seed is built, the seed
   manifest's digest (`with_seed_manifest()`, once). Its `entry` is what
   every relaunch of one phase entry shares (run, issue, phase, seed,
-  lower, and the engine's `entry_label`: the review round, the execution
-  attempt or the replan transaction, so that two entries binding the same
-  revision never share a carried commit); its `identity()` is ADR 0013
-  D19's persisted "seed's identity".
+  lower, and the engine's `entry_label`: the review or fix round within
+  the execution lifecycle, the lifecycle being the execution attempt and
+  the PR number, so a replacement PR's rounds restarting at one are
+  entries of their own; or the replan transaction; so that two entries
+  binding the same revision never share a carried commit); its
+  `identity()` is ADR 0013 D19's persisted "seed's identity".
   `LaunchInputs.git_input` carries it to the seed step, which builds the
   seed from it and chooses no revision of its own.
 - **`candidate_artifact.py`** (git, no workflow): what an exported
@@ -702,8 +704,12 @@ test pins it):
   a controller-owned quarantine, hashed as it is copied, and indexed there
   with `index-pack --strict` against the shared store; then, with the
   quarantine as an alternate, the claimed `HEAD` a commit descending from
-  the seed, every commit of the pack between the seed and that `HEAD`, and
-  every object of the pack reachable from it above the seed; then the
+  the seed, every commit of the pack between the seed and that `HEAD`,
+  every object of the pack reachable from it above the seed, and the
+  closure: every object the `HEAD` reaches above the seed and the carried
+  commit, commits and their parents included, in the pack (the strict
+  index resolves a link in the shared store, which holds objects no launch
+  was given; an artifact naming one without carrying it is refused); then the
   objects the store lacks published by `index-pack --stdin --strict`,
   streamed from the quarantined file (`ExecutionRequest.stdin_path`),
   under L1, the only write; then the candidate re-hashed from the store
@@ -715,9 +721,21 @@ test pins it):
   per-phase rule; `CandidateReceipts`, the run's receipts
   (`candidates/<entry>.json` beside `state.json`, never part of it): each
   launch's seed identity, saved by the seed step, and its verify outcome,
-  saved before the volume is removed; the carried commit is the entry's
-  last imported candidate. `ArtifactCandidateSource` is the verify step;
-  `WorktreeHead` and `ImportedArtifact` are the two candidate reads.
+  a failed export's refusal included, saved before the volume is removed;
+  the carried commit is the candidate of the entry's latest launch whose
+  artifact was accepted, so a later refusal takes nothing away.
+  `ArtifactCandidateSource` is the verify step: it takes the export
+  step's outcome (`Exported`), whose `origin` is the export directory the
+  lifecycle journaled for the launch, and reads an artifact only from the
+  launch's own export directory: the one the engine chose
+  (`LaunchInputs.export_dir`, `export_location()`:
+  `<git common dir>/autoforge/sandbox/<key>/export/<launch id>-<token>`,
+  ADR 0005 D8.4 as amended, a fresh random token per launch), which the
+  lifecycle's export step requires the exporter's export directory to be,
+  opened from the common dir one component at a time. An artifact from any
+  other path or launch is refused before it is read, whatever its
+  manifest says. `WorktreeHead` and `ImportedArtifact` are the two
+  candidate reads.
 
 The engine reaches its backend only through `engine.launch_backend()`.
 The engine's gate runs `enter()` (`_sandbox_entry`), and every enforced
@@ -733,9 +751,24 @@ input (`_launch_git_input`) from what the phase's entry already bound
 (`_bound_revision`: the round's HEAD and merge base for `REVIEW`, the
 reviewed HEAD and its merge base for `FIX`, the entry's fetched base for
 `ANALYZE_EXECUTE` and `REPLAN_REEXECUTE`, the default branch head the
-`UPDATE_EPIC` entry binds once), plus the entry's carried commit from the
-receipts, and refuses the launch before anything of it exists when the
-shared store cannot seed it. Nothing reads GitHub again for it. The
+`UPDATE_EPIC` entry binds at its first seeded launch and records in its
+entry observation's `refs` and `base_sha`, so a relaunch after `resume`
+reuses it), plus the carried commit (`_carried_commit`: the entry's latest
+accepted import from the receipts; for an `ANALYZE_EXECUTE` entry that
+found earlier work on the issue's branch, that branch head, verified and
+fetched by the entry, until a launch imported a commit above it; a branch
+head that does not descend from the base refuses the launch), and refuses
+the launch before anything of it exists when the shared store cannot seed
+it. Nothing reads GitHub again for it. A launch that ends by an
+`ExecutionError` once its command ran (a provider's failure, a stop it
+reports as one) is exported, verified and saved before that error
+propagates when its release verified every removal (`_export_after`);
+`Ctrl-C`, another exception, a refusal before the run and an uncertain
+release export nothing, and the volume stays for reconciliation. The
+write phases' `{{WORKTREE_STATE}}` follows the backend: for one that
+seeds, `worktree_state_container.md` (the workspace is private and seeded;
+uncommitted work is discarded between launches), and the host worktree is
+not read; for bwrap and `disabled`, #187's note, unchanged. The
 engine reads every candidate through one abstraction
 (`_candidate_read`): after a launch whose export the verify step judged,
 `ImportedArtifact`, the commit that step imported and no other (the

@@ -943,8 +943,14 @@ exactly when `tests/sandbox_host.py` measures the host capable
   fetched and `REVIEW` from the round's HEAD and merge base, each input
   saved in the receipts; a default branch moved after the entry's read
   leaving the seed and the prompt on the bound base; `UPDATE_EPIC`
-  binding the default branch head once per entry and `REPLAN_REEXECUTE`
-  its transaction's base; an operator's push after the controller's seeding
+  binding the default branch head at its first seeded launch, in its entry
+  observation, and a new process's relaunch after the default branch moved
+  seeding from that head; `REPLAN_REEXECUTE` its transaction's base; a
+  replacement PR's `FIX` round at the replaced PR's reviewed HEAD and merge
+  base carrying nothing from it; an issue branch with earlier work (alone,
+  or the PR the entry adopts) carried above the base and continued, a
+  relaunch carrying its own import above it, and branch work that does not
+  descend from the base refusing the launch before any journal entry; an operator's push after the controller's seeding
   the next `REVIEW`, and the `FIX` after it seeding from that reviewed
   HEAD; a HEAD past the reviewed one at `FIX`'s entry going `FIX ->
   REVIEW` with no seed and no journal entry, and the re-review seeding
@@ -955,8 +961,17 @@ exactly when `tests/sandbox_host.py` measures the host capable
   backend whose exporter packs a real artifact, the engine's own
   candidate source imports and publishes it, a correction relaunch of the
   same entry carries the commit the first launch's import accepted (never
-  an uncommitted file), and an artifact naming another launch is refused
-  with nothing published.
+  an uncommitted file), an artifact naming another launch is refused
+  with nothing published, and so is a correctly labelled artifact outside
+  the launch's export directory or in an earlier launch's; an accepted
+  launch, a refused one, then a relaunch carrying the accepted import; an
+  exporter's failure saved against the launch's input before the volume's
+  removal, read back by a new process after a crash there; a launch whose
+  run ends by an `ExecutionError` after it committed exported, imported and
+  saved before the error propagates, and the resumed relaunch carrying the
+  commit, while one with an uncertain release exports nothing; a container
+  launch's prompt never describing the dirty host worktree, and the note
+  following the backend (bwrap and `disabled` unchanged).
 - `tests/test_candidate_artifact.py` (#269) runs real git on a store and
   an agent repository in `tmp_path`, with no runtime: a valid artifact
   imported under L1 (the one write, `index-pack --stdin` streamed from
@@ -964,7 +979,10 @@ exactly when `tests/sandbox_host.py` measures the host capable
   seed with an empty pack; a relaunch above a carried commit. Each of
   these is refused with nothing published and no ref moved: an extra
   commit that does not descend from the seed (alone or merged in), an
-  object the candidate does not reach, a claimed `HEAD` that is not a
+  object the candidate does not reach, a candidate reaching an object the
+  pack omits that only the shared store holds (a blob named by a new tree,
+  an unrelated merge parent, a host-only commit claimed with an empty
+  pack, a blob above a relaunch's carried commit), a claimed `HEAD` that is not a
   commit or is below the seed, a pack that fails `--strict`, a corrupt
   pack, a pack missing an object, a thin pack, a pack over the size or
   object-count bound (the over-size one sparse, refused with no
@@ -980,11 +998,16 @@ exactly when `tests/sandbox_host.py` measures the host capable
   container's objects.
 - `tests/test_candidate_source.py` (#269): each phase's rule
   (`bound_git_input`), the receipts (bound once, an outcome saved
-  idempotently, the carried commit the last verified launch's import, a
-  bounded number of launches, a file that does not parse or is a link
+  idempotently, the carried commit the latest accepted launch's import and
+  never taken away by a later refusal, a bounded number of launches that
+  keeps the latest accepted one, a file that does not parse or is a link
   refused), the verify step over real artifacts (accepted and saved, a
   crash before the save verifying again to the same outcome, a refusal
-  saved and never carried, a handle of another launch, no git input), a
+  saved and never carried, a handle of another launch, no git input, a
+  failed export saved as a refusal), the artifact's origin (a correctly
+  labelled artifact from another path, from another launch's export
+  directory, under a name the controller never makes for the launch, with
+  no journaled origin, or through a link, each refused before it is read), a
   relaunch carrying the committed `HEAD` and no uncommitted file, and the
   two candidate reads.
 - `tests/test_git_input.py` (#269): the git input's invariants, its

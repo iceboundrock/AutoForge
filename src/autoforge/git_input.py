@@ -109,12 +109,15 @@ class LaunchGitInput:
     launch's identity (the labels its objects carry), ``repository`` the
     ``owner/name`` and ``object_format`` its object format; ``seed`` the
     expected seed commit, ``lower`` its lower boundary, ``carried`` the
-    carried commit of a relaunch ("" for none), ``seed_manifest_digest`` the
-    digest of the seed's manifest ("" until the seed step built one),
+    carried commit ("" for none: the commit an earlier launch of the entry
+    exported and the controller imported, or the earlier work on the issue's
+    branch an ``ANALYZE_EXECUTE`` entry continues), ``seed_manifest_digest``
+    the digest of the seed's manifest ("" until the seed step built one),
     ``export_command`` whether the launch is an export command rather than
     an agent, and ``entry_label`` the engine's name for the phase entry the
-    launch belongs to (the review round, the execution attempt, the replan
-    transaction), which tells apart two entries that bind the same revision.
+    launch belongs to (the review or fix round within its execution
+    lifecycle, the lifecycle, the replan transaction), which tells apart
+    two entries that bind the same revision.
     """
 
     phase: str

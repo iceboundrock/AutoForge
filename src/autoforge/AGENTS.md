@@ -84,10 +84,11 @@ candidate_artifact.py  an exported artifact (manifest and pack), the export boun
                     publication streamed under L1, D7.5 re-hash); the store checks of
                     a bound revision; git only, no workflow (#269)
 candidate_source.py the engine's candidate source (ADR 0013 D5): each phase's bound
-                    revision as a git input, the verify step for an exported artifact,
-                    the run's candidate receipts beside state.json (seed identity,
-                    outcome, carried commit), the two candidate reads (worktree HEAD
-                    for bwrap and disabled, the imported artifact otherwise) (#269)
+                    revision as a git input, the launch's export directory, the verify
+                    step for an exported artifact (its origin authenticated first), the
+                    run's candidate receipts beside state.json (seed identity, outcome,
+                    carried commit), the two candidate reads (worktree HEAD for bwrap
+                    and disabled, the imported artifact otherwise) (#269)
 sandbox_policy.py   which host resources a launch gets by launch class (ADR 0005 §2.5):
                     LaunchFacts from the engine, ProviderRequirements from an adapter,
                     the SandboxPlan, the path-valued environment rewrite (D8.2),

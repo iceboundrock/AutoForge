@@ -189,14 +189,19 @@ class LaunchInputs:
     for the launch (:class:`~autoforge.git_input.LaunchGitInput`, #269),
     ``None`` for bwrap, which seeds nothing. The seed step builds the seed
     from it and never chooses another revision; the lifecycle completes it
-    with the seed's manifest digest. #290 adds the credential projection's
-    items.
+    with the seed's manifest digest. ``export_dir`` is the launch's export
+    directory, which the engine chose fresh under its own sandbox
+    directories (ADR 0005 D8.4 as amended; #269), "" for a launch that
+    exports nothing: an exporter's export directory is that path or the
+    export is refused, and the verify step reads an artifact from nowhere
+    else. #290 adds the credential projection's items.
     """
 
     owner: LaunchOwner
     workspace: str
     read_context: str = ""
     git_input: LaunchGitInput | None = None
+    export_dir: str = ""
 
 
 class ObjectKind(enum.Enum):

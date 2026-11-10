@@ -19,7 +19,23 @@ one way whatever ran the agent:
 calls): it imports the artifact strictly against the launch's git input
 (:func:`autoforge.candidate_artifact.import_artifact`), and saves the outcome
 in the run's candidate receipts (:class:`CandidateReceipts`) before the
-volume it was read from is removed.
+volume it was read from is removed. An export that failed is saved the same
+way, as the launch's refusal.
+
+**The artifact's origin** is authenticated before a byte of it is read. The
+controller chooses each launch's export directory itself, fresh and under
+its own sandbox directories (:func:`export_location`:
+``<git common dir>/autoforge/sandbox/<key>/export/<launch id>-<token>``,
+ADR 0005 D8.4 as amended, with a random token so that no earlier launch
+ever used the path), and hands it to the launch (``LaunchInputs.export_dir``).
+The lifecycle journals the exporter's export directory only when it is that
+path, and the export step's outcome names the object it journaled
+(``Exported.origin``). The verify step accepts an artifact only when that
+journaled object is the launch's own, names the launch's export directory,
+and the artifact is in it; and it opens that directory from the common dir
+one component at a time, never following a link. An artifact anywhere else
+(another path, another launch's export directory, a directory planted
+beside it) is refused whatever its manifest says, and nothing is published.
 
 **Each phase's bound revision** (ADR 0013 D4; :func:`bound_git_input`), from
 which every launch's git input is made, and which nothing re-reads once it
@@ -42,8 +58,13 @@ A relaunch of the same entry (a correction, a transient retry, a stop that
 ``resume`` relaunches) binds the same revision, and so the same
 :attr:`~autoforge.git_input.LaunchGitInput.entry`, and seeds from it plus
 its carried commit: the ``HEAD`` the controller strictly imported at the end
-of an earlier launch of that entry, when it descends from the seed.
-Uncommitted changes are never carried, since only an imported commit is.
+of the latest earlier launch of that entry whose artifact it accepted, when
+it descends from the seed. A later launch whose artifact was refused
+imported nothing, so it takes nothing away. Uncommitted changes are never
+carried, since only an imported commit is. An ``ANALYZE_EXECUTE`` entry
+that found earlier work on the issue's branch (a branch head, or the PR it
+adopts) carries that head, verified by the entry and descending from the
+base, until a launch of the entry imported a commit above it.
 
 **The receipts** are a file per phase entry, ``candidates/<entry>.json`` in
 the run's state directory, beside ``state.json`` and never part of it, so
@@ -58,6 +79,8 @@ never read as "no receipt".
 from __future__ import annotations
 
 import json
+import re
+import secrets
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -75,8 +98,8 @@ from .git_input import (
     LaunchGitInput,
 )
 from .safefs import SafeRoot
-from .sandbox_backend import Artifact, LaunchHandle, LaunchOwner
-from .sandbox_lifecycle import Verified
+from .sandbox_backend import LaunchHandle, LaunchOwner, ObjectKind
+from .sandbox_lifecycle import Exported, Verified
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 
@@ -88,6 +111,32 @@ RECEIPT_FORMAT = 1
 MAX_RECEIPT_LAUNCHES = 64
 MAX_RECEIPT_BYTES = 1024 * 1024
 MAX_REFUSAL_CHARS = 2000
+# The random part of a launch's export directory's name (:func:`export_location`).
+_EXPORT_TOKEN_HEX = 16
+
+
+def export_location(root: Path, launch: str) -> str:
+    """A fresh export directory for ``launch`` under ``root``, the controller's (D8.4).
+
+    ``root`` is ``<git common dir>/autoforge/sandbox/<key>/export``. The name
+    is the launch's id and a random token, so no earlier launch, of this
+    entry or another, ever wrote that path: a leftover or planted artifact
+    is never at it.
+    """
+    return str(root / f"{launch}-{secrets.token_hex(_EXPORT_TOKEN_HEX // 2)}")
+
+
+def export_leaf(root: Path, path: str, launch: str) -> str:
+    """The name of ``path`` under ``root`` when it is one of ``launch``'s export directories.
+
+    "" for any other path: another directory, a deeper one, another
+    launch's, or a name :func:`export_location` never makes.
+    """
+    parent, _, leaf = path.rpartition("/")
+    pattern = re.escape(launch) + f"-[0-9a-f]{{{_EXPORT_TOKEN_HEX}}}"
+    if parent != str(root) or not re.fullmatch(pattern, leaf):
+        return ""
+    return leaf
 
 
 def bound_git_input(
@@ -222,10 +271,16 @@ class CandidateReceipts:
         return launches
 
     def _write(self, entry: str, launches: list[LaunchReceipt]) -> None:
+        kept = launches[-MAX_RECEIPT_LAUNCHES:]
+        accepted = [item for item in launches if item.accepted]
+        if accepted and accepted[-1] not in kept:
+            # The latest accepted launch is the entry's carried commit: never
+            # dropped for the refused ones after it.
+            kept = [accepted[-1], *launches[-(MAX_RECEIPT_LAUNCHES - 1) :]]
         data = {
             "format": RECEIPT_FORMAT,
             "entry": entry,
-            "launches": [item.to_json() for item in launches[-MAX_RECEIPT_LAUNCHES:]],
+            "launches": [item.to_json() for item in kept],
         }
         self._root.ensure_dir(RECEIPTS_DIR)
         text = json.dumps(data, sort_keys=True, indent=1) + "\n"
@@ -267,10 +322,15 @@ class CandidateReceipts:
         self._write(git_input.entry, launches)
 
     def carried(self, entry: str) -> str:
-        """The entry's carried commit: its last launch's imported candidate, or ""."""
+        """The entry's carried commit: its latest accepted launch's imported candidate, or "".
+
+        A launch whose artifact was refused (or whose export failed)
+        imported nothing, so a later refusal never takes away a commit an
+        earlier launch of the entry imported strictly (ADR 0013 D4).
+        """
         for item in reversed(self.launches(entry)):
-            if item.verified:
-                return item.candidate if item.accepted else ""
+            if item.accepted:
+                return item.candidate
         return ""
 
 
@@ -278,12 +338,19 @@ class CandidateReceipts:
 
 
 class ArtifactCandidateSource:
-    """The verify step for an exported artifact, and its save (ADR 0013 D5, D13, D19).
+    """The verify step for an exported artifact, and its save (ADR 0013 D5, D13, D17, D19).
 
-    :meth:`verify` imports the artifact strictly against the git input the
-    launch's handle carries, never against what the artifact says, and
-    returns the candidate or a refusal; it never raises for the artifact's
-    content. :meth:`save` records the outcome in the receipts.
+    :meth:`verify` takes the export step's outcome: an export that failed
+    is the launch's refusal; an artifact is accepted only from the launch's
+    own export directory (the module docstring's origin), then imported
+    strictly against the git input the launch's handle carries, never
+    against what the artifact says. It returns the candidate or a refusal,
+    and never raises for the artifact's content. :meth:`save` records the
+    outcome against that git input in the receipts, a refusal included.
+
+    ``common`` is the common dir and ``export_root`` the launch's export
+    directories' parent, relative to it
+    (``autoforge/sandbox/<key>/export``).
     """
 
     def __init__(
@@ -293,16 +360,18 @@ class ArtifactCandidateSource:
         *,
         read_commit: ReadCommit,
         receipts: CandidateReceipts,
+        export_root: str,
         git_lock: Callable[[str], AbstractContextManager[object]] | None = None,
     ) -> None:
         self._common = common
         self._runner = runner
         self._read_commit = read_commit
         self._receipts = receipts
+        self._export_root = export_root
         self._git_lock = git_lock
         self._verified: tuple[LaunchGitInput, Verified] | None = None
 
-    def verify(self, artifact: Artifact, handle: LaunchHandle) -> Verified:
+    def verify(self, exported: Exported, handle: LaunchHandle) -> Verified:
         git_input = handle.inputs.git_input
         if git_input is None:
             outcome = Verified(
@@ -322,22 +391,76 @@ class ArtifactCandidateSource:
                 refusal=f"the launch {owner.launch} carries the git input of launch "
                 f"{git_input.launch}, so its export is refused"
             )
+        elif exported.artifact is None:
+            # D17: a failed export is the verify step's refusal, saved as one.
+            outcome = Verified(
+                refusal="the launch's export failed: "
+                + (exported.failure or "its exporter left no artifact")
+            )
         else:
+            outcome = self._import(exported, handle, git_input)
+        self._verified = (git_input, outcome)
+        return outcome
+
+    def _origin_problem(self, exported: Exported, handle: LaunchHandle) -> str:
+        """Why ``exported`` is not from the launch's own export directory, or ""."""
+        owner = handle.inputs.owner
+        expected = handle.inputs.export_dir
+        origin = exported.origin
+        if origin is None or origin.kind is not ObjectKind.EXPORT_DIR or origin.owner != owner:
+            return "it is not in an export directory the launch's lifecycle journaled for it"
+        if not expected or origin.name != expected:
+            return (
+                f"the export directory journaled for the launch is {origin.name}, not the "
+                f"one the controller chose for it ({expected or 'none'})"
+            )
+        assert exported.artifact is not None
+        if exported.artifact.directory != expected:
+            return (
+                f"it is in {exported.artifact.directory}, not in the launch's export "
+                f"directory {expected}"
+            )
+        if not export_leaf(self._common / self._export_root, expected, owner.launch):
+            return (
+                f"the launch's export directory {expected} is not one the controller makes "
+                f"for launch {owner.launch} under {self._common / self._export_root}"
+            )
+        return ""
+
+    def _import(
+        self, exported: Exported, handle: LaunchHandle, git_input: LaunchGitInput
+    ) -> Verified:
+        problem = self._origin_problem(exported, handle)
+        if problem:
+            return Verified(
+                refusal=f"the launch's exported artifact is refused: {problem}; nothing was "
+                "read or published"
+            )
+        leaf = export_leaf(
+            self._common / self._export_root, handle.inputs.export_dir, handle.inputs.owner.launch
+        )
+        try:
+            with SafeRoot.open(self._common) as common:
+                directory = common.subroot(f"{self._export_root}/{leaf}")
+        except (StateError, OSError) as exc:
+            return Verified(
+                refusal="the launch's exported artifact is refused: its export directory "
+                f"cannot be opened from the common dir without following a link "
+                f"({type(exc).__name__}: {exc}); nothing was read or published"
+            )
+        with directory:
             try:
                 imported = import_artifact(
                     self._common,
-                    Path(artifact.directory),
+                    directory,
                     git_input,
                     self._runner,
                     read_commit=self._read_commit,
                     git_lock=self._git_lock,
                 )
             except ObjectImportError as exc:
-                outcome = Verified(refusal=str(exc))
-            else:
-                outcome = Verified(candidate=imported.candidate)
-        self._verified = (git_input, outcome)
-        return outcome
+                return Verified(refusal=str(exc))
+        return Verified(candidate=imported.candidate)
 
     def save(self, outcome: Verified) -> None:
         if self._verified is None:

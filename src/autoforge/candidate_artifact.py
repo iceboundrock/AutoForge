@@ -105,6 +105,7 @@ from .git_input import LaunchGitInput, valid_repository
 from .git_transport import NO_AUTO_MAINTENANCE, local_git_request
 from .locking import SharedGitLock
 from .redaction import redact
+from .safefs import SafeRoot
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 # A commit read from the shared store as its own bytes (ADR 0004 D7.5):
@@ -329,15 +330,24 @@ def _read_bounded(fd: int, size: int, limit: int, name: str) -> bytes:
     return data
 
 
-def _open_artifact(directory: Path) -> int:
-    """The artifact's directory, opened without following a link, holding exactly its files."""
-    try:
-        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except OSError as exc:
-        raise _refused(
-            f"its directory {directory} cannot be opened as a directory without following a "
-            f"link ({exc.strerror})"
-        ) from exc
+def _open_artifact(directory: Path | SafeRoot) -> int:
+    """The artifact's directory, opened without following a link, holding exactly its files.
+
+    A :class:`~autoforge.safefs.SafeRoot` is a directory the caller already
+    opened one component at a time (the verify step's export directory); a
+    path is opened here, its last component without following a link.
+    """
+    if isinstance(directory, SafeRoot):
+        dir_fd = os.dup(directory.fd)
+        directory = directory.path
+    else:
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as exc:
+            raise _refused(
+                f"its directory {directory} cannot be opened as a directory without following "
+                f"a link ({exc.strerror})"
+            ) from exc
     try:
         names = sorted(os.listdir(dir_fd))
     except OSError as exc:
@@ -448,6 +458,25 @@ def _detail(res: ExecutionResult) -> str:
     return f": {redact(lines[-1])[:200]}" if lines else ""
 
 
+def is_ancestor_in(
+    common: Path, ancestor: str, descendant: str, runner: Runner | None = None
+) -> bool:
+    """Whether ``ancestor`` is an ancestor of ``descendant`` (or it) in the shared store alone.
+
+    The controller's hardened local git, with no alternate. A read that
+    fails (a missing commit included) raises
+    :class:`~autoforge.agent_worktree.ObjectImportError`.
+    """
+    res = (runner or execute)(
+        local_git_request(
+            ["--git-dir", str(common), "merge-base", "--is-ancestor", ancestor, descendant]
+        )
+    )
+    if res.timed_out or res.truncated or res.exit_code not in (0, 1):
+        raise ObjectImportError(f"checking ancestry {_ended(res)}{_detail(res)}")
+    return res.exit_code == 0
+
+
 def bound_revision_problem(
     common: Path, git_input: LaunchGitInput, runner: Runner | None = None
 ) -> str:
@@ -509,7 +538,7 @@ def bound_revision_problem(
 
 def import_artifact(
     common: Path,
-    directory: Path,
+    directory: Path | SafeRoot,
     git_input: LaunchGitInput,
     runner: Runner | None,
     *,
@@ -519,7 +548,9 @@ def import_artifact(
 ) -> ImportedCandidate:
     """Import the artifact in ``directory`` strictly into the shared store of ``common``.
 
-    The steps and their order are the module's. Returns the candidate the
+    ``directory`` is a path, or the directory already opened as a
+    :class:`~autoforge.safefs.SafeRoot`. The steps and their order are the
+    module's. Returns the candidate the
     artifact carried; any refusal is an
     :class:`~autoforge.agent_worktree.ObjectImportError`, after which the
     shared store holds nothing the artifact brought. ``read_commit`` reads
