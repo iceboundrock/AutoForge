@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tracemalloc
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -27,6 +28,7 @@ from autoforge.candidate_artifact import (
     ARTIFACT_MANIFEST,
     ARTIFACT_PACK,
     MAX_ARTIFACT_PACK_BYTES,
+    MAX_MANIFEST_BYTES,
     ArtifactLimits,
     CandidateManifest,
     bound_revision_problem,
@@ -655,6 +657,72 @@ def test_the_expected_values_are_the_inputs_never_the_artifacts(repos, work, tmp
 def test_a_manifest_that_does_not_parse_is_refused(raw):
     with pytest.raises(ObjectImportError, match="manifest"):
         parse_manifest(raw)
+
+
+@pytest.fixture
+def digit_limit():
+    """The interpreter's default integer digit limit, whatever the environment set."""
+    before = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(4300)
+    yield 4300
+    sys.set_int_max_str_digits(before)
+
+
+def test_a_manifest_with_an_integer_past_the_digit_limit_is_refused(
+    repos, work, tmp_path, digit_limit
+):
+    """PR #474 R2-F2: a 5,000-digit integer, far below the manifest's size bound,
+    makes the decoder raise ValueError: a candidate refusal, nothing published."""
+    head, pack = work
+    git_input = _input(repos)
+    directory = write_artifact(tmp_path / "out", git_input, head, pack)
+    path = directory / ARTIFACT_MANIFEST
+    raw = path.read_bytes()
+    hostile = raw.replace(b'"issue":269,', b'"issue":1' + b"0" * (digit_limit + 699) + b",")
+    assert hostile != raw and len(hostile) < MAX_MANIFEST_BYTES
+    path.write_bytes(hostile)
+    assert_refused(repos, directory, git_input, r"its manifest does not parse \(ValueError\)")
+    assert not repos.has(head)
+
+
+def test_a_manifest_nested_as_deep_as_its_bound_allows_is_refused(repos, work, tmp_path):
+    """R2-F2: the deepest nesting the size bound admits is refused, nothing
+    published: by the decoder's RecursionError where it recurses that deep,
+    by the schema check where it does not."""
+    head, pack = work
+    git_input = _input(repos)
+    directory = write_artifact(tmp_path / "out", git_input, head, pack)
+    depth = (MAX_MANIFEST_BYTES - 16) // 2
+    hostile = b'{"schema":' + b"[" * depth + b"]" * depth + b"}"
+    assert len(hostile) <= MAX_MANIFEST_BYTES
+    (directory / ARTIFACT_MANIFEST).write_bytes(hostile)
+    assert_refused(repos, directory, git_input, "its manifest")
+    assert not repos.has(head)
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [RecursionError("maximum recursion depth exceeded"), ValueError("Exceeds the limit")],
+)
+def test_every_decoder_failure_is_a_refusal_never_a_raw_error(repos, monkeypatch, raised):
+    """R2-F2: whatever the decoder raises on content, a nesting or digit limit
+    included, is an ObjectImportError naming its type and none of its text."""
+
+    def decoder_fails(text: str):
+        raise raised
+
+    monkeypatch.setattr(candidate_artifact.json, "loads", decoder_fails)
+    with pytest.raises(ObjectImportError) as refused:
+        parse_manifest(_manifest_with_bytes(repos))
+    assert f"its manifest does not parse ({type(raised).__name__})" in str(refused.value)
+    assert "nothing was published" in str(refused.value)
+    assert str(raised) not in str(refused.value)
+
+
+def _manifest_with_bytes(repos: Repos) -> bytes:
+    return CandidateManifest.for_input(
+        _input(repos), candidate=repos.seed, pack_bytes=0, pack_objects=0, pack_sha256="0" * 64
+    ).render()
 
 
 def _manifest_with(repos: Repos, **data) -> bytes:

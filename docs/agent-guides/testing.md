@@ -956,8 +956,16 @@ exactly when `tests/sandbox_host.py` measures the host capable
   REVIEW` with no seed and no journal entry, and the re-review seeding
   from the new HEAD; a push during `REVIEW` leaving the seed at the bound
   HEAD and the round stale; a relaunch of the same `REVIEW` round on the
-  same HEAD with no carried commit; a merge base that is not an ancestor
-  of the bound HEAD refusing the launch before any journal entry. With a
+  same HEAD with no carried commit; a correction relaunch of a `REVIEW`
+  round, and a new process's resumed launch of one, each after the PR's
+  HEAD moved, its base was retargeted or its merge base moved, seeding
+  from the round's first binding, never re-reading the PR for it, the
+  round recorded stale at that binding and the next round seeding from
+  the new revision (PR #474 R2-F1); a manifest the decoder refuses (an
+  integer past the digit limit, deep nesting) saved as the launch's
+  refusal before its volume's removal, nothing published (R2-F2); a
+  merge base that is not an ancestor of the bound HEAD refusing the
+  launch before any journal entry. With a
   backend whose exporter packs a real artifact, the engine's own
   candidate source imports and publishes it, a correction relaunch of the
   same entry carries the commit the first launch's import accepted (never
@@ -988,7 +996,9 @@ exactly when `tests/sandbox_host.py` measures the host capable
   object-count bound (the over-size one sparse, refused with no
   quarantine, no read past its size and a small memory peak), a pack its
   manifest does not describe, a bad header, a manifest that disagrees with
-  the git input in any field, one that does not parse, names refs or
+  the git input in any field, one that does not parse (bytes that are not
+  UTF-8 or JSON, an integer past the interpreter's digit limit, nesting
+  past the decoder's depth, each an `ObjectImportError`), names refs or
   paths or is oversized, a directory or file reached through a link, a
   FIFO, a planted extra entry, a missing pack, a candidate that does not
   read as its own bytes, and a lock not obtained. Crash windows: before

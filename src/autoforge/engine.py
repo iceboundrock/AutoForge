@@ -2761,7 +2761,9 @@ class ControllerEngine:
         """The revision ``phase``'s entry bound, or ``None`` when it bound none (ADR 0013 D4).
 
         ``REVIEW``: the PR HEAD and merge base bound to the round
-        (:meth:`_bind_review_head`), whoever pushed that HEAD. ``FIX``: the
+        (:meth:`_bind_review_head`), whoever pushed that HEAD, and kept for
+        every later launch of the round's entry, a relaunch and a resumed
+        one alike (:meth:`_review_binding_kept`). ``FIX``: the
         reviewed HEAD bound to its entry and that round's merge base.
         ``ANALYZE_EXECUTE`` and ``REPLAN_REEXECUTE``: the base their entry
         read, fetched and recorded. ``UPDATE_EPIC``: the default branch head
@@ -5565,8 +5567,10 @@ class ControllerEngine:
         malformed had every opportunity to post, push or create before it
         returned, and the correction prompt is advice to the agent, not a
         controller check. The probes are pure reads plus the persisted HEAD
-        binding; none consumes a review round, a ``review_history`` entry or
-        an attempt. ``relaunch`` says which of the two calls this is; only
+        binding (which a REVIEW entry under a backend that seeds makes once
+        and keeps for its later launches, :meth:`_review_binding_kept`);
+        none consumes a review round, a ``review_history`` entry or an
+        attempt. ``relaunch`` says which of the two calls this is; only
         REVIEW's block reason uses it, to say what the launch before did
         (#415).
         """
@@ -5578,7 +5582,8 @@ class ControllerEngine:
             # and its round stays bound to the revision its marker names.
             if isinstance(self._require_state().phase_effects().context, ReviewContext):
                 return self._finish_review_entry(plan)
-            self._bind_review_head()
+            if not self._review_binding_kept():
+                self._bind_review_head()
             return self._reconcile_review_entry(plan, relaunch=relaunch)
         if previous == Phase.FIX:
             return self._prepare_fix(plan)
@@ -13034,6 +13039,38 @@ class ControllerEngine:
         state.current_merge_base_sha = merge_base
         state.current_branch = pr.head_ref or state.current_branch
         self._save()
+
+    def _review_binding_kept(self) -> bool:
+        """Whether this REVIEW entry keeps the revision its round already bound (ADR 0013 D4).
+
+        Under a backend that seeds, the round's HEAD, base and merge base are
+        bound once, by the entry's first launch (:meth:`_bind_review_head`),
+        and are the seed of every launch of the entry: a correction or a
+        transient relaunch in this process, and a launch 'resume' makes after
+        an earlier one was saved (``state.attempt`` above 0). None of them
+        reads the PR's revision again, so none seeds from another HEAD under
+        the same round (#269, PR #474 R2-F1). A HEAD, base or merge base that
+        moved meanwhile is found by the post-review read
+        (:meth:`_apply_review`), which records the round stale and carries
+        its findings; the next round binds the new revision. An 'unblock'
+        into ``REVIEW`` resets the attempt, and so binds again, as it always
+        has. A binding with a field missing (a state saved before the merge
+        base was bound) is bound again.
+
+        Under bwrap and ``disabled`` no launch is seeded from the binding:
+        each launch binds the PR as it is right before it (#415), unchanged.
+        """
+        state = self._require_state()
+        if state.attempt < 1:
+            return False
+        if not (state.current_head_sha and state.current_base_ref and state.current_merge_base_sha):
+            return False
+        try:
+            return self._launch_seeds()
+        except AutoForgeError:
+            # A host that cannot enforce is refused where the launch's sandbox
+            # is established; this read never stands in for that refusal.
+            return False
 
     def _reconcile_review_entry(
         self, plan: StepPlan, *, relaunch: bool = False

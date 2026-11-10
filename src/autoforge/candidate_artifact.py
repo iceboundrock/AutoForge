@@ -32,8 +32,10 @@ never retried, nothing published):
    entry that is not one of the two, a link, or anything but a regular file
    is refused before anything is read.
 2. The manifest's size is checked against :data:`MAX_MANIFEST_BYTES` before
-   it is read, then it is parsed strictly (exact keys, exact types) and
-   compared with the launch's git input (:func:`manifest_disagreement`).
+   it is read, then it is parsed strictly (exact keys, exact types; a
+   decoder failure of any kind, the digit and nesting limits included, is
+   a refusal) and compared with the launch's git input
+   (:func:`manifest_disagreement`).
 3. The pack's size, from its descriptor, is checked against the bound and
    the manifest before a byte is read; then its 12-byte header (``PACK``,
    version 2 or 3, the object count) against the count bound and the
@@ -226,10 +228,19 @@ def _refused(text: str) -> ObjectImportError:
 
 
 def parse_manifest(raw: bytes) -> CandidateManifest:
-    """``raw`` as a manifest, strictly: exact keys, exact types, well-formed values."""
+    """``raw`` as a manifest, strictly: exact keys, exact types, well-formed values.
+
+    Whatever the decoder refuses is a candidate refusal, never a raw error
+    that would skip the verify step's save (PR #474 R2-F2): bytes that are
+    not UTF-8, text that is not JSON, an integer longer than the
+    interpreter's digit limit (a :class:`ValueError`), and nesting deeper
+    than the decoder recurses (a :class:`RecursionError`).
+    """
     try:
         data = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (ValueError, RecursionError) as exc:
+        # ValueError covers UnicodeDecodeError, json.JSONDecodeError and the
+        # integer digit limit; only the type is named, never the content.
         raise _refused(f"its manifest does not parse ({type(exc).__name__})") from exc
     if not isinstance(data, dict):
         raise _refused("its manifest is not a JSON object")

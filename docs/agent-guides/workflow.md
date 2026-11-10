@@ -378,8 +378,15 @@ reviewed base branch (`reviewed_base_ref`) and the reviewed merge base
 (`reviewed_merge_base_sha`). The controller reads all of them from GitHub
 right before the reviewer is launched (`current_head_sha`,
 `current_base_ref`, `current_merge_base_sha`) and records them when the
-round is accepted. The round's comment carries the same revision in its
-`ai-review-result` marker (`reviewed_head_sha`, `reviewed_base_ref`,
+round is accepted. Under a backend that seeds its launches (ADR 0013 D4,
+#269), only the round's first launch reads them: a correction, a transient
+relaunch and a launch `resume` makes after an earlier one was saved
+(`attempt` above 0) seed from that binding and read none of it again, so a
+revision that moved meanwhile makes the round stale at the post-review read
+instead of being reviewed under the same round; an `unblock` into `REVIEW`
+resets the attempt and reads them again. Under bwrap and `disabled` every
+launch reads them, as before. The round's comment carries the same
+revision in its `ai-review-result` marker (`reviewed_head_sha`, `reviewed_base_ref`,
 `reviewed_merge_base_sha`), so the durable copy of the review on GitHub
 identifies the diff it decided on and a later entry only ever recognises a
 comment for the base and merge base the PR has now (see **Re-entering a

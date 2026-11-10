@@ -748,7 +748,13 @@ outcome, its save and only then the final clean-up (`_verify_export`).
 An export that failed is the verify step's refusal (ADR 0013 D17). For a
 backend that seeds, `_through_lifecycle` first binds the launch's git
 input (`_launch_git_input`) from what the phase's entry already bound
-(`_bound_revision`: the round's HEAD and merge base for `REVIEW`, the
+(`_bound_revision`: the round's HEAD and merge base for `REVIEW`, bound
+by the entry's first launch and kept for every later launch of the
+entry, a correction, a transient relaunch and a launch `resume` makes
+after an earlier one was saved (`_review_binding_kept`: the PR is not
+read again for them, and a HEAD, base or merge base that moved meanwhile
+makes the round stale at the post-review read; an `unblock` binds again;
+bwrap and `disabled` bind before each launch, unchanged), the
 reviewed HEAD and its merge base for `FIX`, the entry's fetched base for
 `ANALYZE_EXECUTE` and `REPLAN_REEXECUTE`, the default branch head the
 `UPDATE_EPIC` entry binds at its first seeded launch and records in its

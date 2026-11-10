@@ -30,7 +30,12 @@ from pathlib import Path
 import pytest
 
 import autoforge.engine as engine_module
-from autoforge.candidate_artifact import ARTIFACT_MANIFEST, ARTIFACT_PACK, CandidateManifest
+from autoforge.candidate_artifact import (
+    ARTIFACT_MANIFEST,
+    ARTIFACT_PACK,
+    MAX_MANIFEST_BYTES,
+    CandidateManifest,
+)
 from autoforge.candidate_source import CandidateReceipts
 from autoforge.claims import render_progress_marker
 from autoforge.config import ProfileConfig, default_config
@@ -2215,6 +2220,168 @@ def test_a_relaunch_of_the_same_review_round_seeds_from_the_same_head_with_no_ca
     assert first.carried == second.carried == ""
 
 
+DRIFTS = ("head", "base", "merge_base")
+
+
+def _drift(eng: ControllerEngine, gh, kind: str) -> None:
+    """Move the PR's revision as another actor would: its HEAD, its base or its merge base."""
+    if kind == "head":
+        _operator_push(eng, "An operator's push during the round (#2)")
+    elif kind == "base":
+        # Retargeted to a branch at the default branch's head: same merge base.
+        eng.origin.publish(eng.workdir, eng.origin.head("main"), "release")
+        gh.prs[PR].base_ref = "release"
+    else:
+        # The PR's commits land on its base: GitHub's merge base of the base
+        # and the HEAD is then the HEAD itself.
+        eng.origin.publish(eng.workdir, gh.prs[PR].head_sha, "main")
+
+
+def _merge_base_reads(gh) -> int:
+    return len([call for call in gh.calls if call[0] == "get_merge_base_sha"])
+
+
+def _assert_stale_at_the_first_binding(
+    eng: ControllerEngine, first: LaunchGitInput, kind: str
+) -> None:
+    """The round is recorded stale at the binding its first launch seeded from."""
+    state = eng.state
+    assert state.last_review_result == "stale" and state.review_round == 1
+    assert (state.reviewed_head_sha, state.reviewed_merge_base_sha) == (first.seed, first.lower)
+    assert state.reviewed_base_ref == "main"
+    pr = eng.github.prs[PR]
+    assert (state.current_head_sha, state.current_base_ref) == (pr.head_sha, pr.base_ref)
+    # The post-review read reads the merge base only when HEAD and base held.
+    moved = (state.current_head_sha != first.seed, state.current_base_ref != "main")
+    if kind == "head":
+        assert moved == (True, False)
+    elif kind == "base":
+        assert moved == (False, True)
+    else:
+        assert moved == (False, False) and state.current_merge_base_sha != first.lower
+
+
+def _assert_the_next_round_binds_the_new_revision(
+    eng: ControllerEngine, backend, first: LaunchGitInput
+) -> None:
+    *_, fresh = _seeded(backend, "REVIEW")
+    state = eng.state
+    assert fresh.entry != first.entry and fresh.carried == ""
+    assert (fresh.seed, fresh.lower) == (state.reviewed_head_sha, state.reviewed_merge_base_sha)
+    assert state.reviewed_base_ref == eng.github.prs[PR].base_ref
+    assert state.review_round == 2 and state.last_review_result != "stale"
+
+
+@pytest.mark.parametrize("kind", DRIFTS)
+def test_a_review_correction_keeps_the_rounds_binding_and_drift_makes_the_round_stale(
+    tmp_state_dir, fake_github, through_fake, kind
+):
+    """R2-F1: the reviewer's first launch returns no result while the PR's HEAD,
+    base or merge base moves. The correction relaunch seeds from the HEAD and merge
+    base the round bound, with no read of the PR's revision for it, and the
+    post-review read records the round stale at that binding; the next round
+    binds the new revision."""
+    events, backend, journal, _source = through_fake
+    eng_box: list[ControllerEngine] = []
+    reads: list[int] = []
+
+    def agent(req) -> str:
+        events.append(("agent", req.phase))
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        eng = eng_box[0]
+        reads.append(_merge_base_reads(fake_github))
+        if len(reads) == 1:
+            _drift(eng, fake_github, kind)
+            return "the reviewer forgot its CONTROL_RESULT"
+        return block(review_result(eng.state.review_round + 1, eng.state.current_head_sha))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    eng_box.append(eng)
+    _to_fix(eng)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    first, second = _seeded(backend, "REVIEW")
+    assert first.entry == second.entry and first.launch != second.launch
+    assert (second.seed, second.lower, second.carried) == (first.seed, first.lower, "")
+    assert reads[1] == reads[0]  # the relaunch read no merge base: nothing was bound again
+    _assert_stale_at_the_first_binding(eng, first, kind)
+    eng.step()
+    _assert_the_next_round_binds_the_new_revision(eng, backend, first)
+
+
+@pytest.mark.parametrize("kind", DRIFTS)
+def test_a_resumed_review_round_keeps_its_binding_and_drift_makes_the_round_stale(
+    tmp_state_dir, fake_github, through_fake, kind
+):
+    """R2-F1: the controller is stopped during the round's first launch, the PR's
+    HEAD, base or merge base moves, and a new process resumes. Its launch of the
+    same entry seeds from the round's first binding, never reading the PR's
+    revision for it; the round is stale at that binding, and the next round binds
+    the new revision."""
+    events, backend, journal, _source = through_fake
+
+    def stopped(req) -> str:
+        events.append(("agent", req.phase))
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        raise KeyboardInterrupt
+
+    eng = make_engine(tmp_state_dir, stopped, github=fake_github, cfg=_required(), origin=True)
+    _to_fix(eng)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    (first,) = _seeded(backend, "REVIEW")
+    saved = load_state(eng.paths.state_file)
+    assert saved.phase is Phase.REVIEW and saved.attempt == 1
+    _drift(eng, fake_github, kind)
+    box: list[ControllerEngine] = []
+    reads: list[int] = []
+
+    def review(req) -> str:
+        reads.append(_merge_base_reads(fake_github))
+        state = box[0].state
+        return block(review_result(state.review_round + 1, state.current_head_sha))
+
+    resumed = _resumed(eng, fake_github, review)
+    box.append(resumed)
+    before = _merge_base_reads(fake_github)
+    out = resumed.step()
+    assert out.next_phase == "REVIEW", out.message
+    _, second = _seeded(backend, "REVIEW")
+    assert second.entry == first.entry and second.launch != first.launch
+    assert (second.seed, second.lower, second.carried) == (first.seed, first.lower, "")
+    assert reads[0] == before  # the resumed entry read no merge base before its launch
+    _assert_stale_at_the_first_binding(resumed, first, kind)
+    resumed.step()
+    _assert_the_next_round_binds_the_new_revision(resumed, backend, first)
+
+
+def test_under_bwrap_a_review_relaunch_binds_the_pr_as_it_is_before_it(tmp_state_dir, fake_github):
+    """bwrap and ``disabled`` seed nothing from the round's binding: a correction
+    after a push binds the new HEAD, as before #269."""
+    eng_box: list[ControllerEngine] = []
+    heads: list[str] = []
+
+    def agent(req) -> str:
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        eng = eng_box[0]
+        heads.append(eng.state.current_head_sha)
+        if len(heads) == 1:
+            _operator_push(eng, "An operator's push during the round (#2)")
+            return "the reviewer forgot its CONTROL_RESULT"
+        return block(review_result(1, eng.state.current_head_sha))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, origin=True)
+    eng_box.append(eng)
+    _to_fix(eng)
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    first, second = heads
+    assert second != first and second == eng.state.reviewed_head_sha
+    assert eng.state.last_review_result == "clean"
+
+
 def test_a_bound_revision_the_store_cannot_seed_refuses_the_launch_before_any_journal_entry(
     tmp_state_dir, fake_github, through_fake
 ):
@@ -2660,6 +2827,75 @@ def test_a_failed_export_is_recorded_against_the_launchs_input_before_the_volume
     assert after == before
     assert after.git_input == bound.with_seed_manifest(backend.seeds[0].identity)
     assert {obj.name for obj in journal.entries} >= {"vol"}
+
+
+def _past_the_digit_limit(raw: bytes) -> bytes:
+    """The manifest with its issue a 5,000-digit integer: well inside its size bound."""
+    return raw.replace(b'"issue":2,', b'"issue":1' + b"0" * 4999 + b",")
+
+
+def _nested_as_deep_as_the_bound_allows(raw: bytes) -> bytes:
+    depth = (MAX_MANIFEST_BYTES - 16) // 2
+    return b'{"schema":' + b"[" * depth + b"]" * depth + b"}"
+
+
+@pytest.fixture
+def default_digit_limit():
+    """The interpreter's default integer digit limit, whatever the environment set."""
+    before = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(4300)
+    yield
+    sys.set_int_max_str_digits(before)
+
+
+@pytest.mark.parametrize("hostile", [_past_the_digit_limit, _nested_as_deep_as_the_bound_allows])
+def test_a_manifest_the_decoder_refuses_is_saved_as_a_refusal_before_the_volume_goes(
+    tmp_state_dir, fake_github, through_packing, default_digit_limit, hostile
+):
+    """PR #474 R2-F2: an exporter leaves a manifest the JSON decoder refuses (an
+    integer past the digit limit, the deepest nesting the bound admits). Each
+    launch's refusal is saved against its git input before its volume's removal
+    is asked for, the volume goes, and nothing is published."""
+    events, backend, journal = through_packing
+    gh = fake_github
+    export, remove = backend.export, backend.remove
+    on_disk: list[list] = []
+    eng_box: list[ControllerEngine] = []
+
+    def malformed(objects, handle):
+        artifact = export(objects, handle)
+        path = Path(artifact.directory, ARTIFACT_MANIFEST)
+        raw = path.read_bytes()
+        changed = hostile(raw)
+        assert changed != raw and len(changed) <= MAX_MANIFEST_BYTES
+        path.write_bytes(changed)
+        return artifact
+
+    def record_at_the_volume(obj):
+        if obj.kind is ObjectKind.VOLUME:
+            bound = _seeded(backend, "ANALYZE_EXECUTE")[-1]
+            on_disk.append(CandidateReceipts(eng_box[0].state_root()).launches(bound.entry))
+        return remove(obj)
+
+    backend.export = malformed  # type: ignore[method-assign]
+    backend.remove = record_at_the_volume  # type: ignore[method-assign]
+    eng = make_engine(tmp_state_dir, _recording(events), github=gh, cfg=_required(), origin=True)
+    eng_box.append(eng)
+    eng.step()
+    with pytest.raises(ControlResultValidationError, match="its manifest"):
+        eng.step()
+    assert eng.origin.head("autoforge/2") is None and gh.effect_writes == []
+    assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
+    launched = _seeded(backend, "ANALYZE_EXECUTE")
+    launches = CandidateReceipts(eng.state_root()).launches(launched[0].entry)
+    assert len(launches) == len(launched) >= 1
+    for saved in launches:
+        assert saved.verified and not saved.accepted and "its manifest" in saved.refusal
+    # Each launch's refusal was on disk when its volume's removal was asked for.
+    assert [len(seen) for seen in on_disk] == list(range(1, len(launched) + 1))
+    assert all(not seen[-1].accepted and seen[-1].verified for seen in on_disk)
+    assert CandidateReceipts(eng.state_root()).carried(launched[0].entry) == ""
+    assert journal.entries == [] and backend.runtime.volumes == set()
 
 
 def test_a_launch_stopped_after_it_committed_exports_its_work_for_the_relaunch(
