@@ -899,7 +899,9 @@ exactly when `tests/sandbox_host.py` measures the host capable
   projection still goes; the release after the run on
   every path; the exporter's own entry before its create; the volume
   removed only after verify's outcome is saved; a failed export an
-  outcome that keeps the volume until it is saved. A refusal at each step
+  outcome that keeps the volume until it is saved, and so is a launch
+  handed an export directory whose backend makes no exporter, while one
+  handed none skips the export (R3-F1). A refusal at each step
   before the run removes what was made and starts nothing, and an
   environment that failed is never made again; a later process of the
   launch runs in the environment already made; an uncertain release, an
@@ -977,7 +979,13 @@ exactly when `tests/sandbox_host.py` measures the host capable
   removal, read back by a new process after a crash there; a launch whose
   run ends by an `ExecutionError` after it committed exported, imported and
   saved before the error propagates, and the resumed relaunch carrying the
-  commit, while one with an uncertain release exports nothing; a container
+  commit, while one with an uncertain release exports nothing; a seeded
+  launch whose backend makes no exporter refused on every launch, its
+  refusal saved before each volume's removal, the host worktree neither
+  imported nor read as its candidate, nothing published, and one whose
+  environment was never made refused the same way (`NOT_EXPORTED`), while
+  bwrap and `disabled` still import and read the worktree's `HEAD` (PR
+  #474 R3-F1); a container
   launch's prompt never describing the dirty host worktree, and the note
   following the backend (bwrap and `disabled` unchanged).
 - `tests/test_candidate_artifact.py` (#269) runs real git on a store and

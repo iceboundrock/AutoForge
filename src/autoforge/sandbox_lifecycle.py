@@ -51,7 +51,10 @@ engine bound to the lifecycle (``SandboxPlan``):
    its create, its removal journaled after. Its export directory must be
    the one the engine chose for the launch (``LaunchInputs.export_dir``),
    and the outcome names that journaled object (``Exported.origin``): the
-   verify step reads an artifact from nowhere else (#269);
+   verify step reads an artifact from nowhere else (#269). A launch the
+   engine handed an export directory is never skipped: a backend that
+   makes it no exporter is a failed export, refused and saved by verify
+   before the final clean-up (:attr:`LaunchLifecycle.exports`);
 8. *verify* is the caller's (#269, :mod:`autoforge.candidate_source`), a
    failed export included; once its outcome is saved,
    :meth:`LaunchLifecycle.saved` runs. A launch that an exception ended
@@ -687,8 +690,32 @@ class LaunchLifecycle:
             )
         self._backend.start(launch)
 
+    @property
+    def exports(self) -> bool:
+        """Whether the launch's candidate is its exported artifact (ADR 0013 D5; #269).
+
+        The engine's contract, never the backend's choice: a change-producing
+        launch the engine handed an export directory (``LaunchInputs.export_dir``,
+        which it does for every launch of a backend that seeds). Such a
+        launch's candidate is the artifact its verify step accepts, or none.
+        """
+        return self._change_producing and bool(self._inputs.export_dir)
+
+    @property
+    def git_input(self) -> LaunchGitInput | None:
+        """The launch's git input, completed with its seed's manifest once its seed step ended."""
+        return self._inputs.git_input
+
     def export(self) -> Exported | None:
         """The export step; ``None`` when nothing is exported, which skips verify.
+
+        A launch that :attr:`exports` and whose environment was made is never
+        skipped: when its backend makes no exporter, the step's outcome is a
+        failed export, which the verify step refuses and saves like any other
+        (D17), and the volume stays until that refusal is saved
+        (:meth:`saved`). A launch whose environment was never made ran no
+        command and has nothing to export: ``None``, and the caller refuses
+        the candidate of a launch that :attr:`exports` itself.
 
         The exporter's entry is written before its create, and its removal
         journaled after it ran, whatever the export's outcome. An exporter
@@ -702,6 +729,11 @@ class LaunchLifecycle:
         exporter = (
             self._backend.exporter(handle) if self._change_producing and handle is not None else ()
         )
+        if not exporter and handle is not None and self.exports:
+            return Exported(
+                failure=f"its {self._backend.kind.value} backend made no exporter for a launch "
+                "whose candidate is its exported artifact, so nothing was exported"
+            )
         if not exporter or handle is None:
             self._export_skipped = True
             return None

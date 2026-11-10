@@ -36,7 +36,7 @@ from autoforge.candidate_artifact import (
     MAX_MANIFEST_BYTES,
     CandidateManifest,
 )
-from autoforge.candidate_source import CandidateReceipts
+from autoforge.candidate_source import NOT_EXPORTED, CandidateReceipts
 from autoforge.claims import render_progress_marker
 from autoforge.config import ProfileConfig, default_config
 from autoforge.effects import EntryObservation
@@ -1094,14 +1094,54 @@ def test_every_removal_takes_each_container_before_what_it_mounts(staging, chang
     assert journal.entries == [] and backend.runtime.volumes == set()
 
 
-def test_a_backend_with_no_exporter_skips_the_export_and_then_cleans_up():
+def test_a_launch_given_no_export_directory_skips_the_export_and_then_cleans_up():
+    """A change-producing launch the engine asked no export of (bwrap's shape):
+    a backend with no exporter skips the export, and the volume goes."""
+    events: list[tuple] = []
+    backend = FakeBackend(events, exporter=False)
+    journal = FakeJournal(events)
+    inputs = dataclasses.replace(INPUTS, export_dir="")
+    with LaunchLifecycle(backend, journal, inputs, RUNTIME, change_producing=True) as lifecycle:
+        assert not lifecycle.exports
+        _launch(lifecycle, events)
+        assert lifecycle.export() is None
+    assert journal.entries == [] and backend.runtime.volumes == set()
+
+
+def test_a_launch_that_must_export_and_has_no_exporter_is_a_failed_export():
+    """R3-F1: a launch the engine handed an export directory is never skipped. A
+    backend that makes it no exporter is a failed export, whose refusal the
+    verify step saves before the final clean-up removes the volume."""
+    events: list[tuple] = []
+    backend = FakeBackend(events, exporter=False)
+    journal = FakeJournal(events)
+    with _lifecycle(backend, journal) as lifecycle:
+        assert lifecycle.exports
+        _launch(lifecycle, events)
+        exported = lifecycle.export()
+        assert exported is not None and exported.artifact is None
+        assert exported.origin is None
+        assert "made no exporter" in exported.failure
+        # Nothing was exported, and the volume stays until the refusal is saved.
+        assert not any(event[:3] == ("runtime", "create", "exporter") for event in events)
+        assert backend.runtime.volumes == {"vol"}
+        events.append(("engine", "refusal saved"))
+        lifecycle.saved()
+    assert _index(events, "engine", "refusal saved") < _index(events, "runtime", "rm", "vol")
+    assert journal.entries == [] and backend.runtime.volumes == set()
+
+
+def test_a_launch_that_must_export_and_leaves_before_saving_keeps_its_volume():
+    """The failed export of R3-F1 awaits its saved refusal like any other outcome:
+    a launch that leaves before the save keeps its volume for reconciliation."""
     events: list[tuple] = []
     backend = FakeBackend(events, exporter=False)
     journal = FakeJournal(events)
     with _lifecycle(backend, journal) as lifecycle:
         _launch(lifecycle, events)
-        assert lifecycle.export() is None
-    assert journal.entries == [] and backend.runtime.volumes == set()
+        assert lifecycle.export() is not None
+    assert backend.runtime.volumes == {"vol"}
+    assert [obj.name for obj in journal.entries] == ["vol"]
 
 
 def test_a_launch_whose_environment_was_never_made_exports_nothing():
@@ -1331,13 +1371,19 @@ def test_without_a_journal_a_backend_that_makes_an_object_is_refused_before_it_m
 
 @pytest.mark.parametrize("change", [True, False])
 def test_bwrap_does_nothing_but_the_run(change):
-    """Seed, create, stage, the clean-up and reconcile do nothing for bwrap (D13)."""
+    """Seed, create, stage, the clean-up and reconcile do nothing for bwrap (D13).
+
+    The engine hands a bwrap launch no git input and no export directory: it
+    seeds nothing, and its candidate is the worktree's ``HEAD``.
+    """
     events: list[tuple] = []
+    inputs = dataclasses.replace(INPUTS, git_input=None, export_dir="")
     with LaunchLifecycle(
-        BWRAP, NO_JOURNAL, INPUTS, BWRAP.runtime_check(), change_producing=change
+        BWRAP, NO_JOURNAL, inputs, BWRAP.runtime_check(), change_producing=change
     ) as lc:
         assert _launch(lc, events) == "result"
-        assert lc.handle == LaunchHandle(INPUTS, Seed())
+        assert lc.handle == LaunchHandle(inputs, Seed())
+        assert not lc.exports
         assert lc.export() is None
         lc.saved()
     assert events == [("executor", "run", "")]
@@ -2534,6 +2580,140 @@ def test_an_artifact_for_another_launch_is_refused_and_nothing_is_published(
     (analyze, *_rest) = _seeded(backend, "ANALYZE_EXECUTE")
     assert CandidateReceipts(eng.state_root()).carried(analyze.entry) == ""
     assert journal.entries == [] and backend.runtime.volumes == set()
+
+
+# -- a seeded launch that exports nothing (R3-F1) --------------------------------------
+
+
+@pytest.fixture
+def host_candidate_reads(monkeypatch):
+    """Every read of the issue worktree as a candidate source: the strict import
+    after a launch (D6.5) and the ``HEAD`` read through the common dir (D6.3)."""
+    reads: list[str] = []
+    read_head = engine_module.read_candidate
+    import_after = ControllerEngine._import_after_launch
+
+    def recorded_read(*args, **kwargs):
+        reads.append("read HEAD")
+        return read_head(*args, **kwargs)
+
+    def recorded_import(self, worktree):
+        reads.append("import")
+        return import_after(self, worktree)
+
+    monkeypatch.setattr(engine_module, "read_candidate", recorded_read)
+    monkeypatch.setattr(ControllerEngine, "_import_after_launch", recorded_import)
+    return reads
+
+
+def test_a_seeded_launch_whose_backend_makes_no_exporter_is_refused_not_read_from_the_host(
+    tmp_state_dir, fake_github, through_packing, host_candidate_reads, monkeypatch
+):
+    """R3-F1: the backend seeds, so the launch's candidate is its exported artifact
+    (ADR 0013 D5). Its backend makes no exporter: that is a failed export, whose
+    refusal is saved before the final clean-up removes the volume. The worktree's
+    HEAD -- the agent's commit, exactly as it reported it -- is neither imported
+    nor read in its place, on any launch, and nothing is published."""
+    events, backend, journal = through_packing
+    backend.has_exporter = False
+    record = CandidateReceipts.record
+
+    def recorded(self, git_input, outcome):
+        events.append(("engine", "receipt", git_input.launch, outcome.accepted))
+        return record(self, git_input, outcome)
+
+    monkeypatch.setattr(CandidateReceipts, "record", recorded)
+    reported: list[str] = []
+
+    def agent(req) -> str:
+        events.append(("agent", req.phase))
+        out = implement(req)
+        reported.append(git_out("-C", str(req.cwd), "rev-parse", "HEAD"))
+        return out
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    eng.step()
+    with pytest.raises(ControlResultValidationError, match="made no exporter"):
+        eng.step()
+    # Nothing was published, and the run stays where it was.
+    assert eng.origin.head("autoforge/2") is None and fake_github.effect_writes == []
+    assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
+    assert eng.state.current_head_sha in ("", None)
+    # Every launch, corrections included, ran and reported the worktree's HEAD,
+    # and the controller read the worktree as its candidate on none of them.
+    launches = _seeded(backend, "ANALYZE_EXECUTE")
+    assert len(launches) == len(reported) > 1
+    assert host_candidate_reads == []
+    assert not any(event[:3] == ("runtime", "create", "exporter") for event in events)
+    # Each launch's refusal is durable, and saved before its volume was removed.
+    saved = CandidateReceipts(eng.state_root()).launches(launches[0].entry)
+    assert len(saved) == len(launches)
+    assert all(item.verified and not item.accepted for item in saved)
+    assert all("made no exporter" in item.refusal for item in saved)
+    assert CandidateReceipts(eng.state_root()).carried(launches[0].entry) == ""
+    receipts = [i for i, event in enumerate(events) if event[:2] == ("engine", "receipt")]
+    removals = [i for i, event in enumerate(events) if event == ("runtime", "rm", "vol")]
+    assert len(receipts) == len(removals) == len(launches)
+    assert all(r < v for r, v in zip(receipts, removals, strict=True))
+    assert journal.entries == [] and backend.runtime.volumes == set()
+
+
+def test_a_seeded_launch_that_exported_nothing_has_no_candidate(
+    tmp_state_dir, fake_github, through_packing, host_candidate_reads
+):
+    """R3-F1, the engine's half: a seeded change-producing launch whose environment
+    was never made exports nothing (``None``). Its candidate is refused, the
+    refusal saved against its git input, and the worktree's ``HEAD`` is never read."""
+    events, backend, journal = through_packing
+    eng = make_engine(
+        tmp_state_dir, _recording(events), github=fake_github, cfg=_required(), origin=True
+    )
+    eng.step()
+    owner = LaunchOwner(eng.state.run_id, 2, "ANALYZE_EXECUTE", "ANALYZE_EXECUTE-1")
+    base = eng.origin.head("main")
+    git_input = LaunchGitInput(
+        phase="ANALYZE_EXECUTE",
+        run=owner.run,
+        issue=owner.issue,
+        launch=owner.launch,
+        repository="owner/repo",
+        object_format="sha1",
+        seed=base,
+        lower=base,
+    )
+    inputs = LaunchInputs(
+        owner, workspace=str(eng.workdir), git_input=git_input, export_dir="never-made"
+    )
+    with LaunchLifecycle(backend, journal, inputs, RUNTIME, change_producing=True) as lifecycle:
+        assert lifecycle.exports
+        assert lifecycle.launch(lambda: "no plan") == "no plan"
+        eng._launch_seeded = True
+        eng._export_verified = eng._verify_export(lifecycle)
+    assert eng._export_verified == NOT_EXPORTED
+    candidate = eng._read_candidate(str(eng.workdir))
+    assert candidate.head == "" and "exported none" in candidate.problem
+    assert "HEAD is never read in its place" in candidate.problem
+    assert host_candidate_reads == []
+    (saved,) = CandidateReceipts(eng.state_root()).launches(git_input.entry)
+    assert saved.verified and not saved.accepted and saved.refusal == NOT_EXPORTED.refusal
+    assert events == [] and journal.entries == []
+
+
+@pytest.mark.parametrize("mode", ["disabled", "required"])
+def test_bwrap_and_disabled_launches_still_read_the_worktree_head(
+    tmp_state_dir, fake_github, host_candidate_reads, mode
+):
+    """R3-F1 keeps bwrap's and ``disabled``'s source: their candidate is the
+    worktree's ``HEAD``, after the strict import, and nothing is exported."""
+    cfg = default_config()
+    cfg.sandbox.mode = mode
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, cfg=cfg, origin=True)
+    eng.step()
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert not eng._launch_seeded and eng._export_verified is None
+    assert host_candidate_reads[:2] == ["import", "read HEAD"]
+    assert eng.origin.head("autoforge/2") == eng.state.current_head_sha
 
 
 def test_a_second_fix_round_at_the_same_head_carries_nothing_from_the_first(

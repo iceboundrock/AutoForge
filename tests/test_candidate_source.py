@@ -15,6 +15,7 @@ import pytest
 from autoforge.agent_worktree import Candidate
 from autoforge.candidate_source import (
     MAX_RECEIPT_LAUNCHES,
+    NOT_EXPORTED,
     RECEIPTS_DIR,
     ArtifactCandidateSource,
     CandidateReceipts,
@@ -613,3 +614,10 @@ def test_the_imported_read_is_the_verified_commit_and_no_other():
     assert refused == Candidate(False, "", "over the bound")
     unnamed = ImportedArtifact(Verified()).read()
     assert unnamed.head == "" and unnamed.problem == "the verify step named no candidate"
+
+
+def test_a_seeded_launch_no_verify_step_judged_has_no_candidate():
+    """R3-F1: no outcome is NOT_EXPORTED's refusal, never a read of the worktree."""
+    missing = ImportedArtifact(None).read()
+    assert missing == Candidate(False, "", NOT_EXPORTED.refusal)
+    assert not NOT_EXPORTED.accepted and NOT_EXPORTED.candidate == ""

@@ -147,6 +147,7 @@ from .agent_worktree import (
 )
 from .candidate_artifact import bound_revision_problem, is_ancestor_in
 from .candidate_source import (
+    NOT_EXPORTED,
     ArtifactCandidateSource,
     CandidateRead,
     CandidateReceipts,
@@ -1794,9 +1795,16 @@ class ControllerEngine:
         # The HEAD that import covered, "" for none: a validated candidate's
         # provenance says whether it came through the strict import (#173).
         self._imported_head = ""
-        # The verify step's outcome for the latest launch's exported artifact
-        # (ADR 0013 D13), ``None`` when it exported none: then the candidate
-        # is the worktree's ``HEAD``, imported as above (bwrap's).
+        # Where the latest launch's candidate comes from, chosen from its
+        # backend's contract before it runs (ADR 0013 D5; #269): True for a
+        # backend that seeds, whose candidate is its exported artifact and
+        # nothing else; False for bwrap and ``disabled``, whose candidate is
+        # the worktree's ``HEAD``, imported as above.
+        self._launch_seeded = False
+        # The verify step's outcome for that artifact (ADR 0013 D13); ``None``
+        # when no verify step judged one, which for a seeded launch is the
+        # refusal :data:`~autoforge.candidate_source.NOT_EXPORTED`, never the
+        # worktree's ``HEAD``.
         self._export_verified: Verified | None = None
         # Whether this step's REVIEW entry wrote or reused the
         # ``review_evidence`` binding the reviewer's prompt is rendered from
@@ -3191,17 +3199,20 @@ class ControllerEngine:
     def _candidate_read(self, cwd: str) -> CandidateRead:
         """Where the latest launch's candidate is read from (ADR 0013 D5; #269).
 
-        A launch whose export the verify step judged (a backend that
-        exports): the commit that step imported, and no other
-        (:class:`~autoforge.candidate_source.ImportedArtifact`); the worktree
-        is not read, since that launch's agent never wrote it. Otherwise
+        Chosen from the launch's backend contract (:attr:`_launch_seeded`),
+        never from whether a verify outcome exists. A launch of a backend
+        that seeds: the commit its verify step imported from its exported
+        artifact, and no other
+        (:class:`~autoforge.candidate_source.ImportedArtifact`); one that
+        exported nothing, or that no verify step judged, has no candidate
+        (:data:`~autoforge.candidate_source.NOT_EXPORTED`). The worktree is
+        not read, since that launch's agent never wrote it. Otherwise
         (bwrap, ``disabled``): the worktree's ``HEAD`` through the common
         dir, after the strict import that already ran (ADR 0005 D6.3, D6.5;
         :class:`~autoforge.candidate_source.WorktreeHead`), unchanged.
         """
-        verified = self._export_verified
-        if verified is not None:
-            return ImportedArtifact(verified)
+        if self._launch_seeded:
+            return ImportedArtifact(self._export_verified)
         worktree = Path(cwd)
 
         def read_head() -> Candidate:
@@ -15409,6 +15420,7 @@ class ControllerEngine:
                 record.metadata["correction_reply"] = previous_reply.metadata()
             result: AgentExecutionResult | None = None
             self._import_problem = ""
+            self._launch_seeded = False
             self._export_verified = None
             try:
                 with isolated_overrides(identity) as overrides:
@@ -15545,19 +15557,21 @@ class ControllerEngine:
                     + f". stderr tail: {stderr[-2000:]}"
                 )
             try:
-                if self._export_verified is None:
+                if not self._launch_seeded:
                     # ADR 0005 D6.5: the agent's new objects are imported
                     # strictly before its result is checked; tampering is
                     # recorded here and blocks the run.
                     self._import_problem = self._import_after_launch(Path(cwd))
                 else:
-                    # ADR 0013 D13: the launch exported its candidate, and the
-                    # verify step's outcome stands in for that import: a
-                    # refusal is the candidate read's, never a candidate, and
-                    # the candidate read accepts no commit but the one it
-                    # accepted (:meth:`_read_candidate`).
-                    self._imported_head = self._export_verified.candidate
-                    self._import_problem = self._export_verified.problem
+                    # ADR 0013 D5, D13: a seeded launch's candidate is its
+                    # exported artifact, and the verify step's outcome stands
+                    # in for that import: a refusal, or no outcome at all, is
+                    # the candidate read's refusal, never a candidate, and the
+                    # worktree is neither imported nor read
+                    # (:meth:`_candidate_read`).
+                    verified = self._export_verified or NOT_EXPORTED
+                    self._imported_head = verified.candidate if verified.accepted else ""
+                    self._import_problem = verified.problem
                 # Only the tail of a truncated stdout is searched: the block
                 # is the last thing the agent writes, so the kept tail holds
                 # a whole one; a block before the cut is stale or spans it.
@@ -15809,6 +15823,10 @@ class ControllerEngine:
         # bwrap seeds nothing: its worktree is its seed.
         seeds = backend.kind is not BackendKind.BWRAP
         change = phase in WORKTREE_STATE_PHASES
+        # The launch's candidate source, from the backend's contract and
+        # before anything of the launch exists (#269): a seeded launch's
+        # candidate is its verified artifact or none, whatever it exports.
+        self._launch_seeded = seeds
         git_input = self._launch_git_input(phase, owner) if seeds else None
         inputs = LaunchInputs(
             owner,
@@ -15858,18 +15876,28 @@ class ControllerEngine:
     def _verify_export(self, lifecycle: LaunchLifecycle) -> Verified | None:
         """The export, the verify step, its save, then the final clean-up (ADR 0013 D13).
 
-        ``None`` when the launch exported nothing (bwrap, or a launch that is
+        ``None`` when the launch exports nothing (bwrap, or a launch that is
         not change-producing). An export that failed is the verify step's
         refusal (D17), saved against the launch's git input like any other
-        outcome. The outcome is saved before the volume it was read from is
-        removed; a verify step that raises saves nothing, and the volume
-        stays for reconciliation. An exporter that may still be running
-        raises in :meth:`LaunchLifecycle.export`, before anything verifies
-        what it wrote.
+        outcome; so is a launch that :attr:`LaunchLifecycle.exports` and
+        whose backend made it no exporter. One that exports and still
+        exported nothing (its environment was never made) is
+        :data:`~autoforge.candidate_source.NOT_EXPORTED`'s refusal, saved
+        the same way: its candidate is never the worktree's ``HEAD``. The
+        outcome is saved before the volume it was read from is removed; a
+        verify step that raises saves nothing, and the volume stays for
+        reconciliation. An exporter that may still be running raises in
+        :meth:`LaunchLifecycle.export`, before anything verifies what it
+        wrote.
         """
         exported = lifecycle.export()
         if exported is None:
-            return None
+            if not lifecycle.exports:
+                return None
+            git_input = lifecycle.git_input
+            if git_input is not None:
+                self._candidate_receipts().record(git_input, NOT_EXPORTED)
+            return NOT_EXPORTED
         handle = lifecycle.handle
         if handle is None:  # pragma: no cover - an export needs the environment made
             raise SandboxLaunchRefusedError("the launch exported with no environment made")

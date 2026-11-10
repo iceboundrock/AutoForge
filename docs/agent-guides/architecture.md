@@ -745,7 +745,13 @@ compiled by that backend (`sandbox_policy.describe_launch(...,
 backend=...)`) and its environment made by that lifecycle; then the
 release, and for a change-producing launch the export, the verify step's
 outcome, its save and only then the final clean-up (`_verify_export`).
-An export that failed is the verify step's refusal (ADR 0013 D17). For a
+An export that failed is the verify step's refusal (ADR 0013 D17). A
+launch the engine handed an export directory (`LaunchLifecycle.exports`:
+every change-producing launch of a backend that seeds) is never skipped:
+a backend that makes it no exporter is a failed export, refused and saved
+before the final clean-up, and one that exported nothing at all (its
+environment was never made) is `NOT_EXPORTED`'s refusal, saved the same
+way (PR #474 R3-F1). For a
 backend that seeds, `_through_lifecycle` first binds the launch's git
 input (`_launch_git_input`) from what the phase's entry already bound
 (`_bound_revision`: the round's HEAD and merge base for `REVIEW`, bound
@@ -776,12 +782,15 @@ seeds, `worktree_state_container.md` (the workspace is private and seeded;
 uncommitted work is discarded between launches), and the host worktree is
 not read; for bwrap and `disabled`, #187's note, unchanged. The
 engine reads every candidate through one abstraction
-(`_candidate_read`): after a launch whose export the verify step judged,
-`ImportedArtifact`, the commit that step imported and no other (the
-worktree is not read: that launch's agent never wrote it); otherwise
-`WorktreeHead`, bwrap's and `disabled`'s worktree `HEAD` after the strict
-import, unchanged. A refusal is the candidate read's refusal
-(`_import_problem`), never a candidate. bwrap seeds and exports nothing,
+(`_candidate_read`), whose source is chosen from the launch's backend
+contract before the launch runs (`_launch_seeded`), never from whether a
+verify outcome exists: after a launch of a backend that seeds,
+`ImportedArtifact`, the commit its verify step imported and no other, or
+no candidate at all when no verify step judged one (`NOT_EXPORTED`); the
+worktree is neither imported nor read, since that launch's agent never
+wrote it. Otherwise `WorktreeHead`, bwrap's and `disabled`'s worktree
+`HEAD` after the strict import, unchanged. A refusal is the candidate
+read's refusal (`_import_problem`), never a candidate. bwrap seeds and exports nothing,
 so for it no git input is bound, nothing is saved, and its candidate is
 the worktree's `HEAD`, imported and read after the launch as before. Repository-defined commands are compiled by the same
 backend (`_command_sandbox`) but not sequenced yet: under bwrap they need

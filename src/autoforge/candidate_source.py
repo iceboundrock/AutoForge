@@ -12,7 +12,10 @@ one way whatever ran the agent:
   exports (the container backend, #271): the commit the verify step
   imported from the launch's exported artifact, and no other. The worktree
   is not read: a container's agent never wrote it, and a commit in it is
-  never a candidate. A refusal of the verify step is the read's refusal.
+  never a candidate. A refusal of the verify step is the read's refusal,
+  and so is a launch that exported nothing (:data:`NOT_EXPORTED`): which
+  of the two sources a launch reads is chosen from its backend's contract
+  before it runs, never from whether a verify outcome exists.
 
 **The verify step** of a container launch is :class:`ArtifactCandidateSource`
 (the :class:`~autoforge.sandbox_lifecycle.CandidateSource` the lifecycle
@@ -501,13 +504,27 @@ class WorktreeHead:
         return self.read_head()
 
 
+NOT_EXPORTED = Verified(
+    refusal="the launch ran under a backend that seeds, so its candidate is its exported "
+    "artifact (ADR 0013 D5), and it exported none: there is no candidate, the issue "
+    "worktree's HEAD is never read in its place, and nothing was imported or published"
+)
+"""The verify outcome of a launch whose candidate is its artifact and that exported none."""
+
+
 @dataclass(frozen=True)
 class ImportedArtifact:
-    """An exporting backend's candidate: the commit the verify step imported, and no other."""
+    """An exporting backend's candidate: the commit the verify step imported, and no other.
 
-    verified: Verified
+    ``verified`` is ``None`` when no verify step judged the launch's export:
+    that is :data:`NOT_EXPORTED`'s refusal, never a fallback to the worktree.
+    """
+
+    verified: Verified | None
 
     def read(self) -> Candidate:
+        if self.verified is None:
+            return Candidate(False, "", NOT_EXPORTED.problem)
         if not self.verified.accepted:
             return Candidate(False, "", self.verified.problem)
         return Candidate(False, self.verified.candidate, "")
