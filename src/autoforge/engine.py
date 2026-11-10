@@ -2935,12 +2935,39 @@ class ControllerEngine:
         strict import after the launch already ran (:meth:`_invoke_phase`),
         and when it failed, there is no candidate: its reason is the
         refusal, under the phase's existing rule for an unreadable ``HEAD``.
+
+        After a launch whose export the verify step judged (ADR 0013 D13),
+        the candidate is the commit that step accepted and no other: the
+        worktree's ``HEAD`` is one only when it is exactly that commit, so a
+        commit the verify step did not accept is never checked, validated
+        or published. Any other ``HEAD`` is refused under the same rule,
+        until #269's candidate source replaces this read. bwrap exports
+        nothing (no outcome), so its candidate read is unchanged.
         """
         if self._import_problem:
             return Candidate(False, "", self._import_problem)
         worktree = Path(cwd)
-        return read_candidate(
+        candidate = read_candidate(
             self.workspace().git_dirs()[-1], self._agent_admin_dir(worktree), cwd, self._runner
+        )
+        verified = self._export_verified
+        if verified is None:
+            return candidate
+        if not verified.accepted:
+            # Already the import problem after every launch (_invoke_phase);
+            # never a candidate even if read before it was set.
+            return Candidate(False, "", verified.problem)
+        if candidate.head and candidate.head == verified.candidate:
+            return candidate
+        if candidate.attached:
+            found = "attached to a local branch"
+        else:
+            found = candidate.head or candidate.problem or "no commit the shared store holds"
+        return Candidate(
+            candidate.attached,
+            "",
+            f"the worktree's HEAD ({found}) is not the commit the verify step accepted from "
+            f"the launch's export ({verified.candidate}); only that commit is a candidate",
         )
 
     def _checkout_anchor(self) -> tuple[str, str]:
@@ -15219,7 +15246,9 @@ class ControllerEngine:
                 else:
                     # ADR 0013 D13: the launch exported its candidate, and the
                     # verify step's outcome stands in for that import: a
-                    # refusal is the candidate read's, never a candidate.
+                    # refusal is the candidate read's, never a candidate, and
+                    # the candidate read accepts no commit but the one it
+                    # accepted (:meth:`_read_candidate`).
                     self._imported_head = self._export_verified.candidate
                     self._import_problem = self._export_verified.problem
                 # Only the tail of a truncated stdout is searched: the block

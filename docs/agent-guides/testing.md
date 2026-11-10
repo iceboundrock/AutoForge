@@ -913,7 +913,10 @@ exactly when `tests/sandbox_host.py` measures the host capable
   export, the verify step, its save and the final clean-up, and the
   provider's description bound to the fake and its launch container; an
   artifact refused by the verify step, or with no candidate source, never
-  a candidate; an uncertain release that fails the step and is reconciled
+  a candidate; of an agent's two commits, only the one the verify step
+  accepted published, and the other (the worktree's `HEAD`, reported)
+  refused on every launch with nothing pushed or created; an uncertain
+  release that fails the step and is reconciled
   at the next entry; an exporter not verified removed that is never
   verified; the release after `Ctrl-C`, and `Ctrl-C` kept when the release
   is uncertain; a refused runtime check with the state byte-identical;

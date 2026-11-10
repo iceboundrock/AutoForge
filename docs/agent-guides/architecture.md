@@ -671,7 +671,11 @@ outcome, its save and only then the final clean-up (`_verify_export`).
 An export that failed is the verify step's refusal (ADR 0013 D17). The
 outcome stands in for bwrap's strict import: a refusal is the candidate
 read's refusal (`_import_problem`), never a candidate, and an accepted
-outcome names the candidate's commit. bwrap exports nothing, so its
+outcome names the candidate's commit, the only one the candidate read
+then accepts (`_read_candidate`): a worktree `HEAD` that is any other
+commit is refused under the same rule, so no commit the verify step did
+not accept is checked, validated or published (until #269's candidate
+source replaces the worktree read). bwrap exports nothing, so its
 candidate is still the worktree's `HEAD`, imported and read after the
 launch as before. Repository-defined commands are compiled by the same
 backend (`_command_sandbox`) but not sequenced yet: under bwrap they need

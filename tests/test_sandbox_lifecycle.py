@@ -62,7 +62,7 @@ from autoforge.sandbox_lifecycle import (
 from autoforge.sandbox_policy import LaunchClass, LaunchFacts, SandboxPlan
 from autoforge.state import load_state
 from autoforge.transitions import Phase
-from tests.conftest import EPIC, ISSUE, git_repo, implement, make_engine
+from tests.conftest import EPIC, ISSUE, commit_in, git_out, git_repo, implement, make_engine
 
 OWNER = LaunchOwner(run="run-1", issue=268, phase="ANALYZE_EXECUTE", launch="ANALYZE_EXECUTE-1")
 INPUTS = LaunchInputs(OWNER, workspace="/work/268", read_context="/state/read-context/1")
@@ -386,22 +386,28 @@ class FakeJournal:
 
 
 class FakeSource:
-    """The controller's verify step and its save: the worktree's HEAD, or ``verdict``."""
+    """The controller's verify step and its save: the worktree's ``rev``, or ``verdict``.
+
+    ``rev`` is ``HEAD`` unless a test makes the step accept another commit.
+    """
 
     def __init__(self, events: list[tuple], verdict: Verified | None = None) -> None:
         self.events = events
         self.verdict = verdict
+        self.rev = "HEAD"
+        self.accepted: list[str] = []
 
     def verify(self, artifact: Artifact, handle: LaunchHandle) -> Verified:
         self.events.append(("engine", "verify", artifact.directory, handle.inputs.owner.launch))
         if self.verdict is not None:
             return self.verdict
         head = subprocess.run(
-            ["git", "-C", handle.inputs.workspace, "rev-parse", "HEAD"],
+            ["git", "-C", handle.inputs.workspace, "rev-parse", f"{self.rev}^{{commit}}"],
             check=True,
             capture_output=True,
             text=True,
         ).stdout.strip()
+        self.accepted.append(head)
         return Verified(candidate=head)
 
     def save(self, outcome: Verified) -> None:
@@ -1311,6 +1317,50 @@ def test_an_artifact_the_verify_step_refuses_is_never_a_candidate(
     assert all(a < f for a, f in zip(agents, finals, strict=True))
     if source == "refusing":
         assert ("engine", "save", False) in events
+    assert journal.entries == [] and backend.runtime.volumes == set()
+
+
+@pytest.mark.parametrize("accepted", ["HEAD", "HEAD~1"])
+def test_only_the_commit_the_verify_step_accepted_is_published(
+    tmp_state_dir, fake_github, through_fake, accepted
+):
+    """R2-F1 of PR #473: the agent makes two commits and reports the second, its
+    worktree's HEAD. A verify step that accepted that commit publishes it; one
+    that accepted the first instead publishes nothing, on every launch."""
+    events, backend, journal, source = through_fake
+    source.rev = accepted
+    reported: list[str] = []
+
+    def two_commits(req):
+        events.append(("agent", req.phase))
+        commit_in(req.cwd, "Lay the groundwork (#2)")
+        out = implement(req)
+        reported.append(git_out("-C", str(req.cwd), "rev-parse", "HEAD"))
+        return out
+
+    eng = make_engine(tmp_state_dir, two_commits, github=fake_github, cfg=_required(), origin=True)
+    eng.step()
+    if accepted == "HEAD":
+        out = eng.step()
+        assert out.next_phase == "REVIEW", out.message
+        assert reported == source.accepted
+        assert eng.origin.head("autoforge/2") == reported[-1] == eng.state.current_head_sha
+        return
+    with pytest.raises(ControlResultValidationError, match="not the commit the verify step"):
+        eng.step()
+    # Every launch, corrections included, was verified, and the step accepted a
+    # commit other than the one the result reported, each time.
+    assert len(source.accepted) == len(reported) > 1
+    assert all(a != r for a, r in zip(source.accepted, reported, strict=True))
+    for call, (first, second) in zip(
+        eng.provider.calls[1:], zip(source.accepted, reported, strict=True), strict=False
+    ):
+        assert call.correction
+        assert f"HEAD ({second}) is not the commit the verify step accepted" in call.prompt
+        assert f"({first}); only that commit is a candidate" in call.prompt
+    # Nothing was pushed, created or advanced, and the clean-up still ran.
+    assert eng.origin.head("autoforge/2") is None and fake_github.effect_writes == []
+    assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
     assert journal.entries == [] and backend.runtime.volumes == set()
 
 
