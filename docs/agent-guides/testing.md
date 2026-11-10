@@ -856,6 +856,46 @@ exactly when `tests/sandbox_host.py` measures the host capable
   - a missing bind source and an exec failure as refusals.
 - `tests/test_runlog.py` checks that the facts reach `execution.json` and
   `events.jsonl`, redacted, and only for a sandboxed launch.
+- `tests/test_sandbox_backend.py` (the backend seam, ADR 0013 D13, #268)
+  needs no runtime. Only `sandbox_backend.py` imports `sandbox_bwrap.py`,
+  and the seam's modules import no workflow. bwrap's run step and probe
+  are `sandbox_bwrap`'s own and its plan is the compiler; its other steps
+  do nothing, and it never reports an object removed. On a fake backend
+  registered for a launch type of its own, the executor and the duplex
+  executor hand it exactly the command, its cwd and the selected
+  environment (nothing outside the allow-list); the command reads its
+  stdin byte for byte and streams records, while a liveness descriptor
+  of the backend's is never its stdin and receives nothing; a stop ends
+  it as the executor's own; a refusal to prepare and a launch type no
+  backend registered spawn nothing; a setup failure after the spawn is a
+  refusal; and `close()` runs on every exit path, `KeyboardInterrupt` and
+  an exception inside the launch guard included. `SandboxFacts` names its
+  backend, a bwrap record keeps exactly its keys, and a container's facts
+  carry its runtime, rootlessness, image, staging and watch fact.
+- `tests/test_sandbox_lifecycle.py` sequences a fake container backend
+  over a fake runtime that accepts a bind, a volume or a network only in a
+  container's create call, with a fake journal; one event list orders all
+  three. At a command's entry: the runtime check, reconciliation, then the
+  probe, and a refused runtime check writes and reconciles nothing. For
+  one launch, in both staging forms: no journal entry and no runtime call
+  before the seed step ends, and none when it fails; one journal write
+  naming every object before the staging root is written; the staging
+  root proved before the volume's create, that before the stager
+  container's, that before the launch container's; every mount and
+  network in a create call and in no later call; the stager container
+  offline and without the projection; its start, copy-in, stager and
+  prover, and its journaled removal, before the launch container starts;
+  every create and removal journaled first; the release after the run on
+  every path; the exporter's own entry before its create; the volume
+  removed only after verify's outcome is saved. A refusal at each step
+  before the run removes what was made and starts nothing; an uncertain
+  removal stays open and reported; D13's rules refuse bad objects before
+  any journal write; without a journal a backend that makes an object is
+  refused before it makes one; bwrap does nothing but the run. Through
+  the engine: the entry's order, a launch's steps around the agent, the
+  volume reconciled at the next entry, the release after `Ctrl-C`, a
+  refused runtime check with the state byte-identical, nothing under
+  `disabled`, and the same order in a scheduler worker's namespace.
 
 The existing executor and duplex suites are the no-description regression:
 they run unchanged.

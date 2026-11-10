@@ -38,7 +38,7 @@ from .profiles import REQUIRED_PROFILES
 from .providers import AgentProvider, PiProvider, provider_for
 from .redaction import redact
 from .sandbox import NetworkPosition, compile_launch
-from .sandbox_bwrap import ProbeResult
+from .sandbox_backend import ProbeResult
 from .sandbox_policy import (
     OPERATOR_PATHS_KEY,
     SANDBOX_DIR,

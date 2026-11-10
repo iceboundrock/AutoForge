@@ -541,8 +541,9 @@ paths a launch class gets is the engine's (#168), not the compiler's.
 The Linux backend is `src/autoforge/sandbox_bwrap.py`, the only module
 that knows a `bwrap` flag (a test pins it). `prepare()` turns a description
 and a command into a `BwrapLaunch`, and the executor spawns that in the
-command's place: the same `start_new_session`, pipes, limits, containment,
-group kill and exit grace. Every launch gets:
+command's place, through the backend seam (below): the same
+`start_new_session`, pipes, limits, containment, group kill and exit
+grace. Every launch gets:
 
 - user, mount, PID and IPC namespaces; `--unshare-net` only when the
   description asks for an isolated network;
@@ -599,6 +600,63 @@ enforce. That is the engine's routing (#168, below) and the configured
 mode (`disabled` and `required` are #168's; `preferred` and the pre-launch
 capability gate #169's, below). The facts are for the log, and the
 controller never reads them (D16.1).
+
+#### The backend seam (ADR 0013 D13, #268)
+
+A bwrap launch is one process whose death ends the sandbox; a container
+is not. So the seam between the controller and a backend is a lifecycle,
+in two modules, and nothing but the first imports `sandbox_bwrap.py` (a
+test pins it):
+
+- **`sandbox_backend.py`** (executor layer) is the interface a backend
+  implements, `SandboxBackend`: at a command's entry the read-only
+  `runtime_check()`, a remove-only `reconcile()` and the `probe()`; for one
+  launch `plan()`, `seed()`, `objects()` and `make()` (the create step),
+  `stage()` and `start()`, the run step's `prepare()`, `exporter()` and
+  `export()`, and `remove()`, which answers `REMOVED` only for an object
+  verified gone and `UNCERTAIN` otherwise. The run step keeps the existing
+  prepare seam: executor requests are not wrapped, and the executor asks
+  `sandbox_backend.prepare()` for a `PreparedLaunch` (the protocol
+  `BwrapLaunch` satisfies), which picks the backend by the launch's type
+  and refuses a type no backend registered rather than run it unsandboxed.
+  `BwrapBackend` puts bwrap behind it: plan is `compile_launch`, run
+  `sandbox_bwrap.prepare`, probe `sandbox_bwrap.probe`, and every other
+  step does nothing, so no byte of a bwrap launch changes. It is the only
+  backend, and `default_backend()` returns it until #273 makes one
+  selectable.
+- **`sandbox_lifecycle.py`** (engine layer) is the order, and the only
+  caller of the steps. `enter()` runs the runtime check, then
+  reconciliation, then the probe (D16). `LaunchLifecycle` runs seed,
+  create, stage, run, the release, export and, once the caller saved
+  verify's outcome (`saved()`), the final clean-up. Before the create it
+  checks D13's rules (the stager container offline and without the
+  projection, the launch container with it, every mount an object of the
+  launch), writes one journal entry per object in one write, then makes
+  them in D13's order; every removal is journaled first and closed only
+  once verified. The release follows the run on every path, `Ctrl-C`
+  included, and a change-producing launch keeps its volume until
+  `saved()`. A removal that cannot be verified is reported in
+  `uncertain`, its entry left open; it never raises. The journal is a
+  protocol, `LifecycleJournal`; until #272 stores one, the engine's is
+  `NO_JOURNAL`, which refuses every write, so a backend that makes an
+  object is refused before it makes one.
+
+The engine reaches its backend only through `engine.launch_backend()`,
+and the plan step is `sandbox_policy.describe_launch` through
+`default_backend().plan()`; both are bwrap until #273 selects. The
+engine's gate runs `enter()` (`_sandbox_entry`), and every enforced agent
+launch runs through `LaunchLifecycle` (`_through_lifecycle`): seed,
+create, stage, the run, the release. Export, verify and the final
+clean-up are wired by #269 with the candidate source; bwrap exports
+nothing, so its candidate is still the worktree's `HEAD`, imported and
+read after the launch as before. Repository-defined commands are not
+sequenced yet: under bwrap they need nothing, and a container's
+validation is #271's. `SandboxFacts` is qualified by backend (D16):
+`identity` reads its kind and, for a container, the runtime's product,
+version and rootlessness, the image id, the staging method and the watch
+fact, and `describe()` says which backend enforced a launch, never a
+bare "sandboxed". A field bwrap leaves empty is not recorded, so a bwrap
+record is unchanged.
 
 #### Launch routing (ADR 0005, #168)
 
@@ -684,17 +742,20 @@ is dropped, a provider root inside one is dropped in its favour); one under
 the home appears at its spelling in the private home.
 
 **The mode and the gate** (#169, D12.2, D13.5). `engine.probe_sandbox()`
-runs `sandbox_bwrap.probe()`, one real minimal launch of a real launch's
-shape whose refusal is typed (`Capability`: `bwrap` missing, the user, PID
+runs the backend's probe, bwrap's `sandbox_bwrap.probe()`, one real
+minimal launch of a real launch's shape whose refusal is typed (`Capability`: `bwrap` missing, the user, PID
 or IPC namespace, procfs, bind, overlay, Landlock, the session keyring;
 `bwrap`'s generic namespace failure is narrowed by one launch per
 namespace). `ControllerEngine.sandbox_capability()` keeps its answer for
-the engine's process. `_sandbox_gate()` runs at the start of
+the engine's process, for the runtime report it was proved on (ADR 0013
+D16; bwrap's never changes). `_sandbox_gate()` runs at the start of
 `_step_once`, before validation recovery, planning, the step budget and
 anything saved, for a step that may launch (`_step_may_launch`): an
 operator path over a denied root, or a host that cannot enforce under
 `required` or `preferred`, raises (`ConfigurationError`,
-`SandboxCapabilityError`) with the state byte-identical.
+`SandboxCapabilityError`) with the state byte-identical. Between the two
+checks it runs the command's entry, the runtime check and reconciliation
+before the probe (`_sandbox_entry`, above).
 `_sandbox_enforced()` is what every launch site asks (`_agent_sandbox`,
 `_command_sandbox`): `False` under `disabled` without a probe, `True`
 otherwise, since the gate has already refused a host that cannot enforce.

@@ -132,7 +132,7 @@ from functools import partial
 from pathlib import Path
 from typing import NoReturn, TypeVar
 
-from . import __prompt_version__, sandbox_bwrap
+from . import __prompt_version__
 from .agent_worktree import (
     Candidate,
     ObjectImportError,
@@ -520,7 +520,15 @@ from .run_namespace import IssueNamespace, check_standalone_state_dir, inside_sc
 from .runlog import ExecutionRecord, RunLogger, StepLog
 from .safefs import SafeRoot
 from .sandbox import LaunchDescription, NetworkPosition, SandboxFacts
-from .sandbox_bwrap import Capability, ProbeResult
+from .sandbox_backend import (
+    Capability,
+    LaunchOwner,
+    ProbeResult,
+    RuntimeReport,
+    SandboxBackend,
+    default_backend,
+)
+from .sandbox_lifecycle import NO_JOURNAL, LaunchLifecycle, LifecycleJournal, enter
 from .sandbox_pin import MODE_KEY, SandboxPin
 from .sandbox_pin import SOURCE_ACCEPTED as PIN_ACCEPTED
 from .sandbox_pin import SOURCE_STRENGTHENED as PIN_STRENGTHENED
@@ -1464,14 +1472,25 @@ def _operator_home() -> str:
 LOGICAL_ISOLATION_ONLY = "logical isolation only"
 
 
+def launch_backend() -> SandboxBackend:
+    """The backend this controller's enforced launches use (ADR 0013 D13, #268).
+
+    bwrap, the only one until #273 makes a backend selectable. Module-level
+    so that a test can stand a fake backend in for it; the engine reaches
+    its backend only through this, at a command's entry and at each launch.
+    """
+    return default_backend()
+
+
 def probe_sandbox() -> ProbeResult:
     """This host's capability, by one real minimal launch (ADR 0005 D14.1).
 
     Module-level so that a test can stand in for the host; the engine asks
-    once per instance (:meth:`ControllerEngine.sandbox_capability`), and
-    ``doctor`` asks for itself.
+    once per instance for the runtime report it was proved on
+    (:meth:`ControllerEngine.sandbox_capability`), and ``doctor`` asks for
+    itself. The backend's own probe (:meth:`SandboxBackend.probe`).
     """
-    return sandbox_bwrap.probe(home=_operator_home(), environ=os.environ)
+    return launch_backend().probe(home=_operator_home(), environ=os.environ)
 
 
 def sandbox_mode_summary(sandbox: SandboxConfig) -> str:
@@ -1828,8 +1847,13 @@ class ControllerEngine:
         self.interaction_resolver: Resolver | None = None
         # The host's sandbox capability, probed at the first gate that needs
         # it and kept for this engine's process, never across processes
-        # (ADR 0005 D12.2).
+        # (ADR 0005 D12.2), and only for the runtime report it was proved on
+        # (ADR 0013 D16): a fresh report that differs probes again.
         self._sandbox_probe: ProbeResult | None = None
+        self._sandbox_probe_runtime: RuntimeReport | None = None
+        # What the runtime check at this command's last entry proved; read
+        # afresh at every entry, never from a cache (ADR 0013 D16).
+        self._sandbox_runtime: RuntimeReport | None = None
         # The CLI's global flags as this process was started with them
         # (``--config``, ``--state-dir``), set by the CLI and repeated by
         # :meth:`resume_command` (#189). Paths only, never a configuration
@@ -2625,10 +2649,44 @@ class ControllerEngine:
 
     # -- the outer sandbox's mode and gate (ADR 0005 D12.2, D13.5, #169) -------
     def sandbox_capability(self) -> ProbeResult:
-        """Whether this host can enforce a launch, probed once for this engine (D14.1)."""
-        if self._sandbox_probe is None:
+        """Whether this host can enforce a launch, probed once for this engine (D14.1).
+
+        Kept for the runtime report it was proved on (ADR 0013 D16): after a
+        command's entry whose fresh report differs, the host is probed
+        again. bwrap's report never changes, so it is probed once.
+        """
+        runtime = self._sandbox_runtime
+        if runtime is None:
+            runtime = self._sandbox_runtime = launch_backend().runtime_check()
+        if self._sandbox_probe is None or self._sandbox_probe_runtime != runtime:
             self._sandbox_probe = probe_sandbox()
+            self._sandbox_probe_runtime = runtime
         return self._sandbox_probe
+
+    def _lifecycle_journal(self) -> LifecycleJournal:
+        """The run's lifecycle journal (ADR 0013 D6): none exists yet (#272).
+
+        bwrap makes no object, so it never writes one; a backend that would
+        is refused before it makes anything (:data:`NO_JOURNAL`).
+        """
+        return NO_JOURNAL
+
+    def _sandbox_entry(self) -> None:
+        """At a command's entry, before any launch: the runtime check, then
+        reconciliation, then the probe (ADR 0013 D16).
+
+        The runtime check is read afresh every time, and a refusal of it
+        leaves everything as it was, nothing reconciled; the probe's result
+        is reused for the report it was proved on. bwrap's runtime check
+        reads nothing and it has nothing to reconcile, so for it this is the
+        probe of ADR 0005 D12.2 alone.
+        """
+
+        def probe(runtime: RuntimeReport) -> ProbeResult:
+            self._sandbox_runtime = runtime
+            return self.sandbox_capability()
+
+        enter(launch_backend(), self._lifecycle_journal(), probe)
 
     def _sandbox_enforced(self) -> bool:
         """Whether a launch now is enforced; raise when the mode refuses it (D12.2).
@@ -2658,7 +2716,10 @@ class ControllerEngine:
         cannot enforce refuses the step here, and state
         stays byte-identical. Under ``disabled`` it probes nothing. An
         operator read-only path that overlaps what no launch may see is
-        refused here too, whatever the host (D15.4).
+        refused here too, whatever the host (D15.4). After that check, which
+        reads only configuration, comes the command's entry
+        (:meth:`_sandbox_entry`): the runtime check, reconciliation and the
+        probe, in ADR 0013 D16's order.
         """
         if not self.config.sandbox.enabled:
             return
@@ -2667,6 +2728,7 @@ class ControllerEngine:
             raise ConfigurationError(
                 f"{problem}. Nothing was launched, saved or charged; remove or narrow the entry."
             )
+        self._sandbox_entry()
         self._sandbox_enforced()
 
     def _operator_path_problem(self) -> str:
@@ -14995,7 +15057,11 @@ class ControllerEngine:
                     # of the launch runs inside the outer sandbox, or is
                     # refused here or at the spawn; it never runs without it.
                     req.sandbox = self._agent_sandbox(phase, cwd, overrides, read_context)
-                    result = self._launch(provider, req, limits, step_log, phase)
+                    result = self._through_lifecycle(
+                        req.sandbox is not None,
+                        phase,
+                        partial(self._launch, provider, req, limits, step_log, phase),
+                    )
             except ExecutionError as exc:
                 record.error = f"{type(exc).__name__}: {exc}"
                 record.sandbox = _refusal_facts(exc)
@@ -15315,6 +15381,42 @@ class ControllerEngine:
             except ConfigurationError:
                 pass
         return phase.value
+
+    def _through_lifecycle(
+        self, enforced: bool, phase: Phase, launch: Callable[[], AgentExecutionResult]
+    ) -> AgentExecutionResult:
+        """One agent launch through its backend's lifecycle (ADR 0013 D13); ``launch`` unenforced.
+
+        The seed, create and stage steps, then ``launch`` as the run step,
+        whose prepared launch the executor closes on every path, then the
+        release on every path, ``Ctrl-C`` included. A failure of a step up to
+        the run refuses the launch (:class:`SandboxLaunchRefusedError`) with
+        what was made removed, and it is never run without the sandbox
+        instead. For bwrap every step but the run does nothing.
+
+        Export, verify and the final clean-up after them are #269's to wire,
+        with the candidate source: a change-producing launch's volume is
+        therefore kept at the end, for reconciliation, and never removed
+        before a verify outcome is saved. bwrap exports nothing and has no
+        volume: its candidate is the worktree's ``HEAD``, imported and read
+        after the launch as before.
+        """
+        if not enforced:
+            return launch()
+        state = self._require_state()
+        issue = parse_issue_url(state.current_issue_url).number if state.current_issue_url else 0
+        launch_id = f"{phase.value}-{state.attempt}"
+        owner = LaunchOwner(run=state.run_id, issue=issue, phase=phase.value, launch=launch_id)
+        backend = launch_backend()
+        runtime = self._sandbox_runtime or backend.runtime_check()
+        change = phase in WORKTREE_STATE_PHASES
+        with LaunchLifecycle(
+            backend, self._lifecycle_journal(), owner, runtime, change_producing=change
+        ) as lifecycle:
+            lifecycle.seed()
+            lifecycle.create()
+            lifecycle.stage()
+            return lifecycle.run(launch)
 
     def _launch(
         self,

@@ -104,8 +104,8 @@ from .executor import (
     DEFAULT_MAX_OUTPUT_BYTES,
     LIMIT_IDLE,
     MAX_DEADLINE_SECONDS,
-    BwrapLaunch,
     LaunchDescription,
+    PreparedLaunch,
     SandboxFacts,
     _BoundedReader,
     _child_environment,
@@ -529,7 +529,7 @@ def start_duplex(req: DuplexRequest) -> DuplexChild:
         raise
 
 
-def _start(req: DuplexRequest, launch: BwrapLaunch | None) -> DuplexChild:
+def _start(req: DuplexRequest, launch: PreparedLaunch | None) -> DuplexChild:
     """:func:`start_duplex` once the launch is prepared; the handle owns it
     from its return, and the caller closes it on a failure."""
     started = _now()
@@ -609,7 +609,7 @@ class DuplexChild:
         proc: subprocess.Popen[bytes],
         started: str,
         contained: _Containment | None = None,
-        launch: BwrapLaunch | None = None,
+        launch: PreparedLaunch | None = None,
     ) -> None:
         self._req = req
         self._contained = contained

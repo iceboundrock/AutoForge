@@ -71,8 +71,8 @@ from .sandbox import (
     ProjectionRequest,
     SandboxFacts,
     SandboxRequest,
-    compile_launch,
 )
+from .sandbox_backend import default_backend
 
 # Where the controller-owned sandbox directories live (D8.4): under
 # ``<git common dir>/autoforge/sandbox/<key>``, the key being the worktree's
@@ -842,10 +842,12 @@ def describe_launch(
     ``env`` is the environment the launch would get without a sandbox (the
     allow-listed variables and the controller's overrides). A request the
     compiler refuses is a :class:`SandboxLaunchRefusedError` naming the path
-    and the rule, raised before anything is spawned.
+    and the rule, raised before anything is spawned. The compiler is the
+    backend's plan step (ADR 0013 D13): bwrap's is
+    :func:`~autoforge.sandbox.compile_launch`.
     """
     try:
-        description = compile_launch(sandbox_request(facts, needs))
+        description = default_backend().plan(sandbox_request(facts, needs))
     except SandboxPolicyError as exc:
         raise policy_refusal(exc, facts) from exc
     return rewrite_environment(description, env, needs)
