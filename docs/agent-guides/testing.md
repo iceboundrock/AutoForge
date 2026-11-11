@@ -1682,8 +1682,19 @@ a stated reason it has none. The coverage that must keep working:
   publisher as recorded (R1-F4), under the round cap, `--rereview` refused;
   `unblock` refuses that review, writing nothing, while the agent worktree
   holds an untracked file, a modified, staged or assume-unchanged edit, or a
-  commit past the candidate, and enters it from a clean one (R1-F1);
-  `status` names the partial fix; the parser's schema and bounds
+  commit past the candidate, and enters it from a clean one (R1-F1); the same
+  refusal, with nothing written or discarded, after a partial push dropped by
+  a retarget following a crash after the push, after a partial plan dropped
+  by a retarget before its push (the worktree at the unpublished candidate),
+  after a partial fix refused because the PR moved while the fixer ran, and
+  after a plain block whose commit the operator pushed by hand (R2-F1); a
+  partial fix that marks a finding `blocks_publication`, while a PR
+  description, an acceptance comment or operator comments are disabled or
+  not offered, publishes nothing, checks no claim, keeps the commits for the
+  relaunched fixer and stops `agent-blocked`, one such entry holding an
+  acceptance action too; a correction of an unavailable K9, K10 or K12 names
+  that answer (R2-F2); `status` names the partial fix; the parser's schema
+  and bounds, `blocks_publication` a required JSON boolean
 - operator actions (#243, ADR 0004 K10; `tests/test_operator_actions.py`
   for the engine, unblock and `status --action`, K10 in
   `tests/test_effects.py`, the marker in `tests/test_claims.py`,

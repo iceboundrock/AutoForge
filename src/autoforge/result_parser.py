@@ -65,9 +65,10 @@ a target, URL, method, path or command (#211). A FIX result whose status is
 ``blocked`` and which carries ``unresolved`` is a partial fix (#433,
 :class:`PartialFixResult`): the schema of a successful one for the findings it
 resolves, at least one of them ``fixed``, and every other open finding listed
-with the fixer's reason; any other blocked result is read for its ``message``
-alone. An UPDATE_EPIC result is validated
-against the schema of the request that launched the agent
+with the fixer's reason and a required boolean ``blocks_publication`` (PR #475
+R2-F2); any other blocked result is read for its ``message`` alone. An
+UPDATE_EPIC result is validated against the schema of the request that
+launched the agent
 (:class:`UpdateEpicRequest`, D4.7): a re-request after publication carries
 only what it asks for.
 """
@@ -1874,15 +1875,36 @@ def is_partial_fix(phase: Phase, payload: dict) -> bool:
     return phase == Phase.FIX and payload.get("status") == "blocked" and PARTIAL_FIX_KEY in payload
 
 
+# The key of an ``unresolved`` entry that says whether what the finding needs
+# must be on GitHub before the fixer's commits are (PR #475 R2-F2). Required,
+# a JSON boolean: the controller decides publication from it alone, never
+# from the entry's reason text, and an entry that leaves it out is corrected.
+BLOCKS_PUBLICATION_KEY = "blocks_publication"
+
+
 @dataclass(frozen=True)
 class UnresolvedFinding:
-    """An open finding a blocked FIX left unresolved, and the fixer's reason (#433)."""
+    """An open finding a blocked FIX left unresolved, and the fixer's reason (#433).
+
+    ``blocks_publication`` is the fixer's typed answer to whether the commits
+    may be published while this finding stays open (PR #475 R2-F2): ``True``
+    when what it needs must reach GitHub first, typically a PR description,
+    an acceptance comment or operator comments that this run does not offer
+    (disabled, unoffered or declined), so that no resolution can represent it
+    and order it before the push. One such entry makes the whole result a
+    partial fix the controller does not publish.
+    """
 
     finding_id: str
     reason: str
+    blocks_publication: bool
 
     def to_dict(self) -> dict:
-        return {"finding_id": self.finding_id, "reason": self.reason}
+        return {
+            "finding_id": self.finding_id,
+            "reason": self.reason,
+            BLOCKS_PUBLICATION_KEY: self.blocks_publication,
+        }
 
 
 @dataclass
@@ -1903,9 +1925,20 @@ class PartialFixResult(FixResult):
     R1-F2). Each claim is the agent's; the controller verifies the candidate
     and the commits before it plans their push, and records no finding as
     resolved.
+
+    A finding whose need is a publication prerequisite no resolution can
+    represent (a PR description update this run does not offer, say) is an
+    ``unresolved`` entry with ``blocks_publication`` true (PR #475 R2-F2):
+    then the result is :attr:`held`, and the controller publishes nothing of
+    it, checks none of its claims and leaves the commits in the worktree.
     """
 
     unresolved: list[UnresolvedFinding] = field(default_factory=list)
+
+    @property
+    def held(self) -> tuple[str, ...]:
+        """The unresolved findings that must be met before any publication (PR #475 R2-F2)."""
+        return tuple(u.finding_id for u in self.unresolved if u.blocks_publication)
 
     @classmethod
     def from_payload(cls, p: dict) -> PartialFixResult:
@@ -1927,7 +1960,8 @@ class PartialFixResult(FixResult):
         if not isinstance(unresolved_raw, list) or not unresolved_raw:
             raise ControlResultValidationError(
                 f"{ph}: field {PARTIAL_FIX_KEY!r} must be a non-empty list of "
-                "{finding_id, reason} objects; report status 'success' when no finding is left"
+                f"{{finding_id, reason, {BLOCKS_PUBLICATION_KEY}}} objects; report status "
+                "'success' when no finding is left"
             )
         raw = base.resolutions
         if len(raw) + len(unresolved_raw) > MAX_RESOLUTIONS_PER_FIX:
@@ -1952,19 +1986,23 @@ class PartialFixResult(FixResult):
         )
 
 
+_UNRESOLVED_KEYS = ("finding_id", "reason", BLOCKS_PUBLICATION_KEY)
+
+
 def _unresolved(raw: object, index: int) -> UnresolvedFinding:
-    """One ``unresolved`` entry of a partial FIX result: exactly a finding id and a reason."""
+    """One ``unresolved`` entry of a partial FIX result: a finding id, a reason, and
+    whether it blocks publication (PR #475 R2-F2), exactly."""
     ph = "FIX"
     where = f"{PARTIAL_FIX_KEY}[{index}]"
     if not isinstance(raw, dict):
         raise ControlResultValidationError(
-            f"{ph}: {where} must be an object with finding_id and reason"
+            f"{ph}: {where} must be an object with finding_id, reason and {BLOCKS_PUBLICATION_KEY}"
         )
-    extra = sorted(str(k)[:MAX_FINDING_ID_CHARS] for k in raw if k not in ("finding_id", "reason"))
+    extra = sorted(str(k)[:MAX_FINDING_ID_CHARS] for k in raw if k not in _UNRESOLVED_KEYS)
     if extra:
         raise ControlResultValidationError(
             f"{ph}: {where} carries {', '.join(repr(k) for k in extra)}; an unresolved "
-            "finding is exactly {finding_id, reason}"
+            f"finding is exactly {{finding_id, reason, {BLOCKS_PUBLICATION_KEY}}}"
         )
     fid = _finding_id(raw, "finding_id", ph)
     subject = f"unresolved finding {fid}"
@@ -1974,7 +2012,17 @@ def _unresolved(raw: object, index: int) -> UnresolvedFinding:
         subject,
         "reason",
     )
-    return UnresolvedFinding(finding_id=fid, reason=reason)
+    blocks = raw.get(BLOCKS_PUBLICATION_KEY)
+    if not isinstance(blocks, bool):
+        # A JSON boolean, never inferred: an absent, null or string value is
+        # not an answer, and the reason text is never read for one.
+        raise ControlResultValidationError(
+            f"{ph}: {where} ({fid}) field {BLOCKS_PUBLICATION_KEY!r} must be true or false: "
+            "true when something this finding needs must be on GitHub before your commits "
+            "are (the controller then publishes nothing of this result), false when your "
+            "commits can be pushed and reviewed while it stays open. Re-emit the CONTROL_RESULT."
+        )
+    return UnresolvedFinding(finding_id=fid, reason=reason, blocks_publication=blocks)
 
 
 @dataclass

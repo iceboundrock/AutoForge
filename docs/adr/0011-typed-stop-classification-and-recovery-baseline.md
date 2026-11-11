@@ -37,7 +37,8 @@
   (`acceptance-action` for an acceptance action or a description awaiting
   approval, as for any FIX plan). Where the partial fix is not published (its
   candidate fails validation, or the PR moved while the fixer ran or before
-  the push to a commit other than exactly the candidate), the stop is
+  the push to a commit other than exactly the candidate, or the fixer marked
+  a finding it left `blocks_publication`, PR #475 R2-F2), the stop is
   `agent-blocked`, the fixer's message quoted, as for a plain block.
 - **Amends:** nothing. Every phase, edge, exit rule, budget, retry, effect
   and the state file are unchanged; seven `BLOCKED` reasons that told the

@@ -486,6 +486,7 @@ from .replan_txn import (
 )
 from .result_parser import (
     AGENT_MARKER_OPEN_RE,
+    BLOCKS_PUBLICATION_KEY,
     MAX_ACCEPTANCE_BODY_CHARS,
     MAX_CONTROL_RESULT_CHARS,
     MAX_FINDING_ID_CHARS,
@@ -652,7 +653,9 @@ ACCEPTANCE_ACTIONS_UNAVAILABLE = (
     "The `acceptance_action` resolution is not available in this run "
     "(`safety.acceptance_actions: off`): the controller refuses it. When a finding "
     "can only be resolved by publishing text on the issue, report "
-    '`"status": "blocked"` with a `"message"` saying so.'
+    '`"status": "blocked"` with a `"message"` saying so; if you committed fixes for '
+    'other findings, list it under `unresolved` with `"blocks_publication": true` '
+    '(see "When a finding needs a human").'
 )
 # The FIX prompt's description of the ``operator_acceptance`` resolution
 # (#243), rendered into ``{{OPERATOR_ACTIONS}}`` when the FIX entry recorded
@@ -661,7 +664,9 @@ OPERATOR_ACTIONS_TEMPLATE = "operator_acceptance.md"
 OPERATOR_ACTIONS_UNAVAILABLE = (
     "The `operator_acceptance` resolution is not available in this FIX entry ({why}): the "
     "controller refuses it. When a finding can only be resolved by text on another issue, "
-    'report `"status": "blocked"` with a `"message"` saying so.'
+    'report `"status": "blocked"` with a `"message"` saying so; if you committed fixes for '
+    'other findings, list it under `unresolved` with `"blocks_publication": true` '
+    '(see "When a finding needs a human").'
 )
 # The FIX prompt's description of the ``pr_body_update`` resolution (#423),
 # rendered into ``{{PR_BODY_UPDATE}}`` when the FIX entry recorded the body it
@@ -670,7 +675,9 @@ PR_BODY_UPDATE_TEMPLATE = "pr_body_update.md"
 PR_BODY_UPDATE_UNAVAILABLE = (
     "The `pr_body_update` resolution is not available in this FIX entry ({why}): the controller "
     "refuses it. When a finding can only be resolved by changing the PR description, report "
-    '`"status": "blocked"` with a `"message"` saying so.'
+    '`"status": "blocked"` with a `"message"` saying so; if you committed fixes for other '
+    'findings, list it under `unresolved` with `"blocks_publication": true` (see "When a '
+    'finding needs a human").'
 )
 PR_BODY_VIEW_NOT_WRITTEN = "no read context was written for this launch"
 
@@ -5645,6 +5652,17 @@ class ControllerEngine:
         # Agent text, persisted with the plan and quoted by the stop: the same
         # redaction boundary and bound as an agent's block message.
         message = bound_block_reason(redact(str(payload.get("message", ""))))
+        if res.held:
+            # PR #475 R2-F2: a need that must reach GitHub before the commits
+            # and that no resolution of this run can represent, so no plan
+            # could order it before the push. Nothing is planned or sent.
+            self._fix_candidate, self._fix_block = "", ""
+            return self._block(
+                Phase.FIX,
+                plan,
+                self._partial_fix_held_text(res, message),
+                code=StopReasonCode.AGENT_BLOCKED,
+            )
         try:
             nxt, text = self._apply_fix(res, message)
         except VerificationError as exc:
@@ -5654,6 +5672,37 @@ class ControllerEngine:
         if nxt != Phase.BLOCKED:
             raise StateError(f"a partial FIX was applied and left FIX for {nxt.value}")
         return self._block(Phase.FIX, plan, text)
+
+    def _partial_fix_held_text(self, res: PartialFixResult, message: str) -> str:
+        """The stop of a partial fix whose ``unresolved`` blocks publication (PR #475 R2-F2).
+
+        The fixer said, in the typed ``blocks_publication`` field and never
+        through its reason text, that what those findings need must be on
+        GitHub before its commits are: a PR description, an acceptance
+        comment or operator comments this run does not offer, say, which no
+        resolution can carry and so no FIX plan can order before the push.
+        Whether the run offers the kind is not what decides: the controller
+        cannot see which need a finding has, only the fixer's answer. So
+        nothing is published, none of the claims is checked or recorded, and
+        the commits stay in the agent worktree, where the next fixer
+        continues from them. The PR is still at the reviewed HEAD with the
+        round's findings open, so 'unblock' relaunches the fixer.
+        """
+        state = self._require_state()
+        held = res.held
+        reasons = "; ".join(f"{u.finding_id}: {u.reason}" for u in res.unresolved)
+        unblock = self.cli_command("unblock", "--reason", "<what you did>")
+        return (
+            f"{self._partial_fix_prefix(message)}; it marks {', '.join(held)} "
+            f"'{BLOCKS_PUBLICATION_KEY}' (what {'it needs' if len(held) == 1 else 'they need'} "
+            "must be on GitHub before the fixer's commits are), so the controller publishes "
+            "nothing of it: none of its claims was checked or recorded, nothing was pushed, "
+            "created or appended, and the fixer's commits stay in the agent worktree "
+            f"{self.agent_worktree_description()}, untouched. The round's "
+            f"{len(state.open_findings)} finding(s) stay open (the fixer's reasons: {reasons}). "
+            f"Next: meet what the fixer asks for, then '{unblock}': FIX launches the fixer again "
+            "at the reviewed HEAD, which continues from those commits and reports afresh"
+        )
 
     def _partial_fix_prefix(self, message: str) -> str:
         return (
@@ -7498,10 +7547,12 @@ class ControllerEngine:
                 # it (FixResult.from_payload), so it is checked once below.
                 continue
             if r.acceptance_action:
-                new_chars += self._check_acceptance_action(r)
+                with self._held_hint(partial):
+                    new_chars += self._check_acceptance_action(r)
                 continue
             if r.operator_acceptance:
-                new_chars += self._check_operator_acceptance(r)
+                with self._held_hint(partial):
+                    new_chars += self._check_operator_acceptance(r)
                 continue
             if r.resolution != "follow_up_created":
                 continue
@@ -7522,7 +7573,8 @@ class ControllerEngine:
                     "of those, or ask for a new issue with 'follow_up_issue'"
                 )
         if res.pr_body_text:
-            new_chars += self._check_pr_body_update(res)
+            with self._held_hint(partial):
+                new_chars += self._check_pr_body_update(res)
         if new_chars + FixContext.STORED_BOUND > MAX_EFFECT_STATE_CHARS:
             raise ControlResultValidationError(
                 f"FIX: the new follow-up issues and the acceptance or operator comments hold "
@@ -7531,6 +7583,30 @@ class ControllerEngine:
             )
         self._fix_candidate = self._check_fix_candidate(cwd, res.head_sha, res.resolutions)
         return res
+
+    @staticmethod
+    @contextmanager
+    def _held_hint(partial: bool) -> Iterator[None]:
+        """A partial fix's correction of its K9, K10 or K12 also names the held result.
+
+        A K9, K10 or K12 resolution this run cannot carry (the setting is off,
+        the entry offers none, the operator declined it) is corrected with a
+        successful FIX's way out, a plain block. A partial fix has another,
+        which keeps the push from going out ahead of that need: the finding
+        in ``unresolved`` with ``blocks_publication`` true, so nothing of the
+        result is published (PR #475 R2-F2).
+        """
+        try:
+            yield
+        except ControlResultValidationError as exc:
+            if not partial:
+                raise
+            raise ControlResultValidationError(
+                f"{exc}. In this partial fix, if what that finding needs cannot be a resolution "
+                f"here and must be on GitHub before your commits are, list it in 'unresolved' "
+                f"with '{BLOCKS_PUBLICATION_KEY}': true instead: the controller then publishes "
+                "nothing of this result and your commits stay in the worktree"
+            ) from exc
 
     def _check_fix_candidate(
         self, cwd: str, head_sha: str, resolutions: Sequence[FindingResolution]
@@ -7616,8 +7692,16 @@ class ControllerEngine:
         so a refusal is corrected before anything is planned or sent. Since at
         least one resolution is ``fixed``, its candidate is a descendant of the
         reviewed HEAD, never the reviewed HEAD itself.
+
+        A held result (an ``unresolved`` entry with ``blocks_publication``
+        true, PR #475 R2-F2) publishes nothing, so nothing of it is checked
+        here: no correction is asked for claims the controller will not act
+        on, and :meth:`_partial_fix_step` stops with the commits left where
+        they are.
         """
         res = PartialFixResult.from_payload(payload)
+        if res.held:
+            return res
         self._check_fix_claims(res, cwd)
         return res
 
@@ -9344,11 +9428,14 @@ class ControllerEngine:
             )
         else:
             why = f"its last review is {state.last_review_result or 'unrecorded'!r}"
-        if partial:
-            # PR #475 R1-F1: the partial fix was published from the worktree
-            # the reviewer is about to work in, which may still hold the
-            # fixer's uncommitted work for the findings it left.
-            problem = self._partial_fix_worktree_problem(pr)
+        if review_is_this_pr and reviewed and (state.open_findings or state.prior_findings):
+            # PR #475 R1-F1, R2-F1: the round's findings are open or carried,
+            # so a FIX of the round may have left work in the worktree the
+            # reviewer is about to work in (a partial fix's uncommitted edits
+            # for the findings it left, a fixer's unpublished commits),
+            # whichever stop then left the run BLOCKED: a partial plan dropped
+            # by drift no longer has a `partial_fix`.
+            problem = self._unblock_review_worktree_problem(pr, reviewed)
             if problem:
                 return UnblockDecision(
                     None,
@@ -9501,36 +9588,50 @@ class ControllerEngine:
             unreadable_remedy="Fix the cause, then unblock again, or unblock without --rereview",
         )
 
-    def _partial_fix_worktree_problem(self, pr: PRInfo) -> str:
-        """Why the agent worktree refuses the REVIEW after a partial fix, or "" (PR #475 R1-F1).
+    def _unblock_review_worktree_problem(self, pr: PRInfo, reviewed: str) -> str:
+        """Why the agent worktree refuses the REVIEW a plain unblock enters, or "" (PR #475).
 
-        A partial fix publishes the fixer's commits from the worktree the next
-        round's reviewer works in, and the fixer may have left uncommitted
-        edits or untracked files there for the findings it did not resolve:
-        what that reviewer would read and test in place of the revision under
-        review, whose findings it could clear for code the PR does not hold.
-        So the REVIEW a plain 'unblock' enters after one is held to the checks
-        of ``unblock --rereview`` (:meth:`_review_worktree_problem`): the
-        worktree's HEAD, read as a candidate is, is the candidate the partial
-        fix published (or the PR's head, when the operator has checked that
-        out there), and it holds nothing that revision does not, by its own
-        index, a fresh index and the bytes of every file. Nothing is
-        discarded, moved or written: the operator moves the work out.
+        A review of this PR is bound and its findings are open or carried, so
+        a FIX of its round may have run in the worktree the next round's
+        reviewer works in and left work there that the PR does not hold: a
+        partial fix's uncommitted edits for the findings it did not resolve
+        (R1-F1), or commits and edits of a fixer whose result was never
+        published. What that reviewer would read and test there in place of
+        the revision under review, whose findings it could clear for code the
+        PR does not hold. Which stop left the run ``BLOCKED`` is not knowable
+        from state, and no field that a later step clears may decide it: a
+        partial plan dropped by drift, before or after its push, clears
+        ``partial_fix`` with the plan and carries the findings (R2-F1), a
+        partial fix refused before planning never sets it, and a plain block
+        leaves the fixer's work as it found it. So every REVIEW a plain
+        'unblock' enters while the round's findings are open or carried is
+        held to the checks of ``unblock --rereview``
+        (:meth:`_review_worktree_problem`), whatever stopped the run (after a
+        clean review no FIX ran, and those routes are not checked): the
+        worktree's HEAD, read as a candidate is, is the PR's head (the
+        revision that REVIEW binds), the reviewed HEAD (no commit since), or
+        the candidate of the partial fix recorded for the round, and it holds
+        nothing that revision does not, by its own index, a fresh index and
+        the bytes of every file. Nothing is discarded, moved or written: the
+        operator moves the work out.
         """
         state = self._require_state()
-        candidate = str(state.partial_fix["candidate_sha"]).lower()
-        allowed = {candidate: "the partial fix's candidate"}
         head = (pr.head_sha or "").lower()
-        if head and head != candidate:
-            allowed[head] = "the PR's HEAD"
-        move = "move that work out of the worktree yourself, then unblock again"
+        allowed: dict[str, str] = {}
+        if state.partial_fix:
+            allowed[str(state.partial_fix["candidate_sha"]).lower()] = "the partial fix's candidate"
+        if head:
+            allowed.setdefault(head, "the PR's HEAD")
+        allowed.setdefault(reviewed.lower(), "the reviewed HEAD")
+        at = head or reviewed.lower()
         return self._review_worktree_problem(
             allowed,
             "the commit under review",
             left_behind=(
                 "; the next round's reviewer works in that worktree, so it may hold work the "
-                f"revision under review does not. The controller neither discards nor moves it: "
-                f"{move}, with the worktree detached at {candidate[:12]}"
+                "revision under review does not. The controller neither discards nor moves it: "
+                "move that work out of the worktree yourself, then unblock again, with the "
+                f"worktree detached at {at[:12]}"
             ),
             changes_remedy=lambda _prompt: (
                 "No fixer is launched before that review to continue from them: move them out "

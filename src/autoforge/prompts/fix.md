@@ -272,12 +272,12 @@ Emit exactly one block at the end of your final reply:
 
 Some findings only a human can resolve, in a way none of the resolutions above
 expresses: a secret or a repository setting, access you do not have, a
-decision the issue leaves open. Resolve every finding you can first, each
-with the resolution it needs. When one remains that you cannot resolve,
-report `"status": "blocked"` with a `"message"` saying what a human must do.
-If you committed fixes for other findings, list your resolutions too, so that
-the controller publishes them now instead of leaving your commits unpushed in
-this worktree:
+decision the issue leaves open, or a resolution above that this run does not
+offer. Resolve every finding you can first, each with the resolution it needs.
+When one remains that you cannot resolve, report `"status": "blocked"` with a
+`"message"` saying what a human must do. If you committed fixes for other
+findings, list your resolutions too, so that the controller can publish them
+instead of leaving your commits unpushed in this worktree:
 
 ```text
 <<<CONTROL_RESULT>>>
@@ -291,7 +291,8 @@ this worktree:
     {"finding_id": "R{{REVIEW_ROUND}}-F1", "resolution": "fixed", "commit_sha": "<sha>"}
   ],
   "unresolved": [
-    {"finding_id": "R{{REVIEW_ROUND}}-F2", "reason": "<what this finding needs that you cannot do>"}
+    {"finding_id": "R{{REVIEW_ROUND}}-F2", "reason": "<what this finding needs that you cannot do>",
+     "blocks_publication": false}
   ],
   "tests": ["<each test or check command you ran, with its outcome>"]
 }
@@ -311,7 +312,25 @@ this worktree:
   the operator's approval or posting as the sections above say.
 - Every other finding listed above is in `unresolved`, once, with a `reason`
   of at most {{MAX_FIX_RATIONALE_CHARS}} characters (newlines and tabs
-  allowed).
+  allowed) and `blocks_publication`, a JSON `true` or `false` that is always
+  present:
+  - `true` when something the finding needs must be on GitHub before your
+    commits are. It is always `true` for text the finding needs on the issue,
+    on another issue or in the PR description that you cannot list under
+    `resolutions` because this run does not offer that resolution (its
+    section above says so) or the operator declined it: the controller
+    publishes such text before any commit, and here it cannot. It is also
+    `true` when your commits would mislead a reviewer without the finding
+    resolved. One `true` entry makes the result a partial fix the controller
+    does not publish: it checks none of your claims, pushes, creates and
+    appends nothing, and leaves your commits in this worktree, where the
+    next fixer launch continues from them once a human has met the need.
+  - `false` only when your commits can be pushed and reviewed while the
+    finding stays open: a secret or a repository setting only an operator
+    can set, say, or a decision that does not change what your commits do.
+
+  The controller decides from `blocks_publication` alone and never reads
+  your `reason` to decide whether it may publish.
 - The cross-checks and commit-message rules above apply as they do to a
   successful result, and a result that breaks one is refused and you are
   asked to correct it. Once what your resolutions need is published and your

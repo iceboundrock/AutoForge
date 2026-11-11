@@ -788,7 +788,22 @@ anything the pushed commit does not: an untracked file, a modified or
 staged file, an edit an assume-unchanged or skip-worktree mark hides, or a
 later commit. The message names what it found. AutoForge never discards it:
 move it out of the worktree yourself (commit it elsewhere, or copy it and
-remove it), then unblock again.
+remove it), then unblock again. The same check applies to every `unblock`
+that enters `REVIEW` while a review's findings are open or carried, whatever
+stopped the run: a fixer's commit the PR does not hold counts too, so after
+pushing a merge of the fixer's commit by hand, detach the worktree at the
+PR's head (`git -C <worktree> checkout --detach <head>`) before you unblock.
+
+For each finding it left, the fixer also says whether what that finding
+needs must be on GitHub before its commits are. That is always so when the
+finding needs a PR description, a comment on the issue or comments on other
+issues that this run cannot carry: the setting is `off`, the fix offered
+none, or you declined it. Then AutoForge publishes nothing of the result
+and pushes nothing, the commits stay in the agent worktree, and the run
+stops `agent-blocked` with the fixer's message and reasons. Do what it asks
+(edit the description yourself, say), then `autoforge unblock --reason
+"..."`: the fixer is launched again, continues from its commits and reports
+afresh.
 
 If the fixer's commits cannot be published, nothing is pushed, they stay
 in the agent worktree, and the run stops `agent-blocked` with the fixer's

@@ -22,7 +22,7 @@ import pytest
 from autoforge import effects as effects_module
 from autoforge import state as state_module
 from autoforge.effects import EffectKind, Stage
-from autoforge.errors import ControlResultValidationError, StateError
+from autoforge.errors import ControlResultValidationError, GitHubError, StateError
 from autoforge.git_transport import GitTransport
 from autoforge.result_parser import (
     MAX_FIX_RATIONALE_CHARS,
@@ -62,7 +62,17 @@ REASON = "The deploy job reads DEPLOY_TOKEN; setting a repository secret needs a
 FINDINGS = [_finding(1, 1), _finding(1, 2), _finding(1, 3)]
 
 
-def unresolved(finding_id: str, reason: str = REASON) -> dict:
+def unresolved(finding_id: str, reason: str = REASON, *, blocks: bool = False) -> dict:
+    """An ``unresolved`` entry of a partial FIX result, as the fixer reports it."""
+    return {"finding_id": finding_id, "reason": reason, "blocks_publication": blocks}
+
+
+def stored(finding_id: str, reason: str = REASON) -> dict:
+    """An unresolved finding as the controller saves it with a plan or a partial fix.
+
+    Only a result that blocks no publication is planned (PR #475 R2-F2), so
+    the answer is not saved.
+    """
     return {"finding_id": finding_id, "reason": reason}
 
 
@@ -156,6 +166,18 @@ def test_the_unresolved_list_and_nothing_else_makes_a_blocked_fix_partial():
     res = PartialFixResult.from_payload(payload)
     assert [r.finding_id for r in res.resolutions] == ["R1-F1"]
     assert [u.to_dict() for u in res.unresolved] == [unresolved("R1-F2")]
+    assert res.held == ()
+
+
+def test_whether_a_partial_fix_blocks_publication_is_its_typed_field_alone():
+    """PR #475 R2-F2: the fixer answers per unresolved finding, as a JSON
+    boolean; the same reason text with either answer is the same reason, and
+    one blocking entry holds the whole result."""
+    for blocks in (False, True):
+        left = [unresolved("R1-F2", blocks=blocks), unresolved("R1-F3")]
+        res = PartialFixResult.from_payload(_parsed(partial_payload(A, B, [fixed("R1-F1")], left)))
+        assert res.held == (("R1-F2",) if blocks else ())
+        assert [u.reason for u in res.unresolved] == [REASON, REASON]
 
 
 @pytest.mark.parametrize(
@@ -189,6 +211,22 @@ def test_the_unresolved_list_and_nothing_else_makes_a_blocked_fix_partial():
         ({"unresolved": [{"finding_id": "R1-F2", "reason": "   "}]}, "'reason'"),
         ({"unresolved": [{**unresolved("R1-F2"), "url": "x"}]}, "carries 'url'"),
         ({"unresolved": [unresolved("bogus")]}, "invalid finding_id"),
+        (
+            {"unresolved": [{"finding_id": "R1-F2", "reason": REASON}]},
+            "field 'blocks_publication' must be true or false",
+        ),
+        (
+            {"unresolved": [{**unresolved("R1-F2"), "blocks_publication": "true"}]},
+            "field 'blocks_publication' must be true or false",
+        ),
+        (
+            {"unresolved": [{**unresolved("R1-F2"), "blocks_publication": None}]},
+            "field 'blocks_publication' must be true or false",
+        ),
+        (
+            {"unresolved": [{**unresolved("R1-F2"), "blocks_publication": 1}]},
+            "field 'blocks_publication' must be true or false",
+        ),
         (
             {"unresolved": [unresolved("R1-F2", "r" * (MAX_FIX_RATIONALE_CHARS + 1))]},
             f"accepts at most {MAX_FIX_RATIONALE_CHARS}",
@@ -263,7 +301,7 @@ def test_two_fixed_one_human_blocked_pushes_the_candidate_and_stays_blocked(
         "candidate_sha": candidate,
         "published_by": "controller",
         "resolved": ["R1-F1", "R1-F2"],
-        "unresolved": [unresolved("R1-F3")],
+        "unresolved": [stored("R1-F3")],
     }
     assert s.effect_records == [] and s.completion_context == {} and s.entry_observation == {}
     reason = s.block_reason
@@ -291,7 +329,7 @@ def test_a_partial_fix_is_journaled_before_the_push(tmp_state_dir):
     assert push["precondition"]["expected_old"] == reviewed
     context = raw["completion_context"]
     assert [r["finding_id"] for r in context["resolutions"]] == ["R1-F1", "R1-F2"]
-    assert context["unresolved"] == [unresolved("R1-F3")]
+    assert context["unresolved"] == [stored("R1-F3")]
     assert context["message"] == MESSAGE
     assert eng.origin.head(BRANCH) == reviewed, "nothing pushed yet"
 
@@ -512,8 +550,25 @@ def test_a_pr_moved_while_the_fixer_ran_blocks_with_nothing_pushed(tmp_state_dir
     assert "while the fixer ran (a push the controller did not make" in s.block_reason
     assert MESSAGE in s.block_reason and "Nothing was pushed" in s.block_reason
     assert s.open_findings == FINDINGS and s.partial_fix == {} and s.effect_records == []
+    # PR #475 R2-F1: no partial fix is recorded, but the worktree the next
+    # reviewer works in still holds the fixer's commit, which the PR does not.
+    worktree = eng.agent_worktree_path()
+    candidate = _worktree_head(eng.provider.calls[0])
+    raw = eng.paths.state_file.read_text()
+    refused = eng.unblock("the operator set the secret")
+    assert not refused.unblocked, refused.message
+    assert (
+        f"the agent worktree {worktree} is at {candidate[:12]}, not at the PR's HEAD "
+        f"{human[0][:12]} or the reviewed HEAD"
+    ) in refused.message
+    assert "so it may hold commits the PR does not" in refused.message
+    assert eng.paths.state_file.read_text() == raw
+    assert git_out("-C", str(worktree), "rev-parse", "HEAD") == candidate
+    # The operator keeps the fixer's commit elsewhere and detaches the
+    # worktree at the PR's head: the same unblock enters REVIEW.
+    git_out("-C", str(worktree), "checkout", "-q", "--detach", human[0])
     applied = eng.unblock("the operator set the secret")
-    assert applied.unblocked and applied.phase == "REVIEW"
+    assert applied.unblocked and applied.phase == "REVIEW", applied.message
     s = load_state(eng.paths.state_file)
     assert s.prior_findings == FINDINGS and s.open_findings == []
 
@@ -621,7 +676,7 @@ def _held_before_the_push(eng, kinds: list[str], pushes: list[str], reviewed: st
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.BLOCKED and s.partial_fix == {}
     assert [r["kind"] for r in s.effect_records] == [*kinds, "push"]
-    assert s.completion_context["unresolved"] == [unresolved("R1-F3")]
+    assert s.completion_context["unresolved"] == [stored("R1-F3")]
     assert pushes == [] and eng.origin.head(BRANCH) == reviewed
     assert s.open_findings == FINDINGS
     assert "This plan is the partial fix of review round 1" in s.block_reason
@@ -784,14 +839,173 @@ def test_a_partial_fix_with_an_acceptance_action_is_corrected_while_the_setting_
     cfg = default_config()
     cfg.safety = replace(cfg.safety, acceptance_actions="off")
     first = partial_fixer([fixed("R1-F1"), acceptance("R1-F2")])
-    eng = in_fix(tmp_state_dir, gh, scripted(first, plain_blocked), cfg=cfg)
+    # PR #475 R2-F2: corrected, the fixer holds the result instead.
+    held = partial_fixer([fixed("R1-F1")], [unresolved("R1-F2", blocks=True), unresolved("R1-F3")])
+    eng = in_fix(tmp_state_dir, gh, scripted(first, held), cfg=cfg)
     out = eng.step()
     assert out.next_phase == "BLOCKED"
-    assert "which this run does not offer (safety.acceptance_actions: off)" in (
-        eng.provider.calls[1].prompt
-    )
+    assert out.stop is not None and out.stop.code is StopReasonCode.AGENT_BLOCKED
+    correction = eng.provider.calls[1].prompt
+    assert "which this run does not offer (safety.acceptance_actions: off)" in correction
+    assert (
+        "In this partial fix, if what that finding needs cannot be a resolution here and must "
+        "be on GitHub before your commits are, list it in 'unresolved' with "
+        "'blocks_publication': true instead"
+    ) in " ".join(correction.split())
     assert pushes == [] and gh.effect_writes == []
-    assert load_state(eng.paths.state_file).effect_records == []
+    s = load_state(eng.paths.state_file)
+    assert s.effect_records == [] and s.partial_fix == {} and s.open_findings == FINDINGS
+    assert "it marks R1-F2 'blocks_publication'" in s.block_reason
+
+
+# -- a prerequisite no resolution can carry holds the whole result (PR #475 R2-F2) ---------
+
+PREREQUISITE = "R1-F3 needs {what}, which must be on GitHub before these commits are reviewed."
+HELD_HINT = 'list it under `unresolved` with `"blocks_publication": true`'
+
+
+def _safety(**changes):
+    from autoforge.config import default_config
+
+    cfg = default_config()
+    cfg.safety = replace(cfg.safety, **changes)
+    return cfg
+
+
+def _unreadable_issue(gh) -> None:
+    gh.get_issue_errors[ISSUE] = GitHubError("HTTP 403: Resource not accessible by integration")
+
+
+@pytest.mark.parametrize(
+    ("safety", "setup", "what", "unavailable"),
+    [
+        (
+            {"pr_body_updates": "off"},
+            None,
+            "a PR description update",
+            "The `pr_body_update` resolution is not available in this FIX entry "
+            "(`safety.pr_body_updates: off`)",
+        ),
+        (
+            {},
+            None,
+            "a PR description update",
+            "The `pr_body_update` resolution is not available in this FIX entry (when FIX was "
+            "entered the PR's body did not hold exactly the controller's closing block",
+        ),
+        (
+            {"acceptance_actions": "off"},
+            None,
+            "a comment on the issue",
+            "The `acceptance_action` resolution is not available in this run "
+            "(`safety.acceptance_actions: off`)",
+        ),
+        (
+            {"acceptance_actions": "off"},
+            None,
+            "comments on other issues",
+            "The `operator_acceptance` resolution is not available in this FIX entry "
+            "(`safety.acceptance_actions: off`)",
+        ),
+        (
+            {},
+            _unreadable_issue,
+            "comments on other issues",
+            "The `operator_acceptance` resolution is not available in this FIX entry (the "
+            "controller could not read the run's issue when FIX was entered)",
+        ),
+    ],
+    ids=["K12-disabled", "K12-unoffered", "K9-disabled", "K10-disabled", "K10-unoffered"],
+)
+def test_an_unavailable_publication_prerequisite_publishes_nothing(
+    tmp_state_dir, monkeypatch, safety, setup, what, unavailable
+):
+    """The fixer fixed R1-F1 and R1-F2, and R1-F3 needs text that must be on
+    GitHub before its commits, which this run cannot carry as a resolution, so
+    no plan could order it before the push. The prompt tells the fixer to say
+    so in the typed field, and it does: nothing is pushed, created or
+    appended, no claim is recorded, the commits stay in the worktree and the
+    run waits BLOCKED with every finding open. The unblock relaunches the
+    fixer, which finds its commits where it left them."""
+    gh = FakeGitHub()
+    pushes = count_pushes(monkeypatch)
+    relaunched: list[str] = []
+
+    def continues(req) -> str:
+        relaunched.append(_worktree_head(req))
+        return plain_blocked(req)
+
+    left = [unresolved("R1-F3", PREREQUISITE.format(what=what), blocks=True)]
+    cfg = _safety(**safety) if safety else None
+    if setup is not None:
+        setup(gh)
+    eng = in_fix(tmp_state_dir, gh, scripted(partial_fixer(left=left), continues), cfg=cfg)
+    reviewed = eng.state.reviewed_head_sha
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.AGENT_BLOCKED
+    (first,) = eng.provider.calls
+    assert unavailable in first.prompt and HELD_HINT in first.prompt
+    flat = " ".join(first.prompt.split())
+    assert "It is always `true` for text the finding needs on the issue" in flat
+    candidate = _worktree_head(first)
+    assert candidate != reviewed
+    assert pushes == [] and gh.effect_writes == [] and eng.origin.head(BRANCH) == reviewed
+    s = load_state(eng.paths.state_file)
+    assert s.effect_records == [] and s.completion_context == {} and s.partial_fix == {}
+    assert s.last_fix_resolutions == [] and s.open_findings == FINDINGS
+    assert "it marks R1-F3 'blocks_publication'" in s.block_reason
+    assert "the controller publishes nothing of it" in s.block_reason
+    assert "none of its claims was checked or recorded" in s.block_reason
+    assert MESSAGE in s.block_reason and PREREQUISITE.format(what=what) in s.block_reason
+    worktree = eng.agent_worktree_path()
+    assert git_out("-C", str(worktree), "rev-parse", "HEAD") == candidate
+    applied = eng.unblock("the operator met the need")
+    assert applied.unblocked and applied.phase == "FIX", applied.message
+    assert eng.step().next_phase == "BLOCKED"
+    assert relaunched == [candidate], "the next fixer starts from the kept commits"
+    assert pushes == [] and eng.origin.head(BRANCH) == reviewed
+
+
+def test_one_blocking_entry_holds_a_result_whose_other_needs_are_independent(
+    tmp_state_dir, monkeypatch
+):
+    """A partial fix with an operator write (K9) that would hold the push, and an
+    unresolved need marked blocking: nothing is planned, not even the
+    acceptance comment, and nothing is published."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE, "Ship the feature")
+    pushes = count_pushes(monkeypatch)
+    resolutions = [fixed("R1-F1"), acceptance("R1-F2")]
+    left = [unresolved("R1-F3", blocks=True)]
+    eng = in_fix(tmp_state_dir, gh, partial_fixer(resolutions, left))
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.AGENT_BLOCKED
+    assert pushes == [] and gh.effect_writes == [] and gh.comments.get(ISSUE, []) == []
+    s = load_state(eng.paths.state_file)
+    assert s.effect_records == [] and s.acceptance_outcomes == []
+
+
+def test_a_held_partial_fix_is_not_corrected_for_claims_it_never_publishes(
+    tmp_state_dir, monkeypatch
+):
+    """Nothing of a held result is acted on, so its claims are not checked: a
+    head_sha the worktree does not hold asks for no correction."""
+
+    def wrong_head(req) -> str:
+        reviewed = reviewed_head_in(req.prompt)
+        fix_commit(req, "Fix R1-F1 and R1-F2 (#2)")
+        left = [unresolved("R1-F3", blocks=True)]
+        return block(partial_payload(reviewed, "c" * 40, [fixed("R1-F1"), fixed("R1-F2")], left))
+
+    gh = FakeGitHub()
+    pushes = count_pushes(monkeypatch)
+    eng = in_fix(tmp_state_dir, gh, wrong_head)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert len(eng.provider.calls) == 1
+    assert pushes == []
 
 
 # -- the exact candidate pushed while the fixer ran (PR #475 R1-F3) -------------------------
@@ -1071,8 +1285,8 @@ def test_unblock_after_a_partial_fix_refuses_a_worktree_moved_off_the_candidate(
     out = eng.unblock("the operator set the secret")
     assert not out.unblocked
     assert (
-        f"is at {later[:12]}, not at the partial fix's candidate {candidate[:12]}, so it may "
-        "hold commits the PR does not"
+        f"is at {later[:12]}, not at the partial fix's candidate {candidate[:12]} or the "
+        f"reviewed HEAD {eng.state.reviewed_head_sha[:12]}, so it may hold commits the PR does not"
     ) in out.message
     assert git_out("-C", str(worktree), "rev-parse", "HEAD") == later
 
@@ -1086,6 +1300,139 @@ def test_unblock_after_a_partial_fix_enters_review_from_a_clean_published_worktr
     assert eng.step().next_phase == "BLOCKED"
     out = eng.unblock("the operator set the secret")
     assert out.unblocked and out.phase == "REVIEW", out.message
+
+
+# -- the check survives drift, recovery and a plain block (PR #475 R2-F1) ------------------
+
+LEFT_BEHIND = [
+    (_untracked, "`git -C {wt} status` lists them"),
+    (_modified, "`git -C {wt} status` lists them"),
+    (_staged, "`git -C {wt} status` lists them"),
+    (_concealed, "index records as unchanged although they differ from the commit under"),
+]
+LEFT_BEHIND_IDS = ["untracked", "modified", "staged", "concealed"]
+
+
+def _moved_out(cwd: Path, leave) -> None:
+    """What an operator who moved the fixer's leftover work out of ``cwd`` leaves."""
+    if leave is _untracked:
+        (cwd / "draft.txt").unlink()
+        return
+    git_out("-C", str(cwd), "update-index", "--no-assume-unchanged", "cache.py")
+    git_out("-C", str(cwd), "checkout", "-q", "HEAD", "--", "cache.py")
+
+
+def _refuses_until_moved_out(eng, leave, needle: str, label: str, head: str) -> None:
+    """Unblock refuses REVIEW with nothing written or discarded, then enters it."""
+    worktree = eng.agent_worktree_path()
+    status = git_out("-C", str(worktree), "status", "--porcelain")
+    raw = eng.paths.state_file.read_text()
+    refused = eng.unblock("the operator set the secret")
+    assert not refused.unblocked, refused.message
+    assert f"REVIEW round {eng.state.review_round + 1} is not entered" in refused.message
+    assert (
+        f"the agent worktree {worktree} holds 1 uncommitted change(s) on {label} {head[:12]}"
+    ) in refused.message
+    assert needle.format(wt=worktree) in refused.message
+    assert "what it reads and tests there would be those changes" in refused.message
+    assert eng.paths.state_file.read_text() == raw
+    assert git_out("-C", str(worktree), "status", "--porcelain") == status
+    assert git_out("-C", str(worktree), "rev-parse", "HEAD") == head
+    if leave is not _untracked:
+        assert (worktree / "cache.py").read_text("utf-8") == FIXED, "never discarded"
+    _moved_out(worktree, leave)
+    applied = eng.unblock("the operator moved the work out")
+    assert applied.unblocked and applied.phase == "REVIEW", applied.message
+
+
+@pytest.mark.parametrize(("leave", "needle"), LEFT_BEHIND, ids=LEFT_BEHIND_IDS)
+def test_a_partial_push_dropped_by_drift_after_a_crash_keeps_the_worktree_check(
+    tmp_state_dir, monkeypatch, leave, needle
+):
+    """The partial push landed and the process died before it was read back;
+    then the PR was retargeted. The next process finds the drift, drops the
+    plan (``partial_fix`` is never set) and stays BLOCKED. The plain unblock
+    into REVIEW is still held to the worktree checks: the fixer's uncommitted
+    fix for R1-F3 would otherwise be what the reviewer reads and tests, while
+    the published candidate holds the buggy version."""
+    gh = FakeGitHub()
+    pushes = count_pushes(monkeypatch)
+    eng = in_fix(tmp_state_dir, gh, _fixer_leaving(leave))
+    _power_loss_at(eng, EffectKind.PUSH, Stage.OBSERVED, saved=False)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    candidate = _worktree_head(eng.provider.calls[0])
+    assert pushes == [candidate] and eng.origin.head(BRANCH) == candidate
+    gh.prs[PR].base_ref = "release/1.x"
+    again = _resumed(eng, tmp_state_dir, gh, "never")
+    out = again.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.AGENT_BLOCKED
+    assert pushes == [candidate], "never pushed twice"
+    s = load_state(again.paths.state_file)
+    assert s.partial_fix == {} and s.effect_records == [], "the drift dropped the plan"
+    assert s.prior_findings == FINDINGS and s.last_review_result == "stale"
+    assert (Path(again.agent_worktree_path()) / "cache.py").exists()
+    _refuses_until_moved_out(again, leave, needle, "the PR's HEAD", candidate)
+
+
+def test_a_partial_plan_dropped_by_drift_before_its_push_keeps_the_worktree_check(
+    tmp_state_dir, monkeypatch
+):
+    """The plan was saved and the PR retargeted before its push: the plan is
+    dropped unsent and the run stays BLOCKED with no partial fix recorded. The
+    fixer's commit stays in the worktree, unpublished, so REVIEW of the PR's
+    revision is not entered there, where the reviewer would read it, until the
+    operator has moved it out; nothing is discarded."""
+    gh = FakeGitHub()
+    pushes = count_pushes(monkeypatch)
+    eng = in_fix(tmp_state_dir, gh, _fixer_leaving(lambda cwd: None))
+    reviewed = eng.state.reviewed_head_sha
+    _power_loss_at(eng, EffectKind.PUSH, Stage.ATTEMPTED, saved=False)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    candidate = _worktree_head(eng.provider.calls[0])
+    gh.prs[PR].base_ref = "release/1.x"
+    again = _resumed(eng, tmp_state_dir, gh, "never")
+    out = again.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert pushes == [] and again.origin.head(BRANCH) == reviewed
+    assert load_state(again.paths.state_file).partial_fix == {}
+    worktree = again.agent_worktree_path()
+    raw = again.paths.state_file.read_text()
+    refused = again.unblock("the operator set the secret")
+    assert not refused.unblocked, refused.message
+    assert (
+        f"is at {candidate[:12]}, not at the PR's HEAD {reviewed[:12]}, so it may hold commits "
+        "the PR does not"
+    ) in refused.message
+    assert f"with the worktree detached at {reviewed[:12]}" in refused.message
+    assert again.paths.state_file.read_text() == raw
+    assert git_out("-C", str(worktree), "rev-parse", "HEAD") == candidate
+    git_out("-C", str(worktree), "checkout", "-q", "--detach", reviewed)
+    applied = again.unblock("the operator kept the fixer's commit elsewhere")
+    assert applied.unblocked and applied.phase == "REVIEW", applied.message
+
+
+@pytest.mark.parametrize(("leave", "needle"), LEFT_BEHIND, ids=LEFT_BEHIND_IDS)
+def test_a_plain_block_pushed_by_hand_keeps_the_worktree_check(tmp_state_dir, leave, needle):
+    """No partial fix at all: the fixer committed, left work behind and
+    reported a plain block, and the operator pushed exactly its commit by hand.
+    The REVIEW the plain unblock enters is held to the same checks."""
+
+    def blocks(req) -> str:
+        _fixer_leaving(leave)(req)
+        return plain_blocked(req)
+
+    gh = FakeGitHub()
+    eng = in_fix(tmp_state_dir, gh, blocks)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    candidate = _worktree_head(eng.provider.calls[0])
+    eng.origin.publish(eng.workdir, candidate, BRANCH)
+    gh.prs[PR].head_sha = candidate
+    assert load_state(eng.paths.state_file).partial_fix == {}
+    _refuses_until_moved_out(eng, leave, needle, "the PR's HEAD", candidate)
 
 
 # -- the persisted state (protocol 17) ----------------------------------------------------
@@ -1103,7 +1450,7 @@ def _partial_state(**overrides) -> AutoForgeState:
         "candidate_sha": B,
         "published_by": "controller",
         "resolved": ["R1-F1"],
-        "unresolved": [unresolved("R1-F2")],
+        "unresolved": [stored("R1-F2")],
     }
     fields = dict(
         phase=Phase.BLOCKED,
@@ -1154,7 +1501,7 @@ def test_a_partial_fix_record_out_of_its_binding_is_refused(tmp_path, change, ne
         ("published_by", "agent", "published_by"),
         ("resolved", [], "resolved must be"),
         ("unresolved", [{"finding_id": "R1-F2"}], "exactly a finding_id and a reason"),
-        ("unresolved", [unresolved("R1-F1")], "names a finding twice"),
+        ("unresolved", [stored("R1-F1")], "names a finding twice"),
         ("extra", 1, "exactly the keys"),
     ],
 )

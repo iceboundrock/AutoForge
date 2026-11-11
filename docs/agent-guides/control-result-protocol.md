@@ -542,7 +542,7 @@ so a malformed one is corrected, never read as a plain block:
 | `message` | required and non-blank, as for every block; stored redacted and bounded by `MAX_BLOCK_REASON_CHARS` with the plan, and quoted by the stop |
 | `previous_head_sha`, `head_sha` | required SHAs, the same cross-checks as a successful result's |
 | `resolutions` | required, non-empty, every rule of a successful result's (each kind, the one acceptance action, never with operator actions, one PR description); at least one is `fixed`, since a partial fix publishes the commits it made |
-| `unresolved` | required, non-empty list of exactly `{"finding_id", "reason"}`; `reason` non-blank, multi-line, at most `MAX_FIX_RATIONALE_CHARS` |
+| `unresolved` | required, non-empty list of exactly `{"finding_id", "reason", "blocks_publication"}`; `reason` non-blank, multi-line, at most `MAX_FIX_RATIONALE_CHARS`; `blocks_publication` a JSON boolean, never absent or null |
 | `tests` | optional, as a successful result's |
 
 Every resolution kind is accepted because a partial fix is published exactly
@@ -555,14 +555,34 @@ FIX would have waited for. The prompt says a finding the fixer can resolve
 by any kind belongs in `resolutions`, and `unresolved` holds only what no
 kind expresses.
 
+A kind can be unavailable, though: `safety.acceptance_actions` or
+`safety.pr_body_updates` is `off`, the entry offers no operator target or no
+body to replace, or the operator declined the action this round. The need is
+still a write that a FIX plan orders before every push, and no plan can
+order it now, so leaving the finding `unresolved` must not let the push go
+out ahead of it (PR #475 R2-F2). Which need an unresolved finding has is not
+knowable to the controller, and its `reason` is the fixer's prose, never
+read to decide. So each entry carries the fixer's typed answer,
+`blocks_publication`: `true` when what the finding needs must be on GitHub
+before the commits are (always for such an unavailable write, and whenever
+the commits would mislead a reviewer without it), `false` only when the
+commits can be pushed and reviewed while it stays open (a secret, a
+setting, a decision that does not change them). The prompt requires `true`
+for an unavailable write, and a correction of an unavailable kind in a
+partial fix names it. A result with one `true` entry is *held*: the engine
+checks none of its claims, plans and sends nothing, and stops
+`agent-blocked` with the fixer's message, the commits left in the agent
+worktree for the next fixer launch. The answer is not stored: only a result
+that is published is planned.
+
 The two lists name distinct findings, at most `MAX_RESOLUTIONS_PER_FIX`
-together. What the parser cannot see is the engine's, before the result is
-accepted, each refusal a correction with nothing pushed: the two lists name
-exactly the open findings; each resolution meets a successful FIX's engine
-rules (`_check_fix_claims`), so a finding with a follow-up issue the entry
-found is resolved with that issue or left unresolved; and the candidate
-meets every FIX candidate rule, which, as one resolution is `fixed`, makes
-it a descendant of the reviewed HEAD
+together. What the parser cannot see is the engine's, before a result that
+is not held is accepted, each refusal a correction with nothing pushed: the
+two lists name exactly the open findings; each resolution meets a successful
+FIX's engine rules (`_check_fix_claims`), so a finding with a follow-up
+issue the entry found is resolved with that issue or left unresolved; and
+the candidate meets every FIX candidate rule, which, as one resolution is
+`fixed`, makes it a descendant of the reviewed HEAD
 ([github-safety.md](github-safety.md), "A blocked FIX's partial fix").
 
 ### REPLAN_REEXECUTE fields

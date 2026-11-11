@@ -807,6 +807,22 @@ operators pushed them by hand and unblocked to `REVIEW`, outside every record
 the controller keeps. The controller now publishes them itself, by the rules
 and the plan of a successful FIX:
 
+- a result that marks any finding it left `blocks_publication` is *held*
+  and publishes nothing (PR #475 R2-F2). That is the fixer's typed answer
+  that what the finding needs must be on GitHub before the commits are, and
+  the one way to say it when the need is a write this run cannot carry as a
+  resolution: an acceptance comment, operator comments or a description
+  update while its setting is `off`, while the entry offers none, or after
+  the operator declined it. A FIX plan orders every such write before the
+  push, so leaving the finding `unresolved` without that answer would let
+  the commits out ahead of it. Which need a finding has is the fixer's to
+  say; the controller never reads it from the `reason` text, and the prompt
+  requires `true` for an unavailable write. A held result is not checked
+  (nothing of it is acted on), nothing is planned or sent, the commits stay
+  in the agent worktree for the next fixer launch, and the run stops
+  `agent-blocked` quoting the fixer's message and reasons. The PR is still
+  at the reviewed HEAD, so `unblock` relaunches the fixer, which continues
+  from them;
 - the result is checked before it is accepted, and a refusal is a
   correction with nothing planned or pushed: `previous_head_sha` is the
   reviewed HEAD; the resolutions and the `unresolved` findings name exactly
@@ -875,16 +891,27 @@ holds as for any round. The partial fix was published from the agent
 worktree, where the next round's reviewer works and where the fixer may
 have left uncommitted work for the findings it did not resolve, so this
 `REVIEW` is entered only after the checks `unblock --rereview` makes (PR #475
-R1-F1): the worktree's `HEAD`, read as a candidate is, is the published
-candidate (or the PR's current head), and neither its own index, nor a fresh
-index of that revision's tree, nor the bytes of that tree's files show
-anything that revision does not hold. Otherwise `unblock` refuses, naming
-what it found, and writes nothing; the controller never discards or moves
-that work, and the operator moves it out. The prompt's prior findings line
-names the published HEAD, who put it on the branch (the controller's push or
-an external one, from `published_by`), which findings the fixer claimed
-resolved and which it left, and the fixer's reasons follow as data. The
-completed round clears `partial_fix`.
+R1-F1): the worktree's `HEAD`, read as a candidate is, is the PR's current
+head, the reviewed HEAD or the published candidate, and neither its own
+index, nor a fresh index of that revision's tree, nor the bytes of that
+tree's files show anything that revision does not hold. Otherwise `unblock`
+refuses, naming what it found, and writes nothing; the controller never
+discards or moves that work, and the operator moves it out.
+
+The check does not depend on `partial_fix`, which a later step may clear
+(R2-F1): a partial plan the drift rule drops, before or after its push and
+a crash, clears it with the plan, and a partial fix refused before planning
+(a PR that moved while the fixer ran, an exact external candidate ahead of
+an operator write) never set it, yet each leaves the fixer's work in the
+worktree. So every plain `unblock` into `REVIEW` while a review of the PR is
+bound and its findings are open or carried makes these checks, whatever
+stopped the run, a plain block after a hand push included. After a clean
+review no FIX ran, and those routes are not checked.
+
+The prompt's prior findings line names the published HEAD, who put it on the
+branch (the controller's push or an external one, from `published_by`),
+which findings the fixer claimed resolved and which it left, and the fixer's
+reasons follow as data. The completed round clears `partial_fix`.
 
 ### Before UPDATE_EPIC
 

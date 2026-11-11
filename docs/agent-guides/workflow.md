@@ -542,9 +542,21 @@ read in place of the PR. `--rereview` itself is refused there, as for any
 moved revision. `partial_fix` names the candidate, who published it and the
 claims while the findings are carried, and the completed round clears it. A
 partial fix that is not published (its candidate fails validation, the PR
-moved first to a commit other than exactly the candidate) stops
+moved first to a commit other than exactly the candidate, or the fixer
+marked a finding it left `blocks_publication` because what it needs must be
+on GitHub first and no resolution of this run can carry it, R2-F2) stops
 `agent-blocked` with the fixer's message instead, its commits left in the
 worktree, and the decision table applies to the PR as it is.
+
+The worktree check belongs to the decision, not to `partial_fix` (R2-F1): a
+partial plan the drift rule drops clears that field, and a partial fix that
+was never published never set it, while the fixer's work stays in the
+worktree either way. So every plain `unblock` into `REVIEW` while the
+round's findings are open or carried makes the checks, whatever stopped the
+run, a plain block after the operator pushed the fixer's commit by hand
+included. The worktree's `HEAD` may be the PR's head, the reviewed HEAD or a
+recorded partial fix's candidate. The `REVIEW` a FIX routes to on its own
+(a recorded fix, a drift at the FIX entry) is not checked, as before.
 
 ### Re-entering a phase
 
@@ -1023,7 +1035,8 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   A `FIX` agent that reports `blocked` names the flag in the step's
   message. After a partial fix (#433) the PR is past the reviewed HEAD, so
   the flag refuses and the plain unblock re-enters `REVIEW`, after the
-  same worktree checks against the published candidate (PR #475 R1-F1).
+  same worktree checks (PR #475 R1-F1). A plain unblock into `REVIEW` makes
+  them whenever the round's findings are open or carried (R2-F1).
 - **Operator actions awaiting the operator** (#243, ADR 0004 K10). A
   `FIX` plan's operator comments (first in the plan, at most four) ask the
   operator to post a comment on another issue of the repository; the
