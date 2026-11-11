@@ -190,6 +190,8 @@ class StopReasonCode(Enum):
     # The agent's own CONTROL_RESULT status.
     AGENT_BLOCKED = "agent-blocked"
     AGENT_FAILURE = "agent-failure"
+    # A blocked FIX whose commits for some findings the controller published (#433).
+    PARTIAL_FIX = "partial-fix"
     # A launch or its result (the phase unchanged).
     EXECUTION_FAILED = "execution-failed"
     EXECUTION_TIMEOUT = "execution-timeout"
@@ -262,6 +264,7 @@ REASON_FAMILY: dict[StopReasonCode, ReasonFamily] = {
     _C.SANDBOX_TAMPER: _F.WORKSPACE,
     _C.AGENT_BLOCKED: _F.AGENT,
     _C.AGENT_FAILURE: _F.AGENT,
+    _C.PARTIAL_FIX: _F.AGENT,
     _C.EXECUTION_FAILED: _F.EXECUTION,
     _C.EXECUTION_TIMEOUT: _F.EXECUTION,
     _C.SANDBOX_LAUNCH_REFUSED: _F.EXECUTION,

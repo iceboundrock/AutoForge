@@ -795,6 +795,124 @@ Then, in order, all from one persisted plan:
 The marked issue is the durable record of a deferral: state never records
 a resolution GitHub contradicts.
 
+#### A blocked FIX's partial fix (#433)
+
+A fixer that resolved some findings and must report `blocked` for the
+others (a secret, a setting, a decision only a human has) may list its
+resolutions, at least one `fixed`, with its candidate and every other open
+finding under `unresolved`, each with a reason
+([control-result-protocol.md](control-result-protocol.md), "A blocked FIX's
+partial fix"). Before #433 those commits stayed in the agent worktree, and
+operators pushed them by hand and unblocked to `REVIEW`, outside every record
+the controller keeps. The controller now publishes them itself, by the rules
+and the plan of a successful FIX:
+
+- a result that marks any finding it left `blocks_publication` is *held*
+  and publishes nothing (PR #475 R2-F2). That is the fixer's typed answer
+  that what the finding needs must be on GitHub before the commits are, and
+  the one way to say it when the need is a write this run cannot carry as a
+  resolution: an acceptance comment, operator comments or a description
+  update while its setting is `off`, while the entry offers none, or after
+  the operator declined it. A FIX plan orders every such write before the
+  push, so leaving the finding `unresolved` without that answer would let
+  the commits out ahead of it. Which need a finding has is the fixer's to
+  say; the controller never reads it from the `reason` text, and the prompt
+  requires `true` for an unavailable write. A held result is not checked
+  (nothing of it is acted on), nothing is planned or sent, the commits stay
+  in the agent worktree for the next fixer launch, and the run stops
+  `agent-blocked` quoting the fixer's message and reasons. The PR is still
+  at the reviewed HEAD, so `unblock` relaunches the fixer, which continues
+  from them;
+- the result is checked before it is accepted, and a refusal is a
+  correction with nothing planned or pushed: `previous_head_sha` is the
+  reviewed HEAD; the resolutions and the `unresolved` findings name exactly
+  the open findings, once each; each resolution meets the rules of a
+  successful FIX's (a finding with a follow-up issue the entry found is
+  resolved with that issue, or left unresolved); and the candidate is read
+  from the worktree and held to the same rule as any FIX candidate
+  (detached, equal to `head_sha`, a descendant of the reviewed HEAD proven by
+  the transport, each commit of its range under the commit-message policy,
+  each named `commit_sha` in that range);
+- the exact candidate is validated first (ADR 0006 D5.1); the PR must be
+  open at the reviewed HEAD, or already at exactly the candidate (below),
+  headed in the run's repository, and the follow-up issues as the entry
+  observed them. Any of these failing stops with nothing planned or pushed
+  and the fixer's commits left in the worktree. A candidate that fails
+  validation and a PR that moved to any other commit while the fixer ran
+  stop with `agent-blocked` and the fixer's message, never with a relaunch
+  or a review of their own: the fixer said a human must act first;
+- the plan is the plan a successful FIX with these resolutions would save,
+  by the same code: the operator comments (K10) or the acceptance comment
+  (K9) first, then the PR description update (K12), the follow-up issues
+  and marker appends (K5, K6), and the push of the candidate last (K1,
+  `expected_old` the reviewed HEAD), saved with a FIX context that adds the
+  unresolved findings with the fixer's redacted reasons and its redacted,
+  bounded message. So a write that waits for the operator holds the push as
+  it would a successful FIX's (PR #475 R1-F2): an acceptance action or a
+  description awaiting approval, or operator comments not yet verified,
+  stop the plan before anything after them is sent, the commits staying
+  unpushed in the worktree, and the stop says the plan is a partial fix.
+  The first version accepted `fixed` resolutions alone and told the fixer to
+  leave the other kinds `unresolved`, which let the push skip exactly those
+  waits. A saved partial plan whose last record is not its push is
+  corruption the loader refuses;
+- it is completed by the code that completes every FIX plan: reconciled,
+  each record issued at most once in order, the push over the lease, and all
+  read back, so a crash anywhere is reconciled from the journal without a
+  second write, and a branch that someone else moved is never forced. Where
+  that code would route a moved head, base or merge base to `REVIEW`, a
+  partial plan is dropped and its findings carried as any plan's are, but
+  the run stops `BLOCKED` (`agent-blocked`, the drift and the fixer's message
+  quoted) instead of reviewing on its own;
+- once the candidate is read back as the PR head, the claims are recorded
+  as `last_fix_resolutions` (with each comment, receipt and follow-up as a
+  successful FIX records them) and `partial_fix` records the candidate, the
+  reviewed HEAD and who published it: `controller` for the controller's
+  push, `external` when the branch was already at exactly the candidate
+  before the controller sent anything (the push record's attempt count is
+  zero). The plan is dropped, every finding of the round stays open and none
+  is marked resolved, and the run stops `BLOCKED` with `partial-fix`, quoting
+  the fixer's message and reasons.
+
+An external push of exactly the verified candidate is recognised whenever
+it happened (PR #475 R1-F3): after the plan was saved, its push record finds
+it; while the fixer was still running, the PR read before planning finds
+the PR at the candidate, which is not treated as drift, and the plan is
+saved and completed as above with no push sent. In that second case the
+commits are already out, so a plan that would order an acceptance action,
+operator actions or a description update before them cannot be represented:
+it stops `agent-blocked` with nothing planned. Any other commit on the
+branch is drift and is never adopted.
+
+`unblock` decides from the PR as it is then. At the published HEAD, or at a
+later one, it re-enters `REVIEW` with the round's findings carried, never
+`FIX`, since those findings are bound to the reviewed HEAD; the round cap
+holds as for any round. The partial fix was published from the agent
+worktree, where the next round's reviewer works and where the fixer may
+have left uncommitted work for the findings it did not resolve, so this
+`REVIEW` is entered only after the checks `unblock --rereview` makes (PR #475
+R1-F1): the worktree's `HEAD`, read as a candidate is, is the PR's current
+head, the reviewed HEAD or the published candidate, and neither its own
+index, nor a fresh index of that revision's tree, nor the bytes of that
+tree's files show anything that revision does not hold. Otherwise `unblock`
+refuses, naming what it found, and writes nothing; the controller never
+discards or moves that work, and the operator moves it out.
+
+The check does not depend on `partial_fix`, which a later step may clear
+(R2-F1): a partial plan the drift rule drops, before or after its push and
+a crash, clears it with the plan, and a partial fix refused before planning
+(a PR that moved while the fixer ran, an exact external candidate ahead of
+an operator write) never set it, yet each leaves the fixer's work in the
+worktree. So every plain `unblock` into `REVIEW` while a review of the PR is
+bound and its findings are open or carried makes these checks, whatever
+stopped the run, a plain block after a hand push included. After a clean
+review no FIX ran, and those routes are not checked.
+
+The prompt's prior findings line names the published HEAD, who put it on the
+branch (the controller's push or an external one, from `published_by`),
+which findings the fixer claimed resolved and which it left, and the fixer's
+reasons follow as data. The completed round clears `partial_fix`.
+
 ### Before UPDATE_EPIC
 
 The agent makes no GitHub write in this phase (ADR 0004). It returns the

@@ -33,6 +33,10 @@
 - **Amended by #414:** D3's adoption row (taking over a marked PR is the
   operator's decision by command, and the controller's write) and D10,
   which records K11's approval.
+- **Amended by #433:** D5's `agent` row gains `partial-fix`, the stop of a
+  FIX that reported `blocked` after the controller published the commits it
+  verified for some findings. It fails (i) as `agent-blocked` does: what the
+  fixer asked for is a human's answer, and `unblock` alone leaves the stop.
 - **Related:** ADR 0004 (the authority boundary, K9 and K10), ADR 0005 (the
   outer sandbox and its launch classes), ADR 0007 and #126 (the durable
   pause), ADR 0008 D9.4 and D15 (the scheduler's entry checks and
@@ -286,7 +290,7 @@ any other:
 | `github` | `github-read-failed`, `github-checks-refused`, `github-unavailable`, `github-error`, `git-transport` | a credential with the right access, or another read or push | (i) for a credential. (iii) for a transient failure, which `resume` already retries within its bound, and a push, which reconciles by its identity first |
 | `merge_gate` | `merge-inconclusive`, `pr-identity`, `pr-not-open`, `unreviewed-merge`, `merge-checks`, `merge-conflict`, `merge-not-ready`, `merge-write`, `premerge-verification`, `review-certificate`, `review-not-backed` | merging; changing the PR or its checks | (i) for a merge. Changing the PR is implementation work whose result must be reviewed: a workflow phase, not a recovery action. After the operator updates the PR, `unblock` already routes the moved head to `REVIEW` (iii) |
 | `workspace` | `checkout-drift`, `sandbox-tamper` | restoring a checkout or object store something moved | (i): a security signal, which an automatic repair would turn into a downgrade path |
-| `agent` | `agent-blocked`, `agent-failure` | a human's answer, or a fresh launch | (i) for an answer, which is #126's domain. (iii) for a launch, which is `resume` or a new run; `FAILED` has no edge |
+| `agent` | `agent-blocked`, `agent-failure`, `partial-fix` | a human's answer, or a fresh launch | (i) for an answer, which is #126's domain. (iii) for a launch, which is `resume` or a new run; `FAILED` has no edge. After a `partial-fix` stop the controller has already published what it verified, and the answer the fixer asked for is still a human's |
 | `execution` | `execution-failed`, `execution-timeout`, `sandbox-launch-refused`, `interaction-required`, `control-result-invalid`, `verification-failed`, `run-log-refused` | `resume` | (iii): already the route. Whether a *new* failure is transient is a typed adapter rule reviewed as code, as #164 and #395 added, not a model reading stderr (D8). `interaction-required` is #126's domain, and `sandbox-launch-refused` never runs unsandboxed (ADR 0005 D12.1) |
 | `configuration` | `configuration-invalid`, `configuration-drift`, `sandbox-capability`, `scheduler-owned` | another configuration, an accepted drift, a capable host, the scheduler's own commands | (i) |
 | `state` | `state-invalid`, `state-protocol`, `state-transition`, `lock-held` | a repaired or moved-aside state file, a newer controller, the right command, another process ending | (i) |

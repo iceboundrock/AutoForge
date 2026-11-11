@@ -19,6 +19,12 @@
       "change": "Two allow-list keys are added under `execution`, which moves the settings digest and the digests that hold it",
       "why": "#286 gives agent launches and repository commands an allow-list key each. `real_run_config.yaml` sets neither, so every launch of every arm gets the names it got before, and no threshold, task or other setting changes. `tests/evaluation.py` reads the repository commands' names, as the engine now does, so its copy of the validation policy stays the engine's",
       "real_runs_before": "None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since"
+    },
+    {
+      "date": "2026-11-11",
+      "change": "The prompt label moves from `v17` to `v18`, which moves the settings digest and the digests that hold it",
+      "why": "#433 changed the prompts: a FIX agent that must report `blocked` may list the findings it fixed and the ones it left, and the controller publishes the commits it verifies; a REVIEW agent is told how such a partial fix is carried to it. Every arm runs one controller commit with one label, so what is compared does not move, and no threshold, task or other setting changes",
+      "real_runs_before": "None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since"
     }
   ],
   "statistics": {

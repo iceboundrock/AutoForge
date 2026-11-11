@@ -2518,6 +2518,10 @@ class ReviewContext:
 FOLLOW_UP_SOURCE_ENTRY = "entry"
 # D4.6: the redacted form of a FIX rationale, at most this long.
 MAX_STORED_RATIONALE_CHARS = MAX_FIX_RATIONALE_CHARS * MAX_GROWTH_FACTOR
+# A partial fix's block message (#433), as the engine stores it: redacted, then
+# bounded by ``state.MAX_BLOCK_REASON_CHARS`` (``state.bound_block_reason``),
+# which this module cannot import; ``tests/test_partial_fix.py`` pins the two.
+MAX_STORED_FIX_MESSAGE_CHARS = 8000
 
 
 @dataclass(frozen=True)
@@ -2531,12 +2535,25 @@ class FixContext:
     ``operator_acceptance`` finding (#243), and ``pr_body_source`` the plan
     position of the K12 record of a ``pr_body_update`` finding (#423); each is
     set exactly on the resolutions of its kind.
+
+    A partial fix (#433) is the plan of a FIX that reported ``blocked`` with
+    what it resolved, its commits among it: ``unresolved`` names every other
+    open finding with the fixer's (redacted) reason, and ``message`` is the
+    fixer's (redacted, bounded) block message, which the stop that completes
+    the plan quotes. Its resolutions are those of a successful FIX, at least
+    one of them ``fixed``, and its plan is a successful FIX's plan for them,
+    so it ends with the push (K1), which every write that waits for the
+    operator (K9, K10, K12) precedes and holds (PR #475 R1-F2); completing it
+    leaves the findings open and the run ``BLOCKED``. Both are empty for
+    every other plan.
     """
 
     issue_url: str
     pr_url: str
     round: int
     resolutions: tuple[dict, ...]
+    unresolved: tuple[dict, ...] = ()
+    message: str = ""
 
     PHASE = Phase.FIX
     _RESOLUTION_KEYS = (
@@ -2560,8 +2577,14 @@ class FixContext:
         + 16
         + (8 * _KEY_OVERHEAD)
     )
+    # An unresolved entry (#433) holds less than a resolution's bound, and the
+    # two lists together name each open finding once, so the resolution term
+    # covers both; the fixer's message and two keys are added.
     STORED_BOUND = (
-        2 * MAX_URL_CHARS + MAX_RESOLUTIONS_PER_FIX * _RESOLUTION_BOUND + (5 * _KEY_OVERHEAD)
+        2 * MAX_URL_CHARS
+        + MAX_RESOLUTIONS_PER_FIX * _RESOLUTION_BOUND
+        + MAX_STORED_FIX_MESSAGE_CHARS
+        + (7 * _KEY_OVERHEAD)
     )
 
     @classmethod
@@ -2576,7 +2599,10 @@ class FixContext:
     ) -> FixContext:
         what = "FIX completion context"
         data = _context_header(
-            raw, ("issue_url", "pr_url", "round", "resolutions"), binding, cls.PHASE
+            raw,
+            ("issue_url", "pr_url", "round", "resolutions", "unresolved", "message"),
+            binding,
+            cls.PHASE,
         )
         _issue_url(data["issue_url"], f"{what}.issue_url")
         binding.check_issue(data["issue_url"], what)
@@ -2594,16 +2620,76 @@ class FixContext:
             cls._resolution(item, f"{what}.resolutions[{i}]")
             for i, item in enumerate(raw_resolutions)
         ]
+        unresolved = cls._unresolved(data["unresolved"], f"{what}.unresolved")
+        message = _str(data["message"], f"{what}.message", MAX_STORED_FIX_MESSAGE_CHARS)
         ids = [r["finding_id"] for r in resolutions]
         if len(set(ids)) != len(ids):
             _fail(f"{what}.resolutions", "resolves a finding twice")
-        if sorted(ids) != sorted(binding.open_finding_ids):
+        left = [u["finding_id"] for u in unresolved]
+        if set(ids) & set(left):
+            _fail(f"{what}.unresolved", "names a finding the context resolves")
+        if sorted(ids + left) != sorted(binding.open_finding_ids):
             _fail(f"{what}.resolutions", "must resolve exactly the open findings")
+        if unresolved:
+            cls._check_partial(resolutions, message, records, what)
+        elif message:
+            _fail(f"{what}.message", "is the message of a partial fix, and this plan is none")
         cls._check_sources(resolutions, data["pr_url"], records, observation, what)
         cls._check_acceptance(resolutions, data["issue_url"], data["pr_url"], round_, records, what)
         cls._check_operator(resolutions, round_, records, observation, what)
         cls._check_pr_body(resolutions, records, observation, what)
-        return cls(data["issue_url"], data["pr_url"], round_, tuple(resolutions))
+        return cls(
+            data["issue_url"],
+            data["pr_url"],
+            round_,
+            tuple(resolutions),
+            tuple(unresolved),
+            message,
+        )
+
+    @staticmethod
+    def _unresolved(raw: object, what: str) -> list[dict]:
+        """#433: the findings a partial fix leaves open, each with the fixer's reason."""
+        if not isinstance(raw, list) or len(raw) > MAX_RESOLUTIONS_PER_FIX:
+            _fail(what, f"must be a list of at most {MAX_RESOLUTIONS_PER_FIX}")
+        out: list[dict] = []
+        for i, item in enumerate(raw):
+            data = _exact(item, ("finding_id", "reason"), f"{what}[{i}]")
+            fid = _str(data["finding_id"], f"{what}[{i}].finding_id", MAX_FINDING_ID_CHARS)
+            if not FINDING_ID_RE.match(fid):
+                _fail(f"{what}[{i}].finding_id", "is not a finding id")
+            reason = _str(data["reason"], f"{what}[{i}].reason", MAX_STORED_RATIONALE_CHARS)
+            if not reason.strip():
+                _fail(f"{what}[{i}].reason", "is blank")
+            if _RATIONALE_CONTROL_RE.search(reason):
+                _fail(
+                    f"{what}[{i}].reason",
+                    "carries a control character other than a newline or a tab",
+                )
+            out.append(dict(data))
+        if len({u["finding_id"] for u in out}) != len(out):
+            _fail(what, "names a finding twice")
+        return out
+
+    @staticmethod
+    def _check_partial(
+        resolutions: Sequence[dict],
+        message: str,
+        records: Sequence[EffectRecord],
+        what: str,
+    ) -> None:
+        """#433: a partial fix publishes commits, so its plan ends with their push.
+
+        Its other records are held to the rules of every FIX plan (the checks
+        that follow this one), which order each write that waits for the
+        operator before the push (PR #475 R1-F2).
+        """
+        if not message.strip():
+            _fail(f"{what}.message", "is blank, and a partial fix keeps the fixer's message")
+        if not any(r["resolution"] == "fixed" for r in resolutions):
+            _fail(f"{what}.resolutions", "of a partial fix resolve no finding as 'fixed'")
+        if not records or records[-1].kind != EffectKind.PUSH:
+            _fail("effect_records", "of a partial fix must end with the push of its candidate")
 
     @classmethod
     def _resolution(cls, raw: object, what: str) -> dict:
@@ -2842,7 +2928,14 @@ class FixContext:
             "pr_url": self.pr_url,
             "round": self.round,
             "resolutions": [dict(r) for r in self.resolutions],
+            "unresolved": [dict(u) for u in self.unresolved],
+            "message": self.message,
         }
+
+    @property
+    def partial(self) -> bool:
+        """Whether this is the plan of a partial fix (#433)."""
+        return bool(self.unresolved)
 
 
 @dataclass(frozen=True)

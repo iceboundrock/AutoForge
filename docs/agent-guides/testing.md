@@ -40,6 +40,13 @@ High-priority coverage includes:
   under protocol 14 offers no update; a saved plan whose payload, marker, target,
   digests, authorization, `pr_body_source` or entry digest does not hold together
   is refused at load; each malformed outcome and receipt is refused
+- partial fix state (#433, `tests/test_partial_fix.py`): `partial_fix`
+  round-trips; a record off its round, reviewed HEAD, findings or phase, and
+  each malformed key, is refused; a protocol-16 file loads with none and its
+  saved `FIX` plan completes as the full fix it was; an older label carrying
+  any of it and a current file missing the field are refused; a saved partial
+  plan with a blank message, no `fixed` resolution, a coverage that does not
+  hold or a last record that is not its push is refused at load
 - operator-action state (#243, `tests/test_state.py`): every outcome
   round-trips under the current protocol; a protocol-10 file, a `FIX`
   plan included, loads in every phase migrated and is relabelled; an older
@@ -1649,6 +1656,45 @@ a stated reason it has none. The coverage that must keep working:
   ahead of the update is not observed (a K9 comment a crash left unsaved, a K10
   comment posted but not verified, nothing posted, a conflict, a target that cannot
   be read), and the comment's URL kept once the prefix pass has saved it
+- a blocked FIX's partial fix (#433; `tests/test_partial_fix.py`): two
+  findings fixed and one human-blocked push the verified candidate once, read
+  it back and stop `partial-fix` with all three findings open and the claims
+  recorded; the plan is journaled before the push; a plain block, and one
+  shaped like a fix without `unresolved`, push nothing; mismatched claims,
+  candidate, ancestry, commit policy, coverage and a result with no `fixed`
+  resolution are corrected with nothing pushed or published, and so is an
+  acceptance action while `safety.acceptance_actions` is `off`; a finding
+  with a follow-up issue is never claimed fixed; an acceptance action (K9)
+  and a PR description (K12) awaiting approval, and operator comments (K10)
+  not yet verified, hold the push with nothing after them sent, and the
+  approved or verified plan completes from the journal with no fixer
+  relaunched, a crash after K12 included, with one write each (PR #475
+  R1-F2); a candidate failing validation and a PR that moved during the
+  fixer stop `agent-blocked` with nothing pushed; exactly the candidate
+  pushed by hand during the fixer is recorded `external` with nothing sent,
+  and stops with nothing planned when an operator write would have preceded
+  it (R1-F3); a crash after the push completes with no second push and the
+  push attributed to the controller; a branch already at exactly the
+  candidate after the plan is saved is recorded `external` with nothing
+  sent; another push before the controller's is never forced and stays
+  `BLOCKED`; `unblock` re-reviews the published HEAD with every finding
+  carried and the claims and reasons in the prompt, which names the
+  publisher as recorded (R1-F4), under the round cap, `--rereview` refused;
+  `unblock` refuses that review, writing nothing, while the agent worktree
+  holds an untracked file, a modified, staged or assume-unchanged edit, or a
+  commit past the candidate, and enters it from a clean one (R1-F1); the same
+  refusal, with nothing written or discarded, after a partial push dropped by
+  a retarget following a crash after the push, after a partial plan dropped
+  by a retarget before its push (the worktree at the unpublished candidate),
+  after a partial fix refused because the PR moved while the fixer ran, and
+  after a plain block whose commit the operator pushed by hand (R2-F1); a
+  partial fix that marks a finding `blocks_publication`, while a PR
+  description, an acceptance comment or operator comments are disabled or
+  not offered, publishes nothing, checks no claim, keeps the commits for the
+  relaunched fixer and stops `agent-blocked`, one such entry holding an
+  acceptance action too; a correction of an unavailable K9, K10 or K12 names
+  that answer (R2-F2); `status` names the partial fix; the parser's schema
+  and bounds, `blocks_publication` a required JSON boolean
 - operator actions (#243, ADR 0004 K10; `tests/test_operator_actions.py`
   for the engine, unblock and `status --action`, K10 in
   `tests/test_effects.py`, the marker in `tests/test_claims.py`,

@@ -49,6 +49,7 @@ from .effects import (
     LABEL_NONE,
     LAUNCH_LABELS,
     MAX_CONFLICT_REASON_CHARS,
+    MAX_STORED_RATIONALE_CHARS,
     OPERATOR_ACTION_ID_RE,
     PR_BODY_ACTION_ID_RE,
     PUBLISHING_PHASES,
@@ -237,7 +238,13 @@ _PRE_PR_BODY_PROTOCOL = "14"
 # saved with no code, which classifies ``unknown`` exactly as it did), and
 # relabelled. An older file that carries the field is refused
 # (:func:`_refuse_stop_code`).
-_PREVIOUS_PROTOCOL = "15"
+_PRE_STOP_CODE_PROTOCOL = "15"
+# The label before a blocked FIX could publish the commits it made (#433). A
+# protocol-16 file is this protocol's shape without the partial fix state: it
+# is loaded in every phase with ``partial_fix: {}`` and a FIX completion
+# context gains ``unresolved: []`` and ``message: ""``, and relabelled. An
+# older file that carries any of it is refused (:func:`_refuse_partial_fix_state`).
+_PREVIOUS_PROTOCOL = "16"
 # Every label :meth:`AutoForgeState.from_dict` has a rule for: the current
 # one and each older one it migrates or refuses by its own rule. Any other
 # label is refused by :func:`protocol_support`'s classification before the
@@ -253,6 +260,7 @@ SUPPORTED_PROTOCOLS: frozenset[str] = frozenset(
         _PRE_LOCAL_REMOVAL_PROTOCOL,
         _PRE_TAKEOVER_PROTOCOL,
         _PRE_PR_BODY_PROTOCOL,
+        _PRE_STOP_CODE_PROTOCOL,
         _PREVIOUS_PROTOCOL,
         __protocol_version__,
     }
@@ -309,6 +317,22 @@ _PR_BODY_FIELDS = ("pr_body_outcomes",)
 # BLOCKED or FAILED named (``stop_classification.StopReasonCode``'s value),
 # ``""`` in every other phase and for a stop saved before it.
 _STOP_FIELDS = ("stop_code",)
+# The field protocol 17 added (#433): the partial fix a blocked FIX published,
+# ``{}`` when none. Protocol 17 also added a FIX completion context's
+# ``unresolved`` and ``message`` (:func:`_partial_fix_state_in`).
+_PARTIAL_FIX_FIELDS = ("partial_fix",)
+_PARTIAL_FIX_KEYS = (
+    "round",
+    "pr_url",
+    "reviewed_head_sha",
+    "candidate_sha",
+    "published_by",
+    "resolved",
+    "unresolved",
+)
+# Who put the candidate on the PR branch: the controller's push, or a push it
+# found there already, at exactly the candidate, before it sent its own.
+PARTIAL_FIX_PUBLISHERS = ("controller", "external")
 # A persisted code's shape: a code is lower-case words joined by hyphens. Its
 # vocabulary is the classification's, which reads it (an unknown one
 # classifies ``unknown``, never another code); the state only bounds it.
@@ -679,6 +703,20 @@ class AutoForgeState:
     # finding in this round (#243), ``[]`` when none; and ``pr_body_update``:
     # the receipt of the K12 update that resolved it (#423), else null.
     last_fix_resolutions: list[dict] = field(default_factory=list)
+    # The partial fix a blocked FIX of round ``review_round`` published (#433),
+    # ``{}`` when none: ``round``, ``pr_url``, ``reviewed_head_sha`` (the HEAD
+    # its findings are bound to), ``candidate_sha`` (the commit read back as
+    # the PR head), ``published_by`` (``controller`` for the controller's push,
+    # ``external`` when GitHub already held exactly that commit before the
+    # controller sent anything), ``resolved`` (the ids its resolutions claim,
+    # at least one ``fixed``; those resolutions are ``last_fix_resolutions``) and
+    # ``unresolved`` (``finding_id`` and the fixer's redacted ``reason`` for
+    # every other finding of the round). Nothing of it marks a finding
+    # resolved: the round's findings stay open, then carried to the next
+    # REVIEW, whose prompt says which were claimed resolved. Cleared when that
+    # review completes a round, when a FIX of the round is recorded or
+    # dropped, and per PR.
+    partial_fix: dict = field(default_factory=dict)
     # The outcomes of the current PR's acceptance actions (#211), oldest
     # first: ``action_id``, ``round``, ``finding_id``, ``outcome``
     # (verified | declined | stale), ``at``, ``comment_url`` (the verified
@@ -1012,6 +1050,13 @@ class AutoForgeState:
         #   phase with ``""``, a stop saved with no code, which classifies
         #   ``unknown`` as it always did. An older file that carries the
         #   field, even empty, is refused, never merged.
+        # - 16 -> 17: a blocked FIX may publish the commits it made (#433):
+        #   ``partial_fix``, and a FIX completion context's ``unresolved`` and
+        #   ``message``. An older file is loaded in every phase with
+        #   ``partial_fix: {}`` and a FIX context gains ``unresolved: []`` and
+        #   ``message: ""`` (a plan of a fix that resolved every finding,
+        #   which is all an older controller planned). An older file that
+        #   carries any of it is refused, never merged.
         written_by = str(data.get("controller_version", ""))
         legacy = isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS
         if legacy:
@@ -1131,6 +1176,7 @@ class AutoForgeState:
             _PRE_LOCAL_REMOVAL_PROTOCOL,
             _PRE_TAKEOVER_PROTOCOL,
             _PRE_PR_BODY_PROTOCOL,
+            _PRE_STOP_CODE_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1147,8 +1193,8 @@ class AutoForgeState:
             # twelve, which step 3 below handles; protocol 14 adds an effect
             # kind (K11), which an older file is refused for carrying
             # (:func:`_refuse_takeover_records`), protocol 15 the PR body
-            # state and protocol 16 the stop code, each required of its own
-            # files below. Only a legacy label
+            # state, protocol 16 the stop code and protocol 17 the partial
+            # fix state, each required of its own files below. Only a legacy label
             # loads with no effect state (D13.2). Every
             # protocol-7 save writes all four fields, so one that is absent
             # is a truncation or a hand edit, never "nothing planned": a
@@ -1199,7 +1245,7 @@ class AutoForgeState:
                 "sandbox pin",
                 "not a run with none pinned",
             )
-        if raw_protocol in (_PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol in (_PRE_STOP_CODE_PROTOCOL, _PREVIOUS_PROTOCOL, __protocol_version__):
             # Every protocol-15 save writes it, ``[]`` included, so an absent
             # one is a truncation or a hand edit: read as the empty default it
             # would drop a declined update of the round and let it through.
@@ -1209,18 +1255,37 @@ class AutoForgeState:
         else:
             # 14 -> 15 (#423): K12's state is written from protocol 15 on.
             _refuse_pr_body_state(data, str(raw_protocol))
-        if raw_protocol not in (_PRE_PR_BODY_PROTOCOL, _PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol not in (
+            _PRE_PR_BODY_PROTOCOL,
+            _PRE_STOP_CODE_PROTOCOL,
+            _PREVIOUS_PROTOCOL,
+            __protocol_version__,
+        ):
             # 13 -> 14 (#414): K11 is planned from protocol 14 on.
             _refuse_takeover_records(data, str(raw_protocol))
-        if raw_protocol == __protocol_version__:
+        if raw_protocol in (_PREVIOUS_PROTOCOL, __protocol_version__):
             # Every protocol-16 save writes it, ``""`` included, so an absent
             # one is a truncation or a hand edit, never "no code was saved".
             _require_fields(
                 data, raw_protocol, _STOP_FIELDS, "stop code", "not a stop saved with none"
             )
         else:
-            # 15 -> 16 (#374): the stop code is written by this protocol only.
+            # 15 -> 16 (#374): the stop code is written from protocol 16 on.
             _refuse_stop_code(data, str(raw_protocol))
+        if raw_protocol == __protocol_version__:
+            # Every protocol-17 save writes it, ``{}`` included, so an absent
+            # one is a truncation or a hand edit, never "no partial fix".
+            _require_fields(
+                data,
+                raw_protocol,
+                _PARTIAL_FIX_FIELDS,
+                "partial fix",
+                "not a run that published none",
+            )
+        else:
+            # 16 -> 17 (#433): the partial fix state is written by this
+            # protocol only.
+            _refuse_partial_fix_state(data, str(raw_protocol))
         kwargs = dict(data)
         kwargs["phase"] = phase
         kwargs["mode"] = mode
@@ -1233,6 +1298,7 @@ class AutoForgeState:
             _PRE_LOCAL_REMOVAL_PROTOCOL,
             _PRE_TAKEOVER_PROTOCOL,
             _PRE_PR_BODY_PROTOCOL,
+            _PRE_STOP_CODE_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1244,20 +1310,25 @@ class AutoForgeState:
             _PRE_LOCAL_REMOVAL_PROTOCOL,
             _PRE_TAKEOVER_PROTOCOL,
             _PRE_PR_BODY_PROTOCOL,
+            _PRE_STOP_CODE_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
             # Before protocol 11 (#243): over the acceptance migration, so a
             # pre-8 file gains both.
             kwargs.update(_operator_migration(kwargs))
-        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol not in (_PRE_STOP_CODE_PROTOCOL, _PREVIOUS_PROTOCOL, __protocol_version__):
             # Before protocol 15 (#423): over the migrations above, so an older
             # file gains every field a save of this protocol writes.
             kwargs.update(_pr_body_migration(kwargs))
-        if raw_protocol != __protocol_version__:
+        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
             # Before protocol 16 (#374): a stop saved with no code, which
             # classifies ``unknown`` exactly as it did before.
             kwargs["stop_code"] = ""
+        if raw_protocol != __protocol_version__:
+            # Before protocol 17 (#433): over the migrations above, so a FIX
+            # context of any older label gains both keys.
+            kwargs.update(_partial_fix_migration(kwargs))
         if legacy:
             attempt = data.get("attempt", 0)
             if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt >= 1:
@@ -1266,11 +1337,12 @@ class AutoForgeState:
                 )
         # ADR 0009 D8's step 3, after every per-protocol rule above: LOCAL's
         # twelve fields leave a file labelled 12 or older, or refuse it. A
-        # protocol-13, -14, -15 or -16 file is not asked: one that carries any
-        # of them is refused by the unknown-field check below.
+        # protocol-13, -14, -15, -16 or -17 file is not asked: one that carries
+        # any of them is refused by the unknown-field check below.
         if raw_protocol not in (
             _PRE_TAKEOVER_PROTOCOL,
             _PRE_PR_BODY_PROTOCOL,
+            _PRE_STOP_CODE_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1366,6 +1438,7 @@ class AutoForgeState:
         _validate_acceptance_state(state)
         _validate_pr_body_state(state)
         _validate_stop_code(state)
+        _validate_partial_fix(state)
         _validate_operator_state(state)
         _validate_config_fingerprint(state)
         _validate_sandbox_pin(state)
@@ -1638,6 +1711,7 @@ class AutoForgeState:
         self.open_findings = []
         self.prior_findings = []
         self.last_fix_resolutions = []
+        self.partial_fix = {}
         self.acceptance_outcomes = []
         self.pr_body_outcomes = []
         self.operator_comment_outcomes = []
@@ -1912,6 +1986,136 @@ def _validate_stop_code(state: AutoForgeState) -> None:
             f"state field 'stop_code' is {shown(repr(code), _MAX_SHOWN_STOP_CODE_CHARS)} in "
             f"phase {state.phase.value}: a stop code is saved only with BLOCKED or FAILED and "
             "cleared when the run leaves it"
+        )
+
+
+def _partial_fix_state_in(data: dict) -> list[str]:
+    """What of protocol 17's partial fix state (#433) ``data`` carries, named.
+
+    The label decides, not the value: an older file that carries any of it at
+    all, even empty, was not written by the controller its label names.
+    """
+    found: list[str] = []
+    if "partial_fix" in data:
+        found.append("'partial_fix'")
+    context = data.get("completion_context")
+    if isinstance(context, dict):
+        for key in ("unresolved", "message"):
+            if key in context:
+                found.append(f"{key!r} in 'completion_context'")
+    return found
+
+
+def _refuse_partial_fix_state(data: dict, protocol: str) -> None:
+    """A file labelled before protocol 17 never wrote partial fix state (#433)."""
+    planted = _partial_fix_state_in(data)
+    if planted:
+        raise StateError(
+            f"state file is labelled protocol_version {protocol!r}, which never wrote "
+            f"{', '.join(planted)}; refusing to load a file that carries protocol-17 partial "
+            "fix state -- it is a hand edit or a foreign file, not an older controller's state"
+        )
+
+
+def _partial_fix_migration(data: dict) -> dict:
+    """The fields of an older file as protocol 17 writes them (#433).
+
+    ``partial_fix: {}``, and a FIX completion context gains ``unresolved: []``
+    and ``message: ""``: an older controller planned a fix only when every
+    finding was resolved. Malformed values are passed through for validation
+    to refuse.
+    """
+    out: dict = {"partial_fix": {}}
+    context = data.get("completion_context")
+    if isinstance(context, dict) and context.get("phase") == Phase.FIX.value:
+        out["completion_context"] = {**context, "unresolved": [], "message": ""}
+    return out
+
+
+def _validate_partial_fix(state: AutoForgeState) -> None:
+    """``partial_fix`` (#433): its shape, and the round, PR and HEAD it is bound to.
+
+    The record describes the partial fix of the round the state is in, so it
+    names that round, the current PR and the reviewed HEAD the round's
+    findings are bound to, and a candidate that descends from it (another
+    SHA; the descent was proven before the push). It is kept only while that
+    round's findings are open or carried to the next review, and in the
+    phases that hold them: ``BLOCKED`` (where the partial fix stops),
+    ``REVIEW`` (the review an unblock enters), ``FIX`` (a fixer relaunched at
+    the reviewed HEAD after the PR was put back there) and ``FAILED``. Its
+    ids are each once, resolved or unresolved, and every one is a finding of the
+    round. Agent text (``reason``) is bounded and never quoted here.
+    """
+    record = state.partial_fix
+    if not isinstance(record, dict):
+        raise StateError("state field 'partial_fix' must be an object")
+    if not record:
+        return
+    what = "state field 'partial_fix'"
+    keys = set(record)
+    if keys != set(_PARTIAL_FIX_KEYS):
+        raise StateError(f"{what} must hold exactly the keys {list(_PARTIAL_FIX_KEYS)}")
+    if state.phase not in (Phase.BLOCKED, Phase.REVIEW, Phase.FIX, Phase.FAILED):
+        raise StateError(
+            f"{what} is set in phase {state.phase.value}: a partial fix is kept only while "
+            "its round's findings are open or carried (BLOCKED, REVIEW, FIX or FAILED)"
+        )
+    round_ = record["round"]
+    if not isinstance(round_, int) or isinstance(round_, bool) or round_ != state.review_round:
+        raise StateError(f"{what}.round must be the round being fixed, {state.review_round}")
+    if not (
+        isinstance(record["pr_url"], str)
+        and state.current_pr_url
+        and same_pr_url(record["pr_url"], state.current_pr_url)
+    ):
+        raise StateError(f"{what}.pr_url must be the state's current PR")
+    reviewed = record["reviewed_head_sha"]
+    if not isinstance(reviewed, str) or reviewed.lower() != state.reviewed_head_sha.lower():
+        raise StateError(f"{what}.reviewed_head_sha must be the state's reviewed HEAD")
+    candidate = record["candidate_sha"]
+    if (
+        not isinstance(candidate, str)
+        or not _SHA40_RE.fullmatch(candidate)
+        or candidate.lower() == reviewed.lower()
+    ):
+        raise StateError(f"{what}.candidate_sha must be a full SHA other than the reviewed HEAD")
+    if record["published_by"] not in PARTIAL_FIX_PUBLISHERS:
+        raise StateError(f"{what}.published_by must be one of {list(PARTIAL_FIX_PUBLISHERS)}")
+    resolved = record["resolved"]
+    if (
+        not isinstance(resolved, list)
+        or not resolved
+        or not all(isinstance(fid, str) and FINDING_ID_RE.match(fid) for fid in resolved)
+    ):
+        raise StateError(f"{what}.resolved must be a non-empty list of finding ids")
+    unresolved = record["unresolved"]
+    if not isinstance(unresolved, list) or not unresolved:
+        raise StateError(f"{what}.unresolved must be a non-empty list")
+    left: list[str] = []
+    for i, item in enumerate(unresolved):
+        if not isinstance(item, dict) or set(item) != {"finding_id", "reason"}:
+            raise StateError(f"{what}.unresolved[{i}] must be exactly a finding_id and a reason")
+        fid, reason = item["finding_id"], item["reason"]
+        if not isinstance(fid, str) or not FINDING_ID_RE.match(fid):
+            raise StateError(f"{what}.unresolved[{i}].finding_id must be a finding id")
+        if (
+            not isinstance(reason, str)
+            or not reason.strip()
+            or len(reason) > MAX_STORED_RATIONALE_CHARS
+        ):
+            raise StateError(
+                f"{what}.unresolved[{i}].reason must be a non-blank string of at most "
+                f"{MAX_STORED_RATIONALE_CHARS} characters"
+            )
+        left.append(fid)
+    ids = resolved + left
+    if len(set(ids)) != len(ids):
+        raise StateError(f"{what} names a finding twice")
+    held = state.open_findings or state.prior_findings
+    if sorted(ids) != sorted(str(f.get("id", "")) for f in held):
+        raise StateError(
+            f"{what} must name exactly the findings of round {state.review_round}, which "
+            "the state holds open or carried"
         )
 
 

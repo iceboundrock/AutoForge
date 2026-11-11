@@ -1702,7 +1702,15 @@ def test_a_blocked_state_loads_the_plan_of_the_phase_it_stopped():
     ]
 
 
-FIX_CONTEXT = {"phase": "FIX", "issue_url": ISSUE, "pr_url": PR, "round": 1, "resolutions": []}
+FIX_CONTEXT = {
+    "phase": "FIX",
+    "issue_url": ISSUE,
+    "pr_url": PR,
+    "round": 1,
+    "resolutions": [],
+    "unresolved": [],
+    "message": "",
+}
 
 
 def _maximal_follow_ups(count: int) -> list[dict]:

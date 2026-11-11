@@ -3339,6 +3339,7 @@ def _render_status(
         f"Review comment: {state.last_review_comment_url or '-'}",
         f"Open findings: {len(state.open_findings)}",
         f"Prior findings to re-check: {len(state.prior_findings)}{_carried_by(state)}",
+        *_partial_fix_lines(state),
     ]
     if state.superseded_prs:
         lines.append("Superseded PRs:")
@@ -3373,6 +3374,20 @@ def _render_status(
         f"Updated:    {state.updated_at}",
     ]
     return "\n".join(lines)
+
+
+def _partial_fix_lines(state: AutoForgeState) -> list[str]:
+    """The partial fix a blocked FIX published (#433), as ``status`` shows it; ids and SHAs only."""
+    record = state.partial_fix
+    if not record:
+        return []
+    by = "the controller's push" if record["published_by"] == "controller" else "an external push"
+    left = ", ".join(u["finding_id"] for u in record["unresolved"])
+    return [
+        f"Partial fix:   {record['candidate_sha']} over {record['reviewed_head_sha']} "
+        f"(round {record['round']}, {by}): {', '.join(record['resolved'])} claimed resolved, "
+        f"{left} left open"
+    ]
 
 
 def _carried_by(state: AutoForgeState) -> str:
