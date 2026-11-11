@@ -15,7 +15,9 @@ helper environment's Python (3.10 or newer), the `claude-agent-sdk`
 installed in it (0.2.163) and the Claude Code bundled with it (2.1.286);
 Node (24 or newer) and the OpenCode runtime `options.server_command` names
 (`opencode-ai` 1.18.34). It reads versions only: it imports no SDK, runs
-none of the helper environment's `site` startup hooks, never runs the
+none of the helper environment's `site` startup hooks (an interpreter that
+a `._pth` file could make run them, or for which doctor cannot tell, is
+not run at all, and its rows are `SKIP`s), never runs the
 OpenCode runtime (which writes to your home when it starts, even for
 `--version`: its version is read from its npm package), installs nothing,
 starts no session, server or model call, and shows whether the credential

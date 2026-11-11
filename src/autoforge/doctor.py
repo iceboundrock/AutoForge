@@ -156,6 +156,7 @@ from .safefs import STATE_DIR_NEEDS_HARD_LINKS, HardLinksUnavailable, SafeRoot
 from .sandbox_policy import resolve_command
 from .sdk_assets import (
     HelperPin,
+    PthFiles,
     checked_version,
     interpreter_pth_files,
     parse_claude_environment,
@@ -1040,7 +1041,9 @@ class Doctor:
         Read-only (ADR 0007 D2.6 and its amendment): the Claude environment
         probe under ``-I -S -B``, so none of the environment's ``site`` hooks
         runs and no bytecode is written, and never with an interpreter a
-        ``._pth`` file could make import ``site`` anyway; ``node
+        ``._pth`` file could make import ``site`` anyway (beside it, its
+        virtual environment's base or its libpython), nor with one for which
+        that cannot be told; ``node
         --version``; and the OpenCode runtime's ``package.json``, read as a
         file, since running the runtime writes to the home even for
         ``--version``. The probes run under the launch allow-list without
@@ -1109,17 +1112,20 @@ class Doctor:
             return redact(f"{type(exc).__name__}: {exc}")
         return "timed out" if res.timed_out else res
 
-    def _pth_files(self, command: str) -> list[str]:
-        """The ``._pth`` files beside the interpreter ``command`` runs as
-        (:func:`autoforge.sdk_assets.interpreter_pth_files`): a bare name as
-        the launch's ``PATH`` finds it, a relative path against the probe's
-        directory. Nothing when it is not found: the probe then fails to
-        start, and its row says so."""
+    def _pth_files(self, command: str) -> PthFiles:
+        """The ``._pth`` files the interpreter ``command`` would read when it
+        starts (:func:`autoforge.sdk_assets.interpreter_pth_files`): a bare
+        name as the launch's ``PATH`` finds it, a relative path against the
+        probe's directory, with this process's ``LD_LIBRARY_PATH`` (the probe
+        carries it or nothing). Nothing when it is not found: the probe then
+        fails to start, and its row says so."""
         if "/" in command:
-            found = os.path.join(self.cwd, command)
+            found = command
         else:
             found = shutil.which(command, path=os.environ.get("PATH")) or ""
-        return interpreter_pth_files(found) if found else []
+        if not found:
+            return PthFiles(())
+        return interpreter_pth_files(found, self.cwd, os.environ.get("LD_LIBRARY_PATH", ""))
 
     def _claude_sdk_environment(
         self,
@@ -1137,16 +1143,30 @@ class Doctor:
         argv = adapter.environment_probe_command(profiles[0])
         shown = f"{' '.join(argv[:-1])} <the read-only metadata probe>"
         overrides = self._pth_files(command)
-        if overrides:
+        if overrides.found or overrides.unknown:
+            hooks = (
+                "can make it import site even under -S, and with it run the environment's "
+                "startup hooks (.pth import lines, sitecustomize), so doctor runs nothing "
+                "with it"
+            )
+            if overrides.found:
+                why = (
+                    f"{', '.join(overrides.found)}, where Python looks for a ._pth file when "
+                    f"'{command}' starts (beside it, its virtual environment's base "
+                    f"interpreter or its libpython), {hooks}. A helper environment needs no "
+                    "._pth file: name an interpreter without one"
+                )
+            else:
+                why = (
+                    "doctor cannot tell every place Python looks for a ._pth file when "
+                    f"'{command}' starts ({overrides.unknown}), and such a file {hooks}. "
+                    "Name the environment's own interpreter (its bin/python)"
+                )
             skipped = "(the helper environment was not probed; see its row)"
             return [
                 CheckResult.skip(
                     interpreter,
-                    f"not probed: {', '.join(overrides)} beside the interpreter can make it "
-                    "import site even under -S, and with it run the environment's startup "
-                    "hooks (.pth import lines, sitecustomize), so doctor runs nothing with "
-                    "it. A helper environment needs no ._pth file: name an interpreter "
-                    f"without one, or check the environment yourself against {pin.pair()}",
+                    f"not probed: {why}, or check the environment yourself against {pin.pair()}",
                 ),
                 CheckResult.skip(sdk, skipped),
                 CheckResult.skip(runtime, skipped),

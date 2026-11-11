@@ -3143,9 +3143,9 @@ def test_an_interpreter_with_a_pth_file_is_never_probed(tmp_path, beside):
     """A ``._pth`` file beside the interpreter, as named or as its link
     resolves, can import ``site`` even under ``-S``: doctor runs nothing
     with it, and its three rows are SKIPs that say why."""
-    real = tmp_path / "base" / "python3.12"
-    real.parent.mkdir()
-    real.write_text("", encoding="utf-8")
+    from tests.test_sdk_profiles import elf
+
+    real = elf(tmp_path / "base" / "python3.12")
     python = tmp_path / "env" / "bin" / "python"
     python.parent.mkdir(parents=True)
     python.symlink_to(real)
@@ -3162,6 +3162,73 @@ def test_an_interpreter_with_a_pth_file_is_never_probed(tmp_path, beside):
     assert rows[f"claude-sdk SDK package in {label}"].skipped
     assert rows[f"claude-sdk runtime in {label}"].skipped
     assert not any(req.command[0] == str(python) for req in requests)
+
+
+def test_a_copied_environment_whose_base_has_a_pth_file_is_never_run(tmp_path):
+    """R2-F1 of #150's review. In an environment made with ``venv --copies``
+    the interpreter is no link, so CPython takes its base from the ``home``
+    of its ``pyvenv.cfg``, and a ``._pth`` file beside that base imports
+    ``site`` and runs ``sitecustomize`` even under the probe's ``-I -S -B``
+    (the control run). Doctor, with the probe run for real, starts nothing
+    with it: its three rows are SKIPs naming that file, and the hook never
+    runs."""
+    from tests.test_sdk_profiles import copied_environment, run_copied_hooks
+
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    python, pth = copied_environment(tmp_path, markers)
+    run_copied_hooks(python, tmp_path)
+    assert "sitecustomize" in [path.name for path in markers.iterdir()]
+    for marker in markers.iterdir():
+        marker.unlink()
+    requests: list = []
+    base = _sdk_runner(requests=requests)
+
+    def runner(req):
+        return execute(req) if req.command[0] == str(python) else base(req)
+
+    config = _write_config(tmp_path, {"analyze_execute": _claude_sdk(command=str(python))})
+    rows = {
+        r.name: r for r in Doctor(config_path=config, cwd=str(tmp_path), runner=runner).run_all()
+    }
+    label = f"'{python}' (analyze_execute)"
+    interpreter = rows[f"claude-sdk helper environment {label}"]
+    assert interpreter.skipped and str(pth) in interpreter.detail
+    assert "its virtual environment's base interpreter" in interpreter.detail
+    assert rows[f"claude-sdk SDK package in {label}"].skipped
+    assert rows[f"claude-sdk runtime in {label}"].skipped
+    assert not any(req.command[0] == str(python) for req in requests)
+    assert list(markers.iterdir()) == []
+
+
+def test_an_interpreter_whose_startup_doctor_cannot_read_is_never_run(tmp_path):
+    """Where Python would look for a ``._pth`` file cannot be told for a
+    wrapper script (nor for a binary that is not ELF): doctor runs nothing
+    with it, and says why in SKIPs."""
+    started = tmp_path / "started"
+    wrapper = tmp_path / "wrapper" / "python"
+    wrapper.parent.mkdir()
+    wrapper.write_text(f"#!/bin/sh\n: > '{started}'\nexit 1\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    requests: list = []
+    base = _sdk_runner(requests=requests)
+
+    def runner(req):
+        return execute(req) if req.command[0] == str(wrapper) else base(req)
+
+    config = _write_config(tmp_path, {"analyze_execute": _claude_sdk(command=str(wrapper))})
+    rows = {
+        r.name: r for r in Doctor(config_path=config, cwd=str(tmp_path), runner=runner).run_all()
+    }
+    label = f"'{wrapper}' (analyze_execute)"
+    interpreter = rows[f"claude-sdk helper environment {label}"]
+    assert interpreter.skipped
+    assert f"({wrapper} is not an ELF executable doctor can read)" in interpreter.detail
+    assert "Name the environment's own interpreter (its bin/python)" in interpreter.detail
+    assert rows[f"claude-sdk SDK package in {label}"].skipped
+    assert rows[f"claude-sdk runtime in {label}"].skipped
+    assert not any(req.command[0] == str(wrapper) for req in requests)
+    assert not started.exists()
 
 
 def _without_command(profile):

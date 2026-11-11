@@ -19,10 +19,12 @@ helper's bytes for their digest; it starts no process, imports no SDK and
 reaches no network. It also holds what ``doctor`` asks a Claude helper
 environment (:data:`CLAUDE_ENVIRONMENT_PROBE`), how the answers of the
 read-only probes are parsed, and the reads ``doctor`` makes instead of
-running something that would write: an interpreter's ``._pth`` file
-(:func:`interpreter_pth_files`) and an OpenCode runtime's ``package.json``
-(:func:`runtime_package`). The controller never imports an SDK to learn
-its version, and never runs the OpenCode runtime (D2.6 and its amendment).
+running something that would write: every place an interpreter would read
+a ``._pth`` file from (:func:`interpreter_pth_files`, which reads its
+``pyvenv.cfg``, its ELF dynamic section and the loader's cache) and an
+OpenCode runtime's ``package.json`` (:func:`runtime_package`). The
+controller never imports an SDK to learn its version, and never runs the
+OpenCode runtime (D2.6 and its amendment).
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -282,20 +285,324 @@ print(json.dumps(out))
 """
 
 
-def interpreter_pth_files(executable: str) -> list[str]:
-    """The ``._pth`` files beside ``executable``, as found and as resolved.
+# -- where an interpreter looks for a ``._pth`` file (ADR 0007 D2.6's amendment) ---
+# A ``._pth`` file replaces the interpreter's path and, with an ``import
+# site`` line, imports ``site`` even under ``-S``, and with it the
+# environment's startup hooks. CPython 3.11 and later (``Modules/getpath.py``)
+# read the first one found beside, in order: the shared libpython the
+# process runs on (``library``: 3.14 and later on Linux, where ``dladdr``
+# names it), ``sys.executable`` as started (``executable``), and the real
+# base interpreter (``real_executable``). In a virtual environment the base
+# interpreter is the link's target, or, for a copy (``venv --copies``), the
+# file of the same name in the ``home`` of its ``pyvenv.cfg``, else
+# ``python3`` or ``python3.X`` there. ``doctor`` looks for every one of
+# them without running the interpreter, a superset where the exact one
+# cannot be told (each pyvenv.cfg, each base name, each directory the
+# dynamic loader may take libpython from), and runs no probe when one
+# exists or when it cannot tell where they are.
 
-    Such a file overrides the interpreter's path and, with an ``import
-    site`` line, imports ``site`` even under ``-S``, and with it the
-    environment's startup hooks. ``doctor`` therefore runs no probe with an
-    interpreter that has one (ADR 0007 D2.6's amendment). It only looks:
-    the file is not opened.
-    """
-    found = []
-    for path in dict.fromkeys((executable, os.path.realpath(executable))):
-        if os.path.lexists(path + "._pth"):
-            found.append(path + "._pth")
+# The ELF and loader fields read (``elf.h``, glibc ``dl-cache.h``).
+_ELF_MAGIC = b"\x7fELF"
+_PT_LOAD, _PT_DYNAMIC = 1, 2
+_DT_NULL, _DT_NEEDED, _DT_STRTAB, _DT_STRSZ, _DT_RPATH, _DT_RUNPATH = 0, 1, 5, 10, 15, 29
+_LD_CACHE = "/etc/ld.so.cache"
+_LD_CACHE_MAGIC = b"glibc-ld.so.cache1.1"
+_LD_CACHE_HEADER, _LD_CACHE_ENTRY = 48, 24
+# The most of each file that is read.
+_ELF_TABLE_LIMIT = 1 << 20
+_ELF_STRINGS_LIMIT = 1 << 26
+_LD_CACHE_LIMIT = 1 << 26
+_PYVENV_CFG_LIMIT = 1 << 20
+# The directories a glibc or musl loader searches after the paths a binary
+# and LD_LIBRARY_PATH name and glibc's cache, on any distribution, plus each
+# ``<triplet>`` directory under the first three (Debian's multiarch).
+_SYSTEM_LIBRARY_DIRS = ("/lib", "/usr/lib", "/usr/local/lib", "/lib64", "/usr/lib64")
+_MULTIARCH_RE = re.compile(r"[a-z0-9_]+-linux-[a-z0-9_]+")
+_VERSIONED_PYTHON_RE = re.compile(r"python[0-9]+\.[0-9]+")
+_ORIGIN_RE = re.compile(r"\$\{ORIGIN\}|\$ORIGIN(?=/|$)")
+
+
+@dataclass(frozen=True)
+class PthFiles:
+    """What :func:`interpreter_pth_files` found."""
+
+    # Each ``._pth`` file that exists where the interpreter would look.
+    found: tuple[str, ...]
+    # Why doctor cannot tell every place it would look, or ''.
+    unknown: str = ""
+
+
+@dataclass(frozen=True)
+class _Dynamic:
+    """An ELF file's ``DT_NEEDED`` names and its two search paths."""
+
+    needed: tuple[str, ...]
+    rpath: tuple[str, ...]
+    runpath: tuple[str, ...]
+
+
+def _elf_dynamic(path: str) -> _Dynamic | None:
+    """The dynamic section of the ELF file at ``path``: empty for a static
+    executable, ``None`` when the file is not ELF or cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+            if head[:4] != _ELF_MAGIC or head[4] not in (1, 2) or head[5] not in (1, 2):
+                return None
+            wide = head[4] == 2
+            order = "<" if head[5] == 1 else ">"
+            if wide:
+                (phoff,) = struct.unpack_from(order + "Q", head, 32)
+                phentsize, phnum = struct.unpack_from(order + "HH", head, 54)
+                header, header_size, dyn = order + "IIQQQQQQ", 56, order + "qQ"
+            else:
+                (phoff,) = struct.unpack_from(order + "I", head, 28)
+                phentsize, phnum = struct.unpack_from(order + "HH", head, 42)
+                header, header_size, dyn = order + "IIIIIIII", 32, order + "iI"
+            # 0xFFFF (PN_XNUM) keeps the count in a section header: not read.
+            if phentsize < header_size or not 0 < phnum < 0xFFFF:
+                return None
+            f.seek(phoff)
+            table = f.read(phentsize * phnum)
+            loads: list[tuple[int, int, int]] = []
+            dynamic: tuple[int, int] | None = None
+            for index in range(phnum):
+                fields = struct.unpack_from(header, table, index * phentsize)
+                if wide:
+                    kind, _, offset, address, _, size, _, _ = fields
+                else:
+                    kind, offset, address, _, size, _, _, _ = fields
+                if kind == _PT_LOAD:
+                    loads.append((address, offset, size))
+                elif kind == _PT_DYNAMIC:
+                    dynamic = (offset, size)
+            if dynamic is None:
+                return _Dynamic((), (), ())
+            if dynamic[1] > _ELF_TABLE_LIMIT:
+                return None
+            f.seek(dynamic[0])
+            raw = f.read(dynamic[1])
+            entries: list[tuple[int, int]] = []
+            for tag, value in struct.iter_unpack(
+                dyn, raw[: len(raw) - len(raw) % struct.calcsize(dyn)]
+            ):
+                if tag == _DT_NULL:
+                    break
+                entries.append((tag, value))
+            if not any(tag in (_DT_NEEDED, _DT_RPATH, _DT_RUNPATH) for tag, _ in entries):
+                return _Dynamic((), (), ())
+            values = dict(entries)
+            strtab, strsz = values.get(_DT_STRTAB), values.get(_DT_STRSZ, 0)
+            if strtab is None or strsz > _ELF_STRINGS_LIMIT:
+                return None
+            start = next(
+                (
+                    offset + strtab - address
+                    for address, offset, size in loads
+                    if address <= strtab < address + size
+                ),
+                None,
+            )
+            if start is None:
+                return None
+            f.seek(start)
+            strings = f.read(strsz)
+    except (OSError, struct.error):
+        return None
+
+    def text(offset: int) -> str:
+        end = strings.find(b"\0", offset)
+        if offset >= len(strings) or end < 0:
+            raise ValueError("outside the string table")
+        return os.fsdecode(strings[offset:end])
+
+    try:
+        named = [
+            (tag, text(value))
+            for tag, value in entries
+            if tag in (_DT_NEEDED, _DT_RPATH, _DT_RUNPATH)
+        ]
+    except ValueError:
+        return None
+    return _Dynamic(
+        needed=tuple(name for tag, name in named if tag == _DT_NEEDED),
+        rpath=tuple(p for tag, name in named if tag == _DT_RPATH for p in name.split(":")),
+        runpath=tuple(p for tag, name in named if tag == _DT_RUNPATH for p in name.split(":")),
+    )
+
+
+def _ld_cache_paths(name: str, cache: str | None = None) -> list[str] | None:
+    """The paths glibc's loader cache records for the library ``name``:
+    none without a cache, ``None`` when it cannot be read."""
+    cache = _LD_CACHE if cache is None else cache
+    try:
+        with open(cache, "rb") as f:
+            data = f.read(_LD_CACHE_LIMIT + 1)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    start = data.find(_LD_CACHE_MAGIC)
+    if start < 0 or len(data) > _LD_CACHE_LIMIT:
+        return None
+    key = os.fsencode(name)
+
+    def text(offset: int) -> bytes:
+        end = data.find(b"\0", start + offset)
+        if end < 0:
+            raise ValueError("outside the cache")
+        return data[start + offset : end]
+
+    try:
+        (count,) = struct.unpack_from("=I", data, start + 20)
+        found = []
+        for index in range(count):
+            _, name_at, path_at = struct.unpack_from(
+                "=iII", data, start + _LD_CACHE_HEADER + index * _LD_CACHE_ENTRY
+            )
+            if text(name_at) == key:
+                found.append(os.fsdecode(text(path_at)))
+    except (struct.error, ValueError):
+        return None
     return found
+
+
+def _subdirectories(path: str, pattern: re.Pattern[str] | None = None) -> list[str]:
+    try:
+        names = sorted(entry.name for entry in os.scandir(path) if entry.is_dir())
+    except OSError:
+        return []
+    return [os.path.join(path, n) for n in names if pattern is None or pattern.fullmatch(n)]
+
+
+def _files(path: str, prefix: str, suffix: str) -> list[str]:
+    try:
+        names = sorted(entry.name for entry in os.scandir(path) if entry.is_file())
+    except OSError:
+        return []
+    return [os.path.join(path, n) for n in names if n.startswith(prefix) and n.endswith(suffix)]
+
+
+def _system_library_dirs() -> list[str]:
+    dirs = list(_SYSTEM_LIBRARY_DIRS)
+    for base in _SYSTEM_LIBRARY_DIRS[:3]:
+        dirs.extend(_subdirectories(base, _MULTIARCH_RE))
+    # musl reads its path from /etc/ld-musl-<arch>.path when there is one.
+    for listing in _files("/etc", "ld-musl-", ".path"):
+        try:
+            with open(listing, encoding="utf-8", errors="surrogateescape") as f:
+                dirs.extend(re.split(r"[:\n]", f.read(_PYVENV_CFG_LIMIT)))
+        except OSError:
+            continue
+    return [d for d in dict.fromkeys(dirs) if d]
+
+
+def _libpython_paths(
+    name: str, dynamic: _Dynamic, origin: str, cwd: str, library_path: str
+) -> list[str] | str:
+    """Every path the dynamic loader may take the libpython ``name`` from,
+    or why they cannot be told: the binary's ``DT_RPATH`` (without a
+    ``DT_RUNPATH``), ``LD_LIBRARY_PATH``, its ``DT_RUNPATH``, glibc's cache,
+    then the system directories, each with its ``glibc-hwcaps``
+    subdirectories. All of them, not only the first that holds it."""
+    if "/" in name:
+        return [os.path.join(cwd, name)]
+    entries = [
+        *(() if dynamic.runpath else dynamic.rpath),
+        *(re.split(r"[:;]", library_path) if library_path else ()),
+        *dynamic.runpath,
+    ]
+    dirs: list[str] = []
+    for entry in entries:
+        expanded = _ORIGIN_RE.sub(lambda _: origin, entry)
+        if "$" in expanded:
+            return f"its library search path names {entry!r}, which doctor does not expand"
+        dirs.append(os.path.join(cwd, expanded) if expanded else cwd)
+    cached = _ld_cache_paths(name)
+    if cached is None:
+        return f"the dynamic loader's cache {_LD_CACHE} cannot be read"
+    dirs.extend(_system_library_dirs())
+    paths = [
+        os.path.join(place, name)
+        for d in dict.fromkeys(dirs)
+        for place in (*_subdirectories(os.path.join(d, "glibc-hwcaps")), d)
+    ]
+    return [*paths, *cached]
+
+
+def _venv_bases(executable: str, cwd: str) -> list[str] | str:
+    """The base interpreters CPython may take ``executable`` to be a copy
+    of, from the ``home`` of a ``pyvenv.cfg`` one directory above it or
+    beside it (3.11 reads the first of these, 3.10 the second; both are
+    read here), or why they cannot be told. A link's base is its target,
+    which the caller checks already."""
+    bindir = os.path.dirname(executable)
+    bases: list[str] = []
+    for conf in (
+        os.path.join(os.path.dirname(bindir), "pyvenv.cfg"),
+        os.path.join(bindir, "pyvenv.cfg"),
+    ):
+        try:
+            with open(conf, "rb") as f:
+                raw = f.read(_PYVENV_CFG_LIMIT + 1)
+        except OSError:
+            continue
+        if len(raw) > _PYVENV_CFG_LIMIT:
+            return f"{conf} is larger than doctor reads"
+        for line in raw.decode("utf-8", "surrogateescape").splitlines():
+            key, eq, value = line.partition("=")
+            if eq and key.strip().lower() == "home":
+                home = os.path.join(cwd, value.strip())
+                names = [os.path.basename(executable), "python", "python3"]
+                try:
+                    names += sorted(
+                        n for n in os.listdir(home) if _VERSIONED_PYTHON_RE.fullmatch(n)
+                    )
+                except OSError:
+                    pass
+                bases.extend(os.path.join(home, n) for n in dict.fromkeys(names))
+                break
+    return bases
+
+
+def interpreter_pth_files(command: str, cwd: str, library_path: str = "") -> PthFiles:
+    """The ``._pth`` files the interpreter at ``command`` would read when it
+    starts in ``cwd`` with ``LD_LIBRARY_PATH`` ``library_path``, and why
+    doctor cannot tell them all, if it cannot.
+
+    ``command`` is the path the interpreter is started as (a relative one
+    against ``cwd``). Nothing is reported when no file is there: nothing
+    then starts, and the probe's row says so. An interpreter that is not an
+    ELF file (a wrapper script, a macOS binary) cannot be told. It only
+    looks: no ``._pth`` file is opened, and nothing is run.
+    """
+    executable = os.path.abspath(os.path.join(cwd, command))
+    real = os.path.realpath(executable)
+    if not os.path.isfile(real):
+        return PthFiles(())
+    places = [executable, real]
+    unknown = ""
+    dynamic = _elf_dynamic(real)
+    if dynamic is None:
+        unknown = f"{real} is not an ELF executable doctor can read"
+    else:
+        for name in dynamic.needed:
+            if name.startswith("libpython"):
+                paths = _libpython_paths(name, dynamic, os.path.dirname(real), cwd, library_path)
+                if isinstance(paths, str):
+                    unknown = unknown or paths
+                else:
+                    places.extend(paths)
+    bases = _venv_bases(executable, cwd)
+    if isinstance(bases, str):
+        unknown = unknown or bases
+    else:
+        for base in bases:
+            places.extend((base, os.path.realpath(base)))
+    found = tuple(
+        dict.fromkeys(f"{place}._pth" for place in places if os.path.lexists(f"{place}._pth"))
+    )
+    return PthFiles(found, unknown)
 
 
 # The most of a runtime's package.json that is read.

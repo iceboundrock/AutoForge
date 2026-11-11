@@ -450,8 +450,8 @@ launch or in `doctor`.**
   - `node --version`;
   - the runtime's `--version`.
 
-*Amendment (2026-11-11, #150, its review's round 1).* Two of these reads
-wrote with the operator's access, so `doctor` makes them differently:
+*Amendment (2026-11-11, #150, its review's rounds 1 and 2).* Two of these
+reads wrote with the operator's access, so `doctor` makes them differently:
 
 - **The runtime's version.** The OpenCode runtime creates its data,
   config, state and cache directories in the home it is given when it
@@ -470,9 +470,23 @@ wrote with the operator's access, so `doctor` makes them differently:
   `sitecustomize`) before the probe's first line. The probe therefore runs
   as `<interpreter> -I -S -B -c <probe>`. `-S` keeps `site` out, so the
   probe finds the site-packages directories itself, as `site` would but
-  without running a hook. `-B` writes no bytecode. An interpreter with a
-  `._pth` file beside it (as named or as resolved) is not run at all: such
-  a file can import `site` even under `-S`. Its rows are `SKIP`s.
+  without running a hook. `-B` writes no bytecode. A `._pth` file can
+  import `site` even under `-S`. CPython 3.11 and later
+  (`Modules/getpath.py`) read the first one found beside the shared
+  libpython the process runs on (3.14 and later on Linux), beside the
+  interpreter as started, or beside the real base interpreter. In an
+  environment made with `venv --copies` the base interpreter is not the
+  copy's target but the file in the `home` of its `pyvenv.cfg`. The
+  round-2 review ran a hook through that file. `doctor` therefore looks
+  in all of those places without running anything. It reads every
+  `pyvenv.cfg` and every base name CPython may pick, and reads the
+  interpreter's ELF `DT_NEEDED`, `DT_RPATH` and `DT_RUNPATH` entries,
+  `LD_LIBRARY_PATH`, glibc's loader cache and the system library
+  directories for every place the loader may take libpython from. An
+  interpreter for which any of these holds a `._pth` file is not run at
+  all, and neither is one whose places cannot all be told: a script, a
+  binary that is not ELF, a search path naming `$LIB` or `$PLATFORM`, or
+  a loader cache that cannot be read. Its rows are `SKIP`s that say which.
 
 The helper's own argv stays D2.3's: a launch runs the environment as
 installed, hooks included, inside the outer sandbox.

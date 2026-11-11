@@ -2469,8 +2469,14 @@ Keep covered:
 - `doctor` writes nothing with the operator's access (ADR 0007 D2.6's
   amendment, #150's review): the Claude probe, run for real on a helper
   environment whose `.pth` import line is live (a control run shows it
-  runs under `-I` alone), runs no hook; an interpreter with a `._pth` file
-  is not run; the OpenCode runtime is a stand-in that writes to the home,
+  runs under `-I` alone), runs no hook; an interpreter for which Python
+  would read a `._pth` file is not run: beside it as named or resolved,
+  beside a copied environment's base interpreter (`venv --copies`, run
+  for real: a control run shows the base's `._pth` runs `sitecustomize`
+  under `-I -S -B`, and doctor's real probe never starts), or beside the
+  libpython the loader may take (synthetic ELF files and loader cache);
+  nor one whose places cannot be told (a wrapper script, run for real,
+  never starts); the OpenCode runtime is a stand-in that writes to the home,
   XDG and TMPDIR directories when it starts (a control run shows it), and
   with any probe of it run for real the runtime never starts and those
   directories stay as they were.

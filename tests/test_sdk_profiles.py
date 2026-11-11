@@ -14,8 +14,12 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
+import shutil
+import struct
 import subprocess
 import sys
+import sysconfig
 import venv
 from pathlib import Path
 
@@ -37,6 +41,7 @@ from autoforge.sdk_assets import (
     CLAUDE_ENVIRONMENT_PROBE_FLAGS,
     STAGED_HELPER_DIR,
     HelperPin,
+    PthFiles,
     checked_version,
     helper_problem,
     interpreter_pth_files,
@@ -256,29 +261,220 @@ def test_a_runtime_in_no_npm_package_or_a_package_too_large_reads_as_none(tmp_pa
     assert runtime_package(str(binary)) is None
 
 
-def test_a_pth_file_beside_the_interpreter_as_found_or_as_resolved_is_seen(tmp_path):
-    real = tmp_path / "base" / "python3.12"
-    real.parent.mkdir()
-    real.write_text("", encoding="utf-8")
+# -- where an interpreter looks for a ._pth file (ADR 0007 D2.6's amendment) --------
+def elf(path: Path, needed=(), *, rpath: str | None = None, runpath: str | None = None) -> Path:
+    """A minimal 64-bit little-endian ELF executable at ``path``: one
+    ``PT_LOAD`` over the whole file and a ``PT_DYNAMIC`` naming ``needed``
+    and the two search paths, as a linker writes them."""
+    strings = bytearray(b"\0")
+
+    def add(text: str) -> int:
+        at = len(strings)
+        strings.extend(text.encode() + b"\0")
+        return at
+
+    tags = [(1, add(name)) for name in needed]
+    if rpath is not None:
+        tags.append((15, add(rpath)))
+    if runpath is not None:
+        tags.append((29, add(runpath)))
+    strtab = 64 + 2 * 56
+    dynamic_at = strtab + len(strings)
+    tags += [(5, strtab), (10, len(strings)), (0, 0)]
+    dynamic = b"".join(struct.pack("<qQ", tag, value) for tag, value in tags)
+    size = dynamic_at + len(dynamic)
+    header = b"\x7fELF" + bytes([2, 1, 1]) + bytes(9)
+    header += struct.pack("<HHIQQQIHHHHHH", 2, 62, 1, 0, 64, 0, 0, 64, 56, 2, 64, 0, 0)
+    load = struct.pack("<IIQQQQQQ", 1, 5, 0, 0, 0, size, size, 0x1000)
+    dyn = struct.pack(
+        "<IIQQQQQQ", 2, 6, dynamic_at, dynamic_at, dynamic_at, len(dynamic), len(dynamic), 8
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(header + load + dyn + bytes(strings) + dynamic)
+    path.chmod(0o755)
+    return path
+
+
+def ld_cache(path: Path, entries: dict[str, str]) -> Path:
+    """glibc's loader cache (``glibc-ld.so.cache1.1``) recording ``entries``,
+    library name to path."""
+    strings = bytearray()
+    records = []
+    table = 48 + 24 * len(entries)
+    for name, target in entries.items():
+        key = table + len(strings)
+        strings.extend(name.encode() + b"\0")
+        value = table + len(strings)
+        strings.extend(target.encode() + b"\0")
+        records.append(struct.pack("=iIIIQ", 0x0303, key, value, 0, 0))
+    header = struct.pack("=20sIIB3xI12x", b"glibc-ld.so.cache1.1", len(entries), len(strings), 2, 0)
+    path.write_bytes(header + b"".join(records) + bytes(strings))
+    return path
+
+
+@pytest.fixture
+def no_ld_cache(tmp_path, monkeypatch):
+    """No loader cache, so the host's cannot add a path to a test's answer."""
+    monkeypatch.setattr(sdk_assets, "_LD_CACHE", str(tmp_path / "no-ld.so.cache"))
+
+
+def test_python_looks_for_a_pth_file_beside_the_interpreter_as_started_and_as_resolved(tmp_path):
+    real = elf(tmp_path / "base" / "python3.12")
     link = tmp_path / "env" / "bin" / "python"
     link.parent.mkdir(parents=True)
     link.symlink_to(real)
-    assert interpreter_pth_files(str(link)) == []
+    assert interpreter_pth_files(str(link), str(tmp_path)) == PthFiles(())
     Path(f"{real}._pth").write_text("import site\n", encoding="utf-8")
-    assert interpreter_pth_files(str(link)) == [f"{real}._pth"]
+    assert interpreter_pth_files(str(link), str(tmp_path)).found == (f"{real}._pth",)
     Path(f"{link}._pth").write_text("import site\n", encoding="utf-8")
-    assert interpreter_pth_files(str(link)) == [f"{link}._pth", f"{real}._pth"]
+    assert interpreter_pth_files(str(link), str(tmp_path)).found == (f"{link}._pth", f"{real}._pth")
+    # A relative command is the probe directory's, as the interpreter sees it.
+    assert interpreter_pth_files("env/bin/python", str(tmp_path)).found == (
+        f"{link}._pth",
+        f"{real}._pth",
+    )
+
+
+@pytest.mark.parametrize(
+    "layout",
+    ["same-name", "versioned-fallback", "resolved", "pyvenv-beside"],
+)
+def test_python_looks_for_a_pth_file_beside_a_copied_environments_base(tmp_path, layout):
+    """R2-F1 of #150's review: a copy (``venv --copies``) is no link, so
+    CPython takes its base interpreter from the ``home`` of its
+    ``pyvenv.cfg``: the same name there, else ``python3`` or ``python3.X``,
+    resolved. A ``._pth`` file beside that base counts."""
+    python = elf(tmp_path / "env" / "bin" / "python")
+    home = tmp_path / "base" / "bin"
+    home.mkdir(parents=True)
+    conf = (
+        python.parent / "pyvenv.cfg"
+        if layout == "pyvenv-beside"
+        else tmp_path / "env" / "pyvenv.cfg"
+    )
+    conf.write_text(f"home = {home}\ninclude-system-site-packages = false\n", encoding="utf-8")
+    if layout in ("same-name", "pyvenv-beside"):
+        base = elf(home / "python")
+    elif layout == "versioned-fallback":
+        base = elf(home / "python3.12")
+    else:
+        base = elf(tmp_path / "opt" / "python3.12")
+        (home / "python3").symlink_to(base)
+    assert interpreter_pth_files(str(python), str(tmp_path)) == PthFiles(())
+    pth = Path(f"{base}._pth")
+    pth.write_text("import site\n", encoding="utf-8")
+    assert interpreter_pth_files(str(python), str(tmp_path)) == PthFiles((str(pth),))
+
+
+@pytest.mark.parametrize(
+    "found_by", ["rpath", "runpath-origin", "ld-library-path", "hwcaps", "cache"]
+)
+def test_python_looks_for_a_pth_file_beside_the_libpython_it_loads(tmp_path, monkeypatch, found_by):
+    """CPython 3.14 and later on Linux also read one beside the shared
+    libpython the process runs on: wherever the dynamic loader may take it
+    from, every candidate, not only the first."""
+    name = "libpython3.14.so.1.0"
+    lib = tmp_path / "prefix" / "lib"
+    paths = {
+        "rpath": {"rpath": str(lib)},
+        "runpath-origin": {"runpath": "$ORIGIN/../lib"},
+        "hwcaps": {"runpath": "${ORIGIN}/../lib"},
+    }
+    python = elf(
+        tmp_path / "prefix" / "bin" / "python3.14", [name, "libc.so.6"], **paths.get(found_by, {})
+    )
+    library_path = str(lib) if found_by == "ld-library-path" else ""
+    folder = lib / "glibc-hwcaps" / "x86-64-v3" if found_by == "hwcaps" else lib
+    folder.mkdir(parents=True)
+    monkeypatch.setattr(
+        sdk_assets,
+        "_LD_CACHE",
+        str(
+            ld_cache(
+                tmp_path / "ld.so.cache", {name: str(folder / name)} if found_by == "cache" else {}
+            )
+        ),
+    )
+    assert interpreter_pth_files(str(python), str(tmp_path), library_path) == PthFiles(())
+    pth = folder / f"{name}._pth"
+    pth.write_text("import site\n", encoding="utf-8")
+    found = interpreter_pth_files(str(python), str(tmp_path), library_path)
+    assert found.unknown == ""
+    assert [os.path.realpath(path) for path in found.found] == [os.path.realpath(pth)]
+
+
+def test_a_static_interpreter_reads_no_libpython_pth_file(tmp_path, monkeypatch):
+    """A libpython ._pth file counts only for an interpreter linked to it."""
+    lib = tmp_path / "prefix" / "lib"
+    lib.mkdir(parents=True)
+    (lib / "libpython3.14.so.1.0._pth").write_text("import site\n", encoding="utf-8")
+    python = elf(tmp_path / "prefix" / "bin" / "python3.14", ["libc.so.6"], rpath="$ORIGIN/../lib")
+    # Not even a damaged loader cache matters to it.
+    monkeypatch.setattr(sdk_assets, "_LD_CACHE", str(python))
+    assert interpreter_pth_files(str(python), str(tmp_path)) == PthFiles(())
+
+
+@pytest.mark.usefixtures("no_ld_cache")
+def test_where_python_would_look_cannot_always_be_told(tmp_path, monkeypatch):
+    """Doctor then reports why, and its caller runs nothing: a wrapper
+    script, a search path naming a token it does not expand, a loader cache
+    it cannot read, or a pyvenv.cfg larger than it reads."""
+    script = tmp_path / "wrapper" / "python"
+    script.parent.mkdir()
+    script.write_text('#!/bin/sh\nexec python3 "$@"\n', encoding="utf-8")
+    script.chmod(0o755)
+    assert interpreter_pth_files(str(script), str(tmp_path)) == PthFiles(
+        (), f"{script} is not an ELF executable doctor can read"
+    )
+    linked = elf(
+        tmp_path / "linked" / "bin" / "python3.14", ["libpython3.14.so.1.0"], runpath="$LIB/py"
+    )
+    unknown = interpreter_pth_files(str(linked), str(tmp_path)).unknown
+    assert unknown == "its library search path names '$LIB/py', which doctor does not expand"
+    linked = elf(tmp_path / "shared" / "bin" / "python3.14", ["libpython3.14.so.1.0"])
+    monkeypatch.setattr(sdk_assets, "_LD_CACHE", str(script))
+    unknown = interpreter_pth_files(str(linked), str(tmp_path)).unknown
+    assert unknown == f"the dynamic loader's cache {script} cannot be read"
+    copy = elf(tmp_path / "env" / "bin" / "python")
+    big = tmp_path / "env" / "pyvenv.cfg"
+    big.write_text("home = /usr/bin\n" + "#" * (1 << 20), encoding="utf-8")
+    assert interpreter_pth_files(str(copy), str(tmp_path)).unknown == (
+        f"{big} is larger than doctor reads"
+    )
+    # A missing interpreter starts nothing: the probe's own row says so.
+    assert interpreter_pth_files(str(tmp_path / "absent"), str(tmp_path)) == PthFiles(())
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads an ELF interpreter")
+def test_the_elf_reader_reads_what_readelf_reads_of_the_running_interpreter():
+    real = os.path.realpath(sys.executable)
+    dynamic = sdk_assets._elf_dynamic(real)
+    assert dynamic is not None
+    readelf = shutil.which("readelf")
+    if readelf is not None:
+        out = subprocess.run(
+            [readelf, "-d", real], capture_output=True, text=True, timeout=60, check=True
+        ).stdout
+        needed = [
+            line.split("[", 1)[1].rstrip("]") for line in out.splitlines() if "(NEEDED)" in line
+        ]
+        assert list(dynamic.needed) == needed
+    if os.path.isfile("/etc/ld.so.cache"):
+        assert sdk_assets._ld_cache_paths("libc.so.6") is not None
 
 
 # -- the Claude environment probe, run for real (ADR 0007 D2.6's amendment) ---------
-def helper_environment(root: Path, markers: Path, *, sdk: bool = True) -> Path:
+def helper_environment(
+    root: Path, markers: Path, *, sdk: bool = True, symlinks: bool = True
+) -> Path:
     """A Claude helper environment as an operator makes one: a virtual
-    environment of the running interpreter holding a synthetic
+    environment of the running interpreter (its interpreter a link, or a
+    copy as ``venv --copies`` makes) holding a synthetic
     ``claude-agent-sdk`` 0.2.163 (bundled Claude Code 2.1.286) whose package
     exits on import, and a live startup hook: an ``import`` line of a
     ``.pth`` file in its site-packages, which creates ``markers/pth`` when
     ``site`` runs it. Returns the interpreter."""
-    venv.EnvBuilder(with_pip=False, symlinks=True).create(root)
+    venv.EnvBuilder(with_pip=False, symlinks=symlinks).create(root)
     version = f"python{sys.version_info.major}.{sys.version_info.minor}"
     site = root / "lib" / version / "site-packages"
     assert site.is_dir(), site
@@ -301,6 +497,70 @@ def helper_environment(root: Path, markers: Path, *, sdk: bool = True) -> Path:
         binary.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         binary.chmod(0o755)
     return root / "bin" / "python"
+
+
+def copied_environment(root: Path, markers: Path) -> tuple[Path, Path]:
+    """R2-F1 of #150's review: :func:`helper_environment` made with ``venv
+    --copies`` from a base installation whose interpreter has a ``._pth``
+    file. That file names the running interpreter's standard library, a
+    directory whose ``sitecustomize`` creates ``markers/sitecustomize``,
+    and ``import site``. The base is the test's own directory, laid out as a
+    stock one (``python3.X``, ``python3`` linking it, no ``python``), which
+    the environment's ``pyvenv.cfg`` names as its ``home``, as ``venv``
+    writes it for the interpreter it was run with. Returns the interpreter
+    and the ``._pth`` file."""
+    python = helper_environment(root / "env", markers, symlinks=False)
+    assert not python.is_symlink()
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    home = root / "base" / "bin"
+    home.mkdir(parents=True)
+    try:
+        os.link(python, home / version)
+    except OSError:
+        shutil.copy2(python, home / version)
+    (home / "python3").symlink_to(version)
+    hooks = root / "hooks"
+    hooks.mkdir()
+    (hooks / "sitecustomize.py").write_text(
+        f"import os; open(os.path.join({str(markers)!r}, 'sitecustomize'), 'w').close()\n",
+        encoding="utf-8",
+    )
+    paths = sysconfig.get_paths()
+    stdlib = [
+        paths["stdlib"],
+        paths["platstdlib"],
+        os.path.join(paths["platstdlib"], "lib-dynload"),
+    ]
+    pth = home / f"{version}._pth"
+    pth.write_text(
+        "\n".join(
+            [str(hooks), *dict.fromkeys(d for d in stdlib if os.path.isdir(d)), "import site"]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    conf = root / "env" / "pyvenv.cfg"
+    lines = conf.read_text(encoding="utf-8").splitlines()
+    conf.write_text(
+        "\n".join(f"home = {home}" if line.startswith("home") else line for line in lines) + "\n",
+        encoding="utf-8",
+    )
+    return python, pth
+
+
+def run_copied_hooks(python: Path, cwd: Path) -> None:
+    """The control run of :func:`copied_environment`: the interpreter under
+    the probe's own flags, which the base's ``._pth`` file overrides."""
+    env = {"PATH": "/usr/bin:/bin"}
+    if "LD_LIBRARY_PATH" in os.environ:
+        env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+    subprocess.run(
+        [str(python), *CLAUDE_ENVIRONMENT_PROBE_FLAGS, "-c", "pass"],
+        env=env,
+        cwd=cwd,
+        timeout=60,
+        check=True,
+    )
 
 
 def run_hooks(python: Path, cwd: Path) -> None:
@@ -361,6 +621,22 @@ def test_the_claude_probe_finds_no_sdk_in_an_environment_without_one(tmp_path):
     assert env is not None
     assert (env.sdk_version, env.cli_version, env.bundled) == (None, None, False)
     assert list(markers.iterdir()) == []
+
+
+def test_a_copied_environments_base_pth_file_runs_hooks_under_s_and_is_seen(tmp_path):
+    """R2-F1 of #150's review, for real: in an environment made with ``venv
+    --copies``, a ``._pth`` file beside the base interpreter imports
+    ``site`` and runs ``sitecustomize`` even under the probe's ``-I -S -B``
+    (the control run), and :func:`interpreter_pth_files` finds that file,
+    so doctor never starts the interpreter."""
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    python, pth = copied_environment(tmp_path, markers)
+    assert interpreter_pth_files(str(python), str(tmp_path)).found == (str(pth),)
+    run_copied_hooks(python, tmp_path)
+    assert "sitecustomize" in [path.name for path in markers.iterdir()]
+    pth.unlink()
+    assert interpreter_pth_files(str(python), str(tmp_path)) == PthFiles(())
 
 
 # -- the helper argv and the plan ----------------------------------------------------

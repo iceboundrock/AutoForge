@@ -777,8 +777,21 @@ The probe reads the SDK's version from its package metadata and the
 bundled CLI's from its `_cli_version.py`, as files: it imports no SDK and
 starts nothing. `-S` keeps the environment's startup hooks from running
 (an `import` line of a `.pth` file, `sitecustomize`), which `-I` alone
-would run. An interpreter with a `._pth` file beside it is not run at
-all, since that file can turn them back on. Its rows are `SKIP`s.
+would run. A `._pth` file can turn them back on even under `-S`, so
+`doctor` first looks, without running anything, everywhere Python 3.11
+and later look for one when the interpreter starts: beside the
+interpreter as named and as its links resolve; beside its virtual
+environment's base interpreter, which for an environment made with
+`venv --copies` is the one in the `home` that `pyvenv.cfg` names (the same
+name, else `python3` or `python3.X`); and beside the shared `libpython`
+it is linked to (Python 3.14 and later read that one), in every directory
+the dynamic loader could take it from. When one exists, the interpreter
+is not run, and its rows are `SKIP`s that name the file. They are also
+`SKIP`s when `doctor` cannot tell all those places. That happens when
+`command` is a wrapper script or a binary that is not ELF, when the
+binary's library search path names `$LIB` or `$PLATFORM`, or when the
+loader's cache cannot be read. Name the environment's own `bin/python`
+instead.
 
 The OpenCode runtime is never run: it creates its directories in your
 home when it starts, even for `--version`. `doctor` resolves

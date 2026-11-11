@@ -38,9 +38,10 @@ sdk_assets.py       the SDK helpers' packaged manifest (sdk_helpers/manifest.jso
                     helper program, its envelope and protocol, whether it ships, the
                     pinned pair and interpreter floor), the helper digest check, and
                     doctor's read-only probes: the Claude environment probe and its
-                    parser, the ._pth check, the OpenCode runtime's package.json read
-                    (the runtime is never run); provider layer, reads package files
-                    only, imports no SDK (#150)
+                    parser, the ._pth check (beside the interpreter, its venv's base,
+                    its libpython: pyvenv.cfg, ELF dynamic section, loader cache), the
+                    OpenCode runtime's package.json read (the runtime is never run);
+                    provider layer, reads files only, runs nothing, imports no SDK (#150)
 interaction.py      provider-neutral interaction contract (requests, decisions,
                     capabilities, lifecycle, session identity) and the per-launch
                     broker (policy, limits, degradation, capability check, run-log
