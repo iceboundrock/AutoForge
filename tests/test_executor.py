@@ -1044,6 +1044,59 @@ def test_stdin_data_leaves_no_descriptor_behind():
     assert _open_fds() == before
 
 
+def test_a_stdin_file_is_the_childs_stdin_read_at_its_own_pace(tmp_path):
+    """``stdin_path``: the child reads the file as its stdin, to EOF, and the
+    controller never holds it (the strict import of an exported pack, #269)."""
+    data = os.urandom(3 * 1024 * 1024)
+    path = tmp_path / "payload.pack"
+    path.write_bytes(data)
+    before = _baseline_fds()
+    tracemalloc.start()
+    try:
+        res = execute(
+            ExecutionRequest(
+                command=[PY, "-c", _DIGEST_STDIN], stdin_path=str(path), timeout_seconds=30
+            )
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert res.ok, res.stderr
+    assert res.stdout.strip() == _digest(data)
+    assert peak < len(data)
+    assert _open_fds() == before
+
+
+@pytest.mark.parametrize("kind", ["link", "fifo", "directory", "missing"])
+def test_a_stdin_file_that_is_not_a_regular_file_fails_the_spawn(tmp_path, kind):
+    path = tmp_path / "stdin"
+    if kind == "link":
+        target = tmp_path / "target"
+        target.write_bytes(b"secret")
+        path.symlink_to(target)
+    elif kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "directory":
+        path.mkdir()
+    before = _baseline_fds()
+    with pytest.raises(ExecutionError, match="its stdin file cannot be read"):
+        execute(
+            ExecutionRequest(command=[PY, "-c", "pass"], stdin_path=str(path), timeout_seconds=5)
+        )
+    assert _open_fds() == before
+
+
+def test_a_request_with_stdin_data_and_a_stdin_file_is_refused(tmp_path):
+    path = tmp_path / "stdin"
+    path.write_bytes(b"x")
+    with pytest.raises(ExecutionError, match="a child has one stdin"):
+        execute(
+            ExecutionRequest(
+                command=[PY, "-c", "pass"], stdin_data=b"x", stdin_path=str(path), timeout_seconds=5
+            )
+        )
+
+
 @pytest.mark.parametrize("failing_call", [1, 2], ids=["stdin-pipe", "wake-pipe"])
 def test_a_stdin_pipe_that_cannot_be_opened_is_a_launch_failure(monkeypatch, failing_call):
     """The feeder opens its own pipes before the spawn. One that cannot be

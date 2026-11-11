@@ -16,24 +16,40 @@ through a real provider adapter and the real executor.
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
 import autoforge.engine as engine_module
+from autoforge.candidate_artifact import (
+    ARTIFACT_MANIFEST,
+    ARTIFACT_PACK,
+    MAX_MANIFEST_BYTES,
+    CandidateManifest,
+)
+from autoforge.candidate_source import NOT_EXPORTED, CandidateReceipts
+from autoforge.claims import render_progress_marker
 from autoforge.config import ProfileConfig, default_config
+from autoforge.effects import EntryObservation
 from autoforge.engine import ControllerEngine
 from autoforge.errors import (
     ControlResultValidationError,
+    ExecutionError,
     SandboxCleanupUncertainError,
     SandboxLaunchRefusedError,
     SandboxPolicyError,
 )
 from autoforge.executor import ExecutionRequest, execute
+from autoforge.git_input import SEED_MANIFEST_NAME, LaunchGitInput, seed_manifest_digest
 from autoforge.providers import AgentRequest, OpenCodeProvider, ProviderRequirements
 from autoforge.run_namespace import issue_namespace
 from autoforge.sandbox import BackendKind, LaunchDescription, NetworkPosition, SandboxFacts
@@ -65,19 +81,50 @@ from autoforge.state import load_state
 from autoforge.transitions import Phase
 from tests.conftest import (
     EPIC,
+    GIT_IDENT,
     ISSUE,
     PR,
+    analyze_payload,
     block,
     commit_in,
+    connect_origin,
     git_out,
     git_repo,
     implement,
+    isolated_git,
     make_engine,
     review_result,
 )
 
 OWNER = LaunchOwner(run="run-1", issue=268, phase="ANALYZE_EXECUTE", launch="ANALYZE_EXECUTE-1")
-INPUTS = LaunchInputs(OWNER, workspace="/work/268", read_context="/state/read-context/1")
+# The revision the engine bound for the launch (#269): what the seed is built from.
+GIT_INPUT = LaunchGitInput(
+    phase="ANALYZE_EXECUTE",
+    run="run-1",
+    issue=268,
+    launch="ANALYZE_EXECUTE-1",
+    repository="owner/repo",
+    object_format="sha1",
+    seed="a" * 40,
+    lower="a" * 40,
+)
+# ``export_dir`` is the export directory the engine chose for the launch (#269):
+# the fake's exporter fills it under that name.
+INPUTS = LaunchInputs(
+    OWNER,
+    workspace="/work/268",
+    read_context="/state/read-context/1",
+    git_input=GIT_INPUT,
+    export_dir="out",
+)
+
+
+def _bound(seed: Seed, inputs: LaunchInputs = INPUTS) -> LaunchInputs:
+    """``inputs`` as the seed step's end completes them: the seed's manifest bound."""
+    assert inputs.git_input is not None
+    return dataclasses.replace(inputs, git_input=inputs.git_input.with_seed_manifest(seed.identity))
+
+
 RUNTIME = RuntimeReport(
     BackendKind.CONTAINER, "podman", "5.2.0", True, "unix:///run/user/1000/podman.sock", "store-1"
 )
@@ -229,6 +276,10 @@ class FakeBackend:
         self.deny_plan = False
         self.made: list[str] = []
         self.seeded: list[tuple[LaunchInputs, LaunchDescription]] = []
+        self.seeds: list[Seed] = []
+        # Called with each object as the create step makes it: a test swaps
+        # the seed's manifest there, after the git input bound it (#269).
+        self.on_make = None
         self.prepared: list[tuple[LaunchHandle | None, list[str]]] = []
         self.objects_override: tuple[LifecycleObject, ...] | None = None
 
@@ -269,13 +320,20 @@ class FakeBackend:
         return LaunchDescription(mounts=(), network=request.network)
 
     def seed(self, inputs: LaunchInputs, launch: LaunchDescription) -> Seed:
+        """A seed directory holding a manifest of the bound revision (#292 builds the real one)."""
         self.events.append(("host", "seed"))
         self.seeded.append((inputs, launch))
         self._maybe_fail("seed")
-        return Seed("sha256:manifest", "/tmp/seed")
+        assert inputs.git_input is not None, "a container launch is seeded from its git input"
+        directory = tempfile.mkdtemp(prefix="autoforge-fake-seed-")
+        manifest = {"seed": inputs.git_input.seed, "launch": inputs.owner.launch}
+        Path(directory, SEED_MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+        self.seeds.append(Seed(seed_manifest_digest(directory), directory))
+        return self.seeds[-1]
 
     def discard_seed(self, seed: Seed) -> None:
         self.events.append(("host", "discard seed"))
+        shutil.rmtree(seed.directory, ignore_errors=True)
 
     def objects(
         self, inputs: LaunchInputs, seed: Seed, launch: LaunchDescription
@@ -285,7 +343,9 @@ class FakeBackend:
         return container_objects(inputs.owner, self.staging, _network(launch))
 
     def make(self, obj: LifecycleObject, seed: Seed, launch: LaunchDescription) -> None:
-        assert seed.identity == "sha256:manifest"
+        assert seed == self.seeds[-1]
+        if self.on_make is not None:
+            self.on_make(obj, seed)
         if obj.kind is ObjectKind.STAGING_ROOT:
             self.events.append(("host", "write staging root", obj.name))
             self._maybe_fail("staging root")
@@ -327,11 +387,12 @@ class FakeBackend:
         if not self.has_exporter:
             return ()
         owner = handle.inputs.owner
+        out = handle.inputs.export_dir
         return (
             LifecycleObject(
-                owner, ObjectKind.EXPORTER, "exporter", "n-exp", NETWORK_NONE, ("vol", "out")
+                owner, ObjectKind.EXPORTER, "exporter", "n-exp", NETWORK_NONE, ("vol", out)
             ),
-            LifecycleObject(owner, ObjectKind.EXPORT_DIR, "out", "n-out"),
+            LifecycleObject(owner, ObjectKind.EXPORT_DIR, out, "n-out"),
         )
 
     def export(self, objects: tuple[LifecycleObject, ...], handle: LaunchHandle) -> Artifact:
@@ -343,7 +404,7 @@ class FakeBackend:
         self.runtime.start(exporter.name)
         self.runtime.exec(exporter.name, "exporter")
         self._maybe_fail("export")
-        return Artifact("/tmp/out")
+        return Artifact(handle.inputs.export_dir)
 
     def remove(self, obj: LifecycleObject) -> Removal:
         self._maybe_fail(f"remove {obj.kind.value}")
@@ -424,8 +485,11 @@ class FakeSource:
         self.rev = "HEAD"
         self.accepted: list[str] = []
 
-    def verify(self, artifact: Artifact, handle: LaunchHandle) -> Verified:
-        self.events.append(("engine", "verify", artifact.directory, handle.inputs.owner.launch))
+    def verify(self, exported: Exported, handle: LaunchHandle) -> Verified:
+        directory = exported.artifact.directory if exported.artifact is not None else None
+        self.events.append(("engine", "verify", directory, handle.inputs.owner.launch))
+        if exported.artifact is None:
+            return Verified(refusal=f"the launch's export failed: {exported.failure}")
         if self.verdict is not None:
             return self.verdict
         head = subprocess.run(
@@ -648,7 +712,7 @@ def test_a_launch_runs_d13s_steps_in_order(staging):
     saved = _index(events, "engine", "verify outcome saved")
     final_intent = _index(events, "journal", "removals", ("vol", "out"))
     assert exporter_intent < saved < final_intent < _index(events, "runtime", "rm", "vol")
-    assert _index(events, "engine", "verify", Artifact("/tmp/out")) < saved
+    assert _index(events, "engine", "verify", Artifact("out")) < saved
     assert journal.entries == [] and lifecycle.uncertain == []
     assert backend.runtime.containers == {} and backend.runtime.volumes == set()
     assert events[-1] == ("host", "discard seed")
@@ -663,7 +727,8 @@ def test_the_handle_names_the_objects_made_for_the_launch_and_still_in_place():
         lifecycle.export()
     (handle,) = handles
     assert handle is lifecycle.handle
-    assert handle.inputs == INPUTS and handle.seed == Seed("sha256:manifest", "/tmp/seed")
+    assert handle.seed == backend.seeds[-1]
+    assert handle.inputs == _bound(handle.seed)
     # The stager container was removed before the launch container started.
     assert {obj.name for obj in handle.objects} == {"staging", "projection", "vol", "launch"}
     assert all(obj.owner == OWNER for obj in handle.objects)
@@ -698,6 +763,130 @@ def test_a_failed_seed_leaves_no_journal_entry_and_no_runtime_call():
             _launch(lifecycle, events)
     assert events == [("host", "seed"), ("fail", "seed")]
     assert journal.entries == []
+
+
+# -- the launch's git input at the seed step (ADR 0013 D4, D19; #269) -----------------
+
+
+def _bound_lifecycle(backend, journal, events, *, staging_change: bool = True) -> LaunchLifecycle:
+    """A lifecycle whose ``on_seed`` records the completed git input, as the engine saves it."""
+
+    def on_seed(git_input: LaunchGitInput) -> None:
+        events.append(("engine", "bind seed", git_input.seed_manifest_digest))
+
+    return LaunchLifecycle(
+        backend, journal, INPUTS, RUNTIME, change_producing=staging_change, on_seed=on_seed
+    )
+
+
+@pytest.mark.parametrize("staging", ["bind", "copy"])
+def test_the_git_input_is_bound_at_the_end_of_the_seed_step_before_any_journal_entry(staging):
+    events: list[tuple] = []
+    backend = FakeBackend(events, staging=staging)
+    journal = FakeJournal(events)
+    with _bound_lifecycle(backend, journal, events) as lifecycle:
+        _launch(lifecycle, events)
+        lifecycle.export()
+        lifecycle.saved()
+    (seed,) = backend.seeds
+    bound = _index(events, "engine", "bind seed", seed.identity)
+    assert _index(events, "host", "seed") < bound < _first(events, lambda e: e[0] == "journal")
+    # The seed step got the bare input; every later step the completed one.
+    ((inputs, _),) = backend.seeded
+    assert inputs == INPUTS and inputs.git_input.seed_manifest_digest == ""
+    handle = lifecycle.handle
+    assert handle is not None and handle.inputs == _bound(seed)
+    assert handle.inputs.git_input.seed == GIT_INPUT.seed
+    assert handle.inputs.git_input.lower == GIT_INPUT.lower
+
+
+def _swap(seed: Seed, content: dict) -> None:
+    Path(seed.directory, SEED_MANIFEST_NAME).write_text(json.dumps(content), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        {"seed": "b" * 40, "launch": "ANALYZE_EXECUTE-1"},
+        # The same commits with another tag set (D11): another manifest.
+        {"seed": "a" * 40, "launch": "ANALYZE_EXECUTE-1", "tags": {"refs/tags/v1": "c" * 40}},
+    ],
+)
+def test_a_seed_swapped_after_the_input_was_bound_never_reaches_a_container_bind_form(content):
+    """Bind form: refused before the staging root is written, with nothing
+    journaled or made, and the stager never runs."""
+    events: list[tuple] = []
+    backend = FakeBackend(events, staging="bind")
+    journal = FakeJournal(events)
+
+    def on_seed(git_input: LaunchGitInput) -> None:
+        events.append(("engine", "bind seed", git_input.seed_manifest_digest))
+        _swap(backend.seeds[-1], content)
+
+    with pytest.raises(SandboxLaunchRefusedError, match="not handed on to the create step"):
+        with LaunchLifecycle(
+            backend, journal, INPUTS, RUNTIME, change_producing=True, on_seed=on_seed
+        ) as lifecycle:
+            _launch(lifecycle, events)
+    assert not any(event[0] in ("journal", "runtime") for event in events)
+    assert ("host", "write staging root", "staging") not in events
+    assert backend.made == [] and journal.entries == []
+
+
+def test_a_seed_swapped_after_the_input_was_bound_never_reaches_a_container_copy_form():
+    """Copy-in form: refused before the copy-in, the stager never runs, and what
+    was made is removed."""
+    events: list[tuple] = []
+    backend = FakeBackend(events, staging="copy")
+    journal = FakeJournal(events)
+
+    def swap_at_the_last_create(obj: LifecycleObject, seed: Seed) -> None:
+        if obj.kind is ObjectKind.LAUNCH_CONTAINER:
+            _swap(seed, {"seed": "b" * 40})
+
+    backend.on_make = swap_at_the_last_create
+    with pytest.raises(SandboxLaunchRefusedError, match="not handed on to the stager container"):
+        with _bound_lifecycle(backend, journal, events) as lifecycle:
+            _launch(lifecycle, events)
+    assert not any(event[:2] in (("runtime", "cp"), ("runtime", "exec")) for event in events)
+    assert ("runtime", "start", "stager") not in events
+    assert journal.entries == [] and backend.runtime.containers == {}
+    assert backend.runtime.volumes == set()
+
+
+def test_a_seed_whose_step_names_another_manifest_is_refused_before_any_journal_entry():
+    events: list[tuple] = []
+    backend = FakeBackend(events)
+    journal = FakeJournal(events)
+    original = backend.seed
+
+    def misnamed(inputs, launch):
+        seed = original(inputs, launch)
+        return Seed("sha256:" + "0" * 64, seed.directory)
+
+    backend.seed = misnamed  # type: ignore[method-assign]
+    with pytest.raises(SandboxLaunchRefusedError, match="names the manifest"):
+        with _bound_lifecycle(backend, journal, events) as lifecycle:
+            _launch(lifecycle, events)
+    assert ("engine", "bind seed") not in [event[:2] for event in events]
+    assert journal.entries == [] and backend.made == []
+
+
+def test_a_seed_for_a_launch_with_no_git_input_is_refused_before_any_journal_entry():
+    events: list[tuple] = []
+    backend = FakeBackend(events)
+    journal = FakeJournal(events)
+    bare = dataclasses.replace(INPUTS, git_input=None)
+    original = backend.seed
+
+    def seed_anyway(inputs, launch):
+        return original(INPUTS, launch)
+
+    backend.seed = seed_anyway  # type: ignore[method-assign]
+    with pytest.raises(SandboxLaunchRefusedError, match="carries no git input"):
+        with LaunchLifecycle(backend, journal, bare, RUNTIME, change_producing=True) as lifecycle:
+            _launch(lifecycle, events)
+    assert journal.entries == [] and backend.made == []
 
 
 @pytest.mark.parametrize(
@@ -795,7 +984,11 @@ def test_the_volume_is_never_removed_before_verifys_outcome_is_saved():
     journal = FakeJournal(events)
     with _lifecycle(backend, journal) as lifecycle:
         _launch(lifecycle, events)
-        assert lifecycle.export() == Exported(Artifact("/tmp/out"))
+        exported = lifecycle.export()
+        assert exported is not None and exported.artifact == Artifact("out")
+        # The outcome names the export directory the lifecycle journaled (#269).
+        assert exported.origin in journal.created
+        assert exported.origin.kind is ObjectKind.EXPORT_DIR and exported.origin.name == "out"
         # The engine leaves before it saved verify's outcome.
     assert backend.runtime.volumes == {"vol"}
     assert {obj.name for obj in journal.entries} == {"vol", "out"}
@@ -901,14 +1094,54 @@ def test_every_removal_takes_each_container_before_what_it_mounts(staging, chang
     assert journal.entries == [] and backend.runtime.volumes == set()
 
 
-def test_a_backend_with_no_exporter_skips_the_export_and_then_cleans_up():
+def test_a_launch_given_no_export_directory_skips_the_export_and_then_cleans_up():
+    """A change-producing launch the engine asked no export of (bwrap's shape):
+    a backend with no exporter skips the export, and the volume goes."""
+    events: list[tuple] = []
+    backend = FakeBackend(events, exporter=False)
+    journal = FakeJournal(events)
+    inputs = dataclasses.replace(INPUTS, export_dir="")
+    with LaunchLifecycle(backend, journal, inputs, RUNTIME, change_producing=True) as lifecycle:
+        assert not lifecycle.exports
+        _launch(lifecycle, events)
+        assert lifecycle.export() is None
+    assert journal.entries == [] and backend.runtime.volumes == set()
+
+
+def test_a_launch_that_must_export_and_has_no_exporter_is_a_failed_export():
+    """R3-F1: a launch the engine handed an export directory is never skipped. A
+    backend that makes it no exporter is a failed export, whose refusal the
+    verify step saves before the final clean-up removes the volume."""
+    events: list[tuple] = []
+    backend = FakeBackend(events, exporter=False)
+    journal = FakeJournal(events)
+    with _lifecycle(backend, journal) as lifecycle:
+        assert lifecycle.exports
+        _launch(lifecycle, events)
+        exported = lifecycle.export()
+        assert exported is not None and exported.artifact is None
+        assert exported.origin is None
+        assert "made no exporter" in exported.failure
+        # Nothing was exported, and the volume stays until the refusal is saved.
+        assert not any(event[:3] == ("runtime", "create", "exporter") for event in events)
+        assert backend.runtime.volumes == {"vol"}
+        events.append(("engine", "refusal saved"))
+        lifecycle.saved()
+    assert _index(events, "engine", "refusal saved") < _index(events, "runtime", "rm", "vol")
+    assert journal.entries == [] and backend.runtime.volumes == set()
+
+
+def test_a_launch_that_must_export_and_leaves_before_saving_keeps_its_volume():
+    """The failed export of R3-F1 awaits its saved refusal like any other outcome:
+    a launch that leaves before the save keeps its volume for reconciliation."""
     events: list[tuple] = []
     backend = FakeBackend(events, exporter=False)
     journal = FakeJournal(events)
     with _lifecycle(backend, journal) as lifecycle:
         _launch(lifecycle, events)
-        assert lifecycle.export() is None
-    assert journal.entries == [] and backend.runtime.volumes == set()
+        assert lifecycle.export() is not None
+    assert backend.runtime.volumes == {"vol"}
+    assert [obj.name for obj in journal.entries] == ["vol"]
 
 
 def test_a_launch_whose_environment_was_never_made_exports_nothing():
@@ -1138,13 +1371,19 @@ def test_without_a_journal_a_backend_that_makes_an_object_is_refused_before_it_m
 
 @pytest.mark.parametrize("change", [True, False])
 def test_bwrap_does_nothing_but_the_run(change):
-    """Seed, create, stage, the clean-up and reconcile do nothing for bwrap (D13)."""
+    """Seed, create, stage, the clean-up and reconcile do nothing for bwrap (D13).
+
+    The engine hands a bwrap launch no git input and no export directory: it
+    seeds nothing, and its candidate is the worktree's ``HEAD``.
+    """
     events: list[tuple] = []
+    inputs = dataclasses.replace(INPUTS, git_input=None, export_dir="")
     with LaunchLifecycle(
-        BWRAP, NO_JOURNAL, INPUTS, BWRAP.runtime_check(), change_producing=change
+        BWRAP, NO_JOURNAL, inputs, BWRAP.runtime_check(), change_producing=change
     ) as lc:
         assert _launch(lc, events) == "result"
-        assert lc.handle == LaunchHandle(INPUTS, Seed())
+        assert lc.handle == LaunchHandle(inputs, Seed())
+        assert not lc.exports
         assert lc.export() is None
         lc.saved()
     assert events == [("executor", "run", "")]
@@ -1191,6 +1430,7 @@ def test_the_plan_compiles_before_the_environment_is_made_and_binds_it(tmp_path)
     # The seed step got what the plan compiled.
     ((inputs, planned),) = backend.seeded
     assert inputs == INPUTS and planned == description
+    assert binding.handle.inputs == _bound(binding.handle.seed)
 
 
 def test_a_plan_the_policy_refuses_makes_and_starts_nothing(tmp_path):
@@ -1338,6 +1578,9 @@ def through_fake(monkeypatch):
     monkeypatch.setattr(engine_module, "launch_backend", lambda: backend)
     monkeypatch.setattr(ControllerEngine, "_lifecycle_journal", lambda self: journal)
     monkeypatch.setattr(ControllerEngine, "_candidate_source", lambda self: source)
+    # The fake's export directory keeps its short name; the engine's own (a
+    # fresh path under the sandbox directories) is what ``through_packing`` uses.
+    monkeypatch.setattr(ControllerEngine, "_export_dir", lambda self, owner: "out")
 
     def probe() -> ProbeResult:
         events.append(("engine", "probe"))
@@ -1386,7 +1629,7 @@ def test_the_engine_enters_then_runs_a_launch_through_every_step_in_order(
         _index(events, "journal", "removals", ("launch", "projection", "staging")),
         _index(events, "journal", "creates", ("exporter", "out")),
         _index(events, "runtime", "rm", "exporter"),
-        _index(events, "engine", "verify", "/tmp/out", launch),
+        _index(events, "engine", "verify", "out", launch),
         _index(events, "engine", "save", True),
         _index(events, "journal", "removals", ("vol", "out")),
         _index(events, "runtime", "rm", "vol"),
@@ -1486,9 +1729,11 @@ def test_an_artifact_the_verify_step_refuses_is_never_a_candidate(
 def test_only_the_commit_the_verify_step_accepted_is_published(
     tmp_state_dir, fake_github, through_fake, accepted
 ):
-    """R2-F1 of PR #473: the agent makes two commits and reports the second, its
-    worktree's HEAD. A verify step that accepted that commit publishes it; one
-    that accepted the first instead publishes nothing, on every launch."""
+    """R2-F1 of PR #473, under #269's candidate read: the agent makes two commits
+    and reports the second. A verify step that accepted that commit publishes it.
+    One that accepted the first makes the first the candidate, and no other
+    commit: the worktree is not read (ImportedArtifact), the report of another
+    commit is a correction on every launch, and nothing is published."""
     events, backend, journal, source = through_fake
     source.rev = accepted
     reported: list[str] = []
@@ -1508,7 +1753,7 @@ def test_only_the_commit_the_verify_step_accepted_is_published(
         assert reported == source.accepted
         assert eng.origin.head("autoforge/2") == reported[-1] == eng.state.current_head_sha
         return
-    with pytest.raises(ControlResultValidationError, match="not the commit the verify step"):
+    with pytest.raises(ControlResultValidationError, match="field 'head_sha' is"):
         eng.step()
     # Every launch, corrections included, was verified, and the step accepted a
     # commit other than the one the result reported, each time.
@@ -1518,8 +1763,7 @@ def test_only_the_commit_the_verify_step_accepted_is_published(
         eng.provider.calls[1:], zip(source.accepted, reported, strict=True), strict=False
     ):
         assert call.correction
-        assert f"HEAD ({second}) is not the commit the verify step accepted" in call.prompt
-        assert f"({first}); only that commit is a candidate" in call.prompt
+        assert f"field 'head_sha' is {second}, but the worktree's HEAD is {first}" in call.prompt
     # Nothing was pushed, created or advanced, and the clean-up still ran.
     assert eng.origin.head("autoforge/2") is None and fake_github.effect_writes == []
     assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
@@ -1691,3 +1935,1266 @@ def test_a_scheduler_workers_engine_runs_the_same_sequence(tmp_path, fake_github
     ]
     assert order == sorted(order)
     assert journal.entries == []
+
+
+# -- the engine's seeding and candidate source (ADR 0013 D4, D5; #269) -------------------
+
+
+def _seeded(backend: FakeBackend, phase: str) -> list[LaunchGitInput]:
+    """The git input each launch of ``phase`` was seeded from, in order."""
+    found = [inputs.git_input for inputs, _ in backend.seeded if inputs.owner.phase == phase]
+    assert all(item is not None for item in found)
+    return found  # type: ignore[return-value]
+
+
+def _operator_push(eng: ControllerEngine, message: str) -> str:
+    """Another actor's commit on the PR branch, on top of its head; no worktree moves."""
+    head = eng.origin.head("autoforge/2")
+    tree = git_out("-C", str(eng.workdir), "rev-parse", f"{head}^{{tree}}")
+    sha = git_out(
+        "-C", str(eng.workdir), *GIT_IDENT, "commit-tree", tree, "-p", head, "-m", message
+    )
+    eng.origin.publish(eng.workdir, sha, "autoforge/2")
+    return sha
+
+
+def _nit(round_: int) -> dict:
+    return {
+        "id": f"R{round_}-F1",
+        "classification": "nit",
+        "title": "typo",
+        "location": "src/x.py:1",
+        "required_resolution": "fix the typo",
+    }
+
+
+def test_every_launch_is_seeded_from_the_revision_its_phase_bound(
+    tmp_state_dir, fake_github, through_fake
+):
+    """ANALYZE_EXECUTE from the base its entry fetched, REVIEW from the PR HEAD and
+    merge base bound to the round; each input saved before any journal entry."""
+    events, backend, journal, _source = through_fake
+
+    def agent(req) -> str:
+        events.append(("agent", req.phase))
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        return block(review_result(1, fake_github.prs[PR].head_sha))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    base = eng.origin.head("main")
+    eng.step()
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    (analyze,) = _seeded(backend, "ANALYZE_EXECUTE")
+    assert (analyze.seed, analyze.lower, analyze.carried) == (base, base, "")
+    assert analyze.repository == "owner/repo" and analyze.object_format == "sha1"
+    assert analyze.issue == 2 and analyze.run == eng.state.run_id
+    (review,) = _seeded(backend, "REVIEW")
+    assert review.seed == eng.state.reviewed_head_sha == eng.origin.head("autoforge/2")
+    assert review.lower == eng.state.reviewed_merge_base_sha == base
+    assert review.carried == ""
+    receipts = CandidateReceipts(eng.state_root())
+    for bound, seed in zip((analyze, review), backend.seeds, strict=True):
+        (saved,) = receipts.launches(bound.entry)
+        assert saved.git_input == bound.with_seed_manifest(seed.identity)
+
+
+def test_a_default_branch_that_moves_after_binding_leaves_the_launch_on_its_bound_base(
+    tmp_state_dir, fake_github, through_fake
+):
+    """The entry reads the default branch once; it moves before the launch, and
+    neither the seed nor the prompt follow it."""
+    events, backend, journal, _source = through_fake
+    eng = make_engine(
+        tmp_state_dir, _recording(events), github=fake_github, cfg=_required(), origin=True
+    )
+    base = eng.origin.head("main")
+    read = fake_github.get_branch_head_sha
+    moved: list[str] = []
+
+    def read_then_move(repository: str, branch: str) -> str:
+        answer = read(repository, branch)
+        if branch == "main" and not moved:
+            moved.append(commit_in(eng.workdir, "Land something else on main (#9)"))
+            eng.origin.publish(eng.workdir, moved[0], "main")
+        return answer
+
+    fake_github.get_branch_head_sha = read_then_move  # type: ignore[method-assign]
+    eng.step()
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert moved and eng.origin.head("main") == moved[0] != base
+    (analyze,) = _seeded(backend, "ANALYZE_EXECUTE")
+    assert analyze.seed == analyze.lower == base
+    assert moved[0] not in eng.provider.calls[0].prompt
+
+
+def _in_update_epic(eng: ControllerEngine, gh) -> None:
+    """Park ``eng`` in UPDATE_EPIC right after the controller merged the run's PR."""
+    head = eng.origin.head("main")
+    gh.add_pr(head_sha=head, state="MERGED")
+    eng.state.phase = Phase.UPDATE_EPIC
+    eng.state.current_pr_url = PR
+    eng.state.current_branch = "autoforge/2"
+    eng.state.current_head_sha = head
+    eng.state.reviewed_head_sha = head
+    eng.state.last_review_result = "clean"
+    eng.state.review_round = 1
+    eng.state.record_merge(PR)
+    eng._save()
+
+
+def _resumed(eng: ControllerEngine, gh, script) -> ControllerEngine:
+    """A new controller process on the same state, git remote and GitHub."""
+    eng.close()
+    again = make_engine(eng.paths.state_dir, script, github=gh, cfg=_required())
+    connect_origin(again, eng.origin)
+    again.origin = eng.origin  # type: ignore[attr-defined]
+    again.load()
+    return again
+
+
+EPIC_DONE = block(
+    {
+        "phase": "UPDATE_EPIC",
+        "status": "success",
+        "progress": "Implemented issue 2 in PR 42; the test suite passes.",
+        "roadmap_section": "## Roadmap\n- [x] #2 (PR #42)",
+        "next_issue_url": None,
+    }
+)
+
+
+def test_update_epic_binds_the_default_branch_head_once_and_a_resume_keeps_it(
+    tmp_state_dir, fake_github, through_fake
+):
+    """R1-F3: the entry's first launch binds the default branch head and records it
+    in the entry's observation. The controller is stopped during that launch, the
+    default branch moves, and a new process resumes: its relaunch of the same entry
+    seeds from the bound head, never the newer one, and the entry completes."""
+    events, backend, journal, _source = through_fake
+
+    def stopped(req):
+        events.append(("agent", req.phase))
+        raise KeyboardInterrupt
+
+    eng = make_engine(tmp_state_dir, stopped, github=fake_github, cfg=_required(), origin=True)
+    _in_update_epic(eng, fake_github)
+    bound = eng.origin.head("main")
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    (first,) = _seeded(backend, "UPDATE_EPIC")
+    assert (first.seed, first.lower, first.carried) == (bound, bound, "")
+    saved = load_state(eng.paths.state_file).phase_effects().observation
+    assert saved is not None and saved.base_sha == bound
+    assert dict(saved.refs) == {"refs/heads/main": bound}
+    later = commit_in(eng.workdir, "Land something else on main (#9)")
+    eng.origin.publish(eng.workdir, later, "main")
+    reads = len([c for c in fake_github.calls if c[0] == "get_branch_head_sha"])
+    resumed = _resumed(eng, fake_github, lambda req: EPIC_DONE)
+    out = resumed.step()
+    assert out.next_phase == "DONE", out.message
+    _, second = _seeded(backend, "UPDATE_EPIC")
+    assert second.seed == bound != later and second.entry == first.entry
+    assert second.launch != first.launch
+    # The relaunch read the binding back; it never read the default branch again.
+    assert len([c for c in fake_github.calls if c[0] == "get_branch_head_sha"]) == reads
+
+
+def test_an_update_epic_entry_observed_with_no_head_binds_it_at_its_first_seeded_launch(
+    tmp_state_dir, fake_github, through_fake
+):
+    """An observation that recorded no head (an entry first launched under bwrap,
+    say) binds the default branch head as it is at the first seeded launch; the
+    observation goes with the entry."""
+    events, backend, journal, _source = through_fake
+    eng = make_engine(
+        tmp_state_dir, lambda req: EPIC_DONE, github=fake_github, cfg=_required(), origin=True
+    )
+    _in_update_epic(eng, fake_github)
+    eng.state.entry_observation = EntryObservation(
+        Phase.UPDATE_EPIC, ISSUE, PR, {}, None, {render_progress_marker(ISSUE, PR): None}
+    ).to_dict()
+    eng._save()
+    later = commit_in(eng.workdir, "Land something else on main (#9)")
+    eng.origin.publish(eng.workdir, later, "main")
+    assert eng.step().next_phase == "DONE"
+    (only,) = _seeded(backend, "UPDATE_EPIC")
+    assert only.seed == later
+    assert load_state(eng.paths.state_file).entry_observation == {}
+
+
+def replace_launch(owner: LaunchOwner, launch: str) -> LaunchOwner:
+    return dataclasses.replace(owner, launch=launch)
+
+
+def test_replan_seeds_from_its_transactions_verified_base(tmp_state_dir, fake_github, through_fake):
+    events, backend, journal, _source = through_fake
+    eng = make_engine(
+        tmp_state_dir, _recording(events), github=fake_github, cfg=_required(), origin=True
+    )
+    eng.step()
+    base = eng.origin.head("main")
+    eng._replan_entry = engine_module._ReplanEntry("txn-1", "autoforge/2-r1", base)
+    assert eng._bound_revision(Phase.REPLAN_REEXECUTE).seed == base
+    owner = LaunchOwner(eng.state.run_id, 2, "REPLAN_REEXECUTE", "REPLAN_REEXECUTE-1")
+    git_input = eng._launch_git_input(Phase.REPLAN_REEXECUTE, owner)
+    assert (git_input.seed, git_input.lower) == (base, base)
+    eng._replan_entry = None
+    with pytest.raises(SandboxLaunchRefusedError, match="no revision its entry bound"):
+        eng._launch_git_input(Phase.REPLAN_REEXECUTE, owner)
+
+
+def _to_fix(eng: ControllerEngine) -> None:
+    eng.step()
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+
+
+def test_review_seeds_from_another_actors_push_and_fix_from_that_reviewed_head(
+    tmp_state_dir, fake_github, through_fake
+):
+    events, backend, journal, _source = through_fake
+
+    def agent(req) -> str:
+        events.append(("agent", req.phase))
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        if req.phase == "REVIEW":
+            return block(review_result(1, fake_github.prs[PR].head_sha, [_nit(1)]))
+        return "the fixer reports nothing"
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    _to_fix(eng)
+    own = eng.state.current_head_sha
+    operator = _operator_push(eng, "An operator's follow-up (#2)")
+    out = eng.step()
+    assert out.next_phase == "FIX", out.message
+    (review,) = _seeded(backend, "REVIEW")
+    assert review.seed == operator != own and review.carried == ""
+    assert review.lower == eng.state.reviewed_merge_base_sha
+    with pytest.raises(ControlResultValidationError):
+        eng.step()
+    fixes = _seeded(backend, "FIX")
+    assert fixes and all(fix.seed == operator for fix in fixes)
+    assert all(fix.lower == review.lower for fix in fixes)
+    assert len({fix.entry for fix in fixes}) == 1
+
+
+def test_drift_before_fix_goes_back_to_review_with_no_container_and_no_seed(
+    tmp_state_dir, fake_github, through_fake
+):
+    events, backend, journal, _source = through_fake
+    rounds: list[str] = []
+
+    def agent(req) -> str:
+        events.append(("agent", req.phase))
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        head = fake_github.prs[PR].head_sha
+        rounds.append(head)
+        findings = [_nit(len(rounds))] if len(rounds) == 1 else []
+        return block(review_result(len(rounds), head, findings))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    _to_fix(eng)
+    assert eng.step().next_phase == "FIX"
+    moved = _operator_push(eng, "An operator's push after the review (#2)")
+    seeded, created = len(backend.seeded), len(journal.created)
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and "past the reviewed HEAD" in out.message
+    assert len(backend.seeded) == seeded and len(journal.created) == created
+    assert _seeded(backend, "FIX") == []
+    out = eng.step()
+    assert out.next_phase == "READY_FOR_MERGE", out.message
+    first, second = _seeded(backend, "REVIEW")
+    assert second.seed == moved != first.seed and second.entry != first.entry
+
+
+def test_drift_during_review_leaves_the_seed_at_the_bound_head(
+    tmp_state_dir, fake_github, through_fake
+):
+    """The PR moves while the reviewer works: the round is stale, its seed stays
+    the HEAD bound to it, and the next round binds the new HEAD."""
+    events, backend, journal, _source = through_fake
+    moved: list[str] = []
+    eng_box: list[ControllerEngine] = []
+
+    def agent(req) -> str:
+        events.append(("agent", req.phase))
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        head = eng_box[0].state.current_head_sha
+        if not moved:
+            moved.append(_operator_push(eng_box[0], "A push while the reviewer works (#2)"))
+        return block(review_result(eng_box[0].state.review_round + 1, head))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    eng_box.append(eng)
+    _to_fix(eng)
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and eng.state.last_review_result == "stale", out.message
+    (stale,) = _seeded(backend, "REVIEW")
+    assert stale.seed != moved[0]
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    _, fresh = _seeded(backend, "REVIEW")
+    assert fresh.seed == moved[0] and stale.seed != fresh.seed
+
+
+def test_a_relaunch_of_the_same_review_round_seeds_from_the_same_head_with_no_carried_commit(
+    tmp_state_dir, fake_github, through_fake
+):
+    events, backend, journal, _source = through_fake
+    reviews: list[int] = []
+
+    def agent(req) -> str:
+        events.append(("agent", req.phase))
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        reviews.append(1)
+        if len(reviews) == 1:
+            return "the reviewer forgot its CONTROL_RESULT"
+        return block(review_result(1, fake_github.prs[PR].head_sha))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    _to_fix(eng)
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    first, second = _seeded(backend, "REVIEW")
+    assert first.entry == second.entry and first.launch != second.launch
+    assert (first.seed, first.lower) == (second.seed, second.lower)
+    assert first.carried == second.carried == ""
+
+
+DRIFTS = ("head", "base", "merge_base")
+
+
+def _drift(eng: ControllerEngine, gh, kind: str) -> None:
+    """Move the PR's revision as another actor would: its HEAD, its base or its merge base."""
+    if kind == "head":
+        _operator_push(eng, "An operator's push during the round (#2)")
+    elif kind == "base":
+        # Retargeted to a branch at the default branch's head: same merge base.
+        eng.origin.publish(eng.workdir, eng.origin.head("main"), "release")
+        gh.prs[PR].base_ref = "release"
+    else:
+        # The PR's commits land on its base: GitHub's merge base of the base
+        # and the HEAD is then the HEAD itself.
+        eng.origin.publish(eng.workdir, gh.prs[PR].head_sha, "main")
+
+
+def _merge_base_reads(gh) -> int:
+    return len([call for call in gh.calls if call[0] == "get_merge_base_sha"])
+
+
+def _assert_stale_at_the_first_binding(
+    eng: ControllerEngine, first: LaunchGitInput, kind: str
+) -> None:
+    """The round is recorded stale at the binding its first launch seeded from."""
+    state = eng.state
+    assert state.last_review_result == "stale" and state.review_round == 1
+    assert (state.reviewed_head_sha, state.reviewed_merge_base_sha) == (first.seed, first.lower)
+    assert state.reviewed_base_ref == "main"
+    pr = eng.github.prs[PR]
+    assert (state.current_head_sha, state.current_base_ref) == (pr.head_sha, pr.base_ref)
+    # The post-review read reads the merge base only when HEAD and base held.
+    moved = (state.current_head_sha != first.seed, state.current_base_ref != "main")
+    if kind == "head":
+        assert moved == (True, False)
+    elif kind == "base":
+        assert moved == (False, True)
+    else:
+        assert moved == (False, False) and state.current_merge_base_sha != first.lower
+
+
+def _assert_the_next_round_binds_the_new_revision(
+    eng: ControllerEngine, backend, first: LaunchGitInput
+) -> None:
+    *_, fresh = _seeded(backend, "REVIEW")
+    state = eng.state
+    assert fresh.entry != first.entry and fresh.carried == ""
+    assert (fresh.seed, fresh.lower) == (state.reviewed_head_sha, state.reviewed_merge_base_sha)
+    assert state.reviewed_base_ref == eng.github.prs[PR].base_ref
+    assert state.review_round == 2 and state.last_review_result != "stale"
+
+
+@pytest.mark.parametrize("kind", DRIFTS)
+def test_a_review_correction_keeps_the_rounds_binding_and_drift_makes_the_round_stale(
+    tmp_state_dir, fake_github, through_fake, kind
+):
+    """R2-F1: the reviewer's first launch returns no result while the PR's HEAD,
+    base or merge base moves. The correction relaunch seeds from the HEAD and merge
+    base the round bound, with no read of the PR's revision for it, and the
+    post-review read records the round stale at that binding; the next round
+    binds the new revision."""
+    events, backend, journal, _source = through_fake
+    eng_box: list[ControllerEngine] = []
+    reads: list[int] = []
+
+    def agent(req) -> str:
+        events.append(("agent", req.phase))
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        eng = eng_box[0]
+        reads.append(_merge_base_reads(fake_github))
+        if len(reads) == 1:
+            _drift(eng, fake_github, kind)
+            return "the reviewer forgot its CONTROL_RESULT"
+        return block(review_result(eng.state.review_round + 1, eng.state.current_head_sha))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    eng_box.append(eng)
+    _to_fix(eng)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    first, second = _seeded(backend, "REVIEW")
+    assert first.entry == second.entry and first.launch != second.launch
+    assert (second.seed, second.lower, second.carried) == (first.seed, first.lower, "")
+    assert reads[1] == reads[0]  # the relaunch read no merge base: nothing was bound again
+    _assert_stale_at_the_first_binding(eng, first, kind)
+    eng.step()
+    _assert_the_next_round_binds_the_new_revision(eng, backend, first)
+
+
+@pytest.mark.parametrize("kind", DRIFTS)
+def test_a_resumed_review_round_keeps_its_binding_and_drift_makes_the_round_stale(
+    tmp_state_dir, fake_github, through_fake, kind
+):
+    """R2-F1: the controller is stopped during the round's first launch, the PR's
+    HEAD, base or merge base moves, and a new process resumes. Its launch of the
+    same entry seeds from the round's first binding, never reading the PR's
+    revision for it; the round is stale at that binding, and the next round binds
+    the new revision."""
+    events, backend, journal, _source = through_fake
+
+    def stopped(req) -> str:
+        events.append(("agent", req.phase))
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        raise KeyboardInterrupt
+
+    eng = make_engine(tmp_state_dir, stopped, github=fake_github, cfg=_required(), origin=True)
+    _to_fix(eng)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    (first,) = _seeded(backend, "REVIEW")
+    saved = load_state(eng.paths.state_file)
+    assert saved.phase is Phase.REVIEW and saved.attempt == 1
+    _drift(eng, fake_github, kind)
+    box: list[ControllerEngine] = []
+    reads: list[int] = []
+
+    def review(req) -> str:
+        reads.append(_merge_base_reads(fake_github))
+        state = box[0].state
+        return block(review_result(state.review_round + 1, state.current_head_sha))
+
+    resumed = _resumed(eng, fake_github, review)
+    box.append(resumed)
+    before = _merge_base_reads(fake_github)
+    out = resumed.step()
+    assert out.next_phase == "REVIEW", out.message
+    _, second = _seeded(backend, "REVIEW")
+    assert second.entry == first.entry and second.launch != first.launch
+    assert (second.seed, second.lower, second.carried) == (first.seed, first.lower, "")
+    assert reads[0] == before  # the resumed entry read no merge base before its launch
+    _assert_stale_at_the_first_binding(resumed, first, kind)
+    resumed.step()
+    _assert_the_next_round_binds_the_new_revision(resumed, backend, first)
+
+
+def test_under_bwrap_a_review_relaunch_binds_the_pr_as_it_is_before_it(tmp_state_dir, fake_github):
+    """bwrap and ``disabled`` seed nothing from the round's binding: a correction
+    after a push binds the new HEAD, as before #269."""
+    eng_box: list[ControllerEngine] = []
+    heads: list[str] = []
+
+    def agent(req) -> str:
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        eng = eng_box[0]
+        heads.append(eng.state.current_head_sha)
+        if len(heads) == 1:
+            _operator_push(eng, "An operator's push during the round (#2)")
+            return "the reviewer forgot its CONTROL_RESULT"
+        return block(review_result(1, eng.state.current_head_sha))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, origin=True)
+    eng_box.append(eng)
+    _to_fix(eng)
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    first, second = heads
+    assert second != first and second == eng.state.reviewed_head_sha
+    assert eng.state.last_review_result == "clean"
+
+
+def test_a_bound_revision_the_store_cannot_seed_refuses_the_launch_before_any_journal_entry(
+    tmp_state_dir, fake_github, through_fake
+):
+    """A merge base that is not an ancestor of the bound HEAD in the shared store:
+    the REVIEW launch is refused before anything of it is journaled or created."""
+    events, backend, journal, _source = through_fake
+
+    def agent(req) -> str:
+        events.append(("agent", req.phase))
+        return implement(req)
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    _to_fix(eng)
+    tree = git_out("-C", str(eng.workdir), "rev-parse", "HEAD^{tree}")
+    stray = git_out("-C", str(eng.workdir), *GIT_IDENT, "commit-tree", tree, "-m", "Unrelated")
+    eng.origin.publish(eng.workdir, stray, "unrelated")
+    head = fake_github.prs[PR].head_sha
+    fake_github.merge_bases[("main", head)] = stray
+    created = len(journal.created)
+    with pytest.raises(SandboxLaunchRefusedError, match="is not an ancestor of the seed"):
+        eng.step()
+    assert _seeded(backend, "REVIEW") == [] and len(journal.created) == created
+    assert ("agent", "REVIEW") not in events
+    assert load_state(eng.paths.state_file).phase is Phase.REVIEW
+
+
+class PackingBackend(FakeBackend):
+    """A fake container backend whose exporter leaves a real artifact (#271's will).
+
+    The agent of this fake runs in the host worktree, so the exporter packs
+    that worktree's ``HEAD`` above the launch's seed and writes the manifest
+    for the launch's git input, into the launch's export directory.
+    """
+
+    def __init__(self, events: list[tuple], out: Path) -> None:
+        super().__init__(events)
+        self.out = out
+        self.artifacts: list[Path] = []
+
+    def export(self, objects, handle) -> Artifact:
+        super().export(objects, handle)
+        git_input = handle.inputs.git_input
+        assert git_input is not None and git_input.seed_manifest_digest
+        workspace = handle.inputs.workspace
+        head = git_out("-C", workspace, "rev-parse", "HEAD")
+        pack = isolated_git(
+            "-C", workspace, "pack-objects", "--revs", "--stdout", "-q",
+            input=f"{head}\n^{git_input.seed}\n".encode(),
+        )  # fmt: skip
+        # The exporter fills the export directory the controller chose (#269).
+        directory = Path(handle.inputs.export_dir)
+        directory.mkdir()
+        manifest = CandidateManifest.for_input(
+            git_input,
+            candidate=head,
+            pack_bytes=len(pack),
+            pack_objects=int.from_bytes(pack[8:12], "big"),
+            pack_sha256=hashlib.sha256(pack).hexdigest(),
+        )
+        (directory / ARTIFACT_PACK).write_bytes(pack)
+        (directory / ARTIFACT_MANIFEST).write_bytes(manifest.render())
+        self.artifacts.append(directory)
+        return Artifact(str(directory))
+
+
+@pytest.fixture
+def through_packing(monkeypatch, tmp_path):
+    """The engine's backend exports real artifacts, verified by its own candidate source."""
+    events: list[tuple] = []
+    backend = PackingBackend(events, tmp_path / "exports")
+    journal = FakeJournal(events)
+    monkeypatch.setattr(engine_module, "launch_backend", lambda: backend)
+    monkeypatch.setattr(ControllerEngine, "_lifecycle_journal", lambda self: journal)
+    monkeypatch.setattr(engine_module, "probe_sandbox", lambda: ProbeResult(True, "", "fake"))
+    return events, backend, journal
+
+
+def test_the_engines_candidate_source_imports_the_exported_artifact_and_publishes_it(
+    tmp_state_dir, fake_github, through_packing
+):
+    events, backend, journal = through_packing
+    eng = make_engine(
+        tmp_state_dir, _recording(events), github=fake_github, cfg=_required(), origin=True
+    )
+    eng.step()
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    (analyze,) = _seeded(backend, "ANALYZE_EXECUTE")
+    (saved,) = CandidateReceipts(eng.state_root()).launches(analyze.entry)
+    assert saved.accepted and saved.candidate == eng.state.current_head_sha
+    assert eng.origin.head("autoforge/2") == saved.candidate
+    assert journal.entries == [] and backend.runtime.volumes == set()
+
+
+def test_a_correction_relaunch_carries_the_head_the_controller_imported(
+    tmp_state_dir, fake_github, through_packing
+):
+    """The first launch commits, leaves a file uncommitted and reports another
+    commit: corrected. The relaunch of the same entry carries the commit the
+    controller imported, never the uncommitted file, and its candidate is
+    published."""
+    events, backend, journal = through_packing
+    heads: list[str] = []
+
+    def agent(req) -> str:
+        events.append(("agent", req.phase))
+        heads.append(commit_in(req.cwd, "Implement the feature (#2)"))
+        if len(heads) == 1:
+            Path(req.cwd, "scratch.txt").write_text("uncommitted")
+            return block(analyze_payload("0" * 40))
+        return block(analyze_payload(heads[-1]))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    eng.step()
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    first, second = _seeded(backend, "ANALYZE_EXECUTE")
+    assert first.entry == second.entry and first.seed == second.seed
+    assert first.carried == "" and second.carried == heads[0]
+    files = git_out("-C", str(eng.workdir), "ls-tree", "-r", "--name-only", second.carried)
+    assert "scratch.txt" not in files.split()
+    launches = CandidateReceipts(eng.state_root()).launches(first.entry)
+    assert [item.candidate for item in launches] == heads
+    assert eng.origin.head("autoforge/2") == heads[1] == eng.state.current_head_sha
+
+
+def test_an_artifact_for_another_launch_is_refused_and_nothing_is_published(
+    tmp_state_dir, fake_github, through_packing
+):
+    events, backend, journal = through_packing
+    export = backend.export
+
+    def mislabelled(objects, handle):
+        artifact = export(objects, handle)
+        manifest_path = Path(artifact.directory, ARTIFACT_MANIFEST)
+        data = json.loads(manifest_path.read_text())
+        data["launch"] = "ANALYZE_EXECUTE-99"
+        manifest_path.write_text(json.dumps(data))
+        return artifact
+
+    backend.export = mislabelled  # type: ignore[method-assign]
+    eng = make_engine(
+        tmp_state_dir, _recording(events), github=fake_github, cfg=_required(), origin=True
+    )
+    eng.step()
+    with pytest.raises(ControlResultValidationError, match="its manifest names launch"):
+        eng.step()
+    assert eng.origin.head("autoforge/2") is None and fake_github.effect_writes == []
+    assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
+    (analyze, *_rest) = _seeded(backend, "ANALYZE_EXECUTE")
+    assert CandidateReceipts(eng.state_root()).carried(analyze.entry) == ""
+    assert journal.entries == [] and backend.runtime.volumes == set()
+
+
+# -- a seeded launch that exports nothing (R3-F1) --------------------------------------
+
+
+@pytest.fixture
+def host_candidate_reads(monkeypatch):
+    """Every read of the issue worktree as a candidate source: the strict import
+    after a launch (D6.5) and the ``HEAD`` read through the common dir (D6.3)."""
+    reads: list[str] = []
+    read_head = engine_module.read_candidate
+    import_after = ControllerEngine._import_after_launch
+
+    def recorded_read(*args, **kwargs):
+        reads.append("read HEAD")
+        return read_head(*args, **kwargs)
+
+    def recorded_import(self, worktree):
+        reads.append("import")
+        return import_after(self, worktree)
+
+    monkeypatch.setattr(engine_module, "read_candidate", recorded_read)
+    monkeypatch.setattr(ControllerEngine, "_import_after_launch", recorded_import)
+    return reads
+
+
+def test_a_seeded_launch_whose_backend_makes_no_exporter_is_refused_not_read_from_the_host(
+    tmp_state_dir, fake_github, through_packing, host_candidate_reads, monkeypatch
+):
+    """R3-F1: the backend seeds, so the launch's candidate is its exported artifact
+    (ADR 0013 D5). Its backend makes no exporter: that is a failed export, whose
+    refusal is saved before the final clean-up removes the volume. The worktree's
+    HEAD -- the agent's commit, exactly as it reported it -- is neither imported
+    nor read in its place, on any launch, and nothing is published."""
+    events, backend, journal = through_packing
+    backend.has_exporter = False
+    record = CandidateReceipts.record
+
+    def recorded(self, git_input, outcome):
+        events.append(("engine", "receipt", git_input.launch, outcome.accepted))
+        return record(self, git_input, outcome)
+
+    monkeypatch.setattr(CandidateReceipts, "record", recorded)
+    reported: list[str] = []
+
+    def agent(req) -> str:
+        events.append(("agent", req.phase))
+        out = implement(req)
+        reported.append(git_out("-C", str(req.cwd), "rev-parse", "HEAD"))
+        return out
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    eng.step()
+    with pytest.raises(ControlResultValidationError, match="made no exporter"):
+        eng.step()
+    # Nothing was published, and the run stays where it was.
+    assert eng.origin.head("autoforge/2") is None and fake_github.effect_writes == []
+    assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
+    assert eng.state.current_head_sha in ("", None)
+    # Every launch, corrections included, ran and reported the worktree's HEAD,
+    # and the controller read the worktree as its candidate on none of them.
+    launches = _seeded(backend, "ANALYZE_EXECUTE")
+    assert len(launches) == len(reported) > 1
+    assert host_candidate_reads == []
+    assert not any(event[:3] == ("runtime", "create", "exporter") for event in events)
+    # Each launch's refusal is durable, and saved before its volume was removed.
+    saved = CandidateReceipts(eng.state_root()).launches(launches[0].entry)
+    assert len(saved) == len(launches)
+    assert all(item.verified and not item.accepted for item in saved)
+    assert all("made no exporter" in item.refusal for item in saved)
+    assert CandidateReceipts(eng.state_root()).carried(launches[0].entry) == ""
+    receipts = [i for i, event in enumerate(events) if event[:2] == ("engine", "receipt")]
+    removals = [i for i, event in enumerate(events) if event == ("runtime", "rm", "vol")]
+    assert len(receipts) == len(removals) == len(launches)
+    assert all(r < v for r, v in zip(receipts, removals, strict=True))
+    assert journal.entries == [] and backend.runtime.volumes == set()
+
+
+def test_a_seeded_launch_that_exported_nothing_has_no_candidate(
+    tmp_state_dir, fake_github, through_packing, host_candidate_reads
+):
+    """R3-F1, the engine's half: a seeded change-producing launch whose environment
+    was never made exports nothing (``None``). Its candidate is refused, the
+    refusal saved against its git input, and the worktree's ``HEAD`` is never read."""
+    events, backend, journal = through_packing
+    eng = make_engine(
+        tmp_state_dir, _recording(events), github=fake_github, cfg=_required(), origin=True
+    )
+    eng.step()
+    owner = LaunchOwner(eng.state.run_id, 2, "ANALYZE_EXECUTE", "ANALYZE_EXECUTE-1")
+    base = eng.origin.head("main")
+    git_input = LaunchGitInput(
+        phase="ANALYZE_EXECUTE",
+        run=owner.run,
+        issue=owner.issue,
+        launch=owner.launch,
+        repository="owner/repo",
+        object_format="sha1",
+        seed=base,
+        lower=base,
+    )
+    inputs = LaunchInputs(
+        owner, workspace=str(eng.workdir), git_input=git_input, export_dir="never-made"
+    )
+    with LaunchLifecycle(backend, journal, inputs, RUNTIME, change_producing=True) as lifecycle:
+        assert lifecycle.exports
+        assert lifecycle.launch(lambda: "no plan") == "no plan"
+        eng._launch_seeded = True
+        eng._export_verified = eng._verify_export(lifecycle)
+    assert eng._export_verified == NOT_EXPORTED
+    candidate = eng._read_candidate(str(eng.workdir))
+    assert candidate.head == "" and "exported none" in candidate.problem
+    assert "HEAD is never read in its place" in candidate.problem
+    assert host_candidate_reads == []
+    (saved,) = CandidateReceipts(eng.state_root()).launches(git_input.entry)
+    assert saved.verified and not saved.accepted and saved.refusal == NOT_EXPORTED.refusal
+    assert events == [] and journal.entries == []
+
+
+@pytest.mark.parametrize("mode", ["disabled", "required"])
+def test_bwrap_and_disabled_launches_still_read_the_worktree_head(
+    tmp_state_dir, fake_github, host_candidate_reads, mode
+):
+    """R3-F1 keeps bwrap's and ``disabled``'s source: their candidate is the
+    worktree's ``HEAD``, after the strict import, and nothing is exported."""
+    cfg = default_config()
+    cfg.sandbox.mode = mode
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, cfg=cfg, origin=True)
+    eng.step()
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert not eng._launch_seeded and eng._export_verified is None
+    assert host_candidate_reads[:2] == ["import", "read HEAD"]
+    assert eng.origin.head("autoforge/2") == eng.state.current_head_sha
+
+
+def test_a_second_fix_round_at_the_same_head_carries_nothing_from_the_first(
+    tmp_state_dir, fake_github, through_fake
+):
+    """Two FIX entries bind the same reviewed HEAD (a round whose fix moved
+    nothing): the second is an entry of its own, and never carries a commit the
+    first one imported; a relaunch of the first does."""
+    events, backend, journal, _source = through_fake
+
+    def agent(req) -> str:
+        events.append(("agent", req.phase))
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        return block(review_result(1, fake_github.prs[PR].head_sha, [_nit(1)]))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    _to_fix(eng)
+    assert eng.step().next_phase == "FIX"
+    reviewed = eng.state.reviewed_head_sha
+    tree = git_out("-C", str(eng.workdir), "rev-parse", f"{reviewed}^{{tree}}")
+    fixed = git_out(
+        "-C", str(eng.workdir), *GIT_IDENT, "commit-tree", tree, "-p", reviewed, "-m", "Fix (#2)"
+    )
+    owner = LaunchOwner(eng.state.run_id, 2, "FIX", "FIX-1")
+    first = eng._launch_git_input(Phase.FIX, owner)
+    assert (first.seed, first.carried) == (reviewed, "")
+    eng._candidate_receipts().record(first, Verified(candidate=fixed))
+    relaunch = eng._launch_git_input(Phase.FIX, replace_launch(owner, "FIX-2"))
+    assert relaunch.entry == first.entry and relaunch.carried == fixed
+    eng.state.review_round += 1  # the next round, at the same reviewed HEAD
+    next_round = eng._launch_git_input(Phase.FIX, owner)
+    assert next_round.seed == reviewed and next_round.entry != first.entry
+    assert next_round.carried == ""
+
+
+def test_a_replacement_prs_fix_round_carries_nothing_from_the_replaced_prs(
+    tmp_state_dir, fake_github, through_fake
+):
+    """R1-F9: a replan's replacement PR restarts its review rounds at one. Reviewed
+    at the same HEAD and merge base as the replaced PR's round 1, its FIX entry is
+    still an entry of its own: it never carries the replaced PR's fixer commit."""
+    events, backend, journal, _source = through_fake
+
+    def agent(req) -> str:
+        events.append(("agent", req.phase))
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        return block(review_result(1, fake_github.prs[PR].head_sha, [_nit(1)]))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    _to_fix(eng)
+    assert eng.step().next_phase == "FIX"
+    reviewed, merge_base = eng.state.reviewed_head_sha, eng.state.reviewed_merge_base_sha
+    tree = git_out("-C", str(eng.workdir), "rev-parse", f"{reviewed}^{{tree}}")
+    fixed = git_out(
+        "-C", str(eng.workdir), *GIT_IDENT, "commit-tree", tree, "-p", reviewed, "-m", "Fix (#2)"
+    )
+    owner = LaunchOwner(eng.state.run_id, 2, "FIX", "FIX-1")
+    replaced = eng._launch_git_input(Phase.FIX, owner)
+    eng._candidate_receipts().record(replaced, Verified(candidate=fixed))
+    assert eng._launch_git_input(Phase.FIX, replace_launch(owner, "FIX-2")).carried == fixed
+    # What the replacement's activation changes (``_activate_replacement``): a new
+    # execution attempt and PR, its rounds counted from zero again; its first
+    # review then binds round 1 at the same HEAD and merge base.
+    eng.state.execution_attempt += 1
+    eng.state.current_pr_url = "https://github.com/owner/repo/pull/43"
+    eng.state.reviewed_pr_url = eng.state.current_pr_url
+    eng.state.review_round = 1
+    replacement = eng._launch_git_input(Phase.FIX, owner)
+    assert (replacement.seed, replacement.lower) == (reviewed, merge_base)
+    assert replacement.entry_label != replaced.entry_label
+    assert replacement.entry != replaced.entry and replacement.carried == ""
+
+
+# -- an existing issue branch, under a backend that seeds (R1-F4) ------------------------
+
+
+def _earlier_work(eng: ControllerEngine) -> str:
+    """A commit for this issue on ``autoforge/2``, pushed before the run, above main."""
+    main = eng.origin.head("main")
+    tree = git_out("-C", str(eng.workdir), "rev-parse", f"{main}^{{tree}}")
+    sha = git_out(
+        "-C", str(eng.workdir), *GIT_IDENT, "commit-tree", tree, "-p", main, "-m", "Earlier (#2)"
+    )
+    return eng.origin.publish(eng.workdir, sha, "autoforge/2")
+
+
+def _from_start(req) -> str:
+    """The agent the prompt asks for: detached at the start commit, then one commit."""
+    start = re.search(r"Start commit: `([0-9a-f]{40})`", req.prompt)
+    assert start, "the prompt names no start commit"
+    git_out("-C", req.cwd, "checkout", "-q", "--detach", start.group(1))
+    return implement(req)
+
+
+@pytest.mark.parametrize("adopt", [False, True])
+def test_an_implementation_launch_carries_the_branch_work_it_continues(
+    tmp_state_dir, fake_github, through_packing, adopt
+):
+    """The entry finds earlier work on ``autoforge/2`` (with no PR, or an open PR it
+    adopts): the agent is told to start from that head and its candidate must
+    descend from it, so the seed carries it above the bound base, and the
+    candidate imported from the artifact is published as a fast-forward."""
+    events, backend, journal = through_packing
+    eng = make_engine(tmp_state_dir, _from_start, github=fake_github, cfg=_required(), origin=True)
+    base = eng.origin.head("main")
+    earlier = _earlier_work(eng)
+    pr = "https://github.com/owner/repo/pull/41"
+    if adopt:
+        fake_github.add_pr(pr, head_sha=earlier, branch="autoforge/2", body="Started by hand.")
+    eng.step()
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    (analyze,) = _seeded(backend, "ANALYZE_EXECUTE")
+    assert (analyze.seed, analyze.lower, analyze.carried) == (base, base, earlier)
+    (req,) = eng.provider.calls
+    assert f"Start commit: `{earlier}`" in req.prompt
+    head = eng.state.current_head_sha
+    assert git_out("-C", str(eng.workdir), "rev-parse", f"{head}^") == earlier
+    (saved,) = CandidateReceipts(eng.state_root()).launches(analyze.entry)
+    assert saved.accepted and saved.candidate == head
+    assert eng.origin.head("autoforge/2") == head
+    assert eng.state.current_pr_url == (pr if adopt else PR)
+
+
+def test_a_relaunch_carries_its_own_import_above_the_branch_work(
+    tmp_state_dir, fake_github, through_packing
+):
+    """The entry's first launch imports a commit above the branch's head: the
+    relaunch carries that commit, which already holds the branch's work."""
+    events, backend, journal = through_packing
+    heads: list[str] = []
+
+    def agent(req) -> str:
+        if not heads:
+            _from_start(req)
+        heads.append(commit_in(req.cwd, "More work (#2)"))
+        return block(analyze_payload("0" * 40 if len(heads) == 1 else heads[-1]))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    earlier = _earlier_work(eng)
+    eng.step()
+    assert eng.step().next_phase == "REVIEW"
+    first, second = _seeded(backend, "ANALYZE_EXECUTE")
+    assert first.carried == earlier and second.carried == heads[0] != earlier
+
+
+def test_branch_work_that_does_not_descend_from_the_base_refuses_the_launch(
+    tmp_state_dir, fake_github, through_packing
+):
+    """The default branch moved past the branch's base: no seed holds both, so the
+    launch is refused before anything of it is journaled or created."""
+    events, backend, journal = through_packing
+    eng = make_engine(tmp_state_dir, _from_start, github=fake_github, cfg=_required(), origin=True)
+    earlier = _earlier_work(eng)
+    moved = commit_in(eng.workdir, "Land something else on main (#9)")
+    eng.origin.publish(eng.workdir, moved, "main")
+    eng.step()
+    with pytest.raises(SandboxLaunchRefusedError, match=f"branch head {earlier}.*does not descend"):
+        eng.step()
+    assert backend.seeded == [] and journal.created == [] and eng.provider.calls == []
+    assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
+
+
+# -- the workspace note under each backend (R1-F5) ---------------------------------------
+
+CONTAINER_NOTE = "## Your workspace starts from a bound revision"
+HOST_NOTE = "## Uncommitted changes in this worktree"
+
+
+def test_a_container_relaunch_is_never_told_the_host_worktrees_changes(
+    tmp_state_dir, fake_github, through_fake
+):
+    """The first launch leaves a file uncommitted in the host worktree and is
+    corrected. Neither launch's prompt describes the host worktree as its
+    workspace: each says its workspace is seeded and that uncommitted work is
+    discarded between launches."""
+    events, backend, journal, _source = through_fake
+    heads: list[str] = []
+
+    def agent(req) -> str:
+        events.append(("agent", req.phase))
+        heads.append(commit_in(req.cwd, "Implement the feature (#2)"))
+        if len(heads) == 1:
+            Path(req.cwd, "scratch.txt").write_text("uncommitted")
+            return block(analyze_payload("0" * 40))
+        return block(analyze_payload(heads[-1]))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    eng.step()
+    assert eng.step().next_phase == "REVIEW"
+    first, second = eng.provider.calls
+    assert second.correction and Path(second.cwd, "scratch.txt").exists()
+    for req in (first, second):
+        assert CONTAINER_NOTE in req.prompt and HOST_NOTE not in req.prompt
+        assert "scratch.txt" not in req.prompt
+        assert "uncommitted when you finish is lost" in " ".join(req.prompt.split())
+
+
+def test_the_workspace_note_follows_the_backend(tmp_state_dir, fake_github, monkeypatch):
+    """bwrap and ``disabled`` read the host worktree as before; a backend that seeds
+    reads none of it."""
+    eng = make_engine(tmp_state_dir, [], github=fake_github, cfg=_required(), origin=True)
+    worktree = eng._ensure_agent_worktree()
+    (worktree / "scratch.txt").write_text("left by an earlier launch")
+    assert engine_module.launch_backend() is BWRAP
+    hint, note = eng._read_worktree_state(str(worktree))
+    assert HOST_NOTE in hint and "scratch.txt" in hint
+    assert note == "1 uncommitted change(s), described in the prompt"
+    monkeypatch.setattr(engine_module, "launch_backend", lambda: FakeBackend([]))
+    hint, note = eng._read_worktree_state(str(worktree))
+    assert CONTAINER_NOTE in hint and "scratch.txt" not in hint
+    assert note.startswith("a seeded launch: the host worktree is not its workspace")
+    eng.config.sandbox.mode = "disabled"
+    hint, note = eng._read_worktree_state(str(worktree))
+    assert HOST_NOTE in hint and "scratch.txt" in hint
+
+
+# -- a refused launch after an accepted one, a failed export, a stop (R1-F6, F7, F8) -------
+
+
+def test_a_relaunch_after_a_refused_artifact_carries_the_earlier_accepted_import(
+    tmp_state_dir, fake_github, through_packing
+):
+    """Launch 1's artifact is accepted (its report is corrected), launch 2's is
+    refused, and launch 3 still carries what launch 1 imported."""
+    events, backend, journal = through_packing
+    export = backend.export
+    heads: list[str] = []
+
+    def second_mislabelled(objects, handle):
+        artifact = export(objects, handle)
+        if len(backend.artifacts) == 2:
+            path = Path(artifact.directory, ARTIFACT_MANIFEST)
+            data = json.loads(path.read_text())
+            data["launch"] = "ANALYZE_EXECUTE-99"
+            path.write_text(json.dumps(data))
+        return artifact
+
+    def agent(req) -> str:
+        heads.append(commit_in(req.cwd, "Implement the feature (#2)"))
+        return block(analyze_payload("0" * 40 if len(heads) == 1 else heads[-1]))
+
+    backend.export = second_mislabelled  # type: ignore[method-assign]
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    eng.step()
+    try:
+        out = eng.step()
+    except ControlResultValidationError:
+        out = eng.step()  # 'resume': the next step relaunches the same entry
+    assert out.next_phase == "REVIEW", out.message
+    first, second, third = _seeded(backend, "ANALYZE_EXECUTE")
+    assert first.entry == second.entry == third.entry
+    assert (first.carried, second.carried, third.carried) == ("", heads[0], heads[0])
+    launches = CandidateReceipts(eng.state_root()).launches(first.entry)
+    assert [item.accepted for item in launches] == [True, False, True]
+    assert eng.origin.head("autoforge/2") == heads[2] == eng.state.current_head_sha
+
+
+def test_a_failed_export_is_recorded_against_the_launchs_input_before_the_volume_goes(
+    tmp_state_dir, fake_github, through_packing
+):
+    """The exporter fails; the controller dies while removing the volume. A new
+    process reads the refusal back, bound to the launch's git input."""
+    events, backend, journal = through_packing
+    backend.fail = "export"
+    remove = backend.remove
+    on_disk: list[list] = []
+
+    def crash_at_the_volume(obj):
+        if obj.kind is ObjectKind.VOLUME:
+            (bound,) = _seeded(backend, "ANALYZE_EXECUTE")
+            on_disk.append(CandidateReceipts(eng.state_root()).launches(bound.entry))
+            raise KeyboardInterrupt
+        return remove(obj)
+
+    backend.remove = crash_at_the_volume  # type: ignore[method-assign]
+    eng = make_engine(
+        tmp_state_dir, _recording(events), github=fake_github, cfg=_required(), origin=True
+    )
+    eng.step()
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    (bound,) = _seeded(backend, "ANALYZE_EXECUTE")
+    # Recorded before the volume's removal was asked for.
+    ((before,),) = on_disk
+    assert before.verified and "the launch's export failed: fake: export failed" in before.refusal
+    resumed = _resumed(eng, fake_github, _recording(events))
+    (after,) = resumed._candidate_receipts().launches(bound.entry)
+    assert after == before
+    assert after.git_input == bound.with_seed_manifest(backend.seeds[0].identity)
+    assert {obj.name for obj in journal.entries} >= {"vol"}
+
+
+def _past_the_digit_limit(raw: bytes) -> bytes:
+    """The manifest with its issue a 5,000-digit integer: well inside its size bound."""
+    return raw.replace(b'"issue":2,', b'"issue":1' + b"0" * 4999 + b",")
+
+
+def _nested_as_deep_as_the_bound_allows(raw: bytes) -> bytes:
+    depth = (MAX_MANIFEST_BYTES - 16) // 2
+    return b'{"schema":' + b"[" * depth + b"]" * depth + b"}"
+
+
+@pytest.fixture
+def default_digit_limit():
+    """The interpreter's default integer digit limit, whatever the environment set."""
+    before = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(4300)
+    yield
+    sys.set_int_max_str_digits(before)
+
+
+@pytest.mark.parametrize("hostile", [_past_the_digit_limit, _nested_as_deep_as_the_bound_allows])
+def test_a_manifest_the_decoder_refuses_is_saved_as_a_refusal_before_the_volume_goes(
+    tmp_state_dir, fake_github, through_packing, default_digit_limit, hostile
+):
+    """PR #474 R2-F2: an exporter leaves a manifest the JSON decoder refuses (an
+    integer past the digit limit, the deepest nesting the bound admits). Each
+    launch's refusal is saved against its git input before its volume's removal
+    is asked for, the volume goes, and nothing is published."""
+    events, backend, journal = through_packing
+    gh = fake_github
+    export, remove = backend.export, backend.remove
+    on_disk: list[list] = []
+    eng_box: list[ControllerEngine] = []
+
+    def malformed(objects, handle):
+        artifact = export(objects, handle)
+        path = Path(artifact.directory, ARTIFACT_MANIFEST)
+        raw = path.read_bytes()
+        changed = hostile(raw)
+        assert changed != raw and len(changed) <= MAX_MANIFEST_BYTES
+        path.write_bytes(changed)
+        return artifact
+
+    def record_at_the_volume(obj):
+        if obj.kind is ObjectKind.VOLUME:
+            bound = _seeded(backend, "ANALYZE_EXECUTE")[-1]
+            on_disk.append(CandidateReceipts(eng_box[0].state_root()).launches(bound.entry))
+        return remove(obj)
+
+    backend.export = malformed  # type: ignore[method-assign]
+    backend.remove = record_at_the_volume  # type: ignore[method-assign]
+    eng = make_engine(tmp_state_dir, _recording(events), github=gh, cfg=_required(), origin=True)
+    eng_box.append(eng)
+    eng.step()
+    with pytest.raises(ControlResultValidationError, match="its manifest"):
+        eng.step()
+    assert eng.origin.head("autoforge/2") is None and gh.effect_writes == []
+    assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
+    launched = _seeded(backend, "ANALYZE_EXECUTE")
+    launches = CandidateReceipts(eng.state_root()).launches(launched[0].entry)
+    assert len(launches) == len(launched) >= 1
+    for saved in launches:
+        assert saved.verified and not saved.accepted and "its manifest" in saved.refusal
+    # Each launch's refusal was on disk when its volume's removal was asked for.
+    assert [len(seen) for seen in on_disk] == list(range(1, len(launched) + 1))
+    assert all(not seen[-1].accepted and seen[-1].verified for seen in on_disk)
+    assert CandidateReceipts(eng.state_root()).carried(launched[0].entry) == ""
+    assert journal.entries == [] and backend.runtime.volumes == set()
+
+
+def test_a_launch_stopped_after_it_committed_exports_its_work_for_the_relaunch(
+    tmp_state_dir, fake_github, through_packing
+):
+    """The agent commits, then its run ends by an error (a stop the provider
+    reports as one): the work is exported, imported and saved before the error
+    propagates, the volume goes after that, and the resumed relaunch carries the
+    commit."""
+    events, backend, journal = through_packing
+    heads: list[str] = []
+
+    def agent(req) -> str:
+        heads.append(commit_in(req.cwd, "Implement the feature (#2)"))
+        if len(heads) == 1:
+            raise ExecutionError("the agent's run was stopped")
+        return block(analyze_payload(heads[-1]))
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    eng.step()
+    with pytest.raises(ExecutionError, match="the agent's run was stopped"):
+        eng.step()
+    (first,) = _seeded(backend, "ANALYZE_EXECUTE")
+    (saved,) = CandidateReceipts(eng.state_root()).launches(first.entry)
+    assert saved.accepted and saved.candidate == heads[0]
+    assert journal.entries == [] and backend.runtime.volumes == set()
+    assert eng.origin.head("autoforge/2") is None
+    resumed = _resumed(eng, fake_github, agent)
+    out = resumed.step()
+    assert out.next_phase == "REVIEW", out.message
+    _, second = _seeded(backend, "ANALYZE_EXECUTE")
+    assert second.entry == first.entry and second.carried == heads[0]
+    assert resumed.origin.head("autoforge/2") == heads[1] == resumed.state.current_head_sha
+
+
+def test_a_stopped_launch_with_an_uncertain_release_exports_nothing(
+    tmp_state_dir, fake_github, through_packing
+):
+    """The launch container may still write the volume: nothing is exported, the
+    error propagates with the uncertainty noted, and the volume stays."""
+    events, backend, journal = through_packing
+    backend.uncertain = frozenset({ObjectKind.LAUNCH_CONTAINER})
+
+    def agent(req) -> str:
+        commit_in(req.cwd, "Implement the feature (#2)")
+        raise ExecutionError("the agent's run was stopped")
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    eng.step()
+    with pytest.raises(ExecutionError, match="the agent's run was stopped") as raised:
+        eng.step()
+    assert any("launch container launch" in note for note in raised.value.__notes__)
+    assert backend.artifacts == []
+    (first,) = _seeded(backend, "ANALYZE_EXECUTE")
+    assert all(
+        not item.verified for item in CandidateReceipts(eng.state_root()).launches(first.entry)
+    )
+    assert "vol" in {obj.name for obj in journal.entries}
+
+
+# -- the artifact's origin, through the engine (R1-F2) -----------------------------------
+
+
+def test_a_correctly_labelled_artifact_from_another_location_is_never_imported(
+    tmp_state_dir, fake_github, through_packing, tmp_path
+):
+    """The exporter leaves a valid artifact for exactly this launch, but outside the
+    launch's export directory: refused, and nothing is published."""
+    events, backend, journal = through_packing
+    export = backend.export
+
+    def elsewhere(objects, handle):
+        artifact = export(objects, handle)
+        planted = tmp_path / "planted" / Path(artifact.directory).name
+        shutil.copytree(artifact.directory, planted)
+        return Artifact(str(planted))
+
+    backend.export = elsewhere  # type: ignore[method-assign]
+    eng = make_engine(
+        tmp_state_dir, _recording(events), github=fake_github, cfg=_required(), origin=True
+    )
+    eng.step()
+    with pytest.raises(ControlResultValidationError, match="not in the launch's export directory"):
+        eng.step()
+    assert eng.origin.head("autoforge/2") is None and fake_github.effect_writes == []
+    (analyze, *_rest) = _seeded(backend, "ANALYZE_EXECUTE")
+    assert CandidateReceipts(eng.state_root()).carried(analyze.entry) == ""
+
+
+def test_a_correctly_labelled_artifact_in_an_earlier_launchs_export_directory_is_refused(
+    tmp_state_dir, fake_github, through_packing
+):
+    """Launch 2's exporter hands back launch 1's export directory, its manifest
+    rewritten to name launch 2: the artifact is not from launch 2's own export
+    directory, so it is refused."""
+    events, backend, journal = through_packing
+    export = backend.export
+    heads: list[str] = []
+
+    def reuse_the_first(objects, handle):
+        artifact = export(objects, handle)
+        if len(backend.artifacts) == 1:
+            return artifact
+        first = backend.artifacts[0]
+        shutil.copy(Path(artifact.directory, ARTIFACT_PACK), first / ARTIFACT_PACK)
+        shutil.copy(Path(artifact.directory, ARTIFACT_MANIFEST), first / ARTIFACT_MANIFEST)
+        return Artifact(str(first))
+
+    def agent(req) -> str:
+        heads.append(commit_in(req.cwd, "Implement the feature (#2)"))
+        return block(analyze_payload("0" * 40 if len(heads) == 1 else heads[-1]))
+
+    backend.export = reuse_the_first  # type: ignore[method-assign]
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, cfg=_required(), origin=True)
+    eng.step()
+    with pytest.raises(ControlResultValidationError):
+        eng.step()
+    first, second = _seeded(backend, "ANALYZE_EXECUTE")[:2]
+    launches = CandidateReceipts(eng.state_root()).launches(first.entry)
+    refused = next(item for item in launches if item.git_input.launch == second.launch)
+    assert "not in the launch's export directory" in refused.refusal
+    assert eng.origin.head("autoforge/2") is None and fake_github.effect_writes == []

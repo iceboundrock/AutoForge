@@ -447,9 +447,11 @@ fake bwrap, the typed probe; the real reason where the host cannot enforce:
 backend; routing; every provider's    test_sandbox_bwrap.py, test_sandbox_routing.py,
 boundary alike; the gate and modes;   test_sandbox_parity.py; `make test-sandbox` fails
 doctor's rows; the backend seam and  instead), test_engine_sandbox.py,
-the engine's sequence of it (#268)    test_sandbox_gate.py, test_doctor_sandbox.py,
-                                      test_sandbox_host.py (the host measurement),
-                                      test_sandbox_backend.py, test_sandbox_lifecycle.py
+the engine's sequence of it (#268);   test_sandbox_gate.py, test_doctor_sandbox.py,
+the candidate source, the launch's    test_sandbox_host.py (the host measurement),
+git input and the artifact import     test_sandbox_backend.py, test_sandbox_lifecycle.py,
+(#269)                                test_candidate_artifact.py, test_candidate_source.py,
+                                      test_git_input.py
 config, CLI, doctor, CI drift guards  test_config.py, test_cli.py, test_doctor.py, test_ci_workflow.py, test_gitignore.py
 every workflow's actions pinned to a  test_workflow_pins.py (a tag, branch, short SHA, Docker
 commit with its release (#288)        image, local action or missing release fails, a tag in

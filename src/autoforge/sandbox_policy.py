@@ -81,6 +81,9 @@ SANDBOX_DIR = "autoforge/sandbox"
 PRIVATE_OBJECTS = "objects"
 OVERLAY_WORK = "overlay-work"
 CACHE = "cache"
+# The per-launch export directories of a backend that exports (ADR 0005 D8.4
+# as amended by ADR 0013; #269): ``<key>/export/<launch id>-<token>``.
+EXPORT = "export"
 # The admin dir's pointer files pinned read-only for a REMOTE agent (D6.6).
 PINNED_ADMIN_FILES = ("commondir", "gitdir")
 

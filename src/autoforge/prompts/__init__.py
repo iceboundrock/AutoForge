@@ -38,6 +38,10 @@ TEMPLATE_FILES = (
     # What a write phase's worktree holds uncommitted (#187), rendered into
     # the phase template's {{WORKTREE_STATE}} only when there is something.
     "worktree_state.md",
+    # The same, for a launch of a backend that seeds a private workspace
+    # (ADR 0013 D4; #269): the host worktree is not its workspace, and
+    # uncommitted work is discarded between launches.
+    "worktree_state_container.md",
     # The FIX prompt's acceptance_action resolution (#211), rendered into
     # fix.md's {{ACCEPTANCE_ACTIONS}} when safety.acceptance_actions offers it.
     "acceptance_actions.md",

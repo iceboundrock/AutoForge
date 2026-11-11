@@ -1210,6 +1210,7 @@ REMOTE_TEMPLATES = (
     "update_epic_rerequest.md",
     "correction.md",
     "worktree_state.md",
+    "worktree_state_container.md",
     "claude_background_work.md",
 )
 
@@ -1300,6 +1301,22 @@ def test_a_write_template_without_its_worktree_state_fails_to_render(template):
     with pytest.raises(ConfigurationError, match="'WORKTREE_STATE'"):
         render(text, variables)
     assert "WORKTREE_STATE" not in render(text, {**variables, "WORKTREE_STATE": ""})
+
+
+def test_the_container_worktree_state_template_says_nothing_uncommitted_is_carried():
+    """#269 (ADR 0013 D4): a seeded launch's note names no host worktree state; it
+    says the workspace is seeded and that uncommitted work is discarded."""
+    template = prompts.load_template("worktree_state_container.md")
+    assert prompts.required_variables(template) == set()
+    text = " ".join(template.split())
+    for phrase in (
+        "seeded it from the revision it bound for this phase entry",
+        "Uncommitted work from an earlier launch is never carried into this one",
+        "whatever you leave uncommitted when you finish is lost",
+        "Commit your work before you finish",
+    ):
+        assert phrase in text, phrase
+    assert "git status" not in text and "Checked-out branch" not in text
 
 
 def test_the_worktree_state_template_holds_the_instruction():

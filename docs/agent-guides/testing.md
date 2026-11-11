@@ -899,7 +899,9 @@ exactly when `tests/sandbox_host.py` measures the host capable
   projection still goes; the release after the run on
   every path; the exporter's own entry before its create; the volume
   removed only after verify's outcome is saved; a failed export an
-  outcome that keeps the volume until it is saved. A refusal at each step
+  outcome that keeps the volume until it is saved, and so is a launch
+  handed an export directory whose backend makes no exporter, while one
+  handed none skips the export (R3-F1). A refusal at each step
   before the run removes what was made and starts nothing, and an
   environment that failed is never made again; a later process of the
   launch runs in the environment already made; an uncertain release, an
@@ -923,14 +925,113 @@ exactly when `tests/sandbox_host.py` measures the host capable
   container removed before its volume; an
   artifact refused by the verify step, or with no candidate source, never
   a candidate; of an agent's two commits, only the one the verify step
-  accepted published, and the other (the worktree's `HEAD`, reported)
-  refused on every launch with nothing pushed or created; an uncertain
+  accepted is the candidate (the worktree is not read), and a report of
+  the other is corrected on every launch with nothing pushed or created;
+  an uncertain
   release that fails the step and is reconciled
   at the next entry; an exporter not verified removed that is never
   verified; the release after `Ctrl-C`, and `Ctrl-C` kept when the release
   is uncertain; a refused runtime check with the state byte-identical;
   nothing under `disabled`; and the same order in a scheduler worker's
   namespace.
+  For the candidate source and the launch's git input (#269): the input
+  completed with the seed's digest and saved at the end of the seed step,
+  before any journal entry, in both staging forms; a seed manifest swapped
+  after that (other commits, or another tag set) refused before the
+  staging root is written (bind form) or before the copy-in (copy-in
+  form), the stager never run; a seed step naming another manifest, or a
+  seed for a launch with no git input, refused before any journal entry.
+  Through the engine: `ANALYZE_EXECUTE` seeded from the base its entry
+  fetched and `REVIEW` from the round's HEAD and merge base, each input
+  saved in the receipts; a default branch moved after the entry's read
+  leaving the seed and the prompt on the bound base; `UPDATE_EPIC`
+  binding the default branch head at its first seeded launch, in its entry
+  observation, and a new process's relaunch after the default branch moved
+  seeding from that head; `REPLAN_REEXECUTE` its transaction's base; a
+  replacement PR's `FIX` round at the replaced PR's reviewed HEAD and merge
+  base carrying nothing from it; an issue branch with earlier work (alone,
+  or the PR the entry adopts) carried above the base and continued, a
+  relaunch carrying its own import above it, and branch work that does not
+  descend from the base refusing the launch before any journal entry; an operator's push after the controller's seeding
+  the next `REVIEW`, and the `FIX` after it seeding from that reviewed
+  HEAD; a HEAD past the reviewed one at `FIX`'s entry going `FIX ->
+  REVIEW` with no seed and no journal entry, and the re-review seeding
+  from the new HEAD; a push during `REVIEW` leaving the seed at the bound
+  HEAD and the round stale; a relaunch of the same `REVIEW` round on the
+  same HEAD with no carried commit; a correction relaunch of a `REVIEW`
+  round, and a new process's resumed launch of one, each after the PR's
+  HEAD moved, its base was retargeted or its merge base moved, seeding
+  from the round's first binding, never re-reading the PR for it, the
+  round recorded stale at that binding and the next round seeding from
+  the new revision (PR #474 R2-F1); a manifest the decoder refuses (an
+  integer past the digit limit, deep nesting) saved as the launch's
+  refusal before its volume's removal, nothing published (R2-F2); a
+  merge base that is not an ancestor of the bound HEAD refusing the
+  launch before any journal entry. With a
+  backend whose exporter packs a real artifact, the engine's own
+  candidate source imports and publishes it, a correction relaunch of the
+  same entry carries the commit the first launch's import accepted (never
+  an uncommitted file), an artifact naming another launch is refused
+  with nothing published, and so is a correctly labelled artifact outside
+  the launch's export directory or in an earlier launch's; an accepted
+  launch, a refused one, then a relaunch carrying the accepted import; an
+  exporter's failure saved against the launch's input before the volume's
+  removal, read back by a new process after a crash there; a launch whose
+  run ends by an `ExecutionError` after it committed exported, imported and
+  saved before the error propagates, and the resumed relaunch carrying the
+  commit, while one with an uncertain release exports nothing; a seeded
+  launch whose backend makes no exporter refused on every launch, its
+  refusal saved before each volume's removal, the host worktree neither
+  imported nor read as its candidate, nothing published, and one whose
+  environment was never made refused the same way (`NOT_EXPORTED`), while
+  bwrap and `disabled` still import and read the worktree's `HEAD` (PR
+  #474 R3-F1); a container
+  launch's prompt never describing the dirty host worktree, and the note
+  following the backend (bwrap and `disabled` unchanged).
+- `tests/test_candidate_artifact.py` (#269) runs real git on a store and
+  an agent repository in `tmp_path`, with no runtime: a valid artifact
+  imported under L1 (the one write, `index-pack --stdin` streamed from
+  the quarantined file) and re-hashed; a re-import publishing nothing; a
+  seed with an empty pack; a relaunch above a carried commit. Each of
+  these is refused with nothing published and no ref moved: an extra
+  commit that does not descend from the seed (alone or merged in), an
+  object the candidate does not reach, a candidate reaching an object the
+  pack omits that only the shared store holds (a blob named by a new tree,
+  an unrelated merge parent, a host-only commit claimed with an empty
+  pack, a blob above a relaunch's carried commit), a claimed `HEAD` that is not a
+  commit or is below the seed, a pack that fails `--strict`, a corrupt
+  pack, a pack missing an object, a thin pack, a pack over the size or
+  object-count bound (the over-size one sparse, refused with no
+  quarantine, no read past its size and a small memory peak), a pack its
+  manifest does not describe, a bad header, a manifest that disagrees with
+  the git input in any field, one that does not parse (bytes that are not
+  UTF-8 or JSON, an integer past the interpreter's digit limit, nesting
+  past the decoder's depth, each an `ObjectImportError`), names refs or
+  paths or is oversized, a directory or file reached through a link, a
+  FIFO, a planted extra entry, a missing pack, a candidate that does not
+  read as its own bytes, and a lock not obtained. Crash windows: before
+  L1, during `index-pack` and after publication, each followed by a
+  re-import giving the same candidate. The bound revision's store checks
+  (seed, merge base, carried commit, ancestry), read without the
+  container's objects.
+- `tests/test_candidate_source.py` (#269): each phase's rule
+  (`bound_git_input`), the receipts (bound once, an outcome saved
+  idempotently, the carried commit the latest accepted launch's import and
+  never taken away by a later refusal, a bounded number of launches that
+  keeps the latest accepted one, a file that does not parse or is a link
+  refused), the verify step over real artifacts (accepted and saved, a
+  crash before the save verifying again to the same outcome, a refusal
+  saved and never carried, a handle of another launch, no git input, a
+  failed export saved as a refusal), the artifact's origin (a correctly
+  labelled artifact from another path, from another launch's export
+  directory, under a name the controller never makes for the launch, with
+  no journaled origin, or through a link, each refused before it is read), a
+  relaunch carrying the committed `HEAD` and no uncommitted file, and the
+  two candidate reads.
+- `tests/test_git_input.py` (#269): the git input's invariants, its
+  entry, its persisted identity read back strictly, and the seed
+  manifest's digest (a swapped manifest, a link, a FIFO and an oversized
+  file refused).
 
 The existing executor and duplex suites are the no-description regression:
 they run unchanged.

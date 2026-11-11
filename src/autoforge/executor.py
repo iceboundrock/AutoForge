@@ -11,7 +11,10 @@ Safety properties:
   is written in full by a non-blocking feeder and stdin is then closed, so
   the child sees EOF, a child that never reads costs the controller
   nothing past the invocation, and what the child did not read is counted
-  (:class:`_StdinFeeder`, :attr:`ExecutionResult.stdin_unread`);
+  (:class:`_StdinFeeder`, :attr:`ExecutionResult.stdin_unread`), or
+  ``stdin_path``: a regular file the child reads as its stdin at its own
+  pace, opened without following a link, so a payload of any size is
+  never held in the controller's memory;
 - the child runs in its own session/process group, and nothing in that
   group outlives the invocation: on timeout the whole group is terminated
   (SIGTERM, then SIGKILL), and after a normal exit a group that still has
@@ -79,12 +82,14 @@ Safety properties:
 from __future__ import annotations
 
 import ctypes
+import errno
 import math
 import os
 import re
 import select
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -201,6 +206,12 @@ class ExecutionRequest:
     # stdin on ``/dev/null``. For a CLI whose argv cannot carry a payload
     # verbatim (the OpenCode v2 message). Bounded by the timeout, not by size.
     stdin_data: bytes | None = None
+    # A regular file the child reads as its stdin, opened read-only without
+    # following a link and handed to the child as its descriptor 0: for a
+    # payload the controller must never hold in memory whole (the strict
+    # import of an exported pack, ADR 0013 D5). Exclusive with
+    # ``stdin_data``; a path that is not a regular file fails the spawn.
+    stdin_path: str | None = None
     # Called on the reader thread with the stream's name (``"stdout"`` or
     # ``"stderr"``) each time a chunk of it arrives: a liveness signal for an
     # agent that streams nothing parseable (#192). It never sees the bytes,
@@ -1345,6 +1356,25 @@ def _child_environment(
     return child
 
 
+def _open_stdin_file(path: str) -> int:
+    """``path`` opened read-only for a child's stdin; a link or a non-regular file is refused.
+
+    Opened without following a link and without blocking, then checked on
+    the descriptor, so a FIFO swapped in neither blocks the controller nor
+    is handed on. The descriptor is close-on-exec: only the child's
+    descriptor 0, which the spawn makes from it, outlives the spawn.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", path)
+        os.set_blocking(fd, True)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def _spawn(
     command: list[str],
     *,
@@ -1532,28 +1562,49 @@ def _execute(
     started = _now()
     ceiling = req.timeout_seconds if req.timeout_seconds > 0 else None
     limits = _Limits(req.idle_timeout_seconds, ceiling)
+    if req.stdin_data is not None and req.stdin_path is not None:
+        raise ExecutionError(
+            f"failed to spawn {' '.join(req.command)}: a request names stdin data and a "
+            "stdin file, and a child has one stdin"
+        )
     try:
         feeder = None if req.stdin_data is None else _StdinFeeder(req.stdin_data)
     except OSError as exc:
         raise ExecutionError(f"failed to spawn {' '.join(req.command)}: {exc}") from exc
+    try:
+        stdin_file = None if req.stdin_path is None else _open_stdin_file(req.stdin_path)
+    except OSError as exc:
+        if feeder is not None:
+            feeder.stop()
+        raise ExecutionError(
+            f"failed to spawn {' '.join(req.command)}: its stdin file cannot be read ({exc})"
+        ) from exc
     readers: tuple[_BoundedReader, ...] = ()
     timed_out = False
     stopped = False
     timeout_limit = ""
     descendants_killed = False
     left = _Termination(group_survived=False, capture_abandoned=False)
+    if stdin_file is not None:
+        stdin: int = stdin_file
+    else:
+        stdin = subprocess.DEVNULL if feeder is None else feeder.child_end
     try:
         proc = _spawn(
             req.command,
             cwd=req.cwd,
             env={} if launch is not None else _child_environment(req.env_allowlist, req.env),
-            stdin=subprocess.DEVNULL if feeder is None else feeder.child_end,
+            stdin=stdin,
             launch=launch,
         )
     except BaseException:
         if feeder is not None:
             feeder.stop()
         raise
+    finally:
+        # The child holds its own copy as descriptor 0 once it is spawned.
+        if stdin_file is not None:
+            os.close(stdin_file)
     assert proc.stdout is not None and proc.stderr is not None
     if contained is not None:
         contained.child = proc.pid

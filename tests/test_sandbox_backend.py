@@ -212,9 +212,12 @@ def test_only_the_seam_imports_the_bwrap_backend():
 
 
 def test_the_seam_knows_no_workflow():
+    """The seam's modules, and the git input they carry (#269), which is plain
+    data importing nothing of the package."""
     allowed = {
-        "sandbox_backend.py": {"errors", "sandbox", "sandbox_bwrap"},
-        "sandbox_lifecycle.py": {"errors", "sandbox", "sandbox_backend"},
+        "sandbox_backend.py": {"errors", "git_input", "sandbox", "sandbox_bwrap"},
+        "sandbox_lifecycle.py": {"errors", "git_input", "sandbox", "sandbox_backend"},
+        "git_input.py": set(),
     }
     for name, modules in allowed.items():
         tree = ast.parse((SRC / name).read_text())

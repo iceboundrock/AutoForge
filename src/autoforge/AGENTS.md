@@ -44,7 +44,8 @@ loop_detect.py      provider-neutral loop detector: action fingerprints, line ke
                     cycle / novelty / repeated-line / retry signals, warnings,
                     verdict and calibration; pure, reads no clock (#194)
 executor.py         subprocess lifecycle, timeouts, a caller's stop, capture, optional
-                    stdin payload, optional outer sandbox (no workflow semantics)
+                    stdin payload or stdin file (never held in memory), optional outer
+                    sandbox (no workflow semantics)
 executor_duplex.py  duplex child handle for RPC transports: stdin records out, LF-framed
                     stdout records in, idle timeout and max runtime, ADR 0002 teardown;
                     bytes only (#130, #193)
@@ -70,7 +71,24 @@ sandbox_lifecycle.py  the engine's sequence of that interface: a command's entry
                     until verify's outcome is saved, an
                     uncertain removal raised as SandboxCleanupUncertainError; the
                     journal and verify-step protocols (#272, #269 implement them);
-                    no workflow (#268)
+                    the seed step's end binding the git input to the seed's digest,
+                    saved before any journal entry, and the seed handed on only
+                    while its manifest keeps it (#269); no workflow (#268)
+git_input.py        a launch's git input (ADR 0013 D4): the bound revision, typed and
+                    immutable (phase, launch, repository, object format, seed, lower
+                    boundary, carried commit, seed manifest digest), its entry and
+                    persisted identity, the seed manifest's digest; plain data (#269)
+candidate_artifact.py  an exported artifact (manifest and pack), the export bound, and
+                    its strict, bounded, idempotent import into the shared store
+                    (quarantine, index-pack --strict, ancestry and closure checks,
+                    publication streamed under L1, D7.5 re-hash); the store checks of
+                    a bound revision; git only, no workflow (#269)
+candidate_source.py the engine's candidate source (ADR 0013 D5): each phase's bound
+                    revision as a git input, the launch's export directory, the verify
+                    step for an exported artifact (its origin authenticated first), the
+                    run's candidate receipts beside state.json (seed identity, outcome,
+                    carried commit), the two candidate reads (worktree HEAD for bwrap
+                    and disabled, the imported artifact otherwise) (#269)
 sandbox_policy.py   which host resources a launch gets by launch class (ADR 0005 §2.5):
                     LaunchFacts from the engine, ProviderRequirements from an adapter,
                     the SandboxPlan, the path-valued environment rewrite (D8.2),
@@ -307,9 +325,12 @@ sandbox.py, sandbox_bwrap.py                      -> docs/agent-guides/architect
                                                      (Executor) + docs/adr/0005-outer-
                                                      sandbox-and-host-resource-capability-
                                                      model.md and ADR 0002 §4e
-sandbox_backend.py, sandbox_lifecycle.py          -> the same, + docs/adr/0013-container-
+sandbox_backend.py, sandbox_lifecycle.py,
+git_input.py, candidate_artifact.py,
+candidate_source.py                               -> the same, + docs/adr/0013-container-
                                                      sandbox-backend-lifecycle-trust-
-                                                     boundaries-and-rollout.md (D13, D16)
+                                                     boundaries-and-rollout.md (D4, D5, D13,
+                                                     D16)
 sandbox_policy.py, providers.py
 (sandbox_requirements), engine.py (launch
 routing, sandbox directories, the pre-launch

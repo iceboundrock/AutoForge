@@ -25,9 +25,9 @@ The steps, in D13's order, and what bwrap does in each:
 - **plan** (pure): the role-level request, completed by the provider's
   declaration, compiled into a typed, immutable launch. bwrap:
   :func:`~autoforge.sandbox.compile_launch`, as it is.
-- **seed**: the launch's git input and its checked seed, in a
-  controller-owned temporary directory, before any journal entry (#269,
-  #292). bwrap: nothing.
+- **seed**: the launch's checked seed, built from the git input the
+  engine bound (#269), in a controller-owned temporary directory, before
+  any journal entry (#292). bwrap: nothing.
 - **create**: every object of the launch (the staging root, the credential
   projection, the volume, the stager container, the launch container),
   each container with all of its mounts and its network configured by its
@@ -44,7 +44,8 @@ The steps, in D13's order, and what bwrap does in each:
 - **export**, for a change-producing launch: the artifact, untrusted, in
   the launch's export directory. bwrap: nothing is exported; the candidate
   is the worktree's ``HEAD`` (ADR 0005 D6.3), imported strictly (D6.5).
-- **verify** is the engine's (#269), never a backend's.
+- **verify** is the engine's (#269, :mod:`autoforge.candidate_source`),
+  never a backend's.
 - **the final clean-up**, once the verify step's outcome is saved: the
   volume and the export directory. bwrap: nothing.
 - **reconcile** and **probe**, at a command's entry, after the read-only
@@ -83,6 +84,7 @@ from typing import Protocol
 
 from . import sandbox_bwrap
 from .errors import SandboxLaunchRefusedError
+from .git_input import LaunchGitInput
 from .sandbox import (
     BackendKind,
     LaunchDescription,
@@ -183,13 +185,23 @@ class LaunchInputs:
 
     ``owner`` is the labels its objects carry; ``workspace`` the issue
     worktree the launch works in; ``read_context`` the controller-written
-    read context, "" for none. #269 adds the launch's git input (the bound
-    revision), #290 the credential projection's items.
+    read context, "" for none; ``git_input`` the revision the engine bound
+    for the launch (:class:`~autoforge.git_input.LaunchGitInput`, #269),
+    ``None`` for bwrap, which seeds nothing. The seed step builds the seed
+    from it and never chooses another revision; the lifecycle completes it
+    with the seed's manifest digest. ``export_dir`` is the launch's export
+    directory, which the engine chose fresh under its own sandbox
+    directories (ADR 0005 D8.4 as amended; #269), "" for a launch that
+    exports nothing: an exporter's export directory is that path or the
+    export is refused, and the verify step reads an artifact from nowhere
+    else. #290 adds the credential projection's items.
     """
 
     owner: LaunchOwner
     workspace: str
     read_context: str = ""
+    git_input: LaunchGitInput | None = None
+    export_dir: str = ""
 
 
 class ObjectKind(enum.Enum):
@@ -255,10 +267,12 @@ class Removal(enum.Enum):
 class Seed:
     """The seed step's result (ADR 0013 D4; #269 the git input, #292 the seed).
 
-    ``identity`` is what state saves at the step's end (the manifest's
-    digest); ``directory`` the controller-owned temporary directory that
-    holds the seed until the launch's steps have used it. Both are empty
-    for a backend that seeds nothing (:data:`NO_SEED`).
+    ``identity`` is the digest of the seed's manifest
+    (``sha256:<hex>`` of :data:`~autoforge.git_input.SEED_MANIFEST_NAME` in
+    ``directory``), which the launch's git input binds at the step's end;
+    ``directory`` the controller-owned temporary directory that holds the
+    seed until the launch's steps have used it. Both are empty for a
+    backend that seeds nothing (:data:`NO_SEED`).
     """
 
     identity: str = ""

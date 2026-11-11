@@ -364,6 +364,17 @@ has to remember to. The writers that redact before persistence are:
   configured, a one-way SHA-256 that stores no argv, which is also why a
   secret belongs in the allow-listed environment and never in a validation
   argv ([Configuration](../configuration.md#candidate-validation)).
+- the candidate receipts' writer (`CandidateReceipts.record`,
+  `candidate_source.py`, #269): a launch's refusal, which can quote an
+  exporter's failure, a container runtime's message, the paths an
+  artifact's origin named or the strict import's diagnostics. The receipt
+  (`candidates/<entry>.json`, beside `state.json`) is written in the clear,
+  so `receipt_refusal` redacts the whole refusal and only then cuts it to
+  `candidate_source.MAX_REFUSAL_CHARS`. The verify step's outcome itself is
+  not rewritten: where the engine persists text that quotes it (the run
+  log, a block reason) that writer redacts it. `tests/test_candidate_source.py`
+  puts credentials in an exporter's failure and in an origin's path, and
+  one across the bound.
 
 `GitHubClient._run_gh` additionally redacts the `gh` stderr tail where it
 builds a `GitHubError` / `GitHubNotFoundError` / `GitHubUnavailableError`

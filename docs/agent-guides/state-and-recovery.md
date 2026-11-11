@@ -810,6 +810,18 @@ requirement named (#120). Its layout:
                         # prior_updated_at, at]}, the newest 32, atomic replace, written
                         # after the run-log record and before the state save; parsed
                         # strictly, and one that does not parse refuses every rebind
+    candidates/<entry>.json   # the candidate source's receipts (ADR 0013 D19, #269): one
+                        # file per phase entry of a launch under a backend that seeds
+                        # (never under bwrap or `disabled`): {format: 1, entry, launches:
+                        # [git_input, verified, candidate, refusal]}, the newest 64, atomic
+                        # replace, never dropping the latest accepted launch. A launch's
+                        # git input is saved at the end of its seed step, before its first
+                        # journal entry; its verify outcome (a failed export's refusal
+                        # included) before its volume is removed, a refusal redacted and
+                        # then cut to 2,000 characters. A relaunch of the entry
+                        # carries the latest accepted launch's imported candidate. Parsed
+                        # strictly: one that does not parse refuses the launch, never
+                        # reads as "none"
     logs/<run-id>/
         events.jsonl                       # one line per agent invocation, append-only
         <seq>-<phase>-<attempt>/
@@ -1431,6 +1443,30 @@ validation command writes no marker and no record (ADR 0006 D8.5); a refused pre
 verification command blocks the merge gate (`BLOCKED`). `SandboxTamperError`
 is a `VerificationError` for a private object directory that holds what no
 object store does (above); the step enters `BLOCKED`.
+
+An exported artifact the verify step refuses (ADR 0013 D5, D17; #269) is
+an `ObjectImportError`, caught by the candidate source and saved as the
+launch's refusal: the candidate read refuses the candidate with it under
+the phase's existing rule, it is never retried, and nothing of the
+artifact is published. The import writes the shared store only in its
+last step, under L1, and decides every step from the artifact and the
+store alone, so an import cut short at any point (before L1, during
+`index-pack`, after publication, before the outcome is saved) gives the
+same candidate or the same refusal when it runs again; a crash between
+the verify step and its save leaves the volume, which reconciliation
+removes without exporting it (D6). A launch whose bound revision the
+shared store cannot seed (a seed, merge base or carried commit it does not
+hold as a commit, or a merge base that is not an ancestor of the seed) is
+a `SandboxLaunchRefusedError` before any journal entry or create, and a
+later `resume` fetches again. So is an `ANALYZE_EXECUTE` launch whose
+issue branch holds earlier work that does not descend from the bound base.
+`UPDATE_EPIC`'s bound default branch head is persisted in its entry
+observation (`refs` and `base_sha`, the existing fields, set at the
+entry's first seeded launch and saved before anything of the launch
+exists), so `resume` relaunches the same entry from the same head. A
+launch that an `ExecutionError` ends after its command ran is exported,
+verified and saved before the error propagates, when its release verified
+every removal; the relaunch carries what it committed.
 
 The backend seam (ADR 0013, #268) adds `SandboxCleanupUncertainError`, an
 `ExecutionError`: a backend's object of a launch that a removal could not
