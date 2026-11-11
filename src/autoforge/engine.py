@@ -5072,8 +5072,12 @@ class ControllerEngine:
         profile = profile_for_phase(self.config, s.phase, s.review_round)
         variables = self._prompt_variables()
         prompt = self.render_prompt_for(s.phase)
-        command = self.providers.get(profile).build_command_for(profile, prompt)
+        provider = self.providers.get(profile)
+        command = provider.build_command_for(profile, prompt)
         notes.extend(self._isolation_plan_notes())
+        # What the argv does not show of a launch (an SDK helper's runtime,
+        # policy and environment, #150); the adapter's, by name and role only.
+        notes.extend(provider.plan_notes(profile, self.config.execution.agent_environment_names()))
         return StepPlan(
             phase=s.phase.value,
             profile_name=profile.name,

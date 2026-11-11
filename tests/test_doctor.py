@@ -2614,3 +2614,322 @@ def test_the_cli_passes_the_epic_to_doctor(monkeypatch):
     monkeypatch.setattr(cli, "run_doctor", fake)
     assert cli.main(["doctor", "--epic", DOCTOR_EPIC]) == 0
     assert seen["epic_url"] == DOCTOR_EPIC
+
+
+# -- the SDK providers' rows (ADR 0007 D2.6, #150) ---------------------------------
+SDK_PYTHON = "/opt/autoforge-claude-sdk/bin/python"
+SDK_NODE = "/opt/node24/bin/node"
+SDK_SERVER = "/opt/opencode-1.18.34/bin/opencode"
+SDK_COMMANDS = (SDK_PYTHON, SDK_NODE, SDK_SERVER)
+# What a healthy helper environment answers the metadata probe.
+CLAUDE_ENV = {"python": "3.12.4", "sdk": "0.2.163", "cli": "2.1.286", "bundled": True}
+CLAUDE_ROWS = {
+    "launch": "provider claude-sdk can launch (analyze_execute)",
+    "interpreter": f"claude-sdk helper environment '{SDK_PYTHON}' (analyze_execute)",
+    "sdk": f"claude-sdk SDK package in '{SDK_PYTHON}' (analyze_execute)",
+    "runtime": f"claude-sdk runtime in '{SDK_PYTHON}' (analyze_execute)",
+    "credential": "claude-sdk credential (analyze_execute)",
+    "model": "claude-sdk model access (analyze_execute)",
+    "interactions": "claude-sdk interactions (analyze_execute)",
+}
+OPENCODE_ROWS = {
+    "launch": "provider opencode-sdk can launch (review_round_1)",
+    "node": f"opencode-sdk Node '{SDK_NODE}' (review_round_1)",
+    "runtime": f"opencode-sdk runtime '{SDK_SERVER}' (review_round_1)",
+    "credential": "opencode-sdk credential (review_round_1)",
+    "model": "opencode-sdk model access (review_round_1)",
+    "interactions": "opencode-sdk interactions (review_round_1)",
+}
+
+
+def _claude_sdk(**kwargs):
+    profile = {"provider": "claude-sdk", "model": "fable", "command": SDK_PYTHON}
+    profile.update(kwargs)
+    return profile
+
+
+def _opencode_sdk(server=SDK_SERVER, **kwargs):
+    profile = {
+        "provider": "opencode-sdk",
+        "model": "openai/gpt-5.6-luna",
+        "command": SDK_NODE,
+        "options": {"server_command": server, "credential_env": "OPENAI_API_KEY"},
+    }
+    profile.update(kwargs)
+    return profile
+
+
+def _sdk_runner(claude=CLAUDE_ENV, node="v24.11.1", server="1.18.34", requests=None):
+    """The healthy fake, plus scripted SDK executables. Each answer is what
+    the probe prints, ``None`` for a missing executable, or ``(exit, stdout)``;
+    every SDK probe is recorded in ``requests``, and each writes
+    :data:`PLANTED` on stderr, which no row may quote."""
+    base = _runner_factory()
+    answers = {SDK_PYTHON: claude, SDK_NODE: node, SDK_SERVER: server}
+
+    def runner(req):
+        argv = req.command
+        if argv[0] not in answers:
+            return base(req)
+        if requests is not None:
+            requests.append(req)
+        answer = answers[argv[0]]
+        if answer is None:
+            raise ExecutionError(f"executable not found: {argv[0]}")
+        code, out = answer if isinstance(answer, tuple) else (0, answer)
+        if isinstance(out, dict):
+            out = json.dumps(out)
+        return ExecutionResult(argv, req.cwd, code, out + "\n", PLANTED, "t", "t")
+
+    return runner
+
+
+def _sdk_doctor(tmp_path, profiles, monkeypatch=None, **kwargs):
+    config = _write_config(tmp_path, profiles)
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=_sdk_runner(**kwargs))
+    results = d.run_all()
+    for r in results:
+        assert PLANTED not in r.name and PLANTED not in r.detail, r
+    return {r.name: r for r in results}
+
+
+def test_a_claude_sdk_profile_gets_distinct_rows_and_only_the_launch_fails(tmp_path, monkeypatch):
+    """Each part of the helper environment is its own row against the
+    manifest's pinned pair; the credential is shown by name only, and model
+    access is a SKIP, never an OK."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", PLANTED)
+    rows = _sdk_doctor(tmp_path, {"analyze_execute": _claude_sdk()})
+    launch = rows[CLAUDE_ROWS["launch"]]
+    assert not launch.ok and launch.required
+    assert "autoforge-claude-helper (protocol 1" in launch.detail
+    assert "is not shipped with this AutoForge" in launch.detail and "#151" in launch.detail
+    assert rows[CLAUDE_ROWS["interpreter"]].ok
+    assert rows[CLAUDE_ROWS["interpreter"]].detail == "Python 3.12.4 (>= 3.10)"
+    assert rows[CLAUDE_ROWS["sdk"]].ok
+    assert rows[CLAUDE_ROWS["sdk"]].detail == "claude-agent-sdk 0.2.163"
+    assert rows[CLAUDE_ROWS["runtime"]].ok
+    assert rows[CLAUDE_ROWS["runtime"]].detail.startswith("Claude Code 2.1.286, bundled")
+    credential = rows[CLAUDE_ROWS["credential"]]
+    assert credential.ok and credential.required
+    assert "ANTHROPIC_API_KEY set" in credential.detail and "never its value" in credential.detail
+    assert "not proven valid, entitled to the model or billed" in credential.detail
+    model = rows[CLAUDE_ROWS["model"]]
+    assert model.skipped and "fable" in model.detail and "never makes" in model.detail
+    interactions = rows[CLAUDE_ROWS["interactions"]]
+    assert interactions.ok and not interactions.required
+    assert "analyze_execute fail" in interactions.detail and "none yet" in interactions.detail
+    # No generic `--version` row for the interpreter: the probe is the row.
+    assert not any(name.startswith(f"agent '{SDK_PYTHON}'") for name in rows)
+
+
+@pytest.mark.parametrize(
+    "answer, failing, needle, skipped",
+    [
+        (None, "interpreter", "cannot run it: ExecutionError", ("sdk", "runtime")),
+        ((1, "Traceback"), "interpreter", "exited 1 (output not shown", ("sdk", "runtime")),
+        (PLANTED, "interpreter", "cannot read the answer", ("sdk", "runtime")),
+        (
+            {**CLAUDE_ENV, "python": "3.9.18"},
+            "interpreter",
+            "Python 3.9.18: the Claude helper needs Python >= 3.10",
+            (),
+        ),
+        (
+            {**CLAUDE_ENV, "sdk": None},
+            "sdk",
+            "claude-agent-sdk is not installed there",
+            ("runtime",),
+        ),
+        (
+            {**CLAUDE_ENV, "sdk": "0.2.167"},
+            "sdk",
+            "claude-agent-sdk 0.2.167: not the supported pair, claude-agent-sdk 0.2.163 with "
+            "Claude Code 2.1.286",
+            (),
+        ),
+        ({**CLAUDE_ENV, "bundled": False}, "runtime", "carries no bundled Claude Code", ()),
+        ({**CLAUDE_ENV, "cli": None}, "runtime", "cannot be read", ()),
+        ({**CLAUDE_ENV, "cli": "2.1.300"}, "runtime", "Claude Code 2.1.300 (bundled): not the", ()),
+        (
+            {**CLAUDE_ENV, "sdk": PLANTED},
+            "interpreter",
+            "cannot read the answer",
+            ("sdk", "runtime"),
+        ),
+    ],
+    ids=[
+        "no-interpreter",
+        "probe-exits",
+        "unreadable",
+        "old-python",
+        "no-sdk",
+        "sdk-pair",
+        "sdk-without-cli",
+        "cli-unreadable",
+        "cli-pair",
+        "sdk-not-a-version",
+    ],
+)
+def test_each_claude_sdk_environment_problem_is_its_own_actionable_row(
+    tmp_path, answer, failing, needle, skipped
+):
+    rows = _sdk_doctor(tmp_path, {"analyze_execute": _claude_sdk()}, claude=answer)
+    row = rows[CLAUDE_ROWS[failing]]
+    assert not row.ok and row.required and needle in row.detail, row
+    for part in ("interpreter", "sdk", "runtime"):
+        if part == failing:
+            continue
+        other = rows[CLAUDE_ROWS[part]]
+        assert other.skipped if part in skipped else other.ok, other
+
+
+@pytest.mark.parametrize(
+    "node, needle",
+    [
+        (None, "cannot run it: ExecutionError"),
+        ("v22.12.0", "Node 22.12.0: the OpenCode bridge needs Node >= 24"),
+        ("24.1.0", "cannot read the Node version"),
+        (PLANTED, "cannot read the Node version"),
+        ((9, "boom"), "exited 9 (output not shown"),
+    ],
+)
+def test_a_missing_or_old_node_fails_its_own_row(tmp_path, node, needle):
+    rows = _sdk_doctor(tmp_path, {"review_round_1": _opencode_sdk()}, node=node)
+    row = rows[OPENCODE_ROWS["node"]]
+    assert not row.ok and needle in row.detail, row
+    assert rows[OPENCODE_ROWS["runtime"]].ok
+
+
+@pytest.mark.parametrize(
+    "server, needle",
+    [
+        (None, "cannot run it: ExecutionError"),
+        ("opencode v2.0.27", "opencode 2.0.27: not the supported pair, @opencode-ai/sdk 1.18.34"),
+        ("1.18.35", "opencode 1.18.35: not the supported pair"),
+        ("1.18.34-beta.1", "opencode 1.18.34 (pre-release): not the supported pair"),
+        (PLANTED, "cannot read the runtime version"),
+    ],
+)
+def test_a_missing_or_unpinned_opencode_runtime_fails_its_own_row(tmp_path, server, needle):
+    rows = _sdk_doctor(tmp_path, {"review_round_1": _opencode_sdk()}, server=server)
+    row = rows[OPENCODE_ROWS["runtime"]]
+    assert not row.ok and row.required and needle in row.detail, row
+    assert rows[OPENCODE_ROWS["node"]].ok
+
+
+def test_a_healthy_opencode_sdk_profile_passes_all_but_the_launch(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", PLANTED)
+    rows = _sdk_doctor(tmp_path, {"review_round_1": _opencode_sdk()})
+    assert not rows[OPENCODE_ROWS["launch"]].ok
+    assert "autoforge-opencode-bridge" in rows[OPENCODE_ROWS["launch"]].detail
+    assert rows[OPENCODE_ROWS["node"]].detail == "Node 24.11.1 (>= 24)"
+    assert rows[OPENCODE_ROWS["runtime"]].ok
+    assert rows[OPENCODE_ROWS["runtime"]].detail == "opencode 1.18.34"
+    assert rows[OPENCODE_ROWS["credential"]].ok
+    assert "OPENAI_API_KEY set" in rows[OPENCODE_ROWS["credential"]].detail
+    assert rows[OPENCODE_ROWS["model"]].skipped
+
+
+def test_profiles_naming_two_runtimes_get_a_runtime_row_each(tmp_path):
+    other = "/opt/opencode-other/bin/opencode"
+    rows = _sdk_doctor(
+        tmp_path,
+        {"review_round_1": _opencode_sdk(), "review_round_2_5": _opencode_sdk(server=other)},
+    )
+    assert rows[f"opencode-sdk runtime '{SDK_SERVER}' (review_round_1)"].ok
+    # The fake answers only the pinned runtime's path; any other is missing.
+    assert not rows[f"opencode-sdk runtime '{other}' (review_round_2_5)"].ok
+    assert f"opencode-sdk Node '{SDK_NODE}' (review_round_1, review_round_2_5)" in rows
+
+
+@pytest.mark.parametrize(
+    "profile, variable",
+    [(_claude_sdk(), "ANTHROPIC_API_KEY"), (_opencode_sdk(), "OPENAI_API_KEY")],
+)
+def test_a_missing_sdk_credential_fails_by_name(tmp_path, monkeypatch, profile, variable):
+    monkeypatch.delenv(variable, raising=False)
+    rows = _sdk_doctor(tmp_path, {"analyze_execute": profile})
+    row = rows[f"{profile['provider']} credential (analyze_execute)"]
+    assert not row.ok and row.required and f"{variable} " in row.detail
+
+
+def test_a_set_credential_is_never_shown_or_handed_to_a_probe(tmp_path, monkeypatch):
+    """#150: the credential is read for presence only; no probe gets it, nor
+    any other provider's variable or a credential-shaped name, and every
+    probe is one of the three version reads ADR 0007 D2.6 allows."""
+    from autoforge.sdk_assets import CLAUDE_ENVIRONMENT_PROBE
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", PLANTED)
+    monkeypatch.setenv("OPENAI_API_KEY", PLANTED)
+    monkeypatch.setenv("SOME_SERVICE_TOKEN", PLANTED)
+    requests: list = []
+    path = _write_config(
+        tmp_path,
+        {"analyze_execute": _claude_sdk(), "review_round_1": _opencode_sdk()},
+        extra={"execution": {"env_allowlist_extra": ["SOME_SERVICE_*"]}},
+    )
+    d = Doctor(config_path=path, cwd=str(tmp_path), runner=_sdk_runner(requests=requests))
+    for row in d.run_all():
+        assert PLANTED not in row.detail, row
+    commands = [req.command for req in requests]
+    assert commands == [
+        [SDK_PYTHON, "-I", "-c", CLAUDE_ENVIRONMENT_PROBE],
+        [SDK_NODE, "--version"],
+        [SDK_SERVER, "--version"],
+    ]
+    for req in requests:
+        names = req.env_allowlist
+        assert names is not None and not any(name.endswith("*") for name in names)
+        assert {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SOME_SERVICE_TOKEN"}.isdisjoint(names)
+        assert "PATH" in names and req.env is None
+    assert "claude_agent_sdk" not in CLAUDE_ENVIRONMENT_PROBE.replace("claude_agent_sdk/", ""), (
+        "the probe reads the SDK's files, never imports it"
+    )
+
+
+def test_an_unreachable_sdk_profile_needs_no_sdk_runtime(tmp_path):
+    """A profile no phase routes to is not checked: its runtimes are neither
+    probed nor required, so an all-CLI run needs no SDK, Python helper or Node."""
+    requests: list = []
+    path = _write_config(tmp_path, {"spare": _claude_sdk(), "spare2": _opencode_sdk()})
+    d = Doctor(config_path=path, cwd=str(tmp_path), runner=_sdk_runner(requests=requests))
+    names = [r.name for r in d.run_all()]
+    assert requests == []
+    assert not any("sdk" in name.split(" (")[0] for name in names), names
+
+
+def test_the_default_configuration_has_no_sdk_row(tmp_path):
+    requests: list = []
+    d = Doctor(cwd=str(tmp_path), runner=_sdk_runner(requests=requests))
+    names = [r.name for r in d.run_all()]
+    assert requests == [] and not any("sdk" in name for name in names), names
+
+
+def test_a_damaged_manifest_fails_the_launch_row_and_probes_nothing(tmp_path, monkeypatch):
+    import autoforge.sdk_assets as sdk_assets
+
+    damaged = tmp_path / "manifest.json"
+    damaged.write_text('{"schema": 1}', encoding="utf-8")
+    monkeypatch.setattr(sdk_assets, "manifest_path", lambda: damaged)
+    requests: list = []
+    config = _write_config(tmp_path, {"analyze_execute": _claude_sdk()})
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=_sdk_runner(requests=requests))
+    rows = {r.name: r for r in d.run_all()}
+    launch = rows[CLAUDE_ROWS["launch"]]
+    assert not launch.ok and "is damaged" in launch.detail and "reinstall" in launch.detail
+    assert rows["claude-sdk runtime (analyze_execute)"].skipped
+    assert requests == []
+
+
+def test_an_invalid_sdk_profile_reached_only_after_a_merge_fails_one_row(tmp_path):
+    """update_epic is not among the profiles the config row validates; an SDK
+    one its adapter refuses is a FAIL naming the problem, and nothing is probed."""
+    requests: list = []
+    broken = _opencode_sdk()
+    broken["options"] = {"server_command": SDK_SERVER}  # no credential_env
+    config = _write_config(tmp_path, {"update_epic": broken})
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=_sdk_runner(requests=requests))
+    rows = {r.name: r for r in d.run_all()}
+    row = rows["opencode-sdk profiles (update_epic)"]
+    assert not row.ok and "credential_env" in row.detail
+    assert requests == []

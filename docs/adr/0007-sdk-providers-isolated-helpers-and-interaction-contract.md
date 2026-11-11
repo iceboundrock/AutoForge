@@ -9,6 +9,9 @@
   their limits, the lock rule (D7.1 to D7.4, D7.6, D7.7, with the broker
   never pausing until #126), the terminal resolver and the two type
   extensions (D10.5). Every adapter still declares no capability (D5.3).
+  #150 (EPIC #147's opt-in profiles) adds the packaged manifest of D2.2
+  without a helper program, the read-only `doctor` rows of D2.6 and a dry
+  run's plan of the helper argv, with a dated amendment of D2.2 below.
   The rest is not implemented yet.
   It is implemented by #134 (the provider-neutral
   interaction contract and its broker), #126 (the one state bump, `pause`
@@ -356,6 +359,18 @@ pinned by digest and staged per launch.**
   from the controller's checkout or its virtual environment. In REMOTE,
   ADR 0005 denies the controller checkout to the launch (its D13.2), and
   an editable install and its `.venv` usually lie inside it.
+
+*Amendment (2026-11-11, #150).* The manifest exists before either helper
+program, `src/autoforge/sdk_helpers/manifest.json`, read by
+`src/autoforge/sdk_assets.py` relative to the installed package. Each
+entry records, besides the four fields above, the issue that ships the
+helper, the interpreter and its floor (D2.3, D4.4), and the runtime of the
+pair with its version (D4.1, D4.2), so that `doctor` (D2.6) and the
+adapters read one copy of the pins. `sha256` is `null` while the helper is
+not shipped: the adapter then refuses every launch, naming the issue.
+`sdk_helpers/` is a data directory with no `__init__.py`, so nothing
+imports it. #151 and #152 each set their entry's digest when they add the
+program, and a pair still moves only as D4.6 says.
 
 **D2.3 (#151).** **The Claude runtime environment is optional,
 operator-installed and separate from the controller's.**

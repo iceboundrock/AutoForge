@@ -713,10 +713,12 @@ def test_opencode_sdk_profile_refusals(change, match):
 
 @pytest.mark.parametrize("profile", [_claude_profile(), _opencode_profile()])
 def test_sdk_providers_refuse_every_launch_until_their_helper_lands(profile, tmp_path):
+    """The preflight and the launch refuse; the argv a plan shows does not
+    (#150: a dry run renders the helper's argv, which launches nothing)."""
     adapter = provider_for(profile)
+    assert adapter.build_command_for(profile, "x")[0] == profile.command
     for call in (
         lambda: adapter.integration_preflight(("PATH",)),
-        lambda: adapter.build_command_for(profile, "x"),
         lambda: adapter.execute(
             AgentRequest(
                 phase="fix",

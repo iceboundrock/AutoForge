@@ -266,7 +266,11 @@ defaults (see [Agent limits](#agent-limits)), and nothing is inherited from the
 default's `options` or `extra_args` (an OpenCode `auto_approve` on a Claude
 profile, or a Claude flag in a Pi argv, would be wrong). Before #129 a
 provider switch kept the default's `command`, `options` and `extra_args`;
-restate any of them you relied on.
+restate any of them you relied on. An SDK provider has no default binary,
+so a profile switched to one names its `command`
+([SDK profiles](#sdk-profiles-claude-sdk-opencode-sdk)). Switching back is
+removing the override, or naming the default's provider again: the profile
+is then the default's, merged field by field, with the same argv as before.
 
 ### Agent limits
 
@@ -643,14 +647,21 @@ can then outlive the launch, so Pi is attended only there
 `provider: claude-sdk` and `provider: opencode-sdk` are the SDK providers
 of [ADR 0007](adr/0007-sdk-providers-isolated-helpers-and-interaction-contract.md).
 **They cannot launch in this release.** Their policy and configuration
-(#149) are in place, but their helpers are #151's and #152's. A profile
-that uses one validates, `doctor` fails its "can launch" row, and a phase
-that reaches it is refused before anything starts. Route phases to another
-provider until those land. [SDK policy](sdk-policy.md) gives every decision
-below with its evidence.
+(#149) are in place, and `doctor` checks what they need (#150), but their
+helper programs and transports are #151's and #152's. A profile that uses
+one validates, `doctor` fails its "can launch" row, a dry run shows the plan
+and says the launch is refused, and a phase that reaches it is refused
+before anything starts. Route phases to another provider until those land.
+[SDK policy](sdk-policy.md) gives every decision below with its evidence.
+Both are opt-in: nothing in the defaults, the round routing or the merge
+gate changes, and a configuration that routes no phase to one needs no
+SDK, no helper environment and no Node.
 
 - `command` is required. It is the interpreter of the separately installed
   runtime environment: Python for `claude-sdk`, Node for `opencode-sdk`.
+  It names that executable only: the Claude Code CLI is the one bundled
+  with the SDK, and the OpenCode runtime is `options.server_command`.
+  Each is one argv element, never a shell command.
 - `extra_args` must be empty. Every SDK option, flag and setting is fixed
   by the policy: no settings source, no MCP server, no plugin, and only the
   helper's own hook.
@@ -696,6 +707,89 @@ An SDK launch inherits exact names only. The allow-list's `*` prefixes are
 expanded, and every other provider's variables and every credential-shaped
 name are removed before the provider's own credential is added. A key
 forwarded for another provider therefore never reaches it.
+
+`options` values are scalars, as for every provider: a list such as
+`tools` is one comma-separated string. A YAML, TOML or JSON list or mapping
+given for an SDK option, or as an SDK profile's `command`, is refused,
+never passed on as the text the loader makes of it.
+
+The example file carries both profiles, commented out, after `update_epic`:
+
+```yaml
+  analyze_execute:
+    provider: claude-sdk
+    model: fable
+    effort: high
+    command: /opt/autoforge-claude-sdk/bin/python
+    options:
+      interaction_policy: fail
+      tools: Read,Glob,Grep,Edit,Write,Bash
+  review_round_1:
+    provider: opencode-sdk
+    model: openai/gpt-5.6-luna
+    effort: high
+    command: node
+    options:
+      server_command: /opt/opencode-1.18.34/bin/opencode
+      credential_env: OPENAI_API_KEY
+```
+
+#### What an SDK profile needs installed
+
+Installing is an operator step. AutoForge installs nothing: no `pip`,
+`uv`, `npm` or `npx` runs at launch or in `doctor`, and its own install
+stays `dependencies = []`. Each provider runs a helper program of
+AutoForge's, staged per launch from the package and checked against the
+packaged manifest (`src/autoforge/sdk_helpers/manifest.json`), with an
+exact pair of versions (ADR 0007 §2.4):
+
+| Provider | `command` | Runtime | Supported pair |
+|---|---|---|---|
+| `claude-sdk` | the Python (3.10 or newer) of an environment of its own, outside any checkout | the Claude Code bundled in the SDK's platform wheel, never a `claude` found on `PATH` | `claude-agent-sdk` 0.2.163 with Claude Code 2.1.286 |
+| `opencode-sdk` | Node 24 or newer | the `opencode` binary of `opencode-ai`, named in `options.server_command` | `@opencode-ai/sdk` 1.18.34 with `opencode-ai` 1.18.34 |
+
+The Claude helper environment holds `claude-agent-sdk==0.2.163` installed
+from its platform wheel (Linux x86_64 or aarch64): its sdist bundles no
+Claude Code, so it gives no backend. #151 adds the hash-locked install of
+that environment. The OpenCode runtime is a release of its own, separate
+from the `opencode` CLI provider's 2.x line.
+
+#### What `doctor` checks
+
+For each SDK provider a reachable profile routes to, `doctor` prints these
+rows, each with its own remedy. A profile no phase reaches is not checked.
+
+| Row | Checks |
+|---|---|
+| `provider <name> can launch` | the helper program in the manifest; fails in this release |
+| `claude-sdk helper environment '<command>'` | `<command> -I -c <probe>` runs, and its Python is 3.10 or newer |
+| `claude-sdk SDK package in '<command>'` | `claude-agent-sdk` is installed there, at the pinned version |
+| `claude-sdk runtime in '<command>'` | that SDK carries its bundled Claude Code, at the pinned version |
+| `opencode-sdk Node '<command>'` | `<command> --version` is Node 24 or newer |
+| `opencode-sdk runtime '<server_command>'` | `<server_command> --version` is the pinned release |
+| `<name> credential` | the credential variable a launch would carry is set |
+| `<name> model access` | SKIP: only a model call shows whether the key may use the model |
+| `<name> interactions` | each profile's `interaction_policy` and the capabilities declared |
+
+The probe reads the SDK's version from its package metadata and the
+bundled CLI's from its `_cli_version.py`, as files: it imports no SDK and
+starts nothing. The probes run under the launch's allow-list without the
+provider's own credential, and none of their output is quoted. The
+credential row says whether the variable is set, never its value, and a
+key that is set is not a key that works: whether it may use the model, or
+is billed, only a model call shows. `doctor` never logs in, refreshes a
+credential, installs anything, starts a session, a server or a model call,
+or opens a credential file.
+
+#### A dry run
+
+A dry run of a phase routed to an SDK profile shows the helper's argv,
+`<command> [-I] <per-launch helper directory>/<helper>`, without the prompt,
+which travels in the helper's `start` record on stdin. Its notes name the
+helper and its protocol, the runtime and the pinned pair, the policy
+(interaction policy, tools, its digest), the environment by name, the
+state root by role, and why the launch is refused. It imports no SDK,
+starts nothing and writes nothing.
 
 ## Agent environment
 

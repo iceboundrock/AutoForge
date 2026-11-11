@@ -230,11 +230,15 @@ neither can keep off refuses the launch before it starts
 
 The SDK providers ``claude-sdk`` and ``opencode-sdk`` (ADR 0007) have their
 static surface here: names, option keys and validation, the launch
-allow-list and the sandbox declaration. Their policy (tools, permissions,
-setting sources, configuration and session roots, authentication, the
-environment) is :mod:`autoforge.sdk_policy`'s (#149, docs/sdk-policy.md);
-their helpers and transports are #151's and #152's, and until those land
-every launch of one is refused before anything starts.
+allow-list, the sandbox declaration, the helper's argv and a dry run's
+plan notes, and the commands ``doctor``'s read-only version probes run
+(#150). Their policy (tools, permissions, setting sources, configuration
+and session roots, authentication, the environment) is
+:mod:`autoforge.sdk_policy`'s (#149, docs/sdk-policy.md); their helper
+programs and pinned pairs are recorded in the packaged manifest
+(:mod:`autoforge.sdk_assets`); their helpers and transports are #151's and
+#152's, and until those land every launch of one is refused before
+anything starts.
 
 Every adapter runs a :class:`~autoforge.loop_detect.LoopMonitor` under
 :attr:`AgentRequest.loop_detection` (#194): Claude's stream and Pi's events
@@ -316,6 +320,7 @@ from .sandbox_policy import (
     declared_writable,
     executable_requirements,
 )
+from .sdk_assets import CLAUDE_ENVIRONMENT_PROBE, HelperPin, helper_pin, helper_problem
 from .sdk_policy import (
     CLAUDE_SDK,
     CLAUDE_SDK_CREDENTIAL,
@@ -324,9 +329,12 @@ from .sdk_policy import (
     OPENCODE_SDK,
     OPENCODE_SDK_OPTION_KEYS,
     ClaudeSdkPolicy,
+    ClaudeSdkRoots,
     InteractionSettings,
     OpenCodeSdkPolicy,
+    OpenCodeSdkRoots,
     claude_sdk_policy,
+    collection_text,
     interaction_settings,
     opencode_model_problem,
     opencode_sdk_policy,
@@ -780,6 +788,19 @@ class AgentProvider:
         ``None`` for a provider through which nothing can ask. Validated:
         :class:`ConfigurationError` for a value the policy refuses."""
         return None
+
+    def plan_notes(
+        self, profile: ProfileConfig, env_allowlist: tuple[str, ...] | None
+    ) -> list[str]:
+        """What a dry run's plan says of a launch of ``profile`` beyond its
+        argv, for a provider whose launch the argv does not describe (#150).
+
+        ``env_allowlist`` is the configured allow-list of an agent launch.
+        Pure: names and paths by role only, never a value, and nothing is
+        started, imported, written or resolved. The CLI adapters, whose argv
+        is the launch, say nothing more.
+        """
+        return []
 
     def interaction_capabilities(self, profile: ProfileConfig) -> Capabilities:
         """What this provider can carry of a decision for ``profile`` (ADR 0007
@@ -2849,15 +2870,19 @@ class _SdkProvider(AgentProvider):
     runtime_decision = ""
     # Foreign names the operator may still forward by listing them exactly.
     passthrough: tuple[str, ...] = ()
+    # What the helper's argv passes its interpreter before the helper's path.
+    interpreter_flags: tuple[str, ...] = ()
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         super().validate_profile(profile)
         where = f"profile {profile.name!r}"
-        if not profile.command or any(ch.isspace() for ch in profile.command):
+        command = profile.command
+        if not command or any(ch.isspace() for ch in command) or collection_text(command):
             raise ConfigurationError(
                 f"{where}: {self.name} needs 'command', the {self.interpreter} of the "
                 "separately installed runtime environment its helper runs in (ADR 0007 "
-                f"{self.runtime_decision}), with no whitespace; got {profile.command!r}"
+                f"{self.runtime_decision}): one executable, with no whitespace, never a "
+                f"list; got {command!r}"
             )
         if profile.extra_args:
             # Never the arguments themselves: one may carry a settings
@@ -2878,16 +2903,51 @@ class _SdkProvider(AgentProvider):
     def interaction_settings(self, profile: ProfileConfig) -> InteractionSettings | None:
         return interaction_settings(profile.options, f"profile {profile.name!r}")
 
+    def policy_environment_names(self, profile: ProfileConfig) -> tuple[str, ...]:
+        """The variables the policy sets over the launch's allow-listed ones,
+        by name (docs/sdk-policy.md §5, §6, §9)."""
+        raise NotImplementedError
+
+    def runtime_plan(self, profile: ProfileConfig, pin: HelperPin) -> str:
+        """What the plan says of the provider runtime the helper starts."""
+        raise NotImplementedError
+
     # -- shared --------------------------------------------------------------
+    def helper(self) -> HelperPin:
+        """This provider's helper program and pinned pair, from the packaged
+        manifest (:mod:`autoforge.sdk_assets`)."""
+        return helper_pin(self.name)
+
+    def launch_problem(self) -> str:
+        """Why no launch of this provider can start in this release."""
+        pin = self.helper()
+        if not pin.shipped:
+            return (
+                f"its helper program {pin.describe()} is not shipped with this AutoForge: it "
+                f"and its transport are {pin.implemented_by}'s and have not landed"
+            )
+        return helper_problem(pin) or (
+            f"its transport is #{self.transport_issue}'s and has not landed"
+        )
+
     def _refuse_launch(self) -> ConfigurationError:
         return ConfigurationError(
             f"provider {self.name} cannot launch in this release: its policy is in place "
-            f"(docs/sdk-policy.md), but its helper and transport are #{self.transport_issue}'s "
-            "and have not landed. Route this profile to another provider"
+            f"(docs/sdk-policy.md), but {self.launch_problem()}. Route this profile to "
+            "another provider"
         )
 
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
-        raise self._refuse_launch()
+        """The helper's argv as a launch runs it (ADR 0007 D2.2, D2.3, D2.5):
+        ``command`` with the helper staged per launch, by absolute path.
+
+        Never the prompt, which travels in the helper's ``start`` record on
+        stdin (ADR 0007 §5), so a dry run's plan and the run log name the
+        same argv. The staged directory is made for the launch, so it is
+        named by its role. Building it launches nothing; every launch is
+        still refused (:meth:`integration_preflight`, :meth:`execute`).
+        """
+        return [profile.command, *self.interpreter_flags, self.helper().staged_path()]
 
     def integration_preflight(self, env_allowlist: tuple[str, ...] | None) -> None:
         """Refused: nothing can launch yet, so the engine stops here, before
@@ -2896,6 +2956,54 @@ class _SdkProvider(AgentProvider):
 
     def execute(self, req: AgentRequest) -> AgentExecutionResult:
         raise self._refuse_launch()
+
+    def profile_allowlist(self, base: tuple[str, ...], profile: ProfileConfig) -> tuple[str, ...]:
+        """The exact names a launch of ``profile`` inherits from ``base``, the
+        profile's own credential included (``opencode-sdk`` names it per
+        profile)."""
+        return self._allowlist(base, profile)
+
+    def probe_allowlist(self, base: tuple[str, ...]) -> tuple[str, ...]:
+        """What ``doctor``'s version probes of this provider run with: the
+        launch allow-list's filter of ``base`` without the provider's own
+        credential, which no version probe needs (#150)."""
+        return sdk_launch_allowlist(base, (), os.environ.keys())
+
+    def plan_notes(
+        self, profile: ProfileConfig, env_allowlist: tuple[str, ...] | None
+    ) -> list[str]:
+        """The helper, its runtime and pinned pair, the policy, the
+        environment by name, the state root by role, and why the launch is
+        refused (#150). Pure: the manifest is read; nothing is started,
+        imported, created or resolved."""
+        pin = self.helper()
+        policy = self.policy(profile)
+        interaction = policy.interaction
+        if env_allowlist is None:
+            inherited = "the controller's whole environment (no allow-list)"
+        else:
+            names = self.profile_allowlist(env_allowlist, profile)
+            inherited = f"{len(names)} exact name(s): {', '.join(names) or '(none)'}"
+        floor = ".".join(str(part) for part in pin.interpreter_minimum)
+        return [
+            f"{self.name} helper: {pin.describe()}, its sha256 checked against the packaged "
+            f"manifest, staged into a per-launch directory and run by absolute path with "
+            f"{profile.command!r} ({pin.interpreter} >= {floor}); the prompt travels in its "
+            "start record on stdin, never in argv",
+            f"{self.name} runtime: {self.runtime_plan(profile, pin)}; supported pair "
+            f"{pin.pair()} (ADR 0007 §2.4)",
+            f"{self.name} policy (docs/sdk-policy.md): interaction_policy {interaction.policy} "
+            f"(max_wait_seconds {interaction.max_wait_seconds}, max_interactions "
+            f"{interaction.max_interactions}); tools {', '.join(policy.tools)}; policy digest "
+            f"{policy.digest()[:16]}",
+            f"{self.name} environment: {inherited}, other providers' variables and "
+            "credential-shaped names withheld; set over them: "
+            f"{', '.join(self.policy_environment_names(profile))}",
+            f"{self.name} state root: <issue sandbox dir>/sdk/{self.name}/, per issue, never "
+            "inside the worktree (docs/sdk-policy.md §6)",
+            f"{self.name} launch: every launch is refused in this release, before anything "
+            f"starts: {self.launch_problem()}",
+        ]
 
     def launch_allowlist(self, base: tuple[str, ...]) -> tuple[str, ...]:
         """``base`` with every other provider's variables and every
@@ -2933,6 +3041,9 @@ class ClaudeSdkProvider(_SdkProvider):
     transport_issue = "151"
     interpreter = "Python interpreter"
     runtime_decision = "D2.3"
+    # ``-I`` keeps out ``PYTHON*`` variables, the user site directory and the
+    # script's own directory (D2.3).
+    interpreter_flags = ("-I",)
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         super().validate_profile(profile)
@@ -2950,6 +3061,23 @@ class ClaudeSdkProvider(_SdkProvider):
 
     def policy(self, profile: ProfileConfig) -> ClaudeSdkPolicy:
         return claude_sdk_policy(profile.name, profile.options)
+
+    def policy_environment_names(self, profile: ProfileConfig) -> tuple[str, ...]:
+        roots = ClaudeSdkRoots.under(Path("/"))  # by name only: no path is used
+        return tuple(self.policy(profile).environment(roots))
+
+    def runtime_plan(self, profile: ProfileConfig, pin: HelperPin) -> str:
+        return (
+            f"the {pin.runtime} executable bundled in {pin.sdk_package}'s platform wheel, "
+            "passed to the SDK as its cli_path, never one found on PATH (ADR 0007 D2.4)"
+        )
+
+    def environment_probe_command(self, profile: ProfileConfig) -> list[str]:
+        """``doctor``'s read-only probe of the helper environment ``command``
+        names (ADR 0007 D2.6): its Python, and the installed SDK's and its
+        bundled CLI's versions from package files, never an SDK import
+        (:data:`autoforge.sdk_assets.CLAUDE_ENVIRONMENT_PROBE`)."""
+        return [profile.command, *self.interpreter_flags, "-c", CLAUDE_ENVIRONMENT_PROBE]
 
     def sandbox_requirements(
         self, profile: ProfileConfig, command: list[str], env: Mapping[str, str], home: str
@@ -3021,6 +3149,28 @@ class OpenCodeSdkProvider(_SdkProvider):
 
     def policy(self, profile: ProfileConfig) -> OpenCodeSdkPolicy:
         return opencode_sdk_policy(profile.name, profile.options)
+
+    def policy_environment_names(self, profile: ProfileConfig) -> tuple[str, ...]:
+        roots = OpenCodeSdkRoots.under(Path("/"))  # by name only: no path is used
+        return tuple(self.policy(profile).environment(roots))
+
+    def runtime_plan(self, profile: ProfileConfig, pin: HelperPin) -> str:
+        policy = self.policy(profile)
+        argv = policy.server_argv(policy.server_command)
+        return (
+            f"options.server_command {policy.server_command!r}, resolved on the launch's "
+            f"PATH by the adapter and started by the bridge as `{' '.join(argv)}`, with a "
+            "fresh server password in its environment only (ADR 0007 D2.5, D3.1, D3.4)"
+        )
+
+    def node_version_command(self, profile: ProfileConfig) -> list[str]:
+        """``doctor``'s read-only probe of the Node ``command`` names (D2.6, D4.4)."""
+        return [profile.command, "--version"]
+
+    def runtime_version_command(self, profile: ProfileConfig) -> list[str]:
+        """``doctor``'s read-only probe of the OpenCode runtime
+        ``options.server_command`` names (D2.6, D4.2)."""
+        return [self.policy(profile).server_command, "--version"]
 
     def own_names(self, profile: ProfileConfig | None) -> tuple[str, ...]:
         if profile is None:

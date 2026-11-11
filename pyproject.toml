@@ -57,10 +57,13 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 # Every file the package reads at runtime ships in the wheel and the sdist:
-# the prompt templates (`prompts_dir()`). tests/test_packaging.py fails when a
-# file in the package is neither listed here nor named as not shipped, and
-# when code reads a new file relative to the package.
+# the prompt templates (`prompts_dir()`) and the SDK helper manifest
+# (`sdk_assets.helpers_dir()`, #150; `sdk_helpers/` is a data directory, not a
+# package). tests/test_packaging.py fails when a file in the package is
+# neither listed here nor named as not shipped, and when code reads a new
+# file relative to the package.
 [tool.setuptools.package-data]
+"autoforge" = ["sdk_helpers/manifest.json"]
 "autoforge.prompts" = ["*.md"]
 
 [dependency-groups]

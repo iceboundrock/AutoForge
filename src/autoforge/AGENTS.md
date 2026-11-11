@@ -34,6 +34,11 @@ claude_stream.py    Claude stream-json reducer: result text, failure, summary, p
 sdk_policy.py       SDK providers' unattended policy: tools, permissions, setting sources,
                     roots, credentials, environment, interaction-data bounds; provider
                     layer, pure: no process, file, SDK import or os.environ change (#149)
+sdk_assets.py       the SDK helpers' packaged manifest (sdk_helpers/manifest.json: each
+                    helper program, its envelope and protocol, whether it ships, the
+                    pinned pair and interpreter floor), the helper digest check, and
+                    doctor's read-only version probes and their parsers; provider layer,
+                    reads package files only, imports no SDK (#150)
 interaction.py      provider-neutral interaction contract (requests, decisions,
                     capabilities, lifecycle, session identity) and the per-launch
                     broker (policy, limits, degradation, capability check, run-log
@@ -313,12 +318,14 @@ prompts/__init__.py                               -> docs/agent-guides/architect
                                                      (+ docs/adr/0003-pi-agent-provider.md and
                                                      docs/pi-policy.md for Pi)
 interaction.py, cli.py (TerminalResolver),
-claude_sdk.py, opencode_sdk.py,
-sdk_helpers/ (the last three planned)             -> docs/agent-guides/architecture.md
+claude_sdk.py, opencode_sdk.py (planned),
+sdk_helpers/ (the manifest; the helper programs
+planned)                                          -> docs/agent-guides/architecture.md
                                                      + docs/adr/0007-sdk-providers-isolated-
                                                      helpers-and-interaction-contract.md
-sdk_policy.py, providers.py (ClaudeSdkProvider,
-OpenCodeSdkProvider)                              -> docs/sdk-policy.md + docs/adr/0007-sdk-
+sdk_policy.py, sdk_assets.py, providers.py
+(ClaudeSdkProvider, OpenCodeSdkProvider),
+doctor.py (the SDK rows)                          -> docs/sdk-policy.md + docs/adr/0007-sdk-
                                                      providers-isolated-helpers-and-
                                                      interaction-contract.md
 sandbox.py, sandbox_bwrap.py                      -> docs/agent-guides/architecture.md
