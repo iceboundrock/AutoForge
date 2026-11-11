@@ -63,9 +63,10 @@ closed ``kind`` and a bounded body under the same policy
 (``MAX_ACCEPTANCE_BODY_CHARS``, ``MAX_ACCEPTANCE_ACTIONS_PER_FIX``), never
 a target, URL, method, path or command (#211). A FIX result whose status is
 ``blocked`` and which carries ``unresolved`` is a partial fix (#433,
-:class:`PartialFixResult`): the same cross-checks, ``fixed`` resolutions only,
-and every other open finding listed with the fixer's reason; any other
-blocked result is read for its ``message`` alone. An UPDATE_EPIC result is validated
+:class:`PartialFixResult`): the schema of a successful one for the findings it
+resolves, at least one of them ``fixed``, and every other open finding listed
+with the fixer's reason; any other blocked result is read for its ``message``
+alone. An UPDATE_EPIC result is validated
 against the schema of the request that launched the agent
 (:class:`UpdateEpicRequest`, D4.7): a re-request after publication carries
 only what it asks for.
@@ -1885,47 +1886,42 @@ class UnresolvedFinding:
 
 
 @dataclass
-class PartialFixResult:
-    """A blocked FIX result that carries the commits it made for some findings (#433).
+class PartialFixResult(FixResult):
+    """A blocked FIX result that carries what it resolved, its commits among it (#433).
 
     The fixer could resolve some open findings and not the others: a human
-    must act on those (a secret, a setting, a decision). It reports the
-    findings it fixed as ``fixed`` resolutions, exactly as a successful FIX
-    does, with the same cross-checks (``previous_head_sha``, ``head_sha``),
-    and lists every other open finding in ``unresolved`` with its reason.
-    Only ``fixed`` is accepted here: every other resolution asks the
-    controller to publish something (an issue, a comment, a description) or
-    waits for the operator, and a partial result publishes nothing but the
-    commits. Each claim is the agent's; the controller verifies the candidate
+    must act on those in a way no resolution kind expresses (a secret, a
+    setting, a decision). It reports what it resolved exactly as a successful
+    FIX does, every resolution kind included, with the same cross-checks
+    (``previous_head_sha``, ``head_sha``) and the same rules for each kind,
+    and lists every other open finding in ``unresolved`` with its reason. At
+    least one resolution is ``fixed``: a partial fix exists to publish the
+    commits it made, so its plan always ends with their push. The controller
+    plans every resolution as it plans a successful FIX's, so a write that
+    waits for the operator (an acceptance action, operator actions, a PR
+    description update) is ordered before the push and holds it (PR #475
+    R1-F2). Each claim is the agent's; the controller verifies the candidate
     and the commits before it plans their push, and records no finding as
     resolved.
     """
 
-    previous_head_sha: str
-    head_sha: str
-    resolutions: list[FindingResolution] = field(default_factory=list)
     unresolved: list[UnresolvedFinding] = field(default_factory=list)
-    tests: list[str] = field(default_factory=list)
 
     @classmethod
     def from_payload(cls, p: dict) -> PartialFixResult:
         ph = "FIX"
         what = "a blocked FIX result with 'unresolved' (a partial fix)"
-        previous = _req_sha(p, "previous_head_sha", ph)
-        head = _req_sha(p, "head_sha", ph)
-        raw = _raw_resolutions(p)
-        if not raw:
+        if isinstance(p.get("resolutions"), list) and not p["resolutions"]:
             raise ControlResultValidationError(
                 f"{ph}: {what} resolves no finding; list at least one 'fixed' resolution, "
                 "or drop 'unresolved' (and the other result fields) for a plain block"
             )
-        resolutions = [FindingResolution.from_payload(r, i) for i, r in enumerate(raw)]
-        others = [r.finding_id for r in resolutions if r.resolution != "fixed"]
-        if others:
+        base = FixResult.from_payload(p)
+        if not any(r.resolution == "fixed" for r in base.resolutions):
             raise ControlResultValidationError(
-                f"{ph}: {what} carries only 'fixed' resolutions (the commits you made), and "
-                f"these use another: {', '.join(others)}; move each to 'unresolved' with its "
-                "reason, or resolve every finding and report status 'success'"
+                f"{ph}: {what} publishes the commits you made, and none of its resolutions is "
+                "'fixed'; list the findings your commits fix as 'fixed', or drop "
+                "'unresolved' (and the other result fields) for a plain block"
             )
         unresolved_raw = p.get(PARTIAL_FIX_KEY)
         if not isinstance(unresolved_raw, list) or not unresolved_raw:
@@ -1933,6 +1929,7 @@ class PartialFixResult:
                 f"{ph}: field {PARTIAL_FIX_KEY!r} must be a non-empty list of "
                 "{finding_id, reason} objects; report status 'success' when no finding is left"
             )
+        raw = base.resolutions
         if len(raw) + len(unresolved_raw) > MAX_RESOLUTIONS_PER_FIX:
             raise ControlResultValidationError(
                 f"{ph}: {len(raw)} resolutions and {len(unresolved_raw)} unresolved findings "
@@ -1940,18 +1937,18 @@ class PartialFixResult:
                 "one per open finding. Re-emit the CONTROL_RESULT."
             )
         unresolved = [_unresolved(item, i) for i, item in enumerate(unresolved_raw)]
-        ids = [r.finding_id for r in resolutions] + [u.finding_id for u in unresolved]
+        ids = [r.finding_id for r in raw] + [u.finding_id for u in unresolved]
         if len(set(ids)) != len(ids):
             raise ControlResultValidationError(
                 f"{ph}: {what} names a finding twice across 'resolutions' and "
-                f"{PARTIAL_FIX_KEY!r}: {ids}; each open finding is fixed or unresolved, once"
+                f"{PARTIAL_FIX_KEY!r}: {ids}; each open finding is resolved or unresolved, once"
             )
         return cls(
-            previous_head_sha=previous,
-            head_sha=head,
-            resolutions=resolutions,
+            previous_head_sha=base.previous_head_sha,
+            head_sha=base.head_sha,
+            resolutions=base.resolutions,
+            tests=base.tests,
             unresolved=unresolved,
-            tests=_reported_tests(p, ph),
         )
 
 

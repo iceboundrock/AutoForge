@@ -1,17 +1,21 @@
 """A blocked FIX that publishes the commits it made for some findings (#433).
 
 The fixer resolves what it can and reports ``blocked`` for a finding only a
-human can act on, listing the ``fixed`` findings with its candidate and the
-others as ``unresolved``. The controller checks that claim as it checks a
-successful FIX, plans the push of the exact candidate (K1, the only record),
-pushes and reads it back, and stops ``BLOCKED`` with every finding of the
-round still open. Nothing else is published, nothing re-reviews or relaunches
-on its own, and the commits are never discarded, reset or forced.
+human can act on, listing its resolutions (at least one ``fixed``) with its
+candidate and the others as ``unresolved``. The controller checks that claim
+as it checks a successful FIX, plans it as it plans a successful FIX (every
+write that waits for the operator first, holding the push of the exact
+candidate, which is last), completes the plan and reads it back, and stops
+``BLOCKED`` with every finding of the round still open. Nothing re-reviews or
+relaunches on its own, the REVIEW an unblock enters is held to the worktree
+checks of a re-review, and the commits are never discarded, reset or forced.
 """
 
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -32,8 +36,11 @@ from autoforge.stop_classification import StopReasonCode
 from autoforge.transitions import Phase
 from tests.conftest import (
     BRANCH,
+    GIT_IDENT,
+    ISSUE,
     PR,
     FakeGitHub,
+    acceptance,
     block,
     comment_url,
     commit_in,
@@ -41,6 +48,7 @@ from tests.conftest import (
     fixed,
     git_out,
     no_change,
+    pr_body_update,
     publish_pr_head,
     review_result,
     reviewed_head_in,
@@ -158,7 +166,7 @@ def test_the_unresolved_list_and_nothing_else_makes_a_blocked_fix_partial():
         ({"resolutions": []}, "resolves no finding"),
         ({"head_sha": None}, "missing required field 'head_sha'"),
         ({"previous_head_sha": "abc"}, "must be a full git SHA"),
-        ({"resolutions": [no_change("R1-F1")]}, "carries only 'fixed' resolutions"),
+        ({"resolutions": [no_change("R1-F1")]}, "none of its resolutions is 'fixed'"),
         (
             {
                 "resolutions": [
@@ -174,7 +182,7 @@ def test_the_unresolved_list_and_nothing_else_makes_a_blocked_fix_partial():
                     }
                 ]
             },
-            "carries only 'fixed' resolutions",
+            "none of its resolutions is 'fixed'",
         ),
         ({"unresolved": [unresolved("R1-F1")]}, "names a finding twice"),
         ({"unresolved": [{"finding_id": "R1-F2"}]}, "missing required field 'reason'"),
@@ -389,19 +397,6 @@ def _off_the_reviewed_head(req) -> str:
     return block(partial_payload(reviewed, head, [fixed("R1-F1")], [unresolved("R1-F2")]))
 
 
-def _with_an_acceptance_action(req) -> str:
-    """A partial fix that also asks for a comment: a write that may wait for the operator."""
-    reviewed = reviewed_head_in(req.prompt)
-    head = fix_commit(req)
-    action = {
-        "finding_id": "R1-F2",
-        "resolution": "acceptance_action",
-        "rationale": "The finding asks for the evidence to be posted on the issue itself.",
-        "acceptance_action": {"kind": "issue_comment", "body": "The deploy log is attached."},
-    }
-    return block(partial_payload(reviewed, head, [fixed("R1-F1"), action], []))
-
-
 def _closing_keyword(req) -> str:
     reviewed = reviewed_head_in(req.prompt)
     head = fix_commit(req, "Fix the typo, closes #7")
@@ -418,7 +413,6 @@ def _closing_keyword(req) -> str:
         (_wrong_previous, "field 'previous_head_sha' is"),
         (_off_the_reviewed_head, "does not descend from the reviewed HEAD"),
         (_closing_keyword, "closing keyword"),
-        (_with_an_acceptance_action, "carries only 'fixed' resolutions"),
     ],
     ids=[
         "head",
@@ -428,14 +422,12 @@ def _closing_keyword(req) -> str:
         "previous",
         "ancestry",
         "message",
-        "acceptance-action",
     ],
 )
 def test_an_unverifiable_partial_fix_is_corrected_and_publishes_nothing(
     tmp_state_dir, monkeypatch, first, needle
 ):
-    """Mismatched claims, candidate identity, ancestry or commit policy, or a
-    resolution that would publish something else or wait for the operator: the
+    """Mismatched claims, candidate identity, ancestry or commit policy: the
     offer is refused before anything is planned, the fixer is asked again with
     the reason, and its answer (here a plain block) decides. Nothing is pushed
     or published and the worktree is never reset."""
@@ -602,6 +594,296 @@ def test_another_push_before_the_controllers_is_never_forced_over(tmp_state_dir,
     assert s.prior_findings == FINDINGS and s.last_review_result == "stale"
 
 
+# -- writes that wait for the operator hold the push (PR #475 R1-F2) ------------------------
+
+
+def _stages(eng) -> list[tuple[str, str]]:
+    """Every persisted move of a plan record, as (kind, stage), in order."""
+    moves: list[tuple[str, str]] = []
+    persist = eng._persist_effect
+
+    def spy(record):
+        moves.append((record.kind.value, record.stage.value))
+        persist(record)
+
+    eng._persist_effect = spy
+    return moves
+
+
+def _records(eng) -> list:
+    from autoforge.effects import EffectRecord
+
+    return [EffectRecord.from_dict(r) for r in load_state(eng.paths.state_file).effect_records]
+
+
+def _held_before_the_push(eng, kinds: list[str], pushes: list[str], reviewed: str) -> str:
+    """The plan is saved with ``kinds`` before the push and nothing of it is sent."""
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.partial_fix == {}
+    assert [r["kind"] for r in s.effect_records] == [*kinds, "push"]
+    assert s.completion_context["unresolved"] == [unresolved("R1-F3")]
+    assert pushes == [] and eng.origin.head(BRANCH) == reviewed
+    assert s.open_findings == FINDINGS
+    assert "This plan is the partial fix of review round 1" in s.block_reason
+    assert MESSAGE in s.block_reason
+    return s.block_reason
+
+
+def _recorded(eng, candidate: str, *, by: str = "controller") -> AutoForgeState:
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.stop_code == "partial-fix", s.block_reason
+    assert s.open_findings == FINDINGS and s.effect_records == []
+    assert s.partial_fix["candidate_sha"] == candidate
+    assert s.partial_fix["published_by"] == by
+    assert s.partial_fix["resolved"] == ["R1-F1", "R1-F2"]
+    assert eng.origin.head(BRANCH) == candidate
+    return s
+
+
+def test_an_acceptance_action_of_a_partial_fix_holds_the_push_until_approved(
+    tmp_state_dir, monkeypatch
+):
+    """K9 (#211) under ``approve``: the partial plan is a successful FIX's plan,
+    the acceptance comment first, so the push waits for the operator's approval
+    instead of going out with the acceptance finding merely left unresolved.
+    Once approved, the comment is published and read back, then the commit is
+    pushed, and the run stays BLOCKED with every finding open."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE, "Ship the feature")
+    pushes = count_pushes(monkeypatch)
+    resolutions = [fixed("R1-F1"), acceptance("R1-F2")]
+    eng = in_fix(tmp_state_dir, gh, partial_fixer(resolutions))
+    reviewed = eng.state.reviewed_head_sha
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.ACCEPTANCE_ACTION
+    reason = _held_before_the_push(eng, ["acceptance_comment"], pushes, reviewed)
+    assert gh.effect_writes == []
+    (k9, _) = _records(eng)
+    assert k9.stage is Stage.INTENDED and not k9.authorized
+    assert f"--approve-action {k9.action_id}" in reason
+    done = eng.unblock("the operator read the comment", approve_action=k9.action_id)
+    assert done.unblocked and done.phase == "FIX", done.message
+    moves = _stages(eng)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PARTIAL_FIX
+    assert len(eng.provider.calls) == 1, "no fixer relaunched"
+    assert moves == [
+        ("acceptance_comment", "attempted"),
+        ("acceptance_comment", "observed"),
+        ("push", "attempted"),
+        ("push", "observed"),
+    ]
+    candidate = _worktree_head(eng.provider.calls[0])
+    assert pushes == [candidate]
+    s = _recorded(eng, candidate)
+    [comment] = gh.comments[ISSUE]
+    assert [r["acceptance_comment_url"] for r in s.last_fix_resolutions] == ["", comment.url]
+    assert "R1-F1 is claimed fixed; R1-F2 is claimed resolved as acceptance_action" in (
+        s.block_reason
+    )
+    assert f"acceptance comment {comment.url} verified" in s.block_reason
+
+
+def test_operator_actions_of_a_partial_fix_hold_the_push_until_each_is_verified(
+    tmp_state_dir, monkeypatch
+):
+    """K10 (#243): the operator's comments are the plan's prefix, so the push of
+    a partial fix waits until every one is verified, exactly as a successful
+    FIX's does; then it completes from the journal with no fixer relaunched."""
+    from tests.test_operator_actions import (
+        NOTE16,
+        NOTE158,
+        T16,
+        T158,
+        _operating,
+        _post,
+        operator,
+        payload,
+    )
+
+    gh = FakeGitHub()
+    pushes = count_pushes(monkeypatch)
+    resolutions = [fixed("R1-F1"), operator("R1-F2", (16, NOTE16), (158, NOTE158))]
+    eng = _operating(tmp_state_dir, gh, partial_fixer(resolutions), findings=3)
+    eng.state.open_findings = [dict(f) for f in FINDINGS]
+    eng._save()
+    reviewed = eng.state.reviewed_head_sha
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    _held_before_the_push(eng, ["operator_comment", "operator_comment"], pushes, reviewed)
+    _post(gh, T16, 9016, payload(T16, NOTE16, "R1-F2"))
+    assert eng.unblock("posted #16").unblocked
+    assert eng.step().next_phase == "BLOCKED"
+    _held_before_the_push(eng, ["operator_comment", "operator_comment"], pushes, reviewed)
+    _post(gh, T158, 9158, payload(T158, NOTE158, "R1-F2"))
+    assert eng.unblock("posted #158").unblocked
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PARTIAL_FIX
+    assert len(eng.provider.calls) == 1
+    candidate = _worktree_head(eng.provider.calls[0])
+    assert pushes == [candidate]
+    s = _recorded(eng, candidate)
+    evidence = s.last_fix_resolutions[1]["operator_evidence"]
+    assert [e["evidence"] for e in evidence] == ["exact", "exact"]
+
+
+def test_a_pr_body_update_of_a_partial_fix_is_verified_before_the_push_and_recovers(
+    tmp_state_dir, monkeypatch
+):
+    """K12 (#423) under ``approve``: the replacement waits for the operator and
+    holds the push. Approved, it is written and read back; a crash right after
+    is completed by the next process from the journal: one body write, one
+    push, then BLOCKED with every finding open."""
+    from tests.test_pr_body_update import _payload, _resumed, _updating
+
+    gh = FakeGitHub()
+    pushes = count_pushes(monkeypatch)
+    resolutions = [fixed("R1-F1"), pr_body_update("R1-F2")]
+    eng = _updating(tmp_state_dir, gh, partial_fixer(resolutions), policy="approve", findings=3)
+    eng.state.open_findings = [dict(f) for f in FINDINGS]
+    eng._save()
+    reviewed = eng.state.reviewed_head_sha
+    run = eng.state.run_id
+    before = gh.prs[PR].body
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.ACCEPTANCE_ACTION
+    _held_before_the_push(eng, ["pr_body_update"], pushes, reviewed)
+    assert gh.prs[PR].body == before and gh.effect_writes == []
+    (k12, _) = _records(eng)
+    assert eng.unblock("read the description", approve_action=k12.action_id).unblocked
+    _power_loss_at(eng, EffectKind.PR_BODY_UPDATE, Stage.OBSERVED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    assert gh.prs[PR].body == _payload(run) and pushes == []
+    again = _resumed(eng, tmp_state_dir, gh, policy="approve")
+    out = again.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PARTIAL_FIX
+    assert again.provider.calls == []
+    candidate = _worktree_head(eng.provider.calls[0])
+    assert pushes == [candidate]
+    assert [w[0] for w in gh.effect_writes] == ["write_pr_body"]
+    s = _recorded(again, candidate)
+    assert s.last_fix_resolutions[1]["pr_body_update"]["reviewed_head_sha"] == reviewed
+
+
+def test_a_partial_fix_with_an_acceptance_action_is_corrected_while_the_setting_is_off(
+    tmp_state_dir, monkeypatch
+):
+    """Each resolution kind is held to a successful FIX's rules: an acceptance
+    action the configuration does not offer is corrected, nothing planned."""
+    from autoforge.config import default_config
+
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE, "Ship the feature")
+    pushes = count_pushes(monkeypatch)
+    cfg = default_config()
+    cfg.safety = replace(cfg.safety, acceptance_actions="off")
+    first = partial_fixer([fixed("R1-F1"), acceptance("R1-F2")])
+    eng = in_fix(tmp_state_dir, gh, scripted(first, plain_blocked), cfg=cfg)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    assert "which this run does not offer (safety.acceptance_actions: off)" in (
+        eng.provider.calls[1].prompt
+    )
+    assert pushes == [] and gh.effect_writes == []
+    assert load_state(eng.paths.state_file).effect_records == []
+
+
+# -- the exact candidate pushed while the fixer ran (PR #475 R1-F3) -------------------------
+
+
+def _pushes_the_candidate(holder: list):
+    """A ``during`` hook: someone pushes exactly the fixer's commit by hand."""
+
+    def during(req):
+        eng = holder[0]
+        candidate = _worktree_head(req)
+        eng.origin.publish(eng.workdir, candidate, BRANCH)
+        holder[1].prs[PR].head_sha = candidate
+
+    return during
+
+
+def test_the_exact_candidate_pushed_while_the_fixer_ran_is_recorded_as_external(
+    tmp_state_dir, monkeypatch
+):
+    """The operator pushed the fixer's commit by hand while it was still
+    reporting. The candidate is held to every check before planning (binding,
+    branch, validation, follow-ups), planned, and its push finds the branch at
+    it: nothing is sent, the claims are recorded, and the record says the
+    commit was published externally. The reviewer is told so, not that the
+    controller pushed it."""
+    gh = FakeGitHub()
+    pushes = count_pushes(monkeypatch)
+    holder: list = []
+    reviewer_prompts: list[str] = []
+
+    def reviewer(req) -> str:
+        reviewer_prompts.append(req.prompt)
+        return block(review_result(2, eng.state.current_head_sha, []))
+
+    eng = in_fix(
+        tmp_state_dir, gh, scripted(partial_fixer(during=_pushes_the_candidate(holder)), reviewer)
+    )
+    holder.extend([eng, gh])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PARTIAL_FIX
+    candidate = _worktree_head(eng.provider.calls[0])
+    assert pushes == []
+    s = _recorded(eng, candidate, by="external")
+    assert [(r["finding_id"], r["resolution"]) for r in s.last_fix_resolutions] == [
+        ("R1-F1", "fixed"),
+        ("R1-F2", "fixed"),
+    ]
+    assert "pushed by someone else, and sent nothing" in s.block_reason
+    preview = eng.unblock("the operator set the secret", dry_run=True)
+    assert "someone else pushed, and the controller verified," in preview.message
+    assert "the controller published" not in preview.message
+    assert eng.unblock("the operator set the secret").phase == "REVIEW"
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    (prompt,) = reviewer_prompts
+    assert (
+        f"verified the fixer's commits at `{candidate}` and found the PR branch already at "
+        "exactly that commit, pushed by someone else, so it pushed nothing"
+    ) in prompt
+    assert "and pushed them" not in prompt
+    # The static text says who may have pushed, never that it was the controller.
+    flat = " ".join(prompt.split())
+    assert "the line says who put it on the PR branch" in flat
+    assert "the HEAD it names is the one the controller verified and pushed" not in flat
+
+
+def test_the_exact_candidate_pushed_ahead_of_an_operator_write_is_not_planned(
+    tmp_state_dir, monkeypatch
+):
+    """The commits are already out ahead of the acceptance action a FIX plan
+    orders before them: no plan can represent that, so nothing is planned or
+    sent, and the run waits on the fixer's message with the findings open."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE, "Ship the feature")
+    pushes = count_pushes(monkeypatch)
+    holder: list = []
+    fixer_ = partial_fixer(
+        [fixed("R1-F1"), acceptance("R1-F2")], during=_pushes_the_candidate(holder)
+    )
+    eng = in_fix(tmp_state_dir, gh, fixer_)
+    holder.extend([eng, gh])
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.AGENT_BLOCKED
+    assert pushes == [] and gh.effect_writes == []
+    s = load_state(eng.paths.state_file)
+    assert "ahead of the operator's part the resolutions of R1-F2 ask for" in s.block_reason
+    assert MESSAGE in s.block_reason
+    assert s.effect_records == [] and s.partial_fix == {} and s.open_findings == FINDINGS
+
+
 # -- after the stop -----------------------------------------------------------------------
 
 
@@ -638,8 +920,9 @@ def test_unblock_rereviews_the_published_head_with_every_finding_carried(tmp_sta
     out = eng.step()
     assert out.next_phase == "READY_FOR_MERGE", out.message
     (req,) = holder
-    assert f"verified and published `{candidate}`" in req.prompt
-    assert "for R1-F1, R1-F2" in req.prompt and "left R1-F3 unresolved" in req.prompt
+    assert f"verified the fixer's commits at `{candidate}` and pushed them" in req.prompt
+    assert "claims resolutions of R1-F1, R1-F2" in req.prompt
+    assert "left R1-F3 unresolved" in req.prompt
     assert "This round is bound to that published HEAD" in req.prompt
     assert REASON in req.prompt
     s = load_state(eng.paths.state_file)
@@ -676,9 +959,133 @@ def test_status_names_the_partial_fix(tmp_state_dir, capsys):
     out = capsys.readouterr().out
     assert (
         f"Partial fix:   {candidate} over {eng.state.reviewed_head_sha} (round 1, the "
-        "controller's push): R1-F1, R1-F2 claimed fixed, R1-F3 left open"
+        "controller's push): R1-F1, R1-F2 claimed resolved, R1-F3 left open"
     ) in out
     assert "partial-fix" in out
+
+
+# -- the worktree the next reviewer works in (PR #475 R1-F1) -------------------------------
+
+BUGGY = "def cache():\n    return None\n"
+FIXED = "def cache():\n    return {}\n"
+
+
+def _fixer_leaving(leave):
+    """A fixer that commits a real file for R1-F1 and R1-F2, leaves ``leave``
+    behind uncommitted in its worktree, and reports a partial fix."""
+
+    def handler(req) -> str:
+        reviewed = reviewed_head_in(req.prompt)
+        cwd = Path(req.cwd)
+        git_out("-C", str(cwd), "checkout", "-q", "--detach", reviewed)
+        (cwd / "cache.py").write_text(BUGGY, "utf-8")
+        git_out("-C", str(cwd), "add", "cache.py")
+        git_out("-C", str(cwd), *GIT_IDENT, "commit", "-q", "-m", "Fix R1-F1 and R1-F2 (#2)")
+        head = git_out("-C", str(cwd), "rev-parse", "HEAD")
+        leave(cwd)
+        return block(
+            partial_payload(reviewed, head, [fixed("R1-F1"), fixed("R1-F2")], [unresolved("R1-F3")])
+        )
+
+    return handler
+
+
+def _untracked(cwd: Path) -> None:
+    (cwd / "draft.txt").write_text("a half-made fix for R1-F3\n", "utf-8")
+
+
+def _modified(cwd: Path) -> None:
+    (cwd / "cache.py").write_text(FIXED, "utf-8")
+
+
+def _staged(cwd: Path) -> None:
+    _modified(cwd)
+    git_out("-C", str(cwd), "add", "cache.py")
+
+
+def _concealed(cwd: Path) -> None:
+    """An edit the worktree's own index hides from `git status`."""
+    _modified(cwd)
+    git_out("-C", str(cwd), "update-index", "--assume-unchanged", "cache.py")
+    assert git_out("-C", str(cwd), "status", "--porcelain") == ""
+
+
+@pytest.mark.parametrize(
+    ("leave", "needle"),
+    [
+        (_untracked, "`git -C {wt} status` lists them"),
+        (_modified, "`git -C {wt} status` lists them"),
+        (_staged, "`git -C {wt} status` lists them"),
+        (_concealed, "index records as unchanged although they differ from the commit under"),
+    ],
+    ids=["untracked", "modified", "staged", "concealed"],
+)
+def test_unblock_after_a_partial_fix_refuses_a_worktree_holding_uncommitted_work(
+    tmp_state_dir, monkeypatch, leave, needle
+):
+    """The partial fix was published from the worktree the next reviewer works
+    in, and the fixer left work there for R1-F3: what that reviewer would read
+    and test in place of the published commit. Unblock refuses REVIEW, writes
+    nothing and leaves the work exactly as it was; once the operator has moved
+    it out, the same unblock enters REVIEW."""
+    gh = FakeGitHub()
+    eng = in_fix(tmp_state_dir, gh, _fixer_leaving(leave))
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PARTIAL_FIX
+    worktree = eng.agent_worktree_path()
+    candidate = eng.state.partial_fix["candidate_sha"]
+    status = git_out("-C", str(worktree), "status", "--porcelain")
+    raw = eng.paths.state_file.read_text()
+    refused = eng.unblock("the operator set the secret")
+    assert not refused.unblocked, refused.message
+    assert (
+        f"the agent worktree {worktree} holds 1 uncommitted change(s) on the partial fix's "
+        f"candidate {candidate[:12]}"
+    ) in refused.message
+    assert needle.format(wt=worktree) in refused.message
+    assert "what it reads and tests there would be those changes" in refused.message
+    assert "move them out of the worktree yourself" in refused.message
+    assert eng.paths.state_file.read_text() == raw
+    assert git_out("-C", str(worktree), "status", "--porcelain") == status
+    assert git_out("-C", str(worktree), "rev-parse", "HEAD") == candidate
+    if leave is _untracked:
+        assert (worktree / "draft.txt").exists()
+        (worktree / "draft.txt").unlink()
+    else:
+        assert (worktree / "cache.py").read_text("utf-8") == FIXED
+        git_out("-C", str(worktree), "update-index", "--no-assume-unchanged", "cache.py")
+        git_out("-C", str(worktree), "checkout", "-q", "HEAD", "--", "cache.py")
+    applied = eng.unblock("the operator moved the draft out")
+    assert applied.unblocked and applied.phase == "REVIEW", applied.message
+
+
+def test_unblock_after_a_partial_fix_refuses_a_worktree_moved_off_the_candidate(tmp_state_dir):
+    """A commit made in the worktree after the publication is not on the PR:
+    a review there would read it. Refused, the commit kept."""
+    gh = FakeGitHub()
+    eng = _published(tmp_state_dir, gh)
+    worktree = eng.agent_worktree_path()
+    candidate = eng.state.partial_fix["candidate_sha"]
+    later = commit_in(worktree, "More work (#2)")
+    out = eng.unblock("the operator set the secret")
+    assert not out.unblocked
+    assert (
+        f"is at {later[:12]}, not at the partial fix's candidate {candidate[:12]}, so it may "
+        "hold commits the PR does not"
+    ) in out.message
+    assert git_out("-C", str(worktree), "rev-parse", "HEAD") == later
+
+
+def test_unblock_after_a_partial_fix_enters_review_from_a_clean_published_worktree(
+    tmp_state_dir,
+):
+    """The worktree holds exactly the published candidate: REVIEW is entered."""
+    gh = FakeGitHub()
+    eng = in_fix(tmp_state_dir, gh, _fixer_leaving(lambda cwd: None))
+    assert eng.step().next_phase == "BLOCKED"
+    out = eng.unblock("the operator set the secret")
+    assert out.unblocked and out.phase == "REVIEW", out.message
 
 
 # -- the persisted state (protocol 17) ----------------------------------------------------
@@ -843,23 +1250,28 @@ def _saved_partial_plan(tmp_state_dir) -> tuple[FakeGitHub, object, dict]:
     [
         (lambda d: d["completion_context"].update(message=""), "is blank"),
         (
-            lambda d: d["completion_context"]["resolutions"][0].update(
-                resolution="no_change_with_rationale"
-            ),
-            "are 'fixed' only",
+            lambda d: [
+                r.update(
+                    resolution="no_change_with_rationale",
+                    rationale="x" * 60,
+                    commit_sha="",
+                )
+                for r in d["completion_context"]["resolutions"]
+            ],
+            "resolve no finding as 'fixed'",
         ),
         (lambda d: d["completion_context"].update(unresolved=[]), "exactly the open findings"),
         (
             lambda d: d["completion_context"]["unresolved"][0].update(finding_id="R1-F1"),
             "names a finding the context resolves",
         ),
-        (lambda d: d.update(effect_records=[]), "exactly the push of its candidate"),
+        (lambda d: d.update(effect_records=[]), "must end with the push of its candidate"),
     ],
     ids=["message", "kind", "coverage", "twice", "plan"],
 )
 def test_a_damaged_partial_plan_is_refused_on_load(tmp_state_dir, damage, needle):
-    """The journal holds a partial fix to its shape: a message, only 'fixed'
-    resolutions, the open findings exactly once, and the push alone."""
+    """The journal holds a partial fix to its shape: a message, a 'fixed'
+    resolution, the open findings exactly once, and the push last."""
     _, eng, data = _saved_partial_plan(tmp_state_dir)
     damage(data)
     eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")

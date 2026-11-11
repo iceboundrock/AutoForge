@@ -270,12 +270,14 @@ Emit exactly one block at the end of your final reply:
 
 ## When a finding needs a human
 
-Some findings only a human can resolve: a secret or a repository setting,
-access you do not have, a decision the issue leaves open. Resolve every
-finding you can first. When one remains that you cannot resolve, report
-`"status": "blocked"` with a `"message"` saying what a human must do. If you
-committed fixes for other findings, list them too, so that the controller
-publishes them now instead of leaving them unpushed in this worktree:
+Some findings only a human can resolve, in a way none of the resolutions above
+expresses: a secret or a repository setting, access you do not have, a
+decision the issue leaves open. Resolve every finding you can first, each
+with the resolution it needs. When one remains that you cannot resolve,
+report `"status": "blocked"` with a `"message"` saying what a human must do.
+If you committed fixes for other findings, list your resolutions too, so that
+the controller publishes them now instead of leaving your commits unpushed in
+this worktree:
 
 ```text
 <<<CONTROL_RESULT>>>
@@ -298,17 +300,24 @@ publishes them now instead of leaving them unpushed in this worktree:
 
 - `unresolved` is what makes a blocked result a partial fix. Without it the
   controller reads only `message`, and pushes nothing.
-- `resolutions` holds only `fixed` findings, each fixed by a commit after
-  `{{REVIEWED_HEAD_SHA}}`. Every other finding listed above is in
-  `unresolved`, once, with a `reason` of at most {{MAX_FIX_RATIONALE_CHARS}}
-  characters (newlines and tabs allowed). A finding you would resolve another
-  way (a follow-up issue, no change, an acceptance or operator action, a PR
-  description) goes in `unresolved` too: a partial fix publishes nothing but
-  your commits.
+- `resolutions` follows every rule of a successful result above, and at least
+  one of them is `fixed` by a commit after `{{REVIEWED_HEAD_SHA}}`. A finding
+  you can resolve another way (a follow-up issue, no change, an acceptance or
+  operator action, a PR description, where this run offers them) belongs in
+  `resolutions` with that resolution, never in `unresolved`: the controller
+  publishes a partial fix exactly as it publishes a successful result, so an
+  acceptance comment, operator comments or a new PR description is published
+  or verified first, and your commits are pushed only after it, waiting for
+  the operator's approval or posting as the sections above say.
+- Every other finding listed above is in `unresolved`, once, with a `reason`
+  of at most {{MAX_FIX_RATIONALE_CHARS}} characters (newlines and tabs
+  allowed).
 - The cross-checks and commit-message rules above apply as they do to a
   successful result, and a result that breaks one is refused and you are
-  asked to correct it. The controller validates your commit and pushes it to
-  the PR branch, then the run waits for the human: no finding is marked
+  asked to correct it. Once what your resolutions need is published and your
+  commit is pushed, the run waits for the human: no finding is marked
   resolved, and the next review re-checks every finding of this round at the
-  pushed HEAD. Leave the working tree clean.
+  pushed HEAD. Commit everything you want reviewed and leave the working tree
+  clean: the next reviewer works in this worktree, and the controller does
+  not start that review while it holds uncommitted changes.
 - When every finding is resolved, report `"status": "success"` as above.

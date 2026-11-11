@@ -708,12 +708,12 @@ class AutoForgeState:
     # its findings are bound to), ``candidate_sha`` (the commit read back as
     # the PR head), ``published_by`` (``controller`` for the controller's push,
     # ``external`` when GitHub already held exactly that commit before the
-    # controller sent anything), ``resolved`` (the ids its ``fixed``
-    # resolutions claim; those resolutions are ``last_fix_resolutions``) and
+    # controller sent anything), ``resolved`` (the ids its resolutions claim,
+    # at least one ``fixed``; those resolutions are ``last_fix_resolutions``) and
     # ``unresolved`` (``finding_id`` and the fixer's redacted ``reason`` for
     # every other finding of the round). Nothing of it marks a finding
     # resolved: the round's findings stay open, then carried to the next
-    # REVIEW, whose prompt says which were claimed fixed. Cleared when that
+    # REVIEW, whose prompt says which were claimed resolved. Cleared when that
     # review completes a round, when a FIX of the round is recorded or
     # dropped, and per PR.
     partial_fix: dict = field(default_factory=dict)
@@ -2043,7 +2043,7 @@ def _validate_partial_fix(state: AutoForgeState) -> None:
     phases that hold them: ``BLOCKED`` (where the partial fix stops),
     ``REVIEW`` (the review an unblock enters), ``FIX`` (a fixer relaunched at
     the reviewed HEAD after the PR was put back there) and ``FAILED``. Its
-    ids are each once, fixed or unresolved, and every one is a finding of the
+    ids are each once, resolved or unresolved, and every one is a finding of the
     round. Agent text (``reason``) is bounded and never quoted here.
     """
     record = state.partial_fix

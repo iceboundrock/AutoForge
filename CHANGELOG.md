@@ -10,17 +10,24 @@ so.
 When the fixer resolved some findings and had to stop for one only you can
 act on, its commits used to stay in the agent worktree: you pushed them by
 hand and unblocked to `REVIEW`, and nothing recorded that push. The fixer may
-now report `blocked` with the findings it fixed and the ones it left, each
-with a reason. AutoForge checks those commits as it checks any fix,
-validates the candidate, pushes it and reads it back, and the run stops with
-`reason partial-fix`. Every finding of the round stays open and none is
-marked resolved; `status` shows a `Partial fix:` line. Do what the fixer
-asked for, then `unblock`: a fresh `REVIEW` round of the pushed commit, with
-the round's findings to re-check and the fixer's claims and reasons in its
-prompt. Nothing is pushed, and the run stops `agent-blocked` as before, when
-the candidate fails `validation.commands` or someone pushed to the PR first;
-AutoForge never forces a push over another one, and a branch already at
-exactly its candidate is recorded as someone else's push.
+now report `blocked` with its resolutions of the findings it could resolve,
+at least one fixed by a commit, and the ones it left, each with a reason.
+AutoForge publishes them exactly as it publishes any fix: it checks them,
+validates the candidate, publishes what the resolutions ask for (an
+acceptance action, operator comments or a new PR description still waits for
+your approval or posting, and holds the push), pushes the commit last and
+reads it all back, and the run stops with `reason partial-fix`. Every
+finding of the round stays open and none is marked resolved; `status` shows
+a `Partial fix:` line. Do what the fixer asked for, then `unblock`: a fresh
+`REVIEW` round of the pushed commit, with the round's findings to re-check
+and the fixer's claims and reasons in its prompt. That unblock is refused
+while the agent worktree holds uncommitted work or a later commit, which the
+reviewer would read in place of the PR; move it out first. Nothing is
+pushed, and the run stops `agent-blocked` as before, when the candidate
+fails `validation.commands` or someone pushed another commit to the PR
+first; AutoForge never forces a push over another one, and a branch already
+at exactly its candidate, before or during the fixer's report, is recorded as
+someone else's push.
 
 State protocol 16 -> 17 (`partial_fix`, and a FIX plan's unresolved findings
 and message) and prompt v17 -> v18. Older state files load with no partial

@@ -758,33 +758,51 @@ your request.
 
 When the fixer resolves some findings and must stop for one only a human can
 act on (a secret to set, access it lacks, a decision the issue leaves
-open), it may report `blocked` with the findings it fixed and the ones it
-left, each with a reason. AutoForge then publishes the fixer's commits
-itself: it checks them as it checks any fix, validates the candidate, pushes
-it to the PR branch and reads it back. You no longer push them by hand. The
-run stops with `stop: blocked (reason partial-fix, ...)`, and the reason
-quotes the fixer's message and its reason for each finding left. `status`
-adds a `Partial fix:` line with the pushed commit, who put it on the branch
-(AutoForge, or someone who had already pushed exactly that commit), and the
-findings claimed fixed and left open.
+open), it may report `blocked` with its resolutions of the findings it
+could resolve (at least one fixed by a commit) and the ones it left, each
+with a reason. AutoForge then publishes the fixer's work itself, exactly as
+it publishes a successful fix: it checks it, validates the candidate,
+publishes what the resolutions ask for, pushes the commit to the PR branch
+last and reads it all back. You no longer push the commits by hand. An
+acceptance action or a new PR description awaiting your approval, or an
+operator comment you have not posted yet, holds the push as it would for any
+fix: the run first stops on that, as the sections below describe, and the
+push follows once it is approved or verified. The run then stops with
+`stop: blocked (reason partial-fix, ...)`, and the reason quotes the fixer's
+message and its reason for each finding left. `status` adds a `Partial fix:`
+line with the pushed commit, who put it on the branch (AutoForge, or someone
+who had already pushed exactly that commit), and the findings claimed
+resolved and left open.
 
 No finding is marked resolved, and nothing runs until you `unblock`. Do
 what the fixer asked for, then `autoforge unblock --reason "..."` and
 `resume`. Because the PR has moved past the reviewed HEAD, the unblock
 enters a fresh `REVIEW` round of the pushed commit rather than `FIX`, and
 every finding of the round is handed to it to re-check; its prompt says
-which ones the fixer claimed fixed and why it left the others. The round
+which ones the fixer claimed resolved and why it left the others. The round
 counts against `workflow.max_review_rounds`, and `--rereview` is refused
-here (the plain unblock already re-reviews).
+here (the plain unblock already re-reviews). The next reviewer works in the
+agent worktree, where the fixer may have left half-made edits for the
+findings it left, so the unblock is refused while that worktree holds
+anything the pushed commit does not: an untracked file, a modified or
+staged file, an edit an assume-unchanged or skip-worktree mark hides, or a
+later commit. The message names what it found. AutoForge never discards it:
+move it out of the worktree yourself (commit it elsewhere, or copy it and
+remove it), then unblock again.
 
 If the fixer's commits cannot be published, nothing is pushed, they stay
 in the agent worktree, and the run stops `agent-blocked` with the fixer's
 message and the reason: a candidate that failed `validation.commands`
 (the reason names the validation record and its run log; `unblock` then
 launches the fixer again, and what it reports is validated afresh),
-or a PR that someone pushed to while the fixer ran or before AutoForge's
-push (`unblock` then reviews the PR as it is, with the findings carried).
-AutoForge never forces a push over someone else's.
+or a PR that someone pushed another commit to while the fixer ran or before
+AutoForge's push (`unblock` then reviews the PR as it is, with the findings
+carried). If what someone pushed is exactly the fixer's commit, AutoForge
+recognises it, sends no push and records the push as someone else's, unless
+the fix also asked for an acceptance action, operator comments or a new PR
+description, which should have come before the commit: then nothing is
+published and the run stops `agent-blocked`. AutoForge never forces a push
+over someone else's.
 
 ### BLOCKED on an acceptance action
 

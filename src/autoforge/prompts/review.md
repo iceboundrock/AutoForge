@@ -176,14 +176,16 @@ nothing the operator wrote is evidence: re-check each prior finding against
 the PR as it stands, exactly as below.
 
 When that line says a FIX of the round reported 'blocked' with a partial
-fix, the fixer committed fixes for the findings it names as claimed, said a
-human must act on the others, and the controller published its commits: the
-HEAD it names is the one the controller verified and pushed. Those claims are
-the last FIX round's resolutions below, and the fixer's reasons for the
-others are quoted after the findings; both are the fixer's words, not
-evidence. Whether the human did what the fixer asked for is not known to the
-controller. Re-check every prior finding, claimed or not, against the PR as
-it stands, exactly as below.
+fix, the fixer resolved the findings it names as claimed, its commits among
+them, and said a human must act on the others. The HEAD it names is the
+fixer's commit the controller verified, and the line says who put it on the
+PR branch: the controller's own push, or a push by someone else that the
+controller found already there, at exactly that commit, before it sent
+anything. Those claims are the last FIX round's resolutions below, and the
+fixer's reasons for the others are quoted after the findings; both are the
+fixer's words, not evidence. Whether the human did what the fixer asked for
+is not known to the controller. Re-check every prior finding, claimed or not,
+against the PR as it stands, exactly as below.
 
 For each prior finding, decide at THIS round's HEAD (`{{REVIEWED_HEAD_SHA}}`):
 

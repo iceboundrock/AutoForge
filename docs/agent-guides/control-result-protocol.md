@@ -531,26 +531,38 @@ judges it.
 A `FIX` result whose `status` is `blocked` is a plain block, and the
 controller reads only its `message`, unless it carries `unresolved` (#433).
 That key, and nothing else, makes it a partial fix: the fixer resolved some
-findings by commits and needs a human for the others. A blocked result
-shaped like a fix but without `unresolved` stays a plain block, and the
-step's message says that none of its other fields was read. A partial fix
-is validated by the parser as strictly as a successful result, so a
-malformed one is corrected, never read as a plain block:
+findings, at least one by a commit, and needs a human for the others. A
+blocked result shaped like a fix but without `unresolved` stays a plain
+block, and the step's message says that none of its other fields was read. A
+partial fix is validated by the parser as strictly as a successful result,
+so a malformed one is corrected, never read as a plain block:
 
 | Key | Rule |
 |---|---|
 | `message` | required and non-blank, as for every block; stored redacted and bounded by `MAX_BLOCK_REASON_CHARS` with the plan, and quoted by the stop |
 | `previous_head_sha`, `head_sha` | required SHAs, the same cross-checks as a successful result's |
-| `resolutions` | required, non-empty; `fixed` only, with the same per-resolution rules (`commit_sha`, `rationale`). Every other kind would publish something or wait for the operator, and is refused naming the findings |
+| `resolutions` | required, non-empty, every rule of a successful result's (each kind, the one acceptance action, never with operator actions, one PR description); at least one is `fixed`, since a partial fix publishes the commits it made |
 | `unresolved` | required, non-empty list of exactly `{"finding_id", "reason"}`; `reason` non-blank, multi-line, at most `MAX_FIX_RATIONALE_CHARS` |
 | `tests` | optional, as a successful result's |
+
+Every resolution kind is accepted because a partial fix is published exactly
+as a successful result is (PR #475 R1-F2): an acceptance action, operator
+actions and a PR description update are planned before the push and hold
+it, waiting for the operator as they would. Accepting `fixed` alone, as the
+first version did, told the fixer to leave such a finding `unresolved`, and
+the push then went out without the approval or verification a successful
+FIX would have waited for. The prompt says a finding the fixer can resolve
+by any kind belongs in `resolutions`, and `unresolved` holds only what no
+kind expresses.
 
 The two lists name distinct findings, at most `MAX_RESOLUTIONS_PER_FIX`
 together. What the parser cannot see is the engine's, before the result is
 accepted, each refusal a correction with nothing pushed: the two lists name
-exactly the open findings; no `fixed` finding has a follow-up issue the
-entry found; and the candidate meets every FIX candidate rule, which, as
-every resolution is `fixed`, makes it a descendant of the reviewed HEAD
+exactly the open findings; each resolution meets a successful FIX's engine
+rules (`_check_fix_claims`), so a finding with a follow-up issue the entry
+found is resolved with that issue or left unresolved; and the candidate
+meets every FIX candidate rule, which, as one resolution is `fixed`, makes
+it a descendant of the reviewed HEAD
 ([github-safety.md](github-safety.md), "A blocked FIX's partial fix").
 
 ### REPLAN_REEXECUTE fields

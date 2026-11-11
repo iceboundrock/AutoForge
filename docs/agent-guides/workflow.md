@@ -519,11 +519,13 @@ pushes alone repeat a round without the cap ever counting it.
 
 ### A blocked FIX publishes its partial fix
 
-A `FIX` agent that reports `blocked` may list the findings it fixed and the
-ones it left for a human (#433; github-safety.md, "A blocked FIX's partial
-fix"). The controller verifies that partial fix, pushes it as the plan's
-only write and reads it back, then the run stops `BLOCKED` (`partial-fix`)
-with every finding of the round still open: `FIX` has one edge out, to
+A `FIX` agent that reports `blocked` may list the findings it resolved, its
+commits among them, and the ones it left for a human (#433; github-safety.md,
+"A blocked FIX's partial fix"). The controller verifies that partial fix,
+plans and completes it as it would a successful FIX, every write that waits
+for the operator holding the push, which is last, reads it back, then the
+run stops `BLOCKED` (`partial-fix`) with every finding of the round still
+open: `FIX` has one edge out, to
 `REVIEW`, and the round is not complete. Three things deliberately do not
 happen. No finding is marked resolved, because a commit is evidence of a
 claim, not of its truth. Nothing re-reviews or relaunches on its own, since
@@ -532,12 +534,17 @@ same stop. And a plain `unblock` never re-enters `FIX` for the round: the
 PR is past the reviewed HEAD the findings are bound to, so the decision
 table's moved-revision row applies, `REVIEW` of the published HEAD with
 the findings carried as a stale round's are (see "Stale rounds keep their
-findings"), under the round cap. `--rereview` is refused there, as for any
-moved revision. `partial_fix` names the candidate and the claims while the
-findings are carried, and the completed round clears it. A partial fix that
-is not published (its candidate fails validation, the PR moved first)
-stops `agent-blocked` with the fixer's message instead, its commits left in
-the worktree, and the decision table applies to the PR as it is.
+findings"), under the round cap. That `REVIEW` is entered only while the
+agent worktree holds nothing the revision under review does not, by the
+checks of `--rereview` (PR #475 R1-F1): the fixer may have left uncommitted
+work there for the findings it did not resolve, which the reviewer would
+read in place of the PR. `--rereview` itself is refused there, as for any
+moved revision. `partial_fix` names the candidate, who published it and the
+claims while the findings are carried, and the completed round clears it. A
+partial fix that is not published (its candidate fails validation, the PR
+moved first to a commit other than exactly the candidate) stops
+`agent-blocked` with the fixer's message instead, its commits left in the
+worktree, and the decision table applies to the PR as it is.
 
 ### Re-entering a phase
 
@@ -1015,7 +1022,8 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   flag refuses, quoting the plain decision; it excludes the action flags.
   A `FIX` agent that reports `blocked` names the flag in the step's
   message. After a partial fix (#433) the PR is past the reviewed HEAD, so
-  the flag refuses and the plain unblock re-enters `REVIEW`.
+  the flag refuses and the plain unblock re-enters `REVIEW`, after the
+  same worktree checks against the published candidate (PR #475 R1-F1).
 - **Operator actions awaiting the operator** (#243, ADR 0004 K10). A
   `FIX` plan's operator comments (first in the plan, at most four) ask the
   operator to post a comment on another issue of the repository; the

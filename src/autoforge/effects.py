@@ -2537,13 +2537,15 @@ class FixContext:
     set exactly on the resolutions of its kind.
 
     A partial fix (#433) is the plan of a FIX that reported ``blocked`` with
-    the commits it made for some findings: ``unresolved`` names every other
+    what it resolved, its commits among it: ``unresolved`` names every other
     open finding with the fixer's (redacted) reason, and ``message`` is the
     fixer's (redacted, bounded) block message, which the stop that completes
-    the plan quotes. Its resolutions are all ``fixed`` and its plan is the
-    push (K1) alone, so nothing of it waits for the operator or publishes
-    anything else, and completing it leaves the findings open and the run
-    ``BLOCKED``. Both are empty for every other plan.
+    the plan quotes. Its resolutions are those of a successful FIX, at least
+    one of them ``fixed``, and its plan is a successful FIX's plan for them,
+    so it ends with the push (K1), which every write that waits for the
+    operator (K9, K10, K12) precedes and holds (PR #475 R1-F2); completing it
+    leaves the findings open and the run ``BLOCKED``. Both are empty for
+    every other plan.
     """
 
     issue_url: str
@@ -2676,27 +2678,18 @@ class FixContext:
         records: Sequence[EffectRecord],
         what: str,
     ) -> None:
-        """#433: a partial fix resolves only by commit, and its plan is the push alone.
+        """#433: a partial fix publishes commits, so its plan ends with their push.
 
-        Nothing of such a plan waits for the operator (K9, K10, K12) or
-        publishes anything but the commits (K5, K6), so its push is never
-        ordered past a write it would otherwise follow.
+        Its other records are held to the rules of every FIX plan (the checks
+        that follow this one), which order each write that waits for the
+        operator before the push (PR #475 R1-F2).
         """
         if not message.strip():
             _fail(f"{what}.message", "is blank, and a partial fix keeps the fixer's message")
-        if not resolutions:
-            _fail(f"{what}.resolutions", "of a partial fix resolve no finding")
-        others = [r["finding_id"] for r in resolutions if r["resolution"] != "fixed"]
-        if others:
-            _fail(
-                f"{what}.resolutions",
-                f"of a partial fix are 'fixed' only, and {', '.join(others)} are not",
-            )
-        if [r.kind for r in records] != [EffectKind.PUSH]:
-            _fail(
-                "effect_records",
-                "of a partial fix must be exactly the push of its candidate",
-            )
+        if not any(r["resolution"] == "fixed" for r in resolutions):
+            _fail(f"{what}.resolutions", "of a partial fix resolve no finding as 'fixed'")
+        if not records or records[-1].kind != EffectKind.PUSH:
+            _fail("effect_records", "of a partial fix must end with the push of its candidate")
 
     @classmethod
     def _resolution(cls, raw: object, what: str) -> dict:

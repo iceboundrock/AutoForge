@@ -752,12 +752,14 @@ DIAGNOSES: dict[StopReasonCode, Diagnosis] = {
     ),
     StopReasonCode.PARTIAL_FIX: Diagnosis(
         "the FIX agent reported 'blocked' with a partial fix: the controller verified the "
-        "commits it made for some findings and published them as the PR head, and the round's "
+        "commits it made for some findings, completed its plan and read them back as the PR "
+        "head (its own push, or one it found there; the reason says which), and the round's "
         "findings stay open, none marked resolved; the fixer's message and reasons are its "
         "claims, never evidence",
         "read the fixer's message and reasons in the reason and resolve what it asks for; "
         "'unblock' then re-enters REVIEW of the published HEAD with the round's findings "
-        "carried, and no fixer is launched before it",
+        "carried, once the agent worktree holds nothing that HEAD does not, and no fixer is "
+        "launched before it",
     ),
     StopReasonCode.AGENT_FAILURE: Diagnosis(
         "the phase's agent reported 'failure'; FAILED has no outgoing edge",

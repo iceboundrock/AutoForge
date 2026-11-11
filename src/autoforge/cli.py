@@ -3385,7 +3385,7 @@ def _partial_fix_lines(state: AutoForgeState) -> list[str]:
     left = ", ".join(u["finding_id"] for u in record["unresolved"])
     return [
         f"Partial fix:   {record['candidate_sha']} over {record['reviewed_head_sha']} "
-        f"(round {record['round']}, {by}): {', '.join(record['resolved'])} claimed fixed, "
+        f"(round {record['round']}, {by}): {', '.join(record['resolved'])} claimed resolved, "
         f"{left} left open"
     ]
 

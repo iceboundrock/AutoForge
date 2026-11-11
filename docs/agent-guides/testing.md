@@ -45,8 +45,8 @@ High-priority coverage includes:
   each malformed key, is refused; a protocol-16 file loads with none and its
   saved `FIX` plan completes as the full fix it was; an older label carrying
   any of it and a current file missing the field are refused; a saved partial
-  plan whose message, resolution kind, coverage or plan does not hold
-  together is refused at load
+  plan with a blank message, no `fixed` resolution, a coverage that does not
+  hold or a last record that is not its push is refused at load
 - operator-action state (#243, `tests/test_state.py`): every outcome
   round-trips under the current protocol; a protocol-10 file, a `FIX`
   plan included, loads in every phase migrated and is relabelled; an older
@@ -1661,18 +1661,29 @@ a stated reason it has none. The coverage that must keep working:
   it back and stop `partial-fix` with all three findings open and the claims
   recorded; the plan is journaled before the push; a plain block, and one
   shaped like a fix without `unresolved`, push nothing; mismatched claims,
-  candidate, ancestry, commit policy, coverage and any resolution but
-  `fixed` (an acceptance or operator action among them) are corrected with
-  nothing pushed or published; a finding with a follow-up issue is never
-  claimed fixed; a candidate failing validation and a PR that moved during the
-  fixer stop `agent-blocked` with nothing pushed; a crash after the push
-  completes with no second push and the push attributed to the controller; a
-  branch already at exactly the candidate is recorded `external` with nothing
+  candidate, ancestry, commit policy, coverage and a result with no `fixed`
+  resolution are corrected with nothing pushed or published, and so is an
+  acceptance action while `safety.acceptance_actions` is `off`; a finding
+  with a follow-up issue is never claimed fixed; an acceptance action (K9)
+  and a PR description (K12) awaiting approval, and operator comments (K10)
+  not yet verified, hold the push with nothing after them sent, and the
+  approved or verified plan completes from the journal with no fixer
+  relaunched, a crash after K12 included, with one write each (PR #475
+  R1-F2); a candidate failing validation and a PR that moved during the
+  fixer stop `agent-blocked` with nothing pushed; exactly the candidate
+  pushed by hand during the fixer is recorded `external` with nothing sent,
+  and stops with nothing planned when an operator write would have preceded
+  it (R1-F3); a crash after the push completes with no second push and the
+  push attributed to the controller; a branch already at exactly the
+  candidate after the plan is saved is recorded `external` with nothing
   sent; another push before the controller's is never forced and stays
   `BLOCKED`; `unblock` re-reviews the published HEAD with every finding
-  carried and the claims and reasons in the prompt, under the round cap,
-  `--rereview` refused; `status` names the partial fix; the parser's schema
-  and bounds
+  carried and the claims and reasons in the prompt, which names the
+  publisher as recorded (R1-F4), under the round cap, `--rereview` refused;
+  `unblock` refuses that review, writing nothing, while the agent worktree
+  holds an untracked file, a modified, staged or assume-unchanged edit, or a
+  commit past the candidate, and enters it from a clean one (R1-F1);
+  `status` names the partial fix; the parser's schema and bounds
 - operator actions (#243, ADR 0004 K10; `tests/test_operator_actions.py`
   for the engine, unblock and `status --action`, K10 in
   `tests/test_effects.py`, the marker in `tests/test_claims.py`,
