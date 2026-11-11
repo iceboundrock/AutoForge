@@ -50,10 +50,11 @@ NOT_SHIPPED = {
 }
 # The modules that read a file relative to the package, and what they read. Each
 # read must be covered by [tool.setuptools.package-data]; the tests below check
-# the prompt templates, which are all of them today.
+# the prompt templates and the SDK helper manifest (#150).
 PACKAGE_RELATIVE_READS = {
     "autoforge/prompts/__init__.py": "prompts_dir(): the prompt templates",
     "autoforge/engine.py": "check_template_files(): the prompt templates",
+    "autoforge/sdk_assets.py": "helpers_dir(): the SDK helper manifest and shipped helpers",
 }
 # Ways to reach a package resource other than __file__; none is used today.
 RESOURCE_MODULES = ("importlib.resources", "importlib_resources", "pkgutil", "pkg_resources")
@@ -214,6 +215,24 @@ def test_every_prompt_template_is_registered_and_declared():
     assert {f"autoforge/prompts/{n}" for n in prompts.TEMPLATE_FILES} <= (
         dist_check.wheel_package_files()
     )
+
+
+def test_the_sdk_helper_manifest_and_every_shipped_helper_are_declared():
+    """#150: the manifest ships, and so does each helper it says is shipped;
+    one it says is not shipped is not in the package at all."""
+    from autoforge import sdk_assets
+
+    declared = dist_check.declared_resources()
+    assert "autoforge/sdk_helpers/manifest.json" in declared
+    assert "autoforge/sdk_helpers/manifest.json" in dist_check.wheel_package_files()
+    assert sdk_assets.helpers_dir() == PACKAGE_DIR / "sdk_helpers"
+    assert not (PACKAGE_DIR / "sdk_helpers" / "__init__.py").exists(), (
+        "sdk_helpers is a data directory: nothing imports it (ADR 0007 D2.1)"
+    )
+    for pin in sdk_assets.load_manifest().values():
+        helper = f"autoforge/sdk_helpers/{pin.file}"
+        assert (helper in declared) is pin.shipped, helper
+        assert (PACKAGE_DIR / "sdk_helpers" / pin.file).exists() is pin.shipped, helper
 
 
 def _module_reads(path: Path) -> tuple[bool, list[str]]:

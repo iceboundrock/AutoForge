@@ -227,8 +227,8 @@ credential:
    that setuptools, installed only if its SHA-256 is one the file lists
    (`--build-constraints`, `--require-hashes`), and the wheel must name it
    as its `Generator`;
-3. checks both: the exact set of files each ships (every module and every
-   prompt template, `LICENSE`, and nothing else; `MANIFEST.in` keeps the
+3. checks both: the exact set of files each ships (every module, every
+   prompt template and the SDK helper manifest, `LICENSE`, and nothing else; `MANIFEST.in` keeps the
    tests out of the sdist; none of LOCAL mode's files, its `local_*.md`
    templates, `local_workspace.py` or `run_contract.py`, whatever the tree
    declares), `LICENSE` byte for byte, and the core metadata
@@ -243,6 +243,10 @@ credential:
    installed package (never the checkout), checks that the prompt templates
    on disk are exactly the registered ones, and renders every one of them
    the way the engine does, each phase template with its common template;
+   reads the SDK helper manifest from the installed package and renders
+   each SDK provider's helper argv and plan without any SDK imported
+   (#150; the helper programs themselves, and the checks of their lock or
+   bundle, are #151's and #152's);
 6. runs a REMOTE dry run (`autoforge run --epic ... --issue ...
    --dry-run --full-prompt`) in a scratch repository whose `origin` is the
    issues' repository, with a fake `gh` first on `PATH` that records every

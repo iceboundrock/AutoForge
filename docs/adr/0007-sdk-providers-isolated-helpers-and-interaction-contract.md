@@ -9,6 +9,9 @@
   their limits, the lock rule (D7.1 to D7.4, D7.6, D7.7, with the broker
   never pausing until #126), the terminal resolver and the two type
   extensions (D10.5). Every adapter still declares no capability (D5.3).
+  #150 (EPIC #147's opt-in profiles) adds the packaged manifest of D2.2
+  without a helper program, the read-only `doctor` rows of D2.6 and a dry
+  run's plan of the helper argv, with a dated amendment of D2.2 below.
   The rest is not implemented yet.
   It is implemented by #134 (the provider-neutral
   interaction contract and its broker), #126 (the one state bump, `pause`
@@ -357,6 +360,18 @@ pinned by digest and staged per launch.**
   ADR 0005 denies the controller checkout to the launch (its D13.2), and
   an editable install and its `.venv` usually lie inside it.
 
+*Amendment (2026-11-11, #150).* The manifest exists before either helper
+program, `src/autoforge/sdk_helpers/manifest.json`, read by
+`src/autoforge/sdk_assets.py` relative to the installed package. Each
+entry records, besides the four fields above, the issue that ships the
+helper, the interpreter and its floor (D2.3, D4.4), and the runtime of the
+pair with its version (D4.1, D4.2), so that `doctor` (D2.6) and the
+adapters read one copy of the pins. `sha256` is `null` while the helper is
+not shipped: the adapter then refuses every launch, naming the issue.
+`sdk_helpers/` is a data directory with no `__init__.py`, so nothing
+imports it. #151 and #152 each set their entry's digest when they add the
+program, and a pair still moves only as D4.6 says.
+
 **D2.3 (#151).** **The Claude runtime environment is optional,
 operator-installed and separate from the controller's.**
 
@@ -434,6 +449,57 @@ launch or in `doctor`.**
   - the bundled CLI's `_cli_version.py`;
   - `node --version`;
   - the runtime's `--version`.
+
+*Amendment (2026-11-11, #150, its review's rounds 1 and 2).* Two of these
+reads wrote with the operator's access, so `doctor` makes them differently:
+
+- **The runtime's version.** The OpenCode runtime creates its data,
+  config, state and cache directories in the home it is given when it
+  starts, before it reads its arguments. 1.18.34's entry point imports the
+  module that does it. 2.2.6 also wrote a log file and a temporary
+  directory, observed under a scratch home. So `--version` is not
+  read-only, and `doctor` never runs the runtime. It resolves
+  `options.server_command` on the launch's `PATH`, as the adapter does,
+  and reads `version` from the `package.json` of the `opencode-ai` package
+  the resolved file lies in. That is where the package's postinstall puts
+  the platform binary (D2.5). A runtime in no such package is a `SKIP`
+  that says why, never an OK.
+- **The SDK's version.** `-I` keeps out `PYTHON*` variables and the user
+  site directory, but still imports `site`. `site` runs the helper
+  environment's startup hooks (an `import` line of a `.pth` file,
+  `sitecustomize`) before the probe's first line. The probe therefore runs
+  as `<interpreter> -I -S -B -c <probe>`. `-S` keeps `site` out, so the
+  probe finds the site-packages directories itself, as `site` would but
+  without running a hook. `-B` writes no bytecode. A `._pth` file can
+  import `site` even under `-S`. CPython 3.11 and later
+  (`Modules/getpath.py`) read the first one found beside the shared
+  libpython the process runs on (3.14 and later on Linux), beside the
+  interpreter as started, or beside the real base interpreter. In an
+  environment made with `venv --copies` the base interpreter is not the
+  copy's target but the file in the `home` of its `pyvenv.cfg`. The
+  round-2 review ran a hook through that file. `doctor` therefore looks
+  in all of those places without running anything. It reads every
+  `pyvenv.cfg` and every base name CPython may pick, and reads the
+  interpreter's ELF `DT_NEEDED`, `DT_RPATH` and `DT_RUNPATH` entries,
+  `LD_LIBRARY_PATH`, glibc's loader cache and the system library
+  directories for every place the loader may take libpython from. An
+  interpreter for which any of these holds a `._pth` file is not run at
+  all, and neither is one whose places cannot all be told: a script, a
+  binary that is not ELF, a search path naming `$LIB` or `$PLATFORM`, or
+  a loader cache that cannot be read. Its rows are `SKIP`s that say which.
+  `-I` ignores every `PYTHON*` variable but `PYTHONEXECUTABLE`, and
+  CPython also reads `__PYVENV_LAUNCHER__` (3.11 to 3.14 on Linux). Each
+  names the executable the interpreter takes itself to be, and a `._pth`
+  file beside that name counts as one beside the interpreter. An
+  allow-list may forward either; the round-3 review ran a hook that way.
+  The probe therefore never carries them, however the allow-list names
+  them, so the interpreter it starts is the one `command` names and the
+  places above are all it reads. The preflight's login-shell probe, which
+  `doctor` runs too, unsets them before it starts the controller's own
+  interpreter.
+
+The helper's own argv stays D2.3's: a launch runs the environment as
+installed, hooks included, inside the outer sandbox.
 
 **D2.7 (#149).** **Configuration and session roots are #149's.**
 

@@ -29,6 +29,22 @@ a launch refuses either (#165,
 :meth:`autoforge.providers.ClaudeCodeProvider.integration_preflight`,
 :meth:`autoforge.providers.OpenCodeProvider.integration_preflight`).
 
+An SDK provider's profiles (``claude-sdk``, ``opencode-sdk``; ADR 0007,
+#150) get distinct rows: whether it can launch in this release (the
+packaged helper manifest, :mod:`autoforge.sdk_assets`); the helper's
+environment against the manifest's pinned pair, each part its own row
+(the Claude helper's interpreter, the ``claude-agent-sdk`` installed in it
+and the Claude Code bundled with it, read from package metadata and files
+by one ``-I -S -B`` probe that imports no SDK and runs none of the
+environment's ``site`` hooks; Node's ``--version``; the OpenCode runtime's
+version read from its npm package's ``package.json``, never by running it,
+since it writes to the home at startup); the credential by name only;
+model access as a SKIP; and the interaction policy with the capabilities
+declared. A reachable SDK profile with no ``command`` still gets its rows,
+the failing one naming what is missing. The probes run under the launch
+allow-list without the provider's own credential, and none logs in,
+installs, or starts a session, a server or a model call.
+
 Both report the environment an agent and a repository-defined command are
 launched with, by name only (never a value), and run the launch's own
 credential preflight (#165, :func:`autoforge.child_env.preflight`): one
@@ -62,6 +78,7 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import shutil
 import stat
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -123,8 +140,11 @@ from .providers import (
     PI_DEFAULT_AGENT_DIR,
     PI_MIN_VERSION,
     PI_SYSTEM_PROMPT_FILES,
+    AgentProvider,
     ClaudeCodeProvider,
+    ClaudeSdkProvider,
     OpenCodeProvider,
+    OpenCodeSdkProvider,
     PiProvider,
     parse_opencode_version,
     parse_pi_version,
@@ -133,7 +153,23 @@ from .providers import (
 from .redaction import redact, redact_argv
 from .run_namespace import AUTOFORGE_DIRNAME, SCHEDULER_DIRNAME
 from .safefs import STATE_DIR_NEEDS_HARD_LINKS, HardLinksUnavailable, SafeRoot
-from .sdk_policy import SDK_PROVIDERS
+from .sandbox_policy import resolve_command
+from .sdk_assets import (
+    HelperPin,
+    PthFiles,
+    checked_version,
+    interpreter_pth_files,
+    parse_claude_environment,
+    parse_node_version,
+    runtime_package,
+    shown_version,
+)
+from .sdk_policy import (
+    CLAUDE_SDK_CREDENTIAL,
+    SDK_PROVIDERS,
+    claude_sdk_auth_problems,
+    opencode_sdk_auth_problems,
+)
 from .state import SUPPORTED_PROTOCOLS
 from .validation import parse_issue_url, parse_remote_repository
 
@@ -923,7 +959,10 @@ class Doctor:
         CLI, so there is no version to query. A command a Pi profile names
         gets Pi's version floor instead of a bare `--version`, and each Pi
         profile a read-only credential probe; one an OpenCode profile names
-        gets OpenCode's floor.
+        gets OpenCode's floor. An SDK profile has no default command, so one
+        without a ``command`` is grouped too, and :meth:`sdk_checks` fails
+        it by name: ``update_epic`` is reachable after a merge but not
+        validated by the config row (#150).
         """
         groups: dict[tuple[str, str], list[ProfileConfig]] = {}
         for name in reachable:
@@ -931,7 +970,7 @@ class Doctor:
             if profile is None or profile.provider == "scripted":
                 continue
             command = profile.command or DEFAULT_AGENT_COMMANDS.get(profile.provider, "")
-            if not command:
+            if not command and profile.provider not in SDK_PROVIDERS:
                 continue
             groups.setdefault((command, profile.provider), []).append(profile)
         if not groups:
@@ -954,8 +993,7 @@ class Doctor:
                 results.append(self.check_opencode_version(label, command))
                 results.append(self.check_opencode_isolation(cfg, command, profiles))
             elif provider in SDK_PROVIDERS:
-                results.append(self._version_check(label, [command, "--version"]))
-                results.append(self.check_sdk_launch(provider, profiles))
+                results.extend(self.sdk_checks(cfg, provider, profiles))
             else:
                 results.append(self._version_check(label, [command, "--version"]))
                 if provider == "claude":
@@ -969,14 +1007,451 @@ class Doctor:
 
     def check_sdk_launch(self, provider: str, profiles: list[ProfileConfig]) -> CheckResult:
         """FAIL for an SDK provider's profiles: their policy validates (#149),
-        but the helper that would launch them has not landed (#151, #152), so
-        every launch is refused before it starts."""
+        but the helper program that would launch them is not shipped (the
+        packaged manifest says so, #150) and its transport has not landed
+        (#151, #152), so every launch is refused before it starts."""
         name = f"provider {provider} can launch ({', '.join(p.name for p in profiles)})"
         try:
             provider_for(profiles[0]).integration_preflight(None)
         except ConfigurationError as exc:
             return CheckResult(name, False, redact(str(exc)))
         return CheckResult(name, True, "its helper is available")
+
+    # -- the SDK providers (ADR 0007 D2.6; #150) -------------------------------------
+    def sdk_checks(
+        self, cfg: AutoForgeConfig, provider: str, profiles: list[ProfileConfig]
+    ) -> list[CheckResult]:
+        """The rows of one SDK provider's profiles that name one ``command``.
+
+        Each says one thing, so each failure names its own remedy:
+
+        - whether the provider can launch in this release
+          (:meth:`check_sdk_launch`: the helper program, from the packaged
+          manifest);
+        - the helper's environment against the manifest's pinned pair: for
+          ``claude-sdk`` the interpreter, the SDK installed in it and the
+          Claude Code bundled with that SDK; for ``opencode-sdk`` Node and
+          each OpenCode runtime ``options.server_command`` names;
+        - the credential, by name: whether the variable a launch would
+          carry is set, never its value;
+        - model access: a SKIP, since only a model call could show it;
+        - interactions: each profile's policy and the capabilities its
+          adapter declares (ADR 0007 D5.3).
+
+        Read-only (ADR 0007 D2.6 and its amendment): the Claude environment
+        probe under ``-I -S -B``, so none of the environment's ``site`` hooks
+        runs and no bytecode is written, and never with an interpreter a
+        ``._pth`` file could make import ``site`` anyway (beside it, its
+        virtual environment's base or its libpython), nor with one for which
+        that cannot be told; ``node
+        --version``; and the OpenCode runtime's ``package.json``, read as a
+        file, since running the runtime writes to the home even for
+        ``--version``. The probes run under the launch allow-list without
+        the provider's own credential, the Claude probe also without the
+        two variables CPython reads at startup even under ``-I``
+        (``PYTHONEXECUTABLE``, ``__PYVENV_LAUNCHER__``), which would point
+        it at a ``._pth`` file doctor did not look for, however the
+        allow-list names them; their output is never quoted. No SDK is
+        imported, and nothing logs in, refreshes, installs, or starts a
+        session, a server or a model call; no credential file is opened.
+
+        The profiles are validated first: one reachable only after a merge
+        (``update_epic``) is not validated by the config row, and one with
+        no ``command`` reaches here too, so its FAIL names what is missing.
+        """
+        names = ", ".join(p.name for p in profiles)
+        adapter = provider_for(profiles[0])
+        rows = [self.check_sdk_launch(provider, profiles)]
+        if not isinstance(adapter, ClaudeSdkProvider | OpenCodeSdkProvider):
+            return rows
+        try:
+            # The config row validates the required profiles; one reachable
+            # only after a merge (update_epic) is validated here.
+            for profile in profiles:
+                adapter.validate_profile(profile)
+        except ConfigurationError as exc:
+            return [*rows, CheckResult(f"{provider} profiles ({names})", False, redact(str(exc)))]
+        try:
+            pin = adapter.helper()
+        except ConfigurationError as exc:
+            # The launch row already fails with the same reason.
+            return [*rows, CheckResult.skip(f"{provider} runtime ({names})", redact(str(exc)))]
+        if isinstance(adapter, ClaudeSdkProvider):
+            rows.extend(self._claude_sdk_environment(adapter, pin, profiles, names))
+        else:
+            rows.extend(self._opencode_sdk_runtimes(adapter, pin, profiles, names))
+        rows.append(self._sdk_credential(cfg, adapter, profiles, names))
+        rows.append(
+            CheckResult.skip(
+                f"{provider} model access ({names})",
+                "the configuration accepts "
+                + "; ".join(f"{p.name}: model {p.model}, effort {p.effort}" for p in profiles)
+                + "; whether the credential may use them is known only to a model call, "
+                "which doctor never makes",
+            )
+        )
+        rows.append(self._sdk_interactions(adapter, profiles, names))
+        return rows
+
+    def _sdk_probe(
+        self, adapter: ClaudeSdkProvider | OpenCodeSdkProvider, argv: list[str]
+    ) -> ExecutionResult | str:
+        """Run one version probe of an SDK provider: the result, or why it did not run.
+
+        Its environment is the launch allow-list's filter of the configured
+        names, without the provider's own credential and without the names
+        the adapter withholds from a probe however they are listed
+        (:meth:`~autoforge.providers.ClaudeSdkProvider.probe_allowlist`).
+        """
+        cfg = self.config if self.config is not None else AutoForgeConfig()
+        try:
+            res = self._runner(
+                ExecutionRequest(
+                    command=argv,
+                    cwd=self.cwd,
+                    timeout_seconds=self.timeout,
+                    env_allowlist=adapter.probe_allowlist(cfg.execution.agent_environment_names()),
+                )
+            )
+        except Exception as exc:  # spawn failure / missing binary
+            return redact(f"{type(exc).__name__}: {exc}")
+        return "timed out" if res.timed_out else res
+
+    def _pth_files(self, command: str) -> PthFiles:
+        """The ``._pth`` files the interpreter ``command`` would read when it
+        starts (:func:`autoforge.sdk_assets.interpreter_pth_files`): a bare
+        name as the launch's ``PATH`` finds it, a relative path against the
+        probe's directory, with this process's ``LD_LIBRARY_PATH`` (the probe
+        carries it or nothing). The probe never carries a variable that
+        names the interpreter otherwise
+        (:data:`~autoforge.child_env.PYTHON_STARTUP_NAMES`),
+        so these are the places it reads. Nothing when it is not found: the
+        probe then fails to start, and its row says so."""
+        if "/" in command:
+            found = command
+        else:
+            found = shutil.which(command, path=os.environ.get("PATH")) or ""
+        if not found:
+            return PthFiles(())
+        return interpreter_pth_files(found, self.cwd, os.environ.get("LD_LIBRARY_PATH", ""))
+
+    def _claude_sdk_environment(
+        self,
+        adapter: ClaudeSdkProvider,
+        pin: HelperPin,
+        profiles: list[ProfileConfig],
+        names: str,
+    ) -> list[CheckResult]:
+        """The interpreter, the SDK and the bundled Claude Code, as three rows."""
+        command = profiles[0].command
+        interpreter = f"claude-sdk helper environment '{command}' ({names})"
+        sdk = f"claude-sdk SDK package in '{command}' ({names})"
+        runtime = f"claude-sdk runtime in '{command}' ({names})"
+        floor = shown_version(pin.interpreter_minimum)
+        argv = adapter.environment_probe_command(profiles[0])
+        shown = f"{' '.join(argv[:-1])} <the read-only metadata probe>"
+        overrides = self._pth_files(command)
+        if overrides.found or overrides.unknown:
+            hooks = (
+                "can make it import site even under -S, and with it run the environment's "
+                "startup hooks (.pth import lines, sitecustomize), so doctor runs nothing "
+                "with it"
+            )
+            if overrides.found:
+                why = (
+                    f"{', '.join(overrides.found)}, where Python looks for a ._pth file when "
+                    f"'{command}' starts (beside it, its virtual environment's base "
+                    f"interpreter or its libpython), {hooks}. A helper environment needs no "
+                    "._pth file: name an interpreter without one"
+                )
+            else:
+                why = (
+                    "doctor cannot tell every place Python looks for a ._pth file when "
+                    f"'{command}' starts ({overrides.unknown}), and such a file {hooks}. "
+                    "Name the environment's own interpreter (its bin/python)"
+                )
+            skipped = "(the helper environment was not probed; see its row)"
+            return [
+                CheckResult.skip(
+                    interpreter,
+                    f"not probed: {why}, or check the environment yourself against {pin.pair()}",
+                ),
+                CheckResult.skip(sdk, skipped),
+                CheckResult.skip(runtime, skipped),
+            ]
+        res = self._sdk_probe(adapter, argv)
+        found = None
+        if isinstance(res, str):
+            problem = (
+                f"cannot run it: {res}; create the separate helper environment (a "
+                f"{pin.interpreter} >= {floor} environment outside the checkout) and name "
+                "its interpreter in the profile's command (docs/configuration.md, 'SDK "
+                "providers')"
+            )
+        elif res.exit_code != 0:
+            problem = f"`{shown}` exited {res.exit_code} (output not shown; run it yourself)"
+        else:
+            found = parse_claude_environment(res.stdout or "")
+            problem = f"cannot read the answer of `{shown}` (output not shown)"
+        if found is None:
+            skipped = "(the helper environment could not be probed; see its row)"
+            return [
+                CheckResult(interpreter, False, problem),
+                CheckResult.skip(sdk, skipped),
+                CheckResult.skip(runtime, skipped),
+            ]
+        python = shown_version(found.python)
+        rows = [
+            CheckResult(interpreter, True, f"{pin.interpreter} {python} (>= {floor})")
+            if found.python >= pin.interpreter_minimum
+            else CheckResult(
+                interpreter,
+                False,
+                f"{pin.interpreter} {python}: the Claude helper needs {pin.interpreter} >= "
+                f"{floor} (ADR 0007 D2.3)",
+            )
+        ]
+        install = f"install {pin.sdk_package}=={pin.sdk_version} there, from its platform wheel"
+        if found.sdk_version is None:
+            rows.append(
+                CheckResult(sdk, False, f"{pin.sdk_package} is not installed there: {install}")
+            )
+            rows.append(
+                CheckResult.skip(runtime, f"(no {pin.sdk_package}, so no bundled {pin.runtime})")
+            )
+            return rows
+        if found.sdk_version != pin.sdk_version:
+            rows.append(
+                CheckResult(
+                    sdk,
+                    False,
+                    f"{pin.sdk_package} {found.sdk_version}: not the supported pair, "
+                    f"{pin.pair()} (ADR 0007 D4.1); {install}",
+                )
+            )
+        else:
+            rows.append(CheckResult(sdk, True, f"{pin.sdk_package} {found.sdk_version}"))
+        if not found.bundled:
+            rows.append(
+                CheckResult(
+                    runtime,
+                    False,
+                    f"{pin.sdk_package} {found.sdk_version} carries no bundled {pin.runtime} "
+                    "executable (installed from an sdist, or no wheel for this platform): "
+                    "there is no Claude SDK backend here, and AutoForge never uses a claude "
+                    f"found on PATH instead (ADR 0007 D2.4); {install}",
+                )
+            )
+        elif found.cli_version is None:
+            rows.append(
+                CheckResult(
+                    runtime,
+                    False,
+                    f"the version of the {pin.runtime} bundled with {pin.sdk_package} cannot "
+                    f"be read; {install}",
+                )
+            )
+        elif found.cli_version != pin.runtime_version:
+            rows.append(
+                CheckResult(
+                    runtime,
+                    False,
+                    f"{pin.runtime} {found.cli_version} (bundled): not the supported pair, "
+                    f"{pin.pair()} (ADR 0007 D4.1); {install}",
+                )
+            )
+        else:
+            rows.append(
+                CheckResult(
+                    runtime,
+                    True,
+                    f"{pin.runtime} {found.cli_version}, bundled with {pin.sdk_package}",
+                )
+            )
+        return rows
+
+    def _opencode_sdk_runtimes(
+        self,
+        adapter: OpenCodeSdkProvider,
+        pin: HelperPin,
+        profiles: list[ProfileConfig],
+        names: str,
+    ) -> list[CheckResult]:
+        """Node, then each OpenCode runtime the profiles name, one row each."""
+        command = profiles[0].command
+        floor = shown_version(pin.interpreter_minimum)
+        row = f"opencode-sdk Node '{command}' ({names})"
+        argv = adapter.node_version_command(profiles[0])
+        res = self._sdk_probe(adapter, argv)
+        if isinstance(res, str):
+            rows = [
+                CheckResult(
+                    row,
+                    False,
+                    f"cannot run it: {res}; install {pin.interpreter} {floor} or later and "
+                    "name it in the profile's command",
+                )
+            ]
+        elif res.exit_code != 0:
+            rows = [
+                CheckResult(
+                    row,
+                    False,
+                    f"`{' '.join(argv)}` exited {res.exit_code} (output not shown; run it "
+                    "yourself)",
+                )
+            ]
+        else:
+            node = parse_node_version(res.stdout or "")
+            if node is None:
+                detail = (
+                    f"cannot read the {pin.interpreter} version from `{' '.join(argv)}` "
+                    f"(output not shown; need >= {floor})"
+                )
+            elif node < pin.interpreter_minimum:
+                detail = (
+                    f"{pin.interpreter} {shown_version(node)}: the OpenCode bridge needs "
+                    f"{pin.interpreter} >= {floor} (ADR 0007 D4.4)"
+                )
+            else:
+                detail = f"{pin.interpreter} {shown_version(node)} (>= {floor})"
+            rows = [CheckResult(row, node is not None and node >= pin.interpreter_minimum, detail)]
+        servers: dict[str, list[ProfileConfig]] = {}
+        for profile in profiles:
+            servers.setdefault(adapter.policy(profile).server_command, []).append(profile)
+        for server, group in servers.items():
+            rows.append(self._opencode_sdk_runtime(pin, server, group))
+        return rows
+
+    def _opencode_sdk_runtime(
+        self,
+        pin: HelperPin,
+        server: str,
+        profiles: list[ProfileConfig],
+    ) -> CheckResult:
+        """The OpenCode runtime ``server`` names, by its npm package's version.
+
+        Never by running it: the runtime creates its data, config, state and
+        cache directories in the home it is given when it starts, before it
+        reads its arguments, so even ``--version`` writes to the operator's
+        home (ADR 0007 D2.6's amendment). ``server`` is resolved on the
+        launch's ``PATH`` as the adapter resolves it, and the version is read
+        from the ``package.json`` of the ``opencode-ai`` package the resolved
+        file lies in (:func:`autoforge.sdk_assets.runtime_package`). A
+        runtime in no such package is a SKIP: its version is not readable
+        without running it, and doctor never claims what it did not read.
+        """
+        row = f"opencode-sdk runtime '{server}' ({', '.join(p.name for p in profiles)})"
+        wanted = f"install {pin.runtime} {pin.runtime_version} and name its binary in "
+        wanted += "options.server_command"
+        resolved = resolve_command(server, os.environ.get("PATH"))
+        if not resolved:
+            return CheckResult(row, False, f"not an executable file on the launch's PATH; {wanted}")
+        package = runtime_package(resolved)
+        if package is None or package[0] != pin.runtime:
+            return CheckResult.skip(
+                row,
+                f"its version is not readable without running it: {resolved} lies in no "
+                f"{pin.runtime} package (no {pin.runtime} package.json above it), and the "
+                "runtime creates its data, config, state and cache directories in the home "
+                "when it starts, even for --version, so doctor does not run it. Install "
+                f"{pin.runtime} {pin.runtime_version} with npm and name the binary it links "
+                f"in options.server_command, or check `{server} --version` yourself (the "
+                f"supported pair is {pin.pair()})",
+            )
+        version = package[1]
+        if checked_version(version) is None:
+            return CheckResult(
+                row,
+                False,
+                f"cannot read the version in {pin.runtime}'s package.json above {resolved} "
+                f"(not shown; need {pin.runtime_version}); {wanted}",
+            )
+        shown = f"{pin.runtime} {version}"
+        if version != pin.runtime_version:
+            return CheckResult(
+                row,
+                False,
+                f"{shown}: not the supported pair, {pin.pair()} (ADR 0007 D4.2); the "
+                f"opencode CLI provider's release line is separate (D2.5); {wanted}",
+            )
+        return CheckResult(
+            row, True, f"{shown}, read from its package.json (the runtime is never run)"
+        )
+
+    def _sdk_credential(
+        self,
+        cfg: AutoForgeConfig,
+        adapter: ClaudeSdkProvider | OpenCodeSdkProvider,
+        profiles: list[ProfileConfig],
+        names: str,
+    ) -> CheckResult:
+        """Whether each credential a launch would carry is set: by name only.
+
+        The value is neither shown nor kept: the check sees which names of
+        the launch's allow-list are set, as ``"set"``. A key that is set is
+        not a key that works: entitlement and billing are a model call's to
+        show (ADR 0007 D10.2; docs/sdk-policy.md §5, §9).
+        """
+        row = f"{adapter.name} credential ({names})"
+        base = cfg.execution.agent_environment_names()
+        problems: list[str] = []
+        credentials: list[str] = []
+        for profile in profiles:
+            present = {
+                name: "set"
+                for name in adapter.profile_allowlist(base, profile)
+                if os.environ.get(name)
+            }
+            if isinstance(adapter, ClaudeSdkProvider):
+                problems += claude_sdk_auth_problems(present)
+                credentials.append(CLAUDE_SDK_CREDENTIAL)
+            else:
+                policy = adapter.policy(profile)
+                problems += opencode_sdk_auth_problems(policy, present)
+                credentials.append(policy.credential_env)
+        if problems:
+            return CheckResult(row, False, redact("; ".join(dict.fromkeys(problems))))
+        return CheckResult(
+            row,
+            True,
+            f"{', '.join(dict.fromkeys(credentials))} set in the environment a launch "
+            "inherits (whether it is set, never its value); a key that is set is not proven "
+            "valid, entitled to the model or billed: only a model call shows that, and "
+            "doctor makes none",
+        )
+
+    @staticmethod
+    def _sdk_interactions(
+        adapter: AgentProvider, profiles: list[ProfileConfig], names: str
+    ) -> CheckResult:
+        """Each profile's interaction policy and what the adapter declares it can carry."""
+        policies = []
+        for profile in profiles:
+            settings = adapter.interaction_settings(profile)
+            policies.append(f"{profile.name} {settings.policy if settings else 'fail'}")
+        capabilities = adapter.interaction_capabilities(profiles[0])
+        declared = [
+            name
+            for name in (
+                "live_questions",
+                "live_permissions",
+                "durable_replay",
+                "continuation_recovery",
+                "interrupt",
+            )
+            if getattr(capabilities, name)
+        ]
+        detail = f"interaction_policy: {', '.join(policies)}; capabilities declared: "
+        if declared:
+            detail += ", ".join(declared)
+        else:
+            detail += (
+                "none yet (ADR 0007 D5.3: one is declared only once its gates pass on the "
+                "pinned pair), so an ask fails the invocation under every policy, and pause "
+                "is refused"
+            )
+        return CheckResult(f"{adapter.name} interactions ({names})", True, detail, required=False)
 
     def check_pi_outside_instructions(self, profiles: list[ProfileConfig]) -> CheckResult:
         """WARN when Pi would load instruction files from outside the checkout.

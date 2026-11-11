@@ -14,10 +14,17 @@
     network or SDK import, and no change to the controller's environment.
   - `src/autoforge/providers.py` holds the adapters `ClaudeSdkProvider`
     and `OpenCodeSdkProvider`: names, option keys, validation, the launch
-    allow-list and the sandbox declaration.
+    allow-list, the sandbox declaration, and (#150) the helper's argv, a
+    dry run's plan notes and the commands of `doctor`'s version probes.
+  - `src/autoforge/sdk_assets.py` (#150) reads the packaged helper
+    manifest, `src/autoforge/sdk_helpers/manifest.json`: each helper
+    program, its envelope and protocol, whether this release ships it,
+    and the pinned pair (ADR 0007 D2.2, D4.1, D4.2, D4.4).
   - `src/autoforge/config.py` holds the provider names and the
     interaction-wait check in `agent_limits`.
-  - `src/autoforge/doctor.py` holds the "can launch" row.
+  - `src/autoforge/doctor.py` holds the SDK rows: "can launch", the
+    helper environment against the pinned pair, the credential by name,
+    model access and interactions ([Configuration](configuration.md#what-doctor-checks)).
   - `src/autoforge/redaction.py` holds the new credential names.
 - **Evidence base.** Each decision below has one of these statuses:
   - **verified on CLI 2.1.304**: observed by running the Claude Code CLI

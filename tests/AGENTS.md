@@ -437,6 +437,15 @@ Claude stream-json reducer            test_claude_stream.py (adapter on the fake
 SDK policy (#149): options, tools,    test_sdk_policy.py (opt-in probes of an installed Claude
 roots, credentials, environment,      Code CLI or OpenCode runtime against sentinel
 interaction data, the adapters        configuration, each with a control run)
+SDK profiles (#150): the helper       test_sdk_profiles.py (the probe run on a synthetic helper
+manifest, the argv and dry-run plan,  environment with a live .pth hook, whose SDK fails on
+switching, the example, doctor rows   import; a copied environment whose base has a live
+                                      ._pth file; synthetic ELF files and loader cache for
+                                      the libpython ._pth; a forwarded PYTHONEXECUTABLE or
+                                      __PYVENV_LAUNCHER__ naming a live ._pth file; long
+                                      malformed versions); the doctor rows, and the OpenCode
+                                      runtime stand-in that writes when started:
+                                      test_doctor.py; the wheel: test_packaging.py
 live progress, its redaction          test_progress.py
 loop detector (unit and end to end)   test_loop_detect.py (adapters: test_providers.py,
                                       test_pi_rpc.py, test_claude_stream.py)

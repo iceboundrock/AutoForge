@@ -629,6 +629,16 @@ OPENCODE_SDK_OPTION_KEYS = (
 # model credential (no store of ``opencode auth login`` is used).
 _CREDENTIAL_ENV_RE = re.compile(r"[A-Z][A-Z0-9_]{0,55}_API_KEY")
 _SERVER_COMMAND_RE = re.compile(r"[^\x00-\x20\x7f]{1,4096}")
+
+
+def collection_text(value: str) -> bool:
+    """Whether ``value`` is the text the configuration loader makes of a list
+    or a mapping (``"['opencode']"``): every option value is one scalar
+    (``config._as_options``), so such a value is refused where it would name
+    an executable, never passed to a helper as one (#150)."""
+    return value.startswith(("[", "{"))
+
+
 _OPENCODE_MODEL_RE = re.compile(r"[a-z0-9][a-z0-9._-]*/[^\s#]+")
 
 
@@ -745,11 +755,12 @@ def opencode_sdk_policy(profile_name: str, options: Mapping[str, str]) -> OpenCo
         )
     interaction = interaction_settings(options, where)
     server_command = options.get("server_command", "")
-    if not _SERVER_COMMAND_RE.fullmatch(server_command):
+    if not _SERVER_COMMAND_RE.fullmatch(server_command) or collection_text(server_command):
         raise ConfigurationError(
             f"{where}: {OPENCODE_SDK} needs option server_command, the OpenCode runtime "
-            "binary of the pinned release (a command name or an absolute path, with no "
-            f"whitespace or control character; ADR 0007 D2.5), got {server_command!r}"
+            "binary of the pinned release (one command name or absolute path, with no "
+            "whitespace or control character, never a list or mapping; ADR 0007 D2.5), "
+            f"got {server_command!r}"
         )
     credential = options.get("credential_env", "")
     if not _CREDENTIAL_ENV_RE.fullmatch(credential) or (

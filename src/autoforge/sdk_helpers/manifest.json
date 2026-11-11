@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "helpers": {
+    "claude-sdk": {
+      "envelope": "autoforge-claude-helper",
+      "protocol": 1,
+      "file": "claude_helper.py",
+      "sha256": null,
+      "implemented_by": "#151",
+      "interpreter": {"name": "Python", "minimum": "3.10"},
+      "sdk": {"package": "claude-agent-sdk", "version": "0.2.163"},
+      "runtime": {"name": "Claude Code", "version": "2.1.286"}
+    },
+    "opencode-sdk": {
+      "envelope": "autoforge-opencode-bridge",
+      "protocol": 1,
+      "file": "opencode_bridge.mjs",
+      "sha256": null,
+      "implemented_by": "#152",
+      "interpreter": {"name": "Node", "minimum": "24"},
+      "sdk": {"package": "@opencode-ai/sdk", "version": "1.18.34"},
+      "runtime": {"name": "opencode-ai", "version": "1.18.34"}
+    }
+  }
+}

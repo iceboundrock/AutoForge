@@ -175,6 +175,9 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/scheduler.py": ("test_worker",),
     "src/autoforge/scheduler_state.py": (),
     "src/autoforge/scheduler_stop.py": (),
+    "src/autoforge/sdk_assets.py": ("test_sdk_profiles", "test_doctor", "test_packaging"),
+    # the packaged helper manifest (#150)
+    "src/autoforge/sdk_helpers/": ("test_sdk_profiles", "test_packaging"),
     "src/autoforge/sdk_policy.py": ("test_cli",),
     # the engine's sinks and the CLI's stop lines import it (#369)
     "src/autoforge/stop_classification.py": ("test_cli", "test_engine"),

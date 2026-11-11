@@ -39,7 +39,9 @@ imports the ``autoforge`` of the source tree:
 4. From that environment: ``autoforge --version`` and ``autoforge --help``;
    every prompt template loaded and rendered from the installed package
    (this file again, with ``--installed``, on the environment's own
-   interpreter); and a REMOTE ``autoforge run --dry-run --full-prompt`` in
+   interpreter), with the SDK helper manifest read from it and an SDK
+   profile's helper argv and plan rendered without any SDK imported
+   (#150); and a REMOTE ``autoforge run --dry-run --full-prompt`` in
    a scratch git repository whose ``origin`` is the issue's repository,
    with a ``gh`` on ``PATH`` that records any call, answers the reads a
    run makes before its first save (#293: the repository, then the issue,
@@ -1193,7 +1195,41 @@ def check_installed(expect_version: str, source_root: Path) -> None:
         rendered.add(name)
     _check(rendered == set(prompts.TEMPLATE_FILES), "not every template was rendered")
     _say(f"ok: rendered all {len(rendered)} prompt templates from {directory}")
+    _check_sdk_assets(prefix)
     _say(f"ok: {dist.metadata['Name']} {dist.version} imported from {location.parent}")
+
+
+def _check_sdk_assets(prefix: Path) -> None:
+    """#150: the installed package reads its own SDK helper manifest, and an
+    SDK profile's helper argv and plan are rendered without importing an SDK."""
+    from autoforge import sdk_assets
+    from autoforge.config import ProfileConfig, validate_profile
+    from autoforge.providers import provider_for
+    from autoforge.sdk_policy import SDK_PROVIDERS
+
+    manifest = sdk_assets.manifest_path().resolve()
+    _check(manifest.is_relative_to(prefix), f"SDK helper manifest read from {manifest}")
+    pins = sdk_assets.load_manifest()
+    _check(sorted(pins) == sorted(SDK_PROVIDERS), f"manifest names {sorted(pins)}")
+    profiles = [
+        ProfileConfig("analyze_execute", "claude-sdk", "fable", command="python3"),
+        ProfileConfig(
+            "review_round_1",
+            "opencode-sdk",
+            "openai/m",
+            command="node",
+            options={"server_command": "opencode", "credential_env": "OPENAI_API_KEY"},
+        ),
+    ]
+    for profile in profiles:
+        validate_profile(profile)
+        adapter = provider_for(profile)
+        argv = adapter.build_command_for(profile, "PROMPT")
+        _check("PROMPT" not in argv, f"{profile.provider}'s argv carries the prompt: {argv}")
+        _check(bool(adapter.plan_notes(profile, ("PATH",))), f"{profile.provider}: no plan")
+    imported = sorted(n for n in sys.modules if n.split(".")[0] == "claude_agent_sdk")
+    _check(not imported, f"an SDK was imported: {imported}")
+    _say(f"ok: SDK helper manifest read from {manifest}; SDK plans rendered without an SDK")
 
 
 def main(argv: list[str] | None = None) -> int:

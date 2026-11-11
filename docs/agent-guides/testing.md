@@ -2429,8 +2429,9 @@ boundary (`tests/test_sdk_policy.py`). Keep covered:
   input, option, answer or modified input is refused, never clipped. Two
   options shown alike are refused, and a permission ask shows only
   allow-listed keys;
-- every launch path refuses (`integration_preflight`, `build_command_for`,
-  `execute`), and `doctor` fails the "can launch" row;
+- every launch path refuses (`integration_preflight`, `execute`), and
+  `doctor` fails the "can launch" row; `build_command_for` renders the
+  helper's argv for a plan, never the prompt (#150);
 - the interaction wait is below both agent limits under `prompt`.
 
 The opt-in probes (`AUTOFORGE_CLAUDE_SDK_PROBE_CLI`,
@@ -2439,6 +2440,55 @@ policy against sentinel hooks, MCP servers, skills, agents and instruction
 files, and assert that none loads. A control run without the policy
 asserts that the probe can see them load. Re-run both whenever a pin, a
 policy field or a runtime changes.
+
+### SDK profiles (#150, docs/configuration.md "SDK profiles")
+
+`tests/test_sdk_profiles.py`, with the doctor rows in `tests/test_doctor.py`.
+Keep covered:
+
+- the packaged manifest: ADR 0007's pairs, a helper marked shipped only
+  when the package holds it with that digest, and a damaged manifest
+  refused whole with "reinstall"; it is read from the package, and the
+  installed wheel's copy is checked by `make dist-check`;
+- the helper's argv never carries the prompt, and a dry run's plan names
+  the helper, runtime, policy and environment by name only, with no SDK
+  imported and nothing launched or written;
+- switching a default profile to an SDK provider keeps none of its
+  command, options or extra arguments, and switching back restores the
+  argv exactly, in JSON, TOML and both YAML backends; a list given for an
+  SDK executable or option is refused there too;
+- the commented example loads and validates in every backend and leaves
+  the merge gate closed;
+- `doctor`: one row per part (interpreter, SDK, bundled CLI; Node, each
+  runtime; credential; model access as a SKIP; interactions), each failure
+  its own remedy, no probe output or credential value quoted, the probes'
+  exact commands and environment names (no credential, no foreign name),
+  and no row or probe for an SDK profile no phase reaches; a reachable
+  one with no `command` (`update_epic`, both providers, in `run_all` and
+  through `autoforge doctor`) fails by name;
+- `doctor` writes nothing with the operator's access (ADR 0007 D2.6's
+  amendment, #150's review): the Claude probe, run for real on a helper
+  environment whose `.pth` import line is live (a control run shows it
+  runs under `-I` alone), runs no hook; an interpreter for which Python
+  would read a `._pth` file is not run: beside it as named or resolved,
+  beside a copied environment's base interpreter (`venv --copies`, run
+  for real: a control run shows the base's `._pth` runs `sitecustomize`
+  under `-I -S -B`, and doctor's real probe never starts), or beside the
+  libpython the loader may take (synthetic ELF files and loader cache);
+  nor one whose places cannot be told (a wrapper script, run for real,
+  never starts); with `PYTHONEXECUTABLE` or `__PYVENV_LAUNCHER__` set and
+  forwarded, exactly or by a prefix (a control run shows a `._pth` file
+  beside the name it gives runs `sitecustomize` under `-I -S -B`), the
+  probe, run for real, never carries it, its rows read the environment
+  itself, and no hook runs, the login-shell probe's included (which
+  unsets both, whether the allow-list or a startup file set them, and
+  fails when one is read-only: `test_child_env.py`); a malformed version
+  of any length, from the probe or a `package.json`, is refused at once,
+  in a child with a timeout so a pattern that backtracks fails instead of
+  stalling the suite; the OpenCode runtime is a stand-in that writes to the home,
+  XDG and TMPDIR directories when it starts (a control run shows it), and
+  with any probe of it run for real the runtime never starts and those
+  directories stay as they were.
 
 ### Interaction contract and broker (#134, ADR 0007)
 
