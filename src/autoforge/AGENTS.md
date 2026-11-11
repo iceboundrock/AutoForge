@@ -39,7 +39,8 @@ sdk_assets.py       the SDK helpers' packaged manifest (sdk_helpers/manifest.jso
                     pinned pair and interpreter floor), the helper digest check, and
                     doctor's read-only probes: the Claude environment probe and its
                     parser, the ._pth check (beside the interpreter, its venv's base,
-                    its libpython: pyvenv.cfg, ELF dynamic section, loader cache), the
+                    its libpython: pyvenv.cfg, ELF dynamic section, loader cache; the
+                    probe never carries child_env.PYTHON_STARTUP_NAMES), the
                     OpenCode runtime's package.json read (the runtime is never run);
                     provider layer, reads files only, runs nothing, imports no SDK (#150)
 interaction.py      provider-neutral interaction contract (requests, decisions,

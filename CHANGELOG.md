@@ -17,7 +17,9 @@ Node (24 or newer) and the OpenCode runtime `options.server_command` names
 (`opencode-ai` 1.18.34). It reads versions only: it imports no SDK, runs
 none of the helper environment's `site` startup hooks (an interpreter that
 a `._pth` file could make run them, or for which doctor cannot tell, is
-not run at all, and its rows are `SKIP`s), never runs the
+not run at all, and its rows are `SKIP`s; and the probe never carries
+`PYTHONEXECUTABLE` or `__PYVENV_LAUNCHER__`, which Python reads even under
+`-I`, whatever your allow-list forwards), never runs the
 OpenCode runtime (which writes to your home when it starts, even for
 `--version`: its version is read from its npm package), installs nothing,
 starts no session, server or model call, and shows whether the credential
@@ -26,6 +28,12 @@ is a `SKIP`, as is model access, since only a model call could show it. A
 profile no phase reaches is not checked, so a configuration without SDK
 profiles needs no SDK and no Node. One `update_epic` names is checked, and
 fails by name when it has no `command`.
+
+The login-shell probe that runs before every launch, and in `doctor`,
+now unsets `PYTHONEXECUTABLE` and `__PYVENV_LAUNCHER__` before it starts
+AutoForge's own interpreter, so neither can make that interpreter run a
+`sitecustomize` from elsewhere. A startup file that makes either
+read-only now fails the probe.
 
 A dry run of an SDK-routed phase used to stop with the launch refusal. It
 now shows the helper's argv, which never carries the prompt, with notes on

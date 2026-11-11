@@ -1878,7 +1878,11 @@ never the boundary.
   once as `<shell> -l -c <probe>`, in the launch's directory and
   environment (its allow-list, the controller-set variables, the operator's
   `HOME`), through the executor with orphan containment. Once the startup
-  files have run, the shell `exec`s the controller's own interpreter
+  files have run, the shell unsets `PYTHONEXECUTABLE` and
+  `__PYVENV_LAUNCHER__` (`child_env.PYTHON_STARTUP_NAMES`, which CPython
+  reads even under `-I`, and either would make it read a `._pth` file
+  elsewhere; one it cannot unset ends the probe as a problem) and `exec`s
+  the controller's own interpreter
   (`python -I -S`), which reads the environment the shell exports, what
   everything it starts inherits: it compares every controller-set variable
   with its value and looks for every withheld name, and prints after a

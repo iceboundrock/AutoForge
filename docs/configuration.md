@@ -791,7 +791,11 @@ is not run, and its rows are `SKIP`s that name the file. They are also
 `command` is a wrapper script or a binary that is not ELF, when the
 binary's library search path names `$LIB` or `$PLATFORM`, or when the
 loader's cache cannot be read. Name the environment's own `bin/python`
-instead.
+instead. The probe never carries `PYTHONEXECUTABLE` or
+`__PYVENV_LAUNCHER__`, even when an allow-list such as
+`execution.agent_env_allowlist_extra` names them: Python reads both even
+under `-I`, and each would make it read a `._pth` file beside another
+name.
 
 The OpenCode runtime is never run: it creates its directories in your
 home when it starts, even for `--version`. `doctor` resolves
@@ -1051,6 +1055,10 @@ An `export GH_TOKEN=...` in `~/.bash_profile` refuses the launch, naming
 `bash` and `GH_TOKEN`; move it where only an interactive shell runs it
 (in `~/.bashrc` after the usual `case $- in *i*) ;; *) return;; esac`).
 A zsh startup file is never a problem: a launch's zsh reads none of yours.
+The check unsets `PYTHONEXECUTABLE` and `__PYVENV_LAUNCHER__` before it
+starts AutoForge's own Python, since Python reads both even under `-I`;
+a startup file that makes either read-only means the shell could not be
+checked.
 For an agent the run stops before anything is recorded, so it
 can simply be run again once the setting is removed; for a validation or
 pre-merge command it counts as that command failing. `autoforge doctor`

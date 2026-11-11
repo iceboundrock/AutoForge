@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from autoforge import sdk_assets
+from autoforge.child_env import PYTHON_STARTUP_NAMES
 from autoforge.config import (
     ProfileConfig,
     default_config,
@@ -34,6 +35,7 @@ from autoforge.config import (
     validate_required_profiles,
 )
 from autoforge.errors import ConfigurationError
+from autoforge.executor import select_environment
 from autoforge.profiles import REQUIRED_PROFILES
 from autoforge.providers import ClaudeSdkProvider, OpenCodeSdkProvider, provider_for
 from autoforge.sdk_assets import (
@@ -211,6 +213,95 @@ def test_node_versions_are_read_from_one_line(text, found):
 )
 def test_only_text_that_reads_as_a_version_is_shown(text, found):
     assert checked_version(text) == found
+
+
+@pytest.mark.parametrize(
+    "text, found",
+    [
+        ("2.1.0rc1", True),
+        ("1.0.0-beta.1+build", True),
+        ("1.0.0-beta.1+build.5", False),
+        ("2.1.0rc1.post2-dev3", True),
+        ("2.1.0rc1.post2-dev3.x", False),
+        ("1.2.3.4.5.6.7", True),
+        ("1.2.3.4.5.6.7.8", False),
+        ("1.2.3-a.b.c", True),
+        ("1.2.3-a.b.c.d", False),
+        ("1.2.", False),
+        ("1.2.3-", False),
+        ("1.2.3--a", False),
+        ("1", False),
+        ("1." + "2" * 62, True),
+        ("1." + "2" * 63, False),
+    ],
+)
+def test_a_version_reads_as_a_release_and_up_to_three_suffix_parts(text, found):
+    """The forms :func:`checked_version` shows, and the edges of each: two
+    to four release numbers, then at most three suffix parts, the first of
+    which may start with a letter right after the release; nothing longer
+    than 64 characters."""
+    assert (checked_version(text) == text) is found
+
+
+# Malformed versions a damaged or hostile package.json or probe answer may
+# carry. Against the pattern before R3-F2 of #150's review, whose suffix
+# parts could split one run of letters and digits every way, the first did
+# not finish in five seconds and the next two are longer runs of the same
+# kind; the last two end in what no version may, after a long run of parts
+# or of digits.
+LONG_MALFORMED_VERSIONS = [
+    "1.2." + "0" * 320 + "!",
+    "1.2." + "0" * (1 << 16) + "!",
+    "1." + "0a" * (1 << 15) + "!",
+    "1.2.3" + "-a" * (1 << 15) + "!",
+    "1.2.3." + "1" * (1 << 16) + ".",
+]
+_PARSE_LONG_VERSIONS = """
+import json, sys
+from autoforge import sdk_assets
+values = json.load(sys.stdin)
+answers = []
+for value in values:
+    probe = json.dumps({"python": "3.12.1", "sdk": value, "cli": None, "bundled": False})
+    cli = json.dumps({"python": "3.12.1", "sdk": "0.2.163", "cli": value, "bundled": True})
+    answers.append([
+        sdk_assets.checked_version(value),
+        sdk_assets.parse_claude_environment(probe),
+        sdk_assets.parse_claude_environment(cli),
+        bool(sdk_assets._SHOWN_VERSION_RE.fullmatch(value)),
+    ])
+print(json.dumps(answers))
+"""
+
+
+def test_a_long_malformed_version_is_refused_without_backtracking():
+    """R3-F2 of #150's review: both entry points, :func:`checked_version`
+    (the OpenCode runtime's package.json) and the probe's ``sdk`` and
+    ``cli`` fields (:func:`parse_claude_environment`), refuse each long
+    malformed version, and so does the pattern itself, with no length bound
+    in front of it. Run in a child with a timeout, so a pattern that
+    backtracks again fails here instead of stalling the suite."""
+    out = subprocess.run(
+        [sys.executable, "-c", _PARSE_LONG_VERSIONS],
+        input=json.dumps(LONG_MALFORMED_VERSIONS),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    assert json.loads(out.stdout) == [[None, None, None, False]] * len(LONG_MALFORMED_VERSIONS)
+
+
+@pytest.mark.parametrize("field", ["sdk", "cli"])
+def test_a_probe_field_past_the_version_limit_is_not_a_version(field):
+    """A well-formed version longer than 64 characters is refused by the
+    probe's parser as by :func:`checked_version`: the whole answer is
+    unreadable, and nothing of it is shown."""
+    good = {"python": "3.12.1", "sdk": "0.2.163", "cli": "2.1.286", "bundled": True}
+    assert parse_claude_environment(json.dumps(good)) is not None
+    long = "1." + "2" * 63
+    assert parse_claude_environment(json.dumps({**good, field: long})) is None
+    assert parse_claude_environment(json.dumps({**good, field: long[:-1]})) is not None
 
 
 # -- the OpenCode runtime's package (ADR 0007 D2.6's amendment) ---------------------
@@ -499,6 +590,30 @@ def helper_environment(
     return root / "bin" / "python"
 
 
+def hook_pth(pth: Path, hooks: Path, markers: Path) -> None:
+    """A ``._pth`` file at ``pth`` naming the directory ``hooks`` (made
+    here), whose ``sitecustomize`` creates ``markers/sitecustomize``, the
+    running interpreter's standard library, and ``import site``."""
+    hooks.mkdir()
+    (hooks / "sitecustomize.py").write_text(
+        f"import os; open(os.path.join({str(markers)!r}, 'sitecustomize'), 'w').close()\n",
+        encoding="utf-8",
+    )
+    paths = sysconfig.get_paths()
+    stdlib = [
+        paths["stdlib"],
+        paths["platstdlib"],
+        os.path.join(paths["platstdlib"], "lib-dynload"),
+    ]
+    pth.write_text(
+        "\n".join(
+            [str(hooks), *dict.fromkeys(d for d in stdlib if os.path.isdir(d)), "import site"]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def copied_environment(root: Path, markers: Path) -> tuple[Path, Path]:
     """R2-F1 of #150's review: :func:`helper_environment` made with ``venv
     --copies`` from a base installation whose interpreter has a ``._pth``
@@ -519,26 +634,8 @@ def copied_environment(root: Path, markers: Path) -> tuple[Path, Path]:
     except OSError:
         shutil.copy2(python, home / version)
     (home / "python3").symlink_to(version)
-    hooks = root / "hooks"
-    hooks.mkdir()
-    (hooks / "sitecustomize.py").write_text(
-        f"import os; open(os.path.join({str(markers)!r}, 'sitecustomize'), 'w').close()\n",
-        encoding="utf-8",
-    )
-    paths = sysconfig.get_paths()
-    stdlib = [
-        paths["stdlib"],
-        paths["platstdlib"],
-        os.path.join(paths["platstdlib"], "lib-dynload"),
-    ]
     pth = home / f"{version}._pth"
-    pth.write_text(
-        "\n".join(
-            [str(hooks), *dict.fromkeys(d for d in stdlib if os.path.isdir(d)), "import site"]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    hook_pth(pth, root / "hooks", markers)
     conf = root / "env" / "pyvenv.cfg"
     lines = conf.read_text(encoding="utf-8").splitlines()
     conf.write_text(
@@ -552,6 +649,33 @@ def run_copied_hooks(python: Path, cwd: Path) -> None:
     """The control run of :func:`copied_environment`: the interpreter under
     the probe's own flags, which the base's ``._pth`` file overrides."""
     env = {"PATH": "/usr/bin:/bin"}
+    if "LD_LIBRARY_PATH" in os.environ:
+        env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+    subprocess.run(
+        [str(python), *CLAUDE_ENVIRONMENT_PROBE_FLAGS, "-c", "pass"],
+        env=env,
+        cwd=cwd,
+        timeout=60,
+        check=True,
+    )
+
+
+def launcher_override(root: Path, markers: Path) -> Path:
+    """R3-F1 of #150's review: the executable a ``PYTHONEXECUTABLE`` or
+    ``__PYVENV_LAUNCHER__`` variable names, which CPython takes itself to
+    be even under ``-I``. Nothing is there but a ``._pth`` file beside that
+    name (:func:`hook_pth`). Returns the name."""
+    launcher = root / "launcher" / "python"
+    launcher.parent.mkdir(parents=True)
+    hook_pth(Path(f"{launcher}._pth"), root / "launcher-hooks", markers)
+    return launcher
+
+
+def run_override_hooks(python: Path, cwd: Path, name: str, launcher: Path) -> None:
+    """The control run of :func:`launcher_override`: the interpreter under
+    the probe's own flags with the variable ``name`` naming the launcher,
+    which its ``._pth`` file overrides."""
+    env = {"PATH": "/usr/bin:/bin", name: str(launcher)}
     if "LD_LIBRARY_PATH" in os.environ:
         env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
     subprocess.run(
@@ -637,6 +761,38 @@ def test_a_copied_environments_base_pth_file_runs_hooks_under_s_and_is_seen(tmp_
     assert "sitecustomize" in [path.name for path in markers.iterdir()]
     pth.unlink()
     assert interpreter_pth_files(str(python), str(tmp_path)) == PthFiles(())
+
+
+@pytest.mark.parametrize("name", PYTHON_STARTUP_NAMES)
+def test_a_launcher_variable_makes_python_read_a_pth_file_under_s(tmp_path, name):
+    """R3-F1 of #150's review, for real: with ``name`` naming a path beside
+    which a ``._pth`` file lies, the interpreter reads that file and runs
+    ``sitecustomize`` even under the probe's ``-I -S -B`` (the control
+    run), though :func:`interpreter_pth_files` finds no ``._pth`` file for
+    the interpreter itself. The variable must therefore never reach the
+    probe (the next test, and doctor's)."""
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    python = helper_environment(tmp_path / "env", markers)
+    launcher = launcher_override(tmp_path, markers)
+    assert interpreter_pth_files(str(python), str(tmp_path)) == PthFiles(())
+    run_override_hooks(python, tmp_path, name, launcher)
+    assert "sitecustomize" in [path.name for path in markers.iterdir()]
+
+
+@pytest.mark.parametrize(
+    "entry", ["PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__", "PYTHON*", "__PYVENV*", "_*"]
+)
+def test_the_claude_probe_never_carries_a_variable_that_renames_its_interpreter(monkeypatch, entry):
+    """Listed exactly or matched by a prefix, neither variable CPython reads
+    at startup even under ``-I`` is in the probe's allow-list, nor in the
+    environment the executor selects with it; the rest of the list is."""
+    for name in PYTHON_STARTUP_NAMES:
+        monkeypatch.setenv(name, "/elsewhere/python")
+    names = ClaudeSdkProvider().probe_allowlist(("PATH", entry))
+    assert "PATH" in names
+    assert set(PYTHON_STARTUP_NAMES).isdisjoint(names)
+    assert set(PYTHON_STARTUP_NAMES).isdisjoint(select_environment(names))
 
 
 # -- the helper argv and the plan ----------------------------------------------------

@@ -487,6 +487,16 @@ reads wrote with the operator's access, so `doctor` makes them differently:
   all, and neither is one whose places cannot all be told: a script, a
   binary that is not ELF, a search path naming `$LIB` or `$PLATFORM`, or
   a loader cache that cannot be read. Its rows are `SKIP`s that say which.
+  `-I` ignores every `PYTHON*` variable but `PYTHONEXECUTABLE`, and
+  CPython also reads `__PYVENV_LAUNCHER__` (3.11 to 3.14 on Linux). Each
+  names the executable the interpreter takes itself to be, and a `._pth`
+  file beside that name counts as one beside the interpreter. An
+  allow-list may forward either; the round-3 review ran a hook that way.
+  The probe therefore never carries them, however the allow-list names
+  them, so the interpreter it starts is the one `command` names and the
+  places above are all it reads. The preflight's login-shell probe, which
+  `doctor` runs too, unsets them before it starts the controller's own
+  interpreter.
 
 The helper's own argv stays D2.3's: a launch runs the environment as
 installed, hooks included, inside the outer sandbox.

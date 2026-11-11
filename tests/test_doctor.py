@@ -3138,6 +3138,61 @@ def test_the_claude_probe_runs_none_of_the_helper_environments_startup_hooks(tmp
     assert list(markers.iterdir()) == []
 
 
+@pytest.mark.parametrize("name", ["PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__"])
+@pytest.mark.parametrize("listed", ["exactly", "by-prefix"])
+def test_a_forwarded_launcher_variable_never_reaches_the_claude_probe(
+    tmp_path, monkeypatch, name, listed
+):
+    """R3-F1 of #150's review. CPython reads ``PYTHONEXECUTABLE`` and
+    ``__PYVENV_LAUNCHER__`` at startup even under ``-I``, and a ``._pth``
+    file beside the executable either names imports ``site`` and runs
+    ``sitecustomize`` under the probe's ``-I -S -B`` (the control run).
+    ``execution.agent_env_allowlist_extra`` may forward either. Doctor's
+    probe, run for real with the variable set and listed, never carries
+    it: the rows read the helper environment ``command`` names, and no
+    hook runs."""
+    from tests.test_sdk_profiles import (
+        helper_environment,
+        launcher_override,
+        run_override_hooks,
+    )
+
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    python = helper_environment(tmp_path / "env", markers)
+    launcher = launcher_override(tmp_path, markers)
+    run_override_hooks(python, tmp_path, name, launcher)
+    assert "sitecustomize" in [path.name for path in markers.iterdir()]
+    for marker in markers.iterdir():
+        marker.unlink()
+    monkeypatch.setenv(name, str(launcher))
+    requests: list = []
+    base = _sdk_runner()
+
+    def runner(req):
+        if req.command[0] != str(python):
+            return base(req)
+        requests.append(req)
+        return execute(req)
+
+    entry = name if listed == "exactly" else f"{name[:4]}*"
+    config = _write_config(
+        tmp_path,
+        {"analyze_execute": _claude_sdk(command=str(python))},
+        extra={"execution": {"agent_env_allowlist_extra": [entry]}},
+    )
+    rows = {
+        r.name: r for r in Doctor(config_path=config, cwd=str(tmp_path), runner=runner).run_all()
+    }
+    label = f"'{python}' (analyze_execute)"
+    assert rows[f"claude-sdk helper environment {label}"].ok
+    assert rows[f"claude-sdk SDK package in {label}"].detail == "claude-agent-sdk 0.2.163"
+    assert rows[f"claude-sdk runtime in {label}"].ok
+    assert len(requests) == 1 and requests[0].env_allowlist is not None
+    assert name not in requests[0].env_allowlist
+    assert list(markers.iterdir()) == []
+
+
 @pytest.mark.parametrize("beside", ["as-found", "as-resolved"])
 def test_an_interpreter_with_a_pth_file_is_never_probed(tmp_path, beside):
     """A ``._pth`` file beside the interpreter, as named or as its link

@@ -1047,7 +1047,11 @@ class Doctor:
         --version``; and the OpenCode runtime's ``package.json``, read as a
         file, since running the runtime writes to the home even for
         ``--version``. The probes run under the launch allow-list without
-        the provider's own credential, their output never quoted. No SDK is
+        the provider's own credential, the Claude probe also without the
+        two variables CPython reads at startup even under ``-I``
+        (``PYTHONEXECUTABLE``, ``__PYVENV_LAUNCHER__``), which would point
+        it at a ``._pth`` file doctor did not look for, however the
+        allow-list names them; their output is never quoted. No SDK is
         imported, and nothing logs in, refreshes, installs, or starts a
         session, a server or a model call; no credential file is opened.
 
@@ -1095,7 +1099,8 @@ class Doctor:
         """Run one version probe of an SDK provider: the result, or why it did not run.
 
         Its environment is the launch allow-list's filter of the configured
-        names, without the provider's own credential
+        names, without the provider's own credential and without the names
+        the adapter withholds from a probe however they are listed
         (:meth:`~autoforge.providers.ClaudeSdkProvider.probe_allowlist`).
         """
         cfg = self.config if self.config is not None else AutoForgeConfig()
@@ -1117,8 +1122,11 @@ class Doctor:
         starts (:func:`autoforge.sdk_assets.interpreter_pth_files`): a bare
         name as the launch's ``PATH`` finds it, a relative path against the
         probe's directory, with this process's ``LD_LIBRARY_PATH`` (the probe
-        carries it or nothing). Nothing when it is not found: the probe then
-        fails to start, and its row says so."""
+        carries it or nothing). The probe never carries a variable that
+        names the interpreter otherwise
+        (:data:`~autoforge.child_env.PYTHON_STARTUP_NAMES`),
+        so these are the places it reads. Nothing when it is not found: the
+        probe then fails to start, and its row says so."""
         if "/" in command:
             found = command
         else:

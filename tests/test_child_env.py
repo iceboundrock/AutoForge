@@ -32,6 +32,7 @@ from autoforge.child_env import (
     GH_PLACEHOLDER_TOKEN,
     HTTP_CLIENT_CONFIG,
     POSIX_SHELLS,
+    PYTHON_STARTUP_NAMES,
     SHELL_PROBE_MARKER,
     SSH_COMMAND,
     GitConfigEntry,
@@ -1304,6 +1305,61 @@ def test_a_startup_file_that_ends_the_shell_could_not_be_checked(tmp_path, monke
     home = _startup_home(tmp_path, {".bash_profile": "exit 3\n"})
     problems = shell_startup_problems(str(tmp_path), DEFAULT_ENV_ALLOWLIST, home=str(home))
     assert f"the startup files of a login bash ({_BASH}), which could not be checked (exit 3)" in (
+        problems
+    )
+
+
+@needs_bash
+@pytest.mark.parametrize("name", PYTHON_STARTUP_NAMES)
+@pytest.mark.parametrize("route", ["allow-list", "startup-file"])
+def test_the_shell_probe_starts_its_python_as_named_whatever_names_another(
+    tmp_path, monkeypatch, name, route
+):
+    """R3-F1 of #150's review. CPython reads ``PYTHONEXECUTABLE`` and
+    ``__PYVENV_LAUNCHER__`` at startup even under ``-I``, and a ``._pth``
+    file beside the executable either names runs ``sitecustomize`` under
+    the probe's own ``-I -S`` (the control run). Passed on by the
+    allow-list or exported by a login startup file, neither reaches the
+    probe's interpreter: the probe still finds nothing to report, and no
+    hook runs."""
+    from tests.test_sdk_profiles import launcher_override
+
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    launcher = launcher_override(tmp_path, markers)
+    subprocess.run(
+        [sys.executable, "-I", "-S", "-c", "pass"],
+        env={"PATH": "/usr/bin:/bin", name: str(launcher)},
+        cwd=tmp_path,
+        timeout=60,
+        check=True,
+    )
+    assert "sitecustomize" in [path.name for path in markers.iterdir()]
+    for marker in markers.iterdir():
+        marker.unlink()
+    monkeypatch.setenv("SHELL", _BASH)
+    if route == "allow-list":
+        monkeypatch.setenv(name, str(launcher))
+        allowlist, files = (*DEFAULT_ENV_ALLOWLIST, name), {}
+    else:
+        allowlist = DEFAULT_ENV_ALLOWLIST
+        files = {".profile": f"export {name}={launcher}\n", ".bash_profile": ". ~/.profile\n"}
+    home = _startup_home(tmp_path, files)
+    assert shell_startup_problems(str(tmp_path), allowlist, home=str(home)) == []
+    assert list(markers.iterdir()) == []
+
+
+@needs_bash
+def test_a_startup_file_that_pins_a_python_startup_name_could_not_be_checked(tmp_path, monkeypatch):
+    """A name of :data:`PYTHON_STARTUP_NAMES` a startup file makes read-only
+    cannot be unset, so the probe stops before it starts Python, and the
+    shell is a problem, never a pass."""
+    monkeypatch.setenv("SHELL", _BASH)
+    home = _startup_home(
+        tmp_path, {".bash_profile": "readonly __PYVENV_LAUNCHER__=/elsewhere/python\n"}
+    )
+    problems = shell_startup_problems(str(tmp_path), DEFAULT_ENV_ALLOWLIST, home=str(home))
+    assert f"the startup files of a login bash ({_BASH}), which could not be checked (exit 1)" in (
         problems
     )
 

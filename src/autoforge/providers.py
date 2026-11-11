@@ -270,7 +270,12 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .child_env import child_shell, refuse_forbidden_env, undoes_isolation
+from .child_env import (
+    PYTHON_STARTUP_NAMES,
+    child_shell,
+    refuse_forbidden_env,
+    undoes_isolation,
+)
 from .claude_stream import ClaudeStream
 from .config import LoopDetectionConfig, ProfileConfig
 from .errors import (
@@ -2879,6 +2884,9 @@ class _SdkProvider(AgentProvider):
     passthrough: tuple[str, ...] = ()
     # What the helper's argv passes its interpreter before the helper's path.
     interpreter_flags: tuple[str, ...] = ()
+    # What ``doctor``'s version probes never carry, whatever the allow-list
+    # names (:meth:`probe_allowlist`).
+    probe_withheld: tuple[str, ...] = ()
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         super().validate_profile(profile)
@@ -2973,8 +2981,12 @@ class _SdkProvider(AgentProvider):
     def probe_allowlist(self, base: tuple[str, ...]) -> tuple[str, ...]:
         """What ``doctor``'s version probes of this provider run with: the
         launch allow-list's filter of ``base`` without the provider's own
-        credential, which no version probe needs (#150)."""
-        return sdk_launch_allowlist(base, (), os.environ.keys())
+        credential, which no version probe needs (#150), and without
+        :attr:`probe_withheld`, listed exactly or matched by a prefix. The
+        filter's names are exact, so none of them reaches the probe."""
+        withheld = set(self.probe_withheld)
+        names = sdk_launch_allowlist(base, (), os.environ.keys())
+        return tuple(name for name in names if name not in withheld)
 
     def plan_notes(
         self, profile: ProfileConfig, env_allowlist: tuple[str, ...] | None
@@ -3051,6 +3063,10 @@ class ClaudeSdkProvider(_SdkProvider):
     # ``-I`` keeps out ``PYTHON*`` variables, the user site directory and the
     # script's own directory (D2.3).
     interpreter_flags = ("-I",)
+    # The two variables CPython reads at startup even under ``-I``: either
+    # would make the probe's interpreter read a ``._pth`` file doctor did not
+    # look for (R3-F1 of #150's review).
+    probe_withheld = PYTHON_STARTUP_NAMES
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         super().validate_profile(profile)

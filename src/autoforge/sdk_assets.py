@@ -240,6 +240,13 @@ def helper_problem(pin: HelperPin, directory: Path | None = None) -> str:
 # interpreter or one directory up (with the base installation's when it
 # includes system site-packages), else the installation's own prefix.
 # ``-B`` writes no bytecode for the standard-library modules it imports.
+# The probe never carries :data:`autoforge.child_env.PYTHON_STARTUP_NAMES`,
+# the two variables CPython reads even under ``-I``, whatever the allow-list
+# names (``ClaudeSdkProvider.probe_allowlist``): either names another
+# executable, beside which a ``._pth`` file imports ``site`` even under
+# ``-S`` (R3-F1 of #150's review). The interpreter it starts is then the one
+# ``command`` names, and the places :func:`interpreter_pth_files` looks in
+# are all the places it reads.
 CLAUDE_ENVIRONMENT_PROBE_FLAGS = ("-I", "-S", "-B")
 # The interpreter's version, the installed ``claude-agent-sdk``'s version
 # from its package metadata, and the bundled Claude Code's version read as
@@ -653,8 +660,21 @@ def runtime_package(executable: str) -> tuple[str, str] | None:
 
 
 # A version this module shows: a release with an optional suffix, never
-# free text (a probe's answer is untrusted output).
-_SHOWN_VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+){1,3}(?:[.+-]?[0-9A-Za-z]+){0,3}")
+# free text (a probe's answer is untrusted output). The release has two to
+# four numbers; the suffix at most three parts, each a run of letters and
+# digits after a separator (``.``, ``+``, ``-``), the first of which may
+# instead start with a letter right after the release (``2.1.0rc1``). A
+# part ends only at a separator or at the end, so a run of letters and
+# digits is always one part, never split between two: a malformed value
+# fails in time linear in its length, not by backtracking through every
+# split of a run of digits (R3-F2 of #150's review). A value longer than
+# :data:`_VERSION_LIMIT` is not matched at all: no version is that long,
+# and the probe reads a bundled CLI's version up to the same length.
+_SHOWN_VERSION_RE = re.compile(
+    r"[0-9]+(?:\.[0-9]+){1,3}"
+    r"(?:[A-Za-z][0-9A-Za-z]*(?:[.+-][0-9A-Za-z]+){0,2}|(?:[.+-][0-9A-Za-z]+){0,3})"
+)
+_VERSION_LIMIT = 64
 _PYTHON_RE = re.compile(r"([0-9]+)\.([0-9]+)\.([0-9]+)")
 _NODE_RE = re.compile(r"v([0-9]+)\.([0-9]+)\.([0-9]+)")
 
@@ -673,14 +693,17 @@ class ClaudeSdkEnvironment:
 
 def checked_version(value: str) -> str | None:
     """``value`` when it reads as a version (a release with an optional
-    suffix), else ``None``: untrusted text is shown only once it is that."""
-    return value if _SHOWN_VERSION_RE.fullmatch(value) else None
+    suffix, at most :data:`_VERSION_LIMIT` characters), else ``None``:
+    untrusted text is shown only once it is that."""
+    if len(value) > _VERSION_LIMIT or not _SHOWN_VERSION_RE.fullmatch(value):
+        return None
+    return value
 
 
 def _version_field(value: object) -> str | None:
     if value is None:
         return None
-    if not isinstance(value, str) or not _SHOWN_VERSION_RE.fullmatch(value):
+    if not isinstance(value, str) or checked_version(value) is None:
         raise ValueError("not a version")
     return value
 

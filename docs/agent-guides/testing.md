@@ -2476,7 +2476,16 @@ Keep covered:
   under `-I -S -B`, and doctor's real probe never starts), or beside the
   libpython the loader may take (synthetic ELF files and loader cache);
   nor one whose places cannot be told (a wrapper script, run for real,
-  never starts); the OpenCode runtime is a stand-in that writes to the home,
+  never starts); with `PYTHONEXECUTABLE` or `__PYVENV_LAUNCHER__` set and
+  forwarded, exactly or by a prefix (a control run shows a `._pth` file
+  beside the name it gives runs `sitecustomize` under `-I -S -B`), the
+  probe, run for real, never carries it, its rows read the environment
+  itself, and no hook runs, the login-shell probe's included (which
+  unsets both, whether the allow-list or a startup file set them, and
+  fails when one is read-only: `test_child_env.py`); a malformed version
+  of any length, from the probe or a `package.json`, is refused at once,
+  in a child with a timeout so a pattern that backtracks fails instead of
+  stalling the suite; the OpenCode runtime is a stand-in that writes to the home,
   XDG and TMPDIR directories when it starts (a control run shows it), and
   with any probe of it run for real the runtime never starts and those
   directories stay as they were.

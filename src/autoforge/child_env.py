@@ -265,9 +265,21 @@ PROBED_SHELLS = ("sh", "bash", "zsh")
 # Printed by the probe before what it found, so whatever a startup file
 # prints itself is never read as a finding.
 SHELL_PROBE_MARKER = "<<<autoforge-shell-startup>>>"
+# What CPython reads from the environment when it starts even under ``-I``,
+# which ignores every other ``PYTHON*`` variable (``Modules/getpath.py``,
+# 3.11 to 3.14 on Linux; R3-F1 of #150's review). Each names the executable
+# the interpreter takes itself to be, and a ``._pth`` file beside that name
+# imports ``site`` even under ``-S``, and with it ``sitecustomize``. Whatever
+# an allow-list or a startup file passes on, a Python the controller starts
+# for a probe of its own runs without them, so it is the interpreter it
+# names: the shell probe's (:func:`shell_probe_script`) and doctor's probe
+# of a Claude helper environment
+# (:meth:`autoforge.providers.ClaudeSdkProvider.probe_allowlist`).
+PYTHON_STARTUP_NAMES = ("PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__")
 # What the probe runs once the shell's startup files have: the controller's
-# own interpreter, isolated (``-I``, no site), reading the environment the
-# shell exports, which is what everything it starts inherits. It prints the
+# own interpreter, isolated (``-I``, no site, without
+# :data:`PYTHON_STARTUP_NAMES`), reading the environment the shell exports,
+# which is what everything it starts inherits. It prints the
 # marker, then the name of each variable of ``argv`` (a count, that many
 # name and value pairs, then names) that differs or is set; never a value.
 _PROBE_PROGRAM = (
@@ -755,7 +767,13 @@ def shell_probe_script(overrides: Mapping[str, str]) -> str:
     ``overrides`` that is unset, holds another value or is no longer
     exported, and each forbidden name the controller withholds (but
     :data:`STARTUP_TOLERATED`) that is now exported. Values are compared in
-    a process the shell starts and never printed.
+    a process the shell starts and never printed. That process is this
+    interpreter under ``-I -S``, started without
+    :data:`PYTHON_STARTUP_NAMES`, which the shell unsets first: one a
+    startup file or the allow-list passed on would make it read a
+    ``._pth`` file elsewhere and run what that names. A shell that cannot
+    unset one (a startup file made it read-only) stops there with a
+    non-zero status, so its probe is a problem, never a pass.
     """
     pairs = sorted(overrides.items())
     withheld = sorted(set(FORBIDDEN_ENV_NAMES) - set(overrides) - STARTUP_TOLERATED)
@@ -769,7 +787,7 @@ def shell_probe_script(overrides: Mapping[str, str]) -> str:
         *(part for pair in pairs for part in pair),
         *withheld,
     ]
-    return "exec " + shlex.join(argv) + "\n"
+    return f"unset {' '.join(PYTHON_STARTUP_NAMES)} || exit 1\nexec {shlex.join(argv)}\n"
 
 
 def probe_findings(stdout: str, names: Iterable[str]) -> list[str] | None:
