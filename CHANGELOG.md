@@ -14,11 +14,16 @@ checks the pinned pair in its own rows, each with its remedy: the Claude
 helper environment's Python (3.10 or newer), the `claude-agent-sdk`
 installed in it (0.2.163) and the Claude Code bundled with it (2.1.286);
 Node (24 or newer) and the OpenCode runtime `options.server_command` names
-(`opencode-ai` 1.18.34). It reads versions only: it imports no SDK, installs
-nothing, starts no session, server or model call, and shows whether the
-credential variable is set, never its value. Model access is a `SKIP`,
-since only a model call could show it. A profile no phase reaches is not
-checked, so a configuration without SDK profiles needs no SDK and no Node.
+(`opencode-ai` 1.18.34). It reads versions only: it imports no SDK, runs
+none of the helper environment's `site` startup hooks, never runs the
+OpenCode runtime (which writes to your home when it starts, even for
+`--version`: its version is read from its npm package), installs nothing,
+starts no session, server or model call, and shows whether the credential
+variable is set, never its value. A runtime installed other than with npm
+is a `SKIP`, as is model access, since only a model call could show it. A
+profile no phase reaches is not checked, so a configuration without SDK
+profiles needs no SDK and no Node. One `update_epic` names is checked, and
+fails by name when it has no `command`.
 
 A dry run of an SDK-routed phase used to stop with the launch refusal. It
 now shows the helper's argv, which never carries the prompt, with notes on

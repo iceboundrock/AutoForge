@@ -2,6 +2,8 @@
 
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -2616,11 +2618,29 @@ def test_the_cli_passes_the_epic_to_doctor(monkeypatch):
     assert seen["epic_url"] == DOCTOR_EPIC
 
 
-# -- the SDK providers' rows (ADR 0007 D2.6, #150) ---------------------------------
+# -- the SDK providers' rows (ADR 0007 D2.6 and its amendment, #150) ---------------
 SDK_PYTHON = "/opt/autoforge-claude-sdk/bin/python"
 SDK_NODE = "/opt/node24/bin/node"
-SDK_SERVER = "/opt/opencode-1.18.34/bin/opencode"
-SDK_COMMANDS = (SDK_PYTHON, SDK_NODE, SDK_SERVER)
+# A command name: the `sdk_server` fixture installs the pinned runtime as npm
+# does and puts the directory npm links it from first on PATH.
+SDK_SERVER = "opencode-pinned"
+# A stand-in for the OpenCode runtime, which doctor never runs: it creates
+# its data, config, state and cache directories in the home (the XDG
+# variables first), a log file, and a directory in TMPDIR when it starts,
+# before it reads its arguments, so `--version` writes too. That is what the
+# reviewer of #150 read in 1.18.34's global module and what 2.2.6 did under a
+# scratch home on the authoring host. It first records that it started.
+RUNTIME_SCRIPT = """#!/bin/sh
+: > '@STARTED@'
+data="${XDG_DATA_HOME:-$HOME/.local/share}/opencode"
+for dir in "$data/log" "${XDG_CONFIG_HOME:-$HOME/.config}/opencode" \\
+    "${XDG_STATE_HOME:-$HOME/.local/state}/opencode" "${XDG_CACHE_HOME:-$HOME/.cache}/opencode"; do
+  mkdir -p "$dir" || exit 3
+done
+echo started >> "$data/log/opencode.log"
+if [ -n "$TMPDIR" ]; then mkdir -p "$TMPDIR/opencode"; fi
+echo '@VERSION@'
+"""
 # What a healthy helper environment answers the metadata probe.
 CLAUDE_ENV = {"python": "3.12.4", "sdk": "0.2.163", "cli": "2.1.286", "bundled": True}
 CLAUDE_ROWS = {
@@ -2648,6 +2668,44 @@ def _claude_sdk(**kwargs):
     return profile
 
 
+def _install_runtime(root, *, package="opencode-ai", version="1.18.34", in_package=True):
+    """The OpenCode runtime under the prefix ``root`` as ``npm install -g``
+    lays it out: its platform binary at the package's ``bin/opencode.exe``
+    (the package's postinstall puts it there, ADR 0007 D2.5), linked as
+    ``root/bin/<SDK_SERVER>``. ``in_package=False`` lays out a binary in no
+    npm package (an install script's). Returns the file its start writes."""
+    started = root / "started"
+    if in_package:
+        directory = root / "lib" / "node_modules" / package
+        (directory / "bin").mkdir(parents=True)
+        document = {"name": package, "version": version, "bin": {"opencode": "bin/opencode.exe"}}
+        (directory / "package.json").write_text(json.dumps(document), encoding="utf-8")
+        binary = directory / "bin" / "opencode.exe"
+    else:
+        (root / "opt").mkdir(parents=True)
+        binary = root / "opt" / "opencode"
+    script = RUNTIME_SCRIPT.replace("@STARTED@", str(started)).replace("@VERSION@", version)
+    binary.write_text(script, encoding="utf-8")
+    binary.chmod(0o755)
+    (root / "bin").mkdir(parents=True, exist_ok=True)
+    (root / "bin" / SDK_SERVER).symlink_to(binary)
+    return started
+
+
+def _on_path(monkeypatch, root):
+    monkeypatch.setenv("PATH", f"{root / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+@pytest.fixture
+def sdk_server(tmp_path, monkeypatch):
+    """The pinned runtime installed as npm installs it, found on PATH as
+    :data:`SDK_SERVER`; no test may start it."""
+    started = _install_runtime(tmp_path / "npm")
+    _on_path(monkeypatch, tmp_path / "npm")
+    yield started
+    assert not started.exists(), "doctor ran the OpenCode runtime"
+
+
 def _opencode_sdk(server=SDK_SERVER, **kwargs):
     profile = {
         "provider": "opencode-sdk",
@@ -2659,13 +2717,14 @@ def _opencode_sdk(server=SDK_SERVER, **kwargs):
     return profile
 
 
-def _sdk_runner(claude=CLAUDE_ENV, node="v24.11.1", server="1.18.34", requests=None):
+def _sdk_runner(claude=CLAUDE_ENV, node="v24.11.1", requests=None, calls=None):
     """The healthy fake, plus scripted SDK executables. Each answer is what
     the probe prints, ``None`` for a missing executable, or ``(exit, stdout)``;
     every SDK probe is recorded in ``requests``, and each writes
-    :data:`PLANTED` on stderr, which no row may quote."""
-    base = _runner_factory()
-    answers = {SDK_PYTHON: claude, SDK_NODE: node, SDK_SERVER: server}
+    :data:`PLANTED` on stderr, which no row may quote. ``calls`` records
+    every other command."""
+    base = _runner_factory(calls=calls)
+    answers = {SDK_PYTHON: claude, SDK_NODE: node}
 
     def runner(req):
         argv = req.command
@@ -2793,6 +2852,7 @@ def test_each_claude_sdk_environment_problem_is_its_own_actionable_row(
         ((9, "boom"), "exited 9 (output not shown"),
     ],
 )
+@pytest.mark.usefixtures("sdk_server")
 def test_a_missing_or_old_node_fails_its_own_row(tmp_path, node, needle):
     rows = _sdk_doctor(tmp_path, {"review_round_1": _opencode_sdk()}, node=node)
     row = rows[OPENCODE_ROWS["node"]]
@@ -2801,22 +2861,128 @@ def test_a_missing_or_old_node_fails_its_own_row(tmp_path, node, needle):
 
 
 @pytest.mark.parametrize(
-    "server, needle",
+    "install, needle",
     [
-        (None, "cannot run it: ExecutionError"),
-        ("opencode v2.0.27", "opencode 2.0.27: not the supported pair, @opencode-ai/sdk 1.18.34"),
-        ("1.18.35", "opencode 1.18.35: not the supported pair"),
-        ("1.18.34-beta.1", "opencode 1.18.34 (pre-release): not the supported pair"),
-        (PLANTED, "cannot read the runtime version"),
+        (None, "not an executable file on the launch's PATH; install opencode-ai 1.18.34"),
+        (
+            {"version": "2.0.27"},
+            "opencode-ai 2.0.27: not the supported pair, @opencode-ai/sdk 1.18.34 with "
+            "opencode-ai 1.18.34",
+        ),
+        ({"version": "1.18.35"}, "opencode-ai 1.18.35: not the supported pair"),
+        ({"version": "1.18.34-beta.1"}, "opencode-ai 1.18.34-beta.1: not the supported pair"),
+        ({"version": PLANTED}, "cannot read the version in opencode-ai's package.json"),
     ],
+    ids=["missing", "other-line", "other-patch", "pre-release", "not-a-version"],
 )
-def test_a_missing_or_unpinned_opencode_runtime_fails_its_own_row(tmp_path, server, needle):
-    rows = _sdk_doctor(tmp_path, {"review_round_1": _opencode_sdk()}, server=server)
+def test_a_missing_or_unpinned_opencode_runtime_fails_its_own_row(
+    tmp_path, monkeypatch, install, needle
+):
+    """The version is the runtime's package.json's, never the runtime's own
+    answer: each of these fails without the runtime being run."""
+    started = None
+    if install is not None:
+        started = _install_runtime(tmp_path / "npm", **install)
+        _on_path(monkeypatch, tmp_path / "npm")
+    rows = _sdk_doctor(tmp_path, {"review_round_1": _opencode_sdk()})
     row = rows[OPENCODE_ROWS["runtime"]]
     assert not row.ok and row.required and needle in row.detail, row
     assert rows[OPENCODE_ROWS["node"]].ok
+    assert started is None or not started.exists()
 
 
+@pytest.mark.parametrize(
+    "install",
+    [{"in_package": False}, {"package": "opencode-linux-x64"}],
+    ids=["no-package", "another-package"],
+)
+def test_a_runtime_in_no_opencode_ai_package_is_a_skip_never_run(tmp_path, monkeypatch, install):
+    """Its version is not readable without running it, and running it
+    writes: a SKIP that says so, never a claimed OK or a guessed FAIL."""
+    started = _install_runtime(tmp_path / "npm", **install)
+    _on_path(monkeypatch, tmp_path / "npm")
+    rows = _sdk_doctor(tmp_path, {"review_round_1": _opencode_sdk()})
+    row = rows[OPENCODE_ROWS["runtime"]]
+    assert row.skipped and "not readable without running it" in row.detail, row
+    assert "even for --version, so doctor does not run it" in row.detail
+    assert f"`{SDK_SERVER} --version` yourself" in row.detail
+    assert not started.exists()
+
+
+@pytest.mark.parametrize("in_package", [True, False], ids=["npm-package", "no-package"])
+def test_the_opencode_runtime_never_runs_and_the_operators_directories_stay_untouched(
+    tmp_path, monkeypatch, in_package
+):
+    """R1-F1 of #150's review. The stand-in writes to the home's data,
+    config, state and cache directories and to TMPDIR when it starts, as
+    the runtime does even for ``--version`` (the control run shows it). With
+    any probe of the stand-in run for real, doctor leaves the operator's
+    directories as they were, and the runtime never starts."""
+    operator = tmp_path / "operator"
+    dirs = {name: operator / name for name in ("home", "data", "config", "state", "cache", "tmp")}
+    for path in dirs.values():
+        path.mkdir(parents=True)
+    env = {
+        "HOME": str(dirs["home"]),
+        "XDG_DATA_HOME": str(dirs["data"]),
+        "XDG_CONFIG_HOME": str(dirs["config"]),
+        "XDG_STATE_HOME": str(dirs["state"]),
+        "XDG_CACHE_HOME": str(dirs["cache"]),
+        "TMPDIR": str(dirs["tmp"]),
+    }
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    root = tmp_path / "npm"
+    started = _install_runtime(root, in_package=in_package)
+    _on_path(monkeypatch, root)
+
+    def contents():
+        return sorted(str(path.relative_to(operator)) for path in operator.rglob("*"))
+
+    before = contents()
+    control = subprocess.run(
+        [str(root / "bin" / SDK_SERVER), "--version"],
+        env={**env, "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        timeout=30,
+        check=True,
+    )
+    assert control.stdout.strip() == "1.18.34" and started.exists()
+    wrote = {"data/opencode", "config/opencode", "state/opencode", "cache/opencode"}
+    assert wrote | {"tmp/opencode", "data/opencode/log/opencode.log"} <= set(contents())
+    for path in dirs.values():
+        shutil.rmtree(path)
+        path.mkdir()
+    started.unlink()
+    assert contents() == before
+
+    base = _sdk_runner()
+    ran: list = []
+
+    def runner(req):
+        # The stand-in runs for real: a probe of the runtime would write.
+        if req.command[0] == SDK_SERVER or req.command[0].startswith(str(root)):
+            ran.append(req.command)
+            return execute(req)
+        return base(req)
+
+    config = _write_config(tmp_path, {"review_round_1": _opencode_sdk()})
+    doctor = Doctor(config_path=config, cwd=str(tmp_path), runner=runner)
+    rows = {r.name: r for r in doctor.run_all()}
+    row = rows[OPENCODE_ROWS["runtime"]]
+    if in_package:
+        assert row.ok and row.detail == (
+            "opencode-ai 1.18.34, read from its package.json (the runtime is never run)"
+        )
+    else:
+        assert row.skipped, row
+    assert ran == [] and not started.exists()
+    assert contents() == before
+
+
+@pytest.mark.usefixtures("sdk_server")
 def test_a_healthy_opencode_sdk_profile_passes_all_but_the_launch(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", PLANTED)
     rows = _sdk_doctor(tmp_path, {"review_round_1": _opencode_sdk()})
@@ -2824,12 +2990,15 @@ def test_a_healthy_opencode_sdk_profile_passes_all_but_the_launch(tmp_path, monk
     assert "autoforge-opencode-bridge" in rows[OPENCODE_ROWS["launch"]].detail
     assert rows[OPENCODE_ROWS["node"]].detail == "Node 24.11.1 (>= 24)"
     assert rows[OPENCODE_ROWS["runtime"]].ok
-    assert rows[OPENCODE_ROWS["runtime"]].detail == "opencode 1.18.34"
+    assert rows[OPENCODE_ROWS["runtime"]].detail == (
+        "opencode-ai 1.18.34, read from its package.json (the runtime is never run)"
+    )
     assert rows[OPENCODE_ROWS["credential"]].ok
     assert "OPENAI_API_KEY set" in rows[OPENCODE_ROWS["credential"]].detail
     assert rows[OPENCODE_ROWS["model"]].skipped
 
 
+@pytest.mark.usefixtures("sdk_server")
 def test_profiles_naming_two_runtimes_get_a_runtime_row_each(tmp_path):
     other = "/opt/opencode-other/bin/opencode"
     rows = _sdk_doctor(
@@ -2837,7 +3006,7 @@ def test_profiles_naming_two_runtimes_get_a_runtime_row_each(tmp_path):
         {"review_round_1": _opencode_sdk(), "review_round_2_5": _opencode_sdk(server=other)},
     )
     assert rows[f"opencode-sdk runtime '{SDK_SERVER}' (review_round_1)"].ok
-    # The fake answers only the pinned runtime's path; any other is missing.
+    # Only the pinned runtime is installed; the other path names nothing.
     assert not rows[f"opencode-sdk runtime '{other}' (review_round_2_5)"].ok
     assert f"opencode-sdk Node '{SDK_NODE}' (review_round_1, review_round_2_5)" in rows
 
@@ -2853,30 +3022,35 @@ def test_a_missing_sdk_credential_fails_by_name(tmp_path, monkeypatch, profile, 
     assert not row.ok and row.required and f"{variable} " in row.detail
 
 
+@pytest.mark.usefixtures("sdk_server")
 def test_a_set_credential_is_never_shown_or_handed_to_a_probe(tmp_path, monkeypatch):
     """#150: the credential is read for presence only; no probe gets it, nor
     any other provider's variable or a credential-shaped name, and every
-    probe is one of the three version reads ADR 0007 D2.6 allows."""
+    probe is one of the two version reads ADR 0007 D2.6's amendment leaves:
+    the Claude environment's under ``-I -S -B`` and Node's. The OpenCode
+    runtime is never run."""
     from autoforge.sdk_assets import CLAUDE_ENVIRONMENT_PROBE
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", PLANTED)
     monkeypatch.setenv("OPENAI_API_KEY", PLANTED)
     monkeypatch.setenv("SOME_SERVICE_TOKEN", PLANTED)
     requests: list = []
+    calls: list = []
     path = _write_config(
         tmp_path,
         {"analyze_execute": _claude_sdk(), "review_round_1": _opencode_sdk()},
         extra={"execution": {"env_allowlist_extra": ["SOME_SERVICE_*"]}},
     )
-    d = Doctor(config_path=path, cwd=str(tmp_path), runner=_sdk_runner(requests=requests))
+    runner = _sdk_runner(requests=requests, calls=calls)
+    d = Doctor(config_path=path, cwd=str(tmp_path), runner=runner)
     for row in d.run_all():
         assert PLANTED not in row.detail, row
     commands = [req.command for req in requests]
     assert commands == [
-        [SDK_PYTHON, "-I", "-c", CLAUDE_ENVIRONMENT_PROBE],
+        [SDK_PYTHON, "-I", "-S", "-B", "-c", CLAUDE_ENVIRONMENT_PROBE],
         [SDK_NODE, "--version"],
-        [SDK_SERVER, "--version"],
     ]
+    assert not any(SDK_SERVER in argv[0] or "opencode-ai" in argv[0] for argv in calls), calls
     for req in requests:
         names = req.env_allowlist
         assert names is not None and not any(name.endswith("*") for name in names)
@@ -2933,3 +3107,112 @@ def test_an_invalid_sdk_profile_reached_only_after_a_merge_fails_one_row(tmp_pat
     row = rows["opencode-sdk profiles (update_epic)"]
     assert not row.ok and "credential_env" in row.detail
     assert requests == []
+
+
+def test_the_claude_probe_runs_none_of_the_helper_environments_startup_hooks(tmp_path):
+    """R1-F2 of #150's review. ``-I`` alone still imports ``site``, which runs
+    an ``import`` line of a ``.pth`` file in the helper environment with the
+    operator's access (the control run shows the hook is live). Doctor's
+    probe, run for real here, reads the environment and runs no hook."""
+    from tests.test_sdk_profiles import helper_environment, run_hooks
+
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    python = str(helper_environment(tmp_path / "env", markers))
+    run_hooks(Path(python), tmp_path)
+    assert [path.name for path in markers.iterdir()] == ["pth"]
+    (markers / "pth").unlink()
+    base = _sdk_runner()
+
+    def runner(req):
+        return execute(req) if req.command[0] == python else base(req)
+
+    config = _write_config(tmp_path, {"analyze_execute": _claude_sdk(command=python)})
+    rows = {
+        r.name: r for r in Doctor(config_path=config, cwd=str(tmp_path), runner=runner).run_all()
+    }
+    label = f"'{python}' (analyze_execute)"
+    assert rows[f"claude-sdk helper environment {label}"].ok
+    assert rows[f"claude-sdk SDK package in {label}"].detail == "claude-agent-sdk 0.2.163"
+    assert rows[f"claude-sdk runtime in {label}"].ok
+    assert list(markers.iterdir()) == []
+
+
+@pytest.mark.parametrize("beside", ["as-found", "as-resolved"])
+def test_an_interpreter_with_a_pth_file_is_never_probed(tmp_path, beside):
+    """A ``._pth`` file beside the interpreter, as named or as its link
+    resolves, can import ``site`` even under ``-S``: doctor runs nothing
+    with it, and its three rows are SKIPs that say why."""
+    real = tmp_path / "base" / "python3.12"
+    real.parent.mkdir()
+    real.write_text("", encoding="utf-8")
+    python = tmp_path / "env" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.symlink_to(real)
+    pth = Path(f"{python if beside == 'as-found' else real}._pth")
+    pth.write_text("import site\n", encoding="utf-8")
+    requests: list = []
+    config = _write_config(tmp_path, {"analyze_execute": _claude_sdk(command=str(python))})
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=_sdk_runner(requests=requests))
+    rows = {r.name: r for r in d.run_all()}
+    label = f"'{python}' (analyze_execute)"
+    interpreter = rows[f"claude-sdk helper environment {label}"]
+    assert interpreter.skipped and str(pth) in interpreter.detail
+    assert "import site even under -S" in interpreter.detail
+    assert rows[f"claude-sdk SDK package in {label}"].skipped
+    assert rows[f"claude-sdk runtime in {label}"].skipped
+    assert not any(req.command[0] == str(python) for req in requests)
+
+
+def _without_command(profile):
+    profile = dict(profile)
+    del profile["command"]
+    return profile
+
+
+SDK_PROFILES = pytest.mark.parametrize(
+    "provider, profile, interpreter",
+    [
+        ("claude-sdk", _without_command(_claude_sdk()), "Python interpreter"),
+        ("opencode-sdk", _without_command(_opencode_sdk()), "Node executable"),
+    ],
+    ids=["claude-sdk", "opencode-sdk"],
+)
+
+
+@SDK_PROFILES
+def test_a_post_merge_sdk_profile_with_no_command_fails_by_name(
+    tmp_path, provider, profile, interpreter
+):
+    """R1-F3 of #150's review. ``update_epic`` is reachable after a merge
+    but not validated by the config row, and an SDK provider has no default
+    command: the profile still gets its rows, the failing one naming what
+    to set. Nothing is probed."""
+    requests: list = []
+    config = _write_config(tmp_path, {"update_epic": profile})
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=_sdk_runner(requests=requests))
+    rows = {r.name: r for r in d.run_all()}
+    assert rows["config"].ok
+    row = rows[f"{provider} profiles (update_epic)"]
+    assert not row.ok and row.required
+    assert f"{provider} needs 'command', the {interpreter}" in row.detail
+    assert row.detail.endswith("got ''")
+    assert not rows[f"provider {provider} can launch (update_epic)"].ok
+    assert requests == []
+
+
+@SDK_PROFILES
+def test_the_doctor_command_reports_a_post_merge_sdk_profile_with_no_command(
+    tmp_path, monkeypatch, capsys, provider, profile, interpreter
+):
+    """The same, through ``autoforge doctor`` as an operator runs it."""
+    from autoforge import cli
+
+    config = _write_config(tmp_path, {"update_epic": profile})
+    monkeypatch.setattr(cli, "_doctor_runner", _sdk_runner)
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["--config", config, "doctor", "--json"]) == 1
+    checks = {c["name"]: c for c in json.loads(capsys.readouterr().out)["checks"]}
+    row = checks[f"{provider} profiles (update_epic)"]
+    assert not row["ok"] and row["required"]
+    assert f"{provider} needs 'command', the {interpreter}" in row["detail"]

@@ -3,8 +3,10 @@ argv and a dry run's plan, switching a profile to an SDK provider and back,
 and the commented example in every configuration backend.
 
 The doctor rows are ``tests/test_doctor.py``'s, the policy
-``tests/test_sdk_policy.py``'s (#149). Nothing here starts a process, imports
-an SDK or needs Node.
+``tests/test_sdk_policy.py``'s (#149). Nothing here imports an SDK or needs
+Node; the only processes are the Claude environment probe's, run on a
+synthetic helper environment (:func:`helper_environment`), and its control
+runs.
 """
 
 from __future__ import annotations
@@ -12,7 +14,9 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import subprocess
 import sys
+import venv
 from pathlib import Path
 
 import pytest
@@ -29,13 +33,17 @@ from autoforge.errors import ConfigurationError
 from autoforge.profiles import REQUIRED_PROFILES
 from autoforge.providers import ClaudeSdkProvider, OpenCodeSdkProvider, provider_for
 from autoforge.sdk_assets import (
+    CLAUDE_ENVIRONMENT_PROBE,
+    CLAUDE_ENVIRONMENT_PROBE_FLAGS,
     STAGED_HELPER_DIR,
     HelperPin,
+    checked_version,
     helper_problem,
+    interpreter_pth_files,
     load_manifest,
     parse_claude_environment,
     parse_node_version,
-    parse_runtime_version,
+    runtime_package,
 )
 from autoforge.sdk_policy import SDK_PROVIDERS
 from autoforge.transitions import Phase
@@ -187,60 +195,172 @@ def test_node_versions_are_read_from_one_line(text, found):
 @pytest.mark.parametrize(
     "text, found",
     [
-        ("1.18.34", ((1, 18, 34), False)),
-        ("opencode v2.0.27", ((2, 0, 27), False)),
-        ("1.18.34-beta.2", ((1, 18, 34), True)),
-        ("1.18", None),
-        ("1.18.34\n1.18.35", None),
+        ("1.18.34", "1.18.34"),
+        ("1.18.34-beta.2", "1.18.34-beta.2"),
+        ("2.0.27+build.5", "2.0.27+build.5"),
+        ("v1.18.34", None),
+        ("1.18.34 && echo", None),
+        (SECRET, None),
+        ("", None),
     ],
 )
-def test_runtime_versions_are_read_from_one_line(text, found):
-    assert parse_runtime_version(text) == found
+def test_only_text_that_reads_as_a_version_is_shown(text, found):
+    assert checked_version(text) == found
 
 
-def test_the_claude_probe_reads_package_files_and_never_imports_the_sdk(tmp_path):
-    """The probe as doctor runs it, against a synthetic installed SDK whose
-    package fails on import: it reports the versions and imports nothing."""
-    import subprocess
-
-    site = tmp_path / "site"
-    info = site / "claude_agent_sdk-0.2.163.dist-info"
-    package = site / "claude_agent_sdk"
-    (package / "_bundled").mkdir(parents=True)
-    info.mkdir()
-    (info / "METADATA").write_text(
-        "Metadata-Version: 2.1\nName: claude-agent-sdk\nVersion: 0.2.163\n", encoding="utf-8"
-    )
-    (package / "__init__.py").write_text("raise SystemExit('imported')\n", encoding="utf-8")
-    (package / "_cli_version.py").write_text('__cli_version__ = "2.1.286"\n', encoding="utf-8")
-    binary = package / "_bundled" / "claude"
+# -- the OpenCode runtime's package (ADR 0007 D2.6's amendment) ---------------------
+def _package(root: Path, name: str, document: object) -> Path:
+    """An npm package directory under ``root/node_modules`` with its
+    ``package.json`` and the binary npm links, ``bin/opencode.exe``."""
+    package = root / "node_modules" / name
+    (package / "bin").mkdir(parents=True)
+    raw = document if isinstance(document, str) else json.dumps(document)
+    (package / "package.json").write_text(raw, encoding="utf-8")
+    binary = package / "bin" / "opencode.exe"
     binary.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
-    binary.chmod(0o755)
-    # Without -I, so that PYTHONPATH can stand in for the environment's site-packages.
-    out = subprocess.run(
-        [sys.executable, "-c", sdk_assets.CLAUDE_ENVIRONMENT_PROBE],
-        capture_output=True,
-        text=True,
-        env={"PYTHONPATH": str(site), "PATH": "/usr/bin:/bin"},
-        cwd=tmp_path,
+    return binary
+
+
+@pytest.mark.parametrize(
+    "name, document, found",
+    [
+        ("opencode-ai", {"name": "opencode-ai", "version": "1.18.34"}, ("opencode-ai", "1.18.34")),
+        (
+            "@scope/opencode",
+            {"name": "@scope/opencode", "version": "1.0.0"},
+            ("@scope/opencode", "1.0.0"),
+        ),
+        ("opencode-ai", {"name": "opencode-ai"}, None),
+        ("opencode-ai", {"name": "opencode-ai", "version": 1}, None),
+        ("opencode-ai", ["opencode-ai", "1.18.34"], None),
+        ("opencode-ai", "{not json", None),
+    ],
+    ids=["package", "scoped", "no-version", "number", "not-an-object", "not-json"],
+)
+def test_the_runtime_package_is_read_from_the_package_json_above_it(
+    tmp_path, name, document, found
+):
+    assert runtime_package(str(_package(tmp_path, name, document))) == found
+
+
+def test_a_runtime_in_no_npm_package_or_a_package_too_large_reads_as_none(tmp_path):
+    loose = tmp_path / "opt" / "opencode"
+    loose.parent.mkdir()
+    loose.write_text("#!/bin/sh\n", encoding="utf-8")
+    assert runtime_package(str(loose)) is None
+    # The package directory itself is not a file inside it.
+    assert runtime_package(str(tmp_path / "node_modules" / "opencode-ai")) is None
+    binary = _package(tmp_path, "opencode-ai", {"name": "opencode-ai", "version": "1.18.34"})
+    big = {"name": "opencode-ai", "version": "1.18.34", "pad": "x" * (1 << 20)}
+    (binary.parent.parent / "package.json").write_text(json.dumps(big), encoding="utf-8")
+    assert runtime_package(str(binary)) is None
+
+
+def test_a_pth_file_beside_the_interpreter_as_found_or_as_resolved_is_seen(tmp_path):
+    real = tmp_path / "base" / "python3.12"
+    real.parent.mkdir()
+    real.write_text("", encoding="utf-8")
+    link = tmp_path / "env" / "bin" / "python"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(real)
+    assert interpreter_pth_files(str(link)) == []
+    Path(f"{real}._pth").write_text("import site\n", encoding="utf-8")
+    assert interpreter_pth_files(str(link)) == [f"{real}._pth"]
+    Path(f"{link}._pth").write_text("import site\n", encoding="utf-8")
+    assert interpreter_pth_files(str(link)) == [f"{link}._pth", f"{real}._pth"]
+
+
+# -- the Claude environment probe, run for real (ADR 0007 D2.6's amendment) ---------
+def helper_environment(root: Path, markers: Path, *, sdk: bool = True) -> Path:
+    """A Claude helper environment as an operator makes one: a virtual
+    environment of the running interpreter holding a synthetic
+    ``claude-agent-sdk`` 0.2.163 (bundled Claude Code 2.1.286) whose package
+    exits on import, and a live startup hook: an ``import`` line of a
+    ``.pth`` file in its site-packages, which creates ``markers/pth`` when
+    ``site`` runs it. Returns the interpreter."""
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(root)
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    site = root / "lib" / version / "site-packages"
+    assert site.is_dir(), site
+    (site / "zz_hook.pth").write_text(
+        f"import os; open(os.path.join({str(markers)!r}, 'pth'), 'w').close()\n",
+        encoding="utf-8",
+    )
+    if sdk:
+        info = site / "claude_agent_sdk-0.2.163.dist-info"
+        package = site / "claude_agent_sdk"
+        (package / "_bundled").mkdir(parents=True)
+        info.mkdir()
+        (info / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: claude-agent-sdk\nVersion: 0.2.163\n",
+            encoding="utf-8",
+        )
+        (package / "__init__.py").write_text("raise SystemExit('imported')\n", encoding="utf-8")
+        (package / "_cli_version.py").write_text('__cli_version__ = "2.1.286"\n', encoding="utf-8")
+        binary = package / "_bundled" / "claude"
+        binary.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        binary.chmod(0o755)
+    return root / "bin" / "python"
+
+
+def run_hooks(python: Path, cwd: Path) -> None:
+    """The control run: the interpreter with ``-I`` alone, as the probe ran
+    before #150's review, which runs the hook."""
+    subprocess.run(
+        [str(python), "-I", "-c", "pass"],
+        env={"PATH": "/usr/bin:/bin"},
+        cwd=cwd,
         timeout=60,
         check=True,
     )
-    env = parse_claude_environment(out.stdout)
+
+
+def _probe(python: Path, cwd: Path):
+    out = subprocess.run(
+        [str(python), *CLAUDE_ENVIRONMENT_PROBE_FLAGS, "-c", CLAUDE_ENVIRONMENT_PROBE],
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin"},
+        cwd=cwd,
+        timeout=60,
+        check=True,
+    )
+    return parse_claude_environment(out.stdout)
+
+
+def test_the_claude_probe_reads_package_files_and_runs_no_startup_hook(tmp_path):
+    """The probe as doctor runs it, on a helper environment whose ``.pth``
+    import line is live (the control run shows it ran) and whose SDK exits
+    on import: it reports the versions, imports nothing of the
+    environment's and runs no hook (R1-F2 of #150's review)."""
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    python = helper_environment(tmp_path / "env", markers)
+    run_hooks(python, tmp_path)
+    assert [path.name for path in markers.iterdir()] == ["pth"]
+    (markers / "pth").unlink()
+    env = _probe(python, tmp_path)
     assert env is not None
+    assert env.python == tuple(sys.version_info[:3])
     assert (env.sdk_version, env.cli_version, env.bundled) == ("0.2.163", "2.1.286", True)
-    binary.unlink()
-    out = subprocess.run(
-        [sys.executable, "-c", sdk_assets.CLAUDE_ENVIRONMENT_PROBE],
-        capture_output=True,
-        text=True,
-        env={"PYTHONPATH": str(site), "PATH": "/usr/bin:/bin"},
-        cwd=tmp_path,
-        timeout=60,
-        check=True,
-    )
-    env = parse_claude_environment(out.stdout)
+    assert list(markers.iterdir()) == []
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    site = python.parent.parent / "lib" / version / "site-packages"
+    (site / "claude_agent_sdk" / "_bundled" / "claude").unlink()
+    env = _probe(python, tmp_path)
     assert env is not None and env.bundled is False
+    assert list(markers.iterdir()) == []
+
+
+def test_the_claude_probe_finds_no_sdk_in_an_environment_without_one(tmp_path):
+    """An environment without ``claude-agent-sdk`` reads as one, still
+    without running a hook."""
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    env = _probe(helper_environment(tmp_path / "env", markers, sdk=False), tmp_path)
+    assert env is not None
+    assert (env.sdk_version, env.cli_version, env.bundled) == (None, None, False)
+    assert list(markers.iterdir()) == []
 
 
 # -- the helper argv and the plan ----------------------------------------------------

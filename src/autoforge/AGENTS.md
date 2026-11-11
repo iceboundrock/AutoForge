@@ -37,8 +37,10 @@ sdk_policy.py       SDK providers' unattended policy: tools, permissions, settin
 sdk_assets.py       the SDK helpers' packaged manifest (sdk_helpers/manifest.json: each
                     helper program, its envelope and protocol, whether it ships, the
                     pinned pair and interpreter floor), the helper digest check, and
-                    doctor's read-only version probes and their parsers; provider layer,
-                    reads package files only, imports no SDK (#150)
+                    doctor's read-only probes: the Claude environment probe and its
+                    parser, the ._pth check, the OpenCode runtime's package.json read
+                    (the runtime is never run); provider layer, reads package files
+                    only, imports no SDK (#150)
 interaction.py      provider-neutral interaction contract (requests, decisions,
                     capabilities, lifecycle, session identity) and the per-launch
                     broker (policy, limits, degradation, capability check, run-log

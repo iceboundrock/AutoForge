@@ -2463,7 +2463,17 @@ Keep covered:
   runtime; credential; model access as a SKIP; interactions), each failure
   its own remedy, no probe output or credential value quoted, the probes'
   exact commands and environment names (no credential, no foreign name),
-  and no row or probe for an SDK profile no phase reaches.
+  and no row or probe for an SDK profile no phase reaches; a reachable
+  one with no `command` (`update_epic`, both providers, in `run_all` and
+  through `autoforge doctor`) fails by name;
+- `doctor` writes nothing with the operator's access (ADR 0007 D2.6's
+  amendment, #150's review): the Claude probe, run for real on a helper
+  environment whose `.pth` import line is live (a control run shows it
+  runs under `-I` alone), runs no hook; an interpreter with a `._pth` file
+  is not run; the OpenCode runtime is a stand-in that writes to the home,
+  XDG and TMPDIR directories when it starts (a control run shows it), and
+  with any probe of it run for real the runtime never starts and those
+  directories stay as they were.
 
 ### Interaction contract and broker (#134, ADR 0007)
 

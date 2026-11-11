@@ -758,23 +758,38 @@ from the `opencode` CLI provider's 2.x line.
 
 For each SDK provider a reachable profile routes to, `doctor` prints these
 rows, each with its own remedy. A profile no phase reaches is not checked.
+One that `update_epic` names is checked too: it is reachable after a merge,
+so a profile there with no `command` fails by name.
 
 | Row | Checks |
 |---|---|
 | `provider <name> can launch` | the helper program in the manifest; fails in this release |
-| `claude-sdk helper environment '<command>'` | `<command> -I -c <probe>` runs, and its Python is 3.10 or newer |
+| `claude-sdk helper environment '<command>'` | `<command> -I -S -B -c <probe>` runs, and its Python is 3.10 or newer |
 | `claude-sdk SDK package in '<command>'` | `claude-agent-sdk` is installed there, at the pinned version |
 | `claude-sdk runtime in '<command>'` | that SDK carries its bundled Claude Code, at the pinned version |
 | `opencode-sdk Node '<command>'` | `<command> --version` is Node 24 or newer |
-| `opencode-sdk runtime '<server_command>'` | `<server_command> --version` is the pinned release |
+| `opencode-sdk runtime '<server_command>'` | the `opencode-ai` package it lies in is the pinned release; a `SKIP` when it lies in none |
 | `<name> credential` | the credential variable a launch would carry is set |
 | `<name> model access` | SKIP: only a model call shows whether the key may use the model |
 | `<name> interactions` | each profile's `interaction_policy` and the capabilities declared |
 
 The probe reads the SDK's version from its package metadata and the
 bundled CLI's from its `_cli_version.py`, as files: it imports no SDK and
-starts nothing. The probes run under the launch's allow-list without the
-provider's own credential, and none of their output is quoted. The
+starts nothing. `-S` keeps the environment's startup hooks from running
+(an `import` line of a `.pth` file, `sitecustomize`), which `-I` alone
+would run. An interpreter with a `._pth` file beside it is not run at
+all, since that file can turn them back on. Its rows are `SKIP`s.
+
+The OpenCode runtime is never run: it creates its directories in your
+home when it starts, even for `--version`. `doctor` resolves
+`options.server_command` on the launch's `PATH`, and reads the version
+from the `package.json` of the `opencode-ai` package the binary lies in,
+which is where `npm install -g opencode-ai@1.18.34` puts it. For a binary
+installed another way the row is a `SKIP`: check `<server_command>
+--version` yourself.
+
+The probes run under the launch's allow-list without the provider's own
+credential, and none of their output is quoted. The
 credential row says whether the variable is set, never its value, and a
 key that is set is not a key that works: whether it may use the model, or
 is billed, only a model call shows. `doctor` never logs in, refreshes a

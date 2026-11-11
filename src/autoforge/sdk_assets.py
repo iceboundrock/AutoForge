@@ -17,15 +17,19 @@ in it are separate executables (D2.1).
 Provider layer. It reads the manifest and, for a shipped helper, the
 helper's bytes for their digest; it starts no process, imports no SDK and
 reaches no network. It also holds what ``doctor`` asks a Claude helper
-environment (:data:`CLAUDE_ENVIRONMENT_PROBE`) and how the answers of the
-read-only version probes are parsed: the controller never imports an SDK
-to learn its version (D2.6).
+environment (:data:`CLAUDE_ENVIRONMENT_PROBE`), how the answers of the
+read-only probes are parsed, and the reads ``doctor`` makes instead of
+running something that would write: an interpreter's ``._pth`` file
+(:func:`interpreter_pth_files`) and an OpenCode runtime's ``package.json``
+(:func:`runtime_package`). The controller never imports an SDK to learn
+its version, and never runs the OpenCode runtime (D2.6 and its amendment).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -221,23 +225,49 @@ def helper_problem(pin: HelperPin, directory: Path | None = None) -> str:
     return ""
 
 
-# -- read-only version probes (ADR 0007 D2.6) ---------------------------------
+# -- read-only version probes (ADR 0007 D2.6 and its amendment) --------------
 # What ``doctor`` runs with a ``claude-sdk`` profile's interpreter, as
-# ``[interpreter, "-I", "-c", CLAUDE_ENVIRONMENT_PROBE]``: the interpreter's
-# version, the installed ``claude-agent-sdk``'s version from its package
-# metadata, and the bundled Claude Code's version read as text from
-# ``_cli_version.py``, with whether the bundled executable exists (D2.4).
-# It imports no SDK module and starts nothing: ``importlib.metadata`` reads
-# the distribution's files, and the two package files are read, never run.
-# It prints one JSON line.
+# ``[interpreter, *CLAUDE_ENVIRONMENT_PROBE_FLAGS, "-c",
+# CLAUDE_ENVIRONMENT_PROBE]``. ``-I`` alone still imports ``site``, which
+# runs the environment's startup hooks (an ``import`` line of any ``.pth``
+# file in its site-packages, ``sitecustomize``) with the operator's access
+# before the probe's first line. ``-S`` keeps ``site`` out, so the probe
+# finds the site-packages directories itself, as ``site`` would without
+# running a hook: the virtual environment of a ``pyvenv.cfg`` beside the
+# interpreter or one directory up (with the base installation's when it
+# includes system site-packages), else the installation's own prefix.
+# ``-B`` writes no bytecode for the standard-library modules it imports.
+CLAUDE_ENVIRONMENT_PROBE_FLAGS = ("-I", "-S", "-B")
+# The interpreter's version, the installed ``claude-agent-sdk``'s version
+# from its package metadata, and the bundled Claude Code's version read as
+# text from ``_cli_version.py``, with whether the bundled executable exists
+# (D2.4). It imports no SDK module and nothing outside the standard library,
+# and starts nothing: ``importlib.metadata`` reads the distribution's files,
+# and the two package files are read, never run. It prints one JSON line.
 CLAUDE_ENVIRONMENT_PROBE = """\
-import json, os, re, sys
+import json, os, re, site, sys
 from importlib import metadata
 out = {"python": "%d.%d.%d" % sys.version_info[:3], "sdk": None, "cli": None, "bundled": False}
-try:
-    dist = metadata.distribution("claude-agent-sdk")
-except metadata.PackageNotFoundError:
-    dist = None
+bindir = os.path.dirname(os.path.abspath(sys.executable))
+root = os.path.dirname(bindir)
+prefixes = [sys.prefix, sys.exec_prefix]
+for conf in (os.path.join(bindir, "pyvenv.cfg"), os.path.join(root, "pyvenv.cfg")):
+    if os.path.isfile(conf):
+        system = "true"
+        with open(conf, encoding="utf-8") as f:
+            for line in f:
+                key, eq, value = line.partition("=")
+                if eq and key.strip().lower() == "include-system-site-packages":
+                    system = value.strip().lower()
+        prefixes = [root]
+        if system == "true":
+            prefixes += [sys.base_prefix, sys.base_exec_prefix]
+        break
+lib = "python%d.%d" % sys.version_info[:2]
+libdirs = (getattr(sys, "platlibdir", "lib"), "lib")
+dirs = [os.path.join(p, d, lib, "site-packages") for p in prefixes for d in libdirs]
+dirs = [d for d in dict.fromkeys(dirs + site.getsitepackages(prefixes)) if os.path.isdir(d)]
+dist = next(iter(metadata.distributions(name="claude-agent-sdk", path=dirs)), None)
 if dist is not None:
     out["sdk"] = dist.version
     try:
@@ -250,6 +280,71 @@ if dist is not None:
     out["bundled"] = os.path.isfile(binary) and os.access(binary, os.X_OK)
 print(json.dumps(out))
 """
+
+
+def interpreter_pth_files(executable: str) -> list[str]:
+    """The ``._pth`` files beside ``executable``, as found and as resolved.
+
+    Such a file overrides the interpreter's path and, with an ``import
+    site`` line, imports ``site`` even under ``-S``, and with it the
+    environment's startup hooks. ``doctor`` therefore runs no probe with an
+    interpreter that has one (ADR 0007 D2.6's amendment). It only looks:
+    the file is not opened.
+    """
+    found = []
+    for path in dict.fromkeys((executable, os.path.realpath(executable))):
+        if os.path.lexists(path + "._pth"):
+            found.append(path + "._pth")
+    return found
+
+
+# The most of a runtime's package.json that is read.
+_PACKAGE_JSON_LIMIT = 1 << 20
+
+
+def runtime_package(executable: str) -> tuple[str, str] | None:
+    """``(name, version)`` of the npm package the executable file at
+    ``executable`` (an absolute, resolved path) lies in, or ``None``.
+
+    The package is the innermost ``node_modules/<name>`` (or
+    ``node_modules/@scope/<name>``) directory above the file, and its
+    ``package.json`` is read as data, at most :data:`_PACKAGE_JSON_LIMIT`
+    bytes; ``None`` when there is no such directory or that file is not a
+    JSON object naming both as text. ``doctor`` reads the OpenCode
+    runtime's version this way because running the runtime, even for
+    ``--version``, creates directories in the operator's home before it
+    reads its arguments (ADR 0007 D2.6's amendment). ``opencode-ai``'s
+    install puts its platform binary at ``bin/opencode.exe`` inside the
+    package (D2.5), where npm's ``bin`` link points. The values are
+    untrusted text: a caller shows only what it has checked.
+    """
+    parts = Path(executable).parts
+    marks = [index for index, part in enumerate(parts) if part == "node_modules"]
+    if not marks:
+        return None
+    index = marks[-1]
+    end = index + (3 if index + 1 < len(parts) and parts[index + 1].startswith("@") else 2)
+    if end >= len(parts):
+        return None
+    package = Path(*parts[:end]) / "package.json"
+    try:
+        if not package.is_file():
+            return None
+        with package.open("rb") as f:
+            raw = f.read(_PACKAGE_JSON_LIMIT + 1)
+        if len(raw) > _PACKAGE_JSON_LIMIT:
+            return None
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    name, version = data.get("name"), data.get("version")
+    if not isinstance(name, str) or not isinstance(version, str):
+        return None
+    return name, version
+
+
 # A version this module shows: a release with an optional suffix, never
 # free text (a probe's answer is untrusted output).
 _SHOWN_VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+){1,3}(?:[.+-]?[0-9A-Za-z]+){0,3}")
@@ -267,6 +362,12 @@ class ClaudeSdkEnvironment:
     # ``None``: no ``_cli_version.py`` could be read.
     cli_version: str | None
     bundled: bool
+
+
+def checked_version(value: str) -> str | None:
+    """``value`` when it reads as a version (a release with an optional
+    suffix), else ``None``: untrusted text is shown only once it is that."""
+    return value if _SHOWN_VERSION_RE.fullmatch(value) else None
 
 
 def _version_field(value: object) -> str | None:
@@ -310,19 +411,3 @@ def parse_node_version(text: str) -> tuple[int, int, int] | None:
         return None
     major, minor, patch = (int(part) for part in match.groups())
     return major, minor, patch
-
-
-_RUNTIME_RE = re.compile(r"(?:opencode )?v?([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?")
-
-
-def parse_runtime_version(text: str) -> tuple[tuple[int, int, int], bool] | None:
-    """``((major, minor, patch), pre_release)`` from an OpenCode runtime's
-    ``--version`` (``1.18.34``, ``opencode v2.0.27``), or ``None`` when the
-    output is not exactly one such line. A pre-release is never the pinned
-    release, whatever its number (ADR 0007 D4.2)."""
-    lines = text.strip().splitlines()
-    match = _RUNTIME_RE.fullmatch(lines[0].strip()) if len(lines) == 1 else None
-    if match is None:
-        return None
-    major, minor, patch = (int(part) for part in match.group(1, 2, 3))
-    return (major, minor, patch), bool(match.group(4))

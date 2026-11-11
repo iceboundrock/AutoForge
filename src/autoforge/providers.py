@@ -232,7 +232,8 @@ The SDK providers ``claude-sdk`` and ``opencode-sdk`` (ADR 0007) have their
 static surface here: names, option keys and validation, the launch
 allow-list, the sandbox declaration, the helper's argv and a dry run's
 plan notes, and the commands ``doctor``'s read-only version probes run
-(#150). Their policy (tools, permissions, setting sources, configuration
+(#150; the OpenCode runtime is never run, its version is read from its
+package). Their policy (tools, permissions, setting sources, configuration
 and session roots, authentication, the environment) is
 :mod:`autoforge.sdk_policy`'s (#149, docs/sdk-policy.md); their helper
 programs and pinned pairs are recorded in the packaged manifest
@@ -320,7 +321,13 @@ from .sandbox_policy import (
     declared_writable,
     executable_requirements,
 )
-from .sdk_assets import CLAUDE_ENVIRONMENT_PROBE, HelperPin, helper_pin, helper_problem
+from .sdk_assets import (
+    CLAUDE_ENVIRONMENT_PROBE,
+    CLAUDE_ENVIRONMENT_PROBE_FLAGS,
+    HelperPin,
+    helper_pin,
+    helper_problem,
+)
 from .sdk_policy import (
     CLAUDE_SDK,
     CLAUDE_SDK_CREDENTIAL,
@@ -3074,10 +3081,12 @@ class ClaudeSdkProvider(_SdkProvider):
 
     def environment_probe_command(self, profile: ProfileConfig) -> list[str]:
         """``doctor``'s read-only probe of the helper environment ``command``
-        names (ADR 0007 D2.6): its Python, and the installed SDK's and its
-        bundled CLI's versions from package files, never an SDK import
-        (:data:`autoforge.sdk_assets.CLAUDE_ENVIRONMENT_PROBE`)."""
-        return [profile.command, *self.interpreter_flags, "-c", CLAUDE_ENVIRONMENT_PROBE]
+        names (ADR 0007 D2.6 and its amendment): its Python, and the installed
+        SDK's and its bundled CLI's versions from package files, never an SDK
+        import (:data:`autoforge.sdk_assets.CLAUDE_ENVIRONMENT_PROBE`). Not
+        the launch's ``-I`` alone: ``-S`` keeps the environment's ``site``
+        hooks from running, and ``-B`` writes no bytecode."""
+        return [profile.command, *CLAUDE_ENVIRONMENT_PROBE_FLAGS, "-c", CLAUDE_ENVIRONMENT_PROBE]
 
     def sandbox_requirements(
         self, profile: ProfileConfig, command: list[str], env: Mapping[str, str], home: str
@@ -3166,11 +3175,6 @@ class OpenCodeSdkProvider(_SdkProvider):
     def node_version_command(self, profile: ProfileConfig) -> list[str]:
         """``doctor``'s read-only probe of the Node ``command`` names (D2.6, D4.4)."""
         return [profile.command, "--version"]
-
-    def runtime_version_command(self, profile: ProfileConfig) -> list[str]:
-        """``doctor``'s read-only probe of the OpenCode runtime
-        ``options.server_command`` names (D2.6, D4.2)."""
-        return [self.policy(profile).server_command, "--version"]
 
     def own_names(self, profile: ProfileConfig | None) -> tuple[str, ...]:
         if profile is None:

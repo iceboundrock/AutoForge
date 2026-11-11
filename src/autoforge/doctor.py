@@ -35,11 +35,15 @@ packaged helper manifest, :mod:`autoforge.sdk_assets`); the helper's
 environment against the manifest's pinned pair, each part its own row
 (the Claude helper's interpreter, the ``claude-agent-sdk`` installed in it
 and the Claude Code bundled with it, read from package metadata and files
-by one ``-I`` probe that imports no SDK; Node's and the OpenCode runtime's
-``--version``); the credential by name only; model access as a SKIP; and
-the interaction policy with the capabilities declared. The probes run
-under the launch allow-list without the provider's own credential, and
-none logs in, installs, or starts a session, a server or a model call.
+by one ``-I -S -B`` probe that imports no SDK and runs none of the
+environment's ``site`` hooks; Node's ``--version``; the OpenCode runtime's
+version read from its npm package's ``package.json``, never by running it,
+since it writes to the home at startup); the credential by name only;
+model access as a SKIP; and the interaction policy with the capabilities
+declared. A reachable SDK profile with no ``command`` still gets its rows,
+the failing one naming what is missing. The probes run under the launch
+allow-list without the provider's own credential, and none logs in,
+installs, or starts a session, a server or a model call.
 
 Both report the environment an agent and a repository-defined command are
 launched with, by name only (never a value), and run the launch's own
@@ -74,6 +78,7 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import shutil
 import stat
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -148,12 +153,14 @@ from .providers import (
 from .redaction import redact, redact_argv
 from .run_namespace import AUTOFORGE_DIRNAME, SCHEDULER_DIRNAME
 from .safefs import STATE_DIR_NEEDS_HARD_LINKS, HardLinksUnavailable, SafeRoot
+from .sandbox_policy import resolve_command
 from .sdk_assets import (
     HelperPin,
-    dotted,
+    checked_version,
+    interpreter_pth_files,
     parse_claude_environment,
     parse_node_version,
-    parse_runtime_version,
+    runtime_package,
     shown_version,
 )
 from .sdk_policy import (
@@ -951,7 +958,10 @@ class Doctor:
         CLI, so there is no version to query. A command a Pi profile names
         gets Pi's version floor instead of a bare `--version`, and each Pi
         profile a read-only credential probe; one an OpenCode profile names
-        gets OpenCode's floor.
+        gets OpenCode's floor. An SDK profile has no default command, so one
+        without a ``command`` is grouped too, and :meth:`sdk_checks` fails
+        it by name: ``update_epic`` is reachable after a merge but not
+        validated by the config row (#150).
         """
         groups: dict[tuple[str, str], list[ProfileConfig]] = {}
         for name in reachable:
@@ -959,7 +969,7 @@ class Doctor:
             if profile is None or profile.provider == "scripted":
                 continue
             command = profile.command or DEFAULT_AGENT_COMMANDS.get(profile.provider, "")
-            if not command:
+            if not command and profile.provider not in SDK_PROVIDERS:
                 continue
             groups.setdefault((command, profile.provider), []).append(profile)
         if not groups:
@@ -1027,11 +1037,20 @@ class Doctor:
         - interactions: each profile's policy and the capabilities its
           adapter declares (ADR 0007 D5.3).
 
-        Read-only (ADR 0007 D2.6): version probes only, under the launch
-        allow-list without the provider's own credential, their output never
-        quoted. No SDK is imported, and nothing logs in, refreshes, installs,
-        or starts a session, a server or a model call; no credential file is
-        opened.
+        Read-only (ADR 0007 D2.6 and its amendment): the Claude environment
+        probe under ``-I -S -B``, so none of the environment's ``site`` hooks
+        runs and no bytecode is written, and never with an interpreter a
+        ``._pth`` file could make import ``site`` anyway; ``node
+        --version``; and the OpenCode runtime's ``package.json``, read as a
+        file, since running the runtime writes to the home even for
+        ``--version``. The probes run under the launch allow-list without
+        the provider's own credential, their output never quoted. No SDK is
+        imported, and nothing logs in, refreshes, installs, or starts a
+        session, a server or a model call; no credential file is opened.
+
+        The profiles are validated first: one reachable only after a merge
+        (``update_epic``) is not validated by the config row, and one with
+        no ``command`` reaches here too, so its FAIL names what is missing.
         """
         names = ", ".join(p.name for p in profiles)
         adapter = provider_for(profiles[0])
@@ -1090,6 +1109,18 @@ class Doctor:
             return redact(f"{type(exc).__name__}: {exc}")
         return "timed out" if res.timed_out else res
 
+    def _pth_files(self, command: str) -> list[str]:
+        """The ``._pth`` files beside the interpreter ``command`` runs as
+        (:func:`autoforge.sdk_assets.interpreter_pth_files`): a bare name as
+        the launch's ``PATH`` finds it, a relative path against the probe's
+        directory. Nothing when it is not found: the probe then fails to
+        start, and its row says so."""
+        if "/" in command:
+            found = os.path.join(self.cwd, command)
+        else:
+            found = shutil.which(command, path=os.environ.get("PATH")) or ""
+        return interpreter_pth_files(found) if found else []
+
     def _claude_sdk_environment(
         self,
         adapter: ClaudeSdkProvider,
@@ -1103,8 +1134,24 @@ class Doctor:
         sdk = f"claude-sdk SDK package in '{command}' ({names})"
         runtime = f"claude-sdk runtime in '{command}' ({names})"
         floor = shown_version(pin.interpreter_minimum)
-        shown = f"{command} -I -c <the read-only metadata probe>"
-        res = self._sdk_probe(adapter, adapter.environment_probe_command(profiles[0]))
+        argv = adapter.environment_probe_command(profiles[0])
+        shown = f"{' '.join(argv[:-1])} <the read-only metadata probe>"
+        overrides = self._pth_files(command)
+        if overrides:
+            skipped = "(the helper environment was not probed; see its row)"
+            return [
+                CheckResult.skip(
+                    interpreter,
+                    f"not probed: {', '.join(overrides)} beside the interpreter can make it "
+                    "import site even under -S, and with it run the environment's startup "
+                    "hooks (.pth import lines, sitecustomize), so doctor runs nothing with "
+                    "it. A helper environment needs no ._pth file: name an interpreter "
+                    f"without one, or check the environment yourself against {pin.pair()}",
+                ),
+                CheckResult.skip(sdk, skipped),
+                CheckResult.skip(runtime, skipped),
+            ]
+        res = self._sdk_probe(adapter, argv)
         found = None
         if isinstance(res, str):
             problem = (
@@ -1245,47 +1292,64 @@ class Doctor:
         for profile in profiles:
             servers.setdefault(adapter.policy(profile).server_command, []).append(profile)
         for server, group in servers.items():
-            rows.append(self._opencode_sdk_runtime(adapter, pin, server, group))
+            rows.append(self._opencode_sdk_runtime(pin, server, group))
         return rows
 
     def _opencode_sdk_runtime(
         self,
-        adapter: OpenCodeSdkProvider,
         pin: HelperPin,
         server: str,
         profiles: list[ProfileConfig],
     ) -> CheckResult:
+        """The OpenCode runtime ``server`` names, by its npm package's version.
+
+        Never by running it: the runtime creates its data, config, state and
+        cache directories in the home it is given when it starts, before it
+        reads its arguments, so even ``--version`` writes to the operator's
+        home (ADR 0007 D2.6's amendment). ``server`` is resolved on the
+        launch's ``PATH`` as the adapter resolves it, and the version is read
+        from the ``package.json`` of the ``opencode-ai`` package the resolved
+        file lies in (:func:`autoforge.sdk_assets.runtime_package`). A
+        runtime in no such package is a SKIP: its version is not readable
+        without running it, and doctor never claims what it did not read.
+        """
         row = f"opencode-sdk runtime '{server}' ({', '.join(p.name for p in profiles)})"
-        argv = adapter.runtime_version_command(profiles[0])
         wanted = f"install {pin.runtime} {pin.runtime_version} and name its binary in "
         wanted += "options.server_command"
-        res = self._sdk_probe(adapter, argv)
-        if isinstance(res, str):
-            return CheckResult(row, False, f"cannot run it: {res}; {wanted}")
-        if res.exit_code != 0:
+        resolved = resolve_command(server, os.environ.get("PATH"))
+        if not resolved:
+            return CheckResult(row, False, f"not an executable file on the launch's PATH; {wanted}")
+        package = runtime_package(resolved)
+        if package is None or package[0] != pin.runtime:
+            return CheckResult.skip(
+                row,
+                f"its version is not readable without running it: {resolved} lies in no "
+                f"{pin.runtime} package (no {pin.runtime} package.json above it), and the "
+                "runtime creates its data, config, state and cache directories in the home "
+                "when it starts, even for --version, so doctor does not run it. Install "
+                f"{pin.runtime} {pin.runtime_version} with npm and name the binary it links "
+                f"in options.server_command, or check `{server} --version` yourself (the "
+                f"supported pair is {pin.pair()})",
+            )
+        version = package[1]
+        if checked_version(version) is None:
             return CheckResult(
                 row,
                 False,
-                f"`{' '.join(argv)}` exited {res.exit_code} (output not shown; run it yourself)",
+                f"cannot read the version in {pin.runtime}'s package.json above {resolved} "
+                f"(not shown; need {pin.runtime_version}); {wanted}",
             )
-        parsed = parse_runtime_version(res.stdout or "")
-        if parsed is None:
-            return CheckResult(
-                row,
-                False,
-                f"cannot read the runtime version from `{' '.join(argv)}` (output not shown; "
-                f"need {pin.runtime_version})",
-            )
-        version, pre_release = parsed
-        shown = f"opencode {shown_version(version)}" + (" (pre-release)" if pre_release else "")
-        if pre_release or version != dotted(pin.runtime_version):
+        shown = f"{pin.runtime} {version}"
+        if version != pin.runtime_version:
             return CheckResult(
                 row,
                 False,
                 f"{shown}: not the supported pair, {pin.pair()} (ADR 0007 D4.2); the "
                 f"opencode CLI provider's release line is separate (D2.5); {wanted}",
             )
-        return CheckResult(row, True, shown)
+        return CheckResult(
+            row, True, f"{shown}, read from its package.json (the runtime is never run)"
+        )
 
     def _sdk_credential(
         self,

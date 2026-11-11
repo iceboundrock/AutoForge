@@ -450,6 +450,33 @@ launch or in `doctor`.**
   - `node --version`;
   - the runtime's `--version`.
 
+*Amendment (2026-11-11, #150, its review's round 1).* Two of these reads
+wrote with the operator's access, so `doctor` makes them differently:
+
+- **The runtime's version.** The OpenCode runtime creates its data,
+  config, state and cache directories in the home it is given when it
+  starts, before it reads its arguments. 1.18.34's entry point imports the
+  module that does it. 2.2.6 also wrote a log file and a temporary
+  directory, observed under a scratch home. So `--version` is not
+  read-only, and `doctor` never runs the runtime. It resolves
+  `options.server_command` on the launch's `PATH`, as the adapter does,
+  and reads `version` from the `package.json` of the `opencode-ai` package
+  the resolved file lies in. That is where the package's postinstall puts
+  the platform binary (D2.5). A runtime in no such package is a `SKIP`
+  that says why, never an OK.
+- **The SDK's version.** `-I` keeps out `PYTHON*` variables and the user
+  site directory, but still imports `site`. `site` runs the helper
+  environment's startup hooks (an `import` line of a `.pth` file,
+  `sitecustomize`) before the probe's first line. The probe therefore runs
+  as `<interpreter> -I -S -B -c <probe>`. `-S` keeps `site` out, so the
+  probe finds the site-packages directories itself, as `site` would but
+  without running a hook. `-B` writes no bytecode. An interpreter with a
+  `._pth` file beside it (as named or as resolved) is not run at all: such
+  a file can import `site` even under `-S`. Its rows are `SKIP`s.
+
+The helper's own argv stays D2.3's: a launch runs the environment as
+installed, hooks included, inside the outer sandbox.
+
 **D2.7 (#149).** **Configuration and session roots are #149's.**
 
 - A Claude continuation needs the session transcript the paused launch
