@@ -5,6 +5,27 @@ so.
 
 ## Unreleased
 
+### A blocked FIX's commits are pushed by AutoForge, not by hand (#433)
+
+When the fixer resolved some findings and had to stop for one only you can
+act on, its commits used to stay in the agent worktree: you pushed them by
+hand and unblocked to `REVIEW`, and nothing recorded that push. The fixer may
+now report `blocked` with the findings it fixed and the ones it left, each
+with a reason. AutoForge checks those commits as it checks any fix,
+validates the candidate, pushes it and reads it back, and the run stops with
+`reason partial-fix`. Every finding of the round stays open and none is
+marked resolved; `status` shows a `Partial fix:` line. Do what the fixer
+asked for, then `unblock`: a fresh `REVIEW` round of the pushed commit, with
+the round's findings to re-check and the fixer's claims and reasons in its
+prompt. Nothing is pushed, and the run stops `agent-blocked` as before, when
+the candidate fails `validation.commands` or someone pushed to the PR first;
+AutoForge never forces a push over another one, and a branch already at
+exactly its candidate is recorded as someone else's push.
+
+State protocol 16 -> 17 (`partial_fix`, and a FIX plan's unresolved findings
+and message) and prompt v17 -> v18. Older state files load with no partial
+fix, and a FIX plan saved before the upgrade completes as before.
+
 ### A procedure for the end-to-end demonstration, with none recorded yet (#261)
 
 [`docs/demo.md`](docs/demo.md) is the procedure behind Gate 3 of the Public

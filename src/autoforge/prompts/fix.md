@@ -267,3 +267,48 @@ Emit exactly one block at the end of your final reply:
   and you are asked to re-emit it; the controller never clips a resolution.
 - There is no field naming a branch or a pushed HEAD: you push nothing.
 - On failure: `"status": "failure"` plus `"message"`.
+
+## When a finding needs a human
+
+Some findings only a human can resolve: a secret or a repository setting,
+access you do not have, a decision the issue leaves open. Resolve every
+finding you can first. When one remains that you cannot resolve, report
+`"status": "blocked"` with a `"message"` saying what a human must do. If you
+committed fixes for other findings, list them too, so that the controller
+publishes them now instead of leaving them unpushed in this worktree:
+
+```text
+<<<CONTROL_RESULT>>>
+{
+  "phase": "FIX",
+  "status": "blocked",
+  "message": "<what a human must do, and why you cannot>",
+  "previous_head_sha": "{{REVIEWED_HEAD_SHA}}",
+  "head_sha": "<git rev-parse HEAD in this worktree, 40 hex chars>",
+  "resolutions": [
+    {"finding_id": "R{{REVIEW_ROUND}}-F1", "resolution": "fixed", "commit_sha": "<sha>"}
+  ],
+  "unresolved": [
+    {"finding_id": "R{{REVIEW_ROUND}}-F2", "reason": "<what this finding needs that you cannot do>"}
+  ],
+  "tests": ["<each test or check command you ran, with its outcome>"]
+}
+<<<END_CONTROL_RESULT>>>
+```
+
+- `unresolved` is what makes a blocked result a partial fix. Without it the
+  controller reads only `message`, and pushes nothing.
+- `resolutions` holds only `fixed` findings, each fixed by a commit after
+  `{{REVIEWED_HEAD_SHA}}`. Every other finding listed above is in
+  `unresolved`, once, with a `reason` of at most {{MAX_FIX_RATIONALE_CHARS}}
+  characters (newlines and tabs allowed). A finding you would resolve another
+  way (a follow-up issue, no change, an acceptance or operator action, a PR
+  description) goes in `unresolved` too: a partial fix publishes nothing but
+  your commits.
+- The cross-checks and commit-message rules above apply as they do to a
+  successful result, and a result that breaks one is refused and you are
+  asked to correct it. The controller validates your commit and pushes it to
+  the PR branch, then the run waits for the human: no finding is marked
+  resolved, and the next review re-checks every finding of this round at the
+  pushed HEAD. Leave the working tree clean.
+- When every finding is resolved, report `"status": "success"` as above.

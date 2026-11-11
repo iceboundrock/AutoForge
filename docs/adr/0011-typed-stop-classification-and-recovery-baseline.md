@@ -27,6 +27,14 @@
 - **Amended by #374:** D5. The code a sink names is saved with the stop
   (`stop_code`, protocol 16) for `status`'s recovery package, which a
   later process builds; it stays advice that nothing deciding reads.
+- **Amended by #433:** the `partial-fix` code, in the agent family. A FIX
+  that reports `blocked` may list the findings it fixed and the ones it left
+  (a partial fix, protocol 17); the controller verifies the candidate,
+  pushes it and reads it back, then stops with this code from its own sink,
+  so its source is `controller`, not `agent`. Where the partial fix is not
+  published (its candidate fails validation, or the PR moved while the fixer
+  ran or before the push), the stop is `agent-blocked`, the fixer's message
+  quoted, as for a plain block.
 - **Amends:** nothing. Every phase, edge, exit rule, budget, retry, effect
   and the state file are unchanged; seven `BLOCKED` reasons that told the
   operator to `resume`, which refuses a `BLOCKED` run, now say `unblock`.
@@ -213,6 +221,7 @@ exhaustive by `test_every_error_class_is_mapped_explicitly`.
 | merge gate | `READY_FOR_MERGE`, `MERGE` | `blocked` | `merge-inconclusive`, `pr-identity`, `pr-not-open`, `unreviewed-merge`, `merge-checks`, `merge-conflict`, `merge-not-ready`, `merge-write`, `premerge-verification`, `review-certificate`, `review-not-backed` |
 | workspace | around an agent launch | `blocked` | `checkout-drift`, `sandbox-tamper` |
 | agent | the agent-status sink | `blocked`, `failed` | `agent-blocked`, `agent-failure` |
+| agent (#433) | FIX's partial fix: its plan, its completion and its drift | `blocked` | `partial-fix` once the candidate is read back as the PR head; `agent-blocked` when it is not published; any identity, GitHub or bounds code a FIX plan's completion names |
 | execution | an error ending `run` / `step` / `resume` | `resumable_error` | `execution-failed`, `execution-timeout`, `sandbox-launch-refused`, `interaction-required` (SDK questions and permissions, #134), `control-result-invalid`, `verification-failed`, `github-unavailable`, `github-error`, `github-checks-refused`, `git-transport`, `effect-conflict`, `claim-ambiguous`, `pr-owner`, `checkout-drift`, `sandbox-tamper`, `validation-*`, `run-log-refused` (a run log refused after a launch's attempt was saved; exit 2) |
 | refusals | an error before the command acted | `refused` | `configuration-invalid`, `configuration-drift` (#219), `sandbox-capability` (ADR 0005 D12.2), `scheduler-owned`, `state-invalid` (LOCAL's state among them), `state-protocol` (#265), `state-transition`, `lock-held` |
 | intentional | the saved state | `ready_for_merge`, `handoff`, `done`, `in_progress` | the outcome's own code |

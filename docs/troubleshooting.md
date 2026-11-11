@@ -43,7 +43,7 @@ what no test covers.
 | `existing run <id> in phase <P> — use 'resume' to continue or 'run --force' to discard it` (exit 2) | [Starting over](#starting-over) |
 | `another AutoForge controller holds <path> — refusing to run concurrently on the same repository (...)` (exit 2) | [Another controller holds the lock](#another-controller-holds-the-lock) |
 | `'<command>' refuses issue <issue>: ... Only the parallel EPIC scheduler continues an issue its namespace owns ...` (exit 2) | [Another controller holds the lock](#another-controller-holds-the-lock) |
-| `unsupported protocol_version '<n>' (controller speaks '15'): a newer AutoForge wrote it` (exit 2) | [A run a newer controller wrote](usage.md#a-run-a-newer-controller-wrote) |
+| `unsupported protocol_version '<n>' (controller speaks '17'): a newer AutoForge wrote it` (exit 2) | [A run a newer controller wrote](usage.md#a-run-a-newer-controller-wrote) |
 | `refusing to start a new run over an unreadable state file`, `corrupted state file ...` (exit 2) | [The state file](#the-state-file) |
 | `issue <url> has no native parent on GitHub and no --epic was given`, `... has its native parent ... in another repository`, `... is closed on GitHub; a run records only an open EPIC`, `--epic <url> is the issue itself` (from `run`, exit 2) | [Which EPIC a run records](usage.md#which-epic-a-run-records) |
 | `issue <url> changed on GitHub while the run's EPIC was being bound: ...` (from `run`, exit 2) | [Which EPIC a run records](usage.md#which-epic-a-run-records): the issue's parent or state changed while `run` read its EPIC; nothing was written: run the command again |
@@ -170,6 +170,7 @@ and usually what to do. The common causes:
 | `validation.commands` failed three times for the phase | fix the cause; when it was the environment (a missing tool, a full disk), `unblock` makes the next gate run the same commit again ([Candidate validation evidence](usage.md#candidate-validation-evidence)) |
 | no applicable review certificate | `unblock`: it decides a fresh `REVIEW` round, or `READY_FOR_MERGE` once the certificate applies again ([Candidate validation evidence](usage.md#candidate-validation-evidence)) |
 | the fixer's own words: it cannot do what a finding asks (edit the PR description, say) | do it yourself, then `unblock --rereview` for a fresh `REVIEW` round instead of another fixer launch ([A finding the fixer cannot resolve](usage.md#a-finding-the-fixer-cannot-resolve)) |
+| `reason partial-fix`: the fixer fixed some findings, and AutoForge pushed its commits | do what the fixer asked for the findings it left, then `unblock`: a fresh `REVIEW` round of the pushed commit, with every finding of the round to re-check. Do not push the fixer's commits by hand ([A fixer that fixed some findings and needs you for the others](usage.md#a-fixer-that-fixed-some-findings-and-needs-you-for-the-others)) |
 | an acceptance action or operator actions | [The run waits for you](#the-run-waits-for-you-acceptance-and-operator-actions) |
 | a replan transaction | [A replan](#a-replan) |
 

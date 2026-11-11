@@ -308,7 +308,7 @@ def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, 
     sd.mkdir()
     if damage in ("newer", "unknown"):
         newer = _state(7, Phase.REVIEW).to_dict()
-        newer.update(protocol_version="17" if damage == "newer" else "6")
+        newer.update(protocol_version="18" if damage == "newer" else "6")
         (sd / "state.json").write_text(json.dumps(newer), encoding="utf-8")
     elif damage == "garbage":
         (sd / "state.json").write_text("{ not json " + "ghp_" + "b" * 36)
@@ -344,12 +344,12 @@ def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, 
     if damage in ("newer", "unknown"):
         import autoforge
 
-        label = "17" if damage == "newer" else "6"
-        assert f"unsupported protocol_version '{label}' (controller speaks '16')" in hold.problem
+        label = "18" if damage == "newer" else "6"
+        assert f"unsupported protocol_version '{label}' (controller speaks '17')" in hold.problem
         assert f"imported from {os.path.abspath(autoforge.__file__)}" in hold.problem
         assert hold.blocks_admission and hold.issue_number is None and hold.issue_url == ""
         assert (hold.refused_protocol, hold.newer_protocol) == (
-            ("unsupported-newer", "17") if damage == "newer" else ("unsupported-unknown", "")
+            ("unsupported-newer", "18") if damage == "newer" else ("unsupported-unknown", "")
         )
         refusal = admission_refusal(hold)
         assert refusal.startswith(
@@ -358,7 +358,7 @@ def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, 
         )
         assert "#7" not in refusal and "issues/7" not in refusal  # no field of the file
         if damage == "newer":
-            assert "a controller that speaks protocol 17 reads it" in refusal
+            assert "a controller that speaks protocol 18 reads it" in refusal
         else:
             assert "no AutoForge protocol has its label" in refusal
         assert "--force" not in refusal and "archive" not in refusal
@@ -382,13 +382,13 @@ def test_a_refused_standalone_state_keeps_the_controller_however_long_its_path(t
     sd = deep_dir(tmp_path, length - len("/state.json"))
     sd.mkdir(parents=True)
     newer = _state(7, Phase.REVIEW).to_dict()
-    newer.update(protocol_version="17")
+    newer.update(protocol_version="18")
     (sd / "state.json").write_text(json.dumps(newer), encoding="utf-8")
     assert len(str(sd / "state.json")) == length
     before = _tree(sd)
     hold = standalone_hold(sd)
     headline = (
-        "unsupported protocol_version '17' (controller speaks '16'): a newer AutoForge wrote it"
+        "unsupported protocol_version '18' (controller speaks '17'): a newer AutoForge wrote it"
     )
     provenance = f"imported from {os.path.abspath(autoforge.__file__)}, python {sys.executable}"
     assert hold.problem.startswith(f"{headline}, and this controller, autoforge ")
@@ -399,7 +399,7 @@ def test_a_refused_standalone_state_keeps_the_controller_however_long_its_path(t
     report = unreadable_report(hold)
     assert report == f"the standalone state {shown} cannot be read: {hold.problem}"
     assert headline in report and provenance in report
-    assert hold.blocks_admission and hold.newer_protocol == "17"
+    assert hold.blocks_admission and hold.newer_protocol == "18"
     assert _tree(sd) == before
 
 

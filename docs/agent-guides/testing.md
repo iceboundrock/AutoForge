@@ -40,6 +40,13 @@ High-priority coverage includes:
   under protocol 14 offers no update; a saved plan whose payload, marker, target,
   digests, authorization, `pr_body_source` or entry digest does not hold together
   is refused at load; each malformed outcome and receipt is refused
+- partial fix state (#433, `tests/test_partial_fix.py`): `partial_fix`
+  round-trips; a record off its round, reviewed HEAD, findings or phase, and
+  each malformed key, is refused; a protocol-16 file loads with none and its
+  saved `FIX` plan completes as the full fix it was; an older label carrying
+  any of it and a current file missing the field are refused; a saved partial
+  plan whose message, resolution kind, coverage or plan does not hold
+  together is refused at load
 - operator-action state (#243, `tests/test_state.py`): every outcome
   round-trips under the current protocol; a protocol-10 file, a `FIX`
   plan included, loads in every phase migrated and is relabelled; an older
@@ -1649,6 +1656,23 @@ a stated reason it has none. The coverage that must keep working:
   ahead of the update is not observed (a K9 comment a crash left unsaved, a K10
   comment posted but not verified, nothing posted, a conflict, a target that cannot
   be read), and the comment's URL kept once the prefix pass has saved it
+- a blocked FIX's partial fix (#433; `tests/test_partial_fix.py`): two
+  findings fixed and one human-blocked push the verified candidate once, read
+  it back and stop `partial-fix` with all three findings open and the claims
+  recorded; the plan is journaled before the push; a plain block, and one
+  shaped like a fix without `unresolved`, push nothing; mismatched claims,
+  candidate, ancestry, commit policy, coverage and any resolution but
+  `fixed` (an acceptance or operator action among them) are corrected with
+  nothing pushed or published; a finding with a follow-up issue is never
+  claimed fixed; a candidate failing validation and a PR that moved during the
+  fixer stop `agent-blocked` with nothing pushed; a crash after the push
+  completes with no second push and the push attributed to the controller; a
+  branch already at exactly the candidate is recorded `external` with nothing
+  sent; another push before the controller's is never forced and stays
+  `BLOCKED`; `unblock` re-reviews the published HEAD with every finding
+  carried and the claims and reasons in the prompt, under the round cap,
+  `--rereview` refused; `status` names the partial fix; the parser's schema
+  and bounds
 - operator actions (#243, ADR 0004 K10; `tests/test_operator_actions.py`
   for the engine, unblock and `status --action`, K10 in
   `tests/test_effects.py`, the marker in `tests/test_claims.py`,

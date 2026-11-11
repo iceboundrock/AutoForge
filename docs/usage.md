@@ -754,6 +754,38 @@ what the plain decision is. If someone pushes to the PR after the unblock,
 the new round reviews the new HEAD, and its prompt says the PR moved after
 your request.
 
+### A fixer that fixed some findings and needs you for the others
+
+When the fixer resolves some findings and must stop for one only a human can
+act on (a secret to set, access it lacks, a decision the issue leaves
+open), it may report `blocked` with the findings it fixed and the ones it
+left, each with a reason. AutoForge then publishes the fixer's commits
+itself: it checks them as it checks any fix, validates the candidate, pushes
+it to the PR branch and reads it back. You no longer push them by hand. The
+run stops with `stop: blocked (reason partial-fix, ...)`, and the reason
+quotes the fixer's message and its reason for each finding left. `status`
+adds a `Partial fix:` line with the pushed commit, who put it on the branch
+(AutoForge, or someone who had already pushed exactly that commit), and the
+findings claimed fixed and left open.
+
+No finding is marked resolved, and nothing runs until you `unblock`. Do
+what the fixer asked for, then `autoforge unblock --reason "..."` and
+`resume`. Because the PR has moved past the reviewed HEAD, the unblock
+enters a fresh `REVIEW` round of the pushed commit rather than `FIX`, and
+every finding of the round is handed to it to re-check; its prompt says
+which ones the fixer claimed fixed and why it left the others. The round
+counts against `workflow.max_review_rounds`, and `--rereview` is refused
+here (the plain unblock already re-reviews).
+
+If the fixer's commits cannot be published, nothing is pushed, they stay
+in the agent worktree, and the run stops `agent-blocked` with the fixer's
+message and the reason: a candidate that failed `validation.commands`
+(the reason names the validation record and its run log; `unblock` then
+launches the fixer again, and what it reports is validated afresh),
+or a PR that someone pushed to while the fixer ran or before AutoForge's
+push (`unblock` then reviews the PR as it is, with the findings carried).
+AutoForge never forces a push over someone else's.
+
 ### BLOCKED on an acceptance action
 
 A finding or an acceptance criterion sometimes asks for text to be posted

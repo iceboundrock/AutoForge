@@ -61,7 +61,11 @@ target and creates nothing (#163). One of its resolutions may instead ask
 the controller to publish an acceptance comment on the run's own issue: a
 closed ``kind`` and a bounded body under the same policy
 (``MAX_ACCEPTANCE_BODY_CHARS``, ``MAX_ACCEPTANCE_ACTIONS_PER_FIX``), never
-a target, URL, method, path or command (#211). An UPDATE_EPIC result is validated
+a target, URL, method, path or command (#211). A FIX result whose status is
+``blocked`` and which carries ``unresolved`` is a partial fix (#433,
+:class:`PartialFixResult`): the same cross-checks, ``fixed`` resolutions only,
+and every other open finding listed with the fixer's reason; any other
+blocked result is read for its ``message`` alone. An UPDATE_EPIC result is validated
 against the schema of the request that launched the agent
 (:class:`UpdateEpicRequest`, D4.7): a re-request after publication carries
 only what it asks for.
@@ -396,6 +400,11 @@ def parse_control_result(
             raise ControlResultValidationError(
                 f"status {payload['status']!r} requires a non-empty 'message' explaining why"
             )
+        if is_partial_fix(expected_phase, payload):
+            # #433: a blocked FIX that offers the commits it made is held to
+            # the same schema as a successful one, so a malformed offer is
+            # corrected rather than read as a plain block.
+            PartialFixResult.from_payload(payload)
     return payload
 
 
@@ -1831,15 +1840,144 @@ class FixResult:
                 "body. Write one description that resolves them all and re-emit the "
                 "CONTROL_RESULT."
             )
-        tests = _opt_str_list(p, "tests", ph)
-        if len(tests) > MAX_TESTS_REPORTED:
-            raise ControlResultValidationError(
-                f"{ph}: field 'tests' lists {len(tests)} entries; the controller accepts at "
-                f"most {MAX_TESTS_REPORTED}. Summarise them and re-emit the CONTROL_RESULT."
-            )
-        for test in tests:
-            _one_line(_bounded(test, ph, "result", "tests", MAX_TEST_CHARS), ph, "result", "tests")
+        tests = _reported_tests(p, ph)
         return cls(previous_head_sha=previous, head_sha=head, resolutions=resolutions, tests=tests)
+
+
+def _reported_tests(p: dict, ph: str) -> list[str]:
+    """A FIX result's optional ``tests``: one-line strings, bounded, never published."""
+    tests = _opt_str_list(p, "tests", ph)
+    if len(tests) > MAX_TESTS_REPORTED:
+        raise ControlResultValidationError(
+            f"{ph}: field 'tests' lists {len(tests)} entries; the controller accepts at "
+            f"most {MAX_TESTS_REPORTED}. Summarise them and re-emit the CONTROL_RESULT."
+        )
+    for test in tests:
+        _one_line(_bounded(test, ph, "result", "tests", MAX_TEST_CHARS), ph, "result", "tests")
+    return tests
+
+
+# The key that makes a blocked FIX result a partial one (#433). A blocked
+# result without it is a plain block: the controller reads nothing else of
+# it and pushes nothing, as before.
+PARTIAL_FIX_KEY = "unresolved"
+
+
+def is_partial_fix(phase: Phase, payload: dict) -> bool:
+    """Whether ``payload`` is a blocked FIX result that offers a partial fix (#433).
+
+    The agent opts in with :data:`PARTIAL_FIX_KEY`; nothing else of a blocked
+    result is read for it, so a result that names no unresolved finding is
+    never taken for one.
+    """
+    return phase == Phase.FIX and payload.get("status") == "blocked" and PARTIAL_FIX_KEY in payload
+
+
+@dataclass(frozen=True)
+class UnresolvedFinding:
+    """An open finding a blocked FIX left unresolved, and the fixer's reason (#433)."""
+
+    finding_id: str
+    reason: str
+
+    def to_dict(self) -> dict:
+        return {"finding_id": self.finding_id, "reason": self.reason}
+
+
+@dataclass
+class PartialFixResult:
+    """A blocked FIX result that carries the commits it made for some findings (#433).
+
+    The fixer could resolve some open findings and not the others: a human
+    must act on those (a secret, a setting, a decision). It reports the
+    findings it fixed as ``fixed`` resolutions, exactly as a successful FIX
+    does, with the same cross-checks (``previous_head_sha``, ``head_sha``),
+    and lists every other open finding in ``unresolved`` with its reason.
+    Only ``fixed`` is accepted here: every other resolution asks the
+    controller to publish something (an issue, a comment, a description) or
+    waits for the operator, and a partial result publishes nothing but the
+    commits. Each claim is the agent's; the controller verifies the candidate
+    and the commits before it plans their push, and records no finding as
+    resolved.
+    """
+
+    previous_head_sha: str
+    head_sha: str
+    resolutions: list[FindingResolution] = field(default_factory=list)
+    unresolved: list[UnresolvedFinding] = field(default_factory=list)
+    tests: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_payload(cls, p: dict) -> PartialFixResult:
+        ph = "FIX"
+        what = "a blocked FIX result with 'unresolved' (a partial fix)"
+        previous = _req_sha(p, "previous_head_sha", ph)
+        head = _req_sha(p, "head_sha", ph)
+        raw = _raw_resolutions(p)
+        if not raw:
+            raise ControlResultValidationError(
+                f"{ph}: {what} resolves no finding; list at least one 'fixed' resolution, "
+                "or drop 'unresolved' (and the other result fields) for a plain block"
+            )
+        resolutions = [FindingResolution.from_payload(r, i) for i, r in enumerate(raw)]
+        others = [r.finding_id for r in resolutions if r.resolution != "fixed"]
+        if others:
+            raise ControlResultValidationError(
+                f"{ph}: {what} carries only 'fixed' resolutions (the commits you made), and "
+                f"these use another: {', '.join(others)}; move each to 'unresolved' with its "
+                "reason, or resolve every finding and report status 'success'"
+            )
+        unresolved_raw = p.get(PARTIAL_FIX_KEY)
+        if not isinstance(unresolved_raw, list) or not unresolved_raw:
+            raise ControlResultValidationError(
+                f"{ph}: field {PARTIAL_FIX_KEY!r} must be a non-empty list of "
+                "{finding_id, reason} objects; report status 'success' when no finding is left"
+            )
+        if len(raw) + len(unresolved_raw) > MAX_RESOLUTIONS_PER_FIX:
+            raise ControlResultValidationError(
+                f"{ph}: {len(raw)} resolutions and {len(unresolved_raw)} unresolved findings "
+                f"reported; the controller accepts at most {MAX_RESOLUTIONS_PER_FIX} together, "
+                "one per open finding. Re-emit the CONTROL_RESULT."
+            )
+        unresolved = [_unresolved(item, i) for i, item in enumerate(unresolved_raw)]
+        ids = [r.finding_id for r in resolutions] + [u.finding_id for u in unresolved]
+        if len(set(ids)) != len(ids):
+            raise ControlResultValidationError(
+                f"{ph}: {what} names a finding twice across 'resolutions' and "
+                f"{PARTIAL_FIX_KEY!r}: {ids}; each open finding is fixed or unresolved, once"
+            )
+        return cls(
+            previous_head_sha=previous,
+            head_sha=head,
+            resolutions=resolutions,
+            unresolved=unresolved,
+            tests=_reported_tests(p, ph),
+        )
+
+
+def _unresolved(raw: object, index: int) -> UnresolvedFinding:
+    """One ``unresolved`` entry of a partial FIX result: exactly a finding id and a reason."""
+    ph = "FIX"
+    where = f"{PARTIAL_FIX_KEY}[{index}]"
+    if not isinstance(raw, dict):
+        raise ControlResultValidationError(
+            f"{ph}: {where} must be an object with finding_id and reason"
+        )
+    extra = sorted(str(k)[:MAX_FINDING_ID_CHARS] for k in raw if k not in ("finding_id", "reason"))
+    if extra:
+        raise ControlResultValidationError(
+            f"{ph}: {where} carries {', '.join(repr(k) for k in extra)}; an unresolved "
+            "finding is exactly {finding_id, reason}"
+        )
+    fid = _finding_id(raw, "finding_id", ph)
+    subject = f"unresolved finding {fid}"
+    reason = _multi_line(
+        _bounded(_req_str(raw, "reason", ph), ph, subject, "reason", MAX_FIX_RATIONALE_CHARS),
+        ph,
+        subject,
+        "reason",
+    )
+    return UnresolvedFinding(finding_id=fid, reason=reason)
 
 
 @dataclass

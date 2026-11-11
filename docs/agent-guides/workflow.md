@@ -517,6 +517,28 @@ alternative, not consuming a stale round, was rejected: it would relaunch
 the same round profile against a PR that may move again, and it would let
 pushes alone repeat a round without the cap ever counting it.
 
+### A blocked FIX publishes its partial fix
+
+A `FIX` agent that reports `blocked` may list the findings it fixed and the
+ones it left for a human (#433; github-safety.md, "A blocked FIX's partial
+fix"). The controller verifies that partial fix, pushes it as the plan's
+only write and reads it back, then the run stops `BLOCKED` (`partial-fix`)
+with every finding of the round still open: `FIX` has one edge out, to
+`REVIEW`, and the round is not complete. Three things deliberately do not
+happen. No finding is marked resolved, because a commit is evidence of a
+claim, not of its truth. Nothing re-reviews or relaunches on its own, since
+the fixer said a human must act and a launch before that would meet the
+same stop. And a plain `unblock` never re-enters `FIX` for the round: the
+PR is past the reviewed HEAD the findings are bound to, so the decision
+table's moved-revision row applies, `REVIEW` of the published HEAD with
+the findings carried as a stale round's are (see "Stale rounds keep their
+findings"), under the round cap. `--rereview` is refused there, as for any
+moved revision. `partial_fix` names the candidate and the claims while the
+findings are carried, and the completed round clears it. A partial fix that
+is not published (its candidate fails validation, the PR moved first)
+stops `agent-blocked` with the fixer's message instead, its commits left in
+the worktree, and the decision table applies to the PR as it is.
+
 ### Re-entering a phase
 
 `resume` re-enters the persisted phase. Before it does, `step`, `resume`
@@ -677,7 +699,9 @@ next entry could not find again.
   "After FIX"). A saved plan is held to the entry's rules again before it
   sends anything and when it completes: a base or merge base that left the
   findings' binding is the same drift with the findings carried, and a
-  head branch or follow-up issue the plan cannot prove blocks.
+  head branch or follow-up issue the plan cannot prove blocks. A partial
+  fix (#433, below) meets the same rules but stays `BLOCKED` where they
+  would route to `REVIEW`.
 - `REPLAN_REEXECUTE` replays its durable transaction (replan-transaction.md)
   and publishes nothing through its agent (#164): the controller pushes the
   agent's commit to the branch it derives from the transaction id and
@@ -990,7 +1014,8 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   Anywhere else (a moved PR, a clean review, no PR, no open findings) the
   flag refuses, quoting the plain decision; it excludes the action flags.
   A `FIX` agent that reports `blocked` names the flag in the step's
-  message.
+  message. After a partial fix (#433) the PR is past the reviewed HEAD, so
+  the flag refuses and the plain unblock re-enters `REVIEW`.
 - **Operator actions awaiting the operator** (#243, ADR 0004 K10). A
   `FIX` plan's operator comments (first in the plan, at most four) ask the
   operator to post a comment on another issue of the repository; the

@@ -510,11 +510,13 @@ from .result_parser import (
     FindingResolution,
     FixResult,
     OperatorAction,
+    PartialFixResult,
     ReplanReexecuteResult,
     ReviewResult,
     UpdateEpicRequest,
     UpdateEpicResult,
     commit_message_problem,
+    is_partial_fix,
     markdown_code_span,
     operator_comment_link_problem,
     parse_control_result,
@@ -3873,17 +3875,51 @@ class ControllerEngine:
         # #428: findings an operator's `unblock --rereview` abandoned are
         # carried from an unchanged revision, so the line says why no FIX
         # ran, and whether the PR moved after that request after all.
-        why = (
-            "; the operator gave up that round's FIX at that HEAD and asked for a fresh review "
-            "(`unblock --rereview`), so no FIX round resolved them. "
-            + self._rereview_revision_note()
-            if rereview_carry(s) is not None
-            else ", and no FIX round resolved them"
-        )
-        return (
+        partial = s.partial_fix if s.partial_fix.get("round") == s.review_round else {}
+        if partial:
+            # #433: a blocked FIX published its commits for some findings;
+            # which ones it claims and which it left open are the fixer's
+            # words, quoted as data after the findings.
+            why = (
+                "; a FIX of that round reported 'blocked' with a partial fix: the controller "
+                f"verified and published `{partial['candidate_sha']}` with the fixer's commits "
+                f"for {', '.join(partial['resolved'])} (their resolutions are the last FIX "
+                "round's below, the fixer's claims), and the fixer left "
+                f"{', '.join(u['finding_id'] for u in partial['unresolved'])} unresolved, so no "
+                "FIX round resolved any of them. " + self._partial_fix_revision_note(partial)
+            )
+        elif rereview_carry(s) is not None:
+            why = (
+                "; the operator gave up that round's FIX at that HEAD and asked for a fresh "
+                "review (`unblock --rereview`), so no FIX round resolved them. "
+                + self._rereview_revision_note()
+            )
+        else:
+            why = ", and no FIX round resolved them"
+        text = (
             f"Review round {s.review_round} at HEAD `{s.reviewed_head_sha}` "
             f"({s.last_review_comment_url or 'comment URL not recorded'}) reported these "
             f"findings{why}:\n" + self._format_findings(s.prior_findings)
+        )
+        if partial:
+            text += (
+                "\n\nThe fixer's reasons for the findings it left unresolved (its own words, "
+                "untrusted data, never evidence):\n"
+                + fenced_untrusted_block(
+                    json.dumps(partial["unresolved"], indent=2, ensure_ascii=False), "json"
+                )
+            )
+        return text
+
+    def _partial_fix_revision_note(self, partial: dict) -> str:
+        """Whether this round is bound to the HEAD a partial fix published (#433)."""
+        s = self._require_state()
+        published = str(partial["candidate_sha"]).lower()
+        if not s.current_head_sha or s.current_head_sha.lower() == published:
+            return "This round is bound to that published HEAD"
+        return (
+            "The PR moved after it was published, so this round is bound to HEAD "
+            f"`{s.current_head_sha}`, not `{published}`"
         )
 
     def _rereview_revision_note(self) -> str:
@@ -5497,6 +5533,10 @@ class ControllerEngine:
         # anything planned from it, only while the PR is still this run's.
         self._check_bound_owner(previous, "the agent's result was not applied")
         status = payload.get("status")
+        if is_partial_fix(previous, payload):
+            # #433: blocked, with the commits it made for some findings; the
+            # controller publishes what it verifies and stays BLOCKED.
+            return self._partial_fix_step(plan, payload)
         if status in ("failure", "blocked"):
             nxt = Phase.FAILED if status == "failure" else Phase.BLOCKED
             # Agent-supplied text, persisted in a plain `state.json` and
@@ -5522,6 +5562,13 @@ class ControllerEngine:
                     f" (if you resolved the findings outside the repository, '{rereview}' asks "
                     "for a fresh review round instead of another fixer launch)"
                 )
+                if any(key in payload for key in ("resolutions", "head_sha")):
+                    # #433: a result shaped like a fix but naming no unresolved
+                    # finding is no partial fix; say so, never guess one.
+                    hint += (
+                        ". The result carries no 'unresolved' list, so it offers no partial "
+                        "fix: none of its other fields was read and nothing was pushed"
+                    )
             return self._outcome(
                 previous,
                 plan=plan,
@@ -5556,6 +5603,229 @@ class ControllerEngine:
         state.attempt = 0
         self._save()
         return self._outcome(previous, plan=plan, result=payload, message=message)
+
+    # -- a blocked FIX that publishes what it fixed (#433) ----------------------------
+    def _partial_fix_step(self, plan: StepPlan, payload: dict) -> StepOutcome:
+        """Publish a blocked FIX's verified commits, then stay ``BLOCKED`` (#433).
+
+        The result was checked before it was accepted
+        (:meth:`_check_partial_fix_result`). :meth:`_apply_partial_fix` plans
+        the push of its candidate and completes it, or refuses with nothing
+        pushed; either way the run ends ``BLOCKED`` with the round's findings
+        open, because the fixer said a human must act on the others. A read
+        that cannot be completed propagates for 'resume', as after a
+        successful FIX.
+        """
+        res = PartialFixResult.from_payload(payload)
+        # Agent text, persisted with the plan and quoted by the stop: the same
+        # redaction boundary and bound as an agent's block message.
+        message = bound_block_reason(redact(str(payload.get("message", ""))))
+        try:
+            nxt, text = self._apply_partial_fix(res, message)
+        except VerificationError as exc:
+            self._record_verification_failure(Phase.FIX, exc)
+            self._save()
+            raise
+        if nxt != Phase.BLOCKED:
+            raise StateError(f"a partial FIX was applied and left FIX for {nxt.value}")
+        return self._block(Phase.FIX, plan, text)
+
+    def _partial_fix_prefix(self, message: str) -> str:
+        return (
+            f"FIX of review round {self._require_state().review_round} reported 'blocked' "
+            f"with a partial fix (the fixer's message: {message})"
+        )
+
+    def _apply_partial_fix(self, res: PartialFixResult, message: str) -> tuple[Phase, str]:
+        """Plan the push of a partial fix's candidate, save it, then complete (#433).
+
+        The rules of a successful FIX before its plan (:meth:`_apply_fix`),
+        for a plan that is the push alone: the exact candidate passes the
+        controller's validation (ADR 0006 D5.1); the PR is open at the
+        reviewed HEAD, headed at a branch of this repository; and the
+        follow-up issues are as the entry observed them. Any of them failing
+        blocks with nothing planned or pushed, and the fixer's commits stay in
+        the agent worktree. Unlike a successful FIX, neither a candidate that
+        fails validation below the bound nor a PR that moved while the fixer
+        ran is routed on: the fixer reported a need only a human can meet, so
+        the run stays ``BLOCKED`` with its message, and 'unblock' decides
+        from the PR as it is then (FIX again at the reviewed HEAD, REVIEW of
+        a PR that moved). The plan and its context (the ``fixed``
+        resolutions, the unresolved findings with the fixer's reasons, and
+        its message) are saved in one save, and :meth:`_complete_fix` does
+        the rest from what was saved, as a later entry would.
+        """
+        state = self._require_state()
+        reviewed = state.reviewed_head_sha.lower()
+        candidate = self._fix_candidate
+        if (
+            not candidate
+            or candidate != res.head_sha
+            or res.previous_head_sha != reviewed
+            or candidate == reviewed
+        ):
+            raise StateError("a partial FIX was applied without the candidate its check accepted")
+        observation = state.phase_effects().observation
+        if observation is None or observation.phase != Phase.FIX:
+            raise StateError("a partial FIX was applied without the observation of its entry")
+        self._fix_candidate = ""
+        prefix = self._partial_fix_prefix(message)
+        kept = (
+            "Nothing was pushed: the round's findings stay open and the fixer's commits stay in "
+            "the agent worktree"
+        )
+        unblock = self.cli_command("unblock", "--reason", "<what you did>")
+        try:
+            problem = self._gate_producer(Phase.FIX, candidate, reviewed)
+        except _ProducerValidationFailed:
+            counter = state.producer_validation_failure
+            seq = counter["last_record_seq"]
+            view = next(r for r in state.validation_evidence() if r.seq == seq)
+            return _blocked(
+                StopReasonCode.AGENT_BLOCKED,
+                f"{prefix}, and the controller's validation of its candidate {candidate[:12]} "
+                f"did not pass: {_validation_failure_text(view)}. {kept}. Next: read that "
+                f"record's run log and resolve what the fixer asks for, then '{unblock}': FIX "
+                "launches the fixer again at the reviewed HEAD, and whatever it then reports is "
+                "validated afresh",
+            )
+        if problem:
+            return _blocked(
+                reason_code(problem, StopReasonCode.PRODUCER_VALIDATION_BOUND),
+                f"{prefix}; {problem}",
+            )
+        pr = self._require_open_pr()
+        if pr.head_sha.lower() != reviewed:
+            return _blocked(
+                StopReasonCode.AGENT_BLOCKED,
+                f"{prefix}, and PR HEAD {pr.head_sha[:12]} moved past the reviewed HEAD "
+                f"{reviewed[:12]} while the fixer ran (a push the controller did not make; it "
+                f"does not infer which findings it resolved). {kept}. Next: resolve what the "
+                f"fixer asks for, then '{unblock}': REVIEW of the actual revision, with the "
+                "round's findings carried to re-check",
+            )
+        problem = self._fix_branch_problem(pr)
+        if problem:
+            return _blocked(StopReasonCode.PR_IDENTITY, f"{prefix}; {problem}. {kept}")
+        pr_ref = parse_pr_url(state.current_pr_url)
+        open_ids = [str(f["id"]) for f in state.open_findings]
+        ref = f"refs/heads/{pr.head_ref}"
+        try:
+            own, _ = self._fix_follow_ups(pr_ref, open_ids)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return _blocked(
+                StopReasonCode.GITHUB_READ_FAILED,
+                f"{prefix}; the follow-up issues of PR {pr_ref.canonical} could not be read "
+                f"before its plan was saved: {exc}. This is not a transient GitHub failure. "
+                f"{kept}. Fix the cause, then 'unblock'",
+            )
+        except ClaimConflictError as exc:
+            return _blocked(StopReasonCode.CLAIM_AMBIGUOUS, f"{prefix}; {exc}. {kept}")
+        observed = self._fix_observed_objects(pr_ref, open_ids, own)
+        if observed != dict(observation.objects) or dict(observation.refs) != {ref: reviewed}:
+            return _blocked(
+                StopReasonCode.UNJOURNALED_WRITE,
+                f"{prefix}; " + self._unjournaled_fix_text(observation, observed, ref, reviewed),
+            )
+        owner = self._fix_owner()
+        push = EffectRecord.plan(
+            0,
+            EffectKind.PUSH,
+            owner,
+            identity={"repository": state.repository, "ref": ref, "candidate_sha": candidate},
+            target={"repository": state.repository, "ref": ref},
+            precondition={"expected_old": reviewed, "base_sha": reviewed},
+            payload={"sha": candidate},
+        )
+        context = FixContext(
+            state.current_issue_url,
+            state.current_pr_url,
+            state.review_round,
+            tuple(
+                {
+                    "finding_id": r.finding_id,
+                    "resolution": r.resolution,
+                    "rationale": redact(r.rationale),
+                    "commit_sha": r.commit_sha,
+                    "follow_up_source": None,
+                    "acceptance_source": None,
+                    "operator_sources": None,
+                    "pr_body_source": None,
+                }
+                for r in res.resolutions
+            ),
+            tuple({"finding_id": u.finding_id, "reason": redact(u.reason)} for u in res.unresolved),
+            message,
+        )
+        problem = plan_size_problem([push], context)
+        if problem:
+            return _blocked(
+                StopReasonCode.FIX_PLAN_REFUSED,
+                f"{prefix}; its plan cannot be saved: {problem}. {kept}",
+            )
+        state.effect_records = [push.to_dict()]
+        state.completion_context = context.to_dict()
+        # Validated exactly as a later load validates it (D4.6).
+        state.phase_effects()
+        self._save()
+        return self._complete_fix()
+
+    def _partial_fix_recorded(
+        self, context: FixContext, push: EffectRecord, candidate: str, reviewed: str
+    ) -> tuple[Phase, str]:
+        """The stop of a partial fix whose push is read back (#433): ``BLOCKED``, findings open.
+
+        ``last_fix_resolutions`` already holds the ``fixed`` claims, verified
+        against the commits pushed; ``partial_fix`` records the candidate,
+        who put it on the branch (the controller's push, or GitHub already at
+        exactly that commit before the controller sent anything, which the
+        record's attempt count tells apart) and the findings left open with
+        the fixer's reasons. The plan is complete and dropped; the open
+        findings and the review result stay as the round left them. The
+        reason quotes the fixer's message and reasons as its own and names
+        the way on: 'unblock' re-enters REVIEW of the published HEAD with the
+        round's findings carried, since the PR is no longer at the reviewed
+        HEAD; nothing re-reviews or relaunches on its own.
+        """
+        state = self._require_state()
+        published_by = "controller" if push.attempts else "external"
+        resolved = [str(r["finding_id"]) for r in context.resolutions]
+        left = [str(u["finding_id"]) for u in context.unresolved]
+        state.partial_fix = {
+            "round": context.round,
+            "pr_url": state.current_pr_url,
+            "reviewed_head_sha": reviewed,
+            "candidate_sha": candidate,
+            "published_by": published_by,
+            "resolved": resolved,
+            "unresolved": [dict(u) for u in context.unresolved],
+        }
+        state.drop_phase_effects()
+        moved = (
+            f"pushed {candidate[:12]} over {reviewed[:12]}"
+            if published_by == "controller"
+            else (
+                f"found the PR branch already at exactly {candidate[:12]}, pushed by someone "
+                "else, and sent nothing"
+            )
+        )
+        reasons = "; ".join(f"{u['finding_id']}: {u['reason']}" for u in context.unresolved)
+        findings = len(state.open_findings)
+        unblock = self.cli_command("unblock", "--reason", "<what you did>")
+        claimed = f"{', '.join(resolved)} {'is' if len(resolved) == 1 else 'are'}"
+        open_ = f"{', '.join(left)} {'is' if len(left) == 1 else 'are'}"
+        return _blocked(
+            StopReasonCode.PARTIAL_FIX,
+            f"{self._partial_fix_prefix(context.message)}. The controller verified its "
+            f"candidate {candidate[:12]} (the fixer's commits), {moved}, and read it back as "
+            f"the PR head. None of the round's {findings} finding(s) is marked resolved: "
+            f"{claimed} claimed fixed, and {open_} not (the fixer's reasons: {reasons}). "
+            f"Next: resolve what the fixer asks for, then '{unblock}': REVIEW round "
+            f"{state.review_round + 1} reviews {candidate[:12]} with the round's findings "
+            "carried to re-check; no fixer is launched before it",
+        )
 
     def _remote_entry(
         self, previous: Phase, plan: StepPlan, *, relaunch: bool = False
@@ -7337,6 +7607,26 @@ class ControllerEngine:
                 f"{new_chars} characters together, more than the controller journals for one "
                 "FIX round; shorten their bodies and re-emit the CONTROL_RESULT"
             )
+        self._fix_candidate = self._check_fix_candidate(cwd, res.head_sha, res.resolutions)
+        return res
+
+    def _check_fix_candidate(
+        self, cwd: str, head_sha: str, resolutions: Sequence[FindingResolution]
+    ) -> str:
+        """The FIX candidate the controller would publish, read from the worktree (#163).
+
+        :meth:`_check_fix_result`'s rule for the candidate, shared with a
+        partial fix (#433, :meth:`_check_partial_fix_result`): the
+        worktree's ``HEAD`` as the controller reads it, detached, equal to
+        ``head_sha``, and either the reviewed HEAD (no ``fixed`` finding) or a
+        descendant of it whose every published commit passes the
+        commit-message policy and which holds each named ``commit_sha``.
+        Returns that HEAD; a refusal is a correction, a read that cannot be
+        completed a :class:`VerificationError`.
+        """
+        state = self._require_state()
+        reviewed = state.reviewed_head_sha.lower()
+        issue = parse_issue_url(state.current_issue_url)
         candidate = self._read_candidate(cwd)
         if candidate.attached:
             raise ControlResultValidationError(
@@ -7351,12 +7641,12 @@ class ControllerEngine:
                 + (f" ({candidate.problem})" if candidate.problem else "")
                 + f"; check out {reviewed} (or your commits on it) and re-emit the CONTROL_RESULT"
             )
-        if head != res.head_sha:
+        if head != head_sha:
             raise ControlResultValidationError(
-                f"FIX: field 'head_sha' is {res.head_sha}, but the worktree's HEAD is {head}; "
+                f"FIX: field 'head_sha' is {head_sha}, but the worktree's HEAD is {head}; "
                 "report `git rev-parse HEAD`"
             )
-        fixed = [r for r in res.resolutions if r.resolution == "fixed"]
+        fixed = [r for r in resolutions if r.resolution == "fixed"]
         if head == reviewed:
             if fixed:
                 raise ControlResultValidationError(
@@ -7364,8 +7654,7 @@ class ControllerEngine:
                     f"is still the reviewed HEAD {reviewed}: a fixed finding needs a commit. "
                     "Commit the fix, or resolve it another way, and re-emit the CONTROL_RESULT"
                 )
-            self._fix_candidate = head
-            return res
+            return head
         try:
             proof = self._git_transport().prove_range(reviewed, head)
         except GitTransportError as exc:
@@ -7395,7 +7684,50 @@ class ControllerEngine:
                     f"commits after the reviewed HEAD {reviewed[:12]} up to {head[:12]}; name "
                     "the commit that fixed it, or omit commit_sha"
                 )
-        self._fix_candidate = head
+        return head
+
+    def _check_partial_fix_result(self, payload: dict, cwd: str) -> PartialFixResult:
+        """The controller's half of a partial FIX result (#433): coverage and candidate.
+
+        A blocked FIX that offers the commits it made is checked before it is
+        accepted, as a successful one is (:meth:`_check_fix_result`), so a
+        refusal is corrected before anything is planned or pushed. Its
+        ``fixed`` resolutions and its ``unresolved`` findings together name
+        exactly the open findings, once each. A finding whose follow-up issue
+        the entry found is never ``fixed`` here: that issue already is its
+        resolution, which only a successful result records. The candidate is
+        checked by the same rule as every FIX candidate
+        (:meth:`_check_fix_candidate`), and since every resolution is
+        ``fixed`` it is a descendant of the reviewed HEAD, never the reviewed
+        HEAD itself.
+        """
+        state = self._require_state()
+        self._fix_block = ""
+        res = PartialFixResult.from_payload(payload)
+        reviewed = state.reviewed_head_sha.lower()
+        if res.previous_head_sha != reviewed:
+            raise ControlResultValidationError(
+                f"FIX: field 'previous_head_sha' is {res.previous_head_sha}, but the open "
+                f"findings are bound to the reviewed HEAD {reviewed}; report that HEAD"
+            )
+        open_ids = [str(f["id"]) for f in state.open_findings]
+        reported = [r.finding_id for r in res.resolutions] + [u.finding_id for u in res.unresolved]
+        missing = [fid for fid in open_ids if fid not in reported]
+        unknown = [fid for fid in reported if fid not in open_ids]
+        if missing or unknown:
+            raise ControlResultValidationError(
+                f"FIX: 'resolutions' and 'unresolved' together must name exactly the open "
+                f"findings {open_ids}, each once; missing {missing}, unknown {unknown}"
+            )
+        for r in res.resolutions:
+            own = self._existing_follow_ups.get(r.finding_id)
+            if own is not None:
+                raise ControlResultValidationError(
+                    f"FIX: open issue {own} already is the follow-up of {r.finding_id}, which a "
+                    "partial fix cannot record; list it in 'unresolved', or resolve every "
+                    "finding and report status 'success' with that issue as its follow-up"
+                )
+        self._fix_candidate = self._check_fix_candidate(cwd, res.head_sha, res.resolutions)
         return res
 
     def _check_acceptance_action(self, r: FindingResolution) -> int:
@@ -9086,8 +9418,22 @@ class ControllerEngine:
                 "again",
                 pr=pr,
             )
+        partial = state.partial_fix
         if not review_is_this_pr or not reviewed:
             why = "no completed review of it is bound in state"
+        elif (
+            not at_reviewed_revision
+            and partial
+            and (pr.head_sha or "").lower() == str(partial["candidate_sha"]).lower()
+            and pr.base_ref == state.reviewed_base_ref
+        ):
+            # #433: the controller's own publication of a blocked FIX's commits.
+            why = (
+                f"its HEAD {pr.head_sha[:12]} is the partial fix of review round "
+                f"{state.review_round} the controller published over {reviewed[:12]} "
+                f"({', '.join(partial['resolved'])} claimed fixed; "
+                f"{', '.join(u['finding_id'] for u in partial['unresolved'])} left open)"
+            )
         elif not at_reviewed_revision:
             why = (
                 f"its revision moved after review round {state.review_round} (HEAD "
@@ -12672,6 +13018,18 @@ class ControllerEngine:
                     "body again before each later write and before recording the fix, and block "
                     "with nothing more sent if it no longer holds the payload"
                 )
+        if isinstance(effects.context, FixContext) and effects.context.partial:
+            # #433: the plan is the push alone, and its completion stops BLOCKED.
+            left = ", ".join(str(u["finding_id"]) for u in effects.context.unresolved)
+            notes.append(
+                f"would complete the partial fix of review round {effects.context.round} from "
+                "the persisted plan without launching the fixer: re-read the PR's HEAD, base, "
+                "merge base and head branch and the open issues, push the candidate (the plan's "
+                "only write) unless the branch already holds it, read it back, then stay "
+                f"BLOCKED with every finding open ({left} left by the fixer); a PR that moved "
+                "or a base that left the findings' binding drops the plan and stays BLOCKED"
+            )
+            return notes
         if isinstance(effects.context, FixContext):
             notes.append(
                 f"would complete FIX of review round {effects.context.round} from the persisted "
@@ -13548,6 +13906,9 @@ class ControllerEngine:
         self._existing_follow_ups = own
         self._existing_pr_follow_ups = deferred
         state.current_head_sha = pr.head_sha
+        # #433: the fixer starts again from the reviewed HEAD, so a partial fix
+        # of the round published earlier is not on the PR any more.
+        state.partial_fix = {}
         self._save()
         return None
 
@@ -15187,6 +15548,7 @@ class ControllerEngine:
         state.open_findings = []
         state.prior_findings = []
         state.last_fix_resolutions = []
+        state.partial_fix = {}
         state.acceptance_outcomes = []
         state.pr_body_outcomes = []
         state.operator_comment_outcomes = []
@@ -15604,6 +15966,10 @@ class ControllerEngine:
                     # it is corrected before anything is created or pushed
                     # (#163).
                     self._check_fix_result(payload, cwd)
+                if is_partial_fix(phase, payload):
+                    # #433: a blocked FIX that offers the commits it made, held
+                    # to the same rules; corrected before anything is pushed.
+                    self._check_partial_fix_result(payload, cwd)
                 if phase == Phase.REPLAN_REEXECUTE and payload.get("status") == "success":
                     # The candidate the controller would publish, read from
                     # the worktree itself: corrected, or its rejection
@@ -16420,6 +16786,7 @@ class ControllerEngine:
             state.review_round = 0
             state.open_findings = []
             state.prior_findings = []
+            state.partial_fix = {}
             state.review_history = []
             state.acceptance_outcomes = []
             state.pr_body_outcomes = []
@@ -16709,6 +17076,7 @@ class ControllerEngine:
         state.review_round = 0
         state.open_findings = []
         state.prior_findings = []
+        state.partial_fix = {}
         state.review_history = []
         state.acceptance_outcomes = []
         state.pr_body_outcomes = []
@@ -17086,6 +17454,9 @@ class ControllerEngine:
         # merge base -- and the merge gate later requires all four, not the
         # HEAD alone.
         state.review_round = round_
+        # #433: a partial fix describes the round just reviewed, whose
+        # findings this round re-checked; it is history now.
+        state.partial_fix = {}
         state.reviewed_pr_url = parse_pr_url(state.current_pr_url).canonical
         state.reviewed_head_sha = expected_head
         state.reviewed_base_ref = expected_base
@@ -17657,6 +18028,7 @@ class ControllerEngine:
         """
         state = self._require_state()
         state.last_fix_resolutions = []
+        state.partial_fix = {}
         # An acceptance comment the plan held (#211) is stale: it was
         # requested for findings that no longer describe the PR.
         records = state.phase_effects().records
@@ -18107,6 +18479,32 @@ class ControllerEngine:
         )
 
     def _complete_fix(self) -> tuple[Phase, str]:
+        """Finish FIX from the persisted plan (:meth:`_complete_fix_plan`), a partial one too.
+
+        A partial fix (#433) is completed by the same code, and ends
+        ``BLOCKED`` with its findings open (:meth:`_partial_fix_recorded`).
+        Where the plan's drift rule would route on to REVIEW (a PR moved, a
+        base rewritten, a lease refused by a push the controller did not
+        make), a partial fix stays ``BLOCKED`` instead, its plan dropped by
+        that rule as for any fix, the round's findings carried and the
+        fixer's message quoted: the fixer said a human must act, and a REVIEW
+        launched on its own would leave that unread. 'unblock' then re-enters
+        REVIEW of the actual revision.
+        """
+        context = self._require_state().phase_effects().context
+        partial = context if isinstance(context, FixContext) and context.partial else None
+        nxt, message = self._complete_fix_plan()
+        if partial is None or nxt == Phase.BLOCKED:
+            return nxt, message
+        unblock = self.cli_command("unblock", "--reason", "<what you did>")
+        return _blocked(
+            StopReasonCode.AGENT_BLOCKED,
+            f"{self._partial_fix_prefix(partial.message)}; {message}, so its partial fix is not "
+            f"recorded and the run stays BLOCKED. Next: resolve what the fixer asks for, then "
+            f"'{unblock}': REVIEW of the actual revision",
+        )
+
+    def _complete_fix_plan(self) -> tuple[Phase, str]:
         """Finish FIX from the persisted plan: create, append, push, read back (#163).
 
         The same code for the step that saved the plan and for every later
@@ -18335,6 +18733,10 @@ class ControllerEngine:
         self._record_acceptance_outcomes(records, "verified", "")
         self._record_operator_outcomes(records, {}, "")
         state.current_head_sha = latest.head_sha
+        if context.partial and push is not None:
+            # #433: the push is the plan's one record, read back above.
+            return self._partial_fix_recorded(context, records[-1], candidate, reviewed)
+        state.partial_fix = {}
         state.last_review_result = "fixed"
         # The plan is complete, and the save that leaves FIX drops it; the
         # open findings go last, because the plan resolves exactly them.

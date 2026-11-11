@@ -526,6 +526,33 @@ as `pr_body_update` (`action_id`, `pr_url`, `base_sha256`, `body_sha256`,
 bytes only: the next reviewer reads the description in `pull-request.md` and
 judges it.
 
+### A blocked FIX's partial fix
+
+A `FIX` result whose `status` is `blocked` is a plain block, and the
+controller reads only its `message`, unless it carries `unresolved` (#433).
+That key, and nothing else, makes it a partial fix: the fixer resolved some
+findings by commits and needs a human for the others. A blocked result
+shaped like a fix but without `unresolved` stays a plain block, and the
+step's message says that none of its other fields was read. A partial fix
+is validated by the parser as strictly as a successful result, so a
+malformed one is corrected, never read as a plain block:
+
+| Key | Rule |
+|---|---|
+| `message` | required and non-blank, as for every block; stored redacted and bounded by `MAX_BLOCK_REASON_CHARS` with the plan, and quoted by the stop |
+| `previous_head_sha`, `head_sha` | required SHAs, the same cross-checks as a successful result's |
+| `resolutions` | required, non-empty; `fixed` only, with the same per-resolution rules (`commit_sha`, `rationale`). Every other kind would publish something or wait for the operator, and is refused naming the findings |
+| `unresolved` | required, non-empty list of exactly `{"finding_id", "reason"}`; `reason` non-blank, multi-line, at most `MAX_FIX_RATIONALE_CHARS` |
+| `tests` | optional, as a successful result's |
+
+The two lists name distinct findings, at most `MAX_RESOLUTIONS_PER_FIX`
+together. What the parser cannot see is the engine's, before the result is
+accepted, each refusal a correction with nothing pushed: the two lists name
+exactly the open findings; no `fixed` finding has a follow-up issue the
+entry found; and the candidate meets every FIX candidate rule, which, as
+every resolution is `fixed`, makes it a descendant of the reviewed HEAD
+([github-safety.md](github-safety.md), "A blocked FIX's partial fix").
+
 ### REPLAN_REEXECUTE fields
 
 The replan agent publishes nothing (ADR 0004 K1 and K7, #164): it commits on

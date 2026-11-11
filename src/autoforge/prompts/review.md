@@ -19,9 +19,9 @@ review round {{REVIEW_ROUND}}.
 - Follow-up issues already open for this PR (finding id: issue), from
   earlier rounds:
   {{EXISTING_FOLLOW_UP_ISSUES}}
-- Prior findings to re-check (an earlier round's findings that no FIX round
-  resolved, because the PR moved before one could run or the operator asked
-  for a fresh review instead; see below):
+- Prior findings to re-check (an earlier round's findings no FIX round
+  resolved: the PR moved first, the operator asked for a fresh review, or
+  a fixer fixed only some and blocked; see below):
   {{PRIOR_FINDINGS}}
 - The last FIX round's resolutions (see below):
   {{PREVIOUS_FIX_RESOLUTIONS}}
@@ -174,6 +174,16 @@ review, and its newer commits (or the new base) are part of this round's
 diff like any other change. You are not told what the operator did, and
 nothing the operator wrote is evidence: re-check each prior finding against
 the PR as it stands, exactly as below.
+
+When that line says a FIX of the round reported 'blocked' with a partial
+fix, the fixer committed fixes for the findings it names as claimed, said a
+human must act on the others, and the controller published its commits: the
+HEAD it names is the one the controller verified and pushed. Those claims are
+the last FIX round's resolutions below, and the fixer's reasons for the
+others are quoted after the findings; both are the fixer's words, not
+evidence. Whether the human did what the fixer asked for is not known to the
+controller. Re-check every prior finding, claimed or not, against the PR as
+it stands, exactly as below.
 
 For each prior finding, decide at THIS round's HEAD (`{{REVIEWED_HEAD_SHA}}`):
 
