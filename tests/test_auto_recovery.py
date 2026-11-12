@@ -1448,3 +1448,300 @@ def test_an_earlier_steps_decision_whose_record_alone_is_missing_is_completed_an
     assert [line["metadata"]["decision"] for line in _recovery_lines(eng)] == [1]
     assert _journal_of(eng).decisions == () and len(_audits(fake_github)) == 1
     assert len(provider.calls) == 2
+
+
+# -- R4-F1 of PR #480: an audit comment goes on a PR only while the PR is this run's -------
+
+
+def _pr_audit_writes(gh) -> list:
+    return [w for w in gh.effect_writes if w[0] == "create_pr_comment"]
+
+
+class _DisplacedDuring(_Launches):
+    """``_Launches`` whose first launch runs ``during`` first: what happens on GitHub
+    while the agent works."""
+
+    def __init__(self, during, *outcomes) -> None:
+        super().__init__(*outcomes)
+        self.during = during
+
+    def execute(self, req):
+        during, self.during = self.during, None
+        if during is not None:
+            during()
+        return super().execute(req)
+
+
+def _reviewing(tmp_state_dir, gh, provider):
+    from .test_engine import _in_review
+
+    eng = _in_review(tmp_state_dir, gh, [])
+    eng.providers._overrides = {"claude": provider, "opencode": provider}
+    eng.provider = provider
+    return eng
+
+
+def _another_run_owns(gh) -> None:
+    from .test_pr_ownership_414 import OTHER, rewrite_owner
+
+    rewrite_owner(gh, PR, OTHER)
+
+
+def _owner_removed(gh) -> None:
+    from .test_pr_ownership_414 import rewrite_owner, strip_marker
+
+    rewrite_owner(gh, PR, "placeholder")
+    strip_marker(gh, PR)
+
+
+@pytest.mark.parametrize("failure", [IDLE, RUNTIME], ids=["allowed", "refused"])
+@pytest.mark.parametrize(
+    ("displace", "named"),
+    [
+        (_another_run_owns, "af-20261031T040500Z-0a0b0c"),
+        (_owner_removed, "carries no implementation marker"),
+    ],
+    ids=["another-run", "owner-removed"],
+)
+def test_a_takeover_during_the_failed_launch_posts_no_audit_and_blocks(
+    tmp_state_dir, fake_github, failure, displace, named
+):
+    """Another run takes the PR over, or its owner is removed, while the agent
+    runs: the decision is still saved and logged, but its comment is not sent on
+    a PR this run no longer owns, nothing is relaunched, and the run stops as
+    the owner check of its next step would have."""
+    provider = _DisplacedDuring(lambda: displace(fake_github), failure, implement)
+    eng = _reviewing(tmp_state_dir, fake_github, provider)
+
+    outcomes = eng.run(max_steps=5)
+
+    assert len(provider.calls) == 1
+    assert _audits(fake_github, PR) == [] and _pr_audit_writes(fake_github) == []
+    blocked = outcomes[-1]
+    assert blocked.next_phase == "BLOCKED" and blocked.stop.code.value == "pr-owner"
+    assert "Automatic recovery (decision 1)" in blocked.message
+    assert named in blocked.message and "--take-over" in blocked.message
+    assert "audit comment of automatic-recovery decision 1 was not sent" in blocked.message
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.BLOCKED and state.stop_code == "pr-owner"
+    # The decision is kept, its comment unsent; its run log record is written.
+    (entry,) = _journal_of(eng).decisions
+    assert entry.audit.stage is Stage.INTENDED and entry.audit.attempts == 0
+    assert entry.run_log.stage is RunLogStage.WRITTEN and len(_recovery_lines(eng)) == 1
+
+
+def test_an_owner_that_cannot_be_read_before_the_audit_posts_nothing(tmp_state_dir, fake_github):
+    """A conclusive failure of the PR read right before the comment: the owner is
+    not knowable, so the comment is not sent and nothing is relaunched; the next
+    command finds the read still failing and blocks before it executes anything."""
+
+    from autoforge.validation import parse_pr_url
+
+    def get_pr(url):
+        # The PR read alone: its comments can still be listed and written.
+        raise errors.GitHubError("HTTP 403: Resource not accessible")
+
+    def get_pr_comments(url):
+        return fake_github._comments_of(parse_pr_url(url))
+
+    def unreadable():
+        fake_github.get_pr = get_pr
+        fake_github.get_pr_comments = get_pr_comments
+
+    provider = _DisplacedDuring(unreadable, IDLE, implement)
+    eng = _reviewing(tmp_state_dir, fake_github, provider)
+    with pytest.raises(ExecutionTimeoutError, match="nothing was relaunched: its audit comment"):
+        eng.run(max_steps=5)
+    assert len(provider.calls) == 1 and _pr_audit_writes(fake_github) == []
+    (entry,) = _journal_of(eng).decisions
+    assert entry.audit.pending
+
+    eng.state = load_state(eng.paths.state_file)
+    (outcome,) = eng.run(max_steps=5)
+    assert outcome.next_phase == "BLOCKED" and len(provider.calls) == 1
+    assert load_state(eng.paths.state_file).stop_code == "github-read-failed"
+    assert _pr_audit_writes(fake_github) == [] and _journal_of(eng).decisions[0].audit.pending
+
+
+def _unposted_on_the_pr(tmp_state_dir, gh, *, lands: bool, later=()):
+    """A REVIEW run whose idle timeout was decided and whose comment on the PR was
+    not confirmed: not sent (``lands`` false) or sent, its read-back lost."""
+    provider = _Launches(IDLE, *later)
+    eng = _reviewing(tmp_state_dir, gh, provider)
+    gh.write_failures.append(("create_pr_comment", GitHubUnavailableError("reset by peer"), lands))
+    real = gh.get_pr_comments
+    failed: list[str] = []
+
+    def flaky(url):
+        written = any(w[0] == "create_pr_comment" for w in gh.effect_writes)
+        if lands and written and not failed:
+            failed.append(url)
+            raise GitHubUnavailableError("read-back failed")
+        return real(url)
+
+    gh.get_pr_comments = flaky
+    with pytest.raises(ExecutionTimeoutError, match="could not be confirmed"):
+        eng.run(max_steps=5)
+    gh.get_pr_comments = real
+    assert len(provider.calls) == 1 and len(_pr_audit_writes(gh)) == 1
+    assert len(_audits(gh, PR)) == (1 if lands else 0)
+    (entry,) = _journal_of(eng).decisions
+    assert entry.audit.stage is Stage.ATTEMPTED
+    return eng, provider
+
+
+@pytest.mark.parametrize("command", ["run", "step"])
+@pytest.mark.parametrize("lands", [False, True], ids=["unsent", "landed"])
+def test_a_takeover_before_the_replay_posts_no_audit_and_blocks(
+    tmp_state_dir, fake_github, command, lands
+):
+    """Another run takes the PR over before the next command replays the pending
+    comment: that command reads the PR first, sends nothing on it, executes
+    nothing and blocks, the decision kept as it was for a later owner."""
+    eng, provider = _unposted_on_the_pr(tmp_state_dir, fake_github, lands=lands)
+    _another_run_owns(fake_github)
+
+    eng.state = load_state(eng.paths.state_file)
+    outcome = eng.run(max_steps=5)[0] if command == "run" else eng.step()
+
+    assert outcome.next_phase == "BLOCKED" and outcome.stop.code.value == "pr-owner"
+    assert "Automatic recovery decision 1" in outcome.message
+    assert "af-20261031T040500Z-0a0b0c" in outcome.message and "--take-over" in outcome.message
+    assert len(provider.calls) == 1
+    # Nothing was sent again, and a comment that landed is still the only one.
+    assert len(_pr_audit_writes(fake_github)) == 1
+    assert len(_audits(fake_github, PR)) == (1 if lands else 0)
+    (entry,) = _journal_of(eng).decisions
+    assert entry.audit.stage is Stage.ATTEMPTED and entry.audit.attempts == 1
+    # A restart changes nothing: BLOCKED is not resumed, and nothing is sent.
+    eng.state = load_state(eng.paths.state_file)
+    assert eng.run(max_steps=5) == [] and len(_pr_audit_writes(fake_github)) == 1
+
+
+def test_a_plain_unblock_of_a_displaced_audit_still_sends_nothing(tmp_state_dir, fake_github):
+    """Only the operator's takeover hands the PR back: a plain unblock stays
+    BLOCKED on the owner, and nothing is posted or launched."""
+    eng, provider = _unposted_on_the_pr(tmp_state_dir, fake_github, lands=False)
+    _another_run_owns(fake_github)
+    eng.state = load_state(eng.paths.state_file)
+    assert eng.run(max_steps=5)[0].next_phase == "BLOCKED"
+
+    refused = eng.unblock("the operator unblocks without taking the PR back")
+    assert not refused.unblocked and "--take-over" in refused.message
+    eng.state = load_state(eng.paths.state_file)
+    assert eng.run(max_steps=5) == []
+    assert len(provider.calls) == 1 and len(_pr_audit_writes(fake_github)) == 1
+    assert _audits(fake_github, PR) == [] and _journal_of(eng).decisions[0].audit.pending
+
+
+@pytest.mark.parametrize("lands", [False, True], ids=["unsent", "landed"])
+def test_the_operators_takeover_completes_first_then_the_audit_then_the_step(
+    tmp_state_dir, fake_github, lands
+):
+    """The way back the stop names: the operator hands the PR back to this run.
+    The next command writes this run into the marker first, launching no agent,
+    then posts the kept comment once (or adopts the one that landed), and only
+    then launches the step's agent."""
+    from .test_pr_ownership_414 import marker_owner, reviewer
+
+    eng, provider = _unposted_on_the_pr(
+        tmp_state_dir, fake_github, lands=lands, later=(reviewer(fake_github),)
+    )
+    _another_run_owns(fake_github)
+    eng.state = load_state(eng.paths.state_file)
+    assert eng.run(max_steps=5)[0].stop.code.value == "pr-owner"
+
+    taken = eng.unblock("the other run was stopped; this run drives the PR", take_over=PR)
+    assert taken.unblocked, taken.message
+    eng.state = load_state(eng.paths.state_file)
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE
+
+    order: list[str] = []
+    real_write = fake_github.write_pr_body
+    real_comment = fake_github.create_pr_comment
+    real_execute = provider.execute
+
+    def write_pr_body(*args, **kwargs):
+        order.append("takeover")
+        return real_write(*args, **kwargs)
+
+    def create_pr_comment(url, body):
+        order.append("audit" if scan(RECOVERY_AUDIT, body).claims else "review")
+        return real_comment(url, body)
+
+    def execute(req):
+        order.append("launch")
+        return real_execute(req)
+
+    fake_github.write_pr_body = write_pr_body
+    fake_github.create_pr_comment = create_pr_comment
+    provider.execute = execute
+
+    eng.run(max_steps=2)
+
+    assert marker_owner(fake_github._stored(PR).body) == eng.state.run_id
+    audit = [] if lands else ["audit"]
+    assert order == ["takeover", *audit, "launch", "review"], order
+    (comment,) = _audits(fake_github, PR)
+    (entry,) = _journal_of(eng).decisions
+    assert entry.audit.stage is Stage.OBSERVED and comment.url == entry.audit.observed["url"]
+    assert comment.body == entry.audit.body and len(provider.calls) == 2
+
+
+def test_no_agent_is_launched_while_an_audit_waits_for_a_takeover(tmp_state_dir, fake_github):
+    """The deferral rests on the takeover's step launching no agent; a launch
+    reached with the comment still waiting is refused as a controller bug."""
+    eng, provider = _unposted_on_the_pr(tmp_state_dir, fake_github, lands=False)
+    eng.state = load_state(eng.paths.state_file)
+    eng._audit_awaits_takeover = True
+    with pytest.raises(StateError, match="waits for the operator's takeover"):
+        eng._step_once(dry_run=False, allow_merge=False)
+    assert len(provider.calls) == 1
+
+
+def test_an_audit_on_the_runs_issue_needs_no_pr_owner(tmp_state_dir, fake_github):
+    """Before the run has a PR its comment goes on its issue, which has no owner
+    marker: no PR is read for it, and it is posted as before."""
+    eng, _ = _analyzing(tmp_state_dir, fake_github, RUNTIME, implement)
+    fake_github.calls.clear()
+    with pytest.raises(ExecutionTimeoutError):
+        eng.run(max_steps=5)
+    assert len(_audits(fake_github)) == 1
+    assert not [c for c in fake_github.calls if c[0] == "get_pr"]
+
+
+def test_a_takeover_step_github_failed_leaves_every_audit_for_after_the_takeover(
+    tmp_state_dir, fake_github
+):
+    """The takeover's own step fails on GitHub (its write not landed): that
+    failure is decided too, and its comment, on the same PR, waits with the
+    first for the takeover instead of blocking the way back; the next command
+    writes the takeover, then posts both comments, then launches the agent."""
+    from .test_pr_ownership_414 import marker_owner, reviewer
+
+    eng, provider = _unposted_on_the_pr(
+        tmp_state_dir, fake_github, lands=False, later=(reviewer(fake_github),)
+    )
+    _another_run_owns(fake_github)
+    eng.state = load_state(eng.paths.state_file)
+    assert eng.run(max_steps=5)[0].stop.code.value == "pr-owner"
+    assert eng.unblock("this run drives the PR", take_over=PR).unblocked
+    fake_github.write_failures.append(
+        ("write_pr_body", GitHubUnavailableError("GitHub is down"), False)
+    )
+
+    eng.state = load_state(eng.paths.state_file)
+    with pytest.raises(GitHubUnavailableError, match="waits for the journaled takeover"):
+        eng.run(max_steps=5)
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.ANALYZE_EXECUTE and len(provider.calls) == 1
+    assert _audits(fake_github, PR) == [] and len(_pr_audit_writes(fake_github)) == 1
+    assert [d.audit.pending for d in _journal_of(eng).decisions] == [True, True]
+
+    eng.state = state
+    eng.run(max_steps=2)
+    assert marker_owner(fake_github._stored(PR).body) == eng.state.run_id
+    comments = _audits(fake_github, PR)
+    assert [scan(RECOVERY_AUDIT, c.body).claims[0].seq for c in comments] == [1, 2]
+    assert len(provider.calls) == 2
+    assert all(d.audit.stage is Stage.OBSERVED for d in _journal_of(eng).decisions)

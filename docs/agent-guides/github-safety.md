@@ -1410,7 +1410,13 @@ executes nothing until it is (R1-F5 of PR #480): GitHub not answering stops
 that command with the phase unchanged, and a conclusive failure or a
 conflict (another comment carrying the marker, or one whose text is not the
 payload) enters `BLOCKED`; the operator resolves it on GitHub, and an applied
-`unblock` has it reconciled again.
+`unblock` has it reconciled again. A comment on the run's PR is a write on
+that PR and gets K4's owner read right before it is sent, on every entry
+that would send it (D9.4a; R4-F1 of PR #480): a PR another run owns, or
+whose owner is not knowable, enters `BLOCKED` (`pr-owner`) with nothing
+sent or relaunched and the record kept, and the comment then waits for the
+operator's journaled `unblock --take-over` of that PR, whose step writes
+the marker first and launches no agent.
 
 - **Typed writes, never retried blind.** `GitHubClient` has one method per
   write the effects need (`create_issue_comment`, `create_pr_comment`,

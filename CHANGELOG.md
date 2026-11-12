@@ -50,7 +50,12 @@ both are complete. One that cannot be completed is completed by the next
 `run`, `resume` or `step`, once, before it executes anything; until then that
 command stops, and a comment in conflict (another comment carrying its
 marker, or its text edited) or a conclusive GitHub failure stops the run in
-`BLOCKED` for you to resolve before `unblock`. `status` shows the step's
+`BLOCKED` for you to resolve before `unblock`. A comment goes on the PR only
+while the PR is still this run's: when another run took it over while the
+agent ran, or before the next command, nothing is posted or relaunched and
+the run stops in `BLOCKED` (`pr-owner`); if this run is to drive the PR,
+`unblock --take-over` it, and the next `resume` writes the takeover first,
+then posts the kept comment once, then goes on. `status` shows the step's
 allowance and its decisions.
 
 A provider's usage or rate limit is now its own stop,

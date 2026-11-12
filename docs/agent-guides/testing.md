@@ -1861,6 +1861,17 @@ a stated reason it has none. The coverage that must keep working:
   exit 1, never relaunched, adapter to engine (`failed-before-limit` or an
   untyped exit for the 401, the usage-limit stop for the 429), and the same
   session without the message still relaunched once.
+  PR #480's round 4: another run's takeover of the PR, or its owner
+  removed, while the failed agent ran, and a takeover before the next `run`
+  or `step` replays the comment (unsent, or landed with its read-back lost):
+  no audit comment sent, nothing relaunched or executed, `BLOCKED`
+  (`pr-owner`) with the decision kept, a plain `unblock` refused; a PR
+  that cannot be read right before the comment sending nothing; the
+  operator's takeover written first, launching no agent, then the comment
+  posted once or the landed one adopted, then the agent; a GitHub failure
+  of the takeover's own step leaving its comment and the first waiting for
+  the takeover, never blocking the way back; no launch reached while a
+  comment waits for a takeover; no PR read for a comment on the issue.
   Protocol 17 -> 18 in `tests/test_state.py`; the adapters' usage-limit,
   result-less and failed-before-limit facts in `tests/test_providers.py`,
   `tests/test_pi_rpc.py` and `tests/test_claude_stream.py`

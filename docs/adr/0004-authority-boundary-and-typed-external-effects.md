@@ -1687,6 +1687,15 @@ recovery journal instead (`auto_recovery`, ADR 0012 D11 as amended), and
   one whose body is not the payload), enters `BLOCKED`, and an applied
   `unblock` has the conflict reconciled again, its attempt count kept, as
   for a phase plan's record (ADR 0012 D11.5).
+- **Owner (D9.4a; R4-F1 of PR #480):** a comment on a PR is driven only
+  after the PR is read right before it, on every entry that would send it,
+  and its implementation marker names the decision's issue and this run,
+  as for K4. Otherwise nothing is read, persisted or sent: the run enters
+  `BLOCKED` (`pr-owner`), the record kept as it was, and only the
+  operator's `unblock --take-over` of the PR hands it back; the comment
+  waits for that journaled takeover, which its step writes first without
+  launching an agent, and is then posted once, or adopted, before anything
+  else. A comment on the run's issue has no owner marker to read.
 
 **D5.2 (#160).** **Correcting a controller-authored object in place is not a
 kind.** Every payload is rendered from persisted bytes (D8.4), so the

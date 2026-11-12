@@ -715,6 +715,33 @@ decide no relaunch
 `test_repeated_github_failures_stop_every_command_and_lose_no_decision`,
 `test_a_conflicting_audit_blocks_the_run_across_restarts_until_the_operator_resolves_it`).
 
+A comment on the run's PR is a write on that PR, so it is sent only while
+the PR is this run's (ADR 0004 D9.4a; R4-F1 of PR #480): right before it is
+driven, after a failed launch and on every later command that would send it,
+the PR is read as itself, and its implementation marker must name the
+decision's issue and this run, as for K4's review comment. The agent ran for
+minutes, and a takeover in between hands the PR to another run. A PR that
+another run owns, or whose owner is not knowable (no marker, no owner, an
+unreadable marker, a read answered with another PR), stops in `BLOCKED`
+(`pr-owner`) with nothing sent and nothing relaunched, the comment kept
+`intended` or `attempted`; a read that fails conclusively stops as any
+conclusive failure of the audit does, and one GitHub cannot answer now
+stops the command with the phase unchanged. A comment on the issue, before
+the run has a PR, has no owner marker to read. The way back is the one the
+stop names, the operator's `unblock --take-over` of the PR: while that
+takeover is journaled and not yet written, the comment waits for it, still
+unsent; the step that follows writes this run into the marker and completes
+the rest from the journal, launching no agent (a launch reached while the
+comment waits is refused), and the next command or loop step reads the PR
+again, posts the comment once, or adopts the one that landed before the
+takeover, and only then executes anything else. A failure of the takeover's
+own step is decided like any other, and its comment, on the same PR, waits
+for the takeover too, the phase unchanged for `resume`
+(`test_a_takeover_during_the_failed_launch_posts_no_audit_and_blocks`,
+`test_a_takeover_before_the_replay_posts_no_audit_and_blocks`,
+`test_the_operators_takeover_completes_first_then_the_audit_then_the_step`,
+`test_a_takeover_step_github_failed_leaves_every_audit_for_after_the_takeover`).
+
 **D11.6. Where it runs.** Inside the running `run`, `resume` or scheduler
 worker loop (`ControllerEngine.run`), and nowhere else: no daemon, no
 scheduler, no wait. `step` executes exactly one phase and never relaunches
