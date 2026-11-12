@@ -548,7 +548,12 @@ classification: `auto_recovery.py` does not import
   evidence of why the CLI ended: an empty stream, or one that ended before
   the model's first tool call, is an untyped exit whatever stderr says, and
   stderr, free text, is never read for it. An exit code or a missing
-  `CONTROL_RESULT` alone types nothing either (R1-F1 of PR #480).
+  `CONTROL_RESULT` alone types nothing either (R1-F1 of PR #480). What this
+  evidence cannot tell apart is a fault that strikes inside a running
+  session (the host's disk filling up while the model works, say) from a
+  crash of the CLI itself: such a step is relaunched once, through the
+  reconciliation, and its repeat is refused, the step's allowance spent
+  (D11.4).
 
 Refused, and the operator's as before: a hard runtime limit and a loop
 kill (never repeated), a timeout nothing typed, a provider's usage limit
