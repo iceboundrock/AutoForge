@@ -4267,3 +4267,67 @@ def test_a_claude_failure_that_ends_the_cli_is_no_failure_before_a_limit(tmp_pat
 
     _, res = _claude_run(tmp_path, claude_fake.api_failure(401, _API_ERRORS[401]), exit_code=1)
     assert not res.timed_out and res.provider_failure and res.failed_before_limit is None
+
+
+def _typed_api_error_without_result(status):
+    """R3-F1 of PR #480: the session ran (init, a completed tool call of the
+    model's), then the CLI's typed API-error message, and no result after it."""
+    from tests import claude_fake
+
+    return [
+        claude_fake.init(),
+        claude_fake.tool_use("t1", "Read", file_path="a.py"),
+        claude_fake.tool_result("t1", "contents"),
+        claude_fake.api_error_message(status, _API_ERRORS[status]),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "limit"), [(401, None), (429, "claude: API error 429"), (529, None)]
+)
+def test_a_claude_typed_api_error_then_an_idle_kill_keeps_its_facts(tmp_path, status, limit):
+    """The terminal result never arrives: the CLI stays alive after its typed
+    API-error message until its idle limit kills it. The status is the
+    failure before the limit, and a 429 the usage limit, from the message's
+    typed fields alone."""
+    lines = [*_typed_api_error_without_result(status), {"sleep": 30}]
+    _, res = _claude_run(tmp_path, lines, idle=1, exit_code=1)
+    assert res.timed_out and res.timeout_limit == "idle" and res.provider_failure is None
+    assert res.failed_before_limit == f"claude: API error {status}"
+    assert res.usage_limit == limit
+    assert res.transient_failure is None and not res.result_less_exit
+
+
+@pytest.mark.parametrize(
+    ("status", "limit"), [(401, None), (429, "claude: API error 429"), (529, None)]
+)
+def test_a_claude_typed_api_error_then_an_exit_without_its_result_is_no_result_less_exit(
+    tmp_path, status, limit
+):
+    """The CLI exits 1 after its typed API-error message without writing the
+    result: a failed exit naming the status, never a result-less exit, and a
+    429 the usage limit."""
+    _, res = _claude_run(tmp_path, _typed_api_error_without_result(status), exit_code=1)
+    assert not res.timed_out and res.exit_code == 1
+    assert res.provider_failure == (
+        f"claude: exited without a result event, after reporting API error {status} (exit 1)"
+    )
+    assert not res.result_less_exit
+    assert res.usage_limit == limit
+    assert res.transient_failure is None and res.failed_before_limit is None
+    assert res.provider_summary["api_error_records"] == 1
+
+
+def test_a_claude_typed_429_in_a_run_that_succeeded_is_no_usage_limit(tmp_path):
+    """A limit a subagent's call met in a run that then delivered its result is
+    no outcome: only a failed or killed run reports one."""
+    from tests import claude_fake
+
+    lines = [
+        claude_fake.init(),
+        claude_fake.api_error_message(429, _API_ERRORS[429]),
+        claude_fake.result("done"),
+    ]
+    _, res = _claude_run(tmp_path, lines)
+    assert res.provider_failure is None and not res.timed_out and res.exit_code == 0
+    assert res.usage_limit is None and res.failed_before_limit is None

@@ -561,7 +561,8 @@ classification: `auto_recovery.py` does not import
   with no line lost on the way, as its adapter typed it (Claude Code's
   `stream-json` today: the CLI's `system/init` and a tool call of the
   model's, which no authentication, permission, configuration or host
-  failure at the CLI's start produces). The absence of a result is no
+  failure at the CLI's start produces, and no model API error the CLI
+  reported in its own typed message, below). The absence of a result is no
   evidence of why the CLI ended: an empty stream, or one that ended before
   the model's first tool call, is an untyped exit whatever stderr says, and
   stderr, free text, is never read for it. An exit code or a missing
@@ -609,8 +610,22 @@ timeout to relaunch
 (`test_a_claude_failure_then_an_idle_kill_is_never_relaunched`,
 `test_a_failure_reported_before_any_kill_vetoes_the_relaunch`).
 
+Claude Code types a model API error twice: in its own `assistant` message
+(`is_api_error_message: true`, the status as `api_error_status`) and in the
+error `result` that ends the turn. A CLI killed, or exiting, between the two
+never writes the result, so the adapter keeps the message's typed facts
+without it (R3-F1 of PR #480), never its text: killed by a limit, its
+status is the failure before the limit (`claude: API error 401`); exited, it
+is a failed exit naming the status and never a result-less exit, so an
+untyped exit; and a 429 is the usage limit either way (D11.3). The message
+fails nothing by itself: a run whose result then arrives is decided by that
+result, as before
+(`test_a_claude_authentication_error_without_its_result_is_never_relaunched`,
+`test_a_claude_usage_limit_without_its_result_is_a_usage_limit_never_relaunched`).
+
 **D11.3. Usage limits.** An adapter types a provider's usage or rate limit
-from the provider's own typed answer (Claude Code's model API error 429;
+from the provider's own typed answer (Claude Code's model API error 429, in
+its error result or, when that never arrives, its typed API-error message;
 OpenCode's run-level error "The usage limit has been reached", compared
 whole), never as transient. The engine raises `ProviderUsageLimitError`,
 whose stop is `resumable_error` / `provider-usage-limit` naming the provider

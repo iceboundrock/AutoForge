@@ -1856,6 +1856,11 @@ a stated reason it has none. The coverage that must keep working:
   403) and a protocol violation, each followed by an idle kill inside the
   failure's exit grace, never relaunched, adapter to engine, and the same
   fact from OpenCode and Pi refusing the relaunch (`failed-before-limit`).
+  PR #480's round 3: Claude's typed API-error message (401, 429) after a
+  completed tool call, with no result after it, then an idle kill or an
+  exit 1, never relaunched, adapter to engine (`failed-before-limit` or an
+  untyped exit for the 401, the usage-limit stop for the 429), and the same
+  session without the message still relaunched once.
   Protocol 17 -> 18 in `tests/test_state.py`; the adapters' usage-limit,
   result-less and failed-before-limit facts in `tests/test_providers.py`,
   `tests/test_pi_rpc.py` and `tests/test_claude_stream.py`

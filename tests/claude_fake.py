@@ -165,10 +165,26 @@ def api_error(status: int | None, text: str, **over: object) -> str:
     )
 
 
+def api_error_message(status: int | None, text: str) -> str:
+    """The CLI's own ``assistant`` message claude 2.1.314 writes for a model
+    API error once its retries are spent, before the turn's :func:`api_error`
+    result (#395): the error message as its text, typed by
+    ``is_api_error_message`` and the HTTP status as ``api_error_status``."""
+    return line(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": text}]},
+            "error": "server_error",
+            "is_api_error_message": True,
+            "api_error_status": status,
+        }
+    )
+
+
 def api_failure(status: int | None, text: str) -> list[str]:
     """A whole run claude 2.1.314 ends on a model API error (#395): its
     ``init``, the notice of its one retry (``CLAUDE_CODE_MAX_RETRIES=1``; 10
-    by default), the error message as the turn's text and :func:`api_error`.
+    by default), :func:`api_error_message` and :func:`api_error`.
     """
     retry = {
         "type": "system",
@@ -178,14 +194,7 @@ def api_failure(status: int | None, text: str) -> list[str]:
         "retry_delay_ms": 500,
         "error_status": status,
     }
-    message = {
-        "type": "assistant",
-        "message": {"content": [{"type": "text", "text": text}]},
-        "error": "server_error",
-        "is_api_error_message": True,
-        "api_error_status": status,
-    }
-    return [init(), line(retry), line(message), api_error(status, text)]
+    return [init(), line(retry), api_error_message(status, text), api_error(status, text)]
 
 
 def fake_claude(

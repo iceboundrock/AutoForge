@@ -1106,6 +1106,103 @@ def test_the_rule_reads_a_failure_before_the_timeout_that_followed_it():
     assert categorize(both) is RecoveryCategory.PROVIDER_USAGE_LIMIT
 
 
+# -- R3-F1 of PR #480: the CLI's typed API error stands when its result never arrives ------
+
+
+def _typed_api_error_script(status: int, end: str) -> tuple[list, dict]:
+    """The reviewer's reproduction: init, a completed tool call of the model's,
+    the CLI's typed API-error message, then an idle kill or an exit 1, and
+    never the result record that would have repeated the error."""
+    from tests import claude_fake
+
+    from .test_providers import _API_ERRORS
+
+    lines: list = [
+        claude_fake.init(),
+        claude_fake.tool_use("t1", "Read", file_path="src/a.py"),
+        claude_fake.tool_result("t1", "contents"),
+        claude_fake.api_error_message(status, _API_ERRORS[status]),
+    ]
+    if end == "idle-kill":
+        return [*lines, {"sleep": 30}], {"idle": 1}
+    return lines, {"exit_code": 1}
+
+
+@pytest.mark.parametrize("end", ["idle-kill", "exit-without-result"])
+def test_a_claude_authentication_error_without_its_result_is_never_relaunched(
+    tmp_path, tmp_state_dir, fake_github, end
+):
+    """Adapter to engine: Claude's typed 401, then no result. Neither the idle
+    kill nor the exit that follows it is an allowlisted failure to relaunch."""
+    from tests import claude_fake
+
+    lines, kw = _typed_api_error_script(401, end)
+    eng, home = _review_on_claude(tmp_path, tmp_state_dir, fake_github, lines, **kw)
+    with pytest.raises(ExecutionError) as caught:
+        eng.run(max_steps=5)
+    message = str(caught.value)
+    assert claude_fake.launches(home) == 1
+    (entry,) = _journal_of(eng).decisions
+    assert not entry.allowed and entry.refusal is Refusal.NOT_ALLOWLISTED
+    assert _journal_of(eng).relaunches == 0
+    if end == "idle-kill":
+        assert isinstance(caught.value, ExecutionTimeoutError)
+        assert "had already failed the run when the limit killed it (claude: API error 401)" in (
+            message
+        )
+        assert entry.category is RecoveryCategory.FAILED_BEFORE_LIMIT
+        assert "failed before the limit 'claude: API error 401'" in entry.evidence
+    else:
+        assert not isinstance(caught.value, ExecutionTimeoutError | ProviderUsageLimitError)
+        assert "exited without a result event, after reporting API error 401 (exit 1)" in message
+        assert entry.category is RecoveryCategory.UNTYPED_EXIT
+        assert "no result delivered" not in entry.evidence
+    assert "relaunch refused (not-allowlisted)" in message
+    assert load_state(eng.paths.state_file).phase == Phase.REVIEW
+
+
+@pytest.mark.parametrize("end", ["idle-kill", "exit-without-result"])
+def test_a_claude_usage_limit_without_its_result_is_a_usage_limit_never_relaunched(
+    tmp_path, tmp_state_dir, fake_github, end
+):
+    """Adapter to engine: Claude's typed 429, then no result. The step ends as
+    the typed usage-limit stop, from the message's status, never its text."""
+    from tests import claude_fake
+
+    lines, kw = _typed_api_error_script(429, end)
+    eng, home = _review_on_claude(tmp_path, tmp_state_dir, fake_github, lines, **kw)
+    with pytest.raises(ProviderUsageLimitError) as caught:
+        eng.run(max_steps=5)
+    message = str(caught.value)
+    assert "provider limit: claude: API error 429" in message
+    assert "relaunch refused (no-trusted-reset): provider-usage-limit" in message
+    assert caught.value.limit == "claude: API error 429"
+    assert claude_fake.launches(home) == 1
+    (entry,) = _journal_of(eng).decisions
+    assert entry.category is RecoveryCategory.PROVIDER_USAGE_LIMIT
+    assert entry.refusal is Refusal.NO_TRUSTED_RESET
+    assert "provider limit 'claude: API error 429'" in entry.evidence
+    assert ("limit idle" in entry.evidence) is (end == "idle-kill")
+    assert _journal_of(eng).relaunches == 0
+    assert load_state(eng.paths.state_file).phase == Phase.REVIEW
+
+
+def test_the_same_session_without_the_typed_api_error_is_still_relaunched(
+    tmp_path, tmp_state_dir, fake_github
+):
+    """The control: the reproduction without the typed message is the safe
+    result-less exit, relaunched once, so the veto is the message's alone."""
+    from tests import claude_fake
+
+    lines, kw = _typed_api_error_script(401, "exit-without-result")
+    eng, home = _review_on_claude(tmp_path, tmp_state_dir, fake_github, lines[:-1], **kw)
+    outcomes = eng.run(max_steps=2)
+    assert claude_fake.launches(home) == 2
+    assert outcomes[-1].next_phase == "READY_FOR_MERGE", outcomes[-1].message
+    (entry,) = _journal_of(eng).decisions
+    assert entry.category is RecoveryCategory.RESULT_LESS_EXIT and entry.allowed
+
+
 # -- R1-F3 of PR #480: every physical launch is charged, before it starts ----------------
 
 

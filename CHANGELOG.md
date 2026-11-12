@@ -21,7 +21,10 @@ a GitHub failure, a failed verification and any untyped or unknown failure
 still stop for you. So does an idle kill of an agent whose provider had
 already failed the run (an authentication or permission refusal, a protocol
 violation, an error result) and that then stayed alive until the limit: the
-failure ended the run, not the limit. A relaunch is refused when a process the failed launch
+failure ended the run, not the limit. A Claude Code CLI that reported a model
+API error in its typed message is never relaunched either, also when it was
+killed or exited before writing the result that would have repeated it. A
+relaunch is refused when a process the failed launch
 started may still be running, when the killed agent had already printed a
 complete `CONTROL_RESULT`, when the step already used its one automatic
 relaunch (a crash, a `resume` or an `unblock` does not give it another),
@@ -54,7 +57,8 @@ A provider's usage or rate limit is now its own stop,
 `stop: resumable_error (reason provider-usage-limit, ...)`, naming the
 provider and the limit: Claude Code's model API error 429, and OpenCode's
 `Error: The usage limit has been reached`. It is never relaunched, also
-when the CLI then stayed alive until its idle limit killed it; `resume`
+when the CLI then stayed alive until its idle limit killed it, or Claude
+Code reported its 429 and ended before writing its result; `resume`
 once the limit has reset. No provider reports when that is, so the
 controller does not wait for it.
 

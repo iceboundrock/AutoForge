@@ -98,7 +98,12 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
     ended on a model API error, 401 or 403 included, an error result, a
     protocol violation) keeps that failure's fixed kind as
     :attr:`AgentExecutionResult.failed_before_limit`, never read as the
-    limit's (#434).
+    limit's (#434). The CLI's own typed message for a model API error
+    (an ``assistant`` record with ``is_api_error_message`` and
+    ``api_error_status``) counts without the ``result`` that follows it,
+    which a CLI killed or exiting first never writes (R3-F1 of PR #480): its
+    429 is the usage limit, any status is the failure before a limit, and
+    after one no exit is result-less.
     Whether to relaunch is the engine's policy. A relaunched CLI begins with its own retries, so the
     relaunch itself waits through another retry schedule before giving up.
     ``text`` output is not classified.
@@ -486,8 +491,10 @@ class AgentExecutionResult:
     # usage or rate limit (#434): a short, fixed reason naming it, never text
     # taken from the output; never set with ``transient_failure``. Kept when a
     # limit then killed the CLI (``timed_out``): the refusal was established
-    # before it (R1-F2 of PR #480). The engine raises ProviderUsageLimitError
-    # for it and relaunches nothing.
+    # before it (R1-F2 of PR #480). So is one the provider typed in a message
+    # of its own when the record that would have repeated it never arrived
+    # (R3-F1). The engine raises ProviderUsageLimitError for it and relaunches
+    # nothing.
     # ``usage_reset_at`` is a reset time the provider reported in a form the
     # adapter trusts (UTC, ISO 8601); no adapter reads one today, so it is "".
     usage_limit: str | None = None
@@ -496,15 +503,18 @@ class AgentExecutionResult:
     # (#434): the CLI exited on its own inside a session its protocol stream
     # shows was running, before a single result record, with nothing lost
     # from the stream on the way. Never an empty stream, whose cause nothing
-    # typed tells (R1-F1 of PR #480). A fact, not a decision: whether to
+    # typed tells (R1-F1 of PR #480), nor one in which the provider had
+    # reported a typed error (R3-F1). A fact, not a decision: whether to
     # relaunch is the engine's recovery rule.
     result_less_exit: bool = False
     # A run the provider's protocol had already failed when a limit then killed
     # the CLI (``timed_out``, which drops ``provider_failure``: a timeout wins
     # over what the protocol said, ADR 0003 §2.6): a short, fixed reason naming
     # what failed it (an authentication or permission refusal, a protocol
-    # violation, an error result), never text taken from the output; ``None``
-    # without a timeout (#434). The failure, established before the kill, ended
+    # violation, an error result, a model API error the CLI reported in a
+    # typed message of its own before the result that would have failed the
+    # run, R3-F1), never text taken from the output; ``None`` without a
+    # timeout (#434). The failure, established before the kill, ended
     # the run, and a relaunch now may meet it again, so it is never read as the
     # limit's: the engine's recovery rule refuses it (R2-F1 of PR #480).
     failed_before_limit: str | None = None
@@ -1594,6 +1604,15 @@ class ClaudeCodeProvider(AgentProvider):
         summary = stream.summary()
         summary["failure"] = failure or ""
         text = stream.text if failure is None else None
+        # #434: a turn ended at a usage or rate limit, by the failing result's
+        # status or, when that result never arrived, by the CLI's own typed
+        # API-error message (R3-F1 of PR #480). Established by the stream, it
+        # stands whatever ended the CLI after it: one still running at its
+        # idle limit during the failure's exit grace was refused at that limit
+        # all the same, and a relaunch now meets it again (R1-F2). Only for a
+        # run that failed: a limit a subagent met in a run that then succeeded
+        # is no outcome.
+        usage_limit = (stream.limit or stream.api_limit) if timed_out or failure else None
         stdout, truncated = _keep_tail(encodable(text or ""), DEFAULT_MAX_OUTPUT_BYTES)
         result = AgentExecutionResult(
             command=list(res.command),
@@ -1619,23 +1638,25 @@ class ClaudeCodeProvider(AgentProvider):
             stopped_on_failure=cut is _Cut.FAILED,
             stopped_on_reply=replied,
             # A failure the stream recognised as a transient model API error
-            # (#395) stays one when the CLI was stopped after it (#394).
-            transient_failure=None if timed_out or failure is None else stream.transient,
-            # #434: a turn ended at a usage or rate limit. Established by the
-            # stream's own result record, it stands whatever ended the CLI
-            # after it: one still running at its idle limit during the
-            # failure's exit grace was refused at that limit all the same,
-            # and a relaunch now meets it again (R1-F2 of PR #480).
-            usage_limit=stream.limit,
+            # (#395) stays one when the CLI was stopped after it (#394); never
+            # beside a usage limit (#434).
+            transient_failure=(
+                None if timed_out or failure is None or usage_limit else stream.transient
+            ),
+            usage_limit=usage_limit,
             # #434: the stream had failed the run (an authentication or
             # permission refusal, a protocol violation) before a limit killed
             # the CLI, which drops the failure itself; one still running at its
             # idle limit inside the failure's exit grace failed all the same
-            # (R2-F1 of PR #480). Its fixed kind, never the stream's text.
-            failed_before_limit=stream.failure_kind if timed_out else None,
+            # (R2-F1 of PR #480). So had a CLI that reported a model API error
+            # in its own typed message and was killed before the result that
+            # would have failed the run (R3-F1). Its fixed kind, never the
+            # stream's text.
+            failed_before_limit=(stream.failure_kind or stream.api_error) if timed_out else None,
             # #434: a CLI that died inside a running session before any
             # result, on its own (never one a limit or the adapter stopped),
-            # with no line lost on the way (ClaudeStream.result_less).
+            # with no line lost on the way and no model API error reported
+            # (ClaudeStream.result_less).
             result_less_exit=(
                 cut is None
                 and not timed_out

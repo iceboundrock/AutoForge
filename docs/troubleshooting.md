@@ -324,7 +324,10 @@ error's text:
   request for your decision, an untyped exit (an empty stream among them:
   a CLI that failed to authenticate, to load its configuration or to write
   to a full disk prints nothing on stdout, and stderr is never read for
-  this), a result refused after its corrections, a sandbox refusal, a
+  this; and a Claude Code CLI that reported a model API error and exited
+  without its result, the error saying `exited without a result event,
+  after reporting API error <status>`), a result refused after its
+  corrections, a sandbox refusal, a
   GitHub failure or drift, a failed verification, and anything unknown.
 - **Refused even then:** when a process the launch started may still be
   running (`process-may-survive`), when the killed launch had already
