@@ -69,6 +69,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
@@ -591,6 +592,29 @@ class RunLogger:
     def _step_name(self, seq: int, phase: str, attempt: int) -> str:
         safe_phase = re.sub(r"[^a-z0-9._-]", "-", phase.lower()) or "unknown"
         return f"{seq:03d}-{safe_phase}-{attempt}"
+
+    def next_step_name(self, phase: str, attempt: int) -> str:
+        """The step directory the next :meth:`log_execution` without ``step_log`` writes.
+
+        For a caller that journals where a record goes before writing it
+        (an automatic-recovery decision, #434), so that after a crash it can
+        tell the record written (:meth:`holds_step`) from one never begun.
+        """
+        return self._step_name(self._seq + 1, phase, attempt)
+
+    def holds_step(self, name: str) -> bool:
+        """Whether step directory ``name`` holds its record: an ``execution.json`` file.
+
+        :meth:`log_execution` publishes it before the event journal's line,
+        so a directory holding it is a record written, as far as a crash
+        between the two leaves any record (module docstring). Only that one
+        entry is looked at; a name of another shape holds nothing.
+        """
+        if not STEP_DIR_RE.match(name):
+            return False
+        with self._logs_root() as logs:
+            found = logs.lstat(f"{self.run_id}/{name}/execution.json")
+        return found is not None and stat.S_ISREG(found.st_mode)
 
     def begin_step(self, phase: str, attempt: int) -> StepLog:
         """Publish the next step's directory and open its ``progress.log``, before a launch.

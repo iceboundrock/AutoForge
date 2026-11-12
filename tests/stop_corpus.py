@@ -518,8 +518,9 @@ def bookkeeping_kind(record: dict) -> str:
 
     The controller writes a line of itself that records no invocation under
     a ``(...; no agent)`` profile, with no provider and no command: the EPIC
-    a new run binds (``<phase>-epic-binding``, #293) is ``epic-binding``,
-    another such line ``other``. It is no launch. A line that says no agent
+    a new run binds (``<phase>-epic-binding``, #293) is ``epic-binding``, an
+    automatic-recovery decision (``<phase>-auto-recovery``, #434) is
+    ``auto-recovery``, another such line ``other``. It is no launch. A line that says no agent
     but names a provider or a command, and a ``(controller ...)`` profile,
     is none: what it records is not established, so it stays a launch for
     :func:`launch_kind` to type.
@@ -532,7 +533,10 @@ def bookkeeping_kind(record: dict) -> str:
         or record.get("command", [])
     ):
         return ""
-    return "epic-binding" if record.get("phase", "").endswith("-epic-binding") else "other"
+    phase = record.get("phase", "")
+    if phase.endswith("-epic-binding"):
+        return "epic-binding"
+    return "auto-recovery" if phase.endswith("-auto-recovery") else "other"
 
 
 def launch_kind(record: dict) -> str:

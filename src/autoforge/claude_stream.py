@@ -81,13 +81,28 @@ or 5xx (529 is overloaded; the CLI words every 5xx as a server-side issue,
 usually temporary) makes the failure transient: :attr:`ClaudeStream.transient`
 is a fixed reason naming the status. Nothing else does. Not another 4xx: 400,
 401, 403 and 404 are the request's, the credential's or the model's; a 429
-may be a plan's usage limit, which resets hours later; a 413 ends with
+may be a plan's usage limit, which resets hours later, and is typed as a
+limit instead (:attr:`ClaudeStream.limit`, #434), which nothing relaunches; a 413 ends with
 ``terminal_reason: image_error``. Not an error without a status: a refused or
 dropped connection (``api_error: connection_failed``, which a wrong
 ``ANTHROPIC_BASE_URL`` gives too) or the CLI's own request timeout, which
 carries neither a status nor an ``api_error`` and is told apart only by its
 message text. No message text is read for this: the record's typed fields are
 the whole check.
+
+The ``assistant`` record that comes before that ``result`` is the CLI's own,
+and typed too: ``is_api_error_message: true`` and the same status as
+``api_error_status`` (``null`` without one). The first such record is kept
+as :attr:`ClaudeStream.api_error` (``claude: API error <status>``, or
+``claude: API error`` without a status), and one with status 429 as
+:attr:`ClaudeStream.api_limit`, whatever follows them: the terminal
+``result`` that would say the same may never arrive, when the CLI stays
+alive until a limit kills it or exits without writing it (R3-F1 of PR #480).
+Neither record fails the run by itself; the outcome stays the ``result``'s,
+as the paragraph above says. A stream that ended without its ``result``
+after such a record is no result-less exit (:attr:`ClaudeStream.result_less`)
+and fails with the API error as its :attr:`ClaudeStream.failure_kind`. No
+message text is read for it either.
 
 Progress: each record becomes at least one :class:`~autoforge.progress.ProgressEvent`
 (liveness for #193), and the only strings an event carries are the model
@@ -197,8 +212,15 @@ _MAX_COUNT = 10**15
 # that make the failure transient (module docstring, #395): a request
 # timeout and every server error.
 TRANSIENT_API_STATUSES = frozenset({408, *range(500, 600)})
+# The ``api_error_status`` of a turn that ended at a usage or rate limit
+# (#434): never transient, and never relaunched automatically (a plan's usage
+# limit resets hours later, and no record says when).
+LIMIT_API_STATUS = 429
 # A run that cost more than this is not a reading to believe.
 _MAX_COST_USD = Decimal(1_000_000)
+# Two of the fixed reasons :attr:`ClaudeStream.failure_kind` takes (#434).
+_PROTOCOL_VIOLATION = "claude: stream-json protocol violation"
+_ENDED_EARLY = "claude: stdout ended before a result event"
 
 
 def _count(value: object) -> int | None:
@@ -224,9 +246,11 @@ class ClaudeStream:
 
     When the stream is over, :attr:`text` holds the final assistant text on
     success and :attr:`failure` the bounded, redacted reason otherwise,
+    :attr:`failure_kind` a fixed reason naming what failed it (#434),
     :attr:`transient` a fixed reason when that failure is a transient model
-    API error, and :attr:`refused` the requests the CLI refused, whatever
-    the outcome.
+    API error, :attr:`api_error` and :attr:`api_limit` the model API errors
+    the CLI reported in its own typed messages (R3-F1 of PR #480), and
+    :attr:`refused` the requests the CLI refused, whatever the outcome.
     """
 
     def __init__(
@@ -249,6 +273,33 @@ class ClaudeStream:
         # turn on a transient model API error (module docstring): a fixed
         # reason naming the status, never text from the stream.
         self.transient: str | None = None
+        # Set with ``failure`` when that result ended its turn on a model API
+        # error with status 429 (#434): a usage or rate limit, which a launch
+        # now would meet again. A fixed reason, never text from the stream.
+        self.limit: str | None = None
+        # Set with ``failure``: what failed the run, as a fixed reason that
+        # carries no text from the stream (#434): ``claude: API error <status>``
+        # for a turn ended on a model API error with a status (401 and 403 an
+        # authentication or permission refusal), ``claude: API error`` for one
+        # without, ``claude: the run ended in an error``, ``claude: the run did
+        # not succeed``, ``claude: stream-json protocol violation`` or
+        # ``claude: stdout ended before a result event`` (:attr:`api_error`
+        # instead when the CLI had reported one, R3-F1). The adapter keeps it
+        # when a limit then killed the CLI, which drops ``failure`` itself, so
+        # the failure is not mistaken for the limit's (R2-F1 of PR #480).
+        self.failure_kind: str | None = None
+        # The first model API error the CLI reported in an ``assistant``
+        # record of its own (``is_api_error_message: true``), as a fixed
+        # reason naming its ``api_error_status``: ``claude: API error
+        # <status>``, or ``claude: API error`` without a readable status
+        # (module docstring, R3-F1 of PR #480). Kept whatever follows the
+        # record, the terminal ``result`` included or never arriving; it
+        # fails nothing by itself.
+        self.api_error: str | None = None
+        # Set when such a record carried status 429 (#434): a usage or rate
+        # limit the CLI reported, with or without the ``result`` that would
+        # set :attr:`limit`. A fixed reason, never text from the stream.
+        self.api_limit: str | None = None
         # stdout ended inside a turn; the driver names the exit code.
         self.exited_early = False
         # Turns opened so far: the first with the stream, each later one by
@@ -276,8 +327,12 @@ class ClaudeStream:
         self._unknown = 0
         self._after_result = 0
         self._tool_calls = 0
+        # ``system/init`` records seen: the CLI started a session (#434).
+        self._inits = 0
         self._tool_errors = 0
         self._retries = 0
+        # Typed model API-error records of the CLI's (``is_api_error_message``).
+        self._api_errors = 0
         self._result: dict[str, str | int | bool] = {}
 
     @property
@@ -346,16 +401,57 @@ class ClaudeStream:
         if self._results == self._turns or self.failure is not None:
             return
         self.exited_early = True
+        # A model API error the CLI reported before its stdout ended is what
+        # failed the run, as far as anything typed tells (R3-F1 of PR #480).
+        kind = self.api_error or _ENDED_EARLY
+        after = (
+            f", after reporting {self.api_error.removeprefix('claude: ')}" if self.api_error else ""
+        )
         if self._results:
-            self._fail("claude: exited inside a turn that has no result event")
+            self._fail(f"claude: exited inside a turn that has no result event{after}", kind)
             return
-        reason = "claude: exited without a result event"
+        reason = f"claude: exited without a result event{after}"
         if self._oversize:
             reason += (
                 f" ({self._oversize} line(s) past the per-line bound were skipped; "
                 "the result must arrive whole in one line)"
             )
-        self._fail(reason)
+        self._fail(reason, kind)
+
+    @property
+    def result_less(self) -> bool:
+        """Whether the CLI died inside a running session, before any ``result`` (#434).
+
+        A typed fact for the automatic-recovery rule, which relaunches only
+        what positive evidence shows safe to re-enter (ADR 0012 D11.2): the
+        absence of a result says nothing of why the CLI ended. So it holds
+        only when the stream shows the session was running before it ended:
+        the CLI's own ``system/init`` (its configuration loaded and its
+        session started) and at least one tool call of the model's
+        (``tool_use``: the model API answered the credential, and the model
+        was working; the CLI's own message for a failed API request carries
+        no tool call). Then stdout reached EOF with no turn ever closed, no
+        line skipped past the per-line bound (it may have been the result)
+        and no other failure first. An empty stream, or one that ended before
+        the model's first tool call, is no result-less exit: an
+        authentication, permission, configuration or host failure the CLI
+        reports only on stderr ends it exactly so, and stderr is free text,
+        never read for this (R1-F1 of PR #480). Neither is a stream that had
+        a result, or failed on a record, nor one in which the CLI reported a
+        model API error of its own (:attr:`api_error`): its session had
+        failed on the model API, an authentication refusal or a usage limit
+        among the causes, which a launch now may meet again, and the
+        ``result`` that would have said so was never written (R3-F1 of PR
+        #480).
+        """
+        return (
+            self.exited_early
+            and self._results == 0
+            and self._oversize == 0
+            and self._inits > 0
+            and self._tool_calls > 0
+            and self.api_error is None
+        )
 
     def summary(self) -> dict[str, str | int | bool]:
         """The flat, bounded, redacted summary for ``execution.json``."""
@@ -378,6 +474,7 @@ class ClaudeStream:
             "tool_calls": self._tool_calls,
             "tool_errors": self._tool_errors,
             "api_retries": self._retries,
+            "api_error_records": self._api_errors,
             "failure": self.failure or "",
         }
 
@@ -386,13 +483,16 @@ class ClaudeStream:
         if self._emit is not None:
             self._emit(event)
 
-    def _fail(self, reason: str) -> None:
+    def _fail(self, reason: str, kind: str) -> None:
+        """Fail the run, unless it failed already: ``reason`` for the record,
+        ``kind`` the fixed reason :attr:`failure_kind` keeps."""
         if self.failure is None:
             self.failure = clean(reason, MAX_REASON_CHARS)
+            self.failure_kind = kind
             self.text = None
 
     def _protocol(self, what: str) -> None:
-        self._fail(f"claude: stream-json protocol violation: {what}")
+        self._fail(f"claude: stream-json protocol violation: {what}", _PROTOCOL_VIOLATION)
 
     def _take_result(self, record: dict) -> None:
         self._results += 1
@@ -433,18 +533,27 @@ class ClaudeStream:
             if status is not None:
                 facts.append(f"api_error_status {status}")
             excerpt = clean(result, MAX_VALUE_CHARS * 2)
+            api_error = record.get("terminal_reason") == "api_error"
             self._fail(
                 f"claude: the run ended in an error ({', '.join(facts)})"
-                + (f": {excerpt}" if excerpt else "")
+                + (f": {excerpt}" if excerpt else ""),
+                (f"claude: API error {status}" if status is not None else "claude: API error")
+                if api_error
+                else "claude: the run ended in an error",
             )
             # The first failure decides the outcome (:meth:`feed`), so this
             # result's failure is the run's.
-            if record.get("terminal_reason") == "api_error" and status in TRANSIENT_API_STATUSES:
+            if api_error and status in TRANSIENT_API_STATUSES:
                 self.transient = f"claude: API error {status}"
+            if api_error and status == LIMIT_API_STATUS:
+                self.limit = f"claude: API error {status}"
         elif is_error is not False:
             self._protocol("the result event has no boolean 'is_error'")
         elif subtype != "success":
-            self._fail(f"claude: the run did not succeed (subtype {clean(subtype, 60) or '-'})")
+            self._fail(
+                f"claude: the run did not succeed (subtype {clean(subtype, 60) or '-'})",
+                "claude: the run did not succeed",
+            )
         elif not isinstance(result, str):
             self._protocol("the result event has no string 'result'")
         else:
@@ -466,6 +575,7 @@ class ClaudeStream:
     def _system(self, record: dict) -> None:
         subtype = record.get("subtype")
         if subtype == "init":
+            self._inits += 1
             model = record.get("model")
             self._send(
                 ProgressEvent(ProgressKind.STARTED, detail=model if isinstance(model, str) else "")
@@ -504,6 +614,8 @@ class ClaudeStream:
         return [block for block in content if isinstance(block, dict)]
 
     def _assistant(self, record: dict) -> None:
+        if record.get("is_api_error_message") is True:
+            self._take_api_error(record)
         sent = False
         for block in self._blocks(record):
             kind = block.get("type")
@@ -520,6 +632,21 @@ class ClaudeStream:
             self._send(ProgressEvent(ProgressKind.ACTIVITY))
         if self._loop is not None:
             self._loop.turn()
+
+    def _take_api_error(self, record: dict) -> None:
+        """Keep the typed facts of the CLI's own model API-error message (R3-F1 of PR #480).
+
+        Its two typed fields only, never its text: the flag that brought it
+        here and its ``api_error_status``. A status that is no count (absent,
+        ``null``, a string) still names an API error, one without a status.
+        """
+        self._api_errors += 1
+        status = _count(record.get("api_error_status"))
+        reason = f"claude: API error {status}" if status is not None else "claude: API error"
+        if self.api_error is None:
+            self.api_error = reason
+        if status == LIMIT_API_STATUS:
+            self.api_limit = reason
 
     def _tool_use(self, block: dict) -> None:
         self._tool_calls += 1

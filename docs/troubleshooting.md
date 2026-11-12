@@ -31,6 +31,7 @@ what no test covers.
 | `autoforge: error: agent '<profile>' ...`, then `State unchanged.` and `worktree:`, `logs:`, `resume:` lines (exit 1) | [State unchanged: an agent launch failed](#state-unchanged-an-agent-launch-failed) |
 | `... made no progress for <N>s ... and was killed`, `... reached its <N>s maximum runtime and was killed`, `... was killed: the same ... repeated ...` | [An agent was killed: idle timeout, maximum runtime, loop](#an-agent-was-killed-idle-timeout-maximum-runtime-loop) |
 | `failed: claude: the run ended in an error (...)`, `failed: pi: the auth preflight refused the launch: ...`, an `exited 1. stderr tail:` holding the CLI's own error, `(transient: ...)`, `not relaunched: ...` | [Provider authentication, model and API errors](#provider-authentication-model-and-api-errors) |
+| `Automatic recovery (decision <n>): relaunch allowed` or `relaunch refused (<reason>)`, a step printed as `<PHASE> -> <PHASE>`, a PR or issue comment headed `AutoForge automatic recovery`, `stop: resumable_error (reason provider-usage-limit, ...)` | [Automatic recovery: one relaunch per step](#automatic-recovery-one-relaunch-per-step) |
 | `the agent asked for permission (...)`, `an answer to a question` | [An agent asked for permission or input](usage.md#an-agent-asked-for-permission-or-input) |
 | `stop: blocked (reason pr-owner, ...)`, a reason naming `unblock --take-over` (`... names run <id> as its owner, not this run`, `... has no record of the PR`, `... names no run as its owner`) | [Taking over a PR another run owns](usage.md#taking-over-a-pr-another-run-owns) |
 | `status` shows an `Acceptance action A-…` or an `Operator actions (FIX, ...)` block | [The run waits for you: acceptance and operator actions](#the-run-waits-for-you-acceptance-and-operator-actions) |
@@ -43,7 +44,7 @@ what no test covers.
 | `existing run <id> in phase <P> — use 'resume' to continue or 'run --force' to discard it` (exit 2) | [Starting over](#starting-over) |
 | `another AutoForge controller holds <path> — refusing to run concurrently on the same repository (...)` (exit 2) | [Another controller holds the lock](#another-controller-holds-the-lock) |
 | `'<command>' refuses issue <issue>: ... Only the parallel EPIC scheduler continues an issue its namespace owns ...` (exit 2) | [Another controller holds the lock](#another-controller-holds-the-lock) |
-| `unsupported protocol_version '<n>' (controller speaks '17'): a newer AutoForge wrote it` (exit 2) | [A run a newer controller wrote](usage.md#a-run-a-newer-controller-wrote) |
+| `unsupported protocol_version '<n>' (controller speaks '18'): a newer AutoForge wrote it` (exit 2) | [A run a newer controller wrote](usage.md#a-run-a-newer-controller-wrote) |
 | `refusing to start a new run over an unreadable state file`, `corrupted state file ...` (exit 2) | [The state file](#the-state-file) |
 | `issue <url> has no native parent on GitHub and no --epic was given`, `... has its native parent ... in another repository`, `... is closed on GitHub; a run records only an open EPIC`, `--epic <url> is the issue itself` (from `run`, exit 2) | [Which EPIC a run records](usage.md#which-epic-a-run-records) |
 | `issue <url> changed on GitHub while the run's EPIC was being bound: ...` (from `run`, exit 2) | [Which EPIC a run records](usage.md#which-epic-a-run-records): the issue's parent or state changed while `run` read its EPIC; nothing was written: run the command again |
@@ -282,7 +283,13 @@ What the controller already did before it gave up:
   followed by which one). Stop that process before `resume`.
 - **A transient provider failure** is relaunched inside the step, at most
   twice ([Provider errors](#provider-authentication-model-and-api-errors)).
-  Any other non-zero exit, a timeout or a verification failure is not
+- **An idle timeout, or an exit the adapter typed as result-less**, is
+  relaunched once per step by the running `run` or `resume`
+  ([Automatic recovery](#automatic-recovery-one-relaunch-per-step)). If you
+  see the message above, that relaunch was refused, or already spent: its
+  last line says `Automatic recovery (decision <n>): relaunch refused
+  (<reason>)` and why. Any other non-zero exit, a hard runtime limit, a
+  loop kill, a provider's usage limit or a verification failure is not
   retried automatically.
 
 Then look at the worktree (the agent may have committed, or left changes)
@@ -291,7 +298,79 @@ failed, and run the printed `resume`. It starts a fresh agent session with the s
 re-entry reads GitHub first, so work that already landed is adopted, not
 repeated ([Workflow: re-entering a phase](agent-guides/workflow.md#re-entering-a-phase)).
 Each `resume` that launches counts one step toward
-`workflow.max_total_steps`.
+`workflow.max_total_steps`, and so does each correction or transient
+relaunch inside a step: every agent launch is charged before it starts, and
+a relaunch with no step left stops in `BLOCKED` (`step-budget`) instead.
+
+## Automatic recovery: one relaunch per step
+
+Within a running `run` or `resume` (and a scheduler worker), the controller
+relaunches a failed agent step on its own, once, when its fixed rule allows
+it (ADR 0012 D11, #434). `step` never does, and nothing runs in the
+background between commands. The rule reads typed facts only, never the
+error's text:
+
+- **Relaunched:** an agent killed at its idle limit, and an agent CLI that
+  died inside a running session before delivering any result, as its
+  adapter typed it (Claude Code's `stream-json` stream: the CLI's `init` and
+  a tool call of the model's, then no result record).
+- **Never relaunched:** a maximum runtime or a loop kill, a provider's usage
+  or rate limit (`stop: resumable_error (reason provider-usage-limit, ...)`),
+  also when a limit killed the CLI after it had reported the limit, a
+  failure the provider had reported before a limit killed the CLI (an
+  authentication or permission refusal, a protocol violation, an error
+  result: `failed-before-limit`, the error saying `Its provider had already
+  failed the run when the limit killed it (...)`), a
+  request for your decision, an untyped exit (an empty stream among them:
+  a CLI that failed to authenticate, to load its configuration or to write
+  to a full disk prints nothing on stdout, and stderr is never read for
+  this; and a Claude Code CLI that reported a model API error and exited
+  without its result, the error saying `exited without a result event,
+  after reporting API error <status>`), a result refused after its
+  corrections, a sandbox refusal, a
+  GitHub failure or drift, a failed verification, and anything unknown.
+- **Refused even then:** when a process the launch started may still be
+  running (`process-may-survive`), when the killed launch had already
+  printed a complete `CONTROL_RESULT` (`result-delivered`: a relaunch would
+  throw it away), when the step already used its one automatic relaunch,
+  whatever failed then (`allowance-spent`), when `workflow.max_total_steps`
+  (`step-budget`) or this command's `--max-steps` (`invocation-limit`) has no
+  step left, or when a worker was asked to stop (`stop-requested`).
+
+A relaunch prints the failed step as one outcome
+(`ANALYZE_EXECUTE -> ANALYZE_EXECUTE: ... Automatic recovery (decision 1):
+relaunch allowed: idle-timeout ...`), then the next step re-enters the phase
+exactly as `resume` would, reading GitHub first. It counts one step toward
+`workflow.max_total_steps`, like your own `resume`. Every decision, relaunch
+or refusal, is saved in the state, written to the run log
+(`<PHASE>-auto-recovery`) and posted as a comment on the PR, or on the
+issue before there is a PR, headed `AutoForge automatic recovery`. If either
+cannot be completed, nothing is relaunched, and your next `run`, `resume` or
+`step` completes it first, once (a crash in between neither loses nor
+repeats it), and executes nothing until it has:
+
+- the run log refusing the record, or GitHub not answering, stops the
+  command with the phase unchanged; fix the cause and `resume`;
+- a conclusive GitHub failure (`github-read-failed`), or a comment in
+  conflict (`effect-conflict`: a second comment carrying the decision's
+  marker, or one whose text was edited), enters `BLOCKED`, naming the target
+  and the marker. Remove the comments that are not the controller's text
+  (or restore it), then `unblock`; the next command adopts the comment or
+  posts it once.
+
+`status` shows the step's allowance and its decisions under `Automatic
+recovery`, with any record not yet complete.
+
+After a refusal, recover as for any failed launch above. A step whose
+automatic relaunch is spent is not refilled by `resume`, a crash or
+`unblock`; a phase change starts a new step with a fresh one.
+
+Each `resume` of yours still launches the step again, with its usual
+corrections and transient retries, and no automatic relaunch after it: the
+rule bounds what the controller does on its own, not how often you resume.
+`workflow.max_total_steps` is the bound on every launch of the run, the
+ones you resume included, since each launch is charged as one step before
+it starts.
 
 ## An agent was killed: idle timeout, maximum runtime, loop
 
@@ -334,9 +413,9 @@ The CLI's own words are in the message's `stderr tail:` and in the step's
 
 | CLI | How it reads | What it usually means |
 |---|---|---|
-| Claude Code (`output_format: stream-json`, the default) | `agent '<profile>' failed: claude: the run ended in an error (subtype ..., terminal_reason api_error, api_error_status <status>): <the CLI's message>` | 400, 401, 403 or 404: the request, the credential or the model; 429: possibly a plan's usage limit, which resets hours later. 408 and 5xx (529 is overloaded) are transient, once the CLI's own retries are spent. A refused or dropped connection (`api_error: connection_failed`, which a wrong `ANTHROPIC_BASE_URL` gives too) has no status and is not transient |
+| Claude Code (`output_format: stream-json`, the default) | `agent '<profile>' failed: claude: the run ended in an error (subtype ..., terminal_reason api_error, api_error_status <status>): <the CLI's message>` | 400, 401, 403 or 404: the request, the credential or the model; 429: a usage or rate limit, possibly a plan's, which resets hours later (`provider limit: claude: API error 429`, stop `provider-usage-limit`). 408 and 5xx (529 is overloaded) are transient, once the CLI's own retries are spent. A refused or dropped connection (`api_error: connection_failed`, which a wrong `ANTHROPIC_BASE_URL` gives too) has no status and is not transient |
 | Claude Code (`output_format: text`) | `agent '<profile>' exited <N>. stderr tail: ...` | no stream to classify: read the stderr tail |
-| OpenCode | `agent '<profile>' exited 1. stderr tail: ...`, OpenCode's `Error:` line among it | the credential, the model or the provider OpenCode was given. For an `openai/*` model, exits whose errors are all `WebSocket closed with code 1000`, `WebSocket closed with code 1008` or OpenAI's generic `server_error: An error occurred while processing your request. ...` are transient |
+| OpenCode | `agent '<profile>' exited 1. stderr tail: ...`, OpenCode's `Error:` line among it | the credential, the model or the provider OpenCode was given. `Error: The usage limit has been reached` is the provider's usage limit (`provider limit: opencode: ...`, stop `provider-usage-limit`). For an `openai/*` model, exits whose errors are all `WebSocket closed with code 1000`, `WebSocket closed with code 1008` or OpenAI's generic `server_error: An error occurred while processing your request. ...` are transient |
 | Pi | `agent '<profile>' failed: pi: the auth preflight refused the launch: status <status>, provider '<provider>', reason <reason>: <remedy>` | Pi holds no usable sign-in for the model's provider; the reason is one of [`doctor`'s Pi rows](pi.md#doctors-pi-rows), with its remedy |
 | Pi on an API key (`require_oauth: false`) | `pi: prompt rejected before acceptance`, `pi: model error after acceptance` | a missing or invalid key, or a model the key cannot use: no preflight runs on this route ([DeepSeek on an API key](pi.md#deepseek-on-an-api-key)) |
 
@@ -349,7 +428,10 @@ the error, and a result from a failed exit is not read. A transient failure's `e
 ...)`, and when the step stops relaunching, the message says why (`not
 relaunched: this step already relaunched it 2 time(s), the bound of 2`,
 or that a process the launch started may still be running). Any other
-failure, a 429 among them, is not relaunched: it waits for `resume`.
+failure is not relaunched in the step. A usage or rate limit (a 429, or
+OpenCode's usage-limit error) is never relaunched, in the step or by
+automatic recovery: it stops with `provider-usage-limit` and waits for your
+`resume` once the limit has reset, which the provider did not say when.
 
 To recover: sign the CLI in, or fix the profile's model or provider in the
 configuration, run `autoforge doctor` (it checks that each CLI is there,

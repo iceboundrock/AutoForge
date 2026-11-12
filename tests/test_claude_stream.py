@@ -989,3 +989,200 @@ def test_refused_subjects_are_cleaned_and_bounded_and_their_number_is_not():
     assert len(stream.refused) == claude_stream.MAX_REFUSED
     assert stream.refused_count == claude_stream.MAX_REFUSED + 7
     assert all(len(s) <= claude_stream.MAX_SUBJECT_CHARS for _, s in stream.refused)
+
+
+# -- #434: a usage or rate limit, and an exit without any result ------------------------
+
+
+def test_a_turn_ended_at_a_usage_or_rate_limit_is_typed_as_one():
+    """429 is the one status typed as a limit: a fixed reason, never the message,
+    and never transient (a launch now meets the same limit)."""
+    stream, _ = _run(_api_error(429, "API Error: Request rejected (429) · rate_limit_error"))
+    assert stream.limit == "claude: API error 429" and stream.transient is None
+    for status in (529, 408, 401, None, "429"):
+        assert _run(_api_error(status, "x"))[0].limit is None, status
+    # Not an API-error turn, or a later error after the run failed first: not read.
+    assert _run(_api_error(429, "x", terminal_reason="completed"))[0].limit is None
+    assert _run(b"not json", _api_error(429, "x"))[0].limit is None
+
+
+def test_only_a_session_that_ran_and_then_ended_with_no_result_is_result_less():
+    """R1-F1 of PR #480: the absence of a result is no evidence of why the CLI
+    ended. Only its init and a tool call of the model's show the session ran."""
+    init = {"type": "system", "subtype": "init", "model": "m"}
+    tool = {
+        "type": "assistant",
+        "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+    }
+    text = {"type": "assistant", "message": {"content": [{"type": "text", "text": "hm"}]}}
+    assert _run(init, tool)[0].result_less
+    # An empty stream: an authentication, permission, configuration or host
+    # failure the CLI reports on stderr alone ends it exactly so.
+    empty = ClaudeStream(cwd=CWD, emit=None)
+    empty.stream_ended()
+    assert empty.exited_early and not empty.result_less
+    # The session started, but the model never called a tool (the CLI's own
+    # message for a failed request is an assistant record too).
+    assert not _run(init)[0].result_less
+    assert not _run(init, text)[0].result_less
+    # A tool call without the CLI's init is no session it started.
+    assert not _run(tool)[0].result_less
+    # A result arrived (a failing one, or an earlier turn's): not result-less.
+    assert not _run(_api_error(529, "x"))[0].result_less
+    assert not _run(init, tool, _result(), init)[0].result_less
+    # A line skipped past the per-line bound may have been the result.
+    stream = ClaudeStream(cwd=CWD, emit=None)
+    stream.oversize(1 << 20)
+    stream.stream_ended()
+    assert stream.exited_early and not stream.result_less
+    # A protocol violation is no exit without a result.
+    assert not _run(b"not json")[0].result_less
+    assert not _run(_result())[0].result_less
+
+
+_ENDED = "claude: stdout ended before a result event"
+
+
+@pytest.mark.parametrize(
+    ("records", "kind"),
+    [
+        # A turn ended on a model API error: its status, never its message.
+        ((_api_error(401, "Failed to authenticate. sk-ant-secret"),), "claude: API error 401"),
+        ((_api_error(403, "permission denied for /etc/passwd"),), "claude: API error 403"),
+        ((_api_error(529, "overloaded"),), "claude: API error 529"),
+        ((_api_error(None, "Request timed out"),), "claude: API error"),
+        # An error result that is no API error, and a run that did not succeed.
+        (
+            (_result(is_error=True, subtype="error_max_turns", result="x"),),
+            "claude: the run ended in an error",
+        ),
+        ((_result(subtype="error_during_execution"),), "claude: the run did not succeed"),
+        # Every protocol violation is one kind, whatever line broke it.
+        ((b"not json",), "claude: stream-json protocol violation"),
+        (
+            ({"type": "system", "subtype": "init", "model": "m"}, b'{"type": 1}'),
+            "claude: stream-json protocol violation",
+        ),
+        ((_result(is_error="yes"),), "claude: stream-json protocol violation"),
+        # stdout ended with a turn open.
+        (({"type": "system", "subtype": "init", "model": "m"},), _ENDED),
+        ((_result(), {"type": "system", "subtype": "init", "model": "m"}), _ENDED),
+    ],
+)
+def test_a_failure_has_a_fixed_kind_that_carries_no_text_from_the_stream(records, kind):
+    """#434 (R2-F1 of PR #480): what failed the run, as a fixed reason the
+    adapter keeps when a limit then kills the CLI; the first failure's."""
+    stream, _ = _run(*records)
+    assert stream.failure is not None
+    assert stream.failure_kind == kind
+    assert "secret" not in kind and "passwd" not in kind
+
+
+def test_a_run_that_did_not_fail_has_no_failure_kind():
+    assert _run(_result())[0].failure_kind is None
+    # Still running (no EOF yet), the stream has not failed either.
+    assert (
+        _run({"type": "system", "subtype": "init", "model": "m"}, ended=False)[0].failure_kind
+        is None
+    )
+    # The first failure's kind stands: a later record is not read.
+    stream, _ = _run(_api_error(401, "x"), b"not json")
+    assert stream.failure_kind == "claude: API error 401"
+
+
+# -- R3-F1 of PR #480: the CLI's typed API-error message, with or without its result ---
+
+
+def _api_error_message(status: object, text: str = "API Error: sk-ant-secret") -> dict:
+    """The CLI's own ``assistant`` message for a model API error (claude 2.1.314,
+    #395): typed by ``is_api_error_message`` and ``api_error_status``."""
+    return {
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": text}]},
+        "error": "server_error",
+        "is_api_error_message": True,
+        "api_error_status": status,
+    }
+
+
+_INIT = {"type": "system", "subtype": "init", "model": "m"}
+_TOOL = _assistant(_tool_use("t1", "Read", file_path=f"{CWD}/a.py"))
+
+
+@pytest.mark.parametrize(
+    ("status", "error", "limit"),
+    [
+        (401, "claude: API error 401", None),
+        (403, "claude: API error 403", None),
+        (429, "claude: API error 429", "claude: API error 429"),
+        (529, "claude: API error 529", None),
+        (None, "claude: API error", None),
+        # A status that is no count names an API error without a status.
+        ("429", "claude: API error", None),
+        (True, "claude: API error", None),
+    ],
+)
+def test_the_clis_typed_api_error_message_is_kept_without_its_result(status, error, limit):
+    """R3-F1 of PR #480: the typed facts stand whether or not the result that
+    would repeat them arrives; never the message text."""
+    stream, _ = _run(_INIT, _TOOL, _tool_result("t1"), _api_error_message(status), ended=False)
+    assert stream.api_error == error and stream.api_limit == limit
+    assert stream.failure is None and stream.failure_kind is None
+    assert stream.summary()["api_error_records"] == 1
+    stream.stream_ended()
+    # stdout ended without the result: the API error is what failed the run.
+    assert stream.exited_early and not stream.result_less
+    assert stream.failure_kind == error
+    assert stream.failure == (
+        f"claude: exited without a result event, after reporting {error.removeprefix('claude: ')}"
+    )
+    assert "secret" not in stream.failure
+
+
+def test_a_typed_api_error_message_without_the_flag_or_with_another_value_is_not_one():
+    for flag in (None, False, "true", 1):
+        record = _api_error_message(429)
+        if flag is None:
+            del record["is_api_error_message"]
+        else:
+            record["is_api_error_message"] = flag
+        stream, _ = _run(_INIT, _TOOL, _tool_result("t1"), record)
+        assert stream.api_error is None and stream.api_limit is None, flag
+        assert stream.result_less and stream.failure_kind == _ENDED, flag
+
+
+def test_the_first_typed_api_error_is_kept_and_any_429_is_a_limit():
+    stream, _ = _run(_INIT, _api_error_message(529), _api_error_message(429), ended=False)
+    assert stream.api_error == "claude: API error 529"
+    assert stream.api_limit == "claude: API error 429"
+    assert stream.summary()["api_error_records"] == 2
+
+
+def test_the_result_still_decides_a_run_whose_cli_reported_an_api_error():
+    """The typed message fails nothing by itself: the result that follows it
+    decides, as before, and its own facts stand."""
+    stream, _ = _run(*(_INIT, _api_error_message(529)), _api_error(529, "Overloaded"))
+    assert stream.failure_kind == "claude: API error 529"
+    assert stream.transient == "claude: API error 529" and stream.limit is None
+    assert stream.api_error == "claude: API error 529"
+    # A message a subagent's call met, then a main turn that succeeded.
+    stream, _ = _run(_INIT, _api_error_message(429), _result())
+    assert stream.failure is None and stream.text == TEXT
+    assert stream.api_limit == "claude: API error 429"
+
+
+def test_a_typed_api_error_message_ends_a_later_turn_without_its_result():
+    """A turn that closed with its result, then one that reported an API error
+    and never got its own: the API error failed the run."""
+    stream, _ = _run(_INIT, _result(), _INIT, _TOOL, _api_error_message(401))
+    assert stream.exited_early and not stream.result_less
+    assert stream.failure_kind == "claude: API error 401"
+    assert stream.failure == (
+        "claude: exited inside a turn that has no result event, after reporting API error 401"
+    )
+
+
+def test_a_typed_api_error_message_after_the_run_failed_is_not_read():
+    stream, _ = _run(_INIT, b"not json", _api_error_message(429))
+    assert stream.api_error is None and stream.api_limit is None
+    assert stream.failure_kind == "claude: stream-json protocol violation"

@@ -78,7 +78,10 @@ Loop bounds (``workflow:`` config, enforced from persisted state so
   (``stagnation_unchanged_count_rounds``) -> BLOCKED. Rounds of all-new
   findings are progress and only meet the cap.
 - ``max_total_steps``: the run's cumulative ``step_count`` (all issues, all
-  phases, across ``resume``) -> BLOCKED before another step executes. One
+  phases, across ``resume``) -> BLOCKED before another step executes, or
+  before another agent launch of a step: a relaunch within a step (a
+  correction, the retry of a transient failure) is a physical launch
+  charged as one more step, checked and saved before it starts (#434). One
   exception: a REPLAN_REEXECUTE journal past the destructive write
   (SUPERSEDE_INTENT, COMPENSATING, SUPERSEDED) is finished first -- the
   step counts, no agent runs, nothing is closed -- so the source PR the
@@ -104,7 +107,24 @@ Safety rules:
   :data:`MAX_TRANSIENT_RETRIES` times per step, each relaunch after the
   phase-entry reconciliation, and never while a process the failed launch
   started may still be running. A malformed CONTROL_RESULT keeps its
-  separate bounded correction path.
+  separate bounded correction path. A provider's usage or rate limit
+  (``AgentExecutionResult.usage_limit``) is never relaunched: the step
+  raises ``ProviderUsageLimitError``.
+- Bounded automatic recovery (#434, ADR 0012 D11, ``auto_recovery.py``):
+  after every in-step bound, :meth:`ControllerEngine.run` takes one decision
+  of a fixed rule about an error that ended a step of an agent phase, from
+  the error's class and the typed facts of its launch, never its text. An
+  idle timeout or an adapter-typed result-less exit is relaunched once per
+  step (the allowance persisted in ``state.auto_recovery``, shared by every
+  category), within ``workflow.max_total_steps`` and ``--max-steps``, through
+  the same phase-entry reconciliation ``resume`` runs, after the decision is
+  saved, logged and posted as a K13 audit comment (on a PR only while its
+  implementation marker names this run, read right before it, ADR 0004
+  D9.4a; otherwise ``BLOCKED`` with ``pr-owner``); everything else is
+  refused and recorded the same way. A decision whose run log record or
+  comment is not complete is completed by the next ``run``, ``resume`` or
+  ``step`` before it executes anything, or that command stops (BLOCKED on a
+  conflict). ``step`` never relaunches on its own.
 - An agent's request for a human decision goes through the launch's
   interaction broker (``interaction.py``, ADR 0007 D5.2, #134), created for
   a provider whose profile names an ``interaction_policy`` and asking
@@ -144,6 +164,22 @@ from .agent_worktree import (
     read_candidate,
     registered_worktree_roots,
     uncommitted_entries,
+)
+from .auto_recovery import (
+    MAX_EVIDENCE_CHARS,
+    Bounds,
+    DecisionEntry,
+    LaunchEnd,
+    LaunchEndKind,
+    RecoveryDecision,
+    RecoveryJournal,
+    RunLogProgress,
+    RunLogStage,
+    StepKey,
+    audit_record,
+    audit_text,
+    decide,
+    decides,
 )
 from .candidate_artifact import bound_revision_problem, is_ancestor_in
 from .candidate_source import (
@@ -223,6 +259,7 @@ from .effect_ops import (
     OperatorCommentOp,
     PrBodyUpdateOp,
     ProgressCommentOp,
+    RecoveryAuditCommentOp,
     ReviewCommentOp,
     append_problem,
     drive,
@@ -327,6 +364,7 @@ from .errors import (
     LockOrderError,
     MaterializationError,
     NamespaceError,
+    ProviderUsageLimitError,
     PROwnerError,
     SandboxCapabilityError,
     SandboxCleanupUncertainError,
@@ -517,6 +555,7 @@ from .result_parser import (
     UpdateEpicRequest,
     UpdateEpicResult,
     commit_message_problem,
+    holds_control_result,
     is_partial_fix,
     markdown_code_span,
     operator_comment_link_problem,
@@ -596,6 +635,7 @@ from .stop_classification import (
     reason_code,
 )
 from .transitions import (
+    AGENT_PHASES,
     STOP_PHASES,
     TERMINAL_PHASES,
     Phase,
@@ -896,6 +936,46 @@ def _loop_killed(result: AgentExecutionResult) -> str:
     if result.timeout_limit != LIMIT_LOOP:
         return ""
     return result.loop.describe() if result.loop is not None else "it repeated itself"
+
+
+def _add_line(exc: BaseException, line: str) -> None:
+    """Append ``line`` to an error's one-string message (#434), redacted; else a note."""
+    if len(exc.args) == 1 and isinstance(exc.args[0], str):
+        exc.args = (redact(f"{exc.args[0].rstrip()}\n{line}"),)
+    else:
+        exc.add_note(redact(line))
+
+
+def _usage_reset_text(result: AgentExecutionResult) -> str:
+    """What a launch refused at a provider limit says of its reset (#434)."""
+    if result.usage_reset_at:
+        return f"the provider reports a reset at {result.usage_reset_at}"
+    return "the provider reported no reset time"
+
+
+def _launch_end(
+    kind: LaunchEndKind, result: AgentExecutionResult, profile: ProfileConfig
+) -> LaunchEnd:
+    """The typed facts of a failed agent launch, for the recovery rule (#434).
+
+    Each comes from a typed value: the limit the executor or the loop
+    detector recorded, its survivor flags, whether the protocol's framing
+    holds a complete ``CONTROL_RESULT`` in the part of stdout the parser
+    reads (a result delivered before a kill, #285), and the adapter's own
+    fixed findings. No text the agent or its CLI printed is read for it.
+    """
+    return LaunchEnd(
+        kind=kind,
+        timeout_limit=result.timeout_limit if result.timed_out else "",
+        may_have_survivor=result.may_have_survivor,
+        delivered_result=holds_control_result(result.stdout_tail),
+        result_less_exit=result.result_less_exit,
+        usage_limit=result.usage_limit or "",
+        usage_reset_at=result.usage_reset_at if result.usage_limit else "",
+        transient_failure=result.transient_failure or "",
+        failed_before_limit=(result.failed_before_limit or "") if result.timed_out else "",
+        provider=profile.provider,
+    )
 
 
 def _interaction_end(
@@ -1959,6 +2039,12 @@ class ControllerEngine:
         # (#447), set by :meth:`_held_revision_moved` whenever it returns
         # None, "" otherwise: what ``epic recheck`` reports. Never persisted.
         self.held_reason = ""
+        # Set by :meth:`_settle_recovery_decisions` when it left a decision's
+        # audit comment for after the operator's journaled takeover of its PR
+        # (R4-F1 of PR #480): the step that follows completes the takeover
+        # without an agent, and no agent is launched while it is set. Never
+        # persisted: the next settle decides again.
+        self._audit_awaits_takeover = False
 
     # -- the state directory as a held capability --------------------------
     @property
@@ -5313,9 +5399,18 @@ class ControllerEngine:
             yield
 
     def step(self, dry_run: bool = False, allow_merge: bool = False) -> StepOutcome:
+        """Exactly one phase execution. Never relaunches a failed step on its own:
+        the automatic recovery of #434 is :meth:`run`'s, whose loop has a next
+        step to give it; an earlier decision left unsettled is completed
+        first, as there, or the step stops before it executes anything
+        (:meth:`_settle_recovery_decisions`)."""
         if dry_run:
             return self._step_once(dry_run=True, allow_merge=allow_merge)
         with self._execution_lock():
+            if self._require_state().phase not in TERMINAL_PHASES:
+                stopped = self._settle_recovery_decisions()
+                if stopped is not None:
+                    return stopped
             return self._step_once(dry_run=False, allow_merge=allow_merge)
 
     def run(
@@ -5358,6 +5453,21 @@ class ControllerEngine:
         one of the phases executes nothing (READY_FOR_MERGE among them is
         never rechecked). A dry run plans as before: it executes nothing
         either way. The defaults are the loop above.
+
+        Bounded automatic recovery (#434, :mod:`autoforge.auto_recovery`): a
+        step of an agent phase that ends with an error leaving the phase
+        unchanged gets one decision of the fixed rule, journaled in the state,
+        written to the run log and posted as a K13 audit comment
+        (:meth:`_automatic_recovery`). Only an allowlisted failure, the step's
+        one automatic relaunch unspent, with a step of the run's budget and
+        of this loop left and ``should_continue`` still true, its run log
+        record written and its audit comment confirmed, is relaunched: the
+        loop reports the failed step and goes on with the next step, which
+        re-enters the phase exactly as ``resume`` does. Every other error
+        propagates, as before, its refusal added to its text. Before the
+        first step, a decision an earlier command left unsettled is
+        completed, or the loop stops there with nothing executed
+        (:meth:`_settle_recovery_decisions`). A dry run decides nothing.
         """
         if max_steps < 1:
             raise ValueError("max_steps must be >= 1")
@@ -5377,6 +5487,7 @@ class ControllerEngine:
                     self.state.phase = saved_phase
             return outcomes
         all_outcomes: list[StepOutcome] = []
+        audits_settled = False
         with self._execution_lock():
             for index in range(max_steps):
                 assert self.state is not None
@@ -5400,11 +5511,548 @@ class ControllerEngine:
                         break
                     if held is None:
                         break
-                outcome = self._step_once(dry_run=False, allow_merge=allow_merge, held=held)
+                if not audits_settled:
+                    # #434: a decision a crash, the run log or GitHub left
+                    # unsettled is completed before anything else is executed,
+                    # or the loop stops here (R1-F5 of PR #480). One left for
+                    # after the operator's takeover of its PR (R4-F1) is
+                    # settled again before the step after the takeover's.
+                    stopped = self._settle_recovery_decisions()
+                    if stopped is not None:
+                        all_outcomes.append(stopped)
+                        if on_outcome is not None:
+                            on_outcome(stopped)
+                        break
+                    audits_settled = not self._audit_awaits_takeover
+                failing = self.state.phase
+                try:
+                    outcome = self._step_once(dry_run=False, allow_merge=allow_merge, held=held)
+                except AutoForgeError as exc:
+                    relaunch = self._automatic_recovery(
+                        exc,
+                        failing,
+                        steps_left=max_steps - index - 1,
+                        should_continue=should_continue,
+                    )
+                    if relaunch is None:
+                        raise
+                    outcome = relaunch
                 all_outcomes.append(outcome)
                 if on_outcome is not None:
                     on_outcome(outcome)
         return all_outcomes
+
+    # -- bounded automatic recovery (#434) -------------------------------------------
+    def _automatic_recovery(
+        self,
+        exc: AutoForgeError,
+        phase: Phase,
+        *,
+        steps_left: int,
+        should_continue: Callable[[], bool] | None,
+    ) -> StepOutcome | None:
+        """Decide whether the step ``exc`` ended is relaunched, journal it and audit it.
+
+        Returns the outcome that reports the failed step when the next step
+        relaunches it; the ``BLOCKED`` outcome (``pr-owner``) when the PR its
+        audit comment goes on is no longer this run's (R4-F1 of PR #480);
+        ``None`` when it is not relaunched otherwise, with the decision, if
+        one was taken, added to ``exc``'s text for the caller to re-raise.
+
+        Only an error that left an agent phase unchanged is decided
+        (:func:`~autoforge.auto_recovery.decides`): a refusal acted on
+        nothing. The state is read again from disk first, so the decision and
+        the relaunch see exactly what an operator's ``resume`` would: nothing
+        the failed step held only in memory. Then, in this order: the
+        decision (:func:`~autoforge.auto_recovery.decide`, from the journal's
+        allowance for this step and the persisted bounds); one save of it, with
+        its accounting, its ``intended`` K13 record and its run log record
+        still to write, before anything follows from it (D8); the run log
+        record (:meth:`_log_recovery_decision`, its progress journaled); the
+        audit comment, through the effect path, on a PR only while its
+        implementation marker still names this run (:meth:`_require_audit_owner`:
+        the agent ran for minutes, and a takeover in between hands the PR to
+        another run); and only an allowed decision with both complete
+        relaunches. A failure of any of those after the save relaunches
+        nothing and leaves what was saved, which the next command completes
+        before it executes anything, or stops
+        (:meth:`_settle_recovery_decisions`). A PR found to be another
+        run's, or whose owner is not knowable, enters ``BLOCKED`` with the
+        comment unsent and still journaled, as the step's own owner check
+        would have; while the operator's takeover of that PR is journaled
+        and unwritten (the failed step was completing it), the comment waits
+        for it instead, as the settle's does.
+        """
+        if phase not in AGENT_PHASES or not decides(exc):
+            return None
+        try:
+            state = self.load()
+        except AutoForgeError as reread:
+            _add_line(
+                exc,
+                f"Automatic recovery: not decided; the state could not be read again ({reread}).",
+            )
+            return None
+        if state.phase != phase:
+            # The failed step saved another phase before it failed: no longer
+            # an error that left the phase unchanged, and nothing to relaunch.
+            return None
+        try:
+            entry, decision = self._record_recovery_decision(
+                exc, state, steps_left=steps_left, should_continue=should_continue
+            )
+        except AutoForgeError as failure:
+            _add_line(
+                exc,
+                f"Automatic recovery: no decision could be saved ({type(failure).__name__}: "
+                f"{failure}); nothing was relaunched.",
+            )
+            return None
+        try:
+            self._log_recovery_decision(entry.seq)
+        except AutoForgeError as failure:
+            # D8: no relaunch without both audit sinks. The decision is saved
+            # (its allowance spent, both its records still to complete).
+            _add_line(
+                exc,
+                f"Automatic recovery (decision {entry.seq}): {decision.text()}; its run log "
+                f"record could not be written ({type(failure).__name__}: {failure}), so "
+                "nothing was relaunched; the next command completes it and posts its comment "
+                "before it executes anything.",
+            )
+            return None
+        first = bound_block_reason(redact(str(exc).splitlines()[0])) if str(exc) else "-"
+        try:
+            problem = self._recovery_audit_problem(entry.seq)
+        except PROwnerError as lost:
+            # R4-F1 of PR #480 (ADR 0004 D9.4a): the PR is no longer this
+            # run's to post on. The comment stays journaled and unsent; the
+            # stop is the owner check's, which the step after would make,
+            # unless the step that failed was completing the operator's
+            # takeover of that PR, which the next command completes first.
+            target = str(entry.audit.target["target_url"])
+            if self._takeover_awaited(target):
+                _add_line(
+                    exc,
+                    f"Automatic recovery (decision {entry.seq}): {decision.text()}; nothing was "
+                    f"relaunched, and its audit comment waits for the journaled takeover of "
+                    f"{target}, which the next command writes first, launching no agent.",
+                )
+                return None
+            return self._block(
+                phase,
+                None,
+                f"{phase.value} ended with {type(exc).__name__}: {first}. Automatic recovery "
+                f"(decision {entry.seq}): {decision.text()}; nothing was relaunched, and its "
+                f"audit comment was not posted: {lost}",
+                code=StopReasonCode.PR_OWNER,
+            )
+        where = self._recovery_audit_where(entry.seq, problem)
+        if not decision.allowed:
+            _add_line(exc, f"Automatic recovery (decision {entry.seq}): {decision.text()}. {where}")
+            return None
+        if problem:
+            _add_line(
+                exc,
+                f"Automatic recovery (decision {entry.seq}): {decision.text()}, but nothing was "
+                f"relaunched: its audit comment could not be confirmed ({problem}); the step's "
+                "one automatic relaunch is spent, and the next command posts the comment "
+                "before it executes anything.",
+            )
+            return None
+        return self._outcome(
+            phase,
+            message=(
+                f"{phase.value} ended with {type(exc).__name__}: {first}. Automatic recovery "
+                f"(decision {entry.seq}): {decision.text()}. The next step re-enters "
+                f"{phase.value} as 'resume' does, its phase-entry reconciliation first; the "
+                "step has no automatic relaunch left. " + where
+            ),
+        )
+
+    def _record_recovery_decision(
+        self,
+        exc: AutoForgeError,
+        state: AutoForgeState,
+        *,
+        steps_left: int,
+        should_continue: Callable[[], bool] | None,
+    ) -> tuple[DecisionEntry, RecoveryDecision]:
+        """Take the rule's decision about ``exc`` and save it (D8).
+
+        Returns the decision's journal entry and the decision. The entry's
+        audit comment is ``intended`` and its run log record not yet written:
+        both are completed from the entry alone, by this command or the next.
+        """
+        phase = state.phase
+        key = StepKey(
+            phase=phase,
+            issue_url=state.current_issue_url,
+            pr_url=state.current_pr_url,
+            review_round=state.review_round,
+            execution_attempt=state.execution_attempt,
+        )
+        journal = RecoveryJournal.from_dict(state.auto_recovery, state.run_id).for_step(key)
+        max_steps = self.config.workflow.max_total_steps
+        decision = decide(
+            exc,
+            Bounds(
+                relaunches_used=journal.relaunches,
+                step_budget_left=max_steps - state.step_count,
+                invocation_steps_left=steps_left,
+                stop_requested=should_continue is not None and not should_continue(),
+            ),
+        )
+        seq = journal.seq + 1
+        relaunches = journal.relaunches + (0 if decision.refusal is not None else 1)
+        txn = state.replan_transaction.get("transaction_id", "") if state.replan_transaction else ""
+        owner = EffectOwner(
+            run_id=state.run_id,
+            phase=phase,
+            issue_url=state.current_issue_url,
+            pr_url=state.current_pr_url,
+            transaction_id=txn if phase == Phase.REPLAN_REEXECUTE else "",
+        )
+        text = audit_text(
+            decision=decision,
+            run_id=state.run_id,
+            phase=phase,
+            review_round=state.review_round,
+            seq=seq,
+            relaunches=relaunches,
+            step_count=state.step_count,
+            max_total_steps=max_steps,
+        )
+        entry = DecisionEntry(
+            seq=seq,
+            decided_at=utcnow_iso(),
+            step=key,
+            step_count=state.step_count,
+            attempt=state.attempt,
+            error=type(exc).__name__,
+            category=decision.category,
+            refusal=decision.refusal,
+            relaunches=relaunches,
+            evidence=decision.evidence[:MAX_EVIDENCE_CHARS],
+            audit=audit_record(owner, seq, text),
+        )
+        state.auto_recovery = journal.with_decision(entry).to_dict()
+        # D8: authoritative before anything follows from it. A crash after
+        # this save finds the allowance spent and both audit records to
+        # complete, which the next command does before it executes anything.
+        self._save()
+        return entry, decision
+
+    def _recovery_journal(self) -> RecoveryJournal:
+        state = self._require_state()
+        return RecoveryJournal.from_dict(state.auto_recovery, state.run_id)
+
+    def _recovery_log_record(self, entry: DecisionEntry) -> ExecutionRecord:
+        """The run log record of decision ``entry`` (D8): a controller record of no launch.
+
+        Rendered from the journaled entry alone, timed at the decision, so
+        the record a later command completes is the one this command would
+        have written.
+        """
+        state = self._require_state()
+        record = ExecutionRecord(
+            run_id=state.run_id,
+            seq=0,
+            phase=f"{entry.phase.value}-auto-recovery",
+            attempt=max(1, entry.attempt),
+            issue_url=entry.step.issue_url,
+            pr_url=entry.step.pr_url,
+            review_round=entry.step.review_round,
+            profile="(automatic recovery; no agent)",
+            prompt_version=state.prompt_version,
+            started_at=entry.decided_at,
+            finished_at=entry.decided_at,
+            metadata={
+                "decision": entry.seq,
+                "allowed": entry.allowed,
+                "category": entry.category.value,
+                "refusal": entry.refusal.value if entry.refusal is not None else "",
+                "error_class": entry.error,
+                "evidence": entry.evidence,
+                "relaunches": entry.relaunches,
+                "step": entry.step.to_dict(),
+                "step_count": entry.step_count,
+                "max_total_steps": self.config.workflow.max_total_steps,
+                "audit_target": entry.audit.target["target_url"],
+                "audit_marker": entry.audit.marker,
+            },
+        )
+        if not entry.allowed:
+            record.error = f"automatic recovery refused: {entry.text()}"
+        return record
+
+    def _persist_recovery_log(self, seq: int, progress: RunLogProgress) -> None:
+        state = self._require_state()
+        state.auto_recovery = self._recovery_journal().with_run_log(seq, progress).to_dict()
+        self._save()
+
+    def _log_recovery_decision(self, seq: int) -> None:
+        """Write decision ``seq``'s run log record at most once (D8; R1-F4 of PR #480).
+
+        Idempotent across a crash, like a K13 comment: the step directory it
+        goes to is named and saved (``attempted``) before the write, and
+        ``written`` is saved after it. A decision found ``attempted`` is
+        looked for in that one directory first (its ``execution.json``, which
+        the run log publishes before the event journal's line): found, it is
+        adopted, never written twice; absent, it is written now. A refusal
+        of the run log raises, the progress left as saved for the next
+        command.
+        """
+        entry = self._recovery_journal().entry(seq)
+        if entry.run_log.stage is RunLogStage.WRITTEN:
+            return
+        with self._logger() as logger:
+            if entry.run_log.stage is RunLogStage.ATTEMPTED and logger.holds_step(
+                entry.run_log.step_dir
+            ):
+                self._persist_recovery_log(
+                    seq, RunLogProgress(RunLogStage.WRITTEN, entry.run_log.step_dir)
+                )
+                return
+            record = self._recovery_log_record(entry)
+            name = logger.next_step_name(record.phase, record.attempt)
+            self._persist_recovery_log(seq, RunLogProgress(RunLogStage.ATTEMPTED, name))
+            written = logger.log_execution(record)
+            if written.name != name:
+                # One process under the lock names and writes it: a controller bug.
+                raise StateError(
+                    f"the run log wrote decision {seq}'s record to {written.name}, not to the "
+                    f"{name} saved before the write"
+                )
+            self._persist_recovery_log(seq, RunLogProgress(RunLogStage.WRITTEN, name))
+
+    def _drive_recovery_audit(self, seq: int) -> EffectRecord:
+        """Post decision ``seq``'s K13 audit comment at most once; the record as last persisted.
+
+        Through :func:`~autoforge.effect_ops.drive`: the comment is looked
+        for by its marker first, ``attempted`` is saved before the write and
+        the write is read back, so a crash or a retry never posts it twice. A
+        settled record (observed, or in conflict) is returned as it is. A
+        read or write of GitHub that fails raises, the record left as last
+        persisted: :class:`GitHubUnavailableError` (an :class:`EffectPending`
+        included) while the outcome cannot be read yet, another
+        :class:`GitHubError` for a conclusive failure.
+
+        A comment on a PR is driven only after the PR is read right before
+        it and found to be this run's (:meth:`_require_audit_owner`, R4-F1
+        of PR #480): :class:`PROwnerError` otherwise, raised before any
+        read of the comments, persist or write, the record left as it was,
+        so a later command that owns the PR again adopts a comment that
+        landed before, or posts it once.
+        """
+
+        def persist(updated: EffectRecord) -> None:
+            state = self._require_state()
+            state.auto_recovery = self._recovery_journal().with_audit(seq, updated).to_dict()
+            self._save()
+
+        entry = self._recovery_journal().entry(seq)
+        record = entry.audit
+        if not record.pending:
+            return record
+        self._require_audit_owner(entry)
+        return drive(record, RecoveryAuditCommentOp(self.github), persist).record
+
+    def _require_audit_owner(self, entry: DecisionEntry) -> None:
+        """Raise :class:`PROwnerError` unless decision ``entry``'s comment may go on its PR now.
+
+        ADR 0004 D9.4a (R4-F1 of PR #480): a run posts nothing on a PR whose
+        implementation marker does not name it. The audit comment is this
+        run's own text about its own decision, and still a write on the PR,
+        so it gets the read K4's comment gets right before it is sent
+        (:meth:`_complete_review`), on every entry that would send it: the
+        PR is read as itself, with a state, and its marker names the
+        decision's issue and this run. A comment on the run's issue (the
+        run had no PR) has no owner marker to read, and is not checked.
+
+        A read GitHub cannot answer now raises :class:`GitHubUnavailableError`,
+        and one that fails conclusively its :class:`GitHubError`, both before
+        anything is sent and for the caller to classify, as a read of the
+        comments would; neither establishes the owner, so neither lets the
+        comment be sent.
+        """
+        record = entry.audit
+        target = str(record.target["target_url"])
+        try:
+            parse_pr_url(target)
+        except ConfigurationError:
+            return
+        pr = self.github.get_pr(target)
+        what = f"the audit comment of automatic-recovery decision {entry.seq}"
+        again = " again" if record.stage is Stage.ATTEMPTED else ""
+        sent = (
+            f"{what} was not sent{again}; it stays journaled, and is posted, before anything "
+            "else is executed, only once the PR's implementation marker names this run"
+        )
+        unjudgeable = self._unjudgeable_read(pr, target, what)
+        if unjudgeable:
+            raise PROwnerError(self._pr_owner_text(unjudgeable, sent, pr_url=target))
+        problem = self._pr_owner_problem(pr, issue_url=entry.step.issue_url, pr_url=target)
+        if problem:
+            raise PROwnerError(
+                self._pr_owner_text(
+                    problem,
+                    sent,
+                    pr_state=pr.state or "OPEN",
+                    pr_url=target,
+                    unowned=not self._foreign_owner_problem(pr),
+                )
+            )
+
+    def _takeover_awaited(self, url: str) -> bool:
+        """Whether the operator's takeover of PR ``url`` is journaled and not yet written (#414).
+
+        A K11 record, alone in an ANALYZE_EXECUTE plan or appended to a
+        REVIEW or FIX plan (:meth:`_plan_takeover`), still ``intended`` or
+        ``attempted``. The step that follows sends it first and completes
+        the rest from the journal, launching no agent.
+        """
+        effects = self._require_state().phase_effects()
+        record = effects.appended_takeover
+        if (
+            record is None
+            and isinstance(effects.context, AnalyzeContext)
+            and [r.kind for r in effects.records] == [EffectKind.OWNER_TAKEOVER]
+        ):
+            record = effects.records[0]
+        return (
+            record is not None
+            and record.pending
+            and parse_pr_url(str(record.target["pr_url"])).same_target(parse_pr_url(url))
+        )
+
+    def _recovery_audit_problem(self, seq: int) -> str:
+        """Why decision ``seq``'s audit comment is not confirmed now; "" once it is.
+
+        Raises :class:`PROwnerError` when its PR is not this run's to post
+        on (:meth:`_require_audit_owner`): that is a stop, not a comment to
+        try again.
+        """
+        try:
+            record = self._drive_recovery_audit(seq)
+        except PROwnerError:
+            raise
+        except AutoForgeError as exc:
+            # A read or write of GitHub that failed (conclusive or not), a
+            # `gh` that could not be started, or a save of the record that
+            # failed: the record stays as last persisted, for the next command.
+            return f"{type(exc).__name__}: {exc}"
+        if record.stage is Stage.OBSERVED:
+            return ""
+        return record.reason or f"it is {record.stage.value}"
+
+    def _settle_recovery_decisions(self) -> StepOutcome | None:
+        """Complete every decision an earlier command left unsettled, or stop (#434, D8).
+
+        A crash after a decision's save, a run log that refused its record,
+        or GitHub failing its comment leaves the decision unsettled
+        (:attr:`~autoforge.auto_recovery.DecisionEntry.settled`). Before a
+        command executes anything, each is completed, oldest first: its run
+        log record (:meth:`_log_recovery_decision`), then its comment
+        (:meth:`_drive_recovery_audit`). One that cannot be is never passed
+        over (R1-F5 of PR #480), and the journal never drops it: a refusal
+        of the run log, or a GitHub that cannot be read now, raises with the
+        phase unchanged, for ``resume`` to try again; a conclusive GitHub
+        failure, or a comment in conflict, enters BLOCKED with what the
+        operator must resolve, and an applied ``unblock`` has the conflict
+        read again (:meth:`RecoveryJournal.reopened`). ``None`` when
+        everything is settled.
+
+        A comment whose PR is no longer this run's, or whose owner is not
+        knowable, is not sent (:meth:`_require_audit_owner`, R4-F1 of PR
+        #480) and enters BLOCKED (``pr-owner``), as the step's own owner
+        check would, the decision kept. The one exception is the way back
+        that stop names: the operator's ``unblock --take-over`` of that PR,
+        journaled and not yet written (:meth:`_takeover_awaited`). The
+        comment then waits for it, still unsent, and ``None`` is returned
+        with :attr:`_audit_awaits_takeover` set: the step that follows writes
+        this run into the marker and completes the rest from the journal,
+        launching no agent (and :meth:`_step_phase` refuses to launch one
+        while it is set), and the next settle, before the step after it,
+        reads the PR again and posts the comment.
+        """
+        state = self._require_state()
+        self._audit_awaits_takeover = False
+        if not state.auto_recovery:
+            return None
+        for entry in self._recovery_journal().unsettled():
+            what = f"Automatic recovery decision {entry.seq} ({entry.text()})"
+            try:
+                self._log_recovery_decision(entry.seq)
+            except AutoForgeError as exc:
+                _add_line(
+                    exc,
+                    f"{what}: its run log record could not be written, and nothing is "
+                    "executed while a decision's audit is incomplete. Repair the run log, "
+                    "then 'resume'.",
+                )
+                raise
+            if not any(d.seq == entry.seq for d in self._recovery_journal().unsettled()):
+                # Its comment was already observed, and the record just written
+                # settled it: an earlier step's decision is then dropped.
+                continue
+            target = str(entry.audit.target["target_url"])
+            try:
+                record = self._drive_recovery_audit(entry.seq)
+            except PROwnerError as exc:
+                if self._takeover_awaited(target):
+                    self._audit_awaits_takeover = True
+                    continue
+                return self._block(
+                    state.phase,
+                    None,
+                    f"{what}: its audit comment on {target} was not posted, and nothing is "
+                    f"executed while a decision's audit is incomplete. {exc}",
+                    code=StopReasonCode.PR_OWNER,
+                )
+            except GitHubUnavailableError as exc:
+                _add_line(
+                    exc,
+                    f"{what}: its audit comment on {target} could not be confirmed, and "
+                    "nothing is executed while a decision's audit is incomplete; 'resume' "
+                    "reads GitHub again before anything is sent again.",
+                )
+                raise
+            except GitHubError as exc:
+                return self._block(
+                    state.phase,
+                    None,
+                    f"{what}: its audit comment on {target} could not be reconciled with "
+                    f"GitHub: {exc}. This is not a transient failure (authentication, "
+                    "permissions, or malformed data); nothing was sent again, and nothing is "
+                    "executed while a decision's audit is incomplete. Fix the cause, then "
+                    "'unblock'",
+                    code=StopReasonCode.GITHUB_READ_FAILED,
+                )
+            if record.stage is Stage.CONFLICT:
+                return self._block(
+                    state.phase,
+                    None,
+                    f"{what}: its audit comment on {target} is in conflict: {record.reason}. "
+                    "Nothing is executed while a decision's audit is incomplete. Inspect the "
+                    f"comments of {target} that carry its marker ({record.marker}): remove "
+                    "those that are not the controller's text, or restore that text, then "
+                    "'unblock'; the next command reads the target again and adopts the "
+                    "comment, or posts it once, before anything else",
+                    code=StopReasonCode.EFFECT_CONFLICT,
+                )
+        return None
+
+    def _recovery_audit_where(self, seq: int, problem: str) -> str:
+        """Where decision ``seq``'s audit is: its comment, or why it is not posted yet."""
+        entry = self._recovery_journal().entry(seq)
+        url = str((entry.audit.observed or {}).get("url", ""))
+        if url:
+            return f"Audit: {url} and the run log."
+        return (
+            f"Audit: the run log; its comment is not confirmed yet ({problem or 'pending'}), "
+            "and the next command posts it before it executes anything."
+        )
 
     # -- single step ---------------------------------------------------------
     def _outcome(
@@ -5535,6 +6183,15 @@ class ControllerEngine:
         resolved = self._remote_entry(previous, plan)
         if resolved is not None:
             return resolved
+        if self._audit_awaits_takeover:
+            # R4-F1 of PR #480: a decision's audit comment waits for the
+            # takeover this step completes from the journal, which launches no
+            # agent; reaching a launch with it unsent is a controller bug.
+            raise StateError(
+                f"{previous.value} would launch its agent while an automatic-recovery "
+                "decision's audit comment waits for the operator's takeover of its PR; nothing "
+                "was launched. 'resume' settles the decision first"
+            )
 
         try:
             invoked = self._invoke_phase_anchored(
@@ -8438,6 +9095,13 @@ class ControllerEngine:
             # decided on the PR's owner, not on the plan's conflicts, which
             # its phase reports once the takeover is through.
             state.effect_records = [r.reopened().to_dict() for r in effects.records]
+        if state.auto_recovery:
+            # #434 (R1-F5 of PR #480): an automatic-recovery decision whose
+            # audit comment conflicted blocked the run; the operator resolved
+            # it on GitHub, and the next command reads the target again.
+            state.auto_recovery = (
+                RecoveryJournal.from_dict(state.auto_recovery, state.run_id).reopened().to_dict()
+            )
         state.validation_override_seq = watermark
         state.block_reason = ""
         state.stop_code = ""
@@ -13303,7 +13967,7 @@ class ControllerEngine:
             f"so {sent}"
         )
 
-    def _pr_owner_problem(self, pr: PRInfo) -> str:
+    def _pr_owner_problem(self, pr: PRInfo, *, issue_url: str = "", pr_url: str = "") -> str:
         """Why this run may not drive its bound PR ``pr`` (#414, ADR 0004 D9.4a), or ``""``.
 
         A bound run drives its PR only while the PR's ``ai-implementation``
@@ -13317,16 +13981,21 @@ class ControllerEngine:
         state and a refusal is the ordinary ``BLOCKED`` save. A marker naming
         this run is necessary, not sufficient: it never lets a run adopt a PR
         it is not bound to (D9.3); binding is K2, K3, K7 or K11's.
+
+        ``issue_url`` and ``pr_url`` judge a PR the run wrote to for an
+        earlier step, an automatic-recovery decision's audit comment (R4-F1
+        of PR #480), by the issue and PR of that step; the run's current
+        ones by default.
         """
         state = self._require_state()
-        url = parse_pr_url(pr.url or state.current_pr_url).canonical
+        url = parse_pr_url(pr.url or pr_url or state.current_pr_url).canonical
         found = scan(IMPLEMENTATION, pr.body or "")
         if found.defects:
             return (
                 f"PR {url} carries an implementation marker that cannot be read "
                 f"({'; '.join(found.defects)}), so which run owns it is not knowable"
             )
-        issue = parse_issue_url(state.current_issue_url)
+        issue = parse_issue_url(issue_url or state.current_issue_url)
         if not found.claims:
             if not (pr.body or "").strip():
                 return f"PR {url} reads with an empty body, so no implementation marker names a run"
@@ -15750,6 +16419,26 @@ class ControllerEngine:
                 resolved = before_relaunch()
                 if resolved is not None:
                     return resolved
+                # #434 (D7, R1-F3 of PR #480): a relaunch is a physical, paid
+                # launch like the step's first, so it is one more step of the
+                # run: checked against the persisted budget here, and charged
+                # in the save before it starts (below), so a crash while it
+                # runs, or any later command, finds it counted. No step left
+                # stops the run as the budget does before a step.
+                budget = step_budget_reason(state.step_count, self.config.workflow.max_total_steps)
+                if budget:
+                    return self._block(
+                        phase,
+                        None,
+                        self._budget_block_reason(
+                            phase,
+                            f"{budget}; launch {attempt} of this {phase.value} step ended "
+                            f"without a usable result ({self._launch_log_says_why()}), and its "
+                            "relaunch (a correction or the retry of a transient failure) is a "
+                            "launch the budget charges, so nothing was launched again",
+                        ),
+                        code=StopReasonCode.STEP_BUDGET,
+                    )
             # Which UPDATE_EPIC result this launch asks for (ADR 0004 D4.7):
             # decided by the entry above, and the schema its result is held to.
             request = (
@@ -15793,6 +16482,9 @@ class ControllerEngine:
             finally:
                 self._read_context_dir = None
                 self._worktree_state = None
+            if attempt:
+                # The relaunch's step (above), in the save before it starts.
+                state.step_count += 1
             attempt += 1
             state.attempt += 1
             # D13.3: which publication contract this launch runs under, so a
@@ -15800,10 +16492,12 @@ class ControllerEngine:
             # published under the previous contract.
             state.launch_label = launch_label_for(phase)
             # The one write before the agent starts: the attempt counter, the
-            # entry observation (D4.4) and the launch label. A crash while the
-            # agent runs, or a refused run-log write after it returned,
-            # therefore never leaves controller state claiming the phase was
-            # not yet attempted (#55, PR #89).
+            # step it is charged as (the first launch's by the step itself, a
+            # relaunch's above), the entry observation (D4.4) and the launch
+            # label. A crash while the agent runs, or a refused run-log write
+            # after it returned, therefore never leaves controller state
+            # claiming the phase was not yet attempted (#55, PR #89), or the
+            # launch uncharged (#434).
             self._save()
             # The step's log directory and its ``progress.log`` are published
             # here, after the attempt is persisted and before the launch, so
@@ -15946,15 +16640,48 @@ class ControllerEngine:
                 reached = f"killed: {loop}" if loop else _limit_reached(limits, result)
                 killed = f"was killed: {loop}" if loop else f"{reached} and was killed"
                 record.error = _with_leftovers(reached, result.leftovers)
+                if result.usage_limit:
+                    record.error += f" (provider limit: {result.usage_limit})"
+                elif result.failed_before_limit:
+                    record.error += f" (failed before the limit: {result.failed_before_limit})"
                 self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
                 # Which value to change, when one set the limit (#189). What
                 # to inspect and how to resume are added where the step ends
                 # (:meth:`_state_unchanged_text`), as for every agent failure.
                 key = _limit_key(profile, limits, result)
-                raise ExecutionTimeoutError(
-                    _with_leftovers(f"agent '{profile.name}' {killed}", result.leftovers)
-                    + (f". The limit is set by {key}" if key else "")
+                text = _with_leftovers(f"agent '{profile.name}' {killed}", result.leftovers) + (
+                    f". The limit is set by {key}" if key else ""
                 )
+                timeout: ExecutionError
+                if result.usage_limit:
+                    # #434 (D4, R1-F2 of PR #480): the provider had refused the
+                    # launch at a usage or rate limit before the limit killed
+                    # the CLI. The refusal is the cause, and a launch now meets
+                    # it again: the step ends as a usage limit, never as a
+                    # timeout the recovery rule would relaunch.
+                    timeout = ProviderUsageLimitError(
+                        f"{text}, after its provider refused it at a usage or rate limit "
+                        f"(provider limit: {result.usage_limit}; not relaunched: a launch now "
+                        f"meets the same limit, and {_usage_reset_text(result)})",
+                        provider=profile.provider,
+                        limit=result.usage_limit,
+                        reset_at=result.usage_reset_at,
+                    )
+                elif result.failed_before_limit:
+                    # #434 (R2-F1 of PR #480): the provider had failed the run
+                    # (an authentication or permission refusal, a protocol
+                    # violation) before the limit killed the CLI. Still a
+                    # timeout to every other reader; the recovery rule reads
+                    # the typed fact below, never this text, and refuses it.
+                    timeout = ExecutionTimeoutError(
+                        f"{text}. Its provider had already failed the run when the limit "
+                        f"killed it ({result.failed_before_limit})"
+                    )
+                else:
+                    timeout = ExecutionTimeoutError(text)
+                # #434: what the recovery rule reads, typed, never the text.
+                timeout.launch_end = _launch_end(LaunchEndKind.TIMEOUT, result, profile)
+                raise timeout
             if ended_interaction is not None:
                 # ADR 0007 D7.6, D7.7: the agent's request for a decision ended
                 # the launch. Never corrected and never relaunched as
@@ -15969,10 +16696,12 @@ class ControllerEngine:
                     if ended_interaction is Lifecycle.INTERRUPTED
                     else InteractionRequiredError
                 )
-                raise error(
+                ended_error = error(
                     _with_leftovers(f"agent '{profile.name}' {ended}", result.leftovers)
                     + f". stderr tail: {stderr[-2000:]}"
                 )
+                ended_error.launch_end = _launch_end(LaunchEndKind.INTERACTION, result, profile)
+                raise ended_error
             if result.provider_failure or result.failed_exit:
                 # A run that failed inside the provider's protocol, whatever
                 # the exit status, is handled exactly like a failed exit, and
@@ -15986,9 +16715,11 @@ class ControllerEngine:
                 failure = result.provider_failure or f"exit {result.exit_code}"
                 if result.transient_failure:
                     failure += f" (transient: {result.transient_failure})"
+                if result.usage_limit:
+                    failure += f" (provider limit: {result.usage_limit})"
                 record.error = _with_leftovers(failure, result.leftovers)
                 self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
-                if result.transient_failure:
+                if result.transient_failure and not result.usage_limit:
                     # The adapter's fact is the only input naming the failure
                     # transient; whether and how often to relaunch is decided
                     # here. Never while a process the failed launch started
@@ -16004,10 +16735,28 @@ class ControllerEngine:
                         transient_retries += 1
                         continue
                     ended += f" (transient: {result.transient_failure}; not relaunched: {held})"
-                raise ExecutionError(
+                if result.usage_limit:
+                    # #434 (D4): never relaunched at once, transient or not: a
+                    # launch now meets the same limit.
+                    ended += (
+                        f" (provider limit: {result.usage_limit}; not relaunched: a launch "
+                        f"now meets the same limit, and {_usage_reset_text(result)})"
+                    )
+                    limited = ProviderUsageLimitError(
+                        _with_leftovers(f"agent '{profile.name}' {ended}", result.leftovers)
+                        + f". stderr tail: {stderr[-2000:]}",
+                        provider=profile.provider,
+                        limit=result.usage_limit,
+                        reset_at=result.usage_reset_at,
+                    )
+                    limited.launch_end = _launch_end(LaunchEndKind.FAILED_EXIT, result, profile)
+                    raise limited
+                exited = ExecutionError(
                     _with_leftovers(f"agent '{profile.name}' {ended}", result.leftovers)
                     + f". stderr tail: {stderr[-2000:]}"
                 )
+                exited.launch_end = _launch_end(LaunchEndKind.FAILED_EXIT, result, profile)
+                raise exited
             try:
                 if not self._launch_seeded:
                     # ADR 0005 D6.5: the agent's new objects are imported

@@ -11024,6 +11024,7 @@ def _as_protocol_5(eng, *, attempt: int) -> None:
         "pr_body_outcomes",
         "stop_code",
         "partial_fix",
+        "auto_recovery",
         "sandbox_pin",
     ):
         data.pop(key, None)
@@ -11053,7 +11054,7 @@ def test_update_epic_legacy_reentry_adopts_the_agents_comment_and_asks_for_the_s
     assert "posted by an agent under the previous contract" in call.prompt
     assert _progress_posts(fake_github) == [] and len(fake_github.comments[EPIC]) == 1
     s = load_state(eng.paths.state_file)
-    assert s.current_issue_url == ISSUE3 and s.protocol_version == "17"
+    assert s.current_issue_url == ISSUE3 and s.protocol_version == "18"
     assert s.effect_records == []  # adopted with no record (D13.7)
 
 
@@ -12524,7 +12525,9 @@ def test_openai_websocket_disconnect_is_relaunched_at_most_twice_per_step(
     assert "State unchanged" in message and "resume" in message
     state = load_state(eng.paths.state_file)
     assert state.phase == Phase.REVIEW and state.review_round == 0
-    assert state.current_pr_url == PR and state.attempt == 3 and state.step_count == 1
+    # #434 (D7): each relaunch is a physical launch, charged as one more step.
+    assert state.current_pr_url == PR and state.attempt == 3
+    assert state.step_count == 1 + MAX_TRANSIENT_RETRIES
     assert len(calls) == 1 + MAX_TRANSIENT_RETRIES
     run_dir, _ = _step_dir(eng)
     steps = sorted(p for p in run_dir.iterdir() if p.is_dir())

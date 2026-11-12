@@ -67,6 +67,7 @@ from .claims import (
     IMPLEMENTATION,
     OPERATOR_COMMENT,
     PROGRESS,
+    RECOVERY_AUDIT,
     REVIEW,
     Holder,
     MarkerKind,
@@ -91,6 +92,7 @@ from .effects import (
     decide_replace,
 )
 from .errors import (
+    ConfigurationError,
     EffectConflictError,
     GitHubError,
     GitHubNotFoundError,
@@ -1189,6 +1191,54 @@ class ProgressCommentOp:
         self.github.create_issue_comment(record.target["epic_url"], record.body)
 
 
+class RecoveryAuditCommentOp:
+    """K13 (#434): the controller's audit comment of one automatic-recovery decision.
+
+    Identity: the ``ai-recovery-audit`` marker for (issue, run, decision
+    sequence) on the run's PR, or on its issue while the run has no PR.
+    Precondition: no comment of that object carries it. Payload: the
+    controller's audit text and the marker. Completion: exactly one comment
+    carries the marker, and its body equals the payload (D4.5: the complete
+    comment listing of the object, never the search API). The comment is an
+    audit sink: nothing but this reconciliation reads it.
+    """
+
+    def __init__(self, github: GitHubClient) -> None:
+        self.github = github
+
+    def _on_pr(self, record: EffectRecord) -> bool:
+        try:
+            parse_pr_url(record.target["target_url"])
+        except ConfigurationError:
+            return False
+        return True
+
+    def reconcile(self, record: EffectRecord) -> Decision:
+        settled = _settled(record)
+        if settled is not None:
+            return settled
+        target = record.target["target_url"]
+        claim = scan(RECOVERY_AUDIT, record.marker).claims[0]
+        comments = (
+            self.github.get_pr_comments(target)
+            if self._on_pr(record)
+            else self.github.get_issue_comments(target)
+        )
+        claimants = collect(RECOVERY_AUDIT, comments, "comment").claimants(
+            claim.key, f"recovery decision {claim.seq} of run {claim.run_id} on {target}"
+        )
+        if claimants.defects:
+            return _unreadable(record, "comments of its target", claimants.defects)
+        return decide_create(record, _comment_found(self.github, record, claimants.holders))
+
+    def issue(self, record: EffectRecord) -> None:
+        target = record.target["target_url"]
+        if self._on_pr(record):
+            self.github.create_pr_comment(target, record.body)
+        else:
+            self.github.create_issue_comment(target, record.body)
+
+
 class AcceptanceCommentOp:
     """K9: the acceptance comment of one finding on the run's own issue (#211).
 
@@ -1423,6 +1473,7 @@ _GITHUB_OPS: dict[EffectKind, Callable[[GitHubClient], EffectOperation]] = {
     # Read-only: its ``issue`` raises (#243).
     EffectKind.OPERATOR_COMMENT: OperatorCommentOp,
     EffectKind.PR_BODY_UPDATE: PrBodyUpdateOp,
+    EffectKind.RECOVERY_AUDIT_COMMENT: RecoveryAuditCommentOp,
 }
 
 
@@ -1466,6 +1517,7 @@ __all__ = [
     "ProgressCommentOp",
     "PushOp",
     "PushRefusedError",
+    "RecoveryAuditCommentOp",
     "ReplacementPrOp",
     "ReviewCommentOp",
     "drive",

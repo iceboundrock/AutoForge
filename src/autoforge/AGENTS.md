@@ -225,6 +225,12 @@ stop_classification.py  typed stop classification (ADR 0011, #369): outcomes, re
                     a CONTROL_RESULT status, an error's class or a loaded state (with
                     the code its sink saved, stop_code, #374); advice that nothing
                     deciding imports; pure, persists nothing itself
+auto_recovery.py    bounded automatic recovery (#434, ADR 0012 D11): the fixed rule that
+                    decides, from an error's class and its typed launch facts, whether
+                    the running loop relaunches a failed agent step (an idle timeout or
+                    an adapter-typed result-less exit, once per step), the persisted
+                    recovery journal (auto_recovery) and the K13 audit text and record;
+                    never imports stop_classification; pure, persists nothing itself
 recovery_package.py status's recovery action package (#374): from a loaded state, its
                     classification, the configuration and, for 'status --live',
                     unblock's dry-run decision: the diagnosis of the saved stop code,
@@ -353,6 +359,10 @@ agent_worktree.py, git_workspace.py, engine.py
                                                      and state-and-recovery.md + ADR 0005
                                                      D6
 result_parser.py, prompts/*.md                    -> docs/agent-guides/control-result-protocol.md
+auto_recovery.py, engine.py (run's recovery path,
+_automatic_recovery and the K13 audit)          -> docs/adr/0012-recovery-and-escalation-stop-
+                                                     authority-and-advisor-gates.md (D11) + docs/
+                                                     agent-guides/state-and-recovery.md
 stop_classification.py, engine.py (_block and
 _blocked codes, the agent-status sink),
 cli.py (stop lines), errors.py (a new class),

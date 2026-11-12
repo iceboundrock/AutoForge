@@ -2,7 +2,8 @@
 
 An agent's GitHub write (an implementation PR, a review comment, an EPIC
 progress comment, a follow-up issue, an acceptance comment, an operator
-comment) is something a later controller entry
+comment, and the controller's own audit comment of a recovery decision) is
+something a later controller entry
 must be able to *find again* and something the post-agent read-back must be
 able to *hold the agent to*. Both need the same answer to the same question:
 "which object is this phase's write?". This module owns that answer.
@@ -12,7 +13,8 @@ The identity of such a write is a **marker**: an HTML comment
 agent's prompt and the agent copies verbatim into the object. Each marker
 kind has exactly one typed payload (:class:`ImplementationClaim`,
 :class:`ReviewClaim`, :class:`ProgressClaim`, :class:`FollowUpClaim`,
-:class:`AcceptanceClaim`, :class:`OperatorCommentClaim`), one
+:class:`AcceptanceClaim`, :class:`OperatorCommentClaim`,
+:class:`RecoveryAuditClaim`), one
 exact-schema decoder, one renderer, and one ``key``: the value two claims
 are compared by. Nothing outside this module parses a marker.
 
@@ -26,7 +28,7 @@ The contract every consumer gets from :func:`collect`:
   be proven while an object carries a claim that could not be read.
 - **One object, one compatible identity.** A PR carries at most one
   implementation marker, a comment at most one review, progress,
-  acceptance or operator-comment marker,
+  acceptance, operator-comment or recovery-audit marker,
   an issue any number of follow-up markers with distinct keys. An object
   that publishes more is defective, whatever the extra marker names: a
   provenance that names two things proves neither.
@@ -229,6 +231,28 @@ class FollowUpClaim:
         return (self.pr.identity, self.finding_id)
 
 
+@dataclass(frozen=True)
+class RecoveryAuditClaim:
+    """``ai-recovery-audit``: a comment records one automatic-recovery decision (#434).
+
+    The controller posts it on the run's PR, or on its issue while the run
+    has no PR (K13), for every decision its fixed recovery rule takes,
+    relaunch or refusal. The key is the run's issue, the run and the
+    decision's sequence number in that run, so two decisions never share a
+    comment and a decision of another run is never this one's. The comment
+    is an audit sink, never a recovery input: nothing reads it back but the
+    write's own reconciliation.
+    """
+
+    issue: GitHubIssueRef
+    run_id: str
+    seq: int
+
+    @property
+    def key(self) -> Hashable:
+        return (self.issue.identity, self.run_id, self.seq)
+
+
 # -- exact-schema decoding ---------------------------------------------------------
 
 
@@ -428,6 +452,19 @@ def _decode_follow_up(payload: dict) -> FollowUpClaim:
     )
 
 
+def _decode_recovery_audit(payload: dict) -> RecoveryAuditClaim:
+    _exact_keys(payload, ("issue", "run_id", "seq"))
+    seq = payload["seq"]
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+        raise ValueError(f"seq must be a JSON integer >= 1, got {seq!r:.40}")
+    run_id = payload["run_id"]
+    if not isinstance(run_id, str) or len(run_id) > MAX_RUN_ID_CHARS:
+        raise ValueError(f"run_id must be a run id string of at most {MAX_RUN_ID_CHARS} characters")
+    if not RUN_ID_RE.fullmatch(run_id):
+        raise ValueError(f"run_id {run_id!r} is not a run id")
+    return RecoveryAuditClaim(issue=_issue_ref(payload, "issue"), run_id=run_id, seq=seq)
+
+
 # -- kinds ----------------------------------------------------------------------------
 
 # The name prefix ``CONTROLLER_MARKER_OPEN_RE`` ends with; a kind's pattern
@@ -514,6 +551,9 @@ ACCEPTANCE: MarkerKind[AcceptanceClaim] = MarkerKind("ai-acceptance", _decode_ac
 OPERATOR_COMMENT: MarkerKind[OperatorCommentClaim] = MarkerKind(
     "ai-operator-comment", _decode_operator_comment, False
 )
+RECOVERY_AUDIT: MarkerKind[RecoveryAuditClaim] = MarkerKind(
+    "ai-recovery-audit", _decode_recovery_audit, False
+)
 
 
 def render_implementation_marker(issue_url: str, owner_run_id: str | None = None) -> str:
@@ -587,6 +627,13 @@ def render_operator_comment_marker(
 def render_follow_up_marker(pr_url: str, finding_id: str) -> str:
     """The exact ``ai-follow-up`` marker of one deferral (PR, finding id)."""
     return FOLLOW_UP.render({"finding_id": finding_id, "pr": parse_pr_url(pr_url).canonical})
+
+
+def render_recovery_audit_marker(issue_url: str, run_id: str, seq: int) -> str:
+    """The exact ``ai-recovery-audit`` marker of one recovery decision (K13, #434)."""
+    return RECOVERY_AUDIT.render(
+        {"issue": parse_issue_url(issue_url).canonical, "run_id": run_id, "seq": seq}
+    )
 
 
 # -- scanning one object ------------------------------------------------------------
@@ -744,6 +791,7 @@ __all__ = [
     "MAX_BASE_REF_CHARS",
     "OPERATOR_COMMENT",
     "PROGRESS",
+    "RECOVERY_AUDIT",
     "REVIEW",
     "AcceptanceClaim",
     "Claimants",
@@ -754,6 +802,7 @@ __all__ = [
     "MarkerKind",
     "OperatorCommentClaim",
     "ProgressClaim",
+    "RecoveryAuditClaim",
     "ReviewClaim",
     "Scan",
     "collect",
@@ -762,6 +811,7 @@ __all__ = [
     "render_implementation_marker",
     "render_operator_comment_marker",
     "render_progress_marker",
+    "render_recovery_audit_marker",
     "render_review_marker",
     "scan",
 ]

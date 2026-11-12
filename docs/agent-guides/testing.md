@@ -1821,6 +1821,60 @@ a stated reason it has none. The coverage that must keep working:
 
 - external side effect completed before state write
 - resume without duplicating work
+- bounded automatic recovery (#434, ADR 0012 D11; `tests/test_auto_recovery.py`):
+  the rule alone (each failure's one category from typed facts or its class,
+  only the allowlist relaunched, the order of the refusals, a usage limit
+  never relaunched with or without a reset time, the message never read, no
+  stop classification imported, a refusal of the command not decided); the
+  journal's strict shape, its round trip, a fresh allowance per step that
+  keeps only unsettled decisions, its bound dropping settled decisions and
+  never an unsettled one; K13
+  held to its owner and target and refused in a phase plan; the audit text
+  publishable (no mention, issue link, closing keyword or local path); and
+  the engine: an idle timeout and a result-less exit relaunched once with
+  the step charged, the decision journaled, logged and commented on the
+  issue or the PR; a second failure of the step refused whatever it is (a
+  timeout then a usage limit does not loop); a hard runtime limit, a loop
+  kill, an untyped exit, a launch that may have left a process and a result
+  delivered before the kill never relaunched; the step budget, the
+  invocation's `--max-steps` and a stop request refusing; `step` and a dry
+  run deciding nothing; an unconfirmed audit relaunching nothing and posted
+  once by the next command; an audit that landed before a crash adopted; a
+  crash after the decision's save spending the allowance. PR #480's round 1:
+  an empty Claude stream with an authentication or host failure on stderr,
+  and one that ended before the model's first tool call, never relaunched,
+  and a CLI that died inside a running session relaunched once, adapter to
+  engine; a limit reported before an idle kill vetoing the relaunch (Claude
+  through its failure-exit grace, OpenCode, and the rule); every correction
+  and transient relaunch charged against `workflow.max_total_steps` before it
+  starts, mixed with an automatic relaunch at the boundary and across an
+  interruption; a crash before and after the decision's run log write
+  completing it exactly once; repeated GitHub failures stopping `run` and
+  `step` with nothing executed and no decision dropped; a conclusive failure
+  and a conflicting comment blocking until the operator's `unblock`.
+  PR #480's round 2: a Claude authentication or permission refusal (401,
+  403) and a protocol violation, each followed by an idle kill inside the
+  failure's exit grace, never relaunched, adapter to engine, and the same
+  fact from OpenCode and Pi refusing the relaunch (`failed-before-limit`).
+  PR #480's round 3: Claude's typed API-error message (401, 429) after a
+  completed tool call, with no result after it, then an idle kill or an
+  exit 1, never relaunched, adapter to engine (`failed-before-limit` or an
+  untyped exit for the 401, the usage-limit stop for the 429), and the same
+  session without the message still relaunched once.
+  PR #480's round 4: another run's takeover of the PR, or its owner
+  removed, while the failed agent ran, and a takeover before the next `run`
+  or `step` replays the comment (unsent, or landed with its read-back lost):
+  no audit comment sent, nothing relaunched or executed, `BLOCKED`
+  (`pr-owner`) with the decision kept, a plain `unblock` refused; a PR
+  that cannot be read right before the comment sending nothing; the
+  operator's takeover written first, launching no agent, then the comment
+  posted once or the landed one adopted, then the agent; a GitHub failure
+  of the takeover's own step leaving its comment and the first waiting for
+  the takeover, never blocking the way back; no launch reached while a
+  comment waits for a takeover; no PR read for a comment on the issue.
+  Protocol 17 -> 18 in `tests/test_state.py`; the adapters' usage-limit,
+  result-less and failed-before-limit facts in `tests/test_providers.py`,
+  `tests/test_pi_rpc.py` and `tests/test_claude_stream.py`
 - the `UPDATE_EPIC` progress comment across every crash window of the
   effect lifecycle (`test_k8_*` in `tests/test_engine.py`), the one-shot
   legacy re-entry (D13.7) including a crash after its adoption was saved,
