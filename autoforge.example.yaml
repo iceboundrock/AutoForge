@@ -465,8 +465,9 @@ profiles:
   # Switching a profile's provider keeps nothing of the old one (no command,
   # option or extra argument), so the block names everything it needs.
   # Their policy validates and `autoforge doctor` checks the installs they
-  # need, read-only, but every launch is refused, before anything starts,
-  # until their helper programs ship (#151, #152); `doctor` and a dry run
+  # need, read-only. `opencode-sdk` launches through AutoForge's OpenCode
+  # bridge (#152). Every `claude-sdk` launch is refused, before anything
+  # starts, until its helper program ships (#151); `doctor` and a dry run
   # say so. Installing the helper environment, Node and the OpenCode runtime
   # is an operator step AutoForge never performs (docs/configuration.md,
   # "SDK providers"); the policy is docs/sdk-policy.md.
@@ -485,7 +486,7 @@ profiles:
   #   effort: high
   #   command: node                 # Node 24 or later
   #   options:
-  #     server_command: /opt/opencode-1.18.34/bin/opencode  # the opencode-ai 1.18.34 runtime
+  #     server_command: /opt/opencode-1.18.34/node_modules/opencode-ai/bin/opencode.exe  # opencode-ai 1.18.34
   #     credential_env: OPENAI_API_KEY  # the one variable that holds the model key
   # sdk-example-end
 

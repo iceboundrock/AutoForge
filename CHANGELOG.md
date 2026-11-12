@@ -5,6 +5,39 @@ so.
 
 ## Unreleased
 
+### The `opencode-sdk` provider launches (#152)
+
+A profile with `provider: opencode-sdk` now runs. Each launch starts
+AutoForge's OpenCode bridge with the profile's `command` (Node 24 or
+later). The bridge starts the OpenCode runtime `options.server_command`
+names on loopback, with a password made for that launch only. It runs the
+prompt in a session of its own and hands back the final answer to that
+prompt, and only that answer reaches the parser. The runtime must be
+`opencode-ai` 1.18.34: the bridge reads the version back from the server
+and refuses any other before a session starts. The launch runs under the
+usual limits, containment and sandbox. When it ends or a limit falls due,
+the turn is aborted and the server stopped.
+
+- **What you install.** Node 24 or later, and `npm install
+  opencode-ai@1.18.34` in a directory of its own. Set `server_command` to
+  its `node_modules/opencode-ai/bin/opencode.exe`. The bridge itself ships
+  with AutoForge; nothing is installed at launch.
+- **State.** The server's state is kept per issue, under
+  `<git common dir>/autoforge/sandbox/<issue>/sdk/opencode-sdk/`, never in
+  the worktree, and AutoForge never deletes it. Its two configuration
+  directories hold only an ignore file of the runtime's, and a launch
+  cannot write them. A launch that finds anything else there is refused and
+  names it.
+- **Refusals before anything is charged.** A launch is refused, naming
+  what to fix, when the variable `options.credential_env` names is not set,
+  or when `server_command` is not an executable on the launch's `PATH`.
+- **Interactions.** Under `options.interaction_policy: prompt`, a question
+  the agent asks is put to you at the terminal: several questions, several
+  picks and an answer in your own words included. A permission the agent
+  asks for still fails the launch under every policy, and `pause` still
+  waits for #126.
+- **`claude-sdk`** still cannot launch: its helper is #151's.
+
 ### `doctor` checks what an SDK profile needs, and a dry run shows its plan (#150)
 
 The `claude-sdk` and `opencode-sdk` providers still cannot launch: their

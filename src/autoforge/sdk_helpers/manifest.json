@@ -15,7 +15,7 @@
       "envelope": "autoforge-opencode-bridge",
       "protocol": 1,
       "file": "opencode_bridge.mjs",
-      "sha256": null,
+      "sha256": "482988932985b4461ac8fe3f3e6afe55ca975f41babfac2783c4f45ef97cc024",
       "implemented_by": "#152",
       "interpreter": {"name": "Node", "minimum": "24"},
       "sdk": {"package": "@opencode-ai/sdk", "version": "1.18.34"},

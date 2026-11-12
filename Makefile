@@ -49,9 +49,11 @@ test-fast:
 # elsewhere, and here fails instead (AUTOFORGE_REQUIRE_SANDBOX_BACKEND=1).
 # tests/test_ci_workflow.py checks that every module that launches the real
 # backend is listed. Not part of `check`: whether a host can enforce is the
-# host's (docs/development.md, "The outer sandbox").
+# host's (docs/development.md, "The outer sandbox"). The OpenCode gates
+# (#152) are opt-in besides: without AUTOFORGE_OPENCODE_SDK_GATE_RUNTIME they
+# skip before the backend is asked, and say so.
 SANDBOX_TESTS = tests/test_sandbox_bwrap.py tests/test_sandbox_routing.py \
-	tests/test_sandbox_parity.py
+	tests/test_sandbox_parity.py tests/test_opencode_sdk_gates.py
 test-sandbox:
 	AUTOFORGE_REQUIRE_SANDBOX_BACKEND=1 uv run pytest -rs $(SANDBOX_TESTS)
 

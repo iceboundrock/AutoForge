@@ -2224,8 +2224,10 @@ run is fine where it is.
 An unattended run has no one to ask. When an agent wants a permission a
 rule only grants on approval, or an answer to a question, the agent CLI
 refuses the request itself and, on the versions below, tells the agent to
-go on without it. AutoForge cannot answer either until #126 (and the SDK
-providers, #151 and #152) land.
+go on without it. AutoForge cannot answer either for a CLI provider. The
+`opencode-sdk` provider (#152) answers a question live under
+`options.interaction_policy: prompt` ([Configuration](configuration.md#sdk-profiles-claude-sdk-opencode-sdk));
+its permission asks still fail the launch, and `pause` waits for #126.
 
 | CLI (version; how this is known) | A permission that needs approval | A question |
 |---|---|---|

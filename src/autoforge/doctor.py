@@ -31,7 +31,9 @@ a launch refuses either (#165,
 
 An SDK provider's profiles (``claude-sdk``, ``opencode-sdk``; ADR 0007,
 #150) get distinct rows: whether it can launch in this release (the
-packaged helper manifest, :mod:`autoforge.sdk_assets`); the helper's
+packaged helper manifest, :mod:`autoforge.sdk_assets`: ``opencode-sdk``'s
+bridge ships and is checked against its sha256, #152; ``claude-sdk``'s
+helper is #151's and does not); the helper's
 environment against the manifest's pinned pair, each part its own row
 (the Claude helper's interpreter, the ``claude-agent-sdk`` installed in it
 and the Claude Code bundled with it, read from package metadata and files
@@ -1006,10 +1008,12 @@ class Doctor:
         return results
 
     def check_sdk_launch(self, provider: str, profiles: list[ProfileConfig]) -> CheckResult:
-        """FAIL for an SDK provider's profiles: their policy validates (#149),
-        but the helper program that would launch them is not shipped (the
-        packaged manifest says so, #150) and its transport has not landed
-        (#151, #152), so every launch is refused before it starts."""
+        """Whether an SDK provider's profiles can launch in this release: FAIL
+        while the helper program that would launch them is not shipped (the
+        packaged manifest says so, #150), does not match the manifest's
+        sha256, or its transport has not landed (#151), so every launch is
+        refused before it starts; OK once both are in place (#152's bridge).
+        The credential, Node and the runtime each have a row of their own."""
         name = f"provider {provider} can launch ({', '.join(p.name for p in profiles)})"
         try:
             provider_for(profiles[0]).integration_preflight(None)

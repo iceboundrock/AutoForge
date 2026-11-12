@@ -812,8 +812,10 @@ def opencode_sdk_auth_problems(policy: OpenCodeSdkPolicy, env: Mapping[str, str]
 
 
 def server_password() -> str:
-    """A fresh server password for one launch (D3.4): never in an argv, a
-    record, a log or state."""
+    """A fresh server password (D3.4): never in an argv, a record, a log or
+    state. A launch's is the bridge's own, made inside it from 32 random
+    bytes, so it never exists in the controller (#152); this one is for a
+    controller-side probe that starts a server itself."""
     return secrets.token_urlsafe(OPENCODE_SDK_PASSWORD_BYTES)
 
 

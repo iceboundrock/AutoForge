@@ -566,6 +566,7 @@ from .sandbox_policy import (
     LaunchClass,
     LaunchFacts,
     SandboxPlan,
+    StateRoot,
     absolute_spelling,
     class_summary,
     config_file_problem,
@@ -3104,7 +3105,12 @@ class ControllerEngine:
 
     # -- the outer sandbox's facts (ADR 0005 D13.2, #168) ---------------------
     def _agent_sandbox(
-        self, phase: Phase, cwd: str, overrides: Mapping[str, str], read_context: str
+        self,
+        phase: Phase,
+        cwd: str,
+        overrides: Mapping[str, str],
+        read_context: str,
+        provider_state: tuple[tuple[str, StateRoot], ...] = (),
     ) -> LaunchFacts | None:
         """The engine's facts for one agent launch; ``None`` when it is not enforced.
 
@@ -3112,12 +3118,39 @@ class ControllerEngine:
         filesystem boundary, at the first enforced launch that needs them. A
         directory that cannot be prepared refuses the launch. The facts reach
         the provider in a :class:`SandboxPlan` bound to the launch's
-        lifecycle (:meth:`_through_lifecycle`).
+        lifecycle (:meth:`_through_lifecycle`). ``provider_state`` is the
+        provider's state roots, already made (:meth:`_provider_state`).
         """
         if not self._sandbox_enforced():
             return None
         change = phase in WORKTREE_STATE_PHASES
-        return self._remote_facts(cwd, overrides, read_context, cache=change)
+        facts = self._remote_facts(cwd, overrides, read_context, cache=change)
+        return replace(facts, provider_state=provider_state)
+
+    def _provider_state(
+        self, layout: tuple[StateRoot, ...]
+    ) -> tuple[str | None, tuple[tuple[str, StateRoot], ...]]:
+        """Make a provider's state roots under the issue's sandbox directory
+        (ADR 0007 D2.7; docs/sdk-policy.md §6), in every ``sandbox.mode``.
+
+        The directory is ``<git common dir>/autoforge/sandbox/<worktree>``:
+        never inside a working tree, one per issue, and kept, so a
+        continuation finds what its paused launch wrote (D8.4). Each root is
+        created through the controller's filesystem boundary under L1, as the
+        sandbox's own directories are (:meth:`_sandbox_dirs`), and never
+        deleted. Returns the directory (``None`` without a layout) and each
+        root with its host path, for the launch's sandbox facts.
+        """
+        if not layout:
+            return None, ()
+        common = self.workspace().git_dirs()[-1]
+        base = self._sandbox_dirs(
+            common,
+            f"{SANDBOX_DIR}/{self._agent_worktree_name()}",
+            tuple(root.relpath for root in layout),
+            git_lock=self._shared_git_lock,
+        )
+        return str(base), tuple((str(base / root.relpath), root) for root in layout)
 
     def _command_sandbox(
         self, launch_class: LaunchClass, cwd: str, overrides: Mapping[str, str], network: str
@@ -15773,6 +15806,13 @@ class ControllerEngine:
                 cwd, self._runner, env_allowlist=provider.launch_allowlist(env_allowlist)
             )
             provider.integration_preflight(env_allowlist)
+            # An SDK provider's credential by name and its runtime on the
+            # launch's PATH (ADR 0007 D10.2), before anything is charged too.
+            provider.credential_preflight(profile, env_allowlist)
+            # The directories the provider keeps between launches (ADR 0007
+            # D2.7), made under the issue's sandbox directory before anything
+            # is charged; a directory that cannot be made refuses the launch.
+            state_dir, provider_state = self._provider_state(provider.state_layout(profile))
             # What the agent reads from GitHub, read by the controller (it
             # holds no credential to read it itself) and written before the
             # prompt that names it is rendered; nothing is saved yet.
@@ -15837,6 +15877,7 @@ class ControllerEngine:
                 env_allowlist=env_allowlist,
                 loop_detection=self.config.execution.loop_detection,
                 interaction=broker,
+                state_dir=state_dir,
             )
             record = ExecutionRecord(
                 run_id=state.run_id,
@@ -15881,7 +15922,7 @@ class ControllerEngine:
                     # of the launch runs inside the outer sandbox, or is
                     # refused here or at the spawn; it never runs without it.
                     result = self._through_lifecycle(
-                        self._agent_sandbox(phase, cwd, overrides, read_context),
+                        self._agent_sandbox(phase, cwd, overrides, read_context, provider_state),
                         phase,
                         req,
                         partial(self._launch, provider, req, limits, step_log, phase),

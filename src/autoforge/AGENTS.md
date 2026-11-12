@@ -31,6 +31,12 @@ pi_rpc.py           Pi RPC wire protocol: JSONL codec, request ids, event reduce
                     outcome classification; provider layer, no flags and no processes (#131)
 claude_stream.py    Claude stream-json reducer: result text, failure, summary, progress
                     events; provider layer, no flags and no processes (#192)
+opencode_sdk.py     the OpenCode bridge's envelope (autoforge-opencode-bridge, protocol 1):
+                    the start record, caller ids in the runtime's format, the pure
+                    reducer (pair checks, session and admission read-back, events to
+                    progress and loop input, asks normalized for the broker, decisions,
+                    the final answer, failures and the server's stop); provider layer,
+                    no process, no HTTP, no SDK name (#152)
 sdk_policy.py       SDK providers' unattended policy: tools, permissions, setting sources,
                     roots, credentials, environment, interaction-data bounds; provider
                     layer, pure: no process, file, SDK import or os.environ change (#149)
@@ -247,7 +253,10 @@ prompts/            file-based templates ({{VAR}}): common.md (trust boundary), 
   a safety gate as an incidental part of another change.
 - Keep the boundaries: no CLI flags outside `providers.py`, and no
   provider wire-protocol names outside the provider layer (`providers.py`
-  plus the protocol modules it owns, `pi_rpc.py` and `claude_stream.py`);
+  plus the protocol modules it owns, `pi_rpc.py`, `claude_stream.py` and
+  `opencode_sdk.py`). The OpenCode bridge (`sdk_helpers/opencode_bridge.mjs`,
+  built from `helpers/opencode-bridge/`) is a separate program, package
+  data that nothing imports;
   no workflow semantics or JSON in `executor.py` or `executor_duplex.py`,
   and none in `sandbox.py`, `sandbox_bwrap.py`, `sandbox_backend.py` or
   `sandbox_lifecycle.py` either; no `bwrap` flag outside `sandbox_bwrap.py`,
@@ -322,9 +331,9 @@ prompts/__init__.py                               -> docs/agent-guides/architect
                                                      (+ docs/adr/0003-pi-agent-provider.md and
                                                      docs/pi-policy.md for Pi)
 interaction.py, cli.py (TerminalResolver),
-claude_sdk.py, opencode_sdk.py (planned),
-sdk_helpers/ (the manifest; the helper programs
-planned)                                          -> docs/agent-guides/architecture.md
+claude_sdk.py (planned), opencode_sdk.py,
+sdk_helpers/ (the manifest, the OpenCode bridge;
+the Claude helper planned), helpers/opencode-bridge/ -> docs/agent-guides/architecture.md
                                                      + docs/adr/0007-sdk-providers-isolated-
                                                      helpers-and-interaction-contract.md
 sdk_policy.py, sdk_assets.py, providers.py

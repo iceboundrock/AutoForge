@@ -1,0 +1,24 @@
+{
+  "name": "autoforge-opencode-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AutoForge's OpenCode SDK bridge (ADR 0007 D2.2): built into src/autoforge/sdk_helpers/opencode_bridge.mjs",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --project tsconfig.json",
+    "check": "node build.mjs --check && tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "1.18.34"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3"
+  }
+}

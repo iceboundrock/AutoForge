@@ -26,6 +26,7 @@ from autoforge.errors import (
     VerificationError,
 )
 from autoforge.locking import SharedGitLock, shared_git_lock_path
+from autoforge.providers import OpenCodeSdkProvider, ProviderRegistry, ScriptedProvider
 from autoforge.sandbox import Access, Bind, Mask, Overlay
 from autoforge.sandbox_policy import LaunchClass
 from autoforge.state import load_state
@@ -404,3 +405,85 @@ def test_the_dry_run_plan_names_the_sandbox_mode(tmp_state_dir, fake_github):
     (note,) = [n for n in plan.notes if n.startswith("outer sandbox:")]
     assert "required" in note and "never without it" in note
     assert "validation network isolated" in note
+
+
+# -- an SDK provider's state roots (ADR 0007 D2.7; docs/sdk-policy.md §6, #152) --------
+class _Stateful(ScriptedProvider):
+    """A scripted agent that keeps state between launches as ``opencode-sdk`` does:
+    its layout is the real adapter's; its credential preflight is recorded,
+    or refuses with ``refuse``."""
+
+    def __init__(self, script, refuse: str = "") -> None:
+        super().__init__(script)
+        self.refuse = refuse
+        self.preflights: list[str] = []
+
+    def state_layout(self, profile):
+        return OpenCodeSdkProvider().state_layout(profile)
+
+    def credential_preflight(self, profile, env_allowlist):
+        self.preflights.append(profile.name)
+        if self.refuse:
+            raise ConfigurationError(self.refuse)
+
+
+def _stateful(eng, provider: _Stateful):
+    eng.providers = ProviderRegistry(overrides={"claude": provider, "opencode": provider})
+    eng.provider = provider
+    return provider
+
+
+def test_a_providers_state_roots_are_made_under_the_issue_sandbox_dir_when_disabled(
+    tmp_state_dir, fake_github
+):
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, origin=True)
+    provider = _stateful(eng, _Stateful(implement))
+    assert _analyzed(eng).next_phase == "REVIEW"
+    (req,) = provider.calls
+    common = Path(os.path.realpath(tmp_state_dir.parent)) / ".git"
+    base = common / "autoforge" / "sandbox" / "2"
+    assert req.state_dir == str(base) and req.sandbox is None
+    for name in ("home", "config", "data", "cache", "state", "empty-config"):
+        root = base / "sdk" / "opencode-sdk" / name
+        assert root.is_dir() and not root.is_symlink()
+    # Never inside the issue's worktree, which the review reads (D2.7).
+    assert not Path(req.state_dir).is_relative_to(req.cwd)
+    assert provider.preflights == ["analyze_execute"]
+
+
+def test_a_required_launch_projects_the_state_roots_where_its_variables_lead(
+    tmp_state_dir, fake_github
+):
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, cfg=_required(), origin=True)
+    provider = _stateful(eng, _Stateful(implement))
+    assert _analyzed(eng).next_phase == "REVIEW"
+    (description,) = provider.descriptions
+    roots = Path(provider.calls[0].state_dir) / "sdk" / "opencode-sdk"
+    home = Path(os.path.normpath(os.environ["HOME"]))
+    # The compiler sets HOME and XDG_* to the private home: the persistent
+    # roots stand where those names lead inside, as the cache does.
+    for name, place in (("data", ".local/share"), ("state", ".local/state")):
+        bind = _at(description, home / place)
+        assert isinstance(bind, Bind) and bind.source == str(roots / name)
+        assert bind.access is Access.WRITABLE
+    # The configuration root is read-only: the runtime loads agents, commands
+    # and plugins from it, so one launch must not plant any for the next.
+    config = _at(description, home / ".config")
+    assert isinstance(config, Bind) and config.source == str(roots / "config")
+    assert config.access is Access.READ_ONLY
+    empty = _at(description, roots / "empty-config")
+    assert isinstance(empty, Bind) and empty.access is Access.READ_ONLY
+    for unprojected in ("home", "cache"):
+        assert description.inside_path(str(roots / unprojected)) is None
+
+
+def test_a_refused_credential_preflight_launches_and_charges_nothing(tmp_state_dir, fake_github):
+    eng = make_engine(tmp_state_dir, None, github=fake_github, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    attempt = load_state(eng.paths.state_file).attempt
+    provider = _stateful(eng, _Stateful(implement, refuse="OPENAI_API_KEY is not set"))
+    with pytest.raises(ConfigurationError, match="OPENAI_API_KEY is not set"):
+        eng.step()
+    assert provider.calls == []
+    state = load_state(eng.paths.state_file)
+    assert state.phase is Phase.ANALYZE_EXECUTE and state.attempt == attempt

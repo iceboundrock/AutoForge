@@ -264,9 +264,14 @@ its own, all enforced in `src/autoforge/sdk_policy.py`:
 - **No login is reused.** `claude-sdk` has no login-file or keyring item,
   and refuses `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN` by name.
   `opencode-sdk` reads no stored sign-in.
-- **The OpenCode server password** is generated per launch and given to
-  the server's environment alone. It never appears in an argv, a record, a
-  log or state, and its name is in the redaction list above.
+- **The OpenCode server password** is generated per launch by the bridge
+  (32 random bytes) and given to the server's environment alone: it never
+  exists in the controller's process. It never appears in an argv, a
+  record, a log or state, its name is in the redaction list above, and
+  `tests/test_opencode_sdk_provider.py` checks that the password a server
+  got appears nowhere the controller keeps. The bridge never reads the
+  server's configuration back: 1.18.34 answers `/config` with the
+  credential an `{env:...}` reference resolved to.
 - **Names, never values.** Every policy message names a variable, a field
   or a tool and never quotes a value: config validation, the
   authentication checks, the `system/init` check and the

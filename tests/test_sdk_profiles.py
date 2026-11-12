@@ -74,7 +74,7 @@ def _opencode(name: str = "review_round_1", **options: str) -> ProfileConfig:
 
 
 # -- the manifest (ADR 0007 D2.2, D4.1, D4.2, D4.4) ------------------------------------
-def test_the_manifest_pins_adr_0007s_pairs_and_ships_no_helper_yet():
+def test_the_manifest_pins_adr_0007s_pairs_and_ships_the_opencode_bridge_only():
     pins = load_manifest()
     assert sorted(pins) == sorted(SDK_PROVIDERS)
     claude, opencode = pins["claude-sdk"], pins["opencode-sdk"]
@@ -92,10 +92,11 @@ def test_the_manifest_pins_adr_0007s_pairs_and_ships_no_helper_yet():
     )
     assert opencode.pair() == "@opencode-ai/sdk 1.18.34 with opencode-ai 1.18.34"
     assert (opencode.interpreter, opencode.interpreter_minimum) == ("Node", (24,))
-    # #151 and #152 ship the programs; until then neither is in the package.
-    for pin, issue in ((claude, "#151"), (opencode, "#152")):
-        assert not pin.shipped and pin.implemented_by == issue
-        assert "is not shipped with this AutoForge" in helper_problem(pin)
+    # #152 ships the bridge; #151's Claude helper is not in the package yet.
+    assert not claude.shipped and claude.implemented_by == "#151"
+    assert "is not shipped with this AutoForge" in helper_problem(claude)
+    assert opencode.shipped and opencode.implemented_by == "#152"
+    assert helper_problem(opencode) == ""
 
 
 def test_the_manifest_is_read_from_the_package_never_the_source_tree():
@@ -832,7 +833,10 @@ def test_the_plan_names_helper_runtime_policy_and_environment_by_name_only(profi
     assert "GEMINI_API_KEY" not in text  # another provider's credential is withheld
     credential = "ANTHROPIC_API_KEY" if profile.provider == "claude-sdk" else "OPENAI_API_KEY"
     assert f"PATH, HOME, {credential}," in text
-    assert "every launch is refused in this release" in text
+    if profile.provider == "claude-sdk":
+        assert "every launch is refused in this release" in text
+    else:
+        assert "only the final answer of the admitted input reaches the parser" in text
     assert f"<issue sandbox dir>/sdk/{profile.provider}/" in text
     if profile.provider == "opencode-sdk":
         assert f"{SERVER} serve --hostname=127.0.0.1 --port=0" in text
@@ -1046,7 +1050,8 @@ def test_the_example_yaml_with_the_sdk_block_enabled_loads_and_validates(tmp_pat
         }
         assert (opencode.provider, opencode.command) == ("opencode-sdk", "node")
         assert opencode.options == {
-            "server_command": "/opt/opencode-1.18.34/bin/opencode",
+            # Where `npm install opencode-ai@1.18.34` puts the platform binary.
+            "server_command": "/opt/opencode-1.18.34/node_modules/opencode-ai/bin/opencode.exe",
             "credential_env": "OPENAI_API_KEY",
         }
         validate_required_profiles(cfg, REQUIRED_PROFILES)

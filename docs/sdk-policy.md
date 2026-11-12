@@ -2,9 +2,11 @@
 
 - **Status:** the policy is implemented by #149 (EPIC #158). The providers
   it governs, `claude-sdk` and `opencode-sdk`, are configurable and
-  validated, but they **cannot launch yet**: their helpers and transports
-  belong to #151 (Claude) and #152 (OpenCode). Until those land, every
-  launch is refused before anything starts, and `doctor` says so. The
+  validated. `opencode-sdk` launches through #152's bridge, under this
+  policy, with two amendments that #152's probe of the pinned runtime
+  required (§6 and §7, both dated 2026-11-11). `claude-sdk` cannot launch
+  yet: its helper and transport belong to #151, so every launch of it is
+  refused before anything starts, and `doctor` says so. The
   policy implements [ADR 0007](adr/0007-sdk-providers-isolated-helpers-and-interaction-contract.md)
   D2.7, D10.1 and D10.2.
 - **Where:**
@@ -37,6 +39,12 @@
     runtime v2.0.32 installed on the authoring machine. This is *not* the
     pinned 1.18.34 (ADR 0007 D4.2). Each run used `opencode serve` under
     the policy's environment and roots.
+  - **verified on runtime 1.18.34** (#152): observed by running the pinned
+    `opencode-ai` 1.18.34, installed from npm into a scratch directory,
+    under the policy's environment and roots. The gate runs (ADR 0007 §3)
+    went through the real adapter and bridge under `sandbox.mode:
+    required`, against a loopback stand-in model, so no model was called
+    and no credential was read.
   - **source/docs only**: read in ADR 0007 §1.2's artifacts, never run.
   - **gate**: a fact of the pinned pair that only #151's or #152's gates
     can prove (ADR 0007 §3). Until then, the policy states the
@@ -83,7 +91,8 @@ policy names it. A profile cannot carry free text into one.
 
 `opencode-sdk` has no `ask_tools`. A permission ask cannot bind until gate
 G-O11 passes (D3.4), so the broker answers every OpenCode permission ask
-`fail` (D7.1). Questions are unaffected.
+`fail` (D7.1). Questions are unaffected: under `prompt` they are answered
+live, gate G-O3 having passed on the pinned pair (ADR 0007 §3).
 
 The profile's `command` is required too. It names the helper's interpreter:
 Python for `claude-sdk` (D2.3) and Node for `opencode-sdk` (D2.5). No
@@ -236,7 +245,7 @@ and nothing else.
 | Provider | Root | Holds |
 |---|---|---|
 | `claude-sdk` | `<sandbox dir>/sdk/claude-sdk/config`, as `CLAUDE_CONFIG_DIR` | `.claude.json`, `backups/`, `sessions/`, and the transcripts `projects/<cwd>/<session id>.jsonl`. Verified on CLI 2.1.304. |
-| `opencode-sdk` | `<sandbox dir>/sdk/opencode-sdk/{home,config,data,cache,state}` as `HOME` and `XDG_*_HOME`, plus `empty-config` as `OPENCODE_CONFIG_DIR` | the server's database and session history, logs and caches. Verified on runtime 2.0.32: the server wrote to the data, cache and state roots, and nothing else in the probe's directory changed. |
+| `opencode-sdk` | `<sandbox dir>/sdk/opencode-sdk/{home,config,data,cache,state}` as `HOME` and `XDG_*_HOME`, plus `empty-config` as `OPENCODE_CONFIG_DIR` | the server's database and session history, logs and caches. Verified on runtime 2.0.32: the server wrote to the data, cache and state roots, and nothing else in the probe's directory changed. Verified on runtime 1.18.34: the same, but for the project id it caches in the project's git directory (§7). |
 
 The `<sandbox dir>` is the issue's controller-owned sandbox directory from
 `sandbox_policy`, `<git common dir>/autoforge/sandbox/<worktree>`.
@@ -253,15 +262,51 @@ That gives three properties:
 Further rules:
 
 - **AutoForge writes nothing into a root** and copies no credential into
-  it.
+  it, with one exception (next item).
+- **OpenCode's configuration directories are read-only and hold one file.**
+  *Amendment (2026-11-11, #152).* Runtime 1.18.34 treats both
+  configuration directories it reads as its own: the global one
+  (`<config root>/opencode`) and `OPENCODE_CONFIG_DIR` (`empty-config`).
+  Before it serves a directory, it writes an ignore file into each and
+  fails the instance when it cannot (the server's `/event` answers 500). It
+  then installs `@opencode-ai/plugin` 1.18.34 from the npm registry into
+  each, in the background. Both behaviours were observed by running it, and
+  `plugin: []` and `OPENCODE_DISABLE_DEFAULT_PLUGINS=1` change neither.
+  Before every launch the adapter therefore does three things
+  (`OpenCodeSdkProvider.prepare_config`):
+  - it writes the runtime's own ignore file (`.gitignore`, the five names
+    the runtime writes) into each directory that lacks it;
+  - it refuses the launch when either directory holds anything else,
+    naming what it found, and deletes nothing;
+  - it makes both directories mode 0555.
+
+  The configuration root is projected read-only under the sandbox, as the
+  empty directory always was. The instance starts, the install fails (it
+  is a download at launch, which ADR 0007 D2.6 forbids), and so does any
+  write a launch's agent makes there: the runtime loads agents, commands
+  and plugins from both directories, so a writable one would let one launch
+  plant code for the next. Under `sandbox.mode: disabled` the mode is all
+  that holds them, and the refusal is what notices a write.
 - **Retention.** `cleanupPeriodDays` is 30 (`SESSION_RETENTION_DAYS`). A
   continuation whose transcript is gone ends `BLOCKED`, never a new
   session under the recorded id (D2.7, D9.3).
-- **Sandbox projection.** Under the sandbox, each root is an engine
-  carve-out projected on its own, writable (ADR 0005 C5). The OpenCode
-  empty directory is projected read-only. Creating the roots and
-  projecting them is #151's and #152's engine wiring. `claude-sdk`'s
-  declaration already lists `CLAUDE_CONFIG_DIR` as a `dir-rw` item, and
+- **Creation and sandbox projection.** The engine creates a provider's
+  roots before every launch, in every `sandbox.mode`, from the adapter's
+  `state_layout` (`sandbox_policy.StateRoot`), through the controller's
+  filesystem boundary under L1. It names their parent to the adapter
+  (`AgentRequest.state_dir`). Under the sandbox each root is an engine
+  carve-out (ADR 0005 C5). The compiler sets `HOME` and `XDG_*` to the
+  private home, so an OpenCode root that the runtime finds through one of
+  them is projected at that place inside:
+  - the data root (writable) at `$HOME/.local/share`;
+  - the state root (writable) at `$HOME/.local/state`;
+  - the configuration root (read-only) at `$HOME/.config`.
+
+  The empty directory is projected read-only at its host path, which
+  `OPENCODE_CONFIG_DIR` names. The home root is the private home's own and
+  the cache root the launch's cache, so neither is projected: nothing a
+  continuation needs lives there. `claude-sdk`'s layout is #151's; its
+  declaration already lists `CLAUDE_CONFIG_DIR` as a `dir-rw` item and
   refuses one inside `~/.claude` (ADR 0005 D7.2).
 
 ## 7. OpenCode: what a launch loads
@@ -275,9 +320,9 @@ the policy's environment (`OpenCodeSdkPolicy.environment`).
 | global configuration (`~/.config/opencode`), its agents, plugins and `AGENTS.md` | **disable** | `HOME` and `XDG_*_HOME` are the policy's roots; `OPENCODE_CONFIG=""`; `OPENCODE_CONFIG_DIR` is an empty directory | verified on runtime 2.0.32 |
 | the configuration document | **controller-owned** | `OPENCODE_CONFIG_CONTENT` = `config_document()`: `plugin: []`, `mcp: {}`, `instructions: []`, `lsp: false`, `formatter: false`, `autoupdate: false`, `share: "disabled"`, the ruleset, and the `autoforge` agent | verified on runtime 2.0.32: accepted, and the legacy `permission` object was translated to ordered v2 rules (`bash` became `shell`) |
 | MCP servers | **disable** | `mcp: {}` and no project file | verified on runtime 2.0.32: the sentinel server never started |
-| plugins, default plugins | **disable** | `plugin: []`; `OPENCODE_DISABLE_DEFAULT_PLUGINS=1` | the first verified on runtime 2.0.32. The 2.0.32 binary does not contain the second name; whether 1.18.34 reads it is a gate (#152). |
-| Claude Code compatibility (`CLAUDE.md`, `~/.claude/skills`) | **disable** | `OPENCODE_DISABLE_CLAUDE_CODE`, `..._PROMPT`, `..._SKILLS` | the first and last names are in the 2.0.32 binary; `..._PROMPT` is not. Behaviour: gate (#152). |
-| language servers and formatters, their downloads | **disable** | `lsp: false`, `formatter: false`, `OPENCODE_DISABLE_LSP_DOWNLOAD=1` | the first two verified on runtime 2.0.32. The variable is not in the 2.0.32 binary; whether 1.18.34 reads it is a gate (#152). |
+| plugins, default plugins | **disable** | `plugin: []`; `OPENCODE_DISABLE_DEFAULT_PLUGINS=1` | the first verified on runtime 2.0.32. The 2.0.32 binary does not contain the second name; the 1.18.34 binary does. On 1.18.34 no sentinel plugin ran, and the plugin package the runtime installs into its configuration directories is kept out by §6's read-only layout. |
+| Claude Code compatibility (`CLAUDE.md`, `~/.claude/skills`) | **disable** | `OPENCODE_DISABLE_CLAUDE_CODE`, `..._PROMPT`, `..._SKILLS` | the first and last names are in the 2.0.32 binary; `..._PROMPT` is not; all three are in the 1.18.34 binary. Verified on runtime 1.18.34: no sentinel `CLAUDE.md` or skill reached the configuration read back. |
+| language servers and formatters, their downloads | **disable** | `lsp: false`, `formatter: false`, `OPENCODE_DISABLE_LSP_DOWNLOAD=1` | the first two verified on runtime 2.0.32. The variable is not in the 2.0.32 binary; it is in the 1.18.34 binary, whose log says "all LSPs are disabled". |
 | self-update | **disable** | `autoupdate: false`, `OPENCODE_DISABLE_AUTOUPDATE=1`; the bridge never calls the upgrade route (D2.6) | name present in the 2.0.32 binary |
 | `OPENCODE_PERMISSION`, `OPENCODE_SERVER_USERNAME` | **never set** | the ruleset travels in the document only, and the username is the default | neither name is in the 2.0.32 binary |
 
@@ -295,10 +340,30 @@ about each:
   These are names of the 1.x flag set and are set defensively. On 2.0.32
   the document's `plugin: []` and `lsp: false` do their work.
 
-Whether 1.18.34 reads each name is not verified here. #152's pin check and
-gates prove the pinned line, and the configuration read-back of its probe
-(the one in [Tests](#tests)) must show only the empty directory and the
-inline document.
+- **In the 1.18.34 binary's strings** (#152): every name the policy sets but
+  `OPENCODE_CONFIG_PROJECT_DISABLE`, the 2.x name.
+
+*Amendment (2026-11-11, #152): the pinned line.* The probe in
+[Tests](#tests) ran on runtime 1.18.34 under the policy and §6's layout.
+The configuration it read back held only the inline document, no sentinel
+of the project, its parent or the user's root, and no marker was left. A
+control run without the project switches loaded the sentinels. Three more
+behaviours of 1.18.34 were observed:
+
+- **Configuration directories.** It writes into both configuration
+  directories, and installs a package there when it can. §6 holds both
+  read-only.
+- **A project's `.opencode/`.** Under `OPENCODE_DISABLE_PROJECT_CONFIG=1`
+  it is neither loaded nor written: no sentinel agent or command was
+  listed, and a sentinel plugin did not run.
+- **The project id.** In a repository with a commit, it caches the
+  project id as `opencode` in the git common dir, also for a linked
+  worktree such as the issue's, outside every root. The file is in git's
+  own directory, so it is never part of a tree, a diff or a review. Under
+  the sandbox the common dir is read-only, and the write fails without
+  harm: the gates ran in a linked worktree so. Under `disabled` it lands in
+  the operator's repository's common dir. It is not a configuration load;
+  it is recorded here as the one write outside the roots.
 
 ## 8. OpenCode: tools and permissions
 
@@ -349,13 +414,21 @@ inline document.
   login` is **unsupported** in this release: the data root starts empty,
   and no store is projected. `opencode_sdk_auth_problems` refuses a launch
   without the variable, and names it without its value.
-- **Server password.** Each launch gets a fresh password from
-  `secrets.token_urlsafe(32)`: 256 bits, over D3.4's 128. It is passed as
+- **Server password.** Each launch gets a fresh password of 32 random bytes
+  from the operating system's source, base64url: 256 bits, over D3.4's 128.
+  *Amendment (2026-11-11, #152).* The bridge makes it
+  (`crypto.randomBytes(32)`), so it never exists in the controller's
+  process, its request or the executor's environment. It is passed as
   `OPENCODE_SERVER_PASSWORD` to the server alone, never in an argv, a
-  record, a log or state. The username is the runtime's default,
-  `opencode`, and `OPENCODE_SERVER_USERNAME` is never set.
-- **Unauthenticated requests are refused.** Verified on runtime 2.0.32,
-  which answered 401.
+  record, a log or state, and the bridge sends it as the `Authorization:
+  Basic` header of every request. `server_password()`
+  (`secrets.token_urlsafe(32)`) is what a controller-side probe that starts
+  a server itself uses. The username is the runtime's default, `opencode`,
+  and `OPENCODE_SERVER_USERNAME` is never set: the bridge removes it from
+  the server's environment. A test checks that the password the server got
+  appears nowhere the controller keeps (`tests/test_opencode_sdk_provider.py`).
+- **Unauthenticated requests are refused.** Verified on runtime 2.0.32 and
+  on runtime 1.18.34, which both answered 401.
 - **The server's argv** is `<server_command> serve --hostname=127.0.0.1
   --port=0`: loopback, an assigned port, no mDNS and no CORS origin
   (D3.4).
@@ -420,17 +493,27 @@ field and the rule, never the value.
 
 ## Residual risks and follow-ups
 
-- **Neither runtime that was run is the pinned one.** The probes ran Claude
-  Code CLI 2.1.304 (pinned: 2.1.286) and OpenCode runtime 2.0.32 (pinned:
-  1.18.34). #151's and #152's gates re-run them on the pinned pairs, and
-  the `init` check fails closed on any difference.
+- **The Claude probes did not run the pinned CLI.** They ran Claude Code
+  CLI 2.1.304 (pinned: 2.1.286); #151's gates re-run them on the pinned
+  pair, and the `init` check fails closed on any difference. The OpenCode
+  probes ran the pinned runtime 1.18.34 too (#152; §7).
 - **Built-in plugins, skills and agents** are listed by the CLI whatever
   the setting sources. They cannot be invoked, but the `cc-plugin-agents-md`
   built-in's behaviour under the SDK is part of G-C gating.
 - **Managed settings** apply and cannot be disabled (§4).
-- **Not wired yet:** the engine does not yet create the roots, project them
-  in the sandbox, start a helper or run the auth and `init` checks. That
-  is #151's and #152's work, and every launch is refused until then.
+- **The OpenCode runtime still reaches the network for its own purposes.**
+  1.18.34 refreshed its model catalog during the probe (its
+  `catalog.updated` events). The policy does not set
+  `OPENCODE_DISABLE_MODELS_FETCH`, which the 1.18.34 binary contains,
+  because nobody has verified whether a real provider's model still
+  resolves without the catalog. That is a follow-up with its own probe. The
+  plugin install of §6 is kept out by the read-only layout, not by a switch.
+- **The project id cache** of §7 is a write outside the roots, into git's
+  own directory, under `disabled`.
+- **Not wired yet for `claude-sdk`:** the engine creates and projects a
+  provider's roots from its `state_layout` (#152). `claude-sdk`'s layout,
+  its helper, and the auth and `init` checks are #151's, and every
+  `claude-sdk` launch is refused until then.
 
 ## Tests
 
@@ -452,6 +535,17 @@ field and the rule, never the value.
 - the `doctor` row;
 - the interaction-wait check in `agent_limits`.
 
+The OpenCode bridge (#152) is covered by:
+
+- `tests/test_opencode_sdk.py`, its envelope as a pure reducer;
+- `tests/test_opencode_sdk_provider.py`, the adapter and the real packaged
+  bridge against a fake OpenCode server (`tests/opencode_fake.py`), with
+  the startup, the binding, asks and decisions, the final answer, the
+  failures and the teardown. It needs Node 24 or later and skips without
+  it; `AUTOFORGE_REQUIRE_NODE_BRIDGE=1` makes it fail instead;
+- `tests/test_engine_sandbox.py`, the engine's state roots and their
+  projection.
+
 Two pairs of opt-in probes run an installed runtime against sentinel
 configuration: hooks, MCP servers, skills, agents, and `CLAUDE.md`,
 `AGENTS.md` and `opencode.json` in the project, its parent and the user's
@@ -465,5 +559,15 @@ AUTOFORGE_OPENCODE_SDK_PROBE_SERVER=$(command -v opencode) uv run pytest tests/t
 
 The Claude probe answers from a loopback stand-in for the Messages API
 with a synthetic key, so it calls no model and spends nothing. The OpenCode
-probe starts `opencode serve` on loopback and reads its configuration
-back. Neither reads a credential of the operator's.
+probe starts `opencode serve` on loopback, under §6's layout, and reads its
+configuration back. Neither reads a credential of the operator's.
+
+ADR 0007 §3's OpenCode gates run through the real adapter and bridge, under
+`sandbox.mode: required`, against a loopback stand-in model
+(`tests/opencode_standin.py`). They need the pinned runtime, Node 24 or
+later and a host that can enforce the sandbox:
+
+```sh
+AUTOFORGE_OPENCODE_SDK_GATE_RUNTIME=/path/to/node_modules/opencode-ai/bin/opencode.exe \
+    uv run pytest -rs tests/test_opencode_sdk_gates.py
+```

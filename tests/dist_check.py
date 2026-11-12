@@ -1229,7 +1229,18 @@ def _check_sdk_assets(prefix: Path) -> None:
         _check(bool(adapter.plan_notes(profile, ("PATH",))), f"{profile.provider}: no plan")
     imported = sorted(n for n in sys.modules if n.split(".")[0] == "claude_agent_sdk")
     _check(not imported, f"an SDK was imported: {imported}")
-    _say(f"ok: SDK helper manifest read from {manifest}; SDK plans rendered without an SDK")
+    # #152: the wheel ships the OpenCode bridge, and its bytes are the
+    # manifest's: the adapter would refuse to stage anything else.
+    bridge = pins["opencode-sdk"]
+    _check(bridge.shipped, "the manifest says the OpenCode bridge is not shipped")
+    problem = sdk_assets.helper_problem(bridge)
+    _check(not problem, f"the installed OpenCode bridge: {problem}")
+    bundle = (sdk_assets.helpers_dir() / bridge.file).resolve()
+    _check(bundle.is_relative_to(prefix), f"OpenCode bridge read from {bundle}")
+    _say(
+        f"ok: SDK helper manifest read from {manifest}; SDK plans rendered without an SDK; "
+        f"the OpenCode bridge {bridge.file} matches its sha256"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

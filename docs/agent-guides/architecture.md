@@ -59,7 +59,8 @@ AgentProvider
   -> ClaudeSdkProvider   (ADR 0007: policy, validation and declaration in
                           #149, docs/sdk-policy.md; launch planned, #151)
   -> OpenCodeSdkProvider (ADR 0007: policy, validation and declaration in
-                          #149, docs/sdk-policy.md; launch planned, #152)
+                          #149, docs/sdk-policy.md; launch over the Node
+                          bridge in #152, envelope in opencode_sdk.py)
 ```
 
 Provider adapters own:
@@ -211,11 +212,14 @@ and what its check cannot see.
 #### SDK providers and interactions (partly implemented, ADR 0007)
 
 #149's policy is implemented: `sdk_policy.py` and the two adapters'
-static surface. The adapters have names, option keys, validation, the launch
-allow-list and the sandbox declaration, and every launch is still refused
-before it starts. #134's interaction contract and broker are implemented
-(`interaction.py`, below); the helpers, the adapters' mapping and `pause`
-are planned. ADR 0007 decides how an SDK provider fits these boundaries:
+static surface (names, option keys, validation, the launch allow-list and
+the sandbox declaration). #134's interaction contract and broker are
+implemented (`interaction.py`, below). `opencode-sdk` launches (#152): its
+Node bridge, staged per launch from package data, speaks the
+`autoforge-opencode-bridge` envelope, whose controller side and pure
+reducer are `opencode_sdk.py`, and `OpenCodeSdkProvider` drives it.
+`claude-sdk` is still refused before it starts (#151), and `pause` is
+#126's. ADR 0007 decides how an SDK provider fits these boundaries:
 
 - **The policy is data in the provider layer.** `sdk_policy.py` decides
   what a launch may load, which tools it gets and which may ask, its
@@ -232,6 +236,23 @@ are planned. ADR 0007 decides how an SDK provider fits these boundaries:
   sandbox, under the idle timeout and the ceiling.
 - **The helper owns its runtime.** The CLI or `opencode serve` the helper
   starts is its child, in its process group, under one containment owner.
+  The OpenCode bridge starts the server with a password of its own making,
+  binds a session and an input under caller ids, observes the server's
+  events, relays asks and decisions, and reads the admitted input's final
+  answer back from the history. A protocol module is to the bridge what
+  `pi_rpc.py` is to Pi: `opencode_sdk.py` knows the envelope's record names
+  and nothing of HTTP or the SDK, and the adapter owns time, the process
+  and the broker.
+- **A provider that keeps state names it as data.**
+  `AgentProvider.state_layout` lists the directories a provider keeps
+  between launches (`sandbox_policy.StateRoot`). The engine creates them
+  under the issue's sandbox directory before anything is charged, in every
+  `sandbox.mode`, and names their parent in `AgentRequest.state_dir`. Under
+  the sandbox it projects each root as a carve-out, where the private
+  home's variable it stands for leads. The engine names no provider: the
+  layout is the adapter's. `AgentProvider.credential_preflight` is the
+  matching refusal of a launch that could not authenticate, called with
+  `integration_preflight`.
 - **Pinned pairs.** SDK and runtime versions are pinned exactly, and a
   mismatch is a provider failure.
 - **Interactions go through a provider-neutral contract and broker** in
@@ -266,7 +287,10 @@ are planned. ADR 0007 decides how an SDK provider fits these boundaries:
   a failure and counted in `provider_summary` (#258,
   [usage](../usage.md#an-agent-asked-for-permission-or-input)).
 - **A capability exists only after its gate passes.** The gate is an
-  isolated runtime probe, per ADR 0007 §3.
+  isolated runtime probe, per ADR 0007 §3. `opencode-sdk` declares live
+  questions, whose gate passed on the pinned pair through the adapter under
+  the sandbox (D4.3's amendment); every other capability of every adapter
+  is false.
 
 ### Executor
 
@@ -1207,4 +1231,6 @@ providers gets each section on the right launch. Claude Code's
 `claude_background_work.md` is the one section today: what a pending background
 task does to the CLI, and what to stop before the final reply
 ([control-result-protocol.md](control-result-protocol.md)). The `claude-sdk`
-provider names none, since it cannot launch yet.
+provider names none, since it cannot launch yet; `opencode-sdk` names none,
+since its bridge ends the turn itself and only the admitted input's final
+answer reaches the parser.

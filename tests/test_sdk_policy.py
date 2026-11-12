@@ -711,10 +711,11 @@ def test_opencode_sdk_profile_refusals(change, match):
         validate_profile(profile)
 
 
-@pytest.mark.parametrize("profile", [_claude_profile(), _opencode_profile()])
-def test_sdk_providers_refuse_every_launch_until_their_helper_lands(profile, tmp_path):
+def test_claude_sdk_refuses_every_launch_until_its_helper_lands(tmp_path):
     """The preflight and the launch refuse; the argv a plan shows does not
-    (#150: a dry run renders the helper's argv, which launches nothing)."""
+    (#150: a dry run renders the helper's argv, which launches nothing). The
+    OpenCode bridge has landed (#152): tests/test_opencode_sdk_provider.py."""
+    profile = _claude_profile()
     adapter = provider_for(profile)
     assert adapter.build_command_for(profile, "x")[0] == profile.command
     for call in (
@@ -734,13 +735,21 @@ def test_sdk_providers_refuse_every_launch_until_their_helper_lands(profile, tmp
             call()
 
 
-@pytest.mark.parametrize("profile", [_claude_profile(), _opencode_profile()])
-def test_doctor_reports_that_an_sdk_profile_cannot_launch_yet(profile, tmp_path):
+def test_doctor_reports_that_a_claude_sdk_profile_cannot_launch_yet(tmp_path):
     from autoforge.doctor import Doctor
 
+    profile = _claude_profile()
     row = Doctor(cwd=str(tmp_path)).check_sdk_launch(profile.provider, [profile])
     assert not row.ok and row.required
     assert "cannot launch in this release" in row.detail
+
+
+def test_doctor_reports_that_an_opencode_sdk_profile_can_launch(tmp_path):
+    from autoforge.doctor import Doctor
+
+    profile = _opencode_profile()
+    row = Doctor(cwd=str(tmp_path)).check_sdk_launch(profile.provider, [profile])
+    assert row.ok and row.detail == "its helper is available"
 
 
 def test_claude_sdk_declares_an_api_key_and_never_a_login_file(tmp_path):
@@ -999,7 +1008,14 @@ def _opencode_probe(tmp_path: Path, isolated: bool) -> tuple[str, list[str], boo
     environment or (``isolated`` false) without its project switches; the
     configuration it reports, the markers left behind, and whether every
     write stayed in the policy's roots. Asserts an unauthenticated request is
-    refused."""
+    refused.
+
+    The roots are laid out as a launch lays them out (#152): both
+    configuration directories read-only, holding only the runtime's own
+    ignore file (``OpenCodeSdkProvider.prepare_config``), so the probe also
+    shows that nothing is installed into either. One write outside the roots
+    is expected of 1.18.34 and reported, not counted: the project id it
+    caches as ``<project>/.git/opencode`` (docs/sdk-policy.md §7)."""
     server_command = os.environ["AUTOFORGE_OPENCODE_SDK_PROBE_SERVER"]
     markers = tmp_path / "markers"
     markers.mkdir()
@@ -1010,10 +1026,14 @@ def _opencode_probe(tmp_path: Path, isolated: bool) -> tuple[str, list[str], boo
     roots = OpenCodeSdkRoots.under(tmp_path / "sandbox")
     for path in (*roots.writable(), roots.empty_config):
         path.mkdir(parents=True)
+    OpenCodeSdkProvider.prepare_config(roots)
     sdk_base = roots.home.parent
+    project_id_cache = project / ".git" / "opencode"
 
     def outside_roots() -> set[Path]:
-        return {p for p in tmp_path.rglob("*") if sdk_base not in p.parents}
+        return {
+            p for p in tmp_path.rglob("*") if sdk_base not in p.parents and p != project_id_cache
+        }
 
     before = outside_roots()
     password = server_password()
@@ -1067,6 +1087,10 @@ def _opencode_probe(tmp_path: Path, isolated: bool) -> tuple[str, list[str], boo
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(15)
+        for directory in (roots.config / "opencode", roots.empty_config):
+            # Nothing installed into a configuration directory (D2.6).
+            assert sorted(os.listdir(directory)) == [".gitignore"], directory
+            directory.chmod(0o755)
     return config, sorted(os.listdir(markers)), outside_roots() == before
 
 

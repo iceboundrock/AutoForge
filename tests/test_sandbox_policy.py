@@ -7,6 +7,7 @@ No launch here: every test compiles a description from real paths under
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import subprocess
 from pathlib import Path
@@ -34,6 +35,7 @@ from autoforge.sandbox_policy import (
     LaunchClass,
     LaunchFacts,
     ProviderRequirements,
+    StateRoot,
     absolute_spelling,
     config_file_problem,
     declared_writable,
@@ -1111,3 +1113,35 @@ def test_a_profile_whose_declaration_cannot_be_read_refuses_the_file(tmp_path):
         f"so the configuration file {cfg_file} is not shown to lie outside the directories its "
         "launches write"
     )
+
+
+# -- a provider's state roots (ADR 0007 D2.7, #152) --------------------------------------
+@pytest.mark.parametrize("relpath", ["", "/abs/root", "sdk/../escape", "sdk//data", "./sdk"])
+def test_a_state_root_lies_strictly_below_the_sandbox_directory(relpath):
+    with pytest.raises(ValueError, match="relative path below the sandbox directory"):
+        StateRoot(relpath, True, "a root")
+
+
+def test_a_state_root_stands_inside_only_at_a_known_place():
+    with pytest.raises(ValueError, match="cannot stand inside"):
+        StateRoot("sdk/x/data", True, "a root", inside="XDG_RUNTIME_DIR")
+    assert StateRoot("sdk/x/data", True, "a root", inside="XDG_DATA_HOME").inside
+
+
+def test_state_roots_are_engine_carve_outs_where_their_variables_lead(tmp_path):
+    paths = _layout(tmp_path)
+    roots = paths["sandbox"] / "sdk" / "p"
+    state = (
+        (str(roots / "data"), StateRoot("sdk/p/data", True, "data", inside="XDG_DATA_HOME")),
+        (str(roots / "conf"), StateRoot("sdk/p/conf", False, "conf")),
+        (str(roots / "home"), StateRoot("sdk/p/home", True, "home", inside="")),
+    )
+    facts = dataclasses.replace(_remote(paths), provider_state=state)
+    request = sandbox_request(facts)
+    by_label = {p.label: p for p in request.projections}
+    data = by_label["data"]
+    assert data.origin is Origin.ENGINE and data.carve_out and data.access is Access.WRITABLE
+    assert data.target == str(paths["home"] / ".local" / "share")
+    conf = by_label["conf"]
+    assert conf.target is None and conf.access is Access.READ_ONLY and conf.carve_out
+    assert "home" not in by_label

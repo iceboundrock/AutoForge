@@ -646,12 +646,20 @@ can then outlive the launch, so Pi is attended only there
 
 `provider: claude-sdk` and `provider: opencode-sdk` are the SDK providers
 of [ADR 0007](adr/0007-sdk-providers-isolated-helpers-and-interaction-contract.md).
-**They cannot launch in this release.** Their policy and configuration
-(#149) are in place, and `doctor` checks what they need (#150), but their
-helper programs and transports are #151's and #152's. A profile that uses
-one validates, `doctor` fails its "can launch" row, a dry run shows the plan
-and says the launch is refused, and a phase that reaches it is refused
-before anything starts. Route phases to another provider until those land.
+Their policy and configuration (#149) are in place, and `doctor` checks
+what they need (#150).
+
+- **`opencode-sdk` launches** (#152). Each launch runs AutoForge's OpenCode
+  bridge under Node. The bridge starts the pinned OpenCode runtime as its
+  own child, binds a session and an input under ids the controller chose,
+  and hands back the final answer of that input
+  ([OpenCode SDK launches](#opencode-sdk-launches)).
+- **`claude-sdk` cannot launch in this release.** Its helper program and
+  transport are #151's. A profile that uses it validates, but `doctor`
+  fails its "can launch" row, a dry run says the launch is refused, and a
+  phase that reaches it is refused before anything starts. Route those
+  phases to another provider until #151 lands.
+
 [SDK policy](sdk-policy.md) gives every decision below with its evidence.
 Both are opt-in: nothing in the defaults, the round routing or the merge
 gate changes, and a configuration that routes no phase to one needs no
@@ -685,7 +693,12 @@ SDK, no helper environment and no Node.
   - `prompt`: ask the operator live, at the terminal of `run`, `step` or
     `resume`. With no terminal on stdin, when the input
     ends or the wait expires, the ask fails the invocation, and so does a
-    decision the provider cannot carry: it is never offered.
+    decision the provider cannot carry: it is never offered. For
+    `opencode-sdk` only a question can be answered live: one question or
+    several, several picks where a question allows them, and an answer in
+    the operator's own words. A permission ask fails the invocation under
+    every policy, because it is advisory until gate G-O11 passes (ADR 0007
+    D3.4).
   - `pause`: refused until #126 lands.
 
   `options.max_wait_seconds` (default 120) must be below the profile's idle
@@ -730,7 +743,7 @@ The example file carries both profiles, commented out, after `update_epic`:
     effort: high
     command: node
     options:
-      server_command: /opt/opencode-1.18.34/bin/opencode
+      server_command: /opt/opencode-1.18.34/node_modules/opencode-ai/bin/opencode.exe
       credential_env: OPENAI_API_KEY
 ```
 
@@ -752,7 +765,43 @@ The Claude helper environment holds `claude-agent-sdk==0.2.163` installed
 from its platform wheel (Linux x86_64 or aarch64): its sdist bundles no
 Claude Code, so it gives no backend. #151 adds the hash-locked install of
 that environment. The OpenCode runtime is a release of its own, separate
-from the `opencode` CLI provider's 2.x line.
+from the `opencode` CLI provider's 2.x line. `npm install opencode-ai@1.18.34`
+in a directory of its own installs it, with its platform binary at
+`node_modules/opencode-ai/bin/opencode.exe`; name that path in
+`options.server_command`. The OpenCode bridge needs nothing installed: it is
+one file of AutoForge's, with the SDK client inlined.
+
+#### OpenCode SDK launches
+
+A launch of an `opencode-sdk` profile goes like this (ADR 0007 §5;
+[SDK policy](sdk-policy.md) for each decision):
+
+1. **Refusals first.** Before anything is charged, the launch is refused
+   in three cases, each naming what to fix: `options.credential_env` is
+   not set in the environment `autoforge` runs in; `options.server_command`
+   is not an executable on the launch's `PATH`; or the packaged bridge does
+   not match the manifest's sha256.
+2. **The bridge.** It is staged into a directory made for the launch and
+   started with `command` (Node) under the launch's limits, containment and
+   sandbox.
+3. **The server.** The bridge starts `<server_command> serve
+   --hostname=127.0.0.1 --port=0` with a fresh password in that server's
+   environment only, and reads the bound port from the server's readiness
+   line. It then reads the server's version back and refuses any runtime
+   that is not 1.18.34.
+4. **The turn.** The bridge creates a session under an id the controller
+   chose and admits the prompt under another, reading the input back.
+   `effort` becomes the model's reasoning variant. Only the final answer
+   to that input reaches the parser.
+5. **The end.** When the turn ends, or a limit falls due, the bridge
+   aborts the turn if it is still running, then stops the server.
+
+The server keeps its state per issue, under
+`<git common dir>/autoforge/sandbox/<issue>/sdk/opencode-sdk/`, never in the
+worktree. AutoForge never deletes it. The two configuration directories
+there hold only an ignore file of the runtime's, and a launch cannot write
+them. A launch finding anything else in them is refused, naming what it
+found; inspect and remove it ([SDK policy §6](sdk-policy.md#6-configuration-and-session-roots-d27)).
 
 #### What `doctor` checks
 
@@ -763,7 +812,7 @@ so a profile there with no `command` fails by name.
 
 | Row | Checks |
 |---|---|
-| `provider <name> can launch` | the helper program in the manifest; fails in this release |
+| `provider <name> can launch` | the helper program in the manifest, checked against its sha256; fails for `claude-sdk` in this release (#151) |
 | `claude-sdk helper environment '<command>'` | `<command> -I -S -B -c <probe>` runs, and its Python is 3.10 or newer |
 | `claude-sdk SDK package in '<command>'` | `claude-agent-sdk` is installed there, at the pinned version |
 | `claude-sdk runtime in '<command>'` | that SDK carries its bundled Claude Code, at the pinned version |

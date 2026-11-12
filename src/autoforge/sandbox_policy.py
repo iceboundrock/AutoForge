@@ -172,6 +172,54 @@ class ProviderRequirements:
     path_names: tuple[str, ...] = ()
 
 
+# Where a state root stands inside a sandboxed launch, by the name its
+# directory replaces: the compiler sets ``HOME`` and ``XDG_*`` to the private
+# home (ADR 0005 D8.1), so a root the provider finds through one of them is
+# projected at that place in the private home, never under its host path.
+XDG_PLACES = {
+    "XDG_CONFIG_HOME": ".config",
+    "XDG_DATA_HOME": ".local/share",
+    "XDG_STATE_HOME": ".local/state",
+}
+# A state root projected at its own host path (a variable names it there).
+AT_HOST_PATH = "host"
+
+
+@dataclass(frozen=True)
+class StateRoot:
+    """One directory a provider keeps between launches (ADR 0007 D2.7), as data.
+
+    ``relpath`` is where it lies under the issue's controller-owned sandbox
+    directory (``<git common dir>/autoforge/sandbox/<worktree>``), which the
+    engine creates and never deletes; ``writable`` whether the launch may
+    write it. ``inside`` is how a sandboxed launch sees it: at its host path
+    (:data:`AT_HOST_PATH`), at the private home's place for an ``XDG_*`` name
+    of :data:`XDG_PLACES`, or not at all (``""``: the launch's own directory
+    stands in, as the private home's cache does for a cache root). The
+    engine projects each as an engine carve-out (ADR 0005 C5): the sandbox
+    directory lies in a denied root.
+    """
+
+    relpath: str
+    writable: bool
+    label: str
+    inside: str = AT_HOST_PATH
+
+    def __post_init__(self) -> None:
+        parts = self.relpath.split("/")
+        if (
+            not self.relpath
+            or self.relpath.startswith("/")
+            or any(part in ("", ".", "..") for part in parts)
+        ):
+            raise ValueError(
+                f"a state root must be a relative path below the sandbox directory, not "
+                f"{self.relpath!r}"
+            )
+        if self.inside not in ("", AT_HOST_PATH, *XDG_PLACES):
+            raise ValueError(f"a state root cannot stand inside as {self.inside!r}")
+
+
 @dataclass(frozen=True)
 class LaunchFacts:
     """The controller's facts about one launch, as data (ADR 0005 D13.2).
@@ -187,7 +235,9 @@ class LaunchFacts:
     overrides point into. ``home`` is the operator's home and
     ``controller_env`` the controller's environment, for D4.3.
     ``operator_paths`` are ``sandbox.read_only_paths``, as configured
-    (D15.4): read-only for every launch class.
+    (D15.4): read-only for every launch class. ``provider_state`` is the
+    agent's state roots (:class:`StateRoot`), each with its host path, made
+    by the engine for a provider that keeps state between launches.
     """
 
     launch_class: LaunchClass
@@ -205,6 +255,7 @@ class LaunchFacts:
     denied_roots: tuple[str, ...] = ()
     network: NetworkPosition = NetworkPosition.HOST
     operator_paths: tuple[str, ...] = ()
+    provider_state: tuple[tuple[str, StateRoot], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -296,6 +347,15 @@ def sandbox_request(
         )
         if facts.read_context:
             engine(facts.read_context, read_only, "the read context")
+        for path, root in facts.provider_state:
+            if not root.inside:
+                continue
+            target = (
+                posixpath.join(facts.home, XDG_PLACES[root.inside])
+                if root.inside in XDG_PLACES
+                else None
+            )
+            engine(path, writable if root.writable else read_only, root.label, target=target)
     else:
         engine(facts.workspace, writable, "the exported tree", carve_out=False)
     if facts.cache and kind is not LaunchClass.EXPORT_COMMAND:

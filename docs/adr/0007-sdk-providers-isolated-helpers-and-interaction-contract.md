@@ -12,7 +12,12 @@
   #150 (EPIC #147's opt-in profiles) adds the packaged manifest of D2.2
   without a helper program, the read-only `doctor` rows of D2.6 and a dry
   run's plan of the helper argv, with a dated amendment of D2.2 below.
-  The rest is not implemented yet.
+  #152's part is implemented: the OpenCode bridge, its envelope and
+  reducer, the adapter's launch, the engine's state roots, and the gates of
+  §3 that it ran on the pinned pair. Dated amendments record what the probe
+  of runtime 1.18.34 changed: D2.2 (the build), D4.3 (the route families),
+  §3 (the gate results and the capabilities they allow) and §5 (the
+  envelope). #151 and #126 are not implemented yet.
   It is implemented by #134 (the provider-neutral
   interaction contract and its broker), #126 (the one state bump, `pause`
   and continuation in the engine, the operator commands, crash recovery
@@ -501,6 +506,36 @@ reads wrote with the operator's access, so `doctor` makes them differently:
 The helper's own argv stays D2.3's: a launch runs the environment as
 installed, hooks included, inside the outer sandbox.
 
+*Amendment (2026-11-11, #152): the OpenCode bridge's build.*
+
+- **Source and lock.** `helpers/opencode-bridge/` holds the source
+  (`src/bridge.mjs`, plain JavaScript type-checked against the SDK's own
+  declarations), `package.json` with exact pins (`@opencode-ai/sdk`
+  1.18.34, `esbuild` 0.28.2, `typescript` 5.9.3, `@types/node` 24.19.2)
+  and the committed `package-lock.json`. `npm ci` installs them, for a
+  build only: nothing of it ships but the bundle.
+- **Build and manifest.** `npm run build` bundles the SDK's v2 client
+  (`@opencode-ai/sdk/v2/client`, never its server launcher or
+  `cross-spawn`) into `src/autoforge/sdk_helpers/opencode_bridge.mjs`, and
+  writes that file's sha256 into the manifest. The bundle's first lines
+  carry the SDK's MIT license notice. esbuild's output depends only on its
+  version, the sources and the pinned options, so a rebuild from the lock
+  reproduces the bundle byte for byte; `npm run check` fails when the
+  committed bundle or the manifest's sha256 differs from a fresh build,
+  and runs the type check.
+- **CI.** Every `pytest` checks the committed bundle's digest against the
+  manifest: the adapter refuses a mismatch, and the tests stage the real
+  bundle. CI does not rebuild the bundle: its jobs have no Node toolchain,
+  and adding one means pinning another action. A change that moves the
+  bundle runs `npm run check`, and its review sees the digest move with
+  it. A CI job that rebuilds is a follow-up.
+- **Staging.** The adapter stages the bundle like #165's overrides
+  directory: it reads the packaged file once, checks those bytes' sha256,
+  and writes the same bytes, never through a link, into a fresh `mkdtemp`
+  directory outside every repository. The file is mode 0400 and the
+  directory 0500. The directory is projected read-only and removed after
+  the launch. It is not a state directory, so `safefs` does not write it.
+
 **D2.7 (#149).** **Configuration and session roots are #149's.**
 
 - A Claude continuation needs the session transcript the paused launch
@@ -799,6 +834,51 @@ amendment. Two constraints already hold:
   because that reply writes a rule to the project's store (D9.6).
 
 The envelope (§5) does not expose the choice.
+
+*Amendment (2026-11-11, #152): the families, from running 1.18.34.*
+
+- **What the probe found.**
+  - `/api` cannot run a turn. `POST /api/session/{id}/prompt` admits an
+    input durably: it de-duplicates an identical re-admission under the
+    same id and refuses a different one with 409 `ConflictError`. But the
+    runner then ends with `ModelUnavailableError` for any model of a
+    provider the inline document configures: its catalog lists only the
+    runtime's own `opencode` models. `/api/session/{id}/wait` answers 503
+    "not available yet".
+  - The classic engine runs the turn. `POST /session/{id}/prompt_async`
+    runs it on a configured provider, on a session created through `/api`
+    as well.
+  - Classic admission is not idempotent. A caller's `messageID` is taken,
+    but a resend under it adds the parts again: it neither de-duplicates
+    nor refuses.
+  - Asks are classic only. The classic engine emits classic asks
+    (`question.asked`, `permission.asked`) and never their `/api`
+    counterparts; a classic reply settles them. A second reply gets 404.
+  - Creation is not exclusive. `POST /api/session` with an id that exists
+    returns the existing session, so creating cannot by itself refuse a
+    collision.
+- **The choice.**
+  - **Session, under the caller's id:** `GET` then `POST /api/session`.
+    `new` refuses an id the `GET` finds; `continue` and `recover` require
+    one. The bridge checks every field the session read back carries (id,
+    no parent, location, agent, model, variant) against the start record.
+  - **Everything else is classic:**
+    - admission through `prompt_async` with the caller's `messageID`;
+    - the read-back of that message (`GET /session/{id}/message/{mid}`).
+      An identical input already there is not sent again, and a different
+      one is a conflict: the idempotence the route lacks, enforced by the
+      bridge, which holds the only password;
+    - history, by pages from the newest, never past a bound;
+    - status;
+    - abort;
+    - the event stream;
+    - question and permission list, reply and reject.
+
+  Mixing two families across concepts is the bridge this decision allows
+  for. Each concept still uses one family, the session's identity is
+  checked independently of the turn, and an ask of the `/api` family
+  (`question.v2.asked`, `permission.v2.asked`) fails the invocation, since
+  nothing here would answer it.
 
 **D4.4 (#152).** **Node 24 or later; no Bun.**
 
@@ -1563,6 +1643,45 @@ in an adapter only after its gate passes on the pinned pair (D5.3).
 - A gate that fails turns its row into *unsupported* by amendment. The
   implementing child comments on #148 and on the affected issue (D4.6).
 
+*Amendment (2026-11-11, #152): the OpenCode gates run on the pinned pair.*
+
+**How they ran.** `opencode-ai` 1.18.34 was installed from npm, and Node
+was 24.22.2. Each gate was a launch through `OpenCodeSdkProvider` and the
+packaged bridge, under `sandbox.mode: required` (bubblewrap 0.12.0, the
+probe enforced). The issue's roots were made and projected as the engine
+makes them, in a linked worktree. The model was a loopback stand-in
+(`tests/test_opencode_sdk_gates.py`, opt-in). The only departure from the
+policy is the stand-in's `provider` entry in the inline document.
+
+| Gate | Result |
+|---|---|
+| G-O1 | passed: the session exists under the caller's id, with the location, agent and model asked for |
+| G-O2 | passed: an identical input under its id is read back and not sent again; another input under it is a conflict (the bridge's read-back, D4.3's amendment) |
+| G-O3 | passed: one question; two questions, one taking several picks; an answer in the operator's own words. An absent `custom` means a custom answer is allowed, as the runtime documents its default, and the model cannot set it |
+| G-O5 | passed: an interrupt at the invocation's limit aborts the turn; a recovery reads the runtime's `MessageAbortedError` on its message |
+| G-O8 | passed: a new server on the same data root returns the admitted input's final answer from the history and admits nothing |
+| G-O10 | passed after a normal end and at a limit: the server stopped (SIGTERM), the sandbox enforced, nothing left |
+| G-O12 | passed: with 4096 taken, the readiness line names the port bound |
+| G-O13 | passed: `/global/health` reports `1.18.34` |
+| G-O4, G-O6, G-O7, G-O9, G-O11 | not run |
+
+**What the adapter declares.** Live questions, so `offers` for a
+question include an answer, an answer in the operator's own words and a
+cancellation. Everything else stays false (D5.3):
+
+- permission asks, until G-O11 (D3.4);
+- replay and continuation, and with them a pause, until #126 and G-O6;
+- interrupt as a capability.
+
+**One runtime behaviour worth knowing:** a rejected or cancelled question
+ends the turn, so the invocation fails with no final answer.
+
+**What the probe changed elsewhere.** 1.18.34 writes into both
+configuration directories it reads and installs a package there, so both
+are read-only with the runtime's own ignore file in place
+(docs/sdk-policy.md §6). It also caches the project id in the git common
+dir (§7 there).
+
 ## 4. Ownership and dependency plan
 
 ```text
@@ -1640,6 +1759,46 @@ issued. End of file on the helper's stdin is the shutdown request.
 | controller → bridge | `interrupt` | — | a cancellation |
 | bridge → controller | `result` | `text`, `message_id`, `finish` | the final assistant message of the admitted input |
 | bridge → controller | `end`, `failure` | as for Claude | |
+
+*Amendment (2026-11-11, #152): `autoforge-opencode-bridge` protocol 1 as built.*
+`src/autoforge/opencode_sdk.py` holds the controller's side and its
+reducer. `helpers/opencode-bridge/src/bridge.mjs` is the other end.
+
+| Direction | `type` | Fields | When |
+|---|---|---|---|
+| bridge → controller | `hello` | `envelope`, `protocol`, `sdk_version` (the bundled SDK's), `node_version` | first; `start` only after the adapter checked all three |
+| controller → bridge | `start` | `server_command`, `session_id`, `mode` (`new`, `continue`, `recover`), `input_id`, `prompt` (the input for every mode; `recover` checks it), `cwd`, `agent`, `model` (`provider_id`, `model_id`, `variant`: the profile's effort, or null), `expect` (`runtime_version`), `policy` (#149's start fields; its `replies` bound what is ever sent), `limits` (startup, request, settle, abort and stop windows; record, event and response bounds; the history bound) | once; any other field is refused |
+| bridge → controller | `server` | `runtime_version` | after readiness and the version read-back; a mismatch fails before any session call |
+| bridge → controller | `session` | `session_id`, `mode`, `directory`, `agent`, `provider_id`, `model_id`, `variant` | the session read back, each field checked by both sides |
+| bridge → controller | `admitted` | `input_id`, `sent` (false: an identical input was already there) | the input read back under its id; not for `recover` |
+| bridge → controller | `event` | `kind`: `status` (`busy`, `idle`, `retry` with `attempt`), `text`, `reasoning`, `step` (`reason`), `message` (`finish`), `tool` (`status`, `tool`, `call_id`; `detail` on start, one allow-listed input; `input_sha256`, `result_sha256` on end), `error` (`name`), `asks_settled` (`count`) | filtered observations of the bound session; an unknown `kind` is counted |
+| bridge → controller | `ask` | `request_id` (the bridge's), `kind`, `provider_request_id`, `session_id`, `tool` (`message_id`, `call_id`), and either `questions` (each `question`, `header`, `options` with `label` and `description`, `multiple`, `custom`) or `permission`, `patterns`, `metadata_sha256` | a classic ask of the bound session; one from any other session is rejected by the bridge and fails the invocation |
+| controller → bridge | `decision` | `request_id`, `directive` (`answer`, `once`, `reject`, `fail`, `pause`), `answers` (one list per question: the labels picked, then the operator's own words), `message` (a denial's guidance) | one per ask, in order; `always` is refused |
+| controller → bridge | `interrupt` | none | a cancellation; end of stdin is the shutdown request |
+| bridge → controller | `result` | `session_id`, `input_id`, `message_id`, `finish` (`stop` or `length`), `text` | the admitted input's final answer |
+| bridge → controller | `end` | `outcome` (`result`, `interrupted`), `server` (`stopped`: `sigterm`, `sigkill`, `exited`, `survived` or `never_started`; `exit_code`, `signal`), the counts (`events`, `skipped_unknown`, `foreign_events`, `asks`, `sibling_settled`) | last, before exit 0 |
+| bridge → controller | `failure` | `code`, `reason` (bounded, never a secret), `details` (a model error's name, status and whether the runtime marked it retryable), `server`, the counts | last, before exit 1; exit 2 is a crash, after one bounded record when it can |
+
+**The final answer (D10.3).** The bridge decides the turn is over from
+the server's own records, never from an idle signal alone. It needs all
+of these:
+
+- the session is not busy;
+- no ask of this invocation is open;
+- the history, read back, has the admitted input followed by assistant
+  messages only, the last of them completed and answering that input
+  (`parentID`);
+- that message has no error and finished with `stop` or `length`.
+
+Its text parts, other than synthetic or ignored ones, joined with a line
+feed, are the result. A later input in the session, a last answer to
+another input, an unknown finish, a completed tool call with nothing after
+it, or a message with an error fails closed. An abort's
+`MessageAbortedError` after an interrupt is an interrupted end.
+
+**`reissue`** (D9.6) is not in protocol 1. It answers a permission ask
+`once` on a continuation, so it waits for G-O11. Adding it moves the
+protocol to 2.
 
 **No common envelope.** The two share seven record names: `hello`,
 `start`, `ask`, `decision`, `interrupt`, `end` and `failure`. That is the

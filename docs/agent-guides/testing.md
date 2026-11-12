@@ -2402,8 +2402,9 @@ every workflow ([Development](../development.md#pinned-actions)).
 
 ### SDK policy (#149, docs/sdk-policy.md)
 
-The SDK providers cannot launch yet, so their policy is held at its own
-boundary (`tests/test_sdk_policy.py`). Keep covered:
+The policy is held at its own boundary (`tests/test_sdk_policy.py`), apart
+from the launches that run under it: `claude-sdk` cannot launch yet, and
+`opencode-sdk`'s bridge has tests of its own (below). Keep covered:
 
 - every option outside its closed set is a `ConfigurationError` naming the
   key and never quoting an `extra_args` value. That includes the SDKs' own
@@ -2429,9 +2430,9 @@ boundary (`tests/test_sdk_policy.py`). Keep covered:
   input, option, answer or modified input is refused, never clipped. Two
   options shown alike are refused, and a permission ask shows only
   allow-listed keys;
-- every launch path refuses (`integration_preflight`, `execute`), and
-  `doctor` fails the "can launch" row; `build_command_for` renders the
-  helper's argv for a plan, never the prompt (#150);
+- every `claude-sdk` launch path refuses (`integration_preflight`,
+  `execute`), and `doctor` fails its "can launch" row; `build_command_for`
+  renders the helper's argv for a plan, never the prompt (#150);
 - the interaction wait is below both agent limits under `prompt`.
 
 The opt-in probes (`AUTOFORGE_CLAUDE_SDK_PROBE_CLI`,
@@ -2440,6 +2441,57 @@ policy against sentinel hooks, MCP servers, skills, agents and instruction
 files, and assert that none loads. A control run without the policy
 asserts that the probe can see them load. Re-run both whenever a pin, a
 policy field or a runtime changes.
+
+### The OpenCode bridge (#152, ADR 0007 §5)
+
+`tests/test_opencode_sdk.py` holds the envelope as a pure reducer, from
+synthetic records. `tests/test_opencode_sdk_provider.py` runs the adapter
+with the real packaged bridge against `tests/opencode_fake.py`, a fake
+OpenCode server that checks the password on every request. That part needs
+Node 24 or later; its driver tests use a fake bridge in Python and need no
+Node. `tests/test_engine_sandbox.py` holds the engine's state roots. Keep
+covered:
+
+- **The pair.** A `hello` of another envelope, protocol, SDK or a Node
+  below the floor sends no `start`. A server of another runtime version
+  fails before any session call.
+- **The binding.** A session id that exists is refused for `new`. Each
+  field of the session read back is checked. An input id that holds
+  another input is a conflict, and an identical one is read back and never
+  sent again.
+- **The answer.** Only the admitted input's final answer reaches `stdout`:
+  text parts joined, a synthetic part left out. A later input, a last
+  answer to another input, an unknown finish, a session settled after a
+  tool call, and a model error each fail closed. A retryable 5xx is
+  transient.
+- **Asks.**
+  - Questions are answered live through the broker: several picks, the
+    operator's own words, in order.
+  - A permission fails under every policy without its gate.
+  - These are rejected and fail the invocation: an ask from another
+    session, an ask of the `/api` family, a malformed or repeated ask, and
+    an ask with no broker.
+  - A reject reports the asks it settled with it, and they are never
+    answered afterwards.
+- **Bounds.** An event or a final answer past its bound fails closed, and
+  an unknown observation is counted.
+- **Startup and the end.** A server that prints no readiness line, or
+  exits before it, fails the startup. A turn still running at the idle
+  limit or the ceiling is aborted, then the server is stopped, and nothing
+  is left behind.
+- **What is never kept.** The server password appears in no argv, record,
+  stderr, summary or log the controller keeps.
+- **The roots.** The engine makes the roots under the issue's sandbox
+  directory in every mode, projects each where its variable leads under
+  the sandbox, the configuration roots read-only, and a refused credential
+  preflight charges nothing. A configuration directory holding anything
+  but the runtime's ignore file refuses the launch.
+
+The opt-in gates (`AUTOFORGE_OPENCODE_SDK_GATE_RUNTIME`,
+`tests/test_opencode_sdk_gates.py`) run the pinned runtime through the
+adapter under the sandbox against a loopback stand-in model. Re-run them
+whenever the pin, the bridge or the policy changes, and record the result
+in ADR 0007.
 
 ### SDK profiles (#150, docs/configuration.md "SDK profiles")
 

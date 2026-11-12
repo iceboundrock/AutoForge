@@ -2983,11 +2983,12 @@ def test_the_opencode_runtime_never_runs_and_the_operators_directories_stay_unto
 
 
 @pytest.mark.usefixtures("sdk_server")
-def test_a_healthy_opencode_sdk_profile_passes_all_but_the_launch(tmp_path, monkeypatch):
+def test_a_healthy_opencode_sdk_profile_passes_every_row(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", PLANTED)
     rows = _sdk_doctor(tmp_path, {"review_round_1": _opencode_sdk()})
-    assert not rows[OPENCODE_ROWS["launch"]].ok
-    assert "autoforge-opencode-bridge" in rows[OPENCODE_ROWS["launch"]].detail
+    # #152 ships the bridge: its digest matches the manifest.
+    assert rows[OPENCODE_ROWS["launch"]].ok
+    assert rows[OPENCODE_ROWS["launch"]].detail == "its helper is available"
     assert rows[OPENCODE_ROWS["node"]].detail == "Node 24.11.1 (>= 24)"
     assert rows[OPENCODE_ROWS["runtime"]].ok
     assert rows[OPENCODE_ROWS["runtime"]].detail == (
@@ -3319,7 +3320,9 @@ def test_a_post_merge_sdk_profile_with_no_command_fails_by_name(
     assert not row.ok and row.required
     assert f"{provider} needs 'command', the {interpreter}" in row.detail
     assert row.detail.endswith("got ''")
-    assert not rows[f"provider {provider} can launch (update_epic)"].ok
+    # The launch row is about the helper alone: #152 ships the OpenCode one.
+    launch = rows[f"provider {provider} can launch (update_epic)"]
+    assert launch.ok is (provider == "opencode-sdk")
     assert requests == []
 
 

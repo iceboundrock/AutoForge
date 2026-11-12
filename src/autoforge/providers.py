@@ -255,6 +255,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import hashlib
 import json
 import os
 import pwd
@@ -283,6 +284,7 @@ from .errors import (
     ConfigurationError,
     ExecutionError,
     ExecutionTimeoutError,
+    InteractionDataError,
 )
 from .executor import (
     DEFAULT_MAX_OUTPUT_BYTES,
@@ -313,6 +315,15 @@ from .interaction import (
     RequestKind,
 )
 from .loop_detect import LIMIT_LOOP, LoopMonitor, LoopReport
+from .opencode_sdk import (
+    BridgeAsk,
+    BridgeConversation,
+    BridgeLimits,
+    BridgeMode,
+    BridgeStart,
+    opencode_id,
+    split_model,
+)
 from .pi_rpc import PiConversation, encodable
 from .progress import ProgressEvent, ProgressKind, ProgressSink, clean, guarded
 from .redaction import redact
@@ -323,8 +334,10 @@ from .sandbox_policy import (
     AuthMode,
     ProviderRequirements,
     SandboxPlan,
+    StateRoot,
     declared_writable,
     executable_requirements,
+    resolve_command,
 )
 from .sdk_assets import (
     CLAUDE_ENVIRONMENT_PROBE,
@@ -332,6 +345,7 @@ from .sdk_assets import (
     HelperPin,
     helper_pin,
     helper_problem,
+    helpers_dir,
 )
 from .sdk_policy import (
     CLAUDE_SDK,
@@ -339,6 +353,7 @@ from .sdk_policy import (
     CLAUDE_SDK_OPTION_KEYS,
     CLAUDE_SDK_PASSTHROUGH,
     OPENCODE_SDK,
+    OPENCODE_SDK_AGENT,
     OPENCODE_SDK_OPTION_KEYS,
     ClaudeSdkPolicy,
     ClaudeSdkRoots,
@@ -349,6 +364,7 @@ from .sdk_policy import (
     collection_text,
     interaction_settings,
     opencode_model_problem,
+    opencode_sdk_auth_problems,
     opencode_sdk_policy,
     sdk_launch_allowlist,
 )
@@ -406,6 +422,12 @@ class AgentRequest:
     # what the directive says; it never sees the policy. ``None`` (every
     # provider through which nothing can ask) keeps today's behaviour.
     interaction: InteractionBroker | None = None
+    # The issue's controller-owned directory under which a provider that keeps
+    # state between launches (an SDK provider, ADR 0007 D2.7) finds the roots
+    # it declared (:meth:`AgentProvider.state_layout`): the engine creates them
+    # there before the launch and never deletes them. ``None`` for a provider
+    # that declares none.
+    state_dir: str | None = None
 
     def __post_init__(self) -> None:
         self.loop_detection = self.loop_detection.for_invocation(self.profile.provider, self.phase)
@@ -774,6 +796,26 @@ class AgentProvider:
         preflight, before a launch is charged, and :meth:`execute` calls it
         again before it launches. The base adapter has nothing to refuse.
         """
+
+    def credential_preflight(
+        self, profile: ProfileConfig, env_allowlist: tuple[str, ...] | None
+    ) -> None:
+        """Refuse a launch of ``profile`` that could not authenticate, or whose
+        runtime cannot be found, before anything starts (ADR 0007 D10.2).
+
+        Like :meth:`integration_preflight`, called by the engine before a
+        launch is charged and again by :meth:`execute`, and raising
+        :class:`ConfigurationError`. A CLI provider's credential is its own
+        CLI's business, so the base adapter has nothing to refuse.
+        """
+
+    def state_layout(self, profile: ProfileConfig) -> tuple[StateRoot, ...]:
+        """The directories a launch of ``profile`` keeps between launches,
+        under the issue's sandbox directory (ADR 0007 D2.7): the engine makes
+        them before the launch, names their parent in
+        :attr:`AgentRequest.state_dir` and projects them in the sandbox. A
+        CLI provider keeps its state where its CLI does, so none."""
+        return ()
 
     def own_names(self, profile: ProfileConfig | None) -> tuple[str, ...]:
         """The variables this provider adds to the allow-list of ``profile``'s agents."""
@@ -2863,7 +2905,7 @@ _OPENCODE_SDK_EFFORT_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 
 class _SdkProvider(AgentProvider):
     """What the two SDK adapters share: a fixed policy, no pass-through, and
-    no launch until their helper lands.
+    no launch until their helper and transport land (:attr:`transport_ready`).
 
     ``command`` names the helper's interpreter (Python for ``claude-sdk``,
     Node for ``opencode-sdk``; ADR 0007 D2.3, D2.5) and is required: no
@@ -2878,6 +2920,10 @@ class _SdkProvider(AgentProvider):
     # The issue whose helper launches this provider, the helper's
     # interpreter as ``command`` names it, and the decision that says so.
     transport_issue = ""
+    # Whether this release carries the adapter's transport (its duplex driver
+    # of the helper): until it does, every launch is refused whatever the
+    # manifest says.
+    transport_ready = False
     interpreter = ""
     runtime_decision = ""
     # Foreign names the operator may still forward by listing them exactly.
@@ -2934,21 +2980,30 @@ class _SdkProvider(AgentProvider):
         return helper_pin(self.name)
 
     def launch_problem(self) -> str:
-        """Why no launch of this provider can start in this release."""
+        """Why no launch of this provider can start in this release, or ''."""
         pin = self.helper()
         if not pin.shipped:
             return (
                 f"its helper program {pin.describe()} is not shipped with this AutoForge: it "
                 f"and its transport are {pin.implemented_by}'s and have not landed"
             )
-        return helper_problem(pin) or (
-            f"its transport is #{self.transport_issue}'s and has not landed"
-        )
+        problem = helper_problem(pin)
+        if problem:
+            return problem
+        if not self.transport_ready:
+            return f"its transport is #{self.transport_issue}'s and has not landed"
+        return ""
 
-    def _refuse_launch(self) -> ConfigurationError:
+    def _refuse_launch(self, problem: str = "") -> ConfigurationError:
+        problem = problem or self.launch_problem()
+        if self.transport_ready and self.helper().shipped:
+            return ConfigurationError(
+                f"provider {self.name} cannot launch: {problem}. Reinstall AutoForge, or "
+                "route this profile to another provider"
+            )
         return ConfigurationError(
             f"provider {self.name} cannot launch in this release: its policy is in place "
-            f"(docs/sdk-policy.md), but {self.launch_problem()}. Route this profile to "
+            f"(docs/sdk-policy.md), but {problem}. Route this profile to "
             "another provider"
         )
 
@@ -2959,15 +3014,16 @@ class _SdkProvider(AgentProvider):
         Never the prompt, which travels in the helper's ``start`` record on
         stdin (ADR 0007 §5), so a dry run's plan and the run log name the
         same argv. The staged directory is made for the launch, so it is
-        named by its role. Building it launches nothing; every launch is
-        still refused (:meth:`integration_preflight`, :meth:`execute`).
+        named by its role. Building it launches nothing.
         """
         return [profile.command, *self.interpreter_flags, self.helper().staged_path()]
 
     def integration_preflight(self, env_allowlist: tuple[str, ...] | None) -> None:
-        """Refused: nothing can launch yet, so the engine stops here, before
-        a launch is charged."""
-        raise self._refuse_launch()
+        """Refused while the helper cannot be staged or the transport has not
+        landed, so the engine stops here, before a launch is charged."""
+        problem = self.launch_problem()
+        if problem:
+            raise self._refuse_launch(problem)
 
     def execute(self, req: AgentRequest) -> AgentExecutionResult:
         raise self._refuse_launch()
@@ -3020,9 +3076,21 @@ class _SdkProvider(AgentProvider):
             f"{', '.join(self.policy_environment_names(profile))}",
             f"{self.name} state root: <issue sandbox dir>/sdk/{self.name}/, per issue, never "
             "inside the worktree (docs/sdk-policy.md §6)",
-            f"{self.name} launch: every launch is refused in this release, before anything "
-            f"starts: {self.launch_problem()}",
+            self._launch_plan(),
         ]
+
+    def _launch_plan(self) -> str:
+        problem = self.launch_problem()
+        if problem:
+            return (
+                f"{self.name} launch: every launch is refused in this release, before anything "
+                f"starts: {problem}"
+            )
+        return (
+            f"{self.name} launch: the helper runs under the duplex handle, with the launch's "
+            "limits, containment and sandbox; only the final answer of the admitted input "
+            "reaches the parser"
+        )
 
     def launch_allowlist(self, base: tuple[str, ...]) -> tuple[str, ...]:
         """``base`` with every other provider's variables and every
@@ -3142,11 +3210,94 @@ class ClaudeSdkProvider(_SdkProvider):
         )
 
 
+# The bridge's records are bounded like Pi's: the ``result`` record carries a
+# final text up to the stdout bound, which JSON escaping can double.
+OPENCODE_SDK_MAX_RECORD_BYTES = 2 * DEFAULT_MAX_OUTPUT_BYTES + 1024 * 1024
+OPENCODE_SDK_MAX_PENDING_BYTES = 2 * OPENCODE_SDK_MAX_RECORD_BYTES
+# How long after a limit falls due the bridge is given to abort the turn and
+# stop its server in order (its abort and stop windows, with a margin) before
+# the executor kills the group (ADR 0002 §4a).
+OPENCODE_SDK_WIND_DOWN_SECONDS = 25.0
+# How long the bridge is given for its last record once the invocation failed
+# and the controller asked it to stop: its abort, its server's stop, a margin.
+OPENCODE_SDK_STOP_SECONDS = 25.0
+# What runtime 1.18.34 writes into each configuration directory it reads (the
+# global one under XDG_CONFIG_HOME and OPENCODE_CONFIG_DIR) before it serves a
+# directory, failing the instance when it cannot, and then installs
+# ``@opencode-ai/plugin`` there from the npm registry in the background (#152's
+# probe). Both directories are the controller's and read-only to a launch:
+# with this file already in place the instance starts, and the install, a
+# download at launch, fails (ADR 0007 D2.6), as does any write an agent makes
+# there for the next launch to load.
+OPENCODE_SDK_CONFIG_IGNORE = "node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore"
+OPENCODE_SDK_CONFIG_IGNORE_NAME = ".gitignore"
+# What the adapter can carry of a decision (ADR 0007 D5.3): the rows whose
+# gates passed on the pinned pair through it, under the sandbox (#152).
+OPENCODE_SDK_CAPABILITIES = Capabilities(live_questions=True)
+
+
+@contextmanager
+def staged_helper(pin: HelperPin) -> Iterator[str]:
+    """The helper program written into a directory made for one launch (ADR 0007 D2.2).
+
+    The packaged file is read once and its sha256 checked against the
+    manifest; those same bytes are written (never through a link, mode 0400)
+    into a fresh ``mkdtemp`` directory outside every repository, made
+    read-only, and removed when the ``with`` block ends, as #165's overrides
+    directory is. A launch never runs the helper from the controller's
+    checkout or its virtual environment. A digest mismatch or a directory
+    that cannot be prepared refuses the launch before anything starts.
+    """
+    try:
+        data = (helpers_dir() / pin.file).read_bytes()
+    except OSError:
+        raise ConfigurationError(
+            f"its helper program {pin.describe()} is missing from the installed package: "
+            "reinstall AutoForge"
+        ) from None
+    if hashlib.sha256(data).hexdigest() != pin.sha256:
+        raise ConfigurationError(
+            f"its helper program {pin.describe()} does not match the manifest's sha256 (a "
+            "damaged or foreign file): reinstall AutoForge"
+        )
+    try:
+        root = tempfile.mkdtemp(prefix="autoforge-helper-")
+    except OSError as exc:
+        raise ExecutionError(f"cannot stage the {pin.provider} helper: {exc}") from exc
+    try:
+        path = os.path.join(root, pin.file)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            os.chmod(root, 0o500)
+        except OSError as exc:
+            raise ExecutionError(f"cannot stage the {pin.provider} helper: {exc}") from exc
+        yield path
+    finally:
+        try:
+            os.chmod(root, 0o700)
+        except OSError:
+            pass
+        shutil.rmtree(root, ignore_errors=True)
+
+
 class OpenCodeSdkProvider(_SdkProvider):
     """``opencode-sdk``: the OpenCode SDK in a Node bridge (ADR 0007; #152).
 
     Its model credential is the one variable the profile names in
     ``options.credential_env``; no stored sign-in is read (D10.2).
+
+    A launch is one duplex invocation of the bridge
+    (``sdk_helpers/opencode_bridge.mjs``, staged per launch), which starts
+    the pinned runtime as its own child, binds a session under a caller id,
+    admits the prompt under a caller id and reports the final answer of that
+    input (:mod:`autoforge.opencode_sdk` holds the envelope and its reducer).
+    The driver here owns time, the process and the broker; the reducer owns
+    every record name. Every ask goes to the launch's broker. The adapter
+    declares live questions, whose gate passed through it under the sandbox,
+    and nothing else (:meth:`interaction_capabilities`, D5.3): a permission
+    ask fails the invocation under every policy, and the bridge rejects it.
     """
 
     name = OPENCODE_SDK
@@ -3154,8 +3305,24 @@ class OpenCodeSdkProvider(_SdkProvider):
     option_keys = OPENCODE_SDK_OPTION_KEYS
     path_names = ("OPENCODE_CONFIG_DIR",)
     transport_issue = "152"
+    transport_ready = True
     interpreter = "Node executable"
     runtime_decision = "D2.5"
+
+    def __init__(
+        self,
+        runner: Runner | None = None,
+        *,
+        limits: BridgeLimits | None = None,
+        wind_down_seconds: float = OPENCODE_SDK_WIND_DOWN_SECONDS,
+        stop_seconds: float = OPENCODE_SDK_STOP_SECONDS,
+        max_text_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+    ) -> None:
+        super().__init__(runner)
+        self.limits = limits or BridgeLimits(max_record_bytes=OPENCODE_SDK_MAX_RECORD_BYTES)
+        self.wind_down_seconds = wind_down_seconds
+        self.stop_seconds = stop_seconds
+        self.max_text_bytes = max_text_bytes
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         super().validate_profile(profile)
@@ -3197,22 +3364,118 @@ class OpenCodeSdkProvider(_SdkProvider):
             return ()
         return (self.policy(profile).credential_env,)
 
+    def state_layout(self, profile: ProfileConfig) -> tuple[StateRoot, ...]:
+        """:class:`autoforge.sdk_policy.OpenCodeSdkRoots` as the engine makes and
+        projects them (docs/sdk-policy.md §6).
+
+        Under the sandbox the compiler sets ``HOME`` and ``XDG_*`` to the
+        private home, so the configuration, data and state roots are
+        projected where those names lead there; the data root holds the
+        server's database and session history, which a continuation reads
+        again (D2.7, D8.4). The home root is the private home's own, and the
+        cache root the launch's cache, under the sandbox; the empty
+        configuration directory is read-only at its host path, which
+        ``OPENCODE_CONFIG_DIR`` names. The configuration root is read-only
+        too: the runtime loads agents, commands and plugins from it, so a
+        launch that could write it could plant one for the next
+        (:meth:`prepare_config`).
+        """
+        roots = OpenCodeSdkRoots.under(Path("/"))
+        base = Path("/")
+
+        def rel(path: Path) -> str:
+            return str(path.relative_to(base))
+
+        return (
+            StateRoot(rel(roots.home), True, "the opencode-sdk home root", inside=""),
+            # Read-only: the runtime loads agents, commands and plugins from it.
+            StateRoot(
+                rel(roots.config), False, "the opencode-sdk config root", inside="XDG_CONFIG_HOME"
+            ),
+            StateRoot(rel(roots.data), True, "the opencode-sdk data root", inside="XDG_DATA_HOME"),
+            StateRoot(rel(roots.cache), True, "the opencode-sdk cache root", inside=""),
+            StateRoot(
+                rel(roots.state), True, "the opencode-sdk state root", inside="XDG_STATE_HOME"
+            ),
+            StateRoot(rel(roots.empty_config), False, "the opencode-sdk empty config directory"),
+        )
+
+    def interaction_capabilities(self, profile: ProfileConfig) -> Capabilities:
+        """Live questions, every one of them: gate G-O3 passed on the pinned pair
+        through this adapter under ``sandbox.mode: required`` (one question,
+        several, several picks, an answer of the operator's own words; ADR
+        0007 §3 and D4.3's amendment). Nothing else (D5.3): a permission ask
+        stays advisory until G-O11 (D3.4), so the broker answers it ``fail``;
+        no pause exists until #126, and no replay or continuation is declared.
+        """
+        return OPENCODE_SDK_CAPABILITIES
+
+    def credential_preflight(
+        self, profile: ProfileConfig, env_allowlist: tuple[str, ...] | None
+    ) -> None:
+        """The model credential by name (docs/sdk-policy.md §9) and the runtime
+        on the launch's ``PATH`` (D2.5), checked in the environment the launch
+        inherits; names only, never a value."""
+        policy = self.policy(profile)
+        env = self._inherited(self._profile_allowlist(env_allowlist, profile))
+        problems = opencode_sdk_auth_problems(policy, env)
+        if problems:
+            raise ConfigurationError(f"refusing to launch {profile.name!r}: {'; '.join(problems)}")
+        if not self.server_path(profile, env):
+            raise ConfigurationError(
+                f"refusing to launch {profile.name!r}: options.server_command "
+                f"{policy.server_command!r} is not an executable on the launch's PATH (ADR "
+                "0007 D2.5)"
+            )
+
+    def server_path(self, profile: ProfileConfig, env: Mapping[str, str]) -> str:
+        """The resolved absolute path of ``options.server_command`` on ``env``'s
+        ``PATH``, as the launch would run it; '' when it is not found."""
+        return resolve_command(self.policy(profile).server_command, env.get("PATH"))
+
+    def _profile_allowlist(
+        self, env_allowlist: tuple[str, ...] | None, profile: ProfileConfig
+    ) -> tuple[str, ...] | None:
+        return None if env_allowlist is None else self._allowlist(env_allowlist, profile)
+
+    @staticmethod
+    def _inherited(allowlist: tuple[str, ...] | None) -> dict[str, str]:
+        """What a launch with ``allowlist``, already the provider's own
+        (:meth:`environment_allowlist`), inherits from this process."""
+        return dict(os.environ) if allowlist is None else select_environment(allowlist)
+
     def sandbox_requirements(
         self, profile: ProfileConfig, command: list[str], env: Mapping[str, str], home: str
     ) -> ProviderRequirements:
-        """``opencode-sdk``'s declaration (ADR 0005 D7.1, D13.1; ADR 0007 D10.2).
+        """``opencode-sdk``'s declaration (ADR 0005 D7.1, D13.1; ADR 0007 D2.5, D10.2).
 
-        The profile's ``credential_env`` is an ``env`` item, the only
-        credential; no OpenCode store is projected. The policy's roots
-        (:class:`autoforge.sdk_policy.OpenCodeSdkRoots`) are #152's to
-        project. The operator's OpenCode configuration, data and cache
-        directories are the operator configuration roots.
+        Node is the launch's executable. The OpenCode runtime is a second
+        executable, resolved on the launch's ``PATH``, whose install root is
+        projected read-only too (D2.5); the staged helper's directory is
+        read-only (D2.2). The profile's ``credential_env`` is an ``env``
+        item, the only credential; no OpenCode store is projected. The
+        policy's roots are the engine's to make and project
+        (:meth:`state_layout`). The operator's OpenCode configuration, data
+        and cache directories are the operator configuration roots.
         """
         needs = super().sandbox_requirements(profile, command, env, home)
-        credential = self.policy(profile).credential_env
+        policy = self.policy(profile)
+        server, roots, path_dirs, spelled = executable_requirements(
+            policy.server_command, home=home, search_path=env.get("PATH")
+        )
+        staged = (
+            (os.path.dirname(command[1]),)
+            if len(command) > 1 and command[1].startswith("/")
+            else ()
+        )
+        credential = policy.credential_env
         auth = (AuthItem(AuthMode.ENV, credential),) if env.get(credential) else ()
         return dataclasses.replace(
             needs,
+            install_roots=tuple(dict.fromkeys([*needs.install_roots, *roots])),
+            path_dirs=tuple(dict.fromkeys([*needs.path_dirs, *path_dirs])),
+            spelled_paths=tuple(dict.fromkeys([*needs.spelled_paths, *spelled])),
+            config=tuple(dict.fromkeys([*needs.config, *staged])),
             auth=auth,
             operator_config_roots=(
                 os.path.join(home, ".config", "opencode"),
@@ -3221,6 +3484,343 @@ class OpenCodeSdkProvider(_SdkProvider):
                 os.path.join(home, ".opencode"),
             ),
         )
+
+    # -- the launch ---------------------------------------------------------------
+    def roots(self, req: AgentRequest) -> OpenCodeSdkRoots:
+        """The policy's roots under the request's state directory, which the
+        engine made (:meth:`state_layout`); a launch without them is refused."""
+        if not req.state_dir or not req.state_dir.startswith("/"):
+            raise ExecutionError(
+                f"{self.name}: the launch has no state directory for its roots (ADR 0007 D2.7)"
+            )
+        roots = OpenCodeSdkRoots.under(Path(req.state_dir))
+        missing = [
+            str(path)
+            for path in (*roots.writable(), roots.empty_config)
+            if not path.is_dir() or path.is_symlink()
+        ]
+        if missing:
+            raise ExecutionError(
+                f"{self.name}: the state roots were not prepared: {', '.join(missing)}"
+            )
+        self.prepare_config(roots)
+        return roots
+
+    @staticmethod
+    def prepare_config(roots: OpenCodeSdkRoots) -> None:
+        """Hold both configuration directories the runtime reads to what the
+        policy says they are: empty, but for the runtime's own ignore file
+        (:data:`OPENCODE_SDK_CONFIG_IGNORE`), and read-only (mode 0555).
+
+        The global one (``<config root>/opencode``) and ``OPENCODE_CONFIG_DIR``
+        are made when missing, never through a link. A directory holding
+        anything else (an agent, a command, a plugin, a package an earlier
+        launch's agent left for this one to load) refuses the launch, naming
+        what is there: AutoForge deletes nothing (docs/sdk-policy.md §6). Under
+        the sandbox both are projected read-only as well; under ``disabled``
+        the mode is all that holds them, and this check is what notices.
+        """
+        for directory in (roots.config / "opencode", roots.empty_config):
+            try:
+                if not directory.exists() and not directory.is_symlink():
+                    os.mkdir(directory, 0o755)
+                if directory.is_symlink() or not directory.is_dir():
+                    raise ExecutionError(
+                        f"{OPENCODE_SDK}: the configuration directory {directory} is not a "
+                        "directory of the controller's"
+                    )
+                ignore = directory / OPENCODE_SDK_CONFIG_IGNORE_NAME
+                if not ignore.exists() and not ignore.is_symlink():
+                    os.chmod(directory, 0o755)
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                    with os.fdopen(os.open(ignore, flags, 0o444), "w", encoding="utf-8") as out:
+                        out.write(OPENCODE_SDK_CONFIG_IGNORE)
+                unexpected = sorted(
+                    entry.name
+                    for entry in directory.iterdir()
+                    if entry.name != OPENCODE_SDK_CONFIG_IGNORE_NAME
+                )
+                if (
+                    unexpected
+                    or ignore.is_symlink()
+                    or not ignore.is_file()
+                    or ignore.read_text(encoding="utf-8") != OPENCODE_SDK_CONFIG_IGNORE
+                ):
+                    named = ", ".join(unexpected[:5]) or OPENCODE_SDK_CONFIG_IGNORE_NAME
+                    raise ExecutionError(
+                        f"{OPENCODE_SDK}: the configuration directory {directory} holds what "
+                        f"AutoForge did not put there ({named}): an earlier launch wrote it, "
+                        "and the runtime would load it; inspect and remove it"
+                    )
+                os.chmod(directory, 0o555)
+            except OSError as exc:
+                raise ExecutionError(
+                    f"{OPENCODE_SDK}: cannot prepare the configuration directory {directory}: {exc}"
+                ) from exc
+
+    def start_for(self, req: AgentRequest, server_command: str) -> BridgeStart:
+        """A ``new`` start: a fresh session and input, both under caller ids
+        in the runtime's own format, the prompt, the model and its variant
+        (the profile's effort), the pinned runtime version and the policy."""
+        now_ms = int(time.time() * 1000)
+        provider_id, model_id = split_model(req.profile.model)
+        return BridgeStart(
+            server_command=server_command,
+            session_id=opencode_id("ses", now_ms, descending=True),
+            mode=BridgeMode.NEW,
+            input_id=opencode_id("msg", now_ms),
+            prompt=req.prompt,
+            cwd=req.cwd,
+            agent=OPENCODE_SDK_AGENT,
+            provider_id=provider_id,
+            model_id=model_id,
+            variant=req.profile.effort or None,
+            runtime_version=self.helper().runtime_version,
+            policy=self.policy(req.profile).start_fields(),
+            limits=self.limits,
+        )
+
+    def execute(self, req: AgentRequest) -> AgentExecutionResult:
+        """One bridge, one session, one admitted input, its final answer."""
+        return self.run_bridge(req, None)
+
+    def run_bridge(self, req: AgentRequest, start: BridgeStart | None) -> AgentExecutionResult:
+        """Run the bridge for ``start`` (a ``new`` start for ``req`` when
+        ``None``): the transport #126 continues and recovers a session through
+        (``continue``, ``recover``), with no client of its own (ADR 0007 D6.1).
+
+        The bridge runs under the request's idle limit and ceiling. When a
+        limit falls due with the turn still running, and not before, it is
+        cut short: the deadline is pinned, ``interrupt`` is sent and stdin
+        closed, and the duplex handle kills the group if the bridge has not
+        exited :data:`OPENCODE_SDK_WIND_DOWN_SECONDS` after the limit. The
+        result is then ``timed_out`` whatever the bridge said. A failure
+        inside the envelope, an ask that fails, or a bridge that reports a
+        failure is ``provider_failure``; the bridge is then asked to stop in
+        order, within :data:`OPENCODE_SDK_STOP_SECONDS`. ``exit_code`` is
+        always the bridge's real status, and ``stdout`` only the final
+        answer of the admitted input (D10.3).
+        """
+        problem = self.launch_problem()
+        if problem:
+            raise self._refuse_launch(problem)
+        profile = req.profile
+        self.credential_preflight(profile, req.env_allowlist)
+        policy = self.policy(profile)
+        pin = self.helper()
+        roots = self.roots(req)
+        allowlist = self.environment_allowlist(req)
+        env = {**(req.env or {}), **policy.environment(roots)}
+        launch_env = {**self._inherited(allowlist), **env}
+        server = self.server_path(profile, launch_env)
+        if not server:
+            raise ConfigurationError(
+                f"refusing to launch {profile.name!r}: options.server_command "
+                f"{policy.server_command!r} is not an executable on the launch's PATH"
+            )
+        if start is None:
+            start = self.start_for(req, server)
+        emit = guarded(req.progress)
+        monitor = _loop_monitor(req, emit)
+        conversation = BridgeConversation(
+            start,
+            sdk_version=pin.sdk_version,
+            node_minimum=pin.interpreter_minimum,
+            emit=emit,
+            loop=monitor,
+        )
+        with staged_helper(pin) as helper_path:
+            command, description = self.sandboxed(req, [profile.command, helper_path], env)
+            duplex = DuplexRequest(
+                command=command,
+                cwd=req.cwd,
+                env_allowlist=allowlist,
+                env=env,
+                idle_timeout_seconds=req.idle_timeout_seconds,
+                max_runtime_seconds=req.max_runtime_seconds,
+                wind_down_seconds=self.wind_down_seconds,
+                max_record_bytes=start.limits.max_record_bytes,
+                max_pending_bytes=2 * start.limits.max_record_bytes,
+                # The runtime's tools may detach from the group (ADR 0002).
+                contain_orphans=True,
+                sandbox=description,
+            )
+            with start_duplex(duplex) as child:
+                cut_short = self._converse(child, conversation, req.interaction, monitor)
+                cut_limit = child.deadline_limit if cut_short else ""
+                if cut_short:
+                    conversation.deadline_reached()
+                child.close_stdin()
+                res = child.finish()
+        return self._result(req, res, conversation, monitor, cut_short, cut_limit)
+
+    def _result(
+        self,
+        req: AgentRequest,
+        res,
+        conversation: BridgeConversation,
+        monitor: LoopMonitor,
+        cut_short: bool,
+        cut_limit: str,
+    ) -> AgentExecutionResult:
+        timed_out = cut_short or res.timed_out or res.stopped
+        failure = conversation.failure
+        if failure is None and res.records_overflowed:
+            failure = f"{self.name}: protocol violation: records arrived faster than they were read"
+        if failure is None and not timed_out and not conversation.done:
+            failure = f"{self.name}: the bridge ended without its last record"
+        if failure is None and res.exit_code != 0 and not timed_out:
+            failure = f"{self.name}: the bridge exited {res.exit_code} after its last record"
+        if failure is not None and conversation.exited_early:
+            failure = f"{failure} (exit {res.exit_code})"
+        summary = conversation.summary()
+        if failure is not None:
+            summary["failure"] = failure
+        text = conversation.text if failure is None and not conversation.interrupted else None
+        if failure is None and not timed_out and text is None:
+            failure = f"{self.name}: the turn was interrupted before it answered"
+        stdout, truncated = _keep_tail(text or "", self.max_text_bytes)
+        broker = req.interaction
+        interaction = broker.outcome() if broker is not None else None
+        if (
+            interaction is not None
+            and interaction.lifecycle is Lifecycle.COMPLETED
+            and conversation.interrupted
+            and not timed_out
+        ):
+            interaction = InteractionOutcome(Lifecycle.INTERRUPTED)
+        result = AgentExecutionResult(
+            command=list(res.command),
+            exit_code=res.exit_code,
+            stdout=stdout,
+            stderr=res.stderr,
+            started_at=res.started_at,
+            finished_at=res.finished_at,
+            timed_out=timed_out,
+            provider=req.profile.provider,
+            model=req.profile.model,
+            effort=req.profile.effort,
+            stdout_truncated=truncated,
+            stderr_truncated=res.stderr_truncated,
+            stdout_tail_offset=0,
+            descendants_killed=res.descendants_killed,
+            group_survived_kill=res.group_survived_kill,
+            capture_abandoned=res.capture_abandoned,
+            orphans_killed=res.orphans_killed,
+            orphan_survived_kill=res.orphan_survived_kill,
+            orphans_unchecked=res.orphans_unchecked,
+            # A timeout wins over whatever the envelope said (ADR 0003 §2.6).
+            provider_failure=None if timed_out else failure,
+            transient_failure=None if timed_out or failure is None else conversation.transient(),
+            provider_summary=summary,
+            timeout_limit=(res.timeout_limit or cut_limit) if timed_out else "",
+            last_activity_at=res.last_activity_at,
+            sandbox=res.sandbox,
+            interaction=interaction,
+        )
+        return _finish_loop(result, monitor, killed=res.stopped)
+
+    def _send(
+        self, child: DuplexChild, conversation: BridgeConversation, lines: list[bytes]
+    ) -> None:
+        for line in lines:
+            try:
+                child.send_line(line)
+            except ChildStdinClosedError:
+                conversation.stdin_closed()
+                return
+
+    def _converse(
+        self,
+        child: DuplexChild,
+        conversation: BridgeConversation,
+        broker: InteractionBroker | None,
+        loop: LoopMonitor,
+    ) -> bool:
+        """Drive the envelope to its outcome; True when a limit cut it short.
+
+        Once the conversation has failed (the reducer's finding, a failed
+        ask, the bridge's own failure record) the bridge is asked to stop in
+        order (``interrupt``, then end of stdin) and given
+        :attr:`stop_seconds` for its last record, within the deadline. A
+        loop verdict (#194) stops the bridge at once, as for the other
+        providers.
+        """
+        stopping_until: float | None = None
+        try:
+            while not conversation.done:
+                now = time.monotonic()
+                due = child.limit_due()
+                if now >= due:
+                    child.pin_deadline()
+                    if stopping_until is None:
+                        self._send(child, conversation, conversation.interrupt())
+                    return stopping_until is None
+                if conversation.failure is not None and stopping_until is None:
+                    self._send(child, conversation, conversation.interrupt())
+                    child.close_stdin()
+                    stopping_until = now + self.stop_seconds
+                until = due if stopping_until is None else min(due, stopping_until)
+                if stopping_until is not None and now >= stopping_until:
+                    return False
+                item = child.read_line(timeout=max(0.0, until - now))
+                if isinstance(item, Record):
+                    replies, ask = conversation.feed(item.data, time.monotonic())
+                    if loop.verdict is not None and child.stop():
+                        return False
+                    if stopping_until is not None:
+                        # Its stdin is closed: what it still says is read for
+                        # its last record, and nothing more is asked or sent.
+                        continue
+                    self._send(child, conversation, replies)
+                    if ask is not None:
+                        self._send(child, conversation, self._ask(child, conversation, broker, ask))
+                elif isinstance(item, Oversize):
+                    conversation.oversize(item.head, item.limit)
+                elif isinstance(item, Fragment):
+                    conversation.framing_error("stdout ended inside an unterminated record")
+                elif isinstance(item, Overflow):
+                    conversation.framing_error("stdout records arrived faster than they were read")
+                    return False
+                elif isinstance(item, Eof):
+                    conversation.stream_ended()
+                    return False
+                elif item.deadline_exceeded:
+                    return stopping_until is None
+        except ExecutionTimeoutError:
+            return True  # a write overran the deadline; the group is gone
+        return False
+
+    def _ask(
+        self,
+        child: DuplexChild,
+        conversation: BridgeConversation,
+        broker: InteractionBroker | None,
+        ask: BridgeAsk,
+    ) -> list[bytes]:
+        """The broker's directive for ``ask``, as the bridge's decision (D5.2).
+
+        The ask is minted through the broker, which renders and bounds it; a
+        rendering the broker refuses fails the invocation without reaching
+        anyone (D10.4). The broker waits under the invocation's limit
+        (``limit_due``), never past it.
+        """
+        if broker is None:
+            return conversation.refused(
+                ask, f"{self.name}: the agent asked for a decision and the launch has no broker"
+            )
+        try:
+            if ask.kind is RequestKind.QUESTION:
+                request = broker.question(ask.provider_request_id, ask.questions)
+            else:
+                request = broker.permission(
+                    ask.provider_request_id, ask.permission, ask.summary, ask.input_sha256
+                )
+        except InteractionDataError as exc:
+            return conversation.refused(
+                ask, f"{self.name}: an ask the broker cannot render ({exc}); it was rejected"
+            )
+        return conversation.decided(ask, broker.handle(request, child.limit_due()))
 
 
 ScriptHandler = Callable[[AgentRequest], str]

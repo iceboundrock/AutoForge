@@ -141,7 +141,10 @@ bytes, so update it to what the new one shows, never the fixture.
 ## The outer sandbox
 
 `tests/test_sandbox_bwrap.py`, `tests/test_sandbox_routing.py` and
-`tests/test_sandbox_parity.py` launch the real backend (`bwrap`). Each
+`tests/test_sandbox_parity.py` launch the real backend (`bwrap`), and so
+does `tests/test_opencode_sdk_gates.py`, which is opt-in besides: without
+the pinned OpenCode runtime named in `AUTOFORGE_OPENCODE_SDK_GATE_RUNTIME`
+it skips before the backend is asked, and says why. Each
 first runs the backend's own capability probe
 (`autoforge.sandbox_bwrap.probe`, ADR 0005 D14.1) and, on a host that
 cannot enforce, skips with the probe's typed reason: which capability is
@@ -245,8 +248,8 @@ credential:
    the way the engine does, each phase template with its common template;
    reads the SDK helper manifest from the installed package and renders
    each SDK provider's helper argv and plan without any SDK imported
-   (#150; the helper programs themselves, and the checks of their lock or
-   bundle, are #151's and #152's);
+   (#150), and checks that the OpenCode bridge it ships matches the
+   manifest's sha256 (#152; the Claude helper is #151's);
 6. runs a REMOTE dry run (`autoforge run --epic ... --issue ...
    --dry-run --full-prompt`) in a scratch repository whose `origin` is the
    issues' repository, with a fake `gh` first on `PATH` that records every
@@ -306,6 +309,38 @@ out, when code reads a package resource from a module it does not know,
 when the two version strings differ, when the classifiers drift from
 the Python versions CI runs, or when the starters of `examples/` and the
 CLIs they route to drift from what step 7 expects.
+
+## The OpenCode bridge
+
+The `opencode-sdk` provider runs one program of AutoForge's that is not
+Python: `src/autoforge/sdk_helpers/opencode_bridge.mjs`, a single ES module
+with `@opencode-ai/sdk`'s client inlined (ADR 0007 D2.2 and its #152
+amendment). It is generated: never edit it. Its source, pins and lock are
+in `helpers/opencode-bridge/`, and building it needs Node 24 or later and
+npm:
+
+```sh
+cd helpers/opencode-bridge
+npm ci              # the exact pins of package-lock.json, for the build only
+npm run build       # writes the bundle and its sha256 into the manifest
+npm run check       # fails when the bundle or the sha256 differs from a fresh build,
+                    # then type-checks the source against the SDK's declarations
+```
+
+Commit the bundle and `src/autoforge/sdk_helpers/manifest.json` together.
+The adapter refuses to stage a bundle whose sha256 is not the manifest's,
+and the suite stages the real one, so a bundle edited by hand, or rebuilt
+without its manifest, fails `make check`. CI checks that digest on every
+run but does not rebuild the bundle. A change that moves it runs
+`npm run check` itself; moving the pinned pair is an ADR 0007 amendment
+(D4.6).
+
+`tests/test_opencode_sdk_provider.py` runs the real bundle against a fake
+OpenCode server (`tests/opencode_fake.py`) and needs Node 24 or later on
+`PATH`. Without it those tests skip and say why;
+`AUTOFORGE_REQUIRE_NODE_BRIDGE=1` makes them fail instead. The gates of ADR
+0007 §3, against the pinned runtime under the sandbox, are opt-in:
+[SDK policy, Tests](sdk-policy.md#tests).
 
 ## The suite on several workers
 

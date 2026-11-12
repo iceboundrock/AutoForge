@@ -150,6 +150,7 @@ COVERAGE: Mapping[str, Entry] = {
         "test_engine",
     ),
     "src/autoforge/ownership.py": ("test_cli", "test_engine"),
+    "src/autoforge/opencode_sdk.py": ("test_opencode_sdk_provider",),
     "src/autoforge/pi_rpc.py": ("test_providers", "test_live_pi_support"),
     "src/autoforge/premerge.py": ("test_engine", "test_merge_certificate"),
     # every protocol refusal's text, and doctor's controller row (#265)
@@ -176,8 +177,12 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/scheduler_state.py": (),
     "src/autoforge/scheduler_stop.py": (),
     "src/autoforge/sdk_assets.py": ("test_sdk_profiles", "test_doctor", "test_packaging"),
-    # the packaged helper manifest (#150)
-    "src/autoforge/sdk_helpers/": ("test_sdk_profiles", "test_packaging"),
+    # the packaged helper manifest (#150) and the OpenCode bridge it pins (#152)
+    "src/autoforge/sdk_helpers/": (
+        "test_sdk_profiles",
+        "test_packaging",
+        "test_opencode_sdk_provider",
+    ),
     "src/autoforge/sdk_policy.py": ("test_cli",),
     # the engine's sinks and the CLI's stop lines import it (#369)
     "src/autoforge/stop_classification.py": ("test_cli", "test_engine"),
@@ -196,11 +201,16 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/stop_corpus.py": (),
     "tests/live_pi.py": (),
     "tests/operator_comment_fidelity.py": (),
+    "tests/opencode_fake.py": ("test_opencode_sdk_provider",),
+    "tests/opencode_standin.py": ("test_opencode_sdk_gates",),
     "tests/parallel_bench.py": ("test_suite_performance_audit",),  # via suite_comparison
     "tests/pi_fake.py": (),
     "tests/sandbox_host.py": (),
     "tests/scheduler_worker.py": ("test_scheduler", "test_epic_commands", "test_epic_recovery"),
     "tests/suite_comparison.py": (),
+    # The OpenCode bridge's source, lock and build (#152): what they build is
+    # the packaged bundle, which these run
+    "helpers/opencode-bridge/": ("test_opencode_sdk_provider", "test_sdk_profiles"),
     # The evaluation protocol's pinned tasks, thresholds and fixtures (#318)
     "tests/fixtures/evaluation/": ("test_evaluation", "test_evaluation_fixture"),
     # EPIC #338's exit audit: its runs' records, which its section 1 is held to

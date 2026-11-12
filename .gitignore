@@ -25,3 +25,6 @@ autoforge.local.yml
 autoforge.local.toml
 autoforge.local.json
 .env
+
+# The OpenCode bridge's build dependencies (helpers/opencode-bridge/)
+node_modules/
