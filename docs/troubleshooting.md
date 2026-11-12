@@ -298,7 +298,9 @@ failed, and run the printed `resume`. It starts a fresh agent session with the s
 re-entry reads GitHub first, so work that already landed is adopted, not
 repeated ([Workflow: re-entering a phase](agent-guides/workflow.md#re-entering-a-phase)).
 Each `resume` that launches counts one step toward
-`workflow.max_total_steps`.
+`workflow.max_total_steps`, and so does each correction or transient
+relaunch inside a step: every agent launch is charged before it starts, and
+a relaunch with no step left stops in `BLOCKED` (`step-budget`) instead.
 
 ## Automatic recovery: one relaunch per step
 
@@ -309,13 +311,17 @@ background between commands. The rule reads typed facts only, never the
 error's text:
 
 - **Relaunched:** an agent killed at its idle limit, and an agent CLI that
-  ended without delivering any result as its adapter typed it (Claude
-  Code's `stream-json` stream with no result record).
+  died inside a running session before delivering any result, as its
+  adapter typed it (Claude Code's `stream-json` stream: the CLI's `init` and
+  a tool call of the model's, then no result record).
 - **Never relaunched:** a maximum runtime or a loop kill, a provider's usage
   or rate limit (`stop: resumable_error (reason provider-usage-limit, ...)`),
-  a request for your decision, an untyped exit, a result refused after its
-  corrections, a sandbox refusal, a GitHub failure or drift, a failed
-  verification, and anything unknown.
+  also when a limit killed the CLI after it had reported the limit, a
+  request for your decision, an untyped exit (an empty stream among them:
+  a CLI that failed to authenticate, to load its configuration or to write
+  to a full disk prints nothing on stdout, and stderr is never read for
+  this), a result refused after its corrections, a sandbox refusal, a
+  GitHub failure or drift, a failed verification, and anything unknown.
 - **Refused even then:** when a process the launch started may still be
   running (`process-may-survive`), when the killed launch had already
   printed a complete `CONTROL_RESULT` (`result-delivered`: a relaunch would
@@ -331,10 +337,22 @@ exactly as `resume` would, reading GitHub first. It counts one step toward
 `workflow.max_total_steps`, like your own `resume`. Every decision, relaunch
 or refusal, is saved in the state, written to the run log
 (`<PHASE>-auto-recovery`) and posted as a comment on the PR, or on the
-issue before there is a PR, headed `AutoForge automatic recovery`. If that
-comment cannot be posted, nothing is relaunched, and your next command posts
-it first. `status` shows the step's allowance and its decisions under
-`Automatic recovery`.
+issue before there is a PR, headed `AutoForge automatic recovery`. If either
+cannot be completed, nothing is relaunched, and your next `run`, `resume` or
+`step` completes it first, once (a crash in between neither loses nor
+repeats it), and executes nothing until it has:
+
+- the run log refusing the record, or GitHub not answering, stops the
+  command with the phase unchanged; fix the cause and `resume`;
+- a conclusive GitHub failure (`github-read-failed`), or a comment in
+  conflict (`effect-conflict`: a second comment carrying the decision's
+  marker, or one whose text was edited), enters `BLOCKED`, naming the target
+  and the marker. Remove the comments that are not the controller's text
+  (or restore it), then `unblock`; the next command adopts the comment or
+  posts it once.
+
+`status` shows the step's allowance and its decisions under `Automatic
+recovery`, with any record not yet complete.
 
 After a refusal, recover as for any failed launch above. A step whose
 automatic relaunch is spent is not refilled by `resume`, a crash or

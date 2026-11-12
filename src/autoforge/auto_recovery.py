@@ -17,10 +17,12 @@ worker) do that ``resume`` itself, once per step, under a fixed rule:
   classification: a reason code is evidence, never an authority (ADR 0011
   D3), and this module does not import :mod:`autoforge.stop_classification`.
 - **The allowlist** (:data:`ALLOWLIST`, D3): an idle timeout, and a
-  result-less exit the adapter typed as such (D5). Everything else is
-  refused and stays the operator's: a hard runtime limit, a loop kill, a
-  provider's usage limit (D4: never retried at once; no adapter reports a
-  reset time it can trust, and no wait policy exists), a known-transient
+  result-less exit the adapter typed as such from positive evidence that
+  the session ran (D5; never the mere absence of a result). Everything else
+  is refused and stays the operator's: a hard runtime limit, a loop kill, a
+  provider's usage limit (D4: never retried at once, whatever ended the
+  launch after it; no adapter reports a reset time it can trust, and no
+  wait policy exists), a known-transient
   failure whose in-step bound is spent (D6), a request for a human decision,
   a sandbox refusal, a GitHub failure or drift (D6), a failed verification,
   an untyped exit and anything unknown.
@@ -33,7 +35,8 @@ worker) do that ``resume`` itself, once per step, under a fixed rule:
   run, charged against ``workflow.max_total_steps`` like any step, and one
   more step of the invocation's ``--max-steps``; a worker asked to stop is
   not relaunched. The in-step bounds (corrections, ``MAX_TRANSIENT_RETRIES``,
-  the pushed-head wait) are unchanged and come first (D6).
+  the pushed-head wait) are unchanged and come first (D6), and each of their
+  relaunches is charged as a step too, by the engine, before it starts.
 - **Safe re-entry** (D5): the relaunch is the very path ``resume`` takes,
   the phase-entry reconciliation first (journal, effects, candidate,
   worktree), so a step whose work already landed is completed without an
@@ -46,7 +49,11 @@ worker) do that ``resume`` itself, once per step, under a fixed rule:
   :class:`autoforge.effect_ops.RecoveryAuditCommentOp`) on the run's PR, or
   on its issue while it has none, through the idempotent effect path: an
   ``attempted`` record is saved before the write and the comment is found by
-  its marker before anything is sent again. Neither sink is a recovery input.
+  its marker before anything is sent again. The run log record is journaled
+  the same way (:class:`RunLogProgress`). A decision is settled once both
+  are complete; an unsettled one is never dropped, and no command executes
+  anything before completing it, or stopping. Neither sink is a recovery
+  input.
 
 Pure: no I/O, no clock, no GitHub, no state write. The engine gathers the
 facts, persists the journal and performs the audit.
@@ -65,18 +72,24 @@ from .effects import (
     EffectKind,
     EffectOwner,
     EffectRecord,
+    Stage,
     recovery_audit_comment_body,
 )
 from .redaction import redact
+from .runlog import STEP_DIR_RE
 from .transitions import AGENT_PHASES, Phase
 from .validation import parse_issue_url, parse_pr_url
 
 #: D1, D5, D7: automatic paid relaunches of one step, whatever failed.
 MAX_AUTOMATIC_RELAUNCHES_PER_STEP = 1
 #: Decisions the journal keeps (those of the current step, and an older
-#: step's while its audit comment is pending).
+#: step's until both its audit records are complete). An unsettled decision
+#: is never dropped: past the bound the journal refuses a new one instead.
 MAX_RECOVERY_DECISIONS = 16
 _MAX_TEXT_CHARS = 64
+#: The longest typed evidence a decision keeps (:meth:`LaunchEnd.evidence`).
+MAX_EVIDENCE_CHARS = 1024
+_MAX_STEP_DIR_CHARS = 128
 _MAX_ERROR_CLASS_CHARS = 64
 _ERROR_CLASS_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 _TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
@@ -110,9 +123,11 @@ class LaunchEnd:
     may_have_survivor: bool = False
     #: Its output holds a complete ``CONTROL_RESULT`` block (#285, #479).
     delivered_result: bool = False
-    #: The adapter typed the failure as an exit without any result (D5).
+    #: The adapter typed the failure as an exit without any result (D5): the
+    #: CLI died on its own inside a session its stream shows was running.
     result_less_exit: bool = False
-    #: The adapter's fixed reason for a provider usage or rate limit (D4).
+    #: The adapter's fixed reason for a provider usage or rate limit (D4),
+    #: kept whatever ended the launch after it, a limit included.
     usage_limit: str = ""
     #: A reset time the provider reported in a form the adapter trusts.
     usage_reset_at: str = ""
@@ -264,6 +279,12 @@ def categorize(exc: BaseException) -> RecoveryCategory:
     """The category of ``exc``: from its typed launch facts, else its class."""
     launch = launch_end_of(exc)
     if launch is not None:
+        if launch.usage_limit:
+            # First, whatever ended the launch after it (D4): a provider that
+            # refused it at a limit refuses a relaunch now too, so a CLI that
+            # then idled until its limit killed it is no idle timeout to
+            # relaunch (R1-F2 of PR #480).
+            return _RC.PROVIDER_USAGE_LIMIT
         if launch.kind is LaunchEndKind.TIMEOUT:
             return {
                 "idle": _RC.IDLE_TIMEOUT,
@@ -272,8 +293,6 @@ def categorize(exc: BaseException) -> RecoveryCategory:
             }.get(launch.timeout_limit, _RC.TIMEOUT_UNTYPED)
         if launch.kind is LaunchEndKind.INTERACTION:
             return _RC.INTERACTION_REQUIRED
-        if launch.usage_limit:
-            return _RC.PROVIDER_USAGE_LIMIT
         if launch.transient_failure:
             return _RC.TRANSIENT_EXHAUSTED
         if launch.result_less_exit:
@@ -356,10 +375,15 @@ class RecoveryDecision:
 
     def text(self) -> str:
         """One line: what failed, and what the rule decided. Typed values only."""
-        what = f"{self.category.value} ({CATEGORY_TEXT[self.category]})"
-        if self.refusal is None:
-            return f"relaunch allowed: {what}"
-        return f"relaunch refused ({self.refusal.value}): {what}; {REFUSAL_TEXT[self.refusal]}"
+        return decision_text(self.category, self.refusal)
+
+
+def decision_text(category: RecoveryCategory, refusal: Refusal | None) -> str:
+    """One line: what failed, and what the rule decided. Typed values only."""
+    what = f"{category.value} ({CATEGORY_TEXT[category]})"
+    if refusal is None:
+        return f"relaunch allowed: {what}"
+    return f"relaunch refused ({refusal.value}): {what}; {REFUSAL_TEXT[refusal]}"
 
 
 def decide(exc: BaseException, bounds: Bounds) -> RecoveryDecision:
@@ -513,9 +537,54 @@ class StepKey:
         )
 
 
+class RunLogStage(StrEnum):
+    """How far a decision's run log record is (D8; R1-F4 of PR #480)."""
+
+    #: Not written yet: nothing of it was attempted.
+    INTENDED = "intended"
+    #: Its step directory was named and saved, then the write began: whether
+    #: it landed is read from the run log (that directory's record) before
+    #: anything is written again.
+    ATTEMPTED = "attempted"
+    #: Written, in the step directory named.
+    WRITTEN = "written"
+
+
+@dataclass(frozen=True)
+class RunLogProgress:
+    """A decision's run log record: its stage, and the step directory it went to.
+
+    The run log is an audit sink, never read for a decision: only the one
+    directory named here is looked for, after a crash between the write and
+    the save that records it, so the record is completed once, never twice.
+    """
+
+    stage: RunLogStage = RunLogStage.INTENDED
+    step_dir: str = ""
+
+    _KEYS = ("stage", "step_dir")
+
+    def to_dict(self) -> dict:
+        return {"stage": self.stage.value, "step_dir": self.step_dir}
+
+    @classmethod
+    def from_dict(cls, raw: object, what: str) -> RunLogProgress:
+        data = _exact(raw, cls._KEYS, what)
+        try:
+            stage = RunLogStage(_str(data["stage"], f"{what}.stage", _MAX_TEXT_CHARS))
+        except ValueError:
+            raise _fail(f"{what}.stage", "is not a run log stage") from None
+        step_dir = _str(data["step_dir"], f"{what}.step_dir", _MAX_STEP_DIR_CHARS)
+        if stage is RunLogStage.INTENDED and step_dir:
+            raise _fail(what, "names a step directory before its write was attempted")
+        if stage is not RunLogStage.INTENDED and not STEP_DIR_RE.fullmatch(step_dir):
+            raise _fail(f"{what}.step_dir", "must name a step directory of the run log")
+        return cls(stage, step_dir)
+
+
 @dataclass(frozen=True)
 class DecisionEntry:
-    """One persisted decision: its identity, its accounting and its audit record."""
+    """One persisted decision: its identity, its accounting and its audit records."""
 
     seq: int
     decided_at: str
@@ -530,8 +599,13 @@ class DecisionEntry:
     refusal: Refusal | None
     #: The step's automatic relaunches once this decision was taken.
     relaunches: int
+    #: The typed facts it was taken on (:meth:`LaunchEnd.evidence`), for the
+    #: run log record a later command may have to complete.
+    evidence: str
     #: The K13 audit comment of the decision (D8).
     audit: EffectRecord
+    #: Its run log record (D8): how far it is, and where it went.
+    run_log: RunLogProgress = RunLogProgress()
 
     _KEYS = (
         "seq",
@@ -543,12 +617,27 @@ class DecisionEntry:
         "category",
         "refusal",
         "relaunches",
+        "evidence",
         "audit",
+        "run_log",
     )
 
     @property
     def allowed(self) -> bool:
         return self.refusal is None
+
+    @property
+    def settled(self) -> bool:
+        """Both audit records are complete: its comment observed, its run log written.
+
+        Until then the decision is never dropped from the journal, and no
+        command executes anything before completing it, or stopping
+        (R1-F4, R1-F5 of PR #480).
+        """
+        return self.audit.stage is Stage.OBSERVED and self.run_log.stage is RunLogStage.WRITTEN
+
+    def text(self) -> str:
+        return decision_text(self.category, self.refusal)
 
     @property
     def phase(self) -> Phase:
@@ -565,7 +654,9 @@ class DecisionEntry:
             "category": self.category.value,
             "refusal": self.refusal.value if self.refusal is not None else "",
             "relaunches": self.relaunches,
+            "evidence": self.evidence,
             "audit": self.audit.to_dict(),
+            "run_log": self.run_log.to_dict(),
         }
 
     @classmethod
@@ -624,7 +715,9 @@ class DecisionEntry:
             category=category,
             refusal=refusal,
             relaunches=relaunches,
+            evidence=_str(data["evidence"], f"{what}.evidence", MAX_EVIDENCE_CHARS),
             audit=audit,
+            run_log=RunLogProgress.from_dict(data["run_log"], f"{what}.run_log"),
         )
 
 
@@ -637,8 +730,8 @@ class RecoveryJournal:
     :data:`MAX_AUTOMATIC_RELAUNCHES_PER_STEP`); ``categories`` how many of
     its failures each category had, which grants nothing; ``seq`` the run's
     last decision number; ``decisions`` the decisions of this step, and an
-    earlier step's while its audit comment is still pending, oldest first.
-    The empty journal (no decision ever) is saved as ``{}``.
+    earlier step's until it is settled (:attr:`DecisionEntry.settled`),
+    oldest first. The empty journal (no decision ever) is saved as ``{}``.
     """
 
     step: StepKey | None = None
@@ -699,16 +792,23 @@ class RecoveryJournal:
         if allowed > relaunches:
             raise _fail("relaunches", "counts fewer relaunches than its step's decisions made")
         for entry in decisions:
-            if entry.step != step and not entry.audit.pending:
+            if entry.step != step and entry.settled:
                 raise _fail(
                     "decisions", "keeps a settled decision of an earlier step, which it drops"
                 )
         return cls(step, relaunches, categories, seq, decisions)
 
+    def entry(self, seq: int) -> DecisionEntry:
+        """Decision ``seq``, which the journal must hold."""
+        found = next((d for d in self.decisions if d.seq == seq), None)
+        if found is None:
+            raise errors.StateError(f"no recovery decision {seq} is journaled")
+        return found
+
     def for_step(self, key: StepKey) -> RecoveryJournal:
         """This journal for the step ``key``: unchanged for its own step; for
         another, a fresh allowance and counters, keeping only the earlier
-        decisions whose audit comment is still pending."""
+        decisions not yet settled."""
         if self.step == key:
             return self
         return RecoveryJournal(
@@ -716,55 +816,73 @@ class RecoveryJournal:
             relaunches=0,
             categories={},
             seq=self.seq,
-            decisions=tuple(d for d in self.decisions if d.audit.pending),
+            decisions=tuple(d for d in self.decisions if not d.settled),
         )
 
-    def with_decision(
-        self, entry: DecisionEntry
-    ) -> tuple[RecoveryJournal, tuple[DecisionEntry, ...]]:
-        """The journal with ``entry`` appended and counted, and the entries it dropped.
+    def with_decision(self, entry: DecisionEntry) -> RecoveryJournal:
+        """The journal with ``entry`` appended and counted.
 
-        Past :data:`MAX_RECOVERY_DECISIONS` the oldest settled entries go
-        first; only when none is settled does a pending one go (its audit is
-        then the run log's alone, which the caller records).
+        Past :data:`MAX_RECOVERY_DECISIONS` the oldest settled entries go.
+        An unsettled one never does (R1-F5 of PR #480): its audit would be
+        lost for good. A journal whose every entry is unsettled refuses the
+        new one instead, which no run reaches, since no command executes a
+        step before the decisions it finds are settled.
         """
         if self.step is None or entry.step != self.step:
             raise errors.StateError("a recovery decision is journaled for its own step only")
         decisions = [*self.decisions, entry]
-        dropped: list[DecisionEntry] = []
         while len(decisions) > MAX_RECOVERY_DECISIONS:
-            settled = next((d for d in decisions[:-1] if not d.audit.pending), None)
-            victim = settled if settled is not None else decisions[0]
-            decisions.remove(victim)
-            dropped.append(victim)
+            settled = next((d for d in decisions[:-1] if d.settled), None)
+            if settled is None:
+                raise errors.StateError(
+                    f"the recovery journal already holds {MAX_RECOVERY_DECISIONS} decisions "
+                    "whose audit is not complete; none is dropped, so no further decision "
+                    "is recorded until they are"
+                )
+            decisions.remove(settled)
         categories = dict(self.categories)
         categories[entry.category.value] = categories.get(entry.category.value, 0) + 1
-        journal = RecoveryJournal(
+        return RecoveryJournal(
             step=self.step,
             relaunches=entry.relaunches,
             categories=categories,
             seq=entry.seq,
             decisions=tuple(decisions),
         )
-        return journal, tuple(dropped)
 
-    def with_audit(self, seq: int, audit: EffectRecord) -> RecoveryJournal:
-        """The journal with decision ``seq``'s audit record replaced by ``audit``.
-
-        An earlier step's decision is kept only while its audit is pending,
-        so it is dropped once ``audit`` settles it.
-        """
-        if not any(d.seq == seq for d in self.decisions):
-            raise errors.StateError(f"no recovery decision {seq} is journaled")
+    def _with_entry(self, updated: DecisionEntry) -> RecoveryJournal:
+        """The journal with ``updated`` in place of its decision, an earlier
+        step's dropped once it is settled."""
+        self.entry(updated.seq)
         decisions = tuple(
-            replace(d, audit=audit) if d.seq == seq else d
+            updated if d.seq == updated.seq else d
             for d in self.decisions
-            if not (d.seq == seq and d.step != self.step and not audit.pending)
+            if not (d.seq == updated.seq and d.step != self.step and updated.settled)
         )
         return replace(self, decisions=decisions)
 
-    def pending_audits(self) -> tuple[DecisionEntry, ...]:
-        return tuple(d for d in self.decisions if d.audit.pending)
+    def with_audit(self, seq: int, audit: EffectRecord) -> RecoveryJournal:
+        """The journal with decision ``seq``'s audit record replaced by ``audit``."""
+        return self._with_entry(replace(self.entry(seq), audit=audit))
+
+    def with_run_log(self, seq: int, progress: RunLogProgress) -> RecoveryJournal:
+        """The journal with decision ``seq``'s run log progress replaced by ``progress``."""
+        return self._with_entry(replace(self.entry(seq), run_log=progress))
+
+    def unsettled(self) -> tuple[DecisionEntry, ...]:
+        """The decisions whose audit comment or run log record is not complete, oldest first."""
+        return tuple(d for d in self.decisions if not d.settled)
+
+    def reopened(self) -> RecoveryJournal:
+        """The journal with each conflicting audit reconciled again (an applied ``unblock``).
+
+        A ``conflict`` the operator has resolved on GitHub (a stray or edited
+        comment removed, the controller's text restored) is read again by
+        the next command, its attempt count kept (:meth:`EffectRecord.reopened`).
+        """
+        return replace(
+            self, decisions=tuple(replace(d, audit=d.audit.reopened()) for d in self.decisions)
+        )
 
 
 # -- the audit (D8) ----------------------------------------------------------------
@@ -859,6 +977,7 @@ __all__ = [
     "ALLOWLIST",
     "CATEGORY_TEXT",
     "MAX_AUTOMATIC_RELAUNCHES_PER_STEP",
+    "MAX_EVIDENCE_CHARS",
     "MAX_RECOVERY_DECISIONS",
     "REFUSAL_TEXT",
     "Bounds",
@@ -869,6 +988,8 @@ __all__ = [
     "RecoveryDecision",
     "RecoveryJournal",
     "Refusal",
+    "RunLogProgress",
+    "RunLogStage",
     "StepKey",
     "audit_record",
     "audit_target",
@@ -876,5 +997,6 @@ __all__ = [
     "categorize",
     "decide",
     "decides",
+    "decision_text",
     "launch_end_of",
 ]

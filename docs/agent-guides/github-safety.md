@@ -1405,7 +1405,12 @@ journal (`auto_recovery`), `effect_records` refuses it, and the generic `drive`
 issues it (attempted before the write, found by its marker before anything is
 sent again, read back). It is an audit sink: nothing reads the comment to
 decide anything, a failure to post it leaves its record for the next command,
-and an allowed relaunch waits for it.
+and an allowed relaunch waits for it. The command that finds it unposted
+executes nothing until it is (R1-F5 of PR #480): GitHub not answering stops
+that command with the phase unchanged, and a conclusive failure or a
+conflict (another comment carrying the marker, or one whose text is not the
+payload) enters `BLOCKED`; the operator resolves it on GitHub, and an applied
+`unblock` has it reconciled again.
 
 - **Typed writes, never retried blind.** `GitHubClient` has one method per
   write the effects need (`create_issue_comment`, `create_pr_comment`,

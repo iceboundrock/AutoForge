@@ -12525,7 +12525,9 @@ def test_openai_websocket_disconnect_is_relaunched_at_most_twice_per_step(
     assert "State unchanged" in message and "resume" in message
     state = load_state(eng.paths.state_file)
     assert state.phase == Phase.REVIEW and state.review_round == 0
-    assert state.current_pr_url == PR and state.attempt == 3 and state.step_count == 1
+    # #434 (D7): each relaunch is a physical launch, charged as one more step.
+    assert state.current_pr_url == PR and state.attempt == 3
+    assert state.step_count == 1 + MAX_TRANSIENT_RETRIES
     assert len(calls) == 1 + MAX_TRANSIENT_RETRIES
     run_dir, _ = _step_dir(eng)
     steps = sorted(p for p in run_dir.iterdir() if p.is_dir())

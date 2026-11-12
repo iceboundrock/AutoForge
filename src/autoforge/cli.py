@@ -71,7 +71,7 @@ from typing import TextIO
 
 from . import __version__
 from .auto_recovery import ALLOWLIST as RECOVERY_ALLOWLIST
-from .auto_recovery import MAX_AUTOMATIC_RELAUNCHES_PER_STEP, RecoveryJournal
+from .auto_recovery import MAX_AUTOMATIC_RELAUNCHES_PER_STEP, RecoveryJournal, RunLogStage
 from .certificate import NOT_A_PERMISSION
 from .certificate import describe as describe_certificate
 from .config import (
@@ -3015,6 +3015,9 @@ def _render_auto_recovery(state: AutoForgeState, engine: ControllerEngine) -> li
         verdict = "relaunch" if entry.allowed else f"refused ({entry.refusal})"
         url = str((entry.audit.observed or {}).get("url", ""))
         audit = url or f"audit comment {entry.audit.stage.value}"
+        if entry.run_log.stage is not RunLogStage.WRITTEN:
+            # R1-F4 of PR #480: completed by the next command, before it executes anything.
+            audit += f"; run log record {entry.run_log.stage.value}"
         lines.append(
             f"  decision {entry.seq}:    {entry.category.value}, {verdict}, at "
             f"{entry.decided_at} ({audit})"

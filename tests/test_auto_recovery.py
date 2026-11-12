@@ -29,6 +29,8 @@ from autoforge.auto_recovery import (
     RecoveryCategory,
     RecoveryJournal,
     Refusal,
+    RunLogProgress,
+    RunLogStage,
     StepKey,
     audit_record,
     audit_text,
@@ -267,14 +269,24 @@ def _entry(seq: int, exc=None, *, step: StepKey = STEP, bounds: Bounds = GOOD) -
         category=decision.category,
         refusal=decision.refusal,
         relaunches=relaunches,
+        evidence=decision.evidence,
         audit=audit_record(owner, seq, text),
+    )
+
+
+def _settled(entry: DecisionEntry, comment: int = 7) -> DecisionEntry:
+    """``entry`` with both its audit records complete (R1-F4 of PR #480)."""
+    return replace(
+        entry,
+        audit=entry.audit.observing({"url": f"{PR}#issuecomment-{comment}"}),
+        run_log=RunLogProgress(RunLogStage.WRITTEN, f"{entry.seq:03d}-fix-auto-recovery-2"),
     )
 
 
 def _journal(*entries: DecisionEntry) -> RecoveryJournal:
     journal = RecoveryJournal().for_step(STEP)
     for entry in entries:
-        journal, _ = journal.with_decision(entry)
+        journal = journal.with_decision(entry)
     return journal
 
 
@@ -298,45 +310,53 @@ def test_a_category_counter_grants_nothing():
     second = decide(_limited(), bounds)
     third = decide(_result_less(), bounds)
     assert (second.refusal, third.refusal) == (Refusal.NO_TRUSTED_RESET, Refusal.ALLOWANCE_SPENT)
-    journal, _ = journal.with_decision(_entry(2, _limited(), bounds=bounds))
+    journal = journal.with_decision(_entry(2, _limited(), bounds=bounds))
     assert journal.relaunches == 1
     assert dict(journal.categories) == {"idle-timeout": 1, "provider-usage-limit": 1}
 
 
-def test_another_step_gets_a_fresh_allowance_and_keeps_only_pending_audits():
-    settled = _entry(1)
-    settled = replace(settled, audit=settled.audit.observing({"url": f"{PR}#issuecomment-7"}))
-    pending = _entry(2, bounds=replace(GOOD, relaunches_used=1))
-    journal = _journal(settled, pending)
+def test_another_step_gets_a_fresh_allowance_and_keeps_only_unsettled_decisions():
+    settled = _settled(_entry(1))
+    # Its comment is observed, but its run log record was never written.
+    unlogged = _entry(2, bounds=replace(GOOD, relaunches_used=1))
+    unlogged = replace(unlogged, audit=unlogged.audit.observing({"url": f"{PR}#issuecomment-8"}))
+    pending = _entry(3, bounds=replace(GOOD, relaunches_used=1))
+    journal = _journal(settled, unlogged, pending)
     later = StepKey(Phase.REVIEW, ISSUE, PR, 3, 1)
     moved = journal.for_step(later)
     assert (moved.step, moved.relaunches, dict(moved.categories)) == (later, 0, {})
-    assert [d.seq for d in moved.decisions] == [2] and moved.seq == 2
+    assert [d.seq for d in moved.decisions] == [2, 3] and moved.seq == 3
+    assert [d.seq for d in moved.unsettled()] == [2, 3]
     assert journal.for_step(STEP) is journal
-    # Settling the earlier step's pending audit drops it.
-    observed = pending.audit.observing({"url": f"{PR}#issuecomment-8"})
-    assert moved.with_audit(2, observed).decisions == ()
+    RecoveryJournal.from_dict(moved.to_dict(), RUN)
+    # Completing an earlier step's decision drops it, once both halves are done.
+    written = RunLogProgress(RunLogStage.WRITTEN, "009-fix-auto-recovery-2")
+    moved = moved.with_run_log(2, written)
+    assert [d.seq for d in moved.decisions] == [3]
+    observed = pending.audit.observing({"url": f"{PR}#issuecomment-9"})
+    moved = moved.with_audit(3, observed)
+    assert [d.seq for d in moved.decisions] == [3]
+    assert moved.with_run_log(3, written).decisions == ()
     RecoveryJournal.from_dict(moved.to_dict(), RUN)
 
 
-def test_past_its_bound_the_journal_drops_settled_decisions_first():
-    entries = []
-    for seq in range(1, MAX_RECOVERY_DECISIONS + 2):
-        entry = _entry(seq, bounds=replace(GOOD, relaunches_used=1))
-        if seq == 3:
-            entry = replace(entry, audit=entry.audit.observing({"url": f"{PR}#issuecomment-3"}))
-        entries.append(entry)
-    journal = RecoveryJournal().for_step(STEP)
-    dropped_all = []
-    for entry in entries:
-        journal, dropped = journal.with_decision(entry)
-        dropped_all += dropped
-    assert [d.seq for d in dropped_all] == [3]
+def test_past_its_bound_the_journal_drops_settled_decisions_and_never_an_unsettled_one():
+    """R1-F5 of PR #480: an unsettled decision's audit would be lost for good, so
+    the journal refuses a new decision rather than drop one."""
+    spent = replace(GOOD, relaunches_used=1)
+    last = MAX_RECOVERY_DECISIONS + 2
+    # Two settled decisions between unsettled ones.
+    entries = [
+        _settled(_entry(seq, bounds=spent), seq) if seq in (2, 4) else _entry(seq, bounds=spent)
+        for seq in range(1, last + 1)
+    ]
+    journal = _journal(*entries)
+    # Only the two settled ones went; every unsettled one is kept.
+    assert [d.seq for d in journal.decisions] == [1, 3, *range(5, last + 1)]
     assert len(journal.decisions) == MAX_RECOVERY_DECISIONS
-    journal, dropped = journal.with_decision(
-        _entry(len(entries) + 1, bounds=replace(GOOD, relaunches_used=1))
-    )
-    assert [d.seq for d in dropped] == [1]
+    assert not any(d.settled for d in journal.decisions)
+    with pytest.raises(StateError, match="none is dropped"):
+        journal.with_decision(_entry(last + 1, bounds=spent))
 
 
 def _corrupt(mutate) -> dict:
@@ -364,6 +384,17 @@ def _corrupt(mutate) -> dict:
         (lambda r: r["step"].update(issue_url="https://github.com/o/r/pull/1"), "canonical"),
         (lambda r: r["decisions"][0]["audit"].update(kind="progress_comment"), "effect record"),
         (lambda r: r.update(decisions=[{}] * (MAX_RECOVERY_DECISIONS + 1)), "at most"),
+        (lambda r: r["decisions"][0].pop("run_log"), "missing run_log"),
+        (lambda r: r["decisions"][0].update(evidence="x" * 2000), "at most 1024"),
+        (lambda r: r["decisions"][0]["run_log"].update(stage="done"), "not a run log stage"),
+        (
+            lambda r: r["decisions"][0]["run_log"].update(step_dir="001-x-1"),
+            "before its write was attempted",
+        ),
+        (
+            lambda r: r["decisions"][0]["run_log"].update(stage="written", step_dir="../x"),
+            "must name a step directory",
+        ),
     ],
 )
 def test_a_corrupt_journal_is_refused(mutate, match):
@@ -774,12 +805,17 @@ def test_a_crash_after_the_decision_spends_the_allowance(tmp_state_dir, fake_git
     monkeypatch.undo()
     journal = _journal_of(eng)
     assert journal.relaunches == 1 and journal.decisions[0].audit.stage is Stage.INTENDED
-    assert len(provider.calls) == 1
+    # R1-F4 of PR #480: the missing run log record is journaled, not forgotten.
+    assert journal.decisions[0].run_log == RunLogProgress()
+    assert len(provider.calls) == 1 and _recovery_lines(eng) == []
 
     with pytest.raises(ExecutionTimeoutError, match=r"refused \(allowance-spent\)"):
         eng.run(max_steps=5)
     assert len(provider.calls) == 2
     assert len(_audits(fake_github)) == 2
+    # The first decision's record was completed before the step ran, once.
+    assert [line["metadata"]["decision"] for line in _recovery_lines(eng)] == [1, 2]
+    assert all(d.settled for d in _journal_of(eng).decisions)
 
 
 def test_the_audit_comment_goes_on_the_runs_pr_once_it_has_one(tmp_state_dir, fake_github):
@@ -836,11 +872,396 @@ def test_a_run_log_that_refuses_the_decisions_line_relaunches_nothing(
         raise StateError("the run log refused the line")
 
     monkeypatch.setattr(engine_module.ControllerEngine, "_log_recovery_decision", refused)
-    with pytest.raises(ExecutionTimeoutError, match="its run log line could not be written"):
+    with pytest.raises(ExecutionTimeoutError, match="its run log record could not be written"):
         eng.run(max_steps=5)
     monkeypatch.undo()
     assert len(provider.calls) == 1 and _audits(fake_github) == []
     (entry,) = _journal_of(eng).decisions
     assert entry.allowed and entry.audit.stage is Stage.INTENDED
+    assert entry.run_log.stage is RunLogStage.INTENDED
     eng.run(max_steps=1)
     assert len(_audits(fake_github)) == 1 and len(provider.calls) == 2
+    assert [line["metadata"]["decision"] for line in _recovery_lines(eng)] == [1]
+    assert _journal_of(eng).decisions[0].settled
+
+
+# -- R1-F1 of PR #480: only positive evidence makes an exit result-less -------------------
+
+
+def _review_on_claude(tmp_path, tmp_state_dir, gh, lines, *, exit_code=1, stderr="", idle=None):
+    """A run in REVIEW whose reviewer is the real Claude adapter over the fake
+    ``claude``: ``lines`` on its first launch, a clean review on every later one."""
+    from autoforge.profiles import profile_for_phase
+    from tests import claude_fake
+
+    from .conftest import SHA_A
+    from .test_engine import _in_review, _review_on_fake_claude, review_payload
+
+    eng = _in_review(tmp_state_dir, gh, [])
+    reviewed = [claude_fake.init(), claude_fake.result(block(review_payload(1, SHA_A, [])))]
+    home = _review_on_fake_claude(tmp_path, eng, lines, exit_code=exit_code, later=((reviewed, 0),))
+    script = home / "script.json"
+    data = json.loads(script.read_text(encoding="utf-8"))
+    data["stderr"] = stderr
+    script.write_text(json.dumps(data), encoding="utf-8")
+    if idle is not None:
+        profile = profile_for_phase(eng.config, Phase.REVIEW, eng.state.review_round)
+        eng.config.profiles[profile.name] = replace(profile, idle_timeout_seconds=idle)
+    return eng, home
+
+
+@pytest.mark.parametrize(
+    ("lines", "stderr"),
+    [
+        # Authentication, reported on stderr alone, with nothing on stdout.
+        ([], "Invalid API key · Please run /login\n"),
+        # A host failure the same way.
+        ([], "Error: ENOSPC: no space left on device, write\n"),
+        # A configuration or permission failure before the model's first answer.
+        (["INIT"], "Error: permission denied\n"),
+    ],
+    ids=["auth-empty-stdout", "host-empty-stdout", "init-only"],
+)
+def test_a_claude_exit_whose_cause_nothing_typed_tells_is_never_relaunched(
+    tmp_path, tmp_state_dir, fake_github, lines, stderr
+):
+    """The adapter types no result-less exit without positive evidence that the
+    session ran (its init and a tool call of the model's): an empty stream is an
+    untyped exit, which stays the operator's, whatever stderr says."""
+    from tests import claude_fake
+
+    expand = {"INIT": claude_fake.init()}
+    eng, home = _review_on_claude(
+        tmp_path, tmp_state_dir, fake_github, [expand.get(x, x) for x in lines], stderr=stderr
+    )
+    with pytest.raises(ExecutionError, match=r"refused \(not-allowlisted\): untyped-exit"):
+        eng.run(max_steps=5)
+    assert claude_fake.launches(home) == 1
+    (entry,) = _journal_of(eng).decisions
+    assert entry.category is RecoveryCategory.UNTYPED_EXIT and not entry.allowed
+    assert "no result delivered" not in entry.evidence
+    assert load_state(eng.paths.state_file).phase == Phase.REVIEW
+
+
+def test_a_claude_cli_that_died_inside_a_running_session_is_relaunched_once(
+    tmp_path, tmp_state_dir, fake_github
+):
+    """The safe case: the session started, the model was calling tools, and the
+    CLI died before any result (a crash, an abort). Relaunched once through the
+    phase-entry reconciliation, and the review completes."""
+    from tests import claude_fake
+
+    lines = [
+        claude_fake.init(),
+        claude_fake.tool_use("t1", "Read", file_path="src/a.py"),
+        claude_fake.tool_result("t1", "contents"),
+    ]
+    eng, home = _review_on_claude(
+        tmp_path, tmp_state_dir, fake_github, lines, exit_code=134, stderr="Aborted\n"
+    )
+    outcomes = eng.run(max_steps=2)
+    assert claude_fake.launches(home) == 2
+    assert outcomes[-1].next_phase == "READY_FOR_MERGE", outcomes[-1].message
+    (entry,) = _journal_of(eng).decisions
+    assert entry.category is RecoveryCategory.RESULT_LESS_EXIT and entry.allowed
+    assert "no result delivered before the exit" in entry.evidence
+
+
+# -- R1-F2 of PR #480: a usage limit stands whatever ended the launch after it ----------
+
+
+def test_a_claude_limit_then_an_idle_kill_is_a_usage_limit_never_relaunched(
+    tmp_path, tmp_state_dir, fake_github
+):
+    """Claude's typed 429, then the CLI stays alive inside the failure's exit
+    grace until its idle limit kills it: the limit evidence survives the
+    teardown and refuses the relaunch an idle timeout would have had."""
+    from tests import claude_fake
+
+    from .test_engine import RATE_LIMITED
+
+    lines = [*claude_fake.api_failure(429, RATE_LIMITED), {"sleep": 30}]
+    eng, home = _review_on_claude(tmp_path, tmp_state_dir, fake_github, lines, idle=1)
+    with pytest.raises(ProviderUsageLimitError) as caught:
+        eng.run(max_steps=5)
+    message = str(caught.value)
+    assert "provider limit: claude: API error 429" in message
+    assert "relaunch refused (no-trusted-reset): provider-usage-limit" in message
+    assert claude_fake.launches(home) == 1
+    (entry,) = _journal_of(eng).decisions
+    assert entry.category is RecoveryCategory.PROVIDER_USAGE_LIMIT
+    assert "limit idle" in entry.evidence and "claude: API error 429" in entry.evidence
+
+
+@pytest.mark.parametrize(
+    "facts",
+    [
+        {**IDLE, "usage_limit": "opencode: The usage limit has been reached"},
+        {**IDLE, "usage_limit": "claude: API error 429", "exit_code": -1},
+        {**RUNTIME, "usage_limit": "claude: API error 429"},
+    ],
+    ids=["opencode-idle", "claude-idle", "runtime"],
+)
+def test_a_limit_reported_before_any_kill_vetoes_the_relaunch(tmp_state_dir, fake_github, facts):
+    eng, provider = _analyzing(tmp_state_dir, fake_github, facts, implement)
+    with pytest.raises(ProviderUsageLimitError, match=r"refused \(no-trusted-reset\)"):
+        eng.run(max_steps=5)
+    assert len(provider.calls) == 1
+    assert categorize(_limited()) is RecoveryCategory.PROVIDER_USAGE_LIMIT
+    (entry,) = _journal_of(eng).decisions
+    assert entry.category is RecoveryCategory.PROVIDER_USAGE_LIMIT and entry.error == (
+        "ProviderUsageLimitError"
+    )
+
+
+def test_the_rule_reads_a_limit_before_the_timeout_that_followed_it():
+    exc = _idle(usage_limit="claude: API error 429")
+    assert categorize(exc) is RecoveryCategory.PROVIDER_USAGE_LIMIT
+    assert decide(exc, GOOD).refusal is Refusal.NO_TRUSTED_RESET
+
+
+# -- R1-F3 of PR #480: every physical launch is charged, before it starts ----------------
+
+
+TRANSIENT = {
+    "exit_code": 1,
+    "provider_failure": "claude: the run ended in an error (api_error_status 529)",
+    "transient_failure": "claude: API error 529",
+}
+
+
+def _malformed(req) -> str:
+    return "no result block here"
+
+
+def test_a_correction_or_transient_relaunch_is_charged_as_a_step(tmp_state_dir, fake_github):
+    eng, provider = _analyzing(tmp_state_dir, fake_github, TRANSIENT, _malformed, implement)
+    eng.run(max_steps=1)
+    assert len(provider.calls) == 3
+    # The step and its two relaunches: three launches, three steps of the run.
+    assert load_state(eng.paths.state_file).step_count == 3
+
+
+def test_an_in_step_relaunch_past_the_budget_blocks_before_it_launches(tmp_state_dir, fake_github):
+    eng, provider = _analyzing(
+        tmp_state_dir, fake_github, TRANSIENT, _malformed, implement, max_total_steps=2
+    )
+    outcomes = eng.run(max_steps=5)
+    assert len(provider.calls) == 2
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.BLOCKED and state.stop_code == "step-budget"
+    assert state.step_count == 2
+    assert "its relaunch (a correction or the retry of a transient failure)" in (
+        outcomes[-1].message
+    )
+
+
+def test_an_automatic_relaunch_then_in_step_retries_never_exceed_the_budget(
+    tmp_state_dir, fake_github
+):
+    """Mixed: an idle timeout relaunched by the rule (one more step), then two
+    transient failures whose retries are charged too, at a budget of three."""
+    eng, provider = _analyzing(
+        tmp_state_dir, fake_github, IDLE, TRANSIENT, TRANSIENT, implement, max_total_steps=3
+    )
+    eng.run(max_steps=5)
+    assert len(provider.calls) == 3
+    state = load_state(eng.paths.state_file)
+    assert state.step_count == 3 and state.phase == Phase.BLOCKED
+    assert state.stop_code == "step-budget"
+    assert _journal_of(eng).relaunches == 1
+
+
+def test_a_relaunch_interrupted_while_it_runs_stays_charged_after_a_restart(
+    tmp_state_dir, fake_github
+):
+    def power_loss(req):
+        raise KeyboardInterrupt("power loss while the relaunch runs")
+
+    eng, provider = _analyzing(
+        tmp_state_dir, fake_github, TRANSIENT, power_loss, implement, max_total_steps=2
+    )
+    with pytest.raises(KeyboardInterrupt):
+        eng.run(max_steps=5)
+    assert len(provider.calls) == 2
+    assert load_state(eng.paths.state_file).step_count == 2
+
+    # The restarted command reads the charge from disk: no step is left.
+    eng.state = load_state(eng.paths.state_file)
+    outcomes = eng.run(max_steps=5)
+    assert len(provider.calls) == 2
+    assert outcomes[-1].next_phase == "BLOCKED"
+    assert load_state(eng.paths.state_file).stop_code == "step-budget"
+
+
+# -- R1-F4 of PR #480: the run log half of a decision survives a crash -------------------
+
+
+def _crash_around_the_decisions_record(monkeypatch, *, after: bool) -> None:
+    from autoforge import runlog
+
+    real = runlog.RunLogger.log_execution
+
+    def crashing(self, record, *args, **kwargs):
+        if not record.phase.endswith("-auto-recovery"):
+            return real(self, record, *args, **kwargs)
+        if after:
+            real(self, record, *args, **kwargs)
+        raise KeyboardInterrupt("power loss around the decision's run log record")
+
+    monkeypatch.setattr(runlog.RunLogger, "log_execution", crashing)
+
+
+@pytest.mark.parametrize("after", [False, True], ids=["before-the-write", "after-the-write"])
+def test_a_crash_around_the_run_log_record_completes_it_exactly_once(
+    tmp_state_dir, fake_github, monkeypatch, after
+):
+    eng, provider = _analyzing(tmp_state_dir, fake_github, IDLE, implement)
+    _crash_around_the_decisions_record(monkeypatch, after=after)
+    with pytest.raises(KeyboardInterrupt):
+        eng.run(max_steps=5)
+    monkeypatch.undo()
+    (entry,) = _journal_of(eng).decisions
+    assert entry.run_log.stage is RunLogStage.ATTEMPTED and entry.run_log.step_dir
+    assert len(_recovery_lines(eng)) == (1 if after else 0)
+    assert len(provider.calls) == 1 and _audits(fake_github) == []
+
+    eng.state = load_state(eng.paths.state_file)
+    eng.run(max_steps=1)
+    # One record of the decision, in the directory journaled before the write.
+    (line,) = _recovery_lines(eng)
+    assert line["metadata"]["decision"] == 1
+    (entry,) = _journal_of(eng).decisions
+    assert entry.run_log.stage is RunLogStage.WRITTEN and entry.settled
+    assert line["log_dir"].endswith(entry.run_log.step_dir)
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    assert len([p for p in run_dir.iterdir() if "auto-recovery" in p.name]) == 1
+    # Its comment was posted once, then the step ran.
+    assert len(_audits(fake_github)) == 1 and len(provider.calls) == 2
+
+
+# -- R1-F5 of PR #480: nothing executes while a decision is unsettled --------------------
+
+
+def _unconfirmed_decision(tmp_state_dir, gh):
+    """A run whose idle timeout was decided, its audit comment never posted."""
+    eng, provider = _analyzing(tmp_state_dir, gh, IDLE, implement)
+    gh.write_failures.append(
+        ("create_issue_comment", GitHubUnavailableError("GitHub is down"), False)
+    )
+    with pytest.raises(ExecutionTimeoutError, match="could not be confirmed"):
+        eng.run(max_steps=5)
+    assert len(provider.calls) == 1
+    return eng, provider
+
+
+def test_repeated_github_failures_stop_every_command_and_lose_no_decision(
+    tmp_state_dir, fake_github
+):
+    eng, provider = _unconfirmed_decision(tmp_state_dir, fake_github)
+    fake_github.comments_error = GitHubUnavailableError("GitHub is still down")
+    for _ in range(MAX_RECOVERY_DECISIONS + 2):
+        eng.state = load_state(eng.paths.state_file)
+        with pytest.raises(GitHubUnavailableError, match="nothing is executed while"):
+            eng.run(max_steps=5)
+        with pytest.raises(GitHubUnavailableError, match="Automatic recovery decision 1"):
+            eng.step()
+    # Nothing executed, nothing decided again, and the decision is kept unsettled.
+    assert len(provider.calls) == 1
+    journal = _journal_of(eng)
+    assert [d.seq for d in journal.unsettled()] == [1] and journal.seq == 1
+    assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
+
+    fake_github.comments_error = None
+    eng.state = load_state(eng.paths.state_file)
+    eng.run(max_steps=1)
+    assert len(_audits(fake_github)) == 1 and len(provider.calls) == 2
+    assert all(d.settled for d in _journal_of(eng).decisions)
+
+
+def test_a_conclusive_github_failure_of_an_audit_blocks_before_anything_executes(
+    tmp_state_dir, fake_github
+):
+    eng, provider = _unconfirmed_decision(tmp_state_dir, fake_github)
+    fake_github.comments_error = errors.GitHubError("HTTP 403: Resource not accessible")
+    eng.state = load_state(eng.paths.state_file)
+    (outcome,) = eng.run(max_steps=5)
+    assert outcome.next_phase == "BLOCKED" and len(provider.calls) == 1
+    state = load_state(eng.paths.state_file)
+    assert state.stop_code == "github-read-failed"
+    assert "Automatic recovery decision 1" in state.block_reason
+    assert _journal_of(eng).decisions[0].audit.pending
+
+
+def test_a_conflicting_audit_blocks_the_run_across_restarts_until_the_operator_resolves_it(
+    tmp_state_dir, fake_github
+):
+    eng, provider = _unconfirmed_decision(tmp_state_dir, fake_github)
+    (entry,) = _journal_of(eng).decisions
+    # Two comments carry the decision's marker, neither with its exact text.
+    fake_github.add_comment(ISSUE, 901, "edited\n\n" + entry.audit.marker)
+    fake_github.add_comment(ISSUE, 902, "copied\n\n" + entry.audit.marker)
+
+    eng.state = load_state(eng.paths.state_file)
+    (outcome,) = eng.run(max_steps=5)
+    assert outcome.next_phase == "BLOCKED" and len(provider.calls) == 1
+    state = load_state(eng.paths.state_file)
+    assert state.stop_code == "effect-conflict"
+    assert "is in conflict" in state.block_reason and entry.audit.marker in state.block_reason
+    assert _journal_of(eng).decisions[0].audit.stage is Stage.CONFLICT
+
+    # A restart changes nothing: BLOCKED is not resumed, and nothing executes.
+    eng.state = load_state(eng.paths.state_file)
+    assert eng.run(max_steps=5) == [] and len(provider.calls) == 1
+
+    # The operator removes the stray comments, then unblocks.
+    fake_github.comments[ISSUE] = [
+        c for c in fake_github.comments.get(ISSUE, []) if c.id not in (901, 902)
+    ]
+    eng.state = load_state(eng.paths.state_file)
+    unblocked = eng.unblock("removed the two edited copies of the audit comment")
+    assert unblocked.unblocked, unblocked.message
+    assert _journal_of(eng).decisions[0].audit.pending
+    eng.run(max_steps=1)
+    (comment,) = _audits(fake_github)
+    assert comment.body == entry.audit.body
+    assert len(provider.calls) == 2 and all(d.settled for d in _journal_of(eng).decisions)
+
+
+def test_an_earlier_steps_decision_whose_record_alone_is_missing_is_completed_and_dropped(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """Its comment observed, its run log record not written, and the run already
+    in another step: the next command writes the record, which settles the
+    decision, and the journal drops it before the step runs."""
+    from autoforge import engine as engine_module
+
+    eng, provider = _analyzing(tmp_state_dir, fake_github, RUNTIME, implement)
+
+    def refused(self, *args, **kwargs):
+        raise StateError("the run log refused the record")
+
+    monkeypatch.setattr(engine_module.ControllerEngine, "_log_recovery_decision", refused)
+    with pytest.raises(ExecutionTimeoutError):
+        eng.run(max_steps=5)
+    monkeypatch.undo()
+    state = load_state(eng.paths.state_file)
+    journal = RecoveryJournal.from_dict(state.auto_recovery, state.run_id)
+    (entry,) = journal.decisions
+    assert entry.run_log.stage is RunLogStage.INTENDED
+    # Its comment is on GitHub and observed; only the run log record is missing.
+    posted = fake_github.create_issue_comment(ISSUE, entry.audit.body)
+    journal = journal.with_audit(1, entry.audit.observing({"url": posted.url}))
+    # The journal moved on to another step since (a new execution attempt).
+    state.execution_attempt += 1
+    later = replace(entry.step, execution_attempt=state.execution_attempt)
+    journal = journal.for_step(later)
+    assert [d.seq for d in journal.unsettled()] == [1]
+    state.auto_recovery = journal.to_dict()
+    eng.state = state
+    eng._save()
+
+    eng.run(max_steps=1)
+    assert [line["metadata"]["decision"] for line in _recovery_lines(eng)] == [1]
+    assert _journal_of(eng).decisions == () and len(_audits(fake_github)) == 1
+    assert len(provider.calls) == 2

@@ -89,8 +89,11 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
     other failure are not (claude_stream.py says why). A 429 is typed as the
     provider's usage or rate limit instead (#434):
     :attr:`AgentExecutionResult.usage_limit` (``claude: API error 429``), which
-    the engine never relaunches. A stream that ended without a single result
-    record, with no line lost, is a :attr:`AgentExecutionResult.result_less_exit`.
+    the engine never relaunches, whatever ended the CLI after it (a limit
+    included). A CLI that exited on its own inside a running session (its
+    ``system/init`` and a tool call of the model's seen) before a single
+    result record, with no line lost, is a
+    :attr:`AgentExecutionResult.result_less_exit`; an empty stream is not.
     Whether to relaunch is the engine's policy. A relaunched CLI begins with its own retries, so the
     relaunch itself waits through another retry schedule before giving up.
     ``text`` output is not classified.
@@ -153,10 +156,10 @@ OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
     an error the CLI does not print (it prints one execution failure only
     when no step failed before it) and an exit 1 without any error line (a
     cancelled permission prompt, below); both are failed exits all the same.
-    A failed run whose run-level errors include OpenCode's usage-limit error,
-    compared whole (:data:`_OPENCODE_USAGE_LIMIT_ERROR`, whatever the model),
-    is reported as a :attr:`AgentExecutionResult.usage_limit` and never as
-    transient (#434).
+    A failed or timed-out run whose run-level errors include OpenCode's
+    usage-limit error, compared whole (:data:`_OPENCODE_USAGE_LIMIT_ERROR`,
+    whatever the model), is reported as a
+    :attr:`AgentExecutionResult.usage_limit` and never as transient (#434).
   * bash/edit tools run without ``--auto`` under the default agent;
     ``--auto`` is opt-in via ``options.auto_approve: true``.
   * a request of the agent's is refused, never put to a person (#258; run
@@ -471,16 +474,20 @@ class AgentExecutionResult:
     transient_failure: str | None = None
     # A failed run the adapter recognised as its provider refusing it at a
     # usage or rate limit (#434): a short, fixed reason naming it, never text
-    # taken from the output; never set with ``transient_failure``. The engine
-    # raises ProviderUsageLimitError for it and relaunches nothing.
+    # taken from the output; never set with ``transient_failure``. Kept when a
+    # limit then killed the CLI (``timed_out``): the refusal was established
+    # before it (R1-F2 of PR #480). The engine raises ProviderUsageLimitError
+    # for it and relaunches nothing.
     # ``usage_reset_at`` is a reset time the provider reported in a form the
     # adapter trusts (UTC, ISO 8601); no adapter reads one today, so it is "".
     usage_limit: str | None = None
     usage_reset_at: str = ""
     # A failed run the adapter recognised as an exit without any result
-    # (#434): the CLI ended its protocol stream before a single result record,
-    # with nothing lost from the stream on the way. A fact, not a decision:
-    # whether to relaunch is the engine's recovery rule.
+    # (#434): the CLI exited on its own inside a session its protocol stream
+    # shows was running, before a single result record, with nothing lost
+    # from the stream on the way. Never an empty stream, whose cause nothing
+    # typed tells (R1-F1 of PR #480). A fact, not a decision: whether to
+    # relaunch is the engine's recovery rule.
     result_less_exit: bool = False
     # A small flat mapping of scalars, bounded and redacted by the adapter,
     # that the engine writes to ``execution.json`` under this key without
@@ -1595,11 +1602,18 @@ class ClaudeCodeProvider(AgentProvider):
             # A failure the stream recognised as a transient model API error
             # (#395) stays one when the CLI was stopped after it (#394).
             transient_failure=None if timed_out or failure is None else stream.transient,
-            # #434: a turn ended at a usage or rate limit, and a stream that
-            # ended without any result, with no line lost on the way.
-            usage_limit=None if timed_out or failure is None else stream.limit,
+            # #434: a turn ended at a usage or rate limit. Established by the
+            # stream's own result record, it stands whatever ended the CLI
+            # after it: one still running at its idle limit during the
+            # failure's exit grace was refused at that limit all the same,
+            # and a relaunch now meets it again (R1-F2 of PR #480).
+            usage_limit=stream.limit,
+            # #434: a CLI that died inside a running session before any
+            # result, on its own (never one a limit or the adapter stopped),
+            # with no line lost on the way (ClaudeStream.result_less).
             result_less_exit=(
-                not timed_out
+                cut is None
+                and not timed_out
                 and failure is not None
                 and stream.result_less
                 and not res.records_overflowed
@@ -2060,14 +2074,15 @@ class OpenCodeProvider(AgentProvider):
             if errors and all(e in _OPENCODE_OPENAI_TRANSIENT_ERRORS for e in errors):
                 reasons = dict.fromkeys(_OPENCODE_OPENAI_TRANSIENT_ERRORS[e] for e in errors)
                 result.transient_failure = "opencode: " + ", ".join(reasons)
-        if (
-            result.failed_exit
-            and not result.timed_out
-            and _OPENCODE_USAGE_LIMIT_ERROR in _opencode_run_errors(result.stderr)
+        if (result.failed_exit or result.timed_out) and _OPENCODE_USAGE_LIMIT_ERROR in (
+            _opencode_run_errors(result.stderr)
         ):
             # #434: OpenCode's run-level usage-limit error, whatever the model:
             # a launch now meets the same limit, and the error says nothing of
-            # when it resets.
+            # when it resets. Once printed it stands whatever ended the CLI
+            # after it, a limit included: one that hung after the error until
+            # its idle limit was refused at the usage limit all the same
+            # (R1-F2 of PR #480).
             result.usage_limit = f"opencode: {_OPENCODE_USAGE_LIMIT_ERROR}"
             result.transient_failure = None
         refused = _opencode_refused_requests(result.stderr)

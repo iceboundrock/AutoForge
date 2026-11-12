@@ -4125,8 +4125,18 @@ def test_opencode_types_no_usage_limit_on_a_run_that_did_not_fail():
         _opencode_run(f"{OC_ERROR}The usage limit has been reached\n", exit_code=0).usage_limit
         is None
     )
-    timed_out = _opencode_run(f"{OC_ERROR}The usage limit has been reached\n", timed_out=True)
-    assert timed_out.usage_limit is None
+
+
+def test_opencode_keeps_its_usage_limit_when_a_limit_killed_it_after_the_error():
+    """R1-F2 of PR #480: the run-level error was printed, then the CLI hung until
+    its idle limit killed it. The limit stands; the kill does not make it an idle
+    timeout the recovery rule would relaunch."""
+    timed_out = _opencode_run(
+        f"{OC_ERROR}The usage limit has been reached\n", exit_code=-1, timed_out=True
+    )
+    assert timed_out.timed_out
+    assert timed_out.usage_limit == "opencode: The usage limit has been reached"
+    assert timed_out.transient_failure is None
 
 
 @pytest.mark.parametrize(
@@ -4146,26 +4156,54 @@ def test_a_claude_turn_ended_at_a_rate_or_usage_limit_is_typed_never_transient(
 
 
 @pytest.mark.parametrize(
-    ("lines", "exit_code", "result_less"),
+    ("lines", "exit_code", "stderr", "result_less"),
     [
-        ([], 1, True),
-        ([], 0, True),
-        (["RESULT_OK_IS_ERROR"], 1, False),
-        (["not json", "RESULT_OK"], 0, False),
-        (["RESULT_OK"], 0, False),
+        # R1-F1 of PR #480: an empty stream, whatever stderr says, is no evidence.
+        ([], 1, "Invalid API key · Please run /login\n", False),
+        ([], 1, "Error: ENOSPC: no space left on device\n", False),
+        ([], 0, "", False),
+        # Its session started, but the model never called a tool.
+        (["INIT"], 1, "", False),
+        (["INIT", "TEXT"], 1, "", False),
+        # Its session ran and the model was calling tools: died before any result.
+        (["INIT", "TOOL", "TOOL_RESULT"], 1, "", True),
+        (["INIT", "TOOL"], 134, "Aborted\n", True),
+        # A result arrived, or the stream failed on a record.
+        (["INIT", "TOOL", "RESULT_OK_IS_ERROR"], 1, "", False),
+        (["INIT", "TOOL", "not json", "RESULT_OK"], 0, "", False),
+        (["INIT", "RESULT_OK"], 0, "", False),
     ],
 )
-def test_only_a_claude_run_that_delivered_no_result_record_is_a_result_less_exit(
-    tmp_path, lines, exit_code, result_less
+def test_only_a_claude_cli_that_died_inside_a_running_session_is_a_result_less_exit(
+    tmp_path, lines, exit_code, stderr, result_less
 ):
     from tests import claude_fake
 
     expand = {
+        "INIT": claude_fake.init(),
+        "TEXT": claude_fake.line(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "hm"}]}}
+        ),
+        "TOOL": claude_fake.tool_use("t1", "Read", file_path="a.py"),
+        "TOOL_RESULT": claude_fake.tool_result("t1", "contents"),
         "RESULT_OK": claude_fake.result("done"),
         "RESULT_OK_IS_ERROR": claude_fake.result("done", is_error=True),
     }
     _, res = _claude_run(
-        tmp_path, [claude_fake.init(), *(expand.get(x, x) for x in lines)], exit_code=exit_code
+        tmp_path, [expand.get(x, x) for x in lines], exit_code=exit_code, stderr=stderr
     )
     assert res.result_less_exit is result_less
     assert res.usage_limit is None
+
+
+def test_a_claude_limit_survives_the_idle_kill_inside_the_failures_exit_grace(tmp_path):
+    """R1-F2 of PR #480: the 429 result, then a CLI still running when its idle
+    limit falls due inside the failure's exit grace. A timeout, still typed as
+    the provider's limit."""
+    from tests import claude_fake
+
+    lines = [*claude_fake.api_failure(429, _API_ERRORS[429]), {"sleep": 30}]
+    _, res = _claude_run(tmp_path, lines, idle=1, exit_code=1)
+    assert res.timed_out and res.timeout_limit == "idle"
+    assert res.usage_limit == "claude: API error 429"
+    assert res.transient_failure is None and not res.result_less_exit

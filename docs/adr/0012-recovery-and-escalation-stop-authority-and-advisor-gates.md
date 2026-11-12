@@ -539,10 +539,16 @@ classification: `auto_recovery.py` does not import
 **D11.2. The allowlist.** Two categories, and only these, are relaunched:
 
 - `idle-timeout`: the executor killed the agent at its idle limit;
-- `result-less-exit`: the agent's CLI ended its protocol stream before a
-  single result record, with no line lost on the way, as its adapter typed
-  it (Claude Code's `stream-json` today; an exit code or a missing
-  `CONTROL_RESULT` alone types nothing).
+- `result-less-exit`: the agent's CLI exited on its own inside a session
+  its protocol stream shows was running, before a single result record,
+  with no line lost on the way, as its adapter typed it (Claude Code's
+  `stream-json` today: the CLI's `system/init` and a tool call of the
+  model's, which no authentication, permission, configuration or host
+  failure at the CLI's start produces). The absence of a result is no
+  evidence of why the CLI ended: an empty stream, or one that ended before
+  the model's first tool call, is an untyped exit whatever stderr says, and
+  stderr, free text, is never read for it. An exit code or a missing
+  `CONTROL_RESULT` alone types nothing either (R1-F1 of PR #480).
 
 Refused, and the operator's as before: a hard runtime limit and a loop
 kill (never repeated), a timeout nothing typed, a provider's usage limit
@@ -557,7 +563,9 @@ launch started may still run, or when its output holds a complete
 would discard it is not made)
 (`test_only_the_allowlist_is_ever_relaunched`,
 `test_a_result_delivered_before_the_kill_is_never_discarded`,
-`test_a_launch_that_may_have_left_a_process_is_never_relaunched`).
+`test_a_launch_that_may_have_left_a_process_is_never_relaunched`,
+`test_a_claude_exit_whose_cause_nothing_typed_tells_is_never_relaunched`,
+`test_a_claude_cli_that_died_inside_a_running_session_is_relaunched_once`).
 
 **D11.3. Usage limits.** An adapter types a provider's usage or rate limit
 from the provider's own typed answer (Claude Code's model API error 429;
@@ -569,6 +577,14 @@ can trust (no adapter reads one today) the refusal is `no-trusted-reset`,
 and with one it is `no-wait-policy`, since no explicit bounded wait policy
 exists. No wait, no inferred reset and no switch to another profile is made;
 a fallback belongs to #321's routing (`test_a_usage_limit_is_never_relaunched_at_once`).
+A limit the adapter established stands whatever ended the launch after it:
+a CLI that reported its limit and then stayed alive until its idle limit
+killed it (Claude Code inside its failure-exit grace, OpenCode hung after
+its error) keeps the fact through the teardown, the step ends as a usage
+limit, and the rule reads the limit before the timeout, so it is never an
+idle timeout to relaunch (R1-F2 of PR #480;
+`test_a_claude_limit_then_an_idle_kill_is_a_usage_limit_never_relaunched`,
+`test_a_limit_reported_before_any_kill_vetoes_the_relaunch`).
 
 **D11.4. One allowance per step, inside every bound.** A step is one phase
 of one issue, PR, review round and execution attempt, over every command
@@ -585,22 +601,58 @@ relaunch is one more step, charged when it first persists, like any step
 `test_the_step_budget_and_the_invocation_bound_are_never_exceeded`,
 `test_an_invocation_asked_to_stop_is_not_relaunched`).
 
+Every physical launch is charged the same way (D7, R1-F3 of PR #480): a
+relaunch within a step, a correction or the retry of a transient failure,
+is one more step of `workflow.max_total_steps`, checked against the
+persisted count and saved in the save before it starts, so a crash while
+it runs, or any later command, finds it counted. A relaunch with no step
+left enters `BLOCKED` (`step-budget`) with nothing launched, as the budget
+does before a step. So no mix of an automatic relaunch and in-step
+relaunches launches past the budget
+(`test_a_correction_or_transient_relaunch_is_charged_as_a_step`,
+`test_an_automatic_relaunch_then_in_step_retries_never_exceed_the_budget`,
+`test_a_relaunch_interrupted_while_it_runs_stays_charged_after_a_restart`).
+
 **D11.5. The journal and the dual audit.** Every decision, a relaunch or a
 refusal, is in this order: the state read again from disk (the relaunch sees
 exactly what an operator's `resume` would); the decision; one save of it with
-its accounting and its `intended` K13 record (ADR 0004 K13), before anything
-follows from it; its run log line (`<PHASE>-auto-recovery`, profile
-`(automatic recovery; no agent)`, which the corpus tool counts as
-bookkeeping); then its audit comment on the run's PR, or its issue while it
-has none, through the effect path. Only a confirmed comment of an allowed
-decision relaunches; an unconfirmed one relaunches nothing, the allowance
-stays spent, and the next command posts the comment before it executes
-anything. A crash after the save finds the allowance spent and the comment
-pending; a comment that landed before a crash is adopted, never posted
-twice. Neither sink is a recovery input
+its accounting, its typed evidence, its `intended` K13 record (ADR 0004
+K13) and its run log record still to write, before anything follows from
+it; its run log record (`<PHASE>-auto-recovery`, profile `(automatic
+recovery; no agent)`, which the corpus tool counts as bookkeeping); then its
+audit comment on the run's PR, or its issue while it has none, through the
+effect path. Only an allowed decision with both complete relaunches; one
+without relaunches nothing, and the allowance stays spent.
+
+The run log record is completed at most once, like the comment (R1-F4 of
+PR #480): the step directory it goes to is named and saved (`attempted`)
+before the write, and `written` is saved after it. A crash before the write
+leaves it `intended` or `attempted` with no such directory, and the next
+command writes it; a crash after the write leaves it `attempted`, and the
+next command finds that one directory's `execution.json` (the run log
+publishes it before the event journal's line) and adopts it, never writing
+it twice. That one directory is all of the run log ever read for it.
+
+A decision is *settled* once both are complete. The journal never drops an
+unsettled one (past its bound it refuses a new decision instead), and no
+`run`, `resume` or `step` executes anything before every unsettled
+decision it finds is completed, oldest first (R1-F5 of PR #480): a run log
+that refuses the record, or a GitHub that cannot be read now, stops the
+command with the phase unchanged, for `resume` to try again; a conclusive
+GitHub failure (`github-read-failed`) or a comment in conflict
+(`effect-conflict`: a second comment with the marker, or one whose text is
+not the controller's) enters `BLOCKED`, naming the target and the marker.
+The operator resolves it on GitHub and runs `unblock`, which has a
+conflicting comment read again (ADR 0004 D2.4's rule for a phase plan's
+conflict: its attempt count kept); the next command adopts the comment or
+posts it once before anything else. Neither sink is a recovery input: they
+decide no relaunch
 (`test_an_unconfirmed_audit_relaunches_nothing_and_the_next_command_posts_it_once`,
 `test_an_audit_that_landed_before_a_crash_is_adopted_never_posted_twice`,
-`test_a_crash_after_the_decision_spends_the_allowance`).
+`test_a_crash_after_the_decision_spends_the_allowance`,
+`test_a_crash_around_the_run_log_record_completes_it_exactly_once`,
+`test_repeated_github_failures_stop_every_command_and_lose_no_decision`,
+`test_a_conflicting_audit_blocks_the_run_across_restarts_until_the_operator_resolves_it`).
 
 **D11.6. Where it runs.** Inside the running `run`, `resume` or scheduler
 worker loop (`ControllerEngine.run`), and nowhere else: no daemon, no
@@ -626,8 +678,9 @@ Only an error that ends a step of an agent phase is decided; a refusal
 - *Cost.* One paid launch per step at most, counted as a step of
   `workflow.max_total_steps` and of `--max-steps`, against the operator
   `resume` it replaces (the same launch, minutes to hours earlier). Its
-  in-step corrections and transient relaunches are the existing, counted
-  bounds (D9). A hard runtime limit is never repeated, so no allowance buys
+  in-step corrections and transient relaunches are the existing bounds
+  (D9), each now charged as a step of `workflow.max_total_steps` too
+  (D11.4). A hard runtime limit is never repeated, so no allowance buys
   a second multi-hour launch; a usage limit is never relaunched. GitHub
   writes: one comment per decision, posted at most once.
 - *Security.* D3's bounded-relaunch row grants the action, to the
@@ -635,8 +688,9 @@ Only an error that ends a step of an agent phase is decided; a refusal
   relaunch is an ordinary launch, with every check of a launch (the
   sandbox gate, the checkout anchor, the credential preflight, the owner
   check). `DENY` and `INCONCLUSIVE` fail closed: anything not proven allowed
-  is refused, and a decision that cannot be saved, logged or audited
-  relaunches nothing.
+  is refused, a decision that cannot be saved, logged or audited
+  relaunches nothing, and one left unsettled stops every later command
+  until it is settled.
 
 **D11.8. Not done here.** A bounded wait for a trusted reset time and a
 fallback profile (D4, D11.3; #321); typing a result-less exit for OpenCode

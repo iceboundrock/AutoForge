@@ -78,7 +78,10 @@ Loop bounds (``workflow:`` config, enforced from persisted state so
   (``stagnation_unchanged_count_rounds``) -> BLOCKED. Rounds of all-new
   findings are progress and only meet the cap.
 - ``max_total_steps``: the run's cumulative ``step_count`` (all issues, all
-  phases, across ``resume``) -> BLOCKED before another step executes. One
+  phases, across ``resume``) -> BLOCKED before another step executes, or
+  before another agent launch of a step: a relaunch within a step (a
+  correction, the retry of a transient failure) is a physical launch
+  charged as one more step, checked and saved before it starts (#434). One
   exception: a REPLAN_REEXECUTE journal past the destructive write
   (SUPERSEDE_INTENT, COMPENSATING, SUPERSEDED) is finished first -- the
   step counts, no agent runs, nothing is closed -- so the source PR the
@@ -116,7 +119,10 @@ Safety rules:
   category), within ``workflow.max_total_steps`` and ``--max-steps``, through
   the same phase-entry reconciliation ``resume`` runs, after the decision is
   saved, logged and posted as a K13 audit comment; everything else is
-  refused and recorded the same way. ``step`` never relaunches on its own.
+  refused and recorded the same way. A decision whose run log record or
+  comment is not complete is completed by the next ``run``, ``resume`` or
+  ``step`` before it executes anything, or that command stops (BLOCKED on a
+  conflict). ``step`` never relaunches on its own.
 - An agent's request for a human decision goes through the launch's
   interaction broker (``interaction.py``, ADR 0007 D5.2, #134), created for
   a provider whose profile names an ``interaction_policy`` and asking
@@ -158,12 +164,15 @@ from .agent_worktree import (
     uncommitted_entries,
 )
 from .auto_recovery import (
+    MAX_EVIDENCE_CHARS,
     Bounds,
     DecisionEntry,
     LaunchEnd,
     LaunchEndKind,
     RecoveryDecision,
     RecoveryJournal,
+    RunLogProgress,
+    RunLogStage,
     StepKey,
     audit_record,
     audit_text,
@@ -245,7 +254,6 @@ from .config_fingerprint import (
 from .effect_ops import (
     AcceptanceCommentOp,
     Driven,
-    EffectPending,
     OperatorCommentOp,
     PrBodyUpdateOp,
     ProgressCommentOp,
@@ -934,6 +942,13 @@ def _add_line(exc: BaseException, line: str) -> None:
         exc.args = (redact(f"{exc.args[0].rstrip()}\n{line}"),)
     else:
         exc.add_note(redact(line))
+
+
+def _usage_reset_text(result: AgentExecutionResult) -> str:
+    """What a launch refused at a provider limit says of its reset (#434)."""
+    if result.usage_reset_at:
+        return f"the provider reports a reset at {result.usage_reset_at}"
+    return "the provider reported no reset time"
 
 
 def _launch_end(
@@ -5377,13 +5392,16 @@ class ControllerEngine:
     def step(self, dry_run: bool = False, allow_merge: bool = False) -> StepOutcome:
         """Exactly one phase execution. Never relaunches a failed step on its own:
         the automatic recovery of #434 is :meth:`run`'s, whose loop has a next
-        step to give it; a pending audit comment of an earlier decision is
-        settled first, as there."""
+        step to give it; an earlier decision left unsettled is completed
+        first, as there, or the step stops before it executes anything
+        (:meth:`_settle_recovery_decisions`)."""
         if dry_run:
             return self._step_once(dry_run=True, allow_merge=allow_merge)
         with self._execution_lock():
             if self._require_state().phase not in TERMINAL_PHASES:
-                self._settle_recovery_audits()
+                stopped = self._settle_recovery_decisions()
+                if stopped is not None:
+                    return stopped
             return self._step_once(dry_run=False, allow_merge=allow_merge)
 
     def run(
@@ -5433,11 +5451,14 @@ class ControllerEngine:
         written to the run log and posted as a K13 audit comment
         (:meth:`_automatic_recovery`). Only an allowlisted failure, the step's
         one automatic relaunch unspent, with a step of the run's budget and
-        of this loop left and ``should_continue`` still true, and its audit
-        comment confirmed, is relaunched: the loop reports the failed step and
-        goes on with the next step, which re-enters the phase exactly as
-        ``resume`` does. Every other error propagates, as before, its
-        refusal added to its text. A dry run decides nothing.
+        of this loop left and ``should_continue`` still true, its run log
+        record written and its audit comment confirmed, is relaunched: the
+        loop reports the failed step and goes on with the next step, which
+        re-enters the phase exactly as ``resume`` does. Every other error
+        propagates, as before, its refusal added to its text. Before the
+        first step, a decision an earlier command left unsettled is
+        completed, or the loop stops there with nothing executed
+        (:meth:`_settle_recovery_decisions`). A dry run decides nothing.
         """
         if max_steps < 1:
             raise ValueError("max_steps must be >= 1")
@@ -5482,9 +5503,15 @@ class ControllerEngine:
                     if held is None:
                         break
                 if not audits_settled:
-                    # #434: a decision's audit comment a crash or GitHub left
-                    # pending is completed before anything else is executed.
-                    self._settle_recovery_audits()
+                    # #434: a decision a crash, the run log or GitHub left
+                    # unsettled is completed before anything else is executed,
+                    # or the loop stops here (R1-F5 of PR #480).
+                    stopped = self._settle_recovery_decisions()
+                    if stopped is not None:
+                        all_outcomes.append(stopped)
+                        if on_outcome is not None:
+                            on_outcome(stopped)
+                        break
                     audits_settled = True
                 failing = self.state.phase
                 try:
@@ -5526,11 +5553,14 @@ class ControllerEngine:
         the failed step held only in memory. Then, in this order: the
         decision (:func:`~autoforge.auto_recovery.decide`, from the journal's
         allowance for this step and the persisted bounds); one save of it, with
-        its accounting and its ``intended`` K13 record, before anything
-        follows from it (D8); the run log line; the audit comment, through
-        the effect path; and only a confirmed comment of an allowed decision
-        relaunches. A failure of any of those after the save relaunches
-        nothing and leaves what was saved, which the next command completes.
+        its accounting, its ``intended`` K13 record and its run log record
+        still to write, before anything follows from it (D8); the run log
+        record (:meth:`_log_recovery_decision`, its progress journaled); the
+        audit comment, through the effect path; and only an allowed decision
+        with both complete relaunches. A failure of any of those after the
+        save relaunches nothing and leaves what was saved, which the next
+        command completes before it executes anything, or stops
+        (:meth:`_settle_recovery_decisions`).
         """
         if phase not in AGENT_PHASES or not decides(exc):
             return None
@@ -5547,7 +5577,7 @@ class ControllerEngine:
             # an error that left the phase unchanged, and nothing to relaunch.
             return None
         try:
-            entry, decision, dropped = self._record_recovery_decision(
+            entry, decision = self._record_recovery_decision(
                 exc, state, steps_left=steps_left, should_continue=should_continue
             )
         except AutoForgeError as failure:
@@ -5558,18 +5588,19 @@ class ControllerEngine:
             )
             return None
         try:
-            self._log_recovery_decision(entry, decision, dropped)
+            self._log_recovery_decision(entry.seq)
         except AutoForgeError as failure:
             # D8: no relaunch without both audit sinks. The decision is saved
-            # (its allowance spent, its comment pending for the next command).
+            # (its allowance spent, both its records still to complete).
             _add_line(
                 exc,
                 f"Automatic recovery (decision {entry.seq}): {decision.text()}; its run log "
-                f"line could not be written ({type(failure).__name__}: {failure}), so nothing "
-                "was relaunched; the next command posts its comment first.",
+                f"record could not be written ({type(failure).__name__}: {failure}), so "
+                "nothing was relaunched; the next command completes it and posts its comment "
+                "before it executes anything.",
             )
             return None
-        problem = self._drive_recovery_audit(entry.seq, entry.audit)
+        problem = self._recovery_audit_problem(entry.seq)
         where = self._recovery_audit_where(entry.seq, problem)
         if not decision.allowed:
             _add_line(exc, f"Automatic recovery (decision {entry.seq}): {decision.text()}. {where}")
@@ -5579,7 +5610,8 @@ class ControllerEngine:
                 exc,
                 f"Automatic recovery (decision {entry.seq}): {decision.text()}, but nothing was "
                 f"relaunched: its audit comment could not be confirmed ({problem}); the step's "
-                "one automatic relaunch is spent, and the next command posts the comment first.",
+                "one automatic relaunch is spent, and the next command posts the comment "
+                "before it executes anything.",
             )
             return None
         first = bound_block_reason(redact(str(exc).splitlines()[0])) if str(exc) else "-"
@@ -5600,11 +5632,12 @@ class ControllerEngine:
         *,
         steps_left: int,
         should_continue: Callable[[], bool] | None,
-    ) -> tuple[DecisionEntry, RecoveryDecision, tuple[DecisionEntry, ...]]:
+    ) -> tuple[DecisionEntry, RecoveryDecision]:
         """Take the rule's decision about ``exc`` and save it (D8).
 
-        Returns the decision's journal entry, the decision, and the entries the
-        journal dropped past its bound to make room for it.
+        Returns the decision's journal entry and the decision. The entry's
+        audit comment is ``intended`` and its run log record not yet written:
+        both are completed from the entry alone, by this command or the next.
         """
         phase = state.phase
         key = StepKey(
@@ -5655,118 +5688,216 @@ class ControllerEngine:
             category=decision.category,
             refusal=decision.refusal,
             relaunches=relaunches,
+            evidence=decision.evidence[:MAX_EVIDENCE_CHARS],
             audit=audit_record(owner, seq, text),
         )
-        journal, dropped = journal.with_decision(entry)
-        state.auto_recovery = journal.to_dict()
+        state.auto_recovery = journal.with_decision(entry).to_dict()
         # D8: authoritative before anything follows from it. A crash after
-        # this save finds the allowance spent and the audit pending.
+        # this save finds the allowance spent and both audit records to
+        # complete, which the next command does before it executes anything.
         self._save()
-        return entry, decision, dropped
+        return entry, decision
 
-    def _log_recovery_decision(
-        self,
-        entry: DecisionEntry,
-        decision: RecoveryDecision,
-        dropped: Sequence[DecisionEntry],
-    ) -> None:
-        """The decision's run log line (D8): a controller line that records no launch."""
+    def _recovery_journal(self) -> RecoveryJournal:
         state = self._require_state()
-        now = utcnow_iso()
+        return RecoveryJournal.from_dict(state.auto_recovery, state.run_id)
+
+    def _recovery_log_record(self, entry: DecisionEntry) -> ExecutionRecord:
+        """The run log record of decision ``entry`` (D8): a controller record of no launch.
+
+        Rendered from the journaled entry alone, timed at the decision, so
+        the record a later command completes is the one this command would
+        have written.
+        """
+        state = self._require_state()
         record = ExecutionRecord(
             run_id=state.run_id,
             seq=0,
             phase=f"{entry.phase.value}-auto-recovery",
             attempt=max(1, entry.attempt),
-            issue_url=state.current_issue_url,
-            pr_url=state.current_pr_url,
-            review_round=state.review_round,
+            issue_url=entry.step.issue_url,
+            pr_url=entry.step.pr_url,
+            review_round=entry.step.review_round,
             profile="(automatic recovery; no agent)",
             prompt_version=state.prompt_version,
-            started_at=now,
-            finished_at=now,
+            started_at=entry.decided_at,
+            finished_at=entry.decided_at,
             metadata={
                 "decision": entry.seq,
-                "allowed": decision.allowed,
-                "category": decision.category.value,
-                "refusal": decision.refusal.value if decision.refusal is not None else "",
-                "error_class": decision.error,
-                "evidence": decision.evidence,
+                "allowed": entry.allowed,
+                "category": entry.category.value,
+                "refusal": entry.refusal.value if entry.refusal is not None else "",
+                "error_class": entry.error,
+                "evidence": entry.evidence,
                 "relaunches": entry.relaunches,
                 "step": entry.step.to_dict(),
                 "step_count": entry.step_count,
                 "max_total_steps": self.config.workflow.max_total_steps,
                 "audit_target": entry.audit.target["target_url"],
                 "audit_marker": entry.audit.marker,
-                # A pending audit dropped past the journal's bound is this
-                # line's alone; named so the log says it was never posted.
-                "dropped_pending_audits": [d.seq for d in dropped if d.audit.pending],
             },
         )
-        if not decision.allowed:
-            record.error = f"automatic recovery refused: {decision.text()}"
-        self._logger().log_execution(record)
+        if not entry.allowed:
+            record.error = f"automatic recovery refused: {entry.text()}"
+        return record
 
-    def _drive_recovery_audit(self, seq: int, record: EffectRecord) -> str:
-        """Post decision ``seq``'s K13 audit comment at most once; "" once it is observed.
+    def _persist_recovery_log(self, seq: int, progress: RunLogProgress) -> None:
+        state = self._require_state()
+        state.auto_recovery = self._recovery_journal().with_run_log(seq, progress).to_dict()
+        self._save()
+
+    def _log_recovery_decision(self, seq: int) -> None:
+        """Write decision ``seq``'s run log record at most once (D8; R1-F4 of PR #480).
+
+        Idempotent across a crash, like a K13 comment: the step directory it
+        goes to is named and saved (``attempted``) before the write, and
+        ``written`` is saved after it. A decision found ``attempted`` is
+        looked for in that one directory first (its ``execution.json``, which
+        the run log publishes before the event journal's line): found, it is
+        adopted, never written twice; absent, it is written now. A refusal
+        of the run log raises, the progress left as saved for the next
+        command.
+        """
+        entry = self._recovery_journal().entry(seq)
+        if entry.run_log.stage is RunLogStage.WRITTEN:
+            return
+        with self._logger() as logger:
+            if entry.run_log.stage is RunLogStage.ATTEMPTED and logger.holds_step(
+                entry.run_log.step_dir
+            ):
+                self._persist_recovery_log(
+                    seq, RunLogProgress(RunLogStage.WRITTEN, entry.run_log.step_dir)
+                )
+                return
+            record = self._recovery_log_record(entry)
+            name = logger.next_step_name(record.phase, record.attempt)
+            self._persist_recovery_log(seq, RunLogProgress(RunLogStage.ATTEMPTED, name))
+            written = logger.log_execution(record)
+            if written.name != name:
+                # One process under the lock names and writes it: a controller bug.
+                raise StateError(
+                    f"the run log wrote decision {seq}'s record to {written.name}, not to the "
+                    f"{name} saved before the write"
+                )
+            self._persist_recovery_log(seq, RunLogProgress(RunLogStage.WRITTEN, name))
+
+    def _drive_recovery_audit(self, seq: int) -> EffectRecord:
+        """Post decision ``seq``'s K13 audit comment at most once; the record as last persisted.
 
         Through :func:`~autoforge.effect_ops.drive`: the comment is looked
         for by its marker first, ``attempted`` is saved before the write and
         the write is read back, so a crash or a retry never posts it twice. A
-        failure to read or write GitHub leaves the record as persisted and is
-        returned as text: the comment is an audit sink, never an input, so
-        it stops no run by itself (the caller relaunches nothing without it).
+        settled record (observed, or in conflict) is returned as it is. A
+        read or write of GitHub that fails raises, the record left as last
+        persisted: :class:`GitHubUnavailableError` (an :class:`EffectPending`
+        included) while the outcome cannot be read yet, another
+        :class:`GitHubError` for a conclusive failure.
         """
 
         def persist(updated: EffectRecord) -> None:
             state = self._require_state()
-            journal = RecoveryJournal.from_dict(state.auto_recovery, state.run_id)
-            state.auto_recovery = journal.with_audit(seq, updated).to_dict()
+            state.auto_recovery = self._recovery_journal().with_audit(seq, updated).to_dict()
             self._save()
 
-        if record.stage is Stage.OBSERVED:
-            return ""
-        if record.stage is Stage.CONFLICT:
-            return record.reason
+        record = self._recovery_journal().entry(seq).audit
+        if not record.pending:
+            return record
+        return drive(record, RecoveryAuditCommentOp(self.github), persist).record
+
+    def _recovery_audit_problem(self, seq: int) -> str:
+        """Why decision ``seq``'s audit comment is not confirmed now; "" once it is."""
         try:
-            driven = drive(record, RecoveryAuditCommentOp(self.github), persist)
-        except EffectPending as exc:
-            return str(exc)
+            record = self._drive_recovery_audit(seq)
         except AutoForgeError as exc:
             # A read or write of GitHub that failed (conclusive or not), a
             # `gh` that could not be started, or a save of the record that
             # failed: the record stays as last persisted, for the next command.
             return f"{type(exc).__name__}: {exc}"
-        if driven.record.stage is Stage.OBSERVED:
+        if record.stage is Stage.OBSERVED:
             return ""
-        return driven.record.reason or f"it is {driven.record.stage.value}"
+        return record.reason or f"it is {record.stage.value}"
 
-    def _settle_recovery_audits(self) -> None:
-        """Complete every audit comment an earlier decision left pending (#434, D8).
+    def _settle_recovery_decisions(self) -> StepOutcome | None:
+        """Complete every decision an earlier command left unsettled, or stop (#434, D8).
 
-        A crash after a decision's save, or GitHub failing its comment, leaves
-        the K13 record ``intended`` or ``attempted``; the next command posts or
-        adopts it before it executes anything. A failure leaves it pending
-        again, for the command after: an audit sink holds up no run.
+        A crash after a decision's save, a run log that refused its record,
+        or GitHub failing its comment leaves the decision unsettled
+        (:attr:`~autoforge.auto_recovery.DecisionEntry.settled`). Before a
+        command executes anything, each is completed, oldest first: its run
+        log record (:meth:`_log_recovery_decision`), then its comment
+        (:meth:`_drive_recovery_audit`). One that cannot be is never passed
+        over (R1-F5 of PR #480), and the journal never drops it: a refusal
+        of the run log, or a GitHub that cannot be read now, raises with the
+        phase unchanged, for ``resume`` to try again; a conclusive GitHub
+        failure, or a comment in conflict, enters BLOCKED with what the
+        operator must resolve, and an applied ``unblock`` has the conflict
+        read again (:meth:`RecoveryJournal.reopened`). ``None`` when
+        everything is settled.
         """
         state = self._require_state()
         if not state.auto_recovery:
-            return
-        journal = RecoveryJournal.from_dict(state.auto_recovery, state.run_id)
-        for entry in journal.pending_audits():
-            self._drive_recovery_audit(entry.seq, entry.audit)
+            return None
+        for entry in self._recovery_journal().unsettled():
+            what = f"Automatic recovery decision {entry.seq} ({entry.text()})"
+            try:
+                self._log_recovery_decision(entry.seq)
+            except AutoForgeError as exc:
+                _add_line(
+                    exc,
+                    f"{what}: its run log record could not be written, and nothing is "
+                    "executed while a decision's audit is incomplete. Repair the run log, "
+                    "then 'resume'.",
+                )
+                raise
+            if not any(d.seq == entry.seq for d in self._recovery_journal().unsettled()):
+                # Its comment was already observed, and the record just written
+                # settled it: an earlier step's decision is then dropped.
+                continue
+            target = str(entry.audit.target["target_url"])
+            try:
+                record = self._drive_recovery_audit(entry.seq)
+            except GitHubUnavailableError as exc:
+                _add_line(
+                    exc,
+                    f"{what}: its audit comment on {target} could not be confirmed, and "
+                    "nothing is executed while a decision's audit is incomplete; 'resume' "
+                    "reads GitHub again before anything is sent again.",
+                )
+                raise
+            except GitHubError as exc:
+                return self._block(
+                    state.phase,
+                    None,
+                    f"{what}: its audit comment on {target} could not be reconciled with "
+                    f"GitHub: {exc}. This is not a transient failure (authentication, "
+                    "permissions, or malformed data); nothing was sent again, and nothing is "
+                    "executed while a decision's audit is incomplete. Fix the cause, then "
+                    "'unblock'",
+                    code=StopReasonCode.GITHUB_READ_FAILED,
+                )
+            if record.stage is Stage.CONFLICT:
+                return self._block(
+                    state.phase,
+                    None,
+                    f"{what}: its audit comment on {target} is in conflict: {record.reason}. "
+                    "Nothing is executed while a decision's audit is incomplete. Inspect the "
+                    f"comments of {target} that carry its marker ({record.marker}): remove "
+                    "those that are not the controller's text, or restore that text, then "
+                    "'unblock'; the next command reads the target again and adopts the "
+                    "comment, or posts it once, before anything else",
+                    code=StopReasonCode.EFFECT_CONFLICT,
+                )
+        return None
 
     def _recovery_audit_where(self, seq: int, problem: str) -> str:
         """Where decision ``seq``'s audit is: its comment, or why it is not posted yet."""
-        state = self._require_state()
-        journal = RecoveryJournal.from_dict(state.auto_recovery, state.run_id)
-        entry = next((d for d in journal.decisions if d.seq == seq), None)
-        url = str((entry.audit.observed or {}).get("url", "")) if entry is not None else ""
+        entry = self._recovery_journal().entry(seq)
+        url = str((entry.audit.observed or {}).get("url", ""))
         if url:
             return f"Audit: {url} and the run log."
         return (
             f"Audit: the run log; its comment is not confirmed yet ({problem or 'pending'}), "
-            "and the next command posts it before anything else."
+            "and the next command posts it before it executes anything."
         )
 
     # -- single step ---------------------------------------------------------
@@ -8801,6 +8932,13 @@ class ControllerEngine:
             # decided on the PR's owner, not on the plan's conflicts, which
             # its phase reports once the takeover is through.
             state.effect_records = [r.reopened().to_dict() for r in effects.records]
+        if state.auto_recovery:
+            # #434 (R1-F5 of PR #480): an automatic-recovery decision whose
+            # audit comment conflicted blocked the run; the operator resolved
+            # it on GitHub, and the next command reads the target again.
+            state.auto_recovery = (
+                RecoveryJournal.from_dict(state.auto_recovery, state.run_id).reopened().to_dict()
+            )
         state.validation_override_seq = watermark
         state.block_reason = ""
         state.stop_code = ""
@@ -16113,6 +16251,26 @@ class ControllerEngine:
                 resolved = before_relaunch()
                 if resolved is not None:
                     return resolved
+                # #434 (D7, R1-F3 of PR #480): a relaunch is a physical, paid
+                # launch like the step's first, so it is one more step of the
+                # run: checked against the persisted budget here, and charged
+                # in the save before it starts (below), so a crash while it
+                # runs, or any later command, finds it counted. No step left
+                # stops the run as the budget does before a step.
+                budget = step_budget_reason(state.step_count, self.config.workflow.max_total_steps)
+                if budget:
+                    return self._block(
+                        phase,
+                        None,
+                        self._budget_block_reason(
+                            phase,
+                            f"{budget}; launch {attempt} of this {phase.value} step ended "
+                            f"without a usable result ({self._launch_log_says_why()}), and its "
+                            "relaunch (a correction or the retry of a transient failure) is a "
+                            "launch the budget charges, so nothing was launched again",
+                        ),
+                        code=StopReasonCode.STEP_BUDGET,
+                    )
             # Which UPDATE_EPIC result this launch asks for (ADR 0004 D4.7):
             # decided by the entry above, and the schema its result is held to.
             request = (
@@ -16156,6 +16314,9 @@ class ControllerEngine:
             finally:
                 self._read_context_dir = None
                 self._worktree_state = None
+            if attempt:
+                # The relaunch's step (above), in the save before it starts.
+                state.step_count += 1
             attempt += 1
             state.attempt += 1
             # D13.3: which publication contract this launch runs under, so a
@@ -16163,10 +16324,12 @@ class ControllerEngine:
             # published under the previous contract.
             state.launch_label = launch_label_for(phase)
             # The one write before the agent starts: the attempt counter, the
-            # entry observation (D4.4) and the launch label. A crash while the
-            # agent runs, or a refused run-log write after it returned,
-            # therefore never leaves controller state claiming the phase was
-            # not yet attempted (#55, PR #89).
+            # step it is charged as (the first launch's by the step itself, a
+            # relaunch's above), the entry observation (D4.4) and the launch
+            # label. A crash while the agent runs, or a refused run-log write
+            # after it returned, therefore never leaves controller state
+            # claiming the phase was not yet attempted (#55, PR #89), or the
+            # launch uncharged (#434).
             self._save()
             # The step's log directory and its ``progress.log`` are published
             # here, after the attempt is persisted and before the launch, so
@@ -16309,15 +16472,33 @@ class ControllerEngine:
                 reached = f"killed: {loop}" if loop else _limit_reached(limits, result)
                 killed = f"was killed: {loop}" if loop else f"{reached} and was killed"
                 record.error = _with_leftovers(reached, result.leftovers)
+                if result.usage_limit:
+                    record.error += f" (provider limit: {result.usage_limit})"
                 self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
                 # Which value to change, when one set the limit (#189). What
                 # to inspect and how to resume are added where the step ends
                 # (:meth:`_state_unchanged_text`), as for every agent failure.
                 key = _limit_key(profile, limits, result)
-                timeout = ExecutionTimeoutError(
-                    _with_leftovers(f"agent '{profile.name}' {killed}", result.leftovers)
-                    + (f". The limit is set by {key}" if key else "")
+                text = _with_leftovers(f"agent '{profile.name}' {killed}", result.leftovers) + (
+                    f". The limit is set by {key}" if key else ""
                 )
+                timeout: ExecutionError
+                if result.usage_limit:
+                    # #434 (D4, R1-F2 of PR #480): the provider had refused the
+                    # launch at a usage or rate limit before the limit killed
+                    # the CLI. The refusal is the cause, and a launch now meets
+                    # it again: the step ends as a usage limit, never as a
+                    # timeout the recovery rule would relaunch.
+                    timeout = ProviderUsageLimitError(
+                        f"{text}, after its provider refused it at a usage or rate limit "
+                        f"(provider limit: {result.usage_limit}; not relaunched: a launch now "
+                        f"meets the same limit, and {_usage_reset_text(result)})",
+                        provider=profile.provider,
+                        limit=result.usage_limit,
+                        reset_at=result.usage_reset_at,
+                    )
+                else:
+                    timeout = ExecutionTimeoutError(text)
                 # #434: what the recovery rule reads, typed, never the text.
                 timeout.launch_end = _launch_end(LaunchEndKind.TIMEOUT, result, profile)
                 raise timeout
@@ -16377,14 +16558,9 @@ class ControllerEngine:
                 if result.usage_limit:
                     # #434 (D4): never relaunched at once, transient or not: a
                     # launch now meets the same limit.
-                    reset = (
-                        f"the provider reports a reset at {result.usage_reset_at}"
-                        if result.usage_reset_at
-                        else "the provider reported no reset time"
-                    )
                     ended += (
                         f" (provider limit: {result.usage_limit}; not relaunched: a launch "
-                        f"now meets the same limit, and {reset})"
+                        f"now meets the same limit, and {_usage_reset_text(result)})"
                     )
                     limited = ProviderUsageLimitError(
                         _with_leftovers(f"agent '{profile.name}' {ended}", result.leftovers)

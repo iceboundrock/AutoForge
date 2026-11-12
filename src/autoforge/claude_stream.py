@@ -285,6 +285,8 @@ class ClaudeStream:
         self._unknown = 0
         self._after_result = 0
         self._tool_calls = 0
+        # ``system/init`` records seen: the CLI started a session (#434).
+        self._inits = 0
         self._tool_errors = 0
         self._retries = 0
         self._result: dict[str, str | int | bool] = {}
@@ -368,14 +370,32 @@ class ClaudeStream:
 
     @property
     def result_less(self) -> bool:
-        """Whether the CLI ended its stream without a single ``result`` record (#434).
+        """Whether the CLI died inside a running session, before any ``result`` (#434).
 
-        A typed fact for the automatic-recovery rule: stdout reached EOF with
-        no turn ever closed, no line skipped past the per-line bound (it may
-        have been the result) and no other failure first. A stream that had a
-        result, or failed on a record, is no result-less exit.
+        A typed fact for the automatic-recovery rule, which relaunches only
+        what positive evidence shows safe to re-enter (ADR 0012 D11.2): the
+        absence of a result says nothing of why the CLI ended. So it holds
+        only when the stream shows the session was running before it ended:
+        the CLI's own ``system/init`` (its configuration loaded and its
+        session started) and at least one tool call of the model's
+        (``tool_use``: the model API answered the credential, and the model
+        was working; the CLI's own message for a failed API request carries
+        no tool call). Then stdout reached EOF with no turn ever closed, no
+        line skipped past the per-line bound (it may have been the result)
+        and no other failure first. An empty stream, or one that ended before
+        the model's first tool call, is no result-less exit: an
+        authentication, permission, configuration or host failure the CLI
+        reports only on stderr ends it exactly so, and stderr is free text,
+        never read for this (R1-F1 of PR #480). Neither is a stream that had
+        a result, or failed on a record.
         """
-        return self.exited_early and self._results == 0 and self._oversize == 0
+        return (
+            self.exited_early
+            and self._results == 0
+            and self._oversize == 0
+            and self._inits > 0
+            and self._tool_calls > 0
+        )
 
     def summary(self) -> dict[str, str | int | bool]:
         """The flat, bounded, redacted summary for ``execution.json``."""
@@ -488,6 +508,7 @@ class ClaudeStream:
     def _system(self, record: dict) -> None:
         subtype = record.get("subtype")
         if subtype == "init":
+            self._inits += 1
             model = record.get("model")
             self._send(
                 ProgressEvent(ProgressKind.STARTED, detail=model if isinstance(model, str) else "")

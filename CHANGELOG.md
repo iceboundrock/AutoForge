@@ -9,8 +9,10 @@ so.
 
 `run` and `resume` (and a scheduler worker) no longer stop for you after
 every agent failure that leaves the phase unchanged. Two of them, an agent
-killed at its idle limit and an agent CLI that ended without delivering any
-result (Claude Code's `stream-json` stream with no result record), are
+killed at its idle limit and an agent CLI that died inside a running session
+before delivering any result (Claude Code's `stream-json` stream showing the
+CLI's `init` and a tool call of the model's, then no result record; an empty
+stream is not one, whatever the CLI printed on stderr), are
 relaunched once per step by the running command itself, exactly as your
 `resume` would: the phase is reconciled with GitHub first, so work that
 already landed is completed, not repeated. Nothing else is: a maximum
@@ -24,17 +26,29 @@ and when `workflow.max_total_steps` or `--max-steps` has no step left. The
 relaunch counts as a step like any other. `step` never relaunches on its
 own.
 
+**Changed:** `workflow.max_total_steps` now counts every agent launch. A
+correction of a malformed result and the retry of a transient provider
+failure inside a step each count one more step, charged before the launch
+starts; with no step left the run stops in `BLOCKED` (`step-budget`) instead
+of launching. A run that relaunches often reaches the budget sooner than
+before.
+
 Every decision, relaunch or refusal, is saved in the run's state, written
 to the run log, and posted as a comment on the PR (on the issue before there
 is one) headed `AutoForge automatic recovery`, with the rule, the typed
 reason, the evidence, the effect and the budget. Nothing is relaunched until
-that comment is confirmed; one that cannot be posted is posted by the next
-command, once. `status` shows the step's allowance and its decisions.
+both are complete. One that cannot be completed is completed by the next
+`run`, `resume` or `step`, once, before it executes anything; until then that
+command stops, and a comment in conflict (another comment carrying its
+marker, or its text edited) or a conclusive GitHub failure stops the run in
+`BLOCKED` for you to resolve before `unblock`. `status` shows the step's
+allowance and its decisions.
 
 A provider's usage or rate limit is now its own stop,
 `stop: resumable_error (reason provider-usage-limit, ...)`, naming the
 provider and the limit: Claude Code's model API error 429, and OpenCode's
-`Error: The usage limit has been reached`. It is never relaunched; `resume`
+`Error: The usage limit has been reached`. It is never relaunched, also
+when the CLI then stayed alive until its idle limit killed it; `resume`
 once the limit has reset. No provider reports when that is, so the
 controller does not wait for it.
 

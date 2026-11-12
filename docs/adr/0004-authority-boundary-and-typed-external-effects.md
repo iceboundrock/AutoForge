@@ -1679,9 +1679,14 @@ recovery journal instead (`auto_recovery`, ADR 0012 D11 as amended), and
   the next `run`, `resume` or `step` reconciles it before it executes
   anything: a comment that landed is adopted, one that did not is posted
   within the attempt bound. A failure to read or write GitHub leaves the
-  record as saved for the next command; it stops no run by itself, being an
-  audit sink, but an allowed relaunch waits for its comment: nothing is
-  relaunched while it is unconfirmed (ADR 0012 D11.5).
+  record as saved, and nothing is relaunched while it is unconfirmed. The
+  record is never dropped while it is not observed, and the command that
+  finds it so executes nothing until it is (R1-F5 of PR #480): a GitHub that
+  cannot be read now stops that command with the phase unchanged; a
+  conclusive failure, or a `conflict` (a second comment with the marker, or
+  one whose body is not the payload), enters `BLOCKED`, and an applied
+  `unblock` has the conflict reconciled again, its attempt count kept, as
+  for a phase plan's record (ADR 0012 D11.5).
 
 **D5.2 (#160).** **Correcting a controller-authored object in place is not a
 kind.** Every payload is rendered from persisted bytes (D8.4), so the

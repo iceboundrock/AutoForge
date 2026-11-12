@@ -1006,12 +1006,30 @@ def test_a_turn_ended_at_a_usage_or_rate_limit_is_typed_as_one():
     assert _run(b"not json", _api_error(429, "x"))[0].limit is None
 
 
-def test_only_a_stream_with_no_result_at_all_is_result_less():
-    assert _run({"type": "system", "subtype": "init", "model": "m"})[0].result_less
+def test_only_a_session_that_ran_and_then_ended_with_no_result_is_result_less():
+    """R1-F1 of PR #480: the absence of a result is no evidence of why the CLI
+    ended. Only its init and a tool call of the model's show the session ran."""
+    init = {"type": "system", "subtype": "init", "model": "m"}
+    tool = {
+        "type": "assistant",
+        "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+    }
+    text = {"type": "assistant", "message": {"content": [{"type": "text", "text": "hm"}]}}
+    assert _run(init, tool)[0].result_less
+    # An empty stream: an authentication, permission, configuration or host
+    # failure the CLI reports on stderr alone ends it exactly so.
+    empty = ClaudeStream(cwd=CWD, emit=None)
+    empty.stream_ended()
+    assert empty.exited_early and not empty.result_less
+    # The session started, but the model never called a tool (the CLI's own
+    # message for a failed request is an assistant record too).
+    assert not _run(init)[0].result_less
+    assert not _run(init, text)[0].result_less
+    # A tool call without the CLI's init is no session it started.
+    assert not _run(tool)[0].result_less
     # A result arrived (a failing one, or an earlier turn's): not result-less.
     assert not _run(_api_error(529, "x"))[0].result_less
-    init = {"type": "system", "subtype": "init", "model": "m"}
-    assert not _run(_result(), init)[0].result_less
+    assert not _run(init, tool, _result(), init)[0].result_less
     # A line skipped past the per-line bound may have been the result.
     stream = ClaudeStream(cwd=CWD, emit=None)
     stream.oversize(1 << 20)

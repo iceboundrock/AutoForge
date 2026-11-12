@@ -1827,7 +1827,8 @@ a stated reason it has none. The coverage that must keep working:
   never relaunched with or without a reset time, the message never read, no
   stop classification imported, a refusal of the command not decided); the
   journal's strict shape, its round trip, a fresh allowance per step that
-  keeps only pending audits, its bound dropping settled decisions first; K13
+  keeps only unsettled decisions, its bound dropping settled decisions and
+  never an unsettled one; K13
   held to its owner and target and refused in a phase plan; the audit text
   publishable (no mention, issue link, closing keyword or local path); and
   the engine: an idle timeout and a result-less exit relaunched once with
@@ -1839,9 +1840,21 @@ a stated reason it has none. The coverage that must keep working:
   invocation's `--max-steps` and a stop request refusing; `step` and a dry
   run deciding nothing; an unconfirmed audit relaunching nothing and posted
   once by the next command; an audit that landed before a crash adopted; a
-  crash after the decision's save spending the allowance. Protocol 17 -> 18
-  in `tests/test_state.py`; the adapters' usage-limit and result-less facts in
-  `tests/test_providers.py` and `tests/test_claude_stream.py`
+  crash after the decision's save spending the allowance. PR #480's round 1:
+  an empty Claude stream with an authentication or host failure on stderr,
+  and one that ended before the model's first tool call, never relaunched,
+  and a CLI that died inside a running session relaunched once, adapter to
+  engine; a limit reported before an idle kill vetoing the relaunch (Claude
+  through its failure-exit grace, OpenCode, and the rule); every correction
+  and transient relaunch charged against `workflow.max_total_steps` before it
+  starts, mixed with an automatic relaunch at the boundary and across an
+  interruption; a crash before and after the decision's run log write
+  completing it exactly once; repeated GitHub failures stopping `run` and
+  `step` with nothing executed and no decision dropped; a conclusive failure
+  and a conflicting comment blocking until the operator's `unblock`.
+  Protocol 17 -> 18 in `tests/test_state.py`; the adapters' usage-limit and
+  result-less facts in `tests/test_providers.py` and
+  `tests/test_claude_stream.py`
 - the `UPDATE_EPIC` progress comment across every crash window of the
   effect lifecycle (`test_k8_*` in `tests/test_engine.py`), the one-shot
   legacy re-entry (D13.7) including a crash after its adoption was saved,

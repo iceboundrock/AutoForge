@@ -734,10 +734,12 @@ class AutoForgeState:
     # rule's first decision: the step its allowance and failure counters
     # belong to, the step's automatic relaunches (at most one), the run's last
     # decision number, and the decisions of that step (and of an earlier step
-    # while its K13 audit comment is pending), each with its audit record.
-    # Written by the engine's recovery path and read only by it and by
-    # ``status``; never cleared by a phase change, which only moves ``step``
-    # on. Its run log line and its comment are audit sinks, never inputs.
+    # until it is settled), each with its K13 audit record and its run log
+    # progress. Written by the engine's recovery path (and by an applied
+    # ``unblock``, which has a conflicting audit reconciled again) and read
+    # only by it and by ``status``; never cleared by a phase change, which
+    # only moves ``step`` on. Its run log record and its comment are audit
+    # sinks, never inputs.
     auto_recovery: dict = field(default_factory=dict)
     # The outcomes of the current PR's acceptance actions (#211), oldest
     # first: ``action_id``, ``round``, ``finding_id``, ``outcome``

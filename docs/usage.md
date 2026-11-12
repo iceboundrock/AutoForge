@@ -476,15 +476,19 @@ The REVIEW/FIX loop is bounded by the controller, never by prompt wording:
 a cap on review rounds per PR (`workflow.max_review_rounds`, default 20),
 stagnation detection (`workflow.stagnation_*`), and a cumulative step budget
 for the whole run (`workflow.max_total_steps`, default 300, measured on the
-persisted step count so `resume` continues it). Failed agent invocations
+persisted step count so `resume` continues it; every agent launch counts,
+a correction or a transient relaunch inside a step included, charged before
+it starts). Failed agent invocations
 consume neither a review round nor the history. Every bound ends in
 `BLOCKED` with the reason; findings and the PR stay for a human.
 
 A failed agent step is relaunched automatically at most once, and only for
-an idle timeout or an exit its adapter typed as result-less, inside the
-running `run` or `resume`; the relaunch is one more step of
-`workflow.max_total_steps` and of `--max-steps`, and is saved, logged and
-posted as an audit comment first
+an idle timeout or an exit its adapter typed as result-less (a CLI that died
+inside a running session), inside the running `run` or `resume`; the
+relaunch is one more step of `workflow.max_total_steps` and of
+`--max-steps`, and is saved, logged and posted as an audit comment first. A
+decision whose log record or comment is not complete stops the next command
+until it is
 ([Automatic recovery](troubleshooting.md#automatic-recovery-one-relaunch-per-step)).
 
 Replanning is controller policy, not reviewer advice. After a verified
