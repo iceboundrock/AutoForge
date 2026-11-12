@@ -86,8 +86,12 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
     :attr:`AgentExecutionResult.transient_failure` (``claude: API error
     <status>``); any other 4xx, 429 included, an error without a status (a
     refused or dropped connection, the CLI's own request timeout) and any
-    other failure are not (claude_stream.py says why). Whether to relaunch is the
-    engine's policy. A relaunched CLI begins with its own retries, so the
+    other failure are not (claude_stream.py says why). A 429 is typed as the
+    provider's usage or rate limit instead (#434):
+    :attr:`AgentExecutionResult.usage_limit` (``claude: API error 429``), which
+    the engine never relaunches. A stream that ended without a single result
+    record, with no line lost, is a :attr:`AgentExecutionResult.result_less_exit`.
+    Whether to relaunch is the engine's policy. A relaunched CLI begins with its own retries, so the
     relaunch itself waits through another retry schedule before giving up.
     ``text`` output is not classified.
 
@@ -149,6 +153,10 @@ OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
     an error the CLI does not print (it prints one execution failure only
     when no step failed before it) and an exit 1 without any error line (a
     cancelled permission prompt, below); both are failed exits all the same.
+    A failed run whose run-level errors include OpenCode's usage-limit error,
+    compared whole (:data:`_OPENCODE_USAGE_LIMIT_ERROR`, whatever the model),
+    is reported as a :attr:`AgentExecutionResult.usage_limit` and never as
+    transient (#434).
   * bash/edit tools run without ``--auto`` under the default agent;
     ``--auto`` is opt-in via ``options.auto_approve: true``.
   * a request of the agent's is refused, never put to a person (#258; run
@@ -461,6 +469,19 @@ class AgentExecutionResult:
     # relaunch is the engine's policy, which reads no provider name or error
     # text of its own.
     transient_failure: str | None = None
+    # A failed run the adapter recognised as its provider refusing it at a
+    # usage or rate limit (#434): a short, fixed reason naming it, never text
+    # taken from the output; never set with ``transient_failure``. The engine
+    # raises ProviderUsageLimitError for it and relaunches nothing.
+    # ``usage_reset_at`` is a reset time the provider reported in a form the
+    # adapter trusts (UTC, ISO 8601); no adapter reads one today, so it is "".
+    usage_limit: str | None = None
+    usage_reset_at: str = ""
+    # A failed run the adapter recognised as an exit without any result
+    # (#434): the CLI ended its protocol stream before a single result record,
+    # with nothing lost from the stream on the way. A fact, not a decision:
+    # whether to relaunch is the engine's recovery rule.
+    result_less_exit: bool = False
     # A small flat mapping of scalars, bounded and redacted by the adapter,
     # that the engine writes to ``execution.json`` under this key without
     # interpreting it. Never raw protocol records or message contents.
@@ -1574,6 +1595,15 @@ class ClaudeCodeProvider(AgentProvider):
             # A failure the stream recognised as a transient model API error
             # (#395) stays one when the CLI was stopped after it (#394).
             transient_failure=None if timed_out or failure is None else stream.transient,
+            # #434: a turn ended at a usage or rate limit, and a stream that
+            # ended without any result, with no line lost on the way.
+            usage_limit=None if timed_out or failure is None else stream.limit,
+            result_less_exit=(
+                not timed_out
+                and failure is not None
+                and stream.result_less
+                and not res.records_overflowed
+            ),
             provider_summary=summary,
             timeout_limit="" if replied else res.timeout_limit,
             last_activity_at=res.last_activity_at,
@@ -2030,6 +2060,16 @@ class OpenCodeProvider(AgentProvider):
             if errors and all(e in _OPENCODE_OPENAI_TRANSIENT_ERRORS for e in errors):
                 reasons = dict.fromkeys(_OPENCODE_OPENAI_TRANSIENT_ERRORS[e] for e in errors)
                 result.transient_failure = "opencode: " + ", ".join(reasons)
+        if (
+            result.failed_exit
+            and not result.timed_out
+            and _OPENCODE_USAGE_LIMIT_ERROR in _opencode_run_errors(result.stderr)
+        ):
+            # #434: OpenCode's run-level usage-limit error, whatever the model:
+            # a launch now meets the same limit, and the error says nothing of
+            # when it resets.
+            result.usage_limit = f"opencode: {_OPENCODE_USAGE_LIMIT_ERROR}"
+            result.transient_failure = None
         refused = _opencode_refused_requests(result.stderr)
         ended_by_it = ""
         if (
@@ -2080,6 +2120,13 @@ _OPENCODE_OPENAI_TRANSIENT_ERRORS = {
         "error persists."
     ): "OpenAI server_error",
 }
+
+
+# The run-level error OpenCode prints when the provider's usage limit is
+# reached, as #434's survey recorded it (reported from real runs, not run
+# against a CLI here): the whole message, compared whole. It names no reset
+# time.
+_OPENCODE_USAGE_LIMIT_ERROR = "The usage limit has been reached"
 
 
 # How OpenCode prints a request it refuses (#258; 2.1.4, run against a

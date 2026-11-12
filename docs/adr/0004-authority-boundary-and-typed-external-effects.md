@@ -35,6 +35,11 @@
   bounded request that the controller replace the description of the run's
   own PR, its markers and closing reference kept by the controller, under
   `safety.pr_body_updates` (D5.1, K12), with its own protocol bump (D13.12).
+- **Amended by #434:** effect kind K13 (`recovery_audit_comment`), the
+  controller's audit comment of one decision of the bounded automatic
+  recovery rule (ADR 0012 as amended by #434), on the run's PR or, while it
+  has none, its issue. The first kind no phase plan holds: it lives in the
+  recovery journal (`auto_recovery`), with its own protocol bump (D13.13).
 - **Amended by #267 (accepted with required changes, 2026-11-08):** D1.1's sentence naming the
   candidate, for the container backend only ([ADR 0013](0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md) D5). It
   takes effect when #273 makes that backend selectable. ADR 0013 §5.2
@@ -285,6 +290,7 @@ prompts make no GitHub call and are out of scope.
 | comment on another issue of the run's repository as acceptance evidence (a finding or acceptance criterion asks for a note on an issue the run's issue references, or on the EPIC) | no prompt before #243; `fix.md` "Operator actions" (the `operator_acceptance` resolution) | controller-only | operator-performed: effect K10, which the operator posts and the controller verifies and never issues (D2.1a) | #243 |
 | replace the owner in a PR's implementation marker (a takeover) | no prompt before #414; `unblock --take-over` | controller-only | effect K11, on the operator's command (D9.4a) | #414 |
 | replace the description of the run's own PR (a finding says it is stale) | no prompt before #423; `fix.md` "PR description" (the `pr_body_update` resolution) | controller-only | effect K12, under `safety.pr_body_updates` | #423 |
+| audit an automatic-recovery decision (a relaunch or a refusal of the bounded rule) on the run's PR or issue | no prompt: no agent requests it (#434) | controller-only | effect K13, from the controller's own text | #434 |
 | edit the progress comment in place | `update_epic.md` :35–37 | controller-only | removed (D5.2) | #160 |
 | `gh issue edit` on the EPIC | `update_epic.md` :62 (forbidden to agents) | controller-only | unchanged: the controller's roadmap splice | — |
 | source PR close, receipt, compensating reopen | `github.py` :1602, :1619, :1630 | controller-only | unchanged mechanism (D5.4) | — |
@@ -963,6 +969,16 @@ a generic edit: the target is derived and fixed to the bound PR, the text is
 bounded and policed, and everything the controller owns is kept byte for byte.
 A new object, or a new way to reach one, is a further amendment.
 
+**Amended (#434).** A thirteenth kind, K13 (the audit comment of one
+automatic-recovery decision), is added under the same rule, with its own
+protocol bump (D13.13). No agent requests it and no agent text is in it:
+the controller writes it of its own decision, from typed values. It is the
+first kind no phase plan holds. A decision is taken between steps, about a
+step that failed, so its record would otherwise join, and hold up or be
+completed with, the plan of the phase it is about; it is kept in the
+recovery journal instead (`auto_recovery`, ADR 0012 D11 as amended), and
+`effect_records` refuses it.
+
 #### K1. Push an exact candidate (the Git publication layer, §2.6)
 
 - **Consumers:** #161 (the implementation branch), #163 (the fix push),
@@ -1634,6 +1650,38 @@ A new object, or a new way to reach one, is a further amendment.
   `pull-request.md` and judges it against the diff. A finding the description
   still fails to resolve is raised again, so an idempotent update resolves
   nothing by itself.
+
+#### K13. Create the audit comment of an automatic-recovery decision (#434)
+
+- **Consumer:** #434, the bounded automatic recovery rule (ADR 0012, as
+  amended by #434; `src/autoforge/auto_recovery.py`).
+- **Identity:** the `ai-recovery-audit` marker for the run's issue, the run
+  and the decision's sequence number in the run, on the run's PR, or on its
+  issue while the run has no PR (`audit_target`).
+- **Target:** that object's comments.
+- **Precondition:** no comment of the target carries the marker.
+- **Payload:** the controller's audit text (the rule, the typed category,
+  the typed evidence of the failed launch, the decision and its refusal, the
+  effect, the step's and the run's budget, and that no human approved it),
+  a blank line and the marker. It names no user, no issue number and no
+  local path, and is redacted whole.
+- **Completion read-back:** exactly one comment carries the marker, and its
+  body equals the payload (the complete comment listing of the target,
+  never the search API), as for K8.
+- **Where the record lives:** in the decision's entry of the recovery
+  journal (`state.auto_recovery`), never in `effect_records`, which refuses
+  it on load. It is planned with the decision, in the save that records the
+  decision and its accounting, and driven by the generic `drive` (D4.1:
+  `attempted` saved before the write, an ambiguous write read back). Its
+  owner is the step the decision is about.
+- **Windows:** the generic ones. A crash before the decision's save planned
+  nothing. A crash after it leaves the record `intended` or `attempted`, and
+  the next `run`, `resume` or `step` reconciles it before it executes
+  anything: a comment that landed is adopted, one that did not is posted
+  within the attempt bound. A failure to read or write GitHub leaves the
+  record as saved for the next command; it stops no run by itself, being an
+  audit sink, but an allowed relaunch waits for its comment: nothing is
+  relaunched while it is unconfirmed (ADR 0012 D11.5).
 
 **D5.2 (#160).** **Correcting a controller-authored object in place is not a
 kind.** Every payload is rendered from persisted bytes (D8.4), so the
@@ -3136,6 +3184,22 @@ migration rule follows D13.2, by label:
 - a protocol-15 file missing `pr_body_outcomes` is refused: every save writes it;
 - an older controller refuses a protocol-15 file by its label.
 
+**D13.13 (#434).** **K13 and the recovery journal are their own protocol bump.**
+Under D13.1's rule it is made alone: protocol 17 → 18; the prompts do not
+change. It adds the kind and the field `auto_recovery` (the journal that
+holds each K13 record). The number is announced on #23 before the change
+merges, and the label moves with that decision. The migration rule follows
+D13.2, by label:
+
+- a file of an older label loads in every phase with `auto_recovery: {}`: no
+  decision was taken, so every step's allowance is unspent; it is relabelled
+  18 on its next save;
+- a file labelled 17 or older carrying the field, even `{}`, is refused,
+  unchanged, as a hand edit or a foreign file;
+- a protocol-18 file missing `auto_recovery` is refused: every save writes it;
+- a K13 record in `effect_records`, under any label, is refused;
+- an older controller refuses a protocol-18 file by its label.
+
 ## 3. What does not change
 
 - **`CONTROL_RESULT` stays untrusted, and read-back stays authoritative.** The
@@ -3242,6 +3306,7 @@ mechanisms are unchanged and has no child.
 | #243 | the D1.1, D2.4, D4.7, D5.1, D5.7, D8.3 and §4 amendments, D2.1a, K10, D5.8, D5.9, D13.10; the K10 wiring; its D1.2 row |
 | #414 | the D5.1, D9.4 and §3 amendments, D9.4a, K11, D13.11; the owner checks and the K11 wiring; its D1.2 row |
 | #423 | the D5.1 amendment, K12, D13.12; `safety.pr_body_updates`; the K12 wiring; its D1.2 row |
+| #434 | the D5.1 amendment, K13, D13.13; the K13 wiring in the recovery journal; its D1.2 row |
 
 ## 6. Tests the implementing children must add
 

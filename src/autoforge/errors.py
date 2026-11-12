@@ -302,11 +302,41 @@ class WorkerStartupError(AutoForgeError):
 
 
 class ExecutionError(AutoForgeError):
-    """Agent/CLI subprocess failed (non-zero exit, spawn failure, ...)."""
+    """Agent/CLI subprocess failed (non-zero exit, spawn failure, ...).
+
+    ``launch_end`` is typed context, never derived from the message: the
+    :class:`autoforge.auto_recovery.LaunchEnd` the engine observed of the
+    agent launch that ended the step this way (a timeout and its limit, a
+    failed exit and what its adapter typed about it), or ``None`` for an
+    error that ended no agent launch. Only the automatic-recovery rule reads
+    it (#434); every other caller keeps distinguishing on the class.
+    """
+
+    launch_end: object | None = None
 
 
 class ExecutionTimeoutError(ExecutionError):
     """Subprocess exceeded its timeout and was terminated."""
+
+
+class ProviderUsageLimitError(ExecutionError):
+    """The agent's provider refused the launch at a usage or rate limit (#434).
+
+    Raised by the engine for an invocation whose adapter typed its failure
+    as a provider limit (:attr:`autoforge.providers.AgentExecutionResult.usage_limit`),
+    from the provider's own typed answer, never from free text. Never
+    relaunched at once, as transient or as an automatic recovery: a launch
+    now meets the same limit. ``provider`` and ``limit`` name it (``limit``
+    is the adapter's fixed reason); ``reset_at`` is a reset time the provider
+    reported in a form the adapter trusts (UTC, ISO 8601), ``""`` when it
+    reported none, which no adapter reads today. The phase is unchanged.
+    """
+
+    def __init__(self, message: str, *, provider: str = "", limit: str = "", reset_at: str = ""):
+        super().__init__(message)
+        self.provider = provider
+        self.limit = limit
+        self.reset_at = reset_at
 
 
 class InteractionDataError(ExecutionError):

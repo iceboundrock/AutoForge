@@ -4090,3 +4090,82 @@ def test_parse_pi_auth_check_fails_closed_on_drift(stdout, code):
     with pytest.raises(ValueError) as err:
         parse_pi_auth_check(stdout, code)
     assert "sk-x" not in str(err.value)
+
+
+# -- #434: a provider's usage limit, and an exit without any result ----------------------
+
+
+@pytest.mark.parametrize("model", ["openai/gpt-6-luna", "deepseek/deepseek-chat"])
+def test_opencode_types_its_usage_limit_error_whatever_the_model(model):
+    """#434's survey: OpenCode says only that the limit is reached, with no reset
+    time. The adapter types it, never as transient, whatever the provider."""
+    result = _opencode_run(f"{OC_ERROR}The usage limit has been reached\n", model=model)
+    assert result.usage_limit == "opencode: The usage limit has been reached"
+    assert result.usage_reset_at == "" and result.transient_failure is None
+    assert result.exit_code == 1
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        # A tool's error with the same text is the tool's, not the run's.
+        f"{oc_tool_failed('Bash')}\n{OC_ERROR}The usage limit has been reached\n",
+        # Another message that only starts the same way.
+        f"{OC_ERROR}The usage limit has been reached for today\n",
+        f"{OC_WS_CLOSED}\n",
+        "",
+    ],
+)
+def test_opencode_types_no_other_error_as_a_usage_limit(stderr):
+    assert _opencode_run(stderr).usage_limit is None
+
+
+def test_opencode_types_no_usage_limit_on_a_run_that_did_not_fail():
+    assert (
+        _opencode_run(f"{OC_ERROR}The usage limit has been reached\n", exit_code=0).usage_limit
+        is None
+    )
+    timed_out = _opencode_run(f"{OC_ERROR}The usage limit has been reached\n", timed_out=True)
+    assert timed_out.usage_limit is None
+
+
+@pytest.mark.parametrize(
+    ("status", "limit"), [(429, "claude: API error 429"), (529, None), (401, None)]
+)
+def test_a_claude_turn_ended_at_a_rate_or_usage_limit_is_typed_never_transient(
+    tmp_path, status, limit
+):
+    from tests import claude_fake
+
+    _, res = _claude_run(
+        tmp_path, claude_fake.api_failure(status, _API_ERRORS[status]), exit_code=1
+    )
+    assert res.usage_limit == limit
+    if limit:
+        assert res.transient_failure is None and not res.result_less_exit
+
+
+@pytest.mark.parametrize(
+    ("lines", "exit_code", "result_less"),
+    [
+        ([], 1, True),
+        ([], 0, True),
+        (["RESULT_OK_IS_ERROR"], 1, False),
+        (["not json", "RESULT_OK"], 0, False),
+        (["RESULT_OK"], 0, False),
+    ],
+)
+def test_only_a_claude_run_that_delivered_no_result_record_is_a_result_less_exit(
+    tmp_path, lines, exit_code, result_less
+):
+    from tests import claude_fake
+
+    expand = {
+        "RESULT_OK": claude_fake.result("done"),
+        "RESULT_OK_IS_ERROR": claude_fake.result("done", is_error=True),
+    }
+    _, res = _claude_run(
+        tmp_path, [claude_fake.init(), *(expand.get(x, x) for x in lines)], exit_code=exit_code
+    )
+    assert res.result_less_exit is result_less
+    assert res.usage_limit is None

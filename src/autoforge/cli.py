@@ -70,6 +70,8 @@ from pathlib import Path
 from typing import TextIO
 
 from . import __version__
+from .auto_recovery import ALLOWLIST as RECOVERY_ALLOWLIST
+from .auto_recovery import MAX_AUTOMATIC_RELAUNCHES_PER_STEP, RecoveryJournal
 from .certificate import NOT_A_PERMISSION
 from .certificate import describe as describe_certificate
 from .config import (
@@ -2447,6 +2449,7 @@ def cmd_status(args) -> int:
         _render_acceptance_actions(state, engine)
         + _render_operator_actions(state, engine)
         + _render_pr_body_updates(state, engine)
+        + _render_auto_recovery(state, engine)
     )
     lines = parent.lines(engine) if parent is not None else []
     shown = review.lines() if review is not None else []
@@ -2978,6 +2981,49 @@ REASON_NOTE = (
     "saved with the stop, under the configuration of then; the steps under 'Recovery' "
     "below are those this stop allows now"
 )
+
+
+def _render_auto_recovery(state: AutoForgeState, engine: ControllerEngine) -> list[str]:
+    """The human ``Automatic recovery`` block of ``status`` (#434); none before a decision.
+
+    What the journal holds: the step its allowance belongs to, what is left
+    of it, and each decision it keeps with where its audit is. Read-only, and
+    nothing here is a route: the stop's routes are the Recovery block's.
+    """
+    journal = RecoveryJournal.from_dict(state.auto_recovery, state.run_id)
+    if journal.step is None:
+        return []
+    step = journal.step
+    round_ = f", review round {step.review_round}" if step.review_round else ""
+    current = (
+        state.phase is step.phase
+        and state.current_issue_url == step.issue_url
+        and state.current_pr_url == step.pr_url
+        and state.review_round == step.review_round
+        and state.execution_attempt == step.execution_attempt
+    )
+    lines = [
+        f"Automatic recovery (step {step.phase.value}{round_}"
+        + ("" if current else "; an earlier step")
+        + ")",
+        f"  relaunches:    {journal.relaunches} of {MAX_AUTOMATIC_RELAUNCHES_PER_STEP} used",
+    ]
+    if journal.categories:
+        counted = ", ".join(f"{k} {v}" for k, v in sorted(journal.categories.items()))
+        lines.append(f"  failures:      {counted}")
+    for entry in journal.decisions:
+        verdict = "relaunch" if entry.allowed else f"refused ({entry.refusal})"
+        url = str((entry.audit.observed or {}).get("url", ""))
+        audit = url or f"audit comment {entry.audit.stage.value}"
+        lines.append(
+            f"  decision {entry.seq}:    {entry.category.value}, {verdict}, at "
+            f"{entry.decided_at} ({audit})"
+        )
+    lines.append(
+        f"  rule:          only {', '.join(sorted(c.value for c in RECOVERY_ALLOWLIST))}, "
+        f"at most {MAX_AUTOMATIC_RELAUNCHES_PER_STEP} per step; the run log holds every decision"
+    )
+    return lines
 
 
 def _render_pr_body_updates(state: AutoForgeState, engine: ControllerEngine) -> list[str]:

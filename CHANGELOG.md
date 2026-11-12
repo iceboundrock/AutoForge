@@ -5,6 +5,42 @@ so.
 
 ## Unreleased
 
+### A failed agent step is relaunched once on its own, when it is safe to (#434)
+
+`run` and `resume` (and a scheduler worker) no longer stop for you after
+every agent failure that leaves the phase unchanged. Two of them, an agent
+killed at its idle limit and an agent CLI that ended without delivering any
+result (Claude Code's `stream-json` stream with no result record), are
+relaunched once per step by the running command itself, exactly as your
+`resume` would: the phase is reconciled with GitHub first, so work that
+already landed is completed, not repeated. Nothing else is: a maximum
+runtime, a loop kill, a provider's usage limit, a request for your decision,
+a GitHub failure, a failed verification and any untyped or unknown failure
+still stop for you. A relaunch is refused when a process the failed launch
+started may still be running, when the killed agent had already printed a
+complete `CONTROL_RESULT`, when the step already used its one automatic
+relaunch (a crash, a `resume` or an `unblock` does not give it another),
+and when `workflow.max_total_steps` or `--max-steps` has no step left. The
+relaunch counts as a step like any other. `step` never relaunches on its
+own.
+
+Every decision, relaunch or refusal, is saved in the run's state, written
+to the run log, and posted as a comment on the PR (on the issue before there
+is one) headed `AutoForge automatic recovery`, with the rule, the typed
+reason, the evidence, the effect and the budget. Nothing is relaunched until
+that comment is confirmed; one that cannot be posted is posted by the next
+command, once. `status` shows the step's allowance and its decisions.
+
+A provider's usage or rate limit is now its own stop,
+`stop: resumable_error (reason provider-usage-limit, ...)`, naming the
+provider and the limit: Claude Code's model API error 429, and OpenCode's
+`Error: The usage limit has been reached`. It is never relaunched; `resume`
+once the limit has reset. No provider reports when that is, so the
+controller does not wait for it.
+
+State protocol 17 -> 18 (`auto_recovery`, the recovery journal). Older state
+files load with no decision taken. The prompts are unchanged.
+
 ### `doctor` checks what an SDK profile needs, and a dry run shows its plan (#150)
 
 The `claude-sdk` and `opencode-sdk` providers still cannot launch: their

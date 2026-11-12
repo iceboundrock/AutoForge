@@ -1393,6 +1393,19 @@ conflict, never written over or adopted (`PrBodyUpdateOp`,
 `decide_pr_body_update`). That includes an edit after the body was verified: it is
 read again before each later write of the plan and before the fix is recorded
 (`_pr_body_edit_outcome`).
+#434 adds K13, the audit comment of one decision of the bounded automatic
+recovery rule (ADR 0012 D11): the controller's own text about its own decision
+(the rule, the typed category and evidence, the decision, the effect, the
+budget, and that no human approved it), on the run's PR, or on its issue while
+the run has no PR, identified by an `ai-recovery-audit` marker for the issue,
+the run and the decision's number (`RecoveryAuditCommentOp`). No agent asks for
+it and no agent text is in it; it names no user, no issue number and no local
+path. It is the one kind no phase plan holds: its record lives in the recovery
+journal (`auto_recovery`), `effect_records` refuses it, and the generic `drive`
+issues it (attempted before the write, found by its marker before anything is
+sent again, read back). It is an audit sink: nothing reads the comment to
+decide anything, a failure to post it leaves its record for the next command,
+and an allowed relaunch waits for it.
 
 - **Typed writes, never retried blind.** `GitHubClient` has one method per
   write the effects need (`create_issue_comment`, `create_pr_comment`,

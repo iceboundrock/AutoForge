@@ -37,6 +37,16 @@
   FIX that reported `blocked` after the controller published the commits it
   verified for some findings. It fails (i) as `agent-blocked` does: what the
   fixer asked for is a human's answer, and `unblock` alone leaves the stop.
+- **Amended by #434:** gate A reopened for one class only, bounded
+  automatic recovery, under the
+  [maintainer decision on #434](https://github.com/iceboundrock/AutoForge/issues/434#issuecomment-6819386619)
+  of 2026-11-12, which approved the policy and claims no implementation or
+  acceptance. D11 records the rule, the class and the three reviews D5
+  requires; D2's `resumable_error` row, D3's bounded-relaunch row, D5's
+  outcome and its `execution` row (with the new `provider-usage-limit`
+  code), D9's launch bound and D10's persisted field change with it. No
+  advisor, no gate D, no pause, no phase and no edge out of `BLOCKED` or
+  `FAILED` is added.
 - **Related:** ADR 0004 (the authority boundary, K9 and K10), ADR 0005 (the
   outer sandbox and its launch classes), ADR 0007 and #126 (the durable
   pause), ADR 0008 D9.4 and D15 (the scheduler's entry checks and
@@ -132,7 +142,7 @@ reorders an edge.
 |---|---|---|---|---|---|
 | `blocked` | phase `BLOCKED` | the operator: `unblock --reason`, where the controller chooses among `UNBLOCK_TARGETS` from live GitHub or refuses and stays `BLOCKED`; then `resume`. Or a new run (`run --force` when the run holds operator actions) | the operator: `unblock` against that issue's own namespace state directory, after the scheduler exits (ADR 0008 D9.4), then `epic resume`; or `epic archive` and a fresh admission | inspection: `status`, `status --json` and `unblock --dry-run`, which write nothing, and `doctor`, which writes its state-directory probe (D3); the operator's own GitHub actions; `unblock`'s K9 and K10 flags (D3) | `resume` and `step` (terminal for them); any agent launch; an automatic `unblock`; `BLOCKED -> REPLAN_REEXECUTE`; an `unblock` that takes a classification, a code or a recommendation |
 | `failed` | phase `FAILED` | the operator: a new run | `epic archive`, then a fresh admission | the same inspection | `unblock` (it refuses every phase but `BLOCKED`), `resume`, any edge |
-| `resumable_error` | the phase as last saved, with the attempt counter the step saved | the operator: `resume`, which reconciles the phase entry with GitHub before any launch | `epic resume` | the same inspection | treating it as `BLOCKED` or `FAILED`; a relaunch beyond the step's bound; retrying a failure no adapter typed as transient |
+| `resumable_error` | the phase as last saved, with the attempt counter the step saved | the operator: `resume`, which reconciles the phase entry with GitHub before any launch. *Amended by #434:* or the running `run` (or `resume`) itself, once per step, for an allowlisted typed failure only, through the same reconciliation (D11) | `epic resume`; *amended by #434:* or the worker's own loop, by the same rule (D11) | the same inspection | treating it as `BLOCKED` or `FAILED`; a relaunch beyond the step's bound; retrying a failure no adapter typed as transient; *amended by #434:* a second automatic relaunch of a step, whatever failed; an automatic relaunch of a category D11 does not allow |
 | `refused` | nothing: the command acted on no run | the operator, by code (`REFUSAL_ROUTES`). Its `repeat` route is the refused command itself, `resume` and `unblock` included, once the cause is fixed: the recorded configuration restored, or the change accepted with `--accept-config-change` (written to the run log first); a fixed configuration or host; the lock holder gone. Otherwise a state repaired or moved aside (`run --force` quarantines an unreadable one) | the same; `epic resume --accept-config-change` forwards the acceptance to its workers (ADR 0008 D9.4) | the same inspection | a repeat that skips any check of the refused command (below); reading the refusal as a change of the run, which it did not save; a configuration change taken without `--accept-config-change`, a weaker `sandbox.mode` included |
 | `awaiting_input` | #126's pending record (not implemented) | nobody until #126 lands; then #126's decision commands | settled (ADR 0008 D15.1) | the same inspection | producing it for anything but a human's pending answer (D6) |
 | `unknown` | whatever was saved | the operator, after investigating; acting needs live facts re-read | the same | the same inspection | any route a known outcome would grant |
@@ -199,7 +209,7 @@ classification (`test_unblock_takes_no_classification`).
 | Operation | Authority | Mechanism at `0ba238e` | When it cannot allow |
 |---|---|---|---|
 | reconciliation the controller already does (phase entry, effect records, plan completion) | the controller, automatically | ADR 0004 D4; `resume` | conflict or ambiguity: `BLOCKED`; transient: state unchanged, for `resume` |
-| bounded transient reads and relaunches | the controller, automatically, within a typed bound | an adapter's `transient_failure` (at most `MAX_TRANSIENT_RETRIES`, 2, per step); the pushed-head wait (#403); `merge.max_verification_attempts`; `GitHubUnavailableError` for `resume` | bound exhausted: `BLOCKED`, or the error for `resume`. An untyped failure is not transient |
+| bounded transient reads and relaunches | the controller, automatically, within a typed bound | an adapter's `transient_failure` (at most `MAX_TRANSIENT_RETRIES`, 2, per step); the pushed-head wait (#403); `merge.max_verification_attempts`; `GitHubUnavailableError` for `resume`; *amended by #434:* the bounded automatic recovery rule (D11): one relaunch per step of an allowlisted typed failure, journaled and audited | bound exhausted: `BLOCKED`, or the error for `resume`. An untyped failure is not transient. *Amended by #434:* a refused decision leaves the error, with its typed refusal, for `resume` |
 | dry-run inspection and read-only status | anyone | `--dry-run` of `run`, `step`, `resume`, `unblock` and `rebind-epic`; `status` | writes nothing, whatever it finds (`test_run_dry_run_writes_nothing`, `test_unblock_dry_run_reads_github_and_writes_nothing`) |
 | environment checks | anyone | `doctor` | is not write-free, and changes no run whatever it finds. Its one write to the controller's files is its state-directory probe: it creates the state directory when it is absent, and the directory stays; then it creates and removes one probe file in it, through the same boundary as a run's writes (`test_state_dir_on_a_filesystem_without_hard_links_names_the_requirement`). Its sandbox rows launch in system temporary directories they remove. It neither reads nor touches the run's `state.json` (`test_the_controller_row_names_the_imported_package_and_reads_no_state`), and skips the probe for a configuration it refused (`test_doctor_writes_no_state_directory_for_a_configuration_it_refused`) |
 | leaving `BLOCKED` | the operator asks; the controller chooses the phase from live GitHub | `unblock` | refuses, and the run stays `BLOCKED` |
@@ -291,13 +301,24 @@ any other:
 | `merge_gate` | `merge-inconclusive`, `pr-identity`, `pr-not-open`, `unreviewed-merge`, `merge-checks`, `merge-conflict`, `merge-not-ready`, `merge-write`, `premerge-verification`, `review-certificate`, `review-not-backed` | merging; changing the PR or its checks | (i) for a merge. Changing the PR is implementation work whose result must be reviewed: a workflow phase, not a recovery action. After the operator updates the PR, `unblock` already routes the moved head to `REVIEW` (iii) |
 | `workspace` | `checkout-drift`, `sandbox-tamper` | restoring a checkout or object store something moved | (i): a security signal, which an automatic repair would turn into a downgrade path |
 | `agent` | `agent-blocked`, `agent-failure`, `partial-fix` | a human's answer, or a fresh launch | (i) for an answer, which is #126's domain. (iii) for a launch, which is `resume` or a new run; `FAILED` has no edge. After a `partial-fix` stop the controller has already published what it verified, and the answer the fixer asked for is still a human's |
-| `execution` | `execution-failed`, `execution-timeout`, `sandbox-launch-refused`, `interaction-required`, `control-result-invalid`, `verification-failed`, `run-log-refused` | `resume` | (iii): already the route. Whether a *new* failure is transient is a typed adapter rule reviewed as code, as #164 and #395 added, not a model reading stderr (D8). `interaction-required` is #126's domain, and `sandbox-launch-refused` never runs unsandboxed (ADR 0005 D12.1) |
+| `execution` | `execution-failed`, `execution-timeout`, `sandbox-launch-refused`, `interaction-required`, `control-result-invalid`, `verification-failed`, `provider-usage-limit`, `run-log-refused` | `resume` | (iii): already the route. Whether a *new* failure is transient is a typed adapter rule reviewed as code, as #164 and #395 added, not a model reading stderr (D8). `interaction-required` is #126's domain, and `sandbox-launch-refused` never runs unsandboxed (ADR 0005 D12.1). *Amended by #434:* the one class gate A approves comes from this family: an idle timeout and an adapter-typed result-less exit, the controller taking `resume`'s own route once per step (D11). Every other failure of the family stays (iii); a provider's usage limit stays the operator's while no provider reports a reset time the controller can trust (D11.3) |
 | `configuration` | `configuration-invalid`, `configuration-drift`, `sandbox-capability`, `scheduler-owned` | another configuration, an accepted drift, a capable host, the scheduler's own commands | (i) |
 | `state` | `state-invalid`, `state-protocol`, `state-transition`, `lock-held` | a repaired or moved-aside state file, a newer controller, the right command, another process ending | (i) |
 | `unknown` | `unknown` | — | (ii): nothing typed says what happened |
 | `intentional` | `ready-for-merge`, `handoff`, `done`, `in-progress`, `awaiting-input` | nothing: a stop by design keeps ADR 0011 D1's routes (D2), and a pause is answered by its human through #126 (D6) | none applies: not a recovery case |
 
 The class is empty, so A is no-go. Nothing is built only to satisfy #354.
+
+*Amended by #434:* a class now exists, and gate A is a **go for it alone**:
+the controller's own `resume` of a step whose agent launch ended with an
+allowlisted, typed failure, once per step (D11). It meets (i): D3's
+bounded-relaunch row is the controller's, automatically, within a typed
+bound. It meets (ii): the relaunch re-enters the phase through the same
+entry reconciliation an operator's `resume` runs, which reads GitHub and the
+journal itself. And it is not decided deterministically today (iii): before
+#434 the run waited for the operator to type `resume`. D11.7 records the
+threat-model, cost and security reviews. The no-go stands for every other
+family, code and action, and for an advisor in any role.
 
 A later record may reopen A, and give it a go, only by bringing all of the
 following. A qualifying class is necessary, not sufficient: the three
@@ -426,6 +447,12 @@ bundle.
 
 ### D9. Cost and replay
 
+- *Amended by #434:* an automatic relaunch (D11) is one more step of the
+  run, so its launches are counted and bounded like a `resume`'s: a step
+  launches at most `(1 + MAX_AUTOMATIC_RELAUNCHES_PER_STEP) × (1 +
+  execution.max_correction_attempts + MAX_TRANSIENT_RETRIES)` agents over
+  every command that re-enters it, and `workflow.max_total_steps` charges the
+  relaunch as it charges any step.
 - **Count physical model launches.** Every advisor launch, correction and
   transient relaunch is one launch: one run log line with its own producer,
   counted in ADR 0011 D7.3's launch denominator. None is hidden inside
@@ -475,12 +502,146 @@ bundle.
   operator decides with `unblock --take-over` and the controller writes.
   It lands as ADR 0004's D9.4a and K11, with protocol 14 (ADR 0004
   D13.11).
+- **Amended by #434:** the recovery journal (`auto_recovery`, protocol 18,
+  ADR 0004 D13.13) is the authority for D11's accounting: the step's
+  allowance, its failure counters and each decision with its K13 audit
+  record. Only the recovery path writes it and only it and `status` read
+  it; no stop's code is read by it (D11.1).
 - **Ownership stays where it is:** #260 the troubleshooting guide, #311
   target preflight (ADR 0011 D6 leaves open what it owns), #258 requests an
   agent CLI refused, #265 the protocol refusal and its guidance.
 - **GitHub links.** The dependencies this record names are prose. Prose is
   not a scheduler-enforceable `blocked_by` edge, and native links are
   established and read back on GitHub, not here.
+
+### D11. Bounded automatic recovery (#434)
+
+The maintainer decision on #434 approved the policy: D1 (one shared
+per-step allowance, failures counted by category), D3 (on by default for a
+narrow allowlist only), D4 (a usage limit is never retried at once), D5 (a
+result-less exit relaunched at most once, after reconciliation), D6 (in-step
+retries first), D7 (one automatic relaunch per step, inside every existing
+bound) and D8 (the journal and the dual audit). This section is that
+policy as built (`src/autoforge/auto_recovery.py`, `ControllerEngine.run`).
+
+**D11.1. Typed facts, never a reason code or text.** The rule decides on
+the class of the error that ended the step and on the typed facts the
+engine set on it of the agent launch that ended it (`LaunchEnd`, the
+error's `launch_end`): the limit that killed it (`idle`, `max_runtime`,
+`loop`), whether a process it started may still run, whether its output
+holds a complete `CONTROL_RESULT` in the part the parser reads, and what its
+adapter typed (a usage limit, a known-transient failure, an exit without
+any result). It reads no message, no agent output and no stop
+classification: `auto_recovery.py` does not import
+`stop_classification.py`, and ADR 0011 D3 stands
+(`test_the_rule_reads_no_message`, `test_the_rule_reads_no_stop_classification`).
+
+**D11.2. The allowlist.** Two categories, and only these, are relaunched:
+
+- `idle-timeout`: the executor killed the agent at its idle limit;
+- `result-less-exit`: the agent's CLI ended its protocol stream before a
+  single result record, with no line lost on the way, as its adapter typed
+  it (Claude Code's `stream-json` today; an exit code or a missing
+  `CONTROL_RESULT` alone types nothing).
+
+Refused, and the operator's as before: a hard runtime limit and a loop
+kill (never repeated), a timeout nothing typed, a provider's usage limit
+(D11.3), a known-transient failure whose in-step relaunches were spent or
+withheld, a request for a human decision, an untyped exit, a result refused
+after its corrections, a sandbox refusal or clean-up uncertainty, a GitHub
+or git failure (drift and propagation stay stops; the pushed-head wait of
+#403 is in-step and unchanged), a failed verification, effect or claim, and
+anything unknown. An allowlisted failure is still refused when a process the
+launch started may still run, or when its output holds a complete
+`CONTROL_RESULT` (#285; accepting that result is #479's, so a relaunch that
+would discard it is not made)
+(`test_only_the_allowlist_is_ever_relaunched`,
+`test_a_result_delivered_before_the_kill_is_never_discarded`,
+`test_a_launch_that_may_have_left_a_process_is_never_relaunched`).
+
+**D11.3. Usage limits.** An adapter types a provider's usage or rate limit
+from the provider's own typed answer (Claude Code's model API error 429;
+OpenCode's run-level error "The usage limit has been reached", compared
+whole), never as transient. The engine raises `ProviderUsageLimitError`,
+whose stop is `resumable_error` / `provider-usage-limit` naming the provider
+and the limit. It is never relaunched: with no reset time the controller
+can trust (no adapter reads one today) the refusal is `no-trusted-reset`,
+and with one it is `no-wait-policy`, since no explicit bounded wait policy
+exists. No wait, no inferred reset and no switch to another profile is made;
+a fallback belongs to #321's routing (`test_a_usage_limit_is_never_relaunched_at_once`).
+
+**D11.4. One allowance per step, inside every bound.** A step is one phase
+of one issue, PR, review round and execution attempt, over every command
+that re-enters it. Its allowance is `MAX_AUTOMATIC_RELAUNCHES_PER_STEP` (1),
+shared by every category: the second failure of the step is refused
+whatever it is, so a timeout followed by a usage limit cannot loop. Each
+failure also counts in its category, which grants nothing. The allowance is
+persisted, so neither a crash, a later `resume` nor an `unblock` back into
+the same phase refills it; a phase change is a new step. A relaunch also
+needs a step of `workflow.max_total_steps` and one of the invocation's
+`--max-steps`, and a scheduler worker's `should_continue` still true. The
+relaunch is one more step, charged when it first persists, like any step
+(`test_a_second_failure_of_the_step_is_refused_whatever_failed`,
+`test_the_step_budget_and_the_invocation_bound_are_never_exceeded`,
+`test_an_invocation_asked_to_stop_is_not_relaunched`).
+
+**D11.5. The journal and the dual audit.** Every decision, a relaunch or a
+refusal, is in this order: the state read again from disk (the relaunch sees
+exactly what an operator's `resume` would); the decision; one save of it with
+its accounting and its `intended` K13 record (ADR 0004 K13), before anything
+follows from it; its run log line (`<PHASE>-auto-recovery`, profile
+`(automatic recovery; no agent)`, which the corpus tool counts as
+bookkeeping); then its audit comment on the run's PR, or its issue while it
+has none, through the effect path. Only a confirmed comment of an allowed
+decision relaunches; an unconfirmed one relaunches nothing, the allowance
+stays spent, and the next command posts the comment before it executes
+anything. A crash after the save finds the allowance spent and the comment
+pending; a comment that landed before a crash is adopted, never posted
+twice. Neither sink is a recovery input
+(`test_an_unconfirmed_audit_relaunches_nothing_and_the_next_command_posts_it_once`,
+`test_an_audit_that_landed_before_a_crash_is_adopted_never_posted_twice`,
+`test_a_crash_after_the_decision_spends_the_allowance`).
+
+**D11.6. Where it runs.** Inside the running `run`, `resume` or scheduler
+worker loop (`ControllerEngine.run`), and nowhere else: no daemon, no
+scheduler, no wait. `step` executes exactly one phase and never relaunches
+on its own; a dry run decides nothing
+(`test_step_never_relaunches_on_its_own`, `test_a_dry_run_decides_nothing`).
+Only an error that ends a step of an agent phase is decided; a refusal
+(exit 2) acted on nothing and is not.
+
+**D11.7. The three reviews D5 requires.**
+
+- *Threat model.* The rule's inputs are typed values the controller and its
+  adapters produce: an error's class, the executor's limit and survivor
+  flags, the protocol framing of the agent's output, and an adapter's fixed
+  reasons, each from typed fields (ADR 0004 §2.11's agent and project data
+  are actors; neither chooses a value). Nothing untrusted chooses the action
+  or its target: the action is always the same (re-enter the same phase
+  through its reconciliation), and the target is the state's own step. An
+  agent can at most end its own launch idle or without a result, which
+  costs it the step's one relaunch and nothing else; the delivered-result
+  and survivor checks only refuse more. The audit comment carries no agent
+  text.
+- *Cost.* One paid launch per step at most, counted as a step of
+  `workflow.max_total_steps` and of `--max-steps`, against the operator
+  `resume` it replaces (the same launch, minutes to hours earlier). Its
+  in-step corrections and transient relaunches are the existing, counted
+  bounds (D9). A hard runtime limit is never repeated, so no allowance buys
+  a second multi-hour launch; a usage limit is never relaunched. GitHub
+  writes: one comment per decision, posted at most once.
+- *Security.* D3's bounded-relaunch row grants the action, to the
+  controller, within a typed bound. The rule holds no credential: the
+  relaunch is an ordinary launch, with every check of a launch (the
+  sandbox gate, the checkout anchor, the credential preflight, the owner
+  check). `DENY` and `INCONCLUSIVE` fail closed: anything not proven allowed
+  is refused, and a decision that cannot be saved, logged or audited
+  relaunches nothing.
+
+**D11.8. Not done here.** A bounded wait for a trusted reset time and a
+fallback profile (D4, D11.3; #321); typing a result-less exit for OpenCode
+and Pi, whose output types none today; accepting a result delivered before a
+kill (#479).
 
 ## 3. What does not change, and what holds it
 
@@ -495,6 +656,7 @@ bundle.
 | the run log is never a recovery input | `test_runlog_recovers_sequence_from_step_names_never_from_the_journal` |
 | no agent launch holds a credential route | `test_an_agent_finds_no_credential_route_the_controller_finds_every_one` |
 | transient retries are bounded | `test_transient_retries_are_bounded_per_step_across_corrections`, `test_transient_read_failure_is_bounded_then_blocked` |
+| an automatic relaunch is once per step, allowlisted and audited (#434) | `test_only_the_allowlist_is_ever_relaunched`, `test_two_idle_timeouts_relaunch_once`, `test_an_idle_timeout_is_relaunched_once_and_the_run_goes_on` |
 | no write without its authority: K9, K10, merge, downgrade, drift | the tests D3's table names |
 
 Default single-agent behaviour, every default and the prompts are

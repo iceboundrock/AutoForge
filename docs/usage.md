@@ -480,6 +480,13 @@ persisted step count so `resume` continues it). Failed agent invocations
 consume neither a review round nor the history. Every bound ends in
 `BLOCKED` with the reason; findings and the PR stay for a human.
 
+A failed agent step is relaunched automatically at most once, and only for
+an idle timeout or an exit its adapter typed as result-less, inside the
+running `run` or `resume`; the relaunch is one more step of
+`workflow.max_total_steps` and of `--max-steps`, and is saved, logged and
+posted as an audit comment first
+([Automatic recovery](troubleshooting.md#automatic-recovery-one-relaunch-per-step)).
+
 Replanning is controller policy, not reviewer advice. After a verified
 review with findings, `review.replan` may decide to abandon a
 patch-accumulated PR: it preserves compact finding metadata and selected

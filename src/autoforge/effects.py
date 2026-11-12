@@ -23,7 +23,11 @@ the phase's ordered plan (D2.2). The stages are closed (D2.3)::
 
 Only ``observed`` lets the consuming phase advance. A record lives for one
 phase entry: the save that commits the phase drops the records, the entry
-observation and the completion context together (D2.4).
+observation and the completion context together (D2.4). The one exception is
+K13, the audit comment of an automatic-recovery decision (#434): it belongs
+to no phase plan, is never in ``effect_records`` (:func:`load_records`
+refuses it there), and lives in the recovery journal
+(:mod:`autoforge.auto_recovery`) until it is observed or in conflict.
 
 The **entry observation** (:class:`EntryObservation`, D4.4) is what the
 controller read before the phase's first launch, in a kind-neutral shape:
@@ -59,6 +63,7 @@ from .claims import (
     MAX_RUN_ID_CHARS,
     OPERATOR_COMMENT,
     PROGRESS,
+    RECOVERY_AUDIT,
     REVIEW,
     MarkerKind,
     render_acceptance_marker,
@@ -108,7 +113,7 @@ from .result_parser import (
 )
 from .runlog import RUN_ID_RE
 from .transitions import Phase
-from .validation import parse_comment_url, parse_issue_url, parse_pr_url
+from .validation import GitHubRef, parse_comment_url, parse_issue_url, parse_pr_url
 
 # -- bounds ------------------------------------------------------------------------
 
@@ -179,6 +184,11 @@ def compose_append(base: str, block: str) -> str:
 def progress_comment_body(progress: str, marker: str) -> str:
     """K8's payload: the validated progress text, a blank line, the marker (§2.5)."""
     return f"{progress}{APPEND_SEPARATOR}{marker}"
+
+
+def recovery_audit_comment_body(text: str, marker: str) -> str:
+    """K13's payload (#434): the controller's audit text, a blank line, the marker."""
+    return f"{text}{APPEND_SEPARATOR}{marker}"
 
 
 # The prose sections of a review comment, in rendered order, under their
@@ -516,6 +526,9 @@ class EffectKind(StrEnum):
     OPERATOR_COMMENT = "operator_comment"  # K10 (#243): operator-performed, never issued
     OWNER_TAKEOVER = "owner_takeover"  # K11 (#414): the operator's takeover of a PR
     PR_BODY_UPDATE = "pr_body_update"  # K12 (#423): FIX replaces its own PR's description
+    # K13 (#434): the audit comment of one automatic-recovery decision, kept in
+    # the recovery journal and never in a phase plan.
+    RECOVERY_AUDIT_COMMENT = "recovery_audit_comment"
 
 
 class Stage(StrEnum):
@@ -552,7 +565,13 @@ KIND_PHASES: Mapping[EffectKind, frozenset[Phase]] = {
     # PR they are bound to before their journaled plan completes (PR #460 R1-F1).
     EffectKind.OWNER_TAKEOVER: frozenset({Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX}),
     EffectKind.PR_BODY_UPDATE: frozenset({Phase.FIX}),
+    # #434: a decision is taken about a failed step of any phase that launches
+    # an agent, which is every publishing phase.
+    EffectKind.RECOVERY_AUDIT_COMMENT: PUBLISHING_PHASES,
 }
+# The kinds a phase plan (``effect_records``) never holds: K13 lives in the
+# recovery journal (:mod:`autoforge.auto_recovery`).
+JOURNAL_ONLY_KINDS = frozenset({EffectKind.RECOVERY_AUDIT_COMMENT})
 
 # D13.3: the contract a launch ran under, recorded in every pre-launch save of
 # a publishing phase. A phase is controller-published once the running version
@@ -698,6 +717,12 @@ def _comment_url(value: object, what: str) -> None:
     _canonical(value, what, parse_comment_url)
 
 
+def _issue_or_pr_url(value: object, what: str) -> None:
+    """An issue or a PR URL: the object a K13 audit comment is posted on."""
+    text = _str(value, what, MAX_URL_CHARS)
+    _canonical(text, what, _parse_issue_or_pr)
+
+
 def _object_url(value: object, what: str) -> None:
     """An issue, PR or comment URL: what an observed marker-bearing object is."""
     text = _str(value, what, MAX_URL_CHARS)
@@ -706,6 +731,11 @@ def _object_url(value: object, what: str) -> None:
 
 
 def _parse_issue_or_pr(url: str) -> object:
+    return _issue_or_pr_ref(url)
+
+
+def _issue_or_pr_ref(url: str) -> GitHubRef:
+    """``url`` parsed as an issue, else as a PR (ConfigurationError for neither)."""
     try:
         return parse_issue_url(url)
     except ConfigurationError:
@@ -980,6 +1010,16 @@ KIND_SPECS: Mapping[EffectKind, _KindSpec] = {
         payload={"body": _BODY},
         observed={"url": _comment_url},
         completion="progress_comment_exactly_one_body_equals_payload",
+    ),
+    # K13 (#434): the audit comment of one automatic-recovery decision, on the
+    # run's PR, or on its issue while the run has no PR.
+    EffectKind.RECOVERY_AUDIT_COMMENT: _KindSpec(
+        identity={"target_url": _issue_or_pr_url, "marker": _marker_of(RECOVERY_AUDIT)},
+        target={"target_url": _issue_or_pr_url},
+        precondition={"absent": _absent},
+        payload={"body": _BODY},
+        observed={"url": _comment_url},
+        completion="recovery_audit_comment_exactly_one_body_equals_payload",
     ),
     EffectKind.ACCEPTANCE_COMMENT: _KindSpec(
         identity={"issue_url": _issue_url, "marker": _marker_of(ACCEPTANCE)},
@@ -1787,6 +1827,29 @@ def _cross_progress_comment(record: EffectRecord, what: str) -> None:
         _fail(what, "is observed on another issue than its EPIC")
 
 
+def _cross_recovery_audit_comment(record: EffectRecord, what: str) -> None:
+    """K13 (#434): on the owner's PR, or its issue without one; the owner's run and issue."""
+    _same(record, what, (record.identity["target_url"], record.target["target_url"], "target"))
+    target = record.target["target_url"]
+    owner = record.owner
+    expected = owner.pr_url or owner.issue_url
+    if target != expected:
+        _fail(
+            what,
+            "is posted on another object than its owner's PR (or, without one, its issue)",
+        )
+    _check_owner_issue_marker(record, RECOVERY_AUDIT, what)
+    claim = _marker_claim(RECOVERY_AUDIT, record.identity["marker"])
+    if claim.run_id != owner.run_id:
+        _fail(what, "carries a marker of another run than its owner's")
+    tail = APPEND_SEPARATOR + record.identity["marker"]
+    if not record.body.endswith(tail) or not record.body[: len(record.body) - len(tail)].strip():
+        _fail(what, "has a payload body that is not its audit text, a blank line and its marker")
+    parent = _issue_or_pr_ref(target)
+    if record.observed is not None and not parse_comment_url(record.observed["url"]).on(parent):
+        _fail(what, "is observed on another object than its target")
+
+
 def acceptance_action_id(owner: EffectOwner, identity: dict, target: dict, payload: dict) -> str:
     """The id of one acceptance action (#211): ``A-`` and 16 hex digits.
 
@@ -1971,6 +2034,7 @@ _CROSS_CHECKS: Mapping[EffectKind, Callable[[EffectRecord, str], None]] = {
     EffectKind.ACCEPTANCE_COMMENT: _cross_acceptance_comment,
     EffectKind.OPERATOR_COMMENT: _cross_operator_comment,
     EffectKind.PR_BODY_UPDATE: _cross_pr_body_update,
+    EffectKind.RECOVERY_AUDIT_COMMENT: _cross_recovery_audit_comment,
 }
 
 
@@ -1994,6 +2058,11 @@ def load_records(raw: object, binding: Binding) -> tuple[EffectRecord, ...]:
     records = tuple(
         EffectRecord.from_dict(item, f"effect_records[{i}]") for i, item in enumerate(raw)
     )
+    for i, record in enumerate(records):
+        if record.kind in JOURNAL_ONLY_KINDS:
+            # #434: an audit comment belongs to the recovery journal, never to
+            # a phase's plan, whose completion it would hold up or join.
+            _fail(f"effect_records[{i}]", f"is a {record.kind.value} effect, which no plan holds")
     takeovers = [r.position for r in records if r.kind == EffectKind.OWNER_TAKEOVER]
     if len(takeovers) > 1:
         _fail("effect_records", "plans more than one takeover")

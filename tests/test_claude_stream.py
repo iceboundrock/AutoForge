@@ -989,3 +989,34 @@ def test_refused_subjects_are_cleaned_and_bounded_and_their_number_is_not():
     assert len(stream.refused) == claude_stream.MAX_REFUSED
     assert stream.refused_count == claude_stream.MAX_REFUSED + 7
     assert all(len(s) <= claude_stream.MAX_SUBJECT_CHARS for _, s in stream.refused)
+
+
+# -- #434: a usage or rate limit, and an exit without any result ------------------------
+
+
+def test_a_turn_ended_at_a_usage_or_rate_limit_is_typed_as_one():
+    """429 is the one status typed as a limit: a fixed reason, never the message,
+    and never transient (a launch now meets the same limit)."""
+    stream, _ = _run(_api_error(429, "API Error: Request rejected (429) · rate_limit_error"))
+    assert stream.limit == "claude: API error 429" and stream.transient is None
+    for status in (529, 408, 401, None, "429"):
+        assert _run(_api_error(status, "x"))[0].limit is None, status
+    # Not an API-error turn, or a later error after the run failed first: not read.
+    assert _run(_api_error(429, "x", terminal_reason="completed"))[0].limit is None
+    assert _run(b"not json", _api_error(429, "x"))[0].limit is None
+
+
+def test_only_a_stream_with_no_result_at_all_is_result_less():
+    assert _run({"type": "system", "subtype": "init", "model": "m"})[0].result_less
+    # A result arrived (a failing one, or an earlier turn's): not result-less.
+    assert not _run(_api_error(529, "x"))[0].result_less
+    init = {"type": "system", "subtype": "init", "model": "m"}
+    assert not _run(_result(), init)[0].result_less
+    # A line skipped past the per-line bound may have been the result.
+    stream = ClaudeStream(cwd=CWD, emit=None)
+    stream.oversize(1 << 20)
+    stream.stream_ended()
+    assert stream.exited_early and not stream.result_less
+    # A protocol violation is no exit without a result.
+    assert not _run(b"not json")[0].result_less
+    assert not _run(_result())[0].result_less

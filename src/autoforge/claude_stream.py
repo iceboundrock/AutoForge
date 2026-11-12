@@ -81,7 +81,8 @@ or 5xx (529 is overloaded; the CLI words every 5xx as a server-side issue,
 usually temporary) makes the failure transient: :attr:`ClaudeStream.transient`
 is a fixed reason naming the status. Nothing else does. Not another 4xx: 400,
 401, 403 and 404 are the request's, the credential's or the model's; a 429
-may be a plan's usage limit, which resets hours later; a 413 ends with
+may be a plan's usage limit, which resets hours later, and is typed as a
+limit instead (:attr:`ClaudeStream.limit`, #434), which nothing relaunches; a 413 ends with
 ``terminal_reason: image_error``. Not an error without a status: a refused or
 dropped connection (``api_error: connection_failed``, which a wrong
 ``ANTHROPIC_BASE_URL`` gives too) or the CLI's own request timeout, which
@@ -197,6 +198,10 @@ _MAX_COUNT = 10**15
 # that make the failure transient (module docstring, #395): a request
 # timeout and every server error.
 TRANSIENT_API_STATUSES = frozenset({408, *range(500, 600)})
+# The ``api_error_status`` of a turn that ended at a usage or rate limit
+# (#434): never transient, and never relaunched automatically (a plan's usage
+# limit resets hours later, and no record says when).
+LIMIT_API_STATUS = 429
 # A run that cost more than this is not a reading to believe.
 _MAX_COST_USD = Decimal(1_000_000)
 
@@ -249,6 +254,10 @@ class ClaudeStream:
         # turn on a transient model API error (module docstring): a fixed
         # reason naming the status, never text from the stream.
         self.transient: str | None = None
+        # Set with ``failure`` when that result ended its turn on a model API
+        # error with status 429 (#434): a usage or rate limit, which a launch
+        # now would meet again. A fixed reason, never text from the stream.
+        self.limit: str | None = None
         # stdout ended inside a turn; the driver names the exit code.
         self.exited_early = False
         # Turns opened so far: the first with the stream, each later one by
@@ -357,6 +366,17 @@ class ClaudeStream:
             )
         self._fail(reason)
 
+    @property
+    def result_less(self) -> bool:
+        """Whether the CLI ended its stream without a single ``result`` record (#434).
+
+        A typed fact for the automatic-recovery rule: stdout reached EOF with
+        no turn ever closed, no line skipped past the per-line bound (it may
+        have been the result) and no other failure first. A stream that had a
+        result, or failed on a record, is no result-less exit.
+        """
+        return self.exited_early and self._results == 0 and self._oversize == 0
+
     def summary(self) -> dict[str, str | int | bool]:
         """The flat, bounded, redacted summary for ``execution.json``."""
         return {
@@ -441,6 +461,8 @@ class ClaudeStream:
             # result's failure is the run's.
             if record.get("terminal_reason") == "api_error" and status in TRANSIENT_API_STATUSES:
                 self.transient = f"claude: API error {status}"
+            if record.get("terminal_reason") == "api_error" and status == LIMIT_API_STATUS:
+                self.limit = f"claude: API error {status}"
         elif is_error is not False:
             self._protocol("the result event has no boolean 'is_error'")
         elif subtype != "success":

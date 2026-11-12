@@ -111,6 +111,8 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/claims.py": LOOP,
     "src/autoforge/effect_ops.py": (*LOOP, "test_replan", "test_merge_branch"),
     "src/autoforge/effects.py": LOOP,
+    # #434: the run loop's recovery rule, and the journal every state load checks.
+    "src/autoforge/auto_recovery.py": (*LOOP, "test_auto_recovery", "test_state"),
     "src/autoforge/evidence.py": (*LOOP, "test_unblock"),
     "src/autoforge/git_input.py": ("test_sandbox_lifecycle", "test_candidate_source"),
     "src/autoforge/git_transport.py": (*LOOP, "test_replan", "test_validation_gates"),

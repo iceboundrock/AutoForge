@@ -41,6 +41,7 @@ from enum import Enum
 from pathlib import Path
 
 from . import __prompt_version__, __protocol_version__, __version__
+from .auto_recovery import RecoveryJournal
 from .config_fingerprint import RecordedConfiguration
 from .effects import (
     ACTION_ID_RE,
@@ -244,7 +245,13 @@ _PRE_STOP_CODE_PROTOCOL = "15"
 # is loaded in every phase with ``partial_fix: {}`` and a FIX completion
 # context gains ``unresolved: []`` and ``message: ""``, and relabelled. An
 # older file that carries any of it is refused (:func:`_refuse_partial_fix_state`).
-_PREVIOUS_PROTOCOL = "16"
+_PRE_PARTIAL_FIX_PROTOCOL = "16"
+# The label before the automatic-recovery journal (#434). A protocol-17 file
+# is this protocol's shape without ``auto_recovery``: it is loaded in every
+# phase with ``auto_recovery: {}`` (no decision taken, the allowance of every
+# step unspent), and relabelled. An older file that carries the field is
+# refused (:func:`_refuse_auto_recovery_state`).
+_PREVIOUS_PROTOCOL = "17"
 # Every label :meth:`AutoForgeState.from_dict` has a rule for: the current
 # one and each older one it migrates or refuses by its own rule. Any other
 # label is refused by :func:`protocol_support`'s classification before the
@@ -261,6 +268,7 @@ SUPPORTED_PROTOCOLS: frozenset[str] = frozenset(
         _PRE_TAKEOVER_PROTOCOL,
         _PRE_PR_BODY_PROTOCOL,
         _PRE_STOP_CODE_PROTOCOL,
+        _PRE_PARTIAL_FIX_PROTOCOL,
         _PREVIOUS_PROTOCOL,
         __protocol_version__,
     }
@@ -321,6 +329,10 @@ _STOP_FIELDS = ("stop_code",)
 # ``{}`` when none. Protocol 17 also added a FIX completion context's
 # ``unresolved`` and ``message`` (:func:`_partial_fix_state_in`).
 _PARTIAL_FIX_FIELDS = ("partial_fix",)
+# The field protocol 18 added (#434): the automatic-recovery journal
+# (:class:`autoforge.auto_recovery.RecoveryJournal`), ``{}`` when no decision
+# was ever taken.
+_AUTO_RECOVERY_FIELDS = ("auto_recovery",)
 _PARTIAL_FIX_KEYS = (
     "round",
     "pr_url",
@@ -717,6 +729,16 @@ class AutoForgeState:
     # review completes a round, when a FIX of the round is recorded or
     # dropped, and per PR.
     partial_fix: dict = field(default_factory=dict)
+    # The automatic-recovery journal (#434,
+    # :class:`autoforge.auto_recovery.RecoveryJournal`), ``{}`` until the
+    # rule's first decision: the step its allowance and failure counters
+    # belong to, the step's automatic relaunches (at most one), the run's last
+    # decision number, and the decisions of that step (and of an earlier step
+    # while its K13 audit comment is pending), each with its audit record.
+    # Written by the engine's recovery path and read only by it and by
+    # ``status``; never cleared by a phase change, which only moves ``step``
+    # on. Its run log line and its comment are audit sinks, never inputs.
+    auto_recovery: dict = field(default_factory=dict)
     # The outcomes of the current PR's acceptance actions (#211), oldest
     # first: ``action_id``, ``round``, ``finding_id``, ``outcome``
     # (verified | declined | stale), ``at``, ``comment_url`` (the verified
@@ -1057,6 +1079,10 @@ class AutoForgeState:
         #   ``message: ""`` (a plan of a fix that resolved every finding,
         #   which is all an older controller planned). An older file that
         #   carries any of it is refused, never merged.
+        # - 17 -> 18: the automatic-recovery journal (#434): ``auto_recovery``.
+        #   An older file is loaded in every phase with ``{}`` (no decision
+        #   taken, every step's allowance unspent). An older file that carries
+        #   the field, even empty, is refused, never merged.
         written_by = str(data.get("controller_version", ""))
         legacy = isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS
         if legacy:
@@ -1177,6 +1203,7 @@ class AutoForgeState:
             _PRE_TAKEOVER_PROTOCOL,
             _PRE_PR_BODY_PROTOCOL,
             _PRE_STOP_CODE_PROTOCOL,
+            _PRE_PARTIAL_FIX_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1193,8 +1220,9 @@ class AutoForgeState:
             # twelve, which step 3 below handles; protocol 14 adds an effect
             # kind (K11), which an older file is refused for carrying
             # (:func:`_refuse_takeover_records`), protocol 15 the PR body
-            # state, protocol 16 the stop code and protocol 17 the partial
-            # fix state, each required of its own files below. Only a legacy label
+            # state, protocol 16 the stop code, protocol 17 the partial fix
+            # state and protocol 18 the recovery journal, each required of its
+            # own files below. Only a legacy label
             # loads with no effect state (D13.2). Every
             # protocol-7 save writes all four fields, so one that is absent
             # is a truncation or a hand edit, never "nothing planned": a
@@ -1245,7 +1273,12 @@ class AutoForgeState:
                 "sandbox pin",
                 "not a run with none pinned",
             )
-        if raw_protocol in (_PRE_STOP_CODE_PROTOCOL, _PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol in (
+            _PRE_STOP_CODE_PROTOCOL,
+            _PRE_PARTIAL_FIX_PROTOCOL,
+            _PREVIOUS_PROTOCOL,
+            __protocol_version__,
+        ):
             # Every protocol-15 save writes it, ``[]`` included, so an absent
             # one is a truncation or a hand edit: read as the empty default it
             # would drop a declined update of the round and let it through.
@@ -1258,12 +1291,13 @@ class AutoForgeState:
         if raw_protocol not in (
             _PRE_PR_BODY_PROTOCOL,
             _PRE_STOP_CODE_PROTOCOL,
+            _PRE_PARTIAL_FIX_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
             # 13 -> 14 (#414): K11 is planned from protocol 14 on.
             _refuse_takeover_records(data, str(raw_protocol))
-        if raw_protocol in (_PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol in (_PRE_PARTIAL_FIX_PROTOCOL, _PREVIOUS_PROTOCOL, __protocol_version__):
             # Every protocol-16 save writes it, ``""`` included, so an absent
             # one is a truncation or a hand edit, never "no code was saved".
             _require_fields(
@@ -1272,7 +1306,7 @@ class AutoForgeState:
         else:
             # 15 -> 16 (#374): the stop code is written from protocol 16 on.
             _refuse_stop_code(data, str(raw_protocol))
-        if raw_protocol == __protocol_version__:
+        if raw_protocol in (_PREVIOUS_PROTOCOL, __protocol_version__):
             # Every protocol-17 save writes it, ``{}`` included, so an absent
             # one is a truncation or a hand edit, never "no partial fix".
             _require_fields(
@@ -1283,9 +1317,24 @@ class AutoForgeState:
                 "not a run that published none",
             )
         else:
-            # 16 -> 17 (#433): the partial fix state is written by this
-            # protocol only.
+            # 16 -> 17 (#433): the partial fix state is written from protocol
+            # 17 on.
             _refuse_partial_fix_state(data, str(raw_protocol))
+        if raw_protocol == __protocol_version__:
+            # Every protocol-18 save writes it, ``{}`` included, so an absent
+            # one is a truncation or a hand edit: read as the empty default it
+            # would refill an allowance a decision already spent.
+            _require_fields(
+                data,
+                raw_protocol,
+                _AUTO_RECOVERY_FIELDS,
+                "automatic-recovery journal",
+                "not a run that decided nothing",
+            )
+        else:
+            # 17 -> 18 (#434): the recovery journal is written by this
+            # protocol only.
+            _refuse_auto_recovery_state(data, str(raw_protocol))
         kwargs = dict(data)
         kwargs["phase"] = phase
         kwargs["mode"] = mode
@@ -1299,6 +1348,7 @@ class AutoForgeState:
             _PRE_TAKEOVER_PROTOCOL,
             _PRE_PR_BODY_PROTOCOL,
             _PRE_STOP_CODE_PROTOCOL,
+            _PRE_PARTIAL_FIX_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1311,24 +1361,38 @@ class AutoForgeState:
             _PRE_TAKEOVER_PROTOCOL,
             _PRE_PR_BODY_PROTOCOL,
             _PRE_STOP_CODE_PROTOCOL,
+            _PRE_PARTIAL_FIX_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
             # Before protocol 11 (#243): over the acceptance migration, so a
             # pre-8 file gains both.
             kwargs.update(_operator_migration(kwargs))
-        if raw_protocol not in (_PRE_STOP_CODE_PROTOCOL, _PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol not in (
+            _PRE_STOP_CODE_PROTOCOL,
+            _PRE_PARTIAL_FIX_PROTOCOL,
+            _PREVIOUS_PROTOCOL,
+            __protocol_version__,
+        ):
             # Before protocol 15 (#423): over the migrations above, so an older
             # file gains every field a save of this protocol writes.
             kwargs.update(_pr_body_migration(kwargs))
-        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol not in (
+            _PRE_PARTIAL_FIX_PROTOCOL,
+            _PREVIOUS_PROTOCOL,
+            __protocol_version__,
+        ):
             # Before protocol 16 (#374): a stop saved with no code, which
             # classifies ``unknown`` exactly as it did before.
             kwargs["stop_code"] = ""
-        if raw_protocol != __protocol_version__:
+        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
             # Before protocol 17 (#433): over the migrations above, so a FIX
             # context of any older label gains both keys.
             kwargs.update(_partial_fix_migration(kwargs))
+        if raw_protocol != __protocol_version__:
+            # Before protocol 18 (#434): no recovery decision was taken, so
+            # every step's allowance is unspent.
+            kwargs["auto_recovery"] = {}
         if legacy:
             attempt = data.get("attempt", 0)
             if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt >= 1:
@@ -1337,12 +1401,13 @@ class AutoForgeState:
                 )
         # ADR 0009 D8's step 3, after every per-protocol rule above: LOCAL's
         # twelve fields leave a file labelled 12 or older, or refuse it. A
-        # protocol-13, -14, -15, -16 or -17 file is not asked: one that carries
-        # any of them is refused by the unknown-field check below.
+        # protocol-13, -14, -15, -16, -17 or -18 file is not asked: one that
+        # carries any of them is refused by the unknown-field check below.
         if raw_protocol not in (
             _PRE_TAKEOVER_PROTOCOL,
             _PRE_PR_BODY_PROTOCOL,
             _PRE_STOP_CODE_PROTOCOL,
+            _PRE_PARTIAL_FIX_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1439,6 +1504,7 @@ class AutoForgeState:
         _validate_pr_body_state(state)
         _validate_stop_code(state)
         _validate_partial_fix(state)
+        _validate_auto_recovery(state)
         _validate_operator_state(state)
         _validate_config_fingerprint(state)
         _validate_sandbox_pin(state)
@@ -2015,6 +2081,26 @@ def _refuse_partial_fix_state(data: dict, protocol: str) -> None:
             f"{', '.join(planted)}; refusing to load a file that carries protocol-17 partial "
             "fix state -- it is a hand edit or a foreign file, not an older controller's state"
         )
+
+
+def _refuse_auto_recovery_state(data: dict, protocol: str) -> None:
+    """A file labelled before protocol 18 never wrote the recovery journal (#434).
+
+    The label decides, not the value: an older file that carries the field at
+    all, even ``{}``, was not written by the controller its label names.
+    """
+    if "auto_recovery" in data:
+        raise StateError(
+            f"state file is labelled protocol_version {protocol!r}, which never wrote "
+            "'auto_recovery'; refusing to load a file that carries the protocol-18 "
+            "automatic-recovery journal -- it is a hand edit or a foreign file, not an older "
+            "controller's state"
+        )
+
+
+def _validate_auto_recovery(state: AutoForgeState) -> None:
+    """``auto_recovery`` (#434): the journal's whole shape, bound to the state's run."""
+    RecoveryJournal.from_dict(state.auto_recovery, state.run_id)
 
 
 def _partial_fix_migration(data: dict) -> dict:

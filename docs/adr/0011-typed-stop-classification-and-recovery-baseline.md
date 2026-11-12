@@ -40,6 +40,13 @@
   the push to a commit other than exactly the candidate, or the fixer marked
   a finding it left `blocks_publication`, PR #475 R2-F2), the stop is
   `agent-blocked`, the fixer's message quoted, as for a plain block.
+- **Amended by #434:** the `provider-usage-limit` code, in the execution
+  family: the stop of an agent launch whose adapter typed its failure as the
+  provider's usage or rate limit (`ProviderUsageLimitError`, source
+  `exception`, outcome `resumable_error`). It is never relaunched at once.
+  The bounded automatic recovery of #434 (ADR 0012 D11) decides on typed
+  launch facts and error classes of its own, never on a classification: D3
+  stands, and `auto_recovery.py` does not import this module.
 - **Amends:** nothing. Every phase, edge, exit rule, budget, retry, effect
   and the state file are unchanged; seven `BLOCKED` reasons that told the
   operator to `resume`, which refuses a `BLOCKED` run, now say `unblock`.
@@ -227,7 +234,7 @@ exhaustive by `test_every_error_class_is_mapped_explicitly`.
 | workspace | around an agent launch | `blocked` | `checkout-drift`, `sandbox-tamper` |
 | agent | the agent-status sink | `blocked`, `failed` | `agent-blocked`, `agent-failure` |
 | agent (#433) | FIX's partial fix: its plan, its completion and its drift | `blocked` | `partial-fix` once the candidate is read back as the PR head; `agent-blocked` when it is not published; any code a FIX plan's completion names (a write awaiting the operator, an identity, GitHub or bounds code) |
-| execution | an error ending `run` / `step` / `resume` | `resumable_error` | `execution-failed`, `execution-timeout`, `sandbox-launch-refused`, `interaction-required` (SDK questions and permissions, #134), `control-result-invalid`, `verification-failed`, `github-unavailable`, `github-error`, `github-checks-refused`, `git-transport`, `effect-conflict`, `claim-ambiguous`, `pr-owner`, `checkout-drift`, `sandbox-tamper`, `validation-*`, `run-log-refused` (a run log refused after a launch's attempt was saved; exit 2) |
+| execution | an error ending `run` / `step` / `resume` | `resumable_error` | `execution-failed`, `execution-timeout`, `sandbox-launch-refused`, `interaction-required` (SDK questions and permissions, #134), `provider-usage-limit` (#434), `control-result-invalid`, `verification-failed`, `github-unavailable`, `github-error`, `github-checks-refused`, `git-transport`, `effect-conflict`, `claim-ambiguous`, `pr-owner`, `checkout-drift`, `sandbox-tamper`, `validation-*`, `run-log-refused` (a run log refused after a launch's attempt was saved; exit 2) |
 | refusals | an error before the command acted | `refused` | `configuration-invalid`, `configuration-drift` (#219), `sandbox-capability` (ADR 0005 D12.2), `scheduler-owned`, `state-invalid` (LOCAL's state among them), `state-protocol` (#265), `state-transition`, `lock-held` |
 | intentional | the saved state | `ready_for_merge`, `handoff`, `done`, `in_progress` | the outcome's own code |
 | unknown | an unmapped error, an uncoded reason, a persisted stop | `unknown` or the sink's | `unknown` |

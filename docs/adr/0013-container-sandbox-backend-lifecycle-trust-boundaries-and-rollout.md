@@ -2242,7 +2242,7 @@ sections. The tests named in the header check this.
 | D4.1, D4.2, D4.3, D4.4, D4.5, D4.5a, D4.6, D4.7 | **preserved** | D13's ambiguous create borrows D4.3's rule for a local object and adds no effect kind |
 | D5.1, D5.2, D5.3, D5.4, D5.5, D5.6, D5.7, D5.8, D5.9 | **preserved** | no kind is added or changed |
 | K1 | **preserved** | it pushes an exact candidate whose objects are in the shared store after the strict import (D5) |
-| K2, K3, K4, K5, K6, K7, K8, K9, K10, K11, K12 | **preserved** | unchanged |
+| K2, K3, K4, K5, K6, K7, K8, K9, K10, K11, K12, K13 | **preserved** | unchanged |
 | D6.1, D6.2, D6.3, D6.4 | **preserved** | the seed is built from objects; no ref is created (D6.4) |
 | D7.1, D7.2, D7.3, D7.4, D7.5 | **preserved** | the seed pack and the import run through `local_git_request`; D7.5 re-hashes the candidate |
 | D8.1, D8.2, D8.3, D8.4, D8.5, D8.6 | **preserved** | the published-content policy is unchanged |
@@ -2250,7 +2250,7 @@ sections. The tests named in the header check this.
 | D10.1, D10.2 | **preserved** | the read context is delivered at a container path the prompt names, read-only where bound; the controller never reads it back (D2, D12) |
 | D11.1 | **preserved** | the container's own threat model is D18, beside it |
 | D12.1, D12.2, D12.3, D12.4, D12.5, D12.6, D12.7 | **preserved** | module ownership is unchanged |
-| D13.1, D13.2, D13.3, D13.4, D13.5, D13.6, D13.7, D13.8, D13.9, D13.10, D13.11, D13.12 | **preserved** | no protocol number is claimed (D19) |
+| D13.1, D13.2, D13.3, D13.4, D13.5, D13.6, D13.7, D13.8, D13.9, D13.10, D13.11, D13.12, D13.13 | **preserved** | no protocol number is claimed (D19) |
 
 ### 5.3 ADR 0005
 

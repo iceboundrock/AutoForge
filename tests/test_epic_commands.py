@@ -1567,7 +1567,7 @@ def _a_standalone_state_labelled(standalone: Path, issue: int, label: object) ->
     return state_file
 
 
-@pytest.mark.parametrize("label", ["18", "99", "6", "18.0", 18], ids=repr)
+@pytest.mark.parametrize("label", ["19", "99", "6", "19.0", 19], ids=repr)
 def test_a_standalone_state_of_a_protocol_this_controller_does_not_read_admits_nothing(
     epic, tmp_path, label
 ):
@@ -1625,7 +1625,7 @@ def test_a_standalone_state_of_a_protocol_this_controller_does_not_read_admits_n
     assert state_tree(standalone) == before
 
     data = json.loads(state_file.read_text(encoding="utf-8"))
-    data.update(protocol_version="17", phase="REVIEW")
+    data.update(protocol_version="18", phase="REVIEW")
     state_file.write_text(json.dumps(data), encoding="utf-8")
     code, _, _ = e.run()
     assert code == 0 and b.admitted() == [3], e.said
@@ -1708,7 +1708,7 @@ def test_every_report_names_the_standalone_state_on_one_printable_bounded_line(
     b = e.b
     b.issue(2)
     if content == "protocol-14":
-        state_file = _a_standalone_state_labelled(standalone, 2, "18")
+        state_file = _a_standalone_state_labelled(standalone, 2, "19")
     else:
         standalone_state(standalone, 2, Phase.REVIEW)
         state_file = standalone / "state.json"
@@ -1725,11 +1725,11 @@ def test_every_report_names_the_standalone_state_on_one_printable_bounded_line(
     held = f"the standalone state {shown} runs it (phase REVIEW)"
     # The refusal and the controller, right after the path the report names.
     refused = (
-        f"{unreadable}unsupported protocol_version '18' (controller speaks '17'): a newer "
+        f"{unreadable}unsupported protocol_version '19' (controller speaks '18'): a newer "
         "AutoForge wrote it, and this controller, autoforge "
     )
     provenance = (
-        f"(protocol 17) imported from {os.path.abspath(autoforge.__file__)}, "
+        f"(protocol 18) imported from {os.path.abspath(autoforge.__file__)}, "
         f"python {sys.executable}, reads protocols "
     )
 
@@ -1832,13 +1832,13 @@ def test_a_namespace_state_a_newer_controller_wrote_is_held_with_this_controller
     _bind(b, 2, issue_id=b.graph.issue(2, R).id)
     standalone_state(b.ns(2).state_dir, 2, Phase.REVIEW)
     data = json.loads(b.ns(2).state_file.read_text(encoding="utf-8"))
-    data.update(protocol_version="18", phase="A_PHASE_OF_PROTOCOL_18")
+    data.update(protocol_version="19", phase="A_PHASE_OF_PROTOCOL_19")
     b.ns(2).state_file.write_text(json.dumps(data), encoding="utf-8")
     before = (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes())
     code, _, _ = e.run()
     assert code == 0 and b.admitted() == [] and b.claims(2) is None, e.said
     headline = (
-        "unsupported protocol_version '18' (controller speaks '17'): a newer AutoForge wrote it"
+        "unsupported protocol_version '19' (controller speaks '18'): a newer AutoForge wrote it"
     )
     imported = os.path.abspath(autoforge.__file__)
     named = f"; state file {shown_path(str(b.ns(2).state_file))}"
@@ -1848,7 +1848,7 @@ def test_a_namespace_state_a_newer_controller_wrote_is_held_with_this_controller
     assert row["category"] == "uncertain"
     assert row["classification"] == "uncertain(state-corrupt)"
     assert headline in row["detail"] and f"imported from {imported}" in row["detail"]
-    assert "a controller that speaks protocol 18 reads and continues it" in row["detail"]
+    assert "a controller that speaks protocol 19 reads and continues it" in row["detail"]
     assert "epic archive" not in row["detail"] and "by hand" not in row["detail"]
     assert row["next"] == []
     assert (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes()) == before
@@ -1878,7 +1878,7 @@ def test_a_namespace_state_of_a_label_no_protocol_has_offers_no_repair_or_archiv
     code, _, _ = e.run()
     assert code == 0 and b.admitted() == [] and b.claims(2) is None, e.said
     headline = (
-        f"unsupported protocol_version {label!r} (controller speaks '17'): no AutoForge "
+        f"unsupported protocol_version {label!r} (controller speaks '18'): no AutoForge "
         "protocol has that label"
     )
     imported = f"imported from {os.path.abspath(autoforge.__file__)}"
@@ -1943,17 +1943,17 @@ def test_every_report_of_a_refused_namespace_state_keeps_the_controller_however_
     _bind(b, 2, issue_id=b.graph.issue(2, R).id)
     standalone_state(b.ns(2).state_dir, 2, Phase.REVIEW)
     data = json.loads(b.ns(2).state_file.read_text(encoding="utf-8"))
-    data.update(protocol_version="18", phase="A_PHASE_OF_PROTOCOL_18")
+    data.update(protocol_version="19", phase="A_PHASE_OF_PROTOCOL_19")
     b.ns(2).state_file.write_text(json.dumps(data), encoding="utf-8")
     before = (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes())
     shown = shown_path(str(b.ns(2).state_file))
     assert (shown == str(b.ns(2).state_file)) == (length <= MAX_PATH_CHARS)
     refused = (
-        "unsupported protocol_version '18' (controller speaks '17'): a newer AutoForge wrote "
+        "unsupported protocol_version '19' (controller speaks '18'): a newer AutoForge wrote "
         "it, and this controller, autoforge "
     )
     provenance = (
-        f"(protocol 17) imported from {os.path.abspath(autoforge.__file__)}, "
+        f"(protocol 18) imported from {os.path.abspath(autoforge.__file__)}, "
         f"python {sys.executable}, reads protocols "
     )
     named = f"; state file {shown}"
@@ -1978,14 +1978,14 @@ def test_every_report_of_a_refused_namespace_state_keeps_the_controller_however_
     code, out, _ = e.cli("epic", "status", EPIC)
     assert code == 1
     row = keeps_the_provenance(out, f"  #2 uncertain: {corrupt}")
-    assert "a controller that speaks protocol 18 reads and continues it" in row
+    assert "a controller that speaks protocol 19 reads and continues it" in row
     keeps_the_provenance(out, f"problem: issue #2: {corrupt}")
     code, doc = e.status()
     assert code == 1
     (child,) = [row for row in doc["children"] if row["number"] == 2]
     assert child["detail"].startswith(f"{corrupt}{refused}")
     keeps_the_provenance(child["detail"], corrupt)
-    assert "a controller that speaks protocol 18 reads and continues it" in child["detail"]
+    assert "a controller that speaks protocol 19 reads and continues it" in child["detail"]
     keeps_the_provenance("\n".join(doc["problems"]), f"issue #2: {corrupt}")
     assert (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes()) == before
 

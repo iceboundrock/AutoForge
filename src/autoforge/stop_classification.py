@@ -199,6 +199,8 @@ class StopReasonCode(Enum):
     INTERACTION_REQUIRED = "interaction-required"
     CONTROL_RESULT_INVALID = "control-result-invalid"
     VERIFICATION_FAILED = "verification-failed"
+    # The provider refused the launch at a usage or rate limit (#434).
+    PROVIDER_USAGE_LIMIT = "provider-usage-limit"
     # The run log refused a launch's step directory or record, its attempt persisted.
     RUN_LOG_REFUSED = "run-log-refused"
     # Refusals before the command acted (exit 2).
@@ -271,6 +273,7 @@ REASON_FAMILY: dict[StopReasonCode, ReasonFamily] = {
     _C.INTERACTION_REQUIRED: _F.EXECUTION,
     _C.CONTROL_RESULT_INVALID: _F.EXECUTION,
     _C.VERIFICATION_FAILED: _F.EXECUTION,
+    _C.PROVIDER_USAGE_LIMIT: _F.EXECUTION,
     _C.RUN_LOG_REFUSED: _F.EXECUTION,
     _C.CONFIGURATION_INVALID: _F.CONFIGURATION,
     _C.CONFIGURATION_DRIFT: _F.CONFIGURATION,
@@ -520,6 +523,8 @@ EXCEPTION_CLASSES: dict[type[errors.AutoForgeError], tuple[StopOutcome, StopReas
     errors.ExecutionTimeoutError: (_O.RESUMABLE_ERROR, _C.EXECUTION_TIMEOUT),
     errors.InteractionDataError: (_O.RESUMABLE_ERROR, _C.EXECUTION_FAILED),
     errors.InteractionRequiredError: (_O.RESUMABLE_ERROR, _C.INTERACTION_REQUIRED),
+    # #434: never relaunched at once; 'resume' once the limit has reset.
+    errors.ProviderUsageLimitError: (_O.RESUMABLE_ERROR, _C.PROVIDER_USAGE_LIMIT),
     errors.ChildStdinClosedError: (_O.RESUMABLE_ERROR, _C.EXECUTION_FAILED),
     errors.SandboxLaunchRefusedError: (_O.RESUMABLE_ERROR, _C.SANDBOX_LAUNCH_REFUSED),
     # The launch ran, its result is not used, and the next entry reconciles.

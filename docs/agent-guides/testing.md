@@ -1821,6 +1821,27 @@ a stated reason it has none. The coverage that must keep working:
 
 - external side effect completed before state write
 - resume without duplicating work
+- bounded automatic recovery (#434, ADR 0012 D11; `tests/test_auto_recovery.py`):
+  the rule alone (each failure's one category from typed facts or its class,
+  only the allowlist relaunched, the order of the refusals, a usage limit
+  never relaunched with or without a reset time, the message never read, no
+  stop classification imported, a refusal of the command not decided); the
+  journal's strict shape, its round trip, a fresh allowance per step that
+  keeps only pending audits, its bound dropping settled decisions first; K13
+  held to its owner and target and refused in a phase plan; the audit text
+  publishable (no mention, issue link, closing keyword or local path); and
+  the engine: an idle timeout and a result-less exit relaunched once with
+  the step charged, the decision journaled, logged and commented on the
+  issue or the PR; a second failure of the step refused whatever it is (a
+  timeout then a usage limit does not loop); a hard runtime limit, a loop
+  kill, an untyped exit, a launch that may have left a process and a result
+  delivered before the kill never relaunched; the step budget, the
+  invocation's `--max-steps` and a stop request refusing; `step` and a dry
+  run deciding nothing; an unconfirmed audit relaunching nothing and posted
+  once by the next command; an audit that landed before a crash adopted; a
+  crash after the decision's save spending the allowance. Protocol 17 -> 18
+  in `tests/test_state.py`; the adapters' usage-limit and result-less facts in
+  `tests/test_providers.py` and `tests/test_claude_stream.py`
 - the `UPDATE_EPIC` progress comment across every crash window of the
   effect lifecycle (`test_k8_*` in `tests/test_engine.py`), the one-shot
   legacy re-entry (D13.7) including a crash after its adoption was saved,
