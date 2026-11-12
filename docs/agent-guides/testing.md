@@ -1852,9 +1852,13 @@ a stated reason it has none. The coverage that must keep working:
   completing it exactly once; repeated GitHub failures stopping `run` and
   `step` with nothing executed and no decision dropped; a conclusive failure
   and a conflicting comment blocking until the operator's `unblock`.
-  Protocol 17 -> 18 in `tests/test_state.py`; the adapters' usage-limit and
-  result-less facts in `tests/test_providers.py` and
-  `tests/test_claude_stream.py`
+  PR #480's round 2: a Claude authentication or permission refusal (401,
+  403) and a protocol violation, each followed by an idle kill inside the
+  failure's exit grace, never relaunched, adapter to engine, and the same
+  fact from OpenCode and Pi refusing the relaunch (`failed-before-limit`).
+  Protocol 17 -> 18 in `tests/test_state.py`; the adapters' usage-limit,
+  result-less and failed-before-limit facts in `tests/test_providers.py`,
+  `tests/test_pi_rpc.py` and `tests/test_claude_stream.py`
 - the `UPDATE_EPIC` progress comment across every crash window of the
   effect lifecycle (`test_k8_*` in `tests/test_engine.py`), the one-shot
   legacy re-entry (D13.7) including a crash after its adoption was saved,

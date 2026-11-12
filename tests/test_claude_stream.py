@@ -1038,3 +1038,53 @@ def test_only_a_session_that_ran_and_then_ended_with_no_result_is_result_less():
     # A protocol violation is no exit without a result.
     assert not _run(b"not json")[0].result_less
     assert not _run(_result())[0].result_less
+
+
+_ENDED = "claude: stdout ended before a result event"
+
+
+@pytest.mark.parametrize(
+    ("records", "kind"),
+    [
+        # A turn ended on a model API error: its status, never its message.
+        ((_api_error(401, "Failed to authenticate. sk-ant-secret"),), "claude: API error 401"),
+        ((_api_error(403, "permission denied for /etc/passwd"),), "claude: API error 403"),
+        ((_api_error(529, "overloaded"),), "claude: API error 529"),
+        ((_api_error(None, "Request timed out"),), "claude: API error"),
+        # An error result that is no API error, and a run that did not succeed.
+        (
+            (_result(is_error=True, subtype="error_max_turns", result="x"),),
+            "claude: the run ended in an error",
+        ),
+        ((_result(subtype="error_during_execution"),), "claude: the run did not succeed"),
+        # Every protocol violation is one kind, whatever line broke it.
+        ((b"not json",), "claude: stream-json protocol violation"),
+        (
+            ({"type": "system", "subtype": "init", "model": "m"}, b'{"type": 1}'),
+            "claude: stream-json protocol violation",
+        ),
+        ((_result(is_error="yes"),), "claude: stream-json protocol violation"),
+        # stdout ended with a turn open.
+        (({"type": "system", "subtype": "init", "model": "m"},), _ENDED),
+        ((_result(), {"type": "system", "subtype": "init", "model": "m"}), _ENDED),
+    ],
+)
+def test_a_failure_has_a_fixed_kind_that_carries_no_text_from_the_stream(records, kind):
+    """#434 (R2-F1 of PR #480): what failed the run, as a fixed reason the
+    adapter keeps when a limit then kills the CLI; the first failure's."""
+    stream, _ = _run(*records)
+    assert stream.failure is not None
+    assert stream.failure_kind == kind
+    assert "secret" not in kind and "passwd" not in kind
+
+
+def test_a_run_that_did_not_fail_has_no_failure_kind():
+    assert _run(_result())[0].failure_kind is None
+    # Still running (no EOF yet), the stream has not failed either.
+    assert (
+        _run({"type": "system", "subtype": "init", "model": "m"}, ended=False)[0].failure_kind
+        is None
+    )
+    # The first failure's kind stands: a later record is not read.
+    stream, _ = _run(_api_error(401, "x"), b"not json")
+    assert stream.failure_kind == "claude: API error 401"

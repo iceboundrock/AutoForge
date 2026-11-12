@@ -628,8 +628,16 @@ work already landed completes without an agent and a conflict still blocks. A
 refused decision leaves the error, its refusal added to its text, for the
 operator's `resume`. A provider's usage or rate limit is a typed stop
 (`provider-usage-limit`) and is never relaunched, also when a limit killed the
-CLI after the provider had reported it; a hard runtime limit and a loop kill
-are never repeated.
+CLI after the provider had reported it; so is any other failure the adapter
+established before a limit killed the CLI (`failed_before_limit`: an
+authentication or permission refusal, a protocol violation, an error result),
+which the kill does not turn into an idle timeout; a hard runtime limit and a
+loop kill are never repeated. The step's automatic sequence, its failed
+command and the one automatic relaunch, launches at most twice the in-step
+bound above; every `resume` the operator runs after it re-enters the step
+with a fresh in-step bound and no automatic relaunch, so the bound on every
+launch of a step, and of the run, is `workflow.max_total_steps`, which
+charges each launch as one step before it starts.
 
 The reconciliation covers GitHub, not the agent worktree, which every launch
 of the issue reuses as the last one left it (#187). So before each launch of

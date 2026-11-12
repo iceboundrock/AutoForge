@@ -483,7 +483,8 @@ consume neither a review round nor the history. Every bound ends in
 `BLOCKED` with the reason; findings and the PR stay for a human.
 
 A failed agent step is relaunched automatically at most once, and only for
-an idle timeout or an exit its adapter typed as result-less (a CLI that died
+an idle timeout (never one that followed a failure the provider had already
+reported) or an exit its adapter typed as result-less (a CLI that died
 inside a running session), inside the running `run` or `resume`; the
 relaunch is one more step of `workflow.max_total_steps` and of
 `--max-steps`, and is saved, logged and posted as an audit comment first. A

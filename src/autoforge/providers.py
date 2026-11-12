@@ -94,6 +94,11 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
     ``system/init`` and a tool call of the model's seen) before a single
     result record, with no line lost, is a
     :attr:`AgentExecutionResult.result_less_exit`; an empty stream is not.
+    A stream that had failed the run before a limit killed the CLI (a turn
+    ended on a model API error, 401 or 403 included, an error result, a
+    protocol violation) keeps that failure's fixed kind as
+    :attr:`AgentExecutionResult.failed_before_limit`, never read as the
+    limit's (#434).
     Whether to relaunch is the engine's policy. A relaunched CLI begins with its own retries, so the
     relaunch itself waits through another retry schedule before giving up.
     ``text`` output is not classified.
@@ -160,6 +165,9 @@ OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
     usage-limit error, compared whole (:data:`_OPENCODE_USAGE_LIMIT_ERROR`,
     whatever the model), is reported as a
     :attr:`AgentExecutionResult.usage_limit` and never as transient (#434).
+    A timed-out run whose stderr holds any run-level error had failed before
+    the limit killed it: :attr:`AgentExecutionResult.failed_before_limit`
+    (#434; the error's message is not read for it).
   * bash/edit tools run without ``--auto`` under the default agent;
     ``--auto`` is opt-in via ``options.auto_approve: true``.
   * a request of the agent's is refused, never put to a person (#258; run
@@ -206,7 +214,9 @@ run against an installed Pi)::
     events until ``agent_settled``, ``get_last_assistant_text``) is the
     reducer in pi_rpc.py; ``stdout`` of the result is the final assistant
     text, never a protocol record, and an in-protocol failure is reported
-    in :attr:`AgentExecutionResult.provider_failure`.
+    in :attr:`AgentExecutionResult.provider_failure`. One a limit then cut
+    short (inside its abort, say) is reported as
+    :attr:`AgentExecutionResult.failed_before_limit` (#434).
   * ``--thinking`` takes ``off|minimal|low|medium|high|xhigh|max``; the model
     is ``provider/id`` with no ``:<thinking>`` suffix (ADR 0003 §2.2, §2.3).
   * no ``extra_args``: every flag that matters is the adapter's or #132's
@@ -489,6 +499,15 @@ class AgentExecutionResult:
     # typed tells (R1-F1 of PR #480). A fact, not a decision: whether to
     # relaunch is the engine's recovery rule.
     result_less_exit: bool = False
+    # A run the provider's protocol had already failed when a limit then killed
+    # the CLI (``timed_out``, which drops ``provider_failure``: a timeout wins
+    # over what the protocol said, ADR 0003 §2.6): a short, fixed reason naming
+    # what failed it (an authentication or permission refusal, a protocol
+    # violation, an error result), never text taken from the output; ``None``
+    # without a timeout (#434). The failure, established before the kill, ended
+    # the run, and a relaunch now may meet it again, so it is never read as the
+    # limit's: the engine's recovery rule refuses it (R2-F1 of PR #480).
+    failed_before_limit: str | None = None
     # A small flat mapping of scalars, bounded and redacted by the adapter,
     # that the engine writes to ``execution.json`` under this key without
     # interpreting it. Never raw protocol records or message contents.
@@ -1608,6 +1627,12 @@ class ClaudeCodeProvider(AgentProvider):
             # failure's exit grace was refused at that limit all the same,
             # and a relaunch now meets it again (R1-F2 of PR #480).
             usage_limit=stream.limit,
+            # #434: the stream had failed the run (an authentication or
+            # permission refusal, a protocol violation) before a limit killed
+            # the CLI, which drops the failure itself; one still running at its
+            # idle limit inside the failure's exit grace failed all the same
+            # (R2-F1 of PR #480). Its fixed kind, never the stream's text.
+            failed_before_limit=stream.failure_kind if timed_out else None,
             # #434: a CLI that died inside a running session before any
             # result, on its own (never one a limit or the adapter stopped),
             # with no line lost on the way (ClaudeStream.result_less).
@@ -2085,6 +2110,13 @@ class OpenCodeProvider(AgentProvider):
             # (R1-F2 of PR #480).
             result.usage_limit = f"opencode: {_OPENCODE_USAGE_LIMIT_ERROR}"
             result.transient_failure = None
+        if result.timed_out and _opencode_run_errors(result.stderr):
+            # #434: a run-level error, which fails the run, printed before a
+            # limit killed the CLI: the run had failed (an authentication or
+            # permission refusal among them), and the kill does not make it an
+            # idle timeout to relaunch (R2-F1 of PR #480). Its message is not
+            # read for this.
+            result.failed_before_limit = _OPENCODE_FAILED_BEFORE_LIMIT
         refused = _opencode_refused_requests(result.stderr)
         ended_by_it = ""
         if (
@@ -2142,6 +2174,8 @@ _OPENCODE_OPENAI_TRANSIENT_ERRORS = {
 # against a CLI here): the whole message, compared whole. It names no reset
 # time.
 _OPENCODE_USAGE_LIMIT_ERROR = "The usage limit has been reached"
+# What a timed-out run whose stderr holds a run-level error reports (#434).
+_OPENCODE_FAILED_BEFORE_LIMIT = "opencode: a run-level error was printed"
 
 
 # How OpenCode prints a request it refuses (#258; 2.1.4, run against a
@@ -2215,6 +2249,8 @@ def parse_opencode_version(text: str) -> tuple[int, int, int] | None:
 
 
 PI_EFFORTS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+# What a timed-out run whose conversation had already failed reports (#434).
+PI_FAILED_BEFORE_LIMIT = "pi: the RPC conversation had failed the run"
 # ADR 0003 §2.8: the release its RPC, model and auth facts were read from.
 # No upper bound.
 PI_MIN_VERSION = (1, 0, 0)
@@ -2546,6 +2582,9 @@ class PiProvider(AgentProvider):
         )
         with start_duplex(duplex) as child:
             cut_short = self._converse(child, conversation, monitor)
+            # #434: the conversation had failed the run before any limit cut
+            # it short (the deadline's own failure, below, is no such fact).
+            failed_first = conversation.failure is not None
             # The limit that fell due when the conversation was cut short:
             # pinned by then, so Pi's own exit inside the abort keeps it.
             cut_limit = child.deadline_limit if cut_short else ""
@@ -2591,6 +2630,10 @@ class PiProvider(AgentProvider):
             orphans_unchecked=res.orphans_unchecked,
             # A timeout wins over whatever the protocol said (ADR 0003 §2.6).
             provider_failure=None if timed_out else failure,
+            # #434: except that a failure established before the limit (a
+            # limit falling due inside its abort) is kept as a fixed fact, so
+            # the kill is not read as an idle timeout (R2-F1 of PR #480).
+            failed_before_limit=PI_FAILED_BEFORE_LIMIT if timed_out and failed_first else None,
             provider_summary=summary,
             timeout_limit=(res.timeout_limit or cut_limit) if timed_out else "",
             last_activity_at=res.last_activity_at,

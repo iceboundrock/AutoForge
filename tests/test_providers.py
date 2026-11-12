@@ -2018,6 +2018,8 @@ def test_a_fake_claude_that_goes_silent_is_killed_at_its_idle_timeout(tmp_path):
     assert time.monotonic() - started < 15
     assert res.timed_out and res.timeout_limit == "idle" and res.provider_failure is None
     assert res.last_activity_at is not None
+    # #434: nothing had failed the run before the limit: a plain idle timeout.
+    assert res.failed_before_limit is None
 
 
 def _between_turns() -> list:
@@ -4137,6 +4139,27 @@ def test_opencode_keeps_its_usage_limit_when_a_limit_killed_it_after_the_error()
     assert timed_out.timed_out
     assert timed_out.usage_limit == "opencode: The usage limit has been reached"
     assert timed_out.transient_failure is None
+    assert timed_out.failed_before_limit == "opencode: a run-level error was printed"
+
+
+@pytest.mark.parametrize(
+    ("stderr", "kind"),
+    [
+        # R2-F1 of PR #480: any run-level error printed before the kill (an
+        # authentication failure among them), whatever its message.
+        (f"{OC_ERROR}Unauthorized: invalid API key\n", "opencode: a run-level error was printed"),
+        (f"{OC_WS_CLOSED}\n", "opencode: a run-level error was printed"),
+        # A failed tool's error fails no run, and no error line is no failure.
+        (f"{oc_tool_failed('Read')}\n{OC_ERROR}ENOENT\n", None),
+        ("a trace that says Error: somewhere\n", None),
+        ("", None),
+    ],
+)
+def test_opencode_reports_a_run_level_error_printed_before_a_kill(stderr, kind):
+    res = _opencode_run(stderr, exit_code=-1, timed_out=True)
+    assert res.timed_out and res.failed_before_limit == kind
+    # Without a kill the failure is the exit's, and no such fact is reported.
+    assert _opencode_run(stderr).failed_before_limit is None
 
 
 @pytest.mark.parametrize(
@@ -4207,3 +4230,40 @@ def test_a_claude_limit_survives_the_idle_kill_inside_the_failures_exit_grace(tm
     assert res.timed_out and res.timeout_limit == "idle"
     assert res.usage_limit == "claude: API error 429"
     assert res.transient_failure is None and not res.result_less_exit
+    assert res.failed_before_limit == "claude: API error 429"
+
+
+@pytest.mark.parametrize(
+    ("lines", "kind"),
+    [
+        # R2-F1 of PR #480: an authentication or permission refusal ...
+        ("API_401", "claude: API error 401"),
+        ("API_403", "claude: API error 403"),
+        # ... or a protocol violation, then a CLI still running when its idle
+        # limit falls due inside the failure's exit grace.
+        ("MALFORMED", "claude: stream-json protocol violation"),
+    ],
+)
+def test_a_claude_failure_survives_the_idle_kill_inside_its_exit_grace(tmp_path, lines, kind):
+    """The kill drops the failure itself (a timeout wins, ADR 0003 §2.6), but
+    its fixed kind stands, so the timeout is never read as its cause."""
+    from tests import claude_fake
+
+    script = {
+        "API_401": claude_fake.api_failure(401, _API_ERRORS[401]),
+        "API_403": claude_fake.api_failure(403, "API Error: 403 permission_error message"),
+        "MALFORMED": [claude_fake.init(), "{not json"],
+    }[lines]
+    _, res = _claude_run(tmp_path, [*script, {"sleep": 30}], idle=1, exit_code=1)
+    assert res.timed_out and res.timeout_limit == "idle" and res.provider_failure is None
+    assert res.failed_before_limit == kind
+    assert res.usage_limit is None and res.transient_failure is None
+    assert not res.result_less_exit
+
+
+def test_a_claude_failure_that_ends_the_cli_is_no_failure_before_a_limit(tmp_path):
+    """The CLI exited on its own after the failure: a failed exit, not a kill."""
+    from tests import claude_fake
+
+    _, res = _claude_run(tmp_path, claude_fake.api_failure(401, _API_ERRORS[401]), exit_code=1)
+    assert not res.timed_out and res.provider_failure and res.failed_before_limit is None

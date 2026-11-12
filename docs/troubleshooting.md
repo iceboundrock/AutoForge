@@ -317,6 +317,10 @@ error's text:
 - **Never relaunched:** a maximum runtime or a loop kill, a provider's usage
   or rate limit (`stop: resumable_error (reason provider-usage-limit, ...)`),
   also when a limit killed the CLI after it had reported the limit, a
+  failure the provider had reported before a limit killed the CLI (an
+  authentication or permission refusal, a protocol violation, an error
+  result: `failed-before-limit`, the error saying `Its provider had already
+  failed the run when the limit killed it (...)`), a
   request for your decision, an untyped exit (an empty stream among them:
   a CLI that failed to authenticate, to load its configuration or to write
   to a full disk prints nothing on stdout, and stderr is never read for
@@ -357,6 +361,13 @@ recovery`, with any record not yet complete.
 After a refusal, recover as for any failed launch above. A step whose
 automatic relaunch is spent is not refilled by `resume`, a crash or
 `unblock`; a phase change starts a new step with a fresh one.
+
+Each `resume` of yours still launches the step again, with its usual
+corrections and transient retries, and no automatic relaunch after it: the
+rule bounds what the controller does on its own, not how often you resume.
+`workflow.max_total_steps` is the bound on every launch of the run, the
+ones you resume included, since each launch is charged as one step before
+it starts.
 
 ## An agent was killed: idle timeout, maximum runtime, loop
 

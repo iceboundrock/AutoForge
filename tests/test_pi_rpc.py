@@ -22,7 +22,7 @@ from autoforge.config import ProfileConfig
 from autoforge.errors import ExecutionError
 from autoforge.executor_duplex import OVERSIZE_HEAD_BYTES
 from autoforge.pi_rpc import PiConversation, js_trim
-from autoforge.providers import AgentRequest, PiProvider
+from autoforge.providers import PI_FAILED_BEFORE_LIMIT, AgentRequest, PiProvider
 from autoforge.result_parser import parse_control_result
 from autoforge.transitions import Phase
 from tests.conftest import DECODER_LIMIT_RECORDS, SHA_A, analyze_payload, block
@@ -1204,6 +1204,8 @@ def test_provider_a_malformed_extension_ui_method_is_a_provider_failure(tmp_path
     )
     assert not any('"ui-9"' in line for line in fake.stdin())
     assert fake.commands()[-1] == "abort"
+    # Pi settled the abort and exited: a failed run, never a kill.
+    assert not res.timed_out and res.failed_before_limit is None
 
 
 def test_provider_deadline_mid_stream_aborts_then_closes_stdin(tmp_path):
@@ -1223,6 +1225,8 @@ def test_provider_deadline_mid_stream_aborts_then_closes_stdin(tmp_path):
     assert res.provider_summary["abort_sent"] is True
     assert res.provider_summary["failure"].startswith("pi: the deadline was reached")
     assert res.timeout_limit == "max_runtime"
+    # #434: the deadline's own failure is no failure before the limit.
+    assert res.failed_before_limit is None
 
 
 def test_provider_a_silent_pi_is_aborted_at_its_idle_timeout(tmp_path):
@@ -1241,6 +1245,7 @@ def test_provider_a_silent_pi_is_aborted_at_its_idle_timeout(tmp_path):
     assert res.last_activity_at is not None
     assert fake.commands()[-1] == "abort"
     assert fake.sent_at("abort") - launched >= 2
+    assert res.failed_before_limit is None
 
 
 def test_provider_a_pi_silent_for_most_of_its_idle_limit_is_not_cut_short(tmp_path):
@@ -1294,6 +1299,9 @@ def test_provider_a_protocol_failure_shutdown_is_not_stretched_by_output(tmp_pat
         "pi: protocol violation: an extension UI request without a string 'method'"
     )
     assert res.timed_out and res.exit_code == -1 and res.timeout_limit == "idle"
+    # #434 (R2-F1 of PR #480): the protocol had failed the run before the idle
+    # limit killed Pi inside its abort; the kill does not make it an idle timeout.
+    assert res.failed_before_limit == PI_FAILED_BEFORE_LIMIT
 
 
 def test_provider_a_pi_that_ignores_abort_and_stdin_close_is_killed(tmp_path):

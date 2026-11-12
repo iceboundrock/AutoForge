@@ -18,13 +18,19 @@ relaunched once per step by the running command itself, exactly as your
 already landed is completed, not repeated. Nothing else is: a maximum
 runtime, a loop kill, a provider's usage limit, a request for your decision,
 a GitHub failure, a failed verification and any untyped or unknown failure
-still stop for you. A relaunch is refused when a process the failed launch
+still stop for you. So does an idle kill of an agent whose provider had
+already failed the run (an authentication or permission refusal, a protocol
+violation, an error result) and that then stayed alive until the limit: the
+failure ended the run, not the limit. A relaunch is refused when a process the failed launch
 started may still be running, when the killed agent had already printed a
 complete `CONTROL_RESULT`, when the step already used its one automatic
 relaunch (a crash, a `resume` or an `unblock` does not give it another),
 and when `workflow.max_total_steps` or `--max-steps` has no step left. The
 relaunch counts as a step like any other. `step` never relaunches on its
-own.
+own. The automatic relaunch is the step's only one: each `resume` you run
+afterwards launches the step again, within its usual corrections and
+transient retries, and `workflow.max_total_steps` is what bounds every
+launch of the run.
 
 **Changed:** `workflow.max_total_steps` now counts every agent launch. A
 correction of a malformed result and the retry of a transient provider

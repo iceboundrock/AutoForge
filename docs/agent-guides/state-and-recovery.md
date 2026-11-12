@@ -1458,7 +1458,10 @@ known and the retry path is bounded. Current cases include:
   invocation's `--max-steps` each have a step left, and the decision's audit
   comment is confirmed. A provider's usage or rate limit
   (`ProviderUsageLimitError`) is never relaunched, at once or later in the
-  same command; a hard runtime limit and a loop kill are never repeated
+  same command; neither is an idle kill of a launch whose provider had
+  already failed the run (`failed_before_limit`: an authentication or
+  permission refusal, a protocol violation); a hard runtime limit and a loop
+  kill are never repeated
 
 Do not blindly retry semantic or safety failures such as:
 

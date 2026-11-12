@@ -971,6 +971,7 @@ def _launch_end(
         usage_limit=result.usage_limit or "",
         usage_reset_at=result.usage_reset_at if result.usage_limit else "",
         transient_failure=result.transient_failure or "",
+        failed_before_limit=(result.failed_before_limit or "") if result.timed_out else "",
         provider=profile.provider,
     )
 
@@ -16474,6 +16475,8 @@ class ControllerEngine:
                 record.error = _with_leftovers(reached, result.leftovers)
                 if result.usage_limit:
                     record.error += f" (provider limit: {result.usage_limit})"
+                elif result.failed_before_limit:
+                    record.error += f" (failed before the limit: {result.failed_before_limit})"
                 self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
                 # Which value to change, when one set the limit (#189). What
                 # to inspect and how to resume are added where the step ends
@@ -16496,6 +16499,16 @@ class ControllerEngine:
                         provider=profile.provider,
                         limit=result.usage_limit,
                         reset_at=result.usage_reset_at,
+                    )
+                elif result.failed_before_limit:
+                    # #434 (R2-F1 of PR #480): the provider had failed the run
+                    # (an authentication or permission refusal, a protocol
+                    # violation) before the limit killed the CLI. Still a
+                    # timeout to every other reader; the recovery rule reads
+                    # the typed fact below, never this text, and refuses it.
+                    timeout = ExecutionTimeoutError(
+                        f"{text}. Its provider had already failed the run when the limit "
+                        f"killed it ({result.failed_before_limit})"
                     )
                 else:
                     timeout = ExecutionTimeoutError(text)

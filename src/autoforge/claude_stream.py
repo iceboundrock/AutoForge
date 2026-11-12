@@ -204,6 +204,9 @@ TRANSIENT_API_STATUSES = frozenset({408, *range(500, 600)})
 LIMIT_API_STATUS = 429
 # A run that cost more than this is not a reading to believe.
 _MAX_COST_USD = Decimal(1_000_000)
+# Two of the fixed reasons :attr:`ClaudeStream.failure_kind` takes (#434).
+_PROTOCOL_VIOLATION = "claude: stream-json protocol violation"
+_ENDED_EARLY = "claude: stdout ended before a result event"
 
 
 def _count(value: object) -> int | None:
@@ -229,6 +232,7 @@ class ClaudeStream:
 
     When the stream is over, :attr:`text` holds the final assistant text on
     success and :attr:`failure` the bounded, redacted reason otherwise,
+    :attr:`failure_kind` a fixed reason naming what failed it (#434),
     :attr:`transient` a fixed reason when that failure is a transient model
     API error, and :attr:`refused` the requests the CLI refused, whatever
     the outcome.
@@ -258,6 +262,16 @@ class ClaudeStream:
         # error with status 429 (#434): a usage or rate limit, which a launch
         # now would meet again. A fixed reason, never text from the stream.
         self.limit: str | None = None
+        # Set with ``failure``: what failed the run, as a fixed reason that
+        # carries no text from the stream (#434): ``claude: API error <status>``
+        # for a turn ended on a model API error with a status (401 and 403 an
+        # authentication or permission refusal), ``claude: API error`` for one
+        # without, ``claude: the run ended in an error``, ``claude: the run did
+        # not succeed``, ``claude: stream-json protocol violation`` or
+        # ``claude: stdout ended before a result event``. The adapter keeps it
+        # when a limit then killed the CLI, which drops ``failure`` itself, so
+        # the failure is not mistaken for the limit's (R2-F1 of PR #480).
+        self.failure_kind: str | None = None
         # stdout ended inside a turn; the driver names the exit code.
         self.exited_early = False
         # Turns opened so far: the first with the stream, each later one by
@@ -358,7 +372,7 @@ class ClaudeStream:
             return
         self.exited_early = True
         if self._results:
-            self._fail("claude: exited inside a turn that has no result event")
+            self._fail("claude: exited inside a turn that has no result event", _ENDED_EARLY)
             return
         reason = "claude: exited without a result event"
         if self._oversize:
@@ -366,7 +380,7 @@ class ClaudeStream:
                 f" ({self._oversize} line(s) past the per-line bound were skipped; "
                 "the result must arrive whole in one line)"
             )
-        self._fail(reason)
+        self._fail(reason, _ENDED_EARLY)
 
     @property
     def result_less(self) -> bool:
@@ -426,13 +440,16 @@ class ClaudeStream:
         if self._emit is not None:
             self._emit(event)
 
-    def _fail(self, reason: str) -> None:
+    def _fail(self, reason: str, kind: str) -> None:
+        """Fail the run, unless it failed already: ``reason`` for the record,
+        ``kind`` the fixed reason :attr:`failure_kind` keeps."""
         if self.failure is None:
             self.failure = clean(reason, MAX_REASON_CHARS)
+            self.failure_kind = kind
             self.text = None
 
     def _protocol(self, what: str) -> None:
-        self._fail(f"claude: stream-json protocol violation: {what}")
+        self._fail(f"claude: stream-json protocol violation: {what}", _PROTOCOL_VIOLATION)
 
     def _take_result(self, record: dict) -> None:
         self._results += 1
@@ -473,20 +490,27 @@ class ClaudeStream:
             if status is not None:
                 facts.append(f"api_error_status {status}")
             excerpt = clean(result, MAX_VALUE_CHARS * 2)
+            api_error = record.get("terminal_reason") == "api_error"
             self._fail(
                 f"claude: the run ended in an error ({', '.join(facts)})"
-                + (f": {excerpt}" if excerpt else "")
+                + (f": {excerpt}" if excerpt else ""),
+                (f"claude: API error {status}" if status is not None else "claude: API error")
+                if api_error
+                else "claude: the run ended in an error",
             )
             # The first failure decides the outcome (:meth:`feed`), so this
             # result's failure is the run's.
-            if record.get("terminal_reason") == "api_error" and status in TRANSIENT_API_STATUSES:
+            if api_error and status in TRANSIENT_API_STATUSES:
                 self.transient = f"claude: API error {status}"
-            if record.get("terminal_reason") == "api_error" and status == LIMIT_API_STATUS:
+            if api_error and status == LIMIT_API_STATUS:
                 self.limit = f"claude: API error {status}"
         elif is_error is not False:
             self._protocol("the result event has no boolean 'is_error'")
         elif subtype != "success":
-            self._fail(f"claude: the run did not succeed (subtype {clean(subtype, 60) or '-'})")
+            self._fail(
+                f"claude: the run did not succeed (subtype {clean(subtype, 60) or '-'})",
+                "claude: the run did not succeed",
+            )
         elif not isinstance(result, str):
             self._protocol("the result event has no string 'result'")
         else:

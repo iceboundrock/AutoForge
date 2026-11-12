@@ -110,6 +110,16 @@ def _limited(reset: str = "") -> BaseException:
         (_failed(ExecutionTimeoutError), RecoveryCategory.TIMEOUT_UNTYPED),
         (_limited(), RecoveryCategory.PROVIDER_USAGE_LIMIT),
         (ProviderUsageLimitError("no facts"), RecoveryCategory.PROVIDER_USAGE_LIMIT),
+        (_idle(failed_before_limit="claude: API error 401"), RecoveryCategory.FAILED_BEFORE_LIMIT),
+        (
+            _failed(
+                ExecutionTimeoutError,
+                kind=LaunchEndKind.TIMEOUT,
+                timeout_limit="max_runtime",
+                failed_before_limit="claude: stream-json protocol violation",
+            ),
+            RecoveryCategory.FAILED_BEFORE_LIMIT,
+        ),
         (
             _failed(kind=LaunchEndKind.FAILED_EXIT, transient_failure="claude: API error 529"),
             RecoveryCategory.TRANSIENT_EXHAUSTED,
@@ -145,6 +155,7 @@ def test_only_the_allowlist_is_ever_relaunched():
         _failed(ExecutionTimeoutError, kind=LaunchEndKind.TIMEOUT, timeout_limit="max_runtime"),
         _failed(ExecutionTimeoutError, kind=LaunchEndKind.TIMEOUT, timeout_limit="loop"),
         _failed(ExecutionTimeoutError),
+        _idle(failed_before_limit="claude: API error 401"),
         _failed(kind=LaunchEndKind.FAILED_EXIT),
         _failed(kind=LaunchEndKind.FAILED_EXIT, transient_failure="x"),
         GitHubUnavailableError("x"),
@@ -1018,6 +1029,81 @@ def test_the_rule_reads_a_limit_before_the_timeout_that_followed_it():
     exc = _idle(usage_limit="claude: API error 429")
     assert categorize(exc) is RecoveryCategory.PROVIDER_USAGE_LIMIT
     assert decide(exc, GOOD).refusal is Refusal.NO_TRUSTED_RESET
+
+
+# -- R2-F1 of PR #480: a failure stands whatever limit killed the launch after it ----------
+
+
+@pytest.mark.parametrize(
+    ("lines", "kind"),
+    [
+        # An authentication or a permission refusal: the turn's typed status.
+        ("API_401", "claude: API error 401"),
+        ("API_403", "claude: API error 403"),
+        # A protocol violation after the CLI's init.
+        ("MALFORMED", "claude: stream-json protocol violation"),
+    ],
+)
+def test_a_claude_failure_then_an_idle_kill_is_never_relaunched(
+    tmp_path, tmp_state_dir, fake_github, lines, kind
+):
+    """The reviewer's reproduction, adapter to engine: the failure, then a CLI
+    that stays alive inside the failure's exit grace until its idle limit kills
+    it. The kill drops the failure from the result, but its typed kind survives
+    the teardown and refuses the relaunch an idle timeout would have had."""
+    from tests import claude_fake
+
+    from .test_providers import _API_ERRORS
+
+    script = {
+        "API_401": claude_fake.api_failure(401, _API_ERRORS[401]),
+        "API_403": claude_fake.api_failure(403, "API Error: 403 permission_error message"),
+        "MALFORMED": [claude_fake.init(), "{not json"],
+    }[lines]
+    eng, home = _review_on_claude(
+        tmp_path, tmp_state_dir, fake_github, [*script, {"sleep": 30}], idle=1
+    )
+    with pytest.raises(ExecutionTimeoutError) as caught:
+        eng.run(max_steps=5)
+    message = str(caught.value)
+    assert f"Its provider had already failed the run when the limit killed it ({kind})" in message
+    assert "relaunch refused (not-allowlisted): failed-before-limit" in message
+    assert claude_fake.launches(home) == 1
+    (entry,) = _journal_of(eng).decisions
+    assert entry.category is RecoveryCategory.FAILED_BEFORE_LIMIT and not entry.allowed
+    assert entry.error == "ExecutionTimeoutError"
+    assert "limit idle" in entry.evidence and f"failed before the limit '{kind}'" in entry.evidence
+    assert _journal_of(eng).relaunches == 0
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.REVIEW
+
+
+@pytest.mark.parametrize(
+    "facts",
+    [
+        {**IDLE, "failed_before_limit": "opencode: a run-level error was printed"},
+        {**IDLE, "failed_before_limit": "pi: the RPC conversation had failed the run"},
+        {**IDLE, "failed_before_limit": "claude: API error 401"},
+    ],
+    ids=["opencode", "pi", "claude"],
+)
+def test_a_failure_reported_before_any_kill_vetoes_the_relaunch(tmp_state_dir, fake_github, facts):
+    eng, provider = _analyzing(tmp_state_dir, fake_github, facts, implement)
+    with pytest.raises(ExecutionTimeoutError, match=r"refused \(not-allowlisted\)"):
+        eng.run(max_steps=5)
+    assert len(provider.calls) == 1
+    (entry,) = _journal_of(eng).decisions
+    assert entry.category is RecoveryCategory.FAILED_BEFORE_LIMIT
+    assert facts["failed_before_limit"] in entry.evidence
+
+
+def test_the_rule_reads_a_failure_before_the_timeout_that_followed_it():
+    exc = _idle(failed_before_limit="claude: stream-json protocol violation")
+    assert categorize(exc) is RecoveryCategory.FAILED_BEFORE_LIMIT
+    assert decide(exc, GOOD).refusal is Refusal.NOT_ALLOWLISTED
+    # A usage limit is read first: its own refusal, whatever else failed.
+    both = _idle(usage_limit="claude: API error 429", failed_before_limit="claude: API error 429")
+    assert categorize(both) is RecoveryCategory.PROVIDER_USAGE_LIMIT
 
 
 # -- R1-F3 of PR #480: every physical launch is charged, before it starts ----------------

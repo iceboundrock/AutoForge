@@ -22,10 +22,12 @@ worker) do that ``resume`` itself, once per step, under a fixed rule:
   is refused and stays the operator's: a hard runtime limit, a loop kill, a
   provider's usage limit (D4: never retried at once, whatever ended the
   launch after it; no adapter reports a reset time it can trust, and no
-  wait policy exists), a known-transient
-  failure whose in-step bound is spent (D6), a request for a human decision,
-  a sandbox refusal, a GitHub failure or drift (D6), a failed verification,
-  an untyped exit and anything unknown.
+  wait policy exists), a failure the provider had established before a
+  limit killed the launch (an authentication or permission refusal, a
+  protocol violation: the timeout that followed is not its cause), a
+  known-transient failure whose in-step bound is spent (D6), a request for
+  a human decision, a sandbox refusal, a GitHub failure or drift (D6), a
+  failed verification, an untyped exit and anything unknown.
 - **One shared allowance per step** (:data:`MAX_AUTOMATIC_RELAUNCHES_PER_STEP`,
   D1, D7), persisted in the run's state (:class:`RecoveryJournal`), so a
   crash or a later ``resume`` never refills it. Failures are also counted by
@@ -134,6 +136,12 @@ class LaunchEnd:
     #: The adapter's fixed reason for a known-transient failure, whose in-step
     #: relaunches were spent or withheld (D6).
     transient_failure: str = ""
+    #: The adapter's fixed reason for a failure its provider's protocol had
+    #: established before a limit killed the launch (an authentication or
+    #: permission refusal, a protocol violation, an error result): kept
+    #: through the kill, so the timeout is never read as the cause (R2-F1 of
+    #: PR #480). ``""`` for a launch no limit killed.
+    failed_before_limit: str = ""
     #: The launch's provider, as configured (``claude``, ``opencode``, ``pi``).
     provider: str = ""
 
@@ -153,6 +161,8 @@ class LaunchEnd:
             )
         if self.transient_failure:
             parts.append(f"transient '{self.transient_failure}'")
+        if self.failed_before_limit:
+            parts.append(f"failed before the limit '{self.failed_before_limit}'")
         if self.result_less_exit:
             parts.append("no result delivered before the exit")
         parts.append(
@@ -176,6 +186,7 @@ class RecoveryCategory(StrEnum):
 
     IDLE_TIMEOUT = "idle-timeout"
     RESULT_LESS_EXIT = "result-less-exit"
+    FAILED_BEFORE_LIMIT = "failed-before-limit"
     RUNTIME_LIMIT = "runtime-limit"
     LOOP_KILL = "loop-kill"
     TIMEOUT_UNTYPED = "timeout-untyped"
@@ -201,6 +212,11 @@ CATEGORY_TEXT: Mapping[RecoveryCategory, str] = {
     _RC.IDLE_TIMEOUT: "the agent made no progress for its idle limit and was killed",
     _RC.RESULT_LESS_EXIT: (
         "the agent's CLI ended without delivering any result, as its adapter typed it"
+    ),
+    _RC.FAILED_BEFORE_LIMIT: (
+        "the provider had already failed the run (an authentication or permission refusal, "
+        "a protocol violation, an error result) when a limit killed the agent; that failure "
+        "ended it, and a relaunch may meet it again"
     ),
     _RC.RUNTIME_LIMIT: (
         "the agent reached its maximum runtime; hard runtime exhaustion is never "
@@ -285,6 +301,12 @@ def categorize(exc: BaseException) -> RecoveryCategory:
             # then idled until its limit killed it is no idle timeout to
             # relaunch (R1-F2 of PR #480).
             return _RC.PROVIDER_USAGE_LIMIT
+        if launch.failed_before_limit:
+            # Then any other failure the provider had established before a
+            # limit killed the launch: it, not the limit, ended the run, so an
+            # authentication or permission refusal or a protocol violation is
+            # never an idle timeout to relaunch (R2-F1 of PR #480).
+            return _RC.FAILED_BEFORE_LIMIT
         if launch.kind is LaunchEndKind.TIMEOUT:
             return {
                 "idle": _RC.IDLE_TIMEOUT,

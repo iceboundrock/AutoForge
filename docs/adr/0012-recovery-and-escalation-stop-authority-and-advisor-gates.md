@@ -448,11 +448,26 @@ bundle.
 ### D9. Cost and replay
 
 - *Amended by #434:* an automatic relaunch (D11) is one more step of the
-  run, so its launches are counted and bounded like a `resume`'s: a step
-  launches at most `(1 + MAX_AUTOMATIC_RELAUNCHES_PER_STEP) × (1 +
-  execution.max_correction_attempts + MAX_TRANSIENT_RETRIES)` agents over
-  every command that re-enters it, and `workflow.max_total_steps` charges the
-  relaunch as it charges any step.
+  run, so its launches are counted and bounded like a `resume`'s. Two bounds
+  apply, and only the second is cumulative:
+  - The **automatic sequence** of a step, the command whose step failed and
+    the one relaunch the rule then makes, launches at most `(1 +
+    MAX_AUTOMATIC_RELAUNCHES_PER_STEP) × (1 +
+    execution.max_correction_attempts + MAX_TRANSIENT_RETRIES)` agents, 8
+    with the defaults. It bounds what the controller does on its own, not
+    the step. Every **operator-initiated** `resume` (or `run`, or `step`)
+    that re-enters the step afterwards launches up to `1 +
+    execution.max_correction_attempts + MAX_TRANSIENT_RETRIES` agents more,
+    and makes no automatic relaunch, since the step's allowance stays spent
+    (D11.4). A step re-entered often enough therefore launches more: nine
+    one-step invocations of a step whose agent keeps idling launch nine
+    agents, one more than the 8 above.
+  - `workflow.max_total_steps` is the **cumulative bound on physical
+    launches**, of a step and of the run, over every command, whoever starts
+    it. Each launch (a step's first, a correction, a transient retry, an
+    automatic relaunch) is charged as one step, against the persisted count,
+    before it starts (D11.4), so the run's launches never exceed its step
+    count, and none starts once the budget is spent.
 - **Count physical model launches.** Every advisor launch, correction and
   transient relaunch is one launch: one run log line with its own producer,
   counted in ADR 0011 D7.3's launch denominator. None is hidden inside
@@ -464,7 +479,8 @@ bundle.
 - **Estimates are not budgets.** The bounds enforced today are counts and
   time:
   - at most `1 + execution.max_correction_attempts + MAX_TRANSIENT_RETRIES`
-    launches per step;
+    launches per execution of a step (one command's; *amended by #434:* an
+    automatic sequence is at most two of them, above);
   - `workflow.max_total_steps` per run;
   - each profile's idle and maximum-runtime limits.
 
@@ -531,7 +547,8 @@ error's `launch_end`): the limit that killed it (`idle`, `max_runtime`,
 `loop`), whether a process it started may still run, whether its output
 holds a complete `CONTROL_RESULT` in the part the parser reads, and what its
 adapter typed (a usage limit, a known-transient failure, an exit without
-any result). It reads no message, no agent output and no stop
+any result, a failure its provider had established before a limit killed
+it). It reads no message, no agent output and no stop
 classification: `auto_recovery.py` does not import
 `stop_classification.py`, and ADR 0011 D3 stands
 (`test_the_rule_reads_no_message`, `test_the_rule_reads_no_stop_classification`).
@@ -557,7 +574,8 @@ classification: `auto_recovery.py` does not import
 
 Refused, and the operator's as before: a hard runtime limit and a loop
 kill (never repeated), a timeout nothing typed, a provider's usage limit
-(D11.3), a known-transient failure whose in-step relaunches were spent or
+(D11.3), a failure the provider had established before a limit killed the
+launch (below), a known-transient failure whose in-step relaunches were spent or
 withheld, a request for a human decision, an untyped exit, a result refused
 after its corrections, a sandbox refusal or clean-up uncertainty, a GitHub
 or git failure (drift and propagation stay stops; the pushed-head wait of
@@ -571,6 +589,25 @@ would discard it is not made)
 `test_a_launch_that_may_have_left_a_process_is_never_relaunched`,
 `test_a_claude_exit_whose_cause_nothing_typed_tells_is_never_relaunched`,
 `test_a_claude_cli_that_died_inside_a_running_session_is_relaunched_once`).
+
+A failure the adapter established before a limit killed the launch stands
+through the kill (R2-F1 of PR #480). A launch whose provider had already
+failed the run and that stayed alive until a limit killed it is a timeout
+to every other reader, since a timeout wins over what the protocol said
+(ADR 0003 §2.6): Claude Code inside its failure-exit grace after a turn
+ended on a model API error (401 and 403, an authentication or permission
+refusal, included), an error result or a protocol violation; OpenCode hung
+after a run-level error; Pi killed inside the abort that followed a failed
+conversation. The adapter keeps the failure's fixed kind as
+`failed_before_limit` (`claude: API error 401`, `claude: stream-json
+protocol violation`, `opencode: a run-level error was printed`, `pi: the
+RPC conversation had failed the run`), never text from the output, and the
+rule reads it before the timeout, after a usage limit only. Its category,
+`failed-before-limit`, is not on the allowlist, so neither an
+authentication or permission refusal nor protocol drift becomes an idle
+timeout to relaunch
+(`test_a_claude_failure_then_an_idle_kill_is_never_relaunched`,
+`test_a_failure_reported_before_any_kill_vetoes_the_relaunch`).
 
 **D11.3. Usage limits.** An adapter types a provider's usage or rate limit
 from the provider's own typed answer (Claude Code's model API error 429;
@@ -601,6 +638,10 @@ persisted, so neither a crash, a later `resume` nor an `unblock` back into
 the same phase refills it; a phase change is a new step. A relaunch also
 needs a step of `workflow.max_total_steps` and one of the invocation's
 `--max-steps`, and a scheduler worker's `should_continue` still true. The
+allowance bounds the controller's own relaunches, never the operator's: a
+`resume` after it re-enters the step with the in-step bounds and no
+automatic relaunch, and `workflow.max_total_steps` is the bound on every
+launch (D9 as amended, R2-F2 of PR #480). The
 relaunch is one more step, charged when it first persists, like any step
 (`test_a_second_failure_of_the_step_is_refused_whatever_failed`,
 `test_the_step_budget_and_the_invocation_bound_are_never_exceeded`,
@@ -680,7 +721,7 @@ Only an error that ends a step of an agent phase is decided; a refusal
   costs it the step's one relaunch and nothing else; the delivered-result
   and survivor checks only refuse more. The audit comment carries no agent
   text.
-- *Cost.* One paid launch per step at most, counted as a step of
+- *Cost.* One automatic paid relaunch per step at most, counted as a step of
   `workflow.max_total_steps` and of `--max-steps`, against the operator
   `resume` it replaces (the same launch, minutes to hours earlier). Its
   in-step corrections and transient relaunches are the existing bounds
