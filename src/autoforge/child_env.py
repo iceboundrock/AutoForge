@@ -233,8 +233,16 @@ IDENTITY_KEYS = (
 
 # The scopes of the configuration a child's git still reads: the operator's
 # global configuration is replaced (``GIT_CONFIG_GLOBAL``) and the command
-# scope is the controller's own.
-CHILD_SCOPES = ("system", "local", "worktree")
+# scope is the controller's own. ``unknown`` is what Apple's git (Xcode and
+# the Command Line Tools) prints for the gitconfig it ships under
+# ``$(xcode-select -p)/usr/share/git-core`` (``credential.helper
+# osxkeychain``): a file outside the repository that ``GIT_CONFIG_GLOBAL``
+# does not replace, so the child's git reads it and it is held to the system
+# scope's rules.
+CHILD_SCOPES = ("unknown", "system", "local", "worktree")
+# Every scope ``git config --list --show-scope`` prints for the listing the
+# preflight runs.
+LISTED_SCOPES = (*CHILD_SCOPES, "global", "command")
 # The scopes that live in the repository (the shared common dir and the
 # worktree's own configuration), where a credential helper is refused.
 REPOSITORY_SCOPES = ("local", "worktree")
@@ -590,7 +598,7 @@ def parse_git_config_listing(output: str) -> list[GitConfigEntry]:
         raise ExecutionError("git config --list printed a scope without an entry")
     entries = []
     for scope, item in zip(fields[0::2], fields[1::2], strict=True):
-        if scope not in ("system", "global", "local", "worktree", "command"):
+        if scope not in LISTED_SCOPES:
             raise ExecutionError(f"git config --list printed an unknown scope {scope[:40]!r}")
         key, newline, value = item.partition("\n")
         if not key:

@@ -873,6 +873,43 @@ def test_the_listing_parser_keeps_scopes_keys_and_values():
             parse_git_config_listing(bad)
 
 
+# What Apple's git (Xcode or the Command Line Tools) prints first: its own
+# gitconfig under ``$(xcode-select -p)/usr/share/git-core``, a scope
+# ``--show-scope`` has no name for.
+APPLE_GIT_LISTING = (
+    "unknown\0credential.helper\nosxkeychain\0"
+    "unknown\0init.defaultbranch\nmain\0"
+    "global\0user.name\nOp\0"
+    "local\0core.bare\nfalse\0"
+)
+
+
+def test_the_listing_parser_keeps_apple_gits_unnamed_scope():
+    entries = parse_git_config_listing(APPLE_GIT_LISTING)
+    assert entries[:2] == [
+        GitConfigEntry("unknown", "credential.helper", "osxkeychain"),
+        GitConfigEntry("unknown", "init.defaultbranch", "main"),
+    ]
+
+
+def test_apple_gits_helper_is_not_refused_but_the_preflight_still_reads_its_file(tmp_path):
+    """Its helper is cleared at command scope like a system one, but the
+    child's git reads the file, so a credential in a URL there is refused."""
+
+    def runner(listing):
+        def run(req):
+            return ExecutionResult(req.command, req.cwd, 0, listing, "", "t", "t")
+
+        return run
+
+    assert preflight(str(tmp_path), runner(APPLE_GIT_LISTING)).entries == (("user.name", "Op"),)
+    planted = "unknown\0url.https://u:s3cr3t@github.com/.insteadof\nhttps://github.com/\0"
+    with pytest.raises(ConfigurationError) as caught:
+        preflight(str(tmp_path), runner(APPLE_GIT_LISTING + planted))
+    assert "unknown-scope git configuration (url.<url>.insteadof)" in str(caught.value)
+    assert "s3cr3t" not in str(caught.value)
+
+
 @pytest.mark.parametrize(
     ("url", "expected"),
     [
