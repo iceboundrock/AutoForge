@@ -522,7 +522,9 @@ class AgentExecutionResult:
     # handed over whole as ``stdout``, however the CLI ended after it (#479):
     # Claude Code's ``stream-json`` held a reply that decides the run
     # (ClaudeStream.replied: every turn opened has its result, the last a
-    # success holding a block, no tool call open) when the stream ended; Pi's
+    # success holding a block, no tool call open) when the stream ended, with
+    # no line of it skipped past the per-line bound (ClaudeStream.reply_proven,
+    # R3-F1 of PR #481); Pi's
     # conversation settled and its last assistant text read back, before any
     # limit cut it short, with every tool execution ended and nothing but that
     # text's response on stdout after the run settled, through Pi's shutdown
@@ -1566,10 +1568,11 @@ class ClaudeCodeProvider(AgentProvider):
         ``exit_code`` is always the real process status, -1 when the CLI was
         killed. A failure that is a turn ended by a transient model API error
         is also a ``transient_failure`` (#395); ``text`` output carries no
-        record to tell it by. A stream that, read to its end, holds a reply
-        that decides the run is ``reply_delivered`` whatever the CLI did
-        after it (#479), which the engine reads for a CLI that then exited
-        with a failing status; ``text`` output vouches for no reply.
+        record to tell it by. A stream that, read to its end with no line
+        skipped past the per-line bound, holds a reply that decides the run is
+        ``reply_delivered`` whatever the CLI did after it (#479, R3-F1 of PR
+        #481), which the engine reads for a CLI that then exited with a
+        failing status; ``text`` output vouches for no reply.
         """
         if self.output_format(req.profile) != "stream-json":
             return super().execute(req)
@@ -1674,7 +1677,12 @@ class ClaudeCodeProvider(AgentProvider):
             # finds one is no timeout (#439), so a launch whose reply this
             # leaves for the engine to decide on is one that exited with a
             # failing status after it, or that the loop detector stopped.
-            reply_delivered=failure is None and stream.replied,
+            # Only on a stream of which no line was skipped past the per-line
+            # bound (ClaudeStream.reply_proven, R3-F1 of PR #481): a record
+            # never read may have opened a later turn or a tool call, or
+            # failed the run. #439's stop on a reply reads ``replied`` as
+            # before.
+            reply_delivered=failure is None and stream.reply_proven,
             # #434: a CLI that died inside a running session before any
             # result, on its own (never one a limit or the adapter stopped),
             # with no line lost on the way and no model API error reported

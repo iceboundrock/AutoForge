@@ -410,7 +410,13 @@ stop's code or the phase the step moved to.
 If the controller is interrupted after it kept such a reply and before the
 step concluded (a crash, `Ctrl-C`, GitHub not answering), the next `resume`
 checks the kept reply again and goes on from it without running the agent
-again; the error you saw says `is kept in the run's state`. When the kept
+again; the error you saw says `is kept in the run's state`. If the
+interruption came after the step had saved the plan it made from the reply
+(a PR create or a review comment GitHub did not answer, say), the reply was
+already accepted: the error says `so the reply was accepted`, and `resume`
+completes that plan from the journal and records the acceptance, without
+checking the reply again or running the agent. Whichever step settles a kept
+reply writes its `<PHASE>-delivered-result` record, once. When the kept
 reply no longer passes its checks (a commit landed in the worktree after it,
 or the PR moved: its HEAD, its base branch or the merge base its diff is
 computed from), the run stops in `BLOCKED` (`control-result-invalid`) with

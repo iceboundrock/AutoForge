@@ -19,7 +19,9 @@ whether a reply goes to the controller's checks at all.
 - *Delivered complete result*: a completed turn that ended the run on a
   successful final reply, with nothing opened after it, that the adapter
   hands over whole (:attr:`~autoforge.providers.AgentExecutionResult.reply_delivered`,
-  the adapter's typed fact, never its reading of text), whose blocks say
+  the adapter's typed fact, never its reading of text, and only from a
+  protocol it read whole: a Claude ``stream-json`` line skipped past the
+  per-line bound voids it, R3-F1 of PR #481), whose blocks say
   one thing (:func:`~autoforge.result_parser.reply_block_shape`), and that
   the capture bound did not cut.
 - *Terminated process*: how the CLI ended (:class:`ProcessEnd`). A CLI
@@ -43,7 +45,11 @@ whether a reply goes to the controller's checks at all.
   a restart re-checks it rather than run the agent again, R1-F1), and it is
   *accepted* only once the step's own checks after it (the operator's
   checkout unmoved, the PR still the run's, the phase's verification) have
-  applied it as the step's result (:func:`settled_record`).
+  applied it as the step's result (:func:`settled_record`). The save of the
+  plan the verification turns it into is that acceptance, and marks the kept
+  reply :attr:`KeptReply.applied` (R3-F2): a crash or an error after it
+  leaves both the plan and the acceptance's provenance in the state, and the
+  step that completes the plan records the reply as accepted.
 
 **The rule** (:func:`refusal`) reads typed facts only and refuses, first
 match wins: a request of the agent's for a human decision; a failure the
@@ -234,6 +240,21 @@ ACCEPTED = "accepted"
 NOT_ACCEPTED = "not-accepted"
 
 
+class Carried(StrEnum):
+    """How the provisional reply a step settles reached that step (R3-F2 of PR #481)."""
+
+    #: Delivered by the step's own launch.
+    FRESH = "fresh"
+    #: Kept in the state across an interruption, not (yet) checked again.
+    KEPT = "kept"
+    #: Kept across an interruption, checked again and gone on from by this step.
+    RECHECKED = "rechecked"
+    #: Kept across an interruption after the step that went on from it saved
+    #: the plan it turned the reply into (:attr:`KeptReply.applied`): accepted
+    #: before the interruption, and this step goes on from that plan.
+    APPLIED = "applied"
+
+
 def outcome_record(facts: EndFacts, refused: Refusal | None) -> dict[str, object]:
     """``execution.json``'s ``delivered_result``: the outcome, the reason, the facts.
 
@@ -251,23 +272,28 @@ def outcome_record(facts: EndFacts, refused: Refusal | None) -> dict[str, object
 
 
 def settled_record(
-    facts: EndFacts, *, accepted: bool, reason: str, launch_log: str, kept_across_restart: bool
+    facts: EndFacts, *, accepted: bool, reason: str, launch_log: str, carried: Carried
 ) -> dict[str, object]:
     """The step's record of what became of a provisional reply (R1-F4 of PR #481).
 
-    Written once the step has its outcome: :data:`ACCEPTED` when the step
-    applied the reply as its result (its checks after the reply passed: the
-    operator's checkout unmoved, the PR still the run's, and the phase's
-    verification saved the plan it turned the reply into, or recorded the
-    agent's own stop, whatever ended the step after that; R2-F4 of PR #481),
-    :data:`NOT_ACCEPTED` with the step's typed ``reason`` (the stop's code,
-    or the phase it moved to) otherwise. Typed values only.
+    Written once, by the step that has the reply's outcome: :data:`ACCEPTED`
+    when a step applied the reply as its result (its checks after the reply
+    passed: the operator's checkout unmoved, the PR still the run's, and the
+    phase's verification saved the plan it turned the reply into, or
+    recorded the agent's own stop, whatever ended the step after that; R2-F4
+    of PR #481), the step before an interruption included
+    (:attr:`Carried.APPLIED`, R3-F2), :data:`NOT_ACCEPTED` with the step's
+    typed ``reason`` (the stop's code, or the phase it moved to) otherwise.
+    ``kept_across_restart`` says the reply reached the step from the state,
+    ``applied_before_restart`` that it was accepted before the interruption.
+    Typed values only.
     """
     record: dict[str, object] = {
         "outcome": ACCEPTED if accepted else NOT_ACCEPTED,
         **facts.record(),
         "launch_step": launch_log,
-        "kept_across_restart": kept_across_restart,
+        "kept_across_restart": carried is not Carried.FRESH,
+        "applied_before_restart": carried is Carried.APPLIED,
     }
     if not accepted:
         record["reason"] = reason
@@ -296,17 +322,33 @@ def outcome_text(facts: EndFacts, refused: Refusal) -> str:
     )
 
 
-def settled_text(facts: EndFacts, *, accepted: bool, kept_across_restart: bool) -> str:
+def settled_text(facts: EndFacts, *, accepted: bool, carried: Carried) -> str:
     """One sentence for the operator once the step has its outcome (R1-F4 of PR #481).
 
-    Acceptance is claimed only for a reply the step applied as its result
-    (the verification saved the plan it turned it into, or recorded the
-    agent's own stop; R2-F4); a step that ended without applying it says so,
-    and its own message, which says why, follows.
+    Acceptance is claimed only for a reply a step applied as its result (the
+    verification saved the plan it turned it into, or recorded the agent's
+    own stop; R2-F4), this step or the one an interruption ended after that
+    save (:attr:`Carried.APPLIED`, R3-F2); a step that ended without applying
+    it says so, and its own message, which says why, follows.
     """
+    if carried is Carried.APPLIED:
+        return (
+            f"The agent {_end_text(facts)} after delivering its complete final reply; the "
+            "teardown left no process behind, the reply passed the checks of a clean exit's "
+            "reply, then the step's own checks, and the step saved the plan it turned the reply "
+            "into before an interruption: it was accepted, the agent was not run again, and "
+            "this step went on from that plan (#479)."
+        )
+    if carried is Carried.KEPT:
+        return (
+            f"The agent {_end_text(facts)} after delivering its complete final reply, which "
+            "passed the checks of a clean exit's reply and was kept in the run's state across "
+            "an interruption; this step ended without going on from it, so it was not accepted "
+            "(#479). Why follows."
+        )
     kept = (
         ", kept in the run's state across an interruption and checked again"
-        if kept_across_restart
+        if carried is Carried.RECHECKED
         else ""
     )
     head = (
@@ -343,6 +385,7 @@ _KEPT_KEYS = (
     "run_log",
     "payload",
     "payload_sha256",
+    "applied",
 )
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
@@ -429,6 +472,14 @@ class KeptReply:
     #: The launch's step directory in the run log (``NNN-<phase>-<attempt>``).
     run_log: str
     payload: dict = field(default_factory=dict)
+    #: The step's verification saved the plan it turned the reply into: the
+    #: reply was *accepted* (R3-F2 of PR #481). Set in that save, so a crash
+    #: or an error after it, before the step has its outcome, leaves the
+    #: acceptance and its provenance in the state: the step that next enters
+    #: the phase completes the plan from the journal and records the reply
+    #: as accepted. An applied reply is that record's provenance only, never
+    #: a reply to check again or go on from.
+    applied: bool = False
 
     def revision(self) -> tuple[str, str, str]:
         """The revision it is bound to: ``(head_sha, base_ref, merge_base_sha)``."""
@@ -460,6 +511,7 @@ class KeptReply:
             "run_log": self.run_log,
             "payload": self.payload,
             "payload_sha256": payload_digest(self.payload),
+            "applied": self.applied,
         }
 
     @classmethod
@@ -500,6 +552,9 @@ class KeptReply:
             raise _fail("'payload_sha256' is not a SHA-256 digest")
         if digest != payload_digest(payload):
             raise _fail("'payload_sha256' is not the digest of its payload")
+        applied = raw["applied"]
+        if not isinstance(applied, bool):
+            raise _fail("'applied' is not a boolean")
         return cls(
             phase=phase,
             attempt=_count(raw, "attempt", 1),
@@ -515,4 +570,5 @@ class KeptReply:
             limit=limit,
             run_log=run_log,
             payload=payload,
+            applied=applied,
         )

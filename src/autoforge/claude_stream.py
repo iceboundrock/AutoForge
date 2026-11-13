@@ -139,6 +139,10 @@ own ``result`` decides again; a notice between turns does not. A background
 agent's held-back results keep it false until they have arrived. A
 ``tool_result`` skipped past the per-line bound leaves its call open and so
 keeps it false too: the run then waits for the CLI, as it did before #439.
+:attr:`ClaudeStream.reply_proven` is the stricter fact a reply delivered
+before a failing exit is taken on (#479): ``replied`` with no line skipped
+past the per-line bound anywhere in the stream, since a record never read
+may have opened a turn or a tool call, or failed the run (R3-F1 of PR #481).
 
 Loop detection (#194): given a :class:`~autoforge.loop_detect.LoopObserver`,
 each completed tool call is reported as an action fingerprinted from its
@@ -344,6 +348,22 @@ class ClaudeStream:
             and self._results == self._turns
             and not self._open_tools
         )
+
+    @property
+    def reply_proven(self) -> bool:
+        """:attr:`replied`, on a stream of which no line was skipped (#479, R3-F1 of PR #481).
+
+        The proof that the reply ended the run, for a CLI that then exited
+        with a failing status (``AgentExecutionResult.reply_delivered``):
+        :attr:`replied` read from every record the CLI wrote. A line skipped
+        past the per-line bound is a record never read, wherever it stood: a
+        later turn's ``system/init`` or first record, a ``tool_use`` left
+        open, a failing ``result``, or a turn's opening record before the
+        reply that leaves the turn count short. So one skipped line voids the
+        proof. :attr:`replied` itself, on which the driver stops a CLI still
+        running after a reply (#439), does not change.
+        """
+        return self.replied and self._oversize == 0
 
     # -- driver interface ----------------------------------------------------
     def feed(self, data: bytes) -> None:

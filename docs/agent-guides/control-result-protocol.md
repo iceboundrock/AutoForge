@@ -99,8 +99,12 @@ step accepts it only once its own checks after the parse (the PR's owner,
 the phase's verification, which must save the plan it turns the reply into)
 have applied it; a crash in between leaves it for the next command, which
 checks it again exactly as a fresh reply, against the same revision, and
-launches no agent (ADR 0012 D12.4). A clean exit's reply is read exactly as
-before.
+launches no agent (ADR 0012 D12.4). A crash or an error after that save
+leaves the reply marked applied beside the plan: the next command completes
+the plan from the journal and records the reply as accepted, and never checks
+it again (R3-F2 of PR #481). Claude `stream-json` vouches for a reply only
+when no line of its stream was skipped past the per-line bound (R3-F1). A
+clean exit's reply is read exactly as before.
 
 ### What an agent is told about work still running (#440)
 

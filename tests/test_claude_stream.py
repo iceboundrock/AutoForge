@@ -386,6 +386,35 @@ def test_nothing_else_decides_the_run_on_a_reply(records):
     assert not _replied_after(*records)
 
 
+@pytest.mark.parametrize("where", ["after", "before"])
+def test_a_skipped_line_voids_the_proof_of_a_reply_but_not_the_stop_on_it(where):
+    """R3-F1 of PR #481: a line skipped past the per-line bound is a record
+    never read: after the reply it may open a later turn or a tool call, or
+    fail the run; before it, it may open a turn and leave the count short.
+    The proof a reply before a failing exit is taken on (``reply_proven``)
+    fails closed on it, wherever it stood. ``replied``, on which the driver
+    stops a CLI still running after a reply (#439), reads as before."""
+    stream = ClaudeStream(cwd=CWD, is_reply=lambda text: "<<<CONTROL_RESULT>>>" in text)
+    if where == "before":
+        stream.oversize(4096)
+    stream.feed(_line(_result()))
+    assert stream.replied and stream.reply_proven is (where == "after")
+    if where == "after":
+        stream.oversize(4096)
+    assert stream.replied and not stream.reply_proven
+    stream.stream_ended()
+    assert stream.failure is None and stream.text == TEXT
+    assert stream.summary()["oversize_records"] == 1
+
+
+def test_a_reply_read_whole_is_proven():
+    stream = ClaudeStream(cwd=CWD, is_reply=lambda text: "<<<CONTROL_RESULT>>>" in text)
+    use, done = _assistant(_tool_use("t1", "Bash", description="x")), _tool_result("t1")
+    for record in (use, done, _result()):
+        stream.feed(_line(record))
+    assert stream.replied and stream.reply_proven
+
+
 def test_no_text_is_a_reply_without_a_test_for_one():
     stream, _ = _run(_result(), ended=False)
     assert stream.text == TEXT and not stream.replied

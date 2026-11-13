@@ -253,7 +253,7 @@ from .config_fingerprint import (
     RecordedConfiguration,
     fingerprint_routing,
 )
-from .delivered_result import SILENT_REFUSALS, EndFacts, KeptReply, ProcessEnd
+from .delivered_result import SILENT_REFUSALS, Carried, EndFacts, KeptReply, ProcessEnd
 from .delivered_result import Refusal as ReplyRefusal
 from .delivered_result import outcome_record as delivered_outcome_record
 from .delivered_result import outcome_text as delivered_outcome_text
@@ -1370,14 +1370,16 @@ class _Provisional:
 
     The reply a launch delivered before it timed out or exited badly, once
     the checks of a clean exit's reply let it through: how the launch ended,
-    its attempt and run log step, and whether a restart found it kept in the
-    state. The step's outcome decides whether it was accepted.
+    its attempt and run log step, and how it reached the step (its own
+    launch's, or kept in the state across an interruption, checked again or
+    already applied before it; R3-F2). The step's outcome decides whether it
+    was accepted, unless a step before the interruption already applied it.
     """
 
     facts: EndFacts
     attempt: int
     launch_log: str
-    kept_across_restart: bool
+    carried: Carried
 
 
 def _revision_text(head: str, base: str, merge_base: str) -> str:
@@ -1990,16 +1992,16 @@ class ControllerEngine:
         # worktree's ``HEAD``.
         self._export_verified: Verified | None = None
         # #479: the provisional reply this step goes on from, when its agent
-        # launch timed out or exited badly after delivering it (or a restart
+        # launch timed out or exited badly after delivering it (or the step
         # found it kept in the state), until the step has its outcome; and
-        # whether the step applied it as its result (R1-F4 of PR #481).
-        # Reset at every step.
+        # whether it was applied as the step's result (R1-F4 of PR #481): set
+        # by the save of the plan the verification turned it into
+        # (:meth:`_save_plan`, R2-F4), whatever ends the step after that save,
+        # an exception included (R3-F2), or by the record of the agent's own
+        # stop, and found set on a kept reply a step before an interruption
+        # applied. Reset at every step.
         self._delivered: _Provisional | None = None
         self._delivered_applied = False
-        # #479 (R2-F4 of PR #481): set by the save of the plan a verification
-        # turns its result into (:meth:`_save_plan`), and only by it: the
-        # evidence that the step applied its result.
-        self._result_planned = False
         # Whether this step's REVIEW entry wrote or reused the
         # ``review_evidence`` binding the reviewer's prompt is rendered from
         # (ADR 0006 D5.5, D5.7, D9.1); reset at every REVIEW entry, so a plan
@@ -3997,11 +3999,24 @@ class ControllerEngine:
         UPDATE_EPIC context) before anything is written, and completes it
         from what was saved. That save is the explicit evidence that the step
         applied its result (#479, R2-F4 of PR #481): a stop after it (a review
-        round's cap, a conflict, a write that waits for the operator) stopped
-        an applied result, and its completion may drop the plan again.
+        round's cap, a conflict, a write that waits for the operator, another
+        run's takeover of the PR) or an error that ends the step without an
+        outcome (an unavailable GitHub) stopped an applied result, and its
+        completion may drop the plan again. For a provisional reply the same
+        save marks the kept reply applied (R3-F2): an interruption after it
+        leaves the acceptance and its provenance beside the plan, and the
+        step that completes the plan records the reply as accepted
+        (:meth:`_adopt_kept_reply`).
         """
+        state = self._require_state()
+        delivered = self._delivered
+        applies = delivered is not None and delivered.carried in (Carried.FRESH, Carried.RECHECKED)
+        if applies and state.delivered_reply:
+            kept = KeptReply.from_dict(state.delivered_reply)
+            state.delivered_reply = replace(kept, applied=True).to_dict()
         self._save()
-        self._result_planned = True
+        if applies:
+            self._delivered_applied = True
 
     def _record_verification_failure(self, phase: Phase, exc: VerificationError) -> None:
         """Persist a failed verification attempt (bounded, redacted).
@@ -6222,13 +6237,17 @@ class ControllerEngine:
         # record, no plan snapshot, no step or attempt charged.
         if self._step_may_launch(previous, allow_merge):
             self._sandbox_gate()
+        # #479 (R3-F2 of PR #481): a reply the state keeps for this phase entry
+        # is this step's to settle, whatever ends it, a stop below included.
+        self._delivered, self._delivered_applied = None, False
+        self._adopt_kept_reply(previous)
         # Under the lock, before anything else of the step, the plan included
         # (ADR 0006 D11.3): a validation marker a crash left becomes its
         # INTERRUPTED record. A planning refusal must not strand the marker
         # for every resume after it.
         recovered = self._recover_validation_attempt(previous)
         if recovered is not None:
-            return recovered
+            return self._settled(previous, recovered)
         plan = self.plan_step()
 
         # Cumulative step budget: measured on persisted state, so `resume`
@@ -6236,11 +6255,14 @@ class ControllerEngine:
         # that a replan journal past the write is finished first (#71).
         budget = step_budget_reason(state.step_count, self.config.workflow.max_total_steps)
         if budget and self._budget_may_stop(previous):
-            return self._block(
+            return self._settled(
                 previous,
-                plan,
-                self._budget_block_reason(previous, budget, held.pr if held else None),
-                code=StopReasonCode.STEP_BUDGET,
+                self._block(
+                    previous,
+                    plan,
+                    self._budget_block_reason(previous, budget, held.pr if held else None),
+                    code=StopReasonCode.STEP_BUDGET,
+                ),
             )
         if previous == Phase.REVIEW:
             # Review-round cap, whatever path led here (FIX, stale re-review,
@@ -6248,19 +6270,25 @@ class ControllerEngine:
             # starts, no HEAD is bound and no reviewer is invoked.
             cap = next_round_cap_reason(state.review_round, self.config.workflow.max_review_rounds)
             if cap:
-                return self._block(
+                return self._settled(
                     previous,
-                    plan,
-                    self._loop_block_reason(cap),
-                    code=StopReasonCode.REVIEW_ROUND_CAP,
+                    self._block(
+                        previous,
+                        plan,
+                        self._loop_block_reason(cap),
+                        code=StopReasonCode.REVIEW_ROUND_CAP,
+                    ),
                 )
         if previous in (Phase.ANALYZE_EXECUTE, Phase.FIX):
             # ADR 0006 D5.2: a crash after the save that reached the failure
             # bound, before its BLOCKED write, relaunches no agent.
             spent = self._spent_producer_failures(previous)
             if spent:
-                return self._block(
-                    previous, plan, spent, code=StopReasonCode.PRODUCER_VALIDATION_BOUND
+                return self._settled(
+                    previous,
+                    self._block(
+                        previous, plan, spent, code=StopReasonCode.PRODUCER_VALIDATION_BOUND
+                    ),
                 )
 
         # In memory until the step's first save: the launch checkpoint of an
@@ -6270,8 +6298,6 @@ class ControllerEngine:
         # with the same budget. The replan exemption above inherits this rule
         # rather than adding one.
         state.step_count += 1
-        self._delivered, self._delivered_applied = None, False
-        self._result_planned = False
         try:
             outcome = self._step_phase(previous, plan, allow_merge, held)
         except PROwnerError as exc:
@@ -6283,30 +6309,70 @@ class ControllerEngine:
         except Exception as exc:
             if self._delivered is not None:
                 # #479: the step went on from a provisional reply and ended
-                # without an outcome; say what became of the reply.
+                # without an outcome; say what became of the reply. One it
+                # applied is accepted (R3-F2 of PR #481): kept, its record is
+                # the step's that completes the plan; no longer kept, nothing
+                # else will record it, so this step does.
+                if self._delivered_applied and not state.delivered_reply:
+                    with suppress(StateError):
+                        self._log_delivered_settlement(
+                            previous, self._delivered, accepted=True, reason=""
+                        )
                 _add_line(exc, self._delivered_unsettled_text())
             raise
-        if self._delivered is not None:
-            # #479 (R1-F4 of PR #481): the step went on from a provisional
-            # reply; only now, with its outcome, is it accepted or not.
-            outcome = self._settle_delivered(previous, outcome)
-        return outcome
+        return self._settled(previous, outcome)
+
+    def _adopt_kept_reply(self, phase: Phase) -> None:
+        """Take up the reply the state keeps for this phase entry, to settle it (R3-F2 of PR #481).
+
+        A step that went on from a provisional reply and then ended without
+        an outcome (an error, a crash) left it kept in the state, and this
+        step settles it, whatever ends it. An applied reply
+        (:attr:`KeptReply.applied`: that step saved the plan it turned the
+        reply into) was accepted there: this step completes the plan from the
+        journal, and its record says so. One not applied is checked again
+        before anything goes on from it (:meth:`_reuse_kept_reply`), and is
+        not accepted if the step ends before that. The state's load binds a
+        kept reply to its phase, attempt and launch label.
+        """
+        state = self._require_state()
+        if not state.delivered_reply:
+            return
+        kept = KeptReply.from_dict(state.delivered_reply)
+        if kept.phase != phase.value:
+            return
+        self._delivered = _Provisional(
+            kept.facts(),
+            kept.attempt,
+            kept.run_log,
+            Carried.APPLIED if kept.applied else Carried.KEPT,
+        )
+        self._delivered_applied = kept.applied
+
+    def _settled(self, previous: Phase, outcome: StepOutcome) -> StepOutcome:
+        """``outcome``, settling the step's provisional reply first if it has one."""
+        if self._delivered is None:
+            return outcome
+        # #479 (R1-F4 of PR #481): the step went on from a provisional reply,
+        # or found one kept; only now, with its outcome, is it settled.
+        return self._settle_delivered(previous, outcome)
 
     def _settle_delivered(self, previous: Phase, outcome: StepOutcome) -> StepOutcome:
         """Record and report what became of the step's provisional reply (R1-F4 of PR #481).
 
-        Accepted only when the step applied it as its result
+        Accepted only when it was applied as a step's result
         (``_delivered_applied``: the checkout check and the PR owner check
         passed, and the phase's verification saved the plan it turned the
         reply into (:meth:`_save_plan`, R2-F4), whatever stopped the step
-        after that save, or the agent's own reported stop was recorded);
-        otherwise not accepted, with the stop's code or the phase the step
-        moved to without applying it. A step
-        that concluded keeps no reply in the state (the transition out of
-        the phase drops it, and so does every refusal of the step's checks);
-        one still kept here is dropped. The run log gets the decision as a
-        controller-only record, and the outcome opens with one sentence
-        that claims acceptance only when it holds.
+        after that save, or the agent's own reported stop was recorded),
+        by this step or by the one an interruption ended after that save
+        (R3-F2); otherwise not accepted, with the stop's code or the phase
+        the step moved to without applying it. A step that concluded keeps
+        no reply in the state (the transition out of the phase drops it,
+        and so does every refusal of the step's checks); one still kept here
+        is dropped, so a reply is settled once. The run log gets the
+        decision as a controller-only record, and the outcome opens with one
+        sentence that claims acceptance only when it holds.
         """
         delivered = self._delivered
         assert delivered is not None
@@ -6316,11 +6382,21 @@ class ControllerEngine:
             self._save()
         accepted = self._delivered_applied
         stop = outcome.stop.code.value if outcome.stop is not None else outcome.next_phase
+        self._log_delivered_settlement(previous, delivered, accepted=accepted, reason=stop)
+        self._delivered, self._delivered_applied = None, False
+        note = delivered_settled_text(delivered.facts, accepted=accepted, carried=delivered.carried)
+        return replace(outcome, message=f"{note}\n{outcome.message}")
+
+    def _log_delivered_settlement(
+        self, phase: Phase, delivered: _Provisional, *, accepted: bool, reason: str
+    ) -> None:
+        """The controller-only ``<PHASE>-delivered-result`` record of a settled reply."""
+        state = self._require_state()
         now = utcnow_iso()
         record = ExecutionRecord(
             run_id=state.run_id,
             seq=0,
-            phase=f"{previous.value}-delivered-result",
+            phase=f"{phase.value}-delivered-result",
             attempt=delivered.attempt,
             issue_url=state.current_issue_url,
             pr_url=state.current_pr_url,
@@ -6332,16 +6408,12 @@ class ControllerEngine:
             delivered_result=delivered_settled_record(
                 delivered.facts,
                 accepted=accepted,
-                reason=stop,
+                reason=reason,
                 launch_log=delivered.launch_log,
-                kept_across_restart=delivered.kept_across_restart,
+                carried=delivered.carried,
             ),
         )
         self._logger().log_execution(record)
-        note = delivered_settled_text(
-            delivered.facts, accepted=accepted, kept_across_restart=delivered.kept_across_restart
-        )
-        return replace(outcome, message=f"{note}\n{outcome.message}")
 
     def _delivered_unsettled_text(self) -> str:
         """The line a step that went on from a provisional reply, then raised, gains."""
@@ -6353,6 +6425,22 @@ class ControllerEngine:
             if delivered.facts.process_end is ProcessEnd.KILLED
             else "exited with a failing status"
         )
+        if self._delivered_applied and kept:
+            # R3-F2 of PR #481: the plan the reply was turned into is saved,
+            # and the kept reply marked applied beside it.
+            return (
+                f"The agent {end} after delivering its complete final reply, which passed the "
+                "checks of a clean exit's reply and then the step's own checks: the step saved "
+                "the plan it turned the reply into, so the reply was accepted. 'resume' "
+                "completes that plan from the journal without running the agent again, and "
+                "records the reply's acceptance (#479)."
+            )
+        if self._delivered_applied:
+            return (
+                f"The agent {end} after delivering its complete final reply, which passed the "
+                "checks of a clean exit's reply and then the step's own checks: the step applied "
+                "it as its result, so it was accepted (#479)."
+            )
         if kept:
             return (
                 f"The agent {end} after delivering its complete final reply, which passed the "
@@ -6475,10 +6563,6 @@ class ControllerEngine:
                 stop=stop,
             )
 
-        # #479 (R2-F4 of PR #481): whether the verification applied the
-        # result is what it saved, never what the state holds afterwards (a
-        # plan that completed is dropped by the save that concludes it).
-        self._result_planned = False
         try:
             nxt_phase, message = self._verify_and_apply(previous, payload)
         except _ProducerValidationFailed as exc:
@@ -6495,18 +6579,22 @@ class ControllerEngine:
             # verify. Persist the attempt so `resume` re-enters this phase from
             # real state instead of pretending nothing happened. A reply kept
             # from a failed launch (#479) was refused with them: dropped, so
-            # the re-entry is the one any refused result gets.
+            # the re-entry is the one any refused result gets. Unless the
+            # verification had saved its plan (R3-F2 of PR #481): the reply was
+            # accepted, and stays kept as that acceptance's provenance beside
+            # the plan, which the re-entry completes from the journal.
             if isinstance(exc, VerificationError) and previous in (Phase.REVIEW, Phase.FIX):
                 self._record_verification_failure(previous, exc)
-            state.delivered_reply = {}
+            if not self._delivered_applied:
+                state.delivered_reply = {}
             self._save()
             raise
         # #479 (R2-F4 of PR #481): the result was applied if, and only if,
-        # the verification saved the plan it turned it into, whatever stopped
-        # the step after that save (a review round's cap, a conflict) and
-        # whatever moved it on without one (a FIX whose PR moved goes to
-        # REVIEW with no fix recorded).
-        self._delivered_applied = self._result_planned
+        # the verification saved the plan it turned it into (``_save_plan``
+        # set ``_delivered_applied``), whatever stopped the step after that
+        # save (a review round's cap, a conflict) and whatever moved it on
+        # without one (a FIX whose PR moved goes to REVIEW with no fix
+        # recorded).
         if nxt_phase == Phase.BLOCKED:
             # Verification gave up conclusively (bounded re-selection exhausted):
             # BLOCKED is an exceptional holding state outside the topology.
@@ -6546,20 +6634,22 @@ class ControllerEngine:
                 self._partial_fix_held_text(res, message),
                 code=StopReasonCode.AGENT_BLOCKED,
             )
-        self._result_planned = False
         try:
             nxt, text = self._apply_fix(res, message)
         except VerificationError as exc:
             self._record_verification_failure(Phase.FIX, exc)
-            # #479: a reply kept from a failed launch was refused with it.
-            self._require_state().delivered_reply = {}
+            # #479: a reply kept from a failed launch was refused with it,
+            # unless its plan was saved: then it was accepted, and stays kept
+            # beside the plan (R3-F2 of PR #481).
+            if not self._delivered_applied:
+                self._require_state().delivered_reply = {}
             self._save()
             raise
         if nxt != Phase.BLOCKED:
             raise StateError(f"a partial FIX was applied and left FIX for {nxt.value}")
         # #479: the partial fix the reply offered was planned as the step's
-        # result, or refused with nothing planned (R2-F4 of PR #481).
-        self._delivered_applied = self._result_planned
+        # result (``_save_plan`` set ``_delivered_applied``), or refused with
+        # nothing planned (R2-F4 of PR #481).
         return self._block(Phase.FIX, plan, text)
 
     def _partial_fix_held_text(self, res: PartialFixResult, message: str) -> str:
@@ -16747,6 +16837,15 @@ class ControllerEngine:
             # published under the previous contract.
             state.launch_label = launch_label_for(phase)
             # #479: a new launch; a reply an earlier one delivered is not its.
+            # One the step found applied (its plan saved before an
+            # interruption, then voided by its completion) was accepted, and
+            # is settled now, before this launch's save drops it (R3-F2 of PR
+            # #481): the launch may deliver a provisional reply of its own.
+            if self._delivered is not None:
+                self._log_delivered_settlement(
+                    phase, self._delivered, accepted=self._delivered_applied, reason=phase.value
+                )
+                self._delivered, self._delivered_applied = None, False
             state.delivered_reply = {}
             # The one write before the agent starts: the attempt counter, the
             # step it is charged as (the first launch's by the step itself, a
@@ -17146,7 +17245,7 @@ class ControllerEngine:
                         record.error = ""
                         record.delivered_result = delivered_outcome_record(delivery, None)
                         self._delivered = _Provisional(
-                            delivery, state.attempt, step_log.name, kept_across_restart=False
+                            delivery, state.attempt, step_log.name, Carried.FRESH
                         )
                         self._record_invocation(
                             logger, record, prompt, stdout, stderr, phase, step_log
@@ -17186,7 +17285,7 @@ class ControllerEngine:
                 record.error = ""
                 record.delivered_result = delivered_outcome_record(delivery, None)
                 self._delivered = _Provisional(
-                    delivery, state.attempt, step_log.name, kept_across_restart=False
+                    delivery, state.attempt, step_log.name, Carried.FRESH
                 )
             self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
             return payload
@@ -17295,12 +17394,18 @@ class ControllerEngine:
         return kept
 
     def _kept_reply(self, phase: Phase) -> KeptReply | None:
-        """The reply the state keeps for this phase entry's last launch, or ``None``."""
+        """The reply the state keeps for this phase entry's last launch to go on from, or ``None``.
+
+        Never an applied one (R3-F2 of PR #481): its plan was saved, so it was
+        consumed; reaching a launch with it kept means the plan's completion
+        left the phase asking again (an UPDATE_EPIC input a rejection voided,
+        ADR 0004 D4.7), and the agent is launched afresh.
+        """
         state = self._require_state()
         if not state.delivered_reply:
             return None
         kept = KeptReply.from_dict(state.delivered_reply)
-        return kept if kept.phase == phase.value else None
+        return kept if kept.phase == phase.value and not kept.applied else None
 
     def _reuse_kept_reply(
         self, phase: Phase, kept: KeptReply, cwd: str, request: UpdateEpicRequest
@@ -17391,7 +17496,7 @@ class ControllerEngine:
                 code=StopReasonCode.CONTROL_RESULT_INVALID,
             )
         self._launch_log = self._logger().run_dir / kept.run_log
-        self._delivered = _Provisional(facts, kept.attempt, kept.run_log, kept_across_restart=True)
+        self._delivered = _Provisional(facts, kept.attempt, kept.run_log, Carried.RECHECKED)
         return payload
 
     def _failed_launch(

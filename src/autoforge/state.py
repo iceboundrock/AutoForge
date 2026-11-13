@@ -761,13 +761,17 @@ class AutoForgeState:
     # the validated, redacted ``CONTROL_RESULT`` object, its digest, and its
     # binding (phase, attempt, launch label, issue, PR, review round, the
     # candidate the checks read, the revision the run was bound to: the PR's
-    # HEAD, base and merge base, how the launch ended, its run log step).
+    # HEAD, base and merge base, how the launch ended, its run log step), and
+    # ``applied``: the step's verification saved the plan it turned the reply
+    # into, set in that save (R3-F2 of PR #481).
     # Saved before the step goes on from it, so a crash or a restart before
     # the step concludes re-checks it and launches no agent; dropped by a
     # save in another phase or after another launch
     # (:meth:`settle_delivered_reply`), and by the step when its own checks
-    # refuse it. Read only by the engine's launch path, which re-checks it
-    # exactly as a fresh reply before anything follows from it.
+    # refuse it before its plan. Read only by the engine: its launch path
+    # re-checks one not applied exactly as a fresh reply before anything
+    # follows from it, and the step that finds one settles it, an applied
+    # one as accepted while it completes the plan from the journal.
     delivered_reply: dict = field(default_factory=dict)
     # The outcomes of the current PR's acceptance actions (#211), oldest
     # first: ``action_id``, ``round``, ``finding_id``, ``outcome``

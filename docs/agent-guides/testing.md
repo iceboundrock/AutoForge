@@ -1908,7 +1908,15 @@ a stated reason it has none. The coverage that must keep working:
   acceptance and the last relaunching afresh; the save of the plan as the
   evidence of acceptance (R2-F4): a review applied and then stopped by the
   round cap accepted, beside a refusal before its plan in the same phase,
-  and a FIX whose PR moved going to REVIEW not accepted; a clean exit
+  and a FIX whose PR moved going to REVIEW not accepted; the acceptance
+  past an exception or an interruption (R3-F2): a review whose PR another
+  run took over after its plan was saved stopping on `pr-owner` with
+  nothing posted and recorded accepted, a reply whose plan was saved before
+  a PR create outage or a crash marked applied in the state and recorded
+  accepted, once, by the next process that completes the plan with no
+  agent, an applied reply whose plan is gone recorded and never gone on
+  from (the agent launched afresh), and a kept reply the restart refuses
+  recorded not accepted; a clean exit
   recording nothing; a reply refused for each missing fact and by the
   checks a clean exit's reply meets (malformed, another phase, another
   issue, a HEAD that moved after the reply), never corrected or relaunched
@@ -1919,7 +1927,10 @@ a stated reason it has none. The coverage that must keep working:
   budget, `step` and a dry run unchanged; a REVIEW accepted and posted once,
   and one for another HEAD refused; the real adapters: Claude Code's
   `stream-json` reply then an exit 3 accepted, a reply with a call open or
-  overtaken by a later turn never accepted, Pi hanging on its shutdown past
+  overtaken by a later turn never accepted, a reply followed by a line past
+  the per-line bound then an exit 3 never accepted while a clean exit and
+  #439's stop read the same stream as before (R3-F1; the reducer's
+  `reply_proven` in `tests/test_claude_stream.py`), Pi hanging on its shutdown past
   the idle limit or exiting 7 after a settled run accepted, Pi cut short by
   its limit vouching for nothing, Pi with a tool execution left open or a
   later turn written during its shutdown (exiting 7, or killed at the idle

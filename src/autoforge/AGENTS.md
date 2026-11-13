@@ -240,7 +240,8 @@ delivered_result.py a reply delivered before its launch failed (#479, ADR 0012 D
                     and settled outcomes and their texts, and the kept reply's
                     closed shape (KeptReply, the state's delivered_reply, bound to
                     its launch, its candidate and the PR revision the run was bound
-                    to); accepts nothing itself; pure,
+                    to, and marked applied by the save of the plan made from it);
+                    accepts nothing itself; pure,
                     persists nothing itself
 recovery_package.py status's recovery action package (#374): from a loaded state, its
                     classification, the configuration and, for 'status --live',

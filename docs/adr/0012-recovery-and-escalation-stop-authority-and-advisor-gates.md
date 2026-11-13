@@ -819,7 +819,10 @@ every turn opened with no tool call open; Pi's `agent_settled`). A *delivered
 complete result* is a completed turn that ended the run on a successful final
 reply, with nothing opened after it, handed over whole: the adapter's fact
 `AgentExecutionResult.reply_delivered`, set by Claude Code's `stream-json`
-(`ClaudeStream.replied`, read to the stream's end) and by Pi (its
+(`ClaudeStream.reply_proven`: `replied`, read to the stream's end, with no
+line of the stream skipped past the per-line bound, since a record never read
+may have opened a later turn or a tool call, or failed the run, R3-F1 of PR
+#481) and by Pi (its
 conversation settled and its last assistant text read back, before any limit
 cut it short, with every tool execution it started ended by its call id and
 nothing but that text's response on stdout after `agent_settled`, read
@@ -896,14 +899,30 @@ save of the plan the verification turned it into (`_save_plan`), whatever
 stops the step after it (a review round's cap once the round's comment is
 posted, a conflict, a write that waits for the operator) and although the
 plan's completion may drop it again, or the record of the agent's own
-`blocked`/`failure` (R2-F4 of PR #481). A step that stops before that save
+`blocked`/`failure` (R2-F4 of PR #481). That holds on every path out of
+the step after the save, an exception included: another run's takeover of
+the PR found before the first write stops the step in `BLOCKED`
+(`pr-owner`) with nothing sent, and the reply was accepted all the same
+(R3-F2). A step that stops before that save
 (checkout drift, another owner, a verification or validation refusal), or
 moves on without one (a FIX whose PR moved goes to REVIEW with no fix
 recorded), did not accept it (R1-F4). Either way the step's own
 controller-only record in the run log (`<PHASE>-delivered-result`) says so,
 `accepted`, or `not-accepted` with the stop's code or the phase the step
-moved to, and the step's message opens with one sentence that claims
-acceptance only when it holds. A crash
+moved to, with whether the reply reached that step kept across an
+interruption (`kept_across_restart`) and already applied before it
+(`applied_before_restart`), and the step's message opens with one sentence
+that claims acceptance only when it holds. The save of the plan also marks
+the kept reply `applied`, in the same write (R3-F2): an error or a crash
+after it (a PR create GitHub did not answer, say) ends the step without an
+outcome, and the state holds both the plan and the acceptance's
+provenance. The step that next enters the phase takes up the kept reply it
+finds, whatever then ends that step, and settles it once: an applied one is
+recorded `accepted` while the step completes the plan from the journal, and
+is never checked again or gone on from (a launch that finds one, the plan
+gone with the phase asking again, records it first and drops it); one not
+applied is checked again as below, and recorded `not-accepted` if the step
+ends before it goes on from it. A crash
 anywhere after the keeping save, before the step concludes, leaves the
 reply in the state: the next `resume`, `run` or `step` re-enters the phase
 through its reconciliation, which completes a saved plan from the journal
@@ -938,6 +957,10 @@ journal records a refusal's decision, as for any failed step
 `test_a_reply_the_phase_verification_stops_before_planning_is_never_accepted`,
 `test_a_review_applied_before_the_round_cap_stopped_the_step_was_accepted`,
 `test_a_review_refused_before_its_plan_was_saved_was_not_accepted`,
+`test_a_review_whose_pr_was_taken_over_after_its_plan_was_saved_was_accepted`,
+`test_a_reply_applied_before_an_interruption_is_recorded_by_the_step_completing_its_plan`,
+`test_an_applied_reply_whose_plan_is_gone_is_settled_and_never_gone_on_from`,
+`test_a_kept_reply_the_restart_refuses_is_recorded_not_accepted`,
 `test_a_fix_whose_pr_moved_goes_to_review_without_accepting_the_reply`,
 `test_a_reply_the_producer_gate_refuses_below_its_bound_is_dropped_and_relaunched`).
 
@@ -952,7 +975,9 @@ dry run launches nothing to accept
 
 **D12.6. The providers.** Claude Code's `stream-json` vouches for a reply its
 stream decided whatever the exit after it, and for none with a call still
-open or a turn opened after it; Pi vouches for a settled conversation whose
+open or a turn opened after it, nor for one in a stream of which a line was
+skipped past the per-line bound, before the reply or after it (R3-F1 of PR
+#481): a clean exit and #439's stop on a reply read such a stream as before; Pi vouches for a settled conversation whose
 shutdown then hangs past a limit or exits badly, and for none its limit cut
 short, none with a tool execution left open, and none after which Pi wrote
 anything but the text's response, a later turn in its shutdown included (a
@@ -964,6 +989,9 @@ printed before a kill is refused (`no-reply`) and stays the operator's
 (`test_a_claude_cli_that_exits_badly_after_its_reply_has_the_reply_accepted`,
 `test_a_claude_reply_with_a_call_still_open_is_never_accepted`,
 `test_a_claude_reply_overtaken_by_a_later_turn_is_stale_and_never_accepted`,
+`test_a_claude_reply_followed_by_a_line_past_the_bound_is_never_accepted`,
+`test_a_claude_reply_followed_by_a_line_past_the_bound_reads_as_before_otherwise`,
+`test_a_skipped_line_voids_the_proof_of_a_reply_but_not_the_stop_on_it`,
 `test_a_pi_that_hangs_on_shutdown_after_a_settled_run_has_its_reply_accepted`,
 `test_a_pi_that_exits_badly_after_a_settled_run_has_its_reply_accepted`,
 `test_a_pi_reply_with_a_tool_execution_left_open_is_never_accepted`,

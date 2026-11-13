@@ -328,8 +328,9 @@ class ExecutionRecord:
     # fact, the blocks' shape, the capture bound). On the step's own
     # controller-only record (``<PHASE>-delivered-result``,
     # ``delivered_result.settled_record``): ``accepted`` or ``not-accepted``
-    # with the stop's code, the launch's step and whether the reply was kept
-    # across a restart. Typed values only, never the reply. Written to
+    # with the stop's code, the launch's step, whether the reply was kept
+    # across a restart and whether a step before it had already applied it
+    # (R3-F2 of PR #481). Typed values only, never the reply. Written to
     # ``execution.json`` only when there was a reply to decide on.
     delivered_result: dict[str, object] = field(default_factory=dict)
 

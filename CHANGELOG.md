@@ -32,7 +32,12 @@ Your checkout is checked before the reply is saved, so a checkout the agent
 moved stops the step in `BLOCKED` (`checkout-drift`) with nothing saved to
 go on from. A reply counts as accepted once the step saved the plan it made
 from it, even when the step then stopped (a review posted at the last allowed
-round stops at the round cap).
+round stops at the round cap, or another run took the PR over before the
+review was posted). A crash or an error after that save no longer loses the
+acceptance: the kept reply is marked `applied` beside the plan, and the
+`resume` that completes the plan records the reply as accepted. Claude Code's
+`stream-json` vouches for a reply only when no line of its stream was skipped
+past the per-line bound.
 
 A reply that falls short is not corrected and not relaunched over, as
 before: the failure stands, with a line saying why the reply was not taken

@@ -24,6 +24,7 @@ from autoforge.delivered_result import (
     ACCEPTABLE_LIMITS,
     REFUSAL_TEXT,
     SILENT_REFUSALS,
+    Carried,
     EndFacts,
     KeptReply,
     ProcessEnd,
@@ -161,7 +162,7 @@ def test_every_refusal_has_its_text_and_the_record_holds_typed_values_only():
         accepted=False,
         reason="checkout-drift",
         launch_log="003-x-1",
-        kept_across_restart=True,
+        carried=Carried.RECHECKED,
     )
     assert settled == {
         **provisional,
@@ -169,11 +170,28 @@ def test_every_refusal_has_its_text_and_the_record_holds_typed_values_only():
         "reason": "checkout-drift",
         "launch_step": "003-x-1",
         "kept_across_restart": True,
+        "applied_before_restart": False,
     }
-    accepted = settled_text(TAKEN, accepted=True, kept_across_restart=False)
+    # R3-F2 of PR #481: accepted before an interruption, settled after it.
+    applied = settled_record(
+        TAKEN, accepted=True, reason="REVIEW", launch_log="003-x-1", carried=Carried.APPLIED
+    )
+    assert applied == {
+        **provisional,
+        "outcome": "accepted",
+        "launch_step": "003-x-1",
+        "kept_across_restart": True,
+        "applied_before_restart": True,
+    }
+    accepted = settled_text(TAKEN, accepted=True, carried=Carried.FRESH)
     assert "it was accepted" in accepted and "#479" in accepted
-    stopped = settled_text(TAKEN, accepted=False, kept_across_restart=False)
+    stopped = settled_text(TAKEN, accepted=False, carried=Carried.FRESH)
     assert "it was not accepted" in stopped and "applied it" not in stopped
+    before = settled_text(TAKEN, accepted=True, carried=Carried.APPLIED)
+    assert "saved the plan it turned the reply into before an interruption" in before
+    assert "it was accepted" in before
+    kept = settled_text(TAKEN, accepted=False, carried=Carried.KEPT)
+    assert "ended without going on from it, so it was not accepted" in kept
     exited = replace(TAKEN, process_end=ProcessEnd.FAILED_EXIT, limit="")
     assert outcome_text(exited, Refusal.SURVIVOR) == (
         "The agent exited with a failing status; its output was not accepted as the step's "
@@ -334,6 +352,7 @@ def test_a_reply_delivered_before_a_failed_end_is_accepted_and_the_step_goes_on(
         **facts,
         "launch_step": _agent_step(eng).name,
         "kept_across_restart": False,
+        "applied_before_restart": False,
     }
     assert "it was accepted" in outcome.message
     assert state.delivered_reply == {}
@@ -840,6 +859,7 @@ def test_a_new_launch_and_a_phase_change_drop_a_kept_reply(tmp_state_dir, fake_g
         {"merge_base_sha": "d" * 39},
         {"base_ref": None},
         {"base_ref": "m" * 513},
+        {"applied": 1},
     ],
     ids=[
         "digest",
@@ -855,6 +875,7 @@ def test_a_new_launch_and_a_phase_change_drop_a_kept_reply(tmp_state_dir, fake_g
         "short-merge-base",
         "base-not-a-string",
         "base-too-long",
+        "applied-not-a-boolean",
     ],
 )
 def test_a_kept_reply_is_loaded_only_in_its_whole_shape(change):
@@ -875,8 +896,14 @@ def test_a_kept_reply_is_loaded_only_in_its_whole_shape(change):
         payload=analyze_payload("a" * 40),
     )
     assert KeptReply.from_dict(kept.to_dict()) == kept
+    applied = replace(kept, applied=True)
+    assert KeptReply.from_dict(applied.to_dict()) == applied
     with pytest.raises(StateError, match="state field 'delivered_reply'"):
         KeptReply.from_dict({**kept.to_dict(), **change})
+    missing = kept.to_dict()
+    del missing["applied"]
+    with pytest.raises(StateError, match="does not hold exactly"):
+        KeptReply.from_dict(missing)
 
 
 def test_a_state_file_keeping_a_reply_of_another_launch_is_refused(tmp_state_dir, fake_github):
@@ -1059,6 +1086,160 @@ def test_a_review_refused_before_its_plan_was_saved_was_not_accepted(
     settled = _settled(eng)
     assert (settled["outcome"], settled["reason"]) == ("not-accepted", "github-read-failed")
     assert fake_github.effect_writes == []
+
+
+def _settlements(eng) -> list[dict]:
+    """Every ``<PHASE>-delivered-result`` record of the run, in order."""
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    return [
+        json.loads((p / "execution.json").read_text(encoding="utf-8"))["delivered_result"]
+        for p in sorted(run_dir.iterdir())
+        if "-delivered-result-" in p.name
+    ]
+
+
+def test_a_review_whose_pr_was_taken_over_after_its_plan_was_saved_was_accepted(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """R3-F2 of PR #481, an exceptional path: the delivered review's plan is
+    saved, then another run takes the PR over before its comment is sent. The
+    owner check stops the step (``pr-owner``) with nothing posted, as it must,
+    and the reply is recorded as what it was: accepted at that save."""
+    from autoforge.claims import REVIEW, scan
+
+    from .conftest import SHA_A, implementation_pr_body, review_result
+
+    eng, provider = _reviewing(tmp_state_dir, fake_github, block(review_result(1, SHA_A, [])))
+    save_plan = eng._save_plan
+
+    def saved_then_taken_over():
+        save_plan()
+        fake_github.prs[PR].body = implementation_pr_body(owner_run_id="af-20261103T000000Z-0a1b2c")
+
+    monkeypatch.setattr(eng, "_save_plan", saved_then_taken_over)
+    outcome = eng.step()
+    assert outcome.next_phase == "BLOCKED", outcome.message
+    state = load_state(eng.paths.state_file)
+    assert state.stop_code == "pr-owner"
+    posted = [c.body for c in fake_github.comments.get(PR, [])]
+    assert not [b for b in posted if scan(REVIEW, b).claims], "nothing was posted"
+    assert "it was accepted" in outcome.message and "not accepted" not in outcome.message
+    (settled,) = _settlements(eng)
+    assert settled["outcome"] == "accepted" and "reason" not in settled
+    assert settled["kept_across_restart"] is False and settled["applied_before_restart"] is False
+    assert state.delivered_reply == {} and len(provider.calls) == 1
+
+
+@pytest.mark.parametrize("interruption", ["outage", "crash"])
+def test_a_reply_applied_before_an_interruption_is_recorded_by_the_step_completing_its_plan(
+    tmp_state_dir, fake_github, monkeypatch, interruption
+):
+    """R3-F2 of PR #481, persisted-plan recovery: the reply's plan (the push
+    and the PR) is saved, then the step ends without an outcome: the PR
+    create meets an unavailable GitHub, or the controller dies. The save
+    marked the kept reply applied beside the plan, and nothing is recorded
+    yet. The next process completes the plan from the journal, launches no
+    agent, and records the reply once, accepted before the interruption."""
+    from .test_engine import _resumed
+
+    eng, provider = _analyzing(tmp_state_dir, fake_github, (implement, IDLE))
+    if interruption == "outage":
+        fake_github.write_failures.append(
+            ("create_pull_request", GitHubUnavailableError("gh: HTTP 502"), False)
+        )
+        with pytest.raises(GitHubUnavailableError) as caught:
+            eng.step()
+        assert "so the reply was accepted. 'resume' completes that plan" in str(caught.value)
+    else:
+
+        def crash():
+            raise _Crash
+
+        monkeypatch.setattr(eng, "_complete_analyze", crash)
+        with pytest.raises(_Crash):
+            eng.step()
+    on_disk = load_state(eng.paths.state_file)
+    kept = KeptReply.from_dict(on_disk.delivered_reply)
+    assert kept.applied and on_disk.completion_context != {}
+    assert kept.run_log == _agent_step(eng).name
+    assert _execution(eng)["delivered_result"]["outcome"] == "provisional"
+    assert _settlements(eng) == [], "the step had no outcome to record"
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github)
+    later = _no_agent(eng2)
+    outcome = eng2.step()
+    assert outcome.next_phase == "REVIEW", outcome.message
+    assert later.calls == [] and len(provider.calls) == 1
+    assert "saved the plan it turned the reply into before an interruption" in outcome.message
+    assert "it was accepted" in outcome.message and "not accepted" not in outcome.message
+    (settled,) = _settlements(eng2)
+    assert settled == {
+        "outcome": "accepted",
+        "process_end": "killed",
+        "limit": "idle",
+        "reply_delivered": True,
+        "blocks": "one",
+        "truncated": False,
+        "launch_step": kept.run_log,
+        "kept_across_restart": True,
+        "applied_before_restart": True,
+    }
+    assert load_state(eng2.paths.state_file).delivered_reply == {}
+    assert len([p for p in fake_github.prs.values() if ISSUE in p.body]) == 1
+
+
+def test_an_applied_reply_whose_plan_is_gone_is_settled_and_never_gone_on_from(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """R3-F2 of PR #481: a kept reply marked applied is that acceptance's
+    provenance, never a reply to go on from. Reaching a launch with it, its
+    plan gone with the phase asking again (an UPDATE_EPIC input a rejection
+    voided, ADR 0004 D4.7, here marked by hand), the step records it accepted
+    and launches the agent afresh; the new launch's reply decides the step."""
+    from .test_engine import _resumed
+
+    eng, _ = _analyzing(tmp_state_dir, fake_github, (implement, IDLE))
+    _crash_before_the_plan(eng, monkeypatch)
+    with pytest.raises(_Crash):
+        eng.step()
+    eng2 = _resumed(eng, tmp_state_dir, fake_github)
+    old = KeptReply.from_dict(eng2.state.delivered_reply)
+    eng2.state.delivered_reply = replace(old, applied=True).to_dict()
+    eng2.save()
+    fresh = _Ends((implement, {}))
+    eng2.providers._overrides = {"claude": fresh, "opencode": fresh}
+    eng2.provider = fresh
+    outcome = eng2.step()
+    assert outcome.next_phase == "REVIEW", outcome.message
+    assert len(fresh.calls) == 1, "launched afresh, the applied reply not gone on from"
+    (settled,) = _settlements(eng2)
+    assert settled["outcome"] == "accepted" and settled["applied_before_restart"] is True
+    assert settled["launch_step"] == old.run_log
+    assert load_state(eng2.paths.state_file).delivered_reply == {}
+
+
+def test_a_kept_reply_the_restart_refuses_is_recorded_not_accepted(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """R3-F2 of PR #481: the step that finds a reply kept settles it, whatever
+    ends it. Refused when checked again, it is recorded not accepted with the
+    stop's code, so no launch stays provisional for good."""
+    from .test_engine import _resumed
+
+    eng, _ = _analyzing(tmp_state_dir, fake_github, (implement, IDLE))
+    _crash_before_the_plan(eng, monkeypatch)
+    with pytest.raises(_Crash):
+        eng.step()
+    eng2 = _resumed(eng, tmp_state_dir, fake_github)
+    eng2.state.delivered_reply = {**eng2.state.delivered_reply, "review_round": 4}
+    eng2.save()
+    later = _no_agent(eng2)
+    outcome = eng2.step()
+    assert outcome.next_phase == "BLOCKED" and later.calls == []
+    assert "this step ended without going on from it, so it was not accepted" in outcome.message
+    (settled,) = _settlements(eng2)
+    assert (settled["outcome"], settled["reason"]) == ("not-accepted", "control-result-invalid")
+    assert settled["kept_across_restart"] is True and settled["applied_before_restart"] is False
 
 
 def test_a_fix_whose_pr_moved_goes_to_review_without_accepting_the_reply(
@@ -1312,6 +1493,87 @@ def test_a_claude_reply_overtaken_by_a_later_turn_is_stale_and_never_accepted(
         eng.step()
     assert claude_fake.launches(home) == 1
     assert load_state(eng.paths.state_file).phase == Phase.REVIEW
+
+
+def _line_past_the_bound(monkeypatch) -> str:
+    """Claude's per-line bound lowered, and a later ``Edit`` start past it:
+    a record the adapter skips, counts and never reads (R3-F1 of PR #481)."""
+    from autoforge import providers
+    from tests import claude_fake
+
+    monkeypatch.setattr(providers, "CLAUDE_MAX_RECORD_BYTES", 4096)
+    monkeypatch.setattr(providers, "CLAUDE_MAX_PENDING_BYTES", 8192)
+    return claude_fake.tool_use("t2", "Edit", file_path="src/a.py", new_string="x" * 50_000)
+
+
+def test_a_claude_reply_followed_by_a_line_past_the_bound_is_never_accepted(
+    tmp_path, tmp_state_dir, fake_github, monkeypatch
+):
+    """R3-F1 of PR #481, adapter to engine: a review that decides the run,
+    then a line past the per-line bound (a later ``Edit`` start, never read),
+    then an exit 3. The skipped record may have opened a later turn or a tool
+    call, or failed the run, so the adapter vouches for no reply: the launch's
+    failure stands, nothing is posted, and the agent is not launched again."""
+    from autoforge.claims import REVIEW, scan
+    from tests import claude_fake
+
+    from .conftest import SHA_A, review_result
+    from .test_engine import _in_review
+
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    lines = [*_reply_lines(block(review_result(1, SHA_A, []))), _line_past_the_bound(monkeypatch)]
+    home = _claude(tmp_path, eng, lines, exit_code=3)
+    with pytest.raises(ExecutionError) as caught:
+        eng.run(max_steps=5)
+    assert "its output was not accepted as the step's result (no-reply: " in str(caught.value)
+    assert claude_fake.launches(home) == 1, "no correction and no relaunch"
+    (decision,) = _decisions(eng)
+    assert decision.refusal is RecoveryRefusal.NOT_ALLOWLISTED
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.REVIEW and state.delivered_reply == {}
+    posted = [c.body for c in fake_github.comments.get(PR, [])]
+    assert not [b for b in posted if scan(REVIEW, b).claims], "the review was not posted"
+    execution = _execution(eng)
+    assert execution["exit_code"] == 3
+    assert execution["provider_summary"]["oversize_records"] == 1
+    assert execution["delivered_result"] == {
+        "outcome": "refused",
+        "reason": "no-reply",
+        "process_end": "failed-exit",
+        "limit": "",
+        "reply_delivered": False,
+        "blocks": "one",
+        "truncated": False,
+    }
+
+
+@pytest.mark.parametrize("end", ["clean-exit", "kept-alive"])
+def test_a_claude_reply_followed_by_a_line_past_the_bound_reads_as_before_otherwise(
+    tmp_path, tmp_state_dir, fake_github, monkeypatch, end
+):
+    """Beside it, the ends R3-F1 leaves alone: a CLI that exits 0 after the
+    same stream has its reply read as a clean exit's, and one kept alive after
+    it is stopped on its reply (#439), with no delivered-result decision."""
+    from autoforge import executor, providers
+    from tests import claude_fake
+
+    from .conftest import SHA_A, review_result
+    from .test_engine import _in_review
+
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 0.5)
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    lines = [*_reply_lines(block(review_result(1, SHA_A, []))), _line_past_the_bound(monkeypatch)]
+    if end == "kept-alive":
+        lines.append({"sleep": 60})
+    home = _claude(tmp_path, eng, lines, idle=30 if end == "kept-alive" else None)
+    outcome = eng.step()
+    assert outcome.next_phase == "READY_FOR_MERGE", outcome.message
+    assert "(#479)" not in outcome.message
+    assert claude_fake.launches(home) == 1
+    execution = _execution(eng)
+    assert execution["provider_summary"]["oversize_records"] == 1
+    assert "delivered_result" not in execution
 
 
 def _pi_engine(tmp_path_factory, tmp_state_dir, gh, turn, **profile_fields):
