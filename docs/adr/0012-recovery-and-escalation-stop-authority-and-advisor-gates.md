@@ -50,9 +50,12 @@
 - **Amended by #479:** D12 records how the engine accepts a result an
   agent delivered before its launch timed out or exited badly, which D11.2
   left to #479 and the decision on #434 ranked D2. No recovery action is
-  added: accepting a reply relaunches nothing, and D11's rule, its allowlist
-  and its refusal of a launch whose output holds a complete `CONTROL_RESULT`
-  are unchanged. No state field, protocol number, effect kind or
+  added: accepting a reply relaunches nothing, and D11's allowlist and its
+  refusal of a launch whose output holds a complete `CONTROL_RESULT` are
+  unchanged; D11's rule also refuses a launch whose teardown could not look
+  for a re-parented process (`orphans_unchecked`, R1-F2 of PR #481). One state
+  field is added, the provisional reply kept until the step accepts it or not
+  (`delivered_reply`, protocol 18 → 19, D12.4); no effect kind or
   configuration key changes.
 - **Related:** ADR 0004 (the authority boundary, K9 and K10), ADR 0005 (the
   outer sandbox and its launch classes), ADR 0007 and #126 (the durable
@@ -829,8 +832,9 @@ exit (or a provider failure, ADR 0003 §2.6) and a kill at a limit do. A
 of the group outlived SIGKILL, no writer held the pipes, no re-parented
 process outlived its kill, and the platform could look for one
 (`orphans_unchecked` false); a process the teardown killed is gone. An
-*accepted controller result* is never D12's to declare: only the checks
-below accept it.
+*accepted controller result* is never D12's to declare: the checks below
+make the reply *provisional* and no more, and only the step's own checks
+after them (D12.4) accept it.
 
 **D12.2. The rule.** Typed facts only, the first refusal that applies wins:
 a request for a human decision ended the launch; the provider's protocol had
@@ -855,7 +859,9 @@ parse, and the phase's own checks of the run's issue, the worktree's HEAD
 against the reported `head_sha`, the bound PR, HEAD and round. A malformed
 result, another invocation's (another issue, another phase, a review of a
 HEAD the PR no longer has) and a candidate that moved after the reply are
-refused there. A refusal is final for that launch: nothing corrects a reply
+refused there. Passing them makes the reply provisional (`execution.json`'s
+`delivered_result` says `provisional`), never yet accepted (R1-F4 of PR
+#481). A refusal is final for that launch: nothing corrects a reply
 whose launch failed (a correction is a relaunch, and whether the step runs
 again is D11's), and a read that could not be completed proves nothing. The
 launch's failure then ends the step as before, with the reason on it, and
@@ -866,19 +872,52 @@ the reply was not accepted
 `test_a_reply_without_its_proof_is_never_accepted_and_the_step_stops_safely`,
 `test_a_review_for_another_head_delivered_before_a_kill_is_never_accepted`).
 
-**D12.4. Durability.** An accepted reply joins the path of every reply at the
-point the payload is returned: what the step plans from it is saved before
-anything is written, by the effect journal (ADR 0004), so a crash after that
-save completes the plan from the journal and launches no agent, and a write
-whose outcome was lost is read back, never sent twice. A crash before it,
-while the result is only in memory, is a crash during the launch, which the
-attempt saved before the launch already makes `resume` re-enter through the
-phase's reconciliation, as for any reply. The run log records the outcome
-(`execution.json`'s `delivered_result`: accepted or refused, the reason, the
-facts) and is never read for recovery; D11's journal records a refusal's
-decision, as for any failed step
+**D12.4. Durability and acceptance.** A provisional reply is kept in the
+run's state before the step goes on from it (R1-F1 of PR #481): one save
+writes `delivered_reply` (`delivered_result.KeptReply`, state protocol 19),
+the validated `CONTROL_RESULT` object (redacted, as every agent text the
+engine persists; the parser refuses a credential in any field the controller
+publishes, so redaction changes nothing it acts on), its digest, and its
+binding: the phase, attempt and launch label of the launch that delivered
+it, the issue, the PR, the review round, the candidate the checks read, how
+the launch ended and its run log step. The step then goes on from it as from
+any reply: the operator's checkout is checked, the PR's owner, then the
+phase's verification, whose plan the effect journal (ADR 0004) saves before
+anything is written. Only when that verification applies the reply as the
+step's result (the phase advances, its plan is saved before a stop, or the
+agent's own `blocked`/`failure` is recorded) is the reply *accepted*; a step
+that stops before (checkout drift, another owner, a verification or
+validation refusal) did not accept it (R1-F4). Either way the step's own
+controller-only record in the run log (`<PHASE>-delivered-result`) says so,
+`accepted` or `not-accepted` with the stop's code, and the step's message
+opens with one sentence that claims acceptance only when it holds. A crash
+anywhere after the keeping save, before the step concludes, leaves the
+reply in the state: the next `resume`, `run` or `step` re-enters the phase
+through its reconciliation, which completes a saved plan from the journal
+first, and otherwise checks the kept reply again, exactly as a fresh one,
+against the worktree and GitHub as they are then, and goes on from it with
+no agent launched and no step of a launch charged; a write whose outcome
+was lost is read back, never sent twice. A binding that no longer matches
+the run, or a check that now refuses the reply (a candidate that moved, a
+review HEAD the PR no longer has), is a safe stop: `BLOCKED`
+(`control-result-invalid`) with nothing launched, published or applied, and
+the reply dropped, so `unblock` launches the agent afresh. The kept reply is
+dropped by every save in another phase or after another launch, and by the
+step when its own checks refuse it, so a refused reply is never gone on from
+twice. The run log records each outcome (`execution.json`'s
+`delivered_result`: provisional or refused, the reason, the facts; the
+step's record: accepted or not) and is never read for recovery; D11's
+journal records a refusal's decision, as for any failed step
 (`test_an_accepted_reply_is_never_run_again_after_a_restart`,
-`test_an_accepted_reply_whose_pr_create_landed_is_adopted_never_sent_twice`).
+`test_an_accepted_reply_whose_pr_create_landed_is_adopted_never_sent_twice`,
+`test_a_provisional_reply_is_kept_in_the_state_before_the_step_goes_on_from_it`,
+`test_a_kept_review_is_posted_once_after_a_restart_and_the_reviewer_not_run_again`,
+`test_a_kept_reply_whose_candidate_moved_before_the_restart_stops_safely`,
+`test_a_kept_reply_bound_to_another_launch_is_never_gone_on_from`,
+`test_a_kept_reply_outlives_an_unavailable_github_and_resume_goes_on_from_it`,
+`test_a_reply_the_checkout_drift_check_refuses_after_the_parse_is_never_accepted`,
+`test_a_reply_the_phase_verification_stops_before_planning_is_never_accepted`,
+`test_a_reply_the_producer_gate_refuses_below_its_bound_is_dropped_and_relaunched`).
 
 **D12.5. Every bound stays.** The launch was charged as a step before it
 started, and accepting its reply launches nothing, so no step, no relaunch
@@ -914,11 +953,14 @@ turns a failure into an accepted result, so it gets them. *Threat model:*
 every input is typed (the adapter's fact, the executor's flags, the block
 framing the parser reads of any reply); an agent can at most deliver a reply
 and then hang or fail, which buys it nothing the checks of a clean exit would
-not give it, and the stricter block rule refuses an ambiguous reply. *Cost:*
-none added; one paid relaunch saved per accepted reply. *Security:* no
-credential, write or bound changes; every check of a clean exit's reply
-runs; a teardown that may have left a writer, or could not look for one,
-refuses.
+not give it, and the stricter block rule refuses an ambiguous reply; a kept
+reply is re-checked in full after a restart, so time between the crash and
+the restart buys it nothing either. *Cost:* none added; one paid relaunch
+saved per accepted reply, and per crash in a step that went on from one.
+*Security:* no credential, write or bound changes; every check of a clean
+exit's reply runs, again after a restart; the kept payload is redacted
+before it is persisted; a teardown that may have left a writer, or could not
+look for one, refuses, and so does the recovery rule's relaunch (D11).
 
 ## 3. What does not change, and what holds it
 
@@ -934,7 +976,8 @@ refuses.
 | no agent launch holds a credential route | `test_an_agent_finds_no_credential_route_the_controller_finds_every_one` |
 | transient retries are bounded | `test_transient_retries_are_bounded_per_step_across_corrections`, `test_transient_read_failure_is_bounded_then_blocked` |
 | an automatic relaunch is once per step, allowlisted and audited (#434) | `test_only_the_allowlist_is_ever_relaunched`, `test_two_idle_timeouts_relaunch_once`, `test_an_idle_timeout_is_relaunched_once_and_the_run_goes_on` |
-| a result delivered before a failed end is accepted only on proof and only by a clean exit's checks (#479) | `test_each_missing_fact_refuses_the_reply`, `test_a_reply_without_its_proof_is_never_accepted_and_the_step_stops_safely` |
+| a result delivered before a failed end is accepted only on proof and only by a clean exit's checks and the step's own (#479) | `test_each_missing_fact_refuses_the_reply`, `test_a_reply_without_its_proof_is_never_accepted_and_the_step_stops_safely`, `test_a_reply_the_checkout_drift_check_refuses_after_the_parse_is_never_accepted` |
+| a provisional reply is never run again after a crash, and is re-checked before it is gone on from (#479) | `test_a_provisional_reply_is_kept_in_the_state_before_the_step_goes_on_from_it`, `test_a_kept_reply_whose_candidate_moved_before_the_restart_stops_safely` |
 | no write without its authority: K9, K10, merge, downgrade, drift | the tests D3's table names |
 
 Default single-agent behaviour, every default and the prompts are

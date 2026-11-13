@@ -11,22 +11,39 @@ An agent that delivers its whole final reply and then hangs until its idle
 limit or maximum runtime kills it, or whose CLI then exits with a failing
 status, no longer loses the step: the controller takes that reply as the
 step's result, with no relaunch, when it can prove that safe. The provider's
-own protocol must show that the reply ended the run (Claude Code's
-`stream-json` and Pi show it; OpenCode and Claude's `text` output cannot, so
-nothing changes for them), every `CONTROL_RESULT` block in the reply must say
-the same thing, nothing the agent started may still be running, and the
+own protocol must show that the reply ended the run, with no tool call left
+open and nothing written after it (Claude Code's `stream-json` and Pi show
+it, Pi read through its shutdown; OpenCode and Claude's `text` output cannot,
+so nothing changes for them), every `CONTROL_RESULT` block in the reply must
+say the same thing, nothing the agent started may still be running, and the
 reply must pass every check a reply of a clean exit passes (the issue, the
 phase, the reported `head_sha` against the worktree, the PR's HEAD and
 round). A loop kill, a provider failure or a usage limit is never overridden.
+Such a reply is provisional: it is saved in the run's state before the step
+goes on from it, and accepted only once the step's own checks (your checkout
+unmoved, the PR still the run's, the phase's verification) have applied it.
 The step's message then starts with `The agent was killed at its idle limit
-after delivering its complete final reply ...` and the run goes on.
+after delivering its complete final reply ...` and says whether the reply was
+accepted. A crash or `Ctrl-C` before the step concluded leaves it in the
+state: the next `resume` checks it again and goes on from it without running
+the agent again, or stops in `BLOCKED` (`control-result-invalid`) when the
+worktree or the PR moved in between.
 
 A reply that falls short is not corrected and not relaunched over, as
 before: the failure stands, with a line saying why the reply was not taken
 (`its output was not accepted as the step's result (<reason>: ...)`), and
 the automatic recovery audit's evidence names the same reason. Each such
-launch's `execution.json` records the outcome under `delivered_result`. No
-configuration, state or protocol change.
+launch's `execution.json` records the outcome under `delivered_result`
+(`provisional` or `refused`), and the step's own `<PHASE>-delivered-result`
+record says whether the step accepted it.
+
+The automatic relaunch of #434 is now also refused when the platform could
+not look for a process the failed launch left outside its process group (a
+host with no child subreaper, `orphans_unchecked`): `process-may-survive`.
+
+State protocol 18 -> 19 (`delivered_reply`, the kept reply). Older state
+loads with none and is relabelled on its next save; an older controller
+refuses a protocol-19 file by its label.
 
 ### A failed agent step is relaunched once on its own, when it is safe to (#434)
 

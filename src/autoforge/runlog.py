@@ -24,8 +24,10 @@ Layout::
                               # version, teardown, network, tmpfs bounds, unset environment
                               # names, a setup failure) when the launch had one
                               # what became of a reply delivered before the launch
-                              # timed out or exited badly (delivered_result: accepted
-                              # or refused, the reason, the typed facts), #479
+                              # timed out or exited badly (delivered_result: provisional
+                              # or refused, the reason, the typed facts), #479; the
+                              # step's own NNN-<phase>-delivered-result-<n> record
+                              # says whether the step then accepted it
             stdout.log        # redacted stdout (head + omission marker + tail when truncated)
             stderr.log        # redacted stderr (same)
             control-result.json   # parsed CONTROL_RESULT when one was accepted (redacted)
@@ -319,11 +321,16 @@ class ExecutionRecord:
     # launch had a broker.
     interaction: dict[str, object] = field(default_factory=dict)
     # What became of a reply the launch delivered before it timed out or
-    # exited badly (#479, ``delivered_result.outcome_record``): ``accepted`` or
-    # ``refused`` with its typed reason, and the facts it was decided on
-    # (how the CLI ended, the limit, the adapter's delivered-reply fact, the
-    # blocks' shape, the capture bound). Typed values only, never the reply.
-    # Written to ``execution.json`` only when there was a reply to decide on.
+    # exited badly (#479, ``delivered_result.outcome_record``): ``provisional``
+    # (it passed the checks of a clean exit's reply; the step's own checks
+    # decide) or ``refused`` with its typed reason, and the facts it was
+    # decided on (how the CLI ended, the limit, the adapter's delivered-reply
+    # fact, the blocks' shape, the capture bound). On the step's own
+    # controller-only record (``<PHASE>-delivered-result``,
+    # ``delivered_result.settled_record``): ``accepted`` or ``not-accepted``
+    # with the stop's code, the launch's step and whether the reply was kept
+    # across a restart. Typed values only, never the reply. Written to
+    # ``execution.json`` only when there was a reply to decide on.
     delivered_result: dict[str, object] = field(default_factory=dict)
 
 

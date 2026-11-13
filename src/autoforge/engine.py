@@ -145,7 +145,7 @@ import secrets
 import shlex
 import time
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
@@ -253,11 +253,14 @@ from .config_fingerprint import (
     RecordedConfiguration,
     fingerprint_routing,
 )
-from .delivered_result import SILENT_REFUSALS, EndFacts, ProcessEnd
+from .delivered_result import SILENT_REFUSALS, EndFacts, KeptReply, ProcessEnd
 from .delivered_result import Refusal as ReplyRefusal
 from .delivered_result import outcome_record as delivered_outcome_record
 from .delivered_result import outcome_text as delivered_outcome_text
+from .delivered_result import payload_block as kept_payload_block
 from .delivered_result import refusal as delivered_reply_refusal
+from .delivered_result import settled_record as delivered_settled_record
+from .delivered_result import settled_text as delivered_settled_text
 from .effect_ops import (
     AcceptanceCommentOp,
     Driven,
@@ -1361,6 +1364,31 @@ class StepOutcome:
     stop: StopClassification | None = None
 
 
+@dataclass(frozen=True)
+class _Provisional:
+    """A reply the step goes on from before it is accepted (#479, R1-F4 of PR #481).
+
+    The reply a launch delivered before it timed out or exited badly, once
+    the checks of a clean exit's reply let it through: how the launch ended,
+    its attempt and run log step, and whether a restart found it kept in the
+    state. The step's outcome decides whether it was accepted.
+    """
+
+    facts: EndFacts
+    attempt: int
+    launch_log: str
+    kept_across_restart: bool
+
+
+def _planned(state: AutoForgeState, unplanned: dict) -> bool:
+    """Whether a verification saved its plan: a completion context that is not ``unplanned``.
+
+    Every plan save assigns a new context (#479), so the object read before
+    the verification is still there only when nothing was planned.
+    """
+    return bool(state.completion_context) and state.completion_context is not unplanned
+
+
 def _blocked(code: StopReasonCode, reason: str) -> tuple[Phase, str]:
     """A verify or apply step's ``(Phase.BLOCKED, reason)``, the reason carrying ``code``.
 
@@ -1962,10 +1990,13 @@ class ControllerEngine:
         # refusal :data:`~autoforge.candidate_source.NOT_EXPORTED`, never the
         # worktree's ``HEAD``.
         self._export_verified: Verified | None = None
-        # #479: the sentence the step's outcome opens with when the step's
-        # agent launch timed out or exited badly and the reply it had
-        # delivered was accepted; "" otherwise. Reset at every step.
-        self._delivered_note = ""
+        # #479: the provisional reply this step goes on from, when its agent
+        # launch timed out or exited badly after delivering it (or a restart
+        # found it kept in the state), until the step has its outcome; and
+        # whether the step applied it as its result (R1-F4 of PR #481).
+        # Reset at every step.
+        self._delivered: _Provisional | None = None
+        self._delivered_applied = False
         # Whether this step's REVIEW entry wrote or reused the
         # ``review_evidence`` binding the reviewer's prompt is rendered from
         # (ADR 0006 D5.5, D5.7, D9.1); reset at every REVIEW entry, so a plan
@@ -3928,6 +3959,7 @@ class ControllerEngine:
         assert_shared_git_lock_free("save the state")
         self.state.settle_phase_effects()
         self.state.settle_validation_failure()
+        self.state.settle_delivered_reply()
         save_state(self.state, self.paths.state_file, root=self.state_root())
 
     _save = save
@@ -6199,7 +6231,7 @@ class ControllerEngine:
         # with the same budget. The replan exemption above inherits this rule
         # rather than adding one.
         state.step_count += 1
-        self._delivered_note = ""
+        self._delivered, self._delivered_applied = None, False
         try:
             outcome = self._step_phase(previous, plan, allow_merge, held)
         except PROwnerError as exc:
@@ -6208,11 +6240,87 @@ class ControllerEngine:
             # before anything is launched or sent on it; what was sent before
             # stays as persisted, and the operator decides.
             outcome = self._block(previous, plan, str(exc), code=StopReasonCode.PR_OWNER)
-        if self._delivered_note:
-            # #479: the agent's launch timed out or exited badly, and the step
-            # went on from the reply it had delivered; say so first.
-            outcome = replace(outcome, message=f"{self._delivered_note}\n{outcome.message}")
+        except Exception as exc:
+            if self._delivered is not None:
+                # #479: the step went on from a provisional reply and ended
+                # without an outcome; say what became of the reply.
+                _add_line(exc, self._delivered_unsettled_text())
+            raise
+        if self._delivered is not None:
+            # #479 (R1-F4 of PR #481): the step went on from a provisional
+            # reply; only now, with its outcome, is it accepted or not.
+            outcome = self._settle_delivered(previous, outcome)
         return outcome
+
+    def _settle_delivered(self, previous: Phase, outcome: StepOutcome) -> StepOutcome:
+        """Record and report what became of the step's provisional reply (R1-F4 of PR #481).
+
+        Accepted only when the step applied it as its result
+        (``_delivered_applied``: the checkout check, the PR owner check and
+        the phase's verification passed, or the agent's own reported stop
+        was recorded); otherwise not accepted, with the stop's code. A step
+        that concluded keeps no reply in the state (the transition out of
+        the phase drops it, and so does every refusal of the step's checks);
+        one still kept here is dropped. The run log gets the decision as a
+        controller-only record, and the outcome opens with one sentence
+        that claims acceptance only when it holds.
+        """
+        delivered = self._delivered
+        assert delivered is not None
+        state = self._require_state()
+        if state.delivered_reply:
+            state.delivered_reply = {}
+            self._save()
+        accepted = self._delivered_applied
+        stop = outcome.stop.code.value if outcome.stop is not None else outcome.next_phase
+        now = utcnow_iso()
+        record = ExecutionRecord(
+            run_id=state.run_id,
+            seq=0,
+            phase=f"{previous.value}-delivered-result",
+            attempt=delivered.attempt,
+            issue_url=state.current_issue_url,
+            pr_url=state.current_pr_url,
+            review_round=state.review_round,
+            profile="(the reply a failed launch delivered; no agent)",
+            prompt_version=state.prompt_version,
+            started_at=now,
+            finished_at=now,
+            delivered_result=delivered_settled_record(
+                delivered.facts,
+                accepted=accepted,
+                reason=stop,
+                launch_log=delivered.launch_log,
+                kept_across_restart=delivered.kept_across_restart,
+            ),
+        )
+        self._logger().log_execution(record)
+        note = delivered_settled_text(
+            delivered.facts, accepted=accepted, kept_across_restart=delivered.kept_across_restart
+        )
+        return replace(outcome, message=f"{note}\n{outcome.message}")
+
+    def _delivered_unsettled_text(self) -> str:
+        """The line a step that went on from a provisional reply, then raised, gains."""
+        delivered = self._delivered
+        assert delivered is not None
+        kept = bool(self._require_state().delivered_reply)
+        end = (
+            f"was killed at its {delivered.facts.limit} limit"
+            if delivered.facts.process_end is ProcessEnd.KILLED
+            else "exited with a failing status"
+        )
+        if kept:
+            return (
+                f"The agent {end} after delivering its complete final reply, which passed the "
+                "checks of a clean exit's reply and is kept in the run's state: 'resume' checks "
+                "it again and goes on from it without running the agent again (#479)."
+            )
+        return (
+            f"The agent {end} after delivering its complete final reply, which passed the "
+            "checks of a clean exit's reply; the step's own checks refused it, so it was not "
+            "accepted, and 'resume' re-enters the phase as after any refused result (#479)."
+        )
 
     def _step_phase(
         self,
@@ -6297,6 +6405,8 @@ class ControllerEngine:
             # #374: the code goes with the stop it names, for a later status.
             state.stop_code = stop.code.value
             self._save()
+            # #479: the agent's own stop is the step's result.
+            self._delivered_applied = True
             hint = ""
             if previous == Phase.FIX and nxt == Phase.BLOCKED:
                 # #428: a plain unblock relaunches the fixer, which cannot see
@@ -6322,31 +6432,43 @@ class ControllerEngine:
                 stop=stop,
             )
 
+        # #479: the plan a verification saves replaces this object, so a stop
+        # after it is told from one before anything was planned.
+        unplanned = state.completion_context
         try:
             nxt_phase, message = self._verify_and_apply(previous, payload)
         except _ProducerValidationFailed as exc:
             # ADR 0006 D5.2: a conclusive result below the bound, not a
             # VerificationError: the record and the counter are saved, nothing
             # was planned or sent, and the next step relaunches the agent at
-            # this entry, its observation reused (ADR 0004 D4.4).
+            # this entry, its observation reused (ADR 0004 D4.4). A reply kept
+            # from a failed launch (#479) was refused with it: dropped.
+            state.delivered_reply = {}
             self._save()
             return self._outcome(previous, plan=plan, result=payload, message=str(exc))
         except (VerificationError, ControlResultValidationError) as exc:
             # The agent ran (and may have changed GitHub) but its claims did not
             # verify. Persist the attempt so `resume` re-enters this phase from
-            # real state instead of pretending nothing happened.
+            # real state instead of pretending nothing happened. A reply kept
+            # from a failed launch (#479) was refused with them: dropped, so
+            # the re-entry is the one any refused result gets.
             if isinstance(exc, VerificationError) and previous in (Phase.REVIEW, Phase.FIX):
                 self._record_verification_failure(previous, exc)
+            state.delivered_reply = {}
             self._save()
             raise
         if nxt_phase == Phase.BLOCKED:
             # Verification gave up conclusively (bounded re-selection exhausted):
             # BLOCKED is an exceptional holding state outside the topology.
+            # #479: the result was applied if its plan was saved before the stop.
+            self._delivered_applied = _planned(state, unplanned)
             return self._block(previous, plan, message)
         validate_transition(previous, nxt_phase)
         state.phase = nxt_phase
         state.attempt = 0
         self._save()
+        # #479: the phase's verification applied the result.
+        self._delivered_applied = True
         return self._outcome(previous, plan=plan, result=payload, message=message)
 
     # -- a blocked FIX that publishes what it fixed (#433) ----------------------------
@@ -6378,14 +6500,20 @@ class ControllerEngine:
                 self._partial_fix_held_text(res, message),
                 code=StopReasonCode.AGENT_BLOCKED,
             )
+        unplanned = self._require_state().completion_context
         try:
             nxt, text = self._apply_fix(res, message)
         except VerificationError as exc:
             self._record_verification_failure(Phase.FIX, exc)
+            # #479: a reply kept from a failed launch was refused with it.
+            self._require_state().delivered_reply = {}
             self._save()
             raise
         if nxt != Phase.BLOCKED:
             raise StateError(f"a partial FIX was applied and left FIX for {nxt.value}")
+        # #479: the partial fix the reply offered was planned as the step's
+        # result, or refused with nothing planned.
+        self._delivered_applied = _planned(self._require_state(), unplanned)
         return self._block(Phase.FIX, plan, text)
 
     def _partial_fix_held_text(self, res: PartialFixResult, message: str) -> str:
@@ -16445,6 +16573,20 @@ class ControllerEngine:
         self._launch_cwd, self._launch_log = "", None
         cwd = self._execution_cwd()
         self._launch_cwd = cwd
+        kept = self._kept_reply(phase)
+        if kept is not None:
+            # #479 (R1-F1 of PR #481): the last launch of this entry delivered
+            # a reply the state kept before the step went on from it, and the
+            # step did not conclude. It is checked again and gone on from; no
+            # agent is launched, and nothing of a launch is charged or saved.
+            return self._reuse_kept_reply(
+                phase,
+                kept,
+                cwd,
+                self._update_epic_request()
+                if phase == Phase.UPDATE_EPIC
+                else UpdateEpicRequest.FULL,
+            )
         # Names only, never values: what the agent may inherit from the
         # controller's environment (the provider adds its own CLI's names).
         env_allowlist = self.config.execution.agent_environment_names()
@@ -16550,6 +16692,8 @@ class ControllerEngine:
             # later version can tell a launch of its own from one whose agent
             # published under the previous contract.
             state.launch_label = launch_label_for(phase)
+            # #479: a new launch; a reply an earlier one delivered is not its.
+            state.delivered_reply = {}
             # The one write before the agent starts: the attempt counter, the
             # step it is charged as (the first launch's by the step itself, a
             # relaunch's above), the entry observation (D4.4) and the launch
@@ -16843,62 +16987,10 @@ class ControllerEngine:
                         not_taken,
                     )
             try:
-                if not self._launch_seeded:
-                    # ADR 0005 D6.5: the agent's new objects are imported
-                    # strictly before its result is checked; tampering is
-                    # recorded here and blocks the run.
-                    self._import_problem = self._import_after_launch(Path(cwd))
-                else:
-                    # ADR 0013 D5, D13: a seeded launch's candidate is its
-                    # exported artifact, and the verify step's outcome stands
-                    # in for that import: a refusal, or no outcome at all, is
-                    # the candidate read's refusal, never a candidate, and the
-                    # worktree is neither imported nor read
-                    # (:meth:`_candidate_read`).
-                    verified = self._export_verified or NOT_EXPORTED
-                    self._imported_head = verified.candidate if verified.accepted else ""
-                    self._import_problem = verified.problem
                 # Only the tail of a truncated stdout is searched: the block
                 # is the last thing the agent writes, so the kept tail holds
                 # a whole one; a block before the cut is stale or spans it.
-                payload = parse_control_result(
-                    result.stdout_tail, phase, update_epic_request=request
-                )
-                if phase == Phase.UPDATE_EPIC and payload.get("status") == "success":
-                    # The controller's half of the schema (a required roadmap
-                    # section, the publishable comment as a whole): refused
-                    # here, it is corrected before anything is posted.
-                    self._check_update_epic_result(payload, request)
-                if phase == Phase.ANALYZE_EXECUTE and payload.get("status") == "success":
-                    # The candidate the controller would publish, read from
-                    # the worktree itself: refused here, it is corrected
-                    # before anything is pushed or created (#161).
-                    self._check_analyze_result(payload, cwd)
-                if phase == Phase.REVIEW and payload.get("status") == "success":
-                    # The comment the controller would post, rendered from the
-                    # result: refused here, it is corrected before anything is
-                    # posted (#162).
-                    self._check_review_result(payload)
-                if phase == Phase.REVIEW and payload.get("status") == "success":
-                    # ADR 0006 D9.4, in both modes: a clean verdict over a
-                    # validation record that did not pass is refused here, so
-                    # it is corrected before anything is published.
-                    self._check_review_evidence(payload)
-                if phase == Phase.FIX and payload.get("status") == "success":
-                    # The resolutions and the candidate the controller would
-                    # publish, read from the worktree itself: refused here,
-                    # it is corrected before anything is created or pushed
-                    # (#163).
-                    self._check_fix_result(payload, cwd)
-                if is_partial_fix(phase, payload):
-                    # #433: a blocked FIX that offers the commits it made, held
-                    # to the same rules; corrected before anything is pushed.
-                    self._check_partial_fix_result(payload, cwd)
-                if phase == Phase.REPLAN_REEXECUTE and payload.get("status") == "success":
-                    # The candidate the controller would publish, read from
-                    # the worktree itself: corrected, or its rejection
-                    # decided, before anything is pushed or created (#164).
-                    self._check_replan_result(payload, cwd)
+                payload = self._check_reply(phase, result.stdout_tail, cwd, request)
             except VerificationError as exc:
                 if launch_failure is not None and delivery is not None:
                     # #479: a reply whose launch failed is accepted on proof
@@ -16979,16 +17071,234 @@ class ControllerEngine:
                 raise ControlResultValidationError(failed) from exc
             record.parsed_result = payload
             if launch_failure is not None and delivery is not None:
-                # #479: accepted. The launch's end stays on its record as the
-                # facts it is (timed_out, the limit, the exit status, what the
-                # teardown killed); the step goes on as after a clean exit,
-                # its result made durable by the phase's own first save, as
-                # every result is, and the step's message says how it ended.
+                # #479: provisional, never yet accepted (R1-F4 of PR #481).
+                # The launch's end stays on its record as the facts it is
+                # (timed_out, the limit, the exit status, what the teardown
+                # killed). Kept in the state, with its binding, before the
+                # step goes on from it (R1-F1): a crash or a restart before
+                # the step concludes re-checks it and launches no agent. The
+                # step's own checks after it decide whether it is accepted
+                # (:meth:`_settle_delivered`).
+                try:
+                    kept = self._keep_reply(phase, payload, delivery, step_log.name)
+                except BaseException as exc:
+                    # The save that keeps it failed (or was interrupted): the
+                    # launch is still recorded, as every launch is, and the
+                    # failure to save it is what the step ends with.
+                    record.error += (
+                        f"; its reply could not be kept in the run's state: {type(exc).__name__}"
+                    )
+                    with suppress(StateError):
+                        self._record_invocation(
+                            logger, record, prompt, stdout, stderr, phase, step_log
+                        )
+                    raise
+                if kept is None:
+                    record.error += (
+                        "; its reply was not accepted: it could not be kept in the run's state"
+                    )
+                    raise self._failed_launch(
+                        logger,
+                        record,
+                        (prompt, stdout, stderr),
+                        phase,
+                        step_log,
+                        launch_failure,
+                        failure_kind,
+                        result,
+                        profile,
+                        delivery,
+                        ReplyRefusal.CHECKS,
+                    )
                 record.error = ""
                 record.delivered_result = delivered_outcome_record(delivery, None)
-                self._delivered_note = delivered_outcome_text(delivery, None)
+                self._delivered = _Provisional(
+                    delivery, state.attempt, step_log.name, kept_across_restart=False
+                )
             self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
             return payload
+
+    def _check_reply(self, phase: Phase, text: str, cwd: str, request: UpdateEpicRequest) -> dict:
+        """The checks every reply meets before anything follows from it.
+
+        The strict import of the agent's objects (or a seeded launch's
+        verified export), the parse of ``text`` against the phase and the
+        request, and the phase's own checks of the candidate, the comment or
+        the plan the controller would publish. A clean exit's reply, a reply
+        delivered before a failed launch end (#479) and a reply kept across
+        a restart (:meth:`_reuse_kept_reply`) all meet exactly these.
+        """
+        if not self._launch_seeded:
+            # ADR 0005 D6.5: the agent's new objects are imported
+            # strictly before its result is checked; tampering is
+            # recorded here and blocks the run.
+            self._import_problem = self._import_after_launch(Path(cwd))
+        else:
+            # ADR 0013 D5, D13: a seeded launch's candidate is its
+            # exported artifact, and the verify step's outcome stands
+            # in for that import: a refusal, or no outcome at all, is
+            # the candidate read's refusal, never a candidate, and the
+            # worktree is neither imported nor read
+            # (:meth:`_candidate_read`).
+            verified = self._export_verified or NOT_EXPORTED
+            self._imported_head = verified.candidate if verified.accepted else ""
+            self._import_problem = verified.problem
+        payload = parse_control_result(text, phase, update_epic_request=request)
+        if phase == Phase.UPDATE_EPIC and payload.get("status") == "success":
+            # The controller's half of the schema (a required roadmap
+            # section, the publishable comment as a whole): refused
+            # here, it is corrected before anything is posted.
+            self._check_update_epic_result(payload, request)
+        if phase == Phase.ANALYZE_EXECUTE and payload.get("status") == "success":
+            # The candidate the controller would publish, read from
+            # the worktree itself: refused here, it is corrected
+            # before anything is pushed or created (#161).
+            self._check_analyze_result(payload, cwd)
+        if phase == Phase.REVIEW and payload.get("status") == "success":
+            # The comment the controller would post, rendered from the
+            # result: refused here, it is corrected before anything is
+            # posted (#162).
+            self._check_review_result(payload)
+        if phase == Phase.REVIEW and payload.get("status") == "success":
+            # ADR 0006 D9.4, in both modes: a clean verdict over a
+            # validation record that did not pass is refused here, so
+            # it is corrected before anything is published.
+            self._check_review_evidence(payload)
+        if phase == Phase.FIX and payload.get("status") == "success":
+            # The resolutions and the candidate the controller would
+            # publish, read from the worktree itself: refused here,
+            # it is corrected before anything is created or pushed
+            # (#163).
+            self._check_fix_result(payload, cwd)
+        if is_partial_fix(phase, payload):
+            # #433: a blocked FIX that offers the commits it made, held
+            # to the same rules; corrected before anything is pushed.
+            self._check_partial_fix_result(payload, cwd)
+        if phase == Phase.REPLAN_REEXECUTE and payload.get("status") == "success":
+            # The candidate the controller would publish, read from
+            # the worktree itself: corrected, or its rejection
+            # decided, before anything is pushed or created (#164).
+            self._check_replan_result(payload, cwd)
+        return payload
+
+    def _keep_reply(
+        self, phase: Phase, payload: dict, delivery: EndFacts, launch_log: str
+    ) -> KeptReply | None:
+        """Save a provisional reply in the state with its binding (#479, R1-F1 of PR #481).
+
+        One save, after the checks of a clean exit's reply let it through and
+        before the step goes on from it: the payload (redacted, as every
+        agent text the engine persists), the launch it binds to (phase,
+        attempt, launch label, issue, PR, review round, run log step), the
+        candidate the checks read and how the launch ended. ``None``, and
+        nothing saved, for a reply the state could not load back (one past
+        the parser's bound once canonical, say): such a reply is refused.
+        """
+        state = self._require_state()
+        named = str(payload.get("head_sha") or payload.get("reviewed_head_sha") or "").lower()
+        kept = KeptReply(
+            phase=phase.value,
+            attempt=state.attempt,
+            launch_label=state.launch_label,
+            issue_url=state.current_issue_url,
+            pr_url=state.current_pr_url or "",
+            review_round=state.review_round,
+            candidate=named if re.fullmatch(r"[0-9a-f]{40}", named) else "",
+            process_end=delivery.process_end,
+            limit=delivery.limit,
+            run_log=launch_log,
+            payload=redact_dict(payload),
+        )
+        try:
+            KeptReply.from_dict(kept.to_dict())
+        except StateError:
+            return None
+        state.delivered_reply = kept.to_dict()
+        self._save()
+        return kept
+
+    def _kept_reply(self, phase: Phase) -> KeptReply | None:
+        """The reply the state keeps for this phase entry's last launch, or ``None``."""
+        state = self._require_state()
+        if not state.delivered_reply:
+            return None
+        kept = KeptReply.from_dict(state.delivered_reply)
+        return kept if kept.phase == phase.value else None
+
+    def _reuse_kept_reply(
+        self, phase: Phase, kept: KeptReply, cwd: str, request: UpdateEpicRequest
+    ) -> dict | StepOutcome:
+        """Go on from a reply kept across a restart, re-checked; launch no agent (R1-F1).
+
+        The step that kept it ended without concluding (a crash, a restart,
+        an error that left the phase's checks undecided). Its binding must
+        still be the run's (the attempt, the launch label, the issue, the PR
+        and the review round), and the reply meets again every check of a
+        clean exit's reply, against the worktree and GitHub as they are now
+        (the strict import, the parse, the candidate the reply names against
+        the worktree's HEAD, the review's bound HEAD and round). Then the
+        step goes on from it exactly as from a fresh reply, and its own
+        checks decide whether it is accepted. Anything else is a safe stop:
+        ``BLOCKED`` with nothing launched, published or applied, and the
+        reply dropped, so ``unblock`` launches the agent afresh. A seeded
+        launch's export is not read again: its candidate is checked against
+        the worktree, which does not hold it, and the step stops there.
+        """
+        state = self._require_state()
+        bound = (
+            kept.attempt,
+            kept.launch_label,
+            kept.issue_url,
+            kept.pr_url,
+            kept.review_round,
+        )
+        now = (
+            state.attempt,
+            state.launch_label,
+            state.current_issue_url,
+            state.current_pr_url or "",
+            state.review_round,
+        )
+        problem = ""
+        if bound != now:
+            problem = (
+                f"it is bound to attempt {kept.attempt} ({kept.launch_label}) of issue "
+                f"{kept.issue_url or '(none)'}, PR {kept.pr_url or '(none)'} and review round "
+                f"{kept.review_round}, and the run is now at attempt {state.attempt} "
+                f"({state.launch_label or 'no launch'}) of issue "
+                f"{state.current_issue_url or '(none)'}, PR {state.current_pr_url or '(none)'} "
+                f"and review round {state.review_round}"
+            )
+        else:
+            self._launch_seeded = False
+            self._export_verified = None
+            try:
+                payload = self._check_reply(phase, kept_payload_block(kept.payload), cwd, request)
+            except (CheckoutDriftError, SandboxTamperError):
+                raise
+            except (VerificationError, ControlResultError) as exc:
+                problem = f"its checks refused it: {type(exc).__name__}: {exc}"
+        facts = kept.facts()
+        if problem:
+            end = (
+                f"was killed at its {facts.limit} limit"
+                if facts.process_end is ProcessEnd.KILLED
+                else "exited with a failing status"
+            )
+            return self._block(
+                phase,
+                None,
+                f"the reply the {phase.value} agent delivered before its launch {end} (run log "
+                f"step {kept.run_log}) was kept in the run's state across an interruption, and "
+                f"it no longer passes the checks of a clean exit's reply: {problem}. Nothing "
+                "was launched, published or applied, and the reply was dropped (#479). Inspect "
+                f"the worktree {self.agent_worktree_description()} and the PR, then 'unblock': "
+                f"{phase.value} is entered again and its agent launched afresh",
+                code=StopReasonCode.CONTROL_RESULT_INVALID,
+            )
+        self._launch_log = self._logger().run_dir / kept.run_log
+        self._delivered = _Provisional(facts, kept.attempt, kept.run_log, kept_across_restart=True)
+        return payload
 
     def _failed_launch(
         self,

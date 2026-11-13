@@ -11025,6 +11025,7 @@ def _as_protocol_5(eng, *, attempt: int) -> None:
         "stop_code",
         "partial_fix",
         "auto_recovery",
+        "delivered_reply",
         "sandbox_pin",
     ):
         data.pop(key, None)
@@ -11054,7 +11055,7 @@ def test_update_epic_legacy_reentry_adopts_the_agents_comment_and_asks_for_the_s
     assert "posted by an agent under the previous contract" in call.prompt
     assert _progress_posts(fake_github) == [] and len(fake_github.comments[EPIC]) == 1
     s = load_state(eng.paths.state_file)
-    assert s.current_issue_url == ISSUE3 and s.protocol_version == "18"
+    assert s.current_issue_url == ISSUE3 and s.protocol_version == "19"
     assert s.effect_records == []  # adopted with no record (D13.7)
 
 

@@ -235,9 +235,12 @@ delivered_result.py a reply delivered before its launch failed (#479, ADR 0012 D
                     the provider-neutral distinctions (completed turn, delivered
                     complete result, terminated process, successful cleanup, accepted
                     controller result), the typed facts of a launch a limit killed or
-                    that exited badly, and the fixed rule that says whether its reply
-                    goes to the checks a clean exit's reply meets; accepts nothing
-                    itself; pure, persists nothing
+                    that exited badly, the fixed rule that says whether its reply
+                    goes to the checks a clean exit's reply meets, the provisional
+                    and settled outcomes and their texts, and the kept reply's
+                    closed shape (KeptReply, the state's delivered_reply, bound to
+                    its launch and candidate); accepts nothing itself; pure,
+                    persists nothing itself
 recovery_package.py status's recovery action package (#374): from a loaded state, its
                     classification, the configuration and, for 'status --live',
                     unblock's dry-run decision: the diagnosis of the saved stop code,

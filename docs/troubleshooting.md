@@ -44,7 +44,7 @@ what no test covers.
 | `existing run <id> in phase <P> — use 'resume' to continue or 'run --force' to discard it` (exit 2) | [Starting over](#starting-over) |
 | `another AutoForge controller holds <path> — refusing to run concurrently on the same repository (...)` (exit 2) | [Another controller holds the lock](#another-controller-holds-the-lock) |
 | `'<command>' refuses issue <issue>: ... Only the parallel EPIC scheduler continues an issue its namespace owns ...` (exit 2) | [Another controller holds the lock](#another-controller-holds-the-lock) |
-| `unsupported protocol_version '<n>' (controller speaks '18'): a newer AutoForge wrote it` (exit 2) | [A run a newer controller wrote](usage.md#a-run-a-newer-controller-wrote) |
+| `unsupported protocol_version '<n>' (controller speaks '19'): a newer AutoForge wrote it` (exit 2) | [A run a newer controller wrote](usage.md#a-run-a-newer-controller-wrote) |
 | `refusing to start a new run over an unreadable state file`, `corrupted state file ...` (exit 2) | [The state file](#the-state-file) |
 | `issue <url> has no native parent on GitHub and no --epic was given`, `... has its native parent ... in another repository`, `... is closed on GitHub; a run records only an open EPIC`, `--epic <url> is the issue itself` (from `run`, exit 2) | [Which EPIC a run records](usage.md#which-epic-a-run-records) |
 | `issue <url> changed on GitHub while the run's EPIC was being bound: ...` (from `run`, exit 2) | [Which EPIC a run records](usage.md#which-epic-a-run-records): the issue's parent or state changed while `run` read its EPIC; nothing was written: run the command again |
@@ -393,9 +393,25 @@ theirs is never taken), every `CONTROL_RESULT` block in it says
 the same thing, it was not cut at the capture bound, no limit but the idle
 limit or the maximum runtime killed it, nothing the agent started may still
 be running, and the reply passes every check a clean exit's reply passes.
-The step's outcome then starts with `The agent was killed at its idle limit
-after delivering its complete final reply ...` (or `exited with a failing
-status ...`), and the step goes on as usual.
+The reply is then provisional: it is saved in the run's state before the step
+goes on from it, and accepted only once the step's own checks after it (your
+checkout unmoved, the PR still the run's, the phase's verification) have
+applied it. The step's outcome then starts with `The agent was killed at its
+idle limit after delivering its complete final reply ...` (or `exited with a
+failing status ...`) and says whether it `was accepted`, or `was not
+accepted` because the step stopped first (what stopped it follows). The run
+log keeps both: the launch's `execution.json` says `provisional` under
+`delivered_result`, and the step's own record (`<PHASE>-delivered-result`)
+says `accepted` or `not-accepted` with the stop's code.
+
+If the controller is interrupted after it kept such a reply and before the
+step concluded (a crash, `Ctrl-C`, GitHub not answering), the next `resume`
+checks the kept reply again and goes on from it without running the agent
+again; the error you saw says `is kept in the run's state`. When the kept
+reply no longer passes its checks (a commit landed in the worktree after it,
+or the PR moved), the run stops in `BLOCKED` (`control-result-invalid`) with
+nothing launched or published: inspect the worktree and the PR, then
+`unblock`, which launches the agent afresh.
 
 Otherwise the failure stands, with a line saying why the reply was not
 taken: `its output was not accepted as the step's result (<reason>: ...)`.

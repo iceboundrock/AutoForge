@@ -43,6 +43,7 @@ from pathlib import Path
 from . import __prompt_version__, __protocol_version__, __version__
 from .auto_recovery import RecoveryJournal
 from .config_fingerprint import RecordedConfiguration
+from .delivered_result import KeptReply
 from .effects import (
     ACTION_ID_RE,
     EVIDENCE_CLASSES,
@@ -247,11 +248,18 @@ _PRE_STOP_CODE_PROTOCOL = "15"
 # older file that carries any of it is refused (:func:`_refuse_partial_fix_state`).
 _PRE_PARTIAL_FIX_PROTOCOL = "16"
 # The label before the automatic-recovery journal (#434). A protocol-17 file
-# is this protocol's shape without ``auto_recovery``: it is loaded in every
+# is protocol 18's shape without ``auto_recovery``: it is loaded in every
 # phase with ``auto_recovery: {}`` (no decision taken, the allowance of every
 # step unspent), and relabelled. An older file that carries the field is
 # refused (:func:`_refuse_auto_recovery_state`).
-_PREVIOUS_PROTOCOL = "17"
+_PRE_AUTO_RECOVERY_PROTOCOL = "17"
+# The label before a reply delivered before a failed launch end was kept in
+# the state (#479, R1-F1 of PR #481). A protocol-18 file is this protocol's
+# shape without ``delivered_reply``: it is loaded in every phase with
+# ``delivered_reply: {}`` (no reply kept, which is all an older controller
+# could leave: it held such a reply in memory only), and relabelled. An older
+# file that carries the field is refused (:func:`_refuse_delivered_reply`).
+_PREVIOUS_PROTOCOL = "18"
 # Every label :meth:`AutoForgeState.from_dict` has a rule for: the current
 # one and each older one it migrates or refuses by its own rule. Any other
 # label is refused by :func:`protocol_support`'s classification before the
@@ -269,6 +277,7 @@ SUPPORTED_PROTOCOLS: frozenset[str] = frozenset(
         _PRE_PR_BODY_PROTOCOL,
         _PRE_STOP_CODE_PROTOCOL,
         _PRE_PARTIAL_FIX_PROTOCOL,
+        _PRE_AUTO_RECOVERY_PROTOCOL,
         _PREVIOUS_PROTOCOL,
         __protocol_version__,
     }
@@ -333,6 +342,10 @@ _PARTIAL_FIX_FIELDS = ("partial_fix",)
 # (:class:`autoforge.auto_recovery.RecoveryJournal`), ``{}`` when no decision
 # was ever taken.
 _AUTO_RECOVERY_FIELDS = ("auto_recovery",)
+# The field protocol 19 added (#479, R1-F1 of PR #481): the reply a launch
+# delivered before it timed out or exited badly, kept with its binding while
+# the step's checks decide on it, ``{}`` when none is.
+_DELIVERED_REPLY_FIELDS = ("delivered_reply",)
 _PARTIAL_FIX_KEYS = (
     "round",
     "pr_url",
@@ -741,6 +754,20 @@ class AutoForgeState:
     # only moves ``step`` on. Its run log record and its comment are audit
     # sinks, never inputs.
     auto_recovery: dict = field(default_factory=dict)
+    # The reply the current phase entry's last launch delivered before it
+    # timed out or exited badly, once the checks of a clean exit's reply let
+    # it through (#479, R1-F1 of PR #481;
+    # :class:`autoforge.delivered_result.KeptReply`), ``{}`` when none is:
+    # the validated, redacted ``CONTROL_RESULT`` object, its digest, and its
+    # binding (phase, attempt, launch label, issue, PR, review round, the
+    # candidate the checks read, how the launch ended, its run log step).
+    # Saved before the step goes on from it, so a crash or a restart before
+    # the step concludes re-checks it and launches no agent; dropped by a
+    # save in another phase or after another launch
+    # (:meth:`settle_delivered_reply`), and by the step when its own checks
+    # refuse it. Read only by the engine's launch path, which re-checks it
+    # exactly as a fresh reply before anything follows from it.
+    delivered_reply: dict = field(default_factory=dict)
     # The outcomes of the current PR's acceptance actions (#211), oldest
     # first: ``action_id``, ``round``, ``finding_id``, ``outcome``
     # (verified | declined | stale), ``at``, ``comment_url`` (the verified
@@ -1085,6 +1112,11 @@ class AutoForgeState:
         #   An older file is loaded in every phase with ``{}`` (no decision
         #   taken, every step's allowance unspent). An older file that carries
         #   the field, even empty, is refused, never merged.
+        # - 18 -> 19: a reply delivered before a failed launch end is kept
+        #   while the step's checks decide on it (#479, R1-F1 of PR #481):
+        #   ``delivered_reply``. An older file is loaded in every phase with
+        #   ``{}`` (an older controller kept none). An older file that carries
+        #   the field, even empty, is refused, never merged.
         written_by = str(data.get("controller_version", ""))
         legacy = isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS
         if legacy:
@@ -1206,6 +1238,7 @@ class AutoForgeState:
             _PRE_PR_BODY_PROTOCOL,
             _PRE_STOP_CODE_PROTOCOL,
             _PRE_PARTIAL_FIX_PROTOCOL,
+            _PRE_AUTO_RECOVERY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1223,8 +1256,9 @@ class AutoForgeState:
             # kind (K11), which an older file is refused for carrying
             # (:func:`_refuse_takeover_records`), protocol 15 the PR body
             # state, protocol 16 the stop code, protocol 17 the partial fix
-            # state and protocol 18 the recovery journal, each required of its
-            # own files below. Only a legacy label
+            # state, protocol 18 the recovery journal and protocol 19 the
+            # delivered reply, each required of its own files below. Only a
+            # legacy label
             # loads with no effect state (D13.2). Every
             # protocol-7 save writes all four fields, so one that is absent
             # is a truncation or a hand edit, never "nothing planned": a
@@ -1278,6 +1312,7 @@ class AutoForgeState:
         if raw_protocol in (
             _PRE_STOP_CODE_PROTOCOL,
             _PRE_PARTIAL_FIX_PROTOCOL,
+            _PRE_AUTO_RECOVERY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1294,12 +1329,18 @@ class AutoForgeState:
             _PRE_PR_BODY_PROTOCOL,
             _PRE_STOP_CODE_PROTOCOL,
             _PRE_PARTIAL_FIX_PROTOCOL,
+            _PRE_AUTO_RECOVERY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
             # 13 -> 14 (#414): K11 is planned from protocol 14 on.
             _refuse_takeover_records(data, str(raw_protocol))
-        if raw_protocol in (_PRE_PARTIAL_FIX_PROTOCOL, _PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol in (
+            _PRE_PARTIAL_FIX_PROTOCOL,
+            _PRE_AUTO_RECOVERY_PROTOCOL,
+            _PREVIOUS_PROTOCOL,
+            __protocol_version__,
+        ):
             # Every protocol-16 save writes it, ``""`` included, so an absent
             # one is a truncation or a hand edit, never "no code was saved".
             _require_fields(
@@ -1308,7 +1349,7 @@ class AutoForgeState:
         else:
             # 15 -> 16 (#374): the stop code is written from protocol 16 on.
             _refuse_stop_code(data, str(raw_protocol))
-        if raw_protocol in (_PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol in (_PRE_AUTO_RECOVERY_PROTOCOL, _PREVIOUS_PROTOCOL, __protocol_version__):
             # Every protocol-17 save writes it, ``{}`` included, so an absent
             # one is a truncation or a hand edit, never "no partial fix".
             _require_fields(
@@ -1322,7 +1363,7 @@ class AutoForgeState:
             # 16 -> 17 (#433): the partial fix state is written from protocol
             # 17 on.
             _refuse_partial_fix_state(data, str(raw_protocol))
-        if raw_protocol == __protocol_version__:
+        if raw_protocol in (_PREVIOUS_PROTOCOL, __protocol_version__):
             # Every protocol-18 save writes it, ``{}`` included, so an absent
             # one is a truncation or a hand edit: read as the empty default it
             # would refill an allowance a decision already spent.
@@ -1334,9 +1375,25 @@ class AutoForgeState:
                 "not a run that decided nothing",
             )
         else:
-            # 17 -> 18 (#434): the recovery journal is written by this
-            # protocol only.
+            # 17 -> 18 (#434): the recovery journal is written from protocol
+            # 18 on.
             _refuse_auto_recovery_state(data, str(raw_protocol))
+        if raw_protocol == __protocol_version__:
+            # Every protocol-19 save writes it, ``{}`` included, so an absent
+            # one is a truncation or a hand edit: read as the empty default it
+            # would drop a reply the step goes on from and launch the agent
+            # again (R1-F1 of PR #481).
+            _require_fields(
+                data,
+                raw_protocol,
+                _DELIVERED_REPLY_FIELDS,
+                "delivered reply",
+                "not a step with none kept",
+            )
+        else:
+            # 18 -> 19 (#479): the delivered reply is written by this protocol
+            # only.
+            _refuse_delivered_reply(data, str(raw_protocol))
         kwargs = dict(data)
         kwargs["phase"] = phase
         kwargs["mode"] = mode
@@ -1351,6 +1408,7 @@ class AutoForgeState:
             _PRE_PR_BODY_PROTOCOL,
             _PRE_STOP_CODE_PROTOCOL,
             _PRE_PARTIAL_FIX_PROTOCOL,
+            _PRE_AUTO_RECOVERY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1364,6 +1422,7 @@ class AutoForgeState:
             _PRE_PR_BODY_PROTOCOL,
             _PRE_STOP_CODE_PROTOCOL,
             _PRE_PARTIAL_FIX_PROTOCOL,
+            _PRE_AUTO_RECOVERY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1373,6 +1432,7 @@ class AutoForgeState:
         if raw_protocol not in (
             _PRE_STOP_CODE_PROTOCOL,
             _PRE_PARTIAL_FIX_PROTOCOL,
+            _PRE_AUTO_RECOVERY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1381,20 +1441,29 @@ class AutoForgeState:
             kwargs.update(_pr_body_migration(kwargs))
         if raw_protocol not in (
             _PRE_PARTIAL_FIX_PROTOCOL,
+            _PRE_AUTO_RECOVERY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
             # Before protocol 16 (#374): a stop saved with no code, which
             # classifies ``unknown`` exactly as it did before.
             kwargs["stop_code"] = ""
-        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol not in (
+            _PRE_AUTO_RECOVERY_PROTOCOL,
+            _PREVIOUS_PROTOCOL,
+            __protocol_version__,
+        ):
             # Before protocol 17 (#433): over the migrations above, so a FIX
             # context of any older label gains both keys.
             kwargs.update(_partial_fix_migration(kwargs))
-        if raw_protocol != __protocol_version__:
+        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
             # Before protocol 18 (#434): no recovery decision was taken, so
             # every step's allowance is unspent.
             kwargs["auto_recovery"] = {}
+        if raw_protocol != __protocol_version__:
+            # Before protocol 19 (#479): no reply was kept; an older controller
+            # held one in memory only.
+            kwargs["delivered_reply"] = {}
         if legacy:
             attempt = data.get("attempt", 0)
             if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt >= 1:
@@ -1403,13 +1472,14 @@ class AutoForgeState:
                 )
         # ADR 0009 D8's step 3, after every per-protocol rule above: LOCAL's
         # twelve fields leave a file labelled 12 or older, or refuse it. A
-        # protocol-13, -14, -15, -16, -17 or -18 file is not asked: one that
-        # carries any of them is refused by the unknown-field check below.
+        # protocol-13, -14, -15, -16, -17, -18 or -19 file is not asked: one
+        # that carries any of them is refused by the unknown-field check below.
         if raw_protocol not in (
             _PRE_TAKEOVER_PROTOCOL,
             _PRE_PR_BODY_PROTOCOL,
             _PRE_STOP_CODE_PROTOCOL,
             _PRE_PARTIAL_FIX_PROTOCOL,
+            _PRE_AUTO_RECOVERY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1507,6 +1577,7 @@ class AutoForgeState:
         _validate_stop_code(state)
         _validate_partial_fix(state)
         _validate_auto_recovery(state)
+        _validate_delivered_reply(state)
         _validate_operator_state(state)
         _validate_config_fingerprint(state)
         _validate_sandbox_pin(state)
@@ -1724,6 +1795,21 @@ class AutoForgeState:
             self.drop_phase_effects()
         elif self.attempt == 0:
             self.launch_label = LABEL_NONE
+
+    def settle_delivered_reply(self) -> None:
+        """#479 at every save: a kept reply belongs to the launch that delivered it.
+
+        A save in another phase (the transition out of it, ``BLOCKED`` and
+        ``FAILED`` included: ``unblock`` launches afresh) or after another
+        launch (a new attempt, or the reset of a transition) drops it.
+        """
+        kept = self.delivered_reply
+        if (
+            isinstance(kept, dict)
+            and kept
+            and (kept.get("phase"), kept.get("attempt")) != (self.phase.value, self.attempt)
+        ):
+            self.delivered_reply = {}
 
     def settle_validation_failure(self) -> None:
         """ADR 0006 D5.2 at every save: a producer's failure counter is its phase's.
@@ -2097,6 +2183,46 @@ def _refuse_auto_recovery_state(data: dict, protocol: str) -> None:
             "'auto_recovery'; refusing to load a file that carries the protocol-18 "
             "automatic-recovery journal -- it is a hand edit or a foreign file, not an older "
             "controller's state"
+        )
+
+
+def _refuse_delivered_reply(data: dict, protocol: str) -> None:
+    """A file labelled before protocol 19 never wrote the delivered reply (#479).
+
+    The label decides, not the value: an older file that carries the field at
+    all, even ``{}``, was not written by the controller its label names.
+    """
+    if "delivered_reply" in data:
+        raise StateError(
+            f"state file is labelled protocol_version {protocol!r}, which never wrote "
+            "'delivered_reply'; refusing to load a file that carries the protocol-19 "
+            "delivered reply -- it is a hand edit or a foreign file, not an older "
+            "controller's state"
+        )
+
+
+def _validate_delivered_reply(state: AutoForgeState) -> None:
+    """``delivered_reply`` (#479): its whole shape, bound to the state's phase entry.
+
+    Every save drops a kept reply whose phase or attempt is no longer the
+    state's (:meth:`AutoForgeState.settle_delivered_reply`), so one that
+    names another phase, attempt or launch label is a hand edit or a foreign
+    file, and is refused rather than re-checked as this entry's.
+    """
+    if not state.delivered_reply:
+        if not isinstance(state.delivered_reply, dict):
+            raise StateError("state field 'delivered_reply' is not an object")
+        return
+    kept = KeptReply.from_dict(state.delivered_reply)
+    if (kept.phase, kept.attempt, kept.launch_label) != (
+        state.phase.value,
+        state.attempt,
+        state.launch_label,
+    ):
+        raise StateError(
+            "state field 'delivered_reply' is bound to "
+            f"{kept.phase} attempt {kept.attempt} ({kept.launch_label}), not to the state's "
+            f"{state.phase.value} attempt {state.attempt} ({state.launch_label or 'no launch'})"
         )
 
 

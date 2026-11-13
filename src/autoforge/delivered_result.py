@@ -35,9 +35,15 @@ whether a reply goes to the controller's checks at all.
 - *Accepted controller result*: never decided here. A reply this rule lets
   through goes to exactly the checks a reply of a clean exit goes to (the
   strict import or the verified export, the parse, the phase's own checks of
-  the candidate's identity, the worktree's HEAD and the bound PR), and only
-  their passing accepts it. Their refusal is final for that launch: nothing
-  corrects a reply whose launch failed, and the failure stands.
+  the candidate's identity, the worktree's HEAD and the bound PR). Their
+  refusal is final for that launch: nothing corrects a reply whose launch
+  failed, and the failure stands. Their passing makes it *provisional*, no
+  more (R1-F4 of PR #481): it is kept in the run's state with its binding
+  (:class:`KeptReply`, saved before the step goes on from it, so a crash or
+  a restart re-checks it rather than run the agent again, R1-F1), and it is
+  *accepted* only once the step's own checks after it (the operator's
+  checkout unmoved, the PR still the run's, the phase's verification) have
+  applied it as the step's result (:func:`settled_record`).
 
 **The rule** (:func:`refusal`) reads typed facts only and refuses, first
 match wins: a request of the agent's for a human decision; a failure the
@@ -51,18 +57,25 @@ cut. Anything not proven is refused, and a refusal keeps the failure as the
 step's outcome, which the recovery rule (ADR 0012 D11) then decides on as
 before: a launch whose output held a complete block is never relaunched.
 
-Pure: no process, no file, no clock, no GitHub, no state. The engine
-gathers the facts, runs the checks and records the outcome
-(``execution.json``'s ``delivered_result``).
+Pure: no process, no file, no clock, no GitHub, no state write. The engine
+gathers the facts, runs the checks, keeps the reply in the state and records
+the outcome (``execution.json``'s ``delivered_result``, provisional or
+refused; the step's ``<PHASE>-delivered-result`` record, accepted or not).
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 
-from .result_parser import BlockShape
+from .errors import StateError
+from .result_parser import BEGIN, END, MAX_CONTROL_RESULT_CHARS, BlockShape
+from .runlog import STEP_DIR_RE
+from .transitions import AGENT_PHASES
 
 #: The limits after whose kill a delivered reply may still be taken: the
 #: executor's own idle limit and maximum runtime (``executor.LIMIT_IDLE``,
@@ -210,14 +223,52 @@ def refusal(facts: EndFacts) -> Refusal | None:
     return None
 
 
+#: ``execution.json``'s outcome for a reply that passed the checks of a clean
+#: exit's reply: kept, and decided on by the step's own checks after it.
+PROVISIONAL = "provisional"
+#: ``execution.json``'s outcome for a reply the rule or the checks refused.
+REFUSED = "refused"
+#: The step's own record (``<PHASE>-delivered-result``): the step applied the
+#: reply as its result, or stopped before it did.
+ACCEPTED = "accepted"
+NOT_ACCEPTED = "not-accepted"
+
+
 def outcome_record(facts: EndFacts, refused: Refusal | None) -> dict[str, object]:
-    """``execution.json``'s ``delivered_result``: the outcome, the reason, the facts."""
+    """``execution.json``'s ``delivered_result``: the outcome, the reason, the facts.
+
+    A reply the checks of a clean exit's reply let through is
+    :data:`PROVISIONAL`, never accepted: the step's own checks after it
+    decide, in :func:`settled_record` (R1-F4 of PR #481).
+    """
     record: dict[str, object] = {
-        "outcome": "accepted" if refused is None else "refused",
+        "outcome": PROVISIONAL if refused is None else REFUSED,
         **facts.record(),
     }
     if refused is not None:
         record["reason"] = refused.value
+    return record
+
+
+def settled_record(
+    facts: EndFacts, *, accepted: bool, reason: str, launch_log: str, kept_across_restart: bool
+) -> dict[str, object]:
+    """The step's record of what became of a provisional reply (R1-F4 of PR #481).
+
+    Written once the step has its outcome: :data:`ACCEPTED` when the step
+    applied the reply as its result (its checks after the reply passed: the
+    operator's checkout unmoved, the PR still the run's, the phase's
+    verification), :data:`NOT_ACCEPTED` with the stop's typed ``reason``
+    otherwise. Typed values only.
+    """
+    record: dict[str, object] = {
+        "outcome": ACCEPTED if accepted else NOT_ACCEPTED,
+        **facts.record(),
+        "launch_step": launch_log,
+        "kept_across_restart": kept_across_restart,
+    }
+    if not accepted:
+        record["reason"] = reason
     return record
 
 
@@ -227,20 +278,207 @@ def outcome_record(facts: EndFacts, refused: Refusal | None) -> dict[str, object
 SILENT_REFUSALS = frozenset({Refusal.INTERACTION, Refusal.PROVIDER_FAILURE})
 
 
-def outcome_text(facts: EndFacts, refused: Refusal | None) -> str:
-    """One sentence for the operator: how the launch ended and what became of its output."""
-    end = (
+def _end_text(facts: EndFacts) -> str:
+    return (
         f"was killed at its {facts.limit or 'unnamed'} limit"
         if facts.process_end is ProcessEnd.KILLED
         else "exited with a failing status"
     )
-    if refused is None:
-        return (
-            f"The agent {end} after delivering its complete final reply; the teardown left no "
-            "process behind, and the reply passed every check a reply of a clean exit "
-            "passes, so it was accepted and the step was not run again (#479)."
-        )
+
+
+def outcome_text(facts: EndFacts, refused: Refusal) -> str:
+    """One sentence for the operator: how the launch ended, and why its output was refused."""
     return (
-        f"The agent {end}; its output was not accepted as the step's result "
+        f"The agent {_end_text(facts)}; its output was not accepted as the step's result "
         f"({refused.value}: {REFUSAL_TEXT[refused]})."
     )
+
+
+def settled_text(facts: EndFacts, *, accepted: bool, kept_across_restart: bool) -> str:
+    """One sentence for the operator once the step has its outcome (R1-F4 of PR #481).
+
+    Acceptance is claimed only for a reply the step applied as its result;
+    a step that stopped before it did says so, and its own message follows.
+    """
+    kept = (
+        ", kept in the run's state across an interruption and checked again"
+        if kept_across_restart
+        else ""
+    )
+    head = (
+        f"The agent {_end_text(facts)} after delivering its complete final reply; the "
+        f"teardown left no process behind, and the reply passed the checks of a clean exit's "
+        f"reply{kept}"
+    )
+    if accepted:
+        return (
+            f"{head}, then the step's own checks, and the step applied it as its result: it "
+            "was accepted and the agent was not run again (#479)."
+        )
+    return (
+        f"{head}, so the step went on from it without running the agent again; the step "
+        "stopped before applying it, so it was not accepted (#479). What stopped it follows."
+    )
+
+
+# -- the kept reply (R1-F1 of PR #481) ----------------------------------------------
+
+_KEPT_KEYS = (
+    "phase",
+    "attempt",
+    "launch_label",
+    "issue_url",
+    "pr_url",
+    "review_round",
+    "candidate",
+    "process_end",
+    "limit",
+    "run_log",
+    "payload",
+    "payload_sha256",
+)
+_SHA_RE = re.compile(r"[0-9a-f]{40}")
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+_MAX_TEXT_CHARS = 512
+
+
+def payload_text(payload: Mapping[str, object]) -> str:
+    """The canonical JSON of a kept payload: what its digest and its bound are over."""
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def payload_digest(payload: Mapping[str, object]) -> str:
+    """SHA-256 of :func:`payload_text`; a lone surrogate (legal in JSON) is kept as is."""
+    return hashlib.sha256(payload_text(payload).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def payload_block(payload: Mapping[str, object]) -> str:
+    """The payload as the one block a reply holds, for the parser to read again."""
+    return f"{BEGIN}\n{payload_text(payload)}\n{END}"
+
+
+def _fail(message: str) -> StateError:
+    return StateError(f"state field 'delivered_reply': {message}")
+
+
+def _text(raw: Mapping[str, object], key: str) -> str:
+    value = raw[key]
+    if not isinstance(value, str) or len(value) > _MAX_TEXT_CHARS:
+        raise _fail(f"{key!r} is not a string of at most {_MAX_TEXT_CHARS} characters")
+    return value
+
+
+def _count(raw: Mapping[str, object], key: str, low: int) -> int:
+    value = raw[key]
+    if not isinstance(value, int) or isinstance(value, bool) or value < low:
+        raise _fail(f"{key!r} is not an integer of at least {low}")
+    return value
+
+
+@dataclass(frozen=True)
+class KeptReply:
+    """A provisional reply, kept in the run's state with its binding (R1-F1 of PR #481).
+
+    Saved in the one write after the checks of a clean exit's reply let it
+    through and before the step goes on from it, so a crash or a restart
+    before the step concludes checks it again rather than run the agent
+    again. It is bound to the launch that delivered it (the phase, the
+    attempt, the launch label, the issue, the PR and the review round as
+    they stood) and to the candidate those checks read; a later save in
+    another phase, or after another launch, drops it
+    (:meth:`autoforge.state.AutoForgeState.settle_delivered_reply`), and the
+    step drops it when its own checks refuse the reply. The payload is the
+    validated ``CONTROL_RESULT`` object, redacted as every agent text the
+    engine persists is (the parser refuses a credential in a field the
+    controller publishes, so redaction changes nothing it acts on), bounded
+    by the parser's bound on a block, and bound by its digest.
+    """
+
+    phase: str
+    attempt: int
+    launch_label: str
+    issue_url: str
+    pr_url: str
+    review_round: int
+    #: The commit the checks read as the reply's candidate (the worktree's
+    #: HEAD the reply names), or the HEAD a review was bound to; ``""`` for a
+    #: phase that has none.
+    candidate: str
+    process_end: ProcessEnd
+    limit: str
+    #: The launch's step directory in the run log (``NNN-<phase>-<attempt>``).
+    run_log: str
+    payload: dict = field(default_factory=dict)
+
+    def facts(self) -> EndFacts:
+        """The facts the rule let the reply through on, as the note and the record read them."""
+        return EndFacts(
+            process_end=self.process_end,
+            limit=self.limit,
+            reply_delivered=True,
+            blocks=BlockShape.ONE,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "phase": self.phase,
+            "attempt": self.attempt,
+            "launch_label": self.launch_label,
+            "issue_url": self.issue_url,
+            "pr_url": self.pr_url,
+            "review_round": self.review_round,
+            "candidate": self.candidate,
+            "process_end": self.process_end.value,
+            "limit": self.limit,
+            "run_log": self.run_log,
+            "payload": self.payload,
+            "payload_sha256": payload_digest(self.payload),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: object) -> KeptReply:
+        """The kept reply's whole shape, strictly: a field missing, extra or wrong refuses."""
+        if not isinstance(raw, dict) or set(raw) != set(_KEPT_KEYS):
+            raise _fail(f"does not hold exactly {', '.join(_KEPT_KEYS)}")
+        phase = _text(raw, "phase")
+        if phase not in {p.value for p in AGENT_PHASES}:
+            raise _fail(f"phase {phase!r} is not an agent phase")
+        launch_label = _text(raw, "launch_label")
+        if not launch_label:
+            raise _fail("'launch_label' is empty")
+        candidate = _text(raw, "candidate")
+        if candidate and not _SHA_RE.fullmatch(candidate):
+            raise _fail("'candidate' is not a full lowercase commit SHA")
+        try:
+            process_end = ProcessEnd(raw["process_end"])
+        except ValueError:
+            raise _fail(f"'process_end' {raw['process_end']!r} is not one") from None
+        limit = _text(raw, "limit")
+        if (limit in ACCEPTABLE_LIMITS) is not (process_end is ProcessEnd.KILLED):
+            raise _fail("'limit' is not the idle limit or the maximum runtime of a kill")
+        run_log = _text(raw, "run_log")
+        if not STEP_DIR_RE.match(run_log):
+            raise _fail("'run_log' is not a step directory's name")
+        payload = raw["payload"]
+        if not isinstance(payload, dict) or payload.get("phase") != phase:
+            raise _fail("'payload' is not a CONTROL_RESULT object of its phase")
+        if len(payload_text(payload)) > MAX_CONTROL_RESULT_CHARS:
+            raise _fail(f"'payload' is longer than {MAX_CONTROL_RESULT_CHARS} characters")
+        digest = raw["payload_sha256"]
+        if not isinstance(digest, str) or not _DIGEST_RE.fullmatch(digest):
+            raise _fail("'payload_sha256' is not a SHA-256 digest")
+        if digest != payload_digest(payload):
+            raise _fail("'payload_sha256' is not the digest of its payload")
+        return cls(
+            phase=phase,
+            attempt=_count(raw, "attempt", 1),
+            launch_label=launch_label,
+            issue_url=_text(raw, "issue_url"),
+            pr_url=_text(raw, "pr_url"),
+            review_round=_count(raw, "review_round", 0),
+            candidate=candidate,
+            process_end=process_end,
+            limit=limit,
+            run_log=run_log,
+            payload=payload,
+        )

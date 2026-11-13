@@ -1887,7 +1887,20 @@ a stated reason it has none. The coverage that must keep working:
   different blocks, a quoted schema, `1` against `true` and `1.0`); and the
   engine through provider-neutral fixtures: a reply accepted after an idle
   kill, a runtime kill and a failing exit, the PR opened once, nothing
-  relaunched or decided and `execution.json` saying `accepted`; a clean exit
+  relaunched or decided, `execution.json` saying `provisional` and the
+  step's `<PHASE>-delivered-result` record `accepted`, with no reply left
+  kept; the kept reply (R1-F1 of PR #481): a crash after the reply was kept
+  and logged and before the phase's first save, the state holding the reply
+  and its binding, the next process going on from it with no agent and one
+  PR (and, for REVIEW, one comment), a candidate that moved before the
+  restart and a binding that no longer matches stopping in `BLOCKED` with
+  nothing launched or published, GitHub unavailable while verifying leaving
+  the reply kept for `resume`, a new launch or another phase dropping it,
+  and the shape and binding the loader refuses; acceptance only after the
+  step's own checks (R1-F4): a checkout moved after the parse, a
+  verification stop before planning and a producer gate refusal below its
+  bound each leaving the reply not accepted, the message claiming no
+  acceptance and the last relaunching afresh; a clean exit
   recording nothing; a reply refused for each missing fact and by the
   checks a clean exit's reply meets (malformed, another phase, another
   issue, a HEAD that moved after the reply), never corrected or relaunched
@@ -1910,7 +1923,11 @@ a stated reason it has none. The coverage that must keep working:
   bound, leaves it unproven), anything but the text's response after
   `agent_settled` (a later turn, a second settle, an unknown event, a
   notification, a stray response, a fragment, an oversize record) leaving it
-  unproven without failing the run (R1-F3 of PR #481)
+  unproven without failing the run (R1-F3 of PR #481); protocol 18 -> 19 in `tests/test_state.py` (a protocol-18
+  file loads in every phase with no kept reply and is relabelled 19, an older
+  label carrying `delivered_reply` is refused unchanged, a protocol-19 file
+  missing it or holding a malformed one is refused); a keeping save that fails
+  still recording the launch and leaving nothing kept (R1-F1 of PR #481)
 - the `UPDATE_EPIC` progress comment across every crash window of the
   effect lifecycle (`test_k8_*` in `tests/test_engine.py`), the one-shot
   legacy re-entry (D13.7) including a crash after its adoption was saved,
