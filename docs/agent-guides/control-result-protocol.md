@@ -111,7 +111,12 @@ Claude `stream-json` vouches for a reply only when no line of its stream was
 skipped past the per-line bound (R3-F1), and only when every tool call the
 stream started was tracked to its end: one without a string id, sharing the
 id of a call still open, past the reducer's bound, or in content it cannot
-read voids the proof (R4-F1). A clean exit's reply is read exactly as before.
+read voids the proof (R4-F1). Pi's RPC vouches for one only when every tool
+execution it started was ended by its call id: a start without one, past the
+reducer's bound, or sharing the id of an execution still open voids the proof
+(R5-F1). A clean exit's reply is read exactly as before. A kept reply whose
+end is not a kill at the idle limit or the maximum runtime, or a failing exit
+with no limit, is refused on load (R5-F2).
 
 ### What an agent is told about work still running (#440)
 

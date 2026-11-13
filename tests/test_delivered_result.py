@@ -851,7 +851,11 @@ def test_a_new_launch_and_a_phase_change_drop_a_kept_reply(tmp_state_dir, fake_g
         {"attempt": 0},
         {"candidate": "A" * 40},
         {"process_end": "killed", "limit": ""},
+        {"process_end": "killed", "limit": "loop"},
         {"process_end": "failed-exit", "limit": "idle"},
+        {"process_end": "failed-exit", "limit": "max_runtime"},
+        {"process_end": "failed-exit", "limit": "loop"},
+        {"process_end": "failed-exit", "limit": "unknown"},
         {"run_log": "../escape"},
         {"payload": {"phase": "REVIEW", "status": "success"}},
         {"extra": 1},
@@ -867,7 +871,11 @@ def test_a_new_launch_and_a_phase_change_drop_a_kept_reply(tmp_state_dir, fake_g
         "no-attempt",
         "uppercase-sha",
         "kill-without-limit",
-        "exit-with-limit",
+        "kill-at-the-loop-limit",
+        "exit-with-the-idle-limit",
+        "exit-with-the-runtime-limit",
+        "exit-with-the-loop-limit",
+        "exit-with-an-unknown-limit",
         "run-log",
         "payload-of-another-phase",
         "extra-key",
@@ -930,6 +938,71 @@ def test_a_state_file_keeping_a_reply_of_another_launch_is_refused(tmp_state_dir
     eng.paths.state_file.write_text(json.dumps(raw))
     with pytest.raises(StateError, match="is bound to ANALYZE_EXECUTE attempt 1"):
         load_state(eng.paths.state_file)
+
+
+def _keeping(eng, process_end: str, limit: str) -> bytes:
+    """The state file of ``eng`` keeping a reply of its own launch whose end
+    reads ``process_end`` and ``limit``, as a hand edit could leave it."""
+    eng.save()
+    raw = json.loads(eng.paths.state_file.read_text())
+    raw["attempt"], raw["launch_label"] = 1, "controller_publishes"
+    kept = KeptReply(
+        phase="ANALYZE_EXECUTE",
+        attempt=1,
+        launch_label="controller_publishes",
+        issue_url=ISSUE,
+        pr_url="",
+        review_round=0,
+        candidate="",
+        head_sha="",
+        base_ref="",
+        merge_base_sha="",
+        process_end=ProcessEnd.KILLED,
+        limit="idle",
+        run_log="001-analyze_execute-1",
+        payload=analyze_payload("a" * 40),
+    ).to_dict()
+    raw["delivered_reply"] = {**kept, "process_end": process_end, "limit": limit}
+    eng.paths.state_file.write_text(json.dumps(raw))
+    return eng.paths.state_file.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("process_end", "limit", "needle"),
+    [
+        ("failed-exit", "loop", "'limit' of a failing exit is not empty"),
+        ("failed-exit", "unknown", "'limit' of a failing exit is not empty"),
+        ("failed-exit", "idle", "'limit' of a failing exit is not empty"),
+        ("killed", "loop", "'limit' of a kill is not the idle limit or the maximum runtime"),
+        ("killed", "", "'limit' of a kill is not the idle limit or the maximum runtime"),
+    ],
+    ids=["exit-loop", "exit-unknown", "exit-idle", "kill-loop", "kill-unnamed"],
+)
+def test_a_state_file_keeping_a_reply_of_an_impossible_end_is_refused_unchanged(
+    tmp_state_dir, fake_github, process_end, limit, needle
+):
+    """R5-F2 of PR #481: a reply is kept only after a kill at the idle limit or
+    the maximum runtime, or after a failing exit with no limit. Any other pair
+    is a file no step wrote: refused, and the file left as it was."""
+    eng, _ = _analyzing(tmp_state_dir, fake_github)
+    before = _keeping(eng, process_end, limit)
+    with pytest.raises(StateError, match="state field 'delivered_reply'") as caught:
+        load_state(eng.paths.state_file)
+    assert needle in str(caught.value)
+    assert eng.paths.state_file.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("process_end", "limit"),
+    [("failed-exit", ""), ("killed", "idle"), ("killed", "max_runtime")],
+)
+def test_a_state_file_keeping_a_reply_of_a_possible_end_still_loads(
+    tmp_state_dir, fake_github, process_end, limit
+):
+    eng, _ = _analyzing(tmp_state_dir, fake_github)
+    _keeping(eng, process_end, limit)
+    kept = KeptReply.from_dict(load_state(eng.paths.state_file).delivered_reply)
+    assert (kept.process_end, kept.limit) == (ProcessEnd(process_end), limit)
 
 
 # -- acceptance only after the step's own checks (R1-F4 of PR #481) -----------------
@@ -1888,6 +1961,70 @@ def test_a_pi_reply_with_a_tool_execution_left_open_is_never_accepted(
     assert fake_github.effect_writes == [] or all(
         w[0] == "create_issue_comment" for w in fake_github.effect_writes
     )
+
+
+#: Two tool executions Pi reports under one call id still open, a ``bash`` and
+#: an ``edit``, and the end of the ``bash`` only (R5-F1 of PR #481).
+_SHARED_ID = [
+    {"type": "tool_execution_start", "toolCallId": "dup", "toolName": "bash", "args": {}},
+    {"type": "tool_execution_start", "toolCallId": "dup", "toolName": "edit", "args": {}},
+    {"type": "tool_execution_end", "toolCallId": "dup", "toolName": "bash", "isError": False},
+]
+
+
+@pytest.mark.parametrize(
+    ("ending", "error"),
+    [({"close_exit": 7}, ExecutionError), ({"linger": 60}, ExecutionTimeoutError)],
+    ids=["exit", "idle-kill"],
+)
+def test_a_pi_reply_after_a_start_reusing_an_open_id_is_never_accepted(
+    tmp_path_factory, tmp_state_dir, fake_github, ending, error
+):
+    """R5-F1 of PR #481, adapter to engine: Pi starts a ``bash`` and an
+    ``edit`` under one call id, ends one of them, settles with a valid result
+    and ends badly. A single end cannot show both executions ended, so the
+    adapter vouches for no reply: the failure stands, nothing is kept or
+    published, and no relaunch goes over the block in the output."""
+    from tests.pi_fake import PiTurn
+
+    eng, fake = _pi_engine(
+        tmp_path_factory,
+        tmp_state_dir,
+        fake_github,
+        PiTurn(tool_events=_SHARED_ID, **ending),
+        idle_timeout_seconds=2,
+    )
+    with pytest.raises(error) as caught:
+        eng.run(max_steps=5)
+    assert "(no-reply: " in str(caught.value)
+    assert len(fake.launches()) == 1
+    (result,) = eng.pi.results
+    assert result.stdout and not result.reply_delivered
+    assert result.provider_summary["tool_executions"] == 2
+    assert result.provider_summary["open_tool_executions"] == 1
+    assert _execution(eng)["delivered_result"]["reason"] == "no-reply"
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.ANALYZE_EXECUTE and state.current_pr_url in ("", None)
+    assert state.delivered_reply == {}
+    assert all(w[0] == "create_issue_comment" for w in fake_github.effect_writes)
+
+
+def test_a_pi_that_exits_cleanly_after_a_start_reusing_an_open_id_keeps_its_reply_as_before(
+    tmp_path_factory, tmp_state_dir, fake_github
+):
+    """R5-F1 of PR #481: the proof is read only for a launch that ended
+    badly, so a Pi that exits 0 after the same records is read as before."""
+    from tests.pi_fake import PiTurn
+
+    eng, _ = _pi_engine(
+        tmp_path_factory, tmp_state_dir, fake_github, PiTurn(tool_events=_SHARED_ID)
+    )
+    (outcome,) = eng.run(max_steps=1)
+    assert outcome.next_phase == "REVIEW", outcome.message
+    (result,) = eng.pi.results
+    assert not result.reply_delivered and not result.failed_exit and result.provider_failure is None
+    assert result.provider_summary["open_tool_executions"] == 1
+    assert "delivered_result" not in _execution(eng)
 
 
 #: A later turn Pi opens while it shuts down: it starts a write-capable tool.

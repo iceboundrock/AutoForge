@@ -828,7 +828,9 @@ may have opened a later turn or a tool call, or failed the run, R3-F1 of PR
 its calls, are calls no `tool_result` can be shown to end, so each voids the
 proof for good, R4-F1 of PR #481) and by Pi (its
 conversation settled and its last assistant text read back, before any limit
-cut it short, with every tool execution it started ended by its call id and
+cut it short, with every tool execution it started ended by its call id (a
+start sharing the id of an execution still open is one no end can be shown to
+close, so it voids the proof for good, R5-F1 of PR #481) and
 nothing but that text's response on stdout after `agent_settled`, read
 through Pi's shutdown to the end of stdout or the kill that ended it, a
 record of unknown kind included: `PiConversation.reply_settled`, R1-F3 and
@@ -889,8 +891,12 @@ publishes, so redaction changes nothing it acts on), its digest, and its
 binding: the phase, attempt and launch label of the launch that delivered
 it, the issue, the PR, the review round, the candidate the checks read, the
 revision the run was bound to (the PR's HEAD, base and merge base: the diff a
-review decides on, R2-F1), how the launch ended and its run log step. Before
-that save the operator's checkout is checked against the anchor of the
+review decides on, R2-F1), how the launch ended and its run log step. How it
+ended is one of the two ends D12 lets a reply through after: a kill at the
+idle limit or the maximum runtime, or a failing exit, which names no limit;
+a state file holding any other pair (a failing exit naming a limit, a kill at
+another limit or at none) is refused on load, unchanged (R5-F2 of PR #481).
+Before that save the operator's checkout is checked against the anchor of the
 invocation that delivered the reply (R2-F2): the anchor lives in memory only
 and a restart reads one of its own, so a move found only later would go
 unseen by a restart that goes on from the kept reply; a move found there
@@ -1000,8 +1006,9 @@ it cannot read; R4-F1 of PR #481): a clean exit and #439's stop on a reply read 
 shutdown then hangs past a limit or exits badly, and for none its limit cut
 short, none with a tool execution left open, and none after which Pi wrote
 anything but the text's response, a later turn in its shutdown included (a
-start without a call id, or past the reducer's bound, can never be shown
-ended, so it refuses too), and so does a record after the run settled whose
+start without a call id, past the reducer's bound, or sharing the id of an
+execution still open, can never be shown ended, so it refuses too, R5-F1 of
+PR #481), and so does a record after the run settled whose
 kind cannot be known: not UTF-8, not JSON, or not an object with a string
 `type` (R2-F3 of PR #481); OpenCode and Claude's `text` output vouch for none, so a block they
 printed before a kill is refused (`no-reply`) and stays the operator's
@@ -1018,6 +1025,8 @@ printed before a kill is refused (`no-reply`) and stays the operator's
 `test_a_pi_that_hangs_on_shutdown_after_a_settled_run_has_its_reply_accepted`,
 `test_a_pi_that_exits_badly_after_a_settled_run_has_its_reply_accepted`,
 `test_a_pi_reply_with_a_tool_execution_left_open_is_never_accepted`,
+`test_a_pi_reply_after_a_start_reusing_an_open_id_is_never_accepted`,
+`test_a_pi_that_exits_cleanly_after_a_start_reusing_an_open_id_keeps_its_reply_as_before`,
 `test_a_pi_reply_overtaken_by_a_later_turn_in_its_shutdown_is_never_accepted`,
 `test_a_pi_reply_followed_by_an_unreadable_shutdown_record_is_never_accepted`,
 `test_opencode_types_no_reply_so_a_block_before_its_kill_is_never_accepted`).

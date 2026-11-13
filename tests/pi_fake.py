@@ -130,6 +130,10 @@ def agent_end(message):
 
 
 def settle(message):
+    # Tool execution records Pi reports before the run settles, as given:
+    # two starts sharing a call id, say (R5-F1 of PR #481).
+    for record in turn["tool_events"]:
+        emit(record)
     if turn["open_call"]:
         # A tool execution Pi reports started and never ended (#479).
         emit({"type": "tool_execution_start", "toolCallId": turn["open_call"],
@@ -220,7 +224,8 @@ class PiTurn:
     sleeps ``linger`` seconds and exits ``close_exit``: a Pi whose shutdown
     hangs past a limit, or that exits with a failing status after a settled
     run (#479). ``open_call`` reports a tool
-    execution of that call id started before the run settles and never ended.
+    execution of that call id started before the run settles and never ended;
+    ``tool_events`` are tool execution records written, as given, before it.
     """
 
     text: str = ""
@@ -237,6 +242,7 @@ class PiTurn:
     close_exit: int = 0
     shutdown: list[dict | str] = field(default_factory=list)
     open_call: str = ""
+    tool_events: list[dict] = field(default_factory=list)
 
 
 class PiFake:

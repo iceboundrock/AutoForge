@@ -537,8 +537,15 @@ class KeptReply:
         except ValueError:
             raise _fail(f"'process_end' {raw['process_end']!r} is not one") from None
         limit = _text(raw, "limit")
-        if (limit in ACCEPTABLE_LIMITS) is not (process_end is ProcessEnd.KILLED):
-            raise _fail("'limit' is not the idle limit or the maximum runtime of a kill")
+        # The pair, each end on its own (R5-F2 of PR #481): a reply is kept
+        # only after a kill at the idle limit or the maximum runtime, or after
+        # a failing exit, which no limit ended. Any other limit, named or not,
+        # is a pair no step ever kept.
+        if process_end is ProcessEnd.KILLED:
+            if limit not in ACCEPTABLE_LIMITS:
+                raise _fail("'limit' of a kill is not the idle limit or the maximum runtime")
+        elif limit:
+            raise _fail("'limit' of a failing exit is not empty")
         run_log = _text(raw, "run_log")
         if not STEP_DIR_RE.match(run_log):
             raise _fail("'run_log' is not a step directory's name")

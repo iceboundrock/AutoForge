@@ -632,6 +632,38 @@ def test_the_open_tools_are_tracked_without_a_loop_detector_and_past_its_bound(m
     assert not run.c.reply_settled, "a start past the bound can never be shown ended"
 
 
+@pytest.mark.parametrize("ends", [1, 2, 3])
+def test_a_start_reusing_the_id_of_an_execution_still_open_voids_the_proof_for_good(ends):
+    """R5-F1 of PR #481: a ``bash`` and an ``edit`` start sharing an id still
+    open are two executions a single end would close together. The second is
+    never tracked, so no end naming the id, the first or any later one, shows
+    both ended. Never a failure: the text is read back as before."""
+    run = _settled_run()
+    run.feed({"type": "tool_execution_start", "toolCallId": "dup", "toolName": "bash"})
+    run.feed({"type": "tool_execution_start", "toolCallId": "dup", "toolName": "edit"})
+    assert run.c.summary()["open_tool_executions"] == 2
+    for _ in range(ends):
+        run.feed({"type": "tool_execution_end", "toolCallId": "dup", "toolName": "bash"})
+    run.settle().respond("get_last_assistant_text", {"text": FINAL})
+    assert run.c.text == FINAL and run.c.failure is None
+    assert not run.c.reply_settled
+    assert run.c.summary()["open_tool_executions"] == 1
+    assert run.c.summary()["tool_executions"] == 2
+
+
+def test_an_id_reused_after_its_execution_ended_is_tracked_as_a_new_one():
+    """Only a start reusing the id of an execution *still open* is untracked:
+    an id Pi reuses once its execution ended names a new one, matched to its
+    own end, and the reply stays proven."""
+    run = _settled_run()
+    for name in ("bash", "edit"):
+        run.feed({"type": "tool_execution_start", "toolCallId": "t1", "toolName": name})
+        run.feed({"type": "tool_execution_end", "toolCallId": "t1", "toolName": name})
+    run.settle().respond("get_last_assistant_text", {"text": FINAL})
+    assert run.c.text == FINAL and run.c.reply_settled
+    assert run.c.summary()["open_tool_executions"] == 0
+
+
 @pytest.mark.parametrize(
     "later",
     [

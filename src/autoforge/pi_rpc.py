@@ -38,15 +38,17 @@ The conversation, in order (ADR 0003 §2.1 to §2.8):
 The reply's proof (#479, R1-F3 of PR #481): :attr:`PiConversation.reply_settled`
 says the final text was read back from a run that settled with every tool
 execution it started ended (each ``tool_execution_start`` matched by its
-``toolCallId`` to a ``tool_execution_end``; a start without an id, or past
-:data:`MAX_OPEN_TOOLS`, can never be shown ended), and that nothing but the
-text's own response reached stdout after ``agent_settled``, up to the end of
-the stream the caller feeds (the driver feeds what Pi writes during its
-shutdown too). Anything else (a tool still open, a later turn, an extension
-dialog, a record past the bound, a fragment, or a record that is not UTF-8,
-not JSON or not an object with a string ``type``, whose kind cannot be known:
-R2-F3 of PR #481) leaves it false: once the text was read back it is never a
-failure of the run, only no proof that the reply was Pi's last word.
+``toolCallId`` to a ``tool_execution_end``; a start without an id, one past
+:data:`MAX_OPEN_TOOLS`, or one sharing the id of an execution still open,
+which a single end would close with it, can never be shown ended: R5-F1 of
+PR #481), and that nothing but the text's own response reached stdout after
+``agent_settled``, up to the end of the stream the caller feeds (the driver
+feeds what Pi writes during its shutdown too). Anything else (a tool still
+open, a later turn, an extension dialog, a record past the bound, a fragment,
+or a record that is not UTF-8, not JSON or not an object with a string
+``type``, whose kind cannot be known: R2-F3 of PR #481) leaves it false: once
+the text was read back it is never a failure of the run, only no proof that
+the reply was Pi's last word.
 
 Every string that leaves this module for a log (a failure reason, a summary
 value) is bounded, made encodable, redacted and put on one line here. Raw
@@ -229,7 +231,8 @@ class PiConversation:
         self._open_tools: dict[str, tuple[str, bytes]] = {}
         # #479: every tool execution started and not yet ended, by call id,
         # whatever the loop detector does, and the starts that can never be
-        # shown ended (no string id, or past MAX_OPEN_TOOLS).
+        # shown ended (no string id, past MAX_OPEN_TOOLS, or the id of an
+        # execution still open: R5-F1 of PR #481), a count never lowered.
         self._open_calls: set[str] = set()
         self._untracked_calls = 0
         # #479: records that reached stdout after ``agent_settled`` other than
@@ -755,9 +758,19 @@ class PiConversation:
         return []
 
     def _call_started(self, record: dict) -> None:
-        """#479: a tool execution is open until its end names its call id."""
+        """#479: a tool execution is open until its end names its call id.
+
+        A start that can never be shown ended is counted untracked, for good:
+        one without a string id, one past :data:`MAX_OPEN_TOOLS`, and one
+        sharing the id of an execution still open (R5-F1 of PR #481), since
+        a single end naming that id would close both.
+        """
         call_id = record.get("toolCallId")
-        if isinstance(call_id, str) and len(self._open_calls) < MAX_OPEN_TOOLS:
+        if (
+            isinstance(call_id, str)
+            and call_id not in self._open_calls
+            and len(self._open_calls) < MAX_OPEN_TOOLS
+        ):
             self._open_calls.add(call_id)
         else:
             self._untracked_calls += 1

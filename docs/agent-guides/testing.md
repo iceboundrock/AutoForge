@@ -1946,21 +1946,30 @@ a stated reason it has none. The coverage that must keep working:
   its limit vouching for nothing, Pi with a tool execution left open or a
   later turn written during its shutdown (exiting 7, or killed at the idle
   limit) never vouched for while a clean exit after that turn is read as
-  before, Pi writing a record of unknown kind during its shutdown (no
-  `type`, an array, not JSON, not UTF-8) then exiting 7 never vouched for
+  before, Pi starting a `bash` and an `edit` under one open call id and
+  ending one of them (exiting 7, or killed at the idle limit) never vouched
+  for while a clean exit after them is read as before (R5-F1), Pi writing
+  a record of unknown kind during its shutdown (no `type`, an array, not
+  JSON, not UTF-8) then exiting 7 never vouched for
   while a clean exit after one is read as before (R2-F3), OpenCode's plain
   text never vouched for (`linger`, `close_exit`, `shutdown`, raw shutdown
-  lines and `open_call` in `tests/pi_fake.py`); and Pi's reducer alone
-  (`tests/test_pi_rpc.py`): a reply settled only with every tool execution
-  ended by its call id (an unmatched or id-less start, or one past the
-  bound, leaves it unproven), anything but the text's response after
+  lines, `open_call` and `tool_events` in `tests/pi_fake.py`); and Pi's
+  reducer alone (`tests/test_pi_rpc.py`): a reply settled only with every
+  tool execution ended by its call id (an unmatched or id-less start, one
+  past the bound, or one sharing the id of an execution still open, whatever
+  ends follow, leaves it unproven, while an id reused after its execution
+  ended is a new one, R5-F1), anything but the text's response after
   `agent_settled` (a later turn, a second settle, an unknown event, a
   notification, a stray response, a fragment, an oversize record, and a
   record that is not a typed JSON object, R2-F3) leaving it unproven without
   failing the run once the text was read back (R1-F3 of PR #481); protocol 18 -> 19 in `tests/test_state.py` (a protocol-18
   file loads in every phase with no kept reply and is relabelled 19, an older
   label carrying `delivered_reply` is refused unchanged, a protocol-19 file
-  missing it or holding a malformed one is refused); a keeping save that fails
+  missing it or holding a malformed one is refused); a state file keeping a
+  reply whose end is impossible (a failing exit naming a limit, a kill at
+  another limit or none) refused unchanged while a failing exit with no limit
+  and a kill at the idle limit or the maximum runtime still load (R5-F2, in
+  `tests/test_delivered_result.py`); a keeping save that fails
   still recording the launch and leaving nothing kept (R1-F1 of PR #481)
 - the `UPDATE_EPIC` progress comment across every crash window of the
   effect lifecycle (`test_k8_*` in `tests/test_engine.py`), the one-shot

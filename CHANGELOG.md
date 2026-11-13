@@ -42,6 +42,12 @@ followed to its end: a call without an id, one sharing the id of a call still
 open, one past the reducer's tracking bound, or one in an `assistant` record
 whose content cannot be read can never be shown ended, so it voids the proof
 (the stop on a reply of #439 and a clean exit read such a stream as before).
+Pi's RPC vouches for one only when every tool execution it started was ended
+by its call id: a start sharing the id of an execution still open is two
+executions one end would close, so it voids the proof for good, as a start
+without an id does. A state file keeping a reply whose launch end is not a
+kill at the idle limit or the maximum runtime, or a failing exit with no
+limit, is refused, unchanged.
 
 A reply that falls short is not corrected and not relaunched over, as
 before: the failure stands, with a line saying why the reply was not taken
