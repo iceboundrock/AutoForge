@@ -551,7 +551,8 @@ policy as built (`src/autoforge/auto_recovery.py`, `ControllerEngine.run`).
 the class of the error that ended the step and on the typed facts the
 engine set on it of the agent launch that ended it (`LaunchEnd`, the
 error's `launch_end`): the limit that killed it (`idle`, `max_runtime`,
-`loop`), whether a process it started may still run, whether its output
+`loop`), whether a process it started may still run (or the platform could
+not look for one it left outside its group, `orphans_unchecked`), whether its output
 holds a complete `CONTROL_RESULT` in the part the parser reads, and what its
 adapter typed (a usage limit, a known-transient failure, an exit without
 any result, a failure its provider had established before a limit killed
@@ -589,13 +590,17 @@ after its corrections, a sandbox refusal or clean-up uncertainty, a GitHub
 or git failure (drift and propagation stay stops; the pushed-head wait of
 #403 is in-step and unchanged), a failed verification, effect or claim, and
 anything unknown. An allowlisted failure is still refused when a process the
-launch started may still run, or when its output holds a complete
+launch started may still run, or when the platform could not look for one
+the launch left outside its group (`orphans_unchecked`, no child subreaper:
+the teardown cannot prove that no writer remains, so the refusal is
+`process-may-survive`, R1-F2 of PR #481), or when its output holds a complete
 `CONTROL_RESULT` (#285; the engine accepts that result first where it can
 prove it safe, D12, and a relaunch that would discard one it did not accept is
 not made)
 (`test_only_the_allowlist_is_ever_relaunched`,
 `test_a_result_delivered_before_the_kill_is_never_discarded`,
 `test_a_launch_that_may_have_left_a_process_is_never_relaunched`,
+`test_an_idle_timeout_whose_orphans_could_not_be_looked_for_is_never_relaunched`,
 `test_a_claude_exit_whose_cause_nothing_typed_tells_is_never_relaunched`,
 `test_a_claude_cli_that_died_inside_a_running_session_is_relaunched_once`).
 

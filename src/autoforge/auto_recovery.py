@@ -43,8 +43,9 @@ worker) do that ``resume`` itself, once per step, under a fixed rule:
   the phase-entry reconciliation first (journal, effects, candidate,
   worktree), so a step whose work already landed is completed without an
   agent, and a conflict blocks. A launch that may have left a process
-  running, or whose output holds a complete result (#285), is never
-  relaunched: the engine accepts such a result where it can prove it safe
+  running (a survivor of its teardown, or a platform that could not look for
+  one, ``orphans_unchecked``), or whose output holds a complete result
+  (#285), is never relaunched: the engine accepts such a result where it can prove it safe
   (#479, :mod:`autoforge.delivered_result`), and one it did not accept is
   the operator's.
 - **Journal and dual audit** (D8): every decision, relaunch or refusal, is
@@ -125,6 +126,11 @@ class LaunchEnd:
     timeout_limit: str = ""
     #: A process the launch started may still be running (``may_have_survivor``).
     may_have_survivor: bool = False
+    #: The platform could not look for a process the launch left outside its
+    #: group (``orphans_unchecked``, no child subreaper), so the teardown
+    #: cannot prove that no writer remains (#479, R1-F2 of PR #481). Refused
+    #: as :attr:`may_have_survivor` is: one may still be running.
+    orphans_unchecked: bool = False
     #: Its output holds a complete ``CONTROL_RESULT`` block (#285, #479).
     delivered_result: bool = False
     #: Why the engine did not accept the reply the launch delivered
@@ -172,11 +178,15 @@ class LaunchEnd:
             parts.append(f"failed before the limit '{self.failed_before_limit}'")
         if self.result_less_exit:
             parts.append("no result delivered before the exit")
-        parts.append(
-            "a process it started may still be running"
-            if self.may_have_survivor
-            else "no process it started is left"
-        )
+        if self.may_have_survivor:
+            parts.append("a process it started may still be running")
+        elif self.orphans_unchecked:
+            parts.append(
+                "a process it left outside its group could not be looked for on this "
+                "platform, so one may still be running"
+            )
+        else:
+            parts.append("no process it started is left")
         if self.delivered_result:
             parts.append(
                 "its output holds a complete CONTROL_RESULT"
@@ -362,8 +372,9 @@ REFUSAL_TEXT: Mapping[Refusal, str] = {
         "is configured"
     ),
     Refusal.PROCESS_MAY_SURVIVE: (
-        "a process the failed launch started may still be running, and a relaunch would "
-        "race it in the same worktree"
+        "a process the failed launch started may still be running (its teardown left one, "
+        "or the platform could not look for one), and a relaunch would race it in the same "
+        "worktree"
     ),
     Refusal.RESULT_DELIVERED: (
         "the failed launch's output holds a complete CONTROL_RESULT the controller did not "
@@ -445,7 +456,10 @@ def _refusal(
         return Refusal.NO_WAIT_POLICY if reset else Refusal.NO_TRUSTED_RESET
     if category not in ALLOWLIST or launch is None:
         return Refusal.NOT_ALLOWLISTED
-    if launch.may_have_survivor:
+    if launch.may_have_survivor or launch.orphans_unchecked:
+        # A teardown that cannot prove no writer remains is a possible
+        # survivor (R1-F2 of PR #481): a platform with no child subreaper
+        # never looked for what the launch left outside its group.
         return Refusal.PROCESS_MAY_SURVIVE
     if launch.delivered_result:
         return Refusal.RESULT_DELIVERED

@@ -968,9 +968,11 @@ def _launch_end(
     """The typed facts of a failed agent launch, for the recovery rule (#434).
 
     Each comes from a typed value: the limit the executor or the loop
-    detector recorded, its survivor flags, whether the protocol's framing
-    holds a complete ``CONTROL_RESULT`` in the part of stdout the parser
-    reads (a result delivered before a kill, #285), why the engine did not
+    detector recorded, its survivor flags, whether the platform could look
+    for a process the launch left outside its group (R1-F2 of PR #481),
+    whether the protocol's framing holds a complete ``CONTROL_RESULT`` in the
+    part of stdout the parser reads (a result delivered before a kill,
+    #285), why the engine did not
     accept that result (#479), and the adapter's own fixed findings. No text
     the agent or its CLI printed is read for it.
     """
@@ -979,6 +981,7 @@ def _launch_end(
         kind=kind,
         timeout_limit=result.timeout_limit if result.timed_out else "",
         may_have_survivor=result.may_have_survivor,
+        orphans_unchecked=result.orphans_unchecked,
         delivered_result=delivered,
         delivered_refusal=(
             delivered_refusal.value if delivered and delivered_refusal is not None else ""

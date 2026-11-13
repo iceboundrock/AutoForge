@@ -324,7 +324,7 @@ def _other_issue(req) -> str:
         (implement, {**IDLE, "group_survived_kill": True}, "survivor", "process-may-survive"),
         (implement, {**IDLE, "capture_abandoned": True}, "survivor", "process-may-survive"),
         (implement, {**IDLE, "orphan_survived_kill": True}, "survivor", "process-may-survive"),
-        (implement, {**IDLE, "orphans_unchecked": True}, "orphans-unchecked", "result-delivered"),
+        (implement, {**IDLE, "orphans_unchecked": True}, "orphans-unchecked", "process-may-survive"),
         (implement, {**IDLE, "timeout_limit": "loop"}, "limit", "not-allowlisted"),
         (implement, {**IDLE, "timeout_limit": ""}, "limit", "not-allowlisted"),
         (implement, {**IDLE, "stdout_truncated": True}, "truncated", "result-delivered"),

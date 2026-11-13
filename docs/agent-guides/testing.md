@@ -1835,7 +1835,9 @@ a stated reason it has none. The coverage that must keep working:
   the step charged, the decision journaled, logged and commented on the
   issue or the PR; a second failure of the step refused whatever it is (a
   timeout then a usage limit does not loop); a hard runtime limit, a loop
-  kill, an untyped exit, a launch that may have left a process and a result
+  kill, an untyped exit, a launch that may have left a process (an idle
+  timeout on a platform that could not look for a re-parented process
+  included, R1-F2 of PR #481) and a result
   delivered before the kill never relaunched; the step budget, the
   invocation's `--max-steps` and a stop request refusing; `step` and a dry
   run deciding nothing; an unconfirmed audit relaunching nothing and posted

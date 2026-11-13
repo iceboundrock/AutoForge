@@ -188,8 +188,17 @@ def test_the_rule_reads_no_message():
     ("exc", "bounds", "refusal"),
     [
         (_idle(may_have_survivor=True), GOOD, Refusal.PROCESS_MAY_SURVIVE),
+        # R1-F2 of PR #481: a platform that could not look for what the launch
+        # left outside its group cannot prove that no writer remains.
+        (_idle(orphans_unchecked=True), GOOD, Refusal.PROCESS_MAY_SURVIVE),
+        (_result_less(orphans_unchecked=True), GOOD, Refusal.PROCESS_MAY_SURVIVE),
         (_idle(delivered_result=True), GOOD, Refusal.RESULT_DELIVERED),
         (_result_less(may_have_survivor=True), GOOD, Refusal.PROCESS_MAY_SURVIVE),
+        (
+            _idle(orphans_unchecked=True, delivered_result=True),
+            GOOD,
+            Refusal.PROCESS_MAY_SURVIVE,
+        ),
         (_idle(), replace(GOOD, relaunches_used=1), Refusal.ALLOWANCE_SPENT),
         (_idle(), replace(GOOD, step_budget_left=0), Refusal.STEP_BUDGET),
         (_idle(), replace(GOOD, invocation_steps_left=0), Refusal.INVOCATION_LIMIT),
@@ -671,6 +680,27 @@ def test_a_launch_that_may_have_left_a_process_is_never_relaunched(tmp_state_dir
     with pytest.raises(ExecutionTimeoutError, match=r"refused \(process-may-survive\)"):
         eng.run(max_steps=5)
     assert len(provider.calls) == 1
+
+
+def test_an_idle_timeout_whose_orphans_could_not_be_looked_for_is_never_relaunched(
+    tmp_state_dir, fake_github
+):
+    """R1-F2 of PR #481: an idle kill on a platform with no child subreaper,
+    with nothing in the output. The teardown could not look for a process
+    the launch left outside its group, so it cannot prove that no writer
+    remains, and a relaunch in the same worktree could run beside one. The
+    decision refuses it and its evidence says why."""
+    eng, provider = _analyzing(
+        tmp_state_dir, fake_github, {**IDLE, "orphans_unchecked": True}, implement
+    )
+    with pytest.raises(ExecutionTimeoutError, match=r"refused \(process-may-survive\)"):
+        eng.run(max_steps=5)
+    assert len(provider.calls) == 1, "nothing was launched beside the possible orphan"
+    (entry,) = _journal_of(eng).decisions
+    assert entry.category is RecoveryCategory.IDLE_TIMEOUT
+    assert entry.refusal is Refusal.PROCESS_MAY_SURVIVE and _journal_of(eng).relaunches == 0
+    assert "could not be looked for on this platform" in entry.evidence
+    assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
 
 
 def test_a_result_delivered_before_the_kill_is_never_discarded(tmp_state_dir, fake_github):

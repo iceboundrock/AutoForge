@@ -330,7 +330,9 @@ error's text:
   corrections, a sandbox refusal, a
   GitHub failure or drift, a failed verification, and anything unknown.
 - **Refused even then:** when a process the launch started may still be
-  running (`process-may-survive`), when the failed launch's output holds a
+  running, or the platform could not look for one it left outside its
+  process group (`orphans_unchecked`, a host with no child subreaper)
+  (`process-may-survive`), when the failed launch's output holds a
   complete `CONTROL_RESULT` the controller did not accept (`result-delivered`:
   a relaunch would throw it away; the error's line `its output was not
   accepted as the step's result (<reason>: ...)` and `execution.json`'s
