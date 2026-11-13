@@ -396,13 +396,16 @@ be running, and the reply passes every check a clean exit's reply passes.
 The reply is then provisional: it is saved in the run's state before the step
 goes on from it, and accepted only once the step's own checks after it (your
 checkout unmoved, the PR still the run's, the phase's verification) have
-applied it. The step's outcome then starts with `The agent was killed at its
-idle limit after delivering its complete final reply ...` (or `exited with a
-failing status ...`) and says whether it `was accepted`, or `was not
-accepted` because the step stopped first (what stopped it follows). The run
-log keeps both: the launch's `execution.json` says `provisional` under
-`delivered_result`, and the step's own record (`<PHASE>-delivered-result`)
-says `accepted` or `not-accepted` with the stop's code.
+applied it: the verification saved the plan it turned the reply into, even
+if the step then stopped (a review posted at the last allowed round stops
+at the round cap and was accepted). The step's outcome then starts with `The
+agent was killed at its idle limit after delivering its complete final
+reply ...` (or `exited with a failing status ...`) and says whether it `was
+accepted`, or `was not accepted` because the step ended without applying it
+(why follows). The run log keeps both: the launch's `execution.json` says
+`provisional` under `delivered_result`, and the step's own record
+(`<PHASE>-delivered-result`) says `accepted`, or `not-accepted` with the
+stop's code or the phase the step moved to.
 
 If the controller is interrupted after it kept such a reply and before the
 step concluded (a crash, `Ctrl-C`, GitHub not answering), the next `resume`

@@ -257,9 +257,11 @@ def settled_record(
 
     Written once the step has its outcome: :data:`ACCEPTED` when the step
     applied the reply as its result (its checks after the reply passed: the
-    operator's checkout unmoved, the PR still the run's, the phase's
-    verification), :data:`NOT_ACCEPTED` with the stop's typed ``reason``
-    otherwise. Typed values only.
+    operator's checkout unmoved, the PR still the run's, and the phase's
+    verification saved the plan it turned the reply into, or recorded the
+    agent's own stop, whatever ended the step after that; R2-F4 of PR #481),
+    :data:`NOT_ACCEPTED` with the step's typed ``reason`` (the stop's code,
+    or the phase it moved to) otherwise. Typed values only.
     """
     record: dict[str, object] = {
         "outcome": ACCEPTED if accepted else NOT_ACCEPTED,
@@ -297,8 +299,10 @@ def outcome_text(facts: EndFacts, refused: Refusal) -> str:
 def settled_text(facts: EndFacts, *, accepted: bool, kept_across_restart: bool) -> str:
     """One sentence for the operator once the step has its outcome (R1-F4 of PR #481).
 
-    Acceptance is claimed only for a reply the step applied as its result;
-    a step that stopped before it did says so, and its own message follows.
+    Acceptance is claimed only for a reply the step applied as its result
+    (the verification saved the plan it turned it into, or recorded the
+    agent's own stop; R2-F4); a step that ended without applying it says so,
+    and its own message, which says why, follows.
     """
     kept = (
         ", kept in the run's state across an interruption and checked again"
@@ -317,7 +321,7 @@ def settled_text(facts: EndFacts, *, accepted: bool, kept_across_restart: bool) 
         )
     return (
         f"{head}, so the step went on from it without running the agent again; the step "
-        "stopped before applying it, so it was not accepted (#479). What stopped it follows."
+        "ended without applying it as its result, so it was not accepted (#479). Why follows."
     )
 
 

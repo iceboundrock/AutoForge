@@ -885,13 +885,19 @@ the launch ended and its run log step. The step then goes on from it as from
 any reply: the operator's checkout is checked, the PR's owner, then the
 phase's verification, whose plan the effect journal (ADR 0004) saves before
 anything is written. Only when that verification applies the reply as the
-step's result (the phase advances, its plan is saved before a stop, or the
-agent's own `blocked`/`failure` is recorded) is the reply *accepted*; a step
-that stops before (checkout drift, another owner, a verification or
-validation refusal) did not accept it (R1-F4). Either way the step's own
+step's result is the reply *accepted*, and the evidence is explicit: the
+save of the plan the verification turned it into (`_save_plan`), whatever
+stops the step after it (a review round's cap once the round's comment is
+posted, a conflict, a write that waits for the operator) and although the
+plan's completion may drop it again, or the record of the agent's own
+`blocked`/`failure` (R2-F4 of PR #481). A step that stops before that save
+(checkout drift, another owner, a verification or validation refusal), or
+moves on without one (a FIX whose PR moved goes to REVIEW with no fix
+recorded), did not accept it (R1-F4). Either way the step's own
 controller-only record in the run log (`<PHASE>-delivered-result`) says so,
-`accepted` or `not-accepted` with the stop's code, and the step's message
-opens with one sentence that claims acceptance only when it holds. A crash
+`accepted`, or `not-accepted` with the stop's code or the phase the step
+moved to, and the step's message opens with one sentence that claims
+acceptance only when it holds. A crash
 anywhere after the keeping save, before the step concludes, leaves the
 reply in the state: the next `resume`, `run` or `step` re-enters the phase
 through its reconciliation, which completes a saved plan from the journal
@@ -918,6 +924,9 @@ journal records a refusal's decision, as for any failed step
 `test_a_kept_reply_outlives_an_unavailable_github_and_resume_goes_on_from_it`,
 `test_a_reply_the_checkout_drift_check_refuses_after_the_parse_is_never_accepted`,
 `test_a_reply_the_phase_verification_stops_before_planning_is_never_accepted`,
+`test_a_review_applied_before_the_round_cap_stopped_the_step_was_accepted`,
+`test_a_review_refused_before_its_plan_was_saved_was_not_accepted`,
+`test_a_fix_whose_pr_moved_goes_to_review_without_accepting_the_reply`,
 `test_a_reply_the_producer_gate_refuses_below_its_bound_is_dropped_and_relaunched`).
 
 **D12.5. Every bound stays.** The launch was charged as a step before it

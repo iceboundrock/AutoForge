@@ -1380,15 +1380,6 @@ class _Provisional:
     kept_across_restart: bool
 
 
-def _planned(state: AutoForgeState, unplanned: dict) -> bool:
-    """Whether a verification saved its plan: a completion context that is not ``unplanned``.
-
-    Every plan save assigns a new context (#479), so the object read before
-    the verification is still there only when nothing was planned.
-    """
-    return bool(state.completion_context) and state.completion_context is not unplanned
-
-
 def _blocked(code: StopReasonCode, reason: str) -> tuple[Phase, str]:
     """A verify or apply step's ``(Phase.BLOCKED, reason)``, the reason carrying ``code``.
 
@@ -1997,6 +1988,10 @@ class ControllerEngine:
         # Reset at every step.
         self._delivered: _Provisional | None = None
         self._delivered_applied = False
+        # #479 (R2-F4 of PR #481): set by the save of the plan a verification
+        # turns its result into (:meth:`_save_plan`), and only by it: the
+        # evidence that the step applied its result.
+        self._result_planned = False
         # Whether this step's REVIEW entry wrote or reused the
         # ``review_evidence`` binding the reviewer's prompt is rendered from
         # (ADR 0006 D5.5, D5.7, D9.1); reset at every REVIEW entry, so a plan
@@ -3963,6 +3958,20 @@ class ControllerEngine:
         save_state(self.state, self.paths.state_file, root=self.state_root())
 
     _save = save
+
+    def _save_plan(self) -> None:
+        """Save the plan a verification just turned its result into, and note that it did.
+
+        Every phase that applies an agent's result does so by saving a plan
+        (ADR 0004: the effect records and the completion context, or an
+        UPDATE_EPIC context) before anything is written, and completes it
+        from what was saved. That save is the explicit evidence that the step
+        applied its result (#479, R2-F4 of PR #481): a stop after it (a review
+        round's cap, a conflict, a write that waits for the operator) stopped
+        an applied result, and its completion may drop the plan again.
+        """
+        self._save()
+        self._result_planned = True
 
     def _record_verification_failure(self, phase: Phase, exc: VerificationError) -> None:
         """Persist a failed verification attempt (bounded, redacted).
@@ -6232,6 +6241,7 @@ class ControllerEngine:
         # rather than adding one.
         state.step_count += 1
         self._delivered, self._delivered_applied = None, False
+        self._result_planned = False
         try:
             outcome = self._step_phase(previous, plan, allow_merge, held)
         except PROwnerError as exc:
@@ -6256,9 +6266,12 @@ class ControllerEngine:
         """Record and report what became of the step's provisional reply (R1-F4 of PR #481).
 
         Accepted only when the step applied it as its result
-        (``_delivered_applied``: the checkout check, the PR owner check and
-        the phase's verification passed, or the agent's own reported stop
-        was recorded); otherwise not accepted, with the stop's code. A step
+        (``_delivered_applied``: the checkout check and the PR owner check
+        passed, and the phase's verification saved the plan it turned the
+        reply into (:meth:`_save_plan`, R2-F4), whatever stopped the step
+        after that save, or the agent's own reported stop was recorded);
+        otherwise not accepted, with the stop's code or the phase the step
+        moved to without applying it. A step
         that concluded keeps no reply in the state (the transition out of
         the phase drops it, and so does every refusal of the step's checks);
         one still kept here is dropped. The run log gets the decision as a
@@ -6432,9 +6445,10 @@ class ControllerEngine:
                 stop=stop,
             )
 
-        # #479: the plan a verification saves replaces this object, so a stop
-        # after it is told from one before anything was planned.
-        unplanned = state.completion_context
+        # #479 (R2-F4 of PR #481): whether the verification applied the
+        # result is what it saved, never what the state holds afterwards (a
+        # plan that completed is dropped by the save that concludes it).
+        self._result_planned = False
         try:
             nxt_phase, message = self._verify_and_apply(previous, payload)
         except _ProducerValidationFailed as exc:
@@ -6457,18 +6471,20 @@ class ControllerEngine:
             state.delivered_reply = {}
             self._save()
             raise
+        # #479 (R2-F4 of PR #481): the result was applied if, and only if,
+        # the verification saved the plan it turned it into, whatever stopped
+        # the step after that save (a review round's cap, a conflict) and
+        # whatever moved it on without one (a FIX whose PR moved goes to
+        # REVIEW with no fix recorded).
+        self._delivered_applied = self._result_planned
         if nxt_phase == Phase.BLOCKED:
             # Verification gave up conclusively (bounded re-selection exhausted):
             # BLOCKED is an exceptional holding state outside the topology.
-            # #479: the result was applied if its plan was saved before the stop.
-            self._delivered_applied = _planned(state, unplanned)
             return self._block(previous, plan, message)
         validate_transition(previous, nxt_phase)
         state.phase = nxt_phase
         state.attempt = 0
         self._save()
-        # #479: the phase's verification applied the result.
-        self._delivered_applied = True
         return self._outcome(previous, plan=plan, result=payload, message=message)
 
     # -- a blocked FIX that publishes what it fixed (#433) ----------------------------
@@ -6500,7 +6516,7 @@ class ControllerEngine:
                 self._partial_fix_held_text(res, message),
                 code=StopReasonCode.AGENT_BLOCKED,
             )
-        unplanned = self._require_state().completion_context
+        self._result_planned = False
         try:
             nxt, text = self._apply_fix(res, message)
         except VerificationError as exc:
@@ -6512,8 +6528,8 @@ class ControllerEngine:
         if nxt != Phase.BLOCKED:
             raise StateError(f"a partial FIX was applied and left FIX for {nxt.value}")
         # #479: the partial fix the reply offered was planned as the step's
-        # result, or refused with nothing planned.
-        self._delivered_applied = _planned(self._require_state(), unplanned)
+        # result, or refused with nothing planned (R2-F4 of PR #481).
+        self._delivered_applied = self._result_planned
         return self._block(Phase.FIX, plan, text)
 
     def _partial_fix_held_text(self, res: PartialFixResult, message: str) -> str:
@@ -17834,7 +17850,7 @@ class ControllerEngine:
         # the entry observation the pre-launch save persisted: a plan that
         # fails is never written.
         state.phase_effects()
-        self._save()
+        self._save_plan()
         return self._complete_analyze()
 
     def _complete_analyze(self) -> tuple[Phase, str]:
@@ -18627,7 +18643,7 @@ class ControllerEngine:
         # Strictly validated exactly as a later load will validate it: a plan
         # that fails is never written (D4.6).
         state.phase_effects()
-        self._save()
+        self._save_plan()
         return self._complete_review()
 
     def _finish_review_entry(self, plan: StepPlan) -> StepOutcome:
@@ -19394,7 +19410,7 @@ class ControllerEngine:
         # fails is never written (D4.6).
         state.phase_effects()
         self._fix_candidate = ""
-        self._save()
+        self._save_plan()
         return self._complete_fix()
 
     def _finish_fix_entry(self, plan: StepPlan) -> StepOutcome:
@@ -21056,7 +21072,7 @@ class ControllerEngine:
         # the entry observation the pre-launch save persisted: a plan that
         # fails is never written.
         state.phase_effects()
-        self._save()
+        self._save_plan()
         outcome = self._complete_replan(txn)
         if state.phase == Phase.BLOCKED:
             return self._blocked_replan(outcome)
@@ -21408,7 +21424,7 @@ class ControllerEngine:
         # Strictly validated exactly as a later load will validate it: a
         # value that fails is never written.
         state.phase_effects()
-        self._save()
+        self._save_plan()
 
     def _apply_update_epic(self, payload: dict) -> tuple[Phase, str]:
         """Plan, publish and complete UPDATE_EPIC from the agent's result.

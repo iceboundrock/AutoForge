@@ -888,6 +888,99 @@ def test_a_reply_the_phase_verification_stops_before_planning_is_never_accepted(
     assert fake_github.effect_writes == []
 
 
+def _reviewing(tmp_state_dir, gh, reply):
+    """A REVIEW of round 1 whose reviewer delivers ``reply`` and is then killed."""
+    from .test_engine import _in_review
+
+    eng = _in_review(tmp_state_dir, gh, [])
+    provider = _Ends((reply, IDLE))
+    eng.providers._overrides = {"claude": provider, "opencode": provider}
+    eng.provider = provider
+    return eng, provider
+
+
+def test_a_review_applied_before_the_round_cap_stopped_the_step_was_accepted(
+    tmp_state_dir, fake_github
+):
+    """R2-F4 of PR #481: with one review round allowed, the delivered review's
+    comment is posted and its round recorded, then the cap stops the step on
+    its finding. The review was applied, and the save of its plan says so,
+    although the plan's completion dropped the plan before the stop."""
+    from .conftest import SHA_A, controller_review_comment, review_result
+    from .test_engine import _finding
+
+    eng, provider = _reviewing(
+        tmp_state_dir, fake_github, block(review_result(1, SHA_A, [_finding(1)]))
+    )
+    eng.config.workflow.max_review_rounds = 1
+    outcome = eng.step()
+    assert outcome.next_phase == "BLOCKED", outcome.message
+    state = load_state(eng.paths.state_file)
+    assert state.stop_code == "review-round-cap" and state.review_round == 1
+    assert state.completion_context == {}, "the plan completed before the stop"
+    assert controller_review_comment(eng, 1) is not None
+    assert "it was accepted" in outcome.message and "not accepted" not in outcome.message
+    assert _settled(eng) == {**_settled(eng), "outcome": "accepted"}
+    assert "reason" not in _settled(eng)
+    assert len(provider.calls) == 1
+
+
+def test_a_review_refused_before_its_plan_was_saved_was_not_accepted(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """Beside it, a genuine refusal before application, in the same phase and
+    under the same cap: the PR's comments cannot be read before the round's
+    comment would be posted, so nothing is planned, posted or recorded."""
+    from autoforge.errors import GitHubError
+
+    from .conftest import SHA_A, review_result
+    from .test_engine import _finding
+
+    def reply_then_unreadable_comments(req):
+        def unreadable(*_args):
+            raise GitHubError("gh: HTTP 403")
+
+        monkeypatch.setattr(eng, "_review_comments", unreadable)
+        return block(review_result(1, SHA_A, [_finding(1)]))
+
+    eng, _ = _reviewing(tmp_state_dir, fake_github, reply_then_unreadable_comments)
+    eng.config.workflow.max_review_rounds = 1
+    outcome = eng.step()
+    assert outcome.next_phase == "BLOCKED", outcome.message
+    state = load_state(eng.paths.state_file)
+    assert state.stop_code == "github-read-failed" and state.review_round == 0
+    assert "it was not accepted" in outcome.message
+    settled = _settled(eng)
+    assert (settled["outcome"], settled["reason"]) == ("not-accepted", "github-read-failed")
+    assert fake_github.effect_writes == []
+
+
+def test_a_fix_whose_pr_moved_goes_to_review_without_accepting_the_reply(
+    tmp_state_dir, fake_github
+):
+    """R2-F4 of PR #481: a phase that moves on without applying the reply is
+    no acceptance either. The PR moved past the reviewed HEAD while the fixer
+    ran, so FIX goes to REVIEW of the actual revision with no fix recorded."""
+    from .conftest import SHA_B, fixed, fixer
+    from .test_engine import _in_fix
+
+    def fix_then_push(req):
+        text = fixer(fixed("R1-F1"))(req)
+        fake_github.prs[PR] = replace(fake_github.prs[PR], head_sha=SHA_B)
+        return text
+
+    eng = _in_fix(tmp_state_dir, fake_github, None, origin=True)
+    provider = _Ends((fix_then_push, IDLE))
+    eng.providers._overrides = {"claude": provider, "opencode": provider}
+    eng.provider = provider
+    outcome = eng.step()
+    assert outcome.next_phase == "REVIEW", outcome.message
+    assert "no fix recorded" in outcome.message and "it was not accepted" in outcome.message
+    settled = _settled(eng)
+    assert (settled["outcome"], settled["reason"]) == ("not-accepted", "REVIEW")
+    assert load_state(eng.paths.state_file).last_fix_resolutions == []
+
+
 def test_a_reply_the_producer_gate_refuses_below_its_bound_is_dropped_and_relaunched(
     tmp_state_dir, fake_github, monkeypatch
 ):
