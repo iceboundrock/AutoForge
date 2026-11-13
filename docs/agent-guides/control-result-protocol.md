@@ -78,6 +78,22 @@ No other adapter needs it: OpenCode and `text` output print their final text
 at exit, and the Pi adapter shuts its CLI down itself once the conversation
 settles.
 
+### A reply delivered before its launch failed (#479)
+
+A launch that a limit killed or that exited with a failing status used to end
+the step whatever its output held. The engine now takes such a launch's reply
+to the checks above, unchanged, when ADR 0012 D12's typed rule
+(`delivered_result.py`) proves it safe: the adapter vouches for a completed
+final reply (`AgentExecutionResult.reply_delivered`: Claude `stream-json` and
+Pi only), the teardown left nothing running, and no protocol failure, loop
+kill or capture cut stands in the way. That rule reads the blocks once, more
+strictly than steps 1 and 2: `reply_block_shape` wants every complete block to
+decode to the same value and no block begun after the last, so a reply whose
+launch failed is taken only when it says one thing. A reply the checks refuse
+is not corrected: the launch's failure ends the step, with the reason, and the
+recovery rule never relaunches over it. A clean exit's reply is read exactly as
+before.
+
 ### What an agent is told about work still running (#440)
 
 The sentence #393 added said the controller "does not wait for the work", which

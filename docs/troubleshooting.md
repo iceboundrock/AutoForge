@@ -330,9 +330,13 @@ error's text:
   corrections, a sandbox refusal, a
   GitHub failure or drift, a failed verification, and anything unknown.
 - **Refused even then:** when a process the launch started may still be
-  running (`process-may-survive`), when the killed launch had already
-  printed a complete `CONTROL_RESULT` (`result-delivered`: a relaunch would
-  throw it away), when the step already used its one automatic relaunch,
+  running (`process-may-survive`), when the failed launch's output holds a
+  complete `CONTROL_RESULT` the controller did not accept (`result-delivered`:
+  a relaunch would throw it away; the error's line `its output was not
+  accepted as the step's result (<reason>: ...)` and `execution.json`'s
+  `delivered_result` say why: see "The agent replied, then was killed or
+  exited badly"), when the step already used its one
+  automatic relaunch,
   whatever failed then (`allowance-spent`), when `workflow.max_total_steps`
   (`step-budget`) or this command's `--max-steps` (`invocation-limit`) has no
   step left, or when a worker was asked to stop (`stop-requested`).
@@ -371,6 +375,33 @@ rule bounds what the controller does on its own, not how often you resume.
 `workflow.max_total_steps` is the bound on every launch of the run, the
 ones you resume included, since each launch is charged as one step before
 it starts.
+
+## The agent replied, then was killed or exited badly
+
+An agent can deliver its whole final reply and still end badly: its CLI
+exits with a failing status, or hangs after the reply until its idle limit
+or maximum runtime kills it. The controller then takes the reply as the
+step's result, without a relaunch, only when everything is proven (ADR 0012
+D12, #479): the provider's protocol shows the reply ended the run (Claude
+Code's `stream-json` and Pi's RPC can; OpenCode and Claude's `text` output
+cannot, so theirs is never taken), every `CONTROL_RESULT` block in it says
+the same thing, it was not cut at the capture bound, no limit but the idle
+limit or the maximum runtime killed it, nothing the agent started may still
+be running, and the reply passes every check a clean exit's reply passes.
+The step's outcome then starts with `The agent was killed at its idle limit
+after delivering its complete final reply ...` (or `exited with a failing
+status ...`), and the step goes on as usual.
+
+Otherwise the failure stands, with a line saying why the reply was not
+taken: `its output was not accepted as the step's result (<reason>: ...)`.
+The reasons are `limit`, `survivor`, `orphans-unchecked`, `no-reply`,
+`no-block`, `incomplete-block`, `conflicting-blocks`, `truncated` and
+`checks` (the reply went to the checks and they refused it: another issue,
+a malformed result, a HEAD that moved after the reply). The step's
+`execution.json` holds the same under `delivered_result`. Such a reply is
+never corrected and never relaunched over (`result-delivered` above): read
+the step's `stdout.log` and the worktree, then `resume` to run the step
+again.
 
 ## An agent was killed: idle timeout, maximum runtime, loop
 

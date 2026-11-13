@@ -368,6 +368,56 @@ def holds_control_result(text: str) -> bool:
     return True
 
 
+class BlockShape(StrEnum):
+    """What the ``CONTROL_RESULT`` blocks of a final reply say as a whole (#479)."""
+
+    #: Its last complete block is a JSON object within the bound
+    #: (:func:`holds_control_result`), every other complete block decodes to
+    #: the same value, and no block begins after the last one.
+    ONE = "one"
+    #: No complete block, or a last one that is not a JSON object within the bound.
+    NONE = "none"
+    #: A block begins after the last complete one and never ends.
+    INCOMPLETE = "incomplete"
+    #: Two complete blocks that do not decode to the same value.
+    CONFLICTING = "conflicting"
+
+
+def reply_block_shape(text: str) -> BlockShape:
+    """The shape of ``text``'s blocks, for a reply delivered before its launch failed (#479).
+
+    Stricter than :func:`parse_control_result`, which reads the last complete
+    block whatever comes before or after it. A reply whose launch then timed
+    out or exited badly is taken to the controller's checks only when it says
+    one thing: a second complete block that decodes to anything else (an
+    earlier draft, a quoted schema, a block that is not JSON) makes it
+    ``CONFLICTING``, and a block begun after the last complete one, which the
+    agent never closed, ``INCOMPLETE``. A reply that repeats the same block is
+    ``ONE``. Nothing here reads a phase, a status or a field: the checks the
+    engine runs on any reply come after it.
+    """
+    if not holds_control_result(text):
+        return BlockShape.NONE
+    found = list(_BLOCK_RE.finditer(text))
+    if BEGIN in text[found[-1].end() :]:
+        return BlockShape.INCOMPLETE
+    values: list[str] = []
+    for match in found:
+        try:
+            # Compared in one canonical text, so that ``1``, ``1.0`` and
+            # ``true`` (equal as Python values) still differ.
+            values.append(json.dumps(json.loads(match.group(1).strip()), sort_keys=True))
+        except (ValueError, RecursionError):
+            # JSONDecodeError is a ValueError, as is the decoder's own integer
+            # limit; RecursionError is its nesting limit. A block that does
+            # not decode says something other than the last one, which
+            # holds_control_result decoded.
+            return BlockShape.CONFLICTING
+    if any(value != values[-1] for value in values):
+        return BlockShape.CONFLICTING
+    return BlockShape.ONE
+
+
 def parse_control_result(
     stdout: str,
     expected_phase: Phase,

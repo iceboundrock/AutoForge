@@ -181,7 +181,9 @@ for line in sys.stdin.buffer:
     elif kind == "abort":
         respond(kind, rid)
         emit({"type": "agent_settled"})
-sys.exit(0)
+# Stdin closed: how this Pi shuts down (#479).
+time.sleep(turn["linger"])
+sys.exit(turn["close_exit"])
 """
 
 
@@ -201,7 +203,9 @@ class PiTurn:
     that many seconds. ``auth`` and ``auth_exit`` script the ``pi auth
     check`` preflight. ``agent_end_bytes`` makes the run's ``agent_end``
     repeat a user prompt of that many characters, as Pi's repeats every
-    message of the run (#144).
+    message of the run (#144). Once its stdin closes, it sleeps ``linger``
+    seconds and exits ``close_exit``: a Pi whose shutdown hangs past a limit,
+    or that exits with a failing status after a settled run (#479).
     """
 
     text: str = ""
@@ -214,6 +218,8 @@ class PiTurn:
     auth: dict | None = None
     auth_exit: int = 0
     agent_end_bytes: int = 0
+    linger: float = 0.0
+    close_exit: int = 0
 
 
 class PiFake:

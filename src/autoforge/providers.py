@@ -518,6 +518,17 @@ class AgentExecutionResult:
     # the run, and a relaunch now may meet it again, so it is never read as the
     # limit's: the engine's recovery rule refuses it (R2-F1 of PR #480).
     failed_before_limit: str | None = None
+    # The adapter's protocol shows a completed final reply that ended the run,
+    # handed over whole as ``stdout``, however the CLI ended after it (#479):
+    # Claude Code's ``stream-json`` held a reply that decides the run
+    # (ClaudeStream.replied: every turn opened has its result, the last a
+    # success holding a block, no tool call open) when the stream ended; Pi's
+    # conversation settled and its last assistant text read back, before any
+    # limit cut it short. A fact of the protocol, never of text: an output
+    # that types no turn (``text``, OpenCode) never sets it. Whether a launch
+    # that a limit killed or that exited with a failing status is completed
+    # on that reply is the engine's (``delivered_result.py``, ADR 0012 D12).
+    reply_delivered: bool = False
     # A small flat mapping of scalars, bounded and redacted by the adapter,
     # that the engine writes to ``execution.json`` under this key without
     # interpreting it. Never raw protocol records or message contents.
@@ -1553,7 +1564,10 @@ class ClaudeCodeProvider(AgentProvider):
         ``exit_code`` is always the real process status, -1 when the CLI was
         killed. A failure that is a turn ended by a transient model API error
         is also a ``transient_failure`` (#395); ``text`` output carries no
-        record to tell it by.
+        record to tell it by. A stream that, read to its end, holds a reply
+        that decides the run is ``reply_delivered`` whatever the CLI did
+        after it (#479), which the engine reads for a CLI that then exited
+        with a failing status; ``text`` output vouches for no reply.
         """
         if self.output_format(req.profile) != "stream-json":
             return super().execute(req)
@@ -1653,6 +1667,12 @@ class ClaudeCodeProvider(AgentProvider):
             # would have failed the run (R3-F1). Its fixed kind, never the
             # stream's text.
             failed_before_limit=(stream.failure_kind or stream.api_error) if timed_out else None,
+            # #479: the stream, read to its end, holds a reply that decides the
+            # run and failed nothing (an overflow is a failure). A limit that
+            # finds one is no timeout (#439), so a launch whose reply this
+            # leaves for the engine to decide on is one that exited with a
+            # failing status after it, or that the loop detector stopped.
+            reply_delivered=failure is None and stream.replied,
             # #434: a CLI that died inside a running session before any
             # result, on its own (never one a limit or the adapter stopped),
             # with no line lost on the way and no model API error reported
@@ -2560,7 +2580,11 @@ class PiProvider(AgentProvider):
         that fell due. A failure inside the protocol is
         ``provider_failure``; its abort runs under the deadline pinned when
         the failure is acted on. ``exit_code`` is always the real process
-        status. A spawn failure raises :class:`ExecutionError`.
+        status. A spawn failure raises :class:`ExecutionError`. A conversation
+        that settled with its final text read back before any limit cut it
+        short is ``reply_delivered`` (#479), however Pi then shut down: a Pi
+        that ignores its closed stdin until a limit kills it, or that exits
+        with a failing status, delivered that reply all the same.
 
         With ``require_oauth`` (the default) the launch is refused before
         anything is spawned when a provider API key would reach Pi, and a
@@ -2655,6 +2679,12 @@ class PiProvider(AgentProvider):
             # limit falling due inside its abort) is kept as a fixed fact, so
             # the kill is not read as an idle timeout (R2-F1 of PR #480).
             failed_before_limit=PI_FAILED_BEFORE_LIMIT if timed_out and failed_first else None,
+            # #479: the conversation settled with its final text read back
+            # before any limit cut it short, and nothing failed it after (an
+            # overflow while Pi shut down is a failure). Pi may still hang on
+            # its shutdown until a limit kills it, or exit with a failing
+            # status: the reply was delivered all the same.
+            reply_delivered=text is not None and not cut_short,
             provider_summary=summary,
             timeout_limit=(res.timeout_limit or cut_limit) if timed_out else "",
             last_activity_at=res.last_activity_at,

@@ -231,6 +231,13 @@ auto_recovery.py    bounded automatic recovery (#434, ADR 0012 D11): the fixed r
                     an adapter-typed result-less exit, once per step), the persisted
                     recovery journal (auto_recovery) and the K13 audit text and record;
                     never imports stop_classification; pure, persists nothing itself
+delivered_result.py a reply delivered before its launch failed (#479, ADR 0012 D12):
+                    the provider-neutral distinctions (completed turn, delivered
+                    complete result, terminated process, successful cleanup, accepted
+                    controller result), the typed facts of a launch a limit killed or
+                    that exited badly, and the fixed rule that says whether its reply
+                    goes to the checks a clean exit's reply meets; accepts nothing
+                    itself; pure, persists nothing
 recovery_package.py status's recovery action package (#374): from a loaded state, its
                     classification, the configuration and, for 'status --live',
                     unblock's dry-run decision: the diagnosis of the saved stop code,
@@ -363,6 +370,10 @@ auto_recovery.py, engine.py (run's recovery path,
 _automatic_recovery and the K13 audit)          -> docs/adr/0012-recovery-and-escalation-stop-
                                                      authority-and-advisor-gates.md (D11) + docs/
                                                      agent-guides/state-and-recovery.md
+delivered_result.py, engine.py (_invoke_phase's
+failed launch end, _failed_launch)              -> docs/adr/0012-recovery-and-escalation-stop-
+                                                     authority-and-advisor-gates.md (D12) + docs/
+                                                     agent-guides/control-result-protocol.md
 stop_classification.py, engine.py (_block and
 _blocked codes, the agent-status sink),
 cli.py (stop lines), errors.py (a new class),

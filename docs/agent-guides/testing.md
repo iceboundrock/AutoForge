@@ -1875,6 +1875,31 @@ a stated reason it has none. The coverage that must keep working:
   Protocol 17 -> 18 in `tests/test_state.py`; the adapters' usage-limit,
   result-less and failed-before-limit facts in `tests/test_providers.py`,
   `tests/test_pi_rpc.py` and `tests/test_claude_stream.py`
+- a result delivered before a failed launch end (#479, ADR 0012 D12;
+  `tests/test_delivered_result.py`): the rule alone (an idle kill, a runtime
+  kill and a failing exit each let a vouched-for reply through; each missing
+  fact refuses it, in the declared order; a failing exit needs no limit; the
+  record holds typed values only and a protocol failure adds no line); the
+  block shape (one block, the same block repeated, prose around it; none,
+  not an object, not JSON, never closed; a block begun after the last; two
+  different blocks, a quoted schema, `1` against `true` and `1.0`); and the
+  engine through provider-neutral fixtures: a reply accepted after an idle
+  kill, a runtime kill and a failing exit, the PR opened once, nothing
+  relaunched or decided and `execution.json` saying `accepted`; a clean exit
+  recording nothing; a reply refused for each missing fact and by the
+  checks a clean exit's reply meets (malformed, another phase, another
+  issue, a HEAD that moved after the reply), never corrected or relaunched
+  over, the decision's evidence and the run log naming the reason; a
+  provider-established failure keeping its own words; an accepted reply
+  whose PR create failed completed by the next process from the journal
+  with no agent launched, and one whose create landed adopted; the step
+  budget, `step` and a dry run unchanged; a REVIEW accepted and posted once,
+  and one for another HEAD refused; the real adapters: Claude Code's
+  `stream-json` reply then an exit 3 accepted, a reply with a call open or
+  overtaken by a later turn never accepted, Pi hanging on its shutdown past
+  the idle limit or exiting 7 after a settled run accepted, Pi cut short by
+  its limit vouching for nothing, OpenCode's plain text never vouched for
+  (`linger` and `close_exit` in `tests/pi_fake.py`)
 - the `UPDATE_EPIC` progress comment across every crash window of the
   effect lifecycle (`test_k8_*` in `tests/test_engine.py`), the one-shot
   legacy re-entry (D13.7) including a crash after its adoption was saved,

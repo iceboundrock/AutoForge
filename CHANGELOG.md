@@ -5,6 +5,29 @@ so.
 
 ## Unreleased
 
+### A reply the agent delivered before it was killed or exited badly is kept (#479)
+
+An agent that delivers its whole final reply and then hangs until its idle
+limit or maximum runtime kills it, or whose CLI then exits with a failing
+status, no longer loses the step: the controller takes that reply as the
+step's result, with no relaunch, when it can prove that safe. The provider's
+own protocol must show that the reply ended the run (Claude Code's
+`stream-json` and Pi show it; OpenCode and Claude's `text` output cannot, so
+nothing changes for them), every `CONTROL_RESULT` block in the reply must say
+the same thing, nothing the agent started may still be running, and the
+reply must pass every check a reply of a clean exit passes (the issue, the
+phase, the reported `head_sha` against the worktree, the PR's HEAD and
+round). A loop kill, a provider failure or a usage limit is never overridden.
+The step's message then starts with `The agent was killed at its idle limit
+after delivering its complete final reply ...` and the run goes on.
+
+A reply that falls short is not corrected and not relaunched over, as
+before: the failure stands, with a line saying why the reply was not taken
+(`its output was not accepted as the step's result (<reason>: ...)`), and
+the automatic recovery audit's evidence names the same reason. Each such
+launch's `execution.json` records the outcome under `delivered_result`. No
+configuration, state or protocol change.
+
 ### A failed agent step is relaunched once on its own, when it is safe to (#434)
 
 `run` and `resume` (and a scheduler worker) no longer stop for you after

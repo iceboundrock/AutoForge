@@ -1453,10 +1453,11 @@ known and the retry path is bounded. Current cases include:
   launch ended with an idle timeout or an exit its adapter typed as
   result-less is relaunched once, through the phase-entry reconciliation
   `resume` runs, only when no process the launch started may still run, its
-  output holds no complete `CONTROL_RESULT`, the step has not used its one
-  automatic relaunch (whatever failed then), the run's step budget and the
-  invocation's `--max-steps` each have a step left, and the decision's audit
-  comment is confirmed. A provider's usage or rate limit
+  output holds no complete `CONTROL_RESULT` (one the engine accepted, ADR
+  0012 D12, ended no step; one it did not stays the operator's), the step
+  has not used its one automatic relaunch (whatever failed then), the run's
+  step budget and the invocation's `--max-steps` each have a step left, and
+  the decision's audit comment is confirmed. A provider's usage or rate limit
   (`ProviderUsageLimitError`) is never relaunched, at once or later in the
   same command; neither is an idle kill of a launch whose provider had
   already failed the run (`failed_before_limit`: an authentication or

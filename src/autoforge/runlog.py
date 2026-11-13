@@ -23,6 +23,9 @@ Layout::
                               # the outer sandbox's facts (sandbox: enforced, backend and
                               # version, teardown, network, tmpfs bounds, unset environment
                               # names, a setup failure) when the launch had one
+                              # what became of a reply delivered before the launch
+                              # timed out or exited badly (delivered_result: accepted
+                              # or refused, the reason, the typed facts), #479
             stdout.log        # redacted stdout (head + omission marker + tail when truncated)
             stderr.log        # redacted stderr (same)
             control-result.json   # parsed CONTROL_RESULT when one was accepted (redacted)
@@ -315,6 +318,13 @@ class ExecutionRecord:
     # guidance or a tool input. Written to ``execution.json`` only when the
     # launch had a broker.
     interaction: dict[str, object] = field(default_factory=dict)
+    # What became of a reply the launch delivered before it timed out or
+    # exited badly (#479, ``delivered_result.outcome_record``): ``accepted`` or
+    # ``refused`` with its typed reason, and the facts it was decided on
+    # (how the CLI ended, the limit, the adapter's delivered-reply fact, the
+    # blocks' shape, the capture bound). Typed values only, never the reply.
+    # Written to ``execution.json`` only when there was a reply to decide on.
+    delivered_result: dict[str, object] = field(default_factory=dict)
 
 
 class RunLogger:
@@ -679,6 +689,8 @@ class RunLogger:
         # Built from bounded, redacted request fields; redacted again
         # because it is written twice, like the summary.
         record.interaction = redact_dict(record.interaction)
+        # Typed values only; redacted for the same reason.
+        record.delivered_result = redact_dict(record.delivered_result)
         if record.loop is not None:
             # Built from cleaned tool names and counts; redacted again
             # because it is written twice, like the summary.
@@ -748,6 +760,8 @@ class RunLogger:
             execution["sandbox"] = record.sandbox
         if record.interaction:
             execution["interaction"] = record.interaction
+        if record.delivered_result:
+            execution["delivered_result"] = record.delivered_result
         if record.loop_detection:
             execution["ended_by"] = record.ended_by
             execution["loop_detection"] = record.loop_detection

@@ -219,8 +219,9 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        recovery and escalation: the stop and authority
                                        matrices, no-go for an advisor's shadow diagnosis
                                        and for autonomous recovery but one class, the
-                                       bounded automatic recovery of #434, no pre-BLOCK
-                                       pause;
+                                       bounded automatic recovery of #434, the
+                                       acceptance of a result delivered before a
+                                       failed launch end (#479), no pre-BLOCK pause;
                                        the container sandbox backend (accepted with
                                        required changes, nothing implemented): the
                                        lifecycle seam, the death-watch that replaces
@@ -320,9 +321,11 @@ matches none of them needs only this file and the scoped `AGENTS.md`.
   any model launch about a stop, an automatic recovery action, a pause
   before `BLOCKED`, a new route out of `BLOCKED` or `FAILED`), or changing
   the bounded automatic recovery rule (`src/autoforge/auto_recovery.py`,
-  its allowlist, allowance or audit), read
+  its allowlist, allowance or audit), or the acceptance of a result an agent
+  delivered before its launch timed out or exited badly
+  (`src/autoforge/delivered_result.py`), read
   `docs/adr/0012-recovery-and-escalation-stop-authority-and-advisor-gates.md`
-  (D11 for the rule) in addition to ADR 0011.
+  (D11 for the rule, D12 for the acceptance) in addition to ADR 0011.
 - If adding or changing an outer-sandbox backend, or anything of the
   container backend (`sandbox.backend`, its lifecycle steps, journal and
   reconciliation, the image, runtime detection, a container launch's seed

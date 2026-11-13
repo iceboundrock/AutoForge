@@ -47,6 +47,13 @@
   code), D9's launch bound and D10's persisted field change with it. No
   advisor, no gate D, no pause, no phase and no edge out of `BLOCKED` or
   `FAILED` is added.
+- **Amended by #479:** D12 records how the engine accepts a result an
+  agent delivered before its launch timed out or exited badly, which D11.2
+  left to #479 and the decision on #434 ranked D2. No recovery action is
+  added: accepting a reply relaunches nothing, and D11's rule, its allowlist
+  and its refusal of a launch whose output holds a complete `CONTROL_RESULT`
+  are unchanged. No state field, protocol number, effect kind or
+  configuration key changes.
 - **Related:** ADR 0004 (the authority boundary, K9 and K10), ADR 0005 (the
   outer sandbox and its launch classes), ADR 0007 and #126 (the durable
   pause), ADR 0008 D9.4 and D15 (the scheduler's entry checks and
@@ -583,8 +590,9 @@ or git failure (drift and propagation stay stops; the pushed-head wait of
 #403 is in-step and unchanged), a failed verification, effect or claim, and
 anything unknown. An allowlisted failure is still refused when a process the
 launch started may still run, or when its output holds a complete
-`CONTROL_RESULT` (#285; accepting that result is #479's, so a relaunch that
-would discard it is not made)
+`CONTROL_RESULT` (#285; the engine accepts that result first where it can
+prove it safe, D12, and a relaunch that would discard one it did not accept is
+not made)
 (`test_only_the_allowlist_is_ever_relaunched`,
 `test_a_result_delivered_before_the_kill_is_never_discarded`,
 `test_a_launch_that_may_have_left_a_process_is_never_relaunched`,
@@ -782,8 +790,122 @@ Only an error that ends a step of an agent phase is decided; a refusal
 
 **D11.8. Not done here.** A bounded wait for a trusted reset time and a
 fallback profile (D4, D11.3; #321); typing a result-less exit for OpenCode
-and Pi, whose output types none today; accepting a result delivered before a
-kill (#479).
+and Pi, whose output types none today. Accepting a result delivered before a
+kill is D12 (#479).
+
+### D12. A result delivered before a failed launch end (#479)
+
+An agent can deliver its complete final reply and still end badly: its CLI
+exits with a failing status after the reply, or stays alive after it (a
+shutdown that hangs, a task left pending) until a limit kills it. The engine
+used to discard such a reply with the failure, and the operator's `resume`
+paid for the step again (#285). #439 kept a Claude `stream-json` reply that
+decides the run from its idle limit, by stopping the CLI. D12 is the
+provider-neutral rule for every other end, as built
+(`src/autoforge/delivered_result.py`, `ControllerEngine._invoke_phase`). A
+provider's success is a claim: D12 accepts nothing on it alone.
+
+**D12.1. Five distinctions, none implying the next.** A *completed turn* is
+the provider protocol's typed end of the agent's turn (Claude's `result` for
+every turn opened with no tool call open; Pi's `agent_settled`). A *delivered
+complete result* is a completed turn that ended the run on a successful final
+reply, with nothing opened after it, handed over whole: the adapter's fact
+`AgentExecutionResult.reply_delivered`, set by Claude Code's `stream-json`
+(`ClaudeStream.replied`, read to the stream's end) and by Pi (its
+conversation settled and its last assistant text read back, before any limit
+cut it short), never by an output that types no turn (Claude's `text`,
+OpenCode). A *terminated process* is how the CLI ended: an exit 0, or a stop
+after its reply (#439), is read as always and never reaches D12; a failing
+exit (or a provider failure, ADR 0003 §2.6) and a kill at a limit do. A
+*successful cleanup* is the executor's teardown verified complete: no member
+of the group outlived SIGKILL, no writer held the pipes, no re-parented
+process outlived its kill, and the platform could look for one
+(`orphans_unchecked` false); a process the teardown killed is gone. An
+*accepted controller result* is never D12's to declare: only the checks
+below accept it.
+
+**D12.2. The rule.** Typed facts only, the first refusal that applies wins:
+a request for a human decision ended the launch; the provider's protocol had
+failed the run (a provider failure, a failure before the limit, a usage
+limit, a transient failure); a limit other than the idle limit or the
+maximum runtime killed it (the loop detector's verdict is about the very
+activity that produced the reply, and an unnamed limit proves nothing); a
+process the launch started may still run; the platform could not check for
+one; no delivered reply; a reply whose blocks are missing, begun and never
+closed, or in conflict (`reply_block_shape`: every complete block must decode
+to the same value, stricter than the parser's last-block rule, since a reply
+whose launch failed is taken only when it says one thing); a reply the
+capture bound cut. Anything not proven is refused
+(`test_each_missing_fact_refuses_the_reply`,
+`test_the_refusals_come_in_their_declared_order`,
+`test_a_reply_is_taken_only_when_its_blocks_say_one_thing`).
+
+**D12.3. The checks are a clean exit's.** A reply the rule lets through goes
+to exactly the checks the reply of a clean exit goes to, in the same place:
+the strict import or the verified export (ADR 0005 D6.5, ADR 0013 D5), the
+parse, and the phase's own checks of the run's issue, the worktree's HEAD
+against the reported `head_sha`, the bound PR, HEAD and round. A malformed
+result, another invocation's (another issue, another phase, a review of a
+HEAD the PR no longer has) and a candidate that moved after the reply are
+refused there. A refusal is final for that launch: nothing corrects a reply
+whose launch failed (a correction is a relaunch, and whether the step runs
+again is D11's), and a read that could not be completed proves nothing. The
+launch's failure then ends the step as before, with the reason on it, and
+D11 decides on it: a launch whose output holds a complete block is still
+never relaunched (`result-delivered`), and the decision's evidence names why
+the reply was not accepted
+(`test_a_reply_delivered_before_a_failed_end_is_accepted_and_the_step_goes_on`,
+`test_a_reply_without_its_proof_is_never_accepted_and_the_step_stops_safely`,
+`test_a_review_for_another_head_delivered_before_a_kill_is_never_accepted`).
+
+**D12.4. Durability.** An accepted reply joins the path of every reply at the
+point the payload is returned: what the step plans from it is saved before
+anything is written, by the effect journal (ADR 0004), so a crash after that
+save completes the plan from the journal and launches no agent, and a write
+whose outcome was lost is read back, never sent twice. A crash before it,
+while the result is only in memory, is a crash during the launch, which the
+attempt saved before the launch already makes `resume` re-enter through the
+phase's reconciliation, as for any reply. The run log records the outcome
+(`execution.json`'s `delivered_result`: accepted or refused, the reason, the
+facts) and is never read for recovery; D11's journal records a refusal's
+decision, as for any failed step
+(`test_an_accepted_reply_is_never_run_again_after_a_restart`,
+`test_an_accepted_reply_whose_pr_create_landed_is_adopted_never_sent_twice`).
+
+**D12.5. Every bound stays.** The launch was charged as a step before it
+started, and accepting its reply launches nothing, so no step, no relaunch
+and no allowance is spent or refilled; the runtime limits killed the launch
+as before; `step` accepts as `run` does, since accepting is no relaunch; a
+dry run launches nothing to accept
+(`test_an_accepted_reply_after_a_kill_is_charged_one_step_and_decides_nothing`,
+`test_step_accepts_a_delivered_reply_as_run_does`,
+`test_a_dry_run_launches_and_accepts_nothing`).
+
+**D12.6. The providers.** Claude Code's `stream-json` vouches for a reply its
+stream decided whatever the exit after it, and for none with a call still
+open or a turn opened after it; Pi vouches for a settled conversation whose
+shutdown then hangs past a limit or exits badly, and for none its limit cut
+short; OpenCode and Claude's `text` output vouch for none, so a block they
+printed before a kill is refused (`no-reply`) and stays the operator's
+(`test_a_claude_cli_that_exits_badly_after_its_reply_has_the_reply_accepted`,
+`test_a_claude_reply_with_a_call_still_open_is_never_accepted`,
+`test_a_claude_reply_overtaken_by_a_later_turn_is_stale_and_never_accepted`,
+`test_a_pi_that_hangs_on_shutdown_after_a_settled_run_has_its_reply_accepted`,
+`test_a_pi_that_exits_badly_after_a_settled_run_has_its_reply_accepted`,
+`test_opencode_types_no_reply_so_a_block_before_its_kill_is_never_accepted`).
+#439's behaviour is unchanged: its reply still completes the run, as
+before, with no D12 decision.
+
+**D12.7. The three reviews D5 requires.** D12 is no recovery action, but it
+turns a failure into an accepted result, so it gets them. *Threat model:*
+every input is typed (the adapter's fact, the executor's flags, the block
+framing the parser reads of any reply); an agent can at most deliver a reply
+and then hang or fail, which buys it nothing the checks of a clean exit would
+not give it, and the stricter block rule refuses an ambiguous reply. *Cost:*
+none added; one paid relaunch saved per accepted reply. *Security:* no
+credential, write or bound changes; every check of a clean exit's reply
+runs; a teardown that may have left a writer, or could not look for one,
+refuses.
 
 ## 3. What does not change, and what holds it
 
@@ -799,6 +921,7 @@ kill (#479).
 | no agent launch holds a credential route | `test_an_agent_finds_no_credential_route_the_controller_finds_every_one` |
 | transient retries are bounded | `test_transient_retries_are_bounded_per_step_across_corrections`, `test_transient_read_failure_is_bounded_then_blocked` |
 | an automatic relaunch is once per step, allowlisted and audited (#434) | `test_only_the_allowlist_is_ever_relaunched`, `test_two_idle_timeouts_relaunch_once`, `test_an_idle_timeout_is_relaunched_once_and_the_run_goes_on` |
+| a result delivered before a failed end is accepted only on proof and only by a clean exit's checks (#479) | `test_each_missing_fact_refuses_the_reply`, `test_a_reply_without_its_proof_is_never_accepted_and_the_step_stops_safely` |
 | no write without its authority: K9, K10, merge, downgrade, drift | the tests D3's table names |
 
 Default single-agent behaviour, every default and the prompts are

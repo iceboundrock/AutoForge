@@ -253,6 +253,11 @@ from .config_fingerprint import (
     RecordedConfiguration,
     fingerprint_routing,
 )
+from .delivered_result import SILENT_REFUSALS, EndFacts, ProcessEnd
+from .delivered_result import Refusal as ReplyRefusal
+from .delivered_result import outcome_record as delivered_outcome_record
+from .delivered_result import outcome_text as delivered_outcome_text
+from .delivered_result import refusal as delivered_reply_refusal
 from .effect_ops import (
     AcceptanceCommentOp,
     Driven,
@@ -561,6 +566,7 @@ from .result_parser import (
     operator_comment_link_problem,
     parse_control_result,
     published_payload_problem,
+    reply_block_shape,
 )
 from .roadmap import (
     ROADMAP_END_MARKER,
@@ -954,27 +960,62 @@ def _usage_reset_text(result: AgentExecutionResult) -> str:
 
 
 def _launch_end(
-    kind: LaunchEndKind, result: AgentExecutionResult, profile: ProfileConfig
+    kind: LaunchEndKind,
+    result: AgentExecutionResult,
+    profile: ProfileConfig,
+    delivered_refusal: ReplyRefusal | None = None,
 ) -> LaunchEnd:
     """The typed facts of a failed agent launch, for the recovery rule (#434).
 
     Each comes from a typed value: the limit the executor or the loop
     detector recorded, its survivor flags, whether the protocol's framing
     holds a complete ``CONTROL_RESULT`` in the part of stdout the parser
-    reads (a result delivered before a kill, #285), and the adapter's own
-    fixed findings. No text the agent or its CLI printed is read for it.
+    reads (a result delivered before a kill, #285), why the engine did not
+    accept that result (#479), and the adapter's own fixed findings. No text
+    the agent or its CLI printed is read for it.
     """
+    delivered = holds_control_result(result.stdout_tail)
     return LaunchEnd(
         kind=kind,
         timeout_limit=result.timeout_limit if result.timed_out else "",
         may_have_survivor=result.may_have_survivor,
-        delivered_result=holds_control_result(result.stdout_tail),
+        delivered_result=delivered,
+        delivered_refusal=(
+            delivered_refusal.value if delivered and delivered_refusal is not None else ""
+        ),
         result_less_exit=result.result_less_exit,
         usage_limit=result.usage_limit or "",
         usage_reset_at=result.usage_reset_at if result.usage_limit else "",
         transient_failure=result.transient_failure or "",
         failed_before_limit=(result.failed_before_limit or "") if result.timed_out else "",
         provider=profile.provider,
+    )
+
+
+def _end_facts(result: AgentExecutionResult, interaction: bool) -> EndFacts:
+    """The typed facts of a launch that a limit killed or that exited badly (#479).
+
+    What :func:`~autoforge.delivered_result.refusal` decides on: how the CLI
+    ended, the adapter's delivered-reply fact and its failures, the shape of
+    the reply's blocks, the capture bound, and the teardown's survivor and
+    orphan-check flags. No text the agent or its CLI printed is read for it
+    beyond the block framing the parser reads of any reply.
+    """
+    return EndFacts(
+        process_end=ProcessEnd.KILLED if result.timed_out else ProcessEnd.FAILED_EXIT,
+        limit=result.timeout_limit if result.timed_out else "",
+        reply_delivered=result.reply_delivered,
+        blocks=reply_block_shape(result.stdout_tail),
+        truncated=result.stdout_truncated,
+        provider_failed=bool(
+            result.provider_failure
+            or result.failed_before_limit
+            or result.usage_limit
+            or result.transient_failure
+        ),
+        interaction=interaction,
+        may_have_survivor=result.may_have_survivor,
+        orphans_unchecked=result.orphans_unchecked,
     )
 
 
@@ -1918,6 +1959,10 @@ class ControllerEngine:
         # refusal :data:`~autoforge.candidate_source.NOT_EXPORTED`, never the
         # worktree's ``HEAD``.
         self._export_verified: Verified | None = None
+        # #479: the sentence the step's outcome opens with when the step's
+        # agent launch timed out or exited badly and the reply it had
+        # delivered was accepted; "" otherwise. Reset at every step.
+        self._delivered_note = ""
         # Whether this step's REVIEW entry wrote or reused the
         # ``review_evidence`` binding the reviewer's prompt is rendered from
         # (ADR 0006 D5.5, D5.7, D9.1); reset at every REVIEW entry, so a plan
@@ -6151,14 +6196,20 @@ class ControllerEngine:
         # with the same budget. The replan exemption above inherits this rule
         # rather than adding one.
         state.step_count += 1
+        self._delivered_note = ""
         try:
-            return self._step_phase(previous, plan, allow_merge, held)
+            outcome = self._step_phase(previous, plan, allow_merge, held)
         except PROwnerError as exc:
             # #414 (ADR 0004 D9.4a): a read of the bound PR found that another
             # run owns it now, or that its marker cannot say who does. Raised
             # before anything is launched or sent on it; what was sent before
             # stays as persisted, and the operator decides.
-            return self._block(previous, plan, str(exc), code=StopReasonCode.PR_OWNER)
+            outcome = self._block(previous, plan, str(exc), code=StopReasonCode.PR_OWNER)
+        if self._delivered_note:
+            # #479: the agent's launch timed out or exited badly, and the step
+            # went on from the reply it had delivered; say so first.
+            outcome = replace(outcome, message=f"{self._delivered_note}\n{outcome.message}")
+        return outcome
 
     def _step_phase(
         self,
@@ -16362,7 +16413,12 @@ class ControllerEngine:
         A launch that times out, fails or cannot be run, and a result that
         is not corrected, raise with the phase unchanged; the step completes
         their text (:meth:`_state_unchanged_text`) from the working directory
-        and the step log directory recorded here (#189).
+        and the step log directory recorded here (#189). One exception (#479,
+        ADR 0012 D12): a launch that a limit killed or that exited badly after
+        delivering its reply, when :func:`~autoforge.delivered_result.refusal`
+        finds every typed fact it needs, has that reply checked exactly as a
+        clean exit's is, and returns it when the checks accept it; a refusal
+        of those checks is never corrected, and the launch's failure stands.
         """
         assert_shared_git_lock_free(f"launch the {phase.value} agent")
         state = self._require_state()
@@ -16634,6 +16690,12 @@ class ControllerEngine:
             # recorded as given and never interpreted here.
             record.provider_summary = dict(result.provider_summary)
             stdout, stderr = result.stdout or "", result.stderr or ""
+            # #479: the error a launch that timed out, was ended by a request
+            # for a decision or failed ends the step with, and the kind the
+            # recovery rule reads it as. Raised once its delivered reply, if it
+            # had one, is shown not acceptable; the reply is checked first.
+            launch_failure: ExecutionError | None = None
+            failure_kind = LaunchEndKind.FAILED_EXIT
             if result.timed_out:
                 # A loop kill (#194) is a timeout in every respect but its text.
                 loop = _loop_killed(result)
@@ -16644,7 +16706,6 @@ class ControllerEngine:
                     record.error += f" (provider limit: {result.usage_limit})"
                 elif result.failed_before_limit:
                     record.error += f" (failed before the limit: {result.failed_before_limit})"
-                self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
                 # Which value to change, when one set the limit (#189). What
                 # to inspect and how to resume are added where the step ends
                 # (:meth:`_state_unchanged_text`), as for every agent failure.
@@ -16679,10 +16740,8 @@ class ControllerEngine:
                     )
                 else:
                     timeout = ExecutionTimeoutError(text)
-                # #434: what the recovery rule reads, typed, never the text.
-                timeout.launch_end = _launch_end(LaunchEndKind.TIMEOUT, result, profile)
-                raise timeout
-            if ended_interaction is not None:
+                launch_failure, failure_kind = timeout, LaunchEndKind.TIMEOUT
+            elif ended_interaction is not None:
                 # ADR 0007 D7.6, D7.7: the agent's request for a decision ended
                 # the launch. Never corrected and never relaunched as
                 # transient, whatever the adapter also reported: a relaunch
@@ -16690,19 +16749,17 @@ class ControllerEngine:
                 # before the launch stands.
                 ended = _interaction_text(ended_interaction, result, broker)
                 record.error = _with_leftovers(ended, result.leftovers)
-                self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
                 error = (
                     ExecutionError
                     if ended_interaction is Lifecycle.INTERRUPTED
                     else InteractionRequiredError
                 )
-                ended_error = error(
+                launch_failure = error(
                     _with_leftovers(f"agent '{profile.name}' {ended}", result.leftovers)
                     + f". stderr tail: {stderr[-2000:]}"
                 )
-                ended_error.launch_end = _launch_end(LaunchEndKind.INTERACTION, result, profile)
-                raise ended_error
-            if result.provider_failure or result.failed_exit:
+                failure_kind = LaunchEndKind.INTERACTION
+            elif result.provider_failure or result.failed_exit:
                 # A run that failed inside the provider's protocol, whatever
                 # the exit status, is handled exactly like a failed exit, and
                 # its reason is named rather than the status because it says
@@ -16718,7 +16775,6 @@ class ControllerEngine:
                 if result.usage_limit:
                     failure += f" (provider limit: {result.usage_limit})"
                 record.error = _with_leftovers(failure, result.leftovers)
-                self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
                 if result.transient_failure and not result.usage_limit:
                     # The adapter's fact is the only input naming the failure
                     # transient; whether and how often to relaunch is decided
@@ -16733,6 +16789,9 @@ class ControllerEngine:
                         )
                     else:
                         transient_retries += 1
+                        self._record_invocation(
+                            logger, record, prompt, stdout, stderr, phase, step_log
+                        )
                         continue
                     ended += f" (transient: {result.transient_failure}; not relaunched: {held})"
                 if result.usage_limit:
@@ -16742,21 +16801,44 @@ class ControllerEngine:
                         f" (provider limit: {result.usage_limit}; not relaunched: a launch "
                         f"now meets the same limit, and {_usage_reset_text(result)})"
                     )
-                    limited = ProviderUsageLimitError(
+                    launch_failure = ProviderUsageLimitError(
                         _with_leftovers(f"agent '{profile.name}' {ended}", result.leftovers)
                         + f". stderr tail: {stderr[-2000:]}",
                         provider=profile.provider,
                         limit=result.usage_limit,
                         reset_at=result.usage_reset_at,
                     )
-                    limited.launch_end = _launch_end(LaunchEndKind.FAILED_EXIT, result, profile)
-                    raise limited
-                exited = ExecutionError(
-                    _with_leftovers(f"agent '{profile.name}' {ended}", result.leftovers)
-                    + f". stderr tail: {stderr[-2000:]}"
-                )
-                exited.launch_end = _launch_end(LaunchEndKind.FAILED_EXIT, result, profile)
-                raise exited
+                else:
+                    launch_failure = ExecutionError(
+                        _with_leftovers(f"agent '{profile.name}' {ended}", result.leftovers)
+                        + f". stderr tail: {stderr[-2000:]}"
+                    )
+            delivery: EndFacts | None = None
+            if launch_failure is not None:
+                # #479 (ADR 0012 D12): a reply the launch delivered before it
+                # failed goes to the checks below, as a clean exit's does, only
+                # when the rule finds every typed fact it needs: a completed
+                # final reply its adapter vouches for, whole and saying one
+                # thing, an idle or runtime limit or a failing exit, and a
+                # teardown that left nothing running. Otherwise the failure
+                # ends the step as before, and the recovery rule decides on it
+                # (#434: a reply in the output is never relaunched over).
+                delivery = _end_facts(result, interaction=ended_interaction is not None)
+                not_taken = delivered_reply_refusal(delivery)
+                if not_taken is not None:
+                    raise self._failed_launch(
+                        logger,
+                        record,
+                        (prompt, stdout, stderr),
+                        phase,
+                        step_log,
+                        launch_failure,
+                        failure_kind,
+                        result,
+                        profile,
+                        delivery,
+                        not_taken,
+                    )
             try:
                 if not self._launch_seeded:
                     # ADR 0005 D6.5: the agent's new objects are imported
@@ -16815,12 +16897,49 @@ class ControllerEngine:
                     # decided, before anything is pushed or created (#164).
                     self._check_replan_result(payload, cwd)
             except VerificationError as exc:
+                if launch_failure is not None and delivery is not None:
+                    # #479: a reply whose launch failed is accepted on proof
+                    # alone, and a read that could not be completed proves
+                    # nothing: the launch's failure stands.
+                    record.error += f"; its reply was not accepted: {type(exc).__name__}: {exc}"
+                    raise self._failed_launch(
+                        logger,
+                        record,
+                        (prompt, stdout, stderr),
+                        phase,
+                        step_log,
+                        launch_failure,
+                        failure_kind,
+                        result,
+                        profile,
+                        delivery,
+                        ReplyRefusal.CHECKS,
+                    ) from exc
                 # A read of the candidate that could not be completed: not the
                 # agent's error, so no correction; 'resume' reads it again.
                 record.error = f"{type(exc).__name__}: {exc}"
                 self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
                 raise
             except (ControlResultError, ControlResultValidationError) as exc:
+                if launch_failure is not None and delivery is not None:
+                    # #479: refused by the checks a clean exit's reply would
+                    # meet. Never corrected: a correction is a relaunch, and
+                    # whether the failed step runs again is the recovery
+                    # rule's, which refuses it over a reply in the output.
+                    record.error += f"; its reply was not accepted: {type(exc).__name__}: {exc}"
+                    raise self._failed_launch(
+                        logger,
+                        record,
+                        (prompt, stdout, stderr),
+                        phase,
+                        step_log,
+                        launch_failure,
+                        failure_kind,
+                        result,
+                        profile,
+                        delivery,
+                        ReplyRefusal.CHECKS,
+                    ) from exc
                 detail = str(exc)
                 if result.stdout_truncated:
                     detail += (
@@ -16856,8 +16975,49 @@ class ControllerEngine:
                     continue
                 raise ControlResultValidationError(failed) from exc
             record.parsed_result = payload
+            if launch_failure is not None and delivery is not None:
+                # #479: accepted. The launch's end stays on its record as the
+                # facts it is (timed_out, the limit, the exit status, what the
+                # teardown killed); the step goes on as after a clean exit,
+                # its result made durable by the phase's own first save, as
+                # every result is, and the step's message says how it ended.
+                record.error = ""
+                record.delivered_result = delivered_outcome_record(delivery, None)
+                self._delivered_note = delivered_outcome_text(delivery, None)
             self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
             return payload
+
+    def _failed_launch(
+        self,
+        logger: RunLogger,
+        record: ExecutionRecord,
+        texts: tuple[str, str, str],
+        phase: Phase,
+        step_log: StepLog,
+        failure: ExecutionError,
+        kind: LaunchEndKind,
+        result: AgentExecutionResult,
+        profile: ProfileConfig,
+        delivery: EndFacts,
+        refused: ReplyRefusal,
+    ) -> ExecutionError:
+        """Record a launch that failed with its reply not accepted; return its typed error.
+
+        The run log records what became of the reply (``delivered_result``)
+        when the launch had one to look at (:attr:`EndFacts.has_reply`), and
+        the error gains one line saying so, unless its own failure already
+        says everything (:data:`SILENT_REFUSALS`). The error carries the facts
+        the recovery rule reads (:func:`_launch_end`, #434), with the reason
+        (#479).
+        """
+        prompt, stdout, stderr = texts
+        if delivery.has_reply:
+            record.delivered_result = delivered_outcome_record(delivery, refused)
+            if refused not in SILENT_REFUSALS:
+                _add_line(failure, delivered_outcome_text(delivery, refused))
+        self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
+        failure.launch_end = _launch_end(kind, result, profile, refused)
+        return failure
 
     def resume_command(self) -> str:
         """The ``resume`` command that continues this run, as the operator would type it.
