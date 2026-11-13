@@ -524,7 +524,8 @@ class AgentExecutionResult:
     # (ClaudeStream.replied: every turn opened has its result, the last a
     # success holding a block, no tool call open) when the stream ended, with
     # no line of it skipped past the per-line bound (ClaudeStream.reply_proven,
-    # R3-F1 of PR #481); Pi's
+    # R3-F1 of PR #481) and every tool call it started tracked to its end
+    # (R4-F1 of PR #481); Pi's
     # conversation settled and its last assistant text read back, before any
     # limit cut it short, with every tool execution ended and nothing but that
     # text's response on stdout after the run settled, through Pi's shutdown
@@ -1569,10 +1570,11 @@ class ClaudeCodeProvider(AgentProvider):
         killed. A failure that is a turn ended by a transient model API error
         is also a ``transient_failure`` (#395); ``text`` output carries no
         record to tell it by. A stream that, read to its end with no line
-        skipped past the per-line bound, holds a reply that decides the run is
-        ``reply_delivered`` whatever the CLI did after it (#479, R3-F1 of PR
-        #481), which the engine reads for a CLI that then exited with a
-        failing status; ``text`` output vouches for no reply.
+        skipped past the per-line bound and every tool call it started tracked
+        to its end, holds a reply that decides the run is ``reply_delivered``
+        whatever the CLI did after it (#479, R3-F1 and R4-F1 of PR #481),
+        which the engine reads for a CLI that then exited with a failing
+        status; ``text`` output vouches for no reply.
         """
         if self.output_format(req.profile) != "stream-json":
             return super().execute(req)
@@ -1680,7 +1682,10 @@ class ClaudeCodeProvider(AgentProvider):
             # Only on a stream of which no line was skipped past the per-line
             # bound (ClaudeStream.reply_proven, R3-F1 of PR #481): a record
             # never read may have opened a later turn or a tool call, or
-            # failed the run. #439's stop on a reply reads ``replied`` as
+            # failed the run; and only with every tool call the stream
+            # started tracked to its end (R4-F1): one without a usable id or
+            # past the reducer's bound is never counted open, so no result
+            # shows it ended. #439's stop on a reply reads ``replied`` as
             # before.
             reply_delivered=failure is None and stream.reply_proven,
             # #434: a CLI that died inside a running session before any

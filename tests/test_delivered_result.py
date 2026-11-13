@@ -1268,6 +1268,140 @@ def test_a_fix_whose_pr_moved_goes_to_review_without_accepting_the_reply(
     assert load_state(eng.paths.state_file).last_fix_resolutions == []
 
 
+def _fixing_on_a_pr_closed_meanwhile(tmp_state_dir, gh, how: str):
+    """A FIX whose fixer delivers its result, then is killed at its idle limit,
+    with the PR closed while it ran: a successful fix, or a partial one (#433)."""
+    from .conftest import fixed, fixer
+    from .test_partial_fix import in_fix, partial_fixer
+
+    def close(_req=None) -> None:
+        gh.prs[PR] = replace(gh.prs[PR], state="CLOSED")
+
+    if how == "fix":
+        work = fixer(fixed("R1-F1"), fixed("R1-F2"), fixed("R1-F3"))
+
+        def reply(req):
+            text = work(req)
+            close()
+            return text
+
+    else:
+        reply = partial_fixer(during=close)
+    eng = in_fix(tmp_state_dir, gh, None)
+    provider = _Ends((reply, IDLE))
+    eng.providers._overrides = {"claude": provider, "opencode": provider}
+    eng.provider = provider
+    return eng, provider
+
+
+@pytest.mark.parametrize("how", ["fix", "partial-fix"])
+def test_a_reply_an_exceptional_refusal_drops_is_recorded_not_accepted(
+    tmp_state_dir, fake_github, how
+):
+    """R4-F2 of PR #481: the PR closes while the fixer runs, so the step's
+    own verification refuses the delivered reply before anything is planned
+    (``_require_open_pr``) and raises. The refusal is conclusive: the reply
+    is dropped from the state, so no later step will find it to settle. This
+    step records it not accepted, with the phase it leaves as it was (no stop
+    sink named a code, and the engine never classifies an error), and its
+    error is the verification's own, saying so."""
+    from autoforge.errors import VerificationError
+
+    eng, provider = _fixing_on_a_pr_closed_meanwhile(tmp_state_dir, fake_github, how)
+    with pytest.raises(VerificationError, match="is CLOSED") as caught:
+        eng.step()
+    assert "the step's own checks refused it, so it was not accepted" in str(caught.value)
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.FIX and state.delivered_reply == {}
+    (settled,) = _settlements(eng)
+    assert (settled["outcome"], settled["reason"]) == ("not-accepted", "FIX")
+    assert settled["kept_across_restart"] is False and settled["applied_before_restart"] is False
+    assert settled["launch_step"] == _agent_step(eng).name
+    assert _execution(eng)["delivered_result"]["outcome"] == "provisional"
+    assert len(provider.calls) == 1
+    assert [w for w in fake_github.effect_writes if w[0] != "create_issue_comment"] == []
+
+
+def test_a_reply_whose_check_before_keeping_it_raises_is_recorded_not_accepted(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """R4-F2 of PR #481, the other final drop: the operator's checkout cannot
+    be read when the reply would be kept (R2-F2), so the check before keeping
+    it raises. The reply was never kept, so no later step will find it: this
+    step records it not accepted, as a reply the step left its phase without
+    applying (the engine names codes at its sinks and never classifies an
+    error), and the error is the read's own."""
+    from autoforge.errors import VerificationError
+
+    unreadable: list[int] = []
+
+    def reply_then_unreadable_checkout(req):
+        unreadable.append(1)
+        return implement(req)
+
+    eng, provider = _analyzing(tmp_state_dir, fake_github, (reply_then_unreadable_checkout, IDLE))
+    anchor = eng._checkout_anchor
+
+    def checkout_anchor():
+        if unreadable:
+            raise VerificationError("`git rev-parse --verify HEAD` failed in the checkout")
+        return anchor()
+
+    monkeypatch.setattr(eng, "_checkout_anchor", checkout_anchor)
+    with pytest.raises(VerificationError, match="failed in the checkout"):
+        eng.step()
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.ANALYZE_EXECUTE and state.delivered_reply == {}
+    (settled,) = _settlements(eng)
+    assert (settled["outcome"], settled["reason"]) == ("not-accepted", "ANALYZE_EXECUTE")
+    assert _execution(eng)["delivered_result"]["outcome"] == "provisional"
+    assert len(provider.calls) == 1 and fake_github.effect_writes == []
+
+
+def test_a_record_the_refusal_cannot_write_never_replaces_the_step_error(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """R4-F2 of PR #481: the run log refuses the not-accepted record (a full
+    disk, say). The step still raises the verification's own error."""
+    from autoforge.errors import VerificationError
+
+    eng, _ = _fixing_on_a_pr_closed_meanwhile(tmp_state_dir, fake_github, "fix")
+
+    def refusing(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(eng, "_log_delivered_settlement", refusing)
+    with pytest.raises(VerificationError, match="is CLOSED"):
+        eng.step()
+    assert load_state(eng.paths.state_file).delivered_reply == {}
+
+
+def test_a_reply_kept_past_an_undecided_error_is_settled_once_by_the_resume(
+    tmp_state_dir, fake_github
+):
+    """Beside it, an error that decides nothing: GitHub stops answering while
+    the step verifies the reply, which stays kept for 'resume'. The step
+    records no settlement; the resume that goes on from it records the one."""
+    from .test_engine import _resumed
+
+    def reply_then_outage(req):
+        text = implement(req)
+        fake_github.get_repo_error = GitHubUnavailableError("gh: HTTP 502")
+        return text
+
+    eng, _ = _analyzing(tmp_state_dir, fake_github, (reply_then_outage, IDLE))
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert load_state(eng.paths.state_file).delivered_reply != {}
+    assert _settlements(eng) == []
+    fake_github.get_repo_error = None
+    eng2 = _resumed(eng, tmp_state_dir, fake_github)
+    _no_agent(eng2)
+    assert eng2.step().next_phase == "REVIEW"
+    (settled,) = _settlements(eng2)
+    assert settled["outcome"] == "accepted" and settled["kept_across_restart"] is True
+
+
 def test_a_reply_the_producer_gate_refuses_below_its_bound_is_dropped_and_relaunched(
     tmp_state_dir, fake_github, monkeypatch
 ):
@@ -1573,6 +1707,97 @@ def test_a_claude_reply_followed_by_a_line_past_the_bound_reads_as_before_otherw
     assert claude_fake.launches(home) == 1
     execution = _execution(eng)
     assert execution["provider_summary"]["oversize_records"] == 1
+    assert "delivered_result" not in execution
+
+
+def _untracked_call(monkeypatch, how: str) -> list:
+    """A tracked ``Bash`` call and an ``Edit`` start the reducer cannot track,
+    then the ``Bash`` call's result (R4-F1 of PR #481): the ``Edit`` has no
+    id, or comes past the reducer's tracking bound, lowered to one call."""
+    from autoforge import claude_stream
+    from tests import claude_fake
+
+    edit = {"type": "tool_use", "name": "Edit", "input": {"file_path": "src/a.py"}}
+    if how == "past-the-bound":
+        monkeypatch.setattr(claude_stream, "MAX_OPEN_TOOLS", 1)
+        edit["id"] = "t2"
+    return [
+        claude_fake.init(),
+        claude_fake.tool_use("t1", "Bash", command="make check", description="Run checks"),
+        claude_fake.line({"type": "assistant", "message": {"content": [edit]}}),
+        claude_fake.tool_result("t1", "ok"),
+    ]
+
+
+@pytest.mark.parametrize("how", ["no-id", "past-the-bound"])
+def test_a_claude_reply_after_a_call_it_could_not_track_is_never_accepted(
+    tmp_path, tmp_state_dir, fake_github, monkeypatch, how
+):
+    """R4-F1 of PR #481, adapter to engine: an ``Edit`` start without an id,
+    or past the tracking bound, is never counted open, so the review after it
+    decides the run, but nothing shows that call ended. With an exit 3 after
+    the review, the adapter vouches for no reply: the launch's failure
+    stands, nothing is posted, and the agent is not launched again."""
+    from autoforge.claims import REVIEW, scan
+    from tests import claude_fake
+
+    from .conftest import SHA_A, review_result
+    from .test_engine import _in_review
+
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    lines = [
+        *_untracked_call(monkeypatch, how),
+        claude_fake.result(block(review_result(1, SHA_A, []))),
+    ]
+    home = _claude(tmp_path, eng, lines, exit_code=3)
+    with pytest.raises(ExecutionError) as caught:
+        eng.run(max_steps=5)
+    assert "its output was not accepted as the step's result (no-reply: " in str(caught.value)
+    assert claude_fake.launches(home) == 1, "no correction and no relaunch"
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.REVIEW and state.delivered_reply == {}
+    posted = [c.body for c in fake_github.comments.get(PR, [])]
+    assert not [b for b in posted if scan(REVIEW, b).claims], "the review was not posted"
+    execution = _execution(eng)
+    assert execution["exit_code"] == 3
+    summary = execution["provider_summary"]
+    assert (summary["open_tool_calls"], summary["untracked_tool_calls"]) == (0, 1)
+    assert execution["delivered_result"]["outcome"] == "refused"
+    assert execution["delivered_result"]["reason"] == "no-reply"
+    assert execution["delivered_result"]["reply_delivered"] is False
+    run_dir = eng.paths.logs_dir / eng.state.run_id
+    assert not [p for p in run_dir.iterdir() if "-delivered-result-" in p.name]
+
+
+@pytest.mark.parametrize("end", ["clean-exit", "kept-alive"])
+def test_a_claude_reply_after_a_call_it_could_not_track_reads_as_before_otherwise(
+    tmp_path, tmp_state_dir, fake_github, monkeypatch, end
+):
+    """Beside it, the ends R4-F1 leaves alone: a CLI that exits 0 after the
+    same stream has its reply read as a clean exit's, and one kept alive after
+    it is stopped on its reply (#439), with no delivered-result decision."""
+    from autoforge import executor, providers
+    from tests import claude_fake
+
+    from .conftest import SHA_A, review_result
+    from .test_engine import _in_review
+
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(providers, "CLAUDE_REPLIED_EXIT_GRACE_SECONDS", 0.5)
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    lines = [
+        *_untracked_call(monkeypatch, "no-id"),
+        claude_fake.result(block(review_result(1, SHA_A, []))),
+    ]
+    if end == "kept-alive":
+        lines.append({"sleep": 60})
+    home = _claude(tmp_path, eng, lines, idle=30 if end == "kept-alive" else None)
+    outcome = eng.step()
+    assert outcome.next_phase == "READY_FOR_MERGE", outcome.message
+    assert "(#479)" not in outcome.message
+    assert claude_fake.launches(home) == 1
+    execution = _execution(eng)
+    assert execution["provider_summary"]["untracked_tool_calls"] == 1
     assert "delivered_result" not in execution
 
 

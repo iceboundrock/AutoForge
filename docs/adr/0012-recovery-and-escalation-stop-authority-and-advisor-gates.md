@@ -822,7 +822,11 @@ reply, with nothing opened after it, handed over whole: the adapter's fact
 (`ClaudeStream.reply_proven`: `replied`, read to the stream's end, with no
 line of the stream skipped past the per-line bound, since a record never read
 may have opened a later turn or a tool call, or failed the run, R3-F1 of PR
-#481) and by Pi (its
+#481, and with every tool call the stream started tracked to its end: a
+`tool_use` without a string id, with the id of a call still open, or past
+`MAX_OPEN_TOOLS`, and an `assistant` record whose content cannot be read for
+its calls, are calls no `tool_result` can be shown to end, so each voids the
+proof for good, R4-F1 of PR #481) and by Pi (its
 conversation settled and its last assistant text read back, before any limit
 cut it short, with every tool execution it started ended by its call id and
 nothing but that text's response on stdout after `agent_settled`, read
@@ -940,7 +944,16 @@ has), is a safe stop: `BLOCKED`
 the reply dropped, so `unblock` launches the agent afresh. The kept reply is
 dropped by every save in another phase or after another launch, and by the
 step when its own checks refuse it, so a refused reply is never gone on from
-twice. The run log records each outcome (`execution.json`'s
+twice. A step that refuses the reply for good and then raises (its
+verification refuses before planning, as for a FIX whose PR was closed while
+the fixer ran, or the check before keeping the reply cannot read the
+operator's checkout) records it `not-accepted` with the phase it leaves as it
+was (no stop sink named a code, and the engine never classifies an error),
+once the save that drops it has succeeded or when it was never kept, since no
+later step will find it; the error it raises is its own, and
+a record the run log refuses never replaces it. A reply still kept after an
+error that decided nothing (an unavailable GitHub) is undecided, and only
+the step that settles it records it (R4-F2 of PR #481). The run log records each outcome (`execution.json`'s
 `delivered_result`: provisional or refused, the reason, the facts; the
 step's record: accepted or not) and is never read for recovery; D11's
 journal records a refusal's decision, as for any failed step
@@ -962,7 +975,11 @@ journal records a refusal's decision, as for any failed step
 `test_an_applied_reply_whose_plan_is_gone_is_settled_and_never_gone_on_from`,
 `test_a_kept_reply_the_restart_refuses_is_recorded_not_accepted`,
 `test_a_fix_whose_pr_moved_goes_to_review_without_accepting_the_reply`,
-`test_a_reply_the_producer_gate_refuses_below_its_bound_is_dropped_and_relaunched`).
+`test_a_reply_the_producer_gate_refuses_below_its_bound_is_dropped_and_relaunched`,
+`test_a_reply_an_exceptional_refusal_drops_is_recorded_not_accepted`,
+`test_a_reply_whose_check_before_keeping_it_raises_is_recorded_not_accepted`,
+`test_a_record_the_refusal_cannot_write_never_replaces_the_step_error`,
+`test_a_reply_kept_past_an_undecided_error_is_settled_once_by_the_resume`).
 
 **D12.5. Every bound stays.** The launch was charged as a step before it
 started, and accepting its reply launches nothing, so no step, no relaunch
@@ -977,7 +994,9 @@ dry run launches nothing to accept
 stream decided whatever the exit after it, and for none with a call still
 open or a turn opened after it, nor for one in a stream of which a line was
 skipped past the per-line bound, before the reply or after it (R3-F1 of PR
-#481): a clean exit and #439's stop on a reply read such a stream as before; Pi vouches for a settled conversation whose
+#481), nor for one after a tool call it could not track to its end (no
+string id, the id of a call still open, past the reducer's bound, or content
+it cannot read; R4-F1 of PR #481): a clean exit and #439's stop on a reply read such a stream as before; Pi vouches for a settled conversation whose
 shutdown then hangs past a limit or exits badly, and for none its limit cut
 short, none with a tool execution left open, and none after which Pi wrote
 anything but the text's response, a later turn in its shutdown included (a
@@ -992,6 +1011,10 @@ printed before a kill is refused (`no-reply`) and stays the operator's
 `test_a_claude_reply_followed_by_a_line_past_the_bound_is_never_accepted`,
 `test_a_claude_reply_followed_by_a_line_past_the_bound_reads_as_before_otherwise`,
 `test_a_skipped_line_voids_the_proof_of_a_reply_but_not_the_stop_on_it`,
+`test_a_claude_reply_after_a_call_it_could_not_track_is_never_accepted`,
+`test_a_claude_reply_after_a_call_it_could_not_track_reads_as_before_otherwise`,
+`test_a_call_that_cannot_be_tracked_voids_the_proof_of_a_reply_but_not_the_stop_on_it`,
+`test_a_call_past_the_default_bound_voids_the_proof_of_a_reply`,
 `test_a_pi_that_hangs_on_shutdown_after_a_settled_run_has_its_reply_accepted`,
 `test_a_pi_that_exits_badly_after_a_settled_run_has_its_reply_accepted`,
 `test_a_pi_reply_with_a_tool_execution_left_open_is_never_accepted`,

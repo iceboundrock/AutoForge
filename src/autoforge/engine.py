@@ -2002,6 +2002,14 @@ class ControllerEngine:
         # applied. Reset at every step.
         self._delivered: _Provisional | None = None
         self._delivered_applied = False
+        # #479 (R4-F2 of PR #481): whether the step refused that reply for
+        # good before applying it, and the state keeps it no more: set once
+        # the save that drops it after a refusal its verification raised has
+        # succeeded, or when it was never kept (the check before keeping it
+        # raised). No later step will find it, so the step that raises with
+        # it records it not accepted. A reply still kept is undecided, and
+        # the step that finds it settles it. Reset with ``_delivered``.
+        self._delivered_dropped = False
         # Whether this step's REVIEW entry wrote or reused the
         # ``review_evidence`` binding the reviewer's prompt is rendered from
         # (ADR 0006 D5.5, D5.7, D9.1); reset at every REVIEW entry, so a plan
@@ -6239,7 +6247,7 @@ class ControllerEngine:
             self._sandbox_gate()
         # #479 (R3-F2 of PR #481): a reply the state keeps for this phase entry
         # is this step's to settle, whatever ends it, a stop below included.
-        self._delivered, self._delivered_applied = None, False
+        self._forget_delivered()
         self._adopt_kept_reply(previous)
         # Under the lock, before anything else of the step, the plan included
         # (ADR 0006 D11.3): a validation marker a crash left becomes its
@@ -6312,15 +6320,32 @@ class ControllerEngine:
                 # without an outcome; say what became of the reply. One it
                 # applied is accepted (R3-F2 of PR #481): kept, its record is
                 # the step's that completes the plan; no longer kept, nothing
-                # else will record it, so this step does.
-                if self._delivered_applied and not state.delivered_reply:
-                    with suppress(StateError):
+                # else will record it, so this step does. One it refused for
+                # good and dropped (``_delivered_dropped``) is not accepted,
+                # and likewise only this step can record it (R4-F2), with the
+                # phase the step leaves as it was: no stop sink named a code,
+                # and the engine never classifies an error. One still kept and
+                # not applied is undecided: the step that finds it settles it.
+                # A record that cannot be written never replaces the error the
+                # step raised.
+                if not state.delivered_reply and (
+                    self._delivered_applied or self._delivered_dropped
+                ):
+                    accepted = self._delivered_applied
+                    with suppress(StateError, OSError):
                         self._log_delivered_settlement(
-                            previous, self._delivered, accepted=True, reason=""
+                            previous,
+                            self._delivered,
+                            accepted=accepted,
+                            reason="" if accepted else previous.value,
                         )
                 _add_line(exc, self._delivered_unsettled_text())
             raise
         return self._settled(previous, outcome)
+
+    def _forget_delivered(self) -> None:
+        """No provisional reply for the step to settle any more (#479)."""
+        self._delivered, self._delivered_applied, self._delivered_dropped = None, False, False
 
     def _adopt_kept_reply(self, phase: Phase) -> None:
         """Take up the reply the state keeps for this phase entry, to settle it (R3-F2 of PR #481).
@@ -6383,7 +6408,7 @@ class ControllerEngine:
         accepted = self._delivered_applied
         stop = outcome.stop.code.value if outcome.stop is not None else outcome.next_phase
         self._log_delivered_settlement(previous, delivered, accepted=accepted, reason=stop)
-        self._delivered, self._delivered_applied = None, False
+        self._forget_delivered()
         note = delivered_settled_text(delivered.facts, accepted=accepted, carried=delivered.carried)
         return replace(outcome, message=f"{note}\n{outcome.message}")
 
@@ -6588,6 +6613,9 @@ class ControllerEngine:
             if not self._delivered_applied:
                 state.delivered_reply = {}
             self._save()
+            # R4-F2 of PR #481: the drop is saved, so the refusal is final and
+            # :meth:`_step_once` records the reply not accepted.
+            self._delivered_dropped = not self._delivered_applied
             raise
         # #479 (R2-F4 of PR #481): the result was applied if, and only if,
         # the verification saved the plan it turned it into (``_save_plan``
@@ -6640,10 +6668,12 @@ class ControllerEngine:
             self._record_verification_failure(Phase.FIX, exc)
             # #479: a reply kept from a failed launch was refused with it,
             # unless its plan was saved: then it was accepted, and stays kept
-            # beside the plan (R3-F2 of PR #481).
+            # beside the plan (R3-F2 of PR #481). Once the drop is saved the
+            # refusal is final, and :meth:`_step_once` records it (R4-F2).
             if not self._delivered_applied:
                 self._require_state().delivered_reply = {}
             self._save()
+            self._delivered_dropped = not self._delivered_applied
             raise
         if nxt != Phase.BLOCKED:
             raise StateError(f"a partial FIX was applied and left FIX for {nxt.value}")
@@ -16845,7 +16875,7 @@ class ControllerEngine:
                 self._log_delivered_settlement(
                     phase, self._delivered, accepted=self._delivered_applied, reason=phase.value
                 )
-                self._delivered, self._delivered_applied = None, False
+                self._forget_delivered()
             state.delivered_reply = {}
             # The one write before the agent starts: the attempt counter, the
             # step it is charged as (the first launch's by the step itself, a
@@ -17247,6 +17277,11 @@ class ControllerEngine:
                         self._delivered = _Provisional(
                             delivery, state.attempt, step_log.name, Carried.FRESH
                         )
+                        # Never kept (this launch's save dropped any reply
+                        # before it), so no later step will find it: a drift
+                        # is settled by the stop it becomes, and any other
+                        # error by the step that raises it (R4-F2 of PR #481).
+                        self._delivered_dropped = True
                         self._record_invocation(
                             logger, record, prompt, stdout, stderr, phase, step_log
                         )

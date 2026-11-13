@@ -37,7 +37,11 @@ review was posted). A crash or an error after that save no longer loses the
 acceptance: the kept reply is marked `applied` beside the plan, and the
 `resume` that completes the plan records the reply as accepted. Claude Code's
 `stream-json` vouches for a reply only when no line of its stream was skipped
-past the per-line bound.
+past the per-line bound, and when every tool call the stream started could be
+followed to its end: a call without an id, one sharing the id of a call still
+open, one past the reducer's tracking bound, or one in an `assistant` record
+whose content cannot be read can never be shown ended, so it voids the proof
+(the stop on a reply of #439 and a clean exit read such a stream as before).
 
 A reply that falls short is not corrected and not relaunched over, as
 before: the failure stands, with a line saying why the reply was not taken
@@ -45,7 +49,12 @@ before: the failure stands, with a line saying why the reply was not taken
 the automatic recovery audit's evidence names the same reason. Each such
 launch's `execution.json` records the outcome under `delivered_result`
 (`provisional` or `refused`), and the step's own `<PHASE>-delivered-result`
-record says whether the step accepted it.
+record says whether the step accepted it. That includes a step that ends in an
+error after refusing the reply for good (a FIX whose PR was closed while the
+fixer ran, say): the record says `not-accepted` with the phase the step left
+as it was, and the error is still the one the step raised. A reply still kept for
+`resume` (GitHub stopped answering, say) gets its record from the step that
+settles it.
 
 The automatic relaunch of #434 is now also refused when the platform could
 not look for a process the failed launch left outside its process group (a

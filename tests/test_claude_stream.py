@@ -415,6 +415,86 @@ def test_a_reply_read_whole_is_proven():
     assert stream.replied and stream.reply_proven
 
 
+_EDIT = {"type": "tool_use", "name": "Edit", "input": {"file_path": f"{CWD}/a.py"}}
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        pytest.param((_assistant(_EDIT),), id="a_start_without_an_id"),
+        pytest.param((_assistant({**_EDIT, "id": 7}),), id="a_start_with_a_number_for_an_id"),
+        pytest.param((_assistant({**_EDIT, "id": ["t2"]}),), id="a_start_with_a_list_for_an_id"),
+        pytest.param(
+            (
+                _assistant(_tool_use("t1", "Bash", description="x"), {**_EDIT, "id": "t1"}),
+                _tool_result("t1"),
+            ),
+            id="a_start_sharing_the_id_of_a_call_still_open",
+        ),
+        pytest.param(
+            ({"type": "assistant", "message": {"content": "tool_use"}},),
+            id="content_that_is_no_list",
+        ),
+        pytest.param(({"type": "assistant", "message": "tool_use"},), id="no_message_object"),
+        pytest.param(
+            ({"type": "assistant", "message": {"content": [{"type": "text"}, "tool_use"]}},),
+            id="a_block_that_is_no_object",
+        ),
+    ],
+)
+def test_a_call_that_cannot_be_tracked_voids_the_proof_of_a_reply_but_not_the_stop_on_it(
+    records,
+):
+    """R4-F1 of PR #481: a tool call the reducer cannot track is never counted
+    open, so a reply after it decides the run (``replied``, #439, as before),
+    but nothing shows the call ended: the proof a reply before a failing exit
+    is taken on (``reply_proven``) fails closed on it, and stays failed. The
+    run itself reads as before."""
+    stream = ClaudeStream(cwd=CWD, is_reply=lambda text: "<<<CONTROL_RESULT>>>" in text)
+    for record in (_INIT, *records, _result()):
+        stream.feed(_line(record))
+    assert stream.replied and not stream.reply_proven
+    stream.stream_ended()
+    assert stream.failure is None and stream.text == TEXT
+    assert stream.summary()["open_tool_calls"] == 0
+    assert stream.summary()["untracked_tool_calls"] == 1
+
+
+def test_a_call_past_the_default_bound_voids_the_proof_of_a_reply():
+    """R4-F1 of PR #481, at the reducer's own bound: every tracked call ends,
+    and the one past :data:`MAX_OPEN_TOOLS` that was never tracked leaves the
+    reply unproven, though it decides the run (#439)."""
+    bound = claude_stream.MAX_OPEN_TOOLS
+    stream = ClaudeStream(cwd=CWD, is_reply=lambda text: "<<<CONTROL_RESULT>>>" in text)
+    starts = [_tool_use(f"t{n}", "Read", file_path=f"{CWD}/{n}.py") for n in range(bound)]
+    stream.feed(_line(_INIT))
+    stream.feed(_line(_assistant(*starts, _tool_use("past", "Edit", file_path=f"{CWD}/a.py"))))
+    for n in range(bound):
+        stream.feed(_line(_tool_result(f"t{n}")))
+    stream.feed(_line(_result()))
+    assert stream.replied and not stream.reply_proven
+    summary = stream.summary()
+    assert (summary["tool_calls"], summary["open_tool_calls"]) == (bound + 1, 0)
+    assert summary["untracked_tool_calls"] == 1
+
+
+def test_a_reply_with_every_call_tracked_to_its_end_is_proven_up_to_the_bound():
+    """Beside it: as many calls as the bound, each ended, and ids reused only
+    once their call ended, leave the proof as it was."""
+    bound = claude_stream.MAX_OPEN_TOOLS
+    stream = ClaudeStream(cwd=CWD, is_reply=lambda text: "<<<CONTROL_RESULT>>>" in text)
+    starts = [_tool_use(f"t{n}", "Read", file_path=f"{CWD}/{n}.py") for n in range(bound)]
+    stream.feed(_line(_INIT))
+    stream.feed(_line(_assistant(*starts)))
+    for n in range(bound):
+        stream.feed(_line(_tool_result(f"t{n}")))
+    stream.feed(_line(_assistant(_tool_use("t0", "Bash", description="again"))))
+    stream.feed(_line(_tool_result("t0")))
+    stream.feed(_line(_result()))
+    assert stream.replied and stream.reply_proven
+    assert stream.summary()["untracked_tool_calls"] == 0
+
+
 def test_no_text_is_a_reply_without_a_test_for_one():
     stream, _ = _run(_result(), ended=False)
     assert stream.text == TEXT and not stream.replied
@@ -714,6 +794,7 @@ def test_calls_past_the_bound_or_without_an_id_are_not_counted_open(monkeypatch)
     )
     assert stream.summary()["tool_calls"] == 4
     assert _stood(stream) == (1, 0, 2)
+    assert stream.summary()["untracked_tool_calls"] == 2
 
 
 def test_stdout_ending_before_every_held_result_arrived_is_a_failure():

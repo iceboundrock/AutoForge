@@ -102,9 +102,16 @@ checks it again exactly as a fresh reply, against the same revision, and
 launches no agent (ADR 0012 D12.4). A crash or an error after that save
 leaves the reply marked applied beside the plan: the next command completes
 the plan from the journal and records the reply as accepted, and never checks
-it again (R3-F2 of PR #481). Claude `stream-json` vouches for a reply only
-when no line of its stream was skipped past the per-line bound (R3-F1). A
-clean exit's reply is read exactly as before.
+it again (R3-F2 of PR #481). A step that refuses the reply for good and then
+raises (a FIX whose PR was closed while the fixer ran) records it
+`not-accepted` with the phase it leaves as it was, and still raises that
+error; a
+reply still kept for the next command is settled by that command (R4-F2).
+Claude `stream-json` vouches for a reply only when no line of its stream was
+skipped past the per-line bound (R3-F1), and only when every tool call the
+stream started was tracked to its end: one without a string id, sharing the
+id of a call still open, past the reducer's bound, or in content it cannot
+read voids the proof (R4-F1). A clean exit's reply is read exactly as before.
 
 ### What an agent is told about work still running (#440)
 

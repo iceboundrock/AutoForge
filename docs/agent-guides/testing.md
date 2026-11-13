@@ -1930,7 +1930,18 @@ a stated reason it has none. The coverage that must keep working:
   overtaken by a later turn never accepted, a reply followed by a line past
   the per-line bound then an exit 3 never accepted while a clean exit and
   #439's stop read the same stream as before (R3-F1; the reducer's
-  `reply_proven` in `tests/test_claude_stream.py`), Pi hanging on its shutdown past
+  `reply_proven` in `tests/test_claude_stream.py`), a reply after a tool
+  call the reducer could not track (an `Edit` start without an id, or past a
+  lowered tracking bound) then an exit 3 never accepted while a clean exit
+  and #439's stop read the same stream as before (R4-F1; the reducer's
+  untracked starts, duplicate open ids, unreadable content and the default
+  `MAX_OPEN_TOOLS` overflow in `tests/test_claude_stream.py`), a reply the
+  step refused for good before raising (a FIX or a partial FIX whose PR was
+  closed while the fixer ran, a check before keeping it that raised)
+  recorded `not-accepted` with the phase it left as it was and the error
+  kept,
+  while one still kept after an outage is recorded once, by the resume
+  (R4-F2), Pi hanging on its shutdown past
   the idle limit or exiting 7 after a settled run accepted, Pi cut short by
   its limit vouching for nothing, Pi with a tool execution left open or a
   later turn written during its shutdown (exiting 7, or killed at the idle
