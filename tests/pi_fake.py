@@ -130,6 +130,10 @@ def agent_end(message):
 
 
 def settle(message):
+    if turn["open_call"]:
+        # A tool execution Pi reports started and never ended (#479).
+        emit({"type": "tool_execution_start", "toolCallId": turn["open_call"],
+              "toolName": "bash", "args": {}})
     emit({"type": "message_end", "message": message})
     agent_end(message)
     emit({"type": "agent_settled"})
@@ -181,7 +185,10 @@ for line in sys.stdin.buffer:
     elif kind == "abort":
         respond(kind, rid)
         emit({"type": "agent_settled"})
-# Stdin closed: how this Pi shuts down (#479).
+# Stdin closed: how this Pi shuts down (#479). What it writes first, a later
+# turn say, then how long it lingers and how it exits.
+for record in turn["shutdown"]:
+    emit(record)
 time.sleep(turn["linger"])
 sys.exit(turn["close_exit"])
 """
@@ -203,9 +210,11 @@ class PiTurn:
     that many seconds. ``auth`` and ``auth_exit`` script the ``pi auth
     check`` preflight. ``agent_end_bytes`` makes the run's ``agent_end``
     repeat a user prompt of that many characters, as Pi's repeats every
-    message of the run (#144). Once its stdin closes, it sleeps ``linger``
-    seconds and exits ``close_exit``: a Pi whose shutdown hangs past a limit,
-    or that exits with a failing status after a settled run (#479).
+    message of the run (#144). Once its stdin closes, it writes the records
+    of ``shutdown`` (a later turn, say), sleeps ``linger`` seconds and exits
+    ``close_exit``: a Pi whose shutdown hangs past a limit, or that exits with
+    a failing status after a settled run (#479). ``open_call`` reports a tool
+    execution of that call id started before the run settles and never ended.
     """
 
     text: str = ""
@@ -220,6 +229,8 @@ class PiTurn:
     agent_end_bytes: int = 0
     linger: float = 0.0
     close_exit: int = 0
+    shutdown: list[dict] = field(default_factory=list)
+    open_call: str = ""
 
 
 class PiFake:

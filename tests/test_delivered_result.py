@@ -324,7 +324,12 @@ def _other_issue(req) -> str:
         (implement, {**IDLE, "group_survived_kill": True}, "survivor", "process-may-survive"),
         (implement, {**IDLE, "capture_abandoned": True}, "survivor", "process-may-survive"),
         (implement, {**IDLE, "orphan_survived_kill": True}, "survivor", "process-may-survive"),
-        (implement, {**IDLE, "orphans_unchecked": True}, "orphans-unchecked", "process-may-survive"),
+        (
+            implement,
+            {**IDLE, "orphans_unchecked": True},
+            "orphans-unchecked",
+            "process-may-survive",
+        ),
         (implement, {**IDLE, "timeout_limit": "loop"}, "limit", "not-allowlisted"),
         (implement, {**IDLE, "timeout_limit": ""}, "limit", "not-allowlisted"),
         (implement, {**IDLE, "stdout_truncated": True}, "truncated", "result-delivered"),
@@ -748,6 +753,96 @@ def test_a_pi_that_exits_badly_after_a_settled_run_has_its_reply_accepted(
     assert outcome.next_phase == "REVIEW", outcome.message
     (result,) = eng.pi.results
     assert result.exit_code == 7 and result.failed_exit and result.reply_delivered
+
+
+@pytest.mark.parametrize(
+    ("ending", "error"),
+    [({"close_exit": 7}, ExecutionError), ({"linger": 60}, ExecutionTimeoutError)],
+    ids=["exit", "idle-kill"],
+)
+def test_a_pi_reply_with_a_tool_execution_left_open_is_never_accepted(
+    tmp_path_factory, tmp_state_dir, fake_github, ending, error
+):
+    """R1-F3 of PR #481, adapter to engine: Pi reports a tool execution
+    started and never ended, then settles with its final text and ends badly.
+    Its protocol does not prove the reply the run's last word, so the adapter
+    vouches for none: the failure stands, nothing is published, and no
+    relaunch goes over the block in the output."""
+    from tests.pi_fake import PiTurn
+
+    eng, fake = _pi_engine(
+        tmp_path_factory,
+        tmp_state_dir,
+        fake_github,
+        PiTurn(open_call="call-1", **ending),
+        idle_timeout_seconds=2,
+    )
+    with pytest.raises(error) as caught:
+        eng.run(max_steps=5)
+    assert "(no-reply: " in str(caught.value)
+    assert len(fake.launches()) == 1
+    (result,) = eng.pi.results
+    assert result.stdout and not result.reply_delivered
+    assert result.provider_summary["open_tool_executions"] == 1
+    assert _execution(eng)["delivered_result"]["reason"] == "no-reply"
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.ANALYZE_EXECUTE and state.current_pr_url in ("", None)
+    assert fake_github.effect_writes == [] or all(
+        w[0] == "create_issue_comment" for w in fake_github.effect_writes
+    )
+
+
+#: A later turn Pi opens while it shuts down: it starts a write-capable tool.
+_LATER_TURN = [
+    {"type": "agent_start"},
+    {"type": "turn_start"},
+    {"type": "tool_execution_start", "toolCallId": "later", "toolName": "edit", "args": {}},
+]
+
+
+@pytest.mark.parametrize(
+    ("ending", "error"),
+    [({"close_exit": 7}, ExecutionError), ({"linger": 60}, ExecutionTimeoutError)],
+    ids=["exit", "idle-kill"],
+)
+def test_a_pi_reply_overtaken_by_a_later_turn_in_its_shutdown_is_never_accepted(
+    tmp_path_factory, tmp_state_dir, fake_github, ending, error
+):
+    """R1-F3 of PR #481, adapter to engine: the conversation settled and its
+    text was read back, then Pi, its stdin closed, opened another turn before
+    it exited badly or a limit killed it. The adapter reads stdout through
+    the shutdown, so the reply is no longer the run's last word."""
+    from tests.pi_fake import PiTurn
+
+    eng, fake = _pi_engine(
+        tmp_path_factory,
+        tmp_state_dir,
+        fake_github,
+        PiTurn(shutdown=_LATER_TURN, **ending),
+        idle_timeout_seconds=2,
+    )
+    with pytest.raises(error) as caught:
+        eng.run(max_steps=5)
+    assert "(no-reply: " in str(caught.value)
+    assert len(fake.launches()) == 1
+    (result,) = eng.pi.results
+    assert result.stdout and not result.reply_delivered
+    assert result.provider_summary["records_after_settled"] == len(_LATER_TURN)
+    assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
+
+
+def test_a_pi_that_exits_cleanly_after_a_later_turn_keeps_its_reply_as_before(
+    tmp_path_factory, tmp_state_dir, fake_github
+):
+    """The proof is only read for a launch that ended badly: a Pi that exits
+    0 is read as it always was, whatever it wrote while shutting down."""
+    from tests.pi_fake import PiTurn
+
+    eng, _ = _pi_engine(tmp_path_factory, tmp_state_dir, fake_github, PiTurn(shutdown=_LATER_TURN))
+    (outcome,) = eng.run(max_steps=1)
+    assert outcome.next_phase == "REVIEW", outcome.message
+    (result,) = eng.pi.results
+    assert not result.reply_delivered and not result.failed_exit
 
 
 def test_a_pi_cut_short_by_its_limit_delivered_no_reply(

@@ -35,6 +35,17 @@ The conversation, in order (ADR 0003 §2.1 to §2.8):
    ``text`` blocks joined with no separator, then trimmed as JavaScript's
    ``String.prototype.trim`` does) is a protocol failure.
 
+The reply's proof (#479, R1-F3 of PR #481): :attr:`PiConversation.reply_settled`
+says the final text was read back from a run that settled with every tool
+execution it started ended (each ``tool_execution_start`` matched by its
+``toolCallId`` to a ``tool_execution_end``; a start without an id, or past
+:data:`MAX_OPEN_TOOLS`, can never be shown ended), and that nothing but the
+text's own response reached stdout after ``agent_settled``, up to the end of
+the stream the caller feeds (the driver feeds what Pi writes during its
+shutdown too). Anything else (a tool still open, a later turn, an extension
+dialog, a record past the bound, a fragment) leaves it false: it is never a
+failure of the run, only no proof that the reply was Pi's last word.
+
 Every string that leaves this module for a log (a failure reason, a summary
 value) is bounded, made encodable, redacted and put on one line here. Raw
 records, the ``get_state`` object, the model list and message contents
@@ -135,8 +146,9 @@ _ROUND_TRIPS = frozenset({"get_state", "get_available_models", "get_last_assista
 
 MAX_REASON_CHARS = 400
 MAX_VALUE_CHARS = 200
-# Tool executions whose end has not arrived yet, kept for the loop detector.
-# Past the bound an end is still counted, only not an action.
+# Tool executions whose end has not arrived yet, kept for the loop detector
+# and for the reply's proof (#479). Past the bound an end is still counted,
+# only not an action, and a start is one that can never be shown ended.
 MAX_OPEN_TOOLS = 1024
 # The one argument shown per Pi tool in progress; ``bash`` has only its
 # command, which is never shown.
@@ -213,6 +225,15 @@ class PiConversation:
         self._loop = loop
         # Open tool executions by call id: their name and their args' digest.
         self._open_tools: dict[str, tuple[str, bytes]] = {}
+        # #479: every tool execution started and not yet ended, by call id,
+        # whatever the loop detector does, and the starts that can never be
+        # shown ended (no string id, or past MAX_OPEN_TOOLS).
+        self._open_calls: set[str] = set()
+        self._untracked_calls = 0
+        # #479: records that reached stdout after ``agent_settled`` other than
+        # a response to a command still pending, and every record after the
+        # final text was read back (the driver feeds Pi's shutdown too).
+        self._after_settled = 0
         self._model = model
         self._provider, _, self._model_id = model.partition("/")
         self._thinking = thinking
@@ -254,6 +275,24 @@ class PiConversation:
         return self.text is not None or self.failure is not None
 
     @property
+    def reply_settled(self) -> bool:
+        """The proof a delivered reply needs (#479, R1-F3 of PR #481).
+
+        The final text was read back, from a run that settled with every
+        tool execution it started ended, and nothing but the text's own
+        response reached stdout after ``agent_settled`` (what the caller fed
+        afterwards, Pi's shutdown included, counts). Never a failure: false
+        only says the reply cannot be shown to be Pi's last word.
+        """
+        return (
+            self.text is not None
+            and self.failure is None
+            and not self._open_calls
+            and self._untracked_calls == 0
+            and self._after_settled == 0
+        )
+
+    @property
     def abort_settled(self) -> bool:
         """After :meth:`begin_abort`: whether Pi has settled the aborted run."""
         return self._settled or not self._abort_sent
@@ -288,6 +327,9 @@ class PiConversation:
             self._protocol("a stdout record is not a JSON object with a 'type'")
             return []
         kind = record["type"]
+        if self.text is not None or (self._settled and not self._pending_response(record)):
+            # #479: activity the settled reply does not account for.
+            self._after_settled += 1
         if kind == "response":
             return self._response(record, now)
         if kind == "extension_ui_request":
@@ -315,6 +357,8 @@ class PiConversation:
             self._fail(f"pi: no response to {late.command} within {self._round_trip:g}s")
 
     def framing_error(self, what: str) -> None:
+        if self._settled or self.text is not None:
+            self._after_settled += 1  # #479: no proof of what it was
         self._protocol(what)
 
     def oversize(self, head: bytes, limit: int) -> None:
@@ -325,6 +369,8 @@ class PiConversation:
         reported as activity; an ``agent_end``'s ``willRetry`` is not known,
         so it is not counted. Any other record is a protocol violation.
         """
+        if self._settled or self.text is not None:
+            self._after_settled += 1  # #479: a record after the run settled
         kind = next((k for h, k in _OVERSIZE_HEADS.items() if head.startswith(h)), None)
         if kind is None:
             self._protocol(f"a stdout record exceeded {limit} bytes")
@@ -375,6 +421,8 @@ class PiConversation:
             "ui_notifications_ignored": self._notifications_ignored,
             "unknown_events": self._unknown_events,
             "oversize_records": self._oversize_records,
+            "open_tool_executions": len(self._open_calls) + self._untracked_calls,
+            "records_after_settled": self._after_settled,
             "abort_sent": self._abort_sent,
             "failure": self.failure or "",
         }
@@ -384,6 +432,15 @@ class PiConversation:
         request_id = self._new_id()
         self._pending[request_id] = _Pending(command, now)
         return _encode({"id": request_id, "type": command, **fields})
+
+    def _pending_response(self, record: dict) -> bool:
+        """Whether ``record`` is the response to a command still pending."""
+        request_id = record.get("id")
+        return (
+            record.get("type") == "response"
+            and isinstance(request_id, str)
+            and request_id in self._pending
+        )
 
     def _fail(self, reason: str) -> None:
         if not self.done:
@@ -666,8 +723,10 @@ class PiConversation:
                     self._loop.turn(now)
         elif kind == "tool_execution_start":
             self._tool_executions += 1
+            self._call_started(record)
             self._tool_started(record)
         elif kind == "tool_execution_end":
+            self._call_ended(record)
             self._tool_ended(record, now)
         elif kind == "auto_retry_start":
             self._auto_retries += 1
@@ -681,6 +740,19 @@ class PiConversation:
             else:
                 self._retry_failure = None
         return []
+
+    def _call_started(self, record: dict) -> None:
+        """#479: a tool execution is open until its end names its call id."""
+        call_id = record.get("toolCallId")
+        if isinstance(call_id, str) and len(self._open_calls) < MAX_OPEN_TOOLS:
+            self._open_calls.add(call_id)
+        else:
+            self._untracked_calls += 1
+
+    def _call_ended(self, record: dict) -> None:
+        call_id = record.get("toolCallId")
+        if isinstance(call_id, str):
+            self._open_calls.discard(call_id)
 
     def _tool_started(self, record: dict) -> None:
         call_id = record.get("toolCallId")

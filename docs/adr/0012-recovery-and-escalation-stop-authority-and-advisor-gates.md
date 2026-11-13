@@ -818,8 +818,11 @@ reply, with nothing opened after it, handed over whole: the adapter's fact
 `AgentExecutionResult.reply_delivered`, set by Claude Code's `stream-json`
 (`ClaudeStream.replied`, read to the stream's end) and by Pi (its
 conversation settled and its last assistant text read back, before any limit
-cut it short), never by an output that types no turn (Claude's `text`,
-OpenCode). A *terminated process* is how the CLI ended: an exit 0, or a stop
+cut it short, with every tool execution it started ended by its call id and
+nothing but that text's response on stdout after `agent_settled`, read
+through Pi's shutdown to the end of stdout or the kill that ended it:
+`PiConversation.reply_settled`, R1-F3 of PR #481), never by an output that
+types no turn (Claude's `text`, OpenCode). A *terminated process* is how the CLI ended: an exit 0, or a stop
 after its reply (#439), is read as always and never reaches D12; a failing
 exit (or a provider failure, ADR 0003 §2.6) and a kill at a limit do. A
 *successful cleanup* is the executor's teardown verified complete: no member
@@ -890,13 +893,18 @@ dry run launches nothing to accept
 stream decided whatever the exit after it, and for none with a call still
 open or a turn opened after it; Pi vouches for a settled conversation whose
 shutdown then hangs past a limit or exits badly, and for none its limit cut
-short; OpenCode and Claude's `text` output vouch for none, so a block they
+short, none with a tool execution left open, and none after which Pi wrote
+anything but the text's response, a later turn in its shutdown included (a
+start without a call id, or past the reducer's bound, can never be shown
+ended, so it refuses too); OpenCode and Claude's `text` output vouch for none, so a block they
 printed before a kill is refused (`no-reply`) and stays the operator's
 (`test_a_claude_cli_that_exits_badly_after_its_reply_has_the_reply_accepted`,
 `test_a_claude_reply_with_a_call_still_open_is_never_accepted`,
 `test_a_claude_reply_overtaken_by_a_later_turn_is_stale_and_never_accepted`,
 `test_a_pi_that_hangs_on_shutdown_after_a_settled_run_has_its_reply_accepted`,
 `test_a_pi_that_exits_badly_after_a_settled_run_has_its_reply_accepted`,
+`test_a_pi_reply_with_a_tool_execution_left_open_is_never_accepted`,
+`test_a_pi_reply_overtaken_by_a_later_turn_in_its_shutdown_is_never_accepted`,
 `test_opencode_types_no_reply_so_a_block_before_its_kill_is_never_accepted`).
 #439's behaviour is unchanged: its reply still completes the run, as
 before, with no D12 decision.

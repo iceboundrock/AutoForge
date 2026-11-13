@@ -1900,8 +1900,17 @@ a stated reason it has none. The coverage that must keep working:
   `stream-json` reply then an exit 3 accepted, a reply with a call open or
   overtaken by a later turn never accepted, Pi hanging on its shutdown past
   the idle limit or exiting 7 after a settled run accepted, Pi cut short by
-  its limit vouching for nothing, OpenCode's plain text never vouched for
-  (`linger` and `close_exit` in `tests/pi_fake.py`)
+  its limit vouching for nothing, Pi with a tool execution left open or a
+  later turn written during its shutdown (exiting 7, or killed at the idle
+  limit) never vouched for while a clean exit after that turn is read as
+  before, OpenCode's plain text never vouched for (`linger`, `close_exit`,
+  `shutdown` and `open_call` in `tests/pi_fake.py`); and Pi's reducer alone
+  (`tests/test_pi_rpc.py`): a reply settled only with every tool execution
+  ended by its call id (an unmatched or id-less start, or one past the
+  bound, leaves it unproven), anything but the text's response after
+  `agent_settled` (a later turn, a second settle, an unknown event, a
+  notification, a stray response, a fragment, an oversize record) leaving it
+  unproven without failing the run (R1-F3 of PR #481)
 - the `UPDATE_EPIC` progress comment across every crash window of the
   effect lifecycle (`test_k8_*` in `tests/test_engine.py`), the one-shot
   legacy re-entry (D13.7) including a crash after its adoption was saved,

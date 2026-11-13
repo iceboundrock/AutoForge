@@ -524,7 +524,9 @@ class AgentExecutionResult:
     # (ClaudeStream.replied: every turn opened has its result, the last a
     # success holding a block, no tool call open) when the stream ended; Pi's
     # conversation settled and its last assistant text read back, before any
-    # limit cut it short. A fact of the protocol, never of text: an output
+    # limit cut it short, with every tool execution ended and nothing but that
+    # text's response on stdout after the run settled, through Pi's shutdown
+    # (R1-F3 of PR #481). A fact of the protocol, never of text: an output
     # that types no turn (``text``, OpenCode) never sets it. Whether a launch
     # that a limit killed or that exited with a failing status is completed
     # on that reply is the engine's (``delivered_result.py``, ADR 0012 D12).
@@ -2584,7 +2586,12 @@ class PiProvider(AgentProvider):
         that settled with its final text read back before any limit cut it
         short is ``reply_delivered`` (#479), however Pi then shut down: a Pi
         that ignores its closed stdin until a limit kills it, or that exits
-        with a failing status, delivered that reply all the same.
+        with a failing status, delivered that reply all the same. Only when
+        its protocol proves the reply the run's last word, though (R1-F3 of
+        PR #481): every tool execution it started ended, and nothing but the
+        text's response reached stdout after the run settled, read through
+        Pi's shutdown to the end of stdout or the kill that ended it
+        (:meth:`_read_after_reply`, :attr:`PiConversation.reply_settled`).
 
         With ``require_oauth`` (the default) the launch is refused before
         anything is spawned when a provider API key would reach Pi, and a
@@ -2642,6 +2649,11 @@ class PiProvider(AgentProvider):
                 self._abort(child, conversation, self.abort_seconds)
             child.close_stdin()
             res = child.finish()
+            if conversation.text is not None and not cut_short:
+                # #479 (R1-F3 of PR #481): what Pi wrote after its final
+                # text, through its shutdown, is reduced too, so a later turn
+                # or an open tool call is seen before the reply is vouched for.
+                self._read_after_reply(child, conversation)
         timed_out = cut_short or res.timed_out or res.stopped
         failure = conversation.failure
         if conversation.exited_early:
@@ -2683,8 +2695,12 @@ class PiProvider(AgentProvider):
             # before any limit cut it short, and nothing failed it after (an
             # overflow while Pi shut down is a failure). Pi may still hang on
             # its shutdown until a limit kills it, or exit with a failing
-            # status: the reply was delivered all the same.
-            reply_delivered=text is not None and not cut_short,
+            # status: the reply was delivered all the same, provided its
+            # protocol proves it the run's last word (R1-F3 of PR #481): every
+            # tool execution it started ended, and nothing but the text's
+            # response reached stdout after the run settled, up to the end of
+            # the stream or the kill that ended Pi's shutdown.
+            reply_delivered=text is not None and not cut_short and conversation.reply_settled,
             provider_summary=summary,
             timeout_limit=(res.timeout_limit or cut_limit) if timed_out else "",
             last_activity_at=res.last_activity_at,
@@ -2832,6 +2848,39 @@ class PiProvider(AgentProvider):
         except ExecutionTimeoutError:
             return True  # a write overran the deadline; the group is gone
         return False
+
+    @staticmethod
+    def _read_after_reply(child: DuplexChild, conversation: PiConversation) -> None:
+        """Reduce what stdout carried after the final text, to its end (#479).
+
+        Called after :meth:`DuplexChild.finish`, so it never waits: a Pi that
+        exited leaves the rest of its stdout queued up to its end item; one a
+        limit killed in its shutdown leaves what had reached the queue by the
+        kill (what the group wrote as it was killed is never read, and the
+        kill ended it). Every item is fed to the conversation, which counts
+        it against the reply (:attr:`PiConversation.reply_settled`); stdin is
+        closed, so nothing it would answer is sent.
+        """
+        items: list[Record | Oversize | Fragment | Overflow] = []
+        item = child.read_line(timeout=0)
+        while not isinstance(item, Eof):
+            if isinstance(item, Timeout):
+                # Only a kill's: after finish() nothing else waits.
+                items += child.unread_at_deadline()
+                break
+            items.append(item)
+            if isinstance(item, Overflow):
+                break
+            item = child.read_line(timeout=0)
+        for rest in items:
+            if isinstance(rest, Record):
+                conversation.feed(rest.data, time.monotonic())
+            elif isinstance(rest, Oversize):
+                conversation.oversize(rest.head, rest.limit)
+            elif isinstance(rest, Fragment):
+                conversation.framing_error("stdout ended inside an unterminated record")
+            else:
+                conversation.framing_error("stdout records arrived faster than they were read")
 
     def _abort(self, child: DuplexChild, conversation: PiConversation, window: float) -> None:
         """Ask Pi to abort a running prompt and give it ``window`` seconds to settle.

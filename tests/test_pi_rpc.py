@@ -157,9 +157,12 @@ def test_happy_path_returns_the_final_text_and_the_parser_accepts_it():
         "ui_notifications_ignored": 0,
         "unknown_events": 0,
         "oversize_records": 0,
+        "open_tool_executions": 0,
+        "records_after_settled": 0,
         "abort_sent": False,
         "failure": "",
     }
+    assert run.c.reply_settled
     # One prompt, never steer/follow_up, never an abort on success.
     assert run.types().count("prompt") == 1 and "abort" not in run.types()
 
@@ -584,6 +587,108 @@ def test_unknown_events_are_ignored_and_counted():
     run.settle()
     run.respond("get_last_assistant_text", {"text": FINAL})
     assert run.c.text == FINAL and run.c.summary()["unknown_events"] == 2
+
+
+# -- the reply's proof (#479, R1-F3 of PR #481) -----------------------------------------
+def _settled_run() -> Run:
+    return Run().started()
+
+
+def test_a_reply_is_settled_only_with_every_tool_execution_ended():
+    """A start matched by its call id to an end is closed; one left open, or
+    one whose id cannot be matched, leaves the reply unproven. Never a
+    failure: the run's text is read back as before."""
+    closed = _settled_run()
+    closed.feed({"type": "tool_execution_start", "toolCallId": "t1", "toolName": "bash"})
+    closed.feed({"type": "tool_execution_end", "toolCallId": "t1", "toolName": "bash"})
+    closed.settle().respond("get_last_assistant_text", {"text": FINAL})
+    assert closed.c.text == FINAL and closed.c.reply_settled
+
+    for start in (
+        {"type": "tool_execution_start", "toolCallId": "t1", "toolName": "bash"},
+        {"type": "tool_execution_start", "toolName": "bash"},
+    ):
+        run = _settled_run()
+        run.feed({"type": "tool_execution_start", "toolCallId": "t0", "toolName": "read"})
+        run.feed({"type": "tool_execution_end", "toolCallId": "t0", "toolName": "read"})
+        run.feed(start)
+        run.feed({"type": "tool_execution_end", "toolCallId": "t9", "toolName": "bash"})
+        run.settle().respond("get_last_assistant_text", {"text": FINAL})
+        assert run.c.text == FINAL and run.c.failure is None
+        assert not run.c.reply_settled, start
+        assert run.c.summary()["open_tool_executions"] == 1
+
+
+def test_the_open_tools_are_tracked_without_a_loop_detector_and_past_its_bound(monkeypatch):
+    from autoforge import pi_rpc
+
+    monkeypatch.setattr(pi_rpc, "MAX_OPEN_TOOLS", 2)
+    run = _settled_run()
+    for n in range(3):
+        run.feed({"type": "tool_execution_start", "toolCallId": f"t{n}", "toolName": "bash"})
+    for n in range(3):
+        run.feed({"type": "tool_execution_end", "toolCallId": f"t{n}", "toolName": "bash"})
+    run.settle().respond("get_last_assistant_text", {"text": FINAL})
+    assert not run.c.reply_settled, "a start past the bound can never be shown ended"
+
+
+@pytest.mark.parametrize(
+    "later",
+    [
+        {"type": "agent_start"},
+        {"type": "turn_start"},
+        {"type": "tool_execution_start", "toolCallId": "t2", "toolName": "edit"},
+        {"type": "message_update", "assistantMessageEvent": {"type": "text_delta"}},
+        {"type": "agent_settled"},
+        {"type": "brand_new_event"},
+        {"type": "extension_ui_request", "method": "notify", "id": "u1"},
+    ],
+    ids=lambda r: r["type"],
+)
+def test_anything_after_the_run_settled_but_the_texts_response_leaves_it_unproven(later):
+    """Before the text was read back, or after it (what the driver feeds of
+    Pi's shutdown): a later turn, a second settle, an unknown event or a
+    notification all leave the reply unproven, and none fails the run."""
+    before = _settled_run().settle()
+    before.feed(later)
+    before.respond("get_last_assistant_text", {"text": FINAL})
+    after = _settled_run().settle()
+    after.respond("get_last_assistant_text", {"text": FINAL})
+    assert after.c.reply_settled
+    after.feed(later)
+    for run in (before, after):
+        assert run.c.text == FINAL and run.c.failure is None
+        assert not run.c.reply_settled
+        assert run.c.summary()["records_after_settled"] == 1
+
+
+def test_a_stray_response_after_the_text_leaves_it_unproven():
+    """Before the text it is a protocol failure, as ever; after it, the
+    outcome is fixed and only the proof is gone."""
+    run = _settled_run().settle()
+    run.respond("get_last_assistant_text", {"text": FINAL})
+    run.feed({"type": "response", "id": "id-99", "command": "prompt", "success": True})
+    assert run.c.text == FINAL and run.c.failure is None and not run.c.reply_settled
+
+
+def test_a_fragment_or_an_oversize_record_after_the_text_leaves_it_unproven():
+    fragment = _settled_run().settle()
+    fragment.respond("get_last_assistant_text", {"text": FINAL})
+    fragment.c.framing_error("stdout ended inside an unterminated record")
+    oversize = _settled_run().settle()
+    oversize.respond("get_last_assistant_text", {"text": FINAL})
+    oversize.c.oversize(b'{"type":"turn_end",', 10)
+    for run in (fragment, oversize):
+        assert run.c.text == FINAL and run.c.failure is None and not run.c.reply_settled
+
+
+def test_the_texts_own_response_and_events_before_the_settle_leave_it_proven():
+    run = _settled_run()
+    run.feed({"type": "turn_end"})
+    run.feed({"type": "queue_update"})
+    run.settle()
+    run.respond("get_last_assistant_text", {"text": FINAL})
+    assert run.c.reply_settled and run.c.summary()["records_after_settled"] == 0
 
 
 # -- extension UI ---------------------------------------------------------------------------

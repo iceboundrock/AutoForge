@@ -384,9 +384,12 @@ An agent can deliver its whole final reply and still end badly: its CLI
 exits with a failing status, or hangs after the reply until its idle limit
 or maximum runtime kills it. The controller then takes the reply as the
 step's result, without a relaunch, only when everything is proven (ADR 0012
-D12, #479): the provider's protocol shows the reply ended the run (Claude
-Code's `stream-json` and Pi's RPC can; OpenCode and Claude's `text` output
-cannot, so theirs is never taken), every `CONTROL_RESULT` block in it says
+D12, #479): the provider's protocol shows the reply ended the run, with no
+tool call left open and nothing written after it, a later turn included
+(Claude Code's `stream-json` and Pi's RPC can; Pi's is read through its
+shutdown, and its `execution.json` summary counts `open_tool_executions` and
+`records_after_settled`; OpenCode and Claude's `text` output cannot, so
+theirs is never taken), every `CONTROL_RESULT` block in it says
 the same thing, it was not cut at the capture bound, no limit but the idle
 limit or the maximum runtime killed it, nothing the agent started may still
 be running, and the reply passes every check a clean exit's reply passes.
