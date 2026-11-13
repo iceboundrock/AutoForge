@@ -682,6 +682,52 @@ def test_a_fragment_or_an_oversize_record_after_the_text_leaves_it_unproven():
         assert run.c.text == FINAL and run.c.failure is None and not run.c.reply_settled
 
 
+UNREADABLE_RECORDS = {
+    "not-json": b"Shutting down...",
+    "not-utf8": b'{"type": "turn_start", "x": "\xff\xfe"}',
+    "array": b'[{"type": "turn_start"}]',
+    "no-type": b'{"toolCallId": "t2", "toolName": "bash"}',
+    "type-not-a-string": b'{"type": 7}',
+    "decoder-limit": DECODER_LIMIT_RECORDS["deep-nesting"],
+}
+
+
+@pytest.mark.parametrize("record", list(UNREADABLE_RECORDS.values()), ids=list(UNREADABLE_RECORDS))
+def test_an_unreadable_record_after_the_text_leaves_it_unproven(record):
+    """R2-F3 of PR #481: a record whose kind cannot be known (not UTF-8, not
+    JSON, an array, an object without a string 'type') may be a later turn or
+    a tool call, so once the text was read back it voids the proof, as a
+    fragment does. The outcome is fixed: the text stands and nothing fails."""
+    run = _settled_run().settle()
+    run.respond("get_last_assistant_text", {"text": FINAL})
+    assert run.c.reply_settled
+    run.feed(record)
+    assert run.c.text == FINAL and run.c.failure is None
+    assert not run.c.reply_settled
+    assert run.c.summary()["records_after_settled"] == 1
+
+
+@pytest.mark.parametrize("record", list(UNREADABLE_RECORDS.values()), ids=list(UNREADABLE_RECORDS))
+def test_an_unreadable_record_after_the_settle_fails_the_run_as_before(record):
+    """Between the settle and the text it is a protocol failure, as ever: no
+    text, so no reply to vouch for; it counts against the proof all the same."""
+    run = _settled_run().settle()
+    run.feed(record)
+    assert run.failure().startswith("pi: protocol violation: a stdout record")
+    assert not run.c.reply_settled and run.c.summary()["records_after_settled"] == 1
+
+
+def test_an_unreadable_record_before_the_settle_is_not_counted_after_it():
+    """Before the run settled it fails the run and counts nothing after it."""
+    run = _settled_run()
+    run.feed(UNREADABLE_RECORDS["no-type"])
+    assert (
+        run.failure()
+        == "pi: protocol violation: a stdout record is not a JSON object with a 'type'"
+    )
+    assert run.c.summary()["records_after_settled"] == 0
+
+
 def test_the_texts_own_response_and_events_before_the_settle_leave_it_proven():
     run = _settled_run()
     run.feed({"type": "turn_end"})

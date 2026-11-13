@@ -1243,6 +1243,63 @@ def test_a_pi_reply_overtaken_by_a_later_turn_in_its_shutdown_is_never_accepted(
     assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
 
 
+#: Records Pi may write while it shuts down whose kind cannot be known (R2-F3
+#: of PR #481), as the fake's raw lines: hex of the bytes written.
+_UNREADABLE_SHUTDOWN = {
+    "no-type": b'{"toolCallId": "later", "toolName": "edit"}'.hex(),
+    "array": b'[{"type": "turn_start"}]'.hex(),
+    "not-json": b"shutting down".hex(),
+    "not-utf8": b'{"type": "turn_start", "x": "\xff"}'.hex(),
+}
+
+
+@pytest.mark.parametrize(
+    "record", list(_UNREADABLE_SHUTDOWN.values()), ids=list(_UNREADABLE_SHUTDOWN)
+)
+def test_a_pi_reply_followed_by_an_unreadable_shutdown_record_is_never_accepted(
+    tmp_path_factory, tmp_state_dir, fake_github, record
+):
+    """R2-F3 of PR #481, adapter to engine: the conversation settled and its
+    text was read back, then Pi wrote a record whose kind cannot be known (no
+    'type', an array, not JSON, not UTF-8) and exited 7. It may have been a
+    later turn, so the adapter vouches for no reply: the failure stands and
+    nothing is published."""
+    from tests.pi_fake import PiTurn
+
+    eng, fake = _pi_engine(
+        tmp_path_factory, tmp_state_dir, fake_github, PiTurn(shutdown=[record], close_exit=7)
+    )
+    with pytest.raises(ExecutionError) as caught:
+        eng.run(max_steps=5)
+    assert "(no-reply: " in str(caught.value)
+    assert len(fake.launches()) == 1
+    (result,) = eng.pi.results
+    assert result.exit_code == 7 and result.stdout and not result.reply_delivered
+    assert result.provider_summary["records_after_settled"] == 1
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.ANALYZE_EXECUTE and state.delivered_reply == {}
+    assert all(w[0] == "create_issue_comment" for w in fake_github.effect_writes)
+
+
+def test_a_pi_that_exits_cleanly_after_an_unreadable_record_keeps_its_reply_as_before(
+    tmp_path_factory, tmp_state_dir, fake_github
+):
+    """Normal clean-exit handling is unchanged: the proof is read only for a
+    launch that ended badly."""
+    from tests.pi_fake import PiTurn
+
+    eng, _ = _pi_engine(
+        tmp_path_factory,
+        tmp_state_dir,
+        fake_github,
+        PiTurn(shutdown=[_UNREADABLE_SHUTDOWN["no-type"]]),
+    )
+    (outcome,) = eng.run(max_steps=1)
+    assert outcome.next_phase == "REVIEW", outcome.message
+    (result,) = eng.pi.results
+    assert not result.reply_delivered and not result.failed_exit and result.provider_failure is None
+
+
 def test_a_pi_that_exits_cleanly_after_a_later_turn_keeps_its_reply_as_before(
     tmp_path_factory, tmp_state_dir, fake_github
 ):

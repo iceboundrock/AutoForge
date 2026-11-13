@@ -43,7 +43,9 @@ execution it started ended (each ``tool_execution_start`` matched by its
 text's own response reached stdout after ``agent_settled``, up to the end of
 the stream the caller feeds (the driver feeds what Pi writes during its
 shutdown too). Anything else (a tool still open, a later turn, an extension
-dialog, a record past the bound, a fragment) leaves it false: it is never a
+dialog, a record past the bound, a fragment, or a record that is not UTF-8,
+not JSON or not an object with a string ``type``, whose kind cannot be known:
+R2-F3 of PR #481) leaves it false: once the text was read back it is never a
 failure of the run, only no proof that the reply was Pi's last word.
 
 Every string that leaves this module for a log (a failure reason, a summary
@@ -315,17 +317,16 @@ class PiConversation:
         try:
             record = json.loads(data.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            self._protocol("a stdout record is not JSON")
-            return []
+            return self._unreadable("a stdout record is not JSON")
         except (ValueError, RecursionError):
             # The decoder's integer-digit and nesting limits, which are not
             # JSONDecodeError (as in ``claude_stream``); an interrupt still
             # propagates.
-            self._protocol("a stdout record exceeds the JSON decoder's integer or nesting limit")
-            return []
+            return self._unreadable(
+                "a stdout record exceeds the JSON decoder's integer or nesting limit"
+            )
         if not isinstance(record, dict) or not isinstance(record.get("type"), str):
-            self._protocol("a stdout record is not a JSON object with a 'type'")
-            return []
+            return self._unreadable("a stdout record is not a JSON object with a 'type'")
         kind = record["type"]
         if self.text is not None or (self._settled and not self._pending_response(record)):
             # #479: activity the settled reply does not account for.
@@ -357,9 +358,7 @@ class PiConversation:
             self._fail(f"pi: no response to {late.command} within {self._round_trip:g}s")
 
     def framing_error(self, what: str) -> None:
-        if self._settled or self.text is not None:
-            self._after_settled += 1  # #479: no proof of what it was
-        self._protocol(what)
+        self._unreadable(what)
 
     def oversize(self, head: bytes, limit: int) -> None:
         """A stdout record past ``limit`` bytes was dropped; ``head`` is its start.
@@ -448,6 +447,20 @@ class PiConversation:
 
     def _protocol(self, what: str) -> None:
         self._fail(f"pi: protocol violation: {what}")
+
+    def _unreadable(self, what: str) -> list[bytes]:
+        """A stdout record that is not a typed JSON object, or not a whole one.
+
+        A protocol violation, as ever, which changes nothing once the outcome
+        is fixed (:meth:`_fail`). After the run settled, or once the final
+        text was read back (the driver feeds Pi's shutdown too), it also
+        counts against the reply (#479, R2-F3 of PR #481): what it was cannot
+        be known, so it cannot be shown not to be a later turn or a tool call.
+        """
+        if self._settled or self.text is not None:
+            self._after_settled += 1
+        self._protocol(what)
+        return []
 
     def _stage(self) -> str:
         if not self._prompt_sent:

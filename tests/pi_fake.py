@@ -186,9 +186,14 @@ for line in sys.stdin.buffer:
         respond(kind, rid)
         emit({"type": "agent_settled"})
 # Stdin closed: how this Pi shuts down (#479). What it writes first, a later
-# turn say, then how long it lingers and how it exits.
+# turn say, then how long it lingers and how it exits. A string is one raw
+# line, hex-encoded: a record that is not a typed JSON object (R2-F3).
 for record in turn["shutdown"]:
-    emit(record)
+    if isinstance(record, str):
+        out.write(bytes.fromhex(record) + b"\n")
+        out.flush()
+    else:
+        emit(record)
 time.sleep(turn["linger"])
 sys.exit(turn["close_exit"])
 """
@@ -211,9 +216,10 @@ class PiTurn:
     check`` preflight. ``agent_end_bytes`` makes the run's ``agent_end``
     repeat a user prompt of that many characters, as Pi's repeats every
     message of the run (#144). Once its stdin closes, it writes the records
-    of ``shutdown`` (a later turn, say), sleeps ``linger`` seconds and exits
-    ``close_exit``: a Pi whose shutdown hangs past a limit, or that exits with
-    a failing status after a settled run (#479). ``open_call`` reports a tool
+    of ``shutdown`` (a later turn, say; a string is one raw line, hex-encoded),
+    sleeps ``linger`` seconds and exits ``close_exit``: a Pi whose shutdown
+    hangs past a limit, or that exits with a failing status after a settled
+    run (#479). ``open_call`` reports a tool
     execution of that call id started before the run settles and never ended.
     """
 
@@ -229,7 +235,7 @@ class PiTurn:
     agent_end_bytes: int = 0
     linger: float = 0.0
     close_exit: int = 0
-    shutdown: list[dict] = field(default_factory=list)
+    shutdown: list[dict | str] = field(default_factory=list)
     open_call: str = ""
 
 
