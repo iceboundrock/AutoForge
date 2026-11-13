@@ -1896,11 +1896,19 @@ a stated reason it has none. The coverage that must keep working:
   restart and a binding that no longer matches stopping in `BLOCKED` with
   nothing launched or published, GitHub unavailable while verifying leaving
   the reply kept for `resume`, a new launch or another phase dropping it,
-  and the shape and binding the loader refuses; acceptance only after the
+  and the shape and binding the loader refuses; a review kept before a crash
+  whose PR base was retargeted, or whose merge base moved, before the
+  restart stopping in `BLOCKED` with no comment, no round and no reviewer
+  (R2-F1); a checkout the agent moved found before the reply is kept, so a
+  crash while the launch is recorded leaves nothing kept and the restart
+  nothing to go on from (R2-F2); acceptance only after the
   step's own checks (R1-F4): a checkout moved after the parse, a
   verification stop before planning and a producer gate refusal below its
   bound each leaving the reply not accepted, the message claiming no
-  acceptance and the last relaunching afresh; a clean exit
+  acceptance and the last relaunching afresh; the save of the plan as the
+  evidence of acceptance (R2-F4): a review applied and then stopped by the
+  round cap accepted, beside a refusal before its plan in the same phase,
+  and a FIX whose PR moved going to REVIEW not accepted; a clean exit
   recording nothing; a reply refused for each missing fact and by the
   checks a clean exit's reply meets (malformed, another phase, another
   issue, a HEAD that moved after the reply), never corrected or relaunched
@@ -1916,14 +1924,18 @@ a stated reason it has none. The coverage that must keep working:
   its limit vouching for nothing, Pi with a tool execution left open or a
   later turn written during its shutdown (exiting 7, or killed at the idle
   limit) never vouched for while a clean exit after that turn is read as
-  before, OpenCode's plain text never vouched for (`linger`, `close_exit`,
-  `shutdown` and `open_call` in `tests/pi_fake.py`); and Pi's reducer alone
+  before, Pi writing a record of unknown kind during its shutdown (no
+  `type`, an array, not JSON, not UTF-8) then exiting 7 never vouched for
+  while a clean exit after one is read as before (R2-F3), OpenCode's plain
+  text never vouched for (`linger`, `close_exit`, `shutdown`, raw shutdown
+  lines and `open_call` in `tests/pi_fake.py`); and Pi's reducer alone
   (`tests/test_pi_rpc.py`): a reply settled only with every tool execution
   ended by its call id (an unmatched or id-less start, or one past the
   bound, leaves it unproven), anything but the text's response after
   `agent_settled` (a later turn, a second settle, an unknown event, a
-  notification, a stray response, a fragment, an oversize record) leaving it
-  unproven without failing the run (R1-F3 of PR #481); protocol 18 -> 19 in `tests/test_state.py` (a protocol-18
+  notification, a stray response, a fragment, an oversize record, and a
+  record that is not a typed JSON object, R2-F3) leaving it unproven without
+  failing the run once the text was read back (R1-F3 of PR #481); protocol 18 -> 19 in `tests/test_state.py` (a protocol-18
   file loads in every phase with no kept reply and is relabelled 19, an older
   label carrying `delivered_reply` is refused unchanged, a protocol-19 file
   missing it or holding a malformed one is refused); a keeping save that fails

@@ -335,6 +335,9 @@ _KEPT_KEYS = (
     "pr_url",
     "review_round",
     "candidate",
+    "head_sha",
+    "base_ref",
+    "merge_base_sha",
     "process_end",
     "limit",
     "run_log",
@@ -388,7 +391,9 @@ class KeptReply:
     before the step concludes checks it again rather than run the agent
     again. It is bound to the launch that delivered it (the phase, the
     attempt, the launch label, the issue, the PR and the review round as
-    they stood) and to the candidate those checks read; a later save in
+    they stood), to the candidate those checks read, and to the revision
+    the run was bound to (the PR's HEAD, base and merge base: the diff a
+    review decides on, R2-F1); a later save in
     another phase, or after another launch, drops it
     (:meth:`autoforge.state.AutoForgeState.settle_delivered_reply`), and the
     step drops it when its own checks refuse the reply. The payload is the
@@ -408,11 +413,26 @@ class KeptReply:
     #: HEAD the reply names), or the HEAD a review was bound to; ``""`` for a
     #: phase that has none.
     candidate: str
+    #: The revision the run was bound to when the reply was kept (R2-F1 of PR
+    #: #481): the state's ``current_head_sha``, ``current_base_ref`` and
+    #: ``current_merge_base_sha``, lower-cased SHAs, ``""`` where none was
+    #: bound (an ANALYZE_EXECUTE before its PR). A restart goes on from the
+    #: reply only while the run is bound to exactly this revision: a review's
+    #: verdict is about the diff of this HEAD against this base from this
+    #: merge base, and a REVIEW entry under bwrap or ``disabled`` binds them
+    #: again from the PR as it is.
+    head_sha: str
+    base_ref: str
+    merge_base_sha: str
     process_end: ProcessEnd
     limit: str
     #: The launch's step directory in the run log (``NNN-<phase>-<attempt>``).
     run_log: str
     payload: dict = field(default_factory=dict)
+
+    def revision(self) -> tuple[str, str, str]:
+        """The revision it is bound to: ``(head_sha, base_ref, merge_base_sha)``."""
+        return (self.head_sha, self.base_ref, self.merge_base_sha)
 
     def facts(self) -> EndFacts:
         """The facts the rule let the reply through on, as the note and the record read them."""
@@ -432,6 +452,9 @@ class KeptReply:
             "pr_url": self.pr_url,
             "review_round": self.review_round,
             "candidate": self.candidate,
+            "head_sha": self.head_sha,
+            "base_ref": self.base_ref,
+            "merge_base_sha": self.merge_base_sha,
             "process_end": self.process_end.value,
             "limit": self.limit,
             "run_log": self.run_log,
@@ -453,6 +476,10 @@ class KeptReply:
         candidate = _text(raw, "candidate")
         if candidate and not _SHA_RE.fullmatch(candidate):
             raise _fail("'candidate' is not a full lowercase commit SHA")
+        for key in ("head_sha", "merge_base_sha"):
+            sha = _text(raw, key)
+            if sha and not _SHA_RE.fullmatch(sha):
+                raise _fail(f"{key!r} is not a full lowercase commit SHA")
         try:
             process_end = ProcessEnd(raw["process_end"])
         except ValueError:
@@ -481,6 +508,9 @@ class KeptReply:
             pr_url=_text(raw, "pr_url"),
             review_round=_count(raw, "review_round", 0),
             candidate=candidate,
+            head_sha=_text(raw, "head_sha"),
+            base_ref=_text(raw, "base_ref"),
+            merge_base_sha=_text(raw, "merge_base_sha"),
             process_end=process_end,
             limit=limit,
             run_log=run_log,

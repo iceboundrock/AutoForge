@@ -1380,6 +1380,14 @@ class _Provisional:
     kept_across_restart: bool
 
 
+def _revision_text(head: str, base: str, merge_base: str) -> str:
+    """A bound revision for a block reason: its HEAD, base and merge base."""
+    return (
+        f"HEAD {head[:12] or '(none)'} on base {base or '(none)'} from merge base "
+        f"{merge_base[:12] or '(none)'}"
+    )
+
+
 def _blocked(code: StopReasonCode, reason: str) -> tuple[Phase, str]:
     """A verify or apply step's ``(Phase.BLOCKED, reason)``, the reason carrying ``code``.
 
@@ -3454,9 +3462,11 @@ class ControllerEngine:
 
         HEAD and the checked-out branch of the checkout the controller is
         run from are read before the first launch, again before every
-        relaunch (a correction, or the retry of a transient failure), and
-        after the invocation returns -- however it returns -- and a change
-        is a :class:`CheckoutDriftError`, which the step turns
+        relaunch (a correction, or the retry of a transient failure), before
+        a reply delivered before a failed launch end is kept in the state
+        (#479, R2-F2 of PR #481), and after the invocation returns -- however
+        it returns -- and a change is a :class:`CheckoutDriftError`, which the
+        step turns
         into BLOCKED. The agents are launched in the per-issue worktree and
         told to work only there, so the checkout moving means an agent (or
         someone else) did what the prompts forbid, and the controller cannot
@@ -3482,8 +3492,28 @@ class ControllerEngine:
                 )
             return reconcile()
 
+        def check_before_keep() -> None:
+            # #479 (R2-F2 of PR #481): a reply delivered before a failed launch
+            # end is kept in the state before the step goes on from it, and a
+            # restart goes on from a kept reply under an anchor of its own. So
+            # the anchor of the invocation that delivered it is checked before
+            # it is kept, not only once the invocation returns.
+            drift = self._checkout_drift(anchor)
+            if drift:
+                launch = f" (run log {self._launch_log}/)" if self._launch_log else ""
+                raise CheckoutDriftError(
+                    self._checkout_drift_reason(
+                        phase,
+                        drift,
+                        "The agent delivered its reply before its launch ended badly"
+                        f"{launch}; the move was found before the reply was kept, so it was "
+                        "neither kept nor accepted, its claims were not verified and nothing "
+                        "was applied",
+                    )
+                )
+
         try:
-            result = self._invoke_phase(phase, reconcile_anchored)
+            result = self._invoke_phase(phase, reconcile_anchored, check_before_keep)
         except CheckoutDriftError:
             # Found before a relaunch and already worded: not wrapped again.
             raise
@@ -16534,7 +16564,10 @@ class ControllerEngine:
         return {}
 
     def _invoke_phase(
-        self, phase: Phase, before_relaunch: Callable[[], StepOutcome | None]
+        self,
+        phase: Phase,
+        before_relaunch: Callable[[], StepOutcome | None],
+        before_keep: Callable[[], None] | None = None,
     ) -> dict | StepOutcome:
         """Launch the phase's agent, correcting a malformed result within bound.
 
@@ -16566,6 +16599,11 @@ class ControllerEngine:
         finds every typed fact it needs, has that reply checked exactly as a
         clean exit's is, and returns it when the checks accept it; a refusal
         of those checks is never corrected, and the launch's failure stands.
+        ``before_keep`` is called once such a reply passed those checks and
+        before it is kept in the state (:meth:`_keep_reply`), where a restart
+        would go on from it: :meth:`_invoke_phase_anchored` checks the
+        operator's checkout there (R2-F2 of PR #481), and an error it raises
+        ends the invocation with the reply never kept.
         """
         assert_shared_git_lock_free(f"launch the {phase.value} agent")
         state = self._require_state()
@@ -17095,6 +17133,25 @@ class ControllerEngine:
                 # the step concludes re-checks it and launches no agent. The
                 # step's own checks after it decide whether it is accepted
                 # (:meth:`_settle_delivered`).
+                if before_keep is not None:
+                    try:
+                        # R2-F2 of PR #481: the operator's checkout, against this
+                        # invocation's anchor, before the reply is kept. A
+                        # restart takes a fresh anchor, so a move this launch
+                        # made would go unseen by a step that went on from the
+                        # kept reply. A move found here ends the invocation with
+                        # the reply provisional, never kept, never accepted.
+                        before_keep()
+                    except BaseException:
+                        record.error = ""
+                        record.delivered_result = delivered_outcome_record(delivery, None)
+                        self._delivered = _Provisional(
+                            delivery, state.attempt, step_log.name, kept_across_restart=False
+                        )
+                        self._record_invocation(
+                            logger, record, prompt, stdout, stderr, phase, step_log
+                        )
+                        raise
                 try:
                     kept = self._keep_reply(phase, payload, delivery, step_log.name)
                 except BaseException as exc:
@@ -17206,7 +17263,8 @@ class ControllerEngine:
         before the step goes on from it: the payload (redacted, as every
         agent text the engine persists), the launch it binds to (phase,
         attempt, launch label, issue, PR, review round, run log step), the
-        candidate the checks read and how the launch ended. ``None``, and
+        candidate the checks read, the revision the run is bound to (the PR's
+        HEAD, base and merge base, R2-F1) and how the launch ended. ``None``, and
         nothing saved, for a reply the state could not load back (one past
         the parser's bound once canonical, say): such a reply is refused.
         """
@@ -17220,6 +17278,9 @@ class ControllerEngine:
             pr_url=state.current_pr_url or "",
             review_round=state.review_round,
             candidate=named if re.fullmatch(r"[0-9a-f]{40}", named) else "",
+            head_sha=state.current_head_sha.lower(),
+            base_ref=state.current_base_ref,
+            merge_base_sha=state.current_merge_base_sha.lower(),
             process_end=delivery.process_end,
             limit=delivery.limit,
             run_log=launch_log,
@@ -17249,7 +17310,13 @@ class ControllerEngine:
         The step that kept it ended without concluding (a crash, a restart,
         an error that left the phase's checks undecided). Its binding must
         still be the run's (the attempt, the launch label, the issue, the PR
-        and the review round), and the reply meets again every check of a
+        and the review round), and so must the revision it was kept under
+        (the PR's HEAD, base and merge base, which a REVIEW entry under bwrap
+        or ``disabled`` has just bound again from the PR as it is: a review's
+        verdict is about that diff and no other, R2-F1 of PR #481). The
+        operator's checkout needs no such binding: the invocation that
+        delivered the reply checked it before the reply was kept (R2-F2).
+        The reply then meets again every check of a
         clean exit's reply, against the worktree and GitHub as they are now
         (the strict import, the parse, the candidate the reply names against
         the worktree's HEAD, the review's bound HEAD and round). Then the
@@ -17275,6 +17342,11 @@ class ControllerEngine:
             state.current_pr_url or "",
             state.review_round,
         )
+        revision = (
+            state.current_head_sha.lower(),
+            state.current_base_ref,
+            state.current_merge_base_sha.lower(),
+        )
         problem = ""
         if bound != now:
             problem = (
@@ -17284,6 +17356,12 @@ class ControllerEngine:
                 f"({state.launch_label or 'no launch'}) of issue "
                 f"{state.current_issue_url or '(none)'}, PR {state.current_pr_url or '(none)'} "
                 f"and review round {state.review_round}"
+            )
+        elif kept.revision() != revision:
+            problem = (
+                f"it was kept while the run was bound to {_revision_text(*kept.revision())}, "
+                f"and the run is now bound to {_revision_text(*revision)}, so what it decided "
+                "is about another diff than the PR's"
             )
         else:
             self._launch_seeded = False

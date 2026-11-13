@@ -27,7 +27,12 @@ after delivering its complete final reply ...` and says whether the reply was
 accepted. A crash or `Ctrl-C` before the step concluded leaves it in the
 state: the next `resume` checks it again and goes on from it without running
 the agent again, or stops in `BLOCKED` (`control-result-invalid`) when the
-worktree or the PR moved in between.
+worktree or the PR moved in between, its base branch or merge base included.
+Your checkout is checked before the reply is saved, so a checkout the agent
+moved stops the step in `BLOCKED` (`checkout-drift`) with nothing saved to
+go on from. A reply counts as accepted once the step saved the plan it made
+from it, even when the step then stopped (a review posted at the last allowed
+round stops at the round cap).
 
 A reply that falls short is not corrected and not relaunched over, as
 before: the failure stands, with a line saying why the reply was not taken

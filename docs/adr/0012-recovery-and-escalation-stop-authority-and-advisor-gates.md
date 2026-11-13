@@ -880,10 +880,16 @@ the validated `CONTROL_RESULT` object (redacted, as every agent text the
 engine persists; the parser refuses a credential in any field the controller
 publishes, so redaction changes nothing it acts on), its digest, and its
 binding: the phase, attempt and launch label of the launch that delivered
-it, the issue, the PR, the review round, the candidate the checks read, how
-the launch ended and its run log step. The step then goes on from it as from
-any reply: the operator's checkout is checked, the PR's owner, then the
-phase's verification, whose plan the effect journal (ADR 0004) saves before
+it, the issue, the PR, the review round, the candidate the checks read, the
+revision the run was bound to (the PR's HEAD, base and merge base: the diff a
+review decides on, R2-F1), how the launch ended and its run log step. Before
+that save the operator's checkout is checked against the anchor of the
+invocation that delivered the reply (R2-F2): the anchor lives in memory only
+and a restart reads one of its own, so a move found only later would go
+unseen by a restart that goes on from the kept reply; a move found there
+ends the step in `BLOCKED` (`checkout-drift`) with the reply never kept. The
+step then goes on from it as from any reply: the operator's checkout is
+checked again, the PR's owner, then the phase's verification, whose plan the effect journal (ADR 0004) saves before
 anything is written. Only when that verification applies the reply as the
 step's result is the reply *accepted*, and the evidence is explicit: the
 save of the plan the verification turned it into (`_save_plan`), whatever
@@ -905,8 +911,12 @@ first, and otherwise checks the kept reply again, exactly as a fresh one,
 against the worktree and GitHub as they are then, and goes on from it with
 no agent launched and no step of a launch charged; a write whose outcome
 was lost is read back, never sent twice. A binding that no longer matches
-the run, or a check that now refuses the reply (a candidate that moved, a
-review HEAD the PR no longer has), is a safe stop: `BLOCKED`
+the run, a revision the run is no longer bound to (a REVIEW entry under bwrap
+or `disabled` binds the PR's HEAD, base and merge base again before the kept
+reply is read, and a review's verdict is about its own diff alone, so a
+retargeted base or a moved merge base refuses it, R2-F1), or a check that now
+refuses the reply (a candidate that moved, a review HEAD the PR no longer
+has), is a safe stop: `BLOCKED`
 (`control-result-invalid`) with nothing launched, published or applied, and
 the reply dropped, so `unblock` launches the agent afresh. The kept reply is
 dropped by every save in another phase or after another launch, and by the
@@ -919,10 +929,12 @@ journal records a refusal's decision, as for any failed step
 `test_an_accepted_reply_whose_pr_create_landed_is_adopted_never_sent_twice`,
 `test_a_provisional_reply_is_kept_in_the_state_before_the_step_goes_on_from_it`,
 `test_a_kept_review_is_posted_once_after_a_restart_and_the_reviewer_not_run_again`,
+`test_a_kept_review_whose_diff_moved_before_the_restart_stops_safely`,
 `test_a_kept_reply_whose_candidate_moved_before_the_restart_stops_safely`,
 `test_a_kept_reply_bound_to_another_launch_is_never_gone_on_from`,
 `test_a_kept_reply_outlives_an_unavailable_github_and_resume_goes_on_from_it`,
 `test_a_reply_the_checkout_drift_check_refuses_after_the_parse_is_never_accepted`,
+`test_a_checkout_the_agent_moved_is_found_before_its_reply_is_kept`,
 `test_a_reply_the_phase_verification_stops_before_planning_is_never_accepted`,
 `test_a_review_applied_before_the_round_cap_stopped_the_step_was_accepted`,
 `test_a_review_refused_before_its_plan_was_saved_was_not_accepted`,
@@ -967,8 +979,10 @@ every input is typed (the adapter's fact, the executor's flags, the block
 framing the parser reads of any reply); an agent can at most deliver a reply
 and then hang or fail, which buys it nothing the checks of a clean exit would
 not give it, and the stricter block rule refuses an ambiguous reply; a kept
-reply is re-checked in full after a restart, so time between the crash and
-the restart buys it nothing either. *Cost:* none added; one paid relaunch
+reply is re-checked in full after a restart, against the PR revision it was
+kept under, and is kept only once the checkout its invocation was anchored to
+was found unmoved, so time between the crash and the restart buys it nothing
+either. *Cost:* none added; one paid relaunch
 saved per accepted reply, and per crash in a step that went on from one.
 *Security:* no credential, write or bound changes; every check of a clean
 exit's reply runs, again after a restart; the kept payload is redacted
@@ -990,7 +1004,7 @@ look for one, refuses, and so does the recovery rule's relaunch (D11).
 | transient retries are bounded | `test_transient_retries_are_bounded_per_step_across_corrections`, `test_transient_read_failure_is_bounded_then_blocked` |
 | an automatic relaunch is once per step, allowlisted and audited (#434) | `test_only_the_allowlist_is_ever_relaunched`, `test_two_idle_timeouts_relaunch_once`, `test_an_idle_timeout_is_relaunched_once_and_the_run_goes_on` |
 | a result delivered before a failed end is accepted only on proof and only by a clean exit's checks and the step's own (#479) | `test_each_missing_fact_refuses_the_reply`, `test_a_reply_without_its_proof_is_never_accepted_and_the_step_stops_safely`, `test_a_reply_the_checkout_drift_check_refuses_after_the_parse_is_never_accepted` |
-| a provisional reply is never run again after a crash, and is re-checked before it is gone on from (#479) | `test_a_provisional_reply_is_kept_in_the_state_before_the_step_goes_on_from_it`, `test_a_kept_reply_whose_candidate_moved_before_the_restart_stops_safely` |
+| a provisional reply is never run again after a crash, and is re-checked before it is gone on from (#479) | `test_a_provisional_reply_is_kept_in_the_state_before_the_step_goes_on_from_it`, `test_a_kept_reply_whose_candidate_moved_before_the_restart_stops_safely`, `test_a_kept_review_whose_diff_moved_before_the_restart_stops_safely`, `test_a_checkout_the_agent_moved_is_found_before_its_reply_is_kept` |
 | no write without its authority: K9, K10, merge, downgrade, drift | the tests D3's table names |
 
 Default single-agent behaviour, every default and the prompts are

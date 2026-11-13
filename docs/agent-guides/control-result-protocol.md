@@ -92,11 +92,13 @@ decode to the same value and no block begun after the last, so a reply whose
 launch failed is taken only when it says one thing. A reply the checks refuse
 is not corrected: the launch's failure ends the step, with the reason, and the
 recovery rule never relaunches over it. A reply they let through is
-provisional, not yet accepted: it is kept in the state (`delivered_reply`,
-with its binding) before the step goes on from it, and the step accepts it
-only once its own checks after the parse (the operator's checkout, the PR's
-owner, the phase's verification) have applied it; a crash in between leaves
-it for the next command, which checks it again exactly as a fresh reply and
+provisional, not yet accepted: once the operator's checkout is found
+unmoved, it is kept in the state (`delivered_reply`, with its binding and the
+PR revision the run is bound to) before the step goes on from it, and the
+step accepts it only once its own checks after the parse (the PR's owner,
+the phase's verification, which must save the plan it turns the reply into)
+have applied it; a crash in between leaves it for the next command, which
+checks it again exactly as a fresh reply, against the same revision, and
 launches no agent (ADR 0012 D12.4). A clean exit's reply is read exactly as
 before.
 

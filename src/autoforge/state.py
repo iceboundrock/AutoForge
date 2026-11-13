@@ -760,7 +760,8 @@ class AutoForgeState:
     # :class:`autoforge.delivered_result.KeptReply`), ``{}`` when none is:
     # the validated, redacted ``CONTROL_RESULT`` object, its digest, and its
     # binding (phase, attempt, launch label, issue, PR, review round, the
-    # candidate the checks read, how the launch ended, its run log step).
+    # candidate the checks read, the revision the run was bound to: the PR's
+    # HEAD, base and merge base, how the launch ended, its run log step).
     # Saved before the step goes on from it, so a crash or a restart before
     # the step concludes re-checks it and launches no agent; dropped by a
     # save in another phase or after another launch

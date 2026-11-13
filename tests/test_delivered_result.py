@@ -643,6 +643,51 @@ def test_a_kept_review_is_posted_once_after_a_restart_and_the_reviewer_not_run_a
     assert [w[0] for w in fake_github.effect_writes] == ["create_pr_comment"]
 
 
+@pytest.mark.parametrize("moved", ["base", "merge-base"])
+def test_a_kept_review_whose_diff_moved_before_the_restart_stops_safely(
+    tmp_state_dir, fake_github, monkeypatch, moved
+):
+    """R2-F1 of PR #481: the review was kept with the revision it decided on,
+    then, before the restart, the PR's base was retargeted (or its base
+    rewritten, so the merge base moved) while its HEAD stayed. The restart's
+    REVIEW entry binds the PR again as it is (bwrap or disabled), so the kept
+    verdict would certify another diff: a safe stop, no comment, no round
+    recorded, no reviewer launched, and the reply dropped."""
+    from .conftest import MERGE_BASE, MERGE_BASE_B, SHA_A, review_result
+    from .test_engine import _in_review
+
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    provider = _Ends((block(review_result(1, SHA_A, [])), IDLE))
+    eng.providers._overrides = {"claude": provider, "opencode": provider}
+    eng.provider = provider
+    _crash_before_the_plan(eng, monkeypatch)
+    with pytest.raises(_Crash):
+        eng.step()
+    kept = KeptReply.from_dict(load_state(eng.paths.state_file).delivered_reply)
+    assert kept.revision() == (SHA_A, "main", MERGE_BASE)
+    eng.close()
+    if moved == "base":
+        fake_github.prs[PR] = replace(fake_github.prs[PR], base_ref="release")
+    else:
+        fake_github.merge_base = MERGE_BASE_B
+
+    eng2 = make_engine(tmp_state_dir, [], github=fake_github)
+    eng2.load()
+    later = _no_agent(eng2)
+    outcome = eng2.step()
+    assert outcome.next_phase == "BLOCKED", outcome.message
+    assert later.calls == [] and len(provider.calls) == 1
+    assert fake_github.effect_writes == []
+    state = load_state(eng2.paths.state_file)
+    assert state.stop_code == "control-result-invalid" and state.delivered_reply == {}
+    assert state.review_round == 0 and state.review_history == []
+    assert "it was kept while the run was bound to HEAD aaaaaaaaaaaa on base main" in (
+        state.block_reason
+    )
+    now = "on base release from merge base dddd" if moved == "base" else "on base main from"
+    assert now in state.block_reason
+
+
 def test_a_kept_reply_whose_candidate_moved_before_the_restart_stops_safely(
     tmp_state_dir, fake_github, monkeypatch
 ):
@@ -759,6 +804,9 @@ def test_a_new_launch_and_a_phase_change_drop_a_kept_reply(tmp_state_dir, fake_g
         pr_url="",
         review_round=0,
         candidate="a" * 40,
+        head_sha="",
+        base_ref="",
+        merge_base_sha="",
         process_end=ProcessEnd.KILLED,
         limit="idle",
         run_log="001-analyze_execute-1",
@@ -788,6 +836,10 @@ def test_a_new_launch_and_a_phase_change_drop_a_kept_reply(tmp_state_dir, fake_g
         {"run_log": "../escape"},
         {"payload": {"phase": "REVIEW", "status": "success"}},
         {"extra": 1},
+        {"head_sha": "B" * 40},
+        {"merge_base_sha": "d" * 39},
+        {"base_ref": None},
+        {"base_ref": "m" * 513},
     ],
     ids=[
         "digest",
@@ -799,6 +851,10 @@ def test_a_new_launch_and_a_phase_change_drop_a_kept_reply(tmp_state_dir, fake_g
         "run-log",
         "payload-of-another-phase",
         "extra-key",
+        "uppercase-head",
+        "short-merge-base",
+        "base-not-a-string",
+        "base-too-long",
     ],
 )
 def test_a_kept_reply_is_loaded_only_in_its_whole_shape(change):
@@ -810,6 +866,9 @@ def test_a_kept_reply_is_loaded_only_in_its_whole_shape(change):
         pr_url="",
         review_round=0,
         candidate="a" * 40,
+        head_sha="b" * 40,
+        base_ref="main",
+        merge_base_sha="d" * 40,
         process_end=ProcessEnd.KILLED,
         limit="idle",
         run_log="001-analyze_execute-1",
@@ -833,6 +892,9 @@ def test_a_state_file_keeping_a_reply_of_another_launch_is_refused(tmp_state_dir
         pr_url="",
         review_round=0,
         candidate="",
+        head_sha="",
+        base_ref="",
+        merge_base_sha="",
         process_end=ProcessEnd.FAILED_EXIT,
         limit="",
         run_log="001-analyze_execute-1",
@@ -870,7 +932,51 @@ def test_a_reply_the_checkout_drift_check_refuses_after_the_parse_is_never_accep
     assert (settled["outcome"], settled["reason"]) == ("not-accepted", "checkout-drift")
     state = load_state(eng.paths.state_file)
     assert state.delivered_reply == {} and fake_github.effect_writes == []
+    assert "the move was found before the reply was kept" in state.block_reason
     assert len(provider.calls) == 1
+
+
+def test_a_checkout_the_agent_moved_is_found_before_its_reply_is_kept(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """R2-F2 of PR #481, at the crash boundary it names: the agent moved the
+    operator's checkout, delivered its reply and was killed, and the
+    controller dies recording the launch, after the point where the reply
+    used to be kept and before the invocation's own drift check. The drift
+    was found before the keeping save, so the state holds no reply, and the
+    restart, under an anchor of its own, has nothing to go on from: no
+    reply is accepted or published from that launch."""
+    from .test_engine import _commit, _resumed
+
+    def reply_and_move_the_checkout(req):
+        text = implement(req)
+        _commit(tmp_state_dir.parent, "sneaky.txt", "1", "moved by the agent")
+        return text
+
+    eng, provider = _analyzing(tmp_state_dir, fake_github, (reply_and_move_the_checkout, IDLE))
+    kept = []
+    keep = eng._keep_reply
+    monkeypatch.setattr(eng, "_keep_reply", lambda *a: kept.append(1) or keep(*a))
+
+    def crash(*_args):
+        raise _Crash
+
+    monkeypatch.setattr(eng, "_record_invocation", crash)
+    with pytest.raises(_Crash):
+        eng.step()
+    assert kept == [], "the drift check ran before the keeping save"
+    on_disk = load_state(eng.paths.state_file)
+    assert on_disk.delivered_reply == {} and on_disk.phase == Phase.ANALYZE_EXECUTE
+    assert fake_github.effect_writes == []
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github)
+    later = _no_agent(eng2)
+    with pytest.raises(IndexError):
+        eng2.step()  # the restart launches afresh; it has no reply to go on from
+    assert len(later.calls) == 1 and len(provider.calls) == 1
+    assert fake_github.effect_writes == []
+    run_dir = eng2.paths.logs_dir / eng2.state.run_id
+    assert not [p for p in run_dir.iterdir() if "-delivered-result-" in p.name]
 
 
 def test_a_reply_the_phase_verification_stops_before_planning_is_never_accepted(

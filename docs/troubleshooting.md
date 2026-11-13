@@ -412,7 +412,8 @@ step concluded (a crash, `Ctrl-C`, GitHub not answering), the next `resume`
 checks the kept reply again and goes on from it without running the agent
 again; the error you saw says `is kept in the run's state`. When the kept
 reply no longer passes its checks (a commit landed in the worktree after it,
-or the PR moved), the run stops in `BLOCKED` (`control-result-invalid`) with
+or the PR moved: its HEAD, its base branch or the merge base its diff is
+computed from), the run stops in `BLOCKED` (`control-result-invalid`) with
 nothing launched or published: inspect the worktree and the PR, then
 `unblock`, which launches the agent afresh.
 
