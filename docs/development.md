@@ -209,6 +209,29 @@ development host. The rest of the suite stands in for the probe (`tests/conftest
 `sandbox_probe` fixture answers "supported" without a launch), so every
 mode and the pre-launch gate are tested on any host.
 
+**The container backend's policy on a real runtime (#270)** is opt-in,
+because nothing can say yet that a host is capable: the image and the
+probe that would are #271's and #273's.
+`tests/test_container_security_real.py` creates a container exactly as
+the policy renders it, measures it from inside as the agent and judges
+the result (ADR 0013 §7's list for #270: a subordinate UID, no
+capability, a read-only root, no host keyring key, host loopback and a
+host abstract socket unreachable, no route under `--network none`, no
+fake credential outside the projection). It runs only when both
+variables name what to use, and the image must already be present
+locally with `python3` (nothing is pulled):
+
+```bash
+AUTOFORGE_CONTAINER_TEST_RUNTIME=podman AUTOFORGE_CONTAINER_TEST_IMAGE=<image> \
+  uv run pytest -rs tests/test_container_security_real.py
+```
+
+Otherwise, and on a runtime that is not rootless or cannot start a
+container (a host where `newuidmap` is refused, for example), each test
+skips with the reason; `AUTOFORGE_REQUIRE_CONTAINER_RUNTIME=1` makes that
+a failure instead. A skip is never a pass. The rest of the policy is
+tested on any host by `tests/test_sandbox_container.py`, with no runtime.
+
 ## The built distributions
 
 `make check` tests the source tree, through an editable install; it never

@@ -218,6 +218,9 @@ def test_the_seam_knows_no_workflow():
         "sandbox_backend.py": {"errors", "git_input", "sandbox", "sandbox_bwrap"},
         "sandbox_lifecycle.py": {"errors", "git_input", "sandbox", "sandbox_backend"},
         "git_input.py": set(),
+        # #270: the container policy reads child_env's forbidden names only.
+        "sandbox_container.py": {"child_env", "errors", "sandbox"},
+        "container_measure.py": set(),
     }
     for name, modules in allowed.items():
         tree = ast.parse((SRC / name).read_text())

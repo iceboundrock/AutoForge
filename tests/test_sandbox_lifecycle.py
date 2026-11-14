@@ -44,6 +44,7 @@ from autoforge.engine import ControllerEngine
 from autoforge.errors import (
     ControlResultValidationError,
     ExecutionError,
+    SandboxCapabilityError,
     SandboxCleanupUncertainError,
     SandboxLaunchRefusedError,
     SandboxPolicyError,
@@ -585,6 +586,29 @@ def test_a_refused_runtime_check_writes_nothing_and_reconciles_nothing():
         enter(backend, journal, probes.append)  # type: ignore[arg-type]
     assert events == [("runtime", "check"), ("fail", "runtime check")]
     assert probes == [] and len(journal.entries) == 5
+
+
+@pytest.mark.parametrize(
+    ("rootless", "said"), [(False, "reports itself rootful"), (None, "does not say it is rootless")]
+)
+def test_a_runtime_that_is_not_rootless_is_refused_before_reconciliation(rootless, said):
+    """ADR 0013 D10, #270: a rootful runtime (or one that does not say) is refused at the
+    runtime check, before anything is reconciled, saved or launched; nothing is written."""
+    events: list[tuple] = []
+
+    class Rootful(FakeBackend):
+        def runtime_check(self) -> RuntimeReport:
+            self.events.append(("runtime", "check"))
+            return dataclasses.replace(RUNTIME, rootless=rootless)
+
+    entries = container_objects(OWNER, "bind")
+    journal = FakeJournal(events, entries)
+    probes: list[RuntimeReport] = []
+    with pytest.raises(SandboxCapabilityError, match=said) as refused:
+        enter(Rootful(events), journal, probes.append)  # type: ignore[arg-type]
+    assert refused.value.capability == "rootless"
+    assert events == [("runtime", "check")]
+    assert probes == [] and len(journal.entries) == len(entries)
 
 
 def test_reconciliation_closes_only_the_entries_verified_gone():
@@ -1286,6 +1310,9 @@ def _with(**fields):
         ),
         (_bent(LAUNCH_CONTAINER=_with(mounts=("staging", "vol"))), "does not mount the projection"),
         (_bent(LAUNCH_CONTAINER=_with(network="")), "names no network position"),
+        # ADR 0013 D9, #270: no container is ever created on the host's network.
+        (_bent(LAUNCH_CONTAINER=_with(network="host")), "never the host's"),
+        (_bent(LAUNCH_CONTAINER=_with(network="container:other")), "never the host's"),
         (
             _bent(
                 LAUNCH_CONTAINER=_with(mounts=("staging", "vol", "projection", "/home/operator"))

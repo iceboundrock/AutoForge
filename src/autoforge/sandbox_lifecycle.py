@@ -6,7 +6,8 @@ the engine layer's half of the seam: the backend never orders its own
 steps, never writes the journal and never decides what is kept.
 
 **At a command's entry** (:func:`enter`), before anything of a launch, in
-D16's order: the runtime check (read-only, never cached; a refusal leaves
+D16's order: the runtime check (read-only, never cached; a refusal, a
+container runtime that is not rootless included (ADR 0013 D10), leaves
 everything as it was and reconciliation is not attempted), then
 reconciliation (removal intents first, an entry closed only once its
 object is verified gone), then the probe, which the caller caches for the
@@ -108,6 +109,7 @@ from .git_input import GitInputError, LaunchGitInput, seed_manifest_digest, seed
 from .sandbox import LaunchDescription
 from .sandbox_backend import (
     CONTAINER_KINDS,
+    CONTAINER_NETWORKS,
     CREATE_ORDER,
     EXPORT_KINDS,
     NETWORK_NONE,
@@ -123,6 +125,7 @@ from .sandbox_backend import (
     RuntimeReport,
     SandboxBackend,
     Seed,
+    runtime_refusal,
 )
 
 T = TypeVar("T")
@@ -294,8 +297,13 @@ def enter(
     reconciled: a listing from another runtime or store would read as
     "nothing left". ``probe`` is called last, with the report the check
     proved, so that the caller can reuse a result proved on that report.
+    A container runtime that is not rootless is refused the same way, as
+    the runtime check's own refusal (ADR 0013 D10).
     """
     runtime = backend.runtime_check()
+    refusal = runtime_refusal(runtime)
+    if refusal is not None:
+        raise refusal
     still_open = reconcile(backend, journal, runtime)
     return Entry(runtime, probe(runtime), still_open)
 
@@ -353,6 +361,12 @@ def _check_create(objects: tuple[LifecycleObject, ...], owner: LaunchOwner) -> N
             raise _refused(f"the launch container {launch.name} does not mount the projection")
         if not launch.network:
             raise _refused(f"the launch container {launch.name} names no network position")
+        if launch.network not in CONTAINER_NETWORKS:
+            raise _refused(
+                f"the launch container {launch.name} would be created with network "
+                f"{launch.network!r}; a container gets a namespace of its own, never the host's "
+                "(ADR 0013 D9)"
+            )
     sources = {obj.name for obj in objects if obj.kind not in CONTAINER_KINDS}
     _check_mounts(objects, sources)
 

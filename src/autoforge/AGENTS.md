@@ -71,6 +71,7 @@ sandbox_backend.py  the backend seam (ADR 0013 D13): the backend-neutral lifecyc
                     what was made, the binding a compiled launch carries to the
                     executor), its objects and their removal outcomes, bwrap behind
                     it unchanged; the only module that imports sandbox_bwrap;
+                    the refusal of a container runtime that is not rootless (#270);
                     executor layer, no journal, no workflow (#268)
 sandbox_lifecycle.py  the engine's sequence of that interface: a command's entry
                     (runtime check, reconciliation, probe) and one launch's steps in
@@ -83,6 +84,20 @@ sandbox_lifecycle.py  the engine's sequence of that interface: a command's entry
                     the seed step's end binding the git input to the seed's digest,
                     saved before any journal entry, and the seed handed on only
                     while its manifest keeps it (#269); no workflow (#268)
+sandbox_container.py  the container backend's security policy (ADR 0013 D9, D10, D12's
+                    bind sources, D14's mechanisms): the spec a create configures, typed,
+                    with no raw flag, mount or option; D9's network mapping (bridge or
+                    none, no host member); the credential projection (an environment
+                    variable named on the argv and valued only in the runtime client's
+                    environment, a read-only file in the home on bind runtimes) and its
+                    refusals; the create's and the agent exec's arguments, the only
+                    place a container runtime flag is written; the judge of a
+                    measurement, each missing item a ContainerCapability; executor
+                    layer, lstat and realpath only, never a credential's contents;
+                    unreachable before #271 and #273 (#270)
+container_measure.py  what a container enforced, observed from inside as the agent and
+                    printed as JSON for the judge; standard library only, imports
+                    nothing of the package, so the image carries it alone (#270)
 git_input.py        a launch's git input (ADR 0013 D4): the bound revision, typed and
                     immutable (phase, launch, repository, object format, seed, lower
                     boundary, carried commit, seed manifest digest), its entry and
@@ -360,6 +375,10 @@ candidate_source.py                               -> the same, + docs/adr/0013-c
                                                      sandbox-backend-lifecycle-trust-
                                                      boundaries-and-rollout.md (D4, D5, D13,
                                                      D16)
+sandbox_container.py, container_measure.py        -> the same, + ADR 0013 D9, D10, D12, D14,
+                                                     D16 and D18, and docs/agent-guides/
+                                                     github-safety.md (Container launch
+                                                     threat model)
 sandbox_policy.py, providers.py
 (sandbox_requirements), engine.py (launch
 routing, sandbox directories, the pre-launch
