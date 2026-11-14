@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import enum
 import errno
+import ipaddress
 import json
 import os
 import posixpath
@@ -72,6 +73,7 @@ import re
 import stat
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 
 from .child_env import undoes_isolation
 from .errors import SandboxPolicyError
@@ -122,6 +124,29 @@ ROOT_FILESYSTEMS = frozenset({"overlay", "fuse.fuse-overlayfs"})
 # may mount below them is a closed list (:func:`judge`). The sentinel search
 # leaves exactly these out.
 KERNEL_ROOTS = frozenset({"/proc", "/sys", "/dev"})
+# What the ``/dev`` a runtime makes holds, and nothing else. The sentinel
+# search leaves ``/dev`` out, so its listing is what shows a host tmpfs
+# bound there: each device node (:data:`RUNTIME_DEVICES`) and each of these
+# directories must be a mount of its own, which the judge admits on its own
+# terms (the host's node under its own name; a ``devpts`` holding only
+# ``ptmx``, the IPC namespace's empty ``shm`` and ``mqueue``), and each of
+# the symbolic links every OCI runtime adds must point where it does.
+DEV_MOUNTS = frozenset({"pts", "shm", "mqueue"})
+DEV_LINKS: Mapping[str, str] = MappingProxyType(
+    {
+        "fd": "/proc/self/fd",
+        "stdin": "/proc/self/fd/0",
+        "stdout": "/proc/self/fd/1",
+        "stderr": "/proc/self/fd/2",
+        "core": "/proc/kcore",
+        "ptmx": "pts/ptmx",
+    }
+)
+# The container's own cgroup tree, the one mount below ``/sys`` that is not
+# sysfs's or a mask: cgroup v2, read-only, rooted at its cgroup namespace's
+# root. A rootless runtime enforces no PID limit on cgroup v1, so its
+# controller mounts are refused with the rest.
+CGROUP_TARGET = "/sys/fs/cgroup"
 
 # The controller's sandbox directories (ADR 0005 D8.4, as
 # ``sandbox_policy.SANDBOX_DIR``) and, in an issue's, its launches' staging
@@ -1030,11 +1055,15 @@ class PolicyMount:
     ``source`` is a volume's name, or for a bind the tail of the host path
     its root must end with: a mount's root is its path in its filesystem,
     which a mount point or a subvolume can shorten or lengthen at the
-    front, so only the tail is the same everywhere. ``read_only``: the
-    mount must be ``ro``, whatever any writability probe says. ``entries``:
-    for a tmpfs, the names it may hold (the mount points the policy puts in
-    it), since only its content tells a fresh one from a host tmpfs bound in
-    whole.
+    front, so only the tail is the same everywhere. A tail alone does not
+    tell the host's file from another with the same tail, so a bind also
+    carries ``identity``: its host source's device (major, minor) and inode
+    as ``lstat`` reads them on the host (:func:`host_identity`), which the
+    target must show from inside; ``None`` when the source could not be
+    read, which proves nothing. ``read_only``: the mount must be ``ro``,
+    whatever any writability probe says. ``entries``: for a tmpfs, the
+    names it may hold (the mount points the policy puts in it), since only
+    its content tells a fresh one from a host tmpfs bound in whole.
     """
 
     target: str
@@ -1042,11 +1071,26 @@ class PolicyMount:
     source: str = ""
     read_only: bool = False
     entries: frozenset[str] = frozenset()
+    identity: tuple[int, int, int] | None = None
 
 
 def _bind_tail(path: str) -> str:
     """A credential file's tail: its private directory and its name."""
     return "/".join(path.strip("/").split("/")[-2:])
+
+
+def host_identity(path: str) -> tuple[int, int, int] | None:
+    """``path``'s device (major, minor) and inode, by ``lstat``; ``None`` if unreadable.
+
+    What a bind of ``path`` shows at its target from inside, whatever
+    namespace reads it: the same inode on the same device. Metadata only,
+    never the contents (ADR 0005 D7.2).
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    return (os.major(info.st_dev), os.minor(info.st_dev), info.st_ino)
 
 
 @dataclass(frozen=True)
@@ -1059,9 +1103,10 @@ class Expectation:
     :data:`RUNTIME_TEMP`; ``mounts`` every mount the policy makes, each
     with the source, type and read-only option it must show;
     ``container_id`` the measured container's full id, which the runtime's
-    own files must be bound from. ``loopback_listeners`` are the host's
-    nonce listeners, ``(address, port)``, which must cover ``127.0.0.1`` and
-    ``::1``; ``loopback_routes`` the addresses and names the measurement
+    own files must be bound from; each bind's host identity is read by
+    :meth:`for_spec`, when the expectation is built. ``loopback_listeners``
+    are the host's nonce listeners, ``(address, port)``, which must cover
+    ``127.0.0.1`` and ``::1``; ``loopback_routes`` the addresses and names the measurement
     must have tried at each listener's port (:func:`loopback_routes`), to
     which every default gateway it reports is added; ``loopback_nonce`` and
     ``abstract_nonce`` what the host's listeners send. ``sentinels`` are
@@ -1126,10 +1171,22 @@ class Expectation:
             mounts.append(PolicyMount(CACHE_TARGET, MountKind.VOLUME, spec.cache_volume))
         if spec.source is not None:
             mounts.append(
-                PolicyMount(SOURCE_TARGET, MountKind.BIND, spec.source.layout, read_only=True)
+                PolicyMount(
+                    SOURCE_TARGET,
+                    MountKind.BIND,
+                    spec.source.layout,
+                    read_only=True,
+                    identity=host_identity(spec.source.path),
+                )
             )
         mounts.extend(
-            PolicyMount(item.path, MountKind.BIND, _bind_tail(item.source), read_only=True)
+            PolicyMount(
+                item.path,
+                MountKind.BIND,
+                _bind_tail(item.source),
+                read_only=True,
+                identity=host_identity(item.source),
+            )
             for item in spec.projection.files
         )
         return cls(
@@ -1237,28 +1294,87 @@ def _ends_with(root: str, tail: str) -> bool:
     return bool(tail) and (root == "/" + tail or root.endswith("/" + tail))
 
 
-def _contents_problem(contents: object, allowed: frozenset[str] = frozenset()) -> str:
-    """What is wrong with a fresh tmpfs's listing ("" for nothing).
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _contents_problem(contents: object, allowed: Iterable[str] = ()) -> str:
+    """What is wrong with a fresh filesystem's listing ("" for nothing).
 
     A host tmpfs bound in whole (the operator's ``/run/user/<uid>``, a
-    tmpfs ``/tmp`` or ``/dev/shm``) shows the same type and root in
-    ``mountinfo`` as one the runtime makes; only what it holds tells them
-    apart. A fresh one holds nothing but the mount points ``allowed``, and a
+    tmpfs ``/tmp`` or ``/dev/shm``), or a host ``mqueue`` or ``devpts``,
+    shows the same type and root in ``mountinfo`` as one the runtime makes;
+    only what it holds tells them apart. A fresh one holds nothing but the
+    names ``allowed`` (the mount points the policy puts in it), and a
     listing that is missing, failed or cut short proves nothing.
     """
     if not isinstance(contents, Mapping):
-        return "its content was not listed, so a host tmpfs bound there would go unseen"
+        return "its content was not listed, so a host filesystem bound there would go unseen"
     names, count = contents.get("names"), contents.get("count")
-    if not isinstance(names, list) or not isinstance(count, int) or isinstance(count, bool):
+    if not isinstance(names, list) or not _is_int(count):
         return f"its content could not be listed ({contents.get('error') or 'no listing'})"
-    extra = sorted({str(name) for name in names} - allowed)
+    extra = sorted({str(name) for name in names} - set(allowed))
     if extra or count != len(names):
         held = ", ".join(extra[:3]) or f"{count} entries, more than were listed"
-        return f"it holds {held}, which a fresh tmpfs would not"
+        return f"it holds {held}, which a fresh one would not"
     return ""
 
 
-def _policy_mount_problem(mount: _Mount, wanted: PolicyMount, contents: object) -> str:
+def _dev_problem(contents: object, points: frozenset[str]) -> str:
+    """What is wrong with the ``/dev`` tmpfs's listing ("" for nothing).
+
+    The sentinel search leaves ``/dev`` out, so only its listing tells the
+    runtime's from a host tmpfs bound there: nothing in it but
+    :data:`RUNTIME_DEVICES` and :data:`DEV_MOUNTS`, each a mount of its own
+    (``points``, which the judge checks one by one) of the kind it must be,
+    and :data:`DEV_LINKS`, each a link to its fixed target. An entry that
+    is no mount would show what the host tmpfs holds under that name.
+    """
+    problem = _contents_problem(contents, (*RUNTIME_DEVICES, *DEV_MOUNTS, *DEV_LINKS))
+    if problem or not isinstance(contents, Mapping):
+        return problem
+    kinds, links = contents.get("kinds"), contents.get("links")
+    if not isinstance(kinds, Mapping) or not isinstance(links, Mapping):
+        return "what kind each entry is was not reported, so a host file there would go unseen"
+    for name in sorted(str(name) for name in contents.get("names") or ()):
+        kind = kinds.get(name) or "unreported"
+        target = DEV_LINKS.get(name)
+        if target is not None:
+            if kind != "link" or links.get(name) != target:
+                return f"its {name} is {kind}, not the runtime's link to {target}"
+            continue
+        if f"/dev/{name}" not in points:
+            return (
+                f"its {name} is no mount of the runtime's, so the host file there would go "
+                "unseen (the sentinel search leaves /dev out)"
+            )
+        wanted = "char" if name in RUNTIME_DEVICES else "dir"
+        if kind != wanted:
+            return f"its {name} is {kind}, not a {wanted}"
+    return ""
+
+
+def _identity_problem(wanted: PolicyMount, seen: object) -> str:
+    """Whether a bind shows its host source's own device and inode ("" if it does)."""
+    if wanted.identity is None:
+        return (
+            f"its host source .../{wanted.source} could not be identified, so a bind of "
+            "another file with the same path's tail would go unseen"
+        )
+    if not isinstance(seen, list) or len(seen) != 3 or not all(_is_int(part) for part in seen):
+        reported = seen if isinstance(seen, str) else "not reported"
+        return f"its device and inode were not measured ({reported})"
+    if tuple(seen) != wanted.identity:
+        return (
+            f"bound from another file than the host's .../{wanted.source}: its device and "
+            "inode are not the source's"
+        )
+    return ""
+
+
+def _policy_mount_problem(
+    mount: _Mount, wanted: PolicyMount, contents: object, identity: object
+) -> str:
     """What is wrong with a mount at one of the policy's targets ("" for nothing)."""
     if wanted.kind is MountKind.TMPFS:
         if mount.fstype != "tmpfs" or mount.root != "/":
@@ -1271,6 +1387,10 @@ def _policy_mount_problem(mount: _Mount, wanted: PolicyMount, contents: object) 
             return f"mounted from {mount.root}, not from the volume {wanted.source}"
     elif not _ends_with(mount.root, wanted.source):
         return f"bound from {mount.root}, not from .../{wanted.source}"
+    else:
+        problem = _identity_problem(wanted, identity)
+        if problem:
+            return problem
     if wanted.read_only and "ro" not in mount.options:
         return "mounted read-write, where the policy mounts it read-only"
     return ""
@@ -1281,8 +1401,9 @@ def _kernel_mount_problem(mount: _Mount, devices: Mapping[str, str], contents: o
 
     The runtime masks and narrows its own procfs and sysfs: a read-only
     view of the same filesystem, an empty read-only tmpfs (listed empty), or
-    the null device over a path; and it mounts the container's cgroup tree.
-    Nothing else, and no host filesystem, is admitted there.
+    the null device over a path; and it mounts the container's own cgroup
+    tree, once, read-only, at :data:`CGROUP_TARGET`. Nothing else, and no
+    host filesystem, is admitted there.
     """
     kernel = "/proc" if _below(mount.point, "/proc") else "/sys"
     own = "proc" if kernel == "/proc" else "sysfs"
@@ -1296,14 +1417,27 @@ def _kernel_mount_problem(mount: _Mount, devices: Mapping[str, str], contents: o
         or (mount.fstype == "tmpfs" and mount.device == devices.get("/dev"))
     ):
         return ""
-    cgroup = mount.point == "/sys/fs/cgroup" or _below(mount.point, "/sys/fs/cgroup")
-    if cgroup and mount.fstype in ("cgroup2", "cgroup") and mount.root == "/":
-        return ""
+    if mount.fstype in ("cgroup2", "cgroup"):
+        if (
+            mount.point == CGROUP_TARGET
+            and mount.fstype == "cgroup2"
+            and mount.root == "/"
+            and read_only
+        ):
+            return ""
+        return (
+            f"{mount.fstype} from {mount.root}{'' if read_only else ', read-write'}: the "
+            f"runtime mounts only the container's own cgroup2 tree, read-only, at {CGROUP_TARGET}"
+        )
     return f"{mount.fstype} from {mount.root}, not one the runtime makes there"
 
 
 def _runtime_mount_problem(
-    mount: _Mount, expect: Expectation, devices: Mapping[str, str], contents: object
+    mount: _Mount,
+    expect: Expectation,
+    devices: Mapping[str, str],
+    contents: object,
+    points: frozenset[str],
 ) -> str:
     """What is wrong with a mount the policy does not make ("" for one the runtime needs)."""
     point, fstype, root = mount.point, mount.fstype, mount.root
@@ -1325,19 +1459,24 @@ def _runtime_mount_problem(
             return ""
         return f"{fstype} from {root}, not a read-only sysfs"
     if point == "/dev":
-        return "" if fstype == "tmpfs" and fresh else f"{fstype} from {root}, not a tmpfs"
-    if point == "/dev/shm":
-        # The IPC namespace's own, made empty (``--ipc=private``).
         if fstype == "tmpfs" and fresh:
-            return _contents_problem(contents)
-        return f"{fstype} from {root}, not a tmpfs of its own"
+            return _dev_problem(contents, points)
+        return f"{fstype} from {root}, not a tmpfs"
+    # The IPC namespace's own shm and mqueue (``--ipc=private``), made empty,
+    # and a devpts instance of the container's own, holding only its ptmx
+    # (no terminal is allocated): a host one bound there holds more.
+    for own, fs_type, allowed in (
+        ("/dev/shm", "tmpfs", ()),
+        ("/dev/mqueue", "mqueue", ()),
+        ("/dev/pts", "devpts", ("ptmx",)),
+    ):
+        if point == own:
+            if fstype == fs_type and fresh:
+                return _contents_problem(contents, allowed)
+            return f"{fstype} from {root}, not a {fs_type} of its own"
     if _below(point, "/dev"):
         name = point.removeprefix("/dev/")
-        if (
-            (point == "/dev/pts" and fstype == "devpts")
-            or (point == "/dev/mqueue" and fstype == "mqueue")
-            or (name in RUNTIME_DEVICES and fstype == "devtmpfs" and root == f"/{name}")
-        ):
+        if name in RUNTIME_DEVICES and fstype == "devtmpfs" and root == f"/{name}":
             return ""
         return f"{fstype} from {root}, not one the runtime makes there"
     if _below(point, "/proc") or _below(point, "/sys"):
@@ -1441,17 +1580,21 @@ def _judge_filesystem(obs: Mapping[str, object], expect: Expectation) -> list[Fi
         )
     policy = {mount.target: mount for mount in expect.mounts}
     devices = {mount.point: mount.device for mount in mounts if mount.point in KERNEL_ROOTS}
-    listed = obs.get("tmpfs")
-    tmpfs = listed if isinstance(listed, Mapping) else {}
+    points = frozenset(mount.point for mount in mounts)
+    listed = obs.get("listings")
+    listings = listed if isinstance(listed, Mapping) else {}
+    measured = obs.get("identities")
+    identities = measured if isinstance(measured, Mapping) else {}
     for mount in mounts:
         if mount.point == "/":
             continue
         wanted = policy.get(mount.point)
-        contents = tmpfs.get(mount.point)
+        contents = listings.get(mount.point)
         if wanted is not None:
-            problem = _policy_mount_problem(mount, wanted, contents)
+            identity = identities.get(mount.point)
+            problem = _policy_mount_problem(mount, wanted, contents, identity)
         else:
-            problem = _runtime_mount_problem(mount, expect, devices, contents)
+            problem = _runtime_mount_problem(mount, expect, devices, contents, points)
         if problem:
             findings.append(Finding(ContainerCapability.MOUNTS, f"{mount.point}: {problem}"))
     seen = {mount.point for mount in mounts}
@@ -1490,6 +1633,12 @@ _ROUTE_REFUSED = frozenset(
 )
 # A name that does not exist leads nowhere; a failed lookup proves nothing.
 _NO_SUCH_NAME = frozenset({"EAI_NONAME", "EAI_NODATA", "EAI_ADDRFAMILY"})
+# A lookup that reached no resolver: once the container proved it has no
+# interface but loopback and no route, a name it could not look up for that
+# reason leads nowhere either. Any other failure (``EAI_SYSTEM``,
+# ``EAI_MEMORY``, a bad request, an exception) is the measurement's, not the
+# network's, and proves nothing on any network.
+_NO_RESOLVER = frozenset({"EAI_AGAIN"})
 _ABSTRACT_REFUSED = frozenset({"ECONNREFUSED", "EACCES", "EPERM"})
 
 
@@ -1507,15 +1656,32 @@ def _attempts(entry: Mapping[str, object]) -> list[Mapping[str, object]]:
     return [attempt for attempt in attempts if isinstance(attempt, Mapping)]
 
 
-def _route_unproved(entry: Mapping[str, object], nonce: str, offline: bool) -> str:
+def _literal(route: str) -> bool:
+    """Whether ``route`` is an address (a scoped IPv6 one included), which no lookup needs."""
+    try:
+        ipaddress.ip_address(route.partition("%")[0])
+    except ValueError:
+        return False
+    return True
+
+
+def _route_unproved(route: str, entry: Mapping[str, object], nonce: str, offline: bool) -> str:
     """Why one tried address or name does not prove the listener unreachable ("" if it does).
 
-    ``offline``: the container proved it has no interface but loopback and
-    no route, so a name it could not look up leads nowhere either.
+    An address (both loopback families, a host address, a gateway) needs a
+    conclusive attempt on every network: it is never looked up, so a lookup
+    error there means no connection was measured, and no route elsewhere
+    proves its own loopback unreachable. A name may instead not exist; and
+    ``offline``, once the container proved it has no interface but loopback
+    and no route, it may also have reached no resolver (:data:`_NO_RESOLVER`).
     """
     error = entry.get("resolve_error")
     if error is not None:
-        if error in _NO_SUCH_NAME or offline:
+        if not isinstance(error, str):
+            return "the lookup's failure was not reported"
+        if _literal(route):
+            return f"the address was never tried, its lookup having failed ({error})"
+        if error in _NO_SUCH_NAME or (offline and error in _NO_RESOLVER):
             return ""
         return f"the name could not be resolved ({error})"
     attempts = entry.get("attempts")
@@ -1526,6 +1692,8 @@ def _route_unproved(entry: Mapping[str, object], nonce: str, offline: bool) -> s
             return "an attempt was not reported"
         result = attempt.get("result")
         address = attempt.get("address")
+        if not isinstance(result, str):
+            return f"{address} gave no result"
         if result in _ROUTE_REFUSED or _carries(attempt.get("received"), nonce):
             continue  # refused; or reached, which is reported on its own
         if result == "connected":
@@ -1578,7 +1746,7 @@ def _judge_loopback(obs: Mapping[str, object], expect: Expectation, offline: boo
                     Finding(capability, f"no connection to {route} port {port} was tried")
                 )
             for entry in tried:
-                why = _route_unproved(entry, nonce, offline)
+                why = _route_unproved(route, entry, nonce, offline)
                 if why:
                     findings.append(
                         Finding(capability, f"{route} port {port}: {why}, which proves nothing")
@@ -1710,8 +1878,10 @@ def judge(observation: str | Mapping[str, object], expect: Expectation) -> tuple
     :class:`Expectation` asks. An observation that does not parse proves
     nothing: every item is a finding. An item it did not measure, or
     measured inconclusively, is a finding too: a mount it cannot attribute
-    to the policy or the runtime, a connection that was neither refused nor
-    answered and closed, a search that did not cover every place.
+    to the policy or the runtime (a bind whose device and inode are not its
+    host source's, a ``/dev`` entry that is not the runtime's), a
+    connection that was neither refused nor answered and closed, an address
+    never tried, a search that did not cover every place.
     """
     if isinstance(observation, str):
         try:

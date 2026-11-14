@@ -18,7 +18,9 @@ The container is created by :func:`autoforge.sandbox_container.create_argv`
 exactly as the policy renders it, PID 1 standing in for the watcher (#272),
 and measured by :mod:`autoforge.container_measure` run as the agent through
 :func:`~autoforge.sandbox_container.exec_argv`, judged by
-:func:`~autoforge.sandbox_container.judge`. The staging root is a
+:func:`~autoforge.sandbox_container.judge`, which also compares the device
+and inode ``/source`` and the credential file show inside with what the
+host's ``lstat`` of their sources reads. The staging root is a
 :class:`~autoforge.sandbox_container.StagingRoot` in a git common dir of the
 test's own, laid out as the controller lays one out; the host's nonce
 listeners are on ``127.0.0.1`` and ``::1`` both, and a host with no IPv6

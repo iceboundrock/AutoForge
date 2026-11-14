@@ -40,6 +40,8 @@ from autoforge.sandbox_container import (
     AGENT_GID,
     AGENT_UID,
     CACHE_TARGET,
+    CGROUP_TARGET,
+    DEV_LINKS,
     HOME_TARGET,
     HOST_ALIASES,
     HOST_UID_MAP,
@@ -68,6 +70,7 @@ from autoforge.sandbox_container import (
     client_environment,
     create_argv,
     exec_argv,
+    host_identity,
     judge,
     loopback_routes,
     network_for,
@@ -1057,16 +1060,44 @@ SCAN = {
     "incomplete": [],
     "incomplete_count": 0,
 }
-# What each tmpfs of its own held: the runtime's /dev and its device nodes,
-# and every other one empty.
-TMPFS = {
-    "/dev": {"count": 6, "names": ["mqueue", "null", "pts", "shm", "urandom", "zero"]},
-    "/dev/shm": {"count": 0, "names": []},
-    "/sys/firmware": {"count": 0, "names": []},
-    "/tmp": {"count": 0, "names": []},
-    HOME_TARGET: {"count": 0, "names": []},
-    "/proc/acpi": {"count": 0, "names": []},
+# The runtime's /dev: each device node it binds and its own pts, shm and
+# mqueue, each a mount of MOUNTINFO's, and the links every OCI runtime adds.
+DEV_KINDS = {
+    "core": "link",
+    "fd": "link",
+    "mqueue": "dir",
+    "null": "char",
+    "ptmx": "link",
+    "pts": "dir",
+    "shm": "dir",
+    "stderr": "link",
+    "stdin": "link",
+    "stdout": "link",
+    "urandom": "char",
 }
+DEV = {
+    "count": len(DEV_KINDS),
+    "names": sorted(DEV_KINDS),
+    "kinds": DEV_KINDS,
+    "links": dict(DEV_LINKS),
+}
+_EMPTY = {"count": 0, "names": [], "kinds": {}, "links": {}}
+# What each tmpfs, mqueue and devpts of its own held: the runtime's /dev,
+# its devpts with its ptmx alone, and every other one empty.
+LISTINGS = {
+    "/dev": DEV,
+    "/dev/pts": {"count": 1, "names": ["ptmx"], "kinds": {"ptmx": "char"}, "links": {}},
+    "/dev/mqueue": _EMPTY,
+    "/dev/shm": _EMPTY,
+    "/sys/firmware": _EMPTY,
+    "/tmp": _EMPTY,
+    HOME_TARGET: _EMPTY,
+    "/proc/acpi": _EMPTY,
+}
+# The staging root's device and inode, as the host reads it and as /source
+# shows it from inside (a bind shows its source's own).
+SOURCE_ID = (8, 1, 4242)
+IDENTITIES = {"/": [0, 50, 2], "/source": list(SOURCE_ID), TMP_TARGET: [0, 60, 1]}
 GOOD = {
     "status": STATUS,
     "uid_map": "         0          0          1\n         1          1      65536\n",
@@ -1074,7 +1105,8 @@ GOOD = {
     "mountinfo": MOUNTINFO,
     "pids_max": f"{PIDS_LIMIT}\n",
     "writable": WRITABLE,
-    "tmpfs": TMPFS,
+    "listings": LISTINGS,
+    "identities": IDENTITIES,
     "gateways": GATEWAYS,
     "connect": CONNECT,
     "abstract": {"result": "ECONNREFUSED"},
@@ -1105,7 +1137,21 @@ def _expect(**changes) -> Expectation:
         keyring_checked=True,
         sentinels=(frozenset({"env:MODEL_API_KEY"}), frozenset()),
     )
+    # The staging root here is a recorded one, not on this host: its identity is the
+    # recorded one too.
+    expect = _identified(expect, {SOURCE_TARGET: SOURCE_ID})
     return dataclasses.replace(expect, **changes)
+
+
+def _identified(expect: Expectation, identities: dict) -> Expectation:
+    """``expect`` with these binds' host identities, as for_spec would have read them."""
+    mounts = tuple(
+        dataclasses.replace(mount, identity=identities[mount.target])
+        if mount.target in identities
+        else mount
+        for mount in expect.mounts
+    )
+    return dataclasses.replace(expect, mounts=mounts)
 
 
 def test_a_container_that_shows_every_item_has_no_finding():
@@ -1238,6 +1284,14 @@ _HOST_BIND = "8:1 /home/op"
         MOUNTINFO + f"\n611 508 {_HOST_BIND} /sys/kernel/x ro - ext4 /dev/sda1 rw",
         MOUNTINFO + "\n612 508 0:64 / /sys/kernel/debug ro - debugfs debugfs rw",
         MOUNTINFO + "\n613 508 0:65 /user.slice /sys/fs/cgroup/x ro - cgroup2 cgroup2 rw",
+        # Any cgroup mount but the container's own tree, once, read-only, at /sys/fs/cgroup:
+        # another one rooted at its namespace's root, writable or not; the tree writable;
+        # the host's tree seen from the container's namespace; cgroup v1's controllers.
+        MOUNTINFO + "\n620 509 0:57 / /sys/fs/cgroup/host rw - cgroup2 cgroup2 rw",
+        MOUNTINFO + "\n621 509 0:57 / /sys/fs/cgroup/host ro - cgroup2 cgroup2 rw",
+        _mountinfo(CGROUP_TARGET, "622 508 0:57 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw"),
+        _mountinfo(CGROUP_TARGET, "623 508 0:57 /../.. /sys/fs/cgroup ro - cgroup2 cgroup2 rw"),
+        MOUNTINFO + "\n624 509 0:66 / /sys/fs/cgroup/pids ro - cgroup cgroup rw,pids",
         _mountinfo("/sys", "614 500 0:56 / /sys rw,nosuid - sysfs sysfs rw"),
         _mountinfo("/proc", "615 500 8:1 /proc /proc rw - ext4 /dev/sda1 rw"),
         _mountinfo("/dev", "616 500 0:5 / /dev rw - devtmpfs udev rw"),
@@ -1269,28 +1323,86 @@ _HELD = {"count": 2, "names": ["bus", "podman.sock"]}
 
 
 @pytest.mark.parametrize(
-    "tmpfs",
+    "listings",
     [
         # A host tmpfs bound in whole (here the operator's /run/user/<uid>) where the
         # runtime masks a path, where the IPC namespace's shm is, or where the policy
         # makes its own: same type and root, but it holds the host's files.
-        {**TMPFS, "/proc/acpi": _HELD},
-        {**TMPFS, "/sys/firmware": _HELD},
-        {**TMPFS, "/dev/shm": {"count": 1, "names": ["sem.host"]}},
-        {**TMPFS, "/tmp": {"count": 1, "names": [".X11-unix"]}},
-        {**TMPFS, HOME_TARGET: {"count": 1, "names": [".ssh"]}},
+        {**LISTINGS, "/proc/acpi": _HELD},
+        {**LISTINGS, "/sys/firmware": _HELD},
+        {**LISTINGS, "/dev/shm": {"count": 1, "names": ["sem.host"]}},
+        {**LISTINGS, "/tmp": {"count": 1, "names": [".X11-unix"]}},
+        {**LISTINGS, HOME_TARGET: {"count": 1, "names": [".ssh"]}},
+        # The host's message queues or its terminals where the IPC namespace's own and
+        # the container's own devpts are.
+        {**LISTINGS, "/dev/mqueue": {"count": 1, "names": ["host-queue"]}},
+        {**LISTINGS, "/dev/pts": {"count": 3, "names": ["0", "1", "ptmx"]}},
         # A listing cut short, failed or missing proves nothing.
-        {**TMPFS, "/tmp": {"count": 30, "names": []}},
-        {**TMPFS, "/proc/acpi": {"error": "EACCES"}},
-        {key: value for key, value in TMPFS.items() if key != "/sys/firmware"},
-        {**TMPFS, "/dev/shm": {"count": True, "names": []}},
+        {**LISTINGS, "/tmp": {"count": 30, "names": []}},
+        {**LISTINGS, "/proc/acpi": {"error": "EACCES"}},
+        {key: value for key, value in LISTINGS.items() if key != "/sys/firmware"},
+        {key: value for key, value in LISTINGS.items() if key != "/dev/mqueue"},
+        {key: value for key, value in LISTINGS.items() if key != "/dev/pts"},
+        {**LISTINGS, "/dev/shm": {"count": True, "names": []}},
         None,
     ],
 )
-def test_a_tmpfs_is_admitted_only_with_a_fresh_ones_content(tmpfs):
-    """``mountinfo`` cannot tell a fresh tmpfs from a host tmpfs bound in whole: only its
-    listing can, so a tmpfs holding anything but the policy's own mount points is named."""
-    _assert_named({"tmpfs": tmpfs}, ContainerCapability.MOUNTS)
+def test_a_tmpfs_is_admitted_only_with_a_fresh_ones_content(listings):
+    """``mountinfo`` cannot tell a fresh tmpfs, mqueue or devpts from a host one bound in
+    whole: only its listing can, so one holding anything but what the runtime or the
+    policy puts there is named."""
+    _assert_named({"listings": listings}, ContainerCapability.MOUNTS)
+
+
+def _dev(**changes) -> dict:
+    """The /dev listing with these entries' kinds changed (``None`` drops the entry)."""
+    kinds = {**DEV_KINDS, **changes}
+    kinds = {name: kind for name, kind in kinds.items() if kind is not None}
+    return {**DEV, "count": len(kinds), "names": sorted(kinds), "kinds": kinds}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        # A host tmpfs bound at /dev in whole: its files and sockets, beside or instead of
+        # the runtime's entries, all left out of the sentinel search.
+        {"listings": {**LISTINGS, "/dev": _dev(bus="socket", **{"hosts.yml": "file"})}},
+        {"listings": {**LISTINGS, "/dev": _HELD}},
+        # A device or directory of the runtime's names that is no mount: what the host
+        # tmpfs holds under that name.
+        {"listings": {**LISTINGS, "/dev": _dev(zero="char")}},
+        {"mountinfo": _mountinfo("/dev/null", None)},
+        {"mountinfo": _mountinfo("/dev/pts", None)},
+        # The right name of the wrong kind, or a link elsewhere.
+        {"listings": {**LISTINGS, "/dev": _dev(stdin="file")}},
+        {"listings": {**LISTINGS, "/dev": _dev(shm="socket")}},
+        {"listings": {**LISTINGS, "/dev": {**DEV, "links": {**DEV_LINKS, "fd": "/run/user"}}}},
+        {"listings": {**LISTINGS, "/dev": {**DEV, "links": {}}}},
+        # A listing without kinds, cut short, failed or missing proves nothing.
+        {"listings": {**LISTINGS, "/dev": {**DEV, "kinds": None}}},
+        {"listings": {**LISTINGS, "/dev": {**DEV, "count": len(DEV_KINDS) + 1}}},
+        {"listings": {**LISTINGS, "/dev": {"error": "EACCES"}}},
+        {"listings": {key: value for key, value in LISTINGS.items() if key != "/dev"}},
+    ],
+)
+def test_dev_holds_only_the_runtimes_devices_mounts_and_links(change):
+    """The sentinel search leaves /dev out, so its listing is what shows a host tmpfs
+    bound there: only the runtime's device nodes and its own pts, shm and mqueue, each a
+    mount the judge admits on its own, and the OCI links to their fixed targets."""
+    _assert_named(change, ContainerCapability.MOUNTS)
+
+
+def test_the_runtimes_dev_as_each_runtime_makes_it_is_admitted():
+    """Every device the runtime binds, its terminal-less ptmx link, and no core link where
+    the kernel has no /proc/kcore: still the runtime's /dev."""
+    devices = [
+        f"7{index:02d} 502 0:5 /{name} /dev/{name} rw,nosuid,noexec - devtmpfs udev rw"
+        for index, name in enumerate(("full", "random", "tty", "zero"))
+    ]
+    mountinfo = "\n".join([MOUNTINFO, *devices])
+    kinds = {"full": "char", "random": "char", "tty": "char", "zero": "char", "core": None}
+    listings = {**LISTINGS, "/dev": _dev(**kinds)}
+    assert judge({**GOOD, "mountinfo": mountinfo, "listings": listings}, _expect()) == ()
 
 
 def test_the_home_tmpfs_may_hold_the_projections_mount_points(credential):
@@ -1306,17 +1418,91 @@ def test_the_home_tmpfs_may_hold_the_projections_mount_points(credential):
             spec, product=RuntimeProduct.PODMAN, operator_uid=1000, subordinate=()
         ).mounts,
     )
+    expect = _identified(expect, {SOURCE_TARGET: SOURCE_ID})
     home = next(mount for mount in expect.mounts if mount.target == HOME_TARGET)
     assert home.entries == {".config"}
     bound = f"600 515 8:1 /op/.config/provider/key {HOME_TARGET}/.config/p/key ro - ext4 x rw"
-    observation = {**GOOD, "mountinfo": f"{MOUNTINFO}\n{bound}"}
-    held = {**TMPFS, HOME_TARGET: {"count": 1, "names": [".config"]}}
-    assert judge({**observation, "tmpfs": held}, expect) == ()
-    held = {**TMPFS, HOME_TARGET: {"count": 2, "names": [".config", ".netrc"]}}
-    findings = judge({**observation, "tmpfs": held}, expect)
+    identities = {**IDENTITIES, f"{HOME_TARGET}/.config/p/key": list(host_identity(credential))}
+    observation = {**GOOD, "mountinfo": f"{MOUNTINFO}\n{bound}", "identities": identities}
+    held = {**LISTINGS, HOME_TARGET: {"count": 1, "names": [".config"]}}
+    assert judge({**observation, "listings": held}, expect) == ()
+    held = {**LISTINGS, HOME_TARGET: {"count": 2, "names": [".config", ".netrc"]}}
+    findings = judge({**observation, "listings": held}, expect)
     assert [f.detail for f in findings] == [
-        f"{HOME_TARGET}: it holds .netrc, which a fresh tmpfs would not"
+        f"{HOME_TARGET}: it holds .netrc, which a fresh one would not"
     ]
+
+
+_ELSEWHERE = f"/elsewhere/.git/{SANDBOX_DIR}/270/stage/{LAUNCH_ID}"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        # /source from another filesystem and path that ends with the staging layout.
+        {
+            "mountinfo": _mountinfo(
+                SOURCE_TARGET, f"600 500 8:9 {_ELSEWHERE} /source ro - ext4 /dev/sdb1 rw"
+            ),
+            "identities": {**IDENTITIES, SOURCE_TARGET: [8, 9, 77]},
+        },
+        # The same path on the same device, another directory there now.
+        {"identities": {**IDENTITIES, SOURCE_TARGET: [8, 1, 4243]}},
+        {"identities": {**IDENTITIES, SOURCE_TARGET: [8, 2, 4242]}},
+        # An identity not measured, or not one.
+        {"identities": {key: v for key, v in IDENTITIES.items() if key != SOURCE_TARGET}},
+        {"identities": {**IDENTITIES, SOURCE_TARGET: "EACCES"}},
+        {"identities": {**IDENTITIES, SOURCE_TARGET: [8, 1]}},
+        {"identities": {**IDENTITIES, SOURCE_TARGET: [8, 1, True]}},
+        {"identities": None},
+    ],
+)
+def test_a_bind_is_its_host_sources_own_inode_not_a_path_with_the_same_tail(change):
+    """A mount's root ends with its path's tail in any filesystem: another directory that
+    ends with the staging layout passes that alone. /source must show the staging root's
+    own device and inode, as the host read them; one not measured proves nothing."""
+    _assert_named(change, ContainerCapability.MOUNTS)
+
+
+def test_a_bind_whose_host_source_could_not_be_identified_proves_nothing():
+    findings = judge(GOOD, _identified(_expect(), {SOURCE_TARGET: None}))
+    assert [f.detail.split(":")[0] for f in findings] == [SOURCE_TARGET]
+    assert "could not be identified" in findings[0].detail
+
+
+def test_a_credential_file_is_bound_from_its_own_inode_not_one_with_its_tail(tmp_path):
+    """/private/model/key is projected; /unrelated/model/key has the same tail. Bound from
+    the latter, the target shows the latter's inode: named."""
+    private = Path(_secret_file(tmp_path / "private" / "model" / "key"))
+    unrelated = Path(_secret_file(tmp_path / "unrelated" / "model" / "key", "other"))
+    assert private.parent.name == unrelated.parent.name == "model"
+    spec = _launch(
+        source=StagingRoot("/code/.git", "270", LAUNCH_ID),
+        projection=Projection(files=(FileCredential(str(private), ".config/p/key"),)),
+    )
+    built = Expectation.for_spec(
+        spec, product=RuntimeProduct.PODMAN, operator_uid=1000, subordinate=()
+    )
+    expect = _identified(
+        dataclasses.replace(_expect(), mounts=built.mounts), {SOURCE_TARGET: SOURCE_ID}
+    )
+    target = f"{HOME_TARGET}/.config/p/key"
+    held = {**LISTINGS, HOME_TARGET: {"count": 1, "names": [".config"]}}
+
+    def observed(source: Path) -> dict:
+        line = f"600 515 8:1 {source} {target} ro - ext4 x rw"
+        identities = {**IDENTITIES, target: list(host_identity(str(source)))}
+        return {
+            **GOOD,
+            "mountinfo": f"{MOUNTINFO}\n{line}",
+            "identities": identities,
+            "listings": held,
+        }
+
+    assert judge(observed(private), expect) == ()
+    findings = judge(observed(unrelated), expect)
+    assert [f.capability for f in findings] == [ContainerCapability.MOUNTS]
+    assert findings[0].detail.startswith(f"{target}: bound from another file")
 
 
 def test_the_runtimes_own_files_need_the_containers_id():
@@ -1368,6 +1554,19 @@ def test_the_exporters_workspace_must_be_read_only():
         {"gateways": None},
         {"connect": []},
         {"connect": None},
+        # An address is never looked up: a lookup error there is no attempt, whatever it is.
+        {
+            "connect": [
+                *_connect("127.0.0.1"),
+                {"host": "127.0.0.1", "port": PORT, "resolve_error": "EAI_NONAME"},
+            ]
+        },
+        {
+            "connect": [
+                *_connect("fe80::1%eth0"),
+                {"host": "fe80::1%eth0", "port": PORT, "resolve_error": "EAI_ADDRFAMILY"},
+            ]
+        },
         # A name that resolved to nothing tried, or whose lookup failed.
         {"connect": [*_connect("host.containers.internal"), _tried("host.containers.internal")]},
         {
@@ -1491,6 +1690,62 @@ def test_under_network_none_only_loopback_and_no_route_pass():
     assert {f.capability for f in on_bridge} == {ContainerCapability.HOST_LOOPBACK}
 
 
+_OFFLINE = {"interfaces": ["lo"], "routes": [], "gateways": []}
+_OFFLINE_CONNECT = [
+    _tried("127.0.0.1", _refused("127.0.0.1")),
+    _tried("::1", _refused("::1")),
+    {"host": "host.containers.internal", "port": PORT, "resolve_error": "EAI_AGAIN"},
+    {"host": "host.docker.internal", "port": PORT, "resolve_error": "EAI_NONAME"},
+]
+
+
+def _offline(host: str, **entry) -> dict:
+    """The offline observation with ``host``'s entry replaced by ``entry``."""
+    kept = [e for e in _OFFLINE_CONNECT if e["host"] != host]
+    return {**_OFFLINE, "connect": [*kept, {"host": host, "port": PORT, **entry}]}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        # Every entry a system error, both loopback literals included: nothing measured.
+        {
+            **_OFFLINE,
+            "connect": [
+                {"host": host, "port": PORT, "resolve_error": "EAI_SYSTEM"}
+                for host in (*LOOPBACK_ADDRESSES, *HOST_ALIASES)
+            ],
+        },
+        # Each loopback family whose literal was never tried, whatever the lookup said.
+        _offline("127.0.0.1", resolve_error="EAI_SYSTEM"),
+        _offline("::1", resolve_error="EAI_SYSTEM"),
+        _offline("127.0.0.1", resolve_error="EAI_AGAIN"),
+        _offline("::1", resolve_error="EAI_NONAME"),
+        _offline("::1", resolve_error="UnicodeError"),
+        # Each loopback family tried, but the attempt ran out of a resource.
+        _offline("127.0.0.1", attempts=[_refused("127.0.0.1", "EMFILE")]),
+        _offline("::1", attempts=[_refused("::1", "ENOBUFS")]),
+        _offline("127.0.0.1", attempts=[]),
+        # A name whose lookup failed for another reason than reaching no resolver.
+        _offline("host.containers.internal", resolve_error="EAI_SYSTEM"),
+        _offline("host.docker.internal", resolve_error="EAI_MEMORY"),
+        _offline("host.docker.internal", resolve_error="EAI_FAMILY"),
+        _offline("host.docker.internal", resolve_error="UnicodeError"),
+        # A failure or result not reported as one: named, never an error of the judge's.
+        _offline("host.docker.internal", resolve_error=["EAI_NONAME"]),
+        _offline("127.0.0.1", attempts=[{"address": "127.0.0.1", "result": ["ECONNREFUSED"]}]),
+    ],
+)
+def test_offline_a_failed_measurement_proves_no_loopback_unreachable(change):
+    """No route out does not make the container's own loopback unreachable, and a lookup
+    or attempt that failed for a system or resource reason measured no connection: under
+    --network none, both loopback literals need a conclusive attempt, and a name only a
+    lookup that does not exist or reached no resolver."""
+    offline = _expect(network=ContainerNetwork.NONE)
+    assert judge({**GOOD, **_OFFLINE, "connect": _OFFLINE_CONNECT}, offline) == ()
+    _assert_named(change, ContainerCapability.HOST_LOOPBACK, offline)
+
+
 def test_an_observation_that_does_not_parse_proves_nothing():
     findings = judge("Traceback (most recent call last):", _expect())
     assert {f.capability for f in findings} == set(ContainerCapability)
@@ -1520,6 +1775,16 @@ def test_the_expectation_follows_the_spec(credential, staging):
     assert by_target[SOURCE_TARGET].source == staging.layout
     assert by_target[SOURCE_TARGET].read_only
     assert not by_target[CACHE_TARGET].read_only
+    # Each bind's host identity, read by lstat when the expectation is built.
+    info = os.lstat(staging.path)
+    assert by_target[SOURCE_TARGET].identity == (
+        os.major(info.st_dev),
+        os.minor(info.st_dev),
+        info.st_ino,
+    )
+    assert by_target[f"{HOME_TARGET}/.config/p/key"].identity == host_identity(credential)
+    assert host_identity(credential) != host_identity(staging.path)
+    assert host_identity(staging.path + "-missing") is None
 
 
 def test_the_operators_subordinate_ranges_are_read_by_name_or_uid():
@@ -1807,15 +2072,26 @@ def test_a_routing_table_the_kernel_does_not_have_is_empty(tmp_path):
     assert container_measure._lines(str(tmp_path)) is None  # a directory: unreadable
 
 
-def test_the_measurement_lists_each_tmpfs_of_its_own(tmp_path):
-    """Only a tmpfs mounted from its own root is listed (a fresh one, or a host one bound in
-    whole), with its entry count and first names, or the error that kept it unlisted."""
+def test_the_measurement_lists_each_fresh_looking_filesystem_of_its_own(tmp_path):
+    """Only a tmpfs, mqueue or devpts mounted from its own root is listed (a fresh one, or a
+    host one bound in whole), with its entry count, its first names, each one's kind and
+    each link's target, or the error that kept it unlisted."""
     empty = tmp_path / "empty"
     empty.mkdir()
     full = tmp_path / "with space"
     full.mkdir()
-    for index in range(container_measure._MAX_REPORTED + 2):
+    for index in range(container_measure._MAX_LISTED + 2):
         (full / f"f{index:02d}").write_text("x")
+    dev = tmp_path / "dev"
+    dev.mkdir()
+    (dev / "pts").mkdir()
+    (dev / "fd").symlink_to("/proc/self/fd")
+    (dev / "hosts.yml").write_text("x")
+    sock = socket.socket(socket.AF_UNIX)
+    try:
+        sock.bind(str(dev / "bus"))
+    except OSError:
+        pytest.skip("no Unix socket can be bound here")
     escaped = str(full).replace(" ", "\\040")
     mountinfo = "\n".join(
         [
@@ -1824,18 +2100,53 @@ def test_the_measurement_lists_each_tmpfs_of_its_own(tmp_path):
             f"3 0 0:3 / {tmp_path}/missing rw - tmpfs tmpfs rw",
             f"4 0 0:4 /sub {tmp_path} rw - tmpfs tmpfs rw",  # a tmpfs's subdirectory: a bind
             f"5 0 8:1 / {tmp_path} rw - ext4 /dev/sda1 rw",  # not a tmpfs
+            f"6 0 0:5 / {dev} rw - devpts devpts rw",
+            f"7 0 0:6 / {empty} rw - mqueue mqueue rw",
             "garbage",
         ]
     )
-    listed = container_measure._tmpfs_contents(mountinfo)
+    try:
+        listed = container_measure._listings(mountinfo)
+    finally:
+        sock.close()
+    shown = [f"f{index:02d}" for index in range(container_measure._MAX_LISTED)]
     assert listed == {
-        str(empty): {"count": 0, "names": []},
+        str(empty): {"count": 0, "names": [], "kinds": {}, "links": {}},
         str(full): {
-            "count": container_measure._MAX_REPORTED + 2,
-            "names": [f"f{index:02d}" for index in range(container_measure._MAX_REPORTED)],
+            "count": container_measure._MAX_LISTED + 2,
+            "names": shown,
+            "kinds": dict.fromkeys(shown, "file"),
+            "links": {},
         },
         f"{tmp_path}/missing": {"error": "ENOENT"},
+        str(dev): {
+            "count": 4,
+            "names": ["bus", "fd", "hosts.yml", "pts"],
+            "kinds": {"bus": "socket", "fd": "link", "hosts.yml": "file", "pts": "dir"},
+            "links": {"fd": "/proc/self/fd"},
+        },
     }
+
+
+def test_the_measurement_reports_each_mount_points_device_and_inode(tmp_path):
+    """What a bind shows at its target is its source's own device and inode, read by lstat
+    as the host reads the source: never a file's contents."""
+    target = tmp_path / "key"
+    target.write_text(SENTINEL_FILE)
+    target.chmod(0o000)  # metadata only: nothing is read
+    mountinfo = "\n".join(
+        [
+            f"1 0 8:1 /x {target} ro - ext4 /dev/sda1 rw",
+            f"2 0 8:1 /y {target} ro - ext4 /dev/sda1 rw",  # stacked: reported once
+            f"3 0 8:1 /z {tmp_path}/missing ro - ext4 /dev/sda1 rw",
+            "garbage",
+        ]
+    )
+    try:
+        found = container_measure._identities(mountinfo)
+    finally:
+        target.chmod(0o600)
+    assert found == {str(target): list(host_identity(str(target))), f"{tmp_path}/missing": "ENOENT"}
 
 
 def test_the_measurement_imports_nothing_of_autoforge():

@@ -1088,15 +1088,32 @@ exactly when `tests/sandbox_host.py` measures the host capable
   stacked policy mount, an extra one, a host mount anywhere under
   `/proc`, `/sys` or `/dev`, the runtime's own files from another
   container's directory or without the container's id, a root that is not
-  an overlay, and a tmpfs that holds anything a fresh one would not (a
-  host tmpfs bound in whole) or whose listing is missing or cut short are
-  each named. Host loopback needs a conclusive refusal at every route
+  an overlay, and a tmpfs, `mqueue` or `devpts` that holds anything a
+  fresh one would not (a host one bound in whole) or whose listing is
+  missing or cut short are each named. A bind must show its host source's
+  own device and inode: `/source` from another filesystem and path ending
+  with the staging layout, a credential file from `/unrelated/model/key`
+  where `/private/model/key` is projected, an identity not measured and a
+  source the host could not read are named. `/dev` holds only the
+  runtime's entries: a host tmpfs's files and sockets there, a device or
+  directory of the runtime's names that is no mount, an entry of the wrong
+  kind, a link to another target and a listing without kinds are named,
+  and every device the runtime binds, with or without a `core` link, is
+  admitted. Any cgroup mount but one read-only `cgroup2` at
+  `/sys/fs/cgroup` rooted at its namespace's root is named (an extra one
+  under it, writable or not, a writable tree, the host's tree, cgroup v1's
+  controllers). Host loopback needs a conclusive refusal at every route
   (both loopback families, the runtimes' host aliases, rootless Docker's
   host address and every gateway) at each listener's port: a timeout, a
   reset, an unsupported family, a failed lookup, a name resolving to
   nothing tried, a missing attempt or gateway list, a connection that said
   nothing usable, and a host that listened on one family only are named,
-  and so is the nonce, whole or cut short. Any connection to the abstract
+  and so is the nonce, whole or cut short. An address whose lookup failed
+  was never tried, and is named on any network. Under `--network none`,
+  with no interface but loopback and no route proved, every entry failing
+  with `EAI_SYSTEM`, either loopback literal never tried or ending in a
+  resource error (`EMFILE`, `ENOBUFS`), and a name whose lookup failed for
+  any reason but not existing or reaching no resolver are each named. Any connection to the abstract
   socket is named, nonce or not, and so is any result but a refusal or a
   denial. A sentinel search that did not cover every place, walked other
   roots, left out more than the kernel's trees or reported no result for a
@@ -1109,8 +1126,10 @@ exactly when `tests/sandbox_host.py` measures the host capable
   found); reports a file or directory it owns but cannot read, one it can
   search but not list, and a spent byte budget as not covered, and counts
   what it is denied and does not own; records a refusal, the nonce with
-  the peer's close and a silent peer each as they ended; lists each tmpfs
-  mounted from its own root; and reports a routing table it could not
+  the peer's close and a silent peer each as they ended; lists each tmpfs,
+  `mqueue` and `devpts` mounted from its own root, with each entry's kind
+  and each link's target; reports each mount point's device and inode by
+  `lstat`, on a file it cannot read; and reports a routing table it could not
   read as unreported, never as one without a gateway.
 - `tests/test_sandbox_lifecycle.py` also refuses, at a command's entry, a
   runtime that reports itself rootful or does not say, with nothing

@@ -40,8 +40,11 @@ fields:
 
 What it reads: ``/proc/self/status`` (UIDs, GIDs, capabilities,
 ``NoNewPrivs``, ``Seccomp``), ``/proc/self/uid_map``,
-``/proc/self/mountinfo`` and the listing of each tmpfs mounted from its own
-root (``tmpfs``), the cgroup's ``pids.max``, ``/proc/net/dev``,
+``/proc/self/mountinfo``, the listing of each tmpfs, mqueue and devpts
+mounted from its own root (``listings``: names, each one's kind and each
+link's target), each mount point's device and inode by ``lstat``
+(``identities``, never a file's contents), the cgroup's ``pids.max``,
+``/proc/net/dev``,
 ``/proc/net/route`` and ``/proc/net/ipv6_route`` (``gateways`` is ``null``
 when a routing table could not be read). The UID map it prints is
 relative to the parent user namespace, which is not the host's when the
@@ -69,6 +72,22 @@ _CHUNK_BYTES = 1024 * 1024
 _DEFAULT_SCAN_MAX_BYTES = 16 * 1024 * 1024 * 1024
 _MAX_HITS = 20
 _MAX_REPORTED = 20
+# How many entries of one listed filesystem are named, with their kinds: a
+# runtime's /dev holds about fifteen; a count above what was named fails.
+_MAX_LISTED = 64
+# The filesystems listed when mounted from their own root: a fresh one and a
+# host one bound in whole look alike in mountinfo, and only what they hold
+# tells them apart.
+_LISTED_TYPES = frozenset({"tmpfs", "mqueue", "devpts"})
+_KINDS = (
+    (stat.S_ISLNK, "link"),
+    (stat.S_ISDIR, "dir"),
+    (stat.S_ISREG, "file"),
+    (stat.S_ISCHR, "char"),
+    (stat.S_ISBLK, "block"),
+    (stat.S_ISFIFO, "fifo"),
+    (stat.S_ISSOCK, "socket"),
+)
 # keyctl(2)'s number per architecture; KEYCTL_SEARCH; the special keyrings.
 _SYS_KEYCTL = {
     "x86_64": 250,
@@ -289,30 +308,82 @@ def _unescape(field: str) -> str:
     return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
 
 
-def _tmpfs_contents(mountinfo: str) -> dict[str, dict[str, object]]:
-    """What each tmpfs mounted from its own root holds, by mount point.
-
-    A fresh tmpfs the runtime makes is empty, or holds only the mount points
-    the policy puts in it; a host tmpfs bound in whole looks the same in
-    ``mountinfo``, but holds the host's files. So each is listed: its entry
-    count and its first names, or the error that kept it from being listed.
-    """
-    contents: dict[str, dict[str, object]] = {}
+def _mount_lines(mountinfo: str) -> list[tuple[str, str, str]]:
+    """Each ``mountinfo`` line that parses, as its root, mount point and type."""
+    found = []
     for line in mountinfo.splitlines():
         parts = line.split()
         if "-" not in parts[6:]:
             continue
         separator = parts.index("-", 6)
-        if separator + 1 >= len(parts) or parts[separator + 1] != "tmpfs" or parts[3] != "/":
+        if separator + 1 < len(parts):
+            found.append((_unescape(parts[3]), _unescape(parts[4]), parts[separator + 1]))
+    return found
+
+
+def _kind(path: str) -> tuple[str, str | None]:
+    """What ``path`` is, by ``lstat`` (the error that kept it unknown), and a link's target."""
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError as exc:
+        return _error(exc), None
+    kind = next((name for test, name in _KINDS if test(mode)), "other")
+    if kind != "link":
+        return kind, None
+    try:
+        return kind, os.readlink(path)
+    except OSError as exc:
+        return kind, f"unread ({_error(exc)})"
+
+
+def _listings(mountinfo: str) -> dict[str, dict[str, object]]:
+    """What each tmpfs, mqueue and devpts mounted from its own root holds, by mount point.
+
+    A fresh one the runtime makes is empty, or holds only what the runtime
+    or the policy puts in it; a host one bound in whole looks the same in
+    ``mountinfo``, but holds the host's files. So each is listed: its entry
+    count, its first names with each one's kind (``kinds``, by ``lstat``)
+    and each link's target (``links``), or the error that kept it from
+    being listed.
+    """
+    contents: dict[str, dict[str, object]] = {}
+    for root, point, fstype in _mount_lines(mountinfo):
+        if fstype not in _LISTED_TYPES or root != "/":
             continue
-        point = _unescape(parts[4])
         try:
             names = sorted(os.listdir(point))
         except OSError as exc:
             contents[point] = {"error": _error(exc)}
             continue
-        contents[point] = {"count": len(names), "names": names[:_MAX_REPORTED]}
+        shown = names[:_MAX_LISTED]
+        kinds: dict[str, str] = {}
+        links: dict[str, str] = {}
+        for name in shown:
+            kinds[name], target = _kind(os.path.join(point, name))
+            if target is not None:
+                links[name] = target
+        contents[point] = {"count": len(names), "names": shown, "kinds": kinds, "links": links}
     return contents
+
+
+def _identities(mountinfo: str) -> dict[str, object]:
+    """Each mount point's device (major, minor) and inode, by ``lstat``, or the error.
+
+    What a bind's target shows is its host source's own device and inode,
+    which the host compares with the source it meant (metadata only: no
+    file is read).
+    """
+    found: dict[str, object] = {}
+    for _, point, _ in _mount_lines(mountinfo):
+        if point in found:
+            continue
+        try:
+            info = os.lstat(point)
+        except OSError as exc:
+            found[point] = _error(exc)
+            continue
+        found[point] = [os.major(info.st_dev), os.minor(info.st_dev), info.st_ino]
+    return found
 
 
 def _skipped(path: str, skip: list[str]) -> bool:
@@ -466,7 +537,8 @@ def observe(spec: dict[str, object]) -> dict[str, object]:
         "pids_max": pids_max,
         "writable": {place: _writable(place) for place in places},
         # After the writability probes, which remove what they create.
-        "tmpfs": _tmpfs_contents(mountinfo),
+        "listings": _listings(mountinfo),
+        "identities": _identities(mountinfo),
         "gateways": gateways,
         "connect": [_route(host, port) for port in ports for host in hosts],
         "interfaces": _interfaces(),
