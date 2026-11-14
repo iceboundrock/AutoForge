@@ -1168,12 +1168,32 @@ exactly when `tests/sandbox_host.py` measures the host capable
   rotating refresh token are each refused. A stored login (Claude Code's
   file and directory, OpenCode's database, Pi's agent directory, each
   holding a fake credential on a fake host) is never projected, is named
-  as not projected, and keeps its bytes and its time. A relaunch after the
-  operator rotated the key gets a new projection with the new value; an
-  export command's launch class is refused and its allow-list passes no
-  route's variable; other credential-looking variables are withheld. The
-  redaction table of `github-safety.md` is pinned: each routed key's shape
-  is redacted, and the name column, recognised or not, is asserted.
+  as not projected, and keeps its bytes and its time. A plan made from a
+  rotated value gets a new projection with the new value; an export
+  command's launch class is refused and its allow-list passes no route's
+  variable. Of the launch's environment the container receives only the
+  positive allow-list: credentials no naming rule recognises
+  (`AZURE_OPENAI_KEY`, a password in a URL), other routes' keys, host
+  paths and every other setting are withheld, and a declaration that lists
+  a credential, a route's variable or a prefix as a setting, or a store
+  outside the private home, is refused. Every store variable names a place
+  in the private home, unset, at a host path or in the workspace, and the
+  create mounts a tmpfs there. The redaction table of `github-safety.md`
+  is pinned: each routed key's shape is redacted, and the name column,
+  recognised or not, is asserted.
+  Then with fake provider CLIs (`tests/credential_fake.py`: a standalone
+  `claude`, `opencode` and `pi` that find their credential by each CLI's
+  own rules, a stored login of OpenCode and Pi ahead of an environment
+  key, in a stand-in for the container's filesystem): each route's CLI,
+  run by the executor with its adapter's argv and exactly what the launch
+  container receives, authenticates with the projected key in a store that
+  did not exist before, sees no other credential however the operator's
+  shell forwarded it, and no value is on its argv, the create's or in its
+  output. A store left in the workspace or named at a host path is never
+  selected, with a control showing the CLI would take it if the variable
+  were passed on; a refused route starts no CLI; a replacement launch that
+  shares the first one's workspace and cache volume finds an empty store,
+  the rotated key and nothing the first wrote.
 
 The existing executor and duplex suites are the no-description regression:
 they run unchanged.

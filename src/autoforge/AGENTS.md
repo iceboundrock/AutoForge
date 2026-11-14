@@ -102,8 +102,10 @@ container_auth.py   each provider's model credential under the container backend
                     0013 D14): from an adapter's credential_routes and the launch's
                     environment, one variable projected by #270's environment mechanism,
                     or a refusal naming variables and kinds, never a value; a rotating
-                    or stored login never projected, other credential-looking variables
-                    withheld, agent launches only; pure, unreachable before #271 (#290)
+                    or stored login never projected; of the rest of the environment only
+                    a positive allow-list passed, every store variable set to a fresh
+                    place in the private home; agent launches only; pure, unreachable
+                    before #271 (#290)
 git_input.py        a launch's git input (ADR 0013 D4): the bound revision, typed and
                     immutable (phase, launch, repository, object format, seed, lower
                     boundary, carried commit, seed manifest digest), its entry and

@@ -144,6 +144,16 @@ read it before adding tests for a listed area.
   `~/.bashrc` or `~/.zshrc` (or a login shell without one),
   `CLAUDE_ENV_FILE` and `CLAUDE_CODE_SHELL_PREFIX`, with the real bash and
   zsh.
+- `tests/credential_fake.py` holds a fake `claude`, `opencode` and `pi`
+  for the container credential mapping (#290): standalone scripts, run by
+  the `#!` line with no shell in between, that find their model credential
+  by each CLI's own rules (OpenCode's and Pi's stored login ahead of an
+  environment key), in a `Container`, a stand-in for one launch container's
+  filesystem whose `workspace` and `cache` a replacement may share. Each
+  writes into its store and reports its argv, its environment's names with
+  a digest of each value, its home, the store it resolved and whether that
+  existed, and its credential's source and digest; nothing it prints or
+  reports holds a value.
 - `tests/scheduler_worker.py` is the worker process of the scheduler tests
   (#182): `python -P tests/scheduler_worker.py FIXTURES epic _worker ...`,
   the `worker_command` a test gives the scheduler, runs the production
@@ -465,7 +475,8 @@ policy, network mapping, credential   test_git_input.py, test_sandbox_container.
 delivery and their measurement (#270) the measurement on the host is its own negative control),
 each provider's credential mapping    test_container_security_real.py (opt-in, a real rootless
 (#290)                                runtime and image named by AUTOFORGE_CONTAINER_TEST_*),
-                                      test_container_auth.py (fake credentials, no runtime)
+                                      test_container_auth.py (fake credentials, no runtime;
+                                      fake claude, opencode and pi in credential_fake.py)
 config, CLI, doctor, CI drift guards  test_config.py, test_cli.py, test_doctor.py, test_ci_workflow.py, test_gitignore.py
 every workflow's actions pinned to a  test_workflow_pins.py (a tag, branch, short SHA, Docker
 commit with its release (#288)        image, local action or missing release fails, a tag in

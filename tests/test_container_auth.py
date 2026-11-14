@@ -1,12 +1,22 @@
 """Each provider's model credential under the container backend (#290, ADR 0013 D14).
 
-With fake credentials and the real adapters' declarations, and no runtime:
-each provider's login maps to exactly one of #270's mechanisms, and on a
-copy-in runtime to the environment variable; the value is on no argv and in
-no fact, description, refusal or helper container; a login that rotates its
-refresh token on use, or that the CLI rewrites in place, is never projected
-and the host's copy is left as it was; a relaunch gets a new projection; the
-model credential reaches an agent launch and never a repository command.
+With fake credentials, the real adapters' declarations and no runtime: each
+provider's login maps to exactly one of #270's mechanisms, and on a copy-in
+runtime to the environment variable; the value is on no argv and in no fact,
+description, refusal or helper container; a login that rotates its refresh
+token on use, or that the CLI rewrites in place, is never projected and the
+host's copy is left as it was; a relaunch gets a new projection; the model
+credential reaches an agent launch and never a repository command. Of the
+launch's environment the container receives only a positive allow-list, and
+every store variable names a fresh place in the private home.
+
+Then with fake provider CLIs (``tests/credential_fake.py``), which find their
+credential by each CLI's own rules: each route, launched with the adapter's
+own argv and exactly what the launch container receives, authenticates with
+the projected key, in a private store that starts empty, and sees no other
+credential; an inherited store at a host path or in the workspace is never
+selected; a refused route starts nothing; a replacement launch sees nothing
+of the first.
 """
 
 from __future__ import annotations
@@ -19,19 +29,22 @@ from pathlib import Path
 
 import pytest
 
+from autoforge.child_env import undoes_isolation
 from autoforge.config import ExecutionConfig, ProfileConfig
 from autoforge.container_auth import (
+    PASSED_NAMES,
     CredentialKind,
     CredentialPlan,
     CredentialRoutes,
     EnvRoute,
     Mechanism,
+    PrivateStore,
     Refresh,
     credential_looking,
     plan_credentials,
 )
 from autoforge.errors import SandboxPolicyError
-from autoforge.executor import select_environment
+from autoforge.executor import ExecutionRequest, ExecutionResult, execute, select_environment
 from autoforge.providers import (
     CLAUDE_CREDENTIAL_ROUTES,
     CLAUDE_UNSUPPORTED_ROUTES,
@@ -47,6 +60,7 @@ from autoforge.providers import (
 )
 from autoforge.redaction import redact
 from autoforge.sandbox_container import (
+    HOME_TARGET,
     ContainerNetwork,
     ContainerRole,
     ContainerSpec,
@@ -59,8 +73,10 @@ from autoforge.sandbox_container import (
     check_projection,
     client_environment,
     create_argv,
+    create_options,
 )
 from autoforge.sandbox_policy import LaunchClass, ProviderRequirements
+from tests.credential_fake import Container, digest, store_login
 
 SENTINEL = "fake-model-key-290-0b7d51"
 SENTINEL_OTHER = "fake-model-key-290-other-9e24c3"
@@ -104,6 +120,14 @@ ROUTES = [
         for scope, name in sorted(PI_KEY_NAMES.items())
     ),
 ]
+
+
+# Every variable a route of some adapter reads, refused routes included.
+ROUTE_NAMES = sorted(
+    {r.name for r in CLAUDE_CREDENTIAL_ROUTES}
+    | set(OPENCODE_KEY_NAMES.values())
+    | set(PI_KEY_NAMES.values())
+)
 
 
 def _plan(
@@ -214,38 +238,174 @@ def test_no_helper_container_gets_the_projection(provider, profile, name, role, 
     assert SENTINEL not in str(refused.value)
 
 
-def test_only_the_selected_variable_is_projected_and_the_others_are_withheld():
-    """Scoped, never wholesale: an OpenCode launch for an OpenAI model carries the
-    OpenAI key alone; another provider's key and every credential-looking variable is
-    withheld, and an ordinary setting is not."""
-    env = {
-        "OPENAI_API_KEY": SENTINEL,
-        "ANTHROPIC_API_KEY": SENTINEL_OTHER,
-        "GEMINI_API_KEY": SENTINEL_OTHER,
-        "OPENCODE_SERVER_PASSWORD": SENTINEL_OTHER,
-        "OPENCODE_CONFIG_DIR": "/tmp/autoforge-opencode-1",
-        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8000",
-        "EMPTY_API_KEY": "",
+# Credentials no naming rule recognises, each forwarded on purpose by an allow-list
+# entry: none ends in ``_API_KEY``, and some name nothing like a credential at all.
+UNNAMED_CREDENTIALS = {
+    "AZURE_OPENAI_KEY": SENTINEL_OTHER,
+    "MY_PROVIDER_CREDENTIAL": SENTINEL_OTHER,
+    "DATABASE_URL": f"postgres://agent:{SENTINEL_OTHER}@db.invalid/app",
+    "AWS_SECRET_ACCESS_KEY": SENTINEL_OTHER,
+    "OPENCODE_SERVER_PASSWORD": SENTINEL_OTHER,
+    "HTTPS_PROXY": f"http://agent:{SENTINEL_OTHER}@proxy.invalid:3128",
+    "SERVICE_BLOB": SENTINEL_OTHER,
+}
+# What a container launch receives of the launch's environment, besides the
+# projected variable, written out here rather than read from the plan.
+PRIVATE_STORES = {
+    "claude": {"CLAUDE_CONFIG_DIR": "/home/agent/.claude"},
+    "opencode": {"OPENCODE_DB": "/home/agent/.local/share/opencode/opencode.db"},
+    "pi": {"PI_CODING_AGENT_DIR": "/home/agent/.pi/agent"},
+}
+HOST_SETTINGS = {
+    "PATH": "/usr/local/bin:/usr/bin",
+    "HOME": "/home/operator",
+    "USER": "operator",
+    "TMPDIR": "/run/user/1000/tmp",
+    "XDG_DATA_HOME": "/home/operator/.local/share",
+    "XDG_CONFIG_HOME": "/home/operator/.config",
+    "LANG": "C.UTF-8",
+    "TZ": "UTC",
+    "GIT_AUTHOR_NAME": "Operator",
+    "PI_OFFLINE": "1",
+    "OPENCODE_CONFIG_DIR": "/tmp/autoforge-opencode-1",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8000",
+    "ANTHROPIC_BASE_URL": "https://gateway.invalid",
+}
+
+
+def _expected_environment(provider: AgentProvider) -> dict[str, str]:
+    passed = {"LANG": "C.UTF-8", "TZ": "UTC", "GIT_AUTHOR_NAME": "Operator"}
+    if provider.name == "pi":
+        passed["PI_OFFLINE"] = "1"
+    return {"HOME": "/home/agent", **PRIVATE_STORES[provider.name], **passed}
+
+
+@pytest.mark.parametrize(("provider", "profile", "name"), ROUTES)
+def test_the_container_receives_a_positive_allow_list_and_nothing_else(provider, profile, name):
+    """Fail closed: of the launch's environment the container receives the projected
+    variable, the private home and stores, and the allow-listed settings, each by its
+    exact name. A credential no rule names (``AZURE_OPENAI_KEY``, a password in a URL),
+    another provider's key, the host's paths and every other setting are withheld."""
+    others = {
+        other: SENTINEL_OTHER
+        for other in ROUTE_NAMES
+        if other not in {r.name for r in provider.credential_routes(profile).routes}
     }
-    plan = _plan(OpenCodeProvider(), _profile("opencode", "openai/gpt-5.6-luna"), env)
-    assert [item.name for item in plan.projection.env] == ["OPENAI_API_KEY"]
-    assert plan.withheld == ("ANTHROPIC_API_KEY", "GEMINI_API_KEY", "OPENCODE_SERVER_PASSWORD")
-    assert SENTINEL_OTHER not in json.dumps(plan.facts())
+    env = {**HOST_SETTINGS, **UNNAMED_CREDENTIALS, **others, name: SENTINEL}
+    plan = _plan(provider, profile, env)
+    assert plan.container_environment() == _expected_environment(provider)
+    assert [item.name for item in plan.projection.env] == [name]
+    passed = set(_expected_environment(provider)) - {"HOME", *PRIVATE_STORES[provider.name]}
+    assert set(plan.withheld) == set(env) - passed - {name}
+    assert set(UNNAMED_CREDENTIALS) | set(others) <= set(plan.withheld)
+    for value in plan.container_environment().values():
+        assert SENTINEL_OTHER not in value and SENTINEL not in value
+    assert SENTINEL_OTHER not in json.dumps(plan.facts()) + plan.describe()
+
+
+def test_every_passed_name_and_declared_setting_is_no_credential():
+    """The allow-list itself holds no credential, no store and nothing that could hand
+    the launch one: no prefix, no key, token or password."""
+    settings = {
+        setting
+        for provider, profile, _ in (p.values for p in ROUTES)
+        for setting in provider.credential_routes(profile).settings
+    }
+    assert settings == {"PI_OFFLINE", "PI_SKIP_VERSION_CHECK", "PI_TELEMETRY"}
+    for name in PASSED_NAMES | settings:
+        assert "*" not in name and not credential_looking(name), name
+        assert not undoes_isolation(name), name
+    assert not PASSED_NAMES & (set(ROUTE_NAMES) | {"HOME", "PATH"})
+
+
+_X_ROUTE = (EnvRoute("X_KEY", CredentialKind.API_KEY),)
 
 
 @pytest.mark.parametrize(
-    ("name", "looks"),
+    "routes",
     [
-        ("DEEPSEEK_API_KEY", True),
-        ("ANTHROPIC_AUTH_TOKEN", True),
-        ("MY_SECRET", True),
-        ("CLAUDE_CODE_MAX_OUTPUT_TOKENS", False),
-        ("OPENCODE_CONFIG_DIR", False),
-        ("PATH", False),
+        pytest.param(CredentialRoutes("x", _X_ROUTE, settings=("AZURE_OPENAI_KEY",)), id="key"),
+        pytest.param(CredentialRoutes("x", _X_ROUTE, settings=("SERVICE_TOKEN",)), id="token"),
+        pytest.param(CredentialRoutes("x", _X_ROUTE, settings=("X_KEY",)), id="route"),
+        pytest.param(CredentialRoutes("x", _X_ROUTE, settings=("GH_TOKEN",)), id="github"),
+        pytest.param(CredentialRoutes("x", _X_ROUTE, settings=("LC_*",)), id="prefix"),
+        pytest.param(
+            CredentialRoutes("x", _X_ROUTE, stores=(PrivateStore("X_DIR", "/abs"),)),
+            id="absolute",
+        ),
+        pytest.param(
+            CredentialRoutes("x", _X_ROUTE, stores=(PrivateStore("X_DIR", "../x"),)),
+            id="parent",
+        ),
+        pytest.param(
+            CredentialRoutes("x", _X_ROUTE, stores=(PrivateStore("X_KEY", "k"),)),
+            id="store-is-route",
+        ),
+        pytest.param(
+            CredentialRoutes(
+                "x", _X_ROUTE, stores=(PrivateStore("X_DIR", "d"),), settings=("X_DIR",)
+            ),
+            id="store-as-setting",
+        ),
     ],
 )
-def test_what_looks_like_a_credential(name, looks):
-    assert credential_looking(name) is looks
+def test_a_declaration_that_would_pass_a_credential_or_leave_a_store_is_refused(routes):
+    """The allow-list fails closed on a bad declaration too: a credential listed as a
+    setting, a prefix, or a store outside the private home refuses every launch."""
+    with pytest.raises(SandboxPolicyError) as refused:
+        plan_credentials("fake", routes, NO_NEEDS, {"X_KEY": SENTINEL}, launch_class=AGENT)
+    assert SENTINEL not in str(refused.value) and "declares" in str(refused.value)
+
+
+# -- a fresh private store, never an inherited one ------------------------------------
+
+
+@pytest.mark.parametrize(("provider", "profile", "name"), ROUTES)
+@pytest.mark.parametrize(
+    "inherited",
+    [
+        pytest.param({}, id="unset"),
+        pytest.param(
+            {
+                "CLAUDE_CONFIG_DIR": "/home/operator/claude-autoforge",
+                "OPENCODE_DB": "/home/operator/opencode-autoforge/af.db",
+                "PI_CODING_AGENT_DIR": "/home/operator/pi-autoforge",
+            },
+            id="host-path",
+        ),
+        pytest.param(
+            {
+                "CLAUDE_CONFIG_DIR": ".claude",
+                "OPENCODE_DB": "/workspace/.opencode/opencode.db",
+                "PI_CODING_AGENT_DIR": ".pi/agent",
+            },
+            id="workspace-path",
+        ),
+    ],
+)
+def test_every_store_variable_names_a_place_in_the_private_home(provider, profile, name, inherited):
+    """Whatever the launch's environment held, the home and the CLI's store are the
+    private home's: never the host path (absent or unwritable inside), never one in the
+    workspace or a volume (a store left there would win over the projected key)."""
+    plan = _plan(provider, profile, {**inherited, "HOME": "/home/operator", name: SENTINEL})
+    received = plan.container_environment()
+    assert received["HOME"] == HOME_TARGET
+    for store, value in PRIVATE_STORES[provider.name].items():
+        assert received[store] == value and value.startswith(HOME_TARGET + "/")
+        if store in inherited:
+            assert store in plan.withheld
+    for value in inherited.values():
+        assert value not in received.values()
+
+
+def test_the_private_home_is_a_tmpfs_each_create_makes_anew():
+    """Where every store lies: the launch container's create mounts a tmpfs of its own
+    there, mode 0700 and the agent's, and binds nothing at it or below it."""
+    spec = ContainerSpec(ContainerRole.LAUNCH, ContainerNetwork.NONE, "af-vol-290")
+    options = create_options(RuntimeProduct.PODMAN, spec)
+    homes = [o for o in options if o.startswith(f"--tmpfs={HOME_TARGET}:")]
+    assert len(homes) == 1 and "mode=0700" in homes[0]
+    assert not any(o.startswith("--mount") and HOME_TARGET in o for o in options)
 
 
 # -- one credential, chosen by the operator -------------------------------------------
@@ -411,10 +571,11 @@ def test_a_stored_login_is_never_projected_and_the_host_copy_is_left_as_it_was(t
 
 
 @pytest.mark.parametrize(("provider", "profile", "name"), ROUTES)
-def test_a_relaunch_gets_a_new_projection_from_the_host_as_it_is_then(provider, profile, name):
-    """The operator rotated the key on the host between two launches: the second
-    launch's projection carries the new value, in an object of its own, and nothing of
-    the first launch (no file, no home)."""
+def test_a_relaunch_gets_a_new_projection_from_the_environment_it_is_given(provider, profile, name):
+    """Each launch's projection is made from the environment it is given (the
+    controller process's own, which a shell does not change once it runs): a plan made
+    from a rotated value carries it, in an object of its own, and nothing of the first
+    launch (no file, no home)."""
     first = _plan(provider, profile, {name: SENTINEL})
     second = _plan(provider, profile, {name: SENTINEL_ROTATED})
     assert first == second  # the same route, kind and mechanism
@@ -503,3 +664,280 @@ def test_redaction_recognises_these_routed_names_and_not_the_others(name, recogn
     assert set(BY_NAME) == set(SHAPES)
     plain = "plainvalue290plainvalue"
     assert (plain not in redact(f"{name}={plain}")) is recognised
+
+
+# -- the routes through fake provider CLIs (ADR 0013 §7) -------------------------------
+
+
+def _host_environment(provider: AgentProvider, profile: ProfileConfig, name: str) -> dict:
+    """The operator's shell for a launch of ``profile``: the route's key, every other
+    route's variable that is no route of this profile, credentials no rule names, the
+    host's settings and the CLI's store variables at host paths."""
+    own = {r.name for r in provider.credential_routes(profile).routes}
+    return {
+        **HOST_SETTINGS,
+        **UNNAMED_CREDENTIALS,
+        **{other: SENTINEL_OTHER for other in ROUTE_NAMES if other not in own},
+        "CLAUDE_CONFIG_DIR": "/home/operator/claude-autoforge",
+        "OPENCODE_DB": "/home/operator/opencode-autoforge/af.db",
+        "PI_CODING_AGENT_DIR": "/home/operator/pi-autoforge",
+        name: SENTINEL,
+    }
+
+
+def _launch_environment(monkeypatch, provider: AgentProvider, shell: Mapping[str, str]) -> dict:
+    """What the adapter's launch inherits from a controller started in ``shell``, with
+    every variable of it forwarded by ``execution.agent_env_allowlist_extra``: the
+    worst an operator's configuration can do."""
+    for key in list(os.environ):
+        monkeypatch.delenv(key)
+    for key, value in shell.items():
+        monkeypatch.setenv(key, value)
+    config = ExecutionConfig(agent_env_allowlist_extra=sorted(shell))
+    return provider.launch_environment(config.agent_environment_names())
+
+
+def _run(container: Container, provider, profile, environment: Mapping[str, str]):
+    """The adapter's own argv, with the fake CLI in place of the CLI, run by the
+    executor in the container's ``/workspace`` with ``environment`` and nothing else."""
+    result = execute(
+        ExecutionRequest(
+            container.argv(provider.build_command_for(profile, "PROMPT-290")),
+            cwd=str(container.workspace),
+            env=dict(environment),
+            env_allowlist=(),
+            timeout_seconds=60,
+        )
+    )
+    return result, container.read_report()
+
+
+def _launch(container: Container, provider, profile, env, needs=NO_NEEDS):
+    """One container launch as #271 will make it, short of the runtime: the plan, then
+    the CLI started with exactly what the launch container receives, its environment
+    and the projected variable as the runtime client's environment values it."""
+    plan = _plan(provider, profile, env, needs)
+    inside = {**plan.container_environment(), **client_environment({}, plan.projection)}
+    return (plan, *_run(container, provider, profile, inside))
+
+
+def _assert_no_value_in(result: ExecutionResult, report: dict, *texts: str) -> None:
+    for text in (result.stdout, result.stderr, json.dumps(report["argv"]), *texts):
+        for sentinel in (SENTINEL, SENTINEL_OTHER, SENTINEL_ROTATED, SENTINEL_LOGIN):
+            assert sentinel not in text
+
+
+@pytest.mark.parametrize(("provider", "profile", "name"), ROUTES)
+def test_each_route_authenticates_the_cli_with_the_projected_key_alone(
+    provider, profile, name, tmp_path, monkeypatch, host
+):
+    """ADR 0013 §7 with fake CLIs: launched with its adapter's argv and exactly what the
+    launch container receives, each CLI finds the projected key under the route's
+    variable, in a private store that did not exist before it started, and sees no
+    other credential, whatever the operator's shell held and forwarded; no value is on
+    its argv, the create's, or in anything it or the plan says."""
+    env = _launch_environment(monkeypatch, provider, _host_environment(provider, profile, name))
+    container = Container.make(tmp_path / "launch")
+    plan, result, report = _launch(container, provider, profile, env)
+    assert result.exit_code == 0, result.stderr
+    assert report["source"] == f"env:{name}"
+    assert report["digest"] == digest(SENTINEL)
+    assert report["home"] == "/home/agent"
+    assert report["store"].startswith("/home/agent/") and report["store_existed"] is False
+    assert report["wrote"] is True
+    expected = {**_expected_environment(provider), name: SENTINEL}
+    assert report["env"] == {key: digest(value) for key, value in sorted(expected.items())}
+    others = {digest(v) for v in (SENTINEL_OTHER, *UNNAMED_CREDENTIALS.values())}
+    assert not others & set(report["env"].values())
+    create = create_argv(
+        RuntimeProduct.PODMAN,
+        _spec(plan, StagingMethod.BIND),
+        host,
+        name="af-launch-290",
+        labels={"io.autoforge.run": "run-290"},
+        image=IMAGE,
+        command=["/opt/autoforge/watcher"],
+    )
+    _assert_no_value_in(
+        result, report, " ".join(create), plan.describe(), json.dumps(plan.facts()), repr(plan)
+    )
+
+
+# Where a store an inherited variable names would be found, per CLI: the variable,
+# the value the operator's shell held, and the store's path inside the container.
+WORKSPACE_STORES = {
+    "claude": ("CLAUDE_CONFIG_DIR", ".claude", "/workspace/.claude"),
+    "opencode": (
+        "OPENCODE_DB",
+        "/workspace/.opencode/opencode.db",
+        "/workspace/.opencode/opencode.db",
+    ),
+    "pi": ("PI_CODING_AGENT_DIR", ".pi/agent", "/workspace/.pi/agent"),
+}
+
+
+@pytest.mark.parametrize(("provider", "profile", "name"), ROUTES)
+def test_a_populated_store_in_the_workspace_is_never_selected(
+    provider, profile, name, tmp_path, monkeypatch
+):
+    """The repository under work holds a login in a store the operator's variable
+    names inside the container. Passed on (the control), the CLI would read that store
+    and write into the workspace, and OpenCode and Pi would take its login ahead of the
+    key. Under the plan the CLI uses a fresh store of the private home and the key."""
+    variable, value, store = WORKSPACE_STORES[provider.name]
+    shell = {**_host_environment(provider, profile, name), variable: value}
+    env = _launch_environment(monkeypatch, provider, shell)
+    scope = provider.credential_routes(profile).scope
+
+    control = Container.make(tmp_path / "control")
+    store_login(control.path(store), provider.name, scope, SENTINEL_LOGIN)
+    inherited = {key: env[key] for key in env if key not in {"HOME", "PATH"}}
+    _, report = _run(control, provider, profile, {**inherited, "HOME": "/home/agent"})
+    assert report["store"] == store and report["store_existed"] is True
+    if provider.name != "claude":  # Claude Code takes its environment's key first
+        assert report["source"].startswith("store:")
+        assert report["digest"] == digest(SENTINEL_LOGIN)
+
+    container = Container.make(tmp_path / "launch")
+    store_login(container.path(store), provider.name, scope, SENTINEL_LOGIN)
+    _, result, report = _launch(container, provider, profile, env)
+    assert result.exit_code == 0, result.stderr
+    assert report["source"] == f"env:{name}" and report["digest"] == digest(SENTINEL)
+    assert report["store"] == PRIVATE_STORES[provider.name][variable]
+    assert report["store_existed"] is False
+    assert not any("written_by" in p.read_text() for p in _files(container.workspace))
+
+
+@pytest.mark.parametrize(("provider", "profile", "name"), ROUTES)
+def test_a_store_at_a_host_path_is_never_selected(provider, profile, name, tmp_path, monkeypatch):
+    """The operator's store variables name host directories (as the bwrap backend
+    wants them). Passed on (the control), the CLI finds nothing there and cannot write
+    its store, which the container does not hold; under the plan it uses the private
+    home's."""
+    env = _launch_environment(monkeypatch, provider, _host_environment(provider, profile, name))
+    control = Container.make(tmp_path / "control")
+    inherited = {key: env[key] for key in env if key not in {"HOME", "PATH"}}
+    result, report = _run(control, provider, profile, {**inherited, "HOME": "/home/agent"})
+    assert report["store"].startswith("/home/operator/") and report["store_existed"] is False
+    assert result.exit_code == 4 and report["wrote"] is False
+
+    container = Container.make(tmp_path / "launch")
+    _, result, report = _launch(container, provider, profile, env)
+    assert result.exit_code == 0, result.stderr
+    assert report["store"] == next(iter(PRIVATE_STORES[provider.name].values()))
+
+
+def _files(root: Path) -> list[Path]:
+    return [path for path in root.rglob("*") if path.is_file()]
+
+
+@pytest.mark.parametrize(("provider", "profile", "name"), ROUTES)
+def test_a_replacement_launch_sees_nothing_of_the_first(
+    provider, profile, name, tmp_path, monkeypatch
+):
+    """Container A's CLI writes its store; container B, a replacement made by a
+    controller started after the operator rotated the key, shares A's workspace and
+    cache volume. B's CLI finds an empty store and the rotated key, and nothing A wrote.
+    The control: a store variable that named the cache volume, passed on, would hand B
+    what A left there."""
+    workspace, cache = tmp_path / "workspace", tmp_path / "cache"
+    workspace.mkdir()
+    cache.mkdir()
+    shell = _host_environment(provider, profile, name)
+    first = Container.make(tmp_path / "a", workspace=workspace, cache=cache)
+    plan_a, result, report = _launch(
+        first, provider, profile, _launch_environment(monkeypatch, provider, shell)
+    )
+    assert result.exit_code == 0 and report["wrote"] is True
+    assert _files(first.path(HOME_TARGET))  # A wrote into its own private home
+
+    rotated = {**shell, name: SENTINEL_ROTATED}
+    second = Container.make(tmp_path / "b", workspace=workspace, cache=cache)
+    plan_b, result, report = _launch(
+        second, provider, profile, _launch_environment(monkeypatch, provider, rotated)
+    )
+    assert result.exit_code == 0, result.stderr
+    assert report["digest"] == digest(SENTINEL_ROTATED) and report["store_existed"] is False
+    assert plan_b.projection.env[0].value is not plan_a.projection.env[0].value
+    assert not _files(workspace) and not _files(cache)
+
+    variable = next(iter(PRIVATE_STORES[provider.name]))
+    on_cache = "/cache/store.db" if provider.name == "opencode" else "/cache/store"
+    for launch in ("c", "d"):
+        control = Container.make(tmp_path / launch, workspace=workspace, cache=cache)
+        environment = {"HOME": "/home/agent", variable: on_cache, name: SENTINEL}
+        _, report = _run(control, provider, profile, environment)
+    assert report["store_existed"] is True
+
+
+@pytest.mark.parametrize(
+    ("provider", "profile", "env", "launch_class"),
+    [
+        pytest.param(
+            ClaudeCodeProvider(),
+            _profile("claude", "fable"),
+            {"ANTHROPIC_API_KEY": SENTINEL, "CLAUDE_CODE_OAUTH_TOKEN": SENTINEL_OTHER},
+            AGENT,
+            id="two-claude-routes",
+        ),
+        pytest.param(
+            ClaudeCodeProvider(),
+            _profile("claude", "fable"),
+            {"CLAUDE_CODE_OAUTH_REFRESH_TOKEN": SENTINEL_ROTATED},
+            AGENT,
+            id="rotating-refresh-token",
+        ),
+        pytest.param(
+            ClaudeCodeProvider(),
+            _profile("claude", "fable"),
+            {"CLAUDE_CODE_OAUTH_TOKEN": SENTINEL, "ANTHROPIC_AUTH_TOKEN": SENTINEL_OTHER},
+            AGENT,
+            id="gateway-token",
+        ),
+        pytest.param(
+            PiProvider(),
+            _profile("pi", "openai/gpt-5.6-terra"),
+            {"OPENAI_API_KEY": SENTINEL},
+            AGENT,
+            id="pi-chatgpt-sign-in",
+        ),
+        pytest.param(
+            OpenCodeProvider(),
+            _profile("opencode", "groq/llama"),
+            {"GROQ_API_KEY": SENTINEL},
+            AGENT,
+            id="unmapped-model-provider",
+        ),
+        pytest.param(
+            PiProvider(),
+            _profile("pi", "deepseek/deepseek-flash", require_oauth="false"),
+            {"PATH": "/usr/bin"},
+            AGENT,
+            id="no-credential",
+        ),
+        pytest.param(
+            OpenCodeProvider(),
+            _profile("opencode", "openai/gpt-5.6-luna"),
+            {"OPENAI_API_KEY": SENTINEL},
+            LaunchClass.EXPORT_COMMAND,
+            id="repository-command",
+        ),
+    ],
+)
+def test_a_refused_route_starts_no_cli(provider, profile, env, launch_class, tmp_path):
+    """A refusal comes before anything is started: the fake CLI never runs, and the
+    refusal names variables and kinds, never a value."""
+    container = Container.make(tmp_path / "launch")
+    with pytest.raises(SandboxPolicyError) as refused:
+        _launch_refused(container, provider, profile, env, launch_class)
+    for sentinel in (SENTINEL, SENTINEL_OTHER, SENTINEL_ROTATED):
+        assert sentinel not in str(refused.value)
+    assert container.read_report() is None
+
+
+def _launch_refused(container, provider, profile, env, launch_class):
+    plan = plan_credentials(
+        provider.name, provider.credential_routes(profile), NO_NEEDS, env, launch_class=launch_class
+    )
+    inside = {**plan.container_environment(), **client_environment({}, plan.projection)}
+    _run(container, provider, profile, inside)

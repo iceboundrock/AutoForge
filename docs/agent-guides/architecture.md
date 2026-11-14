@@ -846,17 +846,22 @@ adapter states the facts of its CLI, and a provider-neutral module applies
 the rules. `AgentProvider.credential_routes(profile)` declares, as data,
 the variables the profile may take its model credential from, with each
 one's kind and refresh, the variables that would put the CLI on a route the
-container backend refuses, and the model provider the launch authenticates
-to; the base adapter, the SDK providers and the scripted one declare none.
-`container_auth.plan_credentials` takes that declaration, the adapter's
-`sandbox_requirements` (whose `file-ro`, `dir-rw` and `keyring` items are
-the stored logins) and the launch's environment after its allow-list, and
-returns a `CredentialPlan`: one variable, projected by #270's environment
-mechanism as a `Projection`, the logins it does not project and the
-credential-looking variables it withholds, or a `SandboxPolicyError`
-naming variables and kinds. It reads no file and holds the value only in
-the projection's `Secret`. Nothing calls it before #271 builds the launch
-container's create from it.
+container backend refuses, the model provider the launch authenticates
+to, the variables that locate the CLI's own credential store with a place
+for each in the private home, and the exact names of the CLI's settings
+the container may receive; the base adapter, the SDK providers and the
+scripted one declare none. `container_auth.plan_credentials` takes that
+declaration, the adapter's `sandbox_requirements` (whose `file-ro`,
+`dir-rw` and `keyring` items are the stored logins) and the launch's
+environment after its allow-list, and returns a `CredentialPlan`: one
+variable, projected by #270's environment mechanism as a `Projection`;
+the launch container's other variables (`container_environment()`: the
+private home, the private stores, and the names `PASSED_NAMES` and the
+adapter's settings list), which is all #271 may pass of the launch's
+environment; the logins it does not project; and every other variable,
+withheld. Or a `SandboxPolicyError` naming variables and kinds. It reads
+no file and holds the value only in the projection's `Secret`. Nothing
+calls it before #271 builds the launch container's create from it.
 
 #### Launch routing (ADR 0005, #168)
 

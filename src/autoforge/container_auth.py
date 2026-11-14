@@ -31,18 +31,39 @@ to the launch's environment:
   ``keyring`` items: Claude Code's login, OpenCode's database, Pi's agent
   directory) is never projected either: the CLI rewrites it, and AutoForge
   never reads, copies or logs a credential's contents (ADR 0005 D7.2).
-- **Scoped, never wholesale.** Only the selected variable is projected.
-  Every other credential-looking variable of the launch's environment is
-  :attr:`CredentialPlan.withheld`: the container backend (#271) passes none
-  of them into the container.
+- **A positive allow-list, never a filter.** Only the selected variable is
+  projected, and of the rest of the launch's environment the container
+  receives only what :attr:`CredentialPlan.environment` holds: the closed
+  list :data:`PASSED_NAMES` (locale, time zone, terminal, the git author
+  identity) and the provider's declared settings
+  (:attr:`CredentialRoutes.settings`), each by its exact name. Every other
+  variable, whatever its name, is :attr:`CredentialPlan.withheld`: a
+  credential is kept out by not being listed, not by looking like one, so a
+  name no rule recognises (``AZURE_OPENAI_KEY``, ``DATABASE_URL``) is
+  withheld too. The container backend (#271) gives the launch container
+  :meth:`CredentialPlan.container_environment` and the projection, and of
+  the launch's environment nothing else.
+- **A fresh private store, never an inherited one.** ``HOME`` and each
+  variable that locates the CLI's own credential store
+  (:attr:`CredentialRoutes.stores`: ``CLAUDE_CONFIG_DIR``, ``OPENCODE_DB``,
+  ``PI_CODING_AGENT_DIR``) are set to a path in the launch container's
+  private home, whatever the launch's environment held: a host path would
+  be absent or unwritable inside, and a path into the workspace or a
+  volume could select a store that the repository or an earlier launch
+  left there, whose login the CLI would use ahead of the projected key.
+  The private home is a tmpfs made at the container's create
+  (:func:`autoforge.sandbox_container.create_options`), so each store
+  starts empty and goes with the container.
 
 Every supported route is a static value (an API key, or Claude Code's
 long-lived ``claude setup-token`` token), so every route maps to the
 environment variable, which both staging forms deliver: no provider maps to
 the file mechanism, and a copy-in runtime loses no route. Nothing is
 refreshed inside a container, so concurrent workers share no writable
-credential state, and a relaunch gets a new projection from the host's
-environment as it is then.
+credential state. Each launch's plan is made from the environment it is
+given, which is the controller process's own: a value the operator changes
+in a shell reaches the launches of a controller started after the change,
+never those of one already running.
 
 Pure: no process, no file read, no state. The projection's value is a
 :class:`~autoforge.sandbox_container.Secret`; :meth:`CredentialPlan.facts`
@@ -54,15 +75,56 @@ selectable.
 from __future__ import annotations
 
 import enum
+import posixpath
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from .child_env import credential_looking_word
+from .child_env import credential_looking_word, undoes_isolation
 from .errors import SandboxPolicyError
-from .sandbox_container import EnvCredential, Projection, Secret
+from .sandbox_container import HOME_TARGET, EnvCredential, Projection, Secret
 from .sandbox_policy import AuthItem, AuthMode, LaunchClass, ProviderRequirements
 
 _RULE = "D14 provider credential mapping (#290)"
+
+# What a launch container receives of the launch's environment whatever its
+# provider, by exact name, never a prefix: the locale, the time zone, the
+# terminal type and the git author identity (an agent commits in the
+# workspace). None is a credential or locates one. ``PATH``, ``HOME``, the
+# ``XDG_*`` directories, ``TMPDIR`` and the proxy variables are host facts
+# (a proxy URL can carry a password), and the image and the private home
+# give the container its own.
+PASSED_NAMES = frozenset(
+    {
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_ADDRESS",
+        "LC_COLLATE",
+        "LC_CTYPE",
+        "LC_IDENTIFICATION",
+        "LC_MEASUREMENT",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NAME",
+        "LC_NUMERIC",
+        "LC_PAPER",
+        "LC_TELEPHONE",
+        "LC_TIME",
+        "TZ",
+        "TERM",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    }
+)
+
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+# Words that make a declared setting's name read as a credential, beyond
+# #286's (``TOKEN``, ``PAT``, ``SECRET``, ``PASSWORD``, ``GITHUB``): a guard
+# on what an adapter declares, never the boundary, which is the list itself.
+_KEY_WORD_RE = re.compile(r"(?:^|_)(?:API_?KEY|KEY|CREDENTIALS?|AUTH|PASS|PASSWD|COOKIE)(?:_|$)")
 
 
 class CredentialKind(enum.Enum):
@@ -83,8 +145,9 @@ class Refresh(enum.Enum):
     """Who refreshes a credential, and how."""
 
     # Never refreshed by a launch: valid until it expires or is revoked; the
-    # operator rotates it on the host, and the next launch's projection
-    # carries the new value.
+    # operator rotates it on the host, and the first launch of a controller
+    # started with the new value projects it (a running controller keeps the
+    # environment it started with).
     NONE = "never refreshed in a launch"
     # Refreshed by the CLI, which rotates its refresh token on use.
     ROTATING = "refreshed by the CLI, rotating its refresh token"
@@ -120,6 +183,24 @@ class UnsupportedRoute:
 
 
 @dataclass(frozen=True)
+class PrivateStore:
+    """A variable that locates the CLI's own credential store, and its private place.
+
+    ``path`` is relative to the launch container's private home
+    (:data:`~autoforge.sandbox_container.HOME_TARGET`): the plan sets
+    ``name`` to it, whatever the launch's environment held.
+    """
+
+    name: str
+    path: str
+
+    @property
+    def value(self) -> str:
+        """The variable's value inside the launch container."""
+        return posixpath.join(HOME_TARGET, self.path)
+
+
+@dataclass(frozen=True)
 class CredentialRoutes:
     """A provider adapter's declaration for one profile: names and kinds, no value.
 
@@ -128,12 +209,18 @@ class CredentialRoutes:
     its credential from; ``unsupported`` the variables that select a route
     the container backend refuses; ``refusal`` why no route of this profile
     can be projected at all ("" for none), with what the operator can do.
+    ``stores`` are the variables that locate the CLI's own credential store,
+    each set to a fresh place in the private home; ``settings`` the exact
+    names of the CLI's settings, none a credential, that the container
+    receives from the launch's environment besides :data:`PASSED_NAMES`.
     """
 
     scope: str
     routes: tuple[EnvRoute, ...] = ()
     unsupported: tuple[UnsupportedRoute, ...] = ()
     refusal: str = ""
+    stores: tuple[PrivateStore, ...] = ()
+    settings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -169,8 +256,11 @@ class CredentialPlan:
 
     ``name`` is the variable projected, ``kind`` and ``refresh`` what it is,
     ``mechanism`` how #270 delivers it. ``not_projected`` are the provider's
-    declared logins no projection carries, ``withheld`` the credential-looking
-    variables of the launch's environment the container must not receive.
+    declared logins no projection carries. ``environment`` is every other
+    variable the launch container receives, as ``(name, value)`` pairs: the
+    private home, the private stores and the allow-listed names the launch's
+    environment holds, none a credential. ``withheld`` names every variable
+    of the launch's environment the container does not receive from it.
     ``projection`` holds the value, as a :class:`Secret`, for the launch
     container's create alone; it is in no ``repr``, comparison or fact.
     """
@@ -182,8 +272,14 @@ class CredentialPlan:
     refresh: Refresh
     mechanism: Mechanism
     not_projected: tuple[NotProjected, ...] = ()
+    environment: tuple[tuple[str, str], ...] = ()
     withheld: tuple[str, ...] = ()
     projection: Projection = field(default_factory=Projection, repr=False, compare=False)
+
+    def container_environment(self) -> dict[str, str]:
+        """The launch container's variables besides the projection, and of the
+        launch's environment the only ones: no secret is among them."""
+        return dict(self.environment)
 
     def facts(self) -> dict[str, object]:
         """What a journal, a dry run or ``doctor`` may record: presence, kind and capability."""
@@ -195,6 +291,7 @@ class CredentialPlan:
             "refresh": self.refresh.value,
             "mechanism": self.mechanism.value,
             "not_projected": [item.label for item in self.not_projected],
+            "environment": [name for name, _ in self.environment],
             "withheld": list(self.withheld),
         }
 
@@ -206,6 +303,7 @@ class CredentialPlan:
         )
         if self.not_projected:
             text += "; not projected: " + ", ".join(item.label for item in self.not_projected)
+        text += "; the container also receives: " + ", ".join(name for name, _ in self.environment)
         if self.withheld:
             text += "; withheld: " + ", ".join(self.withheld)
         return text
@@ -220,9 +318,49 @@ def _present(env: Mapping[str, str], name: str) -> bool:
 
 
 def credential_looking(name: str) -> bool:
-    """Whether variable ``name`` looks like it holds a credential (#286's words, or a key)."""
+    """Whether variable ``name`` reads as a credential: a guard on what may be
+    listed as passed (:data:`PASSED_NAMES`, an adapter's settings), never the
+    filter of a launch's environment, which is the list itself."""
     upper = name.upper()
-    return upper.endswith("_API_KEY") or bool(credential_looking_word(upper))
+    return bool(credential_looking_word(upper) or _KEY_WORD_RE.search(upper))
+
+
+def _check_declaration(provider: str, routes: CredentialRoutes) -> None:
+    """Refuse a declaration that would pass a credential or leave a store inherited."""
+    credentials = {r.name for r in routes.routes} | {u.name for u in routes.unsupported}
+    stores: set[str] = set()
+    for store in routes.stores:
+        path = store.path
+        if (
+            not _ENV_NAME_RE.match(store.name)
+            or store.name in credentials
+            or store.name == "HOME"
+            or not path
+            or path.startswith("/")
+            or posixpath.normpath(path) != path
+            or path.split("/")[0] == ".."
+        ):
+            raise _refuse(
+                provider,
+                f"the adapter declares {store.name!r} as a store at {path!r}: a store is a "
+                "variable that names no credential, set to a normalized path inside the "
+                "private home",
+            )
+        stores.add(store.name)
+    for name in routes.settings:
+        if (
+            not _ENV_NAME_RE.match(name)
+            or name in credentials
+            or name in stores
+            or credential_looking(name)
+            or undoes_isolation(name)
+        ):
+            raise _refuse(
+                provider,
+                f"the adapter declares {name!r} as a setting the container receives, and it "
+                "is a credential, a store or a name that could hand the launch one: a "
+                "setting is never a credential",
+            )
 
 
 def plan_credentials(
@@ -238,9 +376,14 @@ def plan_credentials(
     ``provider`` is the adapter's name, ``routes`` its declaration for the
     launch's profile (``None``: the adapter maps none), ``needs`` its sandbox
     declaration (whose ``file-ro``, ``dir-rw`` and ``keyring`` items are the
-    stored logins), ``env`` the launch's environment after its allow-list. A
-    refusal is a :class:`SandboxPolicyError` naming variables, kinds and the
-    fix, never a value.
+    stored logins), ``env`` the launch's environment after its allow-list.
+    The plan's :attr:`~CredentialPlan.environment` is all the container
+    receives of ``env`` besides the projection: the private home and stores,
+    and the names :data:`PASSED_NAMES` and ``routes.settings`` list; every
+    other variable of ``env`` is withheld. A refusal is a
+    :class:`SandboxPolicyError` naming variables, kinds and the fix, never a
+    value; so is a declaration that lists a credential as a setting or a
+    store outside the private home.
     """
     if launch_class is not LaunchClass.REMOTE_AGENT:
         raise _refuse(
@@ -254,6 +397,7 @@ def plan_credentials(
             "no credential mapping for this provider under the container backend: #290 "
             "maps Claude Code, OpenCode 2.x and Pi; route the profile to one of them",
         )
+    _check_declaration(provider, routes)
     stores = tuple(item for item in map(_not_projected, needs.auth) if item is not None)
     if routes.refusal:
         raise _refuse(provider, routes.refusal)
@@ -295,9 +439,23 @@ def plan_credentials(
             detail += "; " + "; ".join(f"{item.label}: {item.reason}" for item in stores)
         raise _refuse(provider, detail)
     chosen = present[0]
+    # Set whatever the launch's environment held: the private home, and each
+    # store in it. Then the allow-listed names the launch's environment holds,
+    # and nothing else of it.
+    environment = {"HOME": HOME_TARGET}
+    environment.update((store.name, store.value) for store in routes.stores)
+    allowed = PASSED_NAMES.union(routes.settings)
+    passed = {
+        name: value
+        for name, value in env.items()
+        if value and name in allowed and name not in environment and name != chosen.name
+    }
+    environment.update(passed)
     withheld = tuple(
         sorted(
-            name for name in env if name != chosen.name and env[name] and credential_looking(name)
+            name
+            for name, value in env.items()
+            if value and name != chosen.name and name not in passed
         )
     )
     return CredentialPlan(
@@ -309,6 +467,7 @@ def plan_credentials(
         # Every route is a variable, which both staging forms deliver (D14).
         mechanism=Mechanism.ENV,
         not_projected=stores,
+        environment=tuple(sorted(environment.items())),
         withheld=withheld,
         projection=Projection(env=(EnvCredential(chosen.name, Secret(env[chosen.name])),)),
     )

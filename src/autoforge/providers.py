@@ -308,6 +308,7 @@ from .container_auth import (
     CredentialKind,
     CredentialRoutes,
     EnvRoute,
+    PrivateStore,
     Refresh,
     UnsupportedRoute,
 )
@@ -1387,6 +1388,9 @@ CLAUDE_UNSUPPORTED_ROUTES = (
         )
     ),
 )
+# Where Claude Code keeps its login and settings, in a container launch: the
+# private home's own directory, never the host's or one in the workspace.
+CLAUDE_PRIVATE_STORES = (PrivateStore("CLAUDE_CONFIG_DIR", ".claude"),)
 
 
 class ClaudeCodeProvider(AgentProvider):
@@ -1464,8 +1468,15 @@ class ClaudeCodeProvider(AgentProvider):
         """``ANTHROPIC_API_KEY`` or ``CLAUDE_CODE_OAUTH_TOKEN``, exactly one
         (:data:`CLAUDE_CREDENTIAL_ROUTES`); the login in ``~/.claude`` or
         ``$CLAUDE_CONFIG_DIR`` is never projected, since the CLI refreshes it
-        in place."""
-        return CredentialRoutes("anthropic", CLAUDE_CREDENTIAL_ROUTES, CLAUDE_UNSUPPORTED_ROUTES)
+        in place, and inside the container ``CLAUDE_CONFIG_DIR`` names an
+        empty directory of the private home (:data:`CLAUDE_PRIVATE_STORES`).
+        No other ``ANTHROPIC_*`` or ``CLAUDE_*`` variable is passed."""
+        return CredentialRoutes(
+            "anthropic",
+            CLAUDE_CREDENTIAL_ROUTES,
+            CLAUDE_UNSUPPORTED_ROUTES,
+            stores=CLAUDE_PRIVATE_STORES,
+        )
 
     @contextmanager
     def integration_isolation(self) -> Iterator[dict[str, str]]:
@@ -2077,6 +2088,10 @@ OPENCODE_KEY_NAMES = {
     "google": "GOOGLE_GENERATIVE_AI_API_KEY",
     "openai": "OPENAI_API_KEY",
 }
+# Where OpenCode keeps its account store, in a container launch: a database
+# file in the private home, which starts empty, so a stored account never
+# takes precedence over the projected key.
+OPENCODE_PRIVATE_STORES = (PrivateStore("OPENCODE_DB", ".local/share/opencode/opencode.db"),)
 
 
 class OpenCodeProvider(AgentProvider):
@@ -2140,8 +2155,10 @@ class OpenCodeProvider(AgentProvider):
         never another provider's key nor ``OPENCODE_*`` or ``OPENAI_*``
         wholesale. The account store (the database ``auth login`` writes,
         ``$OPENCODE_DB``) is never projected: OpenCode rewrites it and refreshes
-        the logins it holds. A container's own store, in its private home, is
-        empty, so the key is what the launch authenticates with."""
+        the logins it holds. Inside the container ``OPENCODE_DB`` names a new
+        database in the private home (:data:`OPENCODE_PRIVATE_STORES`), whatever
+        the launch's environment held, so the store is empty and the key is
+        what the launch authenticates with."""
         scope = profile.model.split("/", 1)[0] if "/" in profile.model else ""
         name = OPENCODE_KEY_NAMES.get(scope)
         if name is None:
@@ -2153,7 +2170,9 @@ class OpenCodeProvider(AgentProvider):
                     "account store is never projected: route the profile to a mapped provider"
                 ),
             )
-        return CredentialRoutes(scope, (EnvRoute(name, CredentialKind.API_KEY),))
+        return CredentialRoutes(
+            scope, (EnvRoute(name, CredentialKind.API_KEY),), stores=OPENCODE_PRIVATE_STORES
+        )
 
     @contextmanager
     def integration_isolation(self) -> Iterator[dict[str, str]]:
@@ -2468,6 +2487,13 @@ PI_API_KEY_NAMES = ("OPENAI_API_KEY",)
 # The API-key variable Pi reads for a model provider when a profile sets
 # `require_oauth: false`, under the container backend (#290; docs/pi.md).
 PI_KEY_NAMES = {"deepseek": "DEEPSEEK_API_KEY", "openai": "OPENAI_API_KEY"}
+# Where Pi keeps its credential store and model state, in a container launch:
+# an empty agent directory in the private home, so a key stored in an
+# inherited one never takes precedence over the projected key.
+PI_PRIVATE_STORES = (PrivateStore("PI_CODING_AGENT_DIR", ".pi/agent"),)
+# Pi's switches a container launch receives from the launch's environment:
+# none is a credential or a path.
+PI_CONTAINER_SETTINGS = ("PI_OFFLINE", "PI_SKIP_VERSION_CHECK", "PI_TELEMETRY")
 # What Pi loads from its agent directory and from every directory between
 # `/` and the cwd whatever the resource flags say (docs/pi-policy.md §4-5):
 # the first context file name found in each directory (none with
@@ -2604,7 +2630,9 @@ class PiProvider(AgentProvider):
         the ChatGPT sign-in lives in Pi's agent directory, which Pi refreshes in
         place by rotating its refresh token, and no controller-owned path
         returns a refreshed sign-in to the host, so it is never projected. Nor
-        is a key Pi holds in its own store."""
+        is a key Pi holds in its own store: inside the container
+        ``PI_CODING_AGENT_DIR`` names an empty directory of the private home
+        (:data:`PI_PRIVATE_STORES`), whatever the launch's environment held."""
         scope = self.model_provider(profile)
         if self.require_oauth(profile):
             return CredentialRoutes(
@@ -2627,7 +2655,12 @@ class PiProvider(AgentProvider):
                     "store is never projected: route the profile to a mapped provider"
                 ),
             )
-        return CredentialRoutes(scope, (EnvRoute(name, CredentialKind.API_KEY),))
+        return CredentialRoutes(
+            scope,
+            (EnvRoute(name, CredentialKind.API_KEY),),
+            stores=PI_PRIVATE_STORES,
+            settings=PI_CONTAINER_SETTINGS,
+        )
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         super().validate_profile(profile)

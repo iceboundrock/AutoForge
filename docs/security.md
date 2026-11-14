@@ -268,7 +268,15 @@ Which model credential a container launch will take, by provider:
   sign-in back to your machine.
 
 Anything else is refused before a container is made, with what to set
-instead. The provider-by-provider table, how rotation, revocation and
+instead. Of the rest of your shell's environment the container gets only
+the locale, the time zone, the terminal type, the git author identity and
+Pi's `PI_OFFLINE`, `PI_SKIP_VERSION_CHECK` and `PI_TELEMETRY`, each by its
+exact name: every other variable stays out whatever its name, and each
+CLI's credential store is a new, empty one in the container's private
+home, never one at your `CLAUDE_CONFIG_DIR`, `OPENCODE_DB` or
+`PI_CODING_AGENT_DIR`. A running controller keeps the environment it
+started with: after you rotate a key, restart it from the shell that holds
+the new one. The provider-by-provider table, how rotation, revocation and
 several workers behave, and which variables redaction recognises are in
 [GitHub safety](agent-guides/github-safety.md#provider-credential-mapping-adr-0013-d14-290).
 
