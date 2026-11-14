@@ -54,6 +54,23 @@ to the launch's environment:
   The private home is a tmpfs made at the container's create
   (:func:`autoforge.sandbox_container.create_options`), so each store
   starts empty and goes with the container.
+- **The CLI's integration isolation, set and never inherited.** What keeps
+  a CLI's MCP servers, plugins and the repository's own configuration off
+  (#165; ADR 0013 D7: an installed integration stays disabled) is on the
+  argv for Claude Code and Pi, which a container launch runs unchanged,
+  and in variables for OpenCode, which has no flag for it. The adapter
+  declares those variables with their values
+  (:attr:`CredentialRoutes.isolation`), a path among them naming a place
+  in the private home, and the plan sets each one whatever the launch's
+  environment held: an operator's ``OPENCODE_CONFIG_PROJECT_DISABLE=0`` or
+  ``OPENCODE_CONFIG`` is withheld like any other variable. Without them,
+  OpenCode would load the ``opencode.json`` and ``.opencode/`` of the
+  workspace, which the repository controls. Claude Code's shell variables
+  (``claude_isolation_env``) are not among them: they keep the functions
+  of the operator's shell startup files out of its Bash tool, and the
+  private home, a new tmpfs, holds no such file; ``CLAUDE_CODE_SHELL`` and
+  ``CLAUDE_CODE_SHELL_PREFIX`` are withheld, so neither names a program of
+  the operator's.
 
 Every supported route is a static value (an API key, or Claude Code's
 long-lived ``claude setup-token`` token), so every route maps to the
@@ -182,6 +199,15 @@ class UnsupportedRoute:
     reason: str
 
 
+def private_path(relative: str) -> str:
+    """Where ``relative``, a path of the launch container's private home, is inside it."""
+    return posixpath.join(HOME_TARGET, relative)
+
+
+def _in_private_home(path: str) -> bool:
+    return path.startswith(HOME_TARGET + "/") and posixpath.normpath(path) == path
+
+
 @dataclass(frozen=True)
 class PrivateStore:
     """A variable that locates the CLI's own credential store, and its private place.
@@ -197,7 +223,7 @@ class PrivateStore:
     @property
     def value(self) -> str:
         """The variable's value inside the launch container."""
-        return posixpath.join(HOME_TARGET, self.path)
+        return private_path(self.path)
 
 
 @dataclass(frozen=True)
@@ -213,6 +239,10 @@ class CredentialRoutes:
     each set to a fresh place in the private home; ``settings`` the exact
     names of the CLI's settings, none a credential, that the container
     receives from the launch's environment besides :data:`PASSED_NAMES`.
+    ``isolation`` is the CLI's integration isolation that its argv cannot
+    carry (#165, ADR 0013 D7), as ``(name, value)`` pairs the container
+    receives whatever the launch's environment held: a value that is a
+    path names a place in the private home.
     """
 
     scope: str
@@ -221,6 +251,7 @@ class CredentialRoutes:
     refusal: str = ""
     stores: tuple[PrivateStore, ...] = ()
     settings: tuple[str, ...] = ()
+    isolation: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -258,8 +289,9 @@ class CredentialPlan:
     ``mechanism`` how #270 delivers it. ``not_projected`` are the provider's
     declared logins no projection carries. ``environment`` is every other
     variable the launch container receives, as ``(name, value)`` pairs: the
-    private home, the private stores and the allow-listed names the launch's
-    environment holds, none a credential. ``withheld`` names every variable
+    private home, the private stores, the CLI's integration isolation and
+    the allow-listed names the launch's environment holds, none a
+    credential. ``withheld`` names every variable
     of the launch's environment the container does not receive from it.
     ``projection`` holds the value, as a :class:`Secret`, for the launch
     container's create alone; it is in no ``repr``, comparison or fact.
@@ -326,7 +358,9 @@ def credential_looking(name: str) -> bool:
 
 
 def _check_declaration(provider: str, routes: CredentialRoutes) -> None:
-    """Refuse a declaration that would pass a credential or leave a store inherited."""
+    """Refuse a declaration that would pass a credential, leave a store inherited,
+    or set an isolation variable that is a credential or names a place outside
+    the private home."""
     credentials = {r.name for r in routes.routes} | {u.name for u in routes.unsupported}
     stores: set[str] = set()
     for store in routes.stores:
@@ -361,6 +395,23 @@ def _check_declaration(provider: str, routes: CredentialRoutes) -> None:
                 "is a credential, a store or a name that could hand the launch one: a "
                 "setting is never a credential",
             )
+    taken = credentials | stores | set(routes.settings) | {"HOME"}
+    for name, value in routes.isolation:
+        if (
+            not _ENV_NAME_RE.match(name)
+            or name in taken
+            or credential_looking(name)
+            or undoes_isolation(name)
+            or "\0" in value
+            or ("/" in value and not _in_private_home(value))
+        ):
+            raise _refuse(
+                provider,
+                f"the adapter declares {name!r} as an isolation variable: one names no "
+                "credential, store, passed setting or other isolation variable, and its "
+                "value, when a path, is a normalized place inside the private home",
+            )
+        taken.add(name)
 
 
 def plan_credentials(
@@ -378,12 +429,13 @@ def plan_credentials(
     declaration (whose ``file-ro``, ``dir-rw`` and ``keyring`` items are the
     stored logins), ``env`` the launch's environment after its allow-list.
     The plan's :attr:`~CredentialPlan.environment` is all the container
-    receives of ``env`` besides the projection: the private home and stores,
-    and the names :data:`PASSED_NAMES` and ``routes.settings`` list; every
-    other variable of ``env`` is withheld. A refusal is a
-    :class:`SandboxPolicyError` naming variables, kinds and the fix, never a
-    value; so is a declaration that lists a credential as a setting or a
-    store outside the private home.
+    receives besides the projection: the private home and stores and the
+    CLI's integration isolation (``routes.isolation``), each set whatever
+    ``env`` held, and of ``env`` the names :data:`PASSED_NAMES` and
+    ``routes.settings`` list; every other variable of ``env`` is withheld. A
+    refusal is a :class:`SandboxPolicyError` naming variables, kinds and the
+    fix, never a value; so is a declaration that lists a credential as a
+    setting, or a store or an isolation path outside the private home.
     """
     if launch_class is not LaunchClass.REMOTE_AGENT:
         raise _refuse(
@@ -439,11 +491,12 @@ def plan_credentials(
             detail += "; " + "; ".join(f"{item.label}: {item.reason}" for item in stores)
         raise _refuse(provider, detail)
     chosen = present[0]
-    # Set whatever the launch's environment held: the private home, and each
-    # store in it. Then the allow-listed names the launch's environment holds,
-    # and nothing else of it.
+    # Set whatever the launch's environment held: the private home, each
+    # store in it and the CLI's integration isolation. Then the allow-listed
+    # names the launch's environment holds, and nothing else of it.
     environment = {"HOME": HOME_TARGET}
     environment.update((store.name, store.value) for store in routes.stores)
+    environment.update(routes.isolation)
     allowed = PASSED_NAMES.union(routes.settings)
     passed = {
         name: value

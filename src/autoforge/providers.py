@@ -311,6 +311,7 @@ from .container_auth import (
     PrivateStore,
     Refresh,
     UnsupportedRoute,
+    private_path,
 )
 from .errors import (
     ChildStdinClosedError,
@@ -2092,6 +2093,17 @@ OPENCODE_KEY_NAMES = {
 # file in the private home, which starts empty, so a stored account never
 # takes precedence over the projected key.
 OPENCODE_PRIVATE_STORES = (PrivateStore("OPENCODE_DB", ".local/share/opencode/opencode.db"),)
+# OpenCode's integration isolation in a container launch (#165; ADR 0013 D7):
+# no flag keeps an MCP server, a plugin or the repository's configuration
+# off, so the plan sets :func:`opencode_isolation_env` itself, whatever the
+# launch's environment held, with a global configuration directory of the
+# private home, which starts empty. Run against 2.3.0 with a fresh home and
+# only the private home and database set, `opencode api --standalone GET
+# /api/config` loaded the workspace's `opencode.json` and `.opencode/`; with
+# these as well, only that directory, which OpenCode made.
+OPENCODE_CONTAINER_ISOLATION = tuple(
+    sorted(opencode_isolation_env(private_path(".config/opencode")).items())
+)
 
 
 class OpenCodeProvider(AgentProvider):
@@ -2158,7 +2170,11 @@ class OpenCodeProvider(AgentProvider):
         the logins it holds. Inside the container ``OPENCODE_DB`` names a new
         database in the private home (:data:`OPENCODE_PRIVATE_STORES`), whatever
         the launch's environment held, so the store is empty and the key is
-        what the launch authenticates with."""
+        what the launch authenticates with. The integration isolation every
+        launch sets (:func:`opencode_isolation_env`) is set there too, with an
+        empty configuration directory of the private home
+        (:data:`OPENCODE_CONTAINER_ISOLATION`), never taken from the launch's
+        environment."""
         scope = profile.model.split("/", 1)[0] if "/" in profile.model else ""
         name = OPENCODE_KEY_NAMES.get(scope)
         if name is None:
@@ -2171,7 +2187,10 @@ class OpenCodeProvider(AgentProvider):
                 ),
             )
         return CredentialRoutes(
-            scope, (EnvRoute(name, CredentialKind.API_KEY),), stores=OPENCODE_PRIVATE_STORES
+            scope,
+            (EnvRoute(name, CredentialKind.API_KEY),),
+            stores=OPENCODE_PRIVATE_STORES,
+            isolation=OPENCODE_CONTAINER_ISOLATION,
         )
 
     @contextmanager

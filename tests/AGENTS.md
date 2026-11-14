@@ -149,11 +149,13 @@ read it before adding tests for a listed area.
   the `#!` line with no shell in between, that find their model credential
   by each CLI's own rules (OpenCode's and Pi's stored login ahead of an
   environment key), in a `Container`, a stand-in for one launch container's
-  filesystem whose `workspace` and `cache` a replacement may share. Each
-  writes into its store and reports its argv, its environment's names with
-  a digest of each value, its home, the store it resolved and whether that
-  existed, and its credential's source and digest; nothing it prints or
-  reports holds a value.
+  filesystem whose `workspace` and `cache` a replacement may share. The
+  fake `opencode` also resolves its configuration as 2.x does and reports
+  the MCP servers and plugins it would load. Each writes into its store and
+  reports its argv, its environment's names with a digest of each value,
+  its home, the store it resolved and whether that existed, and its
+  credential's source and digest; nothing it prints or reports holds a
+  value.
 - `tests/scheduler_worker.py` is the worker process of the scheduler tests
   (#182): `python -P tests/scheduler_worker.py FIXTURES epic _worker ...`,
   the `worker_command` a test gives the scheduler, runs the production

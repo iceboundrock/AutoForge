@@ -2546,6 +2546,29 @@ The rules, for every provider:
   or an earlier launch left there, whose login OpenCode and Pi take ahead
   of an environment key. The private home is a tmpfs each create makes
   anew, so each store starts empty and goes with its container.
+- **Integrations stay off, set rather than inherited (ADR 0013 D7).**
+  Claude Code's and Pi's isolation is on their argv (`--safe-mode
+  --strict-mcp-config --setting-sources=user`; `--no-extensions
+  --no-skills` and the rest), which a container launch runs unchanged.
+  OpenCode has no flag for it, so the plan sets the variables every
+  OpenCode launch sets (#165) itself, whatever the launch's environment
+  held: `OPENCODE_CONFIG_PROJECT_DISABLE=1` and
+  `OPENCODE_DISABLE_PROJECT_CONFIG=1`, `OPENCODE_CONFIG` and
+  `OPENCODE_CONFIG_CONTENT` empty, and
+  `OPENCODE_CONFIG_DIR=/home/agent/.config/opencode`, a directory of the
+  private home that starts empty. An operator's value for any of them is
+  withheld like every other variable. Without them OpenCode would load the
+  workspace's `opencode.json` and `.opencode/`, which the repository
+  controls: run against OpenCode 2.3.0 with a fresh home and only the
+  private home and database set, `opencode api --standalone GET
+  /api/config` loaded both; with them, only the empty directory, which
+  OpenCode made. An adapter's isolation variable that names a credential,
+  a store or a passed setting, or a path outside the private home, refuses
+  every launch. Claude Code's shell variables (`CLAUDE_ENV_FILE`,
+  `CLAUDE_CODE_SHELL`, `CLAUDE_CODE_SHELL_PREFIX`) are not set: they keep
+  the functions of the operator's shell startup files out of its Bash
+  tool, and the private home holds no such file; withheld, neither shell
+  variable names a program of the operator's.
 - **Agent launches only.** A repository command's launch class is refused,
   and its allow-list (#286) passes no route's variable by default.
 

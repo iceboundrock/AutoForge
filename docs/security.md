@@ -274,9 +274,12 @@ Pi's `PI_OFFLINE`, `PI_SKIP_VERSION_CHECK` and `PI_TELEMETRY`, each by its
 exact name: every other variable stays out whatever its name, and each
 CLI's credential store is a new, empty one in the container's private
 home, never one at your `CLAUDE_CONFIG_DIR`, `OPENCODE_DB` or
-`PI_CODING_AGENT_DIR`. A running controller keeps the environment it
-started with: after you rotate a key, restart it from the shell that holds
-the new one. The provider-by-provider table, how rotation, revocation and
+`PI_CODING_AGENT_DIR`. Integrations stay off as on your host: OpenCode's
+isolation settings are AutoForge's own whatever your shell sets, so it
+reads no `opencode.json` or `.opencode/` of the repository and starts
+from an empty configuration directory of the container's. A running
+controller keeps the environment it started with: after you rotate a key,
+restart it from the shell that holds the new one. The provider-by-provider table, how rotation, revocation and
 several workers behave, and which variables redaction recognises are in
 [GitHub safety](agent-guides/github-safety.md#provider-credential-mapping-adr-0013-d14-290).
 

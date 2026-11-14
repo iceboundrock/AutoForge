@@ -1178,7 +1178,13 @@ exactly when `tests/sandbox_host.py` measures the host capable
   a credential, a route's variable or a prefix as a setting, or a store
   outside the private home, is refused. Every store variable names a place
   in the private home, unset, at a host path or in the workspace, and the
-  create mounts a tmpfs there. The redaction table of `github-safety.md`
+  create mounts a tmpfs there. OpenCode's isolation variables hold the
+  controller's values whatever the launch's environment held (none, the
+  host launch's, or values that undo them), are the same names and values
+  as its host launch's but for a configuration directory of the private
+  home, and an isolation variable that is a credential, a store, a
+  setting, set twice or a path outside the private home is refused;
+  Claude Code's and Pi's isolation flags are on the argv. The redaction table of `github-safety.md`
   is pinned: each routed key's shape is redacted, and the name column,
   recognised or not, is asserted.
   Then with fake provider CLIs (`tests/credential_fake.py`: a standalone
@@ -1191,7 +1197,13 @@ exactly when `tests/sandbox_host.py` measures the host capable
   shell forwarded it, and no value is on its argv, the create's or in its
   output. A store left in the workspace or named at a host path is never
   selected, with a control showing the CLI would take it if the variable
-  were passed on; a refused route starts no CLI; a replacement launch that
+  were passed on. The fake `opencode` also resolves its configuration as
+  2.x does: with the workspace configuring an MCP server and a plugin and
+  the operator's shell forwarding variables that undo the isolation, it
+  loads none, from an empty configuration directory of the private home,
+  with two controls (the plan's environment without its isolation
+  variables loads the repository's; the shell's variables passed on load
+  every one). A refused route starts no CLI; a replacement launch that
   shares the first one's workspace and cache volume finds an empty store,
   the rotated key and nothing the first wrote.
 

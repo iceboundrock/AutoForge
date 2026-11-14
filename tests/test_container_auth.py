@@ -8,15 +8,19 @@ token on use, or that the CLI rewrites in place, is never projected and the
 host's copy is left as it was; a relaunch gets a new projection; the model
 credential reaches an agent launch and never a repository command. Of the
 launch's environment the container receives only a positive allow-list, and
-every store variable names a fresh place in the private home.
+every store variable names a fresh place in the private home. Integrations
+stay off (ADR 0013 D7): Claude Code's and Pi's isolation flags are on their
+argv, and OpenCode's isolation variables hold the controller's values
+whatever the launch's environment held.
 
 Then with fake provider CLIs (``tests/credential_fake.py``), which find their
 credential by each CLI's own rules: each route, launched with the adapter's
 own argv and exactly what the launch container receives, authenticates with
 the projected key, in a private store that starts empty, and sees no other
 credential; an inherited store at a host path or in the workspace is never
-selected; a refused route starts nothing; a replacement launch sees nothing
-of the first.
+selected; OpenCode loads no MCP server or plugin the repository's
+configuration or the operator's shell names; a refused route starts
+nothing; a replacement launch sees nothing of the first.
 """
 
 from __future__ import annotations
@@ -47,6 +51,7 @@ from autoforge.errors import SandboxPolicyError
 from autoforge.executor import ExecutionRequest, ExecutionResult, execute, select_environment
 from autoforge.providers import (
     CLAUDE_CREDENTIAL_ROUTES,
+    CLAUDE_ISOLATION_FLAGS,
     CLAUDE_UNSUPPORTED_ROUTES,
     OPENCODE_KEY_NAMES,
     PI_KEY_NAMES,
@@ -57,6 +62,7 @@ from autoforge.providers import (
     OpenCodeSdkProvider,
     PiProvider,
     ScriptedProvider,
+    opencode_isolation_env,
 )
 from autoforge.redaction import redact
 from autoforge.sandbox_container import (
@@ -256,6 +262,20 @@ PRIVATE_STORES = {
     "opencode": {"OPENCODE_DB": "/home/agent/.local/share/opencode/opencode.db"},
     "pi": {"PI_CODING_AGENT_DIR": "/home/agent/.pi/agent"},
 }
+# What a launch container's CLI is set to whatever the launch's environment held, to
+# keep integrations off (#165, ADR 0013 D7): OpenCode's variables, with a
+# configuration directory of the private home. Claude Code's and Pi's are on their argv.
+ISOLATION = {
+    "claude": {},
+    "opencode": {
+        "OPENCODE_CONFIG_DIR": "/home/agent/.config/opencode",
+        "OPENCODE_CONFIG_PROJECT_DISABLE": "1",
+        "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+        "OPENCODE_CONFIG": "",
+        "OPENCODE_CONFIG_CONTENT": "",
+    },
+    "pi": {},
+}
 HOST_SETTINGS = {
     "PATH": "/usr/local/bin:/usr/bin",
     "HOME": "/home/operator",
@@ -277,7 +297,12 @@ def _expected_environment(provider: AgentProvider) -> dict[str, str]:
     passed = {"LANG": "C.UTF-8", "TZ": "UTC", "GIT_AUTHOR_NAME": "Operator"}
     if provider.name == "pi":
         passed["PI_OFFLINE"] = "1"
-    return {"HOME": "/home/agent", **PRIVATE_STORES[provider.name], **passed}
+    return {
+        "HOME": "/home/agent",
+        **PRIVATE_STORES[provider.name],
+        **ISOLATION[provider.name],
+        **passed,
+    }
 
 
 @pytest.mark.parametrize(("provider", "profile", "name"), ROUTES)
@@ -295,7 +320,11 @@ def test_the_container_receives_a_positive_allow_list_and_nothing_else(provider,
     plan = _plan(provider, profile, env)
     assert plan.container_environment() == _expected_environment(provider)
     assert [item.name for item in plan.projection.env] == [name]
-    passed = set(_expected_environment(provider)) - {"HOME", *PRIVATE_STORES[provider.name]}
+    passed = set(_expected_environment(provider)) - {
+        "HOME",
+        *PRIVATE_STORES[provider.name],
+        *ISOLATION[provider.name],
+    }
     assert set(plan.withheld) == set(env) - passed - {name}
     assert set(UNNAMED_CREDENTIALS) | set(others) <= set(plan.withheld)
     for value in plan.container_environment().values():
@@ -347,11 +376,40 @@ _X_ROUTE = (EnvRoute("X_KEY", CredentialKind.API_KEY),)
             ),
             id="store-as-setting",
         ),
+        *(
+            pytest.param(CredentialRoutes("x", _X_ROUTE, isolation=(entry,)), id=f"isolation-{i}")
+            for i, entry in (
+                ("is-route", ("X_KEY", "1")),
+                ("is-credential", ("SERVICE_TOKEN", "1")),
+                ("hands-github-login", ("GH_CONFIG_DIR", "/home/agent/gh")),
+                ("is-home", ("HOME", "/home/agent/elsewhere")),
+                ("host-path", ("X_CONFIG", "/tmp/x")),
+                ("relative-path", ("X_CONFIG", "cfg/x")),  # resolved from the workspace
+                ("escapes-home", ("X_CONFIG", "/home/agent/../etc")),
+                ("home-itself", ("X_CONFIG", "/home/agent")),
+            )
+        ),
+        pytest.param(
+            CredentialRoutes(
+                "x", _X_ROUTE, stores=(PrivateStore("X_DIR", "d"),), isolation=(("X_DIR", "1"),)
+            ),
+            id="isolation-is-store",
+        ),
+        pytest.param(
+            CredentialRoutes("x", _X_ROUTE, settings=("X_MODE",), isolation=(("X_MODE", "1"),)),
+            id="isolation-is-setting",
+        ),
+        pytest.param(
+            CredentialRoutes("x", _X_ROUTE, isolation=(("X_MODE", "1"), ("X_MODE", "0"))),
+            id="isolation-twice",
+        ),
     ],
 )
 def test_a_declaration_that_would_pass_a_credential_or_leave_a_store_is_refused(routes):
     """The allow-list fails closed on a bad declaration too: a credential listed as a
-    setting, a prefix, or a store outside the private home refuses every launch."""
+    setting, a prefix, a store outside the private home, or an isolation variable that
+    is a credential, a store, a setting, set twice or set to a place outside the
+    private home refuses every launch."""
     with pytest.raises(SandboxPolicyError) as refused:
         plan_credentials("fake", routes, NO_NEEDS, {"X_KEY": SENTINEL}, launch_class=AGENT)
     assert SENTINEL not in str(refused.value) and "declares" in str(refused.value)
@@ -406,6 +464,69 @@ def test_the_private_home_is_a_tmpfs_each_create_makes_anew():
     homes = [o for o in options if o.startswith(f"--tmpfs={HOME_TARGET}:")]
     assert len(homes) == 1 and "mode=0700" in homes[0]
     assert not any(o.startswith("--mount") and HOME_TARGET in o for o in options)
+
+
+# -- integrations stay off: the isolation is set, never inherited (ADR 0013 D7) -------
+
+# The operator's shell undoing OpenCode's isolation, each variable forwarded on purpose:
+# the project's configuration back on, an explicit file, an inline document and a
+# global directory in the workspace, which the repository controls.
+HOSTILE_OPENCODE_SETTINGS = {
+    "OPENCODE_CONFIG_PROJECT_DISABLE": "0",
+    "OPENCODE_DISABLE_PROJECT_CONFIG": "0",
+    "OPENCODE_CONFIG": "/workspace/explicit.json",
+    "OPENCODE_CONFIG_CONTENT": json.dumps({"mcp": {"content-gh": {"type": "local"}}}),
+    "OPENCODE_CONFIG_DIR": "/workspace/global",
+}
+OPENCODE_ROUTES = [route for route in ROUTES if route.id.startswith("opencode-")]
+
+
+@pytest.mark.parametrize(("provider", "profile", "name"), ROUTES)
+@pytest.mark.parametrize(
+    "inherited",
+    [
+        pytest.param({}, id="unset"),
+        pytest.param(opencode_isolation_env("/tmp/autoforge-opencode-1"), id="host-launch"),
+        pytest.param(HOSTILE_OPENCODE_SETTINGS, id="undone"),
+    ],
+)
+def test_the_cli_s_isolation_is_set_whatever_the_launch_held(provider, profile, name, inherited):
+    """OpenCode's isolation variables hold the controller's values in the container,
+    whether the launch's environment held none, the host launch's (whose configuration
+    directory is a host path) or values that undo them; what it held is withheld."""
+    plan = _plan(provider, profile, {**inherited, name: SENTINEL})
+    received = plan.container_environment()
+    for variable, value in ISOLATION[provider.name].items():
+        assert received[variable] == value
+    assert received.get("OPENCODE_CONFIG_DIR", HOME_TARGET + "/").startswith(HOME_TARGET + "/")
+    assert {k for k, v in inherited.items() if v} <= set(plan.withheld)
+    if not ISOLATION[provider.name]:
+        assert not set(inherited) & set(received)
+
+
+@pytest.mark.parametrize(("provider", "profile", "name"), ROUTES)
+def test_a_container_launch_keeps_the_isolation_of_every_launch(provider, profile, name):
+    """ADR 0013 D7: every launch keeps today's isolation. Claude Code's and Pi's is on
+    the argv a container launch runs unchanged; OpenCode's is the same variables, and
+    the same values, as its host launch sets (#165), but for a configuration directory
+    of the private home, so a variable added there cannot be missed here."""
+    routes = provider.credential_routes(profile)
+    argv = provider.build_command_for(profile, "PROMPT-290")
+    if provider.name == "claude":
+        assert set(CLAUDE_ISOLATION_FLAGS) <= set(argv) and routes.isolation == ()
+    elif provider.name == "pi":
+        assert {"--no-extensions", "--no-skills", "--no-approve"} <= set(argv)
+        assert routes.isolation == ()
+    else:
+        declared = dict(routes.isolation)
+        assert set(declared) == set(OpenCodeProvider.isolation_names)
+        host = opencode_isolation_env("")
+        assert {k: v for k, v in declared.items() if k != "OPENCODE_CONFIG_DIR"} == {
+            k: v for k, v in host.items() if k != "OPENCODE_CONFIG_DIR"
+        }
+        assert declared == ISOLATION["opencode"]
+    for variable in dict(routes.isolation):
+        assert not credential_looking(variable) and not undoes_isolation(variable)
 
 
 # -- one credential, chosen by the operator -------------------------------------------
@@ -825,6 +946,66 @@ def test_a_store_at_a_host_path_is_never_selected(provider, profile, name, tmp_p
     _, result, report = _launch(container, provider, profile, env)
     assert result.exit_code == 0, result.stderr
     assert report["store"] == next(iter(PRIVATE_STORES[provider.name].values()))
+
+
+def _hostile_workspace(container: Container) -> None:
+    """The repository under work configures OpenCode: an ``opencode.json`` naming an
+    MCP server and a ``.opencode/plugin``, and an explicit file and a global
+    directory for the operator's undoing variables to name."""
+    workspace = container.workspace
+    server = {"type": "local", "command": ["gh-mcp"]}
+    (workspace / "opencode.json").write_text(json.dumps({"mcp": {"repo-gh": server}}))
+    (workspace / ".opencode" / "plugin").mkdir(parents=True)
+    (workspace / ".opencode" / "plugin" / "p.js").write_text("export const P = 1\n")
+    (workspace / "explicit.json").write_text(json.dumps({"mcp": {"explicit-gh": server}}))
+    (workspace / "global" / "plugin").mkdir(parents=True)
+    (workspace / "global" / "opencode.json").write_text(json.dumps({"mcp": {"global-gh": server}}))
+    (workspace / "global" / "plugin" / "g.js").write_text("export const G = 1\n")
+
+
+@pytest.mark.parametrize(("provider", "profile", "name"), OPENCODE_ROUTES)
+def test_opencode_loads_no_integration_of_the_repository_or_the_shell(
+    provider, profile, name, tmp_path, monkeypatch
+):
+    """ADR 0013 D7 with the fake CLI, which resolves its configuration as 2.x does: the
+    workspace configures an MCP server and a plugin, and the operator's shell forwards
+    variables that undo the isolation. Two controls: the plan's environment without
+    its isolation variables loads the repository's server and plugin (the contract
+    before #290's round 2); the shell's variables passed on load every one. Under the
+    plan OpenCode loads none, from an empty configuration directory of the private
+    home, and authenticates with the projected key."""
+    shell = {**_host_environment(provider, profile, name), **HOSTILE_OPENCODE_SETTINGS}
+    env = _launch_environment(monkeypatch, provider, shell)
+    plan = _plan(provider, profile, env)
+    projected = client_environment({}, plan.projection)
+
+    control = Container.make(tmp_path / "control")
+    _hostile_workspace(control)
+    bare = {k: v for k, v in plan.container_environment().items() if k not in ISOLATION["opencode"]}
+    result, report = _run(control, provider, profile, {**bare, **projected})
+    assert result.exit_code == 0, result.stderr
+    assert report["configuration"]["mcp"] == ["repo-gh"]
+    assert report["configuration"]["plugins"] == ["/workspace/.opencode/plugin/p.js"]
+
+    passed_on = Container.make(tmp_path / "passed-on")
+    _hostile_workspace(passed_on)
+    inherited = {key: env[key] for key in env if key not in {"HOME", "PATH"}}
+    _, report = _run(passed_on, provider, profile, {**inherited, "HOME": "/home/agent"})
+    assert report["configuration"]["mcp"] == ["content-gh", "explicit-gh", "global-gh", "repo-gh"]
+    assert len(report["configuration"]["plugins"]) == 2
+
+    container = Container.make(tmp_path / "launch")
+    _hostile_workspace(container)
+    _, result, report = _launch(container, provider, profile, env)
+    assert result.exit_code == 0, result.stderr
+    assert report["configuration"] == {
+        "dir": "/home/agent/.config/opencode",
+        "dir_existed": False,
+        "mcp": [],
+        "plugins": [],
+    }
+    assert report["source"] == f"env:{name}" and report["digest"] == digest(SENTINEL)
+    assert set(HOSTILE_OPENCODE_SETTINGS) <= set(plan.withheld)
 
 
 def _files(root: Path) -> list[Path]:
