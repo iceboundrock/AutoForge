@@ -182,6 +182,8 @@ COVERAGE: Mapping[str, Entry] = {
     # #270: the container policy and its measurement, unreachable before #271.
     "src/autoforge/sandbox_container.py": ("test_sandbox_backend",),
     "src/autoforge/container_measure.py": ("test_sandbox_container", "test_sandbox_backend"),
+    # #290: each provider's credential mapping, unreachable before #271.
+    "src/autoforge/container_auth.py": ("test_sandbox_container",),
     "src/autoforge/sandbox_lifecycle.py": ("test_sandbox_gate", "test_engine_sandbox"),
     "src/autoforge/sandbox_pin.py": ("test_cli", "test_state", "test_worker", "test_engine"),
     "src/autoforge/sandbox_policy.py": ("test_engine_sandbox", "test_engine"),

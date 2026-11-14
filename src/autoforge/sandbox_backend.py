@@ -220,7 +220,10 @@ class LaunchInputs:
     directories (ADR 0005 D8.4 as amended; #269), "" for a launch that
     exports nothing: an exporter's export directory is that path or the
     export is refused, and the verify step reads an artifact from nowhere
-    else. #290 adds the credential projection's items.
+    else. The credential projection is not an input here: it is made from
+    the provider's declaration and the launch's environment when the
+    launch is described (``autoforge.container_auth.plan_credentials``,
+    #290), and #271 hands it to the launch container's create.
     """
 
     owner: LaunchOwner

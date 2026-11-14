@@ -1155,6 +1155,25 @@ exactly when `tests/sandbox_host.py` measures the host capable
   skips). It skips with the reason
   wherever it is not opted into or the runtime cannot run a rootless
   container, and has not run on a capable host yet.
+- `tests/test_container_auth.py` (#290) is ADR 0013 §7's list for #290,
+  with fake credentials, the real adapters' declarations and no runtime.
+  Each supported route of Claude Code, OpenCode and Pi maps to the
+  environment variable on both staging forms: the projection passes #270's
+  checks, the create names the variable and holds no value, and the
+  runtime client's environment holds it. The value is in no fact,
+  description, `repr`, refusal or pickle, and no helper container takes
+  the projection. Two Claude routes at once, no credential, a gateway or
+  cloud switch, an unmapped model provider, a provider with no mapping
+  (the SDK providers, the scripted one), Pi's ChatGPT sign-in and a
+  rotating refresh token are each refused. A stored login (Claude Code's
+  file and directory, OpenCode's database, Pi's agent directory, each
+  holding a fake credential on a fake host) is never projected, is named
+  as not projected, and keeps its bytes and its time. A relaunch after the
+  operator rotated the key gets a new projection with the new value; an
+  export command's launch class is refused and its allow-list passes no
+  route's variable; other credential-looking variables are withheld. The
+  redaction table of `github-safety.md` is pinned: each routed key's shape
+  is redacted, and the name column, recognised or not, is asserted.
 
 The existing executor and duplex suites are the no-description regression:
 they run unchanged.

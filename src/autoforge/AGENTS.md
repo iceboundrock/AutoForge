@@ -98,6 +98,12 @@ sandbox_container.py  the container backend's security policy (ADR 0013 D9, D10,
 container_measure.py  what a container enforced, observed from inside as the agent and
                     printed as JSON for the judge; standard library only, imports
                     nothing of the package, so the image carries it alone (#270)
+container_auth.py   each provider's model credential under the container backend (ADR
+                    0013 D14): from an adapter's credential_routes and the launch's
+                    environment, one variable projected by #270's environment mechanism,
+                    or a refusal naming variables and kinds, never a value; a rotating
+                    or stored login never projected, other credential-looking variables
+                    withheld, agent launches only; pure, unreachable before #271 (#290)
 git_input.py        a launch's git input (ADR 0013 D4): the bound revision, typed and
                     immutable (phase, launch, repository, object format, seed, lower
                     boundary, carried commit, seed manifest digest), its entry and
@@ -379,6 +385,9 @@ sandbox_container.py, container_measure.py        -> the same, + ADR 0013 D9, D1
                                                      D16 and D18, and docs/agent-guides/
                                                      github-safety.md (Container launch
                                                      threat model)
+container_auth.py, providers.py
+(credential_routes)                               -> the same, + docs/agent-guides/github-
+                                                     safety.md (Provider credential mapping)
 sandbox_policy.py, providers.py
 (sandbox_requirements), engine.py (launch
 routing, sandbox directories, the pre-launch
