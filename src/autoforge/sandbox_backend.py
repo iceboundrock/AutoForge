@@ -83,7 +83,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from . import sandbox_bwrap
-from .errors import SandboxLaunchRefusedError
+from .errors import SandboxCapabilityError, SandboxLaunchRefusedError
 from .git_input import LaunchGitInput
 from .sandbox import (
     BackendKind,
@@ -101,6 +101,11 @@ from .sandbox_bwrap import ProbeResult as ProbeResult
 # The network position of a helper container: no interface but loopback
 # (ADR 0013 D9).
 NETWORK_NONE = "none"
+# A launch container's other position: a network namespace of its own on the
+# runtime's rootless network, never the host's (D9). These two are every
+# position a container may be created with; ``host`` is none of them.
+NETWORK_BRIDGE = "bridge"
+CONTAINER_NETWORKS = frozenset({NETWORK_BRIDGE, NETWORK_NONE})
 
 
 class PreparedLaunch(Protocol):
@@ -163,6 +168,27 @@ class RuntimeReport:
 
 
 BWRAP_RUNTIME = RuntimeReport(BackendKind.BWRAP)
+
+
+def runtime_refusal(report: RuntimeReport) -> SandboxCapabilityError | None:
+    """Why the runtime check's ``report`` refuses the command, or ``None`` (ADR 0013 D10).
+
+    Rootless only: a container runtime that does not report itself rootless
+    (Docker Engine running as root, rootful Podman, Docker Desktop's engine,
+    or one whose report says nothing) is refused before reconciliation,
+    before anything of the step is saved or launched. Its API socket would be
+    root-equivalent authority one socket away from every agent. bwrap has no
+    runtime to report and is never refused here.
+    """
+    if report.backend is not BackendKind.CONTAINER or report.rootless is True:
+        return None
+    product = report.product or "the container runtime"
+    said = "reports itself rootful" if report.rootless is False else "does not say it is rootless"
+    return SandboxCapabilityError(
+        f"{product} {said}, and the container backend runs only on a rootless runtime "
+        "(ADR 0013 D10); nothing was reconciled, saved or launched",
+        capability="rootless",
+    )
 
 
 @dataclass(frozen=True)

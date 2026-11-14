@@ -174,8 +174,11 @@ One backend exists, Bubblewrap, and everything in this section is about
 it. A container backend, running agents and repository commands in a
 rootless Docker Engine or Podman container, is designed in
 [ADR 0013](adr/0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md)
-and not implemented: there is no `sandbox.backend` key, and no launch uses
-a container runtime.
+and not selectable: parts of it exist (the lifecycle seam, the import of
+an exported candidate, and the security policy that
+[Security](security.md#the-container-backend-is-not-selectable-yet)
+describes), but there is no `sandbox.backend` key, and no launch uses a
+container runtime.
 
 The outer sandbox is experimental: it is opt-in enforcement on a host that
 can enforce it, and it becomes supported only once a `make test-sandbox`

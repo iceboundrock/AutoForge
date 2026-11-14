@@ -802,6 +802,44 @@ fact, and `describe()` says which backend enforced a launch, never a
 bare "sandboxed". A field bwrap leaves empty is not recorded, so a bwrap
 record is unchanged.
 
+**The container security policy (ADR 0013 D9, D10, D12's bind sources,
+D14's mechanisms; #270)**, in two modules. Nothing reaches them before
+#271 builds the container backend and #273 makes it selectable:
+
+- **`sandbox_container.py`** (executor layer) is the only module that
+  writes a container runtime flag, as `sandbox_bwrap.py` is for bwrap. A
+  `ContainerSpec` holds what a create configures that the policy decides,
+  typed, with no field for a raw flag, mount or option: the role (launch,
+  stager, exporter), its `ContainerNetwork` (`bridge` or `none`; the enum
+  has no host member, and `network_for()` maps D9's table), the workspace
+  and cache volumes by name, the staging root bound at `/source` in the
+  bind form, and the launch container's `Projection`. `check_spec()`
+  refuses what D9, D10, D12 and D14 forbid, and `create_argv()` renders
+  the checked spec into `create`'s arguments: the watcher's numeric UID
+  for PID 1, every capability dropped, `no-new-privileges`, a read-only
+  root (Podman's `--read-only-tmpfs=false` keeps `/run` and `/var/tmp`
+  read-only), a PID limit, a private IPC namespace, `--pull=never`, a
+  tmpfs `/tmp` and an agent-owned tmpfs home, the volumes, the read-only
+  binds, and each projected variable by name alone. Its value goes only
+  into the runtime client's environment (`client_environment()`), and a
+  value found on any argument refuses the create. `exec_argv()` runs a
+  command as the agent's UID, with no environment option.
+  `sandbox_backend.runtime_refusal()` refuses a container runtime that
+  does not report itself rootless, and `enter()` applies it before
+  reconciliation; the lifecycle refuses a launch container whose network
+  is not one of `CONTAINER_NETWORKS`.
+- **`container_measure.py`** runs inside a container, as the agent, and
+  prints what the runtime actually enforced: identity, capabilities,
+  `NoNewPrivs`, seccomp, mounts, `pids.max`, writability, the keyring,
+  loopback and abstract-socket reachability, routes, and where fake
+  credentials appear. It imports only the standard library, so the image
+  can carry it alone (#271). `sandbox_container.judge()` judges its
+  output against an `Expectation` built from the spec and names each
+  missing item as a `ContainerCapability`: what the probe (#271, #273)
+  refuses a host for. The agent's UID mapping is judged from the map the
+  host reads for the container's PID 1, never the one seen inside, which
+  is relative to the parent user namespace.
+
 #### Launch routing (ADR 0005, #168)
 
 When the outer sandbox is enforced (`sandbox.mode: required`, or

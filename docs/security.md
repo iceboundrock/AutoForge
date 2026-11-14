@@ -212,6 +212,46 @@ mode anyway, repeat the command with `--accept-config-change`: the change
 is written to the run log first, and the run is pinned to the new mode.
 A stronger mode is pinned without asking. `autoforge status` shows the pin.
 
+### The container backend is not selectable yet
+
+A second sandbox backend, rootless Docker or Podman containers, is
+designed
+([ADR 0013](adr/0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md))
+and partly implemented, and no configuration can select it until
+[#273](https://github.com/iceboundrock/AutoForge/issues/273) lands. Its
+security policy is in place and tested without a runtime; it has not run
+on a real runtime yet. When it is selectable, expect this:
+
+- **Rootless only.** A runtime running as root, Docker Desktop's included,
+  is refused before anything of a step is saved or launched. The agent runs
+  as a fixed non-root UID that maps to one of your subordinate UIDs
+  (`/etc/subuid`), never to yours, with every capability dropped,
+  `no-new-privileges`, a read-only root filesystem, the runtime's default
+  seccomp profile and a PID limit. The runtime itself, and an escape from
+  a container, still carry your UID's authority.
+- **No host path but two kinds, read-only:** the launch's staged copy of
+  the repository, and a model credential file where one is delivered. Your
+  home, `~/.ssh`, gh's and git's credentials, the repository's `.git` and
+  the runtime's own socket are never mounted, and no setting adds a mount,
+  a device, `--privileged` or a host namespace.
+- **The model credential reaches only the agent's own container,** as an
+  environment variable whose value is on no command line, or as a
+  read-only file (a file must be readable by others, in a directory only
+  you can enter). Every tool in that container can read it, and the
+  runtime keeps a variable's value in its record of the container until
+  the container is removed.
+- **The network is the container's own, not your host's.** Your host's
+  loopback services and abstract sockets are unreachable, which a probe
+  must prove before a host is accepted. Everything else is reachable: the
+  internet, your LAN (a service listening on a LAN or wildcard address
+  included) and cloud metadata addresses. This does not restrict traffic
+  to model endpoints, so an agent can still send its own model credential
+  anywhere (#257's residuals R3 and R4; egress control is
+  [#294](https://github.com/iceboundrock/AutoForge/issues/294), later).
+
+The full threat model, its capability matrix and the residuals are in
+[GitHub safety](agent-guides/github-safety.md#container-launch-threat-model-adr-0013-d18-270).
+
 ### Redaction is a baseline
 
 Redaction recognises well-known shapes and variable names and makes no

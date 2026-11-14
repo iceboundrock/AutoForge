@@ -1039,6 +1039,55 @@ exactly when `tests/sandbox_host.py` measures the host capable
   entry, its persisted identity read back strictly, and the seed
   manifest's digest (a swapped manifest, a link, a FIFO and an oversized
   file refused).
+- `tests/test_sandbox_container.py` (#270) needs no runtime. Every create
+  the policy can render (each runtime, role, network, staging form, cache
+  and projection) carries the numeric watcher UID, `--cap-drop=ALL`,
+  `no-new-privileges`, `--read-only`, the PID limit, a private IPC
+  namespace and `--pull=never`, and none of the flags that grant, undo or
+  widen them (`--privileged`, `--cap-add`, `--device`, `-v`, a host or
+  user-namespace mode, a seccomp, AppArmor or label override, an
+  environment file); its network is `bridge`, `pasta` or `none`, never
+  the host's; its writable mounts are the tmpfs `/tmp` and home, the
+  workspace volume (not the exporter's) and the cache, and its binds are
+  exactly the staging root at `/source` and the projection's files,
+  read-only. A helper container on the bridge, or with a projection or a
+  cache, is refused, and so is any configuration key for a raw flag,
+  mount, device or `--privileged`. With fake credentials: a variable's
+  value is on no argument, in no `repr` or pickle, only in the runtime
+  client's environment, and a value found on an argument refuses the
+  create; a variable the client reads or that hands over a credential
+  (`GH_TOKEN`, `SSH_AUTH_SOCK`, `DOCKER_HOST`, `PODMAN_USERNS`, `HOME`,
+  `LD_PRELOAD`, the proxies) is refused; a credential file under the fake
+  home's `~/.ssh`, gh's or git's configuration, `~/.git-credentials`,
+  `~/.netrc`, `~/.gnupg` or the keyrings, the home itself, a runtime
+  socket, a path under `/run` or `$XDG_RUNTIME_DIR`, a link anywhere in
+  the path, a directory or FIFO, a `0600` file (unreadable by the
+  agent's subordinate UID), a file every local user can read, one the
+  operator does not own, a target outside the home and a path that would
+  end the mount's field are refused, and on a copy-in runtime every file
+  is. `runtime_refusal()` refuses a rootful runtime and one that does not
+  say. The judge passes a recorded observation of a compliant container
+  and names each item a changed observation breaks (the UID map the host
+  reads for PID 1, a keep-id-style or identity map, capabilities,
+  `NoNewPrivs`, seccomp, a writable root, an extra mount, `pids.max`,
+  writability, the keyring, the loopback nonce, the abstract socket,
+  interfaces and routes under `none`, a sentinel outside the projection);
+  an observation that does not parse fails every item. The measurement
+  itself runs on this host as a plain process, with a real loopback
+  listener, abstract socket and fake credentials, and the judge must
+  refuse it: its own negative control.
+- `tests/test_sandbox_lifecycle.py` also refuses, at a command's entry, a
+  runtime that reports itself rootful or does not say, with nothing
+  reconciled, journaled or probed, and before the journal write a launch
+  container whose network is `host` or another container's.
+- `tests/test_container_security_real.py` (#270) is ADR 0013 §7's real
+  runtime list for #270, opt-in (`docs/development.md`, "The outer
+  sandbox"): a container created as the policy renders it, measured as
+  the agent and judged, on the bridge with an environment and a file
+  credential and with `--network none`; the runtime's record holds no
+  sentinel but the projected variable's. It skips with the reason
+  wherever it is not opted into or the runtime cannot run a rootless
+  container, and has not run on a capable host yet.
 
 The existing executor and duplex suites are the no-description regression:
 they run unchanged.

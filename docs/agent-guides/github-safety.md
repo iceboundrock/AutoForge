@@ -2298,6 +2298,257 @@ hard-link, sandbox-directory and loopback-listener reports:
 [Usage: outer sandbox](../usage.md#outer-sandbox)). `preferred` means
 `required` (ADR 0009 D7): no launch falls back to logical isolation.
 
+### Container launch threat model (ADR 0013 D18, #270)
+
+ADR 0013 D18, recorded here by #270. It describes launches under
+`sandbox.backend: container`, which no configuration can select before
+#273; until then every enforced launch is bwrap's and the section above
+is the whole model. The policy below is implemented
+(`src/autoforge/sandbox_container.py`) and tested without a runtime; its
+real-runtime tests (`tests/test_container_security_real.py`) are opt-in
+and have not run on a capable host yet, so nothing below is a measured
+claim about Docker or Podman. The actors are ADR 0005 §2.2's.
+
+**Rootless only (D10).** A runtime that does not report itself rootless
+(Docker Engine as root, rootful Podman, Docker Desktop's engine) is refused
+at the runtime check, before reconciliation and before anything of the
+step is saved or launched (`sandbox_backend.runtime_refusal`). The trust
+boundary under a rootless runtime:
+
+- the runtime, and every container, run as the operator's UID on the host,
+  which is what container root maps to. A container escape, a runtime bug
+  or the runtime's API therefore carries the operator's authority, never
+  root's, as under bwrap;
+- the agent and repository commands run as UID 10001 inside, which the
+  user namespace maps to one of the operator's subordinate UIDs
+  (`/etc/subuid`), never to the operator's own and never as container
+  root; PID 1, the watcher, runs as UID 10002. A file the agent writes in
+  `/workspace` is owned on the host by that subordinate UID, in the
+  runtime's storage of the volume. An escape lands as a UID that owns none
+  of the operator's files;
+- every capability is dropped (`--cap-drop=ALL`, none added), so the agent
+  cannot signal the watcher, change an owner or mount anything;
+  `no-new-privileges` keeps a setuid file in the image from giving one
+  back; the runtime's default seccomp profile applies, never overridden;
+- the runtime's API socket (rootless Docker's lives under
+  `$XDG_RUNTIME_DIR`) is authority equal to the operator's. It is never
+  mounted: `/run` and `$XDG_RUNTIME_DIR` are forbidden bind sources, a
+  socket is never a credential file, and host loopback is unreachable.
+  The daemon's own privilege is the operator's.
+
+**What an enforced container launch guarantees,** against ADR 0005's G1
+to G6:
+
+- **G1 holds, and is stronger.** No host path is visible but the closed
+  set of bind sources below, read-only. Controller state, logs, the lock,
+  the checkout, the worktrees and the common dir are absent.
+- **G2 holds.** Host credentials, sockets and keyrings are absent, and the
+  runtime socket is never mounted. A host abstract socket and host
+  loopback are unreachable from the container's network namespace.
+- **G3 is amended.** No host process is visible or can be signalled. The
+  runtime client, the executor's child, is outside the container.
+- **G4 holds.** Writes land only in `/workspace`, the cache volume, the
+  private home and `/tmp`, and in the shared memory and message queues of
+  the container's own IPC namespace. The root is read-only.
+- **G5 holds, and is stronger.** No shared repository state is visible;
+  the candidate comes back only as an untrusted, strictly imported pack.
+- **G6 is amended.** Nothing outlives the invocation on any path the
+  controller runs; after the controller's death, ADR 0013 D6's bound
+  applies (#272).
+
+**The closed set of bind sources (D12).** In the bind form, a launch binds
+exactly these, each read-only, each journaled and existing before its
+container's create:
+
+- the launch's staging root at `/source`, into its stager container and
+  its launch container;
+- a credential file D14 delivers, into the launch container only, at its
+  path in the private home.
+
+Nothing else is bound into a launch's containers: no host home, no `.git`
+common dir or worktree admin dir, no SSH or credential-manager socket, no
+runtime socket, no operator-chosen or repository-chosen path. The
+exporter binds nothing, and the copy-in form binds nothing. A bind source
+must resolve to itself: a symbolic link anywhere in its path is refused,
+since a bind follows it and what it names could change after the check.
+A path holding a comma or a quote is refused, since it would end the
+mount's field. The runtime never relabels a bind source (no `z` or `Z`).
+
+**The network (D9).** No container is created on the host's network
+namespace: the only positions are the bridge and `none`, and the
+lifecycle refuses any other before the journal is written.
+
+| Launch | bwrap (unchanged) | Container |
+|---|---|---|
+| agent | the host network namespace, host abstract sockets scoped out by Landlock | the bridge: a namespace of its own on the runtime's rootless network (Docker's `bridge`, Podman's `pasta`) |
+| export command, `*_network: host` (the default) | the host network namespace | the bridge; for a container, `host` means outbound access, never the host's namespace |
+| export command, `*_network: isolated` | `--unshare-net` | `--network none` |
+| stager, exporter | — | `--network none` |
+
+What a container on the bridge still reaches, stated rather than claimed
+away:
+
+- **general egress, and DNS:** any address on the internet and on the
+  operator's LAN, every service there included. A container daemon or a
+  debugger listening on a LAN or wildcard address, or a port the host
+  publishes on its own LAN address, is reachable. Bridge networking does
+  not restrict traffic to model endpoints, and "network sandboxed" is never
+  claimed; egress mediation is #294, after the MVP;
+- **the bridge's gateway:** reachable as an address, but host loopback is
+  not behind it. Podman's `pasta` is given no option, so Podman's own
+  `--no-map-gw`, `-T none` and `-U none` hold (no host access through the
+  gateway address, no forwarding of the container's loopback ports to the
+  host's); rootless Docker's RootlessKit closes host loopback with its
+  `--disable-host-loopback`, the daemon's default. Both are what the probe
+  must prove, by a nonce listener on `127.0.0.1` and `::1` that must not
+  answer from the container's own loopback, the gateway or the runtimes'
+  host aliases: a host where it answers is refused;
+- **link-local addresses,** a cloud instance's metadata service
+  (`169.254.169.254`) among them, as general egress: not blocked. On a
+  cloud host whose metadata service hands out credentials, that is an
+  exposure the operator must close outside AutoForge.
+
+**#257's residuals R3 and R4, on the container backend:**
+
+- **R3: the model credential is readable by every tool in its launch**
+  (confirmed, by design). An agent that holds its model credential and has
+  general outbound access can send it anywhere. A container does not
+  prevent that: it keeps the credential out of every other launch, the
+  helper containers included, and keeps every other credential out of
+  this one. #294 narrows the channel and cannot close it.
+- **R4: network egress and loopback.** Loopback is closed (above); egress
+  is not, and moves to #294 for containers.
+
+**The credential-delivery mechanisms (D14), a closed set,** each refused
+for any container but the launch container:
+
+- **an environment variable.** The create names it alone
+  (`--env NAME`); the runtime client reads the value from its own
+  environment, so the value is on no argument of any process, and a value
+  found on one refuses the create. A name the runtime client, a shell or
+  the loader reads (`DOCKER_*`, `CONTAINER_*`, `CONTAINERS_*`, `PODMAN_*`,
+  `XDG_*`, `LD_*`, `HOME`, `PATH`, the proxy variables) or one that would
+  hand over a GitHub or git credential or undo isolation (`GH_TOKEN`,
+  `GITHUB_TOKEN`, `SSH_AUTH_SOCK`, `GIT_ASKPASS`, ...) is refused. The
+  value persists in the runtime's record of the container, which
+  `inspect` shows, until the container is removed: storage the operator
+  owns, and a residual. Diagnostics never print a container's environment;
+- **a read-only file, on a bind runtime only,** at its path in the
+  private home. A copy-in runtime would have to read the file to send it,
+  which ADR 0005 D7.2 forbids, so it delivers only variables. The file
+  must be a regular file the operator owns, outside D4.3's forbidden
+  sources (`~/.ssh`, gh's and git's configuration, `~/.git-credentials`,
+  `~/.netrc`, keyrings, `/run`, `$XDG_RUNTIME_DIR`), and readable by the
+  agent: the agent's subordinate UID reads it only through its
+  permission bits for others, so a `0600` file is refused rather than
+  delivered unusable. Since that makes it readable by every local user
+  who can reach it, a directory above it must deny others search (a
+  `0700` directory holding a `0644` file). Its content stays out of the
+  runtime's record.
+
+Every projected value is held as a `Secret`, which no `repr`, string or
+pickle shows. Long-lived login and refresh state stays on the host; a
+container gets a per-launch projection and nothing else (D14). Which
+mechanism each provider uses, and its refresh story, is #290's; removing a
+projection at the release and in reconciliation is #272's.
+
+**The capability matrix.** Each resource of ADR 0005 §2.5, as a container
+launch gets it. "Measured" names what `container_measure.py` observes
+inside and `sandbox_container.judge()` checks, which is what the probe
+(#271, #273) refuses a host for.
+
+| Resource (ADR 0005 §2.5) | Container launch | Enforced by, or refused |
+|---|---|---|
+| workspace | `/workspace`: a volume per launch, seeded from the bound revision; read-only for the exporter | the create's volume mount; writability measured |
+| the workspace's `.git` entry | the private repository inside `/workspace`, agent data; the host never runs git over it | no host `.git` bound (closed set) |
+| the worktree's own admin dir `<common>/worktrees/<id>` | absent: a container launch has no host worktree | refused as a bind source |
+| git common dir (`config`, `hooks`, `refs`, `packed-refs`, `info`, and every entry not masked) | absent | refused as a bind source; mounts measured |
+| git objects | the seed pack, unpacked inside; the candidate leaves only as an exported pack, imported strictly | ADR 0013 D4, D5 (#269, #292) |
+| `<common>/modules` (the main worktree's submodule repositories) | absent | refused as a bind source |
+| `<common>/autoforge` (lock, worktrees root, sandbox dirs) | absent, but for the launch's own staging root at `/source`, read-only | the closed set; mounts measured |
+| `<git dir>/autoforge` (LOCAL state) | absent (LOCAL is removed) | refused as a bind source |
+| other worktrees and their admin dirs | absent | refused as a bind source |
+| the REMOTE controller checkout, `.autoforge/` state and run logs | absent | refused as a bind source |
+| per-launch read context (ADR 0004 D10.2) | a copy in the staging root, or copied in; its state directory is never bound | ADR 0013 D12 |
+| temp (`/tmp`, `TMPDIR`) | a tmpfs per container, `1777`; the IPC namespace's own `/dev/shm` and `/dev/mqueue` | `--tmpfs`, `--ipc=private`; writability measured |
+| home (`HOME`, `XDG_*`) | a tmpfs per container at `/home/agent`, `0700`, owned by the agent | `--tmpfs` with the agent's UID; writability measured |
+| build and tool cache (`XDG_CACHE_HOME`) | a per-issue volume at `/cache` for a change-producing launch container; none for `REVIEW` or an export command | the spec refuses a cache on a helper container |
+| provider executables and libraries | the image's (ADR 0013 D7, #271), never a host install root | no host path bound |
+| system runtime | the image's root filesystem, read-only | `--read-only` (Podman also `--read-only-tmpfs=false`); measured |
+| operator-declared read-only paths | refused under the container backend (ADR 0005 D15.4 as amended) | `read_only_paths` refused at load (#273) |
+| provider configuration | the image's, or written into the private home by the launch | #290, #271 |
+| provider model auth | a projected variable, or a read-only file in the home on a bind runtime | D14's mechanisms above; sentinels measured |
+| GitHub and git credentials | absent | never bound; their variables refused for projection; sentinels measured |
+| SSH (`~/.ssh`, the agent socket) | absent | refused as a bind source; `SSH_AUTH_SOCK` refused for projection |
+| keyrings, D-Bus, path-named IPC sockets, `/run`, `$XDG_RUNTIME_DIR` | absent; the container's own IPC namespace; no host keyring key | refused as bind sources; the runtime's session keyring and seccomp; the keyring measured |
+| `/var`, `/opt`, `/srv`, `/mnt`, `/media`, other homes | the image's, read-only | `--read-only`; mounts and writability measured |
+| unrelated repositories and files | absent | no host path but the closed set |
+| `/proc` | a new procfs in the container's own PID namespace, as the runtime masks it | the runtime; never `--pid=host` |
+| `/dev` | the runtime's minimal device set; no device added | never `--device` or `--privileged` |
+| `/sys` | read-only, as the runtime mounts it for an unprivileged container | the runtime; not measured on its own |
+| network | the bridge or `none`, as the table above | D9; loopback, abstract socket, interfaces and routes measured |
+
+And the properties the policy adds, each measured:
+
+| Property | Mechanism | Measured as |
+|---|---|---|
+| non-root agent on a subordinate UID | `--user` for PID 1, `exec --user=10001:10001` | the UID map the host reads for PID 1; `Uid` and `Gid` |
+| no capability | `--cap-drop=ALL` | `CapInh`, `CapPrm`, `CapEff`, `CapBnd`, `CapAmb` all zero |
+| no privilege gain | `--security-opt=no-new-privileges` | `NoNewPrivs: 1` |
+| the default seccomp profile | no seccomp option | `Seccomp: 2` |
+| a PID limit | `--pids-limit=4096` | the cgroup's `pids.max` |
+| no mount but the policy's | the closed set; the runtime's own `/etc/hosts`, `/etc/hostname`, `/etc/resolv.conf` and `/run/.containerenv` | every mount point in `mountinfo` |
+| no credential outside the projection | the projection alone | fake sentinels searched in the environment and the files |
+
+**What a container does not reproduce, refused rather than claimed:**
+
+- bwrap's Landlock abstract-socket scope (ADR 0005 D9.1). A network
+  namespace of the container's own replaces it; the probe proves a host
+  abstract socket unreachable, and a host where it answers is refused;
+- `LOCAL_AGENT` and `LOCAL_VALIDATION`: LOCAL mode is removed (ADR 0009),
+  and nothing runs on the host instead of a container (ADR 0013 D15);
+- operator-declared read-only paths, refused rather than bound;
+- memory and CPU limits: none is set, as under bwrap; resource exhaustion
+  beyond the PID limit and the tmpfs bounds stays out of scope (ADR 0005
+  §2.2). No raw flag, mount, device, `--privileged` or host-namespace
+  option exists in any configuration to add one.
+
+**Threats and residuals (D18):**
+
+| Threat | Mitigation | Residual |
+|---|---|---|
+| the host runtime socket | never mounted; forbidden by path; host loopback unreachable; the controller's own runtime calls use an empty client configuration (#271) | a daemon on a LAN or wildcard TCP address, reachable through egress |
+| root | rootless only; a non-root agent UID on a subordinate UID; no capability | a kernel, runc or crun exploit lands as the operator's UID: outside the threat model, as a kernel or `bwrap` exploit is |
+| the filesystem | no host path but the bind sources; a read-only root; per-launch volumes | the image's content and its base image's provenance are the operator's |
+| the network | its own namespace; host loopback and abstract sockets unreachable | general egress and DNS (#294) |
+| secrets | a projection per launch, on the launch container only, never on a helper container; no GitHub credential anywhere; no value on an argument | every tool in the container can read the projected model credential (R3); a variable's value persists in the runtime's record until removal |
+| repository hooks | the repository's hooks, filters and configuration run only inside, under the agent's own git; the host never runs git over the container's repository | none on the host |
+
+**Out of scope, as in ADR 0005:** kernel and runtime exploits, a
+malicious operator, network egress, resource exhaustion beyond the stated
+limits, side channels, and credentials the operator deliberately projects.
+A survivor of a killed controller is in scope, and bounded (#272).
+
+**Interactive tooling is not a model.** The
+[Dev Containers specification](https://containers.dev/) and its
+[secrets proposal](https://github.com/devcontainers/spec/blob/main/docs/specs/secrets-support.md)
+supply configuration and lifecycle secrets, not an OAuth broker, and VS
+Code's
+[Git and SSH credential forwarding](https://code.visualstudio.com/remote/advancedcontainers/sharing-git-credentials)
+relays live authority into the container for a developer's own session.
+Neither fits an unattended agent exposed to prompt injection, with the
+controller as the only holder of GitHub write authority: AutoForge adopts
+"identity stays on the host, the container is replaceable" and rejects
+every mechanism that forwards live authority (credential-helper, SSH-agent
+and runtime-socket forwarding, `initializeCommand` on the host, and
+repository-chosen `mounts`, `runArgs` or `privileged`). Passing a secret
+as `docker exec -e NAME=VALUE`, a `remoteEnv` value or a secrets file
+whose values land on an argument is not enough either
+([devcontainers/cli#1317](https://github.com/devcontainers/cli/issues/1317)):
+no value is ever on an argument here. The unit tests search every create's
+arguments for fake sentinels, and the opt-in real-runtime tests the
+container's environment, its files and the runtime's record too.
+
 ## Merge safety
 
 `MERGE` has no agent profile. The controller performs the merge itself (`gh pr merge` via `GitHubClient`, bound to the reviewed HEAD) behind the merge safety gate; agents are never asked to merge, and `common.md` rule "never merge a pull request" is unconditional.
