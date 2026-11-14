@@ -5,6 +5,23 @@ so.
 
 ## Unreleased
 
+### `run` no longer replaces a stopped run that owns a PR without `--force` (#483)
+
+A plain `run` used to replace a `BLOCKED` or `FAILED` run unless it held
+operator actions. If that run owned an open PR, its review history went with
+the state file, while the PR's marker still named the old run. The new run
+then stopped at the PR (`pr-owner`) and, after a take-over, at the old
+run's review comment, and the operator had to clean up GitHub by hand. Now
+`run` exits 2 over such a run and changes nothing. A run owns a PR once its
+state is bound to one, or once its saved plan may have opened, adopted or
+taken one over. The refusal names the PR, says whether `unblock` and
+`resume` continue the run (they do for a `BLOCKED` run without a replan
+journal), and says what `run --force` leaves on GitHub. `run --force` still
+replaces any run, and now prints the PR it leaves behind. A `DONE` run, or a
+stopped run that owns no PR and holds no operator actions, is replaced as
+before. The `stop:` line's new-run route now says when `run` needs
+`--force`, instead of always naming it.
+
 ### A reply the agent delivered before it was killed or exited badly is kept (#479)
 
 An agent that delivers its whole final reply and then hangs until its idle

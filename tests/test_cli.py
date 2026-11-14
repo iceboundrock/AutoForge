@@ -4787,6 +4787,156 @@ def test_run_refuses_to_replace_a_run_holding_operator_actions(
     err = capsys.readouterr().err
     assert "holds operator actions" in err and f"{ids[T16]} on {T16}" in err
     assert "comments stay on GitHub" in err
+    # The FIX plan's run owns its PR too (#483), and the refusal names it.
+    assert (
+        f"existing run {_saved_run_id(state_file)} in phase {phase} owns PR {PR} and holds" in err
+    )
+    assert state_file.read_text() == raw
+
+
+def _saved_run_id(state_file: Path) -> str:
+    return json.loads(state_file.read_text())["run_id"]
+
+
+def _stopped_in_review(capsys, fakes, sd: str, status: str) -> AutoForgeState:
+    """A run whose controller opened PR 42, then whose reviewer reported ``status``."""
+    fakes["handler"] = lambda req: (
+        implement(req)
+        if req.phase == "ANALYZE_EXECUTE"
+        else block({"phase": "REVIEW", "status": status, "message": "needs a human"})
+    )
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 1
+    capsys.readouterr()
+    fakes["handler"] = lambda req: pytest.fail(f"no agent may run: {req.phase}")
+    return load_state(Path(sd) / "state.json")
+
+
+@pytest.mark.parametrize(
+    ("status", "route"),
+    [
+        ("blocked", "'unblock' and then 'resume' continue it (see 'status'), or use 'run --force'"),
+        ("failure", "nothing continues a FAILED run: see 'status', then use 'run --force'"),
+    ],
+)
+def test_run_refuses_to_replace_a_stopped_run_that_owns_its_pr(
+    tmp_path, capsys, monkeypatch, fakes, status, route
+):
+    """#483: a BLOCKED or FAILED run that owns a PR is not replaced by a plain
+    `run`. Replacing it would forget the PR and the review posted on it, while
+    the PR's marker keeps naming the old run, so the new run would stop at the
+    PR (`pr-owner`, ADR 0004 D9.4a) and need a take-over. Nothing is read,
+    launched or written; `--force` still replaces the run, says what it leaves
+    on GitHub, and the new run stops at the PR as that says."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    old = _stopped_in_review(capsys, fakes, sd, status)
+    assert old.current_pr_url == PR and old.phase.value in ("BLOCKED", "FAILED")
+    state_file = Path(sd) / "state.json"
+    before = _files(sd)
+    gh_calls = len(fakes["gh"].calls)
+
+    argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]
+    assert cli.main(argv) == 2
+    captured = capsys.readouterr()
+    left = (
+        f"the PR stays on GitHub, and while it is open its marker, naming run {old.run_id}, "
+        "stops a new run of the issue at it ('pr-owner') until 'unblock --take-over'"
+    )
+    assert captured.out == ""
+    assert (
+        f"autoforge: error: existing run {old.run_id} in phase {old.phase.value} owns PR {PR} "
+        f"— {route} to discard the run ({left})\n"
+    ) in captured.err
+    assert _files(sd) == before
+    assert len(fakes["gh"].calls) == gh_calls
+
+    assert cli.main([*argv, "--force", "--max-steps", "2"]) == 1
+    captured = capsys.readouterr()
+    assert (
+        f"autoforge: replacing run {old.run_id} in phase {old.phase.value}, which owns PR {PR}: "
+        f"{left}\n"
+    ) in captured.err
+    new = load_state(state_file)
+    assert new.run_id != old.run_id
+    assert (new.phase.value, new.stop_code) == ("BLOCKED", "pr-owner")
+    assert old.run_id in new.block_reason and "--take-over" in new.block_reason
+
+
+def test_run_still_replaces_a_stopped_run_that_owns_nothing(tmp_path, capsys, monkeypatch, fakes):
+    """#483 keeps what #243 left replaceable: a BLOCKED run with no PR and no
+    operator action is replaced by a plain `run`, without a note."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    _block_run(tmp_path, capsys, fakes, sd)
+    old = load_state(Path(sd) / "state.json")
+    assert old.phase.value == "BLOCKED" and old.current_pr_url == ""
+    fakes["handler"] = lambda req: block(
+        {"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": "still unclear"}
+    )
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 1
+    captured = capsys.readouterr()
+    assert "existing run" not in captured.err and "replacing run" not in captured.err
+    assert load_state(Path(sd) / "state.json").run_id != old.run_id
+
+
+@pytest.mark.parametrize(
+    ("kind", "stage", "owned"),
+    [
+        # A pushed branch with no PR is prior work a new run continues (D9.4).
+        ("push", "attempted", None),
+        (
+            "implementation_pr",
+            "attempted",
+            "the PR its saved plan may have opened from autoforge/2 in owner/repo",
+        ),
+        ("implementation_pr", "observed", f"PR {PR}"),
+    ],
+)
+def test_run_refuses_to_replace_a_run_whose_plan_opened_a_pr_it_did_not_bind(
+    tmp_path, capsys, monkeypatch, fakes, kind, stage, owned
+):
+    """#483: ANALYZE_EXECUTE binds the PR it opened only after reading it back,
+    and a run that stops in between (a read-back that does not match blocks
+    there) owns a PR its state has no URL for. Its saved plan says so, and a
+    plain `run` refuses to replace it: the PR's marker names it all the same.
+    Stopped after the push and before the PR was sent, it owns no PR, and a
+    plain `run` replaces it as before."""
+    from autoforge.effects import EffectKind, Stage
+
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    fakes["handler"] = implement
+    persist = ControllerEngine._persist_effect
+
+    def stops_after_the_write(self, record):
+        persist(self, record)
+        if record.kind is EffectKind(kind) and record.stage is Stage(stage):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(ControllerEngine, "_persist_effect", stops_after_the_write)
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE])
+    # Only this patch: the fakes and the test's working directory stay.
+    monkeypatch.setattr(ControllerEngine, "_persist_effect", persist)
+    capsys.readouterr()
+    state_file = Path(sd) / "state.json"
+    data = json.loads(state_file.read_text())
+    assert data["current_pr_url"] == ""
+    stages = {r["kind"]: r["stage"] for r in data["effect_records"]}
+    assert stages[kind] == stage and stages["implementation_pr"] in ("intended", stage)
+    data["phase"] = "BLOCKED"
+    state_file.write_text(json.dumps(data))
+    raw = state_file.read_text()
+
+    argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    if owned is None:
+        assert cli.main(argv) == 0
+        assert "existing run" not in capsys.readouterr().err
+        assert load_state(state_file).run_id != data["run_id"]
+        return
+    assert cli.main(argv) == 2
+    err = capsys.readouterr().err
+    assert f"existing run {data['run_id']} in phase BLOCKED owns {owned} — " in err
     assert state_file.read_text() == raw
 
 

@@ -42,6 +42,7 @@ what no test covers.
 | `run ... was recorded under ..., and this command's configuration differs from it` (exit 2) | [The configuration a run was recorded under](usage.md#the-configuration-a-run-was-recorded-under) |
 | `run ... is pinned to sandbox.mode ..., and this command's sandbox.mode, ..., contains its launches less` (exit 2) | [The outer sandbox](#the-outer-sandbox) |
 | `existing run <id> in phase <P> — use 'resume' to continue or 'run --force' to discard it` (exit 2) | [Starting over](#starting-over) |
+| `existing run <id> in phase BLOCKED owns PR <url> ...` or `... holds operator actions (...) ...` (from `run`, exit 2; `FAILED` too) | [Starting over](#starting-over): nothing was changed; continue the run with `unblock` and `resume`, or replace it with `run --force` |
 | `another AutoForge controller holds <path> — refusing to run concurrently on the same repository (...)` (exit 2) | [Another controller holds the lock](#another-controller-holds-the-lock) |
 | `'<command>' refuses issue <issue>: ... Only the parallel EPIC scheduler continues an issue its namespace owns ...` (exit 2) | [Another controller holds the lock](#another-controller-holds-the-lock) |
 | `unsupported protocol_version '<n>' (controller speaks '19'): a newer AutoForge wrote it` (exit 2) | [A run a newer controller wrote](usage.md#a-run-a-newer-controller-wrote) |
@@ -141,7 +142,7 @@ Repair the log directory, then 'resume'`) is `resumable_error`, reason
 `run-log-refused`, since the phase was kept for that `resume`. For example
 
 ```text
-stop: blocked (reason review-round-cap, from controller: the controller entered BLOCKED from REVIEW); next: fix the cause, then 'unblock --reason "..."' (it re-reads GitHub and may refuse), then 'resume' ('epic resume' for a scheduler's issue); or a new run ('run --force' replaces this one)
+stop: blocked (reason review-round-cap, from controller: the controller entered BLOCKED from REVIEW); next: fix the cause, then 'unblock --reason "..."' (it re-reads GitHub and may refuse), then 'resume' ('epic resume' for a scheduler's issue); or a new run ('run' replaces this one, and needs --force when it owns a PR, holds operator actions or is unreadable)
 ```
 
 The code is advice and grants nothing: `unblock` re-reads GitHub whatever
@@ -582,12 +583,26 @@ it ([The configuration a run was recorded under](usage.md#the-configuration-a-ru
 ### Starting over
 
 `autoforge run --epic ... --issue ...` replaces a `BLOCKED`, `FAILED` or
-`DONE` run without asking, except a `BLOCKED` or `FAILED` one that holds
-operator actions, which needs `--force` (the comments stay on GitHub
-either way). A run in any other phase needs `run --force`. Replacing a run
-replaces `state.json`: its review history, its loop-bound counts, its
-replan count and its validation records go with it, so read `status`
-first. Its run logs and worktree stay.
+`DONE` run without asking, except a `BLOCKED` or `FAILED` one that owns a
+PR or holds operator actions, which needs `--force`. A run in any other
+phase needs `run --force`. Replacing a run replaces `state.json`: its review
+history, its loop-bound counts, its replan count and its validation records
+go with it, so read `status` first. Its run logs and worktree stay, and so
+does everything it posted on GitHub.
+
+A run owns a PR once its state is bound to one, or its saved plan may have
+opened, adopted or taken one over before binding it. The state alone
+decides, so a PR closed or merged since still counts. Plain `run` refuses
+such a run with exit 2 and changes nothing (#483):
+
+```text
+autoforge: error: existing run <id> in phase BLOCKED owns PR <url> — 'unblock' and then 'resume' continue it (see 'status'), or use 'run --force' to discard the run (the PR stays on GitHub, and while it is open its marker, naming run <id>, stops a new run of the issue at it ('pr-owner') until 'unblock --take-over')
+```
+
+For a `BLOCKED` run, `unblock` and `resume` continue the run that owns the
+PR, with its review history and journal. A `FAILED` run, or a `BLOCKED` one
+with a replan journal, cannot be continued, and the refusal says so.
+`run --force` replaces either and names the PR it leaves behind.
 
 The new run's `ANALYZE_EXECUTE` does not adopt the open PR carrying the
 issue's `ai-implementation` marker: the PR names the run that owned it, and
@@ -623,8 +638,9 @@ it:
 
 To abandon an issue: close its PR on GitHub (and delete its branch if you
 like), stop anything still running in its worktree, remove the worktree,
-and start the next issue with `run` (`--force`
-when the stopped run is in a working phase).
+and start the next issue with `run --force` (a plain `run` refuses a
+stopped run that owns a PR, even a closed one, and a run in a working
+phase).
 
 ## Another controller holds the lock
 
@@ -879,7 +895,8 @@ The messages below are AutoForge's own refusals, grouped by subject.
   stage and both PRs; a rejection's reason also says what the transaction
   did to the source PR. Inspect those PRs on GitHub and decide by hand
   which one, if either, carries the issue forward. To continue, start a new
-  run; it replaces `state.json`, journal included, so read `status` first.
+  run with `run --force`; it replaces `state.json`, journal included, so read
+  `status` first.
   Its `ANALYZE_EXECUTE` blocks on two open PRs carrying the issue's
   `ai-implementation` marker, so close the PR you do not keep, and on the
   one it then finds, which names the old run: take that one over

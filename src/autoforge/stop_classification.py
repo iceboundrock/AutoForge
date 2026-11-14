@@ -113,7 +113,12 @@ ROUTE_TEXT: dict[OperatorRoute, str] = {
         "'resume' (it reconciles the phase with GitHub first, within the run's step budget)"
     ),
     OperatorRoute.REPEAT: "the same command once the cause is fixed",
-    OperatorRoute.NEW_RUN: "a new run ('run --force' replaces this one)",
+    # 'run' alone replaces a BLOCKED or FAILED run unless it owns a PR or
+    # holds operator actions (#243, #483), and never one it cannot read.
+    OperatorRoute.NEW_RUN: (
+        "a new run ('run' replaces this one, and needs --force when it owns a PR, "
+        "holds operator actions or is unreadable)"
+    ),
     OperatorRoute.MERGE: (
         "merge the PR by hand on GitHub (and close its issue if the merge does not)"
     ),

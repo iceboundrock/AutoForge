@@ -180,7 +180,7 @@ directory: `trace/run-1/` for the first run
 - **Collect a run before you start over.** A new `run` replaces the one in
   the state directory: `run --force` does at any phase, and a plain `run`
   does without asking once the old one is `BLOCKED`, `FAILED` or `DONE`
-  (one that holds operator actions needs `--force`). It replaces
+  (one that owns a PR or holds operator actions needs `--force`). It replaces
   `state.json`, and with it the old run's review history and counts, so
   `status` shows only the new run from then on
   ([Starting over](troubleshooting.md#starting-over)). Before you start
