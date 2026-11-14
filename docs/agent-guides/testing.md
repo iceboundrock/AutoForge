@@ -1050,7 +1050,15 @@ exactly when `tests/sandbox_host.py` measures the host capable
   the host's; its writable mounts are the tmpfs `/tmp` and home, the
   workspace volume (not the exporter's) and the cache, and its binds are
   exactly the staging root at `/source` and the projection's files,
-  read-only. A helper container on the bridge, or with a projection or a
+  read-only. The staging root is only a `StagingRoot`, the launch's own
+  `<common dir>/autoforge/sandbox/<key>/stage/<launch id>`, which is
+  accepted: a path alone is refused (`/usr`, `/etc`, `/`, the checkout,
+  the common dir, a worktree's admin dir, even the root's own path), and
+  so is a `StagingRoot` outside the controller's common dir, with a key or
+  launch id that is not one path component, under the probes' directory,
+  through a link, in a directory the operator does not own or another
+  user can write, missing, or one that is, holds or lies in a checkout or
+  worktree. A helper container on the bridge, or with a projection or a
   cache, is refused, and so is any configuration key for a raw flag,
   mount, device or `--privileged`. With fake credentials: a variable's
   value is on no argument, in no `repr` or pickle, only in the runtime
@@ -1062,20 +1070,48 @@ exactly when `tests/sandbox_host.py` measures the host capable
   `~/.netrc`, `~/.gnupg` or the keyrings, the home itself, a runtime
   socket, a path under `/run` or `$XDG_RUNTIME_DIR`, a link anywhere in
   the path, a directory or FIFO, a `0600` file (unreadable by the
-  agent's subordinate UID), a file every local user can read, one the
-  operator does not own, a target outside the home and a path that would
-  end the mount's field are refused, and on a copy-in runtime every file
-  is. `runtime_refusal()` refuses a rootful runtime and one that does not
+  agent's subordinate UID), a file other local users can reach (no
+  directory above it that only the operator can enter: one searchable by
+  its group or others, one with an NFSv4 or rich ACL, or one whose ACLs
+  cannot be read, a platform without `listxattr` included), one with
+  another hard link, one the operator does not own, a target outside the
+  home and a path that would end the mount's field are refused, and on a
+  copy-in runtime every file is. `runtime_refusal()` refuses a rootful runtime and one that does not
   say. The judge passes a recorded observation of a compliant container
   and names each item a changed observation breaks (the UID map the host
   reads for PID 1, a keep-id-style or identity map, capabilities,
-  `NoNewPrivs`, seccomp, a writable root, an extra mount, `pids.max`,
-  writability, the keyring, the loopback nonce, the abstract socket,
-  interfaces and routes under `none`, a sentinel outside the projection);
-  an observation that does not parse fails every item. The measurement
-  itself runs on this host as a plain process, with a real loopback
-  listener, abstract socket and fake credentials, and the judge must
-  refuse it: its own negative control.
+  `NoNewPrivs`, seccomp, a writable root, `pids.max`, writability, the
+  keyring, interfaces and routes under `none`, a sentinel outside the
+  projection); an observation that does not parse fails every item.
+  Mounts are judged by their source, type and options: a writable
+  `/source`, a bind, volume or tmpfs from the wrong source, a missing or
+  stacked policy mount, an extra one, a host mount anywhere under
+  `/proc`, `/sys` or `/dev`, the runtime's own files from another
+  container's directory or without the container's id, a root that is not
+  an overlay, and a tmpfs that holds anything a fresh one would not (a
+  host tmpfs bound in whole) or whose listing is missing or cut short are
+  each named. Host loopback needs a conclusive refusal at every route
+  (both loopback families, the runtimes' host aliases, rootless Docker's
+  host address and every gateway) at each listener's port: a timeout, a
+  reset, an unsupported family, a failed lookup, a name resolving to
+  nothing tried, a missing attempt or gateway list, a connection that said
+  nothing usable, and a host that listened on one family only are named,
+  and so is the nonce, whole or cut short. Any connection to the abstract
+  socket is named, nonce or not, and so is any result but a refusal or a
+  denial. A sentinel search that did not cover every place, walked other
+  roots, left out more than the kernel's trees or reported no result for a
+  sentinel is named. The measurement itself runs on this host as a plain
+  process, its request (fake credentials included) on standard input,
+  with a real loopback listener, abstract socket and fake credentials, and
+  the judge must refuse it: its own negative control. On its own, the
+  measurement refuses a request given as an argument; reads every file
+  whole (a sentinel past the first MiB, and one across a chunk's edge,
+  found); reports a file or directory it owns but cannot read, one it can
+  search but not list, and a spent byte budget as not covered, and counts
+  what it is denied and does not own; records a refusal, the nonce with
+  the peer's close and a silent peer each as they ended; lists each tmpfs
+  mounted from its own root; and reports a routing table it could not
+  read as unreported, never as one without a gateway.
 - `tests/test_sandbox_lifecycle.py` also refuses, at a command's entry, a
   runtime that reports itself rootful or does not say, with nothing
   reconciled, journaled or probed, and before the journal write a launch
@@ -1085,7 +1121,12 @@ exactly when `tests/sandbox_host.py` measures the host capable
   sandbox"): a container created as the policy renders it, measured as
   the agent and judged, on the bridge with an environment and a file
   credential and with `--network none`; the runtime's record holds no
-  sentinel but the projected variable's. It skips with the reason
+  sentinel but the projected variable's, and neither the create's nor the
+  measurement's `exec` argv holds any sentinel: the request goes on
+  standard input. The staging root is a `StagingRoot` in a common dir of
+  the test's own, laid out as the controller lays one out, and the host
+  listens on both `127.0.0.1` and `::1` (a host without IPv6 loopback
+  skips). It skips with the reason
   wherever it is not opted into or the runtime cannot run a rootless
   container, and has not run on a capable host yet.
 

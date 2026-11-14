@@ -4,33 +4,46 @@ Runs *inside* a container, as the agent would, and prints one JSON object:
 what it observed, never a judgement and never a credential. The host
 judges it (:func:`autoforge.sandbox_container.judge`), so a mistake here
 cannot pass a runtime that enforces less: a field it could not read is
-empty, and an empty field proves nothing.
+empty, an attempt it could not complete says so, and neither proves
+anything.
 
 It imports nothing of :mod:`autoforge` and only the standard library, so
-the image can carry this file alone and run it with ``python3 -I``. Its one
-argument is a JSON object:
+the image can carry this file alone and run it with ``python3 -I``. It
+reads its request, one JSON object, from **standard input**, never from an
+argument: the request holds the fake credentials it searches for, and an
+argument is on a command line every local process can read (and on the
+runtime's ``exec`` argv). A request given as an argument is refused. Its
+fields:
 
 - ``places``: directories whose writability the agent tests, by creating
   and removing a file of its own in each;
-- ``connect_hosts`` and ``connect_ports``: addresses that could lead to the
-  host's loopback (the container's own ``127.0.0.1`` and ``::1``, which a
-  port forwarder could carry out, the slirp4netns and pasta host aliases,
-  the runtimes' host names), to which the default gateways are added; each
-  attempt records what it received, so the host can tell its own
-  listener's nonce from anything else;
+- ``connect_hosts`` and ``connect_ports``: addresses and names that could
+  lead to the host's loopback (the container's own ``127.0.0.1`` and
+  ``::1``, which a port forwarder could carry out, the runtimes' host
+  aliases and host addresses), to which every default gateway is added.
+  Each is resolved, and each address it resolves to tried, recording what
+  came back: a refusal, a timeout, or a connection, with what it received
+  and whether the peer closed, so the host can tell its own listener's
+  nonce, another service and an inconclusive attempt apart;
 - ``abstract``: the name of a host abstract Unix socket to connect to;
 - ``keyring``: the description of a ``user`` key the host put in its
   session keyring, searched for in this process's keyrings;
 - ``sentinels``: fake credential values, reported by index wherever they
   are found (an environment variable as ``env:NAME``, a file by its path),
   so the observation never repeats one;
-- ``scan_roots`` and ``scan_skip``: where the sentinel search walks, and
-  what it leaves out.
+- ``scan_roots``, ``scan_skip`` and ``scan_max_bytes``: where the sentinel
+  search walks, what it leaves out, and how many bytes it reads at most.
+  Every regular file is read whole, in chunks; the search reports its
+  coverage (``scan``): what it could not cover is ``incomplete``, which the
+  judge refuses, and only a file or directory the agent is denied and does
+  not own is ``denied``, being out of the agent's reach.
 
 What it reads: ``/proc/self/status`` (UIDs, GIDs, capabilities,
 ``NoNewPrivs``, ``Seccomp``), ``/proc/self/uid_map``,
-``/proc/self/mountinfo``, the cgroup's ``pids.max``, ``/proc/net/dev``,
-``/proc/net/route`` and ``/proc/net/ipv6_route``. The UID map it prints is
+``/proc/self/mountinfo`` and the listing of each tmpfs mounted from its own
+root (``tmpfs``), the cgroup's ``pids.max``, ``/proc/net/dev``,
+``/proc/net/route`` and ``/proc/net/ipv6_route`` (``gateways`` is ``null``
+when a routing table could not be read). The UID map it prints is
 relative to the parent user namespace, which is not the host's when the
 runtime nests one; the judge reads the map the host sees instead.
 """
@@ -41,14 +54,21 @@ import errno
 import json
 import os
 import platform
+import re
 import socket
+import stat
 import struct
 import sys
+import time
+from typing import TextIO
 
 _TIMEOUT_SECONDS = 2.0
-_RECEIVE_BYTES = 128
-_MAX_SCANNED_BYTES = 1024 * 1024
+_RECEIVE_BYTES = 512
+_MAX_REQUEST_CHARS = 1024 * 1024
+_CHUNK_BYTES = 1024 * 1024
+_DEFAULT_SCAN_MAX_BYTES = 16 * 1024 * 1024 * 1024
 _MAX_HITS = 20
+_MAX_REPORTED = 20
 # keyctl(2)'s number per architecture; KEYCTL_SEARCH; the special keyrings.
 _SYS_KEYCTL = {
     "x86_64": 250,
@@ -62,14 +82,23 @@ _SYS_KEYCTL = {
 }
 _KEYCTL_SEARCH = 10
 _KEYRINGS = {"session": -3, "user": -4, "user-session": -5}
-_HOST_ALIASES = (
+# The default addresses and names to try, when the request names none: both
+# loopback families, both runtimes' host aliases, and rootless Docker's host
+# address (``autoforge.sandbox_container.loopback_routes``).
+_HOST_ROUTES = (
     "127.0.0.1",
     "::1",
-    "10.0.2.2",
-    "169.254.1.2",
     "host.containers.internal",
     "host.docker.internal",
+    "10.0.2.2",
 )
+_EAI_NAMES = {
+    getattr(socket, name): name
+    for name in dir(socket)
+    if name.startswith("EAI_") and isinstance(getattr(socket, name), int)
+}
+# A file or directory the agent is denied: out of its reach unless it owns it.
+_DENIED = (errno.EACCES, errno.EPERM)
 
 
 def _read(path: str) -> str:
@@ -94,38 +123,104 @@ def _writable(place: str) -> bool:
     return True
 
 
-def _gateways() -> list[str]:
+def _lines(path: str, *, missing: list[str] | None = None) -> list[str] | None:
+    """The lines of ``path``: ``missing`` when it does not exist, ``None`` when unreadable."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read().splitlines()
+    except FileNotFoundError:
+        return missing
+    except OSError:
+        return None
+
+
+def _gateways() -> list[str] | None:
+    """Every default gateway; ``None`` when a routing table could not be read.
+
+    ``/proc/net/route`` always has its header line, so an empty one was not
+    read; ``/proc/net/ipv6_route`` is absent only from a kernel without IPv6.
+    A table not read is not a table without a gateway.
+    """
+    ipv4 = _lines("/proc/net/route")
+    ipv6 = _lines("/proc/net/ipv6_route", missing=[])
+    if not ipv4 or ipv6 is None:
+        return None
     found = []
-    for line in _read("/proc/net/route").splitlines()[1:]:
+    for line in ipv4[1:]:
         parts = line.split()
         if len(parts) > 2 and parts[1] == "00000000" and parts[2] != "00000000":
             # The kernel prints the address's four bytes as one host-order word.
             raw = struct.pack("=I", int(parts[2], 16))
             found.append(socket.inet_ntop(socket.AF_INET, raw))
-    for line in _read("/proc/net/ipv6_route").splitlines():
+    for line in ipv6:
         parts = line.split()
         if len(parts) == 10 and parts[0] == "0" * 32 and parts[4] != "0" * 32:
-            found.append(socket.inet_ntop(socket.AF_INET6, bytes.fromhex(parts[4])))
+            address = socket.inet_ntop(socket.AF_INET6, bytes.fromhex(parts[4]))
+            # A link-local gateway is reachable only through its interface.
+            if address.lower().startswith("fe80:"):
+                address = f"{address}%{parts[9]}"
+            found.append(address)
     return found
 
 
-def _receive(sock: socket.socket) -> str:
-    sock.settimeout(_TIMEOUT_SECONDS)
+def _error(exc: OSError) -> str:
+    if isinstance(exc, socket.timeout):
+        return "timeout"
+    return errno.errorcode.get(exc.errno or 0, type(exc).__name__)
+
+
+def _receive(sock: socket.socket) -> tuple[str, bool]:
+    """What the peer sends within the timeout, and whether it closed (EOF) by then."""
+    data = b""
+    deadline = time.monotonic() + _TIMEOUT_SECONDS
     try:
-        return sock.recv(_RECEIVE_BYTES).decode("ascii", "replace")
+        while len(data) < _RECEIVE_BYTES:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            chunk = sock.recv(_RECEIVE_BYTES - len(data))
+            if not chunk:
+                return data.decode("ascii", "replace"), True
+            data += chunk
     except OSError:
-        return ""
+        pass
+    return data.decode("ascii", "replace"), False
 
 
-def _connect(host: str, port: int) -> dict[str, object]:
-    attempt: dict[str, object] = {"host": host, "port": port}
+def _attempt(family: int, kind: int, proto: int, address: tuple) -> dict[str, object]:
+    record: dict[str, object] = {"address": str(address[0])}
     try:
-        with socket.create_connection((host, port), timeout=_TIMEOUT_SECONDS) as sock:
-            attempt["result"] = "connected"
-            attempt["received"] = _receive(sock)
+        with socket.socket(family, kind, proto) as sock:
+            sock.settimeout(_TIMEOUT_SECONDS)
+            sock.connect(address)
+            record["result"] = "connected"
+            record["received"], record["eof"] = _receive(sock)
     except OSError as exc:
-        attempt["result"] = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
-    return attempt
+        record["result"] = _error(exc)
+    return record
+
+
+def _route(host: str, port: int) -> dict[str, object]:
+    """``host`` resolved, and each address it gives tried once."""
+    entry: dict[str, object] = {"host": host, "port": port}
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        entry["resolve_error"] = _EAI_NAMES.get(exc.errno, f"gaierror {exc.errno}")
+        return entry
+    except (OSError, UnicodeError) as exc:
+        entry["resolve_error"] = type(exc).__name__
+        return entry
+    attempts = []
+    seen = set()
+    for family, kind, proto, _, address in infos:
+        if (family, address) in seen:
+            continue
+        seen.add((family, address))
+        attempts.append(_attempt(family, kind, proto, address))
+    entry["attempts"] = attempts
+    return entry
 
 
 def _abstract(name: str) -> dict[str, object]:
@@ -133,9 +228,10 @@ def _abstract(name: str) -> dict[str, object]:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(_TIMEOUT_SECONDS)
             sock.connect("\0" + name)
-            return {"result": "connected", "received": _receive(sock)}
+            received, eof = _receive(sock)
+            return {"result": "connected", "received": received, "eof": eof}
     except OSError as exc:
-        return {"result": errno.errorcode.get(exc.errno or 0, type(exc).__name__)}
+        return {"result": _error(exc)}
 
 
 def _keyring(description: str) -> dict[str, str]:
@@ -188,42 +284,163 @@ def _routes() -> list[str]:
     return routes
 
 
+def _unescape(field: str) -> str:
+    """A ``mountinfo`` field with its octal escapes (``\\040`` for a space) undone."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _tmpfs_contents(mountinfo: str) -> dict[str, dict[str, object]]:
+    """What each tmpfs mounted from its own root holds, by mount point.
+
+    A fresh tmpfs the runtime makes is empty, or holds only the mount points
+    the policy puts in it; a host tmpfs bound in whole looks the same in
+    ``mountinfo``, but holds the host's files. So each is listed: its entry
+    count and its first names, or the error that kept it from being listed.
+    """
+    contents: dict[str, dict[str, object]] = {}
+    for line in mountinfo.splitlines():
+        parts = line.split()
+        if "-" not in parts[6:]:
+            continue
+        separator = parts.index("-", 6)
+        if separator + 1 >= len(parts) or parts[separator + 1] != "tmpfs" or parts[3] != "/":
+            continue
+        point = _unescape(parts[4])
+        try:
+            names = sorted(os.listdir(point))
+        except OSError as exc:
+            contents[point] = {"error": _error(exc)}
+            continue
+        contents[point] = {"count": len(names), "names": names[:_MAX_REPORTED]}
+    return contents
+
+
 def _skipped(path: str, skip: list[str]) -> bool:
     return any(path == root or path.startswith(root.rstrip("/") + "/") for root in skip)
 
 
-def _sentinels(values: list[str], roots: list[str], skip: list[str]) -> dict[str, list[str]]:
-    needles = [value.encode() for value in values]
-    hits: dict[str, list[str]] = {str(index): [] for index in range(len(values))}
+class _BudgetSpent(Exception):
+    """The search read as many bytes as it may: what is left is not covered."""
 
-    def record(index: int, place: str) -> None:
-        if len(hits[str(index)]) < _MAX_HITS:
-            hits[str(index)].append(place)
 
-    for name, value in sorted(os.environ.items()):
-        for index, text in enumerate(values):
-            if text in value:
-                record(index, f"env:{name}")
-    for root in roots:
-        for directory, dirs, files in os.walk(root, followlinks=False):
-            dirs[:] = sorted(d for d in dirs if not _skipped(os.path.join(directory, d), skip))
-            for name in sorted(files):
-                path = os.path.join(directory, name)
-                if _skipped(path, skip):
-                    continue
-                try:
-                    if not os.path.isfile(path) or os.path.islink(path):
-                        continue
-                    if os.path.getsize(path) > _MAX_SCANNED_BYTES:
-                        continue
-                    with open(path, "rb") as handle:
-                        data = handle.read(_MAX_SCANNED_BYTES)
-                except OSError:
-                    continue
-                for index, needle in enumerate(needles):
-                    if needle in data:
-                        record(index, path)
-    return hits
+class _Scan:
+    """One sentinel search: its hits by index, and what it could and could not cover."""
+
+    def __init__(self, values: list[str], max_bytes: int) -> None:
+        self.values = values
+        self.needles = [value.encode() for value in values]
+        self.overlap = max(len(needle) for needle in self.needles) - 1
+        self.max_bytes = max_bytes
+        self.hits: dict[str, list[str]] = {str(index): [] for index in range(len(values))}
+        self.files = 0
+        self.bytes = 0
+        self.denied = 0
+        self.special = 0
+        self.incomplete: list[str] = []
+        self.incomplete_count = 0
+
+    def record(self, index: int, place: str) -> None:
+        if len(self.hits[str(index)]) < _MAX_HITS:
+            self.hits[str(index)].append(place)
+
+    def gap(self, path: str, why: str) -> None:
+        self.incomplete_count += 1
+        if len(self.incomplete) < _MAX_REPORTED:
+            self.incomplete.append(f"{path}: {why}")
+
+    def refused(self, path: str, exc: OSError, searchable: bool) -> None:
+        """A path the agent could not open: denied and not its own is out of its reach."""
+        try:
+            owned = os.lstat(path).st_uid == os.getuid()
+        except OSError:
+            owned = True
+        if exc.errno in _DENIED and not owned and not searchable:
+            self.denied += 1
+        else:
+            self.gap(path, _error(exc))
+
+    def environment(self) -> None:
+        for name, value in sorted(os.environ.items()):
+            for index, text in enumerate(self.values):
+                if text in value:
+                    self.record(index, f"env:{name}")
+
+    def file(self, path: str) -> None:
+        try:
+            info = os.lstat(path)
+        except OSError as exc:
+            self.gap(path, _error(exc))
+            return
+        if stat.S_ISLNK(info.st_mode):
+            return  # its target is searched where it lies
+        if not stat.S_ISREG(info.st_mode):
+            self.special += 1  # a FIFO, socket or device node stores nothing
+            return
+        try:
+            handle = open(path, "rb")  # noqa: SIM115 - closed below, chunks read in a loop
+        except OSError as exc:
+            self.refused(path, exc, searchable=False)
+            return
+        found: set[int] = set()
+        tail = b""
+        try:
+            with handle:
+                while True:
+                    chunk = handle.read(_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    self.bytes += len(chunk)
+                    if self.bytes > self.max_bytes:
+                        self.gap(path, f"the search's {self.max_bytes}-byte budget is spent")
+                        raise _BudgetSpent
+                    window = tail + chunk
+                    for index, needle in enumerate(self.needles):
+                        if index not in found and needle in window:
+                            found.add(index)
+                    tail = window[-self.overlap :] if self.overlap else b""
+        except OSError as exc:
+            self.gap(path, _error(exc))
+        self.files += 1
+        for index in sorted(found):
+            self.record(index, path)
+
+    def walk(self, roots: list[str], skip: list[str]) -> None:
+        def unlisted(exc: OSError) -> None:
+            path = exc.filename or "?"
+            self.refused(path, exc, searchable=os.access(path, os.X_OK))
+
+        for root in roots:
+            for directory, dirs, files in os.walk(root, onerror=unlisted, followlinks=False):
+                dirs[:] = sorted(d for d in dirs if not _skipped(os.path.join(directory, d), skip))
+                for name in sorted(files):
+                    path = os.path.join(directory, name)
+                    if not _skipped(path, skip):
+                        self.file(path)
+
+    def report(self, roots: list[str], skip: list[str]) -> dict[str, object]:
+        return {
+            "roots": roots,
+            "skip": skip,
+            "files": self.files,
+            "bytes": self.bytes,
+            "denied": self.denied,
+            "special": self.special,
+            "incomplete": self.incomplete,
+            "incomplete_count": self.incomplete_count,
+        }
+
+
+def _search(
+    values: list[str], roots: list[str], skip: list[str], max_bytes: int
+) -> tuple[dict[str, list[str]], dict[str, object]]:
+    """Where each sentinel is, and what the search covered."""
+    scan = _Scan(values, max_bytes)
+    scan.environment()
+    try:
+        scan.walk(roots, skip)
+    except _BudgetSpent:
+        pass
+    return scan.hits, scan.report(roots, skip)
 
 
 def _strings(spec: dict[str, object], key: str, default: tuple[str, ...] = ()) -> list[str]:
@@ -235,18 +452,23 @@ def observe(spec: dict[str, object]) -> dict[str, object]:
     """What this process sees, for the host to judge."""
     places = _strings(spec, "places")
     ports = [int(port) for port in _strings(spec, "connect_ports")]
-    hosts = _strings(spec, "connect_hosts", _HOST_ALIASES)
-    for gateway in _gateways():
+    hosts = _strings(spec, "connect_hosts", _HOST_ROUTES)
+    gateways = _gateways()
+    for gateway in gateways or []:
         if gateway not in hosts:
             hosts.append(gateway)
     pids_max = _read("/sys/fs/cgroup/pids.max") or _read("/sys/fs/cgroup/pids/pids.max")
+    mountinfo = _read("/proc/self/mountinfo")
     observation: dict[str, object] = {
         "status": _read("/proc/self/status"),
         "uid_map": _read("/proc/self/uid_map"),
-        "mountinfo": _read("/proc/self/mountinfo"),
+        "mountinfo": mountinfo,
         "pids_max": pids_max,
         "writable": {place: _writable(place) for place in places},
-        "connect": [_connect(host, port) for port in ports for host in hosts],
+        # After the writability probes, which remove what they create.
+        "tmpfs": _tmpfs_contents(mountinfo),
+        "gateways": gateways,
+        "connect": [_route(host, port) for port in ports for host in hosts],
         "interfaces": _interfaces(),
         "routes": _routes(),
     }
@@ -260,14 +482,33 @@ def observe(spec: dict[str, object]) -> dict[str, object]:
     if sentinels:
         roots = _strings(spec, "scan_roots", ("/",))
         skip = _strings(spec, "scan_skip", ("/proc", "/sys", "/dev"))
-        observation["sentinels"] = _sentinels(sentinels, roots, skip)
+        limit = spec.get("scan_max_bytes", _DEFAULT_SCAN_MAX_BYTES)
+        max_bytes = limit if isinstance(limit, int) and limit > 0 else _DEFAULT_SCAN_MAX_BYTES
+        hits, scan = _search(sentinels, roots, skip, max_bytes)
+        observation["sentinels"] = hits
+        observation["scan"] = scan
     return observation
 
 
-def main(argv: list[str]) -> int:
-    spec = json.loads(argv[1]) if len(argv) > 1 else {}
+def main(argv: list[str], stdin: TextIO | None = None) -> int:
+    """Read the request from standard input, print the observation; 2 for a bad request."""
+    if len(argv) > 1:
+        print(
+            "the measurement reads its request from standard input, never an argument, "
+            "so that no fake credential is on a command line",
+            file=sys.stderr,
+        )
+        return 2
+    text = (stdin or sys.stdin).read(_MAX_REQUEST_CHARS + 1)
+    try:
+        spec = json.loads(text) if len(text) <= _MAX_REQUEST_CHARS else None
+    except ValueError:
+        spec = None
     if not isinstance(spec, dict):
-        print("the measurement takes one JSON object", file=sys.stderr)
+        print("the measurement takes one JSON object on standard input", file=sys.stderr)
+        return 2
+    if any(not value for value in _strings(spec, "sentinels")):
+        print("a sentinel is a non-empty string", file=sys.stderr)
         return 2
     print(json.dumps(observe(spec), sort_keys=True))
     return 0

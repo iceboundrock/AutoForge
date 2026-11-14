@@ -27,6 +27,10 @@ network and environment there:
 - **the closed set of bind sources** (D12): the launch's staging root,
   read-only at ``/source``, in the bind form only, and the credential
   files above. Nothing else is bound, and the copy-in form binds nothing.
+  The staging root is never a path alone: it is a :class:`StagingRoot`,
+  the launch's own ``<git common dir>/autoforge/sandbox/<key>/stage/<launch
+  id>``, proved to lie in the controller's own common dir, in directories
+  the operator alone owns and can write, and apart from every checkout.
 
 :func:`create_argv` renders a checked :class:`ContainerSpec` into a
 runtime's ``create`` arguments: the only place a create's flags are
@@ -60,6 +64,7 @@ then no launch reaches this module.
 from __future__ import annotations
 
 import enum
+import errno
 import json
 import os
 import posixpath
@@ -102,9 +107,38 @@ TMP_TARGET = "/tmp"
 # required (Podman's ``--read-only-tmpfs=false`` makes ``/dev/shm`` read-only).
 RUNTIME_TEMP = frozenset({"/dev/shm", "/dev/mqueue"})
 # Files a runtime mounts into every container from its own per-container
-# storage, never from an operator path: allowed by the mount check.
+# storage (``<storage>/containers/<id>/`` for Docker,
+# ``.../overlay-containers/<id>/userdata/`` for Podman), never from an
+# operator path: the mount check admits each only from a directory named by
+# the measured container's own id.
 RUNTIME_FILES = frozenset({"/etc/hosts", "/etc/hostname", "/etc/resolv.conf", "/run/.containerenv"})
-_KERNEL_ROOTS = ("/proc", "/sys", "/dev")
+# The device nodes a rootless runtime binds from the host's ``/dev``, since
+# it cannot make one: the only host device a container gets.
+RUNTIME_DEVICES = frozenset({"null", "zero", "full", "tty", "random", "urandom"})
+# The root filesystem's types: the runtime's overlay of the image, never a
+# host directory.
+ROOT_FILESYSTEMS = frozenset({"overlay", "fuse.fuse-overlayfs"})
+# The kernel's own trees, which the runtime mounts and masks itself; what it
+# may mount below them is a closed list (:func:`judge`). The sentinel search
+# leaves exactly these out.
+KERNEL_ROOTS = frozenset({"/proc", "/sys", "/dev"})
+
+# The controller's sandbox directories (ADR 0005 D8.4, as
+# ``sandbox_policy.SANDBOX_DIR``) and, in an issue's, its launches' staging
+# roots (ADR 0013 D12); the probes' directory is a sibling of every issue's.
+SANDBOX_LAYOUT = "autoforge/sandbox"
+STAGE_DIR = "stage"
+PROBE_DIR = "probe"
+
+# Where a container could reach the host's loopback through (D9): its own
+# loopback, in both families, where a port forwarder could carry a
+# connection out; the runtimes' host aliases, by name, wherever the
+# runtime's ``/etc/hosts`` or DNS gives them; and for rootless Docker,
+# RootlessKit's host address, which its ``--disable-host-loopback`` closes.
+# The measurement adds each default gateway. Every one must be refused
+# conclusively (:func:`judge`).
+LOOPBACK_ADDRESSES = ("127.0.0.1", "::1")
+HOST_ALIASES = ("host.containers.internal", "host.docker.internal")
 # The observation's field for the container's UID map as the host reads it
 # (``/proc/<PID 1's host PID>/uid_map``): the prober adds it beside what the
 # measurement printed from inside.
@@ -130,6 +164,21 @@ class RuntimeProduct(enum.Enum):
 
     DOCKER = "docker"
     PODMAN = "podman"
+
+
+# RootlessKit's address for the host in rootless Docker's namespace
+# (slirp4netns's and pasta's ``10.0.2.2``); Podman's pasta maps its own host
+# address under ``host.containers.internal``, which the alias covers.
+_RUNTIME_HOST_ADDRESSES = {RuntimeProduct.DOCKER: ("10.0.2.2",), RuntimeProduct.PODMAN: ()}
+
+
+def loopback_routes(product: RuntimeProduct) -> tuple[str, ...]:
+    """The addresses and names a measurement must try for ``product`` (D9).
+
+    The measurement adds each default gateway it finds; the judge requires
+    a conclusive refusal at every one, for every port the host listens on.
+    """
+    return (*LOOPBACK_ADDRESSES, *HOST_ALIASES, *_RUNTIME_HOST_ADDRESSES[product])
 
 
 class ContainerRole(enum.Enum):
@@ -272,17 +321,23 @@ class HostContext:
 
     ``home`` is the operator's home, ``environ`` the variables that locate
     D4.3's forbidden sources (:data:`_LOCATION_NAMES`), ``uid`` the
-    operator's UID.
+    operator's UID. ``git_common_dir`` is the controller's git common dir,
+    resolved, which every staging root must lie in ("" for none, and then
+    no staging root is bound); ``checkouts`` the controller's checkout and
+    every worktree it knows, which a staging root must never hold or lie in
+    (D12).
     """
 
     home: str
     environ: Mapping[str, str] = field(repr=False)
     uid: int
+    git_common_dir: str = ""
+    checkouts: tuple[str, ...] = ()
 
     @classmethod
-    def current(cls) -> HostContext:
+    def current(cls, git_common_dir: str = "", checkouts: Iterable[str] = ()) -> HostContext:
         located = {name: os.environ[name] for name in _LOCATION_NAMES if name in os.environ}
-        return cls(os.path.expanduser("~"), located, os.getuid())
+        return cls(os.path.expanduser("~"), located, os.getuid(), git_common_dir, tuple(checkouts))
 
 
 # What a projected variable must never be named, compared upper-cased: what
@@ -422,12 +477,21 @@ def _check_file_credential(item: FileCredential, host: HostContext) -> None:
             "so it is refused rather than delivered unusable (keep it in a directory only "
             "you can enter, readable by others: a 0700 directory holding a 0644 file)",
         )
-    if _reachable_by_others(source):
+    if info.st_nlink != 1:
         raise _refuse(
             source,
             rule,
-            "every local user can read this file: no directory above it denies them "
-            "search; keep it in a directory only you can enter (mode 0700)",
+            "the file has another hard link, through which another local user could "
+            "reach it without passing a directory only you can enter",
+        )
+    if _private_directory(source, host.uid) is None:
+        raise _refuse(
+            source,
+            rule,
+            "other local users can reach this file: no directory above it is one only "
+            "you can enter (yours, with no search permission for its group or others, "
+            "and no access-control list the mode does not show); keep it in a directory "
+            "of mode 0700",
         )
     target = item.target
     if not isinstance(target, str) or not target or target.startswith("/"):
@@ -439,17 +503,49 @@ def _check_file_credential(item: FileCredential, host: HostContext) -> None:
     _check_mount_text(target, target, rule)
 
 
-def _reachable_by_others(path: str) -> bool:
-    """Whether every directory above ``path`` lets others search it."""
+# Access-control lists whose grants the mode bits do not show. A POSIX ACL's
+# mask is the mode's group bits and bounds every named entry, so a mode with
+# no search for group or others bounds it; an NFSv4 or rich ACL is not.
+_OPAQUE_ACLS = frozenset({"system.nfs4_acl", "system.richacl"})
+
+
+def _opaque_acl(path: str) -> bool:
+    """Whether ``path`` may carry an ACL its mode does not show (unknown counts as yes)."""
+    listxattr = getattr(os, "listxattr", None)
+    if listxattr is None:
+        return True  # no way to read them here (not Linux), so privacy is not established
+    try:
+        names = listxattr(path, follow_symlinks=False)
+    except OSError as exc:
+        return exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP)
+    return any(name in _OPAQUE_ACLS for name in names)
+
+
+def _private_directory(path: str, uid: int) -> str | None:
+    """The nearest directory above ``path`` that only ``uid`` (and root) can search.
+
+    The file itself is readable by others, as the agent's subordinate UID
+    needs, so who can read it is who can reach it: a user who cannot search
+    one directory above it cannot. That directory must be ``uid``'s, so no
+    one else can change its mode, with no search permission for its group
+    (a POSIX ACL's named entries included, which its mask bounds) or for
+    others, and no ACL the mode does not show. ``None`` when there is none.
+    """
     current = posixpath.dirname(path)
     while True:
         try:
-            if not os.stat(current).st_mode & stat.S_IXOTH:
-                return False
+            info = os.lstat(current)
         except OSError:
-            return False
+            return None
+        if (
+            stat.S_ISDIR(info.st_mode)
+            and info.st_uid == uid
+            and not info.st_mode & (stat.S_IXGRP | stat.S_IXOTH)
+            and not _opaque_acl(current)
+        ):
+            return current
         if current == "/":
-            return True
+            return None
         current = posixpath.dirname(current)
 
 
@@ -465,8 +561,9 @@ def check_projection(
     only on a bind runtime: a copy-in runtime would have to read it (ADR
     0005 D7.2). It is a regular file the operator owns, resolving to itself,
     outside D4.3's forbidden sources, readable by the agent's subordinate
-    UID through its bits for others, and in a directory others cannot
-    search.
+    UID through its bits for others, with no other hard link, and below a
+    directory only the operator can search: no search permission for its
+    group or others, and no ACL its mode does not show.
     """
     if not projection:
         return
@@ -528,16 +625,47 @@ def client_environment(base: Mapping[str, str], projection: Projection) -> dict[
 
 
 @dataclass(frozen=True)
+class StagingRoot:
+    """A launch's staging root (ADR 0013 D12; ADR 0005 D8.4 as amended): never a path alone.
+
+    ``<common_dir>/autoforge/sandbox/<key>/stage/<launch>``: ``common_dir``
+    is the controller's git common dir, ``key`` the issue's sandbox key (its
+    worktree's name, ``<n>`` or ``epic-<n>``), ``launch`` the launch's id.
+    The engine alone builds one, for the launch it creates; no provider or
+    operator names it, and no other directory can be expressed by one.
+    :func:`check_spec` proves its common dir is the controller's own
+    (:attr:`HostContext.git_common_dir`), each directory of its layout the
+    operator's, a real directory nobody else can write, and the root apart
+    from every checkout. A probe's staging root (ADR 0013 D6, item 9) is
+    #271's to add here.
+    """
+
+    common_dir: str
+    key: str
+    launch: str
+
+    @property
+    def layout(self) -> str:
+        """Its path below the common dir: what a measured ``/source``'s root must end with."""
+        return posixpath.join(SANDBOX_LAYOUT, self.key, STAGE_DIR, self.launch)
+
+    @property
+    def path(self) -> str:
+        """The host directory bound at ``/source``."""
+        return posixpath.join(self.common_dir, self.layout)
+
+
+@dataclass(frozen=True)
 class ContainerSpec:
     """Everything a create configures that the policy decides: no raw flag, mount or option.
 
     ``workspace_volume`` is the launch's ``/workspace`` volume, read-only for
     the exporter; ``cache_volume`` the per-issue cache volume, a
     change-producing launch container's only ("" for none); ``source`` the
-    launch's staging root, bound read-only at ``/source`` into the stager
-    and launch containers in the bind form ("" in the copy-in form);
-    ``projection`` the launch container's credentials. The tmpfs sizes are
-    in bytes, ``None`` for the kernel's default.
+    launch's :class:`StagingRoot`, bound read-only at ``/source`` into the
+    stager and launch containers in the bind form (``None`` in the copy-in
+    form); ``projection`` the launch container's credentials. The tmpfs
+    sizes are in bytes, ``None`` for the kernel's default.
     """
 
     role: ContainerRole
@@ -545,7 +673,7 @@ class ContainerSpec:
     workspace_volume: str
     staging: StagingMethod = StagingMethod.BIND
     cache_volume: str = ""
-    source: str = ""
+    source: StagingRoot | None = None
     projection: Projection = NO_PROJECTION
     home_size_bytes: int | None = None
     tmp_size_bytes: int | None = None
@@ -565,13 +693,105 @@ def _check_volume(name: str, label: str) -> None:
         )
 
 
+def _check_staging_root(root: object, host: HostContext) -> str:
+    """D12 for ``/source``'s source: the launch's own staging root, and nothing else.
+
+    Not any directory that passes the generic checks: the
+    :class:`StagingRoot` of a launch, in the controller's own common dir,
+    each directory from the common dir down a real one that the operator
+    owns and nobody else can write (``safefs`` makes them ``0700``), the
+    root resolving to itself, outside D4.3's forbidden sources and the
+    home, and never holding or lying in the controller's checkout or a
+    worktree. Returns its path.
+    """
+    rule = _RULE_BIND
+    if not isinstance(root, StagingRoot):
+        raise _refuse(
+            str(root),
+            rule,
+            "the staging root is the launch's StagingRoot, which the engine builds; a path "
+            "alone is never bound at /source",
+        )
+    if not host.git_common_dir:
+        raise _refuse(
+            root.path, rule, "no controller git common dir is known to prove the staging root in"
+        )
+    common = _resolved_self(host.git_common_dir, "the controller's git common dir", rule)
+    if root.common_dir != common:
+        raise _refuse(
+            root.path,
+            rule,
+            f"the staging root is not in the controller's own git common dir {common}",
+        )
+    for label, name in (("sandbox key", root.key), ("launch id", root.launch)):
+        if not isinstance(name, str) or not _NAME_RE.match(name):
+            raise _refuse(repr(name), rule, f"the staging root's {label} is not one path component")
+    if root.key == PROBE_DIR:
+        raise _refuse(root.path, rule, "the probes' directory is never a launch's sandbox key")
+    path = root.path
+    _check_mount_text(path, path, rule)
+    current = common
+    for part in root.layout.split("/"):
+        current = posixpath.join(current, part)
+        try:
+            info = os.lstat(current)
+        except OSError as exc:
+            raise _refuse(
+                current, rule, f"the staging root's directory cannot be checked ({exc.strerror})"
+            ) from None
+        if stat.S_ISLNK(info.st_mode):
+            raise _refuse(
+                current,
+                rule,
+                "the staging root passes through a symbolic link; a bind follows it, so what "
+                "it names could change after the check",
+            )
+        if not stat.S_ISDIR(info.st_mode):
+            raise _refuse(
+                current, rule, "the staging root's layout holds something not a directory"
+            )
+        if info.st_uid != host.uid:
+            raise _refuse(
+                current,
+                rule,
+                "the operator does not own this directory of the staging root, so it is not "
+                "the controller's",
+            )
+        if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise _refuse(
+                current,
+                rule,
+                "another user can write this directory of the staging root, and could replace "
+                "what it holds",
+            )
+    if os.path.realpath(path) != path:
+        raise _refuse(path, rule, "the staging root does not resolve to itself")
+    check_declared_path(path, host.home, host.environ, "the staging root")
+    for checkout in host.checkouts:
+        for spelling in {posixpath.normpath(checkout), os.path.realpath(checkout)}:
+            holds = path == spelling or spelling.startswith(path + "/")
+            # The main checkout holds its common dir, and so the staging root
+            # through it: only a checkout that does not hold the common dir is
+            # refused for holding the root.
+            through_common = common == spelling or common.startswith(spelling + "/")
+            within = path.startswith(spelling + "/") and not through_common
+            if holds or within:
+                raise _refuse(
+                    path,
+                    rule,
+                    f"the staging root {'holds' if holds else 'lies in'} the checkout or "
+                    f"worktree {checkout}, which is never bound",
+                )
+    return path
+
+
 def check_spec(spec: ContainerSpec, host: HostContext) -> None:
     """The spec against D9, D10, D12 and D14, before anything is created.
 
     A helper container is offline, with no projection and no cache; the
-    copy-in form binds nothing; the bind form binds only the
-    staging root (a directory resolving to itself, outside D4.3's
-    forbidden sources) at ``/source`` and the projection's files.
+    copy-in form binds nothing; the bind form binds only the launch's
+    staging root (:func:`_check_staging_root`) at ``/source`` and the
+    projection's files.
     """
     if not isinstance(spec.role, ContainerRole) or not isinstance(spec.network, ContainerNetwork):
         raise _refuse(repr(spec.network), _RULE_NETWORK, "not a container network position")
@@ -588,21 +808,19 @@ def check_spec(spec: ContainerSpec, host: HostContext) -> None:
         _check_volume(spec.cache_volume, "cache volume")
         if spec.cache_volume == spec.workspace_volume:
             raise _refuse(spec.cache_volume, _RULE_SPEC, "the cache is a volume of its own")
-    if spec.source:
+    source = ""
+    if spec.source is not None:
         if spec.staging is not StagingMethod.BIND:
-            raise _refuse(spec.source, _RULE_BIND, "the copy-in form binds nothing")
+            raise _refuse(str(spec.source), _RULE_BIND, "the copy-in form binds nothing")
         if spec.role is ContainerRole.EXPORTER:
-            raise _refuse(spec.source, _RULE_BIND, "the exporter binds nothing")
-        source = _resolved_self(spec.source, "the staging root", _RULE_BIND)
-        if not os.path.isdir(source):
-            raise _refuse(source, _RULE_BIND, "the staging root is a directory")
-        check_declared_path(source, host.home, host.environ, "the staging root")
+            raise _refuse(str(spec.source), _RULE_BIND, "the exporter binds nothing")
+        source = _check_staging_root(spec.source, host)
     for size in (spec.home_size_bytes, spec.tmp_size_bytes):
         if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size < 1):
             raise _refuse(str(size), _RULE_SPEC, "a tmpfs size is a positive number of bytes")
     check_projection(spec.projection, role=spec.role, staging=spec.staging, host=host)
     for item in spec.projection.files:
-        if spec.source and _related(item.source, spec.source):
+        if source and _related(item.source, source):
             raise _refuse(item.source, _RULE_BIND, "a credential file overlaps the staging root")
 
 
@@ -675,8 +893,8 @@ def create_options(product: RuntimeProduct, spec: ContainerSpec) -> list[str]:
     ]
     if spec.cache_volume:
         options.append(_volume(spec.cache_volume, CACHE_TARGET))
-    if spec.source:
-        options.append(_bind(spec.source, SOURCE_TARGET))
+    if spec.source is not None:
+        options.append(_bind(spec.source.path, SOURCE_TARGET))
     for item in spec.projection.files:
         options.append(_bind(item.source, item.path))
     for env in spec.projection.env:
@@ -794,6 +1012,43 @@ class Finding:
         return f"{self.capability.value}: {self.detail}"
 
 
+class MountKind(enum.Enum):
+    """How the policy makes one of its mounts, which fixes what a measurement must show."""
+
+    # A fresh tmpfs: of type tmpfs, its root the filesystem's own.
+    TMPFS = "tmpfs"
+    # A runtime volume: its root the volume's data directory, ``volumes/<name>/_data``.
+    VOLUME = "volume"
+    # A bind of a host path: its root ending with that path's tail.
+    BIND = "bind"
+
+
+@dataclass(frozen=True)
+class PolicyMount:
+    """One mount the policy makes, as a measurement must find it.
+
+    ``source`` is a volume's name, or for a bind the tail of the host path
+    its root must end with: a mount's root is its path in its filesystem,
+    which a mount point or a subvolume can shorten or lengthen at the
+    front, so only the tail is the same everywhere. ``read_only``: the
+    mount must be ``ro``, whatever any writability probe says. ``entries``:
+    for a tmpfs, the names it may hold (the mount points the policy puts in
+    it), since only its content tells a fresh one from a host tmpfs bound in
+    whole.
+    """
+
+    target: str
+    kind: MountKind
+    source: str = ""
+    read_only: bool = False
+    entries: frozenset[str] = frozenset()
+
+
+def _bind_tail(path: str) -> str:
+    """A credential file's tail: its private directory and its name."""
+    return "/".join(path.strip("/").split("/")[-2:])
+
+
 @dataclass(frozen=True)
 class Expectation:
     """What one measured container must show; built from its spec (:meth:`for_spec`).
@@ -801,54 +1056,92 @@ class Expectation:
     ``operator_uid`` and ``subordinate`` are the host's (``/etc/subuid``'s
     ranges for the operator, ``(start, count)``); ``writable`` the places the
     agent must be able to write, and the only ones, with
-    :data:`RUNTIME_TEMP`; ``mounts`` the mount points the policy makes;
-    ``loopback_nonce`` and ``abstract_nonce`` what the host's listeners
-    send; ``sentinels`` the places each fake credential may appear, by the
-    index the measurement was given it under (``env:NAME`` for a variable).
+    :data:`RUNTIME_TEMP`; ``mounts`` every mount the policy makes, each
+    with the source, type and read-only option it must show;
+    ``container_id`` the measured container's full id, which the runtime's
+    own files must be bound from. ``loopback_listeners`` are the host's
+    nonce listeners, ``(address, port)``, which must cover ``127.0.0.1`` and
+    ``::1``; ``loopback_routes`` the addresses and names the measurement
+    must have tried at each listener's port (:func:`loopback_routes`), to
+    which every default gateway it reports is added; ``loopback_nonce`` and
+    ``abstract_nonce`` what the host's listeners send. ``sentinels`` are
+    the places each fake credential may appear, by the index the
+    measurement was given it under (``env:NAME`` for a variable), and
+    ``scan_roots`` and ``scan_skip`` what the search must have walked and
+    may have left out.
     """
 
     network: ContainerNetwork
     operator_uid: int
     subordinate: tuple[tuple[int, int], ...]
     writable: frozenset[str]
-    mounts: frozenset[str]
+    mounts: tuple[PolicyMount, ...]
+    container_id: str = ""
     loopback_nonce: str = ""
+    loopback_listeners: tuple[tuple[str, int], ...] = ()
+    loopback_routes: tuple[str, ...] = (*LOOPBACK_ADDRESSES, *HOST_ALIASES)
     abstract_nonce: str = ""
     keyring_checked: bool = False
     sentinels: tuple[frozenset[str], ...] = ()
+    scan_roots: tuple[str, ...] = ("/",)
+    scan_skip: frozenset[str] = KERNEL_ROOTS
     uid: int = AGENT_UID
     gid: int = AGENT_GID
     pids_limit: int = PIDS_LIMIT
+
+    @property
+    def mount_points(self) -> frozenset[str]:
+        return frozenset(mount.target for mount in self.mounts)
 
     @classmethod
     def for_spec(
         cls,
         spec: ContainerSpec,
         *,
+        product: RuntimeProduct,
         operator_uid: int,
         subordinate: tuple[tuple[int, int], ...],
+        container_id: str = "",
         loopback_nonce: str = "",
+        loopback_listeners: tuple[tuple[str, int], ...] = (),
         abstract_nonce: str = "",
         keyring_checked: bool = False,
         sentinels: tuple[frozenset[str], ...] = (),
     ) -> Expectation:
+        exporter = spec.role is ContainerRole.EXPORTER
         writable = {HOME_TARGET, TMP_TARGET}
-        if spec.role is not ContainerRole.EXPORTER:
+        if not exporter:
             writable.add(WORKSPACE_TARGET)
-        mounts = {HOME_TARGET, TMP_TARGET, WORKSPACE_TARGET}
+        # The home holds the projection's files, each under its first component.
+        home = frozenset(item.target.split("/")[0] for item in spec.projection.files)
+        mounts = [
+            PolicyMount(HOME_TARGET, MountKind.TMPFS, entries=home),
+            PolicyMount(TMP_TARGET, MountKind.TMPFS),
+            PolicyMount(
+                WORKSPACE_TARGET, MountKind.VOLUME, spec.workspace_volume, read_only=exporter
+            ),
+        ]
         if spec.cache_volume:
             writable.add(CACHE_TARGET)
-            mounts.add(CACHE_TARGET)
-        if spec.source:
-            mounts.add(SOURCE_TARGET)
-        mounts.update(item.path for item in spec.projection.files)
+            mounts.append(PolicyMount(CACHE_TARGET, MountKind.VOLUME, spec.cache_volume))
+        if spec.source is not None:
+            mounts.append(
+                PolicyMount(SOURCE_TARGET, MountKind.BIND, spec.source.layout, read_only=True)
+            )
+        mounts.extend(
+            PolicyMount(item.path, MountKind.BIND, _bind_tail(item.source), read_only=True)
+            for item in spec.projection.files
+        )
         return cls(
             network=spec.network,
             operator_uid=operator_uid,
             subordinate=subordinate,
             writable=frozenset(writable),
-            mounts=frozenset(mounts),
+            mounts=tuple(mounts),
+            container_id=container_id,
             loopback_nonce=loopback_nonce,
+            loopback_listeners=loopback_listeners,
+            loopback_routes=loopback_routes(product),
             abstract_nonce=abstract_nonce,
             keyring_checked=keyring_checked,
             sentinels=sentinels,
@@ -898,20 +1191,158 @@ def _unescape(field: str) -> str:
     return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
 
 
-def _mounts(text: str) -> list[tuple[str, set[str]]]:
-    """``/proc/self/mountinfo``'s mount points and per-mount options, in order."""
+@dataclass(frozen=True)
+class _Mount:
+    """One line of ``/proc/self/mountinfo``: the fields the judge reads."""
+
+    device: str
+    root: str
+    point: str
+    options: frozenset[str]
+    fstype: str
+
+
+def _mounts(text: str) -> tuple[list[_Mount], int]:
+    """``/proc/self/mountinfo``'s mounts, in order, and how many lines did not parse."""
     mounts = []
+    malformed = 0
     for line in text.splitlines():
         parts = line.split()
-        if len(parts) >= 6:
-            mounts.append((_unescape(parts[4]), set(parts[5].split(","))))
-    return mounts
+        try:
+            separator = parts.index("-", 6)
+        except ValueError:
+            malformed += bool(line.strip())
+            continue
+        if separator + 1 >= len(parts):
+            malformed += 1
+            continue
+        mounts.append(
+            _Mount(
+                device=parts[2],
+                root=_unescape(parts[3]),
+                point=_unescape(parts[4]),
+                options=frozenset(parts[5].split(",")),
+                fstype=parts[separator + 1],
+            )
+        )
+    return mounts, malformed
 
 
-def _runtime_mount(point: str) -> bool:
-    return point in RUNTIME_FILES or any(
-        point == root or point.startswith(root + "/") for root in _KERNEL_ROOTS
-    )
+def _below(path: str, root: str) -> bool:
+    return path.startswith(root + "/")
+
+
+def _ends_with(root: str, tail: str) -> bool:
+    """Whether a mount's ``root`` ends with the path ``tail``, at a component boundary."""
+    return bool(tail) and (root == "/" + tail or root.endswith("/" + tail))
+
+
+def _contents_problem(contents: object, allowed: frozenset[str] = frozenset()) -> str:
+    """What is wrong with a fresh tmpfs's listing ("" for nothing).
+
+    A host tmpfs bound in whole (the operator's ``/run/user/<uid>``, a
+    tmpfs ``/tmp`` or ``/dev/shm``) shows the same type and root in
+    ``mountinfo`` as one the runtime makes; only what it holds tells them
+    apart. A fresh one holds nothing but the mount points ``allowed``, and a
+    listing that is missing, failed or cut short proves nothing.
+    """
+    if not isinstance(contents, Mapping):
+        return "its content was not listed, so a host tmpfs bound there would go unseen"
+    names, count = contents.get("names"), contents.get("count")
+    if not isinstance(names, list) or not isinstance(count, int) or isinstance(count, bool):
+        return f"its content could not be listed ({contents.get('error') or 'no listing'})"
+    extra = sorted({str(name) for name in names} - allowed)
+    if extra or count != len(names):
+        held = ", ".join(extra[:3]) or f"{count} entries, more than were listed"
+        return f"it holds {held}, which a fresh tmpfs would not"
+    return ""
+
+
+def _policy_mount_problem(mount: _Mount, wanted: PolicyMount, contents: object) -> str:
+    """What is wrong with a mount at one of the policy's targets ("" for nothing)."""
+    if wanted.kind is MountKind.TMPFS:
+        if mount.fstype != "tmpfs" or mount.root != "/":
+            return f"{mount.fstype} from {mount.root}, not a tmpfs of its own"
+        problem = _contents_problem(contents, wanted.entries)
+        if problem:
+            return problem
+    elif wanted.kind is MountKind.VOLUME:
+        if not _ends_with(mount.root, f"volumes/{wanted.source}/_data"):
+            return f"mounted from {mount.root}, not from the volume {wanted.source}"
+    elif not _ends_with(mount.root, wanted.source):
+        return f"bound from {mount.root}, not from .../{wanted.source}"
+    if wanted.read_only and "ro" not in mount.options:
+        return "mounted read-write, where the policy mounts it read-only"
+    return ""
+
+
+def _kernel_mount_problem(mount: _Mount, devices: Mapping[str, str], contents: object) -> str:
+    """What is wrong with a mount below ``/proc`` or ``/sys`` ("" for nothing).
+
+    The runtime masks and narrows its own procfs and sysfs: a read-only
+    view of the same filesystem, an empty read-only tmpfs (listed empty), or
+    the null device over a path; and it mounts the container's cgroup tree.
+    Nothing else, and no host filesystem, is admitted there.
+    """
+    kernel = "/proc" if _below(mount.point, "/proc") else "/sys"
+    own = "proc" if kernel == "/proc" else "sysfs"
+    read_only = "ro" in mount.options
+    if mount.fstype == own and mount.device == devices.get(kernel) and read_only:
+        return ""
+    if mount.fstype == "tmpfs" and mount.root == "/" and read_only:
+        return _contents_problem(contents)
+    if mount.root == "/null" and (
+        mount.fstype == "devtmpfs"
+        or (mount.fstype == "tmpfs" and mount.device == devices.get("/dev"))
+    ):
+        return ""
+    cgroup = mount.point == "/sys/fs/cgroup" or _below(mount.point, "/sys/fs/cgroup")
+    if cgroup and mount.fstype in ("cgroup2", "cgroup") and mount.root == "/":
+        return ""
+    return f"{mount.fstype} from {mount.root}, not one the runtime makes there"
+
+
+def _runtime_mount_problem(
+    mount: _Mount, expect: Expectation, devices: Mapping[str, str], contents: object
+) -> str:
+    """What is wrong with a mount the policy does not make ("" for one the runtime needs)."""
+    point, fstype, root = mount.point, mount.fstype, mount.root
+    if point in RUNTIME_FILES:
+        if not expect.container_id:
+            return (
+                "the container's id was not given, so the runtime's own file cannot be "
+                "told from a host bind"
+            )
+        parts = root.split("/")
+        if parts[-1] != posixpath.basename(point) or expect.container_id not in parts:
+            return f"bound from {root}, not from the runtime's directory for this container"
+        return ""
+    fresh = root == "/"
+    if point == "/proc":
+        return "" if fstype == "proc" and fresh else f"{fstype} from {root}, not a procfs"
+    if point == "/sys":
+        if fstype == "sysfs" and fresh and "ro" in mount.options:
+            return ""
+        return f"{fstype} from {root}, not a read-only sysfs"
+    if point == "/dev":
+        return "" if fstype == "tmpfs" and fresh else f"{fstype} from {root}, not a tmpfs"
+    if point == "/dev/shm":
+        # The IPC namespace's own, made empty (``--ipc=private``).
+        if fstype == "tmpfs" and fresh:
+            return _contents_problem(contents)
+        return f"{fstype} from {root}, not a tmpfs of its own"
+    if _below(point, "/dev"):
+        name = point.removeprefix("/dev/")
+        if (
+            (point == "/dev/pts" and fstype == "devpts")
+            or (point == "/dev/mqueue" and fstype == "mqueue")
+            or (name in RUNTIME_DEVICES and fstype == "devtmpfs" and root == f"/{name}")
+        ):
+            return ""
+        return f"{fstype} from {root}, not one the runtime makes there"
+    if _below(point, "/proc") or _below(point, "/sys"):
+        return _kernel_mount_problem(mount, devices, contents)
+    return "the policy made no mount there"
 
 
 def _judge_identity(obs: Mapping[str, object], expect: Expectation) -> list[Finding]:
@@ -991,22 +1422,41 @@ def _judge_identity(obs: Mapping[str, object], expect: Expectation) -> list[Find
 
 def _judge_filesystem(obs: Mapping[str, object], expect: Expectation) -> list[Finding]:
     findings: list[Finding] = []
-    mounts = _mounts(str(obs.get("mountinfo") or ""))
-    roots = [options for point, options in mounts if point == "/"]
-    if not roots or "ro" not in roots[-1]:
+    mounts, malformed = _mounts(str(obs.get("mountinfo") or ""))
+    if malformed:
+        findings.append(
+            Finding(ContainerCapability.MOUNTS, f"{malformed} line(s) of mountinfo do not parse")
+        )
+    roots = [mount for mount in mounts if mount.point == "/"]
+    if not roots or "ro" not in roots[-1].options:
         findings.append(
             Finding(ContainerCapability.READ_ONLY_ROOT, "the root is not mounted read-only")
         )
-    for point, _options in mounts:
-        if point != "/" and point not in expect.mounts and not _runtime_mount(point):
-            findings.append(
-                Finding(
-                    ContainerCapability.MOUNTS,
-                    f"{point} is mounted, and the policy made no mount there",
-                )
+    elif roots[-1].fstype not in ROOT_FILESYSTEMS:
+        findings.append(
+            Finding(
+                ContainerCapability.MOUNTS,
+                f"the root is {roots[-1].fstype}, not the runtime's overlay of the image",
             )
-    for point in sorted(expect.mounts):
-        if point not in {p for p, _ in mounts}:
+        )
+    policy = {mount.target: mount for mount in expect.mounts}
+    devices = {mount.point: mount.device for mount in mounts if mount.point in KERNEL_ROOTS}
+    listed = obs.get("tmpfs")
+    tmpfs = listed if isinstance(listed, Mapping) else {}
+    for mount in mounts:
+        if mount.point == "/":
+            continue
+        wanted = policy.get(mount.point)
+        contents = tmpfs.get(mount.point)
+        if wanted is not None:
+            problem = _policy_mount_problem(mount, wanted, contents)
+        else:
+            problem = _runtime_mount_problem(mount, expect, devices, contents)
+        if problem:
+            findings.append(Finding(ContainerCapability.MOUNTS, f"{mount.point}: {problem}"))
+    seen = {mount.point for mount in mounts}
+    for point in sorted(policy):
+        if point not in seen:
             findings.append(Finding(ContainerCapability.MOUNTS, f"{point} is not mounted"))
     writable_obs = obs.get("writable")
     writable = writable_obs if isinstance(writable_obs, Mapping) else {}
@@ -1029,91 +1479,224 @@ def _judge_filesystem(obs: Mapping[str, object], expect: Expectation) -> list[Fi
     return findings
 
 
+# What a searched keyring may answer when the host's key is not reachable.
 _KEY_ABSENT = frozenset({"ENOKEY", "EPERM", "EACCES", "ENOSYS", "EKEYREVOKED", "EKEYEXPIRED"})
+_KEYRINGS = ("session", "user", "user-session")
+# What proves an address unreachable from inside: a refusal, or no path to it.
+# A timeout, a reset or any other error proves nothing: a slow or lossy path
+# to the host's listener looks the same.
+_ROUTE_REFUSED = frozenset(
+    {"ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH", "EADDRNOTAVAIL", "EACCES", "EPERM"}
+)
+# A name that does not exist leads nowhere; a failed lookup proves nothing.
+_NO_SUCH_NAME = frozenset({"EAI_NONAME", "EAI_NODATA", "EAI_ADDRFAMILY"})
+_ABSTRACT_REFUSED = frozenset({"ECONNREFUSED", "EACCES", "EPERM"})
+
+
+def _carries(received: object, nonce: str) -> bool:
+    """Whether ``received`` holds the nonce, or the start of it (a truncated answer)."""
+    if not isinstance(received, str) or not received or not nonce:
+        return False
+    return nonce in received or nonce.startswith(received)
+
+
+def _attempts(entry: Mapping[str, object]) -> list[Mapping[str, object]]:
+    attempts = entry.get("attempts")
+    if not isinstance(attempts, list):
+        return []
+    return [attempt for attempt in attempts if isinstance(attempt, Mapping)]
+
+
+def _route_unproved(entry: Mapping[str, object], nonce: str, offline: bool) -> str:
+    """Why one tried address or name does not prove the listener unreachable ("" if it does).
+
+    ``offline``: the container proved it has no interface but loopback and
+    no route, so a name it could not look up leads nowhere either.
+    """
+    error = entry.get("resolve_error")
+    if error is not None:
+        if error in _NO_SUCH_NAME or offline:
+            return ""
+        return f"the name could not be resolved ({error})"
+    attempts = entry.get("attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return "it resolved to no address that was tried"
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            return "an attempt was not reported"
+        result = attempt.get("result")
+        address = attempt.get("address")
+        if result in _ROUTE_REFUSED or _carries(attempt.get("received"), nonce):
+            continue  # refused; or reached, which is reported on its own
+        if result == "connected":
+            received = attempt.get("received")
+            if attempt.get("eof") is True and isinstance(received, str) and received:
+                continue  # another service, which answered without the nonce and closed
+            return (
+                f"{address} accepted a connection that neither sent the nonce nor answered "
+                "otherwise and closed"
+            )
+        return f"{address} gave {result or 'no result'}"
+    return ""
+
+
+def _judge_loopback(obs: Mapping[str, object], expect: Expectation, offline: bool) -> list[Finding]:
+    capability = ContainerCapability.HOST_LOOPBACK
+    nonce = expect.loopback_nonce
+    findings: list[Finding] = []
+    listened = {address for address, _ in expect.loopback_listeners}
+    for family in LOOPBACK_ADDRESSES:
+        if family not in listened:
+            findings.append(
+                Finding(
+                    capability,
+                    f"the host had no nonce listener on {family}, so a path to it would go unseen",
+                )
+            )
+    connects = obs.get("connect")
+    entries = [e for e in connects if isinstance(e, Mapping)] if isinstance(connects, list) else []
+    for entry in entries:
+        for attempt in _attempts(entry):
+            if _carries(attempt.get("received"), nonce):
+                findings.append(
+                    Finding(
+                        capability,
+                        f"{entry.get('host')} port {entry.get('port')} "
+                        f"({attempt.get('address')}) reached the host's loopback listener",
+                    )
+                )
+    gateways = obs.get("gateways")
+    if not isinstance(gateways, list) or not all(isinstance(g, str) for g in gateways):
+        findings.append(Finding(capability, "the default gateways were not reported"))
+        gateways = []
+    routes = dict.fromkeys((*LOOPBACK_ADDRESSES, *expect.loopback_routes, *gateways))
+    for port in sorted({port for _, port in expect.loopback_listeners}):
+        for route in routes:
+            tried = [e for e in entries if e.get("host") == route and e.get("port") == port]
+            if not tried:
+                findings.append(
+                    Finding(capability, f"no connection to {route} port {port} was tried")
+                )
+            for entry in tried:
+                why = _route_unproved(entry, nonce, offline)
+                if why:
+                    findings.append(
+                        Finding(capability, f"{route} port {port}: {why}, which proves nothing")
+                    )
+    return findings
+
+
+def _judge_abstract(obs: Mapping[str, object], expect: Expectation) -> list[Finding]:
+    capability = ContainerCapability.HOST_ABSTRACT_SOCKET
+    abstract = obs.get("abstract")
+    if not isinstance(abstract, Mapping) or not abstract.get("result"):
+        return [Finding(capability, "no connection to the abstract socket was tried")]
+    result = abstract.get("result")
+    if result == "connected":
+        # Its name is the host's random one: whatever accepted it is the host's socket.
+        answered = _carries(abstract.get("received"), expect.abstract_nonce)
+        return [
+            Finding(
+                capability,
+                "the host's abstract socket accepted a connection"
+                + (" and sent its nonce" if answered else ""),
+            )
+        ]
+    if result in _ABSTRACT_REFUSED:
+        return []
+    return [Finding(capability, f"connecting to it gave {result}, which proves nothing")]
+
+
+def _judge_keyring(obs: Mapping[str, object]) -> list[Finding]:
+    findings: list[Finding] = []
+    keyring = obs.get("keyring")
+    results = keyring if isinstance(keyring, Mapping) else {}
+    if not results:
+        return [Finding(ContainerCapability.SESSION_KEYRING, "the keyring was not searched")]
+    for where in _KEYRINGS:
+        if where not in results:
+            findings.append(
+                Finding(
+                    ContainerCapability.SESSION_KEYRING, f"the {where} keyring was not searched"
+                )
+            )
+    for where, result in sorted(results.items()):
+        if result not in _KEY_ABSENT:
+            findings.append(
+                Finding(
+                    ContainerCapability.SESSION_KEYRING,
+                    f"searching the {where} keyring for the host's key gave {result}",
+                )
+            )
+    return findings
 
 
 def _judge_network(obs: Mapping[str, object], expect: Expectation) -> list[Finding]:
-    findings: list[Finding] = []
-    if expect.keyring_checked:
-        keyring = obs.get("keyring")
-        results = keyring if isinstance(keyring, Mapping) else {}
-        if not results:
-            findings.append(
-                Finding(ContainerCapability.SESSION_KEYRING, "the keyring was not searched")
-            )
-        for where, result in sorted(results.items()):
-            if result not in _KEY_ABSENT:
-                findings.append(
-                    Finding(
-                        ContainerCapability.SESSION_KEYRING,
-                        f"searching the {where} keyring for the host's key gave {result}",
-                    )
-                )
-    connects = obs.get("connect")
-    attempts = [a for a in connects if isinstance(a, Mapping)] if isinstance(connects, list) else []
-    if expect.loopback_nonce and not attempts:
-        findings.append(
-            Finding(ContainerCapability.HOST_LOOPBACK, "no connection to the listener was tried")
-        )
-    for attempt in attempts:
-        received = str(attempt.get("received") or "")
-        if expect.loopback_nonce and expect.loopback_nonce in received:
-            findings.append(
-                Finding(
-                    ContainerCapability.HOST_LOOPBACK,
-                    f"{attempt.get('host')}:{attempt.get('port')} reached the host's loopback "
-                    "listener",
-                )
-            )
-    abstract = obs.get("abstract")
-    if expect.abstract_nonce:
-        if not isinstance(abstract, Mapping) or not abstract.get("result"):
-            findings.append(
-                Finding(
-                    ContainerCapability.HOST_ABSTRACT_SOCKET,
-                    "no connection to the abstract socket was tried",
-                )
-            )
-        received = str(abstract.get("received") or "") if isinstance(abstract, Mapping) else ""
-        if expect.abstract_nonce in received:
-            findings.append(
-                Finding(
-                    ContainerCapability.HOST_ABSTRACT_SOCKET,
-                    "the host's abstract socket answered",
-                )
-            )
+    findings = _judge_keyring(obs) if expect.keyring_checked else []
+    no_route: list[Finding] = []
     if expect.network is ContainerNetwork.NONE:
         interfaces = obs.get("interfaces")
         names = sorted(interfaces) if isinstance(interfaces, list) else []
         if names != ["lo"]:
-            findings.append(Finding(ContainerCapability.NO_ROUTE, f"interfaces: {names}"))
+            no_route.append(Finding(ContainerCapability.NO_ROUTE, f"interfaces: {names}"))
         routes = obs.get("routes")
         if not isinstance(routes, list) or routes:
-            findings.append(Finding(ContainerCapability.NO_ROUTE, f"routes: {routes}"))
+            no_route.append(Finding(ContainerCapability.NO_ROUTE, f"routes: {routes}"))
+    offline = expect.network is ContainerNetwork.NONE and not no_route
+    if expect.loopback_nonce:
+        findings += _judge_loopback(obs, expect, offline)
+    if expect.abstract_nonce:
+        findings += _judge_abstract(obs, expect)
+    return findings + no_route
+
+
+def _judge_scan(scan: object, expect: Expectation) -> list[Finding]:
+    """The sentinel search's coverage: what it did not cover proves nothing absent there."""
+    capability = ContainerCapability.CREDENTIALS
+    if not isinstance(scan, Mapping):
+        return [Finding(capability, "the search reported no coverage")]
+    findings: list[Finding] = []
+    roots, skip = scan.get("roots"), scan.get("skip")
+    if not isinstance(roots, list) or not set(expect.scan_roots) <= set(roots):
+        findings.append(
+            Finding(capability, f"the search walked {roots}, not {list(expect.scan_roots)}")
+        )
+    if not isinstance(skip, list) or not set(skip) <= expect.scan_skip:
+        findings.append(
+            Finding(capability, f"the search left out {skip}, more than {sorted(expect.scan_skip)}")
+        )
+    incomplete, count = scan.get("incomplete"), scan.get("incomplete_count")
+    if not isinstance(count, int) or isinstance(count, bool) or count != 0 or incomplete != []:
+        examples = "; ".join(str(x) for x in incomplete[:3]) if isinstance(incomplete, list) else ""
+        findings.append(
+            Finding(
+                capability,
+                f"the search could not cover {count if isinstance(count, int) else 'some'} "
+                f"place(s) ({examples or 'unreported'}), so a credential there would go unseen",
+            )
+        )
     return findings
 
 
 def _judge_sentinels(obs: Mapping[str, object], expect: Expectation) -> list[Finding]:
-    findings: list[Finding] = []
+    if not expect.sentinels:
+        return []
+    capability = ContainerCapability.CREDENTIALS
     hits = obs.get("sentinels")
-    found = hits if isinstance(hits, Mapping) else {}
-    if expect.sentinels and not isinstance(hits, Mapping):
-        findings.append(Finding(ContainerCapability.CREDENTIALS, "the sentinels were not searched"))
+    if not isinstance(hits, Mapping):
+        return [Finding(capability, "the sentinels were not searched")]
+    findings = _judge_scan(obs.get("scan"), expect)
     for index, allowed in enumerate(expect.sentinels):
-        places = found.get(str(index))
-        seen = set(places) if isinstance(places, list) else set()
+        places = hits.get(str(index))
+        if not isinstance(places, list) or not all(isinstance(p, str) for p in places):
+            findings.append(Finding(capability, f"fake credential {index} was not searched for"))
+            continue
+        seen = set(places)
         for place in sorted(seen - allowed):
-            findings.append(
-                Finding(
-                    ContainerCapability.CREDENTIALS, f"fake credential {index} found at {place}"
-                )
-            )
+            findings.append(Finding(capability, f"fake credential {index} found at {place}"))
         for place in sorted(allowed - seen):
             findings.append(
-                Finding(
-                    ContainerCapability.CREDENTIALS,
-                    f"projected fake credential {index} missing at {place}",
-                )
+                Finding(capability, f"projected fake credential {index} missing at {place}")
             )
     return findings
 
@@ -1125,7 +1708,10 @@ def judge(observation: str | Mapping[str, object], expect: Expectation) -> tuple
     host reads it, since the one seen inside is relative to the parent user
     namespace. Empty when the container showed everything
     :class:`Expectation` asks. An observation that does not parse proves
-    nothing: every item is a finding.
+    nothing: every item is a finding. An item it did not measure, or
+    measured inconclusively, is a finding too: a mount it cannot attribute
+    to the policy or the runtime, a connection that was neither refused nor
+    answered and closed, a search that did not cover every place.
     """
     if isinstance(observation, str):
         try:

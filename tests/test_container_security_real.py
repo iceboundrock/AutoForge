@@ -10,13 +10,19 @@ What ADR 0013 §7 asks of #270 on a real runtime, with fake credentials only:
 - every fake credential sentinel outside the projection is absent: not in
   the container's environment or files, and not in the runtime's record
   of the container (``inspect``), where only an environment credential's
-  value persists, as D14 states.
+  value persists, as D14 states; and none is on the argv of the create or
+  of the measurement's ``exec``: the measurement takes its request, the
+  sentinels included, on standard input.
 
 The container is created by :func:`autoforge.sandbox_container.create_argv`
 exactly as the policy renders it, PID 1 standing in for the watcher (#272),
 and measured by :mod:`autoforge.container_measure` run as the agent through
 :func:`~autoforge.sandbox_container.exec_argv`, judged by
-:func:`~autoforge.sandbox_container.judge`.
+:func:`~autoforge.sandbox_container.judge`. The staging root is a
+:class:`~autoforge.sandbox_container.StagingRoot` in a git common dir of the
+test's own, laid out as the controller lays one out; the host's nonce
+listeners are on ``127.0.0.1`` and ``::1`` both, and a host with no IPv6
+loopback skips.
 
 **Opt-in.** Until #271 builds the image and the probe exists, nothing can
 say a host is capable, so these tests run only when the operator names a
@@ -67,10 +73,12 @@ from autoforge.sandbox_container import (
     Projection,
     RuntimeProduct,
     Secret,
+    StagingRoot,
     client_environment,
     create_argv,
     exec_argv,
     judge,
+    loopback_routes,
     subordinate_ranges,
 )
 
@@ -133,10 +141,18 @@ class Runtime:
     env: dict[str, str]
     keyed: tuple[str, ...]
 
-    def run(self, args: list[str], *, env: dict[str, str] | None = None, check: bool = True):
+    def run(
+        self,
+        args: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        check: bool = True,
+        stdin: str | None = None,
+    ):
         done = subprocess.run(
             [*self.keyed, self.executable, *args],
             env=env or self.env,
+            input=stdin,
             capture_output=True,
             text=True,
             timeout=_TIMEOUT,
@@ -221,9 +237,10 @@ class Listeners:
 
 
 @pytest.fixture
-def listeners() -> Iterator[Listeners]:
-    """A nonce TCP listener on host loopback (IPv4 and, where it binds, IPv6, on one
-    port) and a host abstract Unix socket."""
+def listeners(runtime) -> Iterator[Listeners]:
+    """A nonce TCP listener on host loopback, IPv4 and IPv6 on one port, and a host
+    abstract Unix socket. Both families are required: a path to the one not listened on
+    would go unseen, so a host with no IPv6 loopback skips."""
     nonce = f"nonce-loopback-{uuid.uuid4().hex}"
     v4 = socket.socket(socket.AF_INET)
     v4.bind(("127.0.0.1", 0))
@@ -233,8 +250,9 @@ def listeners() -> Iterator[Listeners]:
         v6 = socket.socket(socket.AF_INET6)
         v6.bind(("::1", port))
         servers.append(v6)
-    except OSError:
-        pass
+    except OSError as exc:
+        v4.close()
+        _unavailable(f"no listener on the host's ::1 port {port} ({exc.strerror})")
     name = f"autoforge-270-{uuid.uuid4().hex}"
     abstract = socket.socket(socket.AF_UNIX)
     abstract.bind("\0" + name)
@@ -265,7 +283,7 @@ def _measure(
     host: HostContext,
     listeners: Listeners,
     sentinels: tuple[tuple[str, frozenset[str]], ...],
-) -> tuple[dict, str]:
+) -> tuple[dict, str, str]:
     nonce = uuid.uuid4().hex[:12]
     name = f"af-test-270-{nonce}"
     labels = {"io.autoforge.test": "270", "io.autoforge.nonce": nonce}
@@ -287,11 +305,11 @@ def _measure(
             image=runtime.image,
             command=["python3", "-I", "-c", "import time; time.sleep(600)"],
         )
-        assert not any(value in word for word in argv for value, _ in sentinels)
         keyed.run(argv, env=client)
         keyed.run(["start", name])
         request = {
             "places": PLACES,
+            "connect_hosts": list(loopback_routes(runtime.product)),
             "connect_ports": [listeners.port],
             "abstract": listeners.abstract_name,
             "keyring": key,
@@ -300,14 +318,18 @@ def _measure(
             "scan_skip": ["/proc", "/sys", "/dev"],
         }
         source = MEASURE.read_text(encoding="utf-8")
-        measured = keyed.run(
-            exec_argv(runtime.product, name, ["python3", "-I", "-c", source, json.dumps(request)])
-        )
+        # The request, every fake credential in it, goes on standard input: never on the
+        # exec's argv, where every local process could read it (devcontainers/cli#1317).
+        measure = exec_argv(runtime.product, name, ["python3", "-I", "-c", source])
+        for word in (*argv, *measure, *keyed.keyed):
+            assert not any(value in word for value, _ in sentinels), "a sentinel on an argv"
+        measured = keyed.run(measure, stdin=json.dumps(request))
         observation = json.loads(measured.stdout)
         pid = keyed.run(["inspect", "--format", "{{.State.Pid}}", name]).stdout.strip()
         observation[HOST_UID_MAP] = Path(f"/proc/{pid}/uid_map").read_text(encoding="utf-8")
+        container_id = keyed.run(["inspect", "--format", "{{.Id}}", name]).stdout.strip()
         record = keyed.run(["inspect", name]).stdout
-        return observation, record
+        return observation, record, container_id
     finally:
         keyed.run(["rm", "--force", name], check=False)
         keyed.run(["volume", "rm", "--force", spec.workspace_volume], check=False)
@@ -345,17 +367,52 @@ def _credential(tmp_path: Path) -> str:
     return str(path)
 
 
-def _staging(tmp_path: Path) -> str:
-    root = tmp_path / "stage"
-    root.mkdir()
-    (root / "README").write_text("staged\n")
-    root.chmod(0o755)
-    (root / "README").chmod(0o644)
-    return str(root)
+def _common(tmp_path: Path) -> Path:
+    """A git common dir of the test's own, inside its checkout as a main checkout's is."""
+    common = tmp_path / "repo" / ".git"
+    common.mkdir(parents=True, exist_ok=True)
+    return common
 
 
-def _host() -> HostContext:
-    return HostContext.current()
+def _staging(tmp_path: Path) -> StagingRoot:
+    """A staging root laid out as the controller lays one out: 0700 directories, the root
+    itself readable by the agent's subordinate UID, holding one staged file."""
+    root = StagingRoot(str(_common(tmp_path)), "270", f"ANALYZE_EXECUTE-{uuid.uuid4().hex[:8]}")
+    current = Path(root.common_dir)
+    for part in root.layout.split("/"):
+        current = current / part
+        current.mkdir(exist_ok=True)
+        current.chmod(0o700)
+    current.chmod(0o755)
+    (current / "README").write_text("staged\n")
+    (current / "README").chmod(0o644)
+    return root
+
+
+def _host(tmp_path: Path) -> HostContext:
+    common = _common(tmp_path)
+    return HostContext.current(git_common_dir=str(common), checkouts=(str(common.parent),))
+
+
+def _expectation(
+    runtime: Runtime,
+    spec: ContainerSpec,
+    listeners: Listeners,
+    container_id: str,
+    sentinels: tuple[tuple[str, frozenset[str]], ...],
+) -> Expectation:
+    return Expectation.for_spec(
+        spec,
+        product=runtime.product,
+        operator_uid=os.getuid(),
+        subordinate=_subordinate(),
+        container_id=container_id,
+        loopback_nonce=listeners.loopback_nonce,
+        loopback_listeners=(("127.0.0.1", listeners.port), ("::1", listeners.port)),
+        abstract_nonce=listeners.abstract_nonce,
+        keyring_checked=True,
+        sentinels=tuple(allowed for _, allowed in sentinels),
+    )
 
 
 def test_an_agent_on_the_bridge_gets_the_policy_and_only_its_projection(
@@ -381,16 +438,10 @@ def test_an_agent_on_the_bridge_gets_the_policy_and_only_its_projection(
         (SENTINEL_GH, frozenset()),
         (SENTINEL_OTHER, frozenset()),
     )
-    observation, record = _measure(runtime, spec, _host(), listeners, sentinels)
-    expect = Expectation.for_spec(
-        spec,
-        operator_uid=os.getuid(),
-        subordinate=_subordinate(),
-        loopback_nonce=listeners.loopback_nonce,
-        abstract_nonce=listeners.abstract_nonce,
-        keyring_checked=True,
-        sentinels=tuple(allowed for _, allowed in sentinels),
+    observation, record, container_id = _measure(
+        runtime, spec, _host(tmp_path), listeners, sentinels
     )
+    expect = _expectation(runtime, spec, listeners, container_id, sentinels)
     findings = judge(observation, expect)
     assert findings == (), "\n".join(finding.describe() for finding in findings)
     # The runtime's record of the container: no host credential and no file
@@ -410,16 +461,10 @@ def test_an_isolated_launch_has_no_interface_but_loopback_and_no_route(
         source=_staging(tmp_path),
     )
     sentinels = ((SENTINEL_GH, frozenset()), (SENTINEL_OTHER, frozenset()))
-    observation, record = _measure(runtime, spec, _host(), listeners, sentinels)
-    expect = Expectation.for_spec(
-        spec,
-        operator_uid=os.getuid(),
-        subordinate=_subordinate(),
-        loopback_nonce=listeners.loopback_nonce,
-        abstract_nonce=listeners.abstract_nonce,
-        keyring_checked=True,
-        sentinels=tuple(allowed for _, allowed in sentinels),
+    observation, record, container_id = _measure(
+        runtime, spec, _host(tmp_path), listeners, sentinels
     )
+    expect = _expectation(runtime, spec, listeners, container_id, sentinels)
     findings = judge(observation, expect)
     assert findings == (), "\n".join(finding.describe() for finding in findings)
     assert SENTINEL_GH not in record and SENTINEL_OTHER not in record

@@ -2374,6 +2374,27 @@ since a bind follows it and what it names could change after the check.
 A path holding a comma or a quote is refused, since it would end the
 mount's field. The runtime never relabels a bind source (no `z` or `Z`).
 
+`/source` is bound only from the launch's own staging root, never from a
+directory that merely passes the generic path checks. The spec holds no
+path for it, only a `StagingRoot`: the controller's git common dir, the
+issue's sandbox key and the launch's id, which name
+`<git common dir>/autoforge/sandbox/<key>/stage/<launch id>` and nothing
+else. Before any create, the policy proves:
+
+- the common dir is the controller's own, and resolves to itself;
+- the key and the launch id are one path component each, and the key is
+  not the probes' directory;
+- every directory from the common dir down to the root is a real
+  directory, not a link, owned by the operator and writable by nobody
+  else (`safefs` makes them `0700`);
+- the root is outside D4.3's forbidden sources and is not the home or one
+  of its ancestors;
+- the root is not the controller's checkout or a worktree, holds none,
+  and lies in none but the main checkout, which holds the common dir.
+
+So `/usr`, `/etc`, the checkout, the common dir and a worktree's admin
+dir can never be bound there.
+
 **The network (D9).** No container is created on the host's network
 namespace: the only positions are the bridge and `none`, and the
 lifecycle refuses any other before the journal is written.
@@ -2441,10 +2462,18 @@ for any container but the launch container:
   `~/.netrc`, keyrings, `/run`, `$XDG_RUNTIME_DIR`), and readable by the
   agent: the agent's subordinate UID reads it only through its
   permission bits for others, so a `0600` file is refused rather than
-  delivered unusable. Since that makes it readable by every local user
-  who can reach it, a directory above it must deny others search (a
-  `0700` directory holding a `0644` file). Its content stays out of the
-  runtime's record.
+  delivered unusable. That makes it readable by every local user who can
+  reach it, so it must have one hard link, and a directory above it must
+  be one only the operator can enter: owned by the operator, with no
+  search permission for its group or for others, and no access-control
+  list that the mode does not show. A POSIX ACL's named entries are
+  bounded by its mask, which is the mode's group bits, so a mode without
+  group search bounds them. An NFSv4 or rich ACL is not bounded that way,
+  so a directory carrying one, or one whose ACLs cannot be read (on a
+  platform with no way to read them, none can), does not
+  count. In practice that is a `0700` directory holding a `0644` file; a
+  `0750` directory admits its group and is refused. Its content stays out
+  of the runtime's record.
 
 Every projected value is held as a `Secret`, which no `repr`, string or
 pickle shows. Long-lived login and refresh state stays on the host; a
@@ -2483,9 +2512,9 @@ inside and `sandbox_container.judge()` checks, which is what the probe
 | keyrings, D-Bus, path-named IPC sockets, `/run`, `$XDG_RUNTIME_DIR` | absent; the container's own IPC namespace; no host keyring key | refused as bind sources; the runtime's session keyring and seccomp; the keyring measured |
 | `/var`, `/opt`, `/srv`, `/mnt`, `/media`, other homes | the image's, read-only | `--read-only`; mounts and writability measured |
 | unrelated repositories and files | absent | no host path but the closed set |
-| `/proc` | a new procfs in the container's own PID namespace, as the runtime masks it | the runtime; never `--pid=host` |
-| `/dev` | the runtime's minimal device set; no device added | never `--device` or `--privileged` |
-| `/sys` | read-only, as the runtime mounts it for an unprivileged container | the runtime; not measured on its own |
+| `/proc` | a new procfs in the container's own PID namespace, as the runtime masks it | the runtime; never `--pid=host`; every mount below it measured (a read-only view of the same procfs, a read-only tmpfs listed empty, or the null device only) |
+| `/dev` | the runtime's minimal device set; no device added | never `--device` or `--privileged`; every mount below it measured (`devpts`, `mqueue`, the `shm` tmpfs listed empty, and the host's `null`, `zero`, `full`, `tty`, `random` and `urandom` nodes under their own names only) |
+| `/sys` | read-only, as the runtime mounts it for an unprivileged container | the runtime; a read-only sysfs of its own measured, and every mount below it (a read-only view of the same sysfs, a read-only tmpfs listed empty, the null device or the container's cgroup tree only) |
 | network | the bridge or `none`, as the table above | D9; loopback, abstract socket, interfaces and routes measured |
 
 And the properties the policy adds, each measured:
@@ -2497,8 +2526,9 @@ And the properties the policy adds, each measured:
 | no privilege gain | `--security-opt=no-new-privileges` | `NoNewPrivs: 1` |
 | the default seccomp profile | no seccomp option | `Seccomp: 2` |
 | a PID limit | `--pids-limit=4096` | the cgroup's `pids.max` |
-| no mount but the policy's | the closed set; the runtime's own `/etc/hosts`, `/etc/hostname`, `/etc/resolv.conf` and `/run/.containerenv` | every mount point in `mountinfo` |
-| no credential outside the projection | the projection alone | fake sentinels searched in the environment and the files |
+| no mount but the policy's | the closed set; the runtime's own `/etc/hosts`, `/etc/hostname`, `/etc/resolv.conf` and `/run/.containerenv` | every mount in `mountinfo`, by what it is, not only where: the root the runtime's overlay, read-only; each tmpfs of the policy a fresh one, which its listing proves, since a host tmpfs bound in whole (the operator's `/run/user/<uid>`, a tmpfs `/tmp`) shows the same type and root: `/tmp` empty, the home holding only the projection's first directories; each volume mounted from its own `volumes/<name>/_data`; `/source` from the launch's staging root and a credential file from its own path, each `ro` whatever a writability probe says; the runtime's own files only from the directory named by the container's own id; and below `/proc`, `/sys` and `/dev`, only what the rows above list |
+| host loopback and abstract sockets unreachable | the container's own network namespace | a conclusive refusal (a refusal, no route, or a name that does not exist) at both loopback families, both runtimes' host aliases, rootless Docker's host address and every default gateway, at each port the host listens on, from a host listening on both `127.0.0.1` and `::1`; a timeout, a reset, a failed lookup, a routing table not read, or a connection that neither carried the nonce nor answered otherwise and closed (one closed with nothing said included) proves nothing, and the host is refused. Any connection to the host's abstract socket is a reached socket |
+| no credential outside the projection | the projection alone | fake sentinels searched in the environment and in every regular file, each read whole; a file or directory the search could not cover (an I/O error, one the agent owns but cannot read now, one it can search but not list, a spent byte budget) or a sentinel with no result fails the measurement. Only what the agent is denied and does not own is out of its reach, and counted |
 
 **What a container does not reproduce, refused rather than claimed:**
 
@@ -2547,7 +2577,11 @@ whose values land on an argument is not enough either
 ([devcontainers/cli#1317](https://github.com/devcontainers/cli/issues/1317)):
 no value is ever on an argument here. The unit tests search every create's
 arguments for fake sentinels, and the opt-in real-runtime tests the
-container's environment, its files and the runtime's record too.
+container's environment, its files and the runtime's record too. The
+measurement takes its request, the fake sentinels included, on standard
+input and refuses one given as an argument, so the tests' own `exec`
+puts none on an argument either, and the real-runtime tests assert that
+of the create's and the `exec`'s arguments.
 
 ## Merge safety
 

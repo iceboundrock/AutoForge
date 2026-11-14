@@ -14,6 +14,8 @@ judge must name what it does not prove). The real-runtime tests are
 from __future__ import annotations
 
 import dataclasses
+import errno
+import io
 import itertools
 import json
 import os
@@ -39,7 +41,9 @@ from autoforge.sandbox_container import (
     AGENT_UID,
     CACHE_TARGET,
     HOME_TARGET,
+    HOST_ALIASES,
     HOST_UID_MAP,
+    LOOPBACK_ADDRESSES,
     NO_PROJECTION,
     PIDS_LIMIT,
     SOURCE_TARGET,
@@ -59,14 +63,17 @@ from autoforge.sandbox_container import (
     RuntimeProduct,
     Secret,
     StagingMethod,
+    StagingRoot,
     check_spec,
     client_environment,
     create_argv,
     exec_argv,
     judge,
+    loopback_routes,
     network_for,
     subordinate_ranges,
 )
+from autoforge.sandbox_policy import SANDBOX_DIR
 
 REPO = Path(__file__).resolve().parent.parent
 MEASURE = REPO / "src" / "autoforge" / "container_measure.py"
@@ -78,21 +85,50 @@ IMAGE = "sha256:" + "a" * 64
 LABELS = {"io.autoforge.run": "run-1", "io.autoforge.nonce": "n-1"}
 
 
+LAUNCH_ID = "ANALYZE_EXECUTE-1"
+
+
 @pytest.fixture
-def host(tmp_path: Path) -> HostContext:
-    """A fake operator home, so D4.3's forbidden sources are this test's own."""
+def common(tmp_path: Path) -> Path:
+    """The controller's git common dir, inside its checkout as a main checkout's is."""
+    path = tmp_path / "repo" / ".git"
+    path.mkdir(parents=True)
+    return path
+
+
+@pytest.fixture
+def host(tmp_path: Path, common: Path) -> HostContext:
+    """A fake operator home, so D4.3's forbidden sources are this test's own, and the
+    controller's common dir, checkout and a worktree of it."""
     home = tmp_path / "home"
     home.mkdir()
     runtime_dir = tmp_path / "xdg-runtime"
     runtime_dir.mkdir(mode=0o700)
-    return HostContext(str(home), {"XDG_RUNTIME_DIR": str(runtime_dir)}, os.getuid())
+    worktree = common / "autoforge" / "worktrees" / "270"
+    worktree.mkdir(parents=True)
+    (common / "autoforge").chmod(0o700)  # as safefs makes it, whatever the umask
+    checkouts = (str(common.parent), str(worktree))
+    return HostContext(
+        str(home), {"XDG_RUNTIME_DIR": str(runtime_dir)}, os.getuid(), str(common), checkouts
+    )
+
+
+def _stage(common: Path, key: str = "270", launch: str = LAUNCH_ID) -> StagingRoot:
+    """A staging root as the controller makes one: safefs's 0700 directories, the root
+    itself readable by the agent's subordinate UID."""
+    root = StagingRoot(str(common), key, launch)
+    current = common
+    for part in root.layout.split("/"):
+        current = current / part
+        current.mkdir(exist_ok=True)
+        current.chmod(0o700)
+    current.chmod(0o755)
+    return root
 
 
 @pytest.fixture
-def staging(tmp_path: Path) -> str:
-    root = tmp_path / "common" / "autoforge" / "sandbox" / "k" / "stage" / "1"
-    root.mkdir(parents=True)
-    return str(root)
+def staging(common: Path) -> StagingRoot:
+    return _stage(common)
 
 
 @pytest.fixture
@@ -134,7 +170,9 @@ def _launch(**fields) -> ContainerSpec:
 # -- every spec the policy can render ------------------------------------------------
 
 
-def _every_spec(staging: str, credential: str) -> Iterator[tuple[RuntimeProduct, ContainerSpec]]:
+def _every_spec(
+    staging: StagingRoot, credential: str
+) -> Iterator[tuple[RuntimeProduct, ContainerSpec]]:
     projection = Projection(env=(_env(),), files=(FileCredential(credential, ".config/p/key"),))
     for product, role, network, form, cache, project in itertools.product(
         RuntimeProduct,
@@ -160,7 +198,7 @@ def _every_spec(staging: str, credential: str) -> Iterator[tuple[RuntimeProduct,
                 "af-vol-1",
                 staging=form,
                 cache_volume="af-cache-270" if cache else "",
-                source=staging if bound else "",
+                source=staging if bound else None,
                 projection=projected,
             ),
         )
@@ -310,7 +348,7 @@ def test_the_bind_sources_are_a_closed_set(staging, credential, host):
         expected = []
         if spec.source:
             expected.append(
-                f"--mount=type=bind,source={staging},target={SOURCE_TARGET},readonly=true"
+                f"--mount=type=bind,source={staging.path},target={SOURCE_TARGET},readonly=true"
             )
         for item in spec.projection.files:
             expected.append(
@@ -550,11 +588,154 @@ def test_a_credential_file_under_a_forbidden_host_source_is_refused(relative, wh
     assert SENTINEL_GH not in str(refused.value)
 
 
-def test_the_home_itself_or_an_ancestor_is_never_a_bind_source(host, tmp_path):
-    for source in (host.home, str(tmp_path)):
-        spec = _launch(source=source)
+def test_the_home_itself_or_an_ancestor_is_never_a_bind_source(host, staging):
+    """D4.3 still applies to the staging root: never the home or one of its ancestors."""
+    for home in (staging.path, f"{staging.path}/op"):
         with pytest.raises(SandboxPolicyError, match="operator's home"):
-            check_spec(spec, host)
+            check_spec(_launch(source=staging), dataclasses.replace(host, home=home))
+
+
+# -- the staging root: the launch's own, and nothing else (D12) -----------------------
+
+
+def test_the_launchs_own_staging_root_is_bound_read_only_at_source(staging, host, common):
+    """The positive case: the StagingRoot of the launch, in the controller's common dir,
+    in directories only the operator owns and can write, apart from every checkout (the
+    main checkout holds the common dir, and so the root, which is how it must be)."""
+    assert staging.path == f"{common}/{SANDBOX_DIR}/270/stage/{LAUNCH_ID}"
+    assert common.parent.as_posix() in host.checkouts
+    check_spec(_launch(source=staging), host)
+    argv = _argv(_launch(source=staging), host)
+    assert f"--mount=type=bind,source={staging.path},target={SOURCE_TARGET},readonly=true" in argv
+
+
+@pytest.mark.parametrize("path", ["/usr", "/etc", "/", "checkout", "common", "admin", "staging"])
+def test_a_path_alone_is_never_bound_at_source(path, host, common, staging):
+    """D12: no directory reaches /source because it passes the generic checks, not /usr,
+    /etc, the checkout, the common dir or a worktree's admin dir, and not even the staging
+    root's own path: only the StagingRoot the engine builds."""
+    admin = common / "worktrees" / "270"
+    admin.mkdir(parents=True)
+    named = {
+        "checkout": str(common.parent),
+        "common": str(common),
+        "admin": str(admin),
+        "staging": staging.path,
+    }
+    spec = _launch(source=named.get(path, path))
+    with pytest.raises(SandboxPolicyError, match="a path alone is never bound"):
+        check_spec(spec, host)
+
+
+@pytest.mark.parametrize("other", ["/usr", "/etc", "/", "elsewhere", "admin"])
+def test_a_staging_root_outside_the_controllers_common_dir_is_refused(
+    other, host, common, tmp_path
+):
+    """A StagingRoot in another directory, a worktree's admin dir as the "common dir"
+    included, is not the launch's: refused even where its layout exists."""
+    places = {"elsewhere": tmp_path / "elsewhere", "admin": common / "worktrees" / "270"}
+    base = places.get(other, Path(other))
+    if other in places:
+        base.mkdir(parents=True)
+        _stage(base)
+    with pytest.raises(SandboxPolicyError, match="not in the controller's own git common dir"):
+        check_spec(_launch(source=StagingRoot(str(base), "270", LAUNCH_ID)), host)
+
+
+def test_a_staging_root_needs_the_controllers_common_dir_to_be_known(staging, host):
+    unknown = dataclasses.replace(host, git_common_dir="")
+    with pytest.raises(SandboxPolicyError, match="no controller git common dir"):
+        check_spec(_launch(source=staging), unknown)
+
+
+@pytest.mark.parametrize(
+    ("key", "launch"),
+    [
+        ("..", LAUNCH_ID),
+        (".", LAUNCH_ID),
+        ("270/../../..", LAUNCH_ID),
+        ("", LAUNCH_ID),
+        ("270", ".."),
+        ("270", "../../../worktrees/270"),
+        ("270", "a/b"),
+        ("270", ""),
+        ("270", "-x"),
+    ],
+)
+def test_a_staging_roots_key_and_launch_are_one_component_each(key, launch, host, common):
+    """No name climbs out of the layout, towards the common dir or a worktree's admin dir."""
+    with pytest.raises(SandboxPolicyError, match="not one path component"):
+        check_spec(_launch(source=StagingRoot(str(common), key, launch)), host)
+
+
+def test_the_probes_directory_is_never_a_launchs_key(host, common):
+    with pytest.raises(SandboxPolicyError, match="probes' directory"):
+        check_spec(_launch(source=_stage(common, key="probe")), host)
+
+
+def test_a_link_in_the_staging_roots_layout_is_refused(host, common):
+    """A link anywhere from the common dir down: here ``stage`` leads to the common dir's
+    worktree admin directories, so the "staging root" would be a worktree's admin dir."""
+    admin = common / "worktrees" / LAUNCH_ID
+    admin.mkdir(parents=True)
+    issue = common / "autoforge" / "sandbox" / "270"
+    issue.mkdir(parents=True)
+    for directory in (issue, issue.parent, admin, admin.parent):
+        directory.chmod(0o700)
+    (issue / "stage").symlink_to(common / "worktrees")
+    root = StagingRoot(str(common), "270", LAUNCH_ID)
+    assert os.path.isdir(root.path)
+    with pytest.raises(SandboxPolicyError, match="symbolic link"):
+        check_spec(_launch(source=root), host)
+
+
+@pytest.mark.parametrize("part", ["autoforge", "sandbox", "270", "stage", LAUNCH_ID])
+def test_a_staging_root_another_user_can_write_is_refused(part, staging, host, common):
+    """Every directory of the layout is the controller's: one that a group or others can
+    write could have its contents replaced."""
+    path = common
+    for name in staging.layout.split("/"):
+        path = path / name
+        if name == part:
+            break
+    path.chmod(0o777 if part == LAUNCH_ID else 0o770)
+    with pytest.raises(SandboxPolicyError, match="another user can write"):
+        check_spec(_launch(source=staging), host)
+
+
+def test_a_staging_root_the_operator_does_not_own_is_refused(staging, host):
+    with pytest.raises(SandboxPolicyError, match="does not own"):
+        check_spec(_launch(source=staging), dataclasses.replace(host, uid=host.uid + 1))
+
+
+def test_a_staging_root_that_is_missing_or_not_a_directory_is_refused(host, common):
+    with pytest.raises(SandboxPolicyError, match="cannot be checked"):
+        check_spec(_launch(source=StagingRoot(str(common), "270", LAUNCH_ID)), host)
+    root = _stage(common)
+    Path(root.path).rmdir()
+    Path(root.path).write_text("not a directory")
+    with pytest.raises(SandboxPolicyError, match="not a directory"):
+        check_spec(_launch(source=root), host)
+
+
+@pytest.mark.parametrize("where", ["the root", "inside it", "around it"])
+def test_a_staging_root_never_holds_or_lies_in_a_checkout_or_worktree(where, staging, host):
+    """The checkout and every worktree are never bound: a staging root that is one, holds
+    one, or lies in a worktree kept inside the common dir is refused."""
+    worktree = {
+        "the root": staging.path,
+        "inside it": f"{staging.path}/wt",
+        "around it": staging.path.rsplit("/", 2)[0],
+    }[where]
+    hosting = dataclasses.replace(host, checkouts=(*host.checkouts, worktree))
+    with pytest.raises(SandboxPolicyError, match="checkout or worktree"):
+        check_spec(_launch(source=staging), hosting)
+
+
+def test_the_staging_layout_is_the_controllers_sandbox_directory(staging):
+    """The staging root's layout is ADR 0005 D8.4's: under ``sandbox_policy.SANDBOX_DIR``."""
+    assert staging.layout.startswith(SANDBOX_DIR + "/")
+    assert staging.layout == f"{SANDBOX_DIR}/270/stage/{LAUNCH_ID}"
 
 
 def test_a_runtime_socket_is_never_bound(host, tmp_path):
@@ -592,9 +773,12 @@ def test_a_link_anywhere_in_a_bind_source_is_refused(tmp_path, credential, stagi
         with pytest.raises(SandboxPolicyError, match="symbolic link"):
             check_spec(spec, host)
     staged_link = tmp_path / "staged"
-    staged_link.symlink_to(staging)
+    staged_link.symlink_to(Path(staging.path).parent.parent)
+    linked = StagingRoot(str(staged_link), "270", LAUNCH_ID)
     with pytest.raises(SandboxPolicyError, match="symbolic link"):
-        check_spec(_launch(source=str(staged_link)), host)
+        check_spec(
+            _launch(source=linked), dataclasses.replace(host, git_common_dir=str(staged_link))
+        )
 
 
 @pytest.mark.parametrize("kind", ["directory", "fifo"])
@@ -618,22 +802,88 @@ def test_a_credential_file_the_agent_could_not_read_is_refused_not_delivered(tmp
         check_spec(spec, host)
 
 
-def test_a_credential_file_every_local_user_can_read_is_refused(host):
+@pytest.fixture
+def exposed() -> Iterator[Path]:
+    """A directory in the system temp dir, none of whose ancestors is private to the operator."""
     base = Path(tempfile.gettempdir())
-    chain = [base, *base.parents]
-    if not all(os.stat(p).st_mode & stat.S_IXOTH for p in chain):
-        pytest.skip(f"{base} is not searchable by others here")
+    for parent in (base, *base.parents):
+        info = os.stat(parent)
+        if info.st_uid == os.getuid() and not info.st_mode & (stat.S_IXGRP | stat.S_IXOTH):
+            pytest.skip(f"{parent} is private to this user here")
     directory = Path(tempfile.mkdtemp(prefix="af-270-exposed-"))
     try:
-        directory.chmod(0o755)
-        source = _secret_file(directory / "key")
-        spec = _launch(projection=Projection(files=(FileCredential(source, "k"),)))
-        with pytest.raises(SandboxPolicyError, match="every local user can read"):
-            check_spec(spec, host)
+        yield directory
     finally:
         for child in directory.iterdir():
             child.unlink()
         directory.rmdir()
+
+
+@pytest.mark.parametrize("mode", [0o755, 0o751, 0o750, 0o710])
+def test_a_credential_file_other_local_users_can_reach_is_refused(mode, exposed, host):
+    """Every local user (``o+x``), or every member of the directory's group (``g+x``), can
+    reach a 0644 file whose directories are all searchable to them: refused."""
+    exposed.chmod(mode)
+    source = _secret_file(exposed / "key")
+    spec = _launch(projection=Projection(files=(FileCredential(source, "k"),)))
+    with pytest.raises(SandboxPolicyError, match="other local users can reach this file"):
+        check_spec(spec, host)
+
+
+def test_a_credential_file_under_a_directory_only_the_operator_can_enter_is_accepted(exposed, host):
+    exposed.chmod(0o700)
+    source = _secret_file(exposed / "key")
+    check_spec(_launch(projection=Projection(files=(FileCredential(source, "k"),))), host)
+
+
+def test_a_credential_file_with_another_hard_link_is_refused(credential, tmp_path, host):
+    """Another link could sit in a directory others can search."""
+    os.link(credential, tmp_path / "elsewhere")
+    spec = _launch(projection=Projection(files=(FileCredential(credential, "k"),)))
+    with pytest.raises(SandboxPolicyError, match="another hard link"):
+        check_spec(spec, host)
+
+
+@pytest.mark.parametrize(
+    ("listed", "accepted"),
+    [
+        (["system.nfs4_acl"], False),
+        (["system.richacl"], False),
+        (OSError(errno.EIO, "I/O error"), False),
+        (["system.posix_acl_access", "user.note"], True),
+        (OSError(errno.ENOTSUP, "not supported"), True),
+    ],
+)
+def test_an_acl_the_mode_does_not_show_makes_a_directory_not_private(
+    listed, accepted, credential, host, monkeypatch
+):
+    """A POSIX ACL's named entries are bounded by its mask, the mode's group bits, which a
+    private directory has no search in; an NFSv4 or rich ACL is not, and a directory whose
+    ACLs cannot be read is not private either."""
+
+    def listxattr(path, *, follow_symlinks=True):
+        if isinstance(listed, OSError):
+            raise listed
+        return listed
+
+    monkeypatch.setattr(os, "listxattr", listxattr, raising=False)
+    spec = _launch(projection=Projection(files=(FileCredential(credential, "k"),)))
+    if accepted:
+        check_spec(spec, host)
+    else:
+        with pytest.raises(SandboxPolicyError, match="other local users can reach this file"):
+            check_spec(spec, host)
+
+
+def test_a_directorys_acls_unreadable_on_this_platform_make_it_not_private(
+    credential, host, monkeypatch
+):
+    """Without ``os.listxattr`` (not Linux) a directory's ACLs cannot be read, so whether
+    another user can enter it is not established: refused."""
+    monkeypatch.delattr(os, "listxattr", raising=False)
+    spec = _launch(projection=Projection(files=(FileCredential(credential, "k"),)))
+    with pytest.raises(SandboxPolicyError, match="other local users can reach this file"):
+        check_spec(spec, host)
 
 
 def test_a_credential_file_another_user_owns_is_refused(credential, host):
@@ -660,8 +910,9 @@ def test_a_bind_source_that_would_end_a_mount_field_is_refused(tmp_path, host):
     spec = _launch(projection=Projection(files=(FileCredential(source, "k"),)))
     with pytest.raises(SandboxPolicyError, match="end the mount's field"):
         check_spec(spec, host)
-    with pytest.raises(SandboxPolicyError, match="end the mount's field"):
-        check_spec(_launch(source=str(directory)), host)
+    comma = StagingRoot(str(Path(host.git_common_dir)), "270", "a,readonly=false")
+    with pytest.raises(SandboxPolicyError, match="not one path component"):
+        check_spec(_launch(source=comma), host)
 
 
 def test_two_credential_files_never_overlap(tmp_path, credential, host):
@@ -679,7 +930,7 @@ def test_the_staging_root_is_bound_only_where_d12_admits_it(staging, credential,
     )
     with pytest.raises(SandboxPolicyError, match="exporter binds nothing"):
         check_spec(exporter, host)
-    with pytest.raises(SandboxPolicyError, match="is a directory"):
+    with pytest.raises(SandboxPolicyError, match="a path alone is never bound"):
         check_spec(_launch(source=credential), host)
     cache_on_helper = ContainerSpec(
         ContainerRole.STAGER, ContainerNetwork.NONE, "af-vol-1", cache_volume="af-cache"
@@ -722,20 +973,40 @@ STATUS = (
     "NoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t1\n"
 )
 UID_MAP = "         0       1000          1\n         1     100000      65536\n"
+CID = "c0ffee" + "0" * 58
+OTHER_CID = "bad" + "0" * 61
+USERDATA = f"/containers/overlay-containers/{CID}/userdata"
+STAGED = f"/code/.git/{SANDBOX_DIR}/270/stage/{LAUNCH_ID}"
+VOLUME_DATA = "/op/.local/share/containers/storage/volumes/af-vol-1/_data"
+# A rootless Podman container as the policy creates it: the overlay root
+# read-only; its own procfs, sysfs and /dev, with the runtime's masks (a
+# read-only view of /proc/bus, the null device over /proc/kcore, an empty
+# read-only tmpfs over /proc/acpi and /sys/firmware) and the host's device
+# nodes it binds; its own files from its per-container storage; the policy's
+# tmpfs, volume and read-only bind.
 MOUNTINFO = "\n".join(
     [
         "500 400 0:50 / / ro,relatime - overlay overlay rw,lowerdir=/x",
         "501 500 0:51 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw",
         "502 500 0:52 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755",
-        "503 502 0:53 / /dev/shm rw,nosuid,nodev,noexec - tmpfs shm rw,size=65536k",
-        "504 500 0:54 / /sys ro,nosuid,nodev,noexec - sysfs sysfs ro",
-        "505 504 0:55 / /sys/fs/cgroup ro - cgroup2 cgroup2 rw",
-        "506 500 8:1 /home/op/.local/share/docker/c/hosts /etc/hosts rw - ext4 /dev/sda1",
-        "507 500 0:56 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw,mode=1777",
-        "508 500 0:57 / /home/agent rw,nosuid,nodev - tmpfs tmpfs rw,mode=700,uid=10001",
-        "509 500 0:58 / /workspace rw - ext4 /dev/sda1 rw",
-        "510 500 8:1 /code/.git/autoforge/sandbox/k/stage/1 /source ro - ext4 /dev/sda1 rw",
-        r"511 501 0:59 / /proc/acpi ro,relatime - tmpfs tmpfs\040x ro",
+        "503 502 0:53 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw,mode=620",
+        "504 502 0:54 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw",
+        "505 502 0:55 / /dev/shm rw,nosuid,nodev,noexec - tmpfs shm rw,size=65536k",
+        "506 502 0:5 /null /dev/null rw,nosuid,noexec - devtmpfs udev rw,size=8g",
+        "507 502 0:5 /urandom /dev/urandom rw,nosuid,noexec - devtmpfs udev rw,size=8g",
+        "508 500 0:56 / /sys ro,nosuid,nodev,noexec - sysfs sysfs ro",
+        "509 508 0:57 / /sys/fs/cgroup ro,nosuid,nodev,noexec - cgroup2 cgroup2 rw",
+        "510 508 0:58 / /sys/firmware ro,relatime - tmpfs tmpfs ro",
+        f"511 500 0:59 {USERDATA}/hosts /etc/hosts rw,nosuid,nodev - tmpfs tmpfs rw",
+        f"512 500 0:59 {USERDATA}/resolv.conf /etc/resolv.conf rw,nosuid,nodev - tmpfs tmpfs rw",
+        f"513 500 0:59 {USERDATA}/.containerenv /run/.containerenv rw - tmpfs tmpfs rw",
+        "514 500 0:60 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw,mode=1777",
+        "515 500 0:61 / /home/agent rw,nosuid,nodev - tmpfs tmpfs rw,mode=700,uid=110001",
+        f"516 500 8:2 {VOLUME_DATA} /workspace rw,relatime - ext4 /dev/sda2 rw",
+        f"517 500 8:1 {STAGED} /source ro,relatime - ext4 /dev/sda1 rw",
+        "518 501 0:51 /bus /proc/bus ro,nosuid,nodev,noexec,relatime - proc proc rw",
+        "519 501 0:5 /null /proc/kcore rw,nosuid - devtmpfs udev rw",
+        r"520 501 0:62 / /proc/acpi ro,relatime - tmpfs tmpfs\040x ro",
     ]
 )
 WRITABLE = {
@@ -750,6 +1021,52 @@ WRITABLE = {
     HOME_TARGET: True,
     TMP_TARGET: True,
 }
+PORT = 41000
+GATEWAYS = ["192.168.1.1", "fe80::1%eth0"]
+
+
+def _tried(host: str, *attempts: dict, port: int = PORT) -> dict:
+    return {"host": host, "port": port, "attempts": list(attempts)}
+
+
+def _refused(address: str, result: str = "ECONNREFUSED") -> dict:
+    return {"address": address, "result": result}
+
+
+# Every route the judge requires for Podman, each conclusively unreachable: a
+# refusal, no path, a name that does not exist, or another service that
+# answered without the nonce and closed.
+CONNECT = [
+    _tried("127.0.0.1", _refused("127.0.0.1")),
+    _tried("::1", _refused("::1", "EADDRNOTAVAIL")),
+    _tried("host.containers.internal", _refused("169.254.1.2")),
+    {"host": "host.docker.internal", "port": PORT, "resolve_error": "EAI_NONAME"},
+    _tried("192.168.1.1", _refused("192.168.1.1", "EHOSTUNREACH")),
+    _tried(
+        "fe80::1%eth0",
+        {"address": "fe80::1%eth0", "result": "connected", "received": "SSH-2.0-x", "eof": True},
+    ),
+]
+SCAN = {
+    "roots": ["/"],
+    "skip": ["/proc", "/sys", "/dev"],
+    "files": 1200,
+    "bytes": 52_000_000,
+    "denied": 4,
+    "special": 0,
+    "incomplete": [],
+    "incomplete_count": 0,
+}
+# What each tmpfs of its own held: the runtime's /dev and its device nodes,
+# and every other one empty.
+TMPFS = {
+    "/dev": {"count": 6, "names": ["mqueue", "null", "pts", "shm", "urandom", "zero"]},
+    "/dev/shm": {"count": 0, "names": []},
+    "/sys/firmware": {"count": 0, "names": []},
+    "/tmp": {"count": 0, "names": []},
+    HOME_TARGET: {"count": 0, "names": []},
+    "/proc/acpi": {"count": 0, "names": []},
+}
 GOOD = {
     "status": STATUS,
     "uid_map": "         0          0          1\n         1          1      65536\n",
@@ -757,15 +1074,15 @@ GOOD = {
     "mountinfo": MOUNTINFO,
     "pids_max": f"{PIDS_LIMIT}\n",
     "writable": WRITABLE,
-    "connect": [
-        {"host": "127.0.0.1", "port": 41000, "result": "ECONNREFUSED"},
-        {"host": "10.0.2.2", "port": 41000, "result": "connected", "received": "SSH-2.0-x"},
-    ],
+    "tmpfs": TMPFS,
+    "gateways": GATEWAYS,
+    "connect": CONNECT,
     "abstract": {"result": "ECONNREFUSED"},
     "keyring": {"session": "EPERM", "user": "EPERM", "user-session": "EPERM"},
     "interfaces": ["eth0", "lo"],
     "routes": ["ipv4 via eth0"],
     "sentinels": {"0": ["env:MODEL_API_KEY"], "1": []},
+    "scan": SCAN,
 }
 
 
@@ -774,13 +1091,16 @@ def _expect(**changes) -> Expectation:
         ContainerRole.LAUNCH,
         ContainerNetwork.BRIDGE,
         "af-vol-1",
-        source="/code/.git/autoforge/sandbox/k/stage/1",
+        source=StagingRoot("/code/.git", "270", LAUNCH_ID),
     )
     expect = Expectation.for_spec(
         spec,
+        product=RuntimeProduct.PODMAN,
         operator_uid=1000,
         subordinate=((100000, 65536),),
+        container_id=CID,
         loopback_nonce="nonce-loop-1",
+        loopback_listeners=(("127.0.0.1", PORT), ("::1", PORT)),
         abstract_nonce="nonce-abstract-1",
         keyring_checked=True,
         sentinels=(frozenset({"env:MODEL_API_KEY"}), frozenset()),
@@ -798,6 +1118,22 @@ def _status(**fields) -> str:
         key = line.split(":", 1)[0]
         lines.append(f"{key}:\t{fields[key]}" if key in fields else line)
     return "\n".join(lines)
+
+
+def _mountinfo(point: str, line: str | None) -> str:
+    """MOUNTINFO with the line at ``point`` replaced (``None`` drops it)."""
+    lines = [entry for entry in MOUNTINFO.splitlines() if f" {point} " not in entry]
+    return "\n".join(lines if line is None else [*lines, line])
+
+
+def _connect(host: str, *attempts: dict, port: int = PORT) -> list:
+    """CONNECT with ``host``'s entry replaced by these attempts (none drops it)."""
+    kept = [entry for entry in CONNECT if entry["host"] != host]
+    return kept + [_tried(host, *attempts, port=port)] if attempts else kept
+
+
+def _connected(received: str, eof: bool, address: str = "127.0.0.1") -> dict:
+    return {"address": address, "result": "connected", "received": received, "eof": eof}
 
 
 @pytest.mark.parametrize(
@@ -828,18 +1164,6 @@ def _status(**fields) -> str:
             {"mountinfo": MOUNTINFO.replace("/ / ro,relatime", "/ / rw,relatime")},
             ContainerCapability.READ_ONLY_ROOT,
         ),
-        (
-            {"mountinfo": MOUNTINFO + "\n600 500 0:60 / /run/secrets ro - tmpfs t ro"},
-            ContainerCapability.MOUNTS,
-        ),
-        (
-            {"mountinfo": MOUNTINFO + "\n601 500 8:1 /home/op /mnt/home ro - ext4 /dev/sda1 rw"},
-            ContainerCapability.MOUNTS,
-        ),
-        (
-            {"mountinfo": MOUNTINFO.replace(" /source ro", " /elsewhere ro")},
-            ContainerCapability.MOUNTS,
-        ),
         ({"pids_max": "max\n"}, ContainerCapability.PID_LIMIT),
         ({"pids_max": ""}, ContainerCapability.PID_LIMIT),
         ({"writable": {**WRITABLE, "/var/tmp": True}}, ContainerCapability.WRITABLE_PLACES),
@@ -851,34 +1175,20 @@ def _status(**fields) -> str:
             ContainerCapability.SESSION_KEYRING,
         ),
         ({"keyring": {}}, ContainerCapability.SESSION_KEYRING),
-        (
-            {
-                "connect": [
-                    {
-                        "host": "::1",
-                        "port": 41000,
-                        "result": "connected",
-                        "received": "nonce-loop-1",
-                    }
-                ]
-            },
-            ContainerCapability.HOST_LOOPBACK,
-        ),
-        ({"connect": []}, ContainerCapability.HOST_LOOPBACK),
-        (
-            {"abstract": {"result": "connected", "received": "nonce-abstract-1"}},
-            ContainerCapability.HOST_ABSTRACT_SOCKET,
-        ),
-        ({"abstract": None}, ContainerCapability.HOST_ABSTRACT_SOCKET),
+        ({"keyring": {"session": "EPERM", "user": "EPERM"}}, ContainerCapability.SESSION_KEYRING),
         ({"sentinels": {"0": ["env:MODEL_API_KEY"], "1": ["/workspace/x"]}}, "CREDENTIALS"),
-        ({"sentinels": {"0": ["env:MODEL_API_KEY", "env:OTHER"]}}, "CREDENTIALS"),
-        ({"sentinels": {"0": []}}, "CREDENTIALS"),
+        ({"sentinels": {"0": ["env:MODEL_API_KEY", "env:OTHER"], "1": []}}, "CREDENTIALS"),
+        ({"sentinels": {"0": [], "1": []}}, "CREDENTIALS"),
         ({"sentinels": None}, "CREDENTIALS"),
     ],
 )
 def test_each_item_the_container_does_not_show_is_named(change, capability):
+    _assert_named(change, capability)
+
+
+def _assert_named(change: dict, capability, expect: Expectation | None = None) -> None:
     observation = {**GOOD, **change}
-    findings = judge(observation, _expect())
+    findings = judge(observation, expect or _expect())
     if isinstance(capability, ContainerCapability):
         expected = {capability}
     elif isinstance(capability, str):
@@ -890,13 +1200,295 @@ def test_each_item_the_container_does_not_show_is_named(change, capability):
         assert finding.describe().startswith(finding.capability.value + ": ")
 
 
+_HOST_BIND = "8:1 /home/op"
+
+
+@pytest.mark.parametrize(
+    "mountinfo",
+    [
+        # A read-only bind that is writable: its probe failing proves nothing.
+        MOUNTINFO.replace(" /source ro,relatime", " /source rw,relatime"),
+        # The policy's mounts from the wrong source or of the wrong type.
+        _mountinfo("/source", "600 500 8:1 /home/op/code/repo /source ro - ext4 /dev/sda1 rw"),
+        _mountinfo("/source", f"600 500 8:1 {STAGED}-other /source ro - ext4 /dev/sda1 rw"),
+        _mountinfo("/workspace", f"600 500 {_HOST_BIND} /workspace rw - ext4 /dev/sda1 rw"),
+        _mountinfo(
+            "/workspace",
+            "600 500 8:2 /op/.local/share/containers/storage/volumes/af-vol-2/_data "
+            "/workspace rw - ext4 /dev/sda2 rw",
+        ),
+        _mountinfo("/home/agent", f"600 500 {_HOST_BIND} /home/agent rw - ext4 /dev/sda1 rw"),
+        _mountinfo("/tmp", "600 500 0:70 /x /tmp rw - tmpfs tmpfs rw"),
+        # A policy mount missing, and one stacked over it.
+        _mountinfo("/source", None),
+        MOUNTINFO + f"\n600 517 {_HOST_BIND} /source ro - ext4 /dev/sda1 rw",
+        # Something the policy never makes.
+        MOUNTINFO + "\n600 500 0:60 / /run/secrets ro - tmpfs t ro",
+        MOUNTINFO + f"\n601 500 {_HOST_BIND} /mnt/home ro - ext4 /dev/sda1 rw",
+        MOUNTINFO + f"\n602 516 {_HOST_BIND} /workspace/home ro - ext4 /dev/sda1 rw",
+        # Hostile mounts under the kernel trees, which are exempt no more.
+        MOUNTINFO + f"\n603 502 {_HOST_BIND} /dev/hostdata rw - ext4 /dev/sda1 rw",
+        MOUNTINFO + "\n604 502 0:5 /sda /dev/sda rw - devtmpfs udev rw",
+        _mountinfo("/dev/null", "605 502 0:5 /sda /dev/null rw - devtmpfs udev rw"),
+        MOUNTINFO + "\n606 502 0:5 / /dev/hostdev rw - devtmpfs udev rw",
+        MOUNTINFO + f"\n607 501 {_HOST_BIND}/.ssh /proc/acpi/x ro - ext4 /dev/sda1 rw",
+        MOUNTINFO + "\n608 501 0:99 /1 /proc/hostpid ro - proc proc rw",
+        MOUNTINFO + "\n609 501 0:63 / /proc/scsi rw - tmpfs tmpfs rw",
+        MOUNTINFO + "\n610 501 0:51 /sys /proc/sys rw - proc proc rw",
+        MOUNTINFO + f"\n611 508 {_HOST_BIND} /sys/kernel/x ro - ext4 /dev/sda1 rw",
+        MOUNTINFO + "\n612 508 0:64 / /sys/kernel/debug ro - debugfs debugfs rw",
+        MOUNTINFO + "\n613 508 0:65 /user.slice /sys/fs/cgroup/x ro - cgroup2 cgroup2 rw",
+        _mountinfo("/sys", "614 500 0:56 / /sys rw,nosuid - sysfs sysfs rw"),
+        _mountinfo("/proc", "615 500 8:1 /proc /proc rw - ext4 /dev/sda1 rw"),
+        _mountinfo("/dev", "616 500 0:5 / /dev rw - devtmpfs udev rw"),
+        # The runtime's own files from anywhere but this container's directory.
+        _mountinfo("/etc/hosts", f"617 500 {_HOST_BIND}/hosts /etc/hosts ro - ext4 /dev/sda1 rw"),
+        _mountinfo(
+            "/etc/resolv.conf",
+            f"618 500 0:59 /containers/overlay-containers/{OTHER_CID}/userdata/resolv.conf "
+            "/etc/resolv.conf rw - tmpfs tmpfs rw",
+        ),
+        _mountinfo(
+            "/run/.containerenv",
+            f"619 500 0:59 {USERDATA}/hosts /run/.containerenv rw - tmpfs tmpfs rw",
+        ),
+        # A root that is a host directory, not the runtime's overlay.
+        MOUNTINFO.replace("- overlay overlay", "- ext4 /dev/sda1"),
+        MOUNTINFO + "\ngarbage",
+    ],
+)
+def test_a_mount_is_judged_by_its_source_type_and_options_not_its_name(mountinfo):
+    """D12's closed set and a read-only /source are proved by what each mount is: its
+    source, its type and its read-only option. A writable bind, a mount from the wrong
+    source and a host mount under /dev, /proc or /sys are each named; the runtime's own
+    mounts are admitted only as the runtime makes them."""
+    _assert_named({"mountinfo": mountinfo}, ContainerCapability.MOUNTS)
+
+
+_HELD = {"count": 2, "names": ["bus", "podman.sock"]}
+
+
+@pytest.mark.parametrize(
+    "tmpfs",
+    [
+        # A host tmpfs bound in whole (here the operator's /run/user/<uid>) where the
+        # runtime masks a path, where the IPC namespace's shm is, or where the policy
+        # makes its own: same type and root, but it holds the host's files.
+        {**TMPFS, "/proc/acpi": _HELD},
+        {**TMPFS, "/sys/firmware": _HELD},
+        {**TMPFS, "/dev/shm": {"count": 1, "names": ["sem.host"]}},
+        {**TMPFS, "/tmp": {"count": 1, "names": [".X11-unix"]}},
+        {**TMPFS, HOME_TARGET: {"count": 1, "names": [".ssh"]}},
+        # A listing cut short, failed or missing proves nothing.
+        {**TMPFS, "/tmp": {"count": 30, "names": []}},
+        {**TMPFS, "/proc/acpi": {"error": "EACCES"}},
+        {key: value for key, value in TMPFS.items() if key != "/sys/firmware"},
+        {**TMPFS, "/dev/shm": {"count": True, "names": []}},
+        None,
+    ],
+)
+def test_a_tmpfs_is_admitted_only_with_a_fresh_ones_content(tmpfs):
+    """``mountinfo`` cannot tell a fresh tmpfs from a host tmpfs bound in whole: only its
+    listing can, so a tmpfs holding anything but the policy's own mount points is named."""
+    _assert_named({"tmpfs": tmpfs}, ContainerCapability.MOUNTS)
+
+
+def test_the_home_tmpfs_may_hold_the_projections_mount_points(credential):
+    """The runtime makes each projected file's first directory in the home: admitted, and
+    nothing beside it."""
+    spec = _launch(
+        source=StagingRoot("/code/.git", "270", LAUNCH_ID),
+        projection=Projection(files=(FileCredential(credential, ".config/p/key"),)),
+    )
+    expect = dataclasses.replace(
+        _expect(),
+        mounts=Expectation.for_spec(
+            spec, product=RuntimeProduct.PODMAN, operator_uid=1000, subordinate=()
+        ).mounts,
+    )
+    home = next(mount for mount in expect.mounts if mount.target == HOME_TARGET)
+    assert home.entries == {".config"}
+    bound = f"600 515 8:1 /op/.config/provider/key {HOME_TARGET}/.config/p/key ro - ext4 x rw"
+    observation = {**GOOD, "mountinfo": f"{MOUNTINFO}\n{bound}"}
+    held = {**TMPFS, HOME_TARGET: {"count": 1, "names": [".config"]}}
+    assert judge({**observation, "tmpfs": held}, expect) == ()
+    held = {**TMPFS, HOME_TARGET: {"count": 2, "names": [".config", ".netrc"]}}
+    findings = judge({**observation, "tmpfs": held}, expect)
+    assert [f.detail for f in findings] == [
+        f"{HOME_TARGET}: it holds .netrc, which a fresh tmpfs would not"
+    ]
+
+
+def test_the_runtimes_own_files_need_the_containers_id():
+    """Without the container's id, /etc/hosts cannot be told from a host file bound there."""
+    findings = judge(GOOD, _expect(container_id=""))
+    assert {f.capability for f in findings} == {ContainerCapability.MOUNTS}
+    assert {f.detail.split(":")[0] for f in findings} == {
+        "/etc/hosts",
+        "/etc/resolv.conf",
+        "/run/.containerenv",
+    }
+
+
+def test_the_exporters_workspace_must_be_read_only():
+    exporter = ContainerSpec(ContainerRole.EXPORTER, ContainerNetwork.NONE, "af-vol-1")
+    expect = Expectation.for_spec(
+        exporter,
+        product=RuntimeProduct.PODMAN,
+        operator_uid=1000,
+        subordinate=((100000, 65536),),
+        container_id=CID,
+    )
+    mountinfo = _mountinfo("/source", None)
+    writable = {**WRITABLE, WORKSPACE_TARGET: False}
+    offline = {"interfaces": ["lo"], "routes": []}
+    clean = {**GOOD, **offline, "mountinfo": mountinfo, "writable": writable}
+    found = judge(clean, expect)
+    assert {f.detail for f in found} == {
+        "/workspace: mounted read-write, where the policy mounts it read-only"
+    }
+    readonly = mountinfo.replace(" /workspace rw,relatime", " /workspace ro,relatime")
+    assert judge({**clean, "mountinfo": readonly}, expect) == ()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        # One timeout, a reset, an unsupported family: each proves nothing.
+        {"connect": _connect("127.0.0.1", _refused("127.0.0.1", "timeout"))},
+        {"connect": _connect("127.0.0.1", _refused("127.0.0.1", "ECONNRESET"))},
+        {"connect": _connect("::1", _refused("::1", "EAFNOSUPPORT"))},
+        {"connect": _connect("192.168.1.1", _refused("192.168.1.1", "timeout"))},
+        # An address or name not tried, a family left out, a gateway not tried.
+        {"connect": _connect("127.0.0.1")},
+        {"connect": _connect("::1")},
+        {"connect": _connect("host.containers.internal")},
+        {"connect": _connect("fe80::1%eth0")},
+        {"connect": _connect("127.0.0.1", _refused("127.0.0.1"), port=PORT + 1)},
+        {"gateways": None},
+        {"connect": []},
+        {"connect": None},
+        # A name that resolved to nothing tried, or whose lookup failed.
+        {"connect": [*_connect("host.containers.internal"), _tried("host.containers.internal")]},
+        {
+            "connect": [
+                *_connect("host.docker.internal"),
+                {"host": "host.docker.internal", "port": PORT, "resolve_error": "EAI_AGAIN"},
+            ]
+        },
+        # A connection with no nonce that neither closed nor said anything: inconclusive.
+        {"connect": _connect("127.0.0.1", _connected("", eof=False))},
+        {"connect": _connect("127.0.0.1", _connected("SSH-2.0-x", eof=False))},
+        # Accepted and closed with nothing said: a forwarder that dropped it, or worse.
+        {"connect": _connect("127.0.0.1", _connected("", eof=True))},
+        {"connect": _connect("127.0.0.1", {"address": "127.0.0.1", "result": "connected"})},
+        # The nonce, whole or cut short: reached.
+        {"connect": _connect("::1", _connected("nonce-loop-1", eof=True, address="::1"))},
+        {"connect": _connect("127.0.0.1", _connected("nonce-lo", eof=True))},
+        {"connect": _connect("10.0.2.2", _connected("xx nonce-loop-1", eof=False))},
+        # One address of a name proved, another not.
+        {
+            "connect": _connect(
+                "host.containers.internal",
+                _refused("169.254.1.2"),
+                _refused("fd00::2", "timeout"),
+            )
+        },
+    ],
+)
+def test_host_loopback_needs_a_conclusive_refusal_at_every_route(change):
+    """Every route (both loopback families, the runtime's aliases, every gateway) at every
+    listener's port must be refused, unreachable, a name that does not exist, or another
+    service that answered without the nonce and closed. A timeout, a missing attempt, a
+    failed lookup or a silent connection proves nothing; a nonce, even cut short, is a
+    reached listener."""
+    _assert_named(change, ContainerCapability.HOST_LOOPBACK)
+
+
+def test_both_loopback_families_must_have_had_a_listener():
+    """A host that listened on 127.0.0.1 alone would not see a path to its ::1."""
+    findings = judge(GOOD, _expect(loopback_listeners=(("127.0.0.1", PORT),)))
+    assert [f.detail for f in findings] == [
+        "the host had no nonce listener on ::1, so a path to it would go unseen"
+    ]
+
+
+def test_the_routes_a_measurement_must_try_follow_the_runtime():
+    """Rootless Docker's RootlessKit host address is tried there; Podman's host address is
+    its alias's. The measurement's own default list covers both runtimes."""
+    docker, podman = loopback_routes(RuntimeProduct.DOCKER), loopback_routes(RuntimeProduct.PODMAN)
+    assert docker == (*LOOPBACK_ADDRESSES, *HOST_ALIASES, "10.0.2.2")
+    assert podman == (*LOOPBACK_ADDRESSES, *HOST_ALIASES)
+    assert set(docker) | set(podman) <= set(container_measure._HOST_ROUTES)
+    findings = judge(GOOD, dataclasses.replace(_expect(), loopback_routes=docker))
+    assert [f.detail for f in findings] == [f"no connection to 10.0.2.2 port {PORT} was tried"]
+
+
+@pytest.mark.parametrize(
+    "abstract",
+    [
+        None,
+        {},
+        {"result": "connected", "received": "", "eof": False},
+        {"result": "connected", "received": "other", "eof": True},
+        {"result": "connected", "received": "nonce-abstract-1", "eof": True},
+        {"result": "timeout"},
+        {"result": "EAFNOSUPPORT"},
+    ],
+)
+def test_a_host_abstract_socket_needs_a_conclusive_refusal(abstract):
+    """Its name is the host's own random one: anything that accepts a connection to it is
+    reached, nonce or not; only a refusal or a denial proves it unreachable."""
+    _assert_named({"abstract": abstract}, ContainerCapability.HOST_ABSTRACT_SOCKET)
+
+
+@pytest.mark.parametrize("result", ["ECONNREFUSED", "EACCES", "EPERM"])
+def test_a_refused_or_denied_abstract_socket_is_unreachable(result):
+    assert judge({**GOOD, "abstract": {"result": result}}, _expect()) == ()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"scan": None},
+        {"scan": {**SCAN, "incomplete": ["/data/big: EIO"], "incomplete_count": 1}},
+        {"scan": {**SCAN, "incomplete": [], "incomplete_count": 25}},
+        {"scan": {**SCAN, "incomplete_count": None}},
+        {"scan": {key: value for key, value in SCAN.items() if key != "incomplete"}},
+        {"scan": {**SCAN, "roots": ["/workspace"]}},
+        {"scan": {**SCAN, "skip": [*SCAN["skip"], "/home"]}},
+        # A sentinel the search reported nothing for, or nothing usable.
+        {"sentinels": {"0": ["env:MODEL_API_KEY"]}},
+        {"sentinels": {"0": ["env:MODEL_API_KEY"], "1": None}},
+        {"sentinels": {"0": ["env:MODEL_API_KEY"], "1": "none"}},
+    ],
+)
+def test_an_incomplete_sentinel_search_proves_no_credential_absent(change):
+    """A place the search could not cover, a root it did not walk, a tree it left out
+    beyond the kernel's, or a sentinel with no result is a finding, never a clean absence."""
+    _assert_named(change, ContainerCapability.CREDENTIALS)
+
+
 def test_under_network_none_only_loopback_and_no_route_pass():
+    """With no interface but loopback and no route proved, a name the container could not
+    look up leads nowhere; with a route, the same failed lookup proves nothing."""
     offline = _expect(network=ContainerNetwork.NONE)
-    clean = {**GOOD, "interfaces": ["lo"], "routes": []}
+    connect = [
+        _tried("127.0.0.1", _refused("127.0.0.1")),
+        _tried("::1", _refused("::1")),
+        {"host": "host.containers.internal", "port": PORT, "resolve_error": "EAI_AGAIN"},
+        {"host": "host.docker.internal", "port": PORT, "resolve_error": "EAI_NONAME"},
+    ]
+    clean = {**GOOD, "interfaces": ["lo"], "routes": [], "gateways": [], "connect": connect}
     assert judge(clean, offline) == ()
     for change in ({"interfaces": ["lo", "eth0"]}, {"routes": ["ipv4 via tap0"]}):
         findings = judge({**clean, **change}, offline)
-        assert {f.capability for f in findings} == {ContainerCapability.NO_ROUTE}
+        assert {f.capability for f in findings} == {
+            ContainerCapability.NO_ROUTE,
+            ContainerCapability.HOST_LOOPBACK,
+        }
+    on_bridge = judge({**clean, "interfaces": ["eth0", "lo"]}, _expect())
+    assert {f.capability for f in on_bridge} == {ContainerCapability.HOST_LOOPBACK}
 
 
 def test_an_observation_that_does_not_parse_proves_nothing():
@@ -904,16 +1496,30 @@ def test_an_observation_that_does_not_parse_proves_nothing():
     assert {f.capability for f in findings} == set(ContainerCapability)
 
 
-def test_the_expectation_follows_the_spec(credential):
+def test_the_expectation_follows_the_spec(credential, staging):
     exporter = ContainerSpec(ContainerRole.EXPORTER, ContainerNetwork.NONE, "af-vol-1")
-    expect = Expectation.for_spec(exporter, operator_uid=1000, subordinate=())
-    assert WORKSPACE_TARGET not in expect.writable and WORKSPACE_TARGET in expect.mounts
+    expect = Expectation.for_spec(
+        exporter, product=RuntimeProduct.DOCKER, operator_uid=1000, subordinate=()
+    )
+    assert WORKSPACE_TARGET not in expect.writable and WORKSPACE_TARGET in expect.mount_points
+    workspace = next(m for m in expect.mounts if m.target == WORKSPACE_TARGET)
+    assert workspace.read_only and workspace.source == "af-vol-1"
+    assert "10.0.2.2" in expect.loopback_routes
     launch = _launch(
         cache_volume="af-cache",
+        source=staging,
         projection=Projection(files=(FileCredential(credential, ".config/p/key"),)),
     )
-    expect = Expectation.for_spec(launch, operator_uid=1000, subordinate=())
-    assert CACHE_TARGET in expect.writable and f"{HOME_TARGET}/.config/p/key" in expect.mounts
+    expect = Expectation.for_spec(
+        launch, product=RuntimeProduct.PODMAN, operator_uid=1000, subordinate=()
+    )
+    assert CACHE_TARGET in expect.writable
+    by_target = {m.target: m for m in expect.mounts}
+    assert by_target[f"{HOME_TARGET}/.config/p/key"].source == "provider/key"
+    assert by_target[f"{HOME_TARGET}/.config/p/key"].read_only
+    assert by_target[SOURCE_TARGET].source == staging.layout
+    assert by_target[SOURCE_TARGET].read_only
+    assert not by_target[CACHE_TARGET].read_only
 
 
 def test_the_operators_subordinate_ranges_are_read_by_name_or_uid():
@@ -925,39 +1531,36 @@ def test_the_operators_subordinate_ranges_are_read_by_name_or_uid():
 # -- the measurement, on this host as its own negative control --------------------------
 
 
-def _listen(nonce: bytes) -> tuple[socket.socket, int]:
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(("127.0.0.1", 0))
-    server.listen(4)
-
-    def serve() -> None:
+def _serve(server: socket.socket, nonce: bytes, *, silent: bool = False) -> None:
+    def loop() -> None:
+        held = []
         while True:
             try:
                 conn, _ = server.accept()
             except OSError:
                 return
+            if silent:
+                held.append(conn)  # accepted, never answered, never closed
+                continue
             with conn:
                 conn.sendall(nonce)
 
-    threading.Thread(target=serve, daemon=True).start()
-    return server, server.getsockname()[1]
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def _listen(nonce: bytes, family: int = socket.AF_INET, port: int = 0, **kw) -> socket.socket:
+    server = socket.socket(family, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1" if family == socket.AF_INET else "::1", port))
+    server.listen(4)
+    _serve(server, nonce, **kw)
+    return server
 
 
 def _abstract(name: str, nonce: bytes) -> socket.socket:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind("\0" + name)
     server.listen(4)
-
-    def serve() -> None:
-        while True:
-            try:
-                conn, _ = server.accept()
-            except OSError:
-                return
-            with conn:
-                conn.sendall(nonce)
-
-    threading.Thread(target=serve, daemon=True).start()
+    _serve(server, nonce)
     return server
 
 
@@ -966,10 +1569,11 @@ def test_the_measurement_on_the_host_itself_is_refused_item_by_item(tmp_path):
     """Run as a plain host process, the measurement must fail the judge: the host's
     loopback listener and abstract socket answer, the UID is the operator's, and a fake
     credential outside the projection is found. So a container that leaked the same would
-    be named too."""
+    be named too. Its request, the fake credentials included, goes on standard input."""
     nonce = f"nonce-loop-{os.getpid()}"
     abstract_name = f"autoforge-test-270-{os.getpid()}"
-    listener, port = _listen(nonce.encode())
+    listener = _listen(nonce.encode())
+    port = listener.getsockname()[1]
     abstract = _abstract(abstract_name, b"nonce-abstract-host")
     scan = tmp_path / "scan"
     (scan / "deep").mkdir(parents=True)
@@ -986,9 +1590,11 @@ def test_the_measurement_on_the_host_itself_is_refused_item_by_item(tmp_path):
         "scan_skip": [],
     }
     env = {"PATH": os.environ.get("PATH", "/usr/bin"), "MODEL_API_KEY": SENTINEL_ENV}
+    argv = [sys.executable, "-I", str(MEASURE)]
     try:
         done = subprocess.run(
-            [sys.executable, "-I", str(MEASURE), json.dumps(spec)],
+            argv,
+            input=json.dumps(spec),
             env=env,
             capture_output=True,
             text=True,
@@ -998,6 +1604,7 @@ def test_the_measurement_on_the_host_itself_is_refused_item_by_item(tmp_path):
     finally:
         listener.close()
         abstract.close()
+    assert not any(value in word for word in argv for value in (SENTINEL_ENV, SENTINEL_GH))
     observation = json.loads(done.stdout)
     assert SENTINEL_ENV not in done.stdout and SENTINEL_GH not in done.stdout
     assert observation["writable"] == {str(writable): True, "/proc": False}
@@ -1005,9 +1612,15 @@ def test_the_measurement_on_the_host_itself_is_refused_item_by_item(tmp_path):
         "0": ["env:MODEL_API_KEY"],
         "1": [str(scan / "deep" / "hosts.yml")],
     }
+    assert observation["scan"]["incomplete_count"] == 0 and observation["scan"]["files"] == 1
+    loopback = next(e for e in observation["connect"] if e["host"] == "127.0.0.1")
+    assert loopback["attempts"] == [
+        {"address": "127.0.0.1", "result": "connected", "received": nonce, "eof": True}
+    ]
     expect = dataclasses.replace(
         _expect(),
         loopback_nonce=nonce,
+        loopback_listeners=(("127.0.0.1", port), ("::1", port)),
         abstract_nonce="nonce-abstract-host",
         keyring_checked=False,
         operator_uid=os.getuid(),
@@ -1018,7 +1631,90 @@ def test_the_measurement_on_the_host_itself_is_refused_item_by_item(tmp_path):
         ContainerCapability.HOST_ABSTRACT_SOCKET,
         ContainerCapability.AGENT_USER,
         ContainerCapability.CREDENTIALS,
+        ContainerCapability.MOUNTS,
     } <= found
+
+
+def test_the_measurement_records_each_attempt_as_it_ended(monkeypatch):
+    """A refusal, the nonce with the peer's close, and a peer that accepts and stays silent
+    (no EOF, so inconclusive), each recorded as such."""
+    monkeypatch.setattr(container_measure, "_TIMEOUT_SECONDS", 0.3)
+    closed = socket.socket()
+    closed.bind(("127.0.0.1", 0))
+    refused_port = closed.getsockname()[1]
+    closed.close()
+    answering = _listen(b"nonce-x")
+    silent = _listen(b"", silent=True)
+    try:
+        refused = container_measure._route("127.0.0.1", refused_port)
+        answered = container_measure._route("127.0.0.1", answering.getsockname()[1])
+        quiet = container_measure._route("127.0.0.1", silent.getsockname()[1])
+    finally:
+        answering.close()
+        silent.close()
+    assert refused["attempts"] == [{"address": "127.0.0.1", "result": "ECONNREFUSED"}]
+    assert answered["attempts"] == [
+        {"address": "127.0.0.1", "result": "connected", "received": "nonce-x", "eof": True}
+    ]
+    assert quiet["attempts"] == [
+        {"address": "127.0.0.1", "result": "connected", "received": "", "eof": False}
+    ]
+    assert container_measure._abstract(f"autoforge-test-270-none-{os.getpid()}") == {
+        "result": "ECONNREFUSED"
+    }
+
+
+def _search(tmp_path: Path, values: list[str], **kw) -> tuple[dict, dict]:
+    return container_measure._search(values, [str(tmp_path)], [], kw.get("max_bytes", 1 << 40))
+
+
+def test_the_search_reads_every_file_whole(tmp_path):
+    """No size limit: a sentinel past the first MiB, and one across a chunk's edge, are found."""
+    chunk = container_measure._CHUNK_BYTES
+    beyond = tmp_path / "beyond"
+    beyond.write_bytes(b"x" * (chunk + 4096) + SENTINEL_GH.encode() + b"y" * 10)
+    across = tmp_path / "across"
+    across.write_bytes(b"x" * (chunk - 5) + SENTINEL_FILE.encode() + b"y" * 10)
+    hits, scan = _search(tmp_path, [SENTINEL_GH, SENTINEL_FILE])
+    assert hits == {"0": [str(beyond)], "1": [str(across)]}
+    assert scan["incomplete"] == [] and scan["incomplete_count"] == 0
+    assert scan["files"] == 2 and scan["bytes"] == beyond.stat().st_size + across.stat().st_size
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a file whatever its mode")
+def test_what_the_search_cannot_cover_is_reported_and_refused(tmp_path, monkeypatch):
+    """A file or directory the agent owns but cannot read now (it could chmod it), one it
+    can search but not list, and a spent byte budget make the search incomplete, which the
+    judge refuses; a file it is denied and does not own is out of its reach, and counted."""
+    locked = tmp_path / "locked"
+    locked.write_text(SENTINEL_GH)
+    locked.chmod(0o000)
+    unlisted = tmp_path / "unlisted"
+    unlisted.mkdir()
+    (unlisted / "inside").write_text(SENTINEL_GH)
+    unlisted.chmod(0o100)
+    try:
+        hits, scan = _search(tmp_path, [SENTINEL_GH])
+        assert hits == {"0": []}
+        assert scan["incomplete_count"] == 2
+        assert sorted(entry.split(":")[0] for entry in scan["incomplete"]) == sorted(
+            [str(locked), str(unlisted)]
+        )
+        observation = {**GOOD, "scan": {**scan, "roots": ["/"], "skip": SCAN["skip"]}}
+        findings = judge(observation, _expect())
+        assert {f.capability for f in findings} == {ContainerCapability.CREDENTIALS}
+        # The same paths, owned by another UID: denied, out of the agent's reach.
+        unlisted.chmod(0o000)
+        monkeypatch.setattr(container_measure.os, "getuid", lambda: os.geteuid() + 1)
+        hits, scan = _search(tmp_path, [SENTINEL_GH])
+        assert scan["incomplete_count"] == 0 and scan["denied"] == 2
+    finally:
+        monkeypatch.undo()
+        unlisted.chmod(0o700)
+        locked.chmod(0o600)
+    (tmp_path / "big").write_bytes(b"z" * 4096)
+    _, spent = _search(tmp_path, [SENTINEL_GH], max_bytes=1024)
+    assert spent["incomplete_count"] == 1 and "budget" in spent["incomplete"][0]
 
 
 # Spellings only a container runtime's create or exec takes.
@@ -1082,8 +1778,64 @@ def test_the_measurement_adds_each_default_gateway_to_its_attempts(monkeypatch):
             f"{'0' * 32} 00 {'0' * 32} 00 fe80{'0' * 27}1 00000400 00000001 0 00000003 eth0\n"
         ),
     }
-    monkeypatch.setattr(container_measure, "_read", lambda path: files.get(path, ""))
-    assert container_measure._gateways() == ["10.0.2.1", "fe80::1"]
+    tables = {path: text.splitlines() for path, text in files.items()}
+    monkeypatch.setattr(container_measure, "_lines", lambda path, missing=None: tables[path])
+    assert container_measure._gateways() == ["10.0.2.1", "fe80::1%eth0"]
+
+
+@pytest.mark.parametrize(
+    ("ipv4", "ipv6", "expected"),
+    [
+        (None, [], None),  # /proc/net/route unreadable
+        ([], [], None),  # read empty, though it always has its header line
+        (["Iface\tDestination\tGateway"], None, None),  # ipv6_route unreadable
+        (["Iface\tDestination\tGateway"], [], []),  # read, with no default route
+    ],
+)
+def test_a_routing_table_not_read_is_not_one_without_a_gateway(ipv4, ipv6, expected, monkeypatch):
+    """``None`` makes the judge refuse (the gateways went unreported); only tables read
+    whole give a list, which may be empty."""
+    tables = {"/proc/net/route": ipv4, "/proc/net/ipv6_route": ipv6}
+    monkeypatch.setattr(container_measure, "_lines", lambda path, missing=None: tables[path])
+    assert container_measure._gateways() == expected
+
+
+def test_a_routing_table_the_kernel_does_not_have_is_empty(tmp_path):
+    """``/proc/net/ipv6_route`` is absent only from a kernel without IPv6: no IPv6 route."""
+    assert container_measure._lines(str(tmp_path / "absent"), missing=[]) == []
+    assert container_measure._lines(str(tmp_path / "absent")) is None
+    assert container_measure._lines(str(tmp_path)) is None  # a directory: unreadable
+
+
+def test_the_measurement_lists_each_tmpfs_of_its_own(tmp_path):
+    """Only a tmpfs mounted from its own root is listed (a fresh one, or a host one bound in
+    whole), with its entry count and first names, or the error that kept it unlisted."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    full = tmp_path / "with space"
+    full.mkdir()
+    for index in range(container_measure._MAX_REPORTED + 2):
+        (full / f"f{index:02d}").write_text("x")
+    escaped = str(full).replace(" ", "\\040")
+    mountinfo = "\n".join(
+        [
+            f"1 0 0:1 / {empty} rw - tmpfs tmpfs rw",
+            f"2 0 0:2 / {escaped} ro shared:3 - tmpfs tmpfs ro",
+            f"3 0 0:3 / {tmp_path}/missing rw - tmpfs tmpfs rw",
+            f"4 0 0:4 /sub {tmp_path} rw - tmpfs tmpfs rw",  # a tmpfs's subdirectory: a bind
+            f"5 0 8:1 / {tmp_path} rw - ext4 /dev/sda1 rw",  # not a tmpfs
+            "garbage",
+        ]
+    )
+    listed = container_measure._tmpfs_contents(mountinfo)
+    assert listed == {
+        str(empty): {"count": 0, "names": []},
+        str(full): {
+            "count": container_measure._MAX_REPORTED + 2,
+            "names": [f"f{index:02d}" for index in range(container_measure._MAX_REPORTED)],
+        },
+        f"{tmp_path}/missing": {"error": "ENOENT"},
+    }
 
 
 def test_the_measurement_imports_nothing_of_autoforge():
@@ -1092,4 +1844,17 @@ def test_the_measurement_imports_nothing_of_autoforge():
     assert "autoforge" not in "".join(
         line for line in source.splitlines() if line.startswith(("import ", "from "))
     )
-    assert container_measure.main(["measure", "[]"]) == 2
+
+
+def test_the_measurement_reads_its_request_from_standard_input_only(capsys):
+    """An argument is on a command line every local process can read, and on the runtime's
+    exec argv: a request there is refused, so no fake credential can be put on one."""
+    assert container_measure.main(["measure", '{"sentinels": ["x"]}']) == 2
+    assert "standard input" in capsys.readouterr().err
+    assert container_measure.main(["measure"], io.StringIO("[]")) == 2
+    assert container_measure.main(["measure"], io.StringIO("{")) == 2
+    assert container_measure.main(["measure"], io.StringIO('{"sentinels": [""]}')) == 2
+    capsys.readouterr()
+    assert container_measure.main(["-c"], io.StringIO('{"places": []}')) == 0
+    observation = json.loads(capsys.readouterr().out)
+    assert observation["writable"] == {} and "sentinels" not in observation
