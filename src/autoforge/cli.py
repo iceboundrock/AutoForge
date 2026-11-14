@@ -1739,7 +1739,7 @@ def _keeping_refusal(state: AutoForgeState, command: str) -> str:
         return ""
     held = []
     if owned:
-        held.append("owns " + ", ".join(owned))
+        held.append(_owned_prs_held(owned))
     if operator:
         named = "; ".join(
             f"{r.action_id} on {r.target['issue_url']}"
@@ -1768,13 +1768,92 @@ def _keeping_refusal(state: AutoForgeState, command: str) -> str:
     )
 
 
-def _owned_prs_left(state: AutoForgeState, owned: list[str]) -> str:
-    """What replacing a run that owns ``owned`` leaves on GitHub (#483)."""
-    one = len(owned) == 1
+def _owned_prs_held(owned: list[_OwnedPR]) -> str:
+    """``owns PR …`` and ``may own PR …``: what the state confirms, then what it cannot (#483)."""
+    confirmed = [o.name for o in owned if o.confirmed]
+    unconfirmed = [o.name for o in owned if not o.confirmed]
+    held = []
+    if confirmed:
+        held.append("owns " + ", ".join(confirmed))
+    if unconfirmed:
+        held.append("may own " + ", ".join(unconfirmed))
+    return " and ".join(held)
+
+
+def _owned_prs_left(state: AutoForgeState, owned: list[_OwnedPR]) -> str:
+    """What replacing a run that owns ``owned`` leaves on GitHub (#483).
+
+    A PR the state confirms (bound, named by the replan journal, or read back
+    by its record) stays with its marker naming the run, which stops a new
+    run of the issue at it (ADR 0004 D9.4a). A PR the state cannot confirm
+    (a write sent and never read back) is said to stay so only if that write
+    landed. Then the review comments the run posted: a new run does not hold
+    them in its journal, so after the take-over its round-1 review can stop
+    at one of them (D9.6) instead of posting its own.
+    """
+    run = state.run_id
+    stops = "stops a new run of the issue at it ('pr-owner') until 'unblock --take-over'"
+    confirmed = [o for o in owned if o.confirmed]
+    unconfirmed = [o for o in owned if not o.confirmed]
+    left = []
+    if confirmed:
+        one = len(confirmed) == 1
+        left.append(
+            f"{'the PR stays' if one else 'the PRs stay'} on GitHub, and while "
+            f"{'it is' if one else 'one is'} open its marker, naming run {run}, {stops}"
+        )
+    if unconfirmed:
+        one = len(unconfirmed) == 1
+        names = ", ".join(o.name for o in unconfirmed)
+        sent = (
+            f"the write that would name run {run} in the marker of {names} was sent and never "
+            "read back, so only GitHub says whether it landed; if it did"
+            if one
+            else f"the writes that would name run {run} in the markers of {names} were sent and "
+            "never read back, so only GitHub says whether any landed; for each that did"
+        )
+        if confirmed:
+            left.append(f"{sent}, the same holds for that PR")
+        else:
+            left.append(f"{sent}, that PR stays on GitHub, and while it is open its marker {stops}")
+    reviews = _review_comments_left(state)
+    if reviews:
+        left.append(reviews)
+    return "; ".join(left)
+
+
+def _review_comments_left(state: AutoForgeState) -> str:
+    """What replacing a run leaves of its review comments on GitHub, or ``""`` (#483, R1-F1).
+
+    A round the run completed was posted and read back; a review comment of
+    its saved plan may be read back too, or only sent. Either is on the PR
+    the run is bound to and stays on GitHub, outside a new run's journal:
+    after taking that PR over, the new run reviews it from its own round 1
+    (ADR 0004 D9.4a), and a round-1 comment it did not journal for the
+    revision it reviews stops it (``unjournaled-write``, D9.6) until the
+    comment or its marker is removed.
+    """
+    posted = state.review_round > 0
+    sent = False
+    for record in state.phase_effects().records:
+        if record.kind is not EffectKind.REVIEW_COMMENT:
+            continue
+        if record.stage is Stage.OBSERVED:
+            posted = True
+        elif record.attempts:
+            sent = True
+    on = f" on PR {state.current_pr_url}" if state.current_pr_url else ""
+    if posted:
+        what = f"its review comments{on} stay on GitHub too"
+    elif sent:
+        what = f"a review comment{on} it sent and never read back stays on GitHub too, if it landed"
+    else:
+        return ""
     return (
-        f"{'the PR stays' if one else 'the PRs stay'} on GitHub, and while "
-        f"{'it is' if one else 'one is'} open its marker, naming run {state.run_id}, "
-        "stops a new run of the issue at it ('pr-owner') until 'unblock --take-over'"
+        f"{what}, and a new run inherits none of its rounds: after taking that PR over, the new "
+        f"run reviews it from its own round 1, and a round-1 review comment of run "
+        f"{state.run_id} for the revision it reviews stops it ('unjournaled-write') until "
+        "that comment or its marker is removed"
     )
 
 
@@ -1844,7 +1923,7 @@ def cmd_run(args) -> int:
                 print(
                     redact(
                         f"autoforge: replacing run {replaced.run_id} in phase "
-                        f"{replaced.phase.value}, which owns {', '.join(owned)}: "
+                        f"{replaced.phase.value}, which {_owned_prs_held(owned)}: "
                         f"{_owned_prs_left(replaced, owned)}"
                     ),
                     file=sys.stderr,
@@ -3244,7 +3323,22 @@ _PR_OWNING_KINDS = frozenset(
 )
 
 
-def _owned_prs(state: AutoForgeState) -> list[str]:
+@dataclass(frozen=True)
+class _OwnedPR:
+    """A PR a run's state says it owns (#483): its name, and whether the state confirms it.
+
+    ``confirmed`` is the controller's own read-back: the run is bound to the
+    PR, its replan journal names it as the verified replacement, or the
+    record of the write that names the run in its marker is ``observed``.
+    Otherwise the write was sent and never read back, and it may not have
+    landed: the run may own the PR, which may not even exist.
+    """
+
+    name: str
+    confirmed: bool
+
+
+def _owned_prs(state: AutoForgeState) -> list[_OwnedPR]:
     """The PRs a run owns on GitHub as its state records them (#483), each named.
 
     The PR the run is bound to, the replacement its replan journal names, and
@@ -3252,21 +3346,22 @@ def _owned_prs(state: AutoForgeState) -> list[str]:
     issued at least once or reads back as sent, before the binding was saved:
     the implementation marker that write puts on the PR names this run
     (ADR 0004 D9.4a). A record never issued (``intended``, or a conflict found
-    before the first issue) wrote nothing and owns nothing. Read from the
-    state alone, never from GitHub: a PR closed or merged since is still
-    named, since only the operator can say the run is done with it.
+    before the first issue) wrote nothing and owns nothing; one issued and
+    never read back owns the PR only if the write landed, which only GitHub
+    says, so it is not ``confirmed``. Read from the state alone, never from
+    GitHub: a PR closed or merged since is still named, since only the
+    operator can say the run is done with it.
     """
-    owned: list[str] = []
+    owned: dict[str, bool] = {}
 
-    def add(name: str) -> None:
-        if name not in owned:
-            owned.append(name)
+    def add(name: str, confirmed: bool) -> None:
+        owned[name] = owned.get(name, False) or confirmed
 
     if state.current_pr_url:
-        add(f"PR {state.current_pr_url}")
+        add(f"PR {state.current_pr_url}", True)
     txn = _load_replan_journal(state)
     if txn is not None and txn.replacement_pr_url:
-        add(f"PR {txn.replacement_pr_url}")
+        add(f"PR {txn.replacement_pr_url}", True)
     for record in state.phase_effects().records:
         if record.kind not in _PR_OWNING_KINDS:
             continue
@@ -3274,13 +3369,15 @@ def _owned_prs(state: AutoForgeState) -> list[str]:
             continue
         url = (record.observed or {}).get("url") or record.target.get("pr_url")
         if url:
-            add(f"PR {url}")
+            add(f"PR {url}", record.stage is Stage.OBSERVED)
         else:
+            # K2 or K7 sent and never read back: whether it opened a PR at
+            # all is what only GitHub can say.
             add(
-                f"the PR its saved plan may have opened from {record.target['head']} "
-                f"in {record.target['repository']}"
+                f"a PR from {record.target['head']} in {record.target['repository']}",
+                False,
             )
-    return owned
+    return [_OwnedPR(name, confirmed) for name, confirmed in owned.items()]
 
 
 def _operator_actions(state: AutoForgeState) -> list[dict]:

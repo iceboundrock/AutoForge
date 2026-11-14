@@ -307,8 +307,13 @@ replacement its replan journal names, or a PR its plan opens, adopts or
 takes over (K2, K3, K7, K11) with a record observed or issued at least once.
 That PR's marker names the run (ADR 0004 D9.4a), so a fresh state would stop
 at it. The state alone decides: no GitHub read, and a PR closed or merged
-since still counts. `--force` replaces either, and names the PRs it leaves
-on GitHub. The fields are
+since still counts. The refusal tells a confirmed PR (bound, verified by the
+journal, or `observed`) from one whose write was issued and never read back,
+which the run only `may own`, and names the review comments the run posted
+(K4) or only sent, which a new run does not journal: after its take-over,
+a round-1 one for the revision it reviews stops it (D9.6). `--force`
+replaces either, and prints the same account before its first save. The
+fields are
 validated on load against the run's issue, PR and phase, and a corrupt or
 incomplete value fails loudly, never replaced by a default. Every protocol-7
 save writes all four fields, so a protocol-7 file missing one is refused:

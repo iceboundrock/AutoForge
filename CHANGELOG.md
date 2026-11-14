@@ -16,11 +16,15 @@ run's review comment, and the operator had to clean up GitHub by hand. Now
 state is bound to one, or once its saved plan may have opened, adopted or
 taken one over. The refusal names the PR, says whether `unblock` and
 `resume` continue the run (they do for a `BLOCKED` run without a replan
-journal), and says what `run --force` leaves on GitHub. `run --force` still
-replaces any run, and now prints the PR it leaves behind. A `DONE` run, or a
-stopped run that owns no PR and holds no operator actions, is replaced as
-before. The `stop:` line's new-run route now says when `run` needs
-`--force`, instead of always naming it.
+journal), and says what `run --force` leaves on GitHub: the PR, whose
+marker stops a new run until `unblock --take-over`, and the run's review
+comments, one of which can stop the new run again after the take-over
+(`unjournaled-write`). A PR or comment whose write was sent and never read
+back is named as one the run may own or may have posted. `run --force`
+still replaces any run, and now prints the same account first. A `DONE`
+run, or a stopped run that owns no PR and holds no operator actions, is
+replaced as before. The `stop:` line's new-run route now says when `run`
+needs `--force`, instead of always naming it.
 
 ### A reply the agent delivered before it was killed or exited badly is kept (#479)
 
