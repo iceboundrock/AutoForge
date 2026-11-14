@@ -1068,14 +1068,21 @@ exactly when `tests/sandbox_host.py` measures the host capable
   `LD_PRELOAD`, the proxies) is refused; a credential file under the fake
   home's `~/.ssh`, gh's or git's configuration, `~/.git-credentials`,
   `~/.netrc`, `~/.gnupg` or the keyrings, the home itself, a runtime
-  socket, a path under `/run` or `$XDG_RUNTIME_DIR`, a link anywhere in
-  the path, a directory or FIFO, a `0600` file (unreadable by the
-  agent's subordinate UID), a file other local users can reach (no
-  directory above it that only the operator can enter: one searchable by
-  its group or others, one with an NFSv4 or rich ACL, or one whose ACLs
-  cannot be read, a platform without `listxattr` included), one with
-  another hard link, one the operator does not own, a target outside the
-  home and a path that would end the mount's field are refused, and on a
+  socket, a path under `/run` or `$XDG_RUNTIME_DIR`, a file in a
+  controller root (the common dir's `config`, refs, lock, sandbox
+  directory, staging root or a worktree's admin dir; the checkout, an
+  agent worktree, `.autoforge/state.json`, the run logs; state, logs and a
+  worktree configured outside the checkout, or through a link), each
+  otherwise admissible and admitted where the roots are another
+  checkout's, a file when any of those roots is not known or one is
+  relative, a link anywhere in the path, a directory or FIFO, a `0600`
+  file (unreadable by the agent's subordinate UID), a file other local
+  users can reach (no directory above it that only the operator can enter:
+  one searchable by its group or others, one with an NFSv4 or rich ACL, or
+  one whose ACLs cannot be read, a platform without `listxattr` included),
+  one with another hard link, one the operator does not own, a target
+  outside the home and a path that would end the mount's field are
+  refused, and on a
   copy-in runtime every file is. `runtime_refusal()` refuses a rootful runtime and one that does not
   say. The judge passes a recorded observation of a compliant container
   and names each item a changed observation breaks (the UID map the host

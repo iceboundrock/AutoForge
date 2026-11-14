@@ -233,7 +233,10 @@ on a real runtime yet. When it is selectable, expect this:
   the repository, and a model credential file where one is delivered. Your
   home, `~/.ssh`, gh's and git's credentials, the repository's `.git` and
   the runtime's own socket are never mounted, and no setting adds a mount,
-  a device, `--privileged` or a host namespace.
+  a device, `--privileged` or a host namespace. A model credential file
+  inside your checkout, a worktree, the repository's `.git`, or
+  AutoForge's state, run logs or lock, wherever you configured them, is
+  refused: keep it in a directory of its own.
 - **The model credential reaches only the agent's own container,** as an
   environment variable whose value is on no command line, or as a
   read-only file (a file must be readable by others, in a directory only

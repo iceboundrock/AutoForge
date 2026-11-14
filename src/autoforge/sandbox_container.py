@@ -31,6 +31,10 @@ network and environment there:
   the launch's own ``<git common dir>/autoforge/sandbox/<key>/stage/<launch
   id>``, proved to lie in the controller's own common dir, in directories
   the operator alone owns and can write, and apart from every checkout.
+  ADR 0005 C4 applies to both: a credential file lies in no controller
+  root (the common dir, a checkout or worktree, the state directory, the
+  run logs, the lock), and the staging root lies in the common dir only as
+  the carve-out of its own ``/source`` bind.
 
 :func:`create_argv` renders a checked :class:`ContainerSpec` into a
 runtime's ``create`` arguments: the only place a create's flags are
@@ -182,6 +186,7 @@ _RULE_PROJECTION = "D14 credential projection"
 _RULE_BIND = "D12 closed set of bind sources"
 _RULE_NETWORK = "D9 network position"
 _RULE_SPEC = "D10 container policy"
+_RULE_DENIED = "C4 denied roots"
 
 
 class RuntimeProduct(enum.Enum):
@@ -348,9 +353,20 @@ class HostContext:
     D4.3's forbidden sources (:data:`_LOCATION_NAMES`), ``uid`` the
     operator's UID. ``git_common_dir`` is the controller's git common dir,
     resolved, which every staging root must lie in ("" for none, and then
-    no staging root is bound); ``checkouts`` the controller's checkout and
-    every worktree it knows, which a staging root must never hold or lie in
-    (D12).
+    no staging root and no credential file is bound); ``checkouts`` the
+    controller's checkout and every worktree it knows, which a staging root
+    must never hold or lie in (D12). ``denied_roots`` are the engine's
+    (ADR 0005 C4 and D13.2, as ``ControllerEngine.gate_denied_roots``
+    gives them, since a container launch binds no worktree): the state
+    directory and run logs wherever they are configured, the lock,
+    ``<git common dir>/autoforge``, the controller's checkout and every
+    registered worktree.
+
+    A credential file lies in none of the three, the common dir whole,
+    with every worktree's admin dir (:func:`_check_credential_denied`), and
+    is bound only when all three are known. The staging root lies in the
+    common dir's ``autoforge`` as C5's carve-out for ``/source`` alone
+    (:func:`_check_staging_root`).
     """
 
     home: str
@@ -358,11 +374,24 @@ class HostContext:
     uid: int
     git_common_dir: str = ""
     checkouts: tuple[str, ...] = ()
+    denied_roots: tuple[str, ...] = ()
 
     @classmethod
-    def current(cls, git_common_dir: str = "", checkouts: Iterable[str] = ()) -> HostContext:
+    def current(
+        cls,
+        git_common_dir: str = "",
+        checkouts: Iterable[str] = (),
+        denied_roots: Iterable[str] = (),
+    ) -> HostContext:
         located = {name: os.environ[name] for name in _LOCATION_NAMES if name in os.environ}
-        return cls(os.path.expanduser("~"), located, os.getuid(), git_common_dir, tuple(checkouts))
+        return cls(
+            os.path.expanduser("~"),
+            located,
+            os.getuid(),
+            git_common_dir,
+            tuple(checkouts),
+            tuple(denied_roots),
+        )
 
 
 # What a projected variable must never be named, compared upper-cased: what
@@ -467,9 +496,90 @@ def _resolved_self(path: str, subject: str, rule: str) -> str:
     return path
 
 
+def _lies_in(path: str, root: str) -> bool:
+    """Whether ``path`` is ``root`` or lies below it (both absolute and normalized)."""
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _spellings(root: str, label: str) -> set[str]:
+    """A controller root as given, normalized, and where it resolves.
+
+    A state directory may be configured through a link; the source it is
+    compared with resolves to itself, so the resolved spelling is what
+    catches it. A root that is not an absolute path is a fact nobody can
+    check a source against: refused.
+    """
+    if not isinstance(root, str) or not root.startswith("/"):
+        raise _refuse(str(root), _RULE_DENIED, f"{label} is not an absolute path")
+    norm = posixpath.normpath(root)
+    if norm.startswith("//"):
+        norm = "/" + norm.lstrip("/")
+    return {norm, os.path.realpath(norm)}
+
+
+def _controller_roots(host: HostContext) -> tuple[tuple[str, str], ...]:
+    """Every root a credential file may not lie in, labelled, as :class:`HostContext` has them.
+
+    The common dir is one as a whole: it holds every worktree's admin dir
+    (``worktrees/<name>``), the controller's ``autoforge`` directory with
+    its lock, sandbox directories and agent worktrees, and the repository's
+    configuration and refs, none of which a container sees (ADR 0013 D18).
+    """
+    roots: list[tuple[str, str]] = []
+    if host.git_common_dir:
+        roots.append(
+            (
+                "the controller's git common dir, which holds every worktree's admin dir",
+                host.git_common_dir,
+            )
+        )
+    roots += [("the checkout or worktree", checkout) for checkout in host.checkouts]
+    roots += [("the controller's denied root", root) for root in host.denied_roots]
+    return tuple(roots)
+
+
+def _check_credential_denied(source: str, host: HostContext) -> None:
+    """ADR 0005 C4 for a credential file: in no controller root, and no carve-out.
+
+    The fixed forbidden sources (D4.3) are :func:`check_declared_path`'s;
+    these are the checkout's own: the controller's git common dir, the
+    checkout and every worktree, and the engine's denied roots (state, run
+    logs, the lock, wherever they are configured). The staging root's
+    exception is :func:`_check_staging_root`'s, for ``/source`` alone. A
+    file is bound only when every one of these facts is known.
+    """
+    missing = [
+        name
+        for name, known in (
+            ("its git common dir", host.git_common_dir),
+            ("its checkouts", host.checkouts),
+            ("the engine's denied roots", host.denied_roots),
+        )
+        if not known
+    ]
+    if missing:
+        raise _refuse(
+            source,
+            _RULE_DENIED,
+            f"the controller's own roots are not all known ({', '.join(missing)} missing), "
+            "so a credential file cannot be proved outside them and is not bound",
+        )
+    for label, root in _controller_roots(host):
+        for spelling in _spellings(root, label):
+            if _lies_in(source, spelling):
+                raise _refuse(
+                    source,
+                    _RULE_DENIED,
+                    f"a credential file lies in {label} {root}: controller state, git "
+                    "metadata and checkouts are never bound into a container (ADR 0005 C4, "
+                    "ADR 0013 D18)",
+                )
+
+
 def _check_file_credential(item: FileCredential, host: HostContext) -> None:
     rule = _RULE_PROJECTION
     source = _resolved_self(item.source, "a credential file", rule)
+    _check_credential_denied(source, host)
     try:
         info = os.lstat(source)
     except OSError as exc:
@@ -585,7 +695,9 @@ def check_projection(
     SSH agent socket, a git configuration variable). A file is delivered
     only on a bind runtime: a copy-in runtime would have to read it (ADR
     0005 D7.2). It is a regular file the operator owns, resolving to itself,
-    outside D4.3's forbidden sources, readable by the agent's subordinate
+    outside D4.3's forbidden sources and C4's controller roots (the git
+    common dir, every checkout and worktree, the engine's denied roots;
+    :func:`_check_credential_denied`), readable by the agent's subordinate
     UID through its bits for others, with no other hard link, and below a
     directory only the operator can search: no search permission for its
     group or others, and no ACL its mode does not show.
@@ -726,8 +838,11 @@ def _check_staging_root(root: object, host: HostContext) -> str:
     each directory from the common dir down a real one that the operator
     owns and nobody else can write (``safefs`` makes them ``0700``), the
     root resolving to itself, outside D4.3's forbidden sources and the
-    home, and never holding or lying in the controller's checkout or a
-    worktree. Returns its path.
+    home, never holding or lying in the controller's checkout or a
+    worktree, and holding no denied root and lying in none but those that
+    hold ``<common dir>/autoforge``, whose sandbox directory is C5's
+    carve-out for ``/source`` alone (:attr:`HostContext.denied_roots`).
+    Returns its path.
     """
     rule = _RULE_BIND
     if not isinstance(root, StagingRoot):
@@ -806,6 +921,23 @@ def _check_staging_root(root: object, host: HostContext) -> str:
                     rule,
                     f"the staging root {'holds' if holds else 'lies in'} the checkout or "
                     f"worktree {checkout}, which is never bound",
+                )
+    # C4 and C5: the staging root lies in <common dir>/autoforge, a denied
+    # root, as the carve-out of the issue's sandbox directory, and so in any
+    # denied root that holds it (the main checkout). It holds no denied
+    # root, and lies in no other: a state directory or run logs configured
+    # inside the sandbox directory are never bound at /source.
+    carved = posixpath.join(common, SANDBOX_LAYOUT.split("/")[0])
+    for denied in host.denied_roots:
+        for spelling in _spellings(denied, "the controller's denied root"):
+            holds = _lies_in(spelling, path)
+            within = _lies_in(path, spelling) and not _lies_in(carved, spelling)
+            if holds or within:
+                raise _refuse(
+                    path,
+                    _RULE_DENIED,
+                    f"the staging root {'holds' if holds else 'lies in'} the controller's "
+                    f"denied root {denied}, which is never bound",
                 )
     return path
 

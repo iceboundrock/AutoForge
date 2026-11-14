@@ -99,10 +99,25 @@ def common(tmp_path: Path) -> Path:
     return path
 
 
+def _engine_denied_roots(common: Path, worktrees: tuple[Path, ...], state: Path) -> tuple[str, ...]:
+    """The denied roots the engine gives a container launch (ADR 0005 D13.2, as
+    ``ControllerEngine.gate_denied_roots``): the state directory and its run logs, the
+    lock, ``<common dir>/autoforge``, the checkout and every registered worktree."""
+    return (
+        str(state),
+        str(state / "logs"),
+        str(common / "autoforge" / "controller.lock"),
+        str(common / "autoforge"),
+        str(common.parent),
+        *(str(worktree) for worktree in worktrees),
+    )
+
+
 @pytest.fixture
 def host(tmp_path: Path, common: Path) -> HostContext:
     """A fake operator home, so D4.3's forbidden sources are this test's own, and the
-    controller's common dir, checkout and a worktree of it."""
+    controller's common dir, checkout, a worktree of it and the engine's denied roots,
+    the state directory at its default in the checkout."""
     home = tmp_path / "home"
     home.mkdir()
     runtime_dir = tmp_path / "xdg-runtime"
@@ -111,8 +126,14 @@ def host(tmp_path: Path, common: Path) -> HostContext:
     worktree.mkdir(parents=True)
     (common / "autoforge").chmod(0o700)  # as safefs makes it, whatever the umask
     checkouts = (str(common.parent), str(worktree))
+    denied = _engine_denied_roots(common, (worktree,), common.parent / ".autoforge")
     return HostContext(
-        str(home), {"XDG_RUNTIME_DIR": str(runtime_dir)}, os.getuid(), str(common), checkouts
+        str(home),
+        {"XDG_RUNTIME_DIR": str(runtime_dir)},
+        os.getuid(),
+        str(common),
+        checkouts,
+        denied,
     )
 
 
@@ -589,6 +610,161 @@ def test_a_credential_file_under_a_forbidden_host_source_is_refused(relative, wh
         check_spec(spec, host)
     assert why.split()[-1] in str(refused.value)
     assert SENTINEL_GH not in str(refused.value)
+
+
+# -- ADR 0005 C4: the controller's own roots (#270, R3-F1) ------------------------------
+
+
+def _admissible(path: Path, content: str = SENTINEL_GH) -> str:
+    """A file every check but C4 admits: 0644, one link, the operator's, in a 0700
+    directory, so a refusal can only be the denied root's."""
+    source = _secret_file(path, content)
+    path.parent.chmod(0o700)
+    return source
+
+
+def _elsewhere(host: HostContext, tmp_path: Path) -> HostContext:
+    """The same operator with a controller of another checkout: none of the roots of
+    ``host`` is one of its own, so what ``host`` refuses only for C4 it admits."""
+    other = tmp_path / "other-checkout"
+    common = other / ".git"
+    worktree = common / "autoforge" / "worktrees" / "1"
+    return dataclasses.replace(
+        host,
+        git_common_dir=str(common),
+        checkouts=(str(other), str(worktree)),
+        denied_roots=_engine_denied_roots(common, (worktree,), other / ".autoforge"),
+    )
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        "git config",
+        "a worktree's admin dir",
+        "the common dir's refs",
+        "the lock",
+        "the issue's sandbox directory",
+        "the staging root",
+        "state",
+        "run logs",
+        "the checkout",
+        "an agent worktree",
+        "state configured outside the checkout",
+        "run logs configured outside the checkout",
+        "a worktree outside the checkout",
+    ],
+)
+def test_a_credential_file_in_a_controller_root_is_never_bound(
+    where, host, common, staging, tmp_path
+):
+    """C4 for the projection: no credential file from the controller's git common dir
+    (its configuration, refs and every worktree's admin dir), the checkout, a worktree,
+    the lock, the sandbox directories (the staging root's exception is /source's alone),
+    the state directory or the run logs, wherever these are configured. Each file passes
+    every other check: the same file is admitted where the roots are another checkout's."""
+    outside = tmp_path / "configured"
+    paths = {
+        "git config": common / "config",
+        "a worktree's admin dir": common / "worktrees" / "other" / "HEAD",
+        "the common dir's refs": common / "refs" / "heads" / "main",
+        "the lock": common / "autoforge" / "controller.lock",
+        "the issue's sandbox directory": common / SANDBOX_DIR / "270" / "cache" / "key",
+        "the staging root": Path(staging.path) / "key",
+        "state": common.parent / ".autoforge" / "state.json",
+        "run logs": common.parent / ".autoforge" / "logs" / "run-1" / "agent.log",
+        "the checkout": common.parent / "src" / "model.key",
+        "an agent worktree": Path(host.checkouts[1]) / "model.key",
+        "state configured outside the checkout": outside / "state" / "state.json",
+        "run logs configured outside the checkout": outside / "logs" / "run-1" / "agent.log",
+        "a worktree outside the checkout": outside / "worktree-9" / "model.key",
+    }
+    configured = dataclasses.replace(
+        host,
+        checkouts=(*host.checkouts, str(outside / "worktree-9")),
+        denied_roots=(
+            *host.denied_roots,
+            str(outside / "state"),
+            str(outside / "logs"),
+            str(outside / "worktree-9"),
+        ),
+    )
+    source = _admissible(paths[where])
+    spec = _launch(source=staging, projection=Projection(files=(FileCredential(source, "k"),)))
+    with pytest.raises(SandboxPolicyError, match="C4 denied roots") as refused:
+        _argv(spec, configured)
+    assert source in str(refused.value)
+    assert SENTINEL_GH not in str(refused.value)
+    alone = _launch(projection=Projection(files=(FileCredential(source, "k"),)))
+    check_spec(alone, _elsewhere(configured, tmp_path))
+
+
+def test_a_controller_root_configured_through_a_link_is_caught_where_it_resolves(host, tmp_path):
+    """A state directory configured as a link: the file resolves to itself, under the
+    link's target, which is where the root is compared too."""
+    state = tmp_path / "state-target"
+    link = tmp_path / "state-link"
+    source = _admissible(state / "state.json")
+    link.symlink_to(state)
+    linked = dataclasses.replace(host, denied_roots=(*host.denied_roots, str(link)))
+    spec = _launch(projection=Projection(files=(FileCredential(source, "k"),)))
+    check_spec(spec, host)
+    with pytest.raises(SandboxPolicyError, match="C4 denied roots"):
+        check_spec(spec, linked)
+
+
+@pytest.mark.parametrize("missing", ["git_common_dir", "checkouts", "denied_roots"])
+def test_a_credential_file_needs_every_controller_root_known(missing, credential, host):
+    """A fact the C4 check needs that the context does not carry refuses the file: it
+    cannot be proved outside a root nobody named."""
+    empty = "" if missing == "git_common_dir" else ()
+    unknown = dataclasses.replace(host, **{missing: empty})
+    spec = _launch(projection=Projection(files=(FileCredential(credential, "k"),)))
+    with pytest.raises(SandboxPolicyError, match="not all known"):
+        check_spec(spec, unknown)
+    # An environment credential binds nothing, so it needs none of them.
+    check_spec(_launch(projection=Projection(env=(_env(),))), unknown)
+
+
+def test_a_relative_controller_root_is_refused_not_ignored(credential, host):
+    relative = dataclasses.replace(host, denied_roots=(*host.denied_roots, ".autoforge"))
+    spec = _launch(projection=Projection(files=(FileCredential(credential, "k"),)))
+    with pytest.raises(SandboxPolicyError, match="not an absolute path"):
+        check_spec(spec, relative)
+
+
+def test_a_dedicated_model_credential_beside_the_controller_roots_is_bound(host, tmp_path):
+    """The positive case: a model key in a directory of its own, in the home or beside a
+    state directory configured outside the checkout whose name it shares a prefix with,
+    is bound read-only in the home."""
+    state = tmp_path / "state"
+    state.mkdir()
+    configured = dataclasses.replace(host, denied_roots=(*host.denied_roots, str(state)))
+    for directory in (Path(host.home) / ".config" / "model-keys", tmp_path / "state-keys"):
+        directory.mkdir(parents=True, mode=0o700)
+        source = _secret_file(directory / "api-key")
+        item = FileCredential(source, ".config/provider/key")
+        argv = _argv(_launch(projection=Projection(files=(item,))), configured)
+        target = f"{HOME_TARGET}/.config/provider/key"
+        assert f"--mount=type=bind,source={source},target={target},readonly=true" in argv
+        assert not any(SENTINEL_FILE in word for word in argv)
+
+
+@pytest.mark.parametrize("where", ["the sandbox directory", "inside the root"])
+def test_the_staging_roots_carve_out_covers_its_own_sandbox_directory_only(
+    where, staging, host, common
+):
+    """C4 and C5 for /source: the staging root lies in <common dir>/autoforge and in the
+    checkout that holds it, by design, and in no other denied root, nor does it hold one:
+    state or run logs configured in the issue's sandbox directory or in the root refuse it."""
+    denied = {
+        "the sandbox directory": str(common / SANDBOX_DIR / "270"),
+        "inside the root": f"{staging.path}/logs",
+    }[where]
+    check_spec(_launch(source=staging), host)
+    configured = dataclasses.replace(host, denied_roots=(*host.denied_roots, denied))
+    with pytest.raises(SandboxPolicyError, match="C4 denied roots"):
+        check_spec(_launch(source=staging), configured)
 
 
 def test_the_home_itself_or_an_ancestor_is_never_a_bind_source(host, staging):

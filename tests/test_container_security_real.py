@@ -392,8 +392,21 @@ def _staging(tmp_path: Path) -> StagingRoot:
 
 
 def _host(tmp_path: Path) -> HostContext:
+    """The controller's facts as the engine gives them: its common dir and checkout, and
+    its denied roots (ADR 0005 D13.2) with the state directory at its default."""
     common = _common(tmp_path)
-    return HostContext.current(git_common_dir=str(common), checkouts=(str(common.parent),))
+    checkout = common.parent
+    state = checkout / ".autoforge"
+    denied = (
+        str(state),
+        str(state / "logs"),
+        str(common / "autoforge" / "controller.lock"),
+        str(common / "autoforge"),
+        str(checkout),
+    )
+    return HostContext.current(
+        git_common_dir=str(common), checkouts=(str(checkout),), denied_roots=denied
+    )
 
 
 def _expectation(

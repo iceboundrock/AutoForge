@@ -2390,7 +2390,13 @@ else. Before any create, the policy proves:
 - the root is outside D4.3's forbidden sources and is not the home or one
   of its ancestors;
 - the root is not the controller's checkout or a worktree, holds none,
-  and lies in none but the main checkout, which holds the common dir.
+  and lies in none but the main checkout, which holds the common dir;
+- the root holds none of the engine's denied roots (ADR 0005 C4 and
+  D13.2: the state directory and run logs wherever they are configured,
+  the lock, `<git common dir>/autoforge`, the checkout and every
+  registered worktree), and lies in none but those that hold
+  `<git common dir>/autoforge`, whose issue sandbox directory is C5's
+  carve-out for this bind alone.
 
 So `/usr`, `/etc`, the checkout, the common dir and a worktree's admin
 dir can never be bound there.
@@ -2459,7 +2465,13 @@ for any container but the launch container:
   which ADR 0005 D7.2 forbids, so it delivers only variables. The file
   must be a regular file the operator owns, outside D4.3's forbidden
   sources (`~/.ssh`, gh's and git's configuration, `~/.git-credentials`,
-  `~/.netrc`, keyrings, `/run`, `$XDG_RUNTIME_DIR`), and readable by the
+  `~/.netrc`, keyrings, `/run`, `$XDG_RUNTIME_DIR`), outside C4's
+  controller roots with no carve-out (the controller's git common dir
+  whole, so its configuration, refs, the lock, the sandbox directories,
+  the staging root and every worktree's admin dir; the checkout and every
+  worktree; the state directory and run logs wherever they are
+  configured, a link's target included), which the policy must be given
+  before it binds any file, and readable by the
   agent: the agent's subordinate UID reads it only through its
   permission bits for others, so a `0600` file is refused rather than
   delivered unusable. That makes it readable by every local user who can
