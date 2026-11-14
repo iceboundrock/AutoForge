@@ -2490,8 +2490,176 @@ for any container but the launch container:
 Every projected value is held as a `Secret`, which no `repr`, string or
 pickle shows. Long-lived login and refresh state stays on the host; a
 container gets a per-launch projection and nothing else (D14). Which
-mechanism each provider uses, and its refresh story, is #290's; removing a
-projection at the release and in reconciliation is #272's.
+mechanism each provider uses, and its refresh story, is #290's (below);
+removing a projection at the release and in reconciliation is #272's.
+
+### Provider credential mapping (ADR 0013 D14, #290)
+
+Which model credential a container launch of Claude Code, OpenCode 2.x or
+Pi gets, and how. `container_auth.plan_credentials` decides it from what
+the adapter declares for the profile (`AgentProvider.credential_routes`:
+variable names and kinds, never a value) and from the launch's environment
+after its allow-list. Like the rest of this section it is unreachable
+before #271 and #273, and tested only with fake credentials, the real
+adapters' declarations and argv, and fake provider CLIs: no route below
+has run against a real provider or inside a real container. Codex is out
+of scope.
+
+The rules, for every provider:
+
+- **One variable, the operator's choice.** Exactly one of the profile's
+  routes must be present. Two at once (`ANTHROPIC_API_KEY` beside
+  `CLAUDE_CODE_OAUTH_TOKEN`) are refused rather than left to the CLI's own
+  precedence, so a subscription token never gives way silently to a paid
+  API key. None is refused, naming the variables to set.
+- **Never a login that refreshes.** A credential that rotates a refresh
+  token on use is never projected: no controller-owned path brings a
+  refreshed login back to the host, so the container's first refresh would
+  invalidate the host's copy. A login held in a file or directory is never
+  projected either: the CLI rewrites it in place, and AutoForge never reads
+  or copies a credential (ADR 0005 D7.2). The plan names such a login as
+  not projected, and the host copy is never touched.
+- **A positive allow-list, never a filter.** Only the selected variable
+  is projected. Of the rest of the launch's environment the container
+  receives only what the plan's `environment` holds, and the container
+  backend (#271) passes nothing else of it in: the locale (`LANG`,
+  `LANGUAGE`, the `LC_*` names one by one), `TZ`, `TERM` and the git
+  author identity (`GIT_AUTHOR_*`, `GIT_COMMITTER_*`), and for Pi
+  `PI_OFFLINE`, `PI_SKIP_VERSION_CHECK` and `PI_TELEMETRY`, each by its
+  exact name (`container_auth.PASSED_NAMES`, the adapter's declared
+  settings). Every other variable is withheld, whatever its name: a
+  credential no naming rule recognises (`AZURE_OPENAI_KEY`, a password in
+  `DATABASE_URL` or a proxy URL) stays out because it is not listed, not
+  because it looks like one. So do `PATH`, the `XDG_*` directories and
+  every other host fact, and an `ANTHROPIC_*`, `CLAUDE_*`, `OPENCODE_*`
+  or `OPENAI_*` setting a provider's host allow-list passes. A
+  declaration that lists a credential-looking name, a route's variable or
+  a prefix as a setting refuses every launch.
+- **A fresh private store, never an inherited one.** The plan sets `HOME`
+  and the variable that locates each CLI's own credential store to a place
+  in the launch container's private home, whatever the launch's
+  environment held: `CLAUDE_CONFIG_DIR=/home/agent/.claude`,
+  `OPENCODE_DB=/home/agent/.local/share/opencode/opencode.db`,
+  `PI_CODING_AGENT_DIR=/home/agent/.pi/agent`. A host path (the dedicated
+  directory the bwrap backend wants) is absent or unwritable inside, and a
+  path into the workspace or a volume could select a store the repository
+  or an earlier launch left there, whose login OpenCode and Pi take ahead
+  of an environment key. The private home is a tmpfs each create makes
+  anew, so each store starts empty and goes with its container.
+- **Integrations stay off, set rather than inherited (ADR 0013 D7).**
+  Claude Code's and Pi's isolation is on their argv (`--safe-mode
+  --strict-mcp-config --setting-sources=user`; `--no-extensions
+  --no-skills` and the rest), which a container launch runs unchanged.
+  OpenCode has no flag for it, so the plan sets the variables every
+  OpenCode launch sets (#165) itself, whatever the launch's environment
+  held: `OPENCODE_CONFIG_PROJECT_DISABLE=1` and
+  `OPENCODE_DISABLE_PROJECT_CONFIG=1`, `OPENCODE_CONFIG` and
+  `OPENCODE_CONFIG_CONTENT` empty, and
+  `OPENCODE_CONFIG_DIR=/home/agent/.config/opencode`, a directory of the
+  private home that starts empty. An operator's value for any of them is
+  withheld like every other variable. Without them OpenCode would load the
+  workspace's `opencode.json` and `.opencode/`, which the repository
+  controls: run against OpenCode 2.3.0 with a fresh home and only the
+  private home and database set, `opencode api --standalone GET
+  /api/config` loaded both; with them, only the empty directory, which
+  OpenCode made. An adapter's isolation variable that names a credential,
+  a store or a passed setting, or a path outside the private home, refuses
+  every launch. Claude Code's shell variables (`CLAUDE_ENV_FILE`,
+  `CLAUDE_CODE_SHELL`, `CLAUDE_CODE_SHELL_PREFIX`) are not set: they keep
+  the functions of the operator's shell startup files out of its Bash
+  tool, and the private home holds no such file; withheld, neither shell
+  variable names a program of the operator's.
+- **Agent launches only.** A repository command's launch class is refused,
+  and its allow-list (#286) passes no route's variable by default.
+
+Every supported route is a static value carried by one variable, so every
+route maps to the environment variable: both staging forms deliver it, and
+no provider uses the file mechanism.
+
+| Provider | Route | On the host | Provisioned by | Refreshed by | A container launch |
+|---|---|---|---|---|---|
+| Claude Code | `ANTHROPIC_API_KEY` | the environment `autoforge` runs in | the operator | nobody; the operator rotates it | projected, as that variable |
+| Claude Code | `CLAUDE_CODE_OAUTH_TOKEN` | the environment `autoforge` runs in | the operator, with `claude setup-token` on the host, which needs a Claude subscription | nobody: it carries no refresh token; the operator makes a new one when it expires | projected, as that variable |
+| Claude Code | `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` | the environment | the operator | the CLI, rotating it | refused |
+| Claude Code | the login in `~/.claude/.credentials.json` or `$CLAUDE_CONFIG_DIR` (`claude auth login`) | a file or directory | the operator | the CLI, in place | never projected; refused when it is the only login; `CLAUDE_CONFIG_DIR` names an empty directory of the private home |
+| Claude Code | `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY` | the environment | — | — | refused: a gateway token or a cloud's own credentials, not a route #290 maps |
+| OpenCode 2.x | the API key of the model's provider: `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY` or `OPENAI_API_KEY` | the environment | the operator | nobody | projected, that variable alone; every other key withheld |
+| OpenCode 2.x | the account store `opencode auth login` writes (the database `$OPENCODE_DB` or `opencode debug paths` names) | a SQLite database | the operator | OpenCode, in place | never projected; `OPENCODE_DB` names a new database in the private home, so the store is empty and the key is what the launch uses |
+| OpenCode 2.x | any other model provider | — | — | — | refused: no key name mapped |
+| Pi | `require_oauth: false`: `DEEPSEEK_API_KEY` or `OPENAI_API_KEY`, the model provider's, forwarded with `execution.agent_env_allowlist_extra` | the environment | the operator | nobody | projected, as that variable |
+| Pi | `require_oauth: false`: a key in Pi's own store (`auth.json` in `$PI_CODING_AGENT_DIR`) | a directory | the operator | Pi rewrites the directory at startup | never projected; `PI_CODING_AGENT_DIR` names an empty directory of the private home |
+| Pi | `require_oauth: true` (the default): the ChatGPT sign-in | `$PI_CODING_AGENT_DIR`, or `~/.pi/agent` | the operator, with `/login openai` | Pi, rotating its refresh token | refused: run the profile under bwrap, or use an API key |
+
+The key names are the ones each CLI reads, read from Claude Code 2.1.325's
+and OpenCode 2.3.0's builds and from Pi's documented routes
+([Pi](../pi.md)). A model provider with no row has no container route; it
+is refused, not guessed.
+
+What every projected route shares:
+
+- **Concurrency.** Nothing is refreshed inside a container, so workers
+  share no writable credential state: each launch reads the same value
+  from the controller's environment, and none writes one back.
+- **Rotation and revocation.** A controller process takes its
+  environment from the shell that starts it, once, and every plan it makes
+  reads that environment (its own `os.environ`, through the agent
+  allow-list). Changing a variable in the shell afterwards changes nothing
+  in a controller already running, and AutoForge has no in-process
+  refresh. So a rotated key, or a new `claude setup-token` token, reaches
+  the launches of an `autoforge` process started after the operator set it
+  in that shell, never the later launches of a `run`, `step` or `resume`
+  already running, nor of a running `epic` scheduler and the workers it
+  starts: they keep projecting the value they started with. To move a
+  running run to the new value, stop it ([Stopping a run
+  safely](../troubleshooting.md#stopping-a-run-safely); `epic stop` for a
+  scheduler), set the new value in the shell, and start the controller
+  again from that shell (`resume`, or `epic resume`): the new process
+  projects the new value from its first launch. Revoke the old value only
+  after that restart, since a running controller's next launch would carry
+  it. A launch already running keeps the value its container was created
+  with until it ends. An expired or revoked credential fails inside the
+  launch, with the CLI's own error: AutoForge cannot tell an opaque
+  value's expiry beforehand, and a typed classification of that failure is
+  not implemented.
+- **Removal and rehydration.** The value persists in the runtime's record
+  of the launch container until the container is removed, at the release
+  or, after a cancelled launch, a forced stop or a crash, by reconciliation
+  (#272). A replacement container gets a new projection, made from the
+  environment of the controller that makes it (the value that process
+  started with, as above), and nothing of the earlier container's home:
+  its private home and every store in it are new, there is no login to
+  re-run, no home to copy, and no value on an argument.
+- **What is recorded.** `CredentialPlan.facts()` and `describe()` carry
+  the provider, the model provider, the variable's name, its kind, its
+  refresh and the mechanism, and the names of what is not projected, of
+  what the container receives besides the projection and of what is
+  withheld; never a value. The value is a `Secret`, which no `repr`,
+  string or pickle shows.
+- **Subscriptions.** Whether a plan or a provider's terms allow a use is
+  the operator's to check. AutoForge supports one subscription route in a
+  container, Claude Code's `claude setup-token` token, and checks neither
+  eligibility nor terms.
+
+**What redaction recognises, per routed variable.** Redaction is a
+baseline ([Security](../security.md#redaction-is-a-baseline)). A value of
+each provider's current key format is redacted wherever it appears; two
+names are not recognised in a `NAME=value` assignment when the value has
+another shape. `tests/test_container_auth.py` pins this table.
+
+| Variable | By its value's shape | By its name, as `NAME=value` |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | yes (`sk-ant-…`) | yes |
+| `CLAUDE_CODE_OAUTH_TOKEN` | yes (`sk-ant-oat01-…`) | yes |
+| `OPENAI_API_KEY` | yes (`sk-…`, `sk-proj-…`) | yes |
+| `DEEPSEEK_API_KEY` | yes (`sk-…`) | no (#285) |
+| `GOOGLE_GENERATIVE_AI_API_KEY` | yes (`AIza…`, #282) | no (#285) |
+
+**Residual R3, stated plainly.** Every tool in the launch container can
+read the projected credential, and an agent with general outbound access
+can send it anywhere (#257). A container keeps it out of every other
+launch and helper container and keeps every other credential out of this
+one; it does not stop the agent from exfiltrating its own. #294's egress
+mediation narrows that channel and cannot close it.
 
 **The capability matrix.** Each resource of ADR 0005 §2.5, as a container
 launch gets it. "Measured" names what `container_measure.py` observes

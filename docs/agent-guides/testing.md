@@ -1155,6 +1155,57 @@ exactly when `tests/sandbox_host.py` measures the host capable
   skips). It skips with the reason
   wherever it is not opted into or the runtime cannot run a rootless
   container, and has not run on a capable host yet.
+- `tests/test_container_auth.py` (#290) is ADR 0013 §7's list for #290,
+  with fake credentials, the real adapters' declarations and no runtime.
+  Each supported route of Claude Code, OpenCode and Pi maps to the
+  environment variable on both staging forms: the projection passes #270's
+  checks, the create names the variable and holds no value, and the
+  runtime client's environment holds it. The value is in no fact,
+  description, `repr`, refusal or pickle, and no helper container takes
+  the projection. Two Claude routes at once, no credential, a gateway or
+  cloud switch, an unmapped model provider, a provider with no mapping
+  (the SDK providers, the scripted one), Pi's ChatGPT sign-in and a
+  rotating refresh token are each refused. A stored login (Claude Code's
+  file and directory, OpenCode's database, Pi's agent directory, each
+  holding a fake credential on a fake host) is never projected, is named
+  as not projected, and keeps its bytes and its time. A plan made from a
+  rotated value gets a new projection with the new value; an export
+  command's launch class is refused and its allow-list passes no route's
+  variable. Of the launch's environment the container receives only the
+  positive allow-list: credentials no naming rule recognises
+  (`AZURE_OPENAI_KEY`, a password in a URL), other routes' keys, host
+  paths and every other setting are withheld, and a declaration that lists
+  a credential, a route's variable or a prefix as a setting, or a store
+  outside the private home, is refused. Every store variable names a place
+  in the private home, unset, at a host path or in the workspace, and the
+  create mounts a tmpfs there. OpenCode's isolation variables hold the
+  controller's values whatever the launch's environment held (none, the
+  host launch's, or values that undo them), are the same names and values
+  as its host launch's but for a configuration directory of the private
+  home, and an isolation variable that is a credential, a store, a
+  setting, set twice or a path outside the private home is refused;
+  Claude Code's and Pi's isolation flags are on the argv. The redaction table of `github-safety.md`
+  is pinned: each routed key's shape is redacted, and the name column,
+  recognised or not, is asserted.
+  Then with fake provider CLIs (`tests/credential_fake.py`: a standalone
+  `claude`, `opencode` and `pi` that find their credential by each CLI's
+  own rules, a stored login of OpenCode and Pi ahead of an environment
+  key, in a stand-in for the container's filesystem): each route's CLI,
+  run by the executor with its adapter's argv and exactly what the launch
+  container receives, authenticates with the projected key in a store that
+  did not exist before, sees no other credential however the operator's
+  shell forwarded it, and no value is on its argv, the create's or in its
+  output. A store left in the workspace or named at a host path is never
+  selected, with a control showing the CLI would take it if the variable
+  were passed on. The fake `opencode` also resolves its configuration as
+  2.x does: with the workspace configuring an MCP server and a plugin and
+  the operator's shell forwarding variables that undo the isolation, it
+  loads none, from an empty configuration directory of the private home,
+  with two controls (the plan's environment without its isolation
+  variables loads the repository's; the shell's variables passed on load
+  every one). A refused route starts no CLI; a replacement launch that
+  shares the first one's workspace and cache volume finds an empty store,
+  the rotated key and nothing the first wrote.
 
 The existing executor and duplex suites are the no-description regression:
 they run unchanged.

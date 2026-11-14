@@ -304,6 +304,15 @@ from .child_env import (
 )
 from .claude_stream import ClaudeStream
 from .config import LoopDetectionConfig, ProfileConfig
+from .container_auth import (
+    CredentialKind,
+    CredentialRoutes,
+    EnvRoute,
+    PrivateStore,
+    Refresh,
+    UnsupportedRoute,
+    private_path,
+)
 from .errors import (
     ChildStdinClosedError,
     ConfigurationError,
@@ -940,6 +949,16 @@ class AgentProvider:
             path_names=self.path_names,
         )
 
+    def credential_routes(self, profile: ProfileConfig) -> CredentialRoutes | None:
+        """Where ``profile``'s model credential may come from under the container
+        backend (ADR 0013 D14, #290), as data for
+        :func:`autoforge.container_auth.plan_credentials`: names and kinds,
+        never a value. ``None``: this adapter maps no credential, and a
+        container launch of it is refused. Only Claude Code, OpenCode and Pi
+        map one; the SDK providers keep their own policy (ADR 0007).
+        """
+        return None
+
     def written_directories(
         self, profile: ProfileConfig, env_allowlist: tuple[str, ...] | None, home: str
     ) -> tuple[tuple[str, str], ...]:
@@ -1337,6 +1356,44 @@ def claude_configuration_problems(env: Mapping[str, str]) -> list[str]:
     return problems
 
 
+# Claude Code's credential routes under the container backend (#290), read
+# from 2.1.325: an API key, or the long-lived token `claude setup-token`
+# prints, which the operator makes on the host and which no launch refreshes.
+# The refresh token variable is a route too, refused: its use rotates it.
+CLAUDE_CREDENTIAL_ROUTES = (
+    EnvRoute("ANTHROPIC_API_KEY", CredentialKind.API_KEY),
+    EnvRoute("CLAUDE_CODE_OAUTH_TOKEN", CredentialKind.OAUTH_TOKEN),
+    EnvRoute(
+        "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", CredentialKind.OAUTH_REFRESH_TOKEN, Refresh.ROTATING
+    ),
+)
+# What would put Claude Code on another route, which the container backend
+# does not take: a gateway's bearer token, or a cloud provider's credentials,
+# which come from the cloud's own configuration.
+CLAUDE_UNSUPPORTED_ROUTES = (
+    UnsupportedRoute(
+        "ANTHROPIC_AUTH_TOKEN",
+        CredentialKind.GATEWAY_TOKEN,
+        "a gateway's bearer token is not a route #290 maps",
+    ),
+    *(
+        UnsupportedRoute(
+            name,
+            CredentialKind.CLOUD,
+            f"{cloud} authenticates with the cloud's own credentials, which are never projected",
+        )
+        for name, cloud in (
+            ("CLAUDE_CODE_USE_BEDROCK", "Amazon Bedrock"),
+            ("CLAUDE_CODE_USE_VERTEX", "Google Vertex AI"),
+            ("CLAUDE_CODE_USE_FOUNDRY", "Microsoft Foundry"),
+        )
+    ),
+)
+# Where Claude Code keeps its login and settings, in a container launch: the
+# private home's own directory, never the host's or one in the workspace.
+CLAUDE_PRIVATE_STORES = (PrivateStore("CLAUDE_CONFIG_DIR", ".claude"),)
+
+
 class ClaudeCodeProvider(AgentProvider):
     name = "claude"
     # ``ANTHROPIC_API_KEY`` / ``ANTHROPIC_AUTH_TOKEN`` and the base URL and
@@ -1406,6 +1463,20 @@ class ClaudeCodeProvider(AgentProvider):
             home_config=(*needs.home_config, *home_config),
             auth=tuple(auth),
             operator_config_roots=(root, os.path.join(home, ".claude.json")),
+        )
+
+    def credential_routes(self, profile: ProfileConfig) -> CredentialRoutes:
+        """``ANTHROPIC_API_KEY`` or ``CLAUDE_CODE_OAUTH_TOKEN``, exactly one
+        (:data:`CLAUDE_CREDENTIAL_ROUTES`); the login in ``~/.claude`` or
+        ``$CLAUDE_CONFIG_DIR`` is never projected, since the CLI refreshes it
+        in place, and inside the container ``CLAUDE_CONFIG_DIR`` names an
+        empty directory of the private home (:data:`CLAUDE_PRIVATE_STORES`).
+        No other ``ANTHROPIC_*`` or ``CLAUDE_*`` variable is passed."""
+        return CredentialRoutes(
+            "anthropic",
+            CLAUDE_CREDENTIAL_ROUTES,
+            CLAUDE_UNSUPPORTED_ROUTES,
+            stores=CLAUDE_PRIVATE_STORES,
         )
 
     @contextmanager
@@ -2008,6 +2079,33 @@ def opencode_organization_problems(env: Mapping[str, str]) -> list[str]:
     return problems
 
 
+# The API-key variable OpenCode reads for a model provider, under the
+# container backend (#290): names present in the 2.3.0 build, for the
+# providers AutoForge documents. A provider not listed has no container
+# route; its login, OpenCode's account store, is never projected.
+OPENCODE_KEY_NAMES = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "google": "GOOGLE_GENERATIVE_AI_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
+# Where OpenCode keeps its account store, in a container launch: a database
+# file in the private home, which starts empty, so a stored account never
+# takes precedence over the projected key.
+OPENCODE_PRIVATE_STORES = (PrivateStore("OPENCODE_DB", ".local/share/opencode/opencode.db"),)
+# OpenCode's integration isolation in a container launch (#165; ADR 0013 D7):
+# no flag keeps an MCP server, a plugin or the repository's configuration
+# off, so the plan sets :func:`opencode_isolation_env` itself, whatever the
+# launch's environment held, with a global configuration directory of the
+# private home, which starts empty. Run against 2.3.0 with a fresh home and
+# only the private home and database set, `opencode api --standalone GET
+# /api/config` loaded the workspace's `opencode.json` and `.opencode/`; with
+# these as well, only that directory, which OpenCode made.
+OPENCODE_CONTAINER_ISOLATION = tuple(
+    sorted(opencode_isolation_env(private_path(".config/opencode")).items())
+)
+
+
 class OpenCodeProvider(AgentProvider):
     name = "opencode"
     # OpenCode's own settings plus the API keys of the model providers it
@@ -2062,6 +2160,37 @@ class OpenCodeProvider(AgentProvider):
             state=(*needs.state, *state),
             auth=tuple(auth),
             operator_config_roots=roots,
+        )
+
+    def credential_routes(self, profile: ProfileConfig) -> CredentialRoutes:
+        """The API key of the model's provider alone (:data:`OPENCODE_KEY_NAMES`),
+        never another provider's key nor ``OPENCODE_*`` or ``OPENAI_*``
+        wholesale. The account store (the database ``auth login`` writes,
+        ``$OPENCODE_DB``) is never projected: OpenCode rewrites it and refreshes
+        the logins it holds. Inside the container ``OPENCODE_DB`` names a new
+        database in the private home (:data:`OPENCODE_PRIVATE_STORES`), whatever
+        the launch's environment held, so the store is empty and the key is
+        what the launch authenticates with. The integration isolation every
+        launch sets (:func:`opencode_isolation_env`) is set there too, with an
+        empty configuration directory of the private home
+        (:data:`OPENCODE_CONTAINER_ISOLATION`), never taken from the launch's
+        environment."""
+        scope = profile.model.split("/", 1)[0] if "/" in profile.model else ""
+        name = OPENCODE_KEY_NAMES.get(scope)
+        if name is None:
+            return CredentialRoutes(
+                scope or "(no provider)",
+                refusal=(
+                    f"no API-key variable is mapped for OpenCode's model provider {scope!r} "
+                    f"(mapped: {', '.join(sorted(OPENCODE_KEY_NAMES))}), and OpenCode's "
+                    "account store is never projected: route the profile to a mapped provider"
+                ),
+            )
+        return CredentialRoutes(
+            scope,
+            (EnvRoute(name, CredentialKind.API_KEY),),
+            stores=OPENCODE_PRIVATE_STORES,
+            isolation=OPENCODE_CONTAINER_ISOLATION,
         )
 
     @contextmanager
@@ -2374,6 +2503,16 @@ _PI_TOOLS_RE = re.compile(r"[a-z]+(,[a-z]+)*")
 # stored ChatGPT sign-in. A profile with `require_oauth` refuses to launch
 # when one of them would reach Pi (docs/pi-policy.md §8).
 PI_API_KEY_NAMES = ("OPENAI_API_KEY",)
+# The API-key variable Pi reads for a model provider when a profile sets
+# `require_oauth: false`, under the container backend (#290; docs/pi.md).
+PI_KEY_NAMES = {"deepseek": "DEEPSEEK_API_KEY", "openai": "OPENAI_API_KEY"}
+# Where Pi keeps its credential store and model state, in a container launch:
+# an empty agent directory in the private home, so a key stored in an
+# inherited one never takes precedence over the projected key.
+PI_PRIVATE_STORES = (PrivateStore("PI_CODING_AGENT_DIR", ".pi/agent"),)
+# Pi's switches a container launch receives from the launch's environment:
+# none is a credential or a path.
+PI_CONTAINER_SETTINGS = ("PI_OFFLINE", "PI_SKIP_VERSION_CHECK", "PI_TELEMETRY")
 # What Pi loads from its agent directory and from every directory between
 # `/` and the cwd whatever the resource flags say (docs/pi-policy.md §4-5):
 # the first context file name found in each directory (none with
@@ -2503,6 +2642,44 @@ class PiProvider(AgentProvider):
             )
         default = os.path.join(home, PI_DEFAULT_AGENT_DIR.removeprefix("~/"))
         return dataclasses.replace(needs, auth=tuple(auth), operator_config_roots=(default,))
+
+    def credential_routes(self, profile: ProfileConfig) -> CredentialRoutes:
+        """With ``require_oauth: false``, the API key of the model's provider
+        alone (:data:`PI_KEY_NAMES`). With ``require_oauth`` (the default), none:
+        the ChatGPT sign-in lives in Pi's agent directory, which Pi refreshes in
+        place by rotating its refresh token, and no controller-owned path
+        returns a refreshed sign-in to the host, so it is never projected. Nor
+        is a key Pi holds in its own store: inside the container
+        ``PI_CODING_AGENT_DIR`` names an empty directory of the private home
+        (:data:`PI_PRIVATE_STORES`), whatever the launch's environment held."""
+        scope = self.model_provider(profile)
+        if self.require_oauth(profile):
+            return CredentialRoutes(
+                scope,
+                refusal=(
+                    "require_oauth: Pi's ChatGPT sign-in is refreshed in Pi's agent directory "
+                    "by rotating its refresh token, and no controller-owned path returns a "
+                    "refreshed sign-in to the host, so it is never projected (ADR 0013 D14): "
+                    "run this profile under bwrap, or set require_oauth: false with a "
+                    "provider API key"
+                ),
+            )
+        name = PI_KEY_NAMES.get(scope)
+        if name is None:
+            return CredentialRoutes(
+                scope,
+                refusal=(
+                    f"no API-key variable is mapped for Pi's model provider {scope!r} "
+                    f"(mapped: {', '.join(sorted(PI_KEY_NAMES))}), and Pi's own credential "
+                    "store is never projected: route the profile to a mapped provider"
+                ),
+            )
+        return CredentialRoutes(
+            scope,
+            (EnvRoute(name, CredentialKind.API_KEY),),
+            stores=PI_PRIVATE_STORES,
+            settings=PI_CONTAINER_SETTINGS,
+        )
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         super().validate_profile(profile)

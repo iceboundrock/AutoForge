@@ -272,3 +272,11 @@ what the outer sandbox projects is in
 | OpenCode (default for the reviews, `replan_reexecute` and `update_epic`, with `openai/...` models) | The provider credentials you configured in OpenCode, or the `OPENAI_*` (and, for other providers, `ANTHROPIC_*`, `GEMINI_*`, `GOOGLE_*`) variables of that shell | Your OpenAI account, or that of the provider a model names |
 | Pi (optional, per profile) | A DeepSeek API key in Pi's store or forwarded on purpose, or the ChatGPT sign-in you made in Pi ([Pi operator guide](pi.md)) | Your DeepSeek account, or your ChatGPT plan's usage limits |
 | GitHub (`gh` and git, the controller only) | Your `gh` login | Your GitHub plan; the CI your repository runs on the branches AutoForge pushes uses that repository's Actions minutes ([Security boundaries](security.md#pushed-code-runs-in-your-ci)) |
+
+Under the container backend, which no configuration can select yet, a
+launch takes fewer of these: one variable per launch, and none of the
+logins a CLI refreshes in place (Claude Code's `~/.claude`, OpenCode's
+account store, Pi's ChatGPT sign-in). The table, with what each route's
+status rests on, is in
+[GitHub safety: provider credential mapping](agent-guides/github-safety.md#provider-credential-mapping-adr-0013-d14-290);
+no route of it has run against a real provider inside a container.
