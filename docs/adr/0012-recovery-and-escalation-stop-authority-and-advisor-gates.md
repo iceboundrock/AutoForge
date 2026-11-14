@@ -47,6 +47,16 @@
   code), D9's launch bound and D10's persisted field change with it. No
   advisor, no gate D, no pause, no phase and no edge out of `BLOCKED` or
   `FAILED` is added.
+- **Amended by #479:** D12 records how the engine accepts a result an
+  agent delivered before its launch timed out or exited badly, which D11.2
+  left to #479 and the decision on #434 ranked D2. No recovery action is
+  added: accepting a reply relaunches nothing, and D11's allowlist and its
+  refusal of a launch whose output holds a complete `CONTROL_RESULT` are
+  unchanged; D11's rule also refuses a launch whose teardown could not look
+  for a re-parented process (`orphans_unchecked`, R1-F2 of PR #481). One state
+  field is added, the provisional reply kept until the step accepts it or not
+  (`delivered_reply`, protocol 18 → 19, D12.4); no effect kind or
+  configuration key changes.
 - **Related:** ADR 0004 (the authority boundary, K9 and K10), ADR 0005 (the
   outer sandbox and its launch classes), ADR 0007 and #126 (the durable
   pause), ADR 0008 D9.4 and D15 (the scheduler's entry checks and
@@ -544,7 +554,8 @@ policy as built (`src/autoforge/auto_recovery.py`, `ControllerEngine.run`).
 the class of the error that ended the step and on the typed facts the
 engine set on it of the agent launch that ended it (`LaunchEnd`, the
 error's `launch_end`): the limit that killed it (`idle`, `max_runtime`,
-`loop`), whether a process it started may still run, whether its output
+`loop`), whether a process it started may still run (or the platform could
+not look for one it left outside its group, `orphans_unchecked`), whether its output
 holds a complete `CONTROL_RESULT` in the part the parser reads, and what its
 adapter typed (a usage limit, a known-transient failure, an exit without
 any result, a failure its provider had established before a limit killed
@@ -582,12 +593,17 @@ after its corrections, a sandbox refusal or clean-up uncertainty, a GitHub
 or git failure (drift and propagation stay stops; the pushed-head wait of
 #403 is in-step and unchanged), a failed verification, effect or claim, and
 anything unknown. An allowlisted failure is still refused when a process the
-launch started may still run, or when its output holds a complete
-`CONTROL_RESULT` (#285; accepting that result is #479's, so a relaunch that
-would discard it is not made)
+launch started may still run, or when the platform could not look for one
+the launch left outside its group (`orphans_unchecked`, no child subreaper:
+the teardown cannot prove that no writer remains, so the refusal is
+`process-may-survive`, R1-F2 of PR #481), or when its output holds a complete
+`CONTROL_RESULT` (#285; the engine accepts that result first where it can
+prove it safe, D12, and a relaunch that would discard one it did not accept is
+not made)
 (`test_only_the_allowlist_is_ever_relaunched`,
 `test_a_result_delivered_before_the_kill_is_never_discarded`,
 `test_a_launch_that_may_have_left_a_process_is_never_relaunched`,
+`test_an_idle_timeout_whose_orphans_could_not_be_looked_for_is_never_relaunched`,
 `test_a_claude_exit_whose_cause_nothing_typed_tells_is_never_relaunched`,
 `test_a_claude_cli_that_died_inside_a_running_session_is_relaunched_once`).
 
@@ -782,8 +798,256 @@ Only an error that ends a step of an agent phase is decided; a refusal
 
 **D11.8. Not done here.** A bounded wait for a trusted reset time and a
 fallback profile (D4, D11.3; #321); typing a result-less exit for OpenCode
-and Pi, whose output types none today; accepting a result delivered before a
-kill (#479).
+and Pi, whose output types none today. Accepting a result delivered before a
+kill is D12 (#479).
+
+### D12. A result delivered before a failed launch end (#479)
+
+An agent can deliver its complete final reply and still end badly: its CLI
+exits with a failing status after the reply, or stays alive after it (a
+shutdown that hangs, a task left pending) until a limit kills it. The engine
+used to discard such a reply with the failure, and the operator's `resume`
+paid for the step again (#285). #439 kept a Claude `stream-json` reply that
+decides the run from its idle limit, by stopping the CLI. D12 is the
+provider-neutral rule for every other end, as built
+(`src/autoforge/delivered_result.py`, `ControllerEngine._invoke_phase`). A
+provider's success is a claim: D12 accepts nothing on it alone.
+
+**D12.1. Five distinctions, none implying the next.** A *completed turn* is
+the provider protocol's typed end of the agent's turn (Claude's `result` for
+every turn opened with no tool call open; Pi's `agent_settled`). A *delivered
+complete result* is a completed turn that ended the run on a successful final
+reply, with nothing opened after it, handed over whole: the adapter's fact
+`AgentExecutionResult.reply_delivered`, set by Claude Code's `stream-json`
+(`ClaudeStream.reply_proven`: `replied`, read to the stream's end, with no
+line of the stream skipped past the per-line bound, since a record never read
+may have opened a later turn or a tool call, or failed the run, R3-F1 of PR
+#481, and with every tool call the stream started tracked to its end: a
+`tool_use` without a string id, with the id of a call still open, or past
+`MAX_OPEN_TOOLS`, and an `assistant` record whose content cannot be read for
+its calls, are calls no `tool_result` can be shown to end, so each voids the
+proof for good, R4-F1 of PR #481) and by Pi (its
+conversation settled and its last assistant text read back, before any limit
+cut it short, with every tool execution it started ended by its call id (a
+start sharing the id of an execution still open is one no end can be shown to
+close, so it voids the proof for good, R5-F1 of PR #481) and
+nothing but that text's response on stdout after `agent_settled`, read
+through Pi's shutdown to the end of stdout or the kill that ended it, a
+record of unknown kind included: `PiConversation.reply_settled`, R1-F3 and
+R2-F3 of PR #481), never by an output that
+types no turn (Claude's `text`, OpenCode). A *terminated process* is how the CLI ended: an exit 0, or a stop
+after its reply (#439), is read as always and never reaches D12; a failing
+exit (or a provider failure, ADR 0003 §2.6) and a kill at a limit do. A
+*successful cleanup* is the executor's teardown verified complete: no member
+of the group outlived SIGKILL, no writer held the pipes, no re-parented
+process outlived its kill, and the platform could look for one
+(`orphans_unchecked` false); a process the teardown killed is gone. An
+*accepted controller result* is never D12's to declare: the checks below
+make the reply *provisional* and no more, and only the step's own checks
+after them (D12.4) accept it.
+
+**D12.2. The rule.** Typed facts only, the first refusal that applies wins:
+a request for a human decision ended the launch; the provider's protocol had
+failed the run (a provider failure, a failure before the limit, a usage
+limit, a transient failure); a limit other than the idle limit or the
+maximum runtime killed it (the loop detector's verdict is about the very
+activity that produced the reply, and an unnamed limit proves nothing); a
+process the launch started may still run; the platform could not check for
+one; no delivered reply; a reply whose blocks are missing, begun and never
+closed, or in conflict (`reply_block_shape`: every complete block must decode
+to the same value, stricter than the parser's last-block rule, since a reply
+whose launch failed is taken only when it says one thing); a reply the
+capture bound cut. Anything not proven is refused
+(`test_each_missing_fact_refuses_the_reply`,
+`test_the_refusals_come_in_their_declared_order`,
+`test_a_reply_is_taken_only_when_its_blocks_say_one_thing`).
+
+**D12.3. The checks are a clean exit's.** A reply the rule lets through goes
+to exactly the checks the reply of a clean exit goes to, in the same place:
+the strict import or the verified export (ADR 0005 D6.5, ADR 0013 D5), the
+parse, and the phase's own checks of the run's issue, the worktree's HEAD
+against the reported `head_sha`, the bound PR, HEAD and round. A malformed
+result, another invocation's (another issue, another phase, a review of a
+HEAD the PR no longer has) and a candidate that moved after the reply are
+refused there. Passing them makes the reply provisional (`execution.json`'s
+`delivered_result` says `provisional`), never yet accepted (R1-F4 of PR
+#481). A refusal is final for that launch: nothing corrects a reply
+whose launch failed (a correction is a relaunch, and whether the step runs
+again is D11's), and a read that could not be completed proves nothing. The
+launch's failure then ends the step as before, with the reason on it, and
+D11 decides on it: a launch whose output holds a complete block is still
+never relaunched (`result-delivered`), and the decision's evidence names why
+the reply was not accepted
+(`test_a_reply_delivered_before_a_failed_end_is_accepted_and_the_step_goes_on`,
+`test_a_reply_without_its_proof_is_never_accepted_and_the_step_stops_safely`,
+`test_a_review_for_another_head_delivered_before_a_kill_is_never_accepted`).
+
+**D12.4. Durability and acceptance.** A provisional reply is kept in the
+run's state before the step goes on from it (R1-F1 of PR #481): one save
+writes `delivered_reply` (`delivered_result.KeptReply`, state protocol 19),
+the validated `CONTROL_RESULT` object (redacted, as every agent text the
+engine persists; the parser refuses a credential in any field the controller
+publishes, so redaction changes nothing it acts on), its digest, and its
+binding: the phase, attempt and launch label of the launch that delivered
+it, the issue, the PR, the review round, the candidate the checks read, the
+revision the run was bound to (the PR's HEAD, base and merge base: the diff a
+review decides on, R2-F1), how the launch ended and its run log step. How it
+ended is one of the two ends D12 lets a reply through after: a kill at the
+idle limit or the maximum runtime, or a failing exit, which names no limit;
+a state file holding any other pair (a failing exit naming a limit, a kill at
+another limit or at none) is refused on load, unchanged (R5-F2 of PR #481).
+Before that save the operator's checkout is checked against the anchor of the
+invocation that delivered the reply (R2-F2): the anchor lives in memory only
+and a restart reads one of its own, so a move found only later would go
+unseen by a restart that goes on from the kept reply; a move found there
+ends the step in `BLOCKED` (`checkout-drift`) with the reply never kept. The
+step then goes on from it as from any reply: the operator's checkout is
+checked again, the PR's owner, then the phase's verification, whose plan the effect journal (ADR 0004) saves before
+anything is written. Only when that verification applies the reply as the
+step's result is the reply *accepted*, and the evidence is explicit: the
+save of the plan the verification turned it into (`_save_plan`), whatever
+stops the step after it (a review round's cap once the round's comment is
+posted, a conflict, a write that waits for the operator) and although the
+plan's completion may drop it again, or the record of the agent's own
+`blocked`/`failure` (R2-F4 of PR #481). That holds on every path out of
+the step after the save, an exception included: another run's takeover of
+the PR found before the first write stops the step in `BLOCKED`
+(`pr-owner`) with nothing sent, and the reply was accepted all the same
+(R3-F2). A step that stops before that save
+(checkout drift, another owner, a verification or validation refusal), or
+moves on without one (a FIX whose PR moved goes to REVIEW with no fix
+recorded), did not accept it (R1-F4). Either way the step's own
+controller-only record in the run log (`<PHASE>-delivered-result`) says so,
+`accepted`, or `not-accepted` with the stop's code or the phase the step
+moved to, with whether the reply reached that step kept across an
+interruption (`kept_across_restart`) and already applied before it
+(`applied_before_restart`), and the step's message opens with one sentence
+that claims acceptance only when it holds. The save of the plan also marks
+the kept reply `applied`, in the same write (R3-F2): an error or a crash
+after it (a PR create GitHub did not answer, say) ends the step without an
+outcome, and the state holds both the plan and the acceptance's
+provenance. The step that next enters the phase takes up the kept reply it
+finds, whatever then ends that step, and settles it once: an applied one is
+recorded `accepted` while the step completes the plan from the journal, and
+is never checked again or gone on from (a launch that finds one, the plan
+gone with the phase asking again, records it first and drops it); one not
+applied is checked again as below, and recorded `not-accepted` if the step
+ends before it goes on from it. A crash
+anywhere after the keeping save, before the step concludes, leaves the
+reply in the state: the next `resume`, `run` or `step` re-enters the phase
+through its reconciliation, which completes a saved plan from the journal
+first, and otherwise checks the kept reply again, exactly as a fresh one,
+against the worktree and GitHub as they are then, and goes on from it with
+no agent launched and no step of a launch charged; a write whose outcome
+was lost is read back, never sent twice. A binding that no longer matches
+the run, a revision the run is no longer bound to (a REVIEW entry under bwrap
+or `disabled` binds the PR's HEAD, base and merge base again before the kept
+reply is read, and a review's verdict is about its own diff alone, so a
+retargeted base or a moved merge base refuses it, R2-F1), or a check that now
+refuses the reply (a candidate that moved, a review HEAD the PR no longer
+has), is a safe stop: `BLOCKED`
+(`control-result-invalid`) with nothing launched, published or applied, and
+the reply dropped, so `unblock` launches the agent afresh. The kept reply is
+dropped by every save in another phase or after another launch, and by the
+step when its own checks refuse it, so a refused reply is never gone on from
+twice. A step that refuses the reply for good and then raises (its
+verification refuses before planning, as for a FIX whose PR was closed while
+the fixer ran, or the check before keeping the reply cannot read the
+operator's checkout) records it `not-accepted` with the phase it leaves as it
+was (no stop sink named a code, and the engine never classifies an error),
+once the save that drops it has succeeded or when it was never kept, since no
+later step will find it; the error it raises is its own, and
+a record the run log refuses never replaces it. A reply still kept after an
+error that decided nothing (an unavailable GitHub) is undecided, and only
+the step that settles it records it (R4-F2 of PR #481). The run log records each outcome (`execution.json`'s
+`delivered_result`: provisional or refused, the reason, the facts; the
+step's record: accepted or not) and is never read for recovery; D11's
+journal records a refusal's decision, as for any failed step
+(`test_an_accepted_reply_is_never_run_again_after_a_restart`,
+`test_an_accepted_reply_whose_pr_create_landed_is_adopted_never_sent_twice`,
+`test_a_provisional_reply_is_kept_in_the_state_before_the_step_goes_on_from_it`,
+`test_a_kept_review_is_posted_once_after_a_restart_and_the_reviewer_not_run_again`,
+`test_a_kept_review_whose_diff_moved_before_the_restart_stops_safely`,
+`test_a_kept_reply_whose_candidate_moved_before_the_restart_stops_safely`,
+`test_a_kept_reply_bound_to_another_launch_is_never_gone_on_from`,
+`test_a_kept_reply_outlives_an_unavailable_github_and_resume_goes_on_from_it`,
+`test_a_reply_the_checkout_drift_check_refuses_after_the_parse_is_never_accepted`,
+`test_a_checkout_the_agent_moved_is_found_before_its_reply_is_kept`,
+`test_a_reply_the_phase_verification_stops_before_planning_is_never_accepted`,
+`test_a_review_applied_before_the_round_cap_stopped_the_step_was_accepted`,
+`test_a_review_refused_before_its_plan_was_saved_was_not_accepted`,
+`test_a_review_whose_pr_was_taken_over_after_its_plan_was_saved_was_accepted`,
+`test_a_reply_applied_before_an_interruption_is_recorded_by_the_step_completing_its_plan`,
+`test_an_applied_reply_whose_plan_is_gone_is_settled_and_never_gone_on_from`,
+`test_a_kept_reply_the_restart_refuses_is_recorded_not_accepted`,
+`test_a_fix_whose_pr_moved_goes_to_review_without_accepting_the_reply`,
+`test_a_reply_the_producer_gate_refuses_below_its_bound_is_dropped_and_relaunched`,
+`test_a_reply_an_exceptional_refusal_drops_is_recorded_not_accepted`,
+`test_a_reply_whose_check_before_keeping_it_raises_is_recorded_not_accepted`,
+`test_a_record_the_refusal_cannot_write_never_replaces_the_step_error`,
+`test_a_reply_kept_past_an_undecided_error_is_settled_once_by_the_resume`).
+
+**D12.5. Every bound stays.** The launch was charged as a step before it
+started, and accepting its reply launches nothing, so no step, no relaunch
+and no allowance is spent or refilled; the runtime limits killed the launch
+as before; `step` accepts as `run` does, since accepting is no relaunch; a
+dry run launches nothing to accept
+(`test_an_accepted_reply_after_a_kill_is_charged_one_step_and_decides_nothing`,
+`test_step_accepts_a_delivered_reply_as_run_does`,
+`test_a_dry_run_launches_and_accepts_nothing`).
+
+**D12.6. The providers.** Claude Code's `stream-json` vouches for a reply its
+stream decided whatever the exit after it, and for none with a call still
+open or a turn opened after it, nor for one in a stream of which a line was
+skipped past the per-line bound, before the reply or after it (R3-F1 of PR
+#481), nor for one after a tool call it could not track to its end (no
+string id, the id of a call still open, past the reducer's bound, or content
+it cannot read; R4-F1 of PR #481): a clean exit and #439's stop on a reply read such a stream as before; Pi vouches for a settled conversation whose
+shutdown then hangs past a limit or exits badly, and for none its limit cut
+short, none with a tool execution left open, and none after which Pi wrote
+anything but the text's response, a later turn in its shutdown included (a
+start without a call id, past the reducer's bound, or sharing the id of an
+execution still open, can never be shown ended, so it refuses too, R5-F1 of
+PR #481), and so does a record after the run settled whose
+kind cannot be known: not UTF-8, not JSON, or not an object with a string
+`type` (R2-F3 of PR #481); OpenCode and Claude's `text` output vouch for none, so a block they
+printed before a kill is refused (`no-reply`) and stays the operator's
+(`test_a_claude_cli_that_exits_badly_after_its_reply_has_the_reply_accepted`,
+`test_a_claude_reply_with_a_call_still_open_is_never_accepted`,
+`test_a_claude_reply_overtaken_by_a_later_turn_is_stale_and_never_accepted`,
+`test_a_claude_reply_followed_by_a_line_past_the_bound_is_never_accepted`,
+`test_a_claude_reply_followed_by_a_line_past_the_bound_reads_as_before_otherwise`,
+`test_a_skipped_line_voids_the_proof_of_a_reply_but_not_the_stop_on_it`,
+`test_a_claude_reply_after_a_call_it_could_not_track_is_never_accepted`,
+`test_a_claude_reply_after_a_call_it_could_not_track_reads_as_before_otherwise`,
+`test_a_call_that_cannot_be_tracked_voids_the_proof_of_a_reply_but_not_the_stop_on_it`,
+`test_a_call_past_the_default_bound_voids_the_proof_of_a_reply`,
+`test_a_pi_that_hangs_on_shutdown_after_a_settled_run_has_its_reply_accepted`,
+`test_a_pi_that_exits_badly_after_a_settled_run_has_its_reply_accepted`,
+`test_a_pi_reply_with_a_tool_execution_left_open_is_never_accepted`,
+`test_a_pi_reply_after_a_start_reusing_an_open_id_is_never_accepted`,
+`test_a_pi_that_exits_cleanly_after_a_start_reusing_an_open_id_keeps_its_reply_as_before`,
+`test_a_pi_reply_overtaken_by_a_later_turn_in_its_shutdown_is_never_accepted`,
+`test_a_pi_reply_followed_by_an_unreadable_shutdown_record_is_never_accepted`,
+`test_opencode_types_no_reply_so_a_block_before_its_kill_is_never_accepted`).
+#439's behaviour is unchanged: its reply still completes the run, as
+before, with no D12 decision.
+
+**D12.7. The three reviews D5 requires.** D12 is no recovery action, but it
+turns a failure into an accepted result, so it gets them. *Threat model:*
+every input is typed (the adapter's fact, the executor's flags, the block
+framing the parser reads of any reply); an agent can at most deliver a reply
+and then hang or fail, which buys it nothing the checks of a clean exit would
+not give it, and the stricter block rule refuses an ambiguous reply; a kept
+reply is re-checked in full after a restart, against the PR revision it was
+kept under, and is kept only once the checkout its invocation was anchored to
+was found unmoved, so time between the crash and the restart buys it nothing
+either. *Cost:* none added; one paid relaunch
+saved per accepted reply, and per crash in a step that went on from one.
+*Security:* no credential, write or bound changes; every check of a clean
+exit's reply runs, again after a restart; the kept payload is redacted
+before it is persisted; a teardown that may have left a writer, or could not
+look for one, refuses, and so does the recovery rule's relaunch (D11).
 
 ## 3. What does not change, and what holds it
 
@@ -799,6 +1063,8 @@ kill (#479).
 | no agent launch holds a credential route | `test_an_agent_finds_no_credential_route_the_controller_finds_every_one` |
 | transient retries are bounded | `test_transient_retries_are_bounded_per_step_across_corrections`, `test_transient_read_failure_is_bounded_then_blocked` |
 | an automatic relaunch is once per step, allowlisted and audited (#434) | `test_only_the_allowlist_is_ever_relaunched`, `test_two_idle_timeouts_relaunch_once`, `test_an_idle_timeout_is_relaunched_once_and_the_run_goes_on` |
+| a result delivered before a failed end is accepted only on proof and only by a clean exit's checks and the step's own (#479) | `test_each_missing_fact_refuses_the_reply`, `test_a_reply_without_its_proof_is_never_accepted_and_the_step_stops_safely`, `test_a_reply_the_checkout_drift_check_refuses_after_the_parse_is_never_accepted` |
+| a provisional reply is never run again after a crash, and is re-checked before it is gone on from (#479) | `test_a_provisional_reply_is_kept_in_the_state_before_the_step_goes_on_from_it`, `test_a_kept_reply_whose_candidate_moved_before_the_restart_stops_safely`, `test_a_kept_review_whose_diff_moved_before_the_restart_stops_safely`, `test_a_checkout_the_agent_moved_is_found_before_its_reply_is_kept` |
 | no write without its authority: K9, K10, merge, downgrade, drift | the tests D3's table names |
 
 Default single-agent behaviour, every default and the prompts are

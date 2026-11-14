@@ -1835,7 +1835,9 @@ a stated reason it has none. The coverage that must keep working:
   the step charged, the decision journaled, logged and commented on the
   issue or the PR; a second failure of the step refused whatever it is (a
   timeout then a usage limit does not loop); a hard runtime limit, a loop
-  kill, an untyped exit, a launch that may have left a process and a result
+  kill, an untyped exit, a launch that may have left a process (an idle
+  timeout on a platform that could not look for a re-parented process
+  included, R1-F2 of PR #481) and a result
   delivered before the kill never relaunched; the step budget, the
   invocation's `--max-steps` and a stop request refusing; `step` and a dry
   run deciding nothing; an unconfirmed audit relaunching nothing and posted
@@ -1875,6 +1877,100 @@ a stated reason it has none. The coverage that must keep working:
   Protocol 17 -> 18 in `tests/test_state.py`; the adapters' usage-limit,
   result-less and failed-before-limit facts in `tests/test_providers.py`,
   `tests/test_pi_rpc.py` and `tests/test_claude_stream.py`
+- a result delivered before a failed launch end (#479, ADR 0012 D12;
+  `tests/test_delivered_result.py`): the rule alone (an idle kill, a runtime
+  kill and a failing exit each let a vouched-for reply through; each missing
+  fact refuses it, in the declared order; a failing exit needs no limit; the
+  record holds typed values only and a protocol failure adds no line); the
+  block shape (one block, the same block repeated, prose around it; none,
+  not an object, not JSON, never closed; a block begun after the last; two
+  different blocks, a quoted schema, `1` against `true` and `1.0`); and the
+  engine through provider-neutral fixtures: a reply accepted after an idle
+  kill, a runtime kill and a failing exit, the PR opened once, nothing
+  relaunched or decided, `execution.json` saying `provisional` and the
+  step's `<PHASE>-delivered-result` record `accepted`, with no reply left
+  kept; the kept reply (R1-F1 of PR #481): a crash after the reply was kept
+  and logged and before the phase's first save, the state holding the reply
+  and its binding, the next process going on from it with no agent and one
+  PR (and, for REVIEW, one comment), a candidate that moved before the
+  restart and a binding that no longer matches stopping in `BLOCKED` with
+  nothing launched or published, GitHub unavailable while verifying leaving
+  the reply kept for `resume`, a new launch or another phase dropping it,
+  and the shape and binding the loader refuses; a review kept before a crash
+  whose PR base was retargeted, or whose merge base moved, before the
+  restart stopping in `BLOCKED` with no comment, no round and no reviewer
+  (R2-F1); a checkout the agent moved found before the reply is kept, so a
+  crash while the launch is recorded leaves nothing kept and the restart
+  nothing to go on from (R2-F2); acceptance only after the
+  step's own checks (R1-F4): a checkout moved after the parse, a
+  verification stop before planning and a producer gate refusal below its
+  bound each leaving the reply not accepted, the message claiming no
+  acceptance and the last relaunching afresh; the save of the plan as the
+  evidence of acceptance (R2-F4): a review applied and then stopped by the
+  round cap accepted, beside a refusal before its plan in the same phase,
+  and a FIX whose PR moved going to REVIEW not accepted; the acceptance
+  past an exception or an interruption (R3-F2): a review whose PR another
+  run took over after its plan was saved stopping on `pr-owner` with
+  nothing posted and recorded accepted, a reply whose plan was saved before
+  a PR create outage or a crash marked applied in the state and recorded
+  accepted, once, by the next process that completes the plan with no
+  agent, an applied reply whose plan is gone recorded and never gone on
+  from (the agent launched afresh), and a kept reply the restart refuses
+  recorded not accepted; a clean exit
+  recording nothing; a reply refused for each missing fact and by the
+  checks a clean exit's reply meets (malformed, another phase, another
+  issue, a HEAD that moved after the reply), never corrected or relaunched
+  over, the decision's evidence and the run log naming the reason; a
+  provider-established failure keeping its own words; an accepted reply
+  whose PR create failed completed by the next process from the journal
+  with no agent launched, and one whose create landed adopted; the step
+  budget, `step` and a dry run unchanged; a REVIEW accepted and posted once,
+  and one for another HEAD refused; the real adapters: Claude Code's
+  `stream-json` reply then an exit 3 accepted, a reply with a call open or
+  overtaken by a later turn never accepted, a reply followed by a line past
+  the per-line bound then an exit 3 never accepted while a clean exit and
+  #439's stop read the same stream as before (R3-F1; the reducer's
+  `reply_proven` in `tests/test_claude_stream.py`), a reply after a tool
+  call the reducer could not track (an `Edit` start without an id, or past a
+  lowered tracking bound) then an exit 3 never accepted while a clean exit
+  and #439's stop read the same stream as before (R4-F1; the reducer's
+  untracked starts, duplicate open ids, unreadable content and the default
+  `MAX_OPEN_TOOLS` overflow in `tests/test_claude_stream.py`), a reply the
+  step refused for good before raising (a FIX or a partial FIX whose PR was
+  closed while the fixer ran, a check before keeping it that raised)
+  recorded `not-accepted` with the phase it left as it was and the error
+  kept,
+  while one still kept after an outage is recorded once, by the resume
+  (R4-F2), Pi hanging on its shutdown past
+  the idle limit or exiting 7 after a settled run accepted, Pi cut short by
+  its limit vouching for nothing, Pi with a tool execution left open or a
+  later turn written during its shutdown (exiting 7, or killed at the idle
+  limit) never vouched for while a clean exit after that turn is read as
+  before, Pi starting a `bash` and an `edit` under one open call id and
+  ending one of them (exiting 7, or killed at the idle limit) never vouched
+  for while a clean exit after them is read as before (R5-F1), Pi writing
+  a record of unknown kind during its shutdown (no `type`, an array, not
+  JSON, not UTF-8) then exiting 7 never vouched for
+  while a clean exit after one is read as before (R2-F3), OpenCode's plain
+  text never vouched for (`linger`, `close_exit`, `shutdown`, raw shutdown
+  lines, `open_call` and `tool_events` in `tests/pi_fake.py`); and Pi's
+  reducer alone (`tests/test_pi_rpc.py`): a reply settled only with every
+  tool execution ended by its call id (an unmatched or id-less start, one
+  past the bound, or one sharing the id of an execution still open, whatever
+  ends follow, leaves it unproven, while an id reused after its execution
+  ended is a new one, R5-F1), anything but the text's response after
+  `agent_settled` (a later turn, a second settle, an unknown event, a
+  notification, a stray response, a fragment, an oversize record, and a
+  record that is not a typed JSON object, R2-F3) leaving it unproven without
+  failing the run once the text was read back (R1-F3 of PR #481); protocol 18 -> 19 in `tests/test_state.py` (a protocol-18
+  file loads in every phase with no kept reply and is relabelled 19, an older
+  label carrying `delivered_reply` is refused unchanged, a protocol-19 file
+  missing it or holding a malformed one is refused); a state file keeping a
+  reply whose end is impossible (a failing exit naming a limit, a kill at
+  another limit or none) refused unchanged while a failing exit with no limit
+  and a kill at the idle limit or the maximum runtime still load (R5-F2, in
+  `tests/test_delivered_result.py`); a keeping save that fails
+  still recording the launch and leaving nothing kept (R1-F1 of PR #481)
 - the `UPDATE_EPIC` progress comment across every crash window of the
   effect lifecycle (`test_k8_*` in `tests/test_engine.py`), the one-shot
   legacy re-entry (D13.7) including a crash after its adoption was saved,

@@ -5,6 +5,71 @@ so.
 
 ## Unreleased
 
+### A reply the agent delivered before it was killed or exited badly is kept (#479)
+
+An agent that delivers its whole final reply and then hangs until its idle
+limit or maximum runtime kills it, or whose CLI then exits with a failing
+status, no longer loses the step: the controller takes that reply as the
+step's result, with no relaunch, when it can prove that safe. The provider's
+own protocol must show that the reply ended the run, with no tool call left
+open and nothing written after it (Claude Code's `stream-json` and Pi show
+it, Pi read through its shutdown; OpenCode and Claude's `text` output cannot,
+so nothing changes for them), every `CONTROL_RESULT` block in the reply must
+say the same thing, nothing the agent started may still be running, and the
+reply must pass every check a reply of a clean exit passes (the issue, the
+phase, the reported `head_sha` against the worktree, the PR's HEAD and
+round). A loop kill, a provider failure or a usage limit is never overridden.
+Such a reply is provisional: it is saved in the run's state before the step
+goes on from it, and accepted only once the step's own checks (your checkout
+unmoved, the PR still the run's, the phase's verification) have applied it.
+The step's message then starts with `The agent was killed at its idle limit
+after delivering its complete final reply ...` and says whether the reply was
+accepted. A crash or `Ctrl-C` before the step concluded leaves it in the
+state: the next `resume` checks it again and goes on from it without running
+the agent again, or stops in `BLOCKED` (`control-result-invalid`) when the
+worktree or the PR moved in between, its base branch or merge base included.
+Your checkout is checked before the reply is saved, so a checkout the agent
+moved stops the step in `BLOCKED` (`checkout-drift`) with nothing saved to
+go on from. A reply counts as accepted once the step saved the plan it made
+from it, even when the step then stopped (a review posted at the last allowed
+round stops at the round cap, or another run took the PR over before the
+review was posted). A crash or an error after that save no longer loses the
+acceptance: the kept reply is marked `applied` beside the plan, and the
+`resume` that completes the plan records the reply as accepted. Claude Code's
+`stream-json` vouches for a reply only when no line of its stream was skipped
+past the per-line bound, and when every tool call the stream started could be
+followed to its end: a call without an id, one sharing the id of a call still
+open, one past the reducer's tracking bound, or one in an `assistant` record
+whose content cannot be read can never be shown ended, so it voids the proof
+(the stop on a reply of #439 and a clean exit read such a stream as before).
+Pi's RPC vouches for one only when every tool execution it started was ended
+by its call id: a start sharing the id of an execution still open is two
+executions one end would close, so it voids the proof for good, as a start
+without an id does. A state file keeping a reply whose launch end is not a
+kill at the idle limit or the maximum runtime, or a failing exit with no
+limit, is refused, unchanged.
+
+A reply that falls short is not corrected and not relaunched over, as
+before: the failure stands, with a line saying why the reply was not taken
+(`its output was not accepted as the step's result (<reason>: ...)`), and
+the automatic recovery audit's evidence names the same reason. Each such
+launch's `execution.json` records the outcome under `delivered_result`
+(`provisional` or `refused`), and the step's own `<PHASE>-delivered-result`
+record says whether the step accepted it. That includes a step that ends in an
+error after refusing the reply for good (a FIX whose PR was closed while the
+fixer ran, say): the record says `not-accepted` with the phase the step left
+as it was, and the error is still the one the step raised. A reply still kept for
+`resume` (GitHub stopped answering, say) gets its record from the step that
+settles it.
+
+The automatic relaunch of #434 is now also refused when the platform could
+not look for a process the failed launch left outside its process group (a
+host with no child subreaper, `orphans_unchecked`): `process-may-survive`.
+
+State protocol 18 -> 19 (`delivered_reply`, the kept reply). Older state
+loads with none and is relabelled on its next save; an older controller
+refuses a protocol-19 file by its label.
+
 ### A failed agent step is relaunched once on its own, when it is safe to (#434)
 
 `run` and `resume` (and a scheduler worker) no longer stop for you after

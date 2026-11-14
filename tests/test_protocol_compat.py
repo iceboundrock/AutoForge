@@ -97,20 +97,21 @@ def test_the_supported_labels_are_the_loaders_rules_and_nothing_else():
         "16",
         "17",
         "18",
+        "19",
     ]
-    assert __protocol_version__ == "18"
-    assert protocol_ranges(SUPPORTED_PROTOCOLS) == "1-5 and 7-18"
+    assert __protocol_version__ == "19"
+    assert protocol_ranges(SUPPORTED_PROTOCOLS) == "1-5 and 7-19"
 
 
 @pytest.mark.parametrize(
     ("label", "support"),
     [
-        ("18", ProtocolSupport.CURRENT),
+        ("19", ProtocolSupport.CURRENT),
         *(
             (str(n), ProtocolSupport.LEGACY)
-            for n in (1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17)
+            for n in (1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18)
         ),
-        ("19", ProtocolSupport.NEWER),
+        ("20", ProtocolSupport.NEWER),
         ("99", ProtocolSupport.NEWER),
         ("999999999", ProtocolSupport.NEWER),
         ("6", ProtocolSupport.UNKNOWN),
@@ -147,9 +148,9 @@ def test_a_newer_label_is_refused_before_its_phase_and_fields_are_read(tmp_path)
     byte, and nothing is created beside it."""
     path = _saved(
         tmp_path,
-        protocol_version="19",
-        phase="A_PHASE_OF_PROTOCOL_19",
-        a_field_of_protocol_19={"x": 1},
+        protocol_version="20",
+        phase="A_PHASE_OF_PROTOCOL_20",
+        a_field_of_protocol_20={"x": 1},
         controller_version="0.2.0",
     )
     before = (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns)
@@ -158,14 +159,14 @@ def test_a_newer_label_is_refused_before_its_phase_and_fields_are_read(tmp_path)
     exc = refused.value
     assert isinstance(exc, StateError)
     assert str(exc).startswith(
-        f"state file {path}: unsupported protocol_version '19' (controller speaks '18'): "
+        f"state file {path}: unsupported protocol_version '20' (controller speaks '19'): "
         "a newer AutoForge wrote it, and this controller, autoforge "
     )
     assert "unknown phase" not in str(exc) and "unknown field" not in str(exc)
     assert exc.headline == (
-        "unsupported protocol_version '19' (controller speaks '18'): a newer AutoForge wrote it"
+        "unsupported protocol_version '20' (controller speaks '19'): a newer AutoForge wrote it"
     )
-    assert (exc.label, exc.support, exc.newer) == ("'19'", "unsupported-newer", "19")
+    assert (exc.label, exc.support, exc.newer) == ("'20'", "unsupported-newer", "20")
     assert (exc.run_id, exc.written_by, exc.path) == (
         "af-20261021T164241Z-60c7a5",
         "0.2.0",
@@ -175,21 +176,21 @@ def test_a_newer_label_is_refused_before_its_phase_and_fields_are_read(tmp_path)
     assert sorted(p.name for p in tmp_path.iterdir()) == ["state.json"]
 
 
-@pytest.mark.parametrize("label", ["6", "0", "18.0", 18, None, ["18"]], ids=repr)
+@pytest.mark.parametrize("label", ["6", "0", "19.0", 19, None, ["19"]], ids=repr)
 def test_an_unknown_label_is_refused_as_no_protocol_and_left_unchanged(tmp_path, label):
     path = _saved(tmp_path, protocol_version=label, phase="NOT_A_PHASE")
     before = path.read_bytes()
     with pytest.raises(StateProtocolError) as refused:
         load_state(path)
     exc = refused.value
-    assert f"unsupported protocol_version {label!r} (controller speaks '18')" in str(exc)
+    assert f"unsupported protocol_version {label!r} (controller speaks '19')" in str(exc)
     assert "no AutoForge protocol has that label" in str(exc)
     assert (exc.support, exc.newer) == ("unsupported-unknown", "")
     assert path.read_bytes() == before
 
 
 @pytest.mark.parametrize(
-    "label", [None, "18", "17", "16", "15", "14", "13", "12", "7", "1"], ids=repr
+    "label", [None, "19", "18", "17", "16", "15", "14", "13", "12", "7", "1"], ids=repr
 )
 def test_a_supported_label_still_meets_the_loaders_own_checks(tmp_path, label):
     """Classification only admits a label to the loader's rules: an unknown
@@ -206,7 +207,7 @@ def test_a_supported_label_still_meets_the_loaders_own_checks(tmp_path, label):
     with pytest.raises(StateError, match="state file has unknown phase 'NOT_A_PHASE'") as refused:
         load_state(path)
     assert not isinstance(refused.value, StateProtocolError)
-    path = _saved(tmp_path, protocol_version="18", a_field_of_protocol_19=1)
+    path = _saved(tmp_path, protocol_version="19", a_field_of_protocol_20=1)
     with pytest.raises(StateError, match="unknown field") as refused:
         load_state(path)
     assert not isinstance(refused.value, StateProtocolError)
@@ -214,7 +215,7 @@ def test_a_supported_label_still_meets_the_loaders_own_checks(tmp_path, label):
 
 def test_the_mode_is_still_read_before_the_label(tmp_path):
     """ADR 0009 D4: a LOCAL file is an unknown mode under a newer label too."""
-    path = _saved(tmp_path, protocol_version="19", mode="LOCAL")
+    path = _saved(tmp_path, protocol_version="20", mode="LOCAL")
     with pytest.raises(StateError) as refused:
         load_state(path)
     assert str(refused.value) == "state file has unknown mode 'LOCAL'"
@@ -253,7 +254,7 @@ def test_the_identity_is_the_imported_package_and_the_running_interpreter():
         autoforge.__prompt_version__,
     )
     assert identity.summary() == (
-        f"autoforge {autoforge.__version__} (protocol 18) imported from "
+        f"autoforge {autoforge.__version__} (protocol 19) imported from "
         f"{os.path.abspath(autoforge.__file__)}, python {sys.executable}"
     )
 
@@ -264,7 +265,7 @@ def test_a_refusal_names_whatever_package_was_imported(tmp_path, monkeypatch):
     elsewhere = "/opt/another-install/site-packages/autoforge/__init__.py"
     monkeypatch.setattr(sys.modules["autoforge"], "__file__", elsewhere)
     monkeypatch.setattr(sys, "executable", "/opt/another-install/bin/python3")
-    path = _saved(tmp_path, protocol_version="19")
+    path = _saved(tmp_path, protocol_version="20")
     with pytest.raises(StateProtocolError) as refused:
         load_state(path)
     assert f"imported from {elsewhere}, python /opt/another-install/bin/python3" in str(
@@ -311,7 +312,7 @@ def test_a_credential_crossing_the_cut_is_redacted_whole_before_it(tmp_path):
     for text in (exc.label, exc.headline, exc.reason, str(exc)):
         assert "AIza" not in text and "SyFAKE" not in text
     lines = mismatch_lines(
-        exc, identity=ControllerIdentity.current(), reads="1-5 and 7-18", cwd=path, flags=()
+        exc, identity=ControllerIdentity.current(), reads="1-5 and 7-19", cwd=path, flags=()
     )
     text = "\n".join([refusal_headline(exc), *lines])
     assert "AIza" not in text and "SyFAKE" not in text
@@ -322,7 +323,7 @@ def test_the_headline_names_the_state_file_on_one_bounded_line(tmp_path):
     file's path in it, newline, escape or length and all, is shown like every
     other path (``shown_path``): it cannot start a forged line, emit a
     terminal control sequence or run on."""
-    exc = _refusal(tmp_path, protocol_version="19")
+    exc = _refusal(tmp_path, protocol_version="20")
     for path in (
         "/srv/state\nautoforge: error: forged/state.json",
         "/srv/\x1b]0;title\x07\x1b[2J/state.json",
@@ -337,7 +338,7 @@ def test_the_headline_names_the_state_file_on_one_bounded_line(tmp_path):
         assert shown_path(path) in str(exc.at(path, shown=shown_path(path)))
 
 
-@pytest.mark.parametrize("label", ["19", "19" + "9" * 10_000], ids=["newer", "longest"])
+@pytest.mark.parametrize("label", ["20", "20" + "9" * 10_000], ids=["newer", "longest"])
 def test_a_scheduler_report_keeps_the_controller_however_long_every_path(
     tmp_path, monkeypatch, label
 ):
@@ -357,7 +358,7 @@ def test_a_scheduler_report_keeps_the_controller_however_long_every_path(
     provenance = f"imported from {shown_path(module)}, python {shown_path(python)}"
     assert report == f"{exc.reason}; state file {shown_path(state)}"
     assert report.startswith(f"{exc.headline}, and this controller, autoforge ")
-    assert "(protocol 18)" in report and provenance in report
+    assert "(protocol 19)" in report and provenance in report
     assert f"reads protocols {protocol_ranges(SUPPORTED_PROTOCOLS)}" in report
     assert report.index(provenance) < report.index("; state file ")
     assert len(report) < MAX_REFUSAL_CHARS - 500, len(report)
@@ -401,12 +402,12 @@ def test_a_flag_value_not_safe_to_repeat_is_a_labelled_placeholder():
     ids=["newline", "escape", "long", "credential"],
 )
 def test_the_recovery_guidance_is_bounded_and_escaped_line_by_line(tmp_path, value):
-    exc = _refusal(tmp_path, protocol_version="19")
-    identity = ControllerIdentity("0.1.0", "18", "v18", "/src/autoforge/__init__.py", "/py")
+    exc = _refusal(tmp_path, protocol_version="20")
+    identity = ControllerIdentity("0.1.0", "19", "v18", "/src/autoforge/__init__.py", "/py")
     lines = mismatch_lines(
         exc.at(value),
         identity=identity,
-        reads="1-5 and 7-18",
+        reads="1-5 and 7-19",
         cwd=value,
         flags=("--config", value, "--state-dir", value),
     )
@@ -415,9 +416,9 @@ def test_the_recovery_guidance_is_bounded_and_escaped_line_by_line(tmp_path, val
         assert len(line) <= 2 * MAX_PATH_CHARS + 300, len(line)
         assert not line.startswith("autoforge: error: forged")
         assert "AIza" not in line and GOOGLE_KEY_BODY not in line
-    command = next(line for line in lines if "<an autoforge that speaks protocol 19>" in line)
+    command = next(line for line in lines if "<an autoforge that speaks protocol 20>" in line)
     assert command.strip() == (
-        "<an autoforge that speaks protocol 19> --config <the --config value this command was "
+        "<an autoforge that speaks protocol 20> --config <the --config value this command was "
         "given> --state-dir <the --state-dir value this command was given> status"
     )
     assert any("put back the value you typed" in line for line in lines)
@@ -430,28 +431,28 @@ def _refusal(tmp_path: Path, **changes: object) -> StateProtocolError:
 
 
 def test_the_diagnostic_of_a_newer_label_names_a_controller_to_use_by_placeholder(tmp_path):
-    exc = _refusal(tmp_path, protocol_version="19", controller_version="0.2.0")
-    identity = ControllerIdentity("0.1.0", "18", "v18", "/src/autoforge/__init__.py", "/py")
+    exc = _refusal(tmp_path, protocol_version="20", controller_version="0.2.0")
+    identity = ControllerIdentity("0.1.0", "19", "v18", "/src/autoforge/__init__.py", "/py")
     lines = mismatch_lines(
         exc,
         identity=identity,
-        reads="1-5 and 7-18",
+        reads="1-5 and 7-19",
         cwd="/work/repo",
         flags=("--config", "my config.yaml", "--state-dir", ".autoforge/x"),
     )
     text = "\n".join(lines)
     assert lines[0] == "AutoForge controller/state protocol mismatch"
-    assert f"  state:      {exc.path} (protocol_version '19')" in lines
+    assert f"  state:      {exc.path} (protocol_version '20')" in lines
     assert (
         "  recorded:   run af-20261021T164241Z-60c7a5, written by autoforge 0.2.0 "
         "(as the file says; it was not loaded)"
     ) in lines
-    assert "  controller: autoforge 0.1.0, protocol 18 (reads 1-5 and 7-18), prompt v18" in lines
+    assert "  controller: autoforge 0.1.0, protocol 19 (reads 1-5 and 7-19), prompt v18" in lines
     assert "  import:     /src/autoforge/__init__.py" in lines
     assert "  python:     /py" in lines
     assert "  cwd:        /work/repo" in lines
     assert (
-        "                <an autoforge that speaks protocol 19> --config 'my config.yaml' "
+        "                <an autoforge that speaks protocol 20> --config 'my config.yaml' "
         "--state-dir .autoforge/x status"
     ) in lines
     for advice in ("--force", "edit the", "downgrade", "install", "checkout", "PYTHONPATH"):
@@ -465,7 +466,7 @@ def test_the_diagnostic_of_an_unknown_label_names_no_controller_to_use(tmp_path)
     repair and no edit, for a label no protocol has either."""
     exc = _refusal(tmp_path, protocol_version="6")
     lines = mismatch_lines(
-        exc, identity=ControllerIdentity.current(), reads="1-5 and 7-18", cwd="/w", flags=()
+        exc, identity=ControllerIdentity.current(), reads="1-5 and 7-19", cwd="/w", flags=()
     )
     text = "\n".join(lines)
     assert "speaks protocol" not in text and "<an autoforge" not in text
@@ -476,14 +477,14 @@ def test_the_diagnostic_of_an_unknown_label_names_no_controller_to_use(tmp_path)
     assert "Leave the state file as it is" in text
 
 
-@pytest.mark.parametrize("label", ["19", "6"])
+@pytest.mark.parametrize("label", ["20", "6"])
 def test_the_result_line_claims_only_what_holds_before_and_under_the_lock(tmp_path, label):
     """#265 R1-F5: the same diagnostic is printed for a refusal before the
     lock and for one under it, where taking the lock may already have
     written its PID record, so it claims no more than both established."""
     exc = _refusal(tmp_path, protocol_version=label)
     lines = mismatch_lines(
-        exc, identity=ControllerIdentity.current(), reads="1-5 and 7-18", cwd="/w", flags=()
+        exc, identity=ControllerIdentity.current(), reads="1-5 and 7-19", cwd="/w", flags=()
     )
     assert (
         "  result:     refused: the state file and its run logs were not rewritten, the agent "
@@ -493,11 +494,11 @@ def test_the_result_line_claims_only_what_holds_before_and_under_the_lock(tmp_pa
 
 
 def test_a_secret_shaped_run_id_or_flag_never_reaches_the_diagnostic(tmp_path):
-    exc = _refusal(tmp_path, protocol_version="19", run_id=GOOGLE_API_KEY)
+    exc = _refusal(tmp_path, protocol_version="20", run_id=GOOGLE_API_KEY)
     lines = mismatch_lines(
         exc,
         identity=ControllerIdentity.current(),
-        reads="1-5 and 7-18",
+        reads="1-5 and 7-19",
         cwd="/w",
         flags=("--config", f"/home/{GOOGLE_API_KEY}.yaml"),
     )
@@ -518,8 +519,8 @@ def _older_copy(tmp_path: Path) -> Path:
     shutil.copytree(SRC, root / "autoforge", ignore=shutil.ignore_patterns("__pycache__"))
     init = root / "autoforge" / "__init__.py"
     text = init.read_text(encoding="utf-8")
-    assert '__protocol_version__ = "18"' in text
-    init.write_text(text.replace('"18"', '"17"'), encoding="utf-8")
+    assert '__protocol_version__ = "19"' in text
+    init.write_text(text.replace('"19"', '"18"'), encoding="utf-8")
     return root
 
 
@@ -566,12 +567,12 @@ def test_an_older_controller_imported_from_elsewhere_names_itself_and_writes_not
         assert proc.stdout == ""
         err = proc.stderr
         assert (
-            "unsupported protocol_version '18' (controller speaks '17'): a newer AutoForge wrote it"
+            "unsupported protocol_version '19' (controller speaks '18'): a newer AutoForge wrote it"
         ) in err
         assert f"  import:     {copy / 'autoforge' / '__init__.py'}" in err
         assert str(SRC) not in err
         assert f"  python:     {sys.executable}" in err
         assert f"  cwd:        {repo}" in err
-        assert "  controller: autoforge" in err and "protocol 17 (reads 1-5 and 7-17)" in err
-        assert "<an autoforge that speaks protocol 18> --state-dir .autoforge status" in err
+        assert "  controller: autoforge" in err and "protocol 18 (reads 1-5 and 7-18)" in err
+        assert "<an autoforge that speaks protocol 19> --state-dir .autoforge status" in err
         assert tree() == before, words

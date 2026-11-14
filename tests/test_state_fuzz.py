@@ -403,29 +403,33 @@ WELL_FORMED_CHECKPOINTS = (
 
 _CHECKPOINT_REFUSALS = {
     # Protocol 13 has no such field: each is unknown (ADR 0009 D8 step 4).
+    "19": (
+        "state file has unknown field(s) 'local_pending_attempts', "
+        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '19'"
+    ),
     "18": (
         "state file has unknown field(s) 'local_pending_attempts', "
-        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '18'"
+        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '19'"
     ),
     "17": (
         "state file has unknown field(s) 'local_pending_attempts', "
-        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '18'"
+        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '19'"
     ),
     "16": (
         "state file has unknown field(s) 'local_pending_attempts', "
-        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '18'"
+        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '19'"
     ),
     "15": (
         "state file has unknown field(s) 'local_pending_attempts', "
-        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '18'"
+        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '19'"
     ),
     "14": (
         "state file has unknown field(s) 'local_pending_attempts', "
-        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '18'"
+        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '19'"
     ),
     "13": (
         "state file has unknown field(s) 'local_pending_attempts', "
-        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '18'"
+        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '19'"
     ),
     # An older label's LOCAL fields are dropped only when empty (D8 step 3).
     "12": (
@@ -459,12 +463,14 @@ def test_a_remote_state_carrying_a_well_formed_local_checkpoint_is_refused(
     """
     payload = dict(good_remote(), phase=phase.value, protocol_version=label)
     if label != __protocol_version__:
+        del payload["delivered_reply"]  # protocol 19's own field (#479)
+    if label not in (__protocol_version__, "18"):
         del payload["auto_recovery"]  # protocol 18's own field (#434)
-    if label not in (__protocol_version__, "17"):
+    if label not in (__protocol_version__, "18", "17"):
         del payload["partial_fix"]  # protocol 17's own field (#433)
-    if label not in (__protocol_version__, "17", "16"):
+    if label not in (__protocol_version__, "18", "17", "16"):
         del payload["stop_code"]  # protocol 16's own field (#374)
-    if label not in (__protocol_version__, "17", "16", "15"):
+    if label not in (__protocol_version__, "18", "17", "16", "15"):
         del payload["pr_body_outcomes"]  # protocol 15's own field (#423)
     if phase is Phase.BLOCKED or phase is Phase.FAILED:
         payload["block_reason"] = "the run stopped on an unverified launch"

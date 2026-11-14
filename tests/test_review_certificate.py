@@ -477,21 +477,26 @@ def _relabelled(data: dict, label: str) -> dict:
     """``data`` under ``label``: a protocol-12 file carries LOCAL's twelve fields empty."""
     if label == __protocol_version__:
         return {**data, "protocol_version": label}
-    # An older label never wrote protocol 18's field (#434), one before 17 never
-    # wrote protocol 17's (#433), one before 16 never wrote protocol 16's (#374),
-    # and one before 15 never wrote protocol 15's (#423).
+    # An older label never wrote protocol 19's field (#479), one before 18 never
+    # wrote protocol 18's (#434), one before 17 never wrote protocol 17's (#433),
+    # one before 16 never wrote protocol 16's (#374), and one before 15 never
+    # wrote protocol 15's (#423).
     newer = {
-        "17": ("auto_recovery",),
-        "16": ("partial_fix", "auto_recovery"),
-        "15": ("stop_code", "partial_fix", "auto_recovery"),
-    }.get(label, ("pr_body_outcomes", "stop_code", "partial_fix", "auto_recovery"))
+        "18": ("delivered_reply",),
+        "17": ("auto_recovery", "delivered_reply"),
+        "16": ("partial_fix", "auto_recovery", "delivered_reply"),
+        "15": ("stop_code", "partial_fix", "auto_recovery", "delivered_reply"),
+    }.get(
+        label,
+        ("pr_body_outcomes", "stop_code", "partial_fix", "auto_recovery", "delivered_reply"),
+    )
     data = {k: v for k, v in data.items() if k not in newer}
     if label == "12":
         return {**data, **LOCAL_STATE_FIELDS, "protocol_version": "12"}
     return {**data, "protocol_version": label}
 
 
-@pytest.mark.parametrize("label", ["18", "17", "16", "15", "12"])
+@pytest.mark.parametrize("label", ["19", "18", "17", "16", "15", "12"])
 @pytest.mark.parametrize(
     ("plant", "needle"),
     [(_with_record, "end_fingerprint"), (_with_certificate, "review_certificate'.kind")],

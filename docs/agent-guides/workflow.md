@@ -611,8 +611,11 @@ or a stop classification. Only an idle timeout and an exit the adapter typed
 as result-less (a CLI that died on its own inside a session its stream shows
 running, before any result; never an empty stream, whose cause nothing typed
 tells) are relaunched, and only when no process the launch started
-may still run, its output holds no complete `CONTROL_RESULT` (#285; accepting
-one is #479's), the step has not used its one automatic relaunch (shared by
+may still run and the platform could look for one it left outside its group
+(`orphans_unchecked` refuses as a possible survivor, R1-F2 of PR #481), its
+output holds no complete `CONTROL_RESULT` (#285; the engine
+accepts one first where it can prove it safe, ADR 0012 D12, #479), the step has
+not used its one automatic relaunch (shared by
 every category, persisted, so a crash, a later `resume` or an `unblock` back
 into the same phase does not refill it; a phase change is a new step), the
 run's `workflow.max_total_steps` and the invocation's `--max-steps` each have

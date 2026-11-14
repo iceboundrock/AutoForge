@@ -130,6 +130,14 @@ def agent_end(message):
 
 
 def settle(message):
+    # Tool execution records Pi reports before the run settles, as given:
+    # two starts sharing a call id, say (R5-F1 of PR #481).
+    for record in turn["tool_events"]:
+        emit(record)
+    if turn["open_call"]:
+        # A tool execution Pi reports started and never ended (#479).
+        emit({"type": "tool_execution_start", "toolCallId": turn["open_call"],
+              "toolName": "bash", "args": {}})
     emit({"type": "message_end", "message": message})
     agent_end(message)
     emit({"type": "agent_settled"})
@@ -181,7 +189,17 @@ for line in sys.stdin.buffer:
     elif kind == "abort":
         respond(kind, rid)
         emit({"type": "agent_settled"})
-sys.exit(0)
+# Stdin closed: how this Pi shuts down (#479). What it writes first, a later
+# turn say, then how long it lingers and how it exits. A string is one raw
+# line, hex-encoded: a record that is not a typed JSON object (R2-F3).
+for record in turn["shutdown"]:
+    if isinstance(record, str):
+        out.write(bytes.fromhex(record) + b"\n")
+        out.flush()
+    else:
+        emit(record)
+time.sleep(turn["linger"])
+sys.exit(turn["close_exit"])
 """
 
 
@@ -201,7 +219,13 @@ class PiTurn:
     that many seconds. ``auth`` and ``auth_exit`` script the ``pi auth
     check`` preflight. ``agent_end_bytes`` makes the run's ``agent_end``
     repeat a user prompt of that many characters, as Pi's repeats every
-    message of the run (#144).
+    message of the run (#144). Once its stdin closes, it writes the records
+    of ``shutdown`` (a later turn, say; a string is one raw line, hex-encoded),
+    sleeps ``linger`` seconds and exits ``close_exit``: a Pi whose shutdown
+    hangs past a limit, or that exits with a failing status after a settled
+    run (#479). ``open_call`` reports a tool
+    execution of that call id started before the run settles and never ended;
+    ``tool_events`` are tool execution records written, as given, before it.
     """
 
     text: str = ""
@@ -214,6 +238,11 @@ class PiTurn:
     auth: dict | None = None
     auth_exit: int = 0
     agent_end_bytes: int = 0
+    linger: float = 0.0
+    close_exit: int = 0
+    shutdown: list[dict | str] = field(default_factory=list)
+    open_call: str = ""
+    tool_events: list[dict] = field(default_factory=list)
 
 
 class PiFake:

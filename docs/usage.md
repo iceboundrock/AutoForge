@@ -1679,7 +1679,10 @@ but anything else has more than one reading:
   `tool_use` is a call never counted.
 - **The bound.** At most 1024 calls are tracked open at once, and a call
   without an id is not tracked; past the bound `open_tool_calls` stops
-  growing.
+  growing. `untracked_tool_calls` counts the calls never tracked (no id, the
+  id of a call still open, past the bound, or in an `assistant` record whose
+  content could not be read): above 0, a reply before a failing exit is not
+  taken as the step's result (#479).
 
 `execution.command_timeout_seconds` (default 1800) is not an agent limit:
 it bounds only the commands the controller runs itself

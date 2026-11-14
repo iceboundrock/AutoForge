@@ -44,7 +44,7 @@ what no test covers.
 | `existing run <id> in phase <P> — use 'resume' to continue or 'run --force' to discard it` (exit 2) | [Starting over](#starting-over) |
 | `another AutoForge controller holds <path> — refusing to run concurrently on the same repository (...)` (exit 2) | [Another controller holds the lock](#another-controller-holds-the-lock) |
 | `'<command>' refuses issue <issue>: ... Only the parallel EPIC scheduler continues an issue its namespace owns ...` (exit 2) | [Another controller holds the lock](#another-controller-holds-the-lock) |
-| `unsupported protocol_version '<n>' (controller speaks '18'): a newer AutoForge wrote it` (exit 2) | [A run a newer controller wrote](usage.md#a-run-a-newer-controller-wrote) |
+| `unsupported protocol_version '<n>' (controller speaks '19'): a newer AutoForge wrote it` (exit 2) | [A run a newer controller wrote](usage.md#a-run-a-newer-controller-wrote) |
 | `refusing to start a new run over an unreadable state file`, `corrupted state file ...` (exit 2) | [The state file](#the-state-file) |
 | `issue <url> has no native parent on GitHub and no --epic was given`, `... has its native parent ... in another repository`, `... is closed on GitHub; a run records only an open EPIC`, `--epic <url> is the issue itself` (from `run`, exit 2) | [Which EPIC a run records](usage.md#which-epic-a-run-records) |
 | `issue <url> changed on GitHub while the run's EPIC was being bound: ...` (from `run`, exit 2) | [Which EPIC a run records](usage.md#which-epic-a-run-records): the issue's parent or state changed while `run` read its EPIC; nothing was written: run the command again |
@@ -330,9 +330,15 @@ error's text:
   corrections, a sandbox refusal, a
   GitHub failure or drift, a failed verification, and anything unknown.
 - **Refused even then:** when a process the launch started may still be
-  running (`process-may-survive`), when the killed launch had already
-  printed a complete `CONTROL_RESULT` (`result-delivered`: a relaunch would
-  throw it away), when the step already used its one automatic relaunch,
+  running, or the platform could not look for one it left outside its
+  process group (`orphans_unchecked`, a host with no child subreaper)
+  (`process-may-survive`), when the failed launch's output holds a
+  complete `CONTROL_RESULT` the controller did not accept (`result-delivered`:
+  a relaunch would throw it away; the error's line `its output was not
+  accepted as the step's result (<reason>: ...)` and `execution.json`'s
+  `delivered_result` say why: see "The agent replied, then was killed or
+  exited badly"), when the step already used its one
+  automatic relaunch,
   whatever failed then (`allowance-spent`), when `workflow.max_total_steps`
   (`step-budget`) or this command's `--max-steps` (`invocation-limit`) has no
   step left, or when a worker was asked to stop (`stop-requested`).
@@ -371,6 +377,62 @@ rule bounds what the controller does on its own, not how often you resume.
 `workflow.max_total_steps` is the bound on every launch of the run, the
 ones you resume included, since each launch is charged as one step before
 it starts.
+
+## The agent replied, then was killed or exited badly
+
+An agent can deliver its whole final reply and still end badly: its CLI
+exits with a failing status, or hangs after the reply until its idle limit
+or maximum runtime kills it. The controller then takes the reply as the
+step's result, without a relaunch, only when everything is proven (ADR 0012
+D12, #479): the provider's protocol shows the reply ended the run, with no
+tool call left open and nothing written after it, a later turn included
+(Claude Code's `stream-json` and Pi's RPC can; Pi's is read through its
+shutdown, and its `execution.json` summary counts `open_tool_executions` and
+`records_after_settled`; OpenCode and Claude's `text` output cannot, so
+theirs is never taken), every `CONTROL_RESULT` block in it says
+the same thing, it was not cut at the capture bound, no limit but the idle
+limit or the maximum runtime killed it, nothing the agent started may still
+be running, and the reply passes every check a clean exit's reply passes.
+The reply is then provisional: it is saved in the run's state before the step
+goes on from it, and accepted only once the step's own checks after it (your
+checkout unmoved, the PR still the run's, the phase's verification) have
+applied it: the verification saved the plan it turned the reply into, even
+if the step then stopped (a review posted at the last allowed round stops
+at the round cap and was accepted). The step's outcome then starts with `The
+agent was killed at its idle limit after delivering its complete final
+reply ...` (or `exited with a failing status ...`) and says whether it `was
+accepted`, or `was not accepted` because the step ended without applying it
+(why follows). The run log keeps both: the launch's `execution.json` says
+`provisional` under `delivered_result`, and the step's own record
+(`<PHASE>-delivered-result`) says `accepted`, or `not-accepted` with the
+stop's code or the phase the step moved to.
+
+If the controller is interrupted after it kept such a reply and before the
+step concluded (a crash, `Ctrl-C`, GitHub not answering), the next `resume`
+checks the kept reply again and goes on from it without running the agent
+again; the error you saw says `is kept in the run's state`. If the
+interruption came after the step had saved the plan it made from the reply
+(a PR create or a review comment GitHub did not answer, say), the reply was
+already accepted: the error says `so the reply was accepted`, and `resume`
+completes that plan from the journal and records the acceptance, without
+checking the reply again or running the agent. Whichever step settles a kept
+reply writes its `<PHASE>-delivered-result` record, once. When the kept
+reply no longer passes its checks (a commit landed in the worktree after it,
+or the PR moved: its HEAD, its base branch or the merge base its diff is
+computed from), the run stops in `BLOCKED` (`control-result-invalid`) with
+nothing launched or published: inspect the worktree and the PR, then
+`unblock`, which launches the agent afresh.
+
+Otherwise the failure stands, with a line saying why the reply was not
+taken: `its output was not accepted as the step's result (<reason>: ...)`.
+The reasons are `limit`, `survivor`, `orphans-unchecked`, `no-reply`,
+`no-block`, `incomplete-block`, `conflicting-blocks`, `truncated` and
+`checks` (the reply went to the checks and they refused it: another issue,
+a malformed result, a HEAD that moved after the reply). The step's
+`execution.json` holds the same under `delivered_result`. Such a reply is
+never corrected and never relaunched over (`result-delivered` above): read
+the step's `stdout.log` and the worktree, then `resume` to run the step
+again.
 
 ## An agent was killed: idle timeout, maximum runtime, loop
 

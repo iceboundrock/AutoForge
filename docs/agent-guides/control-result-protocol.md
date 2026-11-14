@@ -78,6 +78,46 @@ No other adapter needs it: OpenCode and `text` output print their final text
 at exit, and the Pi adapter shuts its CLI down itself once the conversation
 settles.
 
+### A reply delivered before its launch failed (#479)
+
+A launch that a limit killed or that exited with a failing status used to end
+the step whatever its output held. The engine now takes such a launch's reply
+to the checks above, unchanged, when ADR 0012 D12's typed rule
+(`delivered_result.py`) proves it safe: the adapter vouches for a completed
+final reply (`AgentExecutionResult.reply_delivered`: Claude `stream-json` and
+Pi only), the teardown left nothing running, and no protocol failure, loop
+kill or capture cut stands in the way. That rule reads the blocks once, more
+strictly than steps 1 and 2: `reply_block_shape` wants every complete block to
+decode to the same value and no block begun after the last, so a reply whose
+launch failed is taken only when it says one thing. A reply the checks refuse
+is not corrected: the launch's failure ends the step, with the reason, and the
+recovery rule never relaunches over it. A reply they let through is
+provisional, not yet accepted: once the operator's checkout is found
+unmoved, it is kept in the state (`delivered_reply`, with its binding and the
+PR revision the run is bound to) before the step goes on from it, and the
+step accepts it only once its own checks after the parse (the PR's owner,
+the phase's verification, which must save the plan it turns the reply into)
+have applied it; a crash in between leaves it for the next command, which
+checks it again exactly as a fresh reply, against the same revision, and
+launches no agent (ADR 0012 D12.4). A crash or an error after that save
+leaves the reply marked applied beside the plan: the next command completes
+the plan from the journal and records the reply as accepted, and never checks
+it again (R3-F2 of PR #481). A step that refuses the reply for good and then
+raises (a FIX whose PR was closed while the fixer ran) records it
+`not-accepted` with the phase it leaves as it was, and still raises that
+error; a
+reply still kept for the next command is settled by that command (R4-F2).
+Claude `stream-json` vouches for a reply only when no line of its stream was
+skipped past the per-line bound (R3-F1), and only when every tool call the
+stream started was tracked to its end: one without a string id, sharing the
+id of a call still open, past the reducer's bound, or in content it cannot
+read voids the proof (R4-F1). Pi's RPC vouches for one only when every tool
+execution it started was ended by its call id: a start without one, past the
+reducer's bound, or sharing the id of an execution still open voids the proof
+(R5-F1). A clean exit's reply is read exactly as before. A kept reply whose
+end is not a kill at the idle limit or the maximum runtime, or a failing exit
+with no limit, is refused on load (R5-F2).
+
 ### What an agent is told about work still running (#440)
 
 The sentence #393 added said the controller "does not wait for the work", which

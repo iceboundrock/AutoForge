@@ -139,6 +139,15 @@ own ``result`` decides again; a notice between turns does not. A background
 agent's held-back results keep it false until they have arrived. A
 ``tool_result`` skipped past the per-line bound leaves its call open and so
 keeps it false too: the run then waits for the CLI, as it did before #439.
+:attr:`ClaudeStream.reply_proven` is the stricter fact a reply delivered
+before a failing exit is taken on (#479): ``replied`` with no line skipped
+past the per-line bound anywhere in the stream, since a record never read
+may have opened a turn or a tool call, or failed the run (R3-F1 of PR #481),
+and with every tool call the stream started tracked to its end: a
+``tool_use`` without a string id, with the id of a call still open, or past
+:data:`MAX_OPEN_TOOLS`, and an ``assistant`` record whose content cannot be
+read for its tool calls, are calls no ``tool_result`` can be shown to end
+(R4-F1 of PR #481). ``replied`` does not count them, as before.
 
 Loop detection (#194): given a :class:`~autoforge.loop_detect.LoopObserver`,
 each completed tool call is reported as an action fingerprinted from its
@@ -316,6 +325,12 @@ class ClaudeStream:
         # Open tool calls: their name, with a loop observer their input's
         # digest, and their allow-listed input (:data:`TOOL_DETAILS`).
         self._open_tools: dict[str, tuple[str, bytes, str]] = {}
+        # #479 (R4-F1 of PR #481): tool calls the stream started that no
+        # ``tool_result`` can be shown to end: a ``tool_use`` without a string
+        # id, with the id of a call still open, or past MAX_OPEN_TOOLS, and an
+        # ``assistant`` record whose content cannot be read for its calls.
+        # Never cleared: what was not tracked cannot be found ended later.
+        self._untracked_tools = 0
         # Requests the CLI refused (module docstring): the first
         # :data:`MAX_REFUSED`, each its kind and its cleaned subject ("" for
         # none), and how many there were; a ``tool_use_id`` counts once.
@@ -344,6 +359,27 @@ class ClaudeStream:
             and self._results == self._turns
             and not self._open_tools
         )
+
+    @property
+    def reply_proven(self) -> bool:
+        """:attr:`replied`, on a stream read whole with every call tracked (#479).
+
+        The proof that the reply ended the run, for a CLI that then exited
+        with a failing status (``AgentExecutionResult.reply_delivered``):
+        :attr:`replied` read from every record the CLI wrote, with every tool
+        call it started tracked to its end. A line skipped past the per-line
+        bound is a record never read, wherever it stood: a later turn's
+        ``system/init`` or first record, a ``tool_use`` left open, a failing
+        ``result``, or a turn's opening record before the reply that leaves
+        the turn count short (R3-F1 of PR #481). A tool call the reducer
+        could not track (no string id, the id of a call still open, past
+        :data:`MAX_OPEN_TOOLS`, or in an ``assistant`` record whose content
+        cannot be read) is never counted open, so closing every tracked call
+        says nothing of it (R4-F1 of PR #481). Either voids the proof, for
+        good. :attr:`replied` itself, on which the driver stops a CLI still
+        running after a reply (#439), does not change.
+        """
+        return self.replied and self._oversize == 0 and self._untracked_tools == 0
 
     # -- driver interface ----------------------------------------------------
     def feed(self, data: bytes) -> None:
@@ -467,6 +503,10 @@ class ClaudeStream:
             # count stops at MAX_OPEN_TOOLS.
             "turns": self._turns,
             "open_tool_calls": len(self._open_tools),
+            # Calls never counted open (R4-F1 of PR #481): no string id, the
+            # id of a call still open, past MAX_OPEN_TOOLS, or an ``assistant``
+            # record whose content cannot be read for them.
+            "untracked_tool_calls": self._untracked_tools,
             "records": self._records,
             "oversize_records": self._oversize,
             "unknown_events": self._unknown,
@@ -613,9 +653,19 @@ class ClaudeStream:
             return []
         return [block for block in content if isinstance(block, dict)]
 
+    @staticmethod
+    def _content_readable(record: dict) -> bool:
+        """Whether every content block of ``record`` can be read (R4-F1 of PR #481)."""
+        message = record.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        return isinstance(content, list) and all(isinstance(block, dict) for block in content)
+
     def _assistant(self, record: dict) -> None:
         if record.get("is_api_error_message") is True:
             self._take_api_error(record)
+        if not self._content_readable(record):
+            # R4-F1 of PR #481: a tool call it held could never be shown ended.
+            self._untracked_tools += 1
         sent = False
         for block in self._blocks(record):
             kind = block.get("type")
@@ -655,12 +705,19 @@ class ClaudeStream:
         tool_id = block.get("id")
         tool_input = block.get("input")
         detail = self._detail(name, tool_input)
+        # #479 (R4-F1 of PR #481): a call no ``tool_result`` can be shown to
+        # end is counted untracked: it has no id to match, is past the bound,
+        # or shares its id with a call still open (one result would end both).
         if isinstance(tool_id, str) and len(self._open_tools) < MAX_OPEN_TOOLS:
+            if tool_id in self._open_tools:
+                self._untracked_tools += 1
             self._open_tools[tool_id] = (
                 name,
                 digest(tool_input) if self._loop is not None else b"",
                 detail,
             )
+        else:
+            self._untracked_tools += 1
         self._send(ProgressEvent(ProgressKind.TOOL_STARTED, tool=name, detail=detail))
 
     def _detail(self, name: str, tool_input: object) -> str:

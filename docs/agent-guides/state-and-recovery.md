@@ -135,7 +135,35 @@ observed and its run log record written; an unsettled one is never dropped.
 Only the engine's recovery path writes it (and an applied `unblock`, which
 has a conflicting audit comment reconciled again), and only it and `status`
 read it; a phase change only moves its step on, so a crash, a `resume` or an
-`unblock` never refills a spent allowance. A
+`unblock` never refills a spent allowance. A reply a launch delivered before it
+timed out or exited badly, once the checks of a clean exit's reply let it
+through (ADR 0012 D12, #479), is kept in `delivered_reply`
+(`autoforge.delivered_result.KeptReply`; `{}` when none): the validated
+`CONTROL_RESULT` object, redacted and bounded by the parser's bound, its
+SHA-256, and its binding (phase, attempt, launch label, issue, PR, review
+round, the candidate the checks read, the revision the run was bound to,
+that is the PR's HEAD, base and merge base, how the launch ended and its run
+log step), and `applied`: whether the step's verification saved the plan it
+turned the reply into, the reply's acceptance (R3-F2 of PR #481). It is saved in one write before the step goes on from it, and
+only after the operator's checkout was checked against the invocation's
+anchor (a restart reads an anchor of its own, R2-F2 of PR #481), so a crash
+or a restart before the step concludes finds it, re-checks it exactly as a
+fresh reply and goes on from it with no agent launched; a binding that no
+longer matches, a revision the run is no longer bound to (a REVIEW entry
+under bwrap or `disabled` binds the PR's HEAD, base and merge base again, and
+a review's verdict is about that diff alone, R2-F1), or a check that now
+refuses it (a candidate that moved, a review HEAD the PR no longer has), is
+`BLOCKED` with `control-result-invalid` and nothing launched or applied. The
+save of the plan sets `applied` in the same write: a crash or an error after
+it leaves the plan and the acceptance's provenance together, the next step
+completes the plan from the journal and records the reply as accepted, and an
+applied reply is never checked again or gone on from (a launch drops it after
+recording it). The step that finds a reply kept settles it, whatever ends
+that step. Every save drops it in another phase or
+after another launch (`BLOCKED` and `FAILED` included), and the step drops it
+when its own checks refuse it before its plan is saved (a verification failure, the producer gate);
+the loader refuses one bound to another phase, attempt or launch label than
+the state's. A
 REMOTE `last_fix_resolutions` entry carries `acceptance_comment_url`: the
 comment the controller verified for an `acceptance_action` resolution
 (required, on the run's issue), and `""` for any other (#211).
@@ -569,6 +597,8 @@ Protocol 15 → 16 (#374, ADR 0011 D5 as amended) added the stop's reason code, 
 Protocol 16 → 17 (#433) added the partial fix: the field `partial_fix` above, and `unresolved` (each `finding_id` with the fixer's redacted `reason`) and `message` (the fixer's redacted, bounded block message) on a `FIX` completion context. A context with unresolved findings is a partial fix's plan: at least one of its resolutions is `fixed`, its plan is a FIX plan whose last record is the push (every rule of a FIX plan holds, so a K9, K10 or K12 record precedes it), its message is not blank, and its resolutions and unresolved findings together name the open findings exactly; any other context holds `unresolved: []` and `message: ""`. Every protocol-17 save writes `partial_fix`, `{}` included, so a protocol-17 file missing it is refused. A protocol-16 file, and every older file its own rules load, loads in every phase with `partial_fix: {}`, and a `FIX` context it saved gains `unresolved: []` and `message: ""`, which is exactly what its controller planned: a fix of every finding. It is relabelled 17 on its next save. A file labelled 16 or older that carries any of it, even empty, is a hand edit or a foreign file and is refused, unchanged. The number is the implementation's (`main` was at 16 when it was written); it is settled on #23 before the change merges.
 
 Protocol 17 → 18 (#434) added the automatic-recovery journal: the field `auto_recovery` above, and the effect kind K13 (ADR 0004 D13.13), whose records live in that journal and never in `effect_records`, which refuses one under any label. Every protocol-18 save writes `auto_recovery`, `{}` included, so a protocol-18 file missing it is refused: read as the empty default, it would refill an allowance a decision already spent. A protocol-17 file, and every older file its own rules load, loads in every phase with `auto_recovery: {}` (no decision was taken, so every step's allowance is unspent) and is relabelled 18 on its next save. A file labelled 17 or older that carries the field, even `{}`, is a hand edit or a foreign file and is refused, unchanged. The journal is validated whole on load: its step, every decision's step, category and refusal, a relaunch only for an allowlisted category, the step's relaunches at most one and no fewer than its decisions made, decisions in increasing order up to the journal's number, each audit record a K13 of this run and of its decision's step and number, and no settled decision of an earlier step. The number is the implementation's (`main` was at 17 when it was written); it is settled on #23 before the change merges.
+
+Protocol 18 → 19 (#479, R1-F1 of PR #481) added the kept reply: the field `delivered_reply` above. Every protocol-19 save writes it, `{}` included, so a protocol-19 file missing it is refused: read as the empty default, it would drop a reply the step goes on from and launch the agent again. A protocol-18 file, and every older file its own rules load, loads in every phase with `delivered_reply: {}` (an older controller held such a reply in memory only, so none survived it) and is relabelled 19 on its next save. A file labelled 18 or older that carries the field, even `{}`, is a hand edit or a foreign file and is refused, unchanged. A kept reply is validated whole on load: exactly its keys, an agent phase, an attempt of at least 1, a launch label, a full lower-case candidate SHA or none, the bound revision (a full lower-case HEAD SHA or none, a base branch name of at most 512 characters, a full lower-case merge base SHA or none), a kill at the idle limit or the maximum runtime or a failing exit with no limit (each end checked on its own, so a failing exit naming any limit is refused: R5-F2 of PR #481), a step directory's name, a payload of its own phase within the parser's bound and the digest of that payload, and a boolean `applied` (R3-F2 of PR #481); and it must be bound to the state's own phase, attempt and launch label. The number is the implementation's (`main` was at 18 when it was written); it is settled on #23 before the change merges.
 
 Protocol 5 → 7 (#160) added the effect state above (`effect_records`, `entry_observation`, `completion_context`, `launch_label`). Protocol 6 is skipped, and stays skipped for good: #23 once reserved it for #126, which now takes the next number like every other bump (see "Numbering a new protocol" below). The number this bump took was settled on #23 before it merged. State persisted under protocol 5, or under any older protocol that its own rules load, carries no effect state and loads as none; a legacy file that does carry one of these fields is a hand edit or a foreign file and is refused. A legacy REMOTE file with `attempt >= 1` gets the launch label `agent_publishes` for a phase whose agent published under the previous contract, so that the first entry of this version knows an agent may already have published (D13.3). `UPDATE_EPIC` is the one such phase whose publication this version performs itself: its one-shot legacy re-entry adopts the progress comment that agent posted, with no record, and asks for the selection only (D13.7; [github-safety.md](github-safety.md), "Before UPDATE_EPIC"). LOCAL state, whatever its protocol, carries no effect state.
 
@@ -1453,10 +1483,13 @@ known and the retry path is bounded. Current cases include:
   launch ended with an idle timeout or an exit its adapter typed as
   result-less is relaunched once, through the phase-entry reconciliation
   `resume` runs, only when no process the launch started may still run, its
-  output holds no complete `CONTROL_RESULT`, the step has not used its one
-  automatic relaunch (whatever failed then), the run's step budget and the
-  invocation's `--max-steps` each have a step left, and the decision's audit
-  comment is confirmed. A provider's usage or rate limit
+  output holds no complete `CONTROL_RESULT` (one the engine accepted, ADR
+  0012 D12, ended no step; one it did not stays the operator's), the
+  platform could look for a process the launch left outside its group
+  (`orphans_unchecked` refuses as a possible survivor), the step
+  has not used its one automatic relaunch (whatever failed then), the run's
+  step budget and the invocation's `--max-steps` each have a step left, and
+  the decision's audit comment is confirmed. A provider's usage or rate limit
   (`ProviderUsageLimitError`) is never relaunched, at once or later in the
   same command; neither is an idle kill of a launch whose provider had
   already failed the run (`failed_before_limit`: an authentication or

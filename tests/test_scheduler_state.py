@@ -1112,12 +1112,12 @@ def test_a_namespace_state_refused_for_its_protocol_keeps_the_controller_however
     _save(ns, Phase.REVIEW)
     _open(ns)
     raw = json.loads(ns.state_file.read_text())
-    raw["protocol_version"] = "19"
+    raw["protocol_version"] = "20"
     ns.state_file.write_text(json.dumps(raw))
     assert len(str(ns.state_file)) == length
     before = _tree(ns.directory)
     headline = (
-        "unsupported protocol_version '19' (controller speaks '18'): a newer AutoForge wrote it"
+        "unsupported protocol_version '20' (controller speaks '19'): a newer AutoForge wrote it"
     )
     provenance = f"imported from {os.path.abspath(autoforge.__file__)}, python {sys.executable}"
     shown = shown_path(str(ns.state_file))

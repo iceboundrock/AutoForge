@@ -744,6 +744,14 @@ DIAGNOSES: dict[StopReasonCode, Diagnosis] = {
         "store does (ADR 0005 D6.5); nothing was read from it",
         "inspect the agent worktree's object directory; a human decides",
     ),
+    StopReasonCode.CONTROL_RESULT_INVALID: Diagnosis(
+        "a reply the agent delivered before its launch timed out or exited badly was kept in "
+        "the state across an interruption (#479), and it no longer passes the checks of a "
+        "clean exit's reply (its candidate moved, or the run's PR, round or HEAD did); it "
+        "was dropped, and nothing was launched, published or applied",
+        "inspect the agent worktree and the PR; 'unblock' then launches the phase's agent "
+        "afresh, which sees the worktree as it is now",
+    ),
     StopReasonCode.AGENT_BLOCKED: Diagnosis(
         "the phase's agent reported 'blocked'; its message, the reason, is its claim, never "
         "evidence",
