@@ -304,6 +304,13 @@ from .child_env import (
 )
 from .claude_stream import ClaudeStream
 from .config import LoopDetectionConfig, ProfileConfig
+from .container_auth import (
+    CredentialKind,
+    CredentialRoutes,
+    EnvRoute,
+    Refresh,
+    UnsupportedRoute,
+)
 from .errors import (
     ChildStdinClosedError,
     ConfigurationError,
@@ -940,6 +947,16 @@ class AgentProvider:
             path_names=self.path_names,
         )
 
+    def credential_routes(self, profile: ProfileConfig) -> CredentialRoutes | None:
+        """Where ``profile``'s model credential may come from under the container
+        backend (ADR 0013 D14, #290), as data for
+        :func:`autoforge.container_auth.plan_credentials`: names and kinds,
+        never a value. ``None``: this adapter maps no credential, and a
+        container launch of it is refused. Only Claude Code, OpenCode and Pi
+        map one; the SDK providers keep their own policy (ADR 0007).
+        """
+        return None
+
     def written_directories(
         self, profile: ProfileConfig, env_allowlist: tuple[str, ...] | None, home: str
     ) -> tuple[tuple[str, str], ...]:
@@ -1337,6 +1354,41 @@ def claude_configuration_problems(env: Mapping[str, str]) -> list[str]:
     return problems
 
 
+# Claude Code's credential routes under the container backend (#290), read
+# from 2.1.325: an API key, or the long-lived token `claude setup-token`
+# prints, which the operator makes on the host and which no launch refreshes.
+# The refresh token variable is a route too, refused: its use rotates it.
+CLAUDE_CREDENTIAL_ROUTES = (
+    EnvRoute("ANTHROPIC_API_KEY", CredentialKind.API_KEY),
+    EnvRoute("CLAUDE_CODE_OAUTH_TOKEN", CredentialKind.OAUTH_TOKEN),
+    EnvRoute(
+        "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", CredentialKind.OAUTH_REFRESH_TOKEN, Refresh.ROTATING
+    ),
+)
+# What would put Claude Code on another route, which the container backend
+# does not take: a gateway's bearer token, or a cloud provider's credentials,
+# which come from the cloud's own configuration.
+CLAUDE_UNSUPPORTED_ROUTES = (
+    UnsupportedRoute(
+        "ANTHROPIC_AUTH_TOKEN",
+        CredentialKind.GATEWAY_TOKEN,
+        "a gateway's bearer token is not a route #290 maps",
+    ),
+    *(
+        UnsupportedRoute(
+            name,
+            CredentialKind.CLOUD,
+            f"{cloud} authenticates with the cloud's own credentials, which are never projected",
+        )
+        for name, cloud in (
+            ("CLAUDE_CODE_USE_BEDROCK", "Amazon Bedrock"),
+            ("CLAUDE_CODE_USE_VERTEX", "Google Vertex AI"),
+            ("CLAUDE_CODE_USE_FOUNDRY", "Microsoft Foundry"),
+        )
+    ),
+)
+
+
 class ClaudeCodeProvider(AgentProvider):
     name = "claude"
     # ``ANTHROPIC_API_KEY`` / ``ANTHROPIC_AUTH_TOKEN`` and the base URL and
@@ -1407,6 +1459,13 @@ class ClaudeCodeProvider(AgentProvider):
             auth=tuple(auth),
             operator_config_roots=(root, os.path.join(home, ".claude.json")),
         )
+
+    def credential_routes(self, profile: ProfileConfig) -> CredentialRoutes:
+        """``ANTHROPIC_API_KEY`` or ``CLAUDE_CODE_OAUTH_TOKEN``, exactly one
+        (:data:`CLAUDE_CREDENTIAL_ROUTES`); the login in ``~/.claude`` or
+        ``$CLAUDE_CONFIG_DIR`` is never projected, since the CLI refreshes it
+        in place."""
+        return CredentialRoutes("anthropic", CLAUDE_CREDENTIAL_ROUTES, CLAUDE_UNSUPPORTED_ROUTES)
 
     @contextmanager
     def integration_isolation(self) -> Iterator[dict[str, str]]:
@@ -2008,6 +2067,18 @@ def opencode_organization_problems(env: Mapping[str, str]) -> list[str]:
     return problems
 
 
+# The API-key variable OpenCode reads for a model provider, under the
+# container backend (#290): names present in the 2.3.0 build, for the
+# providers AutoForge documents. A provider not listed has no container
+# route; its login, OpenCode's account store, is never projected.
+OPENCODE_KEY_NAMES = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "google": "GOOGLE_GENERATIVE_AI_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
+
+
 class OpenCodeProvider(AgentProvider):
     name = "opencode"
     # OpenCode's own settings plus the API keys of the model providers it
@@ -2063,6 +2134,26 @@ class OpenCodeProvider(AgentProvider):
             auth=tuple(auth),
             operator_config_roots=roots,
         )
+
+    def credential_routes(self, profile: ProfileConfig) -> CredentialRoutes:
+        """The API key of the model's provider alone (:data:`OPENCODE_KEY_NAMES`),
+        never another provider's key nor ``OPENCODE_*`` or ``OPENAI_*``
+        wholesale. The account store (the database ``auth login`` writes,
+        ``$OPENCODE_DB``) is never projected: OpenCode rewrites it and refreshes
+        the logins it holds. A container's own store, in its private home, is
+        empty, so the key is what the launch authenticates with."""
+        scope = profile.model.split("/", 1)[0] if "/" in profile.model else ""
+        name = OPENCODE_KEY_NAMES.get(scope)
+        if name is None:
+            return CredentialRoutes(
+                scope or "(no provider)",
+                refusal=(
+                    f"no API-key variable is mapped for OpenCode's model provider {scope!r} "
+                    f"(mapped: {', '.join(sorted(OPENCODE_KEY_NAMES))}), and OpenCode's "
+                    "account store is never projected: route the profile to a mapped provider"
+                ),
+            )
+        return CredentialRoutes(scope, (EnvRoute(name, CredentialKind.API_KEY),))
 
     @contextmanager
     def integration_isolation(self) -> Iterator[dict[str, str]]:
@@ -2374,6 +2465,9 @@ _PI_TOOLS_RE = re.compile(r"[a-z]+(,[a-z]+)*")
 # stored ChatGPT sign-in. A profile with `require_oauth` refuses to launch
 # when one of them would reach Pi (docs/pi-policy.md §8).
 PI_API_KEY_NAMES = ("OPENAI_API_KEY",)
+# The API-key variable Pi reads for a model provider when a profile sets
+# `require_oauth: false`, under the container backend (#290; docs/pi.md).
+PI_KEY_NAMES = {"deepseek": "DEEPSEEK_API_KEY", "openai": "OPENAI_API_KEY"}
 # What Pi loads from its agent directory and from every directory between
 # `/` and the cwd whatever the resource flags say (docs/pi-policy.md §4-5):
 # the first context file name found in each directory (none with
@@ -2503,6 +2597,37 @@ class PiProvider(AgentProvider):
             )
         default = os.path.join(home, PI_DEFAULT_AGENT_DIR.removeprefix("~/"))
         return dataclasses.replace(needs, auth=tuple(auth), operator_config_roots=(default,))
+
+    def credential_routes(self, profile: ProfileConfig) -> CredentialRoutes:
+        """With ``require_oauth: false``, the API key of the model's provider
+        alone (:data:`PI_KEY_NAMES`). With ``require_oauth`` (the default), none:
+        the ChatGPT sign-in lives in Pi's agent directory, which Pi refreshes in
+        place by rotating its refresh token, and no controller-owned path
+        returns a refreshed sign-in to the host, so it is never projected. Nor
+        is a key Pi holds in its own store."""
+        scope = self.model_provider(profile)
+        if self.require_oauth(profile):
+            return CredentialRoutes(
+                scope,
+                refusal=(
+                    "require_oauth: Pi's ChatGPT sign-in is refreshed in Pi's agent directory "
+                    "by rotating its refresh token, and no controller-owned path returns a "
+                    "refreshed sign-in to the host, so it is never projected (ADR 0013 D14): "
+                    "run this profile under bwrap, or set require_oauth: false with a "
+                    "provider API key"
+                ),
+            )
+        name = PI_KEY_NAMES.get(scope)
+        if name is None:
+            return CredentialRoutes(
+                scope,
+                refusal=(
+                    f"no API-key variable is mapped for Pi's model provider {scope!r} "
+                    f"(mapped: {', '.join(sorted(PI_KEY_NAMES))}), and Pi's own credential "
+                    "store is never projected: route the profile to a mapped provider"
+                ),
+            )
+        return CredentialRoutes(scope, (EnvRoute(name, CredentialKind.API_KEY),))
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         super().validate_profile(profile)

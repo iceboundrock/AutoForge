@@ -840,6 +840,24 @@ D14's mechanisms; #270)**, in two modules. Nothing reaches them before
   host reads for the container's PID 1, never the one seen inside, which
   is relative to the parent user namespace.
 
+**Each provider's credential under the container backend (ADR 0013 D14,
+#290)** splits the way the sandbox declaration does (ADR 0005 D13.1): the
+adapter states the facts of its CLI, and a provider-neutral module applies
+the rules. `AgentProvider.credential_routes(profile)` declares, as data,
+the variables the profile may take its model credential from, with each
+one's kind and refresh, the variables that would put the CLI on a route the
+container backend refuses, and the model provider the launch authenticates
+to; the base adapter, the SDK providers and the scripted one declare none.
+`container_auth.plan_credentials` takes that declaration, the adapter's
+`sandbox_requirements` (whose `file-ro`, `dir-rw` and `keyring` items are
+the stored logins) and the launch's environment after its allow-list, and
+returns a `CredentialPlan`: one variable, projected by #270's environment
+mechanism as a `Projection`, the logins it does not project and the
+credential-looking variables it withholds, or a `SandboxPolicyError`
+naming variables and kinds. It reads no file and holds the value only in
+the projection's `Secret`. Nothing calls it before #271 builds the launch
+container's create from it.
+
 #### Launch routing (ADR 0005, #168)
 
 When the outer sandbox is enforced (`sandbox.mode: required`, or

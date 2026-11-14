@@ -240,7 +240,7 @@ on a real runtime yet. When it is selectable, expect this:
 - **The model credential reaches only the agent's own container,** as an
   environment variable whose value is on no command line, or as a
   read-only file (a file must be readable by others, in a directory only
-  you can enter). Every tool in that container can read it, and the
+  you can enter; no provider uses a file yet). Every tool in that container can read it, and the
   runtime keeps a variable's value in its record of the container until
   the container is removed.
 - **The network is the container's own, not your host's.** Your host's
@@ -251,6 +251,26 @@ on a real runtime yet. When it is selectable, expect this:
   to model endpoints, so an agent can still send its own model credential
   anywhere (#257's residuals R3 and R4; egress control is
   [#294](https://github.com/iceboundrock/AutoForge/issues/294), later).
+
+Which model credential a container launch will take, by provider:
+
+- **Claude Code:** `ANTHROPIC_API_KEY`, or the long-lived token
+  `claude setup-token` prints, as `CLAUDE_CODE_OAUTH_TOKEN`; exactly one
+  of them. The login `claude auth login` keeps in `~/.claude` is never
+  used, since Claude Code refreshes it in place.
+- **OpenCode 2.x:** the API key of the model's provider alone
+  (`ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`
+  or `OPENAI_API_KEY`). OpenCode's account store is never used.
+- **Pi:** with `require_oauth: false`, `DEEPSEEK_API_KEY` or
+  `OPENAI_API_KEY`, forwarded with `execution.agent_env_allowlist_extra`.
+  The ChatGPT sign-in (`require_oauth: true`, the default) is refused:
+  Pi rotates its refresh token, and nothing would bring the refreshed
+  sign-in back to your machine.
+
+Anything else is refused before a container is made, with what to set
+instead. The provider-by-provider table, how rotation, revocation and
+several workers behave, and which variables redaction recognises are in
+[GitHub safety](agent-guides/github-safety.md#provider-credential-mapping-adr-0013-d14-290).
 
 The full threat model, its capability matrix and the residuals are in
 [GitHub safety](agent-guides/github-safety.md#container-launch-threat-model-adr-0013-d18-270).
