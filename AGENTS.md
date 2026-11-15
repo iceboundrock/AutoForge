@@ -227,10 +227,12 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        lifecycle seam, the death-watch that replaces
                                        --die-with-parent, rootless only, bind or
                                        copy-in per runtime, the invariant map;
-                                       remote execution sandboxes (proposed, nothing
-                                       in the package): the provider comparison, the
-                                       remote contract R1 to R10, a no-go for a
-                                       production adapter and what reopens it)
+                                       remote execution sandboxes (accepted as a
+                                       no-go, nothing in the package): the provider
+                                       comparison, the remote contract R1 to R10, the
+                                       signed-off no-go for a production adapter,
+                                       what reopens it and the SSH-first direction
+                                       for a reopening, which is not a go)
 docs/README.md                         human-oriented documentation index, by intent
 docs/non-code-rules.md                 writing and publishing rules for every non-code artifact
 docs/getting-started.md                operator guide: a first run from nothing, step by step, and the

@@ -1,10 +1,20 @@
 # ADR 0014. Remote execution sandboxes: the contract a provider must meet, and a no-go for now
 
-- **Status:** proposed. The decision proposed here is a **no-go** for a
-  remote production adapter (#277). It is not in effect until the
-  maintainer signs it off on #276, which that issue's fifth acceptance
-  criterion asks for. This line does not record a sign-off. Written at
-  `main` `3311238` (2026-11-15), where every reference below was read.
+- **Status:** accepted: a **no-go** for a remote production adapter
+  (#277). The maintainer signed this record off on 2026-11-15 in the
+  [maintainer's decision on #276](https://github.com/iceboundrock/AutoForge/issues/276#issuecomment-6899777970),
+  as proposed in PR #502. That comment is the sign-off #276's fifth
+  acceptance criterion asks for; this line only records it. The comment
+  accepts §2's reasons ("B1 alone settles it") and holds any later
+  proposal to D2 to D4. One addition followed the sign-off, at PR #502's
+  review (R2-F2): R3 now also refuses a deadline, ceiling or window that
+  is not a finite time. It makes the contract stricter and changes no
+  decision. Written at `main` `3311238` (2026-11-15), where every
+  reference below was read.
+  - *A direction, not a go:* the same comment says where a reopening
+    should start: an operator-owned VM reached over SSH, after the local
+    container backend (#271 to #274). It approves nothing to be built, and
+    B1, B3 and B4 still apply (§5).
   - *Implemented with it:* nothing in the package. No configuration key,
     state field, protocol number, launch class, prompt or default
     changes, and no provider is declared supported. The prototype of §6
@@ -159,11 +169,11 @@ sandboxes.
 commands (`validation.commands`, `merge.verification_commands`) stay on
 the host's enforced backend.
 
-**Consequences of D1 once signed off.**
+**Consequences of D1.**
 
 - #277 is marked not planned, in the same action that completes #276,
-  as #276's planning text says. That action is the maintainer's. This
-  change performs no GitHub action.
+  as #276's planning text says and the sign-off repeats. That action is
+  the maintainer's. This change performs no GitHub action.
 - `docs/compatibility.md` says that remote execution sandboxes are not
   supported, with a pointer here.
 - Nothing is persisted and no protocol number is needed, so #23 has
@@ -265,7 +275,8 @@ one, and EC2's `RunInstances` does not.
 On paper, Vercel meets more of §4 with documented API calls (R1, R2's
 brokering, R3's renewable deadline, R6, R7). A VM over SSH gives the
 liveness signal closest to ADR 0013's death-watch (R3), and portability.
-This ranks nothing for support. It records where a reopening would start.
+This ranks nothing for support. The maintainer's direction (§5) says
+where a reopening should start: an operator-owned VM over SSH.
 
 ## 4. The remote contract
 
@@ -517,6 +528,19 @@ that brings:
 3. **A design for R10's two-backend pin,** or a decision that remote
    validation is acceptable.
 4. **The amendments §7 names,** dated like #267's.
+
+**The maintainer's direction for a reopening** (#276, 2026-11-15, in the
+sign-off the status line records). The local container backend of ADR
+0013, rootless Docker Engine or Podman on the operator's own machine, is
+to be delivered first, through #271 to #274. When this decision is
+reopened, it is to start from an operator-owned VM reached over SSH
+rather than a hosted provider. For that case B2's three questions have
+different answers: the source, issue text and prompts stay on machines
+the maintainer owns, the only new controller credential is an SSH key the
+maintainer controls, and review runs on hardware the maintainer controls.
+This is a direction, not a go, and it approves nothing to be built. B1,
+B3 and B4 still apply, and such a reopening still needs item 2's probe
+and a record of its own.
 
 ## 6. The prototype
 

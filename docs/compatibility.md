@@ -185,10 +185,11 @@ container runtime.
 
 Remote execution sandboxes are not supported: no launch runs on a hosted
 microVM service such as Vercel Sandbox, on a cloud VM, or on a container
-runtime reached over TCP or SSH. A proposed record,
-[ADR 0014](adr/0014-remote-execution-sandboxes-contract-and-no-go.md),
+runtime reached over TCP or SSH.
+[ADR 0014](adr/0014-remote-execution-sandboxes-contract-and-no-go.md)
 compares the providers from their documentation, sets out what one would
-have to meet, and recommends against building an adapter now.
+have to meet, and records the maintainer's decision not to build an
+adapter now.
 
 The outer sandbox is experimental: it is opt-in enforcement on a host that
 can enforce it, and it becomes supported only once a `make test-sandbox`
