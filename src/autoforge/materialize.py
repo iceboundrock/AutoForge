@@ -39,7 +39,7 @@ uses it, and candidate validation (#172) will.
   the listing names for it and the root to the commit's tree, with no entry
   extra or missing. A mismatch is a
   :class:`~autoforge.errors.MaterializationError` naming the entry.
-- **Comparison (PR #444 R3-F1, R4-F1).** :func:`tree_differences`
+- **Comparison (PR #444 R3-F1, R4-F1; #488).** :func:`tree_differences`
   compares a working tree the controller did not write (an agent worktree)
   with a commit's tree the same way, blob by blob, and lists what differs
   instead of raising: what the directory holds besides the tree's entries
@@ -47,7 +47,12 @@ uses it, and candidate validation (#172) will.
   or index can make other bytes read as the commit's. A gitlink's path
   matches only as the empty directory a checkout leaves a submodule it
   does not populate: a populated submodule's content is a repository of
-  its own, never proven the commit's.
+  its own, never proven the commit's. On request, a file may also hold the
+  bytes a checkout writes for it under the ``eol=crlf`` the commit's own
+  ``.gitattributes`` give it (#488): those attributes are read from the
+  commit's tree alone, in a git directory of the controller's own, and the
+  conversion is applied here to the blob's bytes, so no other attribute,
+  conversion or configuration takes part.
 
 Every git process is the hardened local request
 (:func:`~autoforge.git_transport.local_git_request`, ADR 0004 D7.3, D7.5):
@@ -67,10 +72,11 @@ import shutil
 import stat
 import tempfile
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from .errors import CandidateNotMaterializableError, MaterializationError
 from .executor import ExecutionRequest, ExecutionResult
@@ -453,8 +459,20 @@ class _Writer:
             os.close(self._stack.pop()[1])
 
 
+class _BlobSink(Protocol):
+    """Where :class:`_BlobStream` hands each blob: :class:`_Writer`, :class:`_CrlfForms`."""
+
+    def next_blob(self) -> _Entry | None: ...
+
+    def open_blob(self, entry: _Entry) -> None: ...
+
+    def write(self, data: memoryview) -> None: ...
+
+    def close_blob(self) -> None: ...
+
+
 class _BlobStream:
-    """An ``on_chunk`` hook parsing ``git cat-file --batch`` into the writer.
+    """An ``on_chunk`` hook parsing ``git cat-file --batch`` into a sink.
 
     Each blob arrives as ``<id> blob <size>\\n<content>\\n``, in the order
     the ids were asked for. The first problem is kept and ``stop`` is set,
@@ -462,7 +480,7 @@ class _BlobStream:
     :meth:`close`.
     """
 
-    def __init__(self, writer: _Writer, commit: str) -> None:
+    def __init__(self, writer: _BlobSink, commit: str) -> None:
         self._writer = writer
         self._commit = commit
         self._header = bytearray()
@@ -552,34 +570,41 @@ class _BlobStream:
             self._closed = True
 
 
+def _stream_blobs(
+    runner: Runner, repo: str, commit: str, sink: _BlobSink, blobs: Sequence[str]
+) -> None:
+    """Stream the blobs ``blobs`` names from ``repo``'s store into ``sink``, in that order.
+
+    ``sink.next_blob`` yields the entry of each id in turn; anything but
+    exactly those blobs is a :class:`MaterializationError`.
+    """
+    stream = _BlobStream(sink, commit)
+    args = ["cat-file", "--batch", "--buffer"]
+    req = _request(repo, args)
+    req.stdin_data = "".join(f"{oid}\n" for oid in blobs).encode("ascii")
+    req.on_chunk = stream
+    req.stop = stream.stop
+    req.max_output_bytes = _STREAM_CAPTURE_BYTES
+    try:
+        res = runner(req)
+    finally:
+        stream.close()
+    if stream.error is not None:
+        raise stream.error
+    problem = _failure(res, args)
+    if problem:
+        raise MaterializationError(f"commit {commit}: streaming its blobs failed: {problem}")
+    if not stream.done:
+        raise MaterializationError(f"commit {commit}: git sent fewer blobs than the tree lists")
+
+
 def _write(runner: Runner, repo: str, commit: str, listing: _Listing, root: Path) -> None:
     """Write ``listing`` below ``root``, the blobs streamed from the store."""
     writer = _Writer(root, listing, commit)
     try:
-        stream = _BlobStream(writer, commit)
         blobs = [e.oid for e in listing.entries if e.mode not in (_TREE, _GITLINK)]
         if blobs:
-            args = ["cat-file", "--batch", "--buffer"]
-            req = _request(repo, args)
-            req.stdin_data = "".join(f"{oid}\n" for oid in blobs).encode("ascii")
-            req.on_chunk = stream
-            req.stop = stream.stop
-            req.max_output_bytes = _STREAM_CAPTURE_BYTES
-            try:
-                res = runner(req)
-            finally:
-                stream.close()
-            if stream.error is not None:
-                raise stream.error
-            problem = _failure(res, args)
-            if problem:
-                raise MaterializationError(
-                    f"commit {commit}: streaming its blobs failed: {problem}"
-                )
-            if not stream.done:
-                raise MaterializationError(
-                    f"commit {commit}: git sent fewer blobs than the tree lists"
-                )
+            _stream_blobs(runner, repo, commit, writer, blobs)
         writer.finish()
     finally:
         writer.close()
@@ -589,14 +614,21 @@ def _blob_id(algorithm: str, content: bytes) -> str:
     return hashlib.new(algorithm, b"blob %d\0" % len(content) + content).hexdigest()
 
 
-def _file_id(algorithm: str, dir_fd: int, name: bytes, seen: os.stat_result) -> tuple[bytes, str]:
-    """The mode and blob id of the regular file ``name``, from its bytes on disk."""
+def _file_digest(
+    dir_fd: int, name: bytes, seen: os.stat_result, start: Callable[[int], hashlib._Hash]
+) -> tuple[os.stat_result, str]:
+    """The ``fstat`` of the regular file ``name`` and the digest of its bytes on disk.
+
+    ``seen`` is its ``lstat``: the file opened, never through a link, must
+    be that one, and hold as many bytes as it says; ``start`` makes the
+    digest from that size.
+    """
     fd = os.open(name, _READ_FLAGS, dir_fd=dir_fd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (seen.st_dev, seen.st_ino):
             raise OSError(0, "replaced while it was proved")
-        digest = hashlib.new(algorithm, b"blob %d\0" % st.st_size)
+        digest = start(st.st_size)
         total = 0
         while chunk := os.read(fd, _READ_CHUNK_BYTES):
             digest.update(chunk)
@@ -605,7 +637,15 @@ def _file_id(algorithm: str, dir_fd: int, name: bytes, seen: os.stat_result) -> 
             raise OSError(0, "changed size while it was proved")
     finally:
         os.close(fd)
-    return (_EXECUTABLE if st.st_mode & stat.S_IXUSR else _FILE), digest.hexdigest()
+    return st, digest.hexdigest()
+
+
+def _file_id(algorithm: str, dir_fd: int, name: bytes, seen: os.stat_result) -> tuple[bytes, str]:
+    """The mode and blob id of the regular file ``name``, from its bytes on disk."""
+    st, oid = _file_digest(
+        dir_fd, name, seen, lambda size: hashlib.new(algorithm, b"blob %d\0" % size)
+    )
+    return (_EXECUTABLE if st.st_mode & stat.S_IXUSR else _FILE), oid
 
 
 def _tree_id(algorithm: str, entries: list[tuple[bytes, bytes, str]]) -> str:
@@ -801,8 +841,318 @@ def _gitlink_difference(parent: int | None, entry: _Entry) -> str:
         os.close(fd)
 
 
+# -- the commit's own end-of-line checkout form (#488) ---------------------------------------
+#
+# A checkout writes each blob through the conversions its attributes name,
+# so a worktree git checked out itself holds other bytes than the blob
+# wherever an end-of-line conversion applies (``*.bat text eol=crlf``). The
+# one conversion :func:`tree_differences` takes as the commit's is
+# ``eol=crlf`` as the commit's own ``.gitattributes`` give it, applied here
+# as git's ``convert.c`` applies it on checkout.
+
+# The attributes ``convert_attrs`` reads for it, in the order asked for.
+_EOL_ATTRIBUTES = (b"text", b"crlf", b"eol")
+# ``git_path_check_crlf``: what ``text``, else the legacy ``crlf``, makes of
+# a path. ``check-attr`` prints a true attribute and the value ``set`` alike
+# (``unset`` likewise), and git takes either value as unspecified, so
+# :func:`_crlf_conversion` reads such a ``text`` both ways and keeps the
+# stricter answer; a ``crlf`` read so already gives the stricter one.
+_CRLF_STATES = {b"set": "text", b"input": "text", b"auto": "auto", b"unset": "binary"}
+_LONE_LF = re.compile(rb"(?<!\r)\n")
+# What ``gather_stats`` counts as non-printable: the control bytes but BS,
+# HT, FF and ESC (LF and CR are counted apart), and DEL.
+_NON_PRINTABLE = bytes(b for b in range(32) if b not in b"\b\t\n\f\r\x1b") + b"\x7f"
+
+
+def _crlf_conversion(text: bytes, crlf: bytes, eol: bytes) -> str:
+    """The checkout conversion to CRLF these attribute values give a path, or "".
+
+    ``"text"``: a CR before every LF that does not follow one
+    (``CRLF_TEXT_CRLF``); ``"auto"``: the same, only for a blob git takes as
+    text with LF endings alone (``CRLF_AUTO_CRLF``). Only ``eol=crlf``
+    converts, and not on a binary path (``-text``, the ``binary`` macro):
+    ``core.autocrlf`` and ``core.eol``, which make a checkout write CRLF
+    without it, are configuration, which the agent can write.
+
+    A ``text`` that reads ``set`` or ``unset`` may be that value rather than
+    the attribute set or unset, which git takes as unspecified, falling back
+    to ``crlf``: both readings are made and the stricter kept (none over
+    ``"auto"`` over ``"text"``, each converting a subset of what the next
+    converts, identically), so a file is at worst refused where git would
+    have converted it, never taken as a form git does not write.
+    """
+    if eol != b"crlf":
+        return ""
+    fallback = _CRLF_STATES.get(crlf, "")
+    readings = {_CRLF_STATES.get(text) or fallback}
+    if text in (b"set", b"unset"):
+        readings.add(fallback)
+    if "binary" in readings:
+        return ""
+    return "auto" if "auto" in readings else "text"
+
+
+class _CrlfForm:
+    """One blob streamed: its CRLF checkout form's size and digest, and git's stats.
+
+    The form is the blob with a CR put before every LF that does not
+    follow one, as both ``crlf_to_worktree`` and the streaming
+    ``lf_to_crlf_filter`` write it. The stats are ``gather_stats``'s, which
+    decide whether ``text=auto`` converts at all. The blob's own id is
+    computed from the same bytes (:meth:`whole`), so a form is only ever
+    the committed bytes' (ADR 0004 D7.5).
+    """
+
+    def __init__(self, entry: _Entry, object_format: str) -> None:
+        self.entry = entry
+        self._blob = hashlib.new(object_format, b"blob %d\0" % entry.size)
+        self._form = hashlib.sha256()
+        self.size = 0
+        self._read = 0
+        self._last = b""
+        self._cr = self._lf = self._crlf = self._nul = self._non_printable = 0
+
+    def feed(self, data: bytes) -> None:
+        if not data:
+            return
+        pair = self._last == b"\r" and data[:1] == b"\n"
+        self._blob.update(data)
+        self._read += len(data)
+        self._crlf += data.count(b"\r\n") + pair
+        self._cr += data.count(b"\r")
+        self._lf += data.count(b"\n")
+        self._nul += data.count(b"\0")
+        self._non_printable += len(data) - len(data.translate(None, _NON_PRINTABLE))
+        # An LF that ends a CRLF split across two chunks keeps its CR alone.
+        form = b"\n" + _LONE_LF.sub(b"\r\n", data[1:]) if pair else _LONE_LF.sub(b"\r\n", data)
+        self._form.update(form)
+        self.size += len(form)
+        self._last = data[-1:]
+
+    def whole(self) -> bool:
+        """Whether the bytes fed are the blob the listing names, all of them."""
+        return self._read == self.entry.size and self._blob.hexdigest() == self.entry.oid
+
+    @property
+    def digest(self) -> str:
+        return self._form.hexdigest()
+
+    def converts(self, conversion: str) -> bool:
+        """Whether a checkout under ``conversion`` writes this form rather than the blob.
+
+        ``will_convert_lf_to_crlf``: never without an LF to convert; under
+        ``"auto"``, not when the blob holds a CR or a CRLF already, or reads
+        as binary (``convert_is_binary``: a lone CR, a NUL, or more than one
+        non-printable byte in 128 printable ones, a final ``^Z`` not counted).
+        """
+        lone_lf = self._lf - self._crlf
+        if not conversion or not lone_lf:
+            return False
+        if conversion == "text":
+            return True
+        lone_cr = self._cr - self._crlf
+        printable = self._read - self._cr - self._lf - self._non_printable
+        non_printable = self._non_printable - (self._last == b"\x1a")
+        binary = lone_cr or self._nul or (printable >> 7) < non_printable
+        return not lone_cr and not self._crlf and not binary
+
+
+class _CrlfForms:
+    """A :class:`_BlobStream` sink: each listed blob's :class:`_CrlfForm`, by path."""
+
+    def __init__(self, entries: Sequence[_Entry], object_format: str, commit: str) -> None:
+        self._entries = list(entries)
+        self._object_format = object_format
+        self._commit = commit
+        self._next = 0
+        self._current: _CrlfForm | None = None
+        self.forms: dict[bytes, _CrlfForm] = {}
+
+    def next_blob(self) -> _Entry | None:
+        if self._next == len(self._entries):
+            return None
+        self._next += 1
+        return self._entries[self._next - 1]
+
+    def open_blob(self, entry: _Entry) -> None:
+        self._current = _CrlfForm(entry, self._object_format)
+
+    def write(self, data: memoryview) -> None:
+        assert self._current is not None
+        self._current.feed(bytes(data))
+
+    def close_blob(self) -> None:
+        form, self._current = self._current, None
+        assert form is not None
+        if not form.whole():
+            raise MaterializationError(
+                f"commit {self._commit}: git sent bytes for the blob of "
+                f"{_shown(form.entry.path)} that are not its {form.entry.oid}"
+            )
+        self.forms[form.entry.path] = form
+
+
+def _attribute_dir_config(object_format: str) -> str:
+    """The whole configuration of the git directory the attributes are read in."""
+    lines = [
+        "[core]",
+        f"\trepositoryformatversion = {1 if object_format == 'sha256' else 0}",
+        "\tbare = true",
+    ]
+    if object_format == "sha256":
+        lines += ["[extensions]", "\tobjectFormat = sha256"]
+    return "\n".join(lines) + "\n"
+
+
+def _eol_conversions(
+    runner: Runner, repo: str, commit: str, object_format: str, paths: Sequence[bytes]
+) -> dict[bytes, str]:
+    """The checkout conversion to CRLF ``commit``'s own attributes give each of ``paths``.
+
+    Read by git's own attribute machinery, from ``commit``'s tree and nothing
+    else: ``read-tree`` writes a fresh index of ``commit`` and ``check-attr
+    --cached`` reads the ``.gitattributes`` files that index holds, macros
+    included, in a git directory written into a temporary directory of the
+    controller's own, with ``repo``'s store as its object directory. So no
+    attribute a checkout also reads, and the agent can write, is read: no
+    ``.gitattributes`` of a working tree, no ``info/attributes`` (the
+    directory has none), no global attributes file (``core.attributesFile``
+    is ``/dev/null``), no system one (``GIT_ATTR_NOSYSTEM``), and no
+    configuration but the directory's own (``GIT_CONFIG_NOSYSTEM``,
+    ``GIT_CONFIG_GLOBAL``). The directory is removed afterwards, whatever
+    happened.
+    """
+    objects = _git(runner, repo, ["rev-parse", "--path-format=absolute", "--git-path", "objects"])
+    failed = f"commit {commit}: reading its end-of-line attributes failed"
+    try:
+        scratch = Path(tempfile.mkdtemp(prefix="autoforge-attributes-"))
+    except OSError as exc:
+        raise MaterializationError(f"{failed}: {exc.strerror or exc}") from exc
+    try:
+        git_dir = scratch / "git"
+        try:
+            for directory in (git_dir, git_dir / "refs", git_dir / "objects"):
+                directory.mkdir()
+            (git_dir / "HEAD").write_text("ref: refs/heads/autoforge-unborn\n", encoding="ascii")
+            (git_dir / "config").write_text(_attribute_dir_config(object_format), encoding="ascii")
+        except OSError as exc:
+            raise MaterializationError(f"{failed}: {exc.strerror or exc}") from exc
+        env = {
+            "GIT_DIR": str(git_dir),
+            "GIT_INDEX_FILE": str(scratch / "index"),
+            "GIT_OBJECT_DIRECTORY": objects.strip(),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_ATTR_NOSYSTEM": "1",
+        }
+        collector = _Collector()
+        names = [name.decode("ascii") for name in _EOL_ATTRIBUTES]
+        for args in (["read-tree", commit], ["check-attr", "--cached", "--stdin", "-z", *names]):
+            req = local_git_request(
+                ["-c", f"core.attributesFile={os.devnull}", *args],
+                cwd=str(scratch),
+                env=env,
+                timeout_seconds=_GIT_TIMEOUT_SECONDS,
+            )
+            if args[0] == "check-attr":
+                req.stdin_data = b"".join(path + b"\0" for path in paths)
+                req.on_chunk = collector
+                req.max_output_bytes = _STREAM_CAPTURE_BYTES
+            problem = _failure(runner(req), args)
+            if problem:
+                raise MaterializationError(f"{failed}: {problem}")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    fields = bytes(collector.data).split(b"\0")
+    if fields[-1] or (len(fields) - 1) % 3:
+        raise MaterializationError(f"{failed}: `git check-attr` ended mid-record")
+    found: dict[bytes, dict[bytes, bytes]] = {}
+    for start in range(0, len(fields) - 1, 3):
+        path, name, value = fields[start : start + 3]
+        found.setdefault(path, {})[name] = value
+    conversions: dict[bytes, str] = {}
+    for path in paths:
+        values = found.get(path, {})
+        if any(name not in values for name in _EOL_ATTRIBUTES):
+            raise MaterializationError(f"{failed}: `git check-attr` did not answer {_shown(path)}")
+        conversions[path] = _crlf_conversion(*(values[name] for name in _EOL_ATTRIBUTES))
+    return conversions
+
+
+def _holds_form(root_fd: int, entry: _Entry, form: _CrlfForm) -> bool:
+    """Whether the directory ``root_fd`` holds ``entry`` as its mode's file of exactly ``form``.
+
+    Every directory on the path is opened without following a link, and
+    the file is read as :func:`tree_differences` reads one.
+    """
+    opened: list[int] = []
+    try:
+        parent = root_fd
+        for name in entry.parent.split(b"/") if entry.parent else []:
+            fd = _open_listed_dir(parent, name)
+            if fd is None:
+                return False
+            opened.append(fd)
+            parent = fd
+        try:
+            st = os.lstat(entry.name, dir_fd=parent)
+        except FileNotFoundError:
+            return False
+        mode = _EXECUTABLE if st.st_mode & stat.S_IXUSR else _FILE
+        if not stat.S_ISREG(st.st_mode) or mode != entry.mode or st.st_size != form.size:
+            return False
+        _, digest = _file_digest(parent, entry.name, st, lambda _size: hashlib.sha256())
+        return digest == form.digest
+    finally:
+        for fd in opened:
+            os.close(fd)
+
+
+def _crlf_checkouts(
+    runner: Runner,
+    repo: str,
+    commit: str,
+    object_format: str,
+    root: Path,
+    candidates: Sequence[_Entry],
+) -> set[bytes]:
+    """The paths of ``candidates`` that ``root`` holds in ``commit``'s own CRLF checkout form."""
+    conversions = _eol_conversions(
+        runner, repo, commit, object_format, [entry.path for entry in candidates]
+    )
+    converting = [entry for entry in candidates if conversions[entry.path]]
+    if not converting:
+        return set()
+    sink = _CrlfForms(converting, object_format, commit)
+    _stream_blobs(runner, repo, commit, sink, [entry.oid for entry in converting])
+    held: set[bytes] = set()
+    path = b""
+    try:
+        root_fd = os.open(root, _DIR_FLAGS)
+        try:
+            for entry in converting:
+                path = entry.path
+                form = sink.forms[path]
+                if form.converts(conversions[path]) and _holds_form(root_fd, entry, form):
+                    held.add(path)
+        finally:
+            os.close(root_fd)
+    except OSError as exc:
+        raise MaterializationError(
+            f"commit {commit}: {_shown(path)} of {root} could not be compared with its "
+            f"end-of-line checkout form: {exc.strerror or exc}"
+        ) from exc
+    return held
+
+
 def tree_differences(
-    runner: Runner, repo: str, commit: str, object_format: str, root: Path
+    runner: Runner,
+    repo: str,
+    commit: str,
+    object_format: str,
+    root: Path,
+    *,
+    checkout_eol: bool = False,
 ) -> list[TreeDifference]:
     """The entries of ``commit``'s tree that ``root`` does not hold as committed (PR #444 R3-F1).
 
@@ -829,15 +1179,35 @@ def tree_differences(
     submodule settings) is not the commit's either. ``object_format`` names
     the store's format (:func:`read_object_format`). In listing order.
 
+    ``checkout_eol`` (#488): a regular file of its mode whose bytes are not
+    the blob's is compared once more, with the bytes a checkout writes for
+    it under the end-of-line conversion ``commit``'s own ``.gitattributes``
+    give it, and is not listed when it holds exactly those. That is
+    ``eol=crlf`` alone (``text=auto eol=crlf`` only where git takes the
+    blob as text): a CR put before every LF that does not follow one,
+    computed here from the blob's bytes, hashed back to its id as they
+    stream, with the attributes read from ``commit``'s tree by git in a git
+    directory of the controller's own (:func:`_eol_conversions`), never
+    from ``root``, ``info/attributes`` or any configuration. Both forms a
+    file may then hold are functions of the commit alone, what a checkout
+    of it writes with no configuration, so an edit a clean filter maps back
+    to the blob holds neither (R3-F1), and any other conversion (a filter
+    driver, Git LFS, ``ident``, ``working-tree-encoding``, ``core.autocrlf``)
+    is still a difference. No git process reads ``root`` here either, and
+    none runs at all unless a file's bytes differ.
+
     Raises :class:`~autoforge.errors.CandidateNotMaterializableError` when
     ``commit`` is not a commit of the store, and
     :class:`~autoforge.errors.MaterializationError` when the tree cannot be
     listed or a file cannot be read (a directory without permission, a file
-    replaced during the read): never taken as no difference.
+    replaced during the read), or, with ``checkout_eol``, when the
+    attributes or a blob cannot be read: never taken as no difference.
     """
     tree = _commit_tree(runner, repo, commit, object_format)
     listing = _list_tree(runner, repo, commit, tree, object_format, sizes=True)
     found: list[TreeDifference] = []
+    # The regular files listed as modified: another execute bit, size or bytes.
+    rewritten: list[_Entry] = []
     stack: list[tuple[bytes, int | None]] = []
     path = b""
     try:
@@ -864,6 +1234,8 @@ def tree_differences(
                 kind = _blob_difference(object_format, parent, entry)
                 if kind:
                     found.append(TreeDifference(entry.path, kind))
+                    if kind == "modified" and entry.mode != _SYMLINK:
+                        rewritten.append(entry)
     except OSError as exc:
         raise MaterializationError(
             f"commit {commit}: {_shown(path)} of {root} could not be compared with its tree "
@@ -873,7 +1245,10 @@ def tree_differences(
         for _, fd in stack:
             if fd is not None:
                 os.close(fd)
-    return found
+    if not checkout_eol or not rewritten:
+        return found
+    held = _crlf_checkouts(runner, repo, commit, object_format, root, rewritten)
+    return [difference for difference in found if difference.path not in held]
 
 
 @contextmanager

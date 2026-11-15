@@ -743,10 +743,20 @@ assume-unchanged or skip-worktree (`git -C <worktree> ls-files -v` shows
 the mark as a lower-case letter or an `S`), or when a conversion the
 file's attributes name, a clean filter say, maps it back to the committed
 content (`git -C <worktree> check-attr -a -- <file>` names it). The
-message says how many such files there are. A repository whose checkout
-itself writes other bytes than the committed ones (Git LFS, `eol=crlf`,
-`ident`, `working-tree-encoding`) is refused for the same reason. So is a
-submodule's path that holds anything but the empty directory a checkout
+message says how many such files there are and names up to three. The
+one conversion AutoForge takes as the reviewed commit's is an `eol=crlf`
+that the commit's own `.gitattributes` give a file (`*.bat text
+eol=crlf`, say): a file git checked out in that CRLF form is not a
+change. A repository whose checkout writes other bytes than the committed
+ones any other way (Git LFS, a filter driver, `ident`,
+`working-tree-encoding`, or an `eol` that comes from `info/attributes`,
+the worktree or `core.autocrlf` rather than from the commit) is refused
+for the same reason. If such a file holds no edit, write its committed
+bytes back with `git -C <worktree> cat-file blob <commit>:<file> >
+<worktree>/<file>`, then run `git -C <worktree> add -- <file>` so the
+worktree's index records the file again; the message gives both commands
+with the commit filled in. The flag is refused, too, while a
+submodule's path holds anything but the empty directory a checkout
 leaves an unpopulated submodule: a populated submodule is a repository of
 its own whose content AutoForge cannot prove the reviewed commit's, and
 `git status` lists a change there only as far as the submodule's `ignore`
@@ -798,7 +808,11 @@ agent worktree, where the fixer may have left half-made edits for the
 findings it left, so the unblock is refused while that worktree holds
 anything the pushed commit does not: an untracked file, a modified or
 staged file, an edit an assume-unchanged or skip-worktree mark hides, or a
-later commit. The message names what it found. AutoForge never discards it:
+later commit. A file that git checked out in the CRLF form that the pushed
+commit's own `.gitattributes` give it (`eol=crlf`) is not a change; a file
+another conversion rewrote is one, as for `--rereview` above, and the
+message says how to write its committed bytes back. The message names what
+it found. AutoForge never discards it:
 move it out of the worktree yourself (commit it elsewhere, or copy it and
 remove it), then unblock again. The same check applies to every `unblock`
 that enters `REVIEW` while a review's findings are open or carried, whatever

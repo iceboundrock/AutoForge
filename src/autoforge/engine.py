@@ -10614,7 +10614,11 @@ class ControllerEngine:
         name, and a clean filter can map an edit back to the reviewed blob
         (R3-F1), so every blob of the reviewed tree is also compared with
         the worktree's bytes, with no git process reading the worktree
-        (:func:`byte_changes_from_revision`). A submodule's ignore
+        (:func:`byte_changes_from_revision`): only the ``eol=crlf`` the
+        reviewed commit's own ``.gitattributes`` give a file is taken as its
+        content, so the worktree git checked out itself passes (#488), and
+        a file that differs otherwise is named, with how to write its
+        committed bytes back. A submodule's ignore
         setting hides what its checkout holds from a status, and files put
         at a submodule's path without a repository are listed by none
         (R4-F1): both statuses compare a submodule by its gitlink alone,
@@ -10765,6 +10769,11 @@ class ControllerEngine:
         if not entries and not marked and not converted and not populated:
             return ""
         listing, prompt = f"`git -C {path} status` lists them", "its prompt lists them"
+
+        def named(found: Sequence[StatusEntry]) -> str:
+            shown = ", ".join(entry.path for entry in found[:3])
+            return shown + (", ..." if len(found) > 3 else "")
+
         notes: list[str] = []
         if marked or converted:
             causes = []
@@ -10776,23 +10785,30 @@ class ControllerEngine:
                     "or an S"
                 )
             if converted:
+                # #488: the commit's own `eol=crlf` is no difference, so what
+                # is left is a conversion the commit does not name, or an
+                # edit one hides; the operator is told which files, and how
+                # to put the committed bytes back where a file holds no edit.
                 causes.append(
                     f"{len(converted)} whose bytes or execute bit differ from {commit}'s "
-                    "although git reads them as its content, as a filter driver (a "
-                    "clean filter, Git LFS), an end-of-line, ident or working-tree-encoding "
-                    "conversion or core.fileMode=false does; "
-                    f"`git -C {path} check-attr -a -- <file>` names a file's conversions"
+                    f"although git reads them as its content ({named(converted)}), as a filter "
+                    "driver (a clean filter, Git LFS), an ident or working-tree-encoding "
+                    "conversion, an end-of-line conversion other than an `eol=crlf` that "
+                    f"{commit}'s own `.gitattributes` give a file, or core.fileMode=false does; "
+                    f"`git -C {path} check-attr -a -- <file>` names a file's conversions, and "
+                    f"for a file that holds no edit, `git -C {path} cat-file blob "
+                    f"{revision[:12]}:<file> > {path}/<file>` writes the committed bytes back, "
+                    f"after which `git -C {path} add -- <file>` refreshes its entry in the "
+                    "worktree's index"
                 )
             notes.append(
                 f"`git -C {path} status` does not list {len(marked) + len(converted)} of "
                 f"them: {'; '.join(causes)}"
             )
         if populated:
-            shown = ", ".join(entry.path for entry in populated[:3])
-            shown += ", ..." if len(populated) > 3 else ""
             notes.append(
-                f"{len(populated)} at the path of a submodule ({shown}) that is not the empty "
-                f"directory {commit}'s checkout leaves there: a populated submodule "
+                f"{len(populated)} at the path of a submodule ({named(populated)}) that is not "
+                f"the empty directory {commit}'s checkout leaves there: a populated submodule "
                 "is a repository of its own, whose content the controller cannot prove "
                 f"{commit}'s and `git status` lists only as far as the submodule's "
                 "ignore setting (in `.gitmodules` or the configuration) lets it, and files put "

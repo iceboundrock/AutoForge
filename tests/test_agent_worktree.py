@@ -644,6 +644,52 @@ def test_a_conversion_hides_an_edit_from_both_statuses_never_from_the_bytes(repo
     assert _bytes_against(repo) == [StatusEntry(" M", "a.txt")]
 
 
+def _with_committed_eol(repo) -> Path:
+    """A commit whose own `.gitattributes` say `*.bat text eol=crlf`, as flinkt's do,
+    checked out by git into a new worktree registered beside the issue's (#488)."""
+    root = repo["root"]
+    (root / ".gitattributes").write_text("*.bat text eol=crlf\n")
+    (root / "gradlew.bat").write_bytes(b"@echo off\necho hi\n")
+    _git("-C", str(root), "add", ".gitattributes", "gradlew.bat")
+    _git("-C", str(root), *GIT_IDENT, "commit", "-q", "-m", "a batch file")
+    worktree = repo["common"] / "autoforge" / "worktrees" / "3"
+    _git("-C", str(root), "worktree", "add", "-q", "--detach", str(worktree), "HEAD")
+    return worktree
+
+
+def test_a_worktree_git_checked_out_under_the_commits_own_eol_crlf_holds_no_change(repo):
+    """#488: git writes the committed LF blob as CRLF, so its bytes are not
+    the blob's, and both statuses read it as unchanged. The byte comparison
+    takes the CRLF form the reviewed commit's own attributes name as its
+    content, so the worktree AutoForge created and nobody touched passes
+    all three reads. An edit made in that form is still listed."""
+    worktree = _with_committed_eol(repo)
+    assert (worktree / "gradlew.bat").read_bytes() == b"@echo off\r\necho hi\r\n"
+    repo = {**repo, "worktree": worktree, "admin": repo["common"] / "worktrees" / "3"}
+    assert _uncommitted(repo) == [] and _against(repo) == []
+    assert _bytes_against(repo) == []
+    (worktree / "gradlew.bat").write_bytes(b"@echo off\r\necho EDITED\r\n")
+    assert _bytes_against(repo) == [StatusEntry(" M", "gradlew.bat")]
+
+
+def test_a_clean_filter_hides_no_edit_behind_the_commits_own_eol_crlf(repo):
+    """PR #444 R3-F1 still holds where the commit names `eol=crlf`: an edit a
+    clean filter maps back to the reviewed blob, written in CRLF form, holds
+    neither the blob's bytes nor their checkout form, and is listed."""
+    worktree = _with_committed_eol(repo)
+    repo = {**repo, "worktree": worktree, "admin": repo["common"] / "worktrees" / "3"}
+    committed = repo["base"] / "committed.bat"
+    committed.write_bytes(b"@echo off\necho hi\n")
+    clean = f"cat >/dev/null; cat {shlex.quote(str(committed))}"
+    _git("-C", str(repo["root"]), "config", "filter.revert.clean", clean)
+    (repo["common"] / "info").mkdir(exist_ok=True)
+    (repo["common"] / "info" / "attributes").write_text("gradlew.bat filter=revert\n")
+    (worktree / "gradlew.bat").write_bytes(b"@echo off\r\nrm -rf build\r\n")
+    _git("-C", str(worktree), "update-index", "--assume-unchanged", "gradlew.bat")
+    assert _uncommitted(repo) == [] and _against(repo) == []
+    assert _bytes_against(repo) == [StatusEntry(" M", "gradlew.bat")]
+
+
 def test_the_byte_comparison_runs_no_git_in_the_worktree_and_reads_only_tracked_files(repo):
     """The tree is listed from the shared store, with git run in the common
     dir: no git process names the worktree, so no attribute, filter or

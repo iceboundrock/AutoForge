@@ -5,6 +5,26 @@ so.
 
 ## Unreleased
 
+### A worktree git checked out under the commit's own `eol=crlf` no longer stops `unblock` (#488)
+
+An `unblock` into `REVIEW`, and `unblock --rereview`, compare every tracked
+file of the agent worktree byte for byte with the commit under review.
+When a commit's `.gitattributes` say `eol=crlf` (`*.bat text eol=crlf`,
+say), git's checkout writes that file with CRLF line endings while the
+blob holds LF. So the worktree AutoForge created itself failed the
+comparison on every run of such a repository, and the refusal sent you
+looking for uncommitted changes that did not exist. Now a file may also
+hold exactly the bytes a checkout writes under the `eol=crlf` that the
+commit's own `.gitattributes` give it. AutoForge computes those bytes
+itself from the committed blob, and reads the attributes from the
+commit's tree alone. An `eol` that comes from `info/attributes`, the
+worktree, `core.autocrlf` or a global attributes file, all of which the
+agent can write, is still refused, as are Git LFS, a filter driver,
+`ident` and `working-tree-encoding`. An edit that a clean filter hides is
+still found. When files are refused this way, the message now names up to
+three of them and gives the commands that write a file's committed bytes
+back (`git cat-file blob`, then `git add`) for a file that holds no edit.
+
 ### The `claude-sdk` provider launches (#151)
 
 A profile with `provider: claude-sdk` now runs. Until this release every
