@@ -1112,6 +1112,16 @@ a continuation (D8.4). The deferred tool did not run.
 - The ask itself is denied, or rejected. That keeps the action from
   running only under D10.4's conditions.
 
+*Amendment (2026-11-15, #151):* a failed ask ends the run, and the adapter
+then winds the helper down within the limit it had (D3.3). If a limit
+kills the helper during that wind-down (an interrupt or a disconnect that
+hangs), the launch is a timeout to every reader, as ADR 0003 §2.6 has it,
+and the engine raises `ExecutionTimeoutError`, not
+`InteractionRequiredError`. The failure is not lost. The adapter keeps it as
+`failed_before_limit` (`claude-sdk: an ask for a decision had failed the
+run`), and the recovery rule refuses it as `failed-before-limit` (ADR 0012
+D11), so the step is still never relaunched.
+
 **D7.7 (#134).** **Ctrl-C and a denial with guidance are neither of them a
 deferral.**
 

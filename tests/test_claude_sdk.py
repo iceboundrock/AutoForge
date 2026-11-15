@@ -247,6 +247,14 @@ def test_the_envelope_fails_closed(records, named):
         (_result(terminal_reason="something_new"), "did not complete its turn"),
         (_result(stop_reason="max_tokens"), "did not complete its turn"),
         (_result(stop_reason=None), "did not complete its turn"),
+        # R2-F3 of PR #489: a terminal field of the wrong type, an unhashable
+        # one included, fails the run, never a TypeError out of the reducer.
+        (_result(subtype=[]), "a subtype that is not a string"),
+        (_result(subtype={}), "a subtype that is not a string"),
+        (_result(subtype=7), "a subtype that is not a string"),
+        (_result(stop_reason=[]), "did not complete its turn"),
+        (_result(stop_reason={"kind": "end_turn"}), "did not complete its turn"),
+        (_result(stop_reason=7), "did not complete its turn"),
         (_result(deferred_tool_use={"id": "t", "name": "Bash"}), "deferred a tool call"),
         (_result(origin="task-notification"), "injected"),
         (_result(is_error=True, terminal_reason="api_error"), "ended in an error"),
@@ -576,6 +584,13 @@ def test_a_modified_input_the_tool_takes_passes(tool, updated, original):
         ("Bash", {"command": "ls", "timeout": True}, "timeout must be a number"),
         ("Bash", {"command": "ls", "timeout": 0}, "timeout must be a number"),
         ("Bash", {"command": "ls", "timeout": 600_001}, "timeout must be a number"),
+        # R2-F2 of PR #489: an int past the float range is compared as it is,
+        # never converted, and a float that is no number is refused.
+        ("Bash", {"command": "ls", "timeout": 10**400}, "timeout must be a number"),
+        ("Bash", {"command": "ls", "timeout": -(10**400)}, "timeout must be a number"),
+        ("Bash", {"command": "ls", "timeout": float("inf")}, "timeout must be a number"),
+        ("Bash", {"command": "ls", "timeout": float("nan")}, "timeout must be a number"),
+        ("Read", {"file_path": "/w/a", "offset": 10**400}, "offset must be a whole number"),
         ("Bash", {"command": "ls", "run_in_background": "yes"}, "run_in_background must be"),
         ("Bash", {"command": "ls", "description": 7}, "description must be a string"),
         ("Read", {"file_path": "/w/a", "offset": -1}, "offset must be a whole number"),
@@ -777,6 +792,29 @@ def test_an_sdk_failure_is_a_bounded_redacted_provider_failure(
     assert result.stdout == "" and not result.timed_out and took < 30
     # An SDK exception's text (here, a key) is never quoted.
     assert "sk-ant-api03-" not in (result.provider_failure or "") + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("over", "named"),
+    [
+        ({"subtype": []}, "a subtype that is not a string"),
+        ({"subtype": {"kind": "success"}}, "a subtype that is not a string"),
+        ({"stop_reason": []}, "did not complete its turn"),
+        ({"stop_reason": {"kind": "end_turn"}}, "did not complete its turn"),
+    ],
+)
+def test_a_terminal_field_of_the_wrong_type_is_a_provider_failure(
+    tmp_path, sdk_python, launch_env, over, named
+):
+    # R2-F3 of PR #489: an array or an object where the result's subtype or
+    # stop_reason belongs, through the real helper, is the controlled protocol
+    # failure: no text, no delivered reply, and a teardown that completed.
+    result, _, took = _run(tmp_path, sdk_python, fake.script(result={"result": FINAL, **over}))
+    assert named in (result.provider_failure or ""), result.provider_failure
+    assert result.provider_failure.startswith("claude-sdk: ")
+    assert result.stdout == "" and not result.reply_delivered
+    assert not result.timed_out and result.exit_code == 0 and took < 30
+    assert not result.may_have_survivor and not result.orphans_unchecked
 
 
 _SAID = {"message": {"kind": "assistant", "content": [{"type": "text", "text": FINAL}]}}
@@ -1103,6 +1141,20 @@ def test_a_bare_allow_of_a_question_falls_to_the_host_which_denies(
             [Allow(updated_input={"command": "ls", "timeout": "soon"})],
             "timeout must be a number",
         ),
+        # R2-F2 of PR #489: a timeout past the float range, either sign, is
+        # refused as out of range, never an OverflowError out of execute.
+        (
+            PROMPT,
+            [_bash()],
+            [Allow(updated_input={"command": "ls", "timeout": 10**400})],
+            "timeout must be a number of milliseconds from 1 to 600000",
+        ),
+        (
+            PROMPT,
+            [_bash()],
+            [Allow(updated_input={"command": "ls", "timeout": -(10**400)})],
+            "timeout must be a number of milliseconds from 1 to 600000",
+        ),
         (
             PROMPT,
             [_bash()],
@@ -1188,6 +1240,45 @@ def test_a_stalled_decision_is_bounded_by_the_invocations_limit(tmp_path, sdk_py
     assert result.timed_out or (
         result.interaction is not None and result.interaction.lifecycle is Lifecycle.FAILED
     )
+
+
+@pytest.mark.parametrize(
+    ("resolver", "named"),
+    [
+        # No one to ask: the broker's own Fail.
+        (Unattended(), "stdin is not a terminal"),
+        # A decision the adapter could not deliver: the adapter's own failure.
+        (Scripted(Allow(updated_input={"cmd": "ls"})), "lacks command"),
+    ],
+)
+def test_an_ask_that_failed_the_run_survives_a_limit_in_the_wind_down(
+    tmp_path, sdk_python, launch_env, resolver, named
+):
+    # R2-F1 of PR #489: the ask failed the run, and the helper then hung in
+    # its interrupt and its disconnect until the idle limit killed it. The
+    # kill is the teardown's; the ask's failure, kept as a fixed fact, is
+    # what ended the run, so the recovery rule never reads an idle timeout.
+    from autoforge.providers import CLAUDE_SDK_ASK_FAILED_BEFORE_LIMIT
+
+    prompt = fake.script(
+        steps=[_bash(), {"sleep": 120}],
+        result={"result": FINAL},
+        stall=["interrupt", "disconnect"],
+    )
+    options = {**PROMPT, "max_wait_seconds": "1"}
+    adapter = ClaudeSdkProvider(interrupt_seconds=1)
+    result, req, took = _run(
+        tmp_path, sdk_python, prompt, options, resolver, idle=3, adapter=adapter
+    )
+    assert result.timed_out and result.timeout_limit == "idle", (result.timed_out, took)
+    assert result.interaction is not None and result.interaction.lifecycle is Lifecycle.FAILED
+    assert result.failed_before_limit == CLAUDE_SDK_ASK_FAILED_BEFORE_LIMIT
+    assert result.provider_failure is None  # a timeout wins (ADR 0003 §2.6)
+    assert named in str(result.provider_summary["failure"]), result.provider_summary["failure"]
+    assert result.stdout == "" and not result.reply_delivered
+    assert not result.may_have_survivor and took < 30
+    hooks = [e for e in fake.log(Path(req.cwd)) if e.get("hook")]
+    assert hooks[-1]["output"]["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 def test_ctrl_c_during_a_wait_tears_the_helper_down(tmp_path, sdk_python, launch_env):
@@ -1572,3 +1663,76 @@ def test_a_launch_is_handed_its_providers_state_directory(tmp_state_dir):
         assert Path(call.state_dir).parent == common / "autoforge" / "sandbox"
         assert (Path(call.state_dir) / "sdk" / "probe" / "state").is_dir()
     assert eng._provider_state(ScriptedProvider(), provider.calls[0].profile) == ()
+
+
+def test_an_ask_that_failed_the_run_is_never_relaunched_after_a_limit_in_the_wind_down(
+    tmp_state_dir, fake_github, sdk_python, launch_env
+):
+    """R2-F1 of PR #489, adapter to engine: a reviewer's permission request
+    the engine's own broker cannot put to anyone (no terminal) fails the run,
+    and the helper then hangs in its interrupt and its disconnect until the
+    idle limit kills it. The kill is the teardown's: the ask's failure
+    survives it as a fixed fact, and the recovery rule refuses the relaunch
+    an idle timeout would have had (ADR 0007 D7.6: a relaunch would ask
+    again)."""
+    from dataclasses import replace
+
+    from autoforge.auto_recovery import RecoveryCategory, RecoveryJournal
+    from autoforge.errors import ExecutionTimeoutError
+    from autoforge.profiles import profile_for_phase
+    from autoforge.providers import CLAUDE_SDK_ASK_FAILED_BEFORE_LIMIT
+    from autoforge.state import load_state
+    from autoforge.transitions import Phase
+
+    from .test_engine import _in_review
+
+    script = fake.script(
+        steps=[_bash(), {"sleep": 120}],
+        result={"result": FINAL},
+        stall=["interrupt", "disconnect"],
+    )
+
+    class Launches(ClaudeSdkProvider):
+        """The real adapter, its prompt the fake SDK's script on every launch."""
+
+        def __init__(self) -> None:
+            super().__init__(interrupt_seconds=1)
+            self.brokers: list[InteractionBroker | None] = []
+
+        def execute(self, req: AgentRequest):
+            self.brokers.append(req.interaction)
+            req.prompt = script
+            return super().execute(req)
+
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    profile = profile_for_phase(eng.config, Phase.REVIEW, eng.state.review_round)
+    eng.config.profiles[profile.name] = replace(
+        profile,
+        provider=CLAUDE_SDK,
+        model="claude-fable-5-2",
+        effort="high",
+        command=sdk_python,
+        options={**PROMPT, "max_wait_seconds": "1"},
+        extra_args=[],
+        idle_timeout_seconds=3,
+    )
+    provider = Launches()
+    eng.providers._overrides[CLAUDE_SDK] = provider
+    with pytest.raises(ExecutionTimeoutError) as caught:
+        eng.run(max_steps=5)
+    message = str(caught.value)
+    assert (
+        "Its provider had already failed the run when the limit killed it "
+        f"({CLAUDE_SDK_ASK_FAILED_BEFORE_LIMIT})"
+    ) in message
+    assert "relaunch refused (not-allowlisted): failed-before-limit" in message
+    # One launch, under the engine's broker, whose own account is the failure.
+    (broker,) = provider.brokers
+    assert broker is not None and broker.outcome().lifecycle is Lifecycle.FAILED
+    state = load_state(eng.paths.state_file)
+    journal = RecoveryJournal.from_dict(state.auto_recovery, state.run_id)
+    (entry,) = journal.decisions
+    assert entry.category is RecoveryCategory.FAILED_BEFORE_LIMIT and not entry.allowed
+    assert "limit idle" in entry.evidence
+    assert f"failed before the limit '{CLAUDE_SDK_ASK_FAILED_BEFORE_LIMIT}'" in entry.evidence
+    assert journal.relaunches == 0 and state.phase == Phase.REVIEW

@@ -35,7 +35,11 @@ prompt, a JSON object (:func:`script`):
     strings ``disconnect`` writes, as they are, on the helper's wire, which
     it finds by its class name: after the helper's ``end``, once the
     controller has closed its stdin (a record needs its own LF; a string
-    without one is an unterminated tail).
+    without one is an unterminated tail);
+``stall``
+    names among ``interrupt`` and ``disconnect`` whose call hangs for five
+    minutes instead of returning, as an SDK whose CLI no longer answers does
+    (the helper bounds each; the controller's limit kills it first).
 
 An interrupt ends a running step and yields an interrupted result
 (``error_during_execution``, ``aborted_tools``). Each call of a hook or the
@@ -66,6 +70,7 @@ from typing import Any
 __version__ = "0.2.163"
 
 _LOG = ".fake-sdk.jsonl"
+_STALL = 300
 _ENV = ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDE_ENV_FILE",
         "CLAUDE_CODE_SHELL", "CLAUDE_CODE_SHELL_PREFIX",
         "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "ANTHROPIC_API_KEY", "HOME", "GH_TOKEN",
@@ -225,9 +230,13 @@ class ClaudeSDKClient:
             raise RuntimeError("the fake SDK failed to start: sk-ant-api03-" + "z" * 40)
 
     async def interrupt(self):
+        if "interrupt" in self._script.get("stall", ()):
+            await asyncio.sleep(_STALL)
         self._interrupted.set()
 
     async def disconnect(self):
+        if "disconnect" in self._script.get("stall", ()):
+            await asyncio.sleep(_STALL)
         late = self._script.get("after_end")
         if late:
             import gc

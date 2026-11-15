@@ -40,8 +40,9 @@ a changed input (checked against the tool's input schema first), or a
 denial with guidance. Each was verified on the pinned pair against a
 loopback stand-in of the Messages API (ADR 0007 §3's amendment). No model
 was called. Approve-for-session and pausing for a decision (#126) are not
-available. Under `fail`, the default, an ask fails the launch, which is
-never relaunched.
+available. Under `fail`, the default, an ask fails the launch. A launch
+an ask failed is never relaunched, even when a limit kills the helper
+while it shuts down afterwards.
 
 The `opencode-sdk` provider still cannot launch (#152).
 

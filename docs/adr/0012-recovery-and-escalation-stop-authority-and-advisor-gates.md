@@ -624,7 +624,12 @@ rule reads it before the timeout, after a usage limit only. Its category,
 authentication or permission refusal nor protocol drift becomes an idle
 timeout to relaunch
 (`test_a_claude_failure_then_an_idle_kill_is_never_relaunched`,
-`test_a_failure_reported_before_any_kill_vetoes_the_relaunch`).
+`test_a_failure_reported_before_any_kill_vetoes_the_relaunch`). `claude-sdk`
+(#151) keeps `claude-sdk: an ask for a decision had failed the run` when an
+ask had failed the run (ADR 0007 D7.6) and a limit then killed the helper
+while it wound down, so a request for a decision that a relaunch would make
+again never becomes an idle timeout either (R2-F1 of PR #489,
+`test_an_ask_that_failed_the_run_is_never_relaunched_after_a_limit_in_the_wind_down`).
 
 Claude Code types a model API error twice: in its own `assistant` message
 (`is_api_error_message: true`, the status as `api_error_status`) and in the

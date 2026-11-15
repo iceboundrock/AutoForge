@@ -3580,6 +3580,11 @@ CLAUDE_SDK_MAX_PENDING_BYTES = 2 * CLAUDE_SDK_MAX_RECORD_BYTES
 # helper's own drain bound plus a margin. The kill comes this long after a
 # limit falls due (``wind_down_seconds``).
 CLAUDE_SDK_INTERRUPT_SECONDS = 15.0
+# #434 (R2-F1 of PR #489): an ask had failed the run (ADR 0007 D7.6) when a
+# limit killed the helper winding down. The fixed fact kept through the kill
+# (``failed_before_limit``): the recovery rule reads it before the timeout
+# and never relaunches the step, since a relaunch would ask again.
+CLAUDE_SDK_ASK_FAILED_BEFORE_LIMIT = "claude-sdk: an ask for a decision had failed the run"
 # What ``claude-sdk`` can carry of a decision on its pinned pair (ADR 0007
 # D5.3, §3's amendment of #151): a live question (one to four, several
 # labels, an answer of the operator's own words: gate G-C3), a live
@@ -4247,9 +4252,16 @@ class ClaudeSdkProvider(_SdkProvider):
                 else stream.transient
             ),
             usage_limit=usage_limit,
-            # #434: what had failed the run before a limit killed the helper.
+            # #434: what had failed the run before a limit killed the helper,
+            # an ask that failed it first (R2-F1 of PR #489): the ask cut the
+            # run, so a limit that then fell due in the wind-down is the
+            # teardown's, never an idle timeout to relaunch (ADR 0007 D7.6).
             failed_before_limit=(
-                (session.failure_kind or stream.failure_kind or stream.api_error)
+                (
+                    CLAUDE_SDK_ASK_FAILED_BEFORE_LIMIT
+                    if ask_failure is not None
+                    else (session.failure_kind or stream.failure_kind or stream.api_error)
+                )
                 if timed_out
                 else None
             ),

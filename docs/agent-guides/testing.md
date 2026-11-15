@@ -2771,7 +2771,10 @@ handle. Keep covered:
   the helper;
 - only the completed main turn's result is the reply: `success` with
   `is_error` (exit 0 included), an unknown subtype, a `terminal_reason` or
-  `stop_reason` of no completed turn, one absent, a deferral, an injected
+  `stop_reason` of no completed turn, one absent, a `subtype` or
+  `stop_reason` that is no string (an array or an object, through the
+  helper too, with no text, no delivered reply and a completed teardown),
+  a deferral, an injected
   turn, a session id that is not the caller's, a subagent's message, a
   policy departure at `init`, and a turn (a message, an ask, the result)
   with no verified `init` before it, through the helper too (no `init`, or
@@ -2790,10 +2793,15 @@ handle. Keep covered:
   permission approved once, with a modified input, denied with guidance
   or cancelled; a call the policy does not ask about denied by the hook;
   and each ask that cannot be decided (a modified input the tool would not
-  take, an empty one or one with a field of the wrong kind included, the
+  take, an empty one or one with a field of the wrong kind included, a
+  timeout past the float range of either sign among them, the
   interaction limit, data past its bounds or that redaction would
   change, a question the broker cannot render) failing the invocation as
-  ADR 0007 D7.6's failure;
+  ADR 0007 D7.6's failure; and an ask that failed the run, then a helper
+  hung in its interrupt and its disconnect until the idle limit killed it
+  (the fake's `stall`): the ask's failure kept as `failed_before_limit`
+  through the kill, and the step never relaunched, adapter to engine
+  (`failed-before-limit`, R2-F1 of PR #489);
 - the bounds: a limit interrupts the turn and wins, an idle limit, a stalled
   decision bounded by the invocation's limit, Ctrl-C during a wait, stdin
   ending mid-turn, a detached descendant, an output flood past the queue's

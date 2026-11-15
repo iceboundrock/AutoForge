@@ -282,7 +282,11 @@ def _fits(kind: _Kind, value: object) -> bool:
     if kind == _COUNT:
         return isinstance(value, int) and 0 <= value < _MAX_COUNT
     assert kind == _TIMEOUT, kind
-    return math.isfinite(value) and 1 <= value <= BASH_MAX_TIMEOUT_MS
+    # Only a float is tested for finiteness: an int is compared as it is,
+    # since converting one past the float range raises (R2-F2 of PR #489).
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    return 1 <= value <= BASH_MAX_TIMEOUT_MS
 
 
 INTERRUPT = b'{"type":"interrupt"}'
@@ -837,10 +841,14 @@ class ClaudeSdkSession:
                 "claude-sdk: session id mismatch",
             )
             return
+        # Each terminal field's type is checked before it is looked up in a
+        # set: an array or an object is unhashable (R2-F3 of PR #489).
         subtype = result.get("subtype")
-        if subtype not in RESULT_SUBTYPES:
+        if not isinstance(subtype, str) or subtype not in RESULT_SUBTYPES:
             self._fail(
-                f"claude-sdk: the result has an unknown subtype {clean(subtype, 60)!r}",
+                f"claude-sdk: the result has an unknown subtype {clean(subtype, 60)!r}"
+                if isinstance(subtype, str)
+                else "claude-sdk: the result has a subtype that is not a string",
                 "claude-sdk: an unknown outcome",
             )
             return
@@ -862,7 +870,11 @@ class ClaudeSdkSession:
             )
             return
         terminal, stop = result.get("terminal_reason"), result.get("stop_reason")
-        if terminal != COMPLETED_TERMINAL_REASON or stop not in COMPLETED_STOP_REASONS:
+        if (
+            terminal != COMPLETED_TERMINAL_REASON
+            or not isinstance(stop, str)
+            or stop not in COMPLETED_STOP_REASONS
+        ):
             self._fail(
                 "claude-sdk: the result is a success that did not complete its turn "
                 f"(terminal_reason {clean(terminal, 60) or '-'}, stop_reason "
