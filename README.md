@@ -1,488 +1,362 @@
 # AutoForge / 智铸
 
-**Autonomous orchestration for AI-driven software development.**
+**A deterministic controller that takes a GitHub issue through implement,
+review and fix, using coding agents you already have, and stops at a pull
+request ready for a human to merge.**
 
 智铸：AI 驱动的软件工程自动化控制器。
 
-> **Early development (Phase 2).** The first real AI development loop is
-> wired end to end: GitHub issue → Claude Code implementation → controller
-> push and PR → OpenCode review → Claude Code remediation → repeated review
-> → `READY_FOR_MERGE`. Merging is opt-in and controller-owned: by default the
-> loop stops at `READY_FOR_MERGE` for a human; with the merge safety gate
-> open (`safety.allow_merge: true` in config and `--allow-merge` on the CLI)
-> the controller itself verifies the PR on GitHub and merges it. Agents never
-> merge. Nothing here is production ready yet.
+AutoForge is not another coding agent. It runs Claude Code, OpenCode (and
+optionally Pi) as workers. It keeps the workflow state itself, checks
+every claim an agent makes against GitHub, and makes every GitHub write
+itself.
 
-## What AutoForge is (and is not)
+> **Status: pre-Alpha, under active development.** The issue → PR → review
+> → fix → `READY_FOR_MERGE` loop works end to end. It is not production
+> ready, and no public end-to-end demonstration has been recorded yet
+> ([demo procedure](docs/demo.md)). Agents run as you on your machine, and
+> every real run calls models you pay for. Read
+> [Safety and trust boundaries](#safety-and-trust-boundaries) before your
+> first real run.
 
-AutoForge is not another coding agent. It is a deterministic orchestration
-layer that drives existing agents through the software lifecycle and refuses
-to trust anything they claim without checking it against GitHub:
+## Why AutoForge?
 
-```text
-Issue → ANALYZE_EXECUTE (Claude Code) → controller pushes, opens PR → REVIEW (OpenCode)
-       → clean ───────────────────────────────▶ READY_FOR_MERGE
-       → findings ────────────────────────────▶ FIX (Claude Code) → REVIEW …
-       → excessive / low-finding stagnation ──▶ REPLAN_REEXECUTE (OpenCode)
-                                                    → controller pushes, opens replacement PR
-                                                    → REVIEW round 1
-                                       ├─ merge gate closed (default): stops here; human merges
-                                       └─ gate open: controller verifies on GitHub
-                                          → MERGE (gh pr merge by the controller, no agent)
-                                          → UPDATE_EPIC (agent returns the progress text
-                                             and the roadmap section and picks the next
-                                             issue; the controller posts the progress comment,
-                                             splices the section into the EPIC body every N
-                                             merges, reads both back, and verifies the next
-                                             issue on GitHub, or DONE)
+You can already give one issue to a coding agent and get a branch back.
+What you don't get is the rest of the process: a second reviewer, fixes
+for its findings, another review of the new revision, and a reliable
+record of where things stand when something breaks halfway. Without that
+record, "done" is whatever the agent says it is.
+
+AutoForge adds that process around the agents:
+
+| Running an agent directly | Running it through AutoForge |
+|---|---|
+| One session; if it dies, you reconstruct where it was | A multi-phase run with durable state; `resume` continues after a `Ctrl-C`, a kill or a reboot |
+| The agent says it committed, pushed or fixed something | The controller reads the result back from git and GitHub before the run moves on |
+| The same agent often judges its own work | A separate review phase, routed to a model you choose (another vendor's by default) |
+| A review applies to whatever the branch holds now | A clean review is bound to one PR, HEAD SHA and base; a later push sends the run back to review |
+| The agent typically runs with your GitHub login available | Agents get no GitHub credential; the controller performs every GitHub write itself |
+| You decide where to stop it | Review rounds, stagnation and a step budget bound every run; anything the controller can't verify ends in `BLOCKED` with a reason |
+
+## How it works
+
+```mermaid
+flowchart LR
+    I[GitHub issue] --> A["ANALYZE_EXECUTE<br/>agent implements<br/>in its own worktree"]
+    A --> P["controller verifies the commit,<br/>pushes, opens the PR"]
+    P --> R["REVIEW<br/>agent reviews the PR;<br/>controller posts the review"]
+    R -- findings --> F["FIX<br/>agent fixes findings"]
+    F -- "controller verifies, pushes" --> R
+    R -- clean --> M(["READY_FOR_MERGE<br/>a human merges"])
+    R -. "stagnation" .-> X["REPLAN_REEXECUTE<br/>replacement PR"]
+    X -.-> R
 ```
 
-AutoForge itself never writes business code. It holds the workflow state
-machine, selects which provider, model and effort runs each phase, renders
-strictly validated prompts from file templates, invokes `claude` /
-`opencode` through provider adapters and `gh` through a typed client (argv
-lists only, never a shell), parses the machine-readable `CONTROL_RESULT`
-block from agent output, and verifies every claim on GitHub before it
-advances state. Every invocation is logged, redacted, under
-`<state dir>/logs/<run-id>/`; the state directory defaults to `.autoforge/`.
+Agents do the semantic work: implementing, reviewing, fixing. Each phase
+ends with a machine-readable `CONTROL_RESULT` block, and state advances
+only when that block validates *and* GitHub confirms it. Prose like "done"
+or "LGTM" never counts. The controller owns everything else: routing each
+phase to a provider and model, pushing, opening the PR, posting reviews,
+retries, recovery and the safety gates. When it cannot work out the safe
+next state, it stops at `BLOCKED` instead of guessing.
 
-It is a single-machine client tool, not a distributed service: one process
-on your own machine, driving your `git`, `gh`, and agent CLIs under your
-credentials, with local per-checkout state and a single
-OS-level repository lock instead of any coordinator. The expected failure
-modes are a `Ctrl-C`, a killed process, and a reboot, which is why side
-effects are checkpointed before they are performed. What *is* remote and
-concurrent is GitHub and the humans acting on it, which is why nothing
-GitHub-side is believed without being read back. AutoForge never commits to
-the default branch.
+By default every run ends at `READY_FOR_MERGE`, `BLOCKED` or `FAILED`, and
+a human merges. A controller-owned merge, followed by an EPIC progress
+update and a move to the next issue, exists behind an opt-in gate and is
+[experimental](#current-maturity).
 
-## Key properties
+The full state machine is in [Workflow](docs/agent-guides/workflow.md), and
+what each phase verifies on GitHub is in
+[GitHub safety](docs/agent-guides/github-safety.md).
 
-Each line is a summary; the linked document is the precise statement.
+## Key capabilities
 
-- **Read the security boundaries before a first run.** Agents run as you,
-  with network access and your model credentials, and are not sandboxed
-  by default, so a deliberate read of your credential files by absolute
-  path is outside the credential guarantee below. On a public repository
-  anyone who can comment on the issue or PR an agent reads can try to
-  steer it, and everything an agent reads goes to your model vendor. Run
-  AutoForge on issues whose authors you trust, as a dedicated user or in
-  a VM or container, or under `sandbox.mode: required`.
-  [Security boundaries](docs/security.md) lists what AutoForge protects
-  and what it does not, the GitHub token permissions it needs and the
-  recommended settings; [SECURITY.md](SECURITY.md) says how to report a
-  vulnerability.
-- **Agent output is a claim; the controller decides.** State advances only
-  on a strictly validated `CONTROL_RESULT` block plus independent
-  verification, never on prose such as "done" or "LGTM". An invalid
-  transition fails explicitly, and when recovery cannot determine the safe
-  state the run enters `BLOCKED` rather than guess.
-  ([CONTROL_RESULT protocol](docs/agent-guides/control-result-protocol.md),
-  [workflow](docs/agent-guides/workflow.md))
-- **GitHub is read back, not believed.** Each phase re-reads what its agent
-  claims to have done, or what the controller did on its behalf: the
-  implementation commit is the worktree's own HEAD and descends from the
-  default branch, and the PR the controller opened for it is open, at that
-  HEAD, on the issue's branch; the review comment the controller rendered
-  from the reviewer's result is on that PR, exactly once, for the right
-  round and SHA; the fix commit is the fixer's own HEAD, descends from the
-  reviewed HEAD and is the PR's head once the controller has pushed it; the
-  follow-up issues the controller created or recorded a deferral in are the
-  one open issue per finding; the EPIC update exists, and the next issue
-  is open and a native sub-issue of the EPIC.
+- **Independent verification**: the implementation commit must be the
+  worktree's own HEAD and descend from the default branch; the PR must be
+  open at that HEAD; the review comment must appear exactly once for the
+  right round and SHA. A claim that does not check out stops the run.
   ([GitHub safety](docs/agent-guides/github-safety.md))
-- **Agents never merge.** Every agent prompt carries the rule "never merge a
-  pull request". The merge is performed by the controller itself
-  (`gh pr merge --<method> --match-head-commit <reviewed HEAD>`), with no
-  agent invocation.
-- **Merging is off by default and opt-in.** `MERGE` is reachable only when
-  both `safety.allow_merge: true` is set in config *and* `--allow-merge` is
-  passed on the CLI; otherwise the run stops at `READY_FOR_MERGE` and a
-  human merges. Before merging, the controller re-verifies the PR on GitHub
-  and fails closed: a conclusive negative is `BLOCKED`, inconclusive data
-  keeps the phase for a bounded number of `resume --allow-merge` re-checks
-  and then is `BLOCKED`, and nothing is merged in either case. By default a PR that
-  changes a protected path (`.github/workflows/`) is never merged
-  unattended, and a required check is trusted only if it ran the
-  base branch's job and step structure. `doctor` checks that the default
-  branch still requires the CI check; the merge gate itself does not yet
-  consult branch rules. The merge is counted only after GitHub reports
-  `MERGED` at the reviewed HEAD into the reviewed base.
-  ([Merge safety](docs/agent-guides/github-safety.md#merge-safety))
-- **Reviews are bound to a revision.** A clean review is bound to the PR it
-  was posted on (by repository and number), its HEAD SHA, its base branch
-  and its merge base. If the HEAD, the base branch or the merge base moves
-  after the review, the run goes back to `REVIEW` instead of merging, and a
-  different PR than the reviewed one is `BLOCKED`.
-  ([Review binding](docs/agent-guides/workflow.md#bind-reviews-to-pr-head-sha-and-to-the-pr-identity))
-- **State is durable and runs are resumable.** State is written atomically
-  and side effects are checkpointed before they are performed. `resume`
-  re-enters the interrupted phase and reconciles with GitHub first; a
-  corrupt state file fails loudly instead of being reset. One controller
-  runs per checkout under an OS file lock keyed by the git common dir
-  (linked worktrees share it; independent clones are not coordinated). Review rounds, stagnation and a
-  cumulative step budget bound every run, so it cannot loop forever.
+- **Revision-bound review**: a clean review is bound to the PR, its HEAD,
+  its base branch and its merge base. If any of them moves, the run goes
+  back to `REVIEW`. ([Review binding](docs/agent-guides/workflow.md#bind-reviews-to-pr-head-sha-and-to-the-pr-identity))
+- **Durable, resumable runs**: state is written atomically, and side
+  effects are checkpointed before they run. `resume` reconciles with
+  GitHub before re-entering the interrupted phase, and a corrupt state file
+  fails loudly instead of being reset.
   ([State and recovery](docs/agent-guides/state-and-recovery.md))
-- **Agents are separated from your checkout and shell; sandboxing is
-  opt-in.** An agent runs in a per-issue `git worktree` the
-  controller creates, with an allow-listed environment rather than the
-  operator's whole shell, and the controller blocks if its own checkout's
-  HEAD or branch moved while the agent ran. Whatever an agent leaves running is killed when its
-  invocation ends, and what the kill could not remove is reported rather
-  than hidden; the orphans of a process that makes itself a subreaper, and
-  anything handed to a service manager (`systemd-run`, `at`), escape this
-  unseen
-  ([ADR 0002](docs/adr/0002-executor-nothing-outlives-the-invocation.md),
-  [Security boundaries](docs/security.md#other-limits)).
-  By default the agent is not sandboxed: it runs as the operator, with
-  network access and the allow-listed provider credentials.
-  ([Usage](docs/usage.md#how-agents-are-separated-from-your-checkout))
-  `sandbox.mode: required` (Linux, `bwrap`) runs every agent, validation
-  command and pre-merge command inside an outer sandbox, or refuses it: an
-  empty root with only the system runtime, the workspace, read-only git
-  metadata, a private home and what the provider declares, so controller
-  state, other worktrees and your credential files are out of reach. It
-  still runs as your UID, and agents keep the host network. A host that
-  cannot enforce one is refused before the step, with nothing saved,
-  charged or launched; `preferred` means `required`; `doctor`
-  shows which this host gets
-  ([ADR 0005](docs/adr/0005-outer-sandbox-and-host-resource-capability-model.md),
-  [Usage](docs/usage.md#outer-sandbox),
-  [Configuration](docs/configuration.md#outer-sandbox)).
-- **Agents hold no GitHub credential.** The controller makes every GitHub
-  write itself; agents, validation commands and pre-merge commands get no
-  GitHub or git credential through anything AutoForge controls: no token
-  variable `gh` or git reads can be allow-listed (a token you forward under
-  another name is warned about, and is yours to keep out), `gh` finds no login, credential helpers,
-  askpass and the SSH agent and keys are switched off where repository
-  configuration cannot switch them back on, curl and wget read no
-  configured header, a launch's shells read none of your zsh startup
-  files, the provider CLIs load no MCP server, plugin or hook, and a
-  launch is refused (by `doctor` too) while a repository setting,
-  `~/.netrc`, a login shell's startup file or an organization connected
-  to OpenCode would still hand one over. The agent reads the GitHub data its
-  phase needs from files the controller wrote, redacted and bounded. A
-  deliberate same-user read of a credential file by absolute path is
-  outside this guarantee.
-  ([GitHub safety](docs/agent-guides/github-safety.md#agents-hold-no-github-credential))
-- **Logs and CLI output are redacted.** Tokens, API keys and authorization
-  headers are masked (a baseline, with no claim of completeness), and no
-  environment dump is ever written.
-  ([Secrets and logging](docs/agent-guides/secrets-and-logging.md))
+- **Bounded execution**: review rounds, stagnation detection and a
+  cumulative step budget mean a run can't loop forever. `BLOCKED` waits
+  for you to fix the cause and run `unblock`.
+  ([Troubleshooting](docs/troubleshooting.md))
+- **Provider routing**: each phase runs on a configured profile
+  (provider, model, effort). The built-in routing uses Claude Code to
+  implement and fix and OpenCode to review. A Claude-only starter exists,
+  and Pi is optional. ([Configuration](docs/configuration.md))
+- **Opt-in candidate validation**: once you configure
+  `validation.commands` (empty by default), the controller runs them on
+  the exact commit an agent hands back. It refuses to push a candidate that
+  fails, and refuses a clean review over a failing record.
+  ([ADR 0006](docs/adr/0006-candidate-validation-evidence-and-review-certificates.md))
 
 ## Prerequisites
 
-[Compatibility](https://github.com/iceboundrock/AutoForge/blob/main/docs/compatibility.md)
-has the full matrix and the evidence for each entry.
+| You need | Notes |
+|---|---|
+| Linux on x86_64, or macOS on Apple Silicon | Linux x86_64 is tested in CI. macOS on Apple Silicon has been tested by the maintainer ([#482](https://github.com/iceboundrock/AutoForge/pull/482) fixed a macOS-only stop); it has no outer sandbox (`sandbox.mode: required` is refused) and weaker process containment than Linux. Intel Macs, Linux ARM64 and WSL2 are untested. Windows does not work (the lock uses POSIX `fcntl`). |
+| CPython 3.11 or 3.12 | The interpreters CI tests. 3.13 and later are untested; `uv` can fetch 3.12 for you. |
+| [`uv`](https://docs.astral.sh/uv/getting-started/installation/) | Installs AutoForge into its own environment. |
+| `git`, with a global `user.name` and `user.email` | The implementer commits as you. |
+| [GitHub CLI](https://cli.github.com/) `gh` 2.48.0 or newer, signed in | The controller's only route to GitHub. See [token permissions](docs/security.md#github-token-permissions). |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`), signed in | Implements and fixes in the built-in routing. |
+| [OpenCode](https://opencode.ai/) (`opencode`) 2.0.0 or newer | Reviews and replans in the built-in routing. Not needed with the Claude-only starter. |
+| A state directory on a filesystem with hard links | `.autoforge/` by default. vfat/exFAT and some FUSE, SMB and overlay mounts are refused. |
 
-- Linux on x86_64. macOS, Linux ARM64 and WSL2 are untested; Windows is
-  unsupported (AutoForge's lock needs POSIX `fcntl`)
-- CPython 3.11 or 3.12, the versions CI tests; 3.13 and later are untested.
-  `uv` fetches one when the host has none (`--python 3.12` below)
-- `uv` ([install](https://docs.astral.sh/uv/getting-started/installation/))
-- `git`, and `gh` (GitHub CLI **2.48.0 or newer**, authenticated): the
-  client lists branch rules and a PR's changed files with
-  `gh api --paginate --slurp`, which older releases reject; `autoforge doctor`
-  refuses an older `gh` up front
-- `claude` (Claude Code CLI) for `analyze_execute` / `fix` profiles
-- `opencode` (OpenCode CLI) 2.0.0 or newer for the `review_*`,
-  `replan_reexecute` and `update_epic` profiles; 1.x is refused by `doctor`
-  (see [OpenCode profiles](https://github.com/iceboundrock/AutoForge/blob/main/docs/configuration.md#opencode-profiles))
-- `pi` 1.0.0 or newer, only if a profile you route to uses `provider: pi`,
-  holding a DeepSeek API key or signed in with your ChatGPT subscription
-  (see the [Pi operator guide](https://github.com/iceboundrock/AutoForge/blob/main/docs/pi.md)). `doctor` checks
-  only the agent CLIs your configured profiles actually reach
-- a state directory (`.autoforge/` by default; `--state-dir` or
-  `state_dir` in config) on a filesystem with hard links: run logs and
-  other controller files are published by `link(2)` so that a crash never
-  leaves one half-written, and there is no non-atomic fallback. vfat/exFAT
-  and some FUSE, SMB/CIFS and overlay mounts have no hard links; a run, and
-  `autoforge doctor`, refuse such a state directory and say why
-
-Run `autoforge doctor` to check all of the above (read-only apart from
-creating the state directory if it is missing and a probe file it removes).
-
-CLI flag syntax in `autoforge.example.yaml` was checked against the locally
-installed CLIs (Claude Code 2.1.263, OpenCode 2.0.23, gh 2.100.0); the
-versions verified since are in [Compatibility](https://github.com/iceboundrock/AutoForge/blob/main/docs/compatibility.md#agent-clis).
+AutoForge has no account and stores no model credential. Each agent CLI
+uses your own login or key, and each vendor bills you. CI on the branches
+AutoForge pushes uses your GitHub Actions minutes.
+`autoforge doctor` checks all of the above, but only for the agent CLIs
+your configuration actually uses. [Compatibility](docs/compatibility.md)
+has the full matrix and the evidence behind each entry, including the agent
+CLI versions that have been verified.
 
 ## Installation
 
-The distribution is **`autoforge-cli`**; the command it installs is
-`autoforge`. `autoforge` on PyPI is an unrelated project: never
+The PyPI distribution is **`autoforge-cli`**, and the command it installs
+is `autoforge`. The `autoforge` project on PyPI is unrelated: never
 `pip install autoforge`.
 
-A git commit, or a wheel built from one, installs from any commit at or
-after the one that introduced `autoforge-cli` (#256; an earlier commit
-installs a package without its prompt templates); the PyPI method installs
-a published version.
-
-**From a git commit.** Install the command into its own environment with
-`uv tool`. Pin a full commit SHA, or the tag of a published version
-(`v<version>`):
+**Recommended: a pinned commit of `main`.** This README and the docs
+describe `main`. Use a full 40-character commit SHA:
 
 ```bash
 uv tool install --python 3.12 'git+https://github.com/iceboundrock/AutoForge@<commit>'
 autoforge --version
 ```
 
-`uv tool install --reinstall` with another commit replaces it, and
-`uv tool uninstall autoforge-cli` removes it. Add the YAML extra with
+Re-run with `--reinstall` and another commit to upgrade.
+`uv tool uninstall autoforge-cli` removes it. For full YAML support
+(PyYAML), install
 `'autoforge-cli[yaml] @ git+https://github.com/iceboundrock/AutoForge@<commit>'`.
+If the shell can't find `autoforge` afterwards, run
+`uv tool update-shell` and open a new shell.
 
-**From a built wheel.** From a checkout of the commit you want:
-
-```bash
-uv build                 # dist/autoforge_cli-<version>.tar.gz and -py3-none-any.whl
-uv tool install --python 3.12 dist/autoforge_cli-<version>-py3-none-any.whl
-```
-
-**From PyPI.** The published versions are at
-<https://pypi.org/project/autoforge-cli/>, and the
-[releases page](https://github.com/iceboundrock/AutoForge/releases) lists
-them. The first, `0.1.0a0` (2026-10-28), is #295's registration
-prerelease: a pre-Alpha snapshot, not validated for unattended production
-use, and not the Public Alpha
-([#255](https://github.com/iceboundrock/AutoForge/issues/255)). Each file
-PyPI serves was built and uploaded by this repository's `pypi-publish`
-workflow and carries a PEP 740 attestation naming that workflow. Install
-only after checking that the PyPI project page links back to this
-repository:
+**From PyPI.** The only published version is the prerelease `0.1.0a0`
+(2026-10-28). It is a pre-Alpha snapshot that predates much of what this
+README describes, including the starter configurations and the removal of
+LOCAL mode. It is not the Public Alpha
+([#255](https://github.com/iceboundrock/AutoForge/issues/255)).
+Before installing, check that the
+[PyPI project page](https://pypi.org/project/autoforge-cli/) links back to
+this repository:
 
 ```bash
 uv tool install --python 3.12 --prerelease allow autoforge-cli
 ```
 
 `--prerelease allow` is needed while every published version is a
-prerelease (`0.x`, [Releasing](https://github.com/iceboundrock/AutoForge/blob/main/docs/releasing.md#version-scheme));
-`'autoforge-cli==0.1.0a0'` pins one. A published version carries only the
-fixes of the commit it was built from, while security fixes land on `main`
-([Security policy](https://github.com/iceboundrock/AutoForge/blob/main/SECURITY.md#supported-versions)).
-[Releasing](https://github.com/iceboundrock/AutoForge/blob/main/docs/releasing.md)
-describes how a version is built and published.
+prerelease. Security fixes land only on `main`
+([SECURITY.md](SECURITY.md#supported-versions)).
 
-Whichever way it was installed, run `autoforge` from a checkout of the
-repository whose issues it drives; `autoforge doctor` checks the rest.
-Continue a run with the controller that created it, or a newer one: a
-controller refuses a run a newer one wrote (exit 2, nothing written) and
-names the code it imported, and `doctor`'s `controller` row shows which
-code a command line runs
-([A run a newer controller wrote](https://github.com/iceboundrock/AutoForge/blob/main/docs/usage.md#a-run-a-newer-controller-wrote)).
-
-**For development** on AutoForge itself, from a clone of this repository:
+**From a built wheel**, out of a checkout of the commit you want:
 
 ```bash
-uv sync                  # create .venv, install autoforge-cli (editable) + dev tools
-uv sync --extra yaml     # optional: full YAML config support (PyYAML)
-uv run autoforge --help
+uv build
+uv tool install --python 3.12 dist/autoforge_cli-<version>-py3-none-any.whl
 ```
 
-`uv run autoforge` is the same command, run from that clone's `.venv`.
-[Development](https://github.com/iceboundrock/AutoForge/blob/main/docs/development.md) has the checks CI runs.
+**For development on AutoForge itself**, see
+[Contributing](#contributing).
 
-To configure profiles, bounds or the merge gate, copy a starter
-configuration from [`examples/`](https://github.com/iceboundrock/AutoForge/tree/main/examples),
-or `autoforge.example.yaml` (every key), to `autoforge.yaml` and pass it
-with `--config` before the subcommand; see [Configuration](https://github.com/iceboundrock/AutoForge/blob/main/docs/configuration.md).
+However you install it, run `autoforge` from a checkout of the repository
+whose issues it works on. Continue a run with the controller that created
+it, or a newer one. An older controller refuses a run that a newer one
+wrote
+([details](docs/usage.md#a-run-a-newer-controller-wrote)).
 
 ## Quick start
 
-New to AutoForge? [Getting started](https://github.com/iceboundrock/AutoForge/blob/main/docs/getting-started.md)
-walks through a first run on a repository of your own: prerequisites,
-installing, a repository (a new private one, or an existing one you may
-change) with an EPIC and an issue, a starter configuration, what each
-`doctor` row means, a dry run, a real run, and the common first-run
-failures with their fixes. The commands in brief:
+[Getting started](docs/getting-started.md) walks through a first run step
+by step, including what each `doctor` row means and the common first-run
+failures. The short version follows.
 
-Run these from a checkout of the repository the issues belong to. URLs must
-be HTTPS GitHub issue URLs, and the EPIC and the issue must be in that same
-repository (cross-repo runs are rejected). The run records the issue's
-native parent on GitHub as its EPIC; `--epic` is used only for an issue
-with no parent ([Which EPIC a run records](https://github.com/iceboundrock/AutoForge/blob/main/docs/usage.md#which-epic-a-run-records)).
+**1. Pick a repository you can safely experiment on.** A new private one
+is best: a run pushes a branch, opens a PR, posts reviews and may open
+follow-up issues there.
 
 ```bash
-# 1. check the environment (writes nothing but a state-dir probe)
-autoforge doctor
-
-# 2. preview, in the checkout: reads its repository, the issue and its EPIC
-#    through gh, writes nothing
-autoforge run --epic https://github.com/owner/repo/issues/1 \
-              --issue https://github.com/owner/repo/issues/2 --dry-run
-
-# 3. create a run and drive it until READY_FOR_MERGE / BLOCKED / FAILED
-autoforge run --epic https://github.com/owner/repo/issues/1 \
-              --issue https://github.com/owner/repo/issues/2
-
-# 4. inspect it, and continue after an interruption
-autoforge status
-autoforge resume
+gh repo create first-run --private --add-readme --clone
+cd first-run
 ```
 
-With the merge gate closed (the default) the run stops at
-`READY_FOR_MERGE` with a banner naming the issue, PR, review round and
-reviewed HEAD, and a human merges the PR. A push to the PR branch after
-that review sends the run back to `REVIEW` of the new head on the next
-`resume`. Only with `safety.allow_merge:
-true` in config does `autoforge resume --allow-merge` let the
-controller verify the PR on GitHub and merge it itself.
+Create an EPIC issue and a work issue in it, and make the work issue a
+sub-issue of the EPIC (or pass `--epic` below). Both must be in this same
+repository. [Getting started, step 3](docs/getting-started.md#3-choose-and-prepare-a-repository)
+also covers keeping `.autoforge/` and `autoforge.yaml` out of git.
 
-A run in `BLOCKED` stays there until you fix the cause and run
-`autoforge unblock --reason "..."`, which re-inspects GitHub and either
-re-enters the one phase that inspection supports or refuses. When a fixer
-asked the controller to post an acceptance comment on the issue, the run
-waits for you to approve or decline that exact comment
-(`unblock --approve-action` / `--decline-action`). When it asked for a
-comment on another issue (one the run's issue references, or the EPIC),
-you post it yourself, bind an existing comment or withdraw it
-(`unblock --bind-evidence` / `--decline-action`); the controller never posts
-there, and verifies the comment on GitHub. A fixer may also ask the controller
-to replace the description of the run's own PR, which it does by default
-(`safety.pr_body_updates`); an edit made outside that plan stops the run and is
-never written over. When a run stops because the
-PR's implementation marker names another run, or none (`pr-owner`), stop
-the other controller, then `autoforge unblock --take-over <PR URL>` and
-`resume` hand the PR to this run. When `status` warns that GitHub
-now names another parent for the issue than the EPIC the run recorded,
-`autoforge rebind-epic ... --dry-run` previews moving a run stopped at
-`READY_FOR_MERGE` or `BLOCKED` to that parent, before its `UPDATE_EPIC`
-writes to the old one. Every command,
-where a run stops, and how to recover are in
+**2. Write a configuration.** Without `--config`, the built-in routing
+applies (Claude Code plus OpenCode). A starter makes the models you pay for
+visible. Take it from the same revision you installed:
+
+```bash
+ref=<commit>   # the commit you installed from
+curl -fsSL -o autoforge.yaml \
+  "https://raw.githubusercontent.com/iceboundrock/AutoForge/$ref/examples/starter-two-providers.yaml"
+```
+
+Use `starter-claude-only.yaml` if you only have Claude Code. The
+implementer then reviews its own work, which is weaker. Every key is in
+[`autoforge.example.yaml`](autoforge.example.yaml) and
+[Configuration](docs/configuration.md).
+
+**3. Check, preview, run.** Run everything from the checkout. `--config`
+goes *before* the subcommand. Replace `<owner>/<repo>` and the issue
+numbers with your own.
+
+```bash
+# read-only check of git, gh, the agent CLIs, the repository and the config
+autoforge --config autoforge.yaml doctor
+
+# preview: reads the repository, issue and EPIC through gh; starts no agent,
+# writes nothing to git or GitHub, saves no state
+autoforge --config autoforge.yaml run \
+  --epic https://github.com/<owner>/<repo>/issues/1 \
+  --issue https://github.com/<owner>/<repo>/issues/2 --dry-run
+
+# the real run: calls paid models, pushes a branch, opens a PR, posts reviews
+autoforge --config autoforge.yaml run \
+  --epic https://github.com/<owner>/<repo>/issues/1 \
+  --issue https://github.com/<owner>/<repo>/issues/2
+```
+
+While a run is in progress, don't commit or switch branches in this
+checkout. The controller compares HEAD before and after every agent launch,
+and stops at `BLOCKED` if it moved.
+
+**4. See where it stopped, and continue.**
+
+```bash
+autoforge --config autoforge.yaml status   # phase, PR, review rounds, reviewed HEAD, block reason
+autoforge --config autoforge.yaml resume   # continue after Ctrl-C, a kill or a reboot
+```
+
+- **`READY_FOR_MERGE`**: the latest review found nothing left to fix.
+  Read the PR and the review comment, then merge or close it on GitHub
+  yourself. If you push to the PR branch first, `resume` reviews the new
+  head.
+- **`BLOCKED`**: the controller hit something it won't decide alone: a
+  failed check, a claim it couldn't verify, a bound reached. Fix the
+  cause, then run
+  `autoforge --config autoforge.yaml unblock --reason "..."` and `resume`.
+  [Troubleshooting](docs/troubleshooting.md) is indexed by what you see.
+
+Every command and where each one can stop is in
 [Running the remote workflow](docs/usage.md).
 
-To work through an EPIC's issues several at a time,
-`autoforge epic run https://github.com/owner/repo/issues/1` runs up to
-`scheduler.max_parallel` (1-4) of them at once, admitted in dependency order
-from GitHub's native sub-issues and "blocked by" links, each in its own
-worker, namespace and worktree. Every worker stops at its settlement
-boundary (`READY_FOR_MERGE`, `BLOCKED`, `DONE`, `FAILED`), so nothing is
-merged without a human. `epic status` shows each child's category and next
-step without taking a lock, `epic stop` drains it, `epic resume`
-recovers after a crash, a kill or a reboot, and `epic recheck` sends an
-issue settled at `READY_FOR_MERGE` whose PR was pushed to back to review
-([Running an EPIC in parallel](docs/usage.md#running-an-epic-in-parallel)).
-It is experimental: it is verified offline only and has not yet driven a
-real EPIC ([Current maturity](#current-maturity)).
+## Safety and trust boundaries
 
-## Documentation
+The defaults keep a human in charge of merging, but they do not sandbox
+the agents. Before a real run, know these facts:
 
-The [documentation index](docs/README.md) lists everything by intent. The
-most common entry points:
+- **Agents run as you.** By default they have your user ID, your network
+  access and the model credentials you give them. They work in a per-issue
+  `git worktree` with an allow-listed environment. That is logical
+  isolation, not a sandbox: an agent can read whatever your user can read.
+- **The OS sandbox is opt-in and Linux-only.** `sandbox.mode: required`
+  runs every agent and validation command inside a `bwrap` sandbox,
+  provided the host supports it: Linux 6.12+ with Landlock ABI 6,
+  unprivileged user, PID and IPC namespaces, and bubblewrap 0.11+. On a host that can't
+  enforce it, macOS included, the step is refused rather than run unsandboxed. Even
+  enforced, agents keep your UID and the host network. `doctor` shows what
+  your host supports. ([Outer sandbox](docs/usage.md#outer-sandbox))
+- **Issue and PR text is untrusted input.** Anyone who can write the
+  issue, its comments or the code an agent reads can try to steer that
+  agent, and an injected instruction runs as you. Use repositories and
+  issues whose authors you trust, or a dedicated user, VM or container.
+- **Your content goes to your model vendors.** Everything an agent reads
+  is sent to the vendor of the model it runs.
+- **Agents never get a GitHub credential, and never merge.** The
+  controller makes every GitHub write itself and keeps its `gh` login away
+  from agents. One caveat: an agent's same-user read of a credential
+  *file* by absolute path is outside this guarantee unless the sandbox is
+  enforced.
+- **Merging is off by default.** A controller merge requires both
+  `safety.allow_merge: true` in the config *and* `--allow-merge` on the
+  command line. Even then, the controller re-verifies the PR on GitHub and
+  fails closed. Without both, a human merges.
+- **A clean review is not proof of correctness.** A clean review means the
+  reviewer agent found nothing. A validation record means a command passed
+  on one candidate on your host. Neither replaces your own review or your
+  CI.
+- **Logs are redacted on a best-effort basis.** Tokens and authorization
+  headers are masked, and no environment dump is written, but redaction
+  makes no claim of completeness.
 
-| I want to… | Read |
-|---|---|
-| make a first run on a repository of my own, step by step | [Getting started](docs/getting-started.md), starter configurations in [`examples/`](examples) |
-| know which OS, Python, git, `gh`, agent CLI and sandbox host it runs on | [Compatibility](docs/compatibility.md) |
-| run the remote workflow, merge, unblock, troubleshoot or recover a run | [Running the remote workflow](docs/usage.md), [troubleshooting and recovery](docs/troubleshooting.md) |
-| run phases through Pi on a DeepSeek API key or a ChatGPT subscription | [Pi operator guide](docs/pi.md) |
-| configure profiles, bounds and the merge gate | [Configuration](docs/configuration.md), [`autoforge.example.yaml`](autoforge.example.yaml) |
-| know what AutoForge protects, which GitHub token it needs, or report a vulnerability | [Security boundaries](docs/security.md), [SECURITY.md](SECURITY.md) |
-| understand the phases and legal transitions | [Workflow](docs/agent-guides/workflow.md) |
-| know what is verified on GitHub, and what gates a merge | [GitHub safety](docs/agent-guides/github-safety.md) |
-| know how state, locking and crash recovery work | [State and recovery](docs/agent-guides/state-and-recovery.md) |
-| see how the code is divided | [Architecture](docs/agent-guides/architecture.md), [module map](src/autoforge/AGENTS.md) |
-| contribute, run the checks, write tests | [Development](docs/development.md), [Testing](docs/agent-guides/testing.md) |
-| cut or publish a release | [Releasing](docs/releasing.md) |
-| read the design records | [the index](docs/README.md#architecture-decisions); [ADR 0001](docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md) (superseded by ADR 0009 but for what it says of `safefs.py`), [ADR 0002](docs/adr/0002-executor-nothing-outlives-the-invocation.md), [ADR 0003](docs/adr/0003-pi-agent-provider.md), [ADR 0004](docs/adr/0004-authority-boundary-and-typed-external-effects.md), [ADR 0005](docs/adr/0005-outer-sandbox-and-host-resource-capability-model.md), [ADR 0006](docs/adr/0006-candidate-validation-evidence-and-review-certificates.md), [ADR 0007](docs/adr/0007-sdk-providers-isolated-helpers-and-interaction-contract.md) (partly implemented), [ADR 0008](docs/adr/0008-parallel-epic-scheduler-authority-run-identity-claims-and-locks.md), [ADR 0009](docs/adr/0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md) |
-
-Coding agents working on this repository start at [AGENTS.md](AGENTS.md).
+[Security boundaries](docs/security.md) is the full statement: what
+AutoForge protects, what it doesn't, the GitHub token permissions it needs
+and the recommended settings for a repository you care about. To report a
+vulnerability privately, see [SECURITY.md](SECURITY.md).
 
 ## Current maturity
 
-**Supported now (Phase 2):** GitHub issue → Claude Code implementation → the
-controller's push and PR, read back via `gh` → OpenCode review with
-round-based model routing → Claude Code remediation of finding IDs →
-repeated review with SHA binding → `READY_FOR_MERGE`, entered only in the
-write that issues the clean round's review certificate (below); the
-bounded REVIEW/FIX loop with stagnation detection and the
-`REPLAN_REEXECUTE` transaction;
-journal-first recovery of an interrupted push or PR creation;
-bounded correction retry for malformed results; `doctor`; redacted
-per-invocation logs.
+AutoForge is pre-Alpha (`0.x`). The Public Alpha is tracked in
+[#255](https://github.com/iceboundrock/AutoForge/issues/255) and has not
+shipped. The default test suite runs against an in-memory GitHub and
+scripted agents. It never calls a real model and never merges a real PR.
 
-**Opt-in, and only on a host that can enforce it:** the outer sandbox on
-Linux (`sandbox.mode`, off by default), with its capability probe,
-pre-launch gate and `doctor` rows. It needs Linux 6.12+ with Landlock ABI 6,
-unprivileged user, PID and IPC namespaces (some distributions restrict
-them), and a bubblewrap that can mount an overlay (0.11 or later)
-([ADR 0005](docs/adr/0005-outer-sandbox-and-host-resource-capability-model.md)).
-`sandbox.mode: disabled` is not sandboxed. Its boundary is tested across
-every provider path on a capable host (`make test-sandbox`). Hosted CI
-measures its runner on every run (its `bwrap`, user-namespace policy and
-Landlock ABI, in the job summary) and requires the real-backend tests
-wherever the runner can enforce; where it cannot, they skip with the
-probe's reason. It is experimental until a
-`make test-sandbox` run on a capable host is recorded at the release
-candidate.
+| Capability | Status |
+|---|---|
+| Issue → implementation → PR → review → fix → re-review → `READY_FOR_MERGE`, with SHA binding, loop bounds, stagnation and `REPLAN_REEXECUTE` | **Supported**: the default path |
+| Durable state, `resume`, `unblock`, journal-first recovery of an interrupted push or PR creation | **Supported** |
+| `doctor`, dry run, redacted per-invocation logs | **Supported** |
+| Controller-run candidate validation (`validation.commands`) | **Opt-in**: nothing runs until you configure it |
+| Outer sandbox (`sandbox.mode: required`, Linux `bwrap`) | **Opt-in, experimental**: off by default, and enforced only on a capable host |
+| Controller-owned `MERGE` behind the merge gate, and `UPDATE_EPIC` | **Experimental**: verified only against the in-memory fake; never merged a real PR or edited a real EPIC |
+| Parallel EPIC scheduler (`autoforge epic ...`) | **Experimental**: verified offline only; has not driven a real EPIC. Workers never merge. ([Running an EPIC in parallel](docs/usage.md#running-an-epic-in-parallel)) |
+| Pi provider (`provider: pi`) | **Experimental, opt-in**: no built-in profile uses it. ([Pi guide](docs/pi.md)) |
+| `claude-sdk` provider | **Experimental, opt-in**: launches on one pinned SDK pair; no model has been called through it. ([SDK policy](docs/sdk-policy.md)) |
+| `opencode-sdk` provider, container sandbox backend | **Not yet**: `opencode-sdk` refuses every launch; no configuration can select the container backend |
+| Unattended production operation; the merge gate consulting branch rules; merge queues | **Not yet** |
 
-**Opt-in, off until configured:** controller-run validation of the exact
-candidate
-([ADR 0006](docs/adr/0006-candidate-validation-evidence-and-review-certificates.md)).
-`validation.commands` is empty by default, so nothing is validated until
-you configure it. Then the controller runs each command itself against the
-exact commit an agent hands back, in a byte-exact export of its tree, and
-keeps each outcome in the state file as a durable `ValidationRecord`,
-reused for the same candidate, command and policy. A candidate is pushed
-or published only once every command has passed on it. Before a reviewer
-launches, the controller requires records for the candidate under review
-(it validates a PR head that has none, such as a human's push), shows
-their outcomes in the review prompt's evidence section, and refuses a
-clean verdict over a failing record. A record says what the controller
-observed when it ran a command, not that the change is correct, that
-GitHub CI passed or that the result holds on another host; under
-`sandbox.mode: disabled` every command runs unsandboxed as your UID.
+The supported path keeps the merge gate closed: a human reviews and merges
+every PR. `doctor` checks which branch rules require CI, but the merge gate
+itself does not consult them yet.
 
-**Always on, with or without validation:** the review certificate a clean
-round issues on its way to `READY_FOR_MERGE`. It states which candidate
-and revision were reviewed clean, which validation set the reviewer was
-presented, and that every record in it passed; with nothing configured the
-set is empty, and the certificate certifies a clean review and no
-validation. It is a prerequisite, not permission to merge: it is
-not a GitHub approval or a CI result, and it is never shown to an agent or
-published.
+## Documentation
 
-**Experimental: implemented and verified, but exercised only against the
-in-memory fake:** the controller-owned `MERGE` step behind the merge safety
-gate (off by default), including its pre-merge verification and its
-review-certificate check (#175), and `UPDATE_EPIC`. Every claim these
-phases depend on is re-read from GitHub before state advances, but no
-automated test has ever merged a real PR or edited a real EPIC, so treat
-an opened gate as unproven against real services. The supported path
-keeps the gate closed: a human reviews and merges the PR the run leaves at
-`READY_FOR_MERGE`. The gate refuses a certificate that does not apply to
-the live PR revision or to the validation configuration in force, and
-still re-reads every fact it decides on from GitHub. A run saved in
-`READY_FOR_MERGE` or `MERGE` before certificates existed holds none: the
-gate refuses it while its PR is open (`BLOCKED`, nothing merged), and
-`unblock` sends it to a new validated `REVIEW` round.
+The [documentation index](docs/README.md) lists everything by intent.
+Common entry points:
 
-**Experimental: implemented and verified offline:** the parallel EPIC
-scheduler (`autoforge epic run|resume|status|stop|archive|recheck`, ADR 0008). Its
-crash windows are tested by killing real scheduler and worker processes at
-each one, but against the in-memory GitHub and scripted agents only, and it
-has not yet driven a real EPIC: run it on an EPIC you watch, with
-`epic status` open.
+| I want to… | Read |
+|---|---|
+| make a first run, step by step | [Getting started](docs/getting-started.md), starter configs in [`examples/`](examples) |
+| check which OS, Python, `gh` and agent CLI versions work | [Compatibility](docs/compatibility.md) |
+| use every command, merge, unblock or recover | [Running the remote workflow](docs/usage.md), [Troubleshooting](docs/troubleshooting.md) |
+| configure profiles, bounds, validation, the sandbox or the merge gate | [Configuration](docs/configuration.md), [`autoforge.example.yaml`](autoforge.example.yaml) |
+| know what is protected and which GitHub token permissions are needed | [Security boundaries](docs/security.md) |
+| understand the phases and the code's structure | [Workflow](docs/agent-guides/workflow.md), [Architecture](docs/agent-guides/architecture.md), [State and recovery](docs/agent-guides/state-and-recovery.md) |
+| read the design decisions | [Architecture decision records](docs/README.md#architecture-decisions) |
 
-**Experimental:** acceptance actions on other issues, which the operator
-posts or binds (`unblock --bind-evidence`, #243). They are tested offline
-and have been used once for real, in a run on this repository. They stay
-experimental until they are used on a repository other than AutoForge.
+## Contributing
 
-**Experimental and opt-in:** Pi as a provider (`provider: pi`, the
-[Pi operator guide](docs/pi.md)). No built-in profile uses it. Its one
-recorded live run, a review on DeepSeek (#135), was in LOCAL mode, which is
-gone; no live run of the
-[live smoke test](docs/pi.md#prove-it-on-your-machine-the-live-smoke-test)'s
-REMOTE review is recorded yet.
+Bug reports and suggestions go to
+[GitHub Issues](https://github.com/iceboundrock/AutoForge/issues), and
+contributions arrive as pull requests against `main`. Report security
+issues privately ([SECURITY.md](SECURITY.md)), never in a public issue.
 
-The Public Alpha release claims these capabilities at exactly these levels
-([#255](https://github.com/iceboundrock/AutoForge/issues/255), conditions
-C1–C7). The registration prerelease `0.1.0a0` on PyPI (#295) is not the
-Public Alpha; it predates LOCAL's removal, and this section does not
-describe it.
+For a development setup, from a clone of this repository:
 
-**Explicitly not yet:** unattended production operation; the controller
-feeding CI results into the review prompt (the reviewer is asked to inspect
-`gh pr checks` itself, and the merge gate reads the checks); the merge gate
-consulting branch rules (`doctor` reads them, the gate does not); dequeuing a
-PR from a merge queue (the controller refuses to merge into queue-protected
-branches instead).
+```bash
+uv sync              # .venv with autoforge-cli (editable) and the dev tools
+uv run autoforge --help
+make check           # what CI runs: lockfile check, pytest, ruff, ruff format, mypy
+```
+
+[AGENTS.md](AGENTS.md) is the repository contract: safety invariants,
+architectural boundaries, and which guide to read before changing what.
+Human and agent contributors alike start there.
+[Development](docs/development.md) covers the `make` targets and CI, and
+[Testing](docs/agent-guides/testing.md) the coverage contract.
+
+## License
+
+[MIT](LICENSE) © 2026 Ruoshi Li
