@@ -822,8 +822,8 @@ def _hostile_eol(tmp_path: Path, monkeypatch, repo: Path, root: Path, source: st
         (repo / ".git" / "info").mkdir(exist_ok=True)
         (repo / ".git" / "info" / "attributes").write_bytes(b"*.bat text\n")
         _git(repo, "config", "core.eol", "crlf")
-    else:  # an untracked .gitattributes where the checkout is
-        (root / ".gitattributes").write_bytes(rule)
+    else:  # an untracked .gitattributes in the file's directory of the checkout
+        (root / "bin" / ".gitattributes").write_bytes(rule)
 
 
 @pytest.mark.parametrize(
@@ -843,17 +843,34 @@ def test_an_end_of_line_conversion_the_commit_does_not_name_is_a_difference(
     """The attributes and configuration a checkout also reads are the
     agent's to write (#488): a CRLF file whose `eol=crlf` comes from any of
     them, and not from the commit's own `.gitattributes`, is still a
-    difference. Git itself reads the file as unchanged there."""
+    difference. Git itself reads the file as unchanged there. The commit
+    has a `.gitattributes` on the file's path that converts nothing, so
+    `check-attr` runs, in the controller's own git directory, rather than
+    nothing being read at all (PR #503 R1-F1)."""
     repo = _init(tmp_path / "repo")
-    commit = _commit(repo, _tree(repo, {"gradlew.bat": b"@echo off\necho hi\n", "a.txt": b"a\n"}))
+    commit = _commit(
+        repo,
+        _tree(
+            repo,
+            {
+                ".gitattributes": b"*.txt -text\n",
+                "bin": {"gradlew.bat": b"@echo off\necho hi\n"},
+                "a.txt": b"a\n",
+            },
+        ),
+    )
     root = _checkout(repo, commit, tmp_path / "checkout")
-    (root / "gradlew.bat").write_bytes(b"@echo off\r\necho hi\r\n")
+    (root / "bin" / "gradlew.bat").write_bytes(b"@echo off\r\necho hi\r\n")
     _hostile_eol(tmp_path, monkeypatch, repo, root, source)
     if source != "an untracked .gitattributes":
-        clean = _git(repo, "hash-object", "--path=gradlew.bat", str(root / "gradlew.bat"))
-        assert clean.decode().strip() == _out(repo, "rev-parse", f"{commit}:gradlew.bat")
-    found = tree_differences(execute, str(repo), commit, "sha1", root, checkout_eol=True)
-    assert found == [TreeDifference(b"gradlew.bat", "modified")]
+        clean = _git(
+            repo, "hash-object", "--path=bin/gradlew.bat", str(root / "bin" / "gradlew.bat")
+        )
+        assert clean.decode().strip() == _out(repo, "rev-parse", f"{commit}:bin/gradlew.bat")
+    seen: list[ExecutionRequest] = []
+    found = tree_differences(_recording(seen), str(repo), commit, "sha1", root, checkout_eol=True)
+    assert found == [TreeDifference(b"bin/gradlew.bat", "modified")]
+    assert any("check-attr" in req.command for req in seen)
     assert not _leftovers(exports)
 
 
