@@ -2772,20 +2772,26 @@ handle. Keep covered:
 - only the completed main turn's result is the reply: `success` with
   `is_error` (exit 0 included), an unknown subtype, a `terminal_reason` or
   `stop_reason` of no completed turn, one absent, a deferral, an injected
-  turn, a session id that is not the caller's, a subagent's message and a
-  policy departure at `init` each fail closed; a block planted in an
+  turn, a session id that is not the caller's, a subagent's message, a
+  policy departure at `init`, and a turn (a message, an ask, the result)
+  with no verified `init` before it, through the helper too (no `init`, or
+  a late one), each fail closed; a block planted in an
   earlier message, a failure reason or stderr is never read, and a
   malformed completed reply is read (the engine corrects it in a fresh
   session);
 - each envelope violation fails closed: an unknown record or field, a
   record before `hello` or after `end`, an `end` before the result or with
-  an ask open, an interrupted end nobody asked for, a stale decision;
+  an ask open, an interrupted end nobody asked for, a stale decision; and
+  what the helper writes after its `end` (a record, an unterminated tail),
+  read by the adapter's drain after the helper exits, so a reply is taken
+  only from a stream read whole;
 - asks: a question (one or several, several labels, the operator's own
   words) answered with the questions echoed and the answers mapped; a
   permission approved once, with a modified input, denied with guidance
   or cancelled; a call the policy does not ask about denied by the hook;
   and each ask that cannot be decided (a modified input the tool would not
-  take, the interaction limit, data past its bounds or that redaction would
+  take, an empty one or one with a field of the wrong kind included, the
+  interaction limit, data past its bounds or that redaction would
   change, a question the broker cannot render) failing the invocation as
   ADR 0007 D7.6's failure;
 - the bounds: a limit interrupts the turn and wins, an idle limit, a stalled

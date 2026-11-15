@@ -38,15 +38,21 @@ platform wheels for manylinux 2.17 (x86_64, aarch64) and macOS 11 (arm64,
 x86_64); there is no wheel, and so no `claude-sdk` backend, on any other
 platform.
 
-Then name the environment's interpreter as the profile's `command`:
+Then name the environment's interpreter as the profile's `command`, by
+its absolute path. AutoForge runs `command` as written, with no shell, so
+a `~` or a `$HOME` in it is not expanded and the launch would fail with
+`executable not found`. For a user `you` on Linux (`/Users/you` on macOS):
 
 ```yaml
 profiles:
   fix:
     provider: claude-sdk
     model: claude-opus-5-5
-    command: ~/.local/share/autoforge/claude-sdk/bin/python
+    command: /home/you/.local/share/autoforge/claude-sdk/bin/python
 ```
+
+`echo ~/.local/share/autoforge/claude-sdk/bin/python` prints the path to
+write there.
 
 `autoforge doctor` checks the environment against the pinned pair without
 running anything that writes (docs/configuration.md). A launch checks the

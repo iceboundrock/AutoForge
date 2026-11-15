@@ -4048,8 +4048,9 @@ class ClaudeSdkProvider(_SdkProvider):
         guidance, and a ``Fail`` ``fail``, which also ends the run (D7.6). An
         ask the broker cannot be given (no broker, data past its bounds or not
         renderable) fails the same way (D10.4); so does a modified input the
-        tool would not take. A ``Pause`` cannot come (no pause is available
-        until #126) and fails too."""
+        tool would not take, an empty one included
+        (:func:`~autoforge.claude_sdk.modified_input_problem`). A ``Pause``
+        cannot come (no pause is available until #126) and fails too."""
         reason = ""
         request = None
         if broker is None:
@@ -4084,7 +4085,13 @@ class ClaudeSdkProvider(_SdkProvider):
                     return
                 if isinstance(decision, Allow):
                     updated = decision.input_to_send()
-                    problem = modified_input_problem(ask.tool_name, updated) if updated else ""
+                    # Every modified input is checked, an empty one included;
+                    # only none at all runs the call's own input.
+                    problem = (
+                        ""
+                        if updated is None
+                        else modified_input_problem(ask.tool_name, updated, ask.tool_input)
+                    )
                     if not problem:
                         self._send(
                             child, session, session.decide(ask, "allow", updated_input=updated)
@@ -4141,11 +4148,13 @@ class ClaudeSdkProvider(_SdkProvider):
 
     @staticmethod
     def _read_rest(child: DuplexChild, session: ClaudeSdkSession) -> None:
-        """What stdout still held after :meth:`DuplexChild.finish`, to its end:
-        the helper's ``end`` written as its stdin was closed, or what it wrote
-        before a limit killed it. Never waits; nothing is sent."""
-        if session.done:
-            return
+        """Everything stdout still held after :meth:`DuplexChild.finish`, to its
+        end, each item reduced, before the outcome is read: the helper's
+        ``end`` written as its stdin was closed, what it wrote before a limit
+        killed it, and whatever followed an ``end`` already read. The reducer
+        fails the run on anything after ``end`` (a record, one past the bound,
+        an unterminated tail, an overflow), so a reply is accepted only from a
+        stream read whole. Never waits; nothing is sent."""
         item = child.read_line(timeout=0)
         rest: list[Record | Oversize | Fragment | Overflow] = []
         while not isinstance(item, Eof):
@@ -4157,8 +4166,8 @@ class ClaudeSdkProvider(_SdkProvider):
                 break
             item = child.read_line(timeout=0)
         for entry in rest:
-            if session.done:
-                return
+            # Fed even once the session is done: a record after ``end`` fails
+            # it, and one after a failure changes nothing.
             if isinstance(entry, Record):
                 session.feed(entry.data)
             elif isinstance(entry, Oversize):

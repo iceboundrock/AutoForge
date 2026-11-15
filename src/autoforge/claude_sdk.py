@@ -56,7 +56,10 @@ The outcome (ADR 0007 D10.3, D10.4):
   sent.
 * Every ``system/init`` must report the caller's session id and match the
   policy (:meth:`autoforge.sdk_policy.ClaudeSdkPolicy.init_problems`); the
-  ``result`` must report the same session id.
+  ``result`` must report the same session id. Nothing of the turn (an
+  ``assistant`` or ``user`` message, an ``ask``, the ``result``) may come
+  before a ``system/init`` has checked out: a session with no init, or one
+  whose init arrives late, fails closed, and its ask is never put to anyone.
 * Only the ``result`` of the main turn is a completion, and only when it is
   ``success`` with ``is_error: false`` (an API error can come with ``subtype:
   success``), ``terminal_reason: completed``, a ``stop_reason`` of a finished
@@ -92,6 +95,7 @@ two calls in one turn are asked about one at a time.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -174,24 +178,112 @@ _RECORD_KEYS: dict[str, frozenset[str]] = {
     "failure": frozenset({"type", "reason"}),
 }
 _END_COUNTS = ("skipped_unknown", "asks", "hook_denials", "host_denials")
+# The messages of a turn, none of which may come before a verified
+# ``system/init``; another system message or an observation may.
+_TURN_MESSAGES = {
+    "assistant": "an assistant message",
+    "user": "a user message",
+    "result": "the result",
+}
 _PYTHON_RE = re.compile(r"([0-9]+)\.([0-9]+)\.([0-9]+)[a-z0-9+]*")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _MAX_COUNT = 10**9
 
-# The input a modified call must still carry, per tool: the strings the
-# tool's own schema requires. A modified input without them is refused,
-# never sent (the provider's schema, as far as AutoForge knows it).
-TOOL_REQUIRED_STRINGS: dict[str, tuple[str, ...]] = {
-    "Bash": ("command",),
-    "Read": ("file_path",),
-    "Glob": ("pattern",),
-    "Grep": ("pattern",),
-    "Edit": ("file_path", "old_string", "new_string"),
-    "Write": ("file_path", "content"),
-    "NotebookEdit": ("notebook_path", "new_source"),
-    "WebFetch": ("url", "prompt"),
-    "WebSearch": ("query",),
+# The input each tool a profile may ask about takes: every field, its kind,
+# and the required ones, as AutoForge records Claude Code's published tool
+# input types. A modified input is checked against it whole before it is
+# sent (:func:`modified_input_problem`). The table is not read from the
+# pinned runtime, and only a modified Bash ``command`` was probed on it
+# (G-C4), so a field the table does not name passes only as the call itself
+# carried it, and a field it names is held to the kind it names.
+_NAME = "a non-empty string"
+_TEXT = "a string"
+_COUNT = "a whole number from 0"
+_FLAG = "true or false"
+_NAMES = "a list of non-empty strings"
+_TIMEOUT = "a number of milliseconds from 1 to 600000"
+BASH_MAX_TIMEOUT_MS = 600_000
+_Kind = str | tuple[str, ...]  # a kind above, or the strings an enum takes
+
+
+@dataclass(frozen=True)
+class ToolSchema:
+    """One tool's input: the fields it requires and the ones it may take."""
+
+    required: Mapping[str, _Kind]
+    optional: Mapping[str, _Kind]
+
+
+TOOL_INPUT_SCHEMAS: dict[str, ToolSchema] = {
+    "Bash": ToolSchema(
+        {"command": _NAME},
+        {
+            "description": _TEXT,
+            "timeout": _TIMEOUT,
+            "run_in_background": _FLAG,
+            "dangerouslyDisableSandbox": _FLAG,
+        },
+    ),
+    "Read": ToolSchema({"file_path": _NAME}, {"offset": _COUNT, "limit": _COUNT, "pages": _TEXT}),
+    "Glob": ToolSchema({"pattern": _NAME}, {"path": _NAME}),
+    "Grep": ToolSchema(
+        {"pattern": _NAME},
+        {
+            "path": _NAME,
+            "glob": _TEXT,
+            "output_mode": ("content", "files_with_matches", "count"),
+            "-B": _COUNT,
+            "-A": _COUNT,
+            "-C": _COUNT,
+            "context": _COUNT,
+            "-n": _FLAG,
+            "-i": _FLAG,
+            "type": _TEXT,
+            "head_limit": _COUNT,
+            "offset": _COUNT,
+            "multiline": _FLAG,
+        },
+    ),
+    "Edit": ToolSchema(
+        {"file_path": _NAME, "old_string": _TEXT, "new_string": _TEXT}, {"replace_all": _FLAG}
+    ),
+    "Write": ToolSchema({"file_path": _NAME, "content": _TEXT}, {}),
+    "NotebookEdit": ToolSchema(
+        {"notebook_path": _NAME, "new_source": _TEXT},
+        {
+            "cell_id": _TEXT,
+            "cell_type": ("code", "markdown"),
+            "edit_mode": ("replace", "insert", "delete"),
+        },
+    ),
+    "WebFetch": ToolSchema({"url": _NAME, "prompt": _NAME}, {}),
+    "WebSearch": ToolSchema(
+        {"query": _NAME}, {"allowed_domains": _NAMES, "blocked_domains": _NAMES}
+    ),
 }
+
+
+def _fits(kind: _Kind, value: object) -> bool:
+    """Whether ``value`` is of ``kind`` (a JSON ``null`` never is)."""
+    if isinstance(kind, tuple):
+        return isinstance(value, str) and value in kind
+    if kind == _NAME:
+        return isinstance(value, str) and bool(value.strip())
+    if kind == _TEXT:
+        return isinstance(value, str)
+    if kind == _FLAG:
+        return isinstance(value, bool)
+    if kind == _NAMES:
+        return isinstance(value, (list, tuple)) and all(
+            isinstance(item, str) and item.strip() for item in value
+        )
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if kind == _COUNT:
+        return isinstance(value, int) and 0 <= value < _MAX_COUNT
+    assert kind == _TIMEOUT, kind
+    return math.isfinite(value) and 1 <= value <= BASH_MAX_TIMEOUT_MS
+
 
 INTERRUPT = b'{"type":"interrupt"}'
 
@@ -334,16 +426,49 @@ def answer_input(ask: Ask, answer: Answer) -> dict[str, object]:
     return {"questions": questions, "answers": answers}
 
 
-def modified_input_problem(tool_name: str, updated: Mapping[str, object]) -> str:
-    """Why ``updated`` is no input ``tool_name`` takes, or "" (names only)."""
-    missing = [
-        key
-        for key in TOOL_REQUIRED_STRINGS.get(tool_name, ())
-        if not isinstance(updated.get(key), str) or not updated.get(key)
-    ]
+def modified_input_problem(
+    tool_name: str, updated: Mapping[str, object], original: Mapping[str, object] | None
+) -> str:
+    """Why ``updated``, a modified input for a call of ``tool_name`` whose own
+    input was ``original``, is no input the tool takes, or "" (field names
+    only, never a value).
+
+    Every modified input is checked, an empty one included, against the
+    tool's schema (:data:`TOOL_INPUT_SCHEMAS`): each required field present,
+    and every field of the kind the tool takes. A field the schema does not
+    name passes only with exactly the value the call itself carried, so the
+    operator adds nothing that is not checked. A tool with no schema takes
+    no modified input at all.
+    """
+    schema = TOOL_INPUT_SCHEMAS.get(tool_name)
+    if schema is None:
+        return f"AutoForge knows no input schema of {tool_name}, so it cannot modify its input"
+    missing = [key for key in schema.required if key not in updated]
     if missing:
         return f"a modified {tool_name} input lacks {', '.join(missing)}"
+    fields = {**schema.optional, **schema.required}
+    wrong = [
+        key for key, kind in fields.items() if key in updated and not _fits(kind, updated[key])
+    ]
+    if wrong:
+        kinds = "; ".join(f"{key} must be {_kind_name(fields[key])}" for key in wrong)
+        return f"a modified {tool_name} input has a field of the wrong kind: {kinds}"
+    carried = original or {}
+    added = [
+        key
+        for key in updated
+        if key not in fields and (key not in carried or carried[key] != updated[key])
+    ]
+    if added:
+        named = ", ".join(clean(key, 40) for key in sorted(added)[:5])
+        return (
+            f"a modified {tool_name} input sets {named}, which the {tool_name} tool does not take"
+        )
     return ""
+
+
+def _kind_name(kind: _Kind) -> str:
+    return f"one of {', '.join(kind)}" if isinstance(kind, tuple) else kind
 
 
 def _count(value: object) -> int | None:
@@ -398,6 +523,10 @@ class ClaudeSdkSession:
         self._seen_calls: set[str] = set()
         self._asked = 0
         self._inits = 0
+        # A ``system/init`` reported the caller's session id and matched the
+        # policy: nothing of a turn (a message of it, an ask, its result) is
+        # read before one has.
+        self._initialized = False
         self._subagent_records = 0
         self._result_checked = False
         self._model = ""
@@ -630,6 +759,9 @@ class ClaudeSdkSession:
             self.stream.oversize(0)
             return
         kind = data["type"]
+        if kind in _TURN_MESSAGES and not self._initialized:
+            self._uninitialized(_TURN_MESSAGES[kind])
+            return
         if kind in ("assistant", "user") and data.get("parent_tool_use_id") is not None:
             self._subagent_records += 1
             self._fail(
@@ -669,6 +801,19 @@ class ClaudeSdkSession:
                 + "; ".join(problems),
                 "claude-sdk: the runtime departed from the policy",
             )
+            return
+        self._initialized = True
+
+    def _uninitialized(self, what: str) -> None:
+        """``what`` arrived before any ``system/init`` checked out: the turn
+        ran on a session whose tools, permission mode, credential source and
+        session id nobody verified, so nothing of it is read (G-C2: the first
+        ``system/init`` after the query is the prompt's admission)."""
+        self._fail(
+            f"claude-sdk: {what} came before the session's system/init, so the session's "
+            "configuration was never verified",
+            "claude-sdk: no verified system/init",
+        )
 
     @staticmethod
     def _typed_api_error(data: dict) -> dict:
@@ -728,6 +873,10 @@ class ClaudeSdkSession:
         self._result_checked = True
 
     def _ask(self, record: dict) -> Ask | None:
+        if not self._initialized:
+            # Never put to anyone: the call's session was never verified.
+            self._uninitialized("an ask")
+            return None
         request_id, kind = record["request_id"], record["kind"]
         tool, call, agent = record["tool_name"], record["tool_use_id"], record["agent"]
         if not isinstance(request_id, str) or not request_id or request_id in self._seen_requests:

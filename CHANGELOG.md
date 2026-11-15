@@ -23,7 +23,8 @@ What you get:
 - **The [SDK policy](docs/sdk-policy.md)** is applied on every launch.
 - **`ANTHROPIC_API_KEY` only.** It is required, and no login is ever used.
 - **A fresh session id each launch.** Every `system/init` and the result
-  must report it.
+  must report it, and nothing of the turn is read before a `system/init`
+  has passed the policy's checks.
 - **One persistent root per issue.** The configuration and session root
   lies under the issue's sandbox directory; AutoForge creates it, and under
   `sandbox.mode: required` it is projected writable.
@@ -35,11 +36,12 @@ What you get:
 With `interaction_policy: prompt` an `AskUserQuestion` call, or a call of
 a tool in `ask_tools`, is put to you at the terminal: an answer (several
 labels or your own words included), a one-time approval, an approval with
-a changed input, or a denial with guidance. Each was verified on the pinned
-pair against a loopback stand-in of the Messages API (ADR 0007 §3's
-amendment). No model was called. Approve-for-session and pausing for a
-decision (#126) are not available. Under `fail`, the default, an ask fails
-the launch, which is never relaunched.
+a changed input (checked against the tool's input schema first), or a
+denial with guidance. Each was verified on the pinned pair against a
+loopback stand-in of the Messages API (ADR 0007 §3's amendment). No model
+was called. Approve-for-session and pausing for a decision (#126) are not
+available. Under `fail`, the default, an ask fails the launch, which is
+never relaunched.
 
 The `opencode-sdk` provider still cannot launch (#152).
 

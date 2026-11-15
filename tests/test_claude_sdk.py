@@ -308,6 +308,75 @@ def test_an_unknown_observation_is_counted_not_fatal():
     assert session.summary()["skipped_unknown"] == 3
 
 
+_TEXT = _rec("message", data={"type": "assistant", "message": {"content": [{"type": "text"}]}})
+_TOOL_RESULT = _rec(
+    "message",
+    data={
+        "type": "user",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1"}]},
+        "parent_tool_use_id": None,
+    },
+)
+
+
+@pytest.mark.parametrize(
+    ("records", "named"),
+    [
+        # No system/init at all: the result, or a message of the turn, first.
+        ([_result(), END], "the result came before the session's system/init"),
+        ([_TEXT, _result(), END], "an assistant message came before"),
+        ([_TOOL_RESULT, _result(), END], "a user message came before"),
+        # Out of order: the init arrives once the turn is under way, or after it.
+        ([_TEXT, _init(), _result(), END], "an assistant message came before"),
+        ([_result(), _init(), END], "the result came before"),
+        # An init that did not check out verifies nothing: the turn after it
+        # fails on that init's own reason.
+        ([_init(session_id="other"), _TEXT, _result(), END], "session id"),
+        ([_init(tools=["Read"]), _result(), END], "departed from the policy"),
+    ],
+)
+def test_nothing_of_a_turn_is_read_before_a_verified_init(records, named):
+    session = _session()
+    _feed(session, HELLO, *records)
+    assert session.text is None and not session.reply_proven
+    assert named in (session.failed or ""), session.failed
+    assert session.done
+
+
+def test_an_ask_before_the_init_is_never_put_to_anyone():
+    session = _session(PROMPT)
+    assert _feed(session, HELLO, _ask()) == []
+    assert session.open_asks == ()
+    assert "an ask came before the session's system/init" in (session.failed or "")
+    assert session.failure_kind == "claude-sdk: no verified system/init"
+    # A late init changes nothing: the session has failed.
+    _feed(session, _init(PROMPT), _result(), END)
+    assert session.text is None
+
+
+def test_observations_before_the_init_are_read_and_the_turn_after_it_is_the_reply():
+    """A system notice or a rate-limit observation may come before the init;
+    only the turn itself needs one first."""
+    session = _session()
+    notice = _rec("message", data={"type": "system", "subtype": "status"})
+    limit = _rec("message", data={"type": "rate_limit_event", "status": "allowed"})
+    _feed(session, HELLO, notice, limit, _init(), _TEXT, _result(), END)
+    assert session.failed is None and session.text == FINAL and session.reply_proven
+
+
+def test_a_turn_interrupted_before_its_init_ends_interrupted_not_failed():
+    """The controller interrupted before the session started (a limit during
+    connect): the helper's interrupted end is the outcome, with no init."""
+    session = _session()
+    _feed(session, HELLO)
+    session.interrupt()
+    interrupted = _rec(
+        "end", outcome="interrupted", skipped_unknown=0, asks=0, hook_denials=0, host_denials=0
+    )
+    _feed(session, interrupted)
+    assert session.outcome == "interrupted" and session.failure is None and session.text is None
+
+
 def _ask(**over: object) -> bytes:
     tool_input = over.pop("input", {"command": "ls", "description": "list"})
     fields = {
@@ -466,10 +535,71 @@ def test_a_questions_text_is_cleaned_for_display_and_its_key_kept_raw():
     assert answer_input(ask, answer)["answers"] == {raw: "Red"}
 
 
-def test_a_modified_input_must_still_be_the_tools_input():
-    assert modified_input_problem("Bash", {"command": "ls"}) == ""
-    assert "lacks command" in modified_input_problem("Bash", {"cmd": "ls"})
-    assert "lacks file_path, content" in modified_input_problem("Write", {})
+_CALL = {"command": "rm -r x", "description": "remove x"}
+
+
+@pytest.mark.parametrize(
+    ("tool", "updated", "original"),
+    [
+        ("Bash", {"command": "ls"}, _CALL),
+        (
+            "Bash",
+            {"command": "ls", "description": "", "timeout": 5000, "run_in_background": False},
+            _CALL,
+        ),
+        ("Bash", {"command": "ls", "timeout": 600_000.0}, _CALL),
+        # A field AutoForge's schema does not name, kept as the call carried it.
+        ("Bash", {"command": "ls", "newer_field": [1]}, {**_CALL, "newer_field": [1]}),
+        # Empty text where the tool takes it: an edit that deletes, an empty file.
+        ("Edit", {"file_path": "/w/a", "old_string": "x", "new_string": ""}, None),
+        ("Write", {"file_path": "/w/a", "content": ""}, None),
+        ("Grep", {"pattern": "x", "output_mode": "count", "-n": True, "-C": 0}, None),
+        ("NotebookEdit", {"notebook_path": "/w/n", "new_source": "", "edit_mode": "delete"}, None),
+        ("WebSearch", {"query": "q", "allowed_domains": ["example.org"]}, None),
+        ("Read", {"file_path": "/w/a", "offset": 0, "limit": 10}, None),
+    ],
+)
+def test_a_modified_input_the_tool_takes_passes(tool, updated, original):
+    assert modified_input_problem(tool, updated, original) == ""
+
+
+@pytest.mark.parametrize(
+    ("tool", "updated", "named"),
+    [
+        # An empty modified input is a modified input, and is checked.
+        ("Bash", {}, "lacks command"),
+        ("Write", {}, "lacks file_path, content"),
+        ("Bash", {"cmd": "ls"}, "lacks command"),
+        ("Bash", {"command": ""}, "command must be a non-empty string"),
+        ("Bash", {"command": None}, "command must be a non-empty string"),
+        ("Bash", {"command": "ls", "timeout": "5000"}, "timeout must be a number"),
+        ("Bash", {"command": "ls", "timeout": True}, "timeout must be a number"),
+        ("Bash", {"command": "ls", "timeout": 0}, "timeout must be a number"),
+        ("Bash", {"command": "ls", "timeout": 600_001}, "timeout must be a number"),
+        ("Bash", {"command": "ls", "run_in_background": "yes"}, "run_in_background must be"),
+        ("Bash", {"command": "ls", "description": 7}, "description must be a string"),
+        ("Read", {"file_path": "/w/a", "offset": -1}, "offset must be a whole number"),
+        ("Read", {"file_path": "/w/a", "limit": 2.5}, "limit must be a whole number"),
+        ("Grep", {"pattern": "x", "output_mode": "lines"}, "output_mode must be one of"),
+        ("Grep", {"pattern": "x", "-i": 1}, "-i must be true or false"),
+        ("Edit", {"file_path": "/w/a", "old_string": "x", "new_string": None}, "new_string"),
+        ("WebSearch", {"query": "q", "blocked_domains": "a.org"}, "blocked_domains must be"),
+        # A field the tool does not take, which the call did not carry.
+        ("Bash", {"command": "ls", "sudo": True}, "sets sudo, which the Bash tool does not"),
+        # One the call carried, with another value.
+        ("Bash", {"command": "ls", "newer_field": [2]}, "sets newer_field"),
+        ("AskUserQuestion", {"questions": []}, "knows no input schema of AskUserQuestion"),
+    ],
+)
+def test_a_modified_input_the_tool_would_not_take_is_refused(tool, updated, named):
+    original = {**_CALL, "newer_field": [1]}
+    assert named in modified_input_problem(tool, updated, original)
+
+
+def test_every_tool_a_profile_may_ask_about_has_an_input_schema():
+    from autoforge.sdk_policy import CLAUDE_SDK_TOOLS
+
+    assert set(claude_sdk.TOOL_INPUT_SCHEMAS) == set(CLAUDE_SDK_TOOLS)
 
 
 # -- the helper and the adapter, on the fake SDK -------------------------------------
@@ -649,6 +779,111 @@ def test_an_sdk_failure_is_a_bounded_redacted_provider_failure(
     assert "sk-ant-api03-" not in (result.provider_failure or "") + result.stderr
 
 
+_SAID = {"message": {"kind": "assistant", "content": [{"type": "text", "text": FINAL}]}}
+
+
+@pytest.mark.parametrize(
+    ("script", "named"),
+    [
+        # The session emits no system/init at all.
+        ({"init": False}, "the result came before the session's system/init"),
+        ({"init": False, "steps": [_SAID]}, "an assistant message came before"),
+        (
+            {"init": False, "steps": [{"tool": {"id": "t", "name": "Read", "input": {}}}]},
+            "an assistant message came before",
+        ),
+        # Its system/init comes once the turn is under way.
+        ({"init": False, "steps": [_SAID, {"init": {}}]}, "an assistant message came before"),
+    ],
+)
+def test_a_session_without_a_verified_init_is_never_a_reply(
+    tmp_path, sdk_python, launch_env, script, named
+):
+    result, _, took = _run(tmp_path, sdk_python, fake.script(result={"result": FINAL}, **script))
+    assert named in (result.provider_failure or ""), result.provider_failure
+    assert result.stdout == "" and not result.reply_delivered and took < 30
+
+
+def test_an_ask_before_the_init_is_never_put_to_the_operator(tmp_path, sdk_python, launch_env):
+    resolver = Scripted(Allow())
+    # The hook's ask reaches the controller before any message of the turn.
+    call = {"tool": {**_bash()["tool"], "silent": True}}
+    prompt = fake.script(init=False, steps=[call], result={"result": FINAL})
+    result, req, took = _run(tmp_path, sdk_python, prompt, PROMPT, resolver)
+    assert resolver.asked == []
+    assert "an ask came before the session's system/init" in (result.provider_failure or "")
+    assert result.stdout == "" and not result.reply_delivered and took < 30
+    # The helper's waiting hook was settled by the wind-down, as a denial.
+    (hook,) = [e for e in fake.log(Path(req.cwd)) if e.get("hook")]
+    assert hook["output"]["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize(
+    "late",
+    [
+        ['{"type":"failure","reason":"the helper failed after all"}\n'],
+        ['{"type":"message","data":{"type":"system","subtype":"status"}}\n'],
+        [
+            '{"type":"end","outcome":"result","skipped_unknown":0,"asks":0,'
+            '"hook_denials":0,"host_denials":0}\n'
+        ],
+        ["not json\n"],
+    ],
+)
+def test_a_record_the_helper_writes_after_its_end_fails_the_run(
+    tmp_path, sdk_python, launch_env, late
+):
+    """Whatever stdout still held after the helper's ``end`` is read whole
+    before the outcome is: a completed reply followed by anything is no reply."""
+    prompt = fake.script(result={"result": FINAL}, after_end=late)
+    result, _, _ = _run(tmp_path, sdk_python, prompt)
+    assert "a record after the helper's end" in (result.provider_failure or "")
+    assert result.stdout == "" and not result.reply_delivered
+
+
+def test_an_unterminated_tail_after_the_helpers_end_fails_the_run(tmp_path, sdk_python, launch_env):
+    prompt = fake.script(result={"result": FINAL}, after_end=['{"type":"failure","rea'])
+    result, _, _ = _run(tmp_path, sdk_python, prompt)
+    assert "unterminated record" in (result.provider_failure or "")
+    assert result.stdout == "" and not result.reply_delivered
+
+
+class _Rest:
+    """A finished duplex handle's stdout: the items still queued, then EOF."""
+
+    def __init__(self, *items) -> None:
+        from autoforge.executor_duplex import Eof
+
+        self.items = [*items, Eof()]
+
+    def read_line(self, timeout=None):
+        return self.items[0] if len(self.items) == 1 else self.items.pop(0)
+
+    def unread_at_deadline(self):
+        return []
+
+
+def test_the_rest_of_stdout_is_read_past_an_end_it_holds():
+    """An ``end`` in the remainder ends the session, and what follows it is
+    still read: a failure after it fails the run (the adapter's drain, as
+    after a wind-down that did not reach the end in time)."""
+    from autoforge.executor_duplex import Fragment, Oversize, Record
+
+    for late, named in (
+        (Record(_rec("failure", reason="late")), "a record after the helper's end"),
+        (Oversize(1 << 20, b"{"), "longer than"),
+        (Fragment(b'{"type"'), "unterminated record"),
+    ):
+        session = _session()
+        _feed(session, HELLO, _init(), _TEXT)
+        ClaudeSdkProvider._read_rest(_Rest(Record(_result()), Record(END), late), session)
+        assert session.text is None and named in (session.failed or ""), session.failed
+    clean = _session()
+    _feed(clean, HELLO, _init(), _TEXT)
+    ClaudeSdkProvider._read_rest(_Rest(Record(_result()), Record(END)), clean)
+    assert clean.failed is None and clean.text == FINAL and clean.reply_proven
+
+
 def test_a_pair_mismatch_never_starts_a_session(tmp_path_factory, tmp_path, launch_env):
     python = fake.make_environment(tmp_path_factory.mktemp("old-sdk") / "env", version="0.2.150")
     result, req, _ = _run(tmp_path, str(python), fake.script())
@@ -741,6 +976,28 @@ def test_a_question_is_answered_live_with_the_questions_echoed(tmp_path, sdk_pyt
             },
         ),
         (
+            # Optional fields of the kinds the tool takes, and one the call
+            # itself carried, unchanged.
+            Allow(
+                updated_input={
+                    "command": "echo safer",
+                    "timeout": 5000,
+                    "description": "",
+                    "hint": "kept",
+                }
+            ),
+            {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "updatedInput": {
+                    "command": "echo safer",
+                    "timeout": 5000,
+                    "description": "",
+                    "hint": "kept",
+                },
+            },
+        ),
+        (
             Deny(guidance="Use Read instead."),
             {
                 "hookEventName": "PreToolUse",
@@ -760,7 +1017,15 @@ def test_a_question_is_answered_live_with_the_questions_echoed(tmp_path, sdk_pyt
 )
 def test_a_permission_is_decided_live(tmp_path, sdk_python, launch_env, decision, expected):
     prompt = fake.script(
-        steps=[{"tool": {"id": "toolu_b", "name": "Bash", "input": {"command": "rm -r x"}}}],
+        steps=[
+            {
+                "tool": {
+                    "id": "toolu_b",
+                    "name": "Bash",
+                    "input": {"command": "rm -r x", "hint": "kept"},
+                }
+            }
+        ],
         result={"result": FINAL},
     )
     resolver = Scripted(decision)
@@ -803,27 +1068,23 @@ def test_a_call_the_policy_does_not_ask_about_is_denied_by_the_hook(
     assert result.provider_summary["hook_denials"] == 1
 
 
-def test_a_bare_allow_of_a_question_falls_to_the_host_which_denies(tmp_path, sdk_python):
+def test_a_bare_allow_of_a_question_falls_to_the_host_which_denies(
+    tmp_path, sdk_python, launch_env, monkeypatch
+):
     """What the pinned pair does with ``allow`` and no ``answers`` (the fake
     models it): the permission host is asked and denies."""
-    os.environ.setdefault("ANTHROPIC_API_KEY", KEY)
-    try:
-        prompt = fake.script(
-            steps=[{"tool": {"id": "toolu_q", "name": "AskUserQuestion", "input": QUESTION}}],
-            result={"result": FINAL},
-        )
-        adapter, req = _request(tmp_path, sdk_python, prompt, {"interaction_policy": "prompt"})
-        # Answer the helper's ask with a bare allow, as a broken resolver would.
-        orig = adapter._answer
+    prompt = fake.script(
+        steps=[{"tool": {"id": "toolu_q", "name": "AskUserQuestion", "input": QUESTION}}],
+        result={"result": FINAL},
+    )
+    adapter, req = _request(tmp_path, sdk_python, prompt, {"interaction_policy": "prompt"})
 
-        def bare(child, session, ask, broker, asked):
-            adapter._send(child, session, session.decide(ask, "allow"))
+    # Answer the helper's ask with a bare allow, as a broken resolver would.
+    def bare(child, session, ask, broker, asked):
+        adapter._send(child, session, session.decide(ask, "allow"))
 
-        adapter._answer = bare  # type: ignore[method-assign]
-        result = adapter.execute(req)
-        adapter._answer = orig  # type: ignore[method-assign]
-    finally:
-        pass
+    monkeypatch.setattr(adapter, "_answer", bare)
+    result = adapter.execute(req)
     host = next(e for e in fake.log(Path(req.cwd)) if e.get("host"))
     assert host["result"]["behavior"] == "deny"
     assert result.provider_summary["host_denials"] == 1
@@ -834,6 +1095,26 @@ def test_a_bare_allow_of_a_question_falls_to_the_host_which_denies(tmp_path, sdk
     [
         ({"interaction_policy": "fail"}, [], [], None),
         (PROMPT, [_bash()], [Allow(updated_input={"cmd": "ls"})], "lacks command"),
+        # An empty modified input is checked like any other, never sent.
+        (PROMPT, [_bash()], [Allow(updated_input={})], "lacks command"),
+        (
+            PROMPT,
+            [_bash()],
+            [Allow(updated_input={"command": "ls", "timeout": "soon"})],
+            "timeout must be a number",
+        ),
+        (
+            PROMPT,
+            [_bash()],
+            [Allow(updated_input={"command": "ls", "run_in_background": "yes"})],
+            "run_in_background must be true or false",
+        ),
+        (
+            PROMPT,
+            [_bash()],
+            [Allow(updated_input={"command": "ls", "sudo": True})],
+            "which the Bash tool does not take",
+        ),
         (
             {**PROMPT, "max_interactions": "1"},
             [_bash(), _bash("ls", "toolu_c")],
@@ -1140,6 +1421,18 @@ def test_the_helper_lock_pins_the_pair_with_hashes():
     assert "claude-agent-sdk==0.2.163" in text
     pins = [line for line in text.splitlines() if "==" in line and not line.startswith("#")]
     assert pins and all("--hash=sha256:" in text.split(line, 1)[1].split("==")[0] for line in pins)
+
+
+def test_the_install_guide_names_the_interpreter_by_an_absolute_path():
+    """``command`` runs as written, with no shell: a ``~`` would never expand."""
+    import yaml
+
+    guide = (SRC.parent.parent / "helpers" / "claude-sdk" / "README.md").read_text("utf-8")
+    blocks = [b.split("```", 1)[0] for b in guide.split("```yaml\n")[1:]]
+    assert blocks
+    for block in blocks:
+        for profile in yaml.safe_load(block)["profiles"].values():
+            assert os.path.isabs(profile["command"]), profile["command"]
 
 
 def test_claude_sdk_now_launches_and_opencode_sdk_is_still_refused(tmp_path):

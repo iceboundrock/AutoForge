@@ -128,7 +128,10 @@ difference is a provider failure, never something to adapt to.
 values. The adapter runs it on every `init` record and fails the
 invocation on any problem (#151, `src/autoforge/claude_sdk.py`). Every
 `init` and the result must also report the session id AutoForge gave the
-session. It flags:
+session. Nothing of the turn is read before an `init` has passed these
+checks: an assistant or user message, an ask or the result that comes
+first fails the invocation, and that ask is never put to the operator. A
+session that sends no `init`, or sends it late, is never a reply. It flags:
 
 - a tool offered that the policy does not list, or a listed tool missing;
 - an MCP server;
@@ -411,6 +414,20 @@ field and the rule, never the value.
   snapshot is what is validated and what an adapter sends
   (`Allow.input_to_send()`), so changing the caller's object afterwards
   changes nothing.
+- **Checked against the tool's schema.** For `claude-sdk`, every modified
+  input is checked before the approval is sent, an empty one included
+  (`claude_sdk.modified_input_problem`). Each required field must be
+  present, and every field must be of the kind the tool takes: a non-empty
+  string, a string, a whole number, a flag, a list of names, or one of an
+  enum's values. The Bash `timeout` must be from 1 to 600000 ms. The schema
+  is AutoForge's own record of Claude Code's published tool inputs
+  (`claude_sdk.TOOL_INPUT_SCHEMAS`), not read from the pinned runtime. So a field
+  it does not name passes only with exactly the value the call itself
+  carried, and the operator cannot add one that goes unchecked. A modified
+  input that fails the check is never sent: the call is denied and the
+  launch fails as D7.6's failure. Status: source/docs only. The probes ran
+  a modified Bash `command` (G-C4); the other tools' schemas were not
+  probed.
 - **Shown apart from the identity.** An option keeps its raw label (the
   identity a reply carries) apart from what is shown (`question_options`).
   Two labels shown alike are refused, because a person could not tell them

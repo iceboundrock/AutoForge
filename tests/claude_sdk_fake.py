@@ -18,16 +18,24 @@ prompt, a JSON object (:func:`script`):
     builds from the options as the pinned CLI does (``false`` emits none);
 ``steps``
     in order: ``{"message": {...}}`` yields one message (``kind`` names its
-    class); ``{"tool": {"id", "name", "input"}}`` runs the call through the
-    ``PreToolUse`` hook and, for a call the hook neither allows nor denies,
-    the allowed tools and the permission host, as Claude Code does, then
-    yields the assistant ``tool_use`` and the ``tool_result`` (an error for a
-    denied call); ``{"sleep": s}`` waits, interruptibly; ``{"spawn": argv}``
-    starts a process that leaves the helper's process group; ``{"raise":
-    "name"}`` raises; ``{"flood": n}`` yields ``n`` system notices;
-    ``{"stop": true}`` ends the response without a result;
+    class); ``{"init": {...}}`` yields a ``system/init`` there, built as the
+    first one is (for an init that comes late); ``{"tool": {"id", "name",
+    "input"}}`` runs the call through the ``PreToolUse`` hook and, for a call
+    the hook neither allows nor denies, the allowed tools and the permission
+    host, as Claude Code does, then yields the assistant ``tool_use`` and the
+    ``tool_result`` (an error for a denied call; with ``"silent": true`` no
+    ``tool_use`` comes first, as when the SDK's control channel delivers the
+    hook before the message); ``{"sleep": s}`` waits, interruptibly;
+    ``{"spawn": argv}`` starts a process that leaves the helper's process
+    group; ``{"raise": "name"}`` raises; ``{"flood": n}`` yields ``n`` system
+    notices; ``{"stop": true}`` ends the response without a result;
 ``result``
-    fields merged over a completed result (``"result": "<text>"``).
+    fields merged over a completed result (``"result": "<text>"``);
+``after_end``
+    strings ``disconnect`` writes, as they are, on the helper's wire, which
+    it finds by its class name: after the helper's ``end``, once the
+    controller has closed its stdin (a record needs its own LF; a string
+    without one is an unterminated tail).
 
 An interrupt ends a running step and yields an interrupted result
 (``error_during_execution``, ``aborted_tools``). Each call of a hook or the
@@ -220,16 +228,21 @@ class ClaudeSDKClient:
         self._interrupted.set()
 
     async def disconnect(self):
-        return None
+        late = self._script.get("after_end")
+        if late:
+            import gc
+            wire = next(o for o in gc.get_objects() if type(o).__name__ == "Wire")
+            for text in late:
+                wire._write(text.encode())
 
-    def _init(self):
+    def _init(self, extra=None):
         o = self.options
         init = {"type": "system", "subtype": "init", "session_id": o.session_id,
                 "model": o.model or "fake-model", "permissionMode": o.permission_mode,
                 "apiKeySource": ("ANTHROPIC_API_KEY" if os.environ.get("ANTHROPIC_API_KEY")
                                  else "none"),
                 "tools": list(o.tools), "mcp_servers": [], "plugins": [], "cwd": o.cwd}
-        extra = self._script.get("init", {})
+        extra = self._script.get("init", {}) if extra is None else extra
         if extra is False:
             return None
         init.update(extra)
@@ -311,12 +324,15 @@ class ClaudeSDKClient:
             for step in script.get("steps", []):
                 if "message" in step:
                     yield self._message(step["message"])
+                elif "init" in step:
+                    yield self._init(step["init"])
                 elif "tool" in step:
                     spec = step["tool"]
-                    yield AssistantMessage(
-                        content=[ToolUseBlock(spec.get("id", "toolu_x"), spec["name"],
-                                              spec.get("input", {}))],
-                        model=o.model or "fake-model", session_id=o.session_id)
+                    if not spec.get("silent"):
+                        yield AssistantMessage(
+                            content=[ToolUseBlock(spec.get("id", "toolu_x"), spec["name"],
+                                                  spec.get("input", {}))],
+                            model=o.model or "fake-model", session_id=o.session_id)
                     ok, content = await self._tool(spec)
                     turns += 1
                     yield UserMessage(content=[ToolResultBlock(spec.get("id", "toolu_x"), content,
