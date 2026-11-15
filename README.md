@@ -102,7 +102,7 @@ what each phase verifies on GitHub is in
 
 | You need | Notes |
 |---|---|
-| Linux on x86_64 | The only supported platform. macOS, Linux ARM64 and WSL2 are untested. Windows does not work (the lock uses POSIX `fcntl`). |
+| Linux on x86_64, or macOS | Linux x86_64 is tested in CI. macOS has been tested by the maintainer ([#482](https://github.com/iceboundrock/AutoForge/pull/482) fixed a macOS-only stop); it has no outer sandbox (`sandbox.mode: required` is refused) and weaker process containment than Linux. Linux ARM64 and WSL2 are untested. Windows does not work (the lock uses POSIX `fcntl`). |
 | CPython 3.11 or 3.12 | The interpreters CI tests. 3.13 and later are untested; `uv` can fetch 3.12 for you. |
 | [`uv`](https://docs.astral.sh/uv/getting-started/installation/) | Installs AutoForge into its own environment. |
 | `git`, with a global `user.name` and `user.email` | The implementer commits as you. |
@@ -265,7 +265,7 @@ the agents. Before a real run, know these facts:
   runs every agent and validation command inside a `bwrap` sandbox,
   provided the host supports it: Linux 6.12+ with Landlock ABI 6,
   unprivileged user, PID and IPC namespaces, and bubblewrap 0.11+. On a host that can't
-  enforce it, the step is refused rather than run unsandboxed. Even
+  enforce it, macOS included, the step is refused rather than run unsandboxed. Even
   enforced, agents keep your UID and the host network. `doctor` shows what
   your host supports. ([Outer sandbox](docs/usage.md#outer-sandbox))
 - **Issue and PR text is untrusted input.** Anyone who can write the
