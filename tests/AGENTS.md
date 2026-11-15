@@ -549,9 +549,13 @@ ADR 0014)                             remote_sandbox_prototype.py against its Fa
                                       pack in and a candidate back through the real strict
                                       import; each interruption, bound and expiry of the seed's
                                       upload and the artifact's download fails closed and leaves
-                                      nothing to import; the journal entry, the name and tags, an
-                                      ambiguous create resolved by name; the renewed deadline and
-                                      a dead controller's bound; verified deletion and
+                                      nothing to import; a pack the bound manifest does not name
+                                      is refused on the host and by the stager; short local
+                                      writes complete, and one that stops leaves nothing; the
+                                      journal entry, the name and tags, an ambiguous create
+                                      resolved by name; the renewed deadline and a dead
+                                      controller's bound, a deadline read back past it refused
+                                      at the create and at a renewal; verified deletion and
                                       remove-only reconciliation, blocking on what it cannot
                                       prove and on another scope; no GitHub or provider
                                       credential in a create; ADR 0014's tests exist, no protocol

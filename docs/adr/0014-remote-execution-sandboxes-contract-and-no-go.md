@@ -139,8 +139,9 @@ reasons, each enough on its own:
 
 - **The integrity of the transfer.** The prototype carries a seed pack out
   and a candidate pack back, through a fake provider, into the package's
-  unchanged strict import. Every interruption and expiry tried fails
-  closed (§6). Pack transfer works the same whatever the provider is.
+  unchanged strict import. Every interruption, expiry and substituted
+  file tried fails closed (§6). Pack transfer works the same whatever the
+  provider is.
 - **Cost.** At Vercel's documented Pro rates, an hour-long launch at the
   default size costs about $0.11 in compute (§3.2).
 
@@ -329,6 +330,15 @@ marked *prototyped* against a fake provider.
   respects the deadline read. The controller holds the renewal as it
   holds the container backend's liveness stream. No process outlives the
   controller to do it.
+- **The bound is read back, never assumed.** A deadline read back later
+  than the one asked for, after the create or after a renewal, ends the
+  launch: a dead controller's resource would outlive its window. The
+  value read is never clipped locally, because that would not shorten
+  the resource's life. At the create this is a setup failure, before a
+  byte is sent. At a renewal it ends the run step, and the launch's
+  result is not used. Either way the entry stays open until a removal is
+  verified (R6). An earlier deadline is the provider's to choose, and the
+  transfers respect it.
 - **A controller that dies stops renewing,** so the provider ends the
   resource within one window. That bound replaces ADR 0013 D6's
   death-watch for a provider that offers no channel whose end the remote
@@ -347,12 +357,26 @@ marked *prototyped* against a fake provider.
 
 - **In: the seed pack and its manifest** (#292), and a copy of the read
   context, as ADR 0013 D12's copy-in form sends them.
-  - Before a byte leaves, the seed's manifest is the one the launch's git
-    input binds (D4's hand-off).
+  - **The pack is bound through the manifest.** The input binds the
+    manifest's bytes (D4), and the manifest names the pack by its sha256.
+    ADR 0013's manifest names commits, boundaries and tags, not the pack's
+    bytes: there the host checks the pack itself, and the local runtime
+    carries it. Here the pack crosses a provider's API and storage, so the
+    remote side must be able to tell that the pack it holds is the one the
+    host checked. A digest in the manifest is the simplest way, and the
+    prototype's stand-in has one. Rerunning D4's pack checks on the
+    remote side is the alternative a reopening may choose instead.
+  - Before a byte leaves, the manifest read is the one the launch's git
+    input binds (D4's hand-off), it names a pack, and each file is within
+    its bound. The bytes checked are the bytes sent.
   - Each file goes with its size declared, read once from its descriptor
-    and hashed as it is sent.
-  - The manifest's digest is checked again on the bytes sent, and each
-    file against the remote's digest of what it stored.
+    and hashed as it is sent. The pack sent must be the one the manifest
+    names, and each file must match the remote's digest of what it
+    stored.
+  - The stager checks the same binding on the remote side before it
+    indexes anything: the manifest against the input's digest, which
+    comes with its command and never from a file of the remote, and the
+    pack against the manifest.
   - An upload that fails any of these is a setup failure, and no stager
     runs on it.
   - The prover's proof of the tree inside stays the only tree proof (D2).
@@ -384,8 +408,10 @@ marked *prototyped* against a fake provider.
   bound is refused before the pack is read.
 - **What fails a transfer.** A stream that errors, ends short, runs long,
   differs from its claim, or is still running at the deadline fails it.
-  A transfer that would start within a fixed margin of the deadline
-  never starts.
+  So does a local write that stops: every byte a download counts is a
+  byte written, and a short write is resumed where it stopped. A
+  transfer that would start within a fixed margin of the deadline never
+  starts.
 
 **R6. Termination** (*prototyped*).
 
@@ -518,6 +544,16 @@ anything, and it injects the faults the tests need.
   expiry during the upload
   (`test_a_seed_upload_the_deadline_cuts_refuses_the_launch`) each refuse
   the launch.
+- **The pack is the one the bound manifest names.** A pack changed beside
+  an unchanged manifest is refused once it is sent, and the stager would
+  not index it. That holds for another pack `index-pack --strict` would
+  accept, arbitrary bytes, and one flipped byte
+  (`test_a_seed_pack_its_bound_manifest_does_not_name_is_refused_and_never_staged`).
+  The stager also refuses a remote copy changed after the upload, the
+  pack alone or the pack with a manifest that names it
+  (`test_a_seed_the_remote_holds_otherwise_is_never_staged`). A bound
+  manifest that names no pack sends nothing
+  (`test_a_bound_seed_manifest_that_names_no_pack_sends_nothing`).
 - **The artifact fails closed.** A pack stream that errors, ends short or
   runs long leaves an empty export directory
   (`test_an_artifact_download_that_breaks_leaves_nothing_to_import`). So
@@ -530,6 +566,10 @@ anything, and it injects the faults the tests need.
   (`test_an_expired_resource_has_nothing_to_download`). Nothing is ever
   merged with leftovers
   (`test_an_artifact_is_never_merged_with_leftovers_in_the_export_directory`).
+  Short local writes still leave the whole artifact, which the import
+  accepts (`test_short_local_writes_still_leave_the_whole_artifact`), and
+  a local write that stops, in the manifest or the pack, leaves an empty
+  export directory (`test_a_local_write_that_stops_leaves_nothing_to_import`).
 - **R1, identity.** The entry round-trips and is read strictly
   (`test_the_journal_entry_round_trips_and_is_read_strictly`), and the
   name and tags derive from it alone
@@ -551,6 +591,13 @@ anything, and it injects the faults the tests need.
   A controller that stops renewing leaves a resource the provider ends
   within one window
   (`test_a_dead_controller_leaves_a_resource_the_provider_ends_within_one_window`).
+  The bound does not rest on the fake keeping the deadline it was asked
+  for. When it keeps the resource longer, the create is refused, its
+  entry kept and reconciled away
+  (`test_a_create_whose_deadline_reads_back_past_the_one_asked_is_refused_and_kept`),
+  and a renewal past the window or past the ceiling ends the launch, the
+  resource left for its verified removal
+  (`test_a_renewal_whose_deadline_reads_back_past_its_bound_ends_the_launch`).
 - **R6 and R8, termination and reconciliation.**
   - An entry closes only on a lookup that finds nothing
     (`test_termination_closes_only_on_a_lookup_that_finds_nothing`).
@@ -589,10 +636,12 @@ anything, and it injects the faults the tests need.
 - **No network transport is exercised.** The fake's streams are Python
   iterators.
 - **#292 has not built a seed.** The seed pack is `pack-objects` of the
-  seed commit, and its manifest is a stand-in that the git input binds by
-  digest, as #292's will be.
+  seed commit. Its manifest is a stand-in that the git input binds by
+  digest, as #292's will be, and that names the pack's sha256, as R4 asks
+  of a remote backend's.
 - **Nothing runs inside a remote:** no stager, no prover and no agent.
-  Test code plays their part on the remote side.
+  Test code plays their part on the remote side, the stager's check of
+  the seed included.
 
 ## 7. The accepted records
 

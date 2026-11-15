@@ -2,13 +2,15 @@
 
 Real git on real repositories in ``tmp_path``, and no provider: the store
 stands in for the shared object store, and a repository built from nothing
-but the uploaded seed pack stands in for the remote's workspace. The only
+but the uploaded seed pack, once the stager's check has found it the one
+the bound manifest names, stands in for the remote's workspace. The only
 channel between the two is :class:`tests.remote_sandbox_prototype.FakeRemote`'s
 uploads and downloads, and the candidate comes back through the package's
-real strict import. Every other test injects one interruption, one expiry
-or one recovery case and checks that it fails closed: nothing imported,
-nothing left in the export directory, nothing removed that is not proven
-the run's, no entry closed on an unverified removal.
+real strict import. Every other test injects one interruption, one expiry,
+one fault of the provider or of the local disk, or one recovery case and
+checks that it fails closed: nothing staged or imported, nothing left in
+the export directory, nothing removed that is not proven the run's, no
+entry closed on an unverified removal.
 
 The last tests keep ADR 0014 honest: the tests it names exist, it claims no
 state protocol number, its links resolve, it and ADR 0013 agree that a
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import replace
 from pathlib import Path
@@ -44,11 +47,20 @@ from tests import remote_sandbox_prototype as proto
 from tests.conftest import isolated_git
 from tests.remote_sandbox_prototype import (
     CreateRequest,
+    DeadlineUnbounded,
     FakeRemote,
     RemoteGone,
     RemoteIdentity,
 )
-from tests.test_candidate_artifact import Repos, _input, commit, count_of, make_repos, run_import
+from tests.test_candidate_artifact import (
+    Repos,
+    _input,
+    commit,
+    count_of,
+    make_repos,
+    pack_of,
+    run_import,
+)
 from tests.test_container_backend_record import FENCE, LINK, PROTOCOL, _broken
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,17 +96,8 @@ class Scene:
             input=f"{self.repos.seed}\n".encode(),
         )  # fmt: skip
         (self.seed_dir / proto.SEED_PACK).write_bytes(pack)
-        unbound = _input(self.repos)
-        manifest = {
-            "schema": 1,
-            "identity": unbound.identity(),
-            "shallow": [],
-            "tags": {},
-            "pack_sha256": hashlib.sha256(pack).hexdigest(),
-        }
-        (self.seed_dir / SEED_MANIFEST_NAME).write_text(json.dumps(manifest, sort_keys=True))
-        self.git_input: LaunchGitInput = unbound.with_seed_manifest(
-            seed_manifest_digest(str(self.seed_dir))
+        self.git_input: LaunchGitInput = self.bind_seed(
+            {proto.SEED_PACK_DIGEST: hashlib.sha256(pack).hexdigest()}
         )
         self.remote = FakeRemote()
         self.identity = RemoteIdentity.new(
@@ -109,6 +112,26 @@ class Scene:
         self.export = tmp_path / "export"
         self.export.mkdir(mode=0o700)
 
+    def bind_seed(self, fields: dict[str, str]) -> LaunchGitInput:
+        """Write the seed's stand-in manifest with ``fields``; the input that binds it."""
+        unbound = _input(self.repos)
+        manifest = {"schema": 1, "identity": unbound.identity(), "shallow": [], "tags": {}}
+        (self.seed_dir / SEED_MANIFEST_NAME).write_text(
+            json.dumps({**manifest, **fields}, sort_keys=True)
+        )
+        return unbound.with_seed_manifest(seed_manifest_digest(str(self.seed_dir)))
+
+    def send(self, deadline: float) -> None:
+        proto.send_seed(
+            self.remote, self.identity, self.seed_dir, self.git_input, deadline=deadline
+        )
+
+    def staged(self) -> bytes:
+        """The stager's check of what the remote holds: the pack it may index."""
+        return proto.stage_seed(
+            self.remote.stored_files(self.identity.name), self.git_input.seed_manifest_digest
+        )
+
     def create(self, request: CreateRequest | None = None) -> float:
         observed = proto.create_remote(
             self.remote,
@@ -120,12 +143,12 @@ class Scene:
         return observed.deadline
 
     def stage_and_work(self) -> tuple[Path, str]:
-        """The remote side: a repository from the uploaded pack alone, two commits on it."""
+        """The remote side: a repository from the uploaded pack alone, once the
+        stager has found it the one the bound manifest names, two commits on it."""
         work = self.tmp / "remote-workspace"
         work.mkdir()
         git(work, "init", "-q")
-        uploaded = self.remote.stored(self.identity.name, proto.SEED_PACK)
-        git(work, "index-pack", "--stdin", "--strict", input=uploaded)
+        git(work, "index-pack", "--stdin", "--strict", input=self.staged())
         git(work, "checkout", "-q", "--detach", self.repos.seed)
         commit(work, "feature.py", "print('remote')")
         head = commit(work, "tests.py", "assert True")
@@ -151,10 +174,7 @@ class Scene:
 
     def exported(self) -> tuple[str, bytes]:
         """Create, send the seed, work and export: the scene up to the download."""
-        deadline = self.create()
-        proto.send_seed(
-            self.remote, self.identity, self.seed_dir, self.git_input, deadline=deadline
-        )
+        self.send(self.create())
         work, head = self.stage_and_work()
         return head, self.export_from(work, head)
 
@@ -178,6 +198,30 @@ class Scene:
 @pytest.fixture
 def scene(tmp_path: Path) -> Scene:
     return Scene(tmp_path)
+
+
+class ShortWrites:
+    """``os.write`` that writes at most ``step`` bytes a call, as a disk may.
+
+    With ``stall``, the ``stall``-th file written (0 is the first, the
+    artifact's manifest) gets ``step`` bytes and then nothing: each later
+    call for it writes nothing and returns 0, as a write that cannot go on.
+    """
+
+    def __init__(self, step: int, stall: int | None = None) -> None:
+        self.real = os.write
+        self.step, self.stall = step, stall
+        self.files: list[int] = []  # inodes, in the order first written
+        self.calls = 0
+
+    def __call__(self, fd: int, data) -> int:
+        self.calls += 1
+        st = os.fstat(fd)
+        if st.st_ino not in self.files:
+            self.files.append(st.st_ino)
+        if self.files.index(st.st_ino) == self.stall and st.st_size >= self.step:
+            return 0
+        return self.real(fd, bytes(data[: self.step]))
 
 
 # -- seed pack in, candidate pack and manifest out --------------------------------------
@@ -269,11 +313,67 @@ def test_a_seed_upload_the_deadline_cuts_refuses_the_launch(scene):
     deadline = scene.create()
     scene.remote.chunk_seconds = (deadline - scene.remote.now) / 2
     (scene.seed_dir / proto.SEED_PACK).write_bytes(b"P" * (5 * proto.CHUNK_BYTES))
-    with pytest.raises(SandboxLaunchRefusedError):
+    with pytest.raises(SandboxLaunchRefusedError, match="did not reach the remote whole"):
         proto.send_seed(
             scene.remote, scene.identity, scene.seed_dir, scene.git_input, deadline=deadline
         )
     assert scene.remote.lookup(scene.identity.name).state == "stopped"
+
+
+@pytest.mark.parametrize("change", ["another valid pack", "arbitrary bytes", "one byte flipped"])
+def test_a_seed_pack_its_bound_manifest_does_not_name_is_refused_and_never_staged(scene, change):
+    """The pack beside the bound manifest changes, and the manifest does not.
+    The input binds the pack only through the manifest's digest of it, so
+    the launch is refused once the pack is sent, even for a pack that
+    ``index-pack --strict`` would accept; and the stager, which checks the
+    same binding, would not index what the remote holds."""
+    deadline = scene.create()
+    path = scene.seed_dir / proto.SEED_PACK
+    pack = path.read_bytes()
+    if change == "another valid pack":
+        pack = pack_of(scene.repos, [commit(scene.repos.agent, "other.py", "x = 1")])
+    elif change == "arbitrary bytes":
+        pack = b"PACK" + bytes(64)
+    else:
+        pack = pack[:-1] + bytes([pack[-1] ^ 0xFF])
+    path.write_bytes(pack)
+    with pytest.raises(SandboxLaunchRefusedError, match="not the one its bound manifest names"):
+        scene.send(deadline)
+    assert [c[2] for c in scene.puts()] == [SEED_MANIFEST_NAME, proto.SEED_PACK]
+    with pytest.raises(SandboxLaunchRefusedError, match="not the one its bound manifest names"):
+        scene.staged()
+
+
+@pytest.mark.parametrize(
+    "replaced, match",
+    [("the pack", "its bound manifest names"), ("the pack and its manifest", "git input binds")],
+)
+def test_a_seed_the_remote_holds_otherwise_is_never_staged(scene, replaced, match):
+    """The seed reached the remote whole, and the remote's copy changes
+    afterwards: the pack alone, or the pack with a manifest that names it.
+    The stager gets the input's digest with its command, never from a file
+    of the remote, so it stages neither."""
+    scene.send(scene.create())
+    assert scene.staged() == (scene.seed_dir / proto.SEED_PACK).read_bytes()
+    name, other = scene.identity.name, b"PACK" + bytes(64)
+    scene.remote.store(name, proto.SEED_PACK, other)
+    if replaced == "the pack and its manifest":
+        manifest = json.loads(scene.remote.stored(name, SEED_MANIFEST_NAME))
+        manifest[proto.SEED_PACK_DIGEST] = hashlib.sha256(other).hexdigest()
+        scene.remote.store(name, SEED_MANIFEST_NAME, json.dumps(manifest).encode())
+    with pytest.raises(SandboxLaunchRefusedError, match=match):
+        scene.staged()
+
+
+@pytest.mark.parametrize("fields", [{}, {proto.SEED_PACK_DIGEST: "sha256:" + "0" * 64}])
+def test_a_bound_seed_manifest_that_names_no_pack_sends_nothing(scene, fields):
+    """A manifest the input binds but that names no pack by its sha256 binds
+    no pack, so any pack would pass: nothing is sent."""
+    deadline = scene.create()
+    scene.git_input = scene.bind_seed(fields)
+    with pytest.raises(SandboxLaunchRefusedError, match="names no pack"):
+        scene.send(deadline)
+    assert scene.puts() == []
 
 
 def test_a_seed_file_over_its_bound_is_refused_before_it_is_sent(scene):
@@ -310,6 +410,38 @@ def test_an_artifact_download_that_breaks_leaves_nothing_to_import(scene, fault,
     with pytest.raises(ObjectImportError, match=match):
         scene.receive()
     assert [c[2] for c in scene.gets()] == [ARTIFACT_MANIFEST, ARTIFACT_PACK]
+    assert list(scene.export.iterdir()) == []
+    assert not scene.repos.has(head)
+
+
+def test_short_local_writes_still_leave_the_whole_artifact(scene, monkeypatch):
+    """A disk that writes a few bytes a call: every byte received is
+    written, the manifest's and the pack's alike, and the strict import
+    makes the candidate from them."""
+    head, _ = scene.exported()
+    deadline = scene.deadline()
+    writes = ShortWrites(7)
+    with monkeypatch.context() as patched:
+        patched.setattr(proto.os, "write", writes)
+        proto.receive_artifact(scene.remote, scene.identity, scene.export, deadline=deadline)
+    assert len(writes.files) == 2 and writes.calls > 2 * len(scene.gets())
+    for path in (ARTIFACT_MANIFEST, ARTIFACT_PACK):
+        assert (scene.export / path).read_bytes() == scene.remote.stored(scene.identity.name, path)
+    assert run_import(scene.repos, scene.export, scene.git_input).candidate == head
+
+
+@pytest.mark.parametrize("stalled", [ARTIFACT_MANIFEST, ARTIFACT_PACK])
+def test_a_local_write_that_stops_leaves_nothing_to_import(scene, monkeypatch, stalled):
+    """A write that stops after a short one, as a full disk does: the
+    download is refused rather than returned with a truncated file behind
+    it, and every file it wrote, the manifest included, is deleted."""
+    head, _ = scene.exported()
+    deadline = scene.deadline()
+    stall = [ARTIFACT_MANIFEST, ARTIFACT_PACK].index(stalled)
+    with monkeypatch.context() as patched:
+        patched.setattr(proto.os, "write", ShortWrites(7, stall=stall))
+        with pytest.raises(ObjectImportError, match=re.escape(f"download of {stalled} was")):
+            proto.receive_artifact(scene.remote, scene.identity, scene.export, deadline=deadline)
     assert list(scene.export.iterdir()) == []
     assert not scene.repos.has(head)
 
@@ -471,6 +603,45 @@ def test_a_dead_controller_leaves_a_resource_the_provider_ends_within_one_window
     assert observed.state == "stopped" and scene.remote.resources[scene.identity.name].files == {}
     with pytest.raises(RemoteGone):
         proto.keep_deadline(scene.remote, scene.identity, deadline)
+
+
+def test_a_create_whose_deadline_reads_back_past_the_one_asked_is_refused_and_kept(scene):
+    """A provider that keeps the resource even a second past the deadline
+    asked for breaks the window a dead controller's resource is bounded by.
+    The launch is refused before a byte is sent, its entry stays, and
+    reconciliation from that entry removes the resource."""
+    scene.remote.deadline_overshoot = 1.0
+    with pytest.raises(SandboxLaunchRefusedError, match="past the deadline of .* asked for"):
+        scene.create()
+    assert scene.journal == [scene.identity.render()] and scene.puts() == []
+    assert scene.remote.lookup(scene.identity.name).state == "running"
+    entry = RemoteIdentity.parse(scene.journal[0])
+    report = proto.reconcile(scene.remote, scene.identity.run, [entry])
+    assert report == proto.Reconciliation((entry.name,), ())
+    assert scene.remote.resources == {}
+
+
+@pytest.mark.parametrize("bound", ["window", "ceiling"])
+def test_a_renewal_whose_deadline_reads_back_past_its_bound_ends_the_launch(scene, bound):
+    """The provider honours the create, then keeps a renewal past what was
+    asked: one window more, or the ceiling when that comes first. The
+    deadline read is never clipped, which would not shorten the resource's
+    life: the launch ends, the resource is still there for its removal, its
+    entry still open, and termination removes it."""
+    if bound == "ceiling":
+        ceiling = scene.remote.now + 1.5 * scene.identity.window
+        scene.identity = replace(scene.identity, ceiling=ceiling)
+    deadline = scene.create()
+    scene.remote.advance(scene.identity.window / 2 + 1)
+    asked = min(scene.remote.now + scene.identity.window, scene.identity.ceiling)
+    assert (asked == scene.identity.ceiling) is (bound == "ceiling")
+    scene.remote.deadline_overshoot = HOUR
+    with pytest.raises(DeadlineUnbounded, match="past the deadline"):
+        proto.keep_deadline(scene.remote, scene.identity, deadline)
+    observed = scene.remote.lookup(scene.identity.name)
+    assert observed.state == "running" and observed.deadline == asked + HOUR
+    assert scene.journal == [scene.identity.render()]
+    assert proto.terminate(scene.remote, scene.identity) == "removed"
 
 
 # -- R6 and R8: termination and reconciliation ------------------------------------------

@@ -29,18 +29,23 @@ prototypes:
   the provider enforces, at most one renewal window ahead and never past
   the ceiling. :func:`keep_deadline` renews it while the controller runs,
   so a controller that dies leaves a resource the provider ends within one
-  window. That is the controller's request to the provider, not a protocol
-  between AutoForge processes: nothing on the remote side decides anything.
+  window. Both read the deadline back, and a provider that holds the
+  resource past the deadline asked for ends the launch, its entry kept for
+  the removal: the bound is never assumed of the provider. That is the
+  controller's request to the provider, not a protocol between AutoForge
+  processes: nothing on the remote side decides anything.
 - **R4 and R5, the transfer.** :func:`send_seed` checks the seed against
   the launch's git input (ADR 0013 D4's hand-off) before a byte leaves,
-  streams each file with its size declared, and checks the manifest's
-  digest on the bytes it sent and the remote's digest of what it stored.
+  streams each file with its size declared, checks the remote's digest of
+  what it stored, and refuses a pack other than the one the bound manifest
+  names by digest. :func:`stage_seed` is the stager's own check of the
+  same binding, on the remote side, before anything is indexed.
   :func:`receive_artifact` streams the artifact's manifest and pack into
   the launch's export directory under the export bound, hashes the pack as
-  it reads it, stops at the deadline, and deletes whatever it wrote when
-  anything fails. Neither is the content boundary: the strict import
-  (:func:`autoforge.candidate_artifact.import_artifact`) is, and it checks
-  everything again.
+  it reads it, writes every byte it counts, stops at the deadline, and
+  deletes whatever it wrote when anything fails. Neither is the content
+  boundary: the strict import (:func:`autoforge.candidate_artifact.import_artifact`)
+  is, and it checks everything again.
 - **R6 and R8, termination and recovery.** :func:`terminate` destroys an
   owned resource and closes nothing until a passive lookup no longer finds
   it. :func:`reconcile` is remove-only: it never reads a file of a remote
@@ -49,26 +54,32 @@ prototypes:
 
 Every refusal of a launch, a transfer or a removal is one of the package's
 typed errors, as ADR 0013 D17 types the same failure of a local container:
-a seed that cannot be handed on is a setup failure
+a seed that cannot be handed on, or a resource created with a deadline past
+its bound, is a setup failure
 (:class:`~autoforge.errors.SandboxLaunchRefusedError`), an artifact that
 cannot be received a candidate refusal
 (:class:`~autoforge.agent_worktree.ObjectImportError`), a removal that
 cannot be verified :class:`~autoforge.errors.SandboxCleanupUncertainError`,
 and a scope other than the entries' a
-:class:`~autoforge.errors.ConfigurationError`.
+:class:`~autoforge.errors.ConfigurationError`. A renewal the provider holds
+past its bound is :class:`DeadlineUnbounded`: no local container renews a
+deadline, so D17 has no class for it.
 
 :class:`FakeRemote` stands in for the provider. It enforces the deadline
 itself (an expired resource stops and loses its files, as a non-persistent
 sandbox does), and injects the faults the tests need: a lost create
-response, a stream cut with an error, a stream that ends short or runs
-long, a stored file that differs from what was sent, a destroy that returns
-but leaves the resource, a lookup that fails.
+response, a deadline kept past the one asked for, a stream cut with an
+error, a stream that ends short or runs long, a stored file that differs
+from what was sent, a destroy that returns but leaves the resource, a
+lookup that fails.
 """
 
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
+import io
 import json
 import os
 import re
@@ -91,11 +102,13 @@ from autoforge.candidate_artifact import (
 from autoforge.child_env import forbidden_env_entry
 from autoforge.errors import (
     ConfigurationError,
+    ExecutionError,
     SandboxCleanupUncertainError,
     SandboxLaunchRefusedError,
 )
 from autoforge.git_input import (
     DIGEST_PREFIX,
+    MAX_SEED_MANIFEST_BYTES,
     SEED_MANIFEST_NAME,
     LaunchGitInput,
     seed_problem,
@@ -107,6 +120,10 @@ REMOTE_ENTRY_SCHEMA = 1
 # The seed's pack beside its manifest (#292 names the real one).
 SEED_PACK = "seed.pack"
 SEED_FILES = (SEED_MANIFEST_NAME, SEED_PACK)
+# The stand-in manifest's field naming the pack by its sha256: how the git
+# input, which binds the manifest's bytes, binds the pack's too.
+SEED_PACK_DIGEST = "pack_sha256"
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 # A stand-in for #292's seed_max_bytes, which does not exist yet.
 SEED_MAX_BYTES = 512 * 1024 * 1024
 CHUNK_BYTES = 64 * 1024
@@ -327,6 +344,7 @@ class FakeRemote:
         # Faults.
         self.lose_create_response = False  # the create happens, its answer is lost
         self.fail_create_before = False  # the create is lost before it happens
+        self.deadline_overshoot = 0.0  # a create or extend keeps the resource this much longer
         self.fault_path: str | None = None  # the stream faults apply to; None: every one
         self.cut_after: int | None = None  # a stream raises after this many bytes
         self.short_after: int | None = None  # a stream ends, silently, after this many
@@ -377,7 +395,7 @@ class FakeRemote:
             raise ValueError("the deadline is past the provider's longest session")
         if len(tags) > 5 or any(len(v) > MAX_TAG_VALUE for v in tags.values()):
             raise ValueError("the provider keeps five tags of at most 256 characters")
-        self.resources[name] = _Resource(dict(tags), deadline)
+        self.resources[name] = _Resource(dict(tags), deadline + self.deadline_overshoot)
         if self.lose_create_response:
             self.lose_create_response = False
             raise AmbiguousRequest("the connection broke before the provider answered")
@@ -407,7 +425,7 @@ class FakeRemote:
         resource = self._live(name)
         if deadline - self.now > self.max_session:
             raise ValueError("the deadline is past the provider's longest session")
-        resource.deadline = max(resource.deadline, deadline)
+        resource.deadline = max(resource.deadline, deadline + self.deadline_overshoot)
 
     def _faulted(self, path: str) -> bool:
         return self.fault_path is None or self.fault_path == path
@@ -466,6 +484,9 @@ class FakeRemote:
     # What a test plays on the remote side: the stager's and the exporter's work.
     def stored(self, name: str, path: str) -> bytes:
         return self.resources[name].files[path]
+
+    def stored_files(self, name: str) -> dict[str, bytes]:
+        return dict(self.resources[name].files)
 
     def store(self, name: str, path: str, data: bytes) -> None:
         self.resources[name].files[path] = data
@@ -541,9 +562,39 @@ def create_request_problem(request: CreateRequest, provider_credential_names: It
 # -- R1, R3 and R7: create, renew -------------------------------------------------------
 
 
+class DeadlineUnbounded(ExecutionError):
+    """A renewal the provider holds past the deadline asked for: the launch ends (R3).
+
+    The controller asked for at most one window more, never past the
+    ceiling, and read back a later deadline: a controller that died now
+    would leave a resource that outlives its window. The launch's result is
+    not used, and the resource's entry stays open until a removal is
+    verified (:func:`terminate`, or reconciliation). No local container
+    renews a deadline, so ADR 0013 D17 has no class for this; a reopening
+    types it under ADR 0011.
+    """
+
+
 def first_deadline(identity: RemoteIdentity, now: float) -> float:
     """The deadline a create asks for: one window ahead, never past the ceiling."""
     return min(now + identity.window, identity.ceiling)
+
+
+def _deadline_problem(observed: Observation, asked: float) -> str:
+    """Why the deadline the provider holds breaks the one asked for, or "".
+
+    ``asked`` is at most one window ahead of when it was asked and never past
+    the ceiling (:func:`first_deadline`, :func:`keep_deadline`), so a
+    deadline read back later than it breaks both. One read back earlier is
+    the provider's to choose: the transfers respect it.
+    """
+    if observed.deadline > asked:
+        return (
+            f"the provider holds {observed.name} until {observed.deadline:.0f}, "
+            f"{observed.deadline - asked:.0f} s past the deadline of {asked:.0f} asked for, so "
+            "a dead controller's resource would outlive its renewal window"
+        )
+    return ""
 
 
 def create_remote(
@@ -583,9 +634,13 @@ def create_remote(
         )
     write_entry(identity.render())
     observed: Observation | None = None
+    asked = 0.0
     for _ in range(2):
+        # A re-issue asks for a later deadline than the first create did, so
+        # the last one asked bounds whichever create made the resource.
+        asked = first_deadline(identity, remote.clock())
         try:
-            remote.create(identity.name, identity.tags(), first_deadline(identity, remote.clock()))
+            remote.create(identity.name, identity.tags(), asked)
         except (AmbiguousRequest, RemoteExists):
             pass
         except ValueError as exc:
@@ -603,6 +658,12 @@ def create_remote(
             f"the remote launch is refused: {identity.name} holds a resource whose tags are "
             "not its journal entry's; nothing was removed"
         )
+    problem = _deadline_problem(observed, asked)
+    if problem:
+        raise SandboxLaunchRefusedError(
+            f"the remote launch is refused: {problem}. Its entry stays open until its removal "
+            "is verified"
+        )
     if remote.scope() != scope:
         raise SandboxLaunchRefusedError(
             "the remote launch is refused: the provider's scope changed during the create; "
@@ -614,10 +675,13 @@ def create_remote(
 def keep_deadline(remote: FakeRemote, identity: RemoteIdentity, deadline: float) -> float:
     """Renew the resource's deadline while the controller runs (R3); return the new one.
 
-    When less than half a window is left, ask for one window more, never
-    past the ceiling, and read the deadline back: the provider's answer is
-    what the transfers then respect. A controller that stops calling this
-    leaves a resource the provider ends at the last deadline.
+    ``deadline`` is the one this last returned (or the create's). When less
+    than half a window is left, ask for one window more, never past the
+    ceiling, and read the deadline back: the provider's answer is what the
+    transfers then respect. A deadline read back past the one asked for
+    raises :class:`DeadlineUnbounded`, never clipped here: a clipped value
+    would not shorten the resource's life. A controller that stops calling
+    this leaves a resource the provider ends at the last deadline.
     """
     now = remote.clock()
     if deadline - now >= identity.window / 2:
@@ -628,7 +692,13 @@ def keep_deadline(remote: FakeRemote, identity: RemoteIdentity, deadline: float)
     observed = _lookup(remote, identity.name)
     if observed is None or not identity.owns(observed) or observed.state != "running":
         raise RemoteGone(f"{identity.name} is no longer running")
-    return min(observed.deadline, identity.ceiling)
+    problem = _deadline_problem(observed, max(deadline, wanted))
+    if problem:
+        raise DeadlineUnbounded(
+            f"the remote launch is ended: {problem}. Its entry stays open until its removal "
+            "is verified"
+        )
+    return observed.deadline
 
 
 def _lookup(remote: FakeRemote, name: str) -> Observation | None:
@@ -665,13 +735,60 @@ def _open_regular(dir_fd: int, name: str) -> tuple[int, int]:
     return fd, st.st_size
 
 
-def _upload(fd: int, sent: Any, remote: FakeRemote, deadline: float) -> Iterator[bytes]:
-    """The file behind ``fd`` in chunks, hashed into ``sent``; stops at the deadline."""
-    while chunk := os.read(fd, CHUNK_BYTES):
+def _upload(
+    read: Callable[[int], bytes], sent: Any, remote: FakeRemote, deadline: float
+) -> Iterator[bytes]:
+    """What ``read`` yields, in chunks, hashed into ``sent``; stops at the deadline."""
+    while chunk := read(CHUNK_BYTES):
         if remote.clock() >= deadline:
             raise RemoteGone("the resource's deadline passed during the upload")
         sent.update(chunk)
         yield chunk
+
+
+def _read_bounded(fd: int, bound: int) -> bytes:
+    """The file behind ``fd``, read once; refused when it holds more than ``bound``."""
+    data = bytearray()
+    while chunk := os.read(fd, CHUNK_BYTES):
+        data += chunk
+        if len(data) > bound:
+            raise OSError(f"it grew past its bound of {bound} bytes")
+    return bytes(data)
+
+
+def seed_pack_digest(manifest: bytes) -> str:
+    """The sha256 of the pack a seed manifest names, or "" when it names none."""
+    try:
+        data = json.loads(manifest)
+    except (ValueError, RecursionError):
+        return ""
+    value = data.get(SEED_PACK_DIGEST) if isinstance(data, dict) else None
+    return value if isinstance(value, str) and _SHA256_RE.fullmatch(value) else ""
+
+
+def _send(
+    remote: FakeRemote,
+    identity: RemoteIdentity,
+    name: str,
+    read: Callable[[int], bytes],
+    size: int,
+    deadline: float,
+) -> str:
+    """Upload one file of the seed, its size declared; return the sha256 of what was sent.
+
+    The remote's own digest of what it stored must be that one.
+    """
+    sent = hashlib.sha256()
+    try:
+        remote.put(identity.name, name, _upload(read, sent, remote, deadline), size)
+        stored = remote.digest(identity.name, name)
+    except (ConnectionError, OSError, ValueError, KeyError) as exc:
+        raise SandboxLaunchRefusedError(
+            f"the seed's {name} did not reach the remote whole ({exc})"
+        ) from None
+    if stored != sent.hexdigest():
+        raise SandboxLaunchRefusedError(f"the remote stored a {name} other than the one sent")
+    return sent.hexdigest()
 
 
 def send_seed(
@@ -687,53 +804,112 @@ def send_seed(
 
     Before a byte leaves: the seed's manifest is the one the launch's git
     input binds (ADR 0013 D4's hand-off), the deadline leaves the margin,
-    and each file is a regular file within the bound. Each file then goes
-    with its size declared, read once from its descriptor and hashed as it
-    is sent. The manifest's digest is checked again on the bytes sent, and
-    each file against the remote's digest of what it stored. An upload that
-    errors, ends short, crosses the deadline or is stored otherwise refuses
-    the launch, and no stager runs on it: the prover's tree proof inside is
-    still the only tree proof (ADR 0013 D2).
+    each file is a regular file within its bound, and the manifest names
+    the pack by its sha256. The manifest is read once, and the bytes
+    checked are the bytes sent. The pack is read once from its descriptor
+    and hashed as it is sent, and it must be the pack the manifest names:
+    the input binds the manifest's bytes, and through them the pack's. Each
+    file goes with its size declared and is checked against the remote's
+    digest of what it stored. An upload that errors, ends short, crosses
+    the deadline, is stored otherwise or carries another pack refuses the
+    launch, and no stager runs on it; the stager checks the same binding
+    itself (:func:`stage_seed`). The prover's tree proof inside is still
+    the only tree proof (ADR 0013 D2).
     """
     problem = seed_problem(str(seed_dir), git_input) or _time_problem(
         deadline, remote.clock, "the seed's upload"
     )
     if problem:
         raise SandboxLaunchRefusedError(f"the seed is not handed on: {problem}")
+    bounds = {SEED_MANIFEST_NAME: min(max_bytes, MAX_SEED_MANIFEST_BYTES), SEED_PACK: max_bytes}
     dir_fd = os.open(seed_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    opened: dict[str, tuple[int, int]] = {}
     try:
         for name in SEED_FILES:
             try:
-                fd, size = _open_regular(dir_fd, name)
+                opened[name] = _open_regular(dir_fd, name)
             except OSError as exc:
                 raise SandboxLaunchRefusedError(f"the seed's {name} is refused ({exc})") from None
-            try:
-                if size > max_bytes:
-                    raise SandboxLaunchRefusedError(
-                        f"the seed's {name} holds {size} bytes, over the bound of {max_bytes}"
-                    )
-                sent = hashlib.sha256()
-                try:
-                    remote.put(identity.name, name, _upload(fd, sent, remote, deadline), size)
-                    stored = remote.digest(identity.name, name)
-                except (ConnectionError, OSError, ValueError, KeyError) as exc:
-                    raise SandboxLaunchRefusedError(
-                        f"the seed's {name} did not reach the remote whole ({exc})"
-                    ) from None
-            finally:
-                os.close(fd)
-            if name == SEED_MANIFEST_NAME and (
-                DIGEST_PREFIX + sent.hexdigest() != git_input.seed_manifest_digest
-            ):
+            size = opened[name][1]
+            if size > bounds[name]:
                 raise SandboxLaunchRefusedError(
-                    "the seed manifest sent is not the one the launch's git input binds"
+                    f"the seed's {name} holds {size} bytes, over the bound of {bounds[name]}"
                 )
-            if stored != sent.hexdigest():
-                raise SandboxLaunchRefusedError(
-                    f"the remote stored a {name} other than the one sent"
-                )
+        try:
+            manifest = _read_bounded(opened[SEED_MANIFEST_NAME][0], bounds[SEED_MANIFEST_NAME])
+        except OSError as exc:
+            raise SandboxLaunchRefusedError(
+                f"the seed's {SEED_MANIFEST_NAME} is refused ({exc})"
+            ) from None
+        if DIGEST_PREFIX + hashlib.sha256(manifest).hexdigest() != git_input.seed_manifest_digest:
+            raise SandboxLaunchRefusedError(
+                "the seed manifest read is not the one the launch's git input binds"
+            )
+        pack_digest = seed_pack_digest(manifest)
+        if not pack_digest:
+            raise SandboxLaunchRefusedError(
+                f"the bound seed manifest names no pack by its {SEED_PACK_DIGEST}, so no pack "
+                "is bound and none is sent"
+            )
+        _send(
+            remote, identity, SEED_MANIFEST_NAME, io.BytesIO(manifest).read, len(manifest),
+            deadline,
+        )  # fmt: skip
+        pack_fd, pack_size = opened[SEED_PACK]
+        sent = _send(
+            remote, identity, SEED_PACK, functools.partial(os.read, pack_fd), pack_size, deadline
+        )
+        if sent != pack_digest:
+            raise SandboxLaunchRefusedError(
+                "the seed pack sent is not the one its bound manifest names"
+            )
     finally:
+        for fd, _ in opened.values():
+            os.close(fd)
         os.close(dir_fd)
+
+
+def stage_seed(files: Mapping[str, bytes], seed_manifest_digest: str) -> bytes:
+    """The stager's own check of the seed, on the remote side (R4); return the pack.
+
+    Nothing runs inside a remote here, so test code plays the stager, and
+    this is what it checks before it indexes a byte. ``files`` is what the
+    remote holds. ``seed_manifest_digest`` comes with the stager's command,
+    from the launch's git input, never from a file of the remote. The
+    manifest must have that digest, and the pack the digest the manifest
+    names; anything else is a setup failure, and nothing is staged. This
+    guards the transfer and the remote's storage. A provider that alters
+    what runs inside could alter this check too: ADR 0014 §3.3 trusts it
+    for that, as it trusts the agent's execution.
+    """
+    manifest, pack = files.get(SEED_MANIFEST_NAME), files.get(SEED_PACK)
+    if manifest is None or pack is None:
+        raise SandboxLaunchRefusedError("the stager refuses the seed: it is not whole")
+    found = DIGEST_PREFIX + hashlib.sha256(manifest).hexdigest()
+    if not seed_manifest_digest or found != seed_manifest_digest:
+        raise SandboxLaunchRefusedError(
+            "the stager refuses the seed: its manifest is not the one the launch's git input binds"
+        )
+    expected = seed_pack_digest(manifest)
+    if not expected or hashlib.sha256(pack).hexdigest() != expected:
+        raise SandboxLaunchRefusedError(
+            "the stager refuses the seed: its pack is not the one its bound manifest names"
+        )
+    return pack
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte of ``data`` to ``fd``, or raise.
+
+    A short write is resumed where it stopped; one that writes nothing is
+    refused, so a byte counted as received is a byte on disk.
+    """
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError(f"a write stopped with {len(view)} bytes of the chunk unwritten")
+        view = view[written:]
 
 
 def _download(
@@ -750,8 +926,9 @@ def _download(
     """Stream ``path`` of the resource into ``dir_fd`` within ``limit`` bytes.
 
     Returns its size, its sha256 and, with ``keep`` (the manifest, which its
-    bound keeps small), its bytes. Reads at most one chunk past ``limit``,
-    so a stream that runs long is refused without being read whole.
+    bound keeps small), its bytes: each counted only once it is written
+    whole. Reads at most one chunk past ``limit``, so a stream that runs
+    long is refused without being read whole.
     """
     problem = _time_problem(deadline, remote.clock, f"the download of {path}")
     if problem:
@@ -775,10 +952,10 @@ def _download(
                     raise ObjectImportError(
                         f"the artifact is refused: {path} runs past {limit} bytes"
                     )
+                _write_all(fd, chunk)
                 digest.update(chunk)
                 if keep:
                     kept += chunk
-                os.write(fd, chunk)
     except (ConnectionError, OSError, KeyError) as exc:
         raise ObjectImportError(
             f"the artifact is refused: the download of {path} was interrupted ({exc})"
@@ -802,9 +979,10 @@ def receive_artifact(
     within the export bound and the size the manifest claims, hashed as it
     is read. A claim over the bound is refused before the pack is read. A
     stream that errors, ends short, runs long, differs from the claim or
-    crosses the deadline is a candidate refusal, and every file this wrote
-    is deleted: a partial artifact is never left for an import. What comes
-    back is still untrusted: the strict import checks it again.
+    crosses the deadline, and a local write that fails or stops, is a
+    candidate refusal, and every file this wrote is deleted: a partial
+    artifact is never left for an import. What comes back is still
+    untrusted: the strict import checks it again.
     """
     dir_fd = os.open(export_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     written: list[str] = []
