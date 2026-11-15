@@ -1728,12 +1728,22 @@ a stated reason it has none. The coverage that must keep working:
   bit, a link to the form, a half-converted file, a deletion and a
   directory replaced by a link stay differences; the attributes are read
   only when a file's bytes differ, in a removed temporary git directory
-  with no configuration, no global or system attributes and
-  `core.attributesFile` at `/dev/null`, writing nothing into the
-  repository and naming no checkout path; a failing `read-tree`,
-  `check-attr` or `cat-file`, an attribute git did not answer and a blob
-  streamed as other bytes than its id's are failures, never no
-  difference. The merge gate's commands see the committed bytes, and an
+  with no configuration, no global or system attributes,
+  `core.attributesFile` at `/dev/null` and an object directory of its
+  own, writing nothing into the repository and naming no checkout path; a
+  failing `update-index`, `check-attr` or `cat-file`, an attribute git did
+  not answer and a blob streamed as other bytes than its id's are
+  failures, never no difference. What decides the conversion is
+  authenticated (PR #503 R1-F1): a `.gitattributes` blob rewritten in the
+  store at the same size to a rule that converts (sha1 and sha256), a
+  subtree on the file's path, one or two levels down, rewritten with that
+  entry swapped for such a blob or dropped so a parent's rule converts,
+  and a commit rewritten to name another tree each make git's own read
+  through the store say `eol=crlf`, and each fails the comparison; a rule
+  rewritten in the store after it was copied is not read, the object
+  directory git reads holding only the `.gitattributes` blobs on the
+  file's path, once each; a `.gitattributes` committed as a symlink is
+  read as git's checkout reads it. The merge gate's commands see the committed bytes, and an
   unexportable reviewed HEAD stays inconclusive (`tests/test_engine.py`)
 - `ANALYZE_EXECUTE`'s publication (#161, `tests/test_engine.py`, engine
   built with `origin=True`): the controller pushes the agent's commit and
@@ -2272,7 +2282,11 @@ a stated reason it has none. The coverage that must keep working:
   the reviewed commit's own `*.bat text eol=crlf` grants it, and one an
   `eol=crlf` from `info/attributes` rewrote is refused with the file named
   and the commands that write its committed bytes back, after which those
-  commands grant it (#488); the same with the fix made in
+  commands grant it (#488); a CRLF rewrite hidden by a clean filter and an
+  assume-unchanged mark behind the commit's `*.txt -text` rule rewritten in
+  the store's loose object to `*.txt text eol=crlf` is refused, nothing
+  written and the worktree, mark and filter left as they were (PR #503
+  R1-F1); the same with the fix made in
   a submodule whose `.gitmodules` entry says `ignore = all`, left
   uncommitted, committed in the submodule only, or written into the
   unpopulated submodule's directory without a repository, which no plain
@@ -2289,7 +2303,10 @@ a stated reason it has none. The coverage that must keep working:
   conversion from `info/attributes` hides from both statuses, takes a
   worktree git checked out under the commit's own `eol=crlf` as holding
   no change in all three reads, and lists an edit made in that CRLF form
-  and one a clean filter maps back to the blob there (#488), a deletion, a file replaced by a
+  and one a clean filter maps back to the blob there (#488), fails rather
+  than pass all three reads when the commit's `-text` rule is rewritten in
+  the store to `eol=crlf` behind such a hidden CRLF rewrite (PR #503
+  R1-F1), a deletion, a file replaced by a
   link, a retargeted link and an execute bit flipped under
   `core.fileMode=false`, reads files below a directory replaced by a link
   as deleted without following it, a FIFO as retyped without opening it,

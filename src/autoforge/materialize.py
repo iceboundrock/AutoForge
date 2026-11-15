@@ -11,7 +11,8 @@ uses it, and candidate validation (#172) will.
   store, never an issue's private object directory, whose objects reach the
   shared store only through the strict import. A missing commit or blob is
   :class:`~autoforge.errors.CandidateNotMaterializableError`. The tree id is
-  read from the commit itself.
+  read from the commit's own bytes, re-hashed to its id (ADR 0004 D7.5), so
+  a commit object rewritten in the store cannot name another tree.
 - **Writer (D6.2).** ``git ls-tree -r -t -z --full-tree`` lists the tree;
   the blobs are streamed with ``git cat-file --batch``. Nothing else of git
   takes part: no index, no ``checkout-index``, no attribute, eol conversion,
@@ -50,9 +51,12 @@ uses it, and candidate validation (#172) will.
   its own, never proven the commit's. On request, a file may also hold the
   bytes a checkout writes for it under the ``eol=crlf`` the commit's own
   ``.gitattributes`` give it (#488): those attributes are read from the
-  commit's tree alone, in a git directory of the controller's own, and the
-  conversion is applied here to the blob's bytes, so no other attribute,
-  conversion or configuration takes part.
+  commit's tree alone, in a git directory of the controller's own whose
+  object directory holds only the ``.gitattributes`` blobs the controller
+  re-hashed, each bound to the commit by trees re-hashed from the listing
+  (PR #503 R1-F1), and the conversion is applied here to the blob's bytes,
+  so no other attribute, conversion, configuration or object of the store
+  takes part.
 
 Every git process is the hardened local request
 (:func:`~autoforge.git_transport.local_git_request`, ADR 0004 D7.3, D7.5):
@@ -72,6 +76,7 @@ import shutil
 import stat
 import tempfile
 import threading
+import zlib
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -217,7 +222,15 @@ def _is_oid(value: bytes, object_format: str) -> bool:
 
 
 def _commit_tree(runner: Runner, repo: str, commit: str, object_format: str) -> str:
-    """The tree ``commit`` names, after it is found to be a commit in the store."""
+    """The tree ``commit`` names, after it is found to be a commit in the store.
+
+    The tree id is read from the commit's own bytes, which must hash to
+    ``commit`` in ``object_format`` (ADR 0004 D7.5): git re-hashes only
+    some of the objects it reads, which ones depending on the command and
+    its version (``cat-file`` re-hashes none), so the proof that a loose
+    object rewritten in the store names no other tree under the same id is
+    the controller's own (PR #503 R1-F1).
+    """
     if object_format not in _HEX_LENGTH:
         raise MaterializationError(f"unknown object format {object_format!r}")
     if not _is_oid(commit.encode("ascii", "replace"), object_format):
@@ -234,10 +247,24 @@ def _commit_tree(runner: Runner, repo: str, commit: str, object_format: str) -> 
         raise CandidateNotMaterializableError(
             f"{commit} in {repo} is a {kind} object, not a commit"
         )
-    tree = _git(runner, repo, ["rev-parse", "--verify", "--quiet", f"{commit}^{{tree}}"]).strip()
-    if not _is_oid(tree.encode("ascii", "replace"), object_format):
-        raise MaterializationError(f"commit {commit} names no readable tree: {tree[:100]!r}")
-    return tree
+    args = ["cat-file", "commit", commit]
+    collector = _Collector()
+    req = _request(repo, args)
+    req.on_chunk = collector
+    req.max_output_bytes = _STREAM_CAPTURE_BYTES
+    problem = _failure(runner(req), args)
+    if problem:
+        raise MaterializationError(f"commit {commit}: reading it failed: {problem}")
+    raw = bytes(collector.data)
+    if hashlib.new(object_format, b"commit %d\0" % len(raw) + raw).hexdigest() != commit:
+        raise MaterializationError(
+            f"commit {commit}: the bytes {repo}'s store holds for it do not hash to its id "
+            "(a rewritten or substituted object); it is not used"
+        )
+    line = raw.partition(b"\n")[0]
+    if not line.startswith(b"tree ") or not _is_oid(line[5:], object_format):
+        raise MaterializationError(f"commit {commit} names no readable tree: {_shown(line[:100])}")
+    return line[5:].decode("ascii")
 
 
 class _Collector:
@@ -460,7 +487,9 @@ class _Writer:
 
 
 class _BlobSink(Protocol):
-    """Where :class:`_BlobStream` hands each blob: :class:`_Writer`, :class:`_CrlfForms`."""
+    """Where :class:`_BlobStream` hands each blob: :class:`_Writer`, :class:`_CrlfForms`,
+    :class:`_LooseObjects`.
+    """
 
     def next_blob(self) -> _Entry | None: ...
 
@@ -1004,25 +1033,180 @@ def _attribute_dir_config(object_format: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+# The name of the attributes file git reads in each directory of a path,
+# and the modes git reads one from: a blob's, a symlink's link text
+# included. A tree or a gitlink of that name holds no attributes.
+_ATTRIBUTES_FILE = b".gitattributes"
+_BLOB_MODES = (_FILE, _EXECUTABLE, _SYMLINK)
+
+
+def _attribute_files(
+    listing: _Listing, commit: str, object_format: str, paths: Sequence[bytes]
+) -> list[_Entry]:
+    """The ``.gitattributes`` files git reads for ``paths``, from trees proven ``commit``'s.
+
+    For a path, git reads the ``.gitattributes`` of each directory on it,
+    from the root down, and nothing else of the tree. Each of those
+    directories must hold exactly the entries the listing gives it: they
+    are hashed as a tree, in git's order and in ``object_format``, and the
+    id must be the one the listing names for the directory, the root's
+    being the tree read from the commit's own bytes (:func:`_commit_tree`).
+    So every file returned, and the entry of every path of ``paths``, is
+    ``commit``'s by a chain of re-hashed ids, and a tree rewritten in the
+    store to add, drop or swap one fails here (PR #503 R1-F1).
+    """
+    directories: set[bytes] = set()
+    for path in paths:
+        parent = path.rpartition(b"/")[0]
+        while parent not in directories:
+            directories.add(parent)
+            if not parent:
+                break
+            parent = parent.rpartition(b"/")[0]
+    held: dict[bytes, list[_Entry]] = {directory: [] for directory in directories}
+    ids = {b"": listing.tree}
+    for entry in listing.entries:
+        if entry.parent in held:
+            held[entry.parent].append(entry)
+        if entry.mode == _TREE and entry.path in held:
+            ids[entry.path] = entry.oid
+    files: list[_Entry] = []
+    for directory in sorted(directories):
+        entries = held[directory]
+        found = _tree_id(object_format, [(e.name, e.mode, e.oid) for e in entries])
+        want = ids.get(directory)
+        if found != want:
+            raise MaterializationError(
+                f"commit {commit}: the entries the store lists for {_shown(directory)} hash to "
+                f"the tree {found}, not to its {want}: a tree object was rewritten or "
+                "substituted, so its attributes are not read"
+            )
+        files += [e for e in entries if e.name == _ATTRIBUTES_FILE and e.mode in _BLOB_MODES]
+    return files
+
+
+class _LooseObjects:
+    """A :class:`_BlobStream` sink: each blob put into ``objects`` as a loose object.
+
+    Its bytes are compressed into a temporary file as they stream and
+    moved to the blob's id only once they hash to it, so ``objects`` holds
+    nothing but bytes the controller hashed itself (ADR 0004 D7.5).
+    """
+
+    def __init__(
+        self, objects: Path, entries: Sequence[_Entry], object_format: str, commit: str
+    ) -> None:
+        self._objects = objects
+        self._incoming = objects / "incoming"
+        self._entries = list(entries)
+        self._object_format = object_format
+        self._commit = commit
+        self._next = 0
+        self._entry: _Entry | None = None
+        self._fd: int | None = None
+        self._digest = hashlib.new(object_format)
+        self._zip = zlib.compressobj()
+        self._read = 0
+
+    def _fail(self, exc: OSError) -> MaterializationError:
+        shown = _shown(self._entry.path) if self._entry is not None else ""
+        return MaterializationError(
+            f"commit {self._commit}: copying the blob of {shown} failed: {exc.strerror or exc}"
+        )
+
+    def _put(self, data: bytes) -> None:
+        assert self._fd is not None
+        view = memoryview(data)
+        try:
+            while view:
+                view = view[os.write(self._fd, view) :]
+        except OSError as exc:
+            raise self._fail(exc) from exc
+
+    def next_blob(self) -> _Entry | None:
+        if self._next == len(self._entries):
+            return None
+        self._next += 1
+        return self._entries[self._next - 1]
+
+    def open_blob(self, entry: _Entry) -> None:
+        header = b"blob %d\0" % entry.size
+        self._entry = entry
+        self._digest = hashlib.new(self._object_format, header)
+        self._zip = zlib.compressobj()
+        self._read = 0
+        try:
+            self._fd = os.open(self._incoming, _NEW_FILE_FLAGS, 0o600)
+        except OSError as exc:
+            raise self._fail(exc) from exc
+        self._put(self._zip.compress(header))
+
+    def write(self, data: memoryview) -> None:
+        self._digest.update(data)
+        self._read += len(data)
+        self._put(self._zip.compress(data))
+
+    def close_blob(self) -> None:
+        entry = self._entry
+        assert entry is not None
+        try:
+            self._put(self._zip.flush())
+        finally:
+            self.close()
+        if self._read != entry.size or self._digest.hexdigest() != entry.oid:
+            raise MaterializationError(
+                f"commit {self._commit}: git sent bytes for the blob of {_shown(entry.path)} "
+                f"that are not its {entry.oid}"
+            )
+        try:
+            directory = self._objects / entry.oid[:2]
+            directory.mkdir(exist_ok=True)
+            os.rename(self._incoming, directory / entry.oid[2:])
+        except OSError as exc:
+            raise self._fail(exc) from exc
+
+    def close(self) -> None:
+        if self._fd is not None:
+            fd, self._fd = self._fd, None
+            os.close(fd)
+
+
 def _eol_conversions(
-    runner: Runner, repo: str, commit: str, object_format: str, paths: Sequence[bytes]
+    runner: Runner,
+    repo: str,
+    commit: str,
+    object_format: str,
+    listing: _Listing,
+    paths: Sequence[bytes],
 ) -> dict[bytes, str]:
     """The checkout conversion to CRLF ``commit``'s own attributes give each of ``paths``.
 
     Read by git's own attribute machinery, from ``commit``'s tree and nothing
-    else: ``read-tree`` writes a fresh index of ``commit`` and ``check-attr
-    --cached`` reads the ``.gitattributes`` files that index holds, macros
-    included, in a git directory written into a temporary directory of the
-    controller's own, with ``repo``'s store as its object directory. So no
-    attribute a checkout also reads, and the agent can write, is read: no
-    ``.gitattributes`` of a working tree, no ``info/attributes`` (the
-    directory has none), no global attributes file (``core.attributesFile``
-    is ``/dev/null``), no system one (``GIT_ATTR_NOSYSTEM``), and no
-    configuration but the directory's own (``GIT_CONFIG_NOSYSTEM``,
-    ``GIT_CONFIG_GLOBAL``). The directory is removed afterwards, whatever
+    else, in a git directory written into a temporary directory of the
+    controller's own. That directory's object directory is its own as well:
+    it holds only the ``.gitattributes`` files git reads for ``paths``
+    (:func:`_attribute_files`, bound to ``commit`` by re-hashed trees), each
+    copied there from ``repo``'s store once its bytes hash to its id
+    (:class:`_LooseObjects`). ``update-index --index-info`` writes an index
+    of exactly those files, at their paths and with their modes, as a
+    checkout's index holds them, and ``check-attr --cached`` reads them,
+    macros included. Git re-hashes neither a blob ``check-attr`` reads nor
+    a tree below the one it is named, but nothing of ``repo``'s store is
+    read here: a blob or a tree rewritten there, before the copy or after
+    it, cannot change the attributes (PR #503 R1-F1). Nor is any attribute
+    a checkout also reads, and the agent can
+    write: no ``.gitattributes`` of a working tree, no ``info/attributes``
+    (the directory has none), no global attributes file
+    (``core.attributesFile`` is ``/dev/null``), no system one
+    (``GIT_ATTR_NOSYSTEM``), and no configuration but the directory's own
+    (``GIT_CONFIG_NOSYSTEM``, ``GIT_CONFIG_GLOBAL``). With no
+    ``.gitattributes`` in any directory of ``paths``, nothing converts and
+    no git process runs. The directory is removed afterwards, whatever
     happened.
     """
-    objects = _git(runner, repo, ["rev-parse", "--path-format=absolute", "--git-path", "objects"])
+    files = _attribute_files(listing, commit, object_format, paths)
+    if not files:
+        return dict.fromkeys(paths, "")
     failed = f"commit {commit}: reading its end-of-line attributes failed"
     try:
         scratch = Path(tempfile.mkdtemp(prefix="autoforge-attributes-"))
@@ -1030,32 +1214,50 @@ def _eol_conversions(
         raise MaterializationError(f"{failed}: {exc.strerror or exc}") from exc
     try:
         git_dir = scratch / "git"
+        objects = git_dir / "objects"
         try:
-            for directory in (git_dir, git_dir / "refs", git_dir / "objects"):
+            for directory in (git_dir, git_dir / "refs", objects):
                 directory.mkdir()
             (git_dir / "HEAD").write_text("ref: refs/heads/autoforge-unborn\n", encoding="ascii")
             (git_dir / "config").write_text(_attribute_dir_config(object_format), encoding="ascii")
         except OSError as exc:
             raise MaterializationError(f"{failed}: {exc.strerror or exc}") from exc
+        unique = list({entry.oid: entry for entry in files}.values())
+        sink = _LooseObjects(objects, unique, object_format, commit)
+        try:
+            _stream_blobs(runner, repo, commit, sink, [entry.oid for entry in unique])
+        finally:
+            sink.close()
         env = {
             "GIT_DIR": str(git_dir),
             "GIT_INDEX_FILE": str(scratch / "index"),
-            "GIT_OBJECT_DIRECTORY": objects.strip(),
+            "GIT_OBJECT_DIRECTORY": str(objects),
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_ATTR_NOSYSTEM": "1",
         }
+        index = b"".join(
+            b"%s %s\t%s\0" % (entry.mode, entry.oid.encode("ascii"), entry.path) for entry in files
+        )
         collector = _Collector()
         names = [name.decode("ascii") for name in _EOL_ATTRIBUTES]
-        for args in (["read-tree", commit], ["check-attr", "--cached", "--stdin", "-z", *names]):
+        steps = (
+            # ``-z`` first: ``--index-info`` reads its input as soon as it is parsed.
+            (["update-index", "-z", "--index-info"], index),
+            (
+                ["check-attr", "--cached", "--stdin", "-z", *names],
+                b"".join(path + b"\0" for path in paths),
+            ),
+        )
+        for args, data in steps:
             req = local_git_request(
                 ["-c", f"core.attributesFile={os.devnull}", *args],
                 cwd=str(scratch),
                 env=env,
                 timeout_seconds=_GIT_TIMEOUT_SECONDS,
             )
+            req.stdin_data = data
             if args[0] == "check-attr":
-                req.stdin_data = b"".join(path + b"\0" for path in paths)
                 req.on_chunk = collector
                 req.max_output_bytes = _STREAM_CAPTURE_BYTES
             problem = _failure(runner(req), args)
@@ -1113,12 +1315,20 @@ def _crlf_checkouts(
     repo: str,
     commit: str,
     object_format: str,
+    listing: _Listing,
     root: Path,
     candidates: Sequence[_Entry],
 ) -> set[bytes]:
-    """The paths of ``candidates`` that ``root`` holds in ``commit``'s own CRLF checkout form."""
+    """The paths of ``candidates`` that ``root`` holds in ``commit``'s own CRLF checkout form.
+
+    ``listing`` is ``commit``'s, as :func:`tree_differences` read it; the
+    entries of ``candidates`` are its. Their blobs' ids, and the attributes,
+    are taken from it only through trees re-hashed to ``commit``
+    (:func:`_eol_conversions`), and each blob's bytes are hashed back to its
+    id as its form is computed (:class:`_CrlfForms`).
+    """
     conversions = _eol_conversions(
-        runner, repo, commit, object_format, [entry.path for entry in candidates]
+        runner, repo, commit, object_format, listing, [entry.path for entry in candidates]
     )
     converting = [entry for entry in candidates if conversions[entry.path]]
     if not converting:
@@ -1188,20 +1398,29 @@ def tree_differences(
     computed here from the blob's bytes, hashed back to its id as they
     stream, with the attributes read from ``commit``'s tree by git in a git
     directory of the controller's own (:func:`_eol_conversions`), never
-    from ``root``, ``info/attributes`` or any configuration. Both forms a
-    file may then hold are functions of the commit alone, what a checkout
-    of it writes with no configuration, so an edit a clean filter maps back
-    to the blob holds neither (R3-F1), and any other conversion (a filter
-    driver, Git LFS, ``ident``, ``working-tree-encoding``, ``core.autocrlf``)
-    is still a difference. No git process reads ``root`` here either, and
-    none runs at all unless a file's bytes differ.
+    from ``root``, ``info/attributes`` or any configuration. What decides
+    that conversion is authenticated first (PR #503 R1-F1): the tree comes
+    from the commit's re-hashed bytes, each directory on the file's path
+    hashes back to its tree from the listing's entries, so the file's blob
+    id and every ``.gitattributes`` read for it are the commit's, and git
+    reads those attributes only from copies the controller hashed, in an
+    object directory of its own, never from the store, where a rewritten
+    object would read as the original. Both forms a file may then hold are
+    functions of the commit alone, what a checkout of it writes with no
+    configuration, so an edit a clean filter maps back to the blob holds
+    neither (R3-F1), and any other conversion (a filter driver, Git LFS,
+    ``ident``, ``working-tree-encoding``, ``core.autocrlf``) is still a
+    difference. No git process reads ``root`` here either, and none runs at
+    all unless a file's bytes differ.
 
     Raises :class:`~autoforge.errors.CandidateNotMaterializableError` when
     ``commit`` is not a commit of the store, and
-    :class:`~autoforge.errors.MaterializationError` when the tree cannot be
-    listed or a file cannot be read (a directory without permission, a file
-    replaced during the read), or, with ``checkout_eol``, when the
-    attributes or a blob cannot be read: never taken as no difference.
+    :class:`~autoforge.errors.MaterializationError` when the commit's bytes
+    do not hash to its id, the tree cannot be listed or a file cannot be
+    read (a directory without permission, a file replaced during the read),
+    or, with ``checkout_eol``, when the attributes or a blob cannot be read
+    or a tree, an attributes file or a blob on the way is not the bytes its
+    id names: never taken as no difference.
     """
     tree = _commit_tree(runner, repo, commit, object_format)
     listing = _list_tree(runner, repo, commit, tree, object_format, sizes=True)
@@ -1247,7 +1466,7 @@ def tree_differences(
                 os.close(fd)
     if not checkout_eol or not rewritten:
         return found
-    held = _crlf_checkouts(runner, repo, commit, object_format, root, rewritten)
+    held = _crlf_checkouts(runner, repo, commit, object_format, listing, root, rewritten)
     return [difference for difference in found if difference.path not in held]
 
 

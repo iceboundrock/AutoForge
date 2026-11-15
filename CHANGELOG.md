@@ -21,9 +21,15 @@ commit's tree alone. An `eol` that comes from `info/attributes`, the
 worktree, `core.autocrlf` or a global attributes file, all of which the
 agent can write, is still refused, as are Git LFS, a filter driver,
 `ident` and `working-tree-encoding`. An edit that a clean filter hides is
-still found. When files are refused this way, the message now names up to
-three of them and gives the commands that write a file's committed bytes
-back (`git cat-file blob`, then `git add`) for a file that holds no edit.
+still found. So is a rule rewritten in the shared object store: the
+commit, the trees on the file's path and the `.gitattributes` it reads are
+re-hashed to their ids, and git reads the attributes only from the
+controller's own copies of them, so an agent that rewrites the loose
+object of a `-text` rule as an `eol=crlf` one gets the `unblock` refused
+rather than its CRLF file taken as the commit's. When files are refused
+this way, the message now names up to three of them and gives the
+commands that write a file's committed bytes back (`git cat-file blob`,
+then `git add`) for a file that holds no edit.
 
 ### The `claude-sdk` provider launches (#151)
 

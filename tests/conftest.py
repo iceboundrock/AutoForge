@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import zlib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
@@ -1735,6 +1736,19 @@ def git_out(*args: str) -> str:
     res = subprocess.run(["git", *args], capture_output=True, text=True)
     assert res.returncode == 0, f"git {' '.join(args)}: {res.stderr}"
     return res.stdout.strip()
+
+
+def rewrite_loose_object(objects: Path, oid: str, kind: str, content: bytes) -> None:
+    """Overwrite the loose object file of ``oid`` in ``objects`` with ``content``, id kept.
+
+    What an agent that can write the shared object store can do (PR #503
+    R1-F1): git does not re-hash an object it reads, so the store then
+    reads ``oid`` as ``content``, of type ``kind``.
+    """
+    path = objects / oid[:2] / oid[2:]
+    assert path.is_file(), f"{oid} is not a loose object of {objects}"
+    path.chmod(0o644)
+    path.write_bytes(zlib.compress(b"%s %d\0" % (kind.encode("ascii"), len(content)) + content))
 
 
 # The git of an :class:`Origin`, of :func:`github_origin` and of the live

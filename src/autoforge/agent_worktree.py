@@ -571,7 +571,9 @@ def byte_changes_from_revision(
     commit's: the ``eol=crlf`` that ``revision``'s own ``.gitattributes``
     give a file (#488). A file holding the bytes a checkout writes under
     it, computed by the controller from the blob with the attributes read
-    from ``revision``'s tree alone, is no change, so a worktree git checked
+    from ``revision``'s tree alone, the commit, the trees on the file's
+    path and those attributes re-hashed to their ids first (PR #503
+    R1-F1), is no change, so a worktree git checked
     out itself (``*.bat text eol=crlf``) passes; both bytes a file may hold
     are functions of ``revision`` alone, so an edit a clean filter maps
     back to the blob is still listed. A worktree whose checkout converts
