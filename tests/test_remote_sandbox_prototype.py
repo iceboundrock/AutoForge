@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 from dataclasses import replace
@@ -519,6 +520,27 @@ def test_the_journal_entry_round_trips_and_is_read_strictly(scene):
             RemoteIdentity.parse(json.dumps(broken).encode())
 
 
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf], ids=["nan", "inf", "-inf"])
+@pytest.mark.parametrize("field", ["ceiling", "window"])
+def test_a_journal_entry_whose_ceiling_or_window_is_not_finite_is_refused(scene, field, value):
+    """A NaN or infinite window or ceiling makes every deadline asked for
+    unbounded (``min(now + nan, ceiling)`` is NaN), and a resource held
+    until it never ends. The entry is refused when it is made and when it
+    is read, whether the reader meets a ``NaN`` or ``Infinity`` literal or
+    a number too large for a float."""
+    timing = {"ceiling": scene.identity.ceiling, "window": scene.identity.window, field: value}
+    with pytest.raises(ValueError, match=f"its {field} .* not a positive, finite number"):
+        RemoteIdentity.new(scene.git_input, provider="fake", scope=scene.identity.scope, **timing)
+    with pytest.raises(ValueError, match="not a positive, finite number"):
+        replace(scene.identity, **{field: value})
+    data = {**json.loads(scene.identity.render()), field: value}
+    with pytest.raises(ValueError, match="is not a JSON number"):
+        RemoteIdentity.parse(json.dumps(data).encode())
+    overflow = json.dumps({**data, field: 0.5}).replace("0.5", "-1e400" if value < 0 else "1e400")
+    with pytest.raises(ValueError, match="not a positive, finite number"):
+        RemoteIdentity.parse(overflow.encode())
+
+
 def test_the_name_and_tags_derive_from_the_entry_alone(scene):
     entry = scene.identity
     assert proto.NAME_RE.fullmatch(entry.name) and len(entry.name) <= 63
@@ -642,6 +664,62 @@ def test_a_renewal_whose_deadline_reads_back_past_its_bound_ends_the_launch(scen
     assert observed.state == "running" and observed.deadline == asked + HOUR
     assert scene.journal == [scene.identity.render()]
     assert proto.terminate(scene.remote, scene.identity) == "removed"
+
+
+@pytest.mark.parametrize("held", [math.nan, math.inf], ids=["nan", "inf"])
+def test_a_create_whose_deadline_reads_back_not_finite_is_refused_and_kept(scene, held):
+    """NaN and infinity compare false with the deadline asked for, so a
+    check that only asks "later?" would pass them, and the fake, holding the
+    resource until either, never ends it. The create is refused before a
+    byte is sent, its entry stays, and reconciliation from that entry
+    removes a resource still running far past the ceiling."""
+    scene.remote.deadline_overshoot = held
+    with pytest.raises(SandboxLaunchRefusedError, match="not a finite time"):
+        scene.create()
+    assert scene.journal == [scene.identity.render()] and scene.puts() == []
+    scene.remote.advance(scene.identity.ceiling - scene.remote.now + 100_000)
+    assert scene.remote.lookup(scene.identity.name).state == "running"
+    entry = RemoteIdentity.parse(scene.journal[0])
+    report = proto.reconcile(scene.remote, scene.identity.run, [entry])
+    assert report == proto.Reconciliation((entry.name,), ())
+    assert scene.remote.resources == {}
+
+
+@pytest.mark.parametrize("held", [math.nan, math.inf], ids=["nan", "inf"])
+def test_a_renewal_whose_deadline_reads_back_not_finite_ends_the_launch(scene, held):
+    """The provider honours the create, then holds a renewal until NaN or
+    infinity: the launch ends, and the resource, which the fake would keep
+    running past the ceiling, is left for its verified removal, its entry
+    still open."""
+    deadline = scene.create()
+    scene.remote.advance(scene.identity.window / 2 + 1)
+    scene.remote.deadline_overshoot = held
+    with pytest.raises(DeadlineUnbounded, match="not a finite time"):
+        proto.keep_deadline(scene.remote, scene.identity, deadline)
+    assert [c[0] for c in scene.remote.calls].count("extend") == 1
+    scene.remote.advance(scene.identity.ceiling - scene.remote.now + 100_000)
+    assert scene.remote.lookup(scene.identity.name).state == "running"
+    assert scene.journal == [scene.identity.render()]
+    assert proto.terminate(scene.remote, scene.identity) == "removed"
+
+
+@pytest.mark.parametrize("deadline", [math.nan, math.inf], ids=["nan", "inf"])
+def test_a_deadline_that_is_not_finite_starts_no_renewal_and_no_transfer(scene, deadline):
+    """The deadline a renewal or a transfer is given is checked as well: a
+    transfer's margin (``inf - now < margin``) and its stop at the deadline
+    (``now >= nan``) are both false for it, so neither would ever stop a
+    transfer. Each refuses before it asks the provider anything, and the
+    export directory stays empty."""
+    scene.exported()
+    calls = len(scene.remote.calls)
+    with pytest.raises(DeadlineUnbounded, match="not a finite time"):
+        proto.keep_deadline(scene.remote, scene.identity, deadline)
+    with pytest.raises(SandboxLaunchRefusedError, match="not a finite time"):
+        scene.send(deadline)
+    with pytest.raises(ObjectImportError, match="not a finite time"):
+        proto.receive_artifact(scene.remote, scene.identity, scene.export, deadline=deadline)
+    assert scene.remote.calls[calls:] == []
+    assert list(scene.export.iterdir()) == []
 
 
 # -- R6 and R8: termination and reconciliation ------------------------------------------

@@ -30,10 +30,14 @@ prototypes:
   the ceiling. :func:`keep_deadline` renews it while the controller runs,
   so a controller that dies leaves a resource the provider ends within one
   window. Both read the deadline back, and a provider that holds the
-  resource past the deadline asked for ends the launch, its entry kept for
-  the removal: the bound is never assumed of the provider. That is the
-  controller's request to the provider, not a protocol between AutoForge
-  processes: nothing on the remote side decides anything.
+  resource past the deadline asked for, or reports a deadline that is not
+  a finite time, ends the launch, its entry kept for the removal: the
+  bound is never assumed of the provider. The entry's ceiling and window,
+  and every deadline a renewal or a transfer is given, must be finite
+  too: NaN and the infinities compare false with every bound, so a check
+  that only compares would pass them. The renewal is the controller's
+  request to the provider, not a protocol between AutoForge processes:
+  nothing on the remote side decides anything.
 - **R4 and R5, the transfer.** :func:`send_seed` checks the seed against
   the launch's git input (ADR 0013 D4's hand-off) before a byte leaves,
   streams each file with its size declared, checks the remote's digest of
@@ -81,6 +85,7 @@ import functools
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -153,6 +158,17 @@ _KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}")
 _SCOPE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:-]{0,199}")
 _PROVIDER_RE = re.compile(r"[a-z][a-z0-9-]{0,39}")
 
+
+def _finite_time(value: object) -> bool:
+    """Whether ``value`` is a number of seconds every bound can be compared with.
+
+    A check that only compares passes NaN and the infinities: ``NaN > asked``
+    and ``inf < margin`` are both false. A resource held until either never
+    ends.
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 # Hosts a brokered credential would make GitHub write authority for (R9).
 GITHUB_HOSTS = (
     "github.com",
@@ -187,7 +203,9 @@ class RemoteIdentity:
     scope would find nothing, and nothing must be read as gone there
     (ADR 0013 D6 item 10's rule for a store). ``ceiling`` is the launch's
     runtime ceiling plus ADR 0002's graces, as a time: no deadline the
-    controller asks for passes it. ``window`` is the renewal window.
+    controller asks for passes it. ``window`` is the renewal window. Both
+    are positive, finite floats: a non-finite one would make every deadline
+    asked for unbounded (:func:`first_deadline`).
     """
 
     provider: str
@@ -219,8 +237,9 @@ class RemoteIdentity:
         if not isinstance(self.nonce, str) or not _NONCE_RE.fullmatch(self.nonce):
             return "its nonce is not 32 hexadecimal digits"
         for name in ("ceiling", "window"):
-            if type(getattr(self, name)) is not float or getattr(self, name) <= 0:
-                return f"its {name} is not a positive number of seconds"
+            value = getattr(self, name)
+            if type(value) is not float or not _finite_time(value) or value <= 0:
+                return f"its {name} {value!r} is not a positive, finite number of seconds"
         return ""
 
     @classmethod
@@ -269,13 +288,17 @@ class RemoteIdentity:
 
     def render(self) -> bytes:
         data = {"schema": REMOTE_ENTRY_SCHEMA, **{k: getattr(self, k) for k in _ENTRY_TYPES}}
-        return json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+        return json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
     @classmethod
     def parse(cls, raw: bytes) -> RemoteIdentity:
-        """An entry :meth:`render` wrote, read back strictly: exact keys, exact types."""
+        """An entry :meth:`render` wrote, read back strictly: exact keys, exact types.
+
+        ``NaN`` and ``Infinity``, which Python's JSON reader accepts and JSON
+        does not, are refused as they are read.
+        """
         try:
-            data = json.loads(raw)
+            data = json.loads(raw, parse_constant=_refuse_constant)
         except (ValueError, RecursionError) as exc:
             raise ValueError(f"a remote journal entry does not parse ({exc})") from None
         if not isinstance(data, dict) or set(data) != {"schema", *_ENTRY_TYPES}:
@@ -286,6 +309,10 @@ class RemoteIdentity:
             if type(data[key]) is not kind:
                 raise ValueError(f"a remote journal entry's {key} is not a {kind.__name__}")
         return cls(**{key: data[key] for key in _ENTRY_TYPES})
+
+
+def _refuse_constant(name: str) -> float:
+    raise ValueError(f"{name} is not a JSON number")
 
 
 _ENTRY_TYPES: dict[str, type] = {
@@ -425,7 +452,11 @@ class FakeRemote:
         resource = self._live(name)
         if deadline - self.now > self.max_session:
             raise ValueError("the deadline is past the provider's longest session")
-        resource.deadline = max(resource.deadline, deadline + self.deadline_overshoot)
+        held = deadline + self.deadline_overshoot
+        # An extend never shortens the resource. ``max`` would drop a NaN an
+        # injected fault holds (NaN compares false), so it is kept explicitly.
+        if math.isnan(held) or held > resource.deadline:
+            resource.deadline = held
 
     def _faulted(self, path: str) -> bool:
         return self.fault_path is None or self.fault_path == path
@@ -566,8 +597,10 @@ class DeadlineUnbounded(ExecutionError):
     """A renewal the provider holds past the deadline asked for: the launch ends (R3).
 
     The controller asked for at most one window more, never past the
-    ceiling, and read back a later deadline: a controller that died now
-    would leave a resource that outlives its window. The launch's result is
+    ceiling, and read back a later deadline, or one that is not a finite
+    time: a controller that died now would leave a resource that outlives
+    its window. A renewal given a deadline that is not a finite time ends
+    the launch the same way, before it asks anything. The launch's result is
     not used, and the resource's entry stays open until a removal is
     verified (:func:`terminate`, or reconciliation). No local container
     renews a deadline, so ADR 0013 D17 has no class for this; a reopening
@@ -585,9 +618,16 @@ def _deadline_problem(observed: Observation, asked: float) -> str:
 
     ``asked`` is at most one window ahead of when it was asked and never past
     the ceiling (:func:`first_deadline`, :func:`keep_deadline`), so a
-    deadline read back later than it breaks both. One read back earlier is
-    the provider's to choose: the transfers respect it.
+    deadline read back later than it breaks both. So does one that is not a
+    finite time: it compares false with ``asked``, and the resource held
+    until it never ends. One read back earlier is the provider's to choose:
+    the transfers respect it.
     """
+    if not _finite_time(observed.deadline):
+        return (
+            f"the provider reports {observed.name}'s deadline as {observed.deadline!r}, not a "
+            "finite time, so nothing bounds how long a dead controller's resource would run"
+        )
     if observed.deadline > asked:
         return (
             f"the provider holds {observed.name} until {observed.deadline:.0f}, "
@@ -681,8 +721,15 @@ def keep_deadline(remote: FakeRemote, identity: RemoteIdentity, deadline: float)
     transfers then respect. A deadline read back past the one asked for
     raises :class:`DeadlineUnbounded`, never clipped here: a clipped value
     would not shorten the resource's life. A controller that stops calling
-    this leaves a resource the provider ends at the last deadline.
+    this leaves a resource the provider ends at the last deadline. A
+    ``deadline`` that is not a finite time raises :class:`DeadlineUnbounded`
+    before anything is asked: no renewal can be judged against it.
     """
+    if not _finite_time(deadline):
+        raise DeadlineUnbounded(
+            f"the remote launch is ended: the deadline held for {identity.name} is "
+            f"{deadline!r}, not a finite time. Its entry stays open until its removal is verified"
+        )
     now = remote.clock()
     if deadline - now >= identity.window / 2:
         return deadline
@@ -716,6 +763,9 @@ def _lookup(remote: FakeRemote, name: str) -> Observation | None:
 
 
 def _time_problem(deadline: float, clock: Clock, what: str) -> str:
+    """Why a transfer must not start before ``deadline``, or ""."""
+    if not _finite_time(deadline):
+        return f"{what} would start under a deadline of {deadline!r}, not a finite time"
     left = deadline - clock()
     if left < TRANSFER_MARGIN_SECONDS:
         return (

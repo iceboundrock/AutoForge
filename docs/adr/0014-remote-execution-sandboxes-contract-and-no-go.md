@@ -339,6 +339,13 @@ marked *prototyped* against a fake provider.
   result is not used. Either way the entry stays open until a removal is
   verified (R6). An earlier deadline is the provider's to choose, and the
   transfers respect it.
+- **Every time is finite.** A deadline read back as NaN or an infinity
+  ends the launch the same way. Such a value compares false with every
+  bound, so a check that only compares would pass it, and a resource held
+  until it would never end. The ceiling and the renewal window, which the
+  entry records, are refused when they are not finite, as the entry is
+  made and as it is read. So is a deadline a renewal or a transfer is
+  given.
 - **A controller that dies stops renewing,** so the provider ends the
   resource within one window. That bound replaces ADR 0013 D6's
   death-watch for a provider that offers no channel whose end the remote
@@ -571,8 +578,11 @@ anything, and it injects the faults the tests need.
   a local write that stops, in the manifest or the pack, leaves an empty
   export directory (`test_a_local_write_that_stops_leaves_nothing_to_import`).
 - **R1, identity.** The entry round-trips and is read strictly
-  (`test_the_journal_entry_round_trips_and_is_read_strictly`), and the
-  name and tags derive from it alone
+  (`test_the_journal_entry_round_trips_and_is_read_strictly`). A ceiling
+  or window that is not finite is refused when the entry is made and
+  when it is read
+  (`test_a_journal_entry_whose_ceiling_or_window_is_not_finite_is_refused`).
+  The name and tags derive from the entry alone
   (`test_the_name_and_tags_derive_from_the_entry_alone`).
   - A lost create answer is resolved by name and makes no second resource
     (`test_an_ambiguous_create_is_resolved_by_name_and_never_makes_a_second_resource`).
@@ -598,6 +608,13 @@ anything, and it injects the faults the tests need.
   and a renewal past the window or past the ceiling ends the launch, the
   resource left for its verified removal
   (`test_a_renewal_whose_deadline_reads_back_past_its_bound_ends_the_launch`).
+  A deadline read back as NaN or infinity, which the fake never ends, is
+  refused the same way at the create
+  (`test_a_create_whose_deadline_reads_back_not_finite_is_refused_and_kept`)
+  and at a renewal
+  (`test_a_renewal_whose_deadline_reads_back_not_finite_ends_the_launch`).
+  A renewal or a transfer given such a deadline asks the provider nothing
+  (`test_a_deadline_that_is_not_finite_starts_no_renewal_and_no_transfer`).
 - **R6 and R8, termination and reconciliation.**
   - An entry closes only on a lookup that finds nothing
     (`test_termination_closes_only_on_a_lookup_that_finds_nothing`).
