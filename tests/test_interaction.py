@@ -306,6 +306,16 @@ def test_required_offers_name_exactly_what_a_decision_needs():
     assert required_offers(Deny("run the unit tests only")) == {DecisionKind.DENY_GUIDANCE}
 
 
+def test_a_modified_input_nested_past_the_bound_is_refused_never_a_recursion_error():
+    # R4-F2 of PR #489: the snapshot is taken recursively, so the nesting is
+    # counted first, without recursion, and refused as data.
+    deep: object = "x"
+    for _ in range(600):
+        deep = [deep]
+    with pytest.raises(InteractionDataError, match="a modified input nests objects and arrays"):
+        Allow(updated_input={"command": "ls", "extra": deep})
+
+
 def test_a_modified_input_is_a_read_only_snapshot_of_what_was_validated():
     """The whole input, nested values too, is copied when the decision is
     built: changing the caller's object afterwards, or what was sent, never

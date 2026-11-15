@@ -42,7 +42,8 @@ denial with guidance. Each was verified on the pinned pair against a
 loopback stand-in of the Messages API (ADR 0007 §3's amendment). No model
 was called. A call whose input holds a control character or a value
 redaction would hide is never put to you: it is denied and the launch
-fails, because what you were shown would not be what you approve.
+fails, because what you were shown would not be what you approve. So is
+a call whose input nests objects and arrays more than 32 levels deep.
 Approve-for-session and pausing for a decision (#126) are not available.
 Under `fail`, the default, an ask fails the launch. A launch an ask failed
 is never relaunched, even when a limit kills the helper while it shuts

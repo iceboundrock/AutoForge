@@ -64,6 +64,7 @@ from autoforge.providers import (
 from autoforge.sdk_assets import helper_pin, helper_problem, helpers_dir, load_manifest
 from autoforge.sdk_policy import (
     CLAUDE_SDK,
+    MAX_INPUT_DEPTH,
     ClaudeSdkRoots,
     claude_sdk_policy,
     interaction_settings,
@@ -507,6 +508,33 @@ def test_a_permission_input_cleaning_would_change_is_a_problem_not_a_request(too
     (ask,) = _feed(session, HELLO, _init(PROMPT), _ask(input=tool_input))
     assert named in ask.problem, ask.problem
     assert KEY not in ask.problem and "rm -rf" not in ask.problem
+    assert session.failed is None and session.open_asks == (ask,)
+
+
+def _deep(levels: int) -> list:
+    """``levels`` nested arrays, built without recursion."""
+    value: list = []
+    for _ in range(levels - 1):
+        value = [value]
+    return value
+
+
+@pytest.mark.parametrize("kind", ["permission", "question"])
+def test_an_ask_input_nested_past_the_bound_is_a_problem_not_an_error(kind):
+    # R4-F2 of PR #489: on Python 3.11 a permission input carrying 600
+    # nested arrays passed decoding and its digest, then raised
+    # RecursionError in the recursive redaction check. The nesting is now
+    # counted first, without recursion, so the ask of either kind is a
+    # problem the driver fails, never an exception.
+    if kind == "permission":
+        options, tool_input, over = PROMPT, {"command": "ls", "extra": _deep(600)}, {}
+    else:
+        options = {"interaction_policy": "prompt"}
+        tool_input = {"questions": _deep(600)}
+        over = {"kind": "question", "tool_name": "AskUserQuestion"}
+    session = _session(options)
+    (ask,) = _feed(session, HELLO, _init(options), _ask(input=tool_input, **over))
+    assert f"more than {MAX_INPUT_DEPTH} levels deep" in ask.problem, ask.problem
     assert session.failed is None and session.open_asks == (ask,)
 
 
@@ -1419,6 +1447,30 @@ def test_a_permission_input_cleaning_would_change_is_never_put_to_anyone(
     assert result.interaction is not None and result.interaction.lifecycle is Lifecycle.FAILED
     assert named in (result.provider_failure or ""), result.provider_failure
     assert KEY not in (result.provider_failure or "") + result.stderr
+    assert result.stdout == "" and not result.reply_delivered
+    assert not result.timed_out and not result.may_have_survivor and took < 30
+    entries = fake.log(Path(req.cwd))
+    hooks = [e for e in entries if e.get("hook")]
+    assert [h["output"]["hookSpecificOutput"]["permissionDecision"] for h in hooks] == ["deny"]
+    assert not any(e.get("host") for e in entries)
+
+
+def test_a_permission_input_nested_past_the_bound_is_never_put_to_anyone(
+    tmp_path, sdk_python, launch_env
+):
+    # R4-F2 of PR #489: through the real helper, a Bash call whose input
+    # carried 600 nested arrays raised RecursionError out of execute on
+    # Python 3.11, before the resolver was asked. The ask now fails as any
+    # input that cannot be shown does: never put to anyone, the hook denies,
+    # the host never runs the call, the launch fails and its helper is gone.
+    tool = {"id": "toolu_b", "name": "Bash", "input": {"command": "ls", "extra": _deep(600)}}
+    prompt = fake.script(steps=[{"tool": tool}], result={"result": FINAL})
+    resolver = Scripted(Allow())
+    result, req, took = _run(tmp_path, sdk_python, prompt, PROMPT, resolver)
+    assert resolver.asked == [] and len(resolver.decisions) == 1
+    assert result.interaction is not None and result.interaction.lifecycle is Lifecycle.FAILED
+    failure = result.provider_failure or ""
+    assert f"more than {MAX_INPUT_DEPTH} levels deep" in failure, failure
     assert result.stdout == "" and not result.reply_delivered
     assert not result.timed_out and not result.may_have_survivor and took < 30
     entries = fake.log(Path(req.cwd))

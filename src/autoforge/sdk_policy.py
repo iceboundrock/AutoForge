@@ -827,6 +827,14 @@ def server_password() -> str:
 # clipped: approving a clipped input would approve different work.
 MAX_TOOL_NAME_CHARS = 128
 MAX_INPUT_BYTES = 64 * 1024
+# How deeply a tool input may nest objects and arrays, counted without
+# recursion before anything walks it. Its canonical JSON, its redaction, the
+# strings it holds and a modified input's snapshot are each taken
+# recursively, so an input nested past what the interpreter's stack holds (a
+# few hundred levels on Python 3.11) would raise RecursionError instead of
+# being refused (R4-F2 of PR #489). No input of a tool a profile may ask
+# about comes near the bound: an AskUserQuestion call's is five levels deep.
+MAX_INPUT_DEPTH = 32
 MAX_QUESTIONS = 4
 MAX_OPTIONS = 16
 MAX_QUESTION_CHARS = 2000
@@ -859,13 +867,37 @@ DISPLAY_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 
+def refuse_deep_nesting(value: object, what: str, limit: int = MAX_INPUT_DEPTH) -> None:
+    """Raise :class:`InteractionDataError` when ``value`` nests objects and
+    arrays (mappings, lists and tuples) more than ``limit`` levels deep; a
+    value that is no container is level 0. Counted without recursion, so a
+    value nested past the interpreter's stack is refused, never a
+    RecursionError (:data:`MAX_INPUT_DEPTH`)."""
+    pending: list[tuple[object, int]] = [(value, 1)]
+    while pending:
+        item, depth = pending.pop()
+        children: Iterable[object]
+        if isinstance(item, Mapping):
+            children = item.values()
+        elif isinstance(item, (list, tuple)):
+            children = item
+        else:
+            continue
+        if depth > limit:
+            raise InteractionDataError(
+                f"{what} nests objects and arrays more than {limit} levels deep"
+            )
+        pending.extend((child, depth + 1) for child in children)
+
+
 def canonical_json(value: object) -> bytes:
     """``value`` as canonical JSON: sorted keys, no spaces, UTF-8, no NaN.
 
-    A value JSON cannot represent, or a string UTF-8 cannot encode (a lone
-    surrogate, legal in a JSON string's escapes), raises
-    :class:`InteractionDataError`.
+    A value JSON cannot represent, a string UTF-8 cannot encode (a lone
+    surrogate, legal in a JSON string's escapes), or one nested past
+    :data:`MAX_INPUT_DEPTH` raises :class:`InteractionDataError`.
     """
+    refuse_deep_nesting(value, "a value")
     try:
         text = json.dumps(
             value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
@@ -880,7 +912,9 @@ def canonical_json(value: object) -> bytes:
 
 def input_digest(value: object, what: str, limit: int = MAX_INPUT_BYTES) -> str:
     """The SHA-256 of ``value``'s canonical JSON, the identity a decision is
-    bound to (ADR 0007 D9.3); refused past ``limit`` bytes, never clipped."""
+    bound to (ADR 0007 D9.3); refused past ``limit`` bytes or
+    :data:`MAX_INPUT_DEPTH` levels, never clipped."""
+    refuse_deep_nesting(value, what)
     data = canonical_json(value)
     if len(data) > limit:
         raise InteractionDataError(
@@ -924,7 +958,8 @@ def exact_text(value: object, what: str, limit: int) -> str:
 
 def exact_input(value: object, what: str, limit: int = MAX_INPUT_BYTES) -> object:
     """A modified tool input the controller may send back, unchanged, or
-    :class:`InteractionDataError`: JSON within ``limit`` bytes, and every
+    :class:`InteractionDataError`: JSON within ``limit`` bytes and
+    :data:`MAX_INPUT_DEPTH` levels, and every
     string in it, key or value, safe for :func:`exact_text` (redaction would
     change none, and a carriage return is refused like any other control
     character: it redraws the line it is shown on)."""

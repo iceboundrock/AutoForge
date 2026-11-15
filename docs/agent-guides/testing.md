@@ -2743,9 +2743,11 @@ from the `claude-sdk` transport that applies it (#151, below). Keep covered:
   refusals still apply;
 - the roots: REMOTE roots lie outside the worktree;
 - interaction data: an oversized, escape-carrying or credential-shaped
-  input, option, answer or modified input is refused, never clipped. Two
-  options shown alike are refused, and a permission ask shows only
-  allow-listed keys;
+  input, option, answer or modified input is refused, never clipped. An
+  input or modified input nested more than 32 levels deep (up to 100000
+  arrays or objects) is refused as data, never a `RecursionError`
+  (R4-F2 of PR #489). Two options shown alike are refused, and a
+  permission ask shows only allow-listed keys;
 - every launch path refuses (`integration_preflight`, `execute`), and
   `doctor` fails the "can launch" row; `build_command_for` renders the
   helper's argv for a plan, never the prompt (#150);
@@ -2807,7 +2809,12 @@ handle. Keep covered:
   ADR 0007 D7.6's failure; a permission whose own input carries a control
   character (a carriage return among them) or a value redaction would
   change, a field that is not shown included, never reaching the resolver,
-  denied by the hook and failing the invocation; and an ask that failed
+  denied by the hook and failing the invocation; an ask of either kind
+  whose input nests 600 arrays, which on Python 3.11 raised
+  `RecursionError` out of the reducer and `execute` (R4-F2 of PR #489):
+  in the reducer a problem, and through the helper never reaching the
+  resolver, denied by the hook, the invocation failed and the helper torn
+  down, on each interpreter of the CI matrix; and an ask that failed
   the run, then a helper hung in its interrupt and its disconnect until
   the idle limit killed it (the fake's `stall`): the ask's failure kept as
   `failed_before_limit` through the kill, and the step never relaunched,

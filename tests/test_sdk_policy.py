@@ -50,6 +50,7 @@ from autoforge.sdk_policy import (
     CLAUDE_SDK_WRITE_TOOLS,
     DENY,
     MAX_INPUT_BYTES,
+    MAX_INPUT_DEPTH,
     MAX_OPTIONS,
     OPENCODE_SDK_AGENT,
     OPENCODE_SDK_DENIED,
@@ -73,6 +74,7 @@ from autoforge.sdk_policy import (
     opencode_sdk_policy,
     permission_summary,
     question_options,
+    refuse_deep_nesting,
     root_inside,
     sdk_launch_allowlist,
     sdk_root,
@@ -582,6 +584,41 @@ def test_input_digest_binds_the_whole_input_and_refuses_an_oversized_one():
     assert a != input_digest({"command": "ls -a"}, "tool input")
     with pytest.raises(InteractionDataError, match="refused rather than shown in part"):
         input_digest({"content": "x" * MAX_INPUT_BYTES}, "tool input")
+
+
+def _nested(levels: int, container: str = "array") -> object:
+    """A value ``levels`` containers deep, built without recursion."""
+    value: object = "x"
+    for _ in range(levels):
+        value = [value] if container == "array" else {"a": value}
+    return value
+
+
+@pytest.mark.parametrize("container", ["array", "object"])
+@pytest.mark.parametrize("levels", [MAX_INPUT_DEPTH + 1, 600, 100_000])
+def test_an_input_nested_past_the_bound_is_refused_never_a_recursion_error(levels, container):
+    # R4-F2 of PR #489: each check of an input walks it recursively, so one
+    # nested past the interpreter's stack (600 arrays on Python 3.11) raised
+    # RecursionError out of the check. The nesting is counted first, without
+    # recursion, and refused as data.
+    value = {"command": "ls", "extra": _nested(levels - 1, container)}
+    rule = f"more than {MAX_INPUT_DEPTH} levels deep"
+    with pytest.raises(InteractionDataError, match=f"^a value nests .*{rule}"):
+        canonical_json(value)
+    with pytest.raises(InteractionDataError, match=f"^tool input nests .*{rule}"):
+        input_digest(value, "tool input")
+    with pytest.raises(InteractionDataError, match=f"^modified input nests .*{rule}"):
+        exact_input(value, "modified input")
+
+
+def test_an_input_at_the_nesting_bound_passes_and_a_scalar_is_no_level():
+    value = {"command": "ls", "extra": _nested(MAX_INPUT_DEPTH - 1, "object")}
+    assert exact_input(value, "tool input") is value
+    input_digest(value, "tool input")
+    refuse_deep_nesting("x", "a value", limit=0)
+    refuse_deep_nesting([], "a value", limit=1)
+    with pytest.raises(InteractionDataError, match="more than 1 levels deep"):
+        refuse_deep_nesting([()], "a value", limit=1)
 
 
 @pytest.mark.parametrize(

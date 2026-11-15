@@ -395,7 +395,8 @@ field and the rule, never the value.
 
 - **Refused, never clipped.** These values decide what a tool may do or
   what the agent is told:
-  - a tool input (canonical JSON, at most 64 KiB, `input_digest`);
+  - a tool input (canonical JSON, at most 64 KiB and 32 levels of nested
+    objects and arrays, `input_digest`);
   - a question's option and an answer (`exact_text`: at most 200 and 2000
     characters);
   - a modified input (`exact_input`).
@@ -404,7 +405,10 @@ field and the rule, never the value.
   these is refused when it is past its bound, carries a control, format or
   separator character other than a newline or a tab (an escape sequence
   starts with one, and a carriage return, bare or in a CRLF pair, redraws
-  the line it is shown on), or would be changed by redaction.
+  the line it is shown on), or would be changed by redaction. The nesting
+  is counted first, without recursion (`refuse_deep_nesting`): every later
+  check walks the input recursively, so an input nested past what the
+  interpreter's stack holds is refused like any other, never an error.
 
   For `claude-sdk`, a permission ask's own input is checked when the ask
   arrives, before any request is minted (`claude_sdk.ClaudeSdkSession`,
