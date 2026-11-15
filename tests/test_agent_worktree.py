@@ -39,7 +39,7 @@ from autoforge.errors import SandboxTamperError, VerificationError
 from autoforge.executor import ExecutionRequest, execute
 from autoforge.git_workspace import StatusEntry
 
-from .conftest import GIT_IDENT, watched_fifo
+from .conftest import GIT_IDENT, rewrite_loose_object, watched_fifo
 
 
 def _git(*args: str, env: dict[str, str] | None = None) -> str:
@@ -642,6 +642,95 @@ def test_a_conversion_hides_an_edit_from_both_statuses_never_from_the_bytes(repo
     assert _uncommitted(repo) == []
     assert _against(repo) == []
     assert _bytes_against(repo) == [StatusEntry(" M", "a.txt")]
+
+
+def _with_committed_eol(repo, files: dict[str, bytes] | None = None) -> Path:
+    """A commit whose own `.gitattributes` say `*.bat text eol=crlf`, as flinkt's do,
+    checked out by git into a new worktree registered beside the issue's (#488).
+
+    ``files`` (path: bytes) are committed instead, when given."""
+    root = repo["root"]
+    files = files or {
+        ".gitattributes": b"*.bat text eol=crlf\n",
+        "gradlew.bat": b"@echo off\necho hi\n",
+    }
+    for name, content in files.items():
+        (root / name).write_bytes(content)
+    _git("-C", str(root), "add", *files)
+    _git("-C", str(root), *GIT_IDENT, "commit", "-q", "-m", "a batch file")
+    worktree = repo["common"] / "autoforge" / "worktrees" / "3"
+    _git("-C", str(root), "worktree", "add", "-q", "--detach", str(worktree), "HEAD")
+    return worktree
+
+
+def test_a_worktree_git_checked_out_under_the_commits_own_eol_crlf_holds_no_change(repo):
+    """#488: git writes the committed LF blob as CRLF, so its bytes are not
+    the blob's, and both statuses read it as unchanged. The byte comparison
+    takes the CRLF form the reviewed commit's own attributes name as its
+    content, so the worktree AutoForge created and nobody touched passes
+    all three reads. An edit made in that form is still listed."""
+    worktree = _with_committed_eol(repo)
+    assert (worktree / "gradlew.bat").read_bytes() == b"@echo off\r\necho hi\r\n"
+    repo = {**repo, "worktree": worktree, "admin": repo["common"] / "worktrees" / "3"}
+    assert _uncommitted(repo) == [] and _against(repo) == []
+    assert _bytes_against(repo) == []
+    (worktree / "gradlew.bat").write_bytes(b"@echo off\r\necho EDITED\r\n")
+    assert _bytes_against(repo) == [StatusEntry(" M", "gradlew.bat")]
+
+
+def test_a_clean_filter_hides_no_edit_behind_the_commits_own_eol_crlf(repo):
+    """PR #444 R3-F1 still holds where the commit names `eol=crlf`: an edit a
+    clean filter maps back to the reviewed blob, written in CRLF form, holds
+    neither the blob's bytes nor their checkout form, and is listed."""
+    worktree = _with_committed_eol(repo)
+    repo = {**repo, "worktree": worktree, "admin": repo["common"] / "worktrees" / "3"}
+    committed = repo["base"] / "committed.bat"
+    committed.write_bytes(b"@echo off\necho hi\n")
+    clean = f"cat >/dev/null; cat {shlex.quote(str(committed))}"
+    _git("-C", str(repo["root"]), "config", "filter.revert.clean", clean)
+    (repo["common"] / "info").mkdir(exist_ok=True)
+    (repo["common"] / "info" / "attributes").write_text("gradlew.bat filter=revert\n")
+    (worktree / "gradlew.bat").write_bytes(b"@echo off\r\nrm -rf build\r\n")
+    _git("-C", str(worktree), "update-index", "--assume-unchanged", "gradlew.bat")
+    assert _uncommitted(repo) == [] and _against(repo) == []
+    assert _bytes_against(repo) == [StatusEntry(" M", "gradlew.bat")]
+
+
+def test_an_attributes_object_rewritten_in_the_store_hides_no_crlf_edit(repo):
+    """PR #503 R1-F1, the reviewer's reproduction: the reviewed commit's own
+    `.gitattributes` say `*.txt -text`, and the loose object of that blob
+    is rewritten in the shared store, at the same size, to `*.txt text
+    eol=crlf`, the worktree's copy of the file left as committed. With
+    `notes.txt` rewritten in CRLF form, a clean filter mapping it back and
+    an assume-unchanged mark, neither status lists anything, and git reads
+    the rewritten rule from the store. The byte comparison reads the rule
+    only from bytes it re-hashed: they are not the blob's, so all three
+    reads together never pass, and the CRLF file is never taken as the
+    reviewed commit's."""
+    committed_rule = b"*.txt -text" + b" " * 8 + b"\n"
+    forged_rule = b"*.txt text eol=crlf\n"
+    assert len(committed_rule) == len(forged_rule)
+    worktree = _with_committed_eol(
+        repo, {".gitattributes": committed_rule, "notes.txt": b"one\ntwo\n"}
+    )
+    repo = {**repo, "worktree": worktree, "admin": repo["common"] / "worktrees" / "3"}
+    assert (worktree / "notes.txt").read_bytes() == b"one\ntwo\n"
+    assert _bytes_against(repo) == []
+    rule = _git("-C", str(worktree), "rev-parse", "HEAD:.gitattributes")
+    rewrite_loose_object(repo["common"] / "objects", rule, "blob", forged_rule)
+    assert _git("-C", str(repo["root"]), "cat-file", "blob", rule) == forged_rule.decode().strip()
+    assert (worktree / ".gitattributes").read_bytes() == committed_rule
+    committed = repo["base"] / "committed-notes.txt"
+    committed.write_bytes(b"one\ntwo\n")
+    clean = f"cat >/dev/null; cat {shlex.quote(str(committed))}"
+    _git("-C", str(repo["root"]), "config", "filter.revert.clean", clean)
+    (repo["common"] / "info").mkdir(exist_ok=True)
+    (repo["common"] / "info" / "attributes").write_text("notes.txt filter=revert\n")
+    (worktree / "notes.txt").write_bytes(b"one\r\ntwo\r\n")
+    _git("-C", str(worktree), "update-index", "--assume-unchanged", "notes.txt")
+    assert _uncommitted(repo) == [] and _against(repo) == []
+    with pytest.raises(VerificationError, match=f"blob of .gitattributes that are not its {rule}"):
+        _bytes_against(repo)
 
 
 def test_the_byte_comparison_runs_no_git_in_the_worktree_and_reads_only_tracked_files(repo):

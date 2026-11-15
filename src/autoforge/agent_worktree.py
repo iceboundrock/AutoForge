@@ -39,7 +39,10 @@ REMOTE run's issue worktree, whatever ``sandbox.mode`` says (#168).
   end-of-line, ``ident`` or ``working-tree-encoding`` conversion), so
   :func:`byte_changes_from_revision` also compares every blob of the
   reviewed tree with the worktree's bytes with no git process reading the
-  worktree (:func:`~autoforge.materialize.tree_differences`, R3-F1).
+  worktree (:func:`~autoforge.materialize.tree_differences`, R3-F1). The
+  one conversion it takes as the reviewed commit's is the ``eol=crlf`` that
+  commit's own ``.gitattributes`` give a file, so a worktree git checked
+  out itself passes (#488).
   A submodule's ignore setting (``.gitmodules``, ``submodule.<name>.ignore``,
   ``diff.ignoreSubmodules``) would hide what its checkout holds from both
   statuses, so they override it with ``--ignore-submodules=dirty``: a
@@ -564,9 +567,20 @@ def byte_changes_from_revision(
     (:func:`~autoforge.materialize.tree_differences`). A modified, deleted
     or retyped file reads as ``" M"``, ``" D"`` or ``" T"``; a file that is
     not in ``revision`` is not looked at (:func:`changes_from_revision`
-    lists it). A worktree whose checkout converts content itself (Git LFS,
-    ``eol=crlf``) reads as changed: no conversion is trusted to say which
-    bytes are the commit's.
+    lists it). One conversion alone is trusted to say which bytes are the
+    commit's: the ``eol=crlf`` that ``revision``'s own ``.gitattributes``
+    give a file (#488). A file holding the bytes a checkout writes under
+    it, computed by the controller from the blob with the attributes read
+    from ``revision``'s tree alone, the commit, the trees on the file's
+    path and those attributes re-hashed to their ids first (PR #503
+    R1-F1), is no change, so a worktree git checked
+    out itself (``*.bat text eol=crlf``) passes; both bytes a file may hold
+    are functions of ``revision`` alone, so an edit a clean filter maps
+    back to the blob is still listed. A worktree whose checkout converts
+    content any other way (Git LFS, a filter driver, ``ident``,
+    ``working-tree-encoding``, or an ``eol`` from the worktree,
+    ``info/attributes`` or the configuration, ``core.autocrlf`` included)
+    reads as changed.
 
     A gitlink's path (a submodule's) holds the checkout of a repository of
     its own, which both statuses compare by its commit alone and which an
@@ -582,7 +596,9 @@ def byte_changes_from_revision(
     run = runner or execute
     try:
         object_format = read_object_format(run, str(common))
-        differences = tree_differences(run, str(common), revision, object_format, Path(worktree))
+        differences = tree_differences(
+            run, str(common), revision, object_format, Path(worktree), checkout_eol=True
+        )
     except VerificationError as exc:
         raise VerificationError(
             f"cannot compare the bytes of the agent worktree {worktree} with the revision "

@@ -1302,6 +1302,44 @@ def test_unblock_after_a_partial_fix_enters_review_from_a_clean_published_worktr
     assert out.unblocked and out.phase == "REVIEW", out.message
 
 
+def _fixer_committing_a_batch_file(req) -> str:
+    """A fixer whose partial fix also commits `gradlew.bat` (LF) under the
+    candidate's own `*.bat text eol=crlf`, and whose checkout of that commit
+    then wrote the file as CRLF, as git does (flinkt's run, #488)."""
+    reviewed = reviewed_head_in(req.prompt)
+    cwd = Path(req.cwd)
+    git_out("-C", str(cwd), "checkout", "-q", "--detach", reviewed)
+    (cwd / ".gitattributes").write_text("*.bat text eol=crlf\n", "utf-8")
+    (cwd / "gradlew.bat").write_bytes(b"@echo off\necho hi\n")
+    (cwd / "cache.py").write_text(BUGGY, "utf-8")
+    git_out("-C", str(cwd), "add", ".gitattributes", "gradlew.bat", "cache.py")
+    git_out("-C", str(cwd), *GIT_IDENT, "commit", "-q", "-m", "Fix R1-F1 and R1-F2 (#2)")
+    head = git_out("-C", str(cwd), "rev-parse", "HEAD")
+    (cwd / "gradlew.bat").unlink()
+    git_out("-C", str(cwd), "checkout", "-q", head, "--", "gradlew.bat")
+    assert (cwd / "gradlew.bat").read_bytes() == b"@echo off\r\necho hi\r\n"
+    assert git_out("-C", str(cwd), "status", "--porcelain") == ""
+    return block(
+        partial_payload(reviewed, head, [fixed("R1-F1"), fixed("R1-F2")], [unresolved("R1-F3")])
+    )
+
+
+def test_unblock_after_a_partial_fix_enters_review_from_a_worktree_git_wrote_as_crlf(
+    tmp_state_dir,
+):
+    """#488: the candidate's own `.gitattributes` make git write a committed
+    LF file as CRLF. The worktree holds nothing the candidate does not, so
+    the plain unblock enters REVIEW without the operator rewriting a byte."""
+    gh = FakeGitHub()
+    eng = in_fix(tmp_state_dir, gh, _fixer_committing_a_batch_file)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    worktree = eng.agent_worktree_path()
+    applied = eng.unblock("the operator set the secret")
+    assert applied.unblocked and applied.phase == "REVIEW", applied.message
+    assert (worktree / "gradlew.bat").read_bytes() == b"@echo off\r\necho hi\r\n"
+
+
 # -- the check survives drift, recovery and a plain block (PR #475 R2-F1) ------------------
 
 LEFT_BEHIND = [

@@ -658,6 +658,10 @@ GUARDED = {
     ("engine.py", "_ensure_agent_worktree_unlocked"): "worktree",
     # A private GIT_DIR and no local ref: nothing in the common dir (D12.1).
     ("git_transport.py", "push"): "push",
+    # The index of the attributes the commit's own eol=crlf is read from: a
+    # private GIT_DIR, index and object directory in the controller's
+    # temporary directory, nothing in the common dir (#488, PR #503 R1-F1).
+    ("materialize.py", "_eol_conversions"): "update-index",
 }
 
 

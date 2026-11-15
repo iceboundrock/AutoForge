@@ -179,7 +179,10 @@ premerge.py         controller-produced pre-merge evidence (check definitions, t
 materialize.py      byte-exact export of a candidate commit from the shared object store
                     and its hash-back proof; the pre-merge export's writer (ADR 0006 D6, #171);
                     a working tree's blob-by-blob comparison with a commit, a gitlink
-                    matching only as an empty directory (tree_differences)
+                    matching only as an empty directory (tree_differences), and on
+                    request a file in the CRLF form the commit's own eol=crlf gives it,
+                    those attributes read from the commit's tree alone, the commit, the
+                    trees on the path and the attributes re-hashed (#488, PR #503 R1-F1)
 evidence.py         candidate validation evidence: definitions, policy P, ValidationRecords,
                     the attempt marker, their bounds and integrity checks; pure (ADR 0006, #172)
 certificate.py      review certificates: issuance from the review binding, applicability

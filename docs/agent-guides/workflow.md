@@ -1056,9 +1056,26 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   reviewed blob, so every blob of the reviewed tree is also compared with
   the worktree's bytes, mode and file type by the controller itself, with
   no git process reading the worktree and no link followed
-  (`materialize.tree_differences`, R3-F1): a worktree whose checkout
-  converts content (Git LFS, `eol=crlf`) refuses the flag too, since no
-  conversion is trusted to say which bytes are the commit's. A submodule's
+  (`materialize.tree_differences`, R3-F1). The one conversion taken as the
+  reviewed commit's is the `eol=crlf` its own `.gitattributes` give a file
+  (#488): such a file may also hold the bytes a checkout writes under it,
+  which the controller computes from the blob, with those attributes read
+  from the reviewed tree alone in a git directory of its own, so the
+  worktree git checked out itself passes. Git does not re-hash every
+  object it reads, and the agent can rewrite the shared store, so what
+  decides the conversion is authenticated first (PR #503 R1-F1): the tree
+  comes from the commit's re-hashed bytes, every directory on the file's
+  path hashes back to its tree from the entries the store lists, and git
+  reads the `.gitattributes` only from copies whose bytes the controller
+  hashed to their ids, in an object directory of its own; a rewritten
+  object fails the comparison and refuses the flag. Both forms are functions of the
+  reviewed commit alone, so an edit a clean filter maps back to the blob
+  holds neither. A worktree whose checkout converts content any other way
+  (Git LFS, a filter driver, `ident`, `working-tree-encoding`, an `eol`
+  from `info/attributes`, the worktree or the configuration) refuses the
+  flag, since no other conversion is trusted to say which bytes are the
+  commit's; the refusal names those files and says how to write their
+  committed bytes back. A submodule's
   ignore setting (`.gitmodules`, `submodule.<name>.ignore`,
   `diff.ignoreSubmodules`) hides what its checkout holds from a status,
   and files put at a submodule's path without a repository are listed by

@@ -12,6 +12,7 @@ from __future__ import annotations
 import errno
 import os
 import random
+import re
 import shutil
 import stat
 import subprocess
@@ -38,7 +39,7 @@ from autoforge.materialize import (
     tree_differences,
 )
 
-from .conftest import GIT_IDENT, watched_fifo
+from .conftest import GIT_IDENT, rewrite_loose_object, watched_fifo
 
 FORMATS = ["sha1", "sha256"]
 
@@ -660,6 +661,587 @@ def test_a_gitlink_matches_only_as_an_empty_real_directory(tmp_path, exports, wh
         else:
             assert tree_differences(execute, str(repo), commit, "sha1", root) == expected
         assert opened == []
+
+
+# -- the commit's own end-of-line checkout form (#488) --------------------------------------
+def _checkout(repo: Path, commit: str, where: Path) -> Path:
+    """Git's own checkout of ``commit`` into ``where``, by the commit's attributes alone.
+
+    No configuration and no attributes file but the commit's: what a
+    checkout of the commit writes on any machine.
+    """
+    index = where.parent / f"{where.name}-index"
+    env = {
+        "GIT_INDEX_FILE": str(index),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_ATTR_NOSYSTEM": "1",
+    }
+    pure = ("-c", f"core.attributesFile={os.devnull}")
+    _git(repo, *pure, "read-tree", commit, env=env)
+    _git(repo, *pure, "checkout-index", "-a", f"--prefix={where}/", env=env)
+    index.unlink()
+    return where
+
+
+def _crlf(content: bytes) -> bytes:
+    return re.sub(rb"(?<!\r)\n", b"\r\n", content)
+
+
+EOL_ATTRIBUTES = (
+    b"*.bat text eol=crlf\n"
+    b"*.cmd eol=crlf\n"
+    b"*.auto text=auto eol=crlf\n"
+    b"*.legacy crlf eol=crlf\n"
+    b"[attr]windows text eol=crlf\n"
+    b"*.win windows\n"
+    b"*.bin -text eol=crlf\n"
+    b"*.dat binary eol=crlf\n"
+)
+
+
+@pytest.mark.parametrize("object_format", FORMATS)
+@pytest.mark.parametrize("size", [None, 1, 3])
+def test_a_checkout_under_the_commits_own_eol_crlf_is_no_difference(
+    tmp_path, exports, object_format, size
+):
+    """#488: git's checkout of a commit whose own `.gitattributes` say
+    `eol=crlf` writes CRLF where the blob holds LF. The raw comparison
+    lists every such file; with `checkout_eol` none is a difference, for
+    each way the attributes say it (`text eol=crlf`, `eol=crlf` alone, the
+    legacy `crlf`, a macro, `text=auto` where git takes the blob as text, a
+    deeper `.gitattributes`), whatever the chunks the blobs arrive in. The
+    files git leaves as committed (`-text`, `binary`, a `text=auto` blob
+    that holds a CRLF already or a NUL) need no second form."""
+    repo = _init(tmp_path / "repo", object_format)
+    commit = _commit(
+        repo,
+        _tree(
+            repo,
+            {
+                ".gitattributes": EOL_ATTRIBUTES,
+                "gradlew.bat": b"@echo off\necho hi\n",
+                "run.bat": Exe(b"@echo off\r\nmixed\nendings\r\n"),
+                "lone-cr.bat": b"a\rb\n",
+                "plain.cmd": b"one\ntwo",
+                "text.auto": b"a\nb\n",
+                "crlf.auto": b"a\r\nb\n",
+                "nul.auto": b"a\0b\n",
+                "old.legacy": b"x\n",
+                "macro.win": b"y\n",
+                "raw.bin": b"z\n",
+                "raw.dat": b"w\n",
+                "plain.txt": b"untouched\n",
+                "sub": {
+                    ".gitattributes": b"*.bat -text\n",
+                    "kept.bat": b"lf\n",
+                    "deep.cmd": b"c\n",
+                },
+            },
+        ),
+    )
+    root = _checkout(repo, commit, tmp_path / "checkout")
+    assert (root / "gradlew.bat").read_bytes() == b"@echo off\r\necho hi\r\n"
+    assert (root / "run.bat").read_bytes() == b"@echo off\r\nmixed\r\nendings\r\n"
+    assert os.access(root / "run.bat", os.X_OK)
+    assert (root / "nul.auto").read_bytes() == b"a\0b\n"
+    assert (root / "sub" / "kept.bat").read_bytes() == b"lf\n"
+    runner = execute if size is None else _rechunking(size)
+    converted = [
+        b"gradlew.bat",
+        b"lone-cr.bat",
+        b"macro.win",
+        b"old.legacy",
+        b"plain.cmd",
+        b"run.bat",
+        b"sub/deep.cmd",
+        b"text.auto",
+    ]
+    raw = tree_differences(runner, str(repo), commit, object_format, root)
+    assert raw == [TreeDifference(path, "modified") for path in converted]
+    assert tree_differences(runner, str(repo), commit, object_format, root, checkout_eol=True) == []
+    assert not _leftovers(exports)
+
+
+def test_a_text_value_check_attr_prints_like_a_state_is_read_the_stricter_way(tmp_path, exports):
+    """`check-attr` prints `text=set` as it prints `text`, and `text=unset` as
+    `-text`, while git takes both values as unspecified and falls back to
+    `crlf`. Read both ways, the stricter answer is kept: git's checkout of
+    each is no difference or a refusal (`text=unset` with `eol=crlf`, which
+    git converts), and the CRLF form of a file git left as committed is a
+    difference, never taken as the commit's."""
+    repo = _init(tmp_path / "repo")
+    commit = _commit(
+        repo,
+        _tree(
+            repo,
+            {
+                ".gitattributes": (
+                    b"set-binary.x text=set -crlf eol=crlf\n"
+                    b"unset.x text=unset eol=crlf\n"
+                    b"set-auto.x text=set crlf=auto eol=crlf\n"
+                    b"set.x text=set eol=crlf\n"
+                ),
+                "set-binary.x": b"a\nb\n",
+                "unset.x": b"a\nb\n",
+                "set-auto.x": b"a\nb\n",
+                "set.x": b"a\nb\n",
+            },
+        ),
+    )
+    root = _checkout(repo, commit, tmp_path / "checkout")
+    assert (root / "set-binary.x").read_bytes() == b"a\nb\n"
+    for converted in ("unset.x", "set-auto.x", "set.x"):
+        assert (root / converted).read_bytes() == b"a\r\nb\r\n"
+    found = tree_differences(execute, str(repo), commit, "sha1", root, checkout_eol=True)
+    assert found == [TreeDifference(b"unset.x", "modified")]
+    (root / "set-binary.x").write_bytes(b"a\r\nb\r\n")
+    found = tree_differences(execute, str(repo), commit, "sha1", root, checkout_eol=True)
+    assert found == [
+        TreeDifference(b"set-binary.x", "modified"),
+        TreeDifference(b"unset.x", "modified"),
+    ]
+
+
+def _hostile_eol(tmp_path: Path, monkeypatch, repo: Path, root: Path, source: str) -> None:
+    """``eol=crlf`` for every `.bat` file from ``source``, which a checkout reads too."""
+    rule = b"*.bat text eol=crlf\n"
+    if source == "info/attributes":
+        (repo / ".git" / "info").mkdir(exist_ok=True)
+        (repo / ".git" / "info" / "attributes").write_bytes(rule)
+    elif source == "core.attributesFile":
+        (tmp_path / "attributes").write_bytes(rule)
+        _git(repo, "config", "core.attributesFile", str(tmp_path / "attributes"))
+    elif source == "the global attributes file":
+        (tmp_path / "xdg" / "git").mkdir(parents=True)
+        (tmp_path / "xdg" / "git" / "attributes").write_bytes(rule)
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    elif source == "core.autocrlf":
+        _git(repo, "config", "core.autocrlf", "true")
+    elif source == "core.eol":
+        (repo / ".git" / "info").mkdir(exist_ok=True)
+        (repo / ".git" / "info" / "attributes").write_bytes(b"*.bat text\n")
+        _git(repo, "config", "core.eol", "crlf")
+    else:  # an untracked .gitattributes in the file's directory of the checkout
+        (root / "bin" / ".gitattributes").write_bytes(rule)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "info/attributes",
+        "core.attributesFile",
+        "the global attributes file",
+        "core.autocrlf",
+        "core.eol",
+        "an untracked .gitattributes",
+    ],
+)
+def test_an_end_of_line_conversion_the_commit_does_not_name_is_a_difference(
+    tmp_path, monkeypatch, exports, source
+):
+    """The attributes and configuration a checkout also reads are the
+    agent's to write (#488): a CRLF file whose `eol=crlf` comes from any of
+    them, and not from the commit's own `.gitattributes`, is still a
+    difference. Git itself reads the file as unchanged there. The commit
+    has a `.gitattributes` on the file's path that converts nothing, so
+    `check-attr` runs, in the controller's own git directory, rather than
+    nothing being read at all (PR #503 R1-F1)."""
+    repo = _init(tmp_path / "repo")
+    commit = _commit(
+        repo,
+        _tree(
+            repo,
+            {
+                ".gitattributes": b"*.txt -text\n",
+                "bin": {"gradlew.bat": b"@echo off\necho hi\n"},
+                "a.txt": b"a\n",
+            },
+        ),
+    )
+    root = _checkout(repo, commit, tmp_path / "checkout")
+    (root / "bin" / "gradlew.bat").write_bytes(b"@echo off\r\necho hi\r\n")
+    _hostile_eol(tmp_path, monkeypatch, repo, root, source)
+    if source != "an untracked .gitattributes":
+        clean = _git(
+            repo, "hash-object", "--path=bin/gradlew.bat", str(root / "bin" / "gradlew.bat")
+        )
+        assert clean.decode().strip() == _out(repo, "rev-parse", f"{commit}:bin/gradlew.bat")
+    seen: list[ExecutionRequest] = []
+    found = tree_differences(_recording(seen), str(repo), commit, "sha1", root, checkout_eol=True)
+    assert found == [TreeDifference(b"bin/gradlew.bat", "modified")]
+    assert any("check-attr" in req.command for req in seen)
+    assert not _leftovers(exports)
+
+
+def test_under_the_commits_own_eol_crlf_only_its_checkout_form_is_no_difference(tmp_path, exports):
+    """The second form is exactly what git's checkout writes: an edit in
+    CRLF form, a flipped execute bit, a link to a file holding the form, a
+    file with only some of its LFs converted, the converted form of a
+    `text=auto` blob git leaves alone (a NUL, a CRLF already), a deletion
+    and a directory replaced by a link to a copy are all still differences."""
+    repo = _init(tmp_path / "repo")
+    commit = _commit(
+        repo,
+        _tree(
+            repo,
+            {
+                ".gitattributes": b"*.bat text eol=crlf\n*.auto text=auto eol=crlf\n",
+                "crlf.auto": b"a\r\nb\n",
+                "dir": {"x.bat": b"x\n"},
+                "edit.bat": b"echo a\n",
+                "gone.bat": b"g\n",
+                "half.bat": b"a\nb\n",
+                "link.bat": b"echo c\n",
+                "mode.bat": b"echo b\n",
+                "nul.auto": b"a\0b\n",
+            },
+        ),
+    )
+    root = _checkout(repo, commit, tmp_path / "checkout")
+    assert tree_differences(execute, str(repo), commit, "sha1", root, checkout_eol=True) == []
+    (root / "edit.bat").write_bytes(b"echo EDITED\r\n")
+    (root / "mode.bat").chmod(0o755)
+    (tmp_path / "form.bat").write_bytes((root / "link.bat").read_bytes())
+    (root / "link.bat").unlink()
+    os.symlink(tmp_path / "form.bat", root / "link.bat")
+    (root / "half.bat").write_bytes(b"a\r\nb\n")
+    (root / "nul.auto").write_bytes(b"a\0b\r\n")
+    (root / "crlf.auto").write_bytes(b"a\r\nb\r\n")
+    (root / "gone.bat").unlink()
+    shutil.copytree(root / "dir", tmp_path / "copy")
+    shutil.rmtree(root / "dir")
+    os.symlink(tmp_path / "copy", root / "dir")
+    assert tree_differences(execute, str(repo), commit, "sha1", root, checkout_eol=True) == [
+        TreeDifference(b"crlf.auto", "modified"),
+        TreeDifference(b"dir/x.bat", "deleted"),
+        TreeDifference(b"edit.bat", "modified"),
+        TreeDifference(b"gone.bat", "deleted"),
+        TreeDifference(b"half.bat", "modified"),
+        TreeDifference(b"link.bat", "retyped"),
+        TreeDifference(b"mode.bat", "modified"),
+        TreeDifference(b"nul.auto", "modified"),
+    ]
+
+
+@pytest.mark.parametrize("size", [None, 1, 2, 7])
+def test_the_checkout_form_is_gits_whatever_the_bytes(tmp_path, exports, size):
+    """Git's checkout is the oracle: random blobs of LF, CR, CRLF, NUL, `^Z`,
+    DEL and other bytes, and the edges of `text=auto`'s binary test (one
+    non-printable byte in 128 printable ones is text, in 127 binary; a final
+    `^Z` is not counted), each under `text eol=crlf` and `text=auto
+    eol=crlf`, in chunks of any size. Every file git wrote is no difference;
+    where git left a `text=auto` blob with a lone LF as it was, the
+    converted form is one."""
+    rng = random.Random(488)
+    alphabet = b"ab\r\n\n\r\n\x00\x1a\x7f\x01\xc3\t"
+    contents = [bytes(rng.choice(alphabet) for _ in range(rng.randrange(0, 80))) for _ in range(40)]
+    contents += [
+        b"a" * 128 + b"\x01\n",
+        b"a" * 127 + b"\x01\n",
+        b"a" * 10 + b"\n\x1a",
+        b"a" * 10 + b"\x1a\n",
+        b"\n" * 5,
+        b"\r\n\n\r\r\n\n",
+    ]
+    files = {}
+    for i, content in enumerate(contents):
+        files[f"f{i:02d}.t"] = content
+        files[f"f{i:02d}.a"] = content
+    files[".gitattributes"] = b"*.t text eol=crlf\n*.a text=auto eol=crlf\n"
+    repo = _init(tmp_path / "repo")
+    commit = _commit(repo, _tree(repo, files))
+    root = _checkout(repo, commit, tmp_path / "checkout")
+    runner = execute if size is None else _rechunking(size)
+    assert tree_differences(runner, str(repo), commit, "sha1", root, checkout_eol=True) == []
+    left = []
+    for i, content in enumerate(contents):
+        name = f"f{i:02d}.a"
+        if (root / name).read_bytes() == content and _crlf(content) != content:
+            (root / name).write_bytes(_crlf(content))
+            left.append(TreeDifference(name.encode(), "modified"))
+    assert len(left) > 5
+    assert tree_differences(runner, str(repo), commit, "sha1", root, checkout_eol=True) == left
+
+
+def _recording(seen: list[ExecutionRequest]):
+    def runner(req: ExecutionRequest) -> ExecutionResult:
+        seen.append(req)
+        return execute(req)
+
+    return runner
+
+
+def test_the_attributes_are_read_in_a_git_directory_of_the_controllers_own(tmp_path, exports):
+    """No git process reads the checkout, and none runs for the attributes
+    unless a file's bytes differ. Then `update-index` and `check-attr` run
+    in a temporary git directory with no configuration, no global or system
+    attributes and `core.attributesFile` at `/dev/null`, whose object
+    directory is its own, not the repository's store (PR #503 R1-F1); it is
+    removed afterwards, and nothing is written into the repository."""
+    repo = _init(tmp_path / "repo")
+    commit = _commit(
+        repo, _tree(repo, {".gitattributes": b"*.bat eol=crlf\n", "a.bat": b"a\n", "b.txt": b"b\n"})
+    )
+    root = _checkout(repo, commit, tmp_path / "checkout")
+    (root / "a.bat").write_bytes(b"a\n")
+    before = sorted(p.relative_to(repo) for p in (repo / ".git").rglob("*"))
+    seen: list[ExecutionRequest] = []
+    assert (
+        tree_differences(_recording(seen), str(repo), commit, "sha1", root, checkout_eol=True) == []
+    )
+    assert not any({"update-index", "check-attr"} & set(req.command) for req in seen)
+    seen.clear()
+    (root / "a.bat").write_bytes(b"a\r\n")
+    (root / "b.txt").write_bytes(b"edited\n")
+    found = tree_differences(_recording(seen), str(repo), commit, "sha1", root, checkout_eol=True)
+    assert found == [TreeDifference(b"b.txt", "modified")]
+    attributes = [req for req in seen if {"update-index", "check-attr"} & set(req.command)]
+    assert len(attributes) == 2
+    for req in seen:
+        assert not any(str(root) in arg for arg in req.command)
+        assert req.cwd is None or str(root) not in req.cwd
+    for req in attributes:
+        env = req.env or {}
+        assert f"core.attributesFile={os.devnull}" in req.command
+        assert env["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert env["GIT_CONFIG_NOSYSTEM"] == env["GIT_ATTR_NOSYSTEM"] == "1"
+        assert env["GIT_OBJECT_DIRECTORY"] == str(Path(env["GIT_DIR"]) / "objects")
+        assert Path(env["GIT_DIR"]).parent == Path(req.cwd or "")
+        assert Path(env["GIT_DIR"]).is_relative_to(exports)
+        assert Path(env["GIT_INDEX_FILE"]).is_relative_to(exports)
+    assert not _leftovers(exports)
+    assert sorted(p.relative_to(repo) for p in (repo / ".git").rglob("*")) == before
+
+
+def _failing(command: str, stdout: str = "", code: int = 128):
+    def runner(req: ExecutionRequest) -> ExecutionResult:
+        if command in req.command:
+            return ExecutionResult(req.command, req.cwd, code, stdout, "fatal: boom", "t", "t")
+        return execute(req)
+
+    return runner
+
+
+def _rewriting_blobs(old: bytes, new: bytes):
+    """A runner whose ``git cat-file --batch`` stream holds ``new`` where the store has ``old``."""
+
+    def runner(req: ExecutionRequest) -> ExecutionResult:
+        hook = req.on_chunk
+        if hook is None or "--batch" not in req.command:
+            return execute(req)
+        held = bytearray()
+        req.on_chunk = lambda stream, chunk: held.extend(chunk) if stream == "stdout" else None
+        result = execute(req)
+        hook("stdout", bytes(held).replace(old, new))
+        return result
+
+    return runner
+
+
+@pytest.mark.parametrize(
+    ("runner", "message"),
+    [
+        (_failing("check-attr"), "reading its end-of-line attributes failed.*boom"),
+        (_failing("update-index"), "reading its end-of-line attributes failed.*boom"),
+        (_failing("check-attr", code=0), "`git check-attr` did not answer"),
+        (_rewriting_blobs(b"echo a", b"echo b"), "that are not its"),
+        (_failing("--batch"), "streaming its blobs failed.*boom"),
+    ],
+    ids=["check-attr fails", "update-index fails", "no answer", "other bytes", "cat-file fails"],
+)
+def test_an_unreadable_checkout_form_is_a_failure_never_no_difference(
+    tmp_path, exports, runner, message
+):
+    """Attributes git did not answer, or a blob git streamed as other bytes
+    than its id's, prove nothing: the comparison fails, never takes the
+    file as the commit's."""
+    repo = _init(tmp_path / "repo")
+    commit = _commit(
+        repo, _tree(repo, {".gitattributes": b"*.bat eol=crlf\n", "a.bat": b"echo a\n"})
+    )
+    root = _checkout(repo, commit, tmp_path / "checkout")
+    with pytest.raises(MaterializationError, match=message):
+        tree_differences(runner, str(repo), commit, "sha1", root, checkout_eol=True)
+    assert not _leftovers(exports)
+
+
+# The reviewer's reproduction (PR #503 R1-F1): a committed rule that leaves
+# `.txt` files as committed, and a rule of the same size that converts them,
+# which an agent writes into the rule's loose object in the shared store.
+COMMITTED_RULE = b"*.txt -text" + b" " * 8 + b"\n"
+FORGED_RULE = b"*.txt text eol=crlf\n"
+
+
+def _store_attributes(repo: Path, commit: str, path: str) -> bytes:
+    """What git's attribute machinery reads for ``path`` of ``commit`` through ``repo``'s store."""
+    env = {"GIT_INDEX_FILE": str(repo.parent / "store-index")}
+    _git(repo, "read-tree", commit, env=env)
+    found = _git(repo, "check-attr", "--cached", "text", "eol", "--", path, env=env)
+    Path(env["GIT_INDEX_FILE"]).unlink()
+    return found
+
+
+def _tree_body(entries: list[tuple[bytes, bytes, str]]) -> bytes:
+    """The bytes of a tree object of ``(mode, name, id)`` entries, in git's order."""
+    entries = sorted(entries, key=lambda e: e[1] + b"/" if e[0] == b"40000" else e[1])
+    return b"".join(mode + b" " + name + b"\0" + bytes.fromhex(oid) for mode, name, oid in entries)
+
+
+@pytest.mark.parametrize("object_format", FORMATS)
+def test_an_attributes_blob_rewritten_in_the_store_authorizes_no_crlf_form(
+    tmp_path, exports, object_format
+):
+    """PR #503 R1-F1: git does not re-hash the `.gitattributes` blob it
+    reads, so once its loose object holds a same-size rule that converts,
+    git's own attribute read of the commit says `eol=crlf`, although the
+    commit says `-text`. The controller reads the rule only from the bytes
+    it re-hashed: they are not the blob's, and the comparison fails, never
+    taking the CRLF file as the commit's."""
+    assert len(COMMITTED_RULE) == len(FORGED_RULE)
+    repo = _init(tmp_path / "repo", object_format)
+    commit = _commit(repo, _tree(repo, {".gitattributes": COMMITTED_RULE, "notes.txt": b"a\nb\n"}))
+    root = _checkout(repo, commit, tmp_path / "checkout")
+    assert (root / "notes.txt").read_bytes() == b"a\nb\n"
+    (root / "notes.txt").write_bytes(b"a\r\nb\r\n")
+    rule = _out(repo, "rev-parse", f"{commit}:.gitattributes")
+    rewrite_loose_object(repo / ".git" / "objects", rule, "blob", FORGED_RULE)
+    assert _git(repo, "cat-file", "blob", rule) == FORGED_RULE
+    assert b"eol: crlf" in _store_attributes(repo, commit, "notes.txt")
+    assert tree_differences(execute, str(repo), commit, object_format, root) == [
+        TreeDifference(b"notes.txt", "modified")
+    ]
+    forged = f"the blob of .gitattributes that are not its {rule}"
+    with pytest.raises(MaterializationError, match=forged):
+        tree_differences(execute, str(repo), commit, object_format, root, checkout_eol=True)
+    assert not _leftovers(exports)
+
+
+@pytest.mark.parametrize("forgery", ["swapped", "dropped"])
+@pytest.mark.parametrize("depth", [1, 2])
+def test_a_tree_rewritten_in_the_store_authorizes_no_crlf_form(tmp_path, exports, forgery, depth):
+    """PR #503 R1-F1: git re-hashes a tree it is named, but not the trees
+    below it it reads, so a subtree on a file's path rewritten under its
+    id, its `.gitattributes` entry swapped for a blob that converts or
+    dropped so that a parent's rule converts, makes git's attribute read of
+    the commit say `eol=crlf`. Each directory on the path must hash back to
+    its tree from the entries the store lists for it: the forged one does
+    not, and the comparison fails."""
+    repo = _init(tmp_path / "repo")
+    leaf: dict = {".gitattributes": COMMITTED_RULE, "notes.txt": b"a\nb\n"}
+    spec: dict = {".gitattributes": b"*.txt text eol=crlf\n", "docs": leaf}
+    directory = "docs"
+    if depth == 2:
+        spec["docs"] = {"api": leaf, "index.txt": b"i"}
+        directory = "docs/api"
+    path = f"{directory}/notes.txt"
+    commit = _commit(repo, _tree(repo, spec))
+    root = _checkout(repo, commit, tmp_path / "checkout")
+    assert (root / path).read_bytes() == b"a\nb\n"
+    (root / path).write_bytes(b"a\r\nb\r\n")
+    tree = _out(repo, "rev-parse", f"{commit}:{directory}")
+    entries = []
+    for record in _git(repo, "ls-tree", "-z", tree).split(b"\0")[:-1]:
+        meta, _, name = record.partition(b"\t")
+        mode, _, oid = meta.split(b" ")
+        if name == b".gitattributes":
+            if forgery == "dropped":
+                continue
+            oid = _blob(repo, FORGED_RULE).encode()
+        entries.append((mode.lstrip(b"0"), name, oid.decode()))
+    rewrite_loose_object(repo / ".git" / "objects", tree, "tree", _tree_body(entries))
+    assert b"eol: crlf" in _store_attributes(repo, commit, path)
+    listed_for = f"the entries the store lists for {directory} hash to the tree"
+    with pytest.raises(MaterializationError, match=re.escape(listed_for)):
+        tree_differences(execute, str(repo), commit, "sha1", root, checkout_eol=True)
+    assert not _leftovers(exports)
+
+
+@pytest.mark.parametrize("checkout_eol", [False, True])
+def test_a_commit_rewritten_in_the_store_names_no_other_tree(tmp_path, exports, checkout_eol):
+    """PR #503 R1-F1, ADR 0004 D7.5: the commit's loose object rewritten to
+    name another tree, whose attributes convert and whose blob is the CRLF
+    edit, is not read: `cat-file` reads it as the forged bytes, and the
+    tree id comes from the commit's bytes only once they hash to its id,
+    whichever git re-hashes what, so the comparison fails, as the export
+    does."""
+    repo = _init(tmp_path / "repo")
+    commit = _commit(repo, _tree(repo, {".gitattributes": COMMITTED_RULE, "notes.txt": b"a\n"}))
+    root = _checkout(repo, commit, tmp_path / "checkout")
+    (root / "notes.txt").write_bytes(b"a\r\n")
+    (root / ".gitattributes").write_bytes(FORGED_RULE)
+    forged = _tree(repo, {".gitattributes": FORGED_RULE, "notes.txt": b"a\r\n"})
+    raw = _git(repo, "cat-file", "commit", commit)
+    tree = _out(repo, "rev-parse", f"{commit}^{{tree}}")
+    rewrite_loose_object(
+        repo / ".git" / "objects", commit, "commit", raw.replace(tree.encode(), forged.encode())
+    )
+    assert forged.encode() in _git(repo, "cat-file", "commit", commit)
+    with pytest.raises(MaterializationError, match="do not hash to its id"):
+        tree_differences(execute, str(repo), commit, "sha1", root, checkout_eol=checkout_eol)
+    with pytest.raises(MaterializationError, match="do not hash to its id"):
+        with _export(repo, commit):
+            pytest.fail("the body must not run")
+    assert not _leftovers(exports)
+
+
+def test_a_store_rewritten_after_the_copy_cannot_change_the_attributes_read(tmp_path, exports):
+    """PR #503 R1-F1: the attributes are copied out of the store as their
+    bytes are hashed, and git reads them only from that copy. Rewritten in
+    the store once copied, the rule that converts is never read: the CRLF
+    file is still a difference. The object directory git reads them from
+    holds exactly the `.gitattributes` blobs on the file's path, once each
+    (two directories share one here), and nothing of the store."""
+    repo = _init(tmp_path / "repo")
+    commit = _commit(
+        repo,
+        _tree(
+            repo,
+            {
+                ".gitattributes": COMMITTED_RULE,
+                "docs": {".gitattributes": COMMITTED_RULE, "notes.txt": b"a\nb\n"},
+                "other": {".gitattributes": b"*.bat eol=crlf\n", "x.bat": b"x"},
+            },
+        ),
+    )
+    root = _checkout(repo, commit, tmp_path / "checkout")
+    (root / "docs" / "notes.txt").write_bytes(b"a\r\nb\r\n")
+    rule = _out(repo, "rev-parse", f"{commit}:.gitattributes")
+    read: list[set[str]] = []
+
+    def runner(req: ExecutionRequest) -> ExecutionResult:
+        objects = (req.env or {}).get("GIT_OBJECT_DIRECTORY")
+        if "update-index" in req.command:
+            rewrite_loose_object(repo / ".git" / "objects", rule, "blob", FORGED_RULE)
+        if objects and "check-attr" in req.command:
+            files = [p for p in Path(objects).rglob("*") if p.is_file()]
+            read.append({p.parent.name + p.name for p in files})
+        return execute(req)
+
+    found = tree_differences(runner, str(repo), commit, "sha1", root, checkout_eol=True)
+    assert found == [TreeDifference(b"docs/notes.txt", "modified")]
+    assert read == [{rule}]
+    assert _git(repo, "cat-file", "blob", rule) == FORGED_RULE
+    assert not _leftovers(exports)
+
+
+def test_a_symlinked_attributes_file_is_read_as_a_checkout_reads_it(tmp_path, exports):
+    """A `.gitattributes` committed as a symlink is in a checkout's index
+    with its link text as its blob, which git reads as attributes: the
+    controller's index holds it the same way, so git's checkout is no
+    difference, and where git does not convert, the CRLF form is one."""
+    repo = _init(tmp_path / "repo")
+    commit = _commit(
+        repo, _tree(repo, {".gitattributes": Link(b"*.bat text eol=crlf"), "a.bat": b"a\n"})
+    )
+    root = _checkout(repo, commit, tmp_path / "checkout")
+    written = (root / "a.bat").read_bytes()
+    assert tree_differences(execute, str(repo), commit, "sha1", root, checkout_eol=True) == []
+    if written == b"a\n":  # a git that reads no attributes from a link
+        (root / "a.bat").write_bytes(b"a\r\n")
+        assert tree_differences(execute, str(repo), commit, "sha1", root, checkout_eol=True) == [
+            TreeDifference(b"a.bat", "modified")
+        ]
 
 
 # -- identity ------------------------------------------------------------------------------

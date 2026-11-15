@@ -50,6 +50,7 @@ from tests.conftest import (
     review_comment_body,
     review_result,
     reviewed_head_in,
+    rewrite_loose_object,
     scripted,
 )
 from tests.test_engine import _next_process, _stopped_mid_plan
@@ -1673,6 +1674,111 @@ def test_unblock_rereview_refuses_an_edit_a_clean_filter_hides(tmp_state_dir, fa
     assert git_out("-C", str(worktree), "ls-files", "-v") == marks
     assert git_out("-C", str(worktree), "config", "filter.revert.clean")
     assert eng.unblock(REASON).phase == "FIX"
+
+
+def _rewritten_by_checkout(worktree: Path, path: str) -> None:
+    """``path`` written again by git's checkout, through the conversions in effect."""
+    (worktree / path).unlink()
+    git_out("-C", str(worktree), "checkout", "-q", "HEAD", "--", path)
+    assert git_out("-C", str(worktree), "status", "--porcelain") == ""
+
+
+def test_unblock_rereview_takes_the_reviewed_commits_own_eol_crlf_as_its_content(
+    tmp_state_dir, fake_github
+):
+    """#488: the reviewed commit's own `.gitattributes` say `*.bat text
+    eol=crlf`, so git's checkout writes its LF blob as CRLF. That is what a
+    checkout of the reviewed commit holds, not a change: the flag is
+    granted with nothing rewritten."""
+    eng, worktree, _ = _worktree_at_reviewed_head(
+        tmp_state_dir,
+        fake_github,
+        tracked={".gitattributes": "*.bat text eol=crlf\n", "gradlew.bat": "@echo off\n"},
+    )
+    _rewritten_by_checkout(worktree, "gradlew.bat")
+    assert (worktree / "gradlew.bat").read_bytes() == b"@echo off\r\n"
+    out = eng.unblock(REASON, rereview=True)
+    assert out.unblocked and out.phase == "REVIEW", out.message
+    assert (worktree / "gradlew.bat").read_bytes() == b"@echo off\r\n"
+
+
+def test_unblock_rereview_names_a_file_another_conversion_rewrote_and_how_to_restore_it(
+    tmp_state_dir, fake_github
+):
+    """An `eol=crlf` from `info/attributes`, which the agent can write, is
+    not the reviewed commit's: refused as before, but the message names the
+    file and how to write its committed bytes back. Doing exactly that is
+    enough for the flag to be granted."""
+    eng, worktree, head = _worktree_at_reviewed_head(
+        tmp_state_dir, fake_github, tracked={"gradlew.bat": "@echo off\n"}
+    )
+    common = Path(
+        git_out("-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir")
+    )
+    (common / "info").mkdir(exist_ok=True)
+    (common / "info" / "attributes").write_text("*.bat text eol=crlf\n", "utf-8")
+    _rewritten_by_checkout(worktree, "gradlew.bat")
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, rereview=True)
+    assert not out.unblocked
+    assert (
+        "1 whose bytes or execute bit differ from the reviewed commit's although git reads "
+        "them as its content (gradlew.bat)"
+    ) in out.message
+    assert "other than an `eol=crlf` that the reviewed commit's own `.gitattributes` give" in (
+        out.message
+    )
+    restore = f"`git -C {worktree} cat-file blob {head[:12]}:<file> > {worktree}/<file>`"
+    assert restore in out.message
+    assert f"`git -C {worktree} add -- <file>` refreshes its entry" in out.message
+    _assert_untouched(eng, raw)
+    committed = git_out("-C", str(worktree), "cat-file", "blob", f"{head[:12]}:gradlew.bat")
+    (worktree / "gradlew.bat").write_text(committed + "\n", "utf-8")
+    git_out("-C", str(worktree), "add", "--", "gradlew.bat")
+    assert git_out("-C", str(worktree), "status", "--porcelain") == ""
+    out = eng.unblock(REASON, rereview=True)
+    assert out.unblocked and out.phase == "REVIEW", out.message
+
+
+def test_unblock_rereview_refuses_a_crlf_edit_behind_an_attributes_object_rewritten_in_the_store(
+    tmp_state_dir, fake_github
+):
+    """PR #503 R1-F1, the reviewer's reproduction through the whole unblock:
+    the reviewed commit's own `.gitattributes` say `*.txt -text`, and their
+    loose object is rewritten in the shared store, at the same size, to
+    `*.txt text eol=crlf`. The fixer's CRLF rewrite of `notes.txt` is hidden
+    from both statuses by a clean filter and an assume-unchanged mark. The
+    byte comparison reads the rule only from bytes it re-hashed, which are
+    not the blob's, so the flag is refused with nothing written, and the
+    worktree, its mark, the filter and the store are left as they were."""
+    committed_rule = "*.txt -text" + " " * 8 + "\n"
+    forged_rule = b"*.txt text eol=crlf\n"
+    assert len(committed_rule) == len(forged_rule)
+    eng, worktree, head = _worktree_at_reviewed_head(
+        tmp_state_dir,
+        fake_github,
+        tracked={".gitattributes": committed_rule, "notes.txt": "one\ntwo\n"},
+    )
+    common = Path(
+        git_out("-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir")
+    )
+    rule = git_out("-C", str(worktree), "rev-parse", f"{head}:.gitattributes")
+    rewrite_loose_object(common / "objects", rule, "blob", forged_rule)
+    (worktree / "notes.txt").write_bytes(b"one\r\ntwo\r\n")
+    git_out("-C", str(worktree), "update-index", "--assume-unchanged", "notes.txt")
+    _clean_filter_to(worktree, "notes.txt", "one\ntwo\n")
+    assert git_out("-C", str(worktree), "status", "--porcelain") == ""
+    assert git_out("-C", str(worktree), "diff", "--no-ext-diff", head) == ""
+    marks = git_out("-C", str(worktree), "ls-files", "-v")
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, rereview=True)
+    assert not out.unblocked
+    assert f"cannot compare the bytes of the agent worktree {worktree}" in out.message
+    assert f"git sent bytes for the blob of .gitattributes that are not its {rule}" in out.message
+    _assert_untouched(eng, raw)
+    assert (worktree / "notes.txt").read_bytes() == b"one\r\ntwo\r\n"
+    assert git_out("-C", str(worktree), "ls-files", "-v") == marks
+    assert git_out("-C", str(worktree), "cat-file", "blob", rule) == forged_rule.decode().strip()
 
 
 def test_unblock_rereview_refuses_a_worktree_whose_status_cannot_be_read(

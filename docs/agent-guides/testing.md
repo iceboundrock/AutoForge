@@ -1710,7 +1710,40 @@ a stated reason it has none. The coverage that must keep working:
   path, and takes a gitlink as the commit's only as an empty real
   directory: a repository, a file or a subdirectory in it, a link to it or
   above it, a regular file, a FIFO (never opened) or nothing at its path
-  is a difference (R4-F1). The merge gate's commands see the committed bytes, and an
+  is a difference (R4-F1). With `checkout_eol` (#488), git's own checkout
+  is the oracle: a checkout under the commit's own `eol=crlf` (with
+  `text`, alone, the legacy `crlf`, a macro, `text=auto`, a deeper
+  `.gitattributes`, an executable file) is no difference in sha1 and
+  sha256 and in chunks of 1 and 3 bytes, while `-text`, `binary` and a
+  `text=auto` blob git leaves alone need none; random blobs of LF, CR,
+  CRLF, NUL, `^Z` and DEL and the edges of `text=auto`'s binary test match
+  git's checkout in any chunking, and the converted form of a blob git
+  left alone is a difference; a `text=set` or `text=unset`, which
+  `check-attr` prints as it prints the states, is read the stricter way,
+  so the CRLF form of a file git left as committed is a difference; an
+  `eol=crlf` from `info/attributes`,
+  `core.attributesFile`, the global attributes file, `core.autocrlf`,
+  `core.eol` or an untracked `.gitattributes` is a difference although git
+  reads the file as unchanged; an edit in CRLF form, a flipped execute
+  bit, a link to the form, a half-converted file, a deletion and a
+  directory replaced by a link stay differences; the attributes are read
+  only when a file's bytes differ, in a removed temporary git directory
+  with no configuration, no global or system attributes,
+  `core.attributesFile` at `/dev/null` and an object directory of its
+  own, writing nothing into the repository and naming no checkout path; a
+  failing `update-index`, `check-attr` or `cat-file`, an attribute git did
+  not answer and a blob streamed as other bytes than its id's are
+  failures, never no difference. What decides the conversion is
+  authenticated (PR #503 R1-F1): a `.gitattributes` blob rewritten in the
+  store at the same size to a rule that converts (sha1 and sha256), a
+  subtree on the file's path, one or two levels down, rewritten with that
+  entry swapped for such a blob or dropped so a parent's rule converts,
+  and a commit rewritten to name another tree each make git's own read
+  through the store say `eol=crlf`, and each fails the comparison; a rule
+  rewritten in the store after it was copied is not read, the object
+  directory git reads holding only the `.gitattributes` blobs on the
+  file's path, once each; a `.gitattributes` committed as a symlink is
+  read as git's checkout reads it. The merge gate's commands see the committed bytes, and an
   unexportable reviewed HEAD stays inconclusive (`tests/test_engine.py`)
 - `ANALYZE_EXECUTE`'s publication (#161, `tests/test_engine.py`, engine
   built with `origin=True`): the controller pushes the agent's commit and
@@ -1849,7 +1882,9 @@ a stated reason it has none. The coverage that must keep working:
   publisher as recorded (R1-F4), under the round cap, `--rereview` refused;
   `unblock` refuses that review, writing nothing, while the agent worktree
   holds an untracked file, a modified, staged or assume-unchanged edit, or a
-  commit past the candidate, and enters it from a clean one (R1-F1); the same
+  commit past the candidate, and enters it from a clean one (R1-F1), and
+  from one where git wrote a committed LF file as CRLF under the
+  candidate's own `*.bat text eol=crlf`, as in flinkt's run (#488); the same
   refusal, with nothing written or discarded, after a partial push dropped by
   a retarget following a crash after the push, after a partial plan dropped
   by a retarget before its push (the worktree at the unpublished candidate),
@@ -2243,7 +2278,15 @@ a stated reason it has none. The coverage that must keep working:
   they were (R2-F1); the same with the marked edit also mapped back to the
   committed content by a clean filter in the repository's configuration
   and `info/attributes`, which no `git status` lists, the edit, its mark
-  and the filter left as they were (R3-F1); the same with the fix made in
+  and the filter left as they were (R3-F1); a file git wrote as CRLF under
+  the reviewed commit's own `*.bat text eol=crlf` grants it, and one an
+  `eol=crlf` from `info/attributes` rewrote is refused with the file named
+  and the commands that write its committed bytes back, after which those
+  commands grant it (#488); a CRLF rewrite hidden by a clean filter and an
+  assume-unchanged mark behind the commit's `*.txt -text` rule rewritten in
+  the store's loose object to `*.txt text eol=crlf` is refused, nothing
+  written and the worktree, mark and filter left as they were (PR #503
+  R1-F1); the same with the fix made in
   a submodule whose `.gitmodules` entry says `ignore = all`, left
   uncommitted, committed in the submodule only, or written into the
   unpopulated submodule's directory without a repository, which no plain
@@ -2257,7 +2300,13 @@ a stated reason it has none. The coverage that must keep working:
   the shared store, keeps sparse patterns and `core.ignoreStat` from
   marking its entries, and refuses a revision the shared store cannot read;
   the byte comparison lists an edit a clean filter or an end-of-line
-  conversion hides from both statuses, a deletion, a file replaced by a
+  conversion from `info/attributes` hides from both statuses, takes a
+  worktree git checked out under the commit's own `eol=crlf` as holding
+  no change in all three reads, and lists an edit made in that CRLF form
+  and one a clean filter maps back to the blob there (#488), fails rather
+  than pass all three reads when the commit's `-text` rule is rewritten in
+  the store to `eol=crlf` behind such a hidden CRLF rewrite (PR #503
+  R1-F1), a deletion, a file replaced by a
   link, a retargeted link and an execute bit flipped under
   `core.fileMode=false`, reads files below a directory replaced by a link
   as deleted without following it, a FIFO as retyped without opening it,
