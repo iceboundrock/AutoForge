@@ -1006,16 +1006,24 @@ class Doctor:
         return results
 
     def check_sdk_launch(self, provider: str, profiles: list[ProfileConfig]) -> CheckResult:
-        """FAIL for an SDK provider's profiles: their policy validates (#149),
-        but the helper program that would launch them is not shipped (the
-        packaged manifest says so, #150) and its transport has not landed
-        (#151, #152), so every launch is refused before it starts."""
+        """Whether an SDK provider's profiles can launch in this release: its
+        helper program is shipped and matches the packaged manifest's sha256
+        (#150), and its transport has landed (``claude-sdk``'s in #151;
+        ``opencode-sdk``'s is #152's). FAIL, naming why, while every launch is
+        refused before it starts. The credential is its own row."""
         name = f"provider {provider} can launch ({', '.join(p.name for p in profiles)})"
+        adapter = provider_for(profiles[0])
+        if not isinstance(adapter, ClaudeSdkProvider | OpenCodeSdkProvider):
+            return CheckResult(name, False, f"{provider} is not an SDK provider")
         try:
-            provider_for(profiles[0]).integration_preflight(None)
+            problem = adapter.launch_problem()
         except ConfigurationError as exc:
             return CheckResult(name, False, redact(str(exc)))
-        return CheckResult(name, True, "its helper is available")
+        if problem:
+            return CheckResult(name, False, redact(adapter.refusal_text()))
+        return CheckResult(
+            name, True, f"its helper {adapter.helper().describe()} matches the packaged manifest"
+        )
 
     # -- the SDK providers (ADR 0007 D2.6; #150) -------------------------------------
     def sdk_checks(
@@ -1444,7 +1452,9 @@ class Doctor:
         ]
         detail = f"interaction_policy: {', '.join(policies)}; capabilities declared: "
         if declared:
-            detail += ", ".join(declared)
+            detail += (
+                ", ".join(declared) + " (ADR 0007 §3's gates on the pinned pair); no pause (#126)"
+            )
         else:
             detail += (
                 "none yet (ADR 0007 D5.3: one is declared only once its gates pass on the "

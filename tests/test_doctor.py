@@ -2752,16 +2752,16 @@ def _sdk_doctor(tmp_path, profiles, monkeypatch=None, **kwargs):
     return {r.name: r for r in results}
 
 
-def test_a_claude_sdk_profile_gets_distinct_rows_and_only_the_launch_fails(tmp_path, monkeypatch):
+def test_a_claude_sdk_profile_gets_distinct_rows_and_can_launch(tmp_path, monkeypatch):
     """Each part of the helper environment is its own row against the
-    manifest's pinned pair; the credential is shown by name only, and model
-    access is a SKIP, never an OK."""
+    manifest's pinned pair; the helper ships (#151), the credential is shown
+    by name only, and model access is a SKIP, never an OK."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", PLANTED)
     rows = _sdk_doctor(tmp_path, {"analyze_execute": _claude_sdk()})
     launch = rows[CLAUDE_ROWS["launch"]]
-    assert not launch.ok and launch.required
+    assert launch.ok and launch.required
     assert "autoforge-claude-helper (protocol 1" in launch.detail
-    assert "is not shipped with this AutoForge" in launch.detail and "#151" in launch.detail
+    assert "matches the packaged manifest" in launch.detail
     assert rows[CLAUDE_ROWS["interpreter"]].ok
     assert rows[CLAUDE_ROWS["interpreter"]].detail == "Python 3.12.4 (>= 3.10)"
     assert rows[CLAUDE_ROWS["sdk"]].ok
@@ -2776,7 +2776,9 @@ def test_a_claude_sdk_profile_gets_distinct_rows_and_only_the_launch_fails(tmp_p
     assert model.skipped and "fable" in model.detail and "never makes" in model.detail
     interactions = rows[CLAUDE_ROWS["interactions"]]
     assert interactions.ok and not interactions.required
-    assert "analyze_execute fail" in interactions.detail and "none yet" in interactions.detail
+    assert "analyze_execute fail" in interactions.detail
+    assert "live_questions, live_permissions, interrupt" in interactions.detail
+    assert "no pause (#126)" in interactions.detail
     # No generic `--version` row for the interpreter: the probe is the row.
     assert not any(name.startswith(f"agent '{SDK_PYTHON}'") for name in rows)
 
@@ -3319,7 +3321,8 @@ def test_a_post_merge_sdk_profile_with_no_command_fails_by_name(
     assert not row.ok and row.required
     assert f"{provider} needs 'command', the {interpreter}" in row.detail
     assert row.detail.endswith("got ''")
-    assert not rows[f"provider {provider} can launch (update_epic)"].ok
+    # The launch row is the helper's: claude-sdk's ships (#151), opencode-sdk's not.
+    assert rows[f"provider {provider} can launch (update_epic)"].ok is (provider == "claude-sdk")
     assert requests == []
 
 

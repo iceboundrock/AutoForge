@@ -50,6 +50,7 @@ from autoforge.sdk_policy import (
     CLAUDE_SDK_WRITE_TOOLS,
     DENY,
     MAX_INPUT_BYTES,
+    MAX_INPUT_DEPTH,
     MAX_OPTIONS,
     OPENCODE_SDK_AGENT,
     OPENCODE_SDK_DENIED,
@@ -73,6 +74,7 @@ from autoforge.sdk_policy import (
     opencode_sdk_policy,
     permission_summary,
     question_options,
+    refuse_deep_nesting,
     root_inside,
     sdk_launch_allowlist,
     sdk_root,
@@ -584,6 +586,41 @@ def test_input_digest_binds_the_whole_input_and_refuses_an_oversized_one():
         input_digest({"content": "x" * MAX_INPUT_BYTES}, "tool input")
 
 
+def _nested(levels: int, container: str = "array") -> object:
+    """A value ``levels`` containers deep, built without recursion."""
+    value: object = "x"
+    for _ in range(levels):
+        value = [value] if container == "array" else {"a": value}
+    return value
+
+
+@pytest.mark.parametrize("container", ["array", "object"])
+@pytest.mark.parametrize("levels", [MAX_INPUT_DEPTH + 1, 600, 100_000])
+def test_an_input_nested_past_the_bound_is_refused_never_a_recursion_error(levels, container):
+    # R4-F2 of PR #489: each check of an input walks it recursively, so one
+    # nested past the interpreter's stack (600 arrays on Python 3.11) raised
+    # RecursionError out of the check. The nesting is counted first, without
+    # recursion, and refused as data.
+    value = {"command": "ls", "extra": _nested(levels - 1, container)}
+    rule = f"more than {MAX_INPUT_DEPTH} levels deep"
+    with pytest.raises(InteractionDataError, match=f"^a value nests .*{rule}"):
+        canonical_json(value)
+    with pytest.raises(InteractionDataError, match=f"^tool input nests .*{rule}"):
+        input_digest(value, "tool input")
+    with pytest.raises(InteractionDataError, match=f"^modified input nests .*{rule}"):
+        exact_input(value, "modified input")
+
+
+def test_an_input_at_the_nesting_bound_passes_and_a_scalar_is_no_level():
+    value = {"command": "ls", "extra": _nested(MAX_INPUT_DEPTH - 1, "object")}
+    assert exact_input(value, "tool input") is value
+    input_digest(value, "tool input")
+    refuse_deep_nesting("x", "a value", limit=0)
+    refuse_deep_nesting([], "a value", limit=1)
+    with pytest.raises(InteractionDataError, match="more than 1 levels deep"):
+        refuse_deep_nesting([()], "a value", limit=1)
+
+
 @pytest.mark.parametrize(
     "value, match",
     [
@@ -711,10 +748,11 @@ def test_opencode_sdk_profile_refusals(change, match):
         validate_profile(profile)
 
 
-@pytest.mark.parametrize("profile", [_claude_profile(), _opencode_profile()])
+@pytest.mark.parametrize("profile", [_opencode_profile()])
 def test_sdk_providers_refuse_every_launch_until_their_helper_lands(profile, tmp_path):
     """The preflight and the launch refuse; the argv a plan shows does not
-    (#150: a dry run renders the helper's argv, which launches nothing)."""
+    (#150: a dry run renders the helper's argv, which launches nothing).
+    ``claude-sdk``'s helper landed (#151, tests/test_claude_sdk.py)."""
     adapter = provider_for(profile)
     assert adapter.build_command_for(profile, "x")[0] == profile.command
     for call in (
@@ -734,13 +772,21 @@ def test_sdk_providers_refuse_every_launch_until_their_helper_lands(profile, tmp
             call()
 
 
-@pytest.mark.parametrize("profile", [_claude_profile(), _opencode_profile()])
-def test_doctor_reports_that_an_sdk_profile_cannot_launch_yet(profile, tmp_path):
+def test_doctor_reports_that_an_sdk_profile_cannot_launch_yet(tmp_path):
     from autoforge.doctor import Doctor
 
+    profile = _opencode_profile()
     row = Doctor(cwd=str(tmp_path)).check_sdk_launch(profile.provider, [profile])
     assert not row.ok and row.required
     assert "cannot launch in this release" in row.detail
+
+
+def test_doctor_reports_that_claude_sdk_can_launch(tmp_path):
+    from autoforge.doctor import Doctor
+
+    profile = _claude_profile()
+    row = Doctor(cwd=str(tmp_path)).check_sdk_launch(profile.provider, [profile])
+    assert row.ok and row.required and "matches the packaged manifest" in row.detail
 
 
 def test_claude_sdk_declares_an_api_key_and_never_a_login_file(tmp_path):

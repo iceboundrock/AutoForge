@@ -263,9 +263,33 @@ package). Their policy (tools, permissions, setting sources, configuration
 and session roots, authentication, the environment) is
 :mod:`autoforge.sdk_policy`'s (#149, docs/sdk-policy.md); their helper
 programs and pinned pairs are recorded in the packaged manifest
-(:mod:`autoforge.sdk_assets`); their helpers and transports are #151's and
-#152's, and until those land every launch of one is refused before
-anything starts.
+(:mod:`autoforge.sdk_assets`).
+
+Claude Agent SDK (``claude-agent-sdk`` 0.2.163 with its bundled Claude Code
+2.1.286, #151; the gate probes ran that pair against a loopback stand-in of
+the Messages API, ADR 0007 §3's amendment)::
+
+    <helper environment's python> -I <per-launch dir>/claude_helper.py
+                                                (one JSON record per line on stdin/stdout)
+
+  * the helper (``sdk_helpers/claude_helper.py``, package data, staged per
+    launch after its sha256 is checked) runs ``ClaudeSDKClient``: one
+    ``connect``, one ``query`` with the prompt, the response to its first
+    result, ``interrupt`` on a cancellation or stdin EOF, ``disconnect``.
+    The envelope and its reducer are :mod:`autoforge.claude_sdk`; ``stdout``
+    of the result is the completed main turn's ``result`` text only.
+  * every SDK option is a field of the policy: no ``extra_args``, no setting
+    source, no MCP server or plugin, the bundled CLI as ``cli_path``, a
+    caller UUID as ``session_id``, the ``PreToolUse`` hook on every call and
+    a permission host that denies, ``verbatim_prompts``. The launch gets
+    ``ANTHROPIC_API_KEY`` and no other credential, the issue's configuration
+    and session root as ``CLAUDE_CONFIG_DIR`` and #165's shell isolation.
+  * an ``AskUserQuestion`` call or an ``ask_tools`` call is put to the
+    launch's broker (``interaction_policy: prompt``); its decision reaches
+    the model through the hook's answer.
+
+``opencode-sdk``'s bridge and transport are #152's, and until they land
+every launch of it is refused before anything starts.
 
 Every adapter runs a :class:`~autoforge.loop_detect.LoopMonitor` under
 :attr:`AgentRequest.loop_detection` (#194): Claude's stream and Pi's events
@@ -281,6 +305,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import hashlib
 import json
 import os
 import pwd
@@ -291,6 +316,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
@@ -301,6 +327,14 @@ from .child_env import (
     child_shell,
     refuse_forbidden_env,
     undoes_isolation,
+)
+from .claude_sdk import (
+    Ask,
+    ClaudeSdkSession,
+    answer_input,
+    ask_questions,
+    modified_input_problem,
+    start_record,
 )
 from .claude_stream import ClaudeStream
 from .config import LoopDetectionConfig, ProfileConfig
@@ -318,6 +352,7 @@ from .errors import (
     ConfigurationError,
     ExecutionError,
     ExecutionTimeoutError,
+    InteractionDataError,
 )
 from .executor import (
     DEFAULT_MAX_OUTPUT_BYTES,
@@ -331,6 +366,7 @@ from .executor import (
 from .executor_duplex import (
     DuplexChild,
     DuplexRequest,
+    DuplexResult,
     Eof,
     Fragment,
     Overflow,
@@ -341,7 +377,13 @@ from .executor_duplex import (
 )
 from .interaction import (
     NO_CAPABILITIES,
+    Allow,
+    Answer,
     Capabilities,
+    DecisionKind,
+    Deliver,
+    Deny,
+    Fail,
     InteractionBroker,
     InteractionOutcome,
     Lifecycle,
@@ -367,6 +409,7 @@ from .sdk_assets import (
     HelperPin,
     helper_pin,
     helper_problem,
+    helpers_dir,
 )
 from .sdk_policy import (
     CLAUDE_SDK,
@@ -375,16 +418,19 @@ from .sdk_policy import (
     CLAUDE_SDK_PASSTHROUGH,
     OPENCODE_SDK,
     OPENCODE_SDK_OPTION_KEYS,
+    SDK_ROOT_DIR,
     ClaudeSdkPolicy,
     ClaudeSdkRoots,
     InteractionSettings,
     OpenCodeSdkPolicy,
     OpenCodeSdkRoots,
+    claude_sdk_auth_problems,
     claude_sdk_policy,
     collection_text,
     interaction_settings,
     opencode_model_problem,
     opencode_sdk_policy,
+    permission_summary,
     sdk_launch_allowlist,
 )
 
@@ -441,6 +487,13 @@ class AgentRequest:
     # what the directive says; it never sees the policy. ``None`` (every
     # provider through which nothing can ask) keeps today's behaviour.
     interaction: InteractionBroker | None = None
+    # The issue's controller-owned sandbox directory
+    # (``<git common dir>/autoforge/sandbox/<worktree>``), under which the
+    # engine created the directories :meth:`AgentProvider.state_directories`
+    # names for this provider, persistent and per issue, before the launch
+    # (#151); a sandboxed launch has each projected writable as an engine
+    # carve-out. "" for a provider that names none.
+    state_dir: str = ""
 
     def __post_init__(self) -> None:
         self.loop_detection = self.loop_detection.for_invocation(self.profile.provider, self.phase)
@@ -777,6 +830,28 @@ def _name_refused(
     return result
 
 
+def _without_engine_state(
+    needs: ProviderRequirements, engine_state: tuple[str, ...]
+) -> ProviderRequirements:
+    """``needs`` without a writable directory the engine itself projects (#151):
+    a provider state directory of :meth:`AgentProvider.state_directories` lies
+    under the masked ``<git common dir>/autoforge``, where only the engine may
+    carve out (ADR 0005 C5), and the engine's projection already shows it
+    writable at its host path, so a variable naming it stays true inside."""
+    if not engine_state:
+        return needs
+    own = set(engine_state)
+    return dataclasses.replace(
+        needs,
+        state=tuple(path for path in needs.state if path not in own),
+        auth=tuple(
+            item
+            for item in needs.auth
+            if not (item.mode is AuthMode.DIR_RW and item.source in own and item.target is None)
+        ),
+    )
+
+
 def _truthy(value: str | None, default: bool) -> bool:
     if value is None or value == "":
         return default
@@ -896,6 +971,18 @@ class AgentProvider:
         """
         return []
 
+    def state_directories(self, profile: ProfileConfig) -> tuple[str, ...]:
+        """The directories a launch of ``profile`` keeps its provider state in,
+        relative to the issue's sandbox directory (#151): the engine creates
+        them through its filesystem boundary before the launch, in every
+        sandbox mode, passes the sandbox directory as
+        :attr:`AgentRequest.state_dir` and, under an enforced mode, projects
+        each writable as an engine carve-out. Persistent and per issue, never
+        inside a working tree; AutoForge never deletes them. Names only: the
+        engine knows nothing of what they hold. None for a CLI adapter.
+        """
+        return ()
+
     def interaction_capabilities(self, profile: ProfileConfig) -> Capabilities:
         """What this provider can carry of a decision for ``profile`` (ADR 0007
         D5.1, D5.3), for the launch's broker.
@@ -1006,6 +1093,7 @@ class AgentProvider:
             return command, None
         launch_env = {**self.launch_environment(req.env_allowlist), **(env or {})}
         needs = self.sandbox_requirements(req.profile, command, launch_env, req.sandbox.facts.home)
+        needs = _without_engine_state(needs, req.sandbox.facts.provider_state)
         description = req.sandbox.describe(needs, launch_env)
         if needs.executable:
             command = [needs.executable, *command[1:]]
@@ -1274,6 +1362,52 @@ def claude_isolation_env(env_file: str, shell: str) -> dict[str, str]:
     }
 
 
+@contextmanager
+def claude_shell_isolation() -> Iterator[dict[str, str]]:
+    """A :data:`CLAUDE_SHELL_CLEANER` file for one Claude Code launch's
+    ``CLAUDE_ENV_FILE``, a bash or zsh to run Bash tool commands in and no
+    shell prefix (:func:`claude_isolation_env`): no function or alias of
+    the operator's shell startup files runs in one (#165). For the ``claude``
+    CLI and for the Claude Code the ``claude-sdk`` helper starts (#151).
+
+    The directory (``mkdtemp``, mode 0700) is removed when the launch
+    ends; one that cannot be made or written is an
+    :class:`ExecutionError`, before anything is launched.
+    """
+    try:
+        env_dir = tempfile.mkdtemp(prefix="autoforge-claude-")
+    except OSError as exc:
+        raise ExecutionError(f"cannot prepare the claude shell environment: {exc}") from exc
+    try:
+        env_file = os.path.join(env_dir, CLAUDE_ENV_FILE_NAME)
+        try:
+            fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(CLAUDE_SHELL_CLEANER)
+        except OSError as exc:
+            raise ExecutionError(f"cannot prepare the claude shell environment: {exc}") from exc
+        yield claude_isolation_env(env_file, claude_shell(child_shell()))
+    finally:
+        shutil.rmtree(env_dir, ignore_errors=True)
+
+
+def complete_claude_isolation(isolation: Mapping[str, str], environment: Mapping[str, str]) -> None:
+    """Add :func:`claude_login_path` of the ``PATH`` Claude Code starts with
+    (inside a sandbox, as rewritten there) to the launch's
+    ``CLAUDE_ENV_FILE``; nothing when it starts with no ``PATH``, or
+    :func:`claude_shell_isolation` named no such file (#347)."""
+    env_file = isolation.get("CLAUDE_ENV_FILE")
+    path = environment.get("PATH")
+    if not env_file or not path:
+        return
+    try:
+        fd = os.open(env_file, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            handle.write(claude_login_path(path))
+    except OSError as exc:
+        raise ExecutionError(f"cannot prepare the claude shell environment: {exc}") from exc
+
+
 # Read whole to find its ``env``, and refused past this size: Claude Code's
 # global configuration grows with its project history.
 CLAUDE_MAX_CONFIG_BYTES = 32 * 1024 * 1024
@@ -1483,47 +1617,16 @@ class ClaudeCodeProvider(AgentProvider):
     def integration_isolation(self) -> Iterator[dict[str, str]]:
         """A :data:`CLAUDE_SHELL_CLEANER` file for this launch's
         ``CLAUDE_ENV_FILE``, a bash or zsh to run Bash tool commands in and no
-        shell prefix (:func:`claude_isolation_env`): no function or alias of
-        the operator's shell startup files runs in one (#165).
-        :meth:`complete_isolation` adds the launch's ``PATH`` (#347).
-
-        The directory (``mkdtemp``, mode 0700) is removed when the launch
-        ends; one that cannot be made or written is an
-        :class:`ExecutionError`, before anything is launched.
-        """
-        try:
-            env_dir = tempfile.mkdtemp(prefix="autoforge-claude-")
-        except OSError as exc:
-            raise ExecutionError(f"cannot prepare the claude shell environment: {exc}") from exc
-        try:
-            env_file = os.path.join(env_dir, CLAUDE_ENV_FILE_NAME)
-            try:
-                fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    handle.write(CLAUDE_SHELL_CLEANER)
-            except OSError as exc:
-                raise ExecutionError(f"cannot prepare the claude shell environment: {exc}") from exc
-            yield claude_isolation_env(env_file, claude_shell(child_shell()))
-        finally:
-            shutil.rmtree(env_dir, ignore_errors=True)
+        shell prefix (:func:`claude_shell_isolation`, #165)."""
+        with claude_shell_isolation() as isolation:
+            yield isolation
 
     def complete_isolation(
         self, isolation: Mapping[str, str], environment: Mapping[str, str]
     ) -> None:
-        """Add :func:`claude_login_path` of the ``PATH`` Claude Code starts
-        with (inside a sandbox, as rewritten there) to the launch's
-        ``CLAUDE_ENV_FILE``; nothing when it starts with no ``PATH``, or
-        :meth:`integration_isolation` named no such file."""
-        env_file = isolation.get("CLAUDE_ENV_FILE")
-        path = environment.get("PATH")
-        if not env_file or not path:
-            return
-        try:
-            fd = os.open(env_file, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
-            with os.fdopen(fd, "a", encoding="utf-8") as handle:
-                handle.write(claude_login_path(path))
-        except OSError as exc:
-            raise ExecutionError(f"cannot prepare the claude shell environment: {exc}") from exc
+        """Add the login ``PATH`` to the launch's ``CLAUDE_ENV_FILE``
+        (:func:`complete_claude_isolation`, #347)."""
+        complete_claude_isolation(isolation, environment)
 
     def integration_preflight(self, env_allowlist: tuple[str, ...] | None) -> None:
         """Refuse a launch while Claude Code's own configuration would set a
@@ -3258,7 +3361,8 @@ _OPENCODE_SDK_EFFORT_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 
 class _SdkProvider(AgentProvider):
     """What the two SDK adapters share: a fixed policy, no pass-through, and
-    no launch until their helper lands.
+    no launch until their helper and transport land (``claude-sdk``'s did in
+    #151; ``opencode-sdk``'s is #152's).
 
     ``command`` names the helper's interpreter (Python for ``claude-sdk``,
     Node for ``opencode-sdk``; ADR 0007 D2.3, D2.5) and is required: no
@@ -3273,6 +3377,9 @@ class _SdkProvider(AgentProvider):
     # The issue whose helper launches this provider, the helper's
     # interpreter as ``command`` names it, and the decision that says so.
     transport_issue = ""
+    # Whether this release has the provider's transport: its adapter drives
+    # the helper (``execute``). Until then every launch is refused.
+    transport_landed = False
     interpreter = ""
     runtime_decision = ""
     # Foreign names the operator may still forward by listing them exactly.
@@ -3329,23 +3436,32 @@ class _SdkProvider(AgentProvider):
         return helper_pin(self.name)
 
     def launch_problem(self) -> str:
-        """Why no launch of this provider can start in this release."""
+        """Why no launch of this provider can start in this release, or "" when
+        one can: its helper is shipped and matches the manifest's sha256, and
+        its transport has landed."""
         pin = self.helper()
         if not pin.shipped:
             return (
                 f"its helper program {pin.describe()} is not shipped with this AutoForge: it "
                 f"and its transport are {pin.implemented_by}'s and have not landed"
             )
-        return helper_problem(pin) or (
-            f"its transport is #{self.transport_issue}'s and has not landed"
-        )
+        problem = helper_problem(pin)
+        if problem:
+            return problem
+        if not self.transport_landed:
+            return f"its transport is #{self.transport_issue}'s and has not landed"
+        return ""
 
-    def _refuse_launch(self) -> ConfigurationError:
-        return ConfigurationError(
+    def refusal_text(self) -> str:
+        """Why every launch of this provider is refused, as an operator reads it."""
+        return (
             f"provider {self.name} cannot launch in this release: its policy is in place "
             f"(docs/sdk-policy.md), but {self.launch_problem()}. Route this profile to "
             "another provider"
         )
+
+    def _refuse_launch(self) -> ConfigurationError:
+        return ConfigurationError(self.refusal_text())
 
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
         """The helper's argv as a launch runs it (ADR 0007 D2.2, D2.3, D2.5):
@@ -3360,9 +3476,10 @@ class _SdkProvider(AgentProvider):
         return [profile.command, *self.interpreter_flags, self.helper().staged_path()]
 
     def integration_preflight(self, env_allowlist: tuple[str, ...] | None) -> None:
-        """Refused: nothing can launch yet, so the engine stops here, before
-        a launch is charged."""
-        raise self._refuse_launch()
+        """Refused while :meth:`launch_problem` names a reason, so the engine
+        stops here, before a launch is charged."""
+        if self.launch_problem():
+            raise self._refuse_launch()
 
     def execute(self, req: AgentRequest) -> AgentExecutionResult:
         raise self._refuse_launch()
@@ -3415,9 +3532,22 @@ class _SdkProvider(AgentProvider):
             f"{', '.join(self.policy_environment_names(profile))}",
             f"{self.name} state root: <issue sandbox dir>/sdk/{self.name}/, per issue, never "
             "inside the worktree (docs/sdk-policy.md §6)",
-            f"{self.name} launch: every launch is refused in this release, before anything "
-            f"starts: {self.launch_problem()}",
+            self.launch_plan(profile),
         ]
+
+    def launch_plan(self, profile: ProfileConfig) -> str:
+        """The plan's last note: how a launch runs, or why every one is refused."""
+        problem = self.launch_problem()
+        if problem:
+            return (
+                f"{self.name} launch: every launch is refused in this release, before "
+                f"anything starts: {problem}"
+            )
+        return f"{self.name} launch: {self.launch_description(profile)}"
+
+    def launch_description(self, profile: ProfileConfig) -> str:
+        """What a launch does, for :meth:`launch_plan` once it can start."""
+        raise NotImplementedError
 
     def launch_allowlist(self, base: tuple[str, ...]) -> tuple[str, ...]:
         """``base`` with every other provider's variables and every
@@ -3439,20 +3569,147 @@ class _SdkProvider(AgentProvider):
         )
 
 
+# The helper's records are bounded like a stream-json line: the final
+# ``result`` must arrive whole, and JSON escaping (the helper writes ASCII)
+# can grow a final text that is itself up to the stdout bound.
+CLAUDE_SDK_MAX_RECORD_BYTES = CLAUDE_MAX_RECORD_BYTES
+CLAUDE_SDK_MAX_PENDING_BYTES = 2 * CLAUDE_SDK_MAX_RECORD_BYTES
+# How long a helper whose run is being ended (a limit fell due, the run
+# failed, an ask failed it) is given to interrupt its turn, drain the
+# interrupted result and write its ``end``, after the interrupt is sent: the
+# helper's own drain bound plus a margin. The kill comes this long after a
+# limit falls due (``wind_down_seconds``).
+CLAUDE_SDK_INTERRUPT_SECONDS = 15.0
+# #434 (R2-F1 of PR #489): an ask had failed the run (ADR 0007 D7.6) when a
+# limit killed the helper winding down. The fixed fact kept through the kill
+# (``failed_before_limit``): the recovery rule reads it before the timeout
+# and never relaunches the step, since a relaunch would ask again.
+CLAUDE_SDK_ASK_FAILED_BEFORE_LIMIT = "claude-sdk: an ask for a decision had failed the run"
+# What ``claude-sdk`` can carry of a decision on its pinned pair (ADR 0007
+# D5.3, §3's amendment of #151): a live question (one to four, several
+# labels, an answer of the operator's own words: gate G-C3), a live
+# permission approved once, with a modified input, or denied with guidance
+# (G-C4), and an interrupt (G-C5); probed through this adapter and helper
+# on SDK 0.2.163 with its bundled Claude Code 2.1.286 against a loopback
+# stand-in of the Messages API. Never a session approval (the policy writes
+# no permission rule: docs/sdk-policy.md §3), and no pause: replay and
+# continuation are #126's, gated by G-C6 and G-C7.
+CLAUDE_SDK_CAPABILITIES = Capabilities(
+    live_questions=True,
+    live_permissions=True,
+    interrupt=True,
+    unsupported=frozenset({DecisionKind.ALLOW_SESSION}),
+)
+# Where a launch's state directory lies under the issue's sandbox directory
+# (ClaudeSdkRoots.under): ``sdk/claude-sdk/config``.
+CLAUDE_SDK_STATE_DIR = f"{SDK_ROOT_DIR}/{CLAUDE_SDK}/config"
+
+
+@contextmanager
+def _staged_helper(pin: HelperPin) -> Iterator[str]:
+    """The helper program, staged for one launch (ADR 0007 D2.2): its bytes
+    read once from the installed package, checked against the manifest's
+    sha256 and written into a directory made for this launch (``mkdtemp``,
+    mode 0700, outside every repository), read-only; the path of the copy.
+    The directory is removed when the launch ends. A file that is missing or
+    does not match refuses the launch (:class:`ConfigurationError`); one that
+    cannot be written is an :class:`ExecutionError`, before anything starts.
+    """
+    try:
+        body = (helpers_dir() / pin.file).read_bytes()
+    except OSError:
+        body = None
+    if body is None or hashlib.sha256(body).hexdigest() != pin.sha256:
+        raise ConfigurationError(
+            f"provider {pin.provider} cannot launch: {helper_problem(pin) or 'its helper changed'}"
+        )
+    try:
+        directory = tempfile.mkdtemp(prefix="autoforge-claude-sdk-")
+    except OSError as exc:
+        raise ExecutionError(f"cannot stage the {pin.provider} helper: {exc}") from exc
+    try:
+        path = os.path.join(directory, pin.file)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(body)
+            os.chmod(path, 0o400)
+            os.chmod(directory, 0o500)
+        except OSError as exc:
+            raise ExecutionError(f"cannot stage the {pin.provider} helper: {exc}") from exc
+        yield path
+    finally:
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _spelled_interpreter(command: str, search_path: str | None) -> str:
+    """The absolute path ``command`` is started by, links not followed, or ""."""
+    found = command if "/" in command else shutil.which(command, path=search_path)
+    return os.path.abspath(found) if found and os.path.isabs(found) else ""
+
+
+def _python_environment(interpreter: str) -> str:
+    """The virtual environment whose ``bin/`` ``interpreter`` lies in (its
+    ``pyvenv.cfg`` beside ``bin/``), or "" when it lies in none."""
+    if not interpreter:
+        return ""
+    prefix = os.path.dirname(os.path.dirname(interpreter))
+    return prefix if os.path.isfile(os.path.join(prefix, "pyvenv.cfg")) else ""
+
+
+class _SdkCut(enum.Enum):
+    """Why :meth:`ClaudeSdkProvider._converse` ended a helper still running."""
+
+    # A limit fell due: a timeout.
+    DEADLINE = "deadline"
+    # Stopped on the loop detector's verdict (#194): a timeout whose limit is ``loop``.
+    LOOP = "loop"
+    # The run failed (the envelope, the policy, the pair) or an ask failed it:
+    # the helper is interrupted and wound down.
+    FAILED = "failed"
+
+
 class ClaudeSdkProvider(_SdkProvider):
     """``claude-sdk``: the Claude Agent SDK in a helper process (ADR 0007; #151).
 
     Authenticates with ``ANTHROPIC_API_KEY`` alone, never a claude.ai login
     (D10.2); a Bedrock, Vertex AI or Foundry route is not supported in this
     release (docs/sdk-policy.md §5).
+
+    The static surface is #149's and #150's; the launch is #151's
+    (:meth:`execute`): the staged helper (``sdk_helpers/claude_helper.py``)
+    under the duplex handle, its envelope reduced by
+    :class:`~autoforge.claude_sdk.ClaudeSdkSession`, and each of its asks put
+    to the launch's broker.
     """
 
     name = CLAUDE_SDK
     environment_names = (CLAUDE_SDK_CREDENTIAL,)
     option_keys = CLAUDE_SDK_OPTION_KEYS
-    path_names = ("CLAUDE_CONFIG_DIR",)
+    # The SDK's bundled Claude Code is the CLI #165 isolates: its Bash tool
+    # gets the same shell isolation (docs/sdk-policy.md §2, "startup scripts").
+    isolation_names = ClaudeCodeProvider.isolation_names
+    path_names = ("CLAUDE_CONFIG_DIR", "CLAUDE_ENV_FILE", "CLAUDE_CODE_SHELL")
     passthrough = CLAUDE_SDK_PASSTHROUGH
     transport_issue = "151"
+    transport_landed = True
+
+    @contextmanager
+    def integration_isolation(self) -> Iterator[dict[str, str]]:
+        """The ``claude`` CLI's shell isolation, for the Claude Code the helper
+        starts (:func:`claude_shell_isolation`)."""
+        with claude_shell_isolation() as isolation:
+            yield isolation
+
+    def complete_isolation(
+        self, isolation: Mapping[str, str], environment: Mapping[str, str]
+    ) -> None:
+        complete_claude_isolation(isolation, environment)
+
     interpreter = "Python interpreter"
     runtime_decision = "D2.3"
     # ``-I`` keeps out ``PYTHON*`` variables, the user site directory and the
@@ -3462,6 +3719,21 @@ class ClaudeSdkProvider(_SdkProvider):
     # would make the probe's interpreter read a ``._pth`` file doctor did not
     # look for (R3-F1 of #150's review).
     probe_withheld = PYTHON_STARTUP_NAMES
+
+    def __init__(
+        self,
+        runner: Runner | None = None,
+        *,
+        capabilities: Capabilities = CLAUDE_SDK_CAPABILITIES,
+        interrupt_seconds: float = CLAUDE_SDK_INTERRUPT_SECONDS,
+        max_text_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        max_record_bytes: int = CLAUDE_SDK_MAX_RECORD_BYTES,
+    ) -> None:
+        super().__init__(runner)
+        self.capabilities = capabilities
+        self.interrupt_seconds = interrupt_seconds
+        self.max_text_bytes = max_text_bytes
+        self.max_record_bytes = max_record_bytes
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         super().validate_profile(profile)
@@ -3479,6 +3751,32 @@ class ClaudeSdkProvider(_SdkProvider):
 
     def policy(self, profile: ProfileConfig) -> ClaudeSdkPolicy:
         return claude_sdk_policy(profile.name, profile.options)
+
+    def state_directories(self, profile: ProfileConfig) -> tuple[str, ...]:
+        """The configuration and session root, ``sdk/claude-sdk/config``
+        (:class:`~autoforge.sdk_policy.ClaudeSdkRoots`, docs/sdk-policy.md §6)."""
+        return (CLAUDE_SDK_STATE_DIR,)
+
+    def interaction_capabilities(self, profile: ProfileConfig) -> Capabilities:
+        """:data:`CLAUDE_SDK_CAPABILITIES`, the gates that passed on the pinned pair."""
+        return self.capabilities
+
+    def integration_preflight(self, env_allowlist: tuple[str, ...] | None) -> None:
+        """Refuse a launch whose helper is not usable (missing, or not the
+        manifest's sha256) or whose environment would not authenticate with
+        ``ANTHROPIC_API_KEY`` alone (:func:`~autoforge.sdk_policy.claude_sdk_auth_problems`,
+        D10.2), before a launch is charged. Names only, never a value."""
+        super().integration_preflight(env_allowlist)
+        problems = claude_sdk_auth_problems(self.launch_environment(env_allowlist))
+        if problems:
+            raise ConfigurationError(f"refusing to launch {self.name}: {'; '.join(problems)}")
+
+    def launch_description(self, profile: ProfileConfig) -> str:
+        return (
+            "one helper per launch under the duplex handle, its group contained (ADR 0002), "
+            f"{CLAUDE_SDK_CREDENTIAL} required, a fresh session id each launch, and only the "
+            "completed main turn's result text read as the reply"
+        )
 
     def policy_environment_names(self, profile: ProfileConfig) -> tuple[str, ...]:
         roots = ClaudeSdkRoots.under(Path("/"))  # by name only: no path is used
@@ -3512,6 +3810,24 @@ class ClaudeSdkProvider(_SdkProvider):
         configuration roots.
         """
         needs = super().sandbox_requirements(profile, command, env, home)
+        # The staged helper's directory (D2.2), read-only like #165's
+        # overrides: ``[interpreter, -I, <staged helper>]``.
+        staged = command[-1] if len(command) > 1 else ""
+        config = (os.path.dirname(staged),) if os.path.isabs(staged) else ()
+        # The launch's CLAUDE_ENV_FILE (#165's shell cleaner), read-only.
+        env_file = env.get("CLAUDE_ENV_FILE", "")
+        if env_file.startswith("/"):
+            config = (*config, env_file)
+        # The helper environment (D2.3): its prefix read-only, and its
+        # interpreter as spelled, which must lead inside where it leads here.
+        spelled = _spelled_interpreter(command[0], env.get("PATH"))
+        environment = _python_environment(spelled)
+        roots = (*needs.install_roots, environment) if environment else needs.install_roots
+        spelled_paths = (
+            (*needs.spelled_paths, spelled)
+            if spelled and spelled != needs.executable
+            else needs.spelled_paths
+        )
         auth = (
             [AuthItem(AuthMode.ENV, CLAUDE_SDK_CREDENTIAL)]
             if env.get(CLAUDE_SDK_CREDENTIAL)
@@ -3529,11 +3845,449 @@ class ClaudeSdkProvider(_SdkProvider):
             )
         return dataclasses.replace(
             needs,
+            install_roots=tuple(dict.fromkeys(roots)),
+            spelled_paths=spelled_paths,
+            config=(*needs.config, *config),
             auth=tuple(auth),
             operator_config_roots=(
                 os.path.join(home, ".claude"),
                 os.path.join(home, ".claude.json"),
             ),
+        )
+
+    def sandboxed(
+        self, req: AgentRequest, command: list[str], env: Mapping[str, str] | None
+    ) -> tuple[list[str], LaunchDescription | None]:
+        """As every adapter's, but the interpreter keeps the path ``command``
+        spells (:meth:`sandbox_requirements` declares it): CPython finds its
+        virtual environment's ``pyvenv.cfg`` beside the path it was started
+        by, so the resolved base interpreter would run without the helper
+        environment and its SDK (seen under ``bwrap``)."""
+        launch_path = {**self.launch_environment(req.env_allowlist), **(env or {})}.get("PATH")
+        spelled = _spelled_interpreter(command[0], launch_path)
+        command, description = super().sandboxed(req, command, env)
+        if description is not None and spelled:
+            command = [spelled, *command[1:]]
+        return command, description
+
+    # -- the launch (#151) ---------------------------------------------------
+    def execute(self, req: AgentRequest) -> AgentExecutionResult:
+        """One helper, one session, one query, one final text (ADR 0007 D1.1).
+
+        Refused before anything starts (:class:`ConfigurationError` or
+        :class:`ExecutionError`): a helper that is not the manifest's, no
+        state directory from the engine, or an environment that would not
+        authenticate with ``ANTHROPIC_API_KEY`` alone. Otherwise the staged
+        helper runs under the duplex handle with the allow-listed
+        environment, the controller's overrides and the policy's variables
+        (``CLAUDE_CONFIG_DIR`` in the issue's state directory), the idle limit
+        and the ceiling, ``contain_orphans`` and the request's sandbox: one
+        containment owner for the helper, the SDK's Claude Code and
+        everything that starts (D3.2).
+
+        The session reducer (:class:`~autoforge.claude_sdk.ClaudeSdkSession`)
+        checks ``hello`` against the pinned pair before ``start`` is sent and
+        decides the outcome; each ask goes to the broker
+        (:meth:`_answer`). When a limit falls due, the run fails or an ask
+        fails it, the deadline is pinned, the helper is sent ``interrupt``
+        and given :attr:`interrupt_seconds` to drain its turn and end, and
+        then its stdin is closed; the duplex handle kills what is left. A
+        timeout wins over what the envelope said (ADR 0003 §2.6), and
+        ``exit_code`` is always the helper's real status. ``stdout`` is the
+        completed main turn's ``result`` text only, tail-bounded.
+        """
+        policy = self.policy(req.profile)
+        pin = self.helper()
+        problem = self.launch_problem()
+        if problem:
+            raise self._refuse_launch()
+        if not req.state_dir:
+            raise ExecutionError(
+                f"{self.name}: the launch has no state directory: the engine creates the "
+                "issue's configuration and session root before every launch (#151)"
+            )
+        roots = ClaudeSdkRoots.under(Path(req.state_dir))
+        if not roots.config.is_dir():
+            raise ExecutionError(
+                f"{self.name}: the launch's configuration and session root does not exist"
+            )
+        base = {**(req.env or {}), **policy.environment(roots)}
+        inherited = {**self.launch_environment(req.env_allowlist), **base}
+        auth = claude_sdk_auth_problems(inherited)
+        if auth:
+            raise ExecutionError(f"refusing to launch {self.name}: {'; '.join(auth)}")
+        # The root persists between launches and its agent can write it: an
+        # ``env`` left in its settings or global configuration would be set
+        # over the launch's isolation, as for the CLI provider (#165).
+        problems = claude_configuration_problems(inherited)
+        if problems:
+            raise ExecutionError(
+                f"refusing to launch {self.name}: its configuration and session root sets "
+                f"variables over the environment AutoForge gives a launch: {'; '.join(problems)}"
+            )
+        emit = guarded(req.progress)
+        monitor = _loop_monitor(req, emit)
+        session_id = str(uuid.uuid4())
+        start = start_record(
+            session_id=session_id,
+            prompt=req.prompt,
+            cwd=req.cwd,
+            model=req.profile.model,
+            effort=req.profile.effort,
+            policy=policy,
+            max_record_bytes=self.max_record_bytes,
+        )
+        session = ClaudeSdkSession(
+            pin=pin,
+            policy=policy,
+            session_id=session_id,
+            start=start,
+            cwd=req.cwd,
+            emit=emit,
+            loop=_ClockedLoop(monitor),
+        )
+        asked: list[str] = []
+        with _staged_helper(pin) as helper, self.integration_isolation() as isolation:
+            env = {**(req.env or {}), **isolation, **policy.environment(roots)}
+            command = [req.profile.command, *self.interpreter_flags, helper]
+            command, description = self.sandboxed(req, command, env)
+            self.complete_isolation(isolation, self.started_environment(req, env, description))
+            duplex = DuplexRequest(
+                command=command,
+                cwd=req.cwd,
+                env_allowlist=self.environment_allowlist(req),
+                env=env,
+                idle_timeout_seconds=req.idle_timeout_seconds,
+                max_runtime_seconds=req.max_runtime_seconds,
+                # The interrupt comes after a limit, so the kill waits for it.
+                wind_down_seconds=self.interrupt_seconds,
+                max_record_bytes=self.max_record_bytes,
+                max_pending_bytes=2 * self.max_record_bytes,
+                # Nothing an agent starts outlives its invocation (ADR 0002).
+                contain_orphans=True,
+                sandbox=description,
+            )
+            with start_duplex(duplex) as child:
+                cut = self._converse(child, session, req.interaction, monitor, asked)
+                cut_limit = child.deadline_limit if cut is _SdkCut.DEADLINE else ""
+                if cut in (_SdkCut.DEADLINE, _SdkCut.FAILED) and session.started:
+                    child.pin_deadline()
+                    self._wind_down(child, session)
+                child.close_stdin()
+                session.stdin_closed()
+                res = child.finish()
+                self._read_rest(child, session)
+        return self._result(req, res, session, cut, cut_limit, asked, monitor)
+
+    def _send(self, child: DuplexChild, session: ClaudeSdkSession, line: bytes) -> None:
+        try:
+            child.send_line(line)
+        except ChildStdinClosedError:
+            session.framing_error("the helper closed its stdin")
+
+    def _flush(self, child: DuplexChild, session: ClaudeSdkSession) -> None:
+        while session.outbox:
+            self._send(child, session, session.outbox.pop(0))
+
+    def _converse(
+        self,
+        child: DuplexChild,
+        session: ClaudeSdkSession,
+        broker: InteractionBroker | None,
+        monitor: LoopMonitor,
+        asked: list[str],
+    ) -> _SdkCut | None:
+        """Drive the session to its end; why it was cut short, or ``None``.
+
+        The limit is recomputed on every turn, since the helper's output
+        moves it; once it falls due the caller pins it and winds the helper
+        down. A loop verdict (#194) stops a helper still running at once, as
+        on a timeout. ``asked`` collects the reason of an ask that failed the
+        run (a broker ``Fail``, or data the broker could not be given).
+        """
+        try:
+            while not session.done:
+                self._flush(child, session)
+                if asked:
+                    return _SdkCut.FAILED
+                now = time.monotonic()
+                due = child.limit_due()
+                if now >= due:
+                    return _SdkCut.DEADLINE
+                item = child.read_line(timeout=max(0.0, due - now))
+                if isinstance(item, Record):
+                    ask = session.feed(item.data)
+                    if monitor.verdict is not None and child.stop():
+                        return _SdkCut.LOOP
+                    if ask is not None:
+                        self._answer(child, session, ask, broker, asked)
+                elif isinstance(item, Oversize | Fragment | Overflow):
+                    self._framing(session, item)
+                elif isinstance(item, Eof):
+                    session.stream_ended()
+                elif item.deadline_exceeded:
+                    return _SdkCut.DEADLINE
+            self._flush(child, session)
+        except ExecutionTimeoutError:
+            return _SdkCut.DEADLINE  # a write overran the deadline; the group is gone
+        if session.failure is not None and session.started and not session.helper_failed:
+            return _SdkCut.FAILED
+        return None
+
+    def _answer(
+        self,
+        child: DuplexChild,
+        session: ClaudeSdkSession,
+        ask: Ask,
+        broker: InteractionBroker | None,
+        asked: list[str],
+    ) -> None:
+        """Put ``ask`` to the broker and send the helper what its directive says
+        (ADR 0007 D9.2): an answer or an approval is ``allow`` (an answer with
+        the questions and their answers as the call's input, a modified input
+        as validated), a denial or a cancellation ``deny`` with the operator's
+        guidance, and a ``Fail`` ``fail``, which also ends the run (D7.6). An
+        ask the broker cannot be given (no broker, data past its bounds or not
+        renderable) fails the same way (D10.4); so does a modified input the
+        tool would not take, an empty one included
+        (:func:`~autoforge.claude_sdk.modified_input_problem`). A ``Pause``
+        cannot come (no pause is available until #126) and fails too."""
+        reason = ""
+        request = None
+        if broker is None:
+            reason = "the agent asked for a decision, and this launch has no broker to ask"
+        elif ask.problem:
+            reason = f"the agent asked for a decision AutoForge cannot show: {ask.problem}"
+        else:
+            try:
+                if ask.kind is RequestKind.QUESTION:
+                    request = broker.question(ask.tool_use_id, ask_questions(ask), agent=ask.agent)
+                else:
+                    assert ask.tool_input is not None
+                    request = broker.permission(
+                        ask.tool_use_id,
+                        ask.tool_name,
+                        permission_summary(ask.tool_name, ask.tool_input),
+                        ask.input_sha256,
+                        agent=ask.agent,
+                    )
+            except InteractionDataError as exc:
+                reason = f"the agent asked for a decision AutoForge cannot show: {exc}"
+        if request is not None and broker is not None:
+            directive = broker.handle(request, child.limit_due())
+            if isinstance(directive, Deliver):
+                decision = directive.decision
+                if isinstance(decision, Answer):
+                    self._send(
+                        child,
+                        session,
+                        session.decide(ask, "allow", updated_input=answer_input(ask, decision)),
+                    )
+                    return
+                if isinstance(decision, Allow):
+                    updated = decision.input_to_send()
+                    # Every modified input is checked, an empty one included;
+                    # only none at all runs the call's own input.
+                    problem = (
+                        ""
+                        if updated is None
+                        else modified_input_problem(ask.tool_name, updated, ask.tool_input)
+                    )
+                    if not problem:
+                        self._send(
+                            child, session, session.decide(ask, "allow", updated_input=updated)
+                        )
+                        return
+                    reason = f"the decision was not delivered: {problem}"
+                else:
+                    guidance = decision.guidance if isinstance(decision, Deny) else None
+                    self._send(child, session, session.decide(ask, "deny", guidance=guidance))
+                    return
+            elif isinstance(directive, Fail):
+                reason = directive.reason
+            else:
+                reason = (
+                    f"the agent asked for a decision ({request.what}) and the broker paused, "
+                    "but no pending-interaction record exists to pause into (#126)"
+                )
+        asked.append(clean(reason, 400))
+        self._send(
+            child,
+            session,
+            session.decide(ask, "fail", guidance="AutoForge cannot give this decision"),
+        )
+
+    def _wind_down(self, child: DuplexChild, session: ClaudeSdkSession) -> None:
+        """Interrupt the helper's turn and read it to its ``end``, within
+        :attr:`interrupt_seconds` (ADR 0007 D3.3): what it writes meanwhile
+        cannot stretch the deadline the caller pinned. An ask that arrives
+        meanwhile is denied. A framing violation fails the session here as
+        in :meth:`_converse` (:meth:`_framing`), so a result read after a
+        record was lost is never the reply (R4-F1 of PR #489)."""
+        end = time.monotonic() + self.interrupt_seconds
+        try:
+            self._send(child, session, session.interrupt())
+            while not session.done:
+                now = time.monotonic()
+                if now >= end:
+                    return
+                item = child.read_line(timeout=end - now)
+                if isinstance(item, Record):
+                    ask = session.feed(item.data)
+                    if ask is not None:
+                        self._send(
+                            child,
+                            session,
+                            session.decide(ask, "deny", guidance="AutoForge is ending this run"),
+                        )
+                elif isinstance(item, Oversize | Fragment | Overflow):
+                    self._framing(session, item)
+                    if isinstance(item, Overflow):
+                        return
+                elif isinstance(item, Eof):
+                    session.stream_ended()
+                    return
+                elif item.deadline_exceeded:
+                    return
+        except ExecutionTimeoutError:
+            return
+
+    @staticmethod
+    def _framing(session: ClaudeSdkSession, item: Oversize | Fragment | Overflow) -> None:
+        """A framing violation of the helper's stdout, failed alike wherever
+        it is read (:meth:`_converse`, :meth:`_wind_down`, :meth:`_read_rest`):
+        the helper bounds and terminates every record it writes, so a record
+        past the bound, an unterminated tail or an overflow means the stream
+        was not read whole, and no reply is taken from it."""
+        if isinstance(item, Oversize):
+            session.oversize(item.limit)
+        elif isinstance(item, Fragment):
+            session.framing_error("stdout ended inside an unterminated record")
+        else:
+            session.framing_error("stdout records arrived faster than they were read")
+
+    @staticmethod
+    def _read_rest(child: DuplexChild, session: ClaudeSdkSession) -> None:
+        """Everything stdout still held after :meth:`DuplexChild.finish`, to its
+        end, each item reduced, before the outcome is read: the helper's
+        ``end`` written as its stdin was closed, what it wrote before a limit
+        killed it, and whatever followed an ``end`` already read. The reducer
+        fails the run on anything after ``end`` (a record, one past the bound,
+        an unterminated tail, an overflow), so a reply is accepted only from a
+        stream read whole. Never waits; nothing is sent."""
+        item = child.read_line(timeout=0)
+        rest: list[Record | Oversize | Fragment | Overflow] = []
+        while not isinstance(item, Eof):
+            if isinstance(item, Timeout):
+                rest += child.unread_at_deadline()
+                break
+            rest.append(item)
+            if isinstance(item, Overflow):
+                break
+            item = child.read_line(timeout=0)
+        for entry in rest:
+            # Fed even once the session is done: a record after ``end`` fails
+            # it, and one after a failure changes nothing.
+            if isinstance(entry, Record):
+                session.feed(entry.data)
+            else:
+                ClaudeSdkProvider._framing(session, entry)
+        if isinstance(item, Eof):
+            session.stream_ended()
+
+    def _result(
+        self,
+        req: AgentRequest,
+        res: DuplexResult,
+        session: ClaudeSdkSession,
+        cut: _SdkCut | None,
+        cut_limit: str,
+        asked: list[str],
+        monitor: LoopMonitor,
+    ) -> AgentExecutionResult:
+        """The invocation's result from the duplex facts and the session's."""
+        stream = session.stream
+        timed_out = cut in (_SdkCut.DEADLINE, _SdkCut.LOOP) or res.timed_out or res.stopped
+        broker = req.interaction
+        ask_failure = asked[0] if asked else None
+        failure = ask_failure or session.failed
+        if failure is None and res.records_overflowed:
+            failure = f"{self.name}: the helper's records arrived faster than they were read"
+        if failure is None and session.outcome == "interrupted":
+            failure = f"{self.name}: the helper ended its turn interrupted"
+        if session.helper_failed and failure is not None and res.exit_code:
+            failure = f"{failure} (exit {res.exit_code})"
+        text = session.text if failure is None else None
+        stdout, truncated = _keep_tail(encodable(text or ""), self.max_text_bytes)
+        interaction: InteractionOutcome | None = None
+        if broker is not None or ask_failure is not None:
+            outcome = broker.outcome() if broker is not None else None
+            failed = ask_failure is not None or (
+                outcome is not None and outcome.lifecycle is Lifecycle.FAILED
+            )
+            interaction = (
+                InteractionOutcome(Lifecycle.FAILED)
+                if failed
+                else (outcome or InteractionOutcome(Lifecycle.COMPLETED))
+            )
+        usage_limit = (stream.limit or stream.api_limit) if timed_out or failure else None
+        summary = session.summary()
+        summary["failure"] = failure or ""
+        result = AgentExecutionResult(
+            command=list(res.command),
+            exit_code=res.exit_code,
+            stdout=stdout,
+            stderr=res.stderr,
+            started_at=res.started_at,
+            finished_at=res.finished_at,
+            timed_out=timed_out,
+            provider=req.profile.provider,
+            model=req.profile.model,
+            effort=req.profile.effort,
+            stdout_truncated=truncated,
+            stderr_truncated=res.stderr_truncated,
+            stdout_tail_offset=0,
+            descendants_killed=res.descendants_killed,
+            group_survived_kill=res.group_survived_kill,
+            capture_abandoned=res.capture_abandoned,
+            orphans_killed=res.orphans_killed,
+            orphan_survived_kill=res.orphan_survived_kill,
+            orphans_unchecked=res.orphans_unchecked,
+            # A timeout wins over whatever the envelope said (ADR 0003 §2.6).
+            provider_failure=None if timed_out else failure,
+            # A model API error the stream typed as transient (#395), never
+            # beside a usage limit (#434) or a failure of the envelope's own.
+            transient_failure=(
+                None
+                if timed_out or failure is None or usage_limit or session.failure
+                else stream.transient
+            ),
+            usage_limit=usage_limit,
+            # #434: what had failed the run before a limit killed the helper,
+            # an ask that failed it first (R2-F1 of PR #489): the ask cut the
+            # run, so a limit that then fell due in the wind-down is the
+            # teardown's, never an idle timeout to relaunch (ADR 0007 D7.6).
+            failed_before_limit=(
+                (
+                    CLAUDE_SDK_ASK_FAILED_BEFORE_LIMIT
+                    if ask_failure is not None
+                    else (session.failure_kind or stream.failure_kind or stream.api_error)
+                )
+                if timed_out
+                else None
+            ),
+            # #479: the helper's own account proves the reply the run's last
+            # word: the completed main turn, the end after it, every record read.
+            reply_delivered=failure is None and session.reply_proven,
+            provider_summary=summary,
+            timeout_limit=(res.timeout_limit or cut_limit) if timed_out else "",
+            last_activity_at=res.last_activity_at,
+            sandbox=res.sandbox,
+            interaction=interaction,
+        )
+        result = _finish_loop(result, monitor, killed=cut is _SdkCut.LOOP)
+        return _name_refused(
+            result, stream.refused, stream.refused_count, self.name, "the Claude Agent SDK"
         )
 
 

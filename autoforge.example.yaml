@@ -465,11 +465,12 @@ profiles:
   # Switching a profile's provider keeps nothing of the old one (no command,
   # option or extra argument), so the block names everything it needs.
   # Their policy validates and `autoforge doctor` checks the installs they
-  # need, read-only, but every launch is refused, before anything starts,
-  # until their helper programs ship (#151, #152); `doctor` and a dry run
-  # say so. Installing the helper environment, Node and the OpenCode runtime
-  # is an operator step AutoForge never performs (docs/configuration.md,
-  # "SDK providers"); the policy is docs/sdk-policy.md.
+  # need, read-only. `claude-sdk` launches (#151; install its environment
+  # from helpers/claude-sdk/requirements.txt). Every `opencode-sdk` launch is
+  # refused, before anything starts, until its bridge ships (#152); `doctor`
+  # and a dry run say so. Installing the helper environment, Node and the
+  # OpenCode runtime is an operator step AutoForge never performs
+  # (docs/configuration.md, "SDK providers"); the policy is docs/sdk-policy.md.
   # sdk-example-start
   # analyze_execute:
   #   provider: claude-sdk

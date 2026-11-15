@@ -187,7 +187,11 @@ class LaunchFacts:
     overrides point into. ``home`` is the operator's home and
     ``controller_env`` the controller's environment, for D4.3.
     ``operator_paths`` are ``sandbox.read_only_paths``, as configured
-    (D15.4): read-only for every launch class.
+    (D15.4): read-only for every launch class. ``provider_state`` are the
+    persistent provider state directories the engine created for an agent
+    launch under the issue's sandbox directory
+    (``AgentProvider.state_directories``, #151): each writable at its host
+    path, an engine carve-out of the masked ``<common>/autoforge``.
     """
 
     launch_class: LaunchClass
@@ -205,6 +209,7 @@ class LaunchFacts:
     denied_roots: tuple[str, ...] = ()
     network: NetworkPosition = NetworkPosition.HOST
     operator_paths: tuple[str, ...] = ()
+    provider_state: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -296,6 +301,13 @@ def sandbox_request(
         )
         if facts.read_context:
             engine(facts.read_context, read_only, "the read context")
+        for state in facts.provider_state:
+            engine(
+                state,
+                writable,
+                "the provider's state directory",
+                carve_out=_inside(state, common),
+            )
     else:
         engine(facts.workspace, writable, "the exported tree", carve_out=False)
     if facts.cache and kind is not LaunchClass.EXPORT_COMMAND:

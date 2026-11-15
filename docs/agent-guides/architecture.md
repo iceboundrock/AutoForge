@@ -57,7 +57,8 @@ AgentProvider
                           in #129; execution over RPC in #131; the resource,
                           tool and credential policy in #132, docs/pi-policy.md)
   -> ClaudeSdkProvider   (ADR 0007: policy, validation and declaration in
-                          #149, docs/sdk-policy.md; launch planned, #151)
+                          #149, docs/sdk-policy.md; the helper, its envelope
+                          in claude_sdk.py and the launch in #151)
   -> OpenCodeSdkProvider (ADR 0007: policy, validation and declaration in
                           #149, docs/sdk-policy.md; launch planned, #152)
 ```
@@ -211,11 +212,15 @@ and what its check cannot see.
 #### SDK providers and interactions (partly implemented, ADR 0007)
 
 #149's policy is implemented: `sdk_policy.py` and the two adapters'
-static surface. The adapters have names, option keys, validation, the launch
-allow-list and the sandbox declaration, and every launch is still refused
-before it starts. #134's interaction contract and broker are implemented
-(`interaction.py`, below); the helpers, the adapters' mapping and `pause`
-are planned. ADR 0007 decides how an SDK provider fits these boundaries:
+static surface (names, option keys, validation, the launch allow-list and
+the sandbox declaration). #134's interaction contract and broker are
+implemented (`interaction.py`, below). #151 implements `claude-sdk`'s
+launch: the helper program `sdk_helpers/claude_helper.py`, its envelope and
+session reducer in `claude_sdk.py`, and `ClaudeSdkProvider.execute`, which
+stages the helper, drives it over the duplex handle and maps each ask
+through the broker. `opencode-sdk`'s launch (#152) and `pause` (#126) are
+planned; every `opencode-sdk` launch is still refused before it starts.
+ADR 0007 decides how an SDK provider fits these boundaries:
 
 - **The policy is data in the provider layer.** `sdk_policy.py` decides
   what a launch may load, which tools it gets and which may ask, its
@@ -232,6 +237,13 @@ are planned. ADR 0007 decides how an SDK provider fits these boundaries:
   sandbox, under the idle timeout and the ceiling.
 - **The helper owns its runtime.** The CLI or `opencode serve` the helper
   starts is its child, in its process group, under one containment owner.
+- **The engine makes the provider's state directories, provider-neutrally.**
+  An adapter names them (`AgentProvider.state_directories`, relative to
+  the issue's sandbox directory); the engine creates them before every
+  launch, in every mode, passes the sandbox directory as
+  `AgentRequest.state_dir`, and under an enforced mode projects each one
+  writable as an engine carve-out (`LaunchFacts.provider_state`). The
+  engine knows nothing of what they hold.
 - **Pinned pairs.** SDK and runtime versions are pinned exactly, and a
   mismatch is a provider failure.
 - **Interactions go through a provider-neutral contract and broker** in
@@ -256,8 +268,11 @@ are planned. ADR 0007 decides how an SDK provider fits these boundaries:
   never corrected or relaunched as transient (D7.6), and nothing is
   persisted. Until #126 lands the broker never pauses: the `pause`
   policy, its pending record, the operator commands and recovery are
-  #126's. Every adapter declares no capability (D5.3), so every ask
-  fails today, whatever the policy. A CLI adapter gets no broker: its CLI
+  #126's. An adapter declares a capability only once its gate passed on
+  its pinned pair (D5.3): `claude-sdk` declares live questions, live
+  permissions and interrupt (ADR 0007 §3's amendment of #151); every other
+  adapter declares none, so its asks fail whatever the policy. A CLI
+  adapter gets no broker: its CLI
   refuses an ask itself and tells the agent to go on. When the CLI's output
   shows that such a refusal is all that failed the run (an OpenCode exit 1
   with no error of its own), the adapter reports `failed` itself, with the
@@ -1272,4 +1287,6 @@ providers gets each section on the right launch. Claude Code's
 `claude_background_work.md` is the one section today: what a pending background
 task does to the CLI, and what to stop before the final reply
 ([control-result-protocol.md](control-result-protocol.md)). The `claude-sdk`
-provider names none, since it cannot launch yet.
+provider names none: its helper reads the session to the query's first
+result and then ends it, so nothing left pending keeps a launch alive (a
+background task is ended with the session).

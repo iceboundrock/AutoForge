@@ -74,7 +74,7 @@ def _opencode(name: str = "review_round_1", **options: str) -> ProfileConfig:
 
 
 # -- the manifest (ADR 0007 D2.2, D4.1, D4.2, D4.4) ------------------------------------
-def test_the_manifest_pins_adr_0007s_pairs_and_ships_no_helper_yet():
+def test_the_manifest_pins_adr_0007s_pairs_and_ships_the_claude_helper():
     pins = load_manifest()
     assert sorted(pins) == sorted(SDK_PROVIDERS)
     claude, opencode = pins["claude-sdk"], pins["opencode-sdk"]
@@ -92,10 +92,12 @@ def test_the_manifest_pins_adr_0007s_pairs_and_ships_no_helper_yet():
     )
     assert opencode.pair() == "@opencode-ai/sdk 1.18.34 with opencode-ai 1.18.34"
     assert (opencode.interpreter, opencode.interpreter_minimum) == ("Node", (24,))
-    # #151 and #152 ship the programs; until then neither is in the package.
-    for pin, issue in ((claude, "#151"), (opencode, "#152")):
-        assert not pin.shipped and pin.implemented_by == issue
-        assert "is not shipped with this AutoForge" in helper_problem(pin)
+    # #151 ships the Claude helper with its digest; #152's bridge is not in
+    # the package yet.
+    assert claude.shipped and claude.implemented_by == "#151"
+    assert helper_problem(claude) == ""
+    assert not opencode.shipped and opencode.implemented_by == "#152"
+    assert "is not shipped with this AutoForge" in helper_problem(opencode)
 
 
 def test_the_manifest_is_read_from_the_package_never_the_source_tree():
@@ -832,7 +834,11 @@ def test_the_plan_names_helper_runtime_policy_and_environment_by_name_only(profi
     assert "GEMINI_API_KEY" not in text  # another provider's credential is withheld
     credential = "ANTHROPIC_API_KEY" if profile.provider == "claude-sdk" else "OPENAI_API_KEY"
     assert f"PATH, HOME, {credential}," in text
-    assert "every launch is refused in this release" in text
+    if profile.provider == "claude-sdk":
+        assert "claude-sdk launch: one helper per launch under the duplex handle" in text
+        assert "refused" not in text
+    else:
+        assert "every launch is refused in this release" in text
     assert f"<issue sandbox dir>/sdk/{profile.provider}/" in text
     if profile.provider == "opencode-sdk":
         assert f"{SERVER} serve --hostname=127.0.0.1 --port=0" in text
@@ -859,7 +865,7 @@ def test_a_dry_run_of_an_sdk_profile_renders_its_plan_and_launches_nothing(
     assert plan.prompt_full and plan.prompt_full not in " ".join(plan.command)
     notes = "\n".join(plan.notes)
     assert "claude-sdk helper: autoforge-claude-helper (protocol 1" in notes
-    assert "claude-sdk launch: every launch is refused in this release" in notes
+    assert "claude-sdk launch: one helper per launch under the duplex handle" in notes
     assert eng.provider.calls == [] and fake_github.effect_writes == []
     assert not eng.paths.state_file.exists()
     assert not [name for name in sys.modules if name.startswith("claude_agent_sdk")]

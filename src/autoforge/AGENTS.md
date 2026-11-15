@@ -31,6 +31,11 @@ pi_rpc.py           Pi RPC wire protocol: JSONL codec, request ids, event reduce
                     outcome classification; provider layer, no flags and no processes (#131)
 claude_stream.py    Claude stream-json reducer: result text, failure, summary, progress
                     events; provider layer, no flags and no processes (#192)
+claude_sdk.py       the Claude SDK helper's envelope (autoforge-claude-helper, protocol 1):
+                    record codec, session reducer (the pair from hello, the init and
+                    session checks, the completed main turn's result), asks and their
+                    questions and answers; reuses claude_stream.py for the messages;
+                    provider layer, no flags and no processes (#151)
 sdk_policy.py       SDK providers' unattended policy: tools, permissions, setting sources,
                     roots, credentials, environment, interaction-data bounds; provider
                     layer, pure: no process, file, SDK import or os.environ change (#149)
@@ -289,7 +294,10 @@ prompts/            file-based templates ({{VAR}}): common.md (trust boundary), 
   a safety gate as an incidental part of another change.
 - Keep the boundaries: no CLI flags outside `providers.py`, and no
   provider wire-protocol names outside the provider layer (`providers.py`
-  plus the protocol modules it owns, `pi_rpc.py` and `claude_stream.py`);
+  plus the protocol modules it owns, `pi_rpc.py`, `claude_stream.py` and
+  `claude_sdk.py`); no import of an SDK (`claude_agent_sdk`) anywhere in
+  the package, and no import of `sdk_helpers/`, whose helper programs are
+  separate executables (ADR 0007 D2.1, D2.2);
   no workflow semantics or JSON in `executor.py` or `executor_duplex.py`,
   and none in `sandbox.py`, `sandbox_bwrap.py`, `sandbox_backend.py` or
   `sandbox_lifecycle.py` either; no `bwrap` flag outside `sandbox_bwrap.py`,
@@ -365,8 +373,8 @@ prompts/__init__.py                               -> docs/agent-guides/architect
                                                      docs/pi-policy.md for Pi)
 interaction.py, cli.py (TerminalResolver),
 claude_sdk.py, opencode_sdk.py (planned),
-sdk_helpers/ (the manifest; the helper programs
-planned)                                          -> docs/agent-guides/architecture.md
+sdk_helpers/ (the manifest, claude_helper.py; the
+OpenCode bridge planned)                          -> docs/agent-guides/architecture.md
                                                      + docs/adr/0007-sdk-providers-isolated-
                                                      helpers-and-interaction-contract.md
 sdk_policy.py, sdk_assets.py, providers.py

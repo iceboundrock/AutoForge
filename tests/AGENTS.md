@@ -15,7 +15,7 @@ read it before adding tests for a listed area.
   use real local Python subprocesses only. One exception is an opt-in
   probe, skipped unless its variable names an installed runtime
   (`AUTOFORGE_PI_E2E_BIN`, `AUTOFORGE_CLAUDE_SDK_PROBE_CLI`,
-  `AUTOFORGE_OPENCODE_SDK_PROBE_SERVER`). Such a probe uses a temporary home
+  `AUTOFORGE_CLAUDE_SDK_PROBE_PYTHON`, `AUTOFORGE_OPENCODE_SDK_PROBE_SERVER`). Such a probe uses a temporary home
   and synthetic credentials, and calls no model: the Claude probe answers
   from a loopback stand-in. The other is the live Pi smoke test
   (`tests/test_live_pi.py`, #135), whose one test (a REMOTE REVIEW, one
@@ -144,6 +144,13 @@ read it before adding tests for a listed area.
   `~/.bashrc` or `~/.zshrc` (or a login shell without one),
   `CLAUDE_ENV_FILE` and `CLAUDE_CODE_SHELL_PREFIX`, with the real bash and
   zsh.
+- `tests/claude_sdk_fake.py` holds a fake `claude_agent_sdk` (#151),
+  installed into a throwaway virtual environment by `make_environment`, in
+  which the real Claude SDK helper runs unchanged: a session's prompt is
+  its script (messages, tool calls through the helper's `PreToolUse` hook
+  and permission host, sleeps, a detached process, an exception, a flood),
+  and what it was given and what its callbacks answered is logged in the
+  working directory (`log`).
 - `tests/credential_fake.py` holds a fake `claude`, `opencode` and `pi`
   for the container credential mapping (#290): standalone scripts, run by
   the `#!` line with no shell in between, that find their model credential
@@ -447,6 +454,9 @@ live Pi smoke test (#135)             test_live_pi.py (opt-in: -m live, AUTOFORG
                                       credential scan, the checks, the flow rehearsed on the
                                       fake pi)
 Claude stream-json reducer            test_claude_stream.py (adapter on the fake: test_providers.py)
+Claude SDK transport (#151): the      test_claude_sdk.py (the real helper on the fake SDK of
+envelope, helper and adapter          claude_sdk_fake.py); test_claude_sdk_probe.py (opt-in
+                                      gate probes of an installed pinned pair)
 SDK policy (#149): options, tools,    test_sdk_policy.py (opt-in probes of an installed Claude
 roots, credentials, environment,      Code CLI or OpenCode runtime against sentinel
 interaction data, the adapters        configuration, each with a control run)

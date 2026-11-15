@@ -63,7 +63,7 @@ where = ["src"]
 # neither listed here nor named as not shipped, and when code reads a new
 # file relative to the package.
 [tool.setuptools.package-data]
-"autoforge" = ["sdk_helpers/manifest.json"]
+"autoforge" = ["sdk_helpers/manifest.json", "sdk_helpers/claude_helper.py"]
 "autoforge.prompts" = ["*.md"]
 
 [dependency-groups]

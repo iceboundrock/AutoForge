@@ -51,7 +51,7 @@ test-fast:
 # backend is listed. Not part of `check`: whether a host can enforce is the
 # host's (docs/development.md, "The outer sandbox").
 SANDBOX_TESTS = tests/test_sandbox_bwrap.py tests/test_sandbox_routing.py \
-	tests/test_sandbox_parity.py
+	tests/test_sandbox_parity.py tests/test_claude_sdk_probe.py
 test-sandbox:
 	AUTOFORGE_REQUIRE_SANDBOX_BACKEND=1 uv run pytest -rs $(SANDBOX_TESTS)
 

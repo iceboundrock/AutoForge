@@ -268,8 +268,9 @@ credential:
    the way the engine does, each phase template with its common template;
    reads the SDK helper manifest from the installed package and renders
    each SDK provider's helper argv and plan without any SDK imported
-   (#150; the helper programs themselves, and the checks of their lock or
-   bundle, are #151's and #152's);
+   (#150; the Claude helper ships since #151, and its digest, lock and
+   imports are checked by `tests/test_claude_sdk.py`; the OpenCode bridge
+   is #152's);
 6. runs a REMOTE dry run (`autoforge run --epic ... --issue ...
    --dry-run --full-prompt`) in a scratch repository whose `origin` is the
    issues' repository, with a fake `gh` first on `PATH` that records every

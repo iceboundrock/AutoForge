@@ -12,7 +12,12 @@
   #150 (EPIC #147's opt-in profiles) adds the packaged manifest of D2.2
   without a helper program, the read-only `doctor` rows of D2.6 and a dry
   run's plan of the helper argv, with a dated amendment of D2.2 below.
-  The rest is not implemented yet.
+  #151 implements the Claude helper, its envelope and its adapter (D1.1,
+  D2.1-D2.4, D3.2, D3.3, D4.1, D4.5, D9.1, D10.3, D10.4 for Claude), runs
+  the Claude gates of §3 on the pinned pair and declares the capabilities
+  that passed (D5.3), with dated amendments of §3 and §5 below.
+  `opencode-sdk` (#152), the pause and the continuation (#126, D9.2-D9.4's
+  deferral) are not implemented yet.
   It is implemented by #134 (the provider-neutral
   interaction contract and its broker), #126 (the one state bump, `pause`
   and continuation in the engine, the operator commands, crash recovery
@@ -1107,6 +1112,16 @@ a continuation (D8.4). The deferred tool did not run.
 - The ask itself is denied, or rejected. That keeps the action from
   running only under D10.4's conditions.
 
+*Amendment (2026-11-15, #151):* a failed ask ends the run, and the adapter
+then winds the helper down within the limit it had (D3.3). If a limit
+kills the helper during that wind-down (an interrupt or a disconnect that
+hangs), the launch is a timeout to every reader, as ADR 0003 §2.6 has it,
+and the engine raises `ExecutionTimeoutError`, not
+`InteractionRequiredError`. The failure is not lost. The adapter keeps it as
+`failed_before_limit` (`claude-sdk: an ask for a decision had failed the
+run`), and the recovery rule refuses it as `failed-before-limit` (ADR 0012
+D11), so the step is still never relaunched.
+
 **D7.7 (#134).** **Ctrl-C and a denial with guidance are neither of them a
 deferral.**
 
@@ -1563,6 +1578,47 @@ in an adapter only after its gate passes on the pinned pair (D5.3).
 - A gate that fails turns its row into *unsupported* by amendment. The
   implementing child comments on #148 and on the affected issue (D4.6).
 
+*Amendment (2026-11-15, #151): the Claude gates on the pinned pair.* Each
+probe is a scripted launch through the real `ClaudeSdkProvider` and the
+real helper, on `claude-agent-sdk` 0.2.163 with its bundled Claude Code
+2.1.286 (installed from `helpers/claude-sdk/`'s lock on CPython 3.12),
+against a loopback stand-in for the Messages API, with a temporary `HOME`
+and root and a synthetic key, so no model was called. The probes are
+`tests/test_claude_sdk_probe.py`, opt-in through
+`AUTOFORGE_CLAUDE_SDK_PROBE_PYTHON`; the G-C1, G-C4, G-C5 and G-C9 rows also
+ran under `sandbox.mode: required`'s backend (`bwrap` 0.12.0, a REMOTE
+agent's facts, the root an engine carve-out).
+
+| Gate | Result |
+|---|---|
+| G-C1 | **passed.** `system/init` and the `ResultMessage` report the caller's UUID, and the only transcript is `projects/<cwd>/<uuid>.jsonl` under the root. |
+| G-C2 | observed, not separately gated: `system/init` arrives after `query()`. The reducer holds it to that: an assistant or user message, an ask or the result before a `system/init` that checked out fails the invocation. A refused prompt was not probed; any result that is not a completed turn fails the invocation. |
+| G-C3 | **passed**, for one and for two questions, `multiSelect` with two labels, and an answer outside the options. The hook's `allow` with the original `questions` and an `answers` object (each question's text mapped to its labels joined by `", "`) reaches the model as `Your questions have been answered: "<question>"="<labels>"`; an answer outside the options as `The user answered: ...`. A bare `allow` without `answers` falls through to the permission host, which denies it. A question whose input Claude Code's own schema refuses (one with a single option) never reaches the hook. |
+| G-C4 | **passed**: `allow` runs the call once; `allow` with `updatedInput` runs that input; `deny` with a reason reaches the model as `PreToolUse:<tool> hook error: <reason>`; two calls in one turn are asked about, and approved, one at a time. |
+| G-C5 | **passed**: a limit during a running `Bash` call interrupts it; the turn ends with an `error_during_execution` result, `terminal_reason: aborted_tools`, under a second after the interrupt, and the helper ends `interrupted`. |
+| G-C6, G-C7 | not run: the pause and the continuation are #126's. |
+| G-C8 | not run: `Agent` and `Task` stay disallowed, and a subagent's message fails the invocation. |
+| G-C9 | **passed** after a normal end and after a limit: no process of the launch, the interrupted `Bash` call's included, outlives it. Not probed on the pair for a loop stop, Ctrl-C or a helper crash, which the duplex teardown covers as for every provider; `tests/test_claude_sdk.py` runs Ctrl-C and a helper failure on a fake SDK. |
+| G-C10 | **passed**: a hook whose `HookMatcher.timeout` is the per-wait limit plus 30 s is not timed out by a wait inside it; one past its timeout is reported to the model as not answered, and its call does not run. |
+
+`claude-sdk` therefore declares `live_questions` (an answer of the
+operator's own words included), `live_permissions` (once, a modified
+input, a denial with guidance) and `interrupt`; session approval stays
+unsupported (D9.2's hook, #149's policy), and `durable_replay` and
+`continuation_recovery` stay false. Three other facts of the pair, from
+the same runs: `terminal_reason` is `completed` and `stop_reason`
+`end_turn` on a completed turn, which the adapter requires; the locked
+environment makes `opentelemetry` importable (D2.1), and the helper starts
+no span, so the SDK adds no trace context; and under the sandbox the
+helper environment's interpreter must be started by its own path inside
+the environment, never the base interpreter it resolves to, since CPython
+finds the environment's `pyvenv.cfg` beside the path it was started by
+(the adapter declares that path and the environment's prefix, D2.3).
+The SDK's Claude Code takes the same shell snapshot as the CLI provider's,
+so a function or alias of `~/.bashrc` reached a Bash tool command in a
+control run; with #165's cleaner, which the adapter sets as for the CLI
+provider, neither did (docs/sdk-policy.md §2).
+
 ## 4. Ownership and dependency plan
 
 ```text
@@ -1653,6 +1709,29 @@ only duplication. Every payload differs:
 A common envelope would be a generic transport (D5.4) shaped by two
 providers. It is reconsidered only when a third helper repeats the same
 payloads.
+
+*Amendment (2026-11-15, #151): `autoforge-claude-helper` protocol 1 as
+implemented.* `src/autoforge/claude_sdk.py` names every field, and the
+helper is `src/autoforge/sdk_helpers/claude_helper.py`. Against the table
+above:
+
+- `start` also carries `max_record_bytes`, the bound of every record the
+  helper writes. Its `mode` is `new` only and it has no `continuation`, and
+  `interactions.defer` is `false`: the continuation and the deferral are
+  #126's. The policy's flat fields add `verbatim_prompts: true`.
+- `message.data` carries no assistant or thinking text, no tool result
+  content (its digest instead) and no raw usage object: only the final
+  result's `result` crosses as text (D10.3).
+- `ask.input` is `null` when the call's input does not fit one record; the
+  adapter then fails the ask.
+- `decision.directive` is `allow`, `deny` or `fail`; `pause` comes with
+  #126. An answer is an `allow` whose `updated_input` holds the original
+  questions and the answers.
+- `end` also carries `asks`, `hook_denials` and `host_denials`.
+
+D9.1's UUID is generated by the adapter, per launch, until #126 persists
+it in its launch checkpoint; nothing is persisted before then, so no
+continuation exists.
 
 ## 6. Composition with other decisions
 

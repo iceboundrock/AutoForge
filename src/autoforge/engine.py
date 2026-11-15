@@ -487,7 +487,13 @@ from .prompts import (
     render,
     render_phase,
 )
-from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry, provider_for
+from .providers import (
+    AgentExecutionResult,
+    AgentProvider,
+    AgentRequest,
+    ProviderRegistry,
+    provider_for,
+)
 from .read_context import (
     MAX_LISTED_ISSUES,
     OperatorEvidence,
@@ -3282,7 +3288,12 @@ class ControllerEngine:
 
     # -- the outer sandbox's facts (ADR 0005 D13.2, #168) ---------------------
     def _agent_sandbox(
-        self, phase: Phase, cwd: str, overrides: Mapping[str, str], read_context: str
+        self,
+        phase: Phase,
+        cwd: str,
+        overrides: Mapping[str, str],
+        read_context: str,
+        provider_state: tuple[str, ...] = (),
     ) -> LaunchFacts | None:
         """The engine's facts for one agent launch; ``None`` when it is not enforced.
 
@@ -3290,12 +3301,39 @@ class ControllerEngine:
         filesystem boundary, at the first enforced launch that needs them. A
         directory that cannot be prepared refuses the launch. The facts reach
         the provider in a :class:`SandboxPlan` bound to the launch's
-        lifecycle (:meth:`_through_lifecycle`).
+        lifecycle (:meth:`_through_lifecycle`). ``provider_state`` are the
+        provider's state directories :meth:`_provider_state` made, each an
+        engine carve-out (#151).
         """
         if not self._sandbox_enforced():
             return None
         change = phase in WORKTREE_STATE_PHASES
-        return self._remote_facts(cwd, overrides, read_context, cache=change)
+        facts = self._remote_facts(cwd, overrides, read_context, cache=change)
+        return replace(facts, provider_state=provider_state)
+
+    def _provider_state(self, provider: AgentProvider, profile: ProfileConfig) -> tuple[str, ...]:
+        """The issue's sandbox directory and the provider's state directories in it.
+
+        Created for every launch whose provider names any
+        (:meth:`AgentProvider.state_directories`, #151), in every sandbox mode,
+        through the same boundary and lock as the sandbox directories
+        (:meth:`_sandbox_dirs`), which AutoForge never deletes: an SDK
+        provider's configuration and session root is per issue, persistent,
+        and never inside a working tree (docs/sdk-policy.md §6). A directory
+        that cannot be prepared refuses the launch. ``()`` when it names none:
+        nothing is created.
+        """
+        names = provider.state_directories(profile)
+        if not names:
+            return ()
+        common = self.workspace().git_dirs()[-1]
+        base = self._sandbox_dirs(
+            common,
+            f"{SANDBOX_DIR}/{self._agent_worktree_name()}",
+            names,
+            git_lock=self._shared_git_lock,
+        )
+        return (str(base), *(str(base / name) for name in names))
 
     def _command_sandbox(
         self, launch_class: LaunchClass, cwd: str, overrides: Mapping[str, str], network: str
@@ -16957,11 +16995,18 @@ class ControllerEngine:
             try:
                 with isolated_overrides(identity) as overrides:
                     req.env = overrides
+                    # The provider's persistent state directories (#151), made
+                    # before the launch in every mode, a refusal recorded as
+                    # the sandbox directories' is; nothing for a CLI provider.
+                    provider_state = self._provider_state(provider, profile)
+                    req.state_dir = provider_state[0] if provider_state else ""
                     # ADR 0005: under `sandbox.mode: required` every process
                     # of the launch runs inside the outer sandbox, or is
                     # refused here or at the spawn; it never runs without it.
                     result = self._through_lifecycle(
-                        self._agent_sandbox(phase, cwd, overrides, read_context),
+                        self._agent_sandbox(
+                            phase, cwd, overrides, read_context, provider_state[1:]
+                        ),
                         phase,
                         req,
                         partial(self._launch, provider, req, limits, step_log, phase),

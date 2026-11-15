@@ -1,11 +1,16 @@
 # SDK providers: unattended resource, tool, permission, root and authentication policy
 
-- **Status:** the policy is implemented by #149 (EPIC #158). The providers
-  it governs, `claude-sdk` and `opencode-sdk`, are configurable and
-  validated, but they **cannot launch yet**: their helpers and transports
-  belong to #151 (Claude) and #152 (OpenCode). Until those land, every
-  launch is refused before anything starts, and `doctor` says so. The
-  policy implements [ADR 0007](adr/0007-sdk-providers-isolated-helpers-and-interaction-contract.md)
+- **Status:** the policy is implemented by #149 (EPIC #158). It governs
+  two providers, `claude-sdk` and `opencode-sdk`, both configurable and
+  validated:
+  - **`claude-sdk` launches** (#151): its helper program, envelope and
+    adapter apply this policy at every launch, and the engine creates and
+    projects its root (§6).
+  - **`opencode-sdk` cannot launch yet**: its bridge and transport are
+    #152's. Until they land, every launch is refused before anything
+    starts, and `doctor` says so.
+
+  The policy implements [ADR 0007](adr/0007-sdk-providers-isolated-helpers-and-interaction-contract.md)
   D2.7, D10.1 and D10.2.
 - **Where:**
   - `src/autoforge/sdk_policy.py` holds the policy: tables, builders,
@@ -27,6 +32,12 @@
     model access and interactions ([Configuration](configuration.md#what-doctor-checks)).
   - `src/autoforge/redaction.py` holds the new credential names.
 - **Evidence base.** Each decision below has one of these statuses:
+  - **verified on the pinned pair**: observed by #151's gate probes, which
+    run the real adapter and helper on `claude-agent-sdk` 0.2.163 with its
+    bundled Claude Code 2.1.286, against a loopback stand-in for the
+    Messages API, with a temporary `HOME` and root and a synthetic key, once
+    without a sandbox and once under `bwrap`
+    (`tests/test_claude_sdk_probe.py`).
   - **verified on CLI 2.1.304**: observed by running the Claude Code CLI
     2.1.304 installed on the authoring machine. This is *not* the pinned
     2.1.286 that `claude-agent-sdk` 0.2.163 bundles (ADR 0007 D2.4). Each
@@ -104,17 +115,23 @@ The helper receives the policy as flat fields in its `start` record
 | project and user skills, agents and commands (`.claude/skills`, `.claude/agents`, `$CLAUDE_CONFIG_DIR/...`) | **disable** | no settings source | verified on CLI 2.1.304: no sentinel skill or agent was listed |
 | `CLAUDE.md` and `AGENTS.md` auto-discovery: project, parent, nested, and user `$CLAUDE_CONFIG_DIR/CLAUDE.md` | **disable** (see §4 for repository instructions) | no settings source | verified on CLI 2.1.304: no sentinel string reached a model request. The control run sent the project, parent and user files. |
 | auto memory | **disable** | `settings` = `{"autoMemoryEnabled": false, ...}` | verified on CLI 2.1.304: `init.memory_paths` is gone |
-| hooks | **only the helper's own** | `hooks` = the helper's `PreToolUse` callback (D9.2). No hook from any settings file. | verified on CLI 2.1.304 (settings hooks). The callback itself is #151's gate. |
+| hooks | **only the helper's own** | `hooks` = the helper's `PreToolUse` callback (D9.2). No hook from any settings file. | verified on CLI 2.1.304 (settings hooks); the callback verified on the pinned pair (it sees every call, and its decisions reach the model as §3 says) |
 | managed (administrator) settings and managed `CLAUDE.md` | **inherit (unsupported to disable)** | no SDK option turns them off | source/docs only. They are the administrator's, outside any repository, and are recorded as a limit (§4). |
-| startup scripts (`CLAUDE_ENV_FILE`, a shell's startup files) | **disable** | the helper's environment carries no `CLAUDE_ENV_FILE` (§5). The Bash tool's shell isolation is #151's, as for the CLI provider (#165). | gate (#151) |
+| startup scripts (`CLAUDE_ENV_FILE`, a shell's startup files) | **disable** | the operator's `CLAUDE_ENV_FILE` never reaches the helper (§5). Every launch sets #165's own instead, as for the CLI provider: a per-launch `CLAUDE_ENV_FILE` holding the shell cleaner, `CLAUDE_CODE_SHELL` and an empty `CLAUDE_CODE_SHELL_PREFIX`, the file projected read-only. A launch is refused while the root's `settings.json` or `.claude.json` has an `env` that would set a variable over them (the root persists, and its agent can write it). | verified on the pinned pair: no function or alias of `~/.bashrc` reached a Bash tool command; a control run without the cleaner saw both (the shell snapshot) |
+| the prompt's own text (`@path` mentions, slash commands) | **delivered as written** | `verbatim_prompts=True`: the rendered phase prompt is task data, so no `@path` is expanded and no slash command is dispatched (Claude Code 2.1.248 or later) | source/docs only; the pinned pair delivers the prompt (gate probes) |
 | auto-update, telemetry, error reporting | **disable** | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` | source/docs only |
 | `extra_args`, a settings path, `add_dirs`, `agents`, `system_prompt.append` | **unsupported** | not fields of the policy; the helper sets none | — |
 
 **The `system/init` check.** The pinned pair is fixed (D4.1), so a
 difference is a provider failure, never something to adapt to.
 `ClaudeSdkPolicy.init_problems` names each departure; it names fields, never
-values. It is #151's to run on the first `init` record, failing the
-invocation on any problem. It flags:
+values. The adapter runs it on every `init` record and fails the
+invocation on any problem (#151, `src/autoforge/claude_sdk.py`). Every
+`init` and the result must also report the session id AutoForge gave the
+session. Nothing of the turn is read before an `init` has passed these
+checks: an assistant or user message, an ask or the result that comes
+first fails the invocation, and that ask is never put to the operator. A
+session that sends no `init`, or sends it late, is never a reply. It flags:
 
 - a tool offered that the policy does not list, or a listed tool missing;
 - an MCP server;
@@ -212,7 +229,8 @@ and nothing else.
 
 - **No fallback.** `claude_sdk_auth_problems` refuses a launch without the
   key, or one that would carry a refused route. Its messages name
-  variables, never values. It is #151's to run before the helper starts.
+  variables, never values. The adapter runs it at the preflight, before a
+  launch is charged, and again before the helper starts (#151).
 - **The key's source is checked.** `init.apiKeySource` must be
   `ANTHROPIC_API_KEY`. Status: verified on CLI 2.1.304, which reports
   `"ANTHROPIC_API_KEY"` with a key and `"none"` without one.
@@ -259,10 +277,18 @@ Further rules:
   session under the recorded id (D2.7, D9.3).
 - **Sandbox projection.** Under the sandbox, each root is an engine
   carve-out projected on its own, writable (ADR 0005 C5). The OpenCode
-  empty directory is projected read-only. Creating the roots and
-  projecting them is #151's and #152's engine wiring. `claude-sdk`'s
-  declaration already lists `CLAUDE_CONFIG_DIR` as a `dir-rw` item, and
-  refuses one inside `~/.claude` (ADR 0005 D7.2).
+  empty directory is projected read-only.
+- **Creation and projection (#151).** An adapter names its state
+  directories relative to the issue's sandbox directory
+  (`AgentProvider.state_directories`; `claude-sdk`: `sdk/claude-sdk/config`).
+  The engine creates them before every launch, in every sandbox mode,
+  through the same boundary and lock as the sandbox directories, and hands
+  the sandbox directory to the adapter (`AgentRequest.state_dir`). Under an
+  enforced mode it projects each one writable as an engine carve-out
+  (`LaunchFacts.provider_state`), and the adapter's own `dir-rw` item for
+  the same directory is dropped. `claude-sdk`'s declaration still refuses
+  a `CLAUDE_CONFIG_DIR` inside `~/.claude` (ADR 0005 D7.2). OpenCode's
+  roots are #152's.
 
 ## 7. OpenCode: what a launch loads
 
@@ -369,7 +395,8 @@ field and the rule, never the value.
 
 - **Refused, never clipped.** These values decide what a tool may do or
   what the agent is told:
-  - a tool input (canonical JSON, at most 64 KiB, `input_digest`);
+  - a tool input (canonical JSON, at most 64 KiB and 32 levels of nested
+    objects and arrays, `input_digest`);
   - a question's option and an answer (`exact_text`: at most 200 and 2000
     characters);
   - a modified input (`exact_input`).
@@ -378,7 +405,19 @@ field and the rule, never the value.
   these is refused when it is past its bound, carries a control, format or
   separator character other than a newline or a tab (an escape sequence
   starts with one, and a carriage return, bare or in a CRLF pair, redraws
-  the line it is shown on), or would be changed by redaction.
+  the line it is shown on), or would be changed by redaction. The nesting
+  is counted first, without recursion (`refuse_deep_nesting`): every later
+  check walks the input recursively, so an input nested past what the
+  interpreter's stack holds is refused like any other, never an error.
+
+  For `claude-sdk`, a permission ask's own input is checked when the ask
+  arrives, before any request is minted (`claude_sdk.ClaudeSdkSession`,
+  with `exact_input`). The whole input is checked, every key and every
+  field that is not shown included, because an approval covers all of it.
+  An input that fails the check is never put to anyone: the call is denied
+  and the launch fails as D7.6's failure. A question's input is held to the
+  question rules below instead: its options are exact text, and its text,
+  header and descriptions are only shown.
 - **Bound by digest.** A decision is bound to the SHA-256 of the input's
   canonical JSON (sorted keys, no spaces, UTF-8, no NaN; D9.3). A value
   that has none, such as a lone surrogate (legal as a JSON escape, not in
@@ -388,6 +427,20 @@ field and the rule, never the value.
   snapshot is what is validated and what an adapter sends
   (`Allow.input_to_send()`), so changing the caller's object afterwards
   changes nothing.
+- **Checked against the tool's schema.** For `claude-sdk`, every modified
+  input is checked before the approval is sent, an empty one included
+  (`claude_sdk.modified_input_problem`). Each required field must be
+  present, and every field must be of the kind the tool takes: a non-empty
+  string, a string, a whole number, a flag, a list of names, or one of an
+  enum's values. The Bash `timeout` must be from 1 to 600000 ms. The schema
+  is AutoForge's own record of Claude Code's published tool inputs
+  (`claude_sdk.TOOL_INPUT_SCHEMAS`), not read from the pinned runtime. So a field
+  it does not name passes only with exactly the value the call itself
+  carried, and the operator cannot add one that goes unchecked. A modified
+  input that fails the check is never sent: the call is denied and the
+  launch fails as D7.6's failure. Status: source/docs only. The probes ran
+  a modified Bash `command` (G-C4); the other tools' schemas were not
+  probed.
 - **Shown apart from the identity.** An option keeps its raw label (the
   identity a reply carries) apart from what is shown (`question_options`).
   Two labels shown alike are refused, because a person could not tell them
@@ -420,19 +473,39 @@ field and the rule, never the value.
 
 ## Residual risks and follow-ups
 
-- **Neither runtime that was run is the pinned one.** The probes ran Claude
-  Code CLI 2.1.304 (pinned: 2.1.286) and OpenCode runtime 2.0.32 (pinned:
-  1.18.34). #151's and #152's gates re-run them on the pinned pairs, and
-  the `init` check fails closed on any difference.
+- **#149's sentinel probes did not run the pinned runtimes.** They ran
+  Claude Code CLI 2.1.304 (pinned: 2.1.286) and OpenCode runtime 2.0.32
+  (pinned: 1.18.34). #151's gate probes ran the pinned Claude pair through
+  the real adapter and helper (ADR 0007 §3's amendment), and on it the
+  `init` record matched the policy; the sentinel probes themselves were not
+  re-run on 2.1.286. #152's gates cover OpenCode. The `init` check fails
+  closed on any difference.
 - **Built-in plugins, skills and agents** are listed by the CLI whatever
   the setting sources. They cannot be invoked, but the `cc-plugin-agents-md`
   built-in's behaviour under the SDK is part of G-C gating.
 - **Managed settings** apply and cannot be disabled (§4).
-- **Not wired yet:** the engine does not yet create the roots, project them
-  in the sandbox, start a helper or run the auth and `init` checks. That
-  is #151's and #152's work, and every launch is refused until then.
+- **OpenCode is not wired yet:** its roots, server and checks are #152's,
+  and every `opencode-sdk` launch is refused until then.
+- **A hook timeout that happens anyway.** The CLI times a `PreToolUse` hook
+  out after `max_wait_seconds` plus a margin (ADR 0007 D7.3), and the
+  broker answers before that. Should the controller stall past it, the
+  pinned CLI reports the call as not run and the agent goes on; the adapter
+  does not see that the hook timed out.
 
 ## Tests
+
+`tests/test_claude_sdk.py` covers #151's transport without the SDK: the
+envelope reducer from synthetic records, the real helper as a child on a
+fake `claude_agent_sdk` (`tests/claude_sdk_fake.py`), through the real
+adapter, and the structural rules (no SDK import in the controller, the
+helper's imports and Python floor, the manifest's digest, the lock).
+`tests/test_claude_sdk_probe.py` holds the opt-in gate probes on an
+installed pinned pair:
+
+```sh
+AUTOFORGE_CLAUDE_SDK_PROBE_PYTHON=/path/to/claude-sdk-env/bin/python \
+    uv run pytest tests/test_claude_sdk_probe.py
+```
 
 `tests/test_sdk_policy.py` covers:
 

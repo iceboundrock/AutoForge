@@ -87,6 +87,7 @@ from .sdk_policy import (
     exact_input,
     exact_text,
     question_options,
+    refuse_deep_nesting,
     shown,
 )
 
@@ -410,6 +411,8 @@ class Allow:
         if self.updated_input is not None:
             if not isinstance(self.updated_input, Mapping):
                 raise InteractionDataError("a modified input is not an object")
+            # Bounded before the snapshot, which is taken recursively (R4-F2).
+            refuse_deep_nesting(self.updated_input, "a modified input")
             snapshot = json.loads(canonical_json(_thawed(self.updated_input)))
             exact_input(snapshot, "a modified input")
             object.__setattr__(self, "updated_input", _frozen(snapshot))
