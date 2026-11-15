@@ -22,10 +22,13 @@ import ast
 import hashlib
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -721,6 +724,37 @@ def launch_env(monkeypatch):
     monkeypatch.setenv("FAKE_SECRET_TOKEN", "t" * 30)
 
 
+@pytest.fixture
+def staged(monkeypatch) -> list[tuple[Path, bool]]:
+    """Each helper copy this test's launches staged, in order, with whether it
+    was a file when the launch was handed it. The real staging runs unchanged
+    and still removes its directory; this only records the path it yields,
+    so a cleanup check reads this test's own directory and never a scan of
+    the shared temporary directory, where a concurrent worker's launch
+    stages its own (R5-F1 of PR #489)."""
+    import autoforge.providers as providers
+
+    original = providers._staged_helper
+    seen: list[tuple[Path, bool]] = []
+
+    @contextmanager
+    def recording(pin):
+        with original(pin) as helper:
+            seen.append((Path(helper), Path(helper).is_file()))
+            yield helper
+
+    monkeypatch.setattr(providers, "_staged_helper", recording)
+    return seen
+
+
+def _removed(staged: list[tuple[Path, bool]]) -> None:
+    """One helper copy was staged, in a directory of its own, and is gone."""
+    assert len(staged) == 1, staged
+    helper, was_file = staged[0]
+    assert was_file and helper.parent.name.startswith("autoforge-claude-sdk-"), staged
+    assert not helper.parent.exists(), helper.parent
+
+
 class Scripted:
     """A resolver: the next scripted decision (or a callable of the request)."""
 
@@ -782,7 +816,7 @@ def _run(tmp_path, command, prompt, options=None, resolver=None, **kw):
     return result, req, time.monotonic() - started
 
 
-def test_a_completed_session_through_the_real_helper(tmp_path, sdk_python, launch_env):
+def test_a_completed_session_through_the_real_helper(tmp_path, sdk_python, launch_env, staged):
     prompt = fake.script(
         steps=[
             {"message": {"kind": "assistant", "content": [{"type": "text", "text": FINAL}]}},
@@ -822,6 +856,7 @@ def test_a_completed_session_through_the_real_helper(tmp_path, sdk_python, launc
     assert env["OPENAI_API_KEY"] is None and env["FAKE_SECRET_TOKEN"] is None
     assert entries[1] == {"hook": "Bash", "tool_use_id": "toolu_1", "output": {}}
     # The staged copy is gone, and stray output went to stderr, not the wire.
+    _removed(staged)
     assert "stray output" in result.stderr
 
 
@@ -1533,17 +1568,32 @@ def test_an_ask_that_failed_the_run_survives_a_limit_in_the_wind_down(
     assert hooks[-1]["output"]["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
-def test_ctrl_c_during_a_wait_tears_the_helper_down(tmp_path, sdk_python, launch_env):
+def test_ctrl_c_during_a_wait_tears_the_helper_down(tmp_path, sdk_python, launch_env, staged):
+    # R5-F1 of PR #489: the cleanup check compared two scans of /tmp and
+    # failed on xdist workers whenever another worker's launch staged its
+    # helper between them. It now reads this launch's own directory, and the
+    # race is played here on every run: while this launch waits, a stand-in
+    # for a concurrent launch stages a directory under the same prefix in the
+    # same temporary directory, and still holds it when this one is torn down.
+    others: list[Path] = []
+
     def interrupt(request, deadline):
+        others.append(Path(tempfile.mkdtemp(prefix="autoforge-claude-sdk-")))
         raise KeyboardInterrupt
 
     marker = f"sleep 302.{os.getpid()}"
     prompt = fake.script(steps=[{"spawn": ["sh", "-c", marker]}, _bash()])
     adapter, req = _request(tmp_path, sdk_python, prompt, PROMPT, Scripted(interrupt))
-    before = set(Path("/tmp").glob("autoforge-claude-sdk-*"))
-    with pytest.raises(KeyboardInterrupt):
-        adapter.execute(req)
-    assert set(Path("/tmp").glob("autoforge-claude-sdk-*")) <= before
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            adapter.execute(req)
+        _removed(staged)
+        # The teardown removed its own directory alone: the other launch's stays.
+        assert len(others) == 1 and others[0].is_dir(), others
+        assert others[0].parent == staged[0][0].parent.parent
+    finally:
+        for other in others:
+            shutil.rmtree(other, ignore_errors=True)
     found = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True).stdout
     assert not found.strip()
 
