@@ -404,6 +404,21 @@ class ClaudeStream:
         if not isinstance(record, dict) or not isinstance(record.get("type"), str):
             self._protocol("a stdout line is not a JSON object with a 'type'")
             return
+        self._reduce(record)
+
+    def feed_record(self, record: dict) -> None:
+        """Reduce one record already decoded: an SDK message the Claude SDK
+        helper re-serialized to the CLI record it was parsed from, with the
+        fields this reducer reads (#151, ADR 0007 §5)."""
+        self._records += 1
+        if self.failure is not None:
+            return
+        if not isinstance(record.get("type"), str):
+            self._protocol("a record is not a JSON object with a 'type'")
+            return
+        self._reduce(record)
+
+    def _reduce(self, record: dict) -> None:
         kind = record["type"]
         if kind == "result":
             if self._results < self._turns:

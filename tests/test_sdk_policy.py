@@ -711,10 +711,11 @@ def test_opencode_sdk_profile_refusals(change, match):
         validate_profile(profile)
 
 
-@pytest.mark.parametrize("profile", [_claude_profile(), _opencode_profile()])
+@pytest.mark.parametrize("profile", [_opencode_profile()])
 def test_sdk_providers_refuse_every_launch_until_their_helper_lands(profile, tmp_path):
     """The preflight and the launch refuse; the argv a plan shows does not
-    (#150: a dry run renders the helper's argv, which launches nothing)."""
+    (#150: a dry run renders the helper's argv, which launches nothing).
+    ``claude-sdk``'s helper landed (#151, tests/test_claude_sdk.py)."""
     adapter = provider_for(profile)
     assert adapter.build_command_for(profile, "x")[0] == profile.command
     for call in (
@@ -734,13 +735,21 @@ def test_sdk_providers_refuse_every_launch_until_their_helper_lands(profile, tmp
             call()
 
 
-@pytest.mark.parametrize("profile", [_claude_profile(), _opencode_profile()])
-def test_doctor_reports_that_an_sdk_profile_cannot_launch_yet(profile, tmp_path):
+def test_doctor_reports_that_an_sdk_profile_cannot_launch_yet(tmp_path):
     from autoforge.doctor import Doctor
 
+    profile = _opencode_profile()
     row = Doctor(cwd=str(tmp_path)).check_sdk_launch(profile.provider, [profile])
     assert not row.ok and row.required
     assert "cannot launch in this release" in row.detail
+
+
+def test_doctor_reports_that_claude_sdk_can_launch(tmp_path):
+    from autoforge.doctor import Doctor
+
+    profile = _claude_profile()
+    row = Doctor(cwd=str(tmp_path)).check_sdk_launch(profile.provider, [profile])
+    assert row.ok and row.required and "matches the packaged manifest" in row.detail
 
 
 def test_claude_sdk_declares_an_api_key_and_never_a_login_file(tmp_path):

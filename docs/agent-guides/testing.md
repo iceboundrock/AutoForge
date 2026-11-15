@@ -2719,8 +2719,8 @@ every workflow ([Development](../development.md#pinned-actions)).
 
 ### SDK policy (#149, docs/sdk-policy.md)
 
-The SDK providers cannot launch yet, so their policy is held at its own
-boundary (`tests/test_sdk_policy.py`). Keep covered:
+The policy is held at its own boundary (`tests/test_sdk_policy.py`), apart
+from the `claude-sdk` transport that applies it (#151, below). Keep covered:
 
 - every option outside its closed set is a `ConfigurationError` naming the
   key and never quoting an `extra_args` value. That includes the SDKs' own
@@ -2757,6 +2757,57 @@ policy against sentinel hooks, MCP servers, skills, agents and instruction
 files, and assert that none loads. A control run without the policy
 asserts that the probe can see them load. Re-run both whenever a pin, a
 policy field or a runtime changes.
+
+### The `claude-sdk` transport (#151, ADR 0007)
+
+`tests/test_claude_sdk.py`, with no SDK, Claude Code, network or
+credential: the envelope reducer from synthetic records, and the real
+helper as a child on the fake `claude_agent_sdk` of
+`tests/claude_sdk_fake.py`, alone and through the real adapter and duplex
+handle. Keep covered:
+
+- `hello` off the pinned pair, envelope or protocol starts no session, and
+  a `start` off protocol 1 or one that would widen the policy is refused by
+  the helper;
+- only the completed main turn's result is the reply: `success` with
+  `is_error` (exit 0 included), an unknown subtype, a `terminal_reason` or
+  `stop_reason` of no completed turn, one absent, a deferral, an injected
+  turn, a session id that is not the caller's, a subagent's message and a
+  policy departure at `init` each fail closed; a block planted in an
+  earlier message, a failure reason or stderr is never read, and a
+  malformed completed reply is read (the engine corrects it in a fresh
+  session);
+- each envelope violation fails closed: an unknown record or field, a
+  record before `hello` or after `end`, an `end` before the result or with
+  an ask open, an interrupted end nobody asked for, a stale decision;
+- asks: a question (one or several, several labels, the operator's own
+  words) answered with the questions echoed and the answers mapped; a
+  permission approved once, with a modified input, denied with guidance
+  or cancelled; a call the policy does not ask about denied by the hook;
+  and each ask that cannot be decided (a modified input the tool would not
+  take, the interaction limit, data past its bounds or that redaction would
+  change, a question the broker cannot render) failing the invocation as
+  ADR 0007 D7.6's failure;
+- the bounds: a limit interrupts the turn and wins, an idle limit, a stalled
+  decision bounded by the invocation's limit, Ctrl-C during a wait, stdin
+  ending mid-turn, a detached descendant, an output flood past the queue's
+  bound failing closed, a result past the stdout bound tail-bounded;
+- the launch: the options the SDK is given (setting sources, MCP, plugins,
+  tools, permission mode, session id, the bundled CLI, verbatim prompts,
+  the hook and its timeout), the environment the helper gets (the root, the
+  policy's variables, #165's shell isolation, no other provider's or
+  credential-shaped variable), the refusals before anything starts (no key,
+  a refused route, no state directory, a helper that is not the manifest's,
+  an `env` left in the persistent root), and the sandbox declaration (the
+  staged helper, the environment's prefix and spelled interpreter, the
+  engine's state directory dropped);
+- the structure: no SDK or `sdk_helpers` import in the controller, the
+  helper's imports and Python 3.10 floor, the manifest's digest, the lock.
+
+`tests/test_claude_sdk_probe.py` is the opt-in gate probe of an installed
+pinned pair (`AUTOFORGE_CLAUDE_SDK_PROBE_PYTHON`), against a loopback
+stand-in, with and without `bwrap`; its results are ADR 0007 §3's
+amendment.
 
 ### SDK profiles (#150, docs/configuration.md "SDK profiles")
 

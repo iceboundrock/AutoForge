@@ -646,12 +646,21 @@ can then outlive the launch, so Pi is attended only there
 
 `provider: claude-sdk` and `provider: opencode-sdk` are the SDK providers
 of [ADR 0007](adr/0007-sdk-providers-isolated-helpers-and-interaction-contract.md).
-**They cannot launch in this release.** Their policy and configuration
-(#149) are in place, and `doctor` checks what they need (#150), but their
-helper programs and transports are #151's and #152's. A profile that uses
-one validates, `doctor` fails its "can launch" row, a dry run shows the plan
-and says the launch is refused, and a phase that reaches it is refused
-before anything starts. Route phases to another provider until those land.
+Their policy and configuration (#149) are in place, and `doctor` checks
+what they need (#150).
+
+- **`claude-sdk` launches** (#151). Each launch stages the packaged helper
+  (its sha256 checked against the manifest), starts it in the helper
+  environment `command` names, checks the pinned pair from the helper's
+  first record, and gives Claude Code a fresh session id and the issue's
+  configuration and session root. Only the completed main turn's result
+  text is read as the reply. Under `interaction_policy: prompt` a question
+  or an `ask_tools` call is put to you live.
+- **`opencode-sdk` cannot launch in this release**: its bridge and
+  transport are #152's. A profile that uses it validates, `doctor` fails its
+  "can launch" row, a dry run shows the plan and says the launch is
+  refused, and a phase that reaches it is refused before anything starts.
+  Route those phases to another provider until #152 lands.
 [SDK policy](sdk-policy.md) gives every decision below with its evidence.
 Both are opt-in: nothing in the defaults, the round routing or the merge
 gate changes, and a configuration that routes no phase to one needs no
@@ -750,9 +759,11 @@ exact pair of versions (ADR 0007 §2.4):
 
 The Claude helper environment holds `claude-agent-sdk==0.2.163` installed
 from its platform wheel (Linux x86_64 or aarch64): its sdist bundles no
-Claude Code, so it gives no backend. #151 adds the hash-locked install of
-that environment. The OpenCode runtime is a release of its own, separate
-from the `opencode` CLI provider's 2.x line.
+Claude Code, so it gives no backend. Install it from the hash-locked
+`helpers/claude-sdk/requirements.txt`, wheels only
+([helpers/claude-sdk/README.md](../helpers/claude-sdk/README.md)). The
+OpenCode runtime is a release of its own, separate from the `opencode` CLI
+provider's 2.x line.
 
 #### What `doctor` checks
 

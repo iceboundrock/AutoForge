@@ -461,6 +461,10 @@ class ClaudeSdkPolicy:
             "can_use_tool": DENY,
             "can_use_tool_message": CLAUDE_SDK_HOST_DENY,
             "hooks": ["PreToolUse"],
+            # The rendered phase prompt is task data delivered as written: no
+            # ``@path`` expansion and no slash-command dispatch (the SDK's
+            # ``verbatim_prompts``, Claude Code 2.1.248 or later; #151).
+            "verbatim_prompts": True,
             # No approval outlives its call: the hook answers allow or deny,
             # never ``updated_permissions``, so no setting is written.
             "session_approval": False,

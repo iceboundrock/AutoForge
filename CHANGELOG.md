@@ -5,6 +5,44 @@ so.
 
 ## Unreleased
 
+### The `claude-sdk` provider launches (#151)
+
+A profile with `provider: claude-sdk` now runs. Until this release every
+such launch was refused. Each launch runs the Claude Agent SDK in a helper
+program that AutoForge ships and checks against its packaged sha256. The
+helper runs in a Python environment of your own, installed from the
+hash-locked `helpers/claude-sdk/requirements.txt`, wheels only
+(`helpers/claude-sdk/README.md`). It runs under the same duplex handle,
+containment, idle limit, ceiling and outer sandbox as every agent.
+
+What you get:
+
+- **A fixed pair.** The pair is exactly `claude-agent-sdk` 0.2.163 with
+  its bundled Claude Code 2.1.286. A launch checks it from the helper's
+  first record and refuses any other.
+- **The [SDK policy](docs/sdk-policy.md)** is applied on every launch.
+- **`ANTHROPIC_API_KEY` only.** It is required, and no login is ever used.
+- **A fresh session id each launch.** Every `system/init` and the result
+  must report it.
+- **One persistent root per issue.** The configuration and session root
+  lies under the issue's sandbox directory; AutoForge creates it, and under
+  `sandbox.mode: required` it is projected writable.
+- **Only the completed main turn's result is the reply.** An error result
+  (including `subtype: success` with `is_error`), an interrupted turn, a
+  deferral, a session or policy mismatch, or a subagent fails the launch
+  instead. No other text the agent wrote is ever parsed.
+
+With `interaction_policy: prompt` an `AskUserQuestion` call, or a call of
+a tool in `ask_tools`, is put to you at the terminal: an answer (several
+labels or your own words included), a one-time approval, an approval with
+a changed input, or a denial with guidance. Each was verified on the pinned
+pair against a loopback stand-in of the Messages API (ADR 0007 §3's
+amendment). No model was called. Approve-for-session and pausing for a
+decision (#126) are not available. Under `fail`, the default, an ask fails
+the launch, which is never relaunched.
+
+The `opencode-sdk` provider still cannot launch (#152).
+
 ### `run` no longer replaces a stopped run that owns a PR without `--force` (#483)
 
 A plain `run` used to replace a `BLOCKED` or `FAILED` run unless it held

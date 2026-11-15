@@ -142,7 +142,8 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/CLAUDE.md": ("test_packaging",),
     "src/autoforge/candidate_artifact.py": ("test_candidate_source", "test_sandbox_lifecycle"),
     "src/autoforge/candidate_source.py": ("test_sandbox_lifecycle", "test_engine_sandbox"),
-    "src/autoforge/claude_stream.py": ("test_providers",),
+    "src/autoforge/claude_sdk.py": ("test_claude_sdk",),
+    "src/autoforge/claude_stream.py": ("test_providers", "test_claude_sdk"),
     "src/autoforge/cli.py": (),
     "src/autoforge/config_fingerprint.py": ("test_cli",),
     "src/autoforge/doctor.py": ("test_cli",),
@@ -192,7 +193,7 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/scheduler_stop.py": (),
     "src/autoforge/sdk_assets.py": ("test_sdk_profiles", "test_doctor", "test_packaging"),
     # the packaged helper manifest (#150)
-    "src/autoforge/sdk_helpers/": ("test_sdk_profiles", "test_packaging"),
+    "src/autoforge/sdk_helpers/": ("test_sdk_profiles", "test_packaging", "test_claude_sdk"),
     "src/autoforge/sdk_policy.py": ("test_cli",),
     # the engine's sinks and the CLI's stop lines import it (#369)
     "src/autoforge/stop_classification.py": ("test_cli", "test_engine"),
@@ -214,6 +215,7 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/operator_comment_fidelity.py": (),
     "tests/parallel_bench.py": ("test_suite_performance_audit",),  # via suite_comparison
     "tests/pi_fake.py": (),
+    "tests/claude_sdk_fake.py": ("test_claude_sdk",),
     "tests/sandbox_host.py": (),
     "tests/scheduler_worker.py": ("test_scheduler", "test_epic_commands", "test_epic_recovery"),
     "tests/suite_comparison.py": (),

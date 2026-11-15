@@ -186,10 +186,14 @@ def test_main_carries_no_other_version(version: str):
 def test_every_file_in_the_package_is_shipped_or_named_as_not_shipped():
     """A data file added to the package must be declared or excluded on purpose."""
     declared = dist_check.declared_resources()
+    # A program in ``sdk_helpers/`` is data, never a module of the package
+    # (ADR 0007 D2.2): it ships only by its declaration, as every data file.
     found = {
         path.relative_to(REPO_ROOT / "src").as_posix()
         for path in PACKAGE_DIR.rglob("*")
-        if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".py"
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and (path.suffix != ".py" or "sdk_helpers" in path.parts)
     }
     undeclared = sorted(found - declared - NOT_SHIPPED.keys())
     assert not undeclared, (
