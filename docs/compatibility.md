@@ -183,6 +183,13 @@ an exported candidate, and the security policy that
 describes), but there is no `sandbox.backend` key, and no launch uses a
 container runtime.
 
+Remote execution sandboxes are not supported: no launch runs on a hosted
+microVM service such as Vercel Sandbox, on a cloud VM, or on a container
+runtime reached over TCP or SSH. A proposed record,
+[ADR 0014](adr/0014-remote-execution-sandboxes-contract-and-no-go.md),
+compares the providers from their documentation, sets out what one would
+have to meet, and recommends against building an adapter now.
+
 The outer sandbox is experimental: it is opt-in enforcement on a host that
 can enforce it, and it becomes supported only once a `make test-sandbox`
 run on a capable host is recorded at the release candidate
