@@ -2790,7 +2790,11 @@ handle. Keep covered:
   an ask open, an interrupted end nobody asked for, a stale decision; and
   what the helper writes after its `end` (a record, an unterminated tail),
   read by the adapter's drain after the helper exits, so a reply is taken
-  only from a stream read whole;
+  only from a stream read whole; and a framing violation (a record past
+  the bound, an unterminated tail, an overflow) read while the helper winds
+  down after a limit, before a completed result and its `end`, which fails
+  the run and is kept through the timeout as `failed_before_limit`, with
+  no reply delivered (R4-F1 of PR #489);
 - asks: a question (one or several, several labels, the operator's own
   words) answered with the questions echoed and the answers mapped; a
   permission approved once, with a modified input, denied with guidance

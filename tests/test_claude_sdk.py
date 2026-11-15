@@ -1023,6 +1023,46 @@ def test_the_rest_of_stdout_is_read_past_an_end_it_holds():
     assert clean.failed is None and clean.text == FINAL and clean.reply_proven
 
 
+class _Winding(_Rest):
+    """A running duplex handle being wound down: what is sent, and stdout's items."""
+
+    def __init__(self, *items) -> None:
+        super().__init__(*items)
+        self.sent: list[bytes] = []
+
+    def send_line(self, line: bytes) -> None:
+        self.sent.append(line)
+
+
+def test_a_framing_violation_in_the_wind_down_fails_the_run():
+    """R4-F1 of PR #489: a record past the bound, an unterminated tail or an
+    overflow read while the helper winds down fails the session as it does
+    before the limit, though a completed result and the helper's end follow:
+    a result read after a record was lost is never the reply."""
+    from autoforge.executor_duplex import Fragment, Overflow, Oversize, Record
+
+    for violation, named in (
+        (Oversize(1 << 20, b"{"), "longer than"),
+        (Fragment(b'{"type"'), "unterminated record"),
+        (Overflow(), "faster than they were read"),
+    ):
+        session = _session()
+        _feed(session, HELLO, _init(), _TEXT)
+        child = _Winding(violation, Record(_result()), Record(END))
+        ClaudeSdkProvider()._wind_down(child, session)
+        assert child.sent == [claude_sdk.INTERRUPT]
+        assert session.text is None and not session.reply_proven
+        assert named in (session.failed or ""), session.failed
+        assert session.failure_kind == "claude-sdk: helper protocol violation"
+        # The drain that follows in execute() leaves the failure standing.
+        ClaudeSdkProvider._read_rest(child, session)
+        assert session.text is None and named in (session.failed or ""), session.failed
+    clean = _session()
+    _feed(clean, HELLO, _init(), _TEXT)
+    ClaudeSdkProvider()._wind_down(_Winding(Record(_result()), Record(END)), clean)
+    assert clean.failed is None and clean.text == FINAL and clean.reply_proven
+
+
 def test_a_pair_mismatch_never_starts_a_session(tmp_path_factory, tmp_path, launch_env):
     python = fake.make_environment(tmp_path_factory.mktemp("old-sdk") / "env", version="0.2.150")
     result, req, _ = _run(tmp_path, str(python), fake.script())
@@ -1038,6 +1078,35 @@ def test_a_limit_interrupts_the_turn_and_wins(tmp_path, sdk_python, launch_env):
     assert result.stdout == "" and result.provider_failure is None
     assert result.provider_summary["outcome"] == "interrupted"
     assert took < 2 + ClaudeSdkProvider().interrupt_seconds
+
+
+@pytest.mark.parametrize("lost", [False, True], ids=["read-whole", "record-past-the-bound"])
+def test_a_record_past_the_bound_in_the_wind_down_is_no_reply_after_a_limit(
+    tmp_path, sdk_python, launch_env, lost
+):
+    """R4-F1 of PR #489: the turn outran the ceiling, and the helper, its
+    event loop held, wrote the turn's completed result and its ``end``
+    before it read the interrupt, so the wind-down read them. Read whole,
+    that is a reply delivered before the limit's kill (#479); after a record
+    past the bound it is none: the violation fails the run, and is kept
+    through the timeout as what had failed it."""
+    adapter = ClaudeSdkProvider(interrupt_seconds=5)
+    steps: list[dict] = [{"block": 3}]
+    if lost:
+        steps.append({"oversize": adapter.max_record_bytes + 1})
+    prompt = fake.script(steps=steps, result={"result": FINAL})
+    result, _, took = _run(tmp_path, sdk_python, prompt, ceiling=2, adapter=adapter)
+    assert result.timed_out and result.timeout_limit == "max_runtime"
+    assert result.provider_failure is None  # a timeout wins (ADR 0003 §2.6)
+    assert not result.may_have_survivor and took < 2 + 5 + 5
+    if not lost:
+        assert result.provider_summary["outcome"] == "result"
+        assert result.reply_delivered and result.stdout == FINAL
+        assert result.failed_before_limit is None
+        return
+    assert result.failed_before_limit == "claude-sdk: helper protocol violation"
+    assert "longer than" in str(result.provider_summary["failure"])
+    assert result.stdout == "" and not result.reply_delivered
 
 
 def test_an_idle_limit_ends_a_silent_turn(tmp_path, sdk_python, launch_env):

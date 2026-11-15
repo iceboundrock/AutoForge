@@ -26,6 +26,11 @@ prompt, a JSON object (:func:`script`):
     ``tool_result`` (an error for a denied call; with ``"silent": true`` no
     ``tool_use`` comes first, as when the SDK's control channel delivers the
     hook before the message); ``{"sleep": s}`` waits, interruptibly;
+    ``{"block": s}`` holds the helper's event loop for ``s`` seconds, as an
+    SDK that never yields does, so an interrupt sent meanwhile is read only
+    after the turn's result; ``{"oversize": n}`` writes one record of ``n``
+    bytes and its LF on the helper's wire there, past any bound the helper
+    keeps (a system notice padded to length);
     ``{"spawn": argv}`` starts a process that leaves the helper's process
     group; ``{"raise": "name"}`` raises; ``{"flood": n}`` yields ``n`` system
     notices; ``{"stop": true}`` ends the response without a result;
@@ -64,6 +69,7 @@ import asyncio
 import json
 import os
 import subprocess
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -80,6 +86,14 @@ _ENV = ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDE
 def _log(cwd, entry):
     with open(os.path.join(cwd, _LOG), "a") as fh:
         fh.write(json.dumps(entry, default=str) + "\n")
+
+
+def _wire_write(texts):
+    """Write each string, as it is, on the helper's wire, found by its class name."""
+    import gc
+    wire = next(o for o in gc.get_objects() if type(o).__name__ == "Wire")
+    for text in texts:
+        wire._write(text.encode())
 
 
 @dataclass
@@ -239,10 +253,7 @@ class ClaudeSDKClient:
             await asyncio.sleep(_STALL)
         late = self._script.get("after_end")
         if late:
-            import gc
-            wire = next(o for o in gc.get_objects() if type(o).__name__ == "Wire")
-            for text in late:
-                wire._write(text.encode())
+            _wire_write(late)
 
     def _init(self, extra=None):
         o = self.options
@@ -349,6 +360,13 @@ class ClaudeSDKClient:
                     await self._wait(0)
                 elif "sleep" in step:
                     await self._wait(step["sleep"])
+                elif "block" in step:
+                    time.sleep(step["block"])
+                elif "oversize" in step:
+                    head = '{"type":"message","data":{"type":"system","subtype":"status","pad":"'
+                    tail = '"}}'
+                    _wire_write([head + "x" * (step["oversize"] - len(head) - len(tail)) + tail
+                                 + "\n"])
                 elif "spawn" in step:
                     subprocess.Popen(step["spawn"], start_new_session=True,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

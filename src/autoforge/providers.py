@@ -4021,12 +4021,8 @@ class ClaudeSdkProvider(_SdkProvider):
                         return _SdkCut.LOOP
                     if ask is not None:
                         self._answer(child, session, ask, broker, asked)
-                elif isinstance(item, Oversize):
-                    session.oversize(item.limit)
-                elif isinstance(item, Fragment):
-                    session.framing_error("stdout ended inside an unterminated record")
-                elif isinstance(item, Overflow):
-                    session.framing_error("stdout records arrived faster than they were read")
+                elif isinstance(item, Oversize | Fragment | Overflow):
+                    self._framing(session, item)
                 elif isinstance(item, Eof):
                     session.stream_ended()
                 elif item.deadline_exceeded:
@@ -4125,7 +4121,9 @@ class ClaudeSdkProvider(_SdkProvider):
         """Interrupt the helper's turn and read it to its ``end``, within
         :attr:`interrupt_seconds` (ADR 0007 D3.3): what it writes meanwhile
         cannot stretch the deadline the caller pinned. An ask that arrives
-        meanwhile is denied."""
+        meanwhile is denied. A framing violation fails the session here as
+        in :meth:`_converse` (:meth:`_framing`), so a result read after a
+        record was lost is never the reply (R4-F1 of PR #489)."""
         end = time.monotonic() + self.interrupt_seconds
         try:
             self._send(child, session, session.interrupt())
@@ -4142,14 +4140,31 @@ class ClaudeSdkProvider(_SdkProvider):
                             session,
                             session.decide(ask, "deny", guidance="AutoForge is ending this run"),
                         )
-                elif isinstance(item, Eof | Overflow):
-                    if isinstance(item, Eof):
-                        session.stream_ended()
+                elif isinstance(item, Oversize | Fragment | Overflow):
+                    self._framing(session, item)
+                    if isinstance(item, Overflow):
+                        return
+                elif isinstance(item, Eof):
+                    session.stream_ended()
                     return
-                elif isinstance(item, Timeout) and item.deadline_exceeded:
+                elif item.deadline_exceeded:
                     return
         except ExecutionTimeoutError:
             return
+
+    @staticmethod
+    def _framing(session: ClaudeSdkSession, item: Oversize | Fragment | Overflow) -> None:
+        """A framing violation of the helper's stdout, failed alike wherever
+        it is read (:meth:`_converse`, :meth:`_wind_down`, :meth:`_read_rest`):
+        the helper bounds and terminates every record it writes, so a record
+        past the bound, an unterminated tail or an overflow means the stream
+        was not read whole, and no reply is taken from it."""
+        if isinstance(item, Oversize):
+            session.oversize(item.limit)
+        elif isinstance(item, Fragment):
+            session.framing_error("stdout ended inside an unterminated record")
+        else:
+            session.framing_error("stdout records arrived faster than they were read")
 
     @staticmethod
     def _read_rest(child: DuplexChild, session: ClaudeSdkSession) -> None:
@@ -4175,12 +4190,8 @@ class ClaudeSdkProvider(_SdkProvider):
             # it, and one after a failure changes nothing.
             if isinstance(entry, Record):
                 session.feed(entry.data)
-            elif isinstance(entry, Oversize):
-                session.oversize(entry.limit)
-            elif isinstance(entry, Fragment):
-                session.framing_error("stdout ended inside an unterminated record")
             else:
-                session.framing_error("stdout records arrived faster than they were read")
+                ClaudeSdkProvider._framing(session, entry)
         if isinstance(item, Eof):
             session.stream_ended()
 
