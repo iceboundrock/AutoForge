@@ -36,7 +36,7 @@ short:
 
 | You need | Version | Why |
 |---|---|---|
-| Linux on x86_64 | | the platform the first prerelease claims; macOS is untested and Windows does not work |
+| Linux on x86_64, or macOS on Apple Silicon | | Linux is tested in CI, and macOS on Apple Silicon by the maintainer, without the outer sandbox ([Compatibility](compatibility.md#operating-system-and-architecture)); Intel Macs are untested and Windows does not work |
 | Python | 3.11 or 3.12 | the interpreters CI tests; `uv` can install one (`uv python install 3.12`) |
 | [`uv`](https://docs.astral.sh/uv/) | | installs AutoForge into an environment of its own |
 | git, with your name and e-mail address set | | any recent version; `doctor` checks that `git --version` runs. The implementer commits as you: see the identity below |

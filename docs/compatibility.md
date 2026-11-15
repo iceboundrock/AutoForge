@@ -12,8 +12,9 @@ labels:
 The first prerelease, `0.1.0a0` (published on PyPI on 2026-10-28), claims
 Linux x86_64 with CPython 3.11 and 3.12 only
 ([#256 D3](https://github.com/iceboundrock/AutoForge/issues/256#issuecomment-6375246718)).
-macOS, Linux ARM64 and Python 3.13 and later are later, separately tracked
-work, and stay untested until CI or a recorded run proves them.
+macOS on Apple Silicon has since been run by the maintainer (below).
+Intel macOS, Linux ARM64 and Python 3.13 and later are later, separately
+tracked work, and stay untested until CI or a recorded run proves them.
 
 The CI jobs cited below are those of
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), all on GitHub's
@@ -49,7 +50,8 @@ then-current releases of each tool.
 |---|---|---|
 | Linux x86_64 | **supported** | `test (py3.11)`, `test (py3.12)`: the suite, with real git, local processes, file locks and process containment. `dist (py3.11)`, `dist (py3.12)`: the built wheel installed outside the checkout and run. Both on `ubuntu-latest`. |
 | Linux ARM64 (aarch64) and other architectures | untested | No CI job or recorded run. AutoForge is pure Python with no architecture-specific code, but nothing has proved it on such a host. |
-| macOS (Apple Silicon or Intel) | untested; not supported by the first prerelease | Never run in CI. The code has fallbacks (no child subreaper, so a process that leaves its group may outlive the invocation and is reported as `orphans_unchecked`; an `O_TMPFILE` fallback; a darwin `statfs` branch), but there is no outer sandbox (`sandbox.mode: required` is refused) and process containment is weaker than on Linux ([ADR 0002](adr/0002-executor-nothing-outlives-the-invocation.md), [Security boundaries](security.md#other-limits)). No parity with Linux is claimed. |
+| macOS on Apple Silicon | **supported**, with the limits here; not by the first prerelease | Run by the maintainer, not in CI; [#482](https://github.com/iceboundrock/AutoForge/pull/482) fixed the stop Apple's git caused at every launch. The code has fallbacks (no child subreaper, so a process that leaves its group may outlive the invocation and is reported as `orphans_unchecked`; an `O_TMPFILE` fallback; a darwin `statfs` branch), but there is no outer sandbox (`sandbox.mode: required` is refused) and process containment is weaker than on Linux ([ADR 0002](adr/0002-executor-nothing-outlives-the-invocation.md), [Security boundaries](security.md#other-limits)). No parity with Linux is claimed. |
+| macOS on Intel | untested | No CI job or recorded run. The same code paths as Apple Silicon, with the same limits. |
 | Windows | **unsupported** | `src/autoforge/locking.py` imports `fcntl` unconditionally (POSIX `flock`), so AutoForge does not start, and the executor's process containment is POSIX-only. |
 | WSL2 | untested | Not measured ([ADR 0005 §4](adr/0005-outer-sandbox-and-host-resource-capability-model.md#4-platform-behaviour)). |
 
