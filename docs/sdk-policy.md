@@ -405,6 +405,15 @@ field and the rule, never the value.
   separator character other than a newline or a tab (an escape sequence
   starts with one, and a carriage return, bare or in a CRLF pair, redraws
   the line it is shown on), or would be changed by redaction.
+
+  For `claude-sdk`, a permission ask's own input is checked when the ask
+  arrives, before any request is minted (`claude_sdk.ClaudeSdkSession`,
+  with `exact_input`). The whole input is checked, every key and every
+  field that is not shown included, because an approval covers all of it.
+  An input that fails the check is never put to anyone: the call is denied
+  and the launch fails as D7.6's failure. A question's input is held to the
+  question rules below instead: its options are exact text, and its text,
+  header and descriptions are only shown.
 - **Bound by digest.** A decision is bound to the SHA-256 of the input's
   canonical JSON (sorted keys, no spaces, UTF-8, no NaN; D9.3). A value
   that has none, such as a lone surrogate (legal as a JSON escape, not in

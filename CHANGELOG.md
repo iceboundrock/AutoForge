@@ -30,8 +30,9 @@ What you get:
   `sandbox.mode: required` it is projected writable.
 - **Only the completed main turn's result is the reply.** An error result
   (including `subtype: success` with `is_error`), an interrupted turn, a
-  deferral, a session or policy mismatch, or a subagent fails the launch
-  instead. No other text the agent wrote is ever parsed.
+  deferral, a turn the session injected or whose origin cannot be read, a
+  session or policy mismatch, or a subagent fails the launch instead. No
+  other text the agent wrote is ever parsed.
 
 With `interaction_policy: prompt` an `AskUserQuestion` call, or a call of
 a tool in `ask_tools`, is put to you at the terminal: an answer (several
@@ -39,10 +40,13 @@ labels or your own words included), a one-time approval, an approval with
 a changed input (checked against the tool's input schema first), or a
 denial with guidance. Each was verified on the pinned pair against a
 loopback stand-in of the Messages API (ADR 0007 §3's amendment). No model
-was called. Approve-for-session and pausing for a decision (#126) are not
-available. Under `fail`, the default, an ask fails the launch. A launch
-an ask failed is never relaunched, even when a limit kills the helper
-while it shuts down afterwards.
+was called. A call whose input holds a control character or a value
+redaction would hide is never put to you: it is denied and the launch
+fails, because what you were shown would not be what you approve.
+Approve-for-session and pausing for a decision (#126) are not available.
+Under `fail`, the default, an ask fails the launch. A launch an ask failed
+is never relaunched, even when a limit kills the helper while it shuts
+down afterwards.
 
 The `opencode-sdk` provider still cannot launch (#152).
 

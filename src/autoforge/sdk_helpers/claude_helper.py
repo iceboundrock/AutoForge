@@ -337,13 +337,31 @@ def _flat_usage(usage: object) -> dict[str, int]:
     }
 
 
+# What a result's ``origin`` becomes when it is no object with a non-empty
+# string ``kind``: never ``None``, which says the CLI attributed nothing, so
+# the controller fails a provenance it cannot read (R3-F2 of PR #489).
+MALFORMED_ORIGIN = {"malformed": True}
+
+
+def _origin(origin: object) -> object:
+    """A result's ``origin`` as the reducer reads it: ``None`` when absent,
+    its ``kind`` when it is an object with a non-empty string kind, and
+    :data:`MALFORMED_ORIGIN` for anything else."""
+    if origin is None:
+        return None
+    if isinstance(origin, dict):
+        kind = origin.get("kind")
+        if isinstance(kind, str) and kind:
+            return kind
+    return dict(MALFORMED_ORIGIN)
+
+
 def message_record(sdk: Any, message: object) -> dict[str, Any] | None:
     """The record of one SDK message, or ``None`` for a type this helper does
     not know (counted, D10.4)."""
     if isinstance(message, sdk.ResultMessage):
         deferred = message.deferred_tool_use
         denials = message.permission_denials if isinstance(message.permission_denials, list) else []
-        origin = message.origin if isinstance(message.origin, dict) else None
         return {
             "type": "result",
             "subtype": message.subtype,
@@ -372,7 +390,7 @@ def message_record(sdk: Any, message: object) -> dict[str, Any] | None:
             },
             "structured_output": message.structured_output is not None,
             "errors": len(message.errors) if isinstance(message.errors, list) else 0,
-            "origin": origin.get("kind") if origin is not None else None,
+            "origin": _origin(message.origin),
         }
     if isinstance(message, sdk.AssistantMessage):
         return {

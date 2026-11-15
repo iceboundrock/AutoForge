@@ -63,8 +63,10 @@ The outcome (ADR 0007 D10.3, D10.4):
 * Only the ``result`` of the main turn is a completion, and only when it is
   ``success`` with ``is_error: false`` (an API error can come with ``subtype:
   success``), ``terminal_reason: completed``, a ``stop_reason`` of a finished
-  turn, no ``deferred_tool_use`` and no injected origin, and the helper's
-  ``end`` then says ``result``. Its ``result`` text becomes stdout, verbatim;
+  turn, no ``deferred_tool_use`` and an origin that is absent or ``human``
+  (an injected turn's origin, and one the helper could not read as an object
+  with a string ``kind``, fail closed), and the helper's ``end`` then says
+  ``result``. Its ``result`` text becomes stdout, verbatim;
   no other text crosses the envelope, so a ``CONTROL_RESULT`` planted in an
   earlier message, a diagnostic or stderr is never parsed. An interrupted
   turn's result never is.
@@ -112,6 +114,7 @@ from .sdk_policy import (
     MAX_QUESTIONS,
     ClaudeSdkPolicy,
     canonical_json,
+    exact_input,
     input_digest,
 )
 
@@ -351,8 +354,10 @@ def decision_record(
 class Ask:
     """One ``ask`` the helper sent: an interaction-eligible call's PreToolUse
     hook, waiting for a directive. ``problem`` is why its data cannot be put
-    to anyone (past a bound, not canonical JSON, a digest that differs), in
-    which case the driver answers it as the broker's ``Fail``."""
+    to anyone (past a bound, not canonical JSON, a digest that differs, or,
+    for a permission, an input with a control character or a value
+    redaction would change), in which case the driver answers it as the
+    broker's ``Fail``."""
 
     request_id: str
     kind: RequestKind
@@ -862,6 +867,16 @@ class ClaudeSdkSession:
             )
             return
         origin = result.get("origin")
+        if origin is not None and not isinstance(origin, str):
+            # The helper's marker for an origin that is no object with a
+            # string kind: a provenance that cannot be read is never taken
+            # for an absent one (R3-F2 of PR #489).
+            self._fail(
+                "claude-sdk: the result carries an origin that is not an object with a "
+                "string kind, so whose turn it answers is unknown",
+                "claude-sdk: a malformed origin",
+            )
+            return
         if origin not in (None, "human"):
             self._fail(
                 "claude-sdk: the result answers a turn the session injected, not AutoForge's "
@@ -926,6 +941,15 @@ class ClaudeSdkSession:
             try:
                 if input_digest(tool_input, "the call's input") != digest:
                     problem = "the call's input does not match the digest the helper sent"
+                elif kind == "permission":
+                    # Refused, never rewritten (docs/sdk-policy.md §10): the
+                    # operator is shown a cleaned and redacted summary, so a
+                    # call whose input cleaning or redaction would change is
+                    # never put to anyone, and an approval never covers work
+                    # other than what was shown (R3-F1 of PR #489). A
+                    # question's input is held to the question rules instead
+                    # (ask_questions, the Question type).
+                    exact_input(tool_input, "the call's input")
             except InteractionDataError as exc:
                 problem = str(exc)
         ask = Ask(

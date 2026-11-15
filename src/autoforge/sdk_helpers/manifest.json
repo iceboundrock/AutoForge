@@ -5,7 +5,7 @@
       "envelope": "autoforge-claude-helper",
       "protocol": 1,
       "file": "claude_helper.py",
-      "sha256": "60f127ecd6180e0a86e82e0d6b26b6b04f3629a312ae87eab7bfb4e4d09cd01a",
+      "sha256": "60700e1ee5f88129a2f4affe9734c5f82367b58fa75ae80f5d486b0aeda490a1",
       "implemented_by": "#151",
       "interpreter": {"name": "Python", "minimum": "3.10"},
       "sdk": {"package": "claude-agent-sdk", "version": "0.2.163"},

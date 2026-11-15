@@ -257,6 +257,13 @@ def test_the_envelope_fails_closed(records, named):
         (_result(stop_reason=7), "did not complete its turn"),
         (_result(deferred_tool_use={"id": "t", "name": "Bash"}), "deferred a tool call"),
         (_result(origin="task-notification"), "injected"),
+        # R3-F2 of PR #489: the helper's marker for an origin it could not
+        # read, and any other value that is not a kind, is never an absent one.
+        (_result(origin={"malformed": True}), "not an object with a string kind"),
+        (_result(origin={"kind": "human"}), "not an object with a string kind"),
+        (_result(origin=[]), "not an object with a string kind"),
+        (_result(origin=7), "not an object with a string kind"),
+        (_result(origin=False), "not an object with a string kind"),
         (_result(is_error=True, terminal_reason="api_error"), "ended in an error"),
         (_result(subtype="error_max_turns"), "did not succeed"),
         (_result(result=None), "no string 'result'"),
@@ -274,6 +281,13 @@ def test_an_outcome_that_is_no_completed_main_turn_fails_closed(record, named):
     _feed(session, HELLO, _init(), record, _result(), END)
     assert session.text is None and named in (session.failed or ""), session.failed
     assert session.failed.startswith("claude-sdk: ")
+
+
+@pytest.mark.parametrize("origin", [None, "human"])
+def test_a_result_of_absent_or_human_origin_is_the_reply(origin):
+    session = _session()
+    _feed(session, HELLO, _init(), _result(origin=origin), END)
+    assert session.failed is None and session.text == FINAL
 
 
 def test_success_with_is_error_is_a_failure_not_a_reply():
@@ -393,8 +407,11 @@ def _ask(**over: object) -> bytes:
         "tool_name": "Bash",
         "tool_use_id": "toolu_1",
         "input": tool_input,
+        # The helper's canonical JSON: sorted keys, no spaces, UTF-8.
         "input_sha256": hashlib.sha256(
-            json.dumps(tool_input, sort_keys=True, separators=(",", ":")).encode()
+            json.dumps(
+                tool_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode()
         ).hexdigest(),
         "agent": None,
         **over,
@@ -467,6 +484,52 @@ def test_ask_data_that_cannot_be_shown_is_a_problem_not_a_request():
     assert "more than 65536" in oversize.problem
     assert "does not match the digest" in digest.problem
     assert "does not fit one helper record" in missing.problem
+
+
+@pytest.mark.parametrize(
+    ("tool_input", "named"),
+    [
+        ({"command": f"ANTHROPIC_API_KEY={KEY} ./deploy"}, "credential-shaped value"),
+        ({"command": f"curl https://x:{'a' * 40}@h/p"}, "credential-shaped value"),
+        # A field that is never shown is approved too, so it is held alike.
+        ({"command": "ls", "hint": f"ANTHROPIC_API_KEY={KEY}"}, "credential-shaped value"),
+        ({"command": "echo safe\rrm -rf ~"}, "control or escape character"),
+        ({"command": "ls\r\n"}, "control or escape character"),
+        ({"command": "\x1b[2Kls"}, "control or escape character"),
+        ({"command": "ls", "descr\u202eiption": "x"}, "control or escape character"),
+    ],
+)
+def test_a_permission_input_cleaning_would_change_is_a_problem_not_a_request(tool_input, named):
+    # R3-F1 of PR #489: the operator is shown a cleaned and redacted summary
+    # of a permission's input, so an input that cleaning or redaction would
+    # change is refused before any request is minted (docs/sdk-policy.md §10).
+    session = _session(PROMPT)
+    (ask,) = _feed(session, HELLO, _init(PROMPT), _ask(input=tool_input))
+    assert named in ask.problem, ask.problem
+    assert KEY not in ask.problem and "rm -rf" not in ask.problem
+    assert session.failed is None and session.open_asks == (ask,)
+
+
+def test_a_permission_input_with_newlines_and_tabs_is_put_as_it_is():
+    session = _session(PROMPT)
+    tool_input = {"command": "printf 'a\\tb'\n\tls", "description": "two lines"}
+    (ask,) = _feed(session, HELLO, _init(PROMPT), _ask(input=tool_input))
+    assert ask.problem == "" and ask.tool_input == tool_input
+
+
+def test_a_question_input_is_held_to_the_question_rules_not_refused_whole():
+    # A question's text is cleaned for display, not refused (the Question
+    # type); only a permission's input is checked whole when the ask arrives.
+    options = {"interaction_policy": "prompt"}
+    session = _session(options)
+    raw = {"questions": [{**QUESTION["questions"][0], "question": "\x1b[2JWhich colors?"}]}
+    (ask,) = _feed(
+        session,
+        HELLO,
+        _init(options),
+        _ask(kind="question", tool_name="AskUserQuestion", input=raw),
+    )
+    assert ask.problem == ""
 
 
 QUESTION = {
@@ -815,6 +878,44 @@ def test_a_terminal_field_of_the_wrong_type_is_a_provider_failure(
     assert result.stdout == "" and not result.reply_delivered
     assert not result.timed_out and result.exit_code == 0 and took < 30
     assert not result.may_have_survivor and not result.orphans_unchecked
+
+
+_NO_KIND = "not an object with a string kind"
+
+
+@pytest.mark.parametrize(
+    ("origin", "named"),
+    [
+        # R3-F2 of PR #489: an origin that is no object with a non-empty
+        # string kind was read as an absent one, and the turn as the reply.
+        ("task-notification", _NO_KIND),
+        (7, _NO_KIND),
+        ({}, _NO_KIND),
+        ({"kind": None, "subkind": "scheduled-trigger"}, _NO_KIND),
+        ({"kind": 7}, _NO_KIND),
+        ({"kind": ""}, _NO_KIND),
+        ({"kind": "task-notification"}, "injected"),
+    ],
+)
+def test_a_result_of_malformed_or_injected_origin_is_a_provider_failure(
+    tmp_path, sdk_python, launch_env, origin, named
+):
+    script = fake.script(result={"result": FINAL, "origin": origin})
+    result, _, took = _run(tmp_path, sdk_python, script)
+    assert named in (result.provider_failure or ""), result.provider_failure
+    assert result.provider_failure.startswith("claude-sdk: ")
+    assert result.stdout == "" and not result.reply_delivered
+    assert not result.timed_out and result.exit_code == 0 and took < 30
+    assert not result.may_have_survivor and not result.orphans_unchecked
+
+
+@pytest.mark.parametrize("origin", [None, {"kind": "human", "undocumented": 1}])
+def test_a_result_of_absent_or_human_origin_through_the_helper_is_the_reply(
+    tmp_path, sdk_python, launch_env, origin
+):
+    script = fake.script(result={"result": FINAL, "origin": origin})
+    result, _, _ = _run(tmp_path, sdk_python, script)
+    assert result.provider_failure is None and result.stdout == FINAL and result.reply_delivered
 
 
 _SAID = {"message": {"kind": "assistant", "content": [{"type": "text", "text": FINAL}]}}
@@ -1225,6 +1326,36 @@ def test_an_ask_that_cannot_be_decided_fails_the_invocation(
     assert result.stdout == "" and took < 30
     hooks = [e for e in fake.log(Path(req.cwd)) if e.get("hook")]
     assert hooks[-1]["output"]["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize(
+    ("command", "named"),
+    [
+        (f"ANTHROPIC_API_KEY={KEY} ./deploy", "credential-shaped value"),
+        ("echo safe\rrm -rf x", "control or escape character"),
+    ],
+    ids=["credential-assignment", "carriage-return"],
+)
+def test_a_permission_input_cleaning_would_change_is_never_put_to_anyone(
+    tmp_path, sdk_python, launch_env, command, named
+):
+    # R3-F1 of PR #489: the operator would have been shown the command
+    # cleaned and redacted, and an Allow approved the call as it ran. Now the
+    # ask fails before any request is minted: the resolver is never asked,
+    # the hook denies, the host never runs the call and the launch fails.
+    prompt = fake.script(steps=[_bash(command)], result={"result": FINAL})
+    resolver = Scripted(Allow())
+    result, req, took = _run(tmp_path, sdk_python, prompt, PROMPT, resolver)
+    assert resolver.asked == [] and len(resolver.decisions) == 1
+    assert result.interaction is not None and result.interaction.lifecycle is Lifecycle.FAILED
+    assert named in (result.provider_failure or ""), result.provider_failure
+    assert KEY not in (result.provider_failure or "") + result.stderr
+    assert result.stdout == "" and not result.reply_delivered
+    assert not result.timed_out and not result.may_have_survivor and took < 30
+    entries = fake.log(Path(req.cwd))
+    hooks = [e for e in entries if e.get("hook")]
+    assert [h["output"]["hookSpecificOutput"]["permissionDecision"] for h in hooks] == ["deny"]
+    assert not any(e.get("host") for e in entries)
 
 
 def test_a_stalled_decision_is_bounded_by_the_invocations_limit(tmp_path, sdk_python, launch_env):

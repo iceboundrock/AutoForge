@@ -2775,7 +2775,10 @@ handle. Keep covered:
   `stop_reason` that is no string (an array or an object, through the
   helper too, with no text, no delivered reply and a completed teardown),
   a deferral, an injected
-  turn, a session id that is not the caller's, a subagent's message, a
+  turn, an origin that is not an object with a non-empty string `kind` (a
+  scalar, an empty object, a missing or invalid `kind`, through the helper
+  too, never read as an absent origin, while an absent or `human` one is
+  the reply), a session id that is not the caller's, a subagent's message, a
   policy departure at `init`, and a turn (a message, an ask, the result)
   with no verified `init` before it, through the helper too (no `init`, or
   a late one), each fail closed; a block planted in an
@@ -2797,11 +2800,14 @@ handle. Keep covered:
   timeout past the float range of either sign among them, the
   interaction limit, data past its bounds or that redaction would
   change, a question the broker cannot render) failing the invocation as
-  ADR 0007 D7.6's failure; and an ask that failed the run, then a helper
-  hung in its interrupt and its disconnect until the idle limit killed it
-  (the fake's `stall`): the ask's failure kept as `failed_before_limit`
-  through the kill, and the step never relaunched, adapter to engine
-  (`failed-before-limit`, R2-F1 of PR #489);
+  ADR 0007 D7.6's failure; a permission whose own input carries a control
+  character (a carriage return among them) or a value redaction would
+  change, a field that is not shown included, never reaching the resolver,
+  denied by the hook and failing the invocation; and an ask that failed
+  the run, then a helper hung in its interrupt and its disconnect until
+  the idle limit killed it (the fake's `stall`): the ask's failure kept as
+  `failed_before_limit` through the kill, and the step never relaunched,
+  adapter to engine (`failed-before-limit`, R2-F1 of PR #489);
 - the bounds: a limit interrupts the turn and wins, an idle limit, a stalled
   decision bounded by the invocation's limit, Ctrl-C during a wait, stdin
   ending mid-turn, a detached descendant, an output flood past the queue's
