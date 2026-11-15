@@ -991,8 +991,9 @@ makes `unblock` re-enter `FIX`, which only reads: each action is recorded
 `verified` or `stale`, and the PR goes back to `REVIEW`. The next review is
 handed `operator-evidence.md`, the operator comments verified for the round,
 and still judges whether they resolve the finding. `run` refuses to replace a
-`BLOCKED` or `FAILED` run that holds operator actions without `--force`; the
-comments stay on GitHub either way.
+`BLOCKED` or `FAILED` run that holds operator actions, or owns a PR, without
+`--force`; the comments stay on GitHub either way
+([Starting over](troubleshooting.md#starting-over)).
 
 ### When a fix replaces the PR description
 
@@ -1154,7 +1155,9 @@ still refused; at a new revision, the taking run posts its own "Round 1".
 ### DONE and FAILED
 
 `DONE` is reached when `UPDATE_EPIC` reports no next issue. `DONE` and
-`FAILED` have no outgoing edges; `autoforge run` starts a new run.
+`FAILED` have no outgoing edges; `autoforge run` starts a new run, and
+needs `--force` over a `FAILED` run that owns a PR or holds operator actions
+([Starting over](troubleshooting.md#starting-over)).
 
 ## Running an EPIC in parallel
 

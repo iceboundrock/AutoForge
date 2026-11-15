@@ -1651,10 +1651,12 @@ def _scheduler_view(engine: ControllerEngine, *, dry_run: bool = False) -> bool 
 
 def _existing_run_guard(
     engine: ControllerEngine, force: bool, command: str = "run"
-) -> tuple[int | None, bool]:
+) -> tuple[int | None, bool, AutoForgeState | None]:
     """Decide whether a fresh run may overwrite the run at ``engine.paths``.
 
-    Returns ``(exit_code_or_None, corrupt)``. A verdict that lets the run
+    Returns ``(exit_code_or_None, corrupt, existing)``: ``existing`` is the
+    readable run a go-ahead replaces, ``None`` when there is none (no state,
+    or an unreadable one, which ``corrupt`` says). A verdict that lets the run
     go ahead must be taken with the controller lock held: one taken before
     the lock could go stale. A refusal writes nothing, so ``run`` also asks
     once before it takes the lock, and returns at once when refused (#387).
@@ -1688,7 +1690,7 @@ def _existing_run_guard(
                 ),
                 file=sys.stderr,
             )
-            return 2, False
+            return 2, False, None
         if not force:
             refusal = (
                 "autoforge: error: refusing to start a new run over an unreadable "
@@ -1699,10 +1701,10 @@ def _existing_run_guard(
             # is echoed verbatim), so the refusal is state-derived output
             # like the terminal lines and crosses the boundary assembled.
             print(redact(f"autoforge: error: {exc}\n{refusal}"), file=sys.stderr)
-            return 2, False
-        return None, True
+            return 2, False, None
+        return None, True, None
     if existing is None:
-        return None, False
+        return None, False, None
     if existing.phase not in TERMINAL_PHASES and not force:
         print(
             redact(
@@ -1712,27 +1714,147 @@ def _existing_run_guard(
             ),
             file=sys.stderr,
         )
-        return 2, False
-    operator = _operator_records(existing) if existing.phase in _KEEPING_PHASES else []
-    if operator and not force:
-        # #243: a BLOCKED or FAILED run keeps its FIX plan, and an operator
-        # action of it may already be on GitHub; replacing the run silently
-        # would forget what the operator was asked to post.
+        return 2, False, None
+    if existing.phase in _KEEPING_PHASES and not force:
+        refusal = _keeping_refusal(existing, command)
+        if refusal:
+            print(redact(refusal), file=sys.stderr)
+            return 2, False, None
+    return None, False, existing
+
+
+def _keeping_refusal(state: AutoForgeState, command: str) -> str:
+    """Why a plain ``run`` keeps a BLOCKED or FAILED run, or ``""`` when it may replace it.
+
+    Two things such a run holds are already on GitHub and are lost from
+    state by a replacement: an operator action of its FIX plan (#243), which
+    the operator may have posted, and a PR it owns (#483), whose marker names
+    it (ADR 0004 D9.4a), so a new run of the issue blocks on the PR and does
+    not adopt the review comments the old run posted on it (D9.6). ``--force``
+    still discards the run; the refusal says what that leaves behind.
+    """
+    operator = _operator_records(state)
+    owned = _owned_prs(state)
+    if not operator and not owned:
+        return ""
+    held = []
+    if owned:
+        held.append(_owned_prs_held(owned))
+    if operator:
         named = "; ".join(
             f"{r.action_id} on {r.target['issue_url']}"
             + (f" ({(r.observed or {}).get('url')})" if r.stage is Stage.OBSERVED else "")
             for r in operator
         )
-        print(
-            redact(
-                f"autoforge: error: existing run {existing.run_id} in phase "
-                f"{existing.phase.value} holds operator actions ({named}) — see 'status', "
-                f"or use '{command} --force' to discard the run (the comments stay on GitHub)"
-            ),
-            file=sys.stderr,
+        held.append(f"holds operator actions ({named})")
+    left = ["the comments stay on GitHub"] if operator else []
+    if owned:
+        left.append(_owned_prs_left(state, owned))
+    discard = f"'{command} --force' to discard the run ({'; '.join(left)})"
+    if state.phase is Phase.BLOCKED and not state.replan_transaction:
+        route = f"'unblock' and then 'resume' continue it (see 'status'), or use {discard}"
+    else:
+        # FAILED has no outgoing edge, and 'unblock' refuses a run whose
+        # replan journal is recorded: a new run is the only way on.
+        why = (
+            "nothing continues a FAILED run"
+            if state.phase is Phase.FAILED
+            else "'unblock' cannot continue a run with a replan journal"
         )
-        return 2, False
-    return None, False
+        route = f"{why}: see 'status', then use {discard}"
+    return (
+        f"autoforge: error: existing run {state.run_id} in phase {state.phase.value} "
+        f"{' and '.join(held)} — {route}"
+    )
+
+
+def _owned_prs_held(owned: list[_OwnedPR]) -> str:
+    """``owns PR …`` and ``may own PR …``: what the state confirms, then what it cannot (#483)."""
+    confirmed = [o.name for o in owned if o.confirmed]
+    unconfirmed = [o.name for o in owned if not o.confirmed]
+    held = []
+    if confirmed:
+        held.append("owns " + ", ".join(confirmed))
+    if unconfirmed:
+        held.append("may own " + ", ".join(unconfirmed))
+    return " and ".join(held)
+
+
+def _owned_prs_left(state: AutoForgeState, owned: list[_OwnedPR]) -> str:
+    """What replacing a run that owns ``owned`` leaves on GitHub (#483).
+
+    A PR the state confirms (bound, named by the replan journal, or read back
+    by its record) stays with its marker naming the run, which stops a new
+    run of the issue at it (ADR 0004 D9.4a). A PR the state cannot confirm
+    (a write sent and never read back) is said to stay so only if that write
+    landed. Then the review comments the run posted: a new run does not hold
+    them in its journal, so after the take-over its round-1 review can stop
+    at one of them (D9.6) instead of posting its own.
+    """
+    run = state.run_id
+    stops = "stops a new run of the issue at it ('pr-owner') until 'unblock --take-over'"
+    confirmed = [o for o in owned if o.confirmed]
+    unconfirmed = [o for o in owned if not o.confirmed]
+    left = []
+    if confirmed:
+        one = len(confirmed) == 1
+        left.append(
+            f"{'the PR stays' if one else 'the PRs stay'} on GitHub, and while "
+            f"{'it is' if one else 'one is'} open its marker, naming run {run}, {stops}"
+        )
+    if unconfirmed:
+        one = len(unconfirmed) == 1
+        names = ", ".join(o.name for o in unconfirmed)
+        sent = (
+            f"the write that would name run {run} in the marker of {names} was sent and never "
+            "read back, so only GitHub says whether it landed; if it did"
+            if one
+            else f"the writes that would name run {run} in the markers of {names} were sent and "
+            "never read back, so only GitHub says whether any landed; for each that did"
+        )
+        if confirmed:
+            left.append(f"{sent}, the same holds for that PR")
+        else:
+            left.append(f"{sent}, that PR stays on GitHub, and while it is open its marker {stops}")
+    reviews = _review_comments_left(state)
+    if reviews:
+        left.append(reviews)
+    return "; ".join(left)
+
+
+def _review_comments_left(state: AutoForgeState) -> str:
+    """What replacing a run leaves of its review comments on GitHub, or ``""`` (#483, R1-F1).
+
+    A round the run completed was posted and read back; a review comment of
+    its saved plan may be read back too, or only sent. Either is on the PR
+    the run is bound to and stays on GitHub, outside a new run's journal:
+    after taking that PR over, the new run reviews it from its own round 1
+    (ADR 0004 D9.4a), and a round-1 comment it did not journal for the
+    revision it reviews stops it (``unjournaled-write``, D9.6) until the
+    comment or its marker is removed.
+    """
+    posted = state.review_round > 0
+    sent = False
+    for record in state.phase_effects().records:
+        if record.kind is not EffectKind.REVIEW_COMMENT:
+            continue
+        if record.stage is Stage.OBSERVED:
+            posted = True
+        elif record.attempts:
+            sent = True
+    on = f" on PR {state.current_pr_url}" if state.current_pr_url else ""
+    if posted:
+        what = f"its review comments{on} stay on GitHub too"
+    elif sent:
+        what = f"a review comment{on} it sent and never read back stays on GitHub too, if it landed"
+    else:
+        return ""
+    return (
+        f"{what}, and a new run inherits none of its rounds: after taking that PR over, the new "
+        f"run reviews it from its own round 1, and a round-1 review comment of run "
+        f"{state.run_id} for the revision it reviews stops it ('unjournaled-write') until "
+        "that comment or its marker is removed"
+    )
 
 
 def cmd_run(args) -> int:
@@ -1759,7 +1881,7 @@ def cmd_run(args) -> int:
     # A run the state already there refuses is refused before the lock too:
     # the refusal writes nothing, and taking the lock would write its PID
     # record in the state directory when that is the lock's own (#387).
-    rc, _ = _existing_run_guard(engine, args.force)
+    rc, _, _ = _existing_run_guard(engine, args.force)
     if rc is not None:
         return rc
     # Inspect, decide, quarantine, write the first state AND execute under
@@ -1770,7 +1892,7 @@ def cmd_run(args) -> int:
     # would let a second controller take over the repository and both would
     # then run agents and persist state over each other.
     with engine.locked():
-        rc, corrupt = _existing_run_guard(engine, args.force)
+        rc, corrupt, replaced = _existing_run_guard(engine, args.force)
         if rc is not None:
             return rc
         # A scheduler-owned issue is refused before anything is read from
@@ -1793,6 +1915,19 @@ def cmd_run(args) -> int:
         if corrupt:
             moved = engine.quarantine_state()
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
+        if replaced is not None and replaced.phase is not Phase.DONE:
+            # Only --force replaces a run that owns a PR and has not finished
+            # (#483): say what it leaves on GitHub before the save forgets it.
+            owned = _owned_prs(replaced)
+            if owned:
+                print(
+                    redact(
+                        f"autoforge: replacing run {replaced.run_id} in phase "
+                        f"{replaced.phase.value}, which {_owned_prs_held(owned)}: "
+                        f"{_owned_prs_left(replaced, owned)}"
+                    ),
+                    file=sys.stderr,
+                )
         engine.save()
         engine.log_epic_binding(binding)
         _attach_terminal(engine)
@@ -3173,6 +3308,76 @@ _KEEPING_PHASES = (Phase.BLOCKED, Phase.FAILED)
 def _operator_records(state: AutoForgeState) -> list[EffectRecord]:
     """The persisted K10 records of the current plan (#243)."""
     return [r for r in state.phase_effects().records if r.kind is EffectKind.OPERATOR_COMMENT]
+
+
+# The writes that put a run's id into a PR's implementation marker (ADR 0004
+# D9.4a): K2 opens the PR, K3 adopts one, K7 opens a replan's replacement and
+# K11 takes one over.
+_PR_OWNING_KINDS = frozenset(
+    {
+        EffectKind.IMPLEMENTATION_PR,
+        EffectKind.ADOPT_PR,
+        EffectKind.REPLACEMENT_PR,
+        EffectKind.OWNER_TAKEOVER,
+    }
+)
+
+
+@dataclass(frozen=True)
+class _OwnedPR:
+    """A PR a run's state says it owns (#483): its name, and whether the state confirms it.
+
+    ``confirmed`` is the controller's own read-back: the run is bound to the
+    PR, its replan journal names it as the verified replacement, or the
+    record of the write that names the run in its marker is ``observed``.
+    Otherwise the write was sent and never read back, and it may not have
+    landed: the run may own the PR, which may not even exist.
+    """
+
+    name: str
+    confirmed: bool
+
+
+def _owned_prs(state: AutoForgeState) -> list[_OwnedPR]:
+    """The PRs a run owns on GitHub as its state records them (#483), each named.
+
+    The PR the run is bound to, the replacement its replan journal names, and
+    each PR its saved plan opens, adopts or takes over with a write that was
+    issued at least once or reads back as sent, before the binding was saved:
+    the implementation marker that write puts on the PR names this run
+    (ADR 0004 D9.4a). A record never issued (``intended``, or a conflict found
+    before the first issue) wrote nothing and owns nothing; one issued and
+    never read back owns the PR only if the write landed, which only GitHub
+    says, so it is not ``confirmed``. Read from the state alone, never from
+    GitHub: a PR closed or merged since is still named, since only the
+    operator can say the run is done with it.
+    """
+    owned: dict[str, bool] = {}
+
+    def add(name: str, confirmed: bool) -> None:
+        owned[name] = owned.get(name, False) or confirmed
+
+    if state.current_pr_url:
+        add(f"PR {state.current_pr_url}", True)
+    txn = _load_replan_journal(state)
+    if txn is not None and txn.replacement_pr_url:
+        add(f"PR {txn.replacement_pr_url}", True)
+    for record in state.phase_effects().records:
+        if record.kind not in _PR_OWNING_KINDS:
+            continue
+        if record.stage is not Stage.OBSERVED and record.attempts == 0:
+            continue
+        url = (record.observed or {}).get("url") or record.target.get("pr_url")
+        if url:
+            add(f"PR {url}", record.stage is Stage.OBSERVED)
+        else:
+            # K2 or K7 sent and never read back: whether it opened a PR at
+            # all is what only GitHub can say.
+            add(
+                f"a PR from {record.target['head']} in {record.target['repository']}",
+                False,
+            )
+    return [_OwnedPR(name, confirmed) for name, confirmed in owned.items()]
 
 
 def _operator_actions(state: AutoForgeState) -> list[dict]:

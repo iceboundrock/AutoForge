@@ -4787,7 +4787,513 @@ def test_run_refuses_to_replace_a_run_holding_operator_actions(
     err = capsys.readouterr().err
     assert "holds operator actions" in err and f"{ids[T16]} on {T16}" in err
     assert "comments stay on GitHub" in err
+    # The FIX plan's run owns its PR too (#483), and the refusal names it.
+    assert (
+        f"existing run {_saved_run_id(state_file)} in phase {phase} owns PR {PR} and holds" in err
+    )
     assert state_file.read_text() == raw
+
+
+def _saved_run_id(state_file: Path) -> str:
+    return json.loads(state_file.read_text())["run_id"]
+
+
+def _stopped_in_review(capsys, fakes, sd: str, status: str) -> AutoForgeState:
+    """A run whose controller opened PR 42, then whose reviewer reported ``status``."""
+    fakes["handler"] = lambda req: (
+        implement(req)
+        if req.phase == "ANALYZE_EXECUTE"
+        else block({"phase": "REVIEW", "status": status, "message": "needs a human"})
+    )
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 1
+    capsys.readouterr()
+    fakes["handler"] = lambda req: pytest.fail(f"no agent may run: {req.phase}")
+    return load_state(Path(sd) / "state.json")
+
+
+@pytest.mark.parametrize(
+    ("status", "route"),
+    [
+        ("blocked", "'unblock' and then 'resume' continue it (see 'status'), or use 'run --force'"),
+        ("failure", "nothing continues a FAILED run: see 'status', then use 'run --force'"),
+    ],
+)
+def test_run_refuses_to_replace_a_stopped_run_that_owns_its_pr(
+    tmp_path, capsys, monkeypatch, fakes, status, route
+):
+    """#483: a BLOCKED or FAILED run that owns a PR is not replaced by a plain
+    `run`. Replacing it would forget the PR and the review posted on it, while
+    the PR's marker keeps naming the old run, so the new run would stop at the
+    PR (`pr-owner`, ADR 0004 D9.4a) and need a take-over. Nothing is read,
+    launched or written; `--force` still replaces the run, says what it leaves
+    on GitHub, and the new run stops at the PR as that says."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    old = _stopped_in_review(capsys, fakes, sd, status)
+    assert old.current_pr_url == PR and old.phase.value in ("BLOCKED", "FAILED")
+    state_file = Path(sd) / "state.json"
+    before = _files(sd)
+    gh_calls = len(fakes["gh"].calls)
+
+    argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]
+    assert cli.main(argv) == 2
+    captured = capsys.readouterr()
+    left = (
+        f"the PR stays on GitHub, and while it is open its marker, naming run {old.run_id}, "
+        "stops a new run of the issue at it ('pr-owner') until 'unblock --take-over'"
+    )
+    assert captured.out == ""
+    assert (
+        f"autoforge: error: existing run {old.run_id} in phase {old.phase.value} owns PR {PR} "
+        f"— {route} to discard the run ({left})\n"
+    ) in captured.err
+    assert _files(sd) == before
+    assert len(fakes["gh"].calls) == gh_calls
+
+    assert cli.main([*argv, "--force", "--max-steps", "2"]) == 1
+    captured = capsys.readouterr()
+    assert (
+        f"autoforge: replacing run {old.run_id} in phase {old.phase.value}, which owns PR {PR}: "
+        f"{left}\n"
+    ) in captured.err
+    new = load_state(state_file)
+    assert new.run_id != old.run_id
+    assert (new.phase.value, new.stop_code) == ("BLOCKED", "pr-owner")
+    assert old.run_id in new.block_reason and "--take-over" in new.block_reason
+
+
+def test_run_still_replaces_a_stopped_run_that_owns_nothing(tmp_path, capsys, monkeypatch, fakes):
+    """#483 keeps what #243 left replaceable: a BLOCKED run with no PR and no
+    operator action is replaced by a plain `run`, without a note."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    _block_run(tmp_path, capsys, fakes, sd)
+    old = load_state(Path(sd) / "state.json")
+    assert old.phase.value == "BLOCKED" and old.current_pr_url == ""
+    fakes["handler"] = lambda req: block(
+        {"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": "still unclear"}
+    )
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 1
+    captured = capsys.readouterr()
+    assert "existing run" not in captured.err and "replacing run" not in captured.err
+    assert load_state(Path(sd) / "state.json").run_id != old.run_id
+
+
+_TAKE_OVER = "stops a new run of the issue at it ('pr-owner') until 'unblock --take-over'"
+_CONTINUE = "'unblock' and then 'resume' continue it (see 'status'), or use 'run --force'"
+_REPLAN = (
+    "'unblock' cannot continue a run with a replan journal: see 'status', then use 'run --force'"
+)
+PR41 = "https://github.com/owner/repo/pull/41"
+
+
+def _confirmed_left(run_id: str, several: bool = False) -> str:
+    """What `--force` leaves of the PRs the state confirms the run owns (#483)."""
+    stay, which = ("the PRs stay", "one is") if several else ("the PR stays", "it is")
+    return f"{stay} on GitHub, and while {which} open its marker, naming run {run_id}, {_TAKE_OVER}"
+
+
+def _unconfirmed_left(run_id: str, name: str, *, beside: bool = False) -> str:
+    """What `--force` leaves of a PR a write sent and never read back may give the run (R1-F1)."""
+    sent = (
+        f"the write that would name run {run_id} in the marker of {name} was sent and never "
+        "read back, so only GitHub says whether it landed; if it did"
+    )
+    if beside:
+        return f"{sent}, the same holds for that PR"
+    return f"{sent}, that PR stays on GitHub, and while it is open its marker {_TAKE_OVER}"
+
+
+def _reviews_left(run_id: str) -> str:
+    """What `--force` leaves of the review comments a run posted on PR 42 (R1-F1)."""
+    return (
+        f"its review comments on PR {PR} stay on GitHub too, and a new run inherits none of "
+        "its rounds: after taking that PR over, the new run reviews it from its own round 1, "
+        f"and a round-1 review comment of run {run_id} for the revision it reviews stops it "
+        "('unjournaled-write') until that comment or its marker is removed"
+    )
+
+
+def _refused_then_forced(capsys, fakes, sd: str, held: str, left: str, route: str = _CONTINUE):
+    """A plain `run` over the stopped run at ``sd`` is refused, naming what it ``held`` and
+    what `--force` would leave; `--force` prints the same before replacing it (#483).
+
+    The refusal changes no file of the state directory and reads nothing from
+    GitHub; the forced run replaces the run and stops after one step.
+    """
+    state_file = Path(sd) / "state.json"
+    old = load_state(state_file)
+    before = _files(sd)
+    gh_calls = len(fakes["gh"].calls)
+    argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    assert cli.main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert (
+        f"autoforge: error: existing run {old.run_id} in phase {old.phase.value} {held} — "
+        f"{route} to discard the run ({left})\n"
+    ) in captured.err
+    assert _files(sd) == before
+    assert len(fakes["gh"].calls) == gh_calls
+
+    fakes["handler"] = lambda req: pytest.fail(f"no agent may run: {req.phase}")
+    assert cli.main([*argv, "--force"]) == 0
+    assert (
+        f"autoforge: replacing run {old.run_id} in phase {old.phase.value}, which {held}: {left}\n"
+    ) in capsys.readouterr().err
+    assert load_state(state_file).run_id != old.run_id
+
+
+def _replaced_without_a_word(capsys, sd: str) -> None:
+    """A plain `run` replaces the stopped run at ``sd``: no refusal and no note (#483)."""
+    state_file = Path(sd) / "state.json"
+    old = load_state(state_file)
+    argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    assert cli.main(argv) == 0
+    err = capsys.readouterr().err
+    assert "existing run" not in err and "replacing run" not in err
+    assert load_state(state_file).run_id != old.run_id
+
+
+def _stopped_after(monkeypatch, capsys, sd: str, kind: str, stage: str, go) -> dict:
+    """Run ``go()`` until the controller persists a ``kind`` record at ``stage``, and stop
+    the process there, as a crash would; the run, made BLOCKED, as the state file holds it.
+
+    A run that stops between a write and its binding has to be BLOCKED by a
+    read-back that does not match; the phase stands in for that stop.
+    """
+    from autoforge.effects import EffectKind, Stage
+
+    persist = ControllerEngine._persist_effect
+
+    def stops_after_the_write(self, record):
+        persist(self, record)
+        if record.kind is EffectKind(kind) and record.stage is Stage(stage):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(ControllerEngine, "_persist_effect", stops_after_the_write)
+    with pytest.raises(KeyboardInterrupt):
+        go()
+    # Only this patch: the fakes and the test's working directory stay.
+    monkeypatch.setattr(ControllerEngine, "_persist_effect", persist)
+    capsys.readouterr()
+    state_file = Path(sd) / "state.json"
+    data = json.loads(state_file.read_text())
+    assert {r["kind"]: r["stage"] for r in data["effect_records"]}[kind] == stage
+    data["phase"] = "BLOCKED"
+    state_file.write_text(json.dumps(data))
+    return data
+
+
+def test_a_forced_replacement_says_where_the_new_run_stops_on_the_old_review(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#483 R1-F1, the issue's incident: the run opened PR 42, posted its round-1
+    review, and stopped BLOCKED when its fixer reported `blocked`. A plain `run`
+    is refused, and the refusal names the review comments beside the PR; `run
+    --force` says the same before it replaces the run. The new run then stops
+    where that said: at the PR (`pr-owner`), and after `unblock --take-over` and
+    `resume`, at the old run's round-1 comment (`unjournaled-write`), which its
+    journal does not hold. No reviewer is launched."""
+    monkeypatch.chdir(tmp_path)
+    gh = fakes["gh"]
+    finding = {
+        "id": "R1-F1",
+        "classification": "blocked",
+        "title": "prerequisite",
+        "location": "src/x.py:1",
+        "required_resolution": "merge the prerequisite first",
+    }
+
+    def agent(req):
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        if req.phase == "REVIEW":
+            return block(review_result(1, gh.prs[PR].head_sha, [finding]))
+        return block({"phase": "FIX", "status": "blocked", "message": "the prerequisite first"})
+
+    fakes["handler"] = agent
+    sd = str(tmp_path / ".autoforge")
+    state_file = Path(sd) / "state.json"
+    argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]
+    assert cli.main(argv) == 1
+    capsys.readouterr()
+    old = load_state(state_file)
+    assert (old.phase, old.current_pr_url, old.review_round) == (Phase.BLOCKED, PR, 1)
+    round_one = old.last_review_comment_url
+    assert round_one
+    fakes["handler"] = lambda req: pytest.fail(f"no agent may run: {req.phase}")
+    before = _files(sd)
+    gh_calls = len(gh.calls)
+
+    left = f"{_confirmed_left(old.run_id)}; {_reviews_left(old.run_id)}"
+    assert cli.main(argv) == 2
+    assert (
+        f"autoforge: error: existing run {old.run_id} in phase BLOCKED owns PR {PR} — "
+        f"{_CONTINUE} to discard the run ({left})\n"
+    ) in capsys.readouterr().err
+    assert _files(sd) == before and len(gh.calls) == gh_calls
+
+    assert cli.main([*argv, "--force", "--max-steps", "2"]) == 1
+    assert (
+        f"autoforge: replacing run {old.run_id} in phase BLOCKED, which owns PR {PR}: {left}\n"
+    ) in capsys.readouterr().err
+    new = load_state(state_file)
+    assert (new.phase.value, new.stop_code) == ("BLOCKED", "pr-owner")
+
+    unblock = ["--state-dir", sd, "unblock", "--reason", "the old run is gone"]
+    assert cli.main([*unblock, "--take-over", PR]) == 0
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "resume", "--max-steps", "2"]) == 1
+    capsys.readouterr()
+    new = load_state(state_file)
+    assert (new.phase, new.current_pr_url, new.review_round) == (Phase.BLOCKED, PR, 0)
+    assert new.stop_code == "unjournaled-write" and round_one in new.block_reason
+    # The take-over wrote the new run into the marker; the old comment stays.
+    assert f'"owner_run_id": "{new.run_id}"' in gh.prs[PR].body
+
+
+@pytest.mark.parametrize("stage", ["attempted", "observed"])
+def test_the_refusal_names_a_review_comment_sent_and_never_read_back_as_such(
+    tmp_path, capsys, monkeypatch, fakes, stage
+):
+    """#483 R1-F1: a run stopped after REVIEW sent its round-1 comment (K4) and
+    before the round was recorded. Read back, the comment is on the PR, and the
+    refusal and the note say it stays, as for a recorded round; only sent, it
+    may not have landed, and they say that it stays only if it did."""
+    monkeypatch.chdir(tmp_path)
+    gh = fakes["gh"]
+    fakes["handler"] = lambda req: (
+        implement(req)
+        if req.phase == "ANALYZE_EXECUTE"
+        else block(review_result(1, gh.prs[PR].head_sha))
+    )
+    sd = str(tmp_path / ".autoforge")
+    argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]
+    data = _stopped_after(monkeypatch, capsys, sd, "review_comment", stage, lambda: cli.main(argv))
+    assert (data["current_pr_url"], data["review_round"]) == (PR, 0)
+    run_id = data["run_id"]
+    reviews = _reviews_left(run_id)
+    if stage == "attempted":
+        reviews = reviews.replace(
+            f"its review comments on PR {PR} stay on GitHub too",
+            f"a review comment on PR {PR} it sent and never read back stays on GitHub too, "
+            "if it landed",
+        )
+    left = f"{_confirmed_left(run_id)}; {reviews}"
+    _refused_then_forced(capsys, fakes, sd, f"owns PR {PR}", left)
+
+
+@pytest.mark.parametrize(
+    ("kind", "stage", "held"),
+    [
+        # A pushed branch with no PR is prior work a new run continues (D9.4).
+        ("push", "attempted", None),
+        # Sent and never read back: GitHub alone says whether it opened a PR.
+        ("implementation_pr", "attempted", "may own a PR from autoforge/2 in owner/repo"),
+        ("implementation_pr", "observed", f"owns PR {PR}"),
+    ],
+)
+def test_run_refuses_to_replace_a_run_whose_plan_opened_a_pr_it_did_not_bind(
+    tmp_path, capsys, monkeypatch, fakes, kind, stage, held
+):
+    """#483: ANALYZE_EXECUTE binds the PR it opened only after reading it back,
+    and a run that stops in between (a read-back that does not match blocks
+    there) owns a PR its state has no URL for. Its saved plan says so, and a
+    plain `run` refuses to replace it: the PR's marker names it all the same.
+    A write sent and never read back may not have landed, and the refusal and
+    the note say so (R1-F1). Stopped after the push and before the PR was
+    sent, it owns no PR, and a plain `run` replaces it as before."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    fakes["handler"] = implement
+    argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]
+    data = _stopped_after(monkeypatch, capsys, sd, kind, stage, lambda: cli.main(argv))
+    assert data["current_pr_url"] == ""
+    stages = {r["kind"]: r["stage"] for r in data["effect_records"]}
+    assert stages["implementation_pr"] in ("intended", stage)
+    if held is None:
+        _replaced_without_a_word(capsys, sd)
+        return
+    run_id = data["run_id"]
+    left = (
+        _confirmed_left(run_id)
+        if stage == "observed"
+        else _unconfirmed_left(run_id, "a PR from autoforge/2 in owner/repo")
+    )
+    _refused_then_forced(capsys, fakes, sd, held, left)
+
+
+def _earlier_work_on_the_branch(tmp_path, fakes) -> str:
+    """A commit for this issue on ``autoforge/2`` before the run, pushed by someone else."""
+    sha = git_out(
+        "-C",
+        str(tmp_path),
+        *GIT_IDENT,
+        "commit-tree",
+        "HEAD^{tree}",
+        "-p",
+        "HEAD",
+        "-m",
+        "Earlier work (#2)",
+    )
+    return fakes["origin"].publish(tmp_path, sha, "autoforge/2")
+
+
+@pytest.mark.parametrize(
+    ("stage", "held"), [("attempted", f"may own PR {PR41}"), ("observed", f"owns PR {PR41}")]
+)
+def test_run_refuses_to_replace_a_run_whose_plan_adopted_a_pr_it_did_not_bind(
+    tmp_path, capsys, monkeypatch, fakes, stage, held
+):
+    """#483, R1-F2: the run's ANALYZE_EXECUTE adopts the open unmarked PR on its
+    branch (K3), writing its marker into the PR's body, and binds it only after
+    the read-back. Stopped after the write was sent, it may own the PR: the
+    PR is there, and only GitHub says whether its marker names the run. Stopped
+    after the read-back, it owns it. Either way a plain `run` refuses, and
+    `--force` says what it leaves."""
+    from tests.test_engine import _from_start
+
+    monkeypatch.chdir(tmp_path)
+    earlier = _earlier_work_on_the_branch(tmp_path, fakes)
+    fakes["gh"].add_pr(PR41, head_sha=earlier, branch="autoforge/2", body="Started by hand.")
+    fakes["handler"] = _from_start
+    sd = str(tmp_path / ".autoforge")
+    argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]
+    data = _stopped_after(monkeypatch, capsys, sd, "adopt_pr", stage, lambda: cli.main(argv))
+    assert data["current_pr_url"] == "" and PR not in fakes["gh"].prs
+    run_id = data["run_id"]
+    left = (
+        _confirmed_left(run_id) if stage == "observed" else _unconfirmed_left(run_id, f"PR {PR41}")
+    )
+    _refused_then_forced(capsys, fakes, sd, held, left)
+
+
+def _taking_over(tmp_path, capsys, monkeypatch, fakes) -> list[str]:
+    """A fresh run blocked on PR 42, whose marker names another run, then `unblock
+    --take-over` (K11 journaled, nothing written); the `resume` that writes it."""
+    from tests.conftest import implementation_pr_body
+
+    monkeypatch.chdir(tmp_path)
+    gh = fakes["gh"]
+    gh.add_pr(PR, head_sha=SHA_A, branch="autoforge/2")
+    gh.prs[PR].body = implementation_pr_body(owner_run_id="af-20261103T000000Z-0a1b2c")
+    sd = str(tmp_path / ".autoforge")
+    argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "2"]
+    assert cli.main(argv) == 1
+    unblock = ["--state-dir", sd, "unblock", "--reason", "handed over"]
+    assert cli.main([*unblock, "--take-over", PR]) == 0
+    capsys.readouterr()
+    assert gh.effect_writes == []
+    return ["--state-dir", sd, "resume", "--max-steps", "1"]
+
+
+def test_run_replaces_a_run_whose_takeover_conflicted_before_it_was_sent(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#483, R1-F2: a take-over (K11) that found the PR's body changed since
+    `--take-over` read it conflicts before its first issue. It wrote nothing,
+    so the marker never named the run, and the run owns no PR: a plain `run`
+    replaces it, without a note."""
+    resume = _taking_over(tmp_path, capsys, monkeypatch, fakes)
+    gh = fakes["gh"]
+    gh.prs[PR].body += "\nEdited after the take-over was recorded.\n"
+    assert cli.main(resume) == 1
+    capsys.readouterr()
+    sd = resume[1]
+    data = json.loads((Path(sd) / "state.json").read_text())
+    (record,) = [r for r in data["effect_records"] if r["kind"] == "owner_takeover"]
+    assert (data["phase"], record["stage"], record["attempts"]) == ("BLOCKED", "conflict", 0)
+    assert data["current_pr_url"] == "" and gh.effect_writes == []
+    _replaced_without_a_word(capsys, sd)
+
+
+@pytest.mark.parametrize(
+    ("stage", "held"), [("attempted", f"may own PR {PR}"), ("observed", f"owns PR {PR}")]
+)
+def test_run_refuses_to_replace_a_run_whose_takeover_was_sent(
+    tmp_path, capsys, monkeypatch, fakes, stage, held
+):
+    """#483, R1-F2: once the take-over (K11) is sent, the PR's marker may name
+    the run, and once it is read back it does, before the run binds the PR.
+    Either way a plain `run` refuses, and `--force` says what it leaves: the PR
+    the run only may own is named as such (R1-F1)."""
+    resume = _taking_over(tmp_path, capsys, monkeypatch, fakes)
+    sd = resume[1]
+    data = _stopped_after(
+        monkeypatch, capsys, sd, "owner_takeover", stage, lambda: cli.main(resume)
+    )
+    assert data["current_pr_url"] == ""
+    run_id = data["run_id"]
+    left = _confirmed_left(run_id) if stage == "observed" else _unconfirmed_left(run_id, f"PR {PR}")
+    _refused_then_forced(capsys, fakes, sd, held, left)
+
+
+@pytest.mark.parametrize("stage", ["attempted", "observed"])
+def test_run_refuses_to_replace_a_run_whose_replan_opened_a_replacement(
+    tmp_path, capsys, monkeypatch, fakes, stage
+):
+    """#483, R1-F2: a replan (REPLAN_REEXECUTE) opens its replacement PR (K7)
+    with a marker naming the run, while the run is still bound to its source
+    PR. Stopped after the write was sent, the run owns the source and may own
+    the replacement; after the read-back, it owns both. A plain `run` refuses
+    and names `run --force` as the only way on, since `unblock` refuses a run
+    with a replan journal; `--force` says what it leaves of each."""
+    from tests.test_replan import _history, _replan_agent
+
+    monkeypatch.chdir(tmp_path)
+    gh = fakes["gh"]
+    sd = str(tmp_path / ".autoforge")
+    eng = make_engine(Path(sd), _replan_agent(gh), github=gh)
+    eng.origin = fakes["origin"]
+    source = publish_pr_head(eng)
+    gh.add_pr(head_sha=source, branch=BRANCH, linked=[2])
+    eng.state.phase = Phase.REVIEW
+    eng.state.current_pr_url = PR
+    eng.state.current_branch = BRANCH
+    eng.state.current_head_sha = source
+    eng.state.review_round = 19
+    eng.state.review_history = _history([3 + (n % 2) for n in range(19)])
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    data = _stopped_after(monkeypatch, capsys, sd, "replacement_pr", stage, eng.step)
+    eng.close()
+    assert data["current_pr_url"] == PR and data["replan_transaction"]
+    (record,) = [r for r in data["effect_records"] if r["kind"] == "replacement_pr"]
+    run_id = data["run_id"]
+    if stage == "observed":
+        replacement = record["observed"]["url"]
+        held = f"owns PR {PR}, PR {replacement}"
+        left = _confirmed_left(run_id, several=True)
+    else:
+        name = f"a PR from {record['target']['head']} in owner/repo"
+        held = f"owns PR {PR} and may own {name}"
+        left = f"{_confirmed_left(run_id)}; {_unconfirmed_left(run_id, name, beside=True)}"
+    # The source PR's 19 rounds are its review history, which stays too.
+    left = f"{left}; {_reviews_left(run_id)}"
+    _refused_then_forced(capsys, fakes, sd, held, left, route=_REPLAN)
+
+
+def test_run_refuses_to_replace_a_run_whose_replan_journal_names_a_replacement(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#483, R1-F2: a replan journal that bound its verified replacement names a
+    PR the run owns beside the source it is still bound to, with nothing of the
+    plan left to say so. A plain `run` refuses, naming both and `run --force`
+    as the only way on; `--force` says what it leaves of both."""
+    from autoforge.replan_txn import ReplanStage
+    from tests.test_replan import REPLACEMENT_PR, _seed_txn
+
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    _stopped_in_review(capsys, fakes, sd, "blocked")
+    state_file = Path(sd) / "state.json"
+    data = json.loads(state_file.read_text())
+    assert data["effect_records"] == []
+    data["replan_transaction"] = _seed_txn(ReplanStage.VERIFIED).to_dict()
+    state_file.write_text(json.dumps(data))
+    held = f"owns PR {PR}, PR {REPLACEMENT_PR}"
+    left = _confirmed_left(data["run_id"], several=True)
+    _refused_then_forced(capsys, fakes, sd, held, left, route=_REPLAN)
 
 
 # -- the recorded configuration (#219) ------------------------------------------------

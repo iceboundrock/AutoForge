@@ -301,7 +301,19 @@ operator and for `unblock` back into the phase (which reconciles a
 `conflict` record again, with its attempt count kept). Because of that,
 `run` refuses to replace a `BLOCKED` or `FAILED` run whose plan holds
 operator actions unless `--force` is given, naming each action and any
-observed comment (#243); the comments stay on GitHub either way. The fields are
+observed comment (#243); the comments stay on GitHub either way. It refuses
+one that owns a PR the same way (#483): the PR its state is bound to, the
+replacement its replan journal names, or a PR its plan opens, adopts or
+takes over (K2, K3, K7, K11) with a record observed or issued at least once.
+That PR's marker names the run (ADR 0004 D9.4a), so a fresh state would stop
+at it. The state alone decides: no GitHub read, and a PR closed or merged
+since still counts. The refusal tells a confirmed PR (bound, verified by the
+journal, or `observed`) from one whose write was issued and never read back,
+which the run only `may own`, and names the review comments the run posted
+(K4) or only sent, which a new run does not journal: after its take-over,
+a round-1 one for the revision it reviews stops it (D9.6). `--force`
+replaces either, and prints the same account before its first save. The
+fields are
 validated on load against the run's issue, PR and phase, and a corrupt or
 incomplete value fails loudly, never replaced by a default. Every protocol-7
 save writes all four fields, so a protocol-7 file missing one is refused:
