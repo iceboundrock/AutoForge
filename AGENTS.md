@@ -226,7 +226,13 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        required changes, nothing implemented): the
                                        lifecycle seam, the death-watch that replaces
                                        --die-with-parent, rootless only, bind or
-                                       copy-in per runtime, the invariant map)
+                                       copy-in per runtime, the invariant map;
+                                       remote execution sandboxes (accepted as a
+                                       no-go, nothing in the package): the provider
+                                       comparison, the remote contract R1 to R10, the
+                                       signed-off no-go for a production adapter,
+                                       what reopens it and the SSH-first direction
+                                       for a reopening, which is not a go)
 docs/README.md                         human-oriented documentation index, by intent
 docs/non-code-rules.md                 writing and publishing rules for every non-code artifact
 docs/getting-started.md                operator guide: a first run from nothing, step by step, and the
@@ -333,6 +339,11 @@ matches none of them needs only this file and the scoped `AGENTS.md`.
   `docs/adr/0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md`
   in addition to
   `docs/adr/0005-outer-sandbox-and-host-resource-capability-model.md`.
+- If proposing or adding a backend whose runtime is on another machine (a
+  remote execution sandbox: a hosted microVM service, a cloud VM, a
+  runtime endpoint over TCP or SSH), read
+  `docs/adr/0014-remote-execution-sandboxes-contract-and-no-go.md` in
+  addition to ADR 0013.
 - If adding or changing tests, or changing behaviour in a high-priority
   coverage area, read `tests/AGENTS.md` and `docs/agent-guides/testing.md`.
 - If changing `tests/evaluation.py`, `tests/evaluation_fixture.py` or

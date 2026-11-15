@@ -544,6 +544,25 @@ ADR 0013)                             every decision of ADRs 0002, 0004, 0005, 0
                                       no other does, ADR 0013's list of its amendments names
                                       what the map marks amended, no protocol number is
                                       claimed, the links resolve, every ADR has an index row)
+remote execution sandboxes (#276,     test_remote_sandbox_prototype.py (the prototype in
+ADR 0014)                             remote_sandbox_prototype.py against its FakeRemote: a seed
+                                      pack in and a candidate back through the real strict
+                                      import; each interruption, bound and expiry of the seed's
+                                      upload and the artifact's download fails closed and leaves
+                                      nothing to import; a pack the bound manifest does not name
+                                      is refused on the host and by the stager; short local
+                                      writes complete, and one that stops leaves nothing; the
+                                      journal entry, the name and tags, an ambiguous create
+                                      resolved by name; the renewed deadline and a dead
+                                      controller's bound, a deadline read back past it or not
+                                      finite refused at the create and at a renewal, a ceiling,
+                                      window or given deadline that is not finite refused;
+                                      verified deletion and remove-only reconciliation,
+                                      blocking on what it cannot prove and on another scope;
+                                      no GitHub or provider credential in a create; ADR 0014's
+                                      tests exist, no protocol number, its links, its agreement
+                                      with ADR 0013 D16, and the package never imports the
+                                      prototype)
 the recovery action package and       test_recovery_package.py (the scenario table on real stops
 status --live (#374)                  read back by a fresh CLI engine: K10, K9 approve and
                                       decline, PR #314's false conflict beside an authentic one,
