@@ -13,9 +13,12 @@ operator's global configuration pointed at a home of the test's own.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
+import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -23,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from autoforge import source_staging
 from autoforge.errors import SandboxLaunchRefusedError
 from autoforge.executor import execute
 from autoforge.git_input import SEED_MANIFEST_NAME, LaunchGitInput, seed_manifest_digest
@@ -54,7 +58,7 @@ from autoforge.sandbox_container import (
     check_spec,
     create_options,
 )
-from autoforge.sandbox_lifecycle import LaunchLifecycle
+from autoforge.sandbox_lifecycle import LaunchLifecycle, reconcile
 from autoforge.seed_pack import (
     CONVERSIONS,
     LFS,
@@ -67,12 +71,14 @@ from autoforge.seed_pack import (
 from autoforge.source_staging import (
     PRIVATE_DIRECTORY_MODE,
     STAGED_ENTRIES,
+    STAGED_OWNER,
     STAGED_READ_CONTEXT,
     STAGED_SEED,
     STAGED_TREE,
     SourceStaging,
     StagedSource,
     as_seed,
+    owner_record,
 )
 
 from .test_seed_pack import (
@@ -90,6 +96,7 @@ from .test_seed_pack import (
 
 KEY = "292"
 OWNER = LaunchOwner(run="run-1", issue=292, phase="REVIEW", launch="L-1")
+NONCE = "n-root"
 RUNTIME = RuntimeReport(
     BackendKind.CONTAINER, "podman", "5.2.0", True, "unix:///run/user/1000/podman.sock", "store-1"
 )
@@ -139,9 +146,14 @@ def review_input(review: Review, launch: str = "L-1") -> LaunchGitInput:
     return git_input("REVIEW", review.head, review.merge_base, launch=launch)
 
 
+def owner_of(gi: LaunchGitInput) -> LaunchOwner:
+    """The launch ``gi`` names, as its objects' labels say."""
+    return LaunchOwner(run=gi.run, issue=gi.issue, phase=gi.phase, launch=gi.launch)
+
+
 def bound(staging: SourceStaging, gi: LaunchGitInput) -> tuple[Seed, LaunchGitInput]:
     """The seed step and its end: the seed built, the input completed with its digest."""
-    seed = staging.seed(LaunchInputs(OWNER, workspace="/nowhere", git_input=gi))
+    seed = staging.seed(LaunchInputs(owner_of(gi), workspace="/nowhere", git_input=gi))
     return seed, gi.with_seed_manifest(seed.identity)
 
 
@@ -159,10 +171,12 @@ def stage(
     staging = staging_for(review.repo, **kwargs)
     gi = review_input(review, launch)
     seed, gi = bound(staging, gi)
-    owner = dataclasses.replace(OWNER, launch=launch)
+    owner = owner_of(gi)
     root = staging.staging_root(owner)
     assert root is not None
-    staged = staging.make_staging_root(root, seed, gi, str(read_context(tmp_path)))
+    staged = staging.make_staging_root(
+        root, seed, gi, str(read_context(tmp_path)), owner=owner, nonce=NONCE
+    )
     return staging, staged, seed
 
 
@@ -321,23 +335,202 @@ def test_a_directory_substituted_at_the_staging_roots_path_is_refused(tmp_path):
         staging.reprove(staged)
 
 
-def test_nothing_mounted_below_the_staging_root_passes_its_proof(tmp_path, monkeypatch):
-    """A directory on another device below the root (a mount nested in it) is refused."""
+def mounted_at(monkeypatch, *suffixes: str) -> None:
+    """Report another mount id for each entry whose path ends with one of ``suffixes``.
+
+    The kernel's mount id is what the staging root's checks compare, so a
+    bind mount from the same filesystem and a file mount read as what they
+    are; the cases with real mounts are :func:`test_real_mounts_are_refused`.
+    """
+    real = source_staging._mount_id
+
+    def mount_id(fd: int, where: str) -> int:
+        found = real(fd, where)
+        return found + 1 if str(where).endswith(suffixes) else found
+
+    monkeypatch.setattr(source_staging, "_mount_id", mount_id)
+
+
+@pytest.mark.parametrize(
+    "where", ["tree/src", "tree/README", "tree/src/c.py", "seed/seed.pack", "read-context/files"]
+)
+def test_a_mount_below_the_staging_root_fails_its_proof(tmp_path, monkeypatch, where):
+    """A directory or a file on another mount below the root, from any filesystem, is refused."""
     review = review_repo(tmp_path)
     staging, staged, _ = stage(tmp_path, review)
-    real = os.lstat
-
-    def lstat(path, *args, **kwargs):
-        found = real(path, *args, **kwargs)
-        if path == "src" and stat.S_ISDIR(found.st_mode):
-            values = list(found)
-            values[stat.ST_DEV] = found.st_dev + 1
-            return os.stat_result(values)
-        return found
-
-    monkeypatch.setattr(os, "lstat", lstat)
-    with pytest.raises(SandboxLaunchRefusedError, match="mounted at tree/src"):
+    mounted_at(monkeypatch, where)
+    with pytest.raises(SandboxLaunchRefusedError, match=f"mounted at {where} below it"):
         staging.reprove(staged)
+
+
+@pytest.mark.parametrize("where", ["/autoforge/sandbox", f"/{KEY}", "/stage", "/stage/L-1"])
+def test_a_mount_in_the_staging_roots_layout_fails_its_proof(tmp_path, monkeypatch, where):
+    review = review_repo(tmp_path)
+    staging, staged, _ = stage(tmp_path, review)
+    mounted_at(monkeypatch, where)
+    with pytest.raises(SandboxLaunchRefusedError, match="is a mount point"):
+        staging.reprove(staged)
+
+
+READ_CONTEXT_CHANGES = {
+    "added": "files/planted.md was added",
+    "changed": "README.md was changed",
+    "removed": "README.md was removed",
+    "file to directory": "README.md was a file and is a dir now",
+    "directory to file": "files was a dir and is a file now",
+    "file to link": "read-context/README.md is not of the kind a staging root holds there",
+    "file to fifo": "read-context/README.md is not of the kind a staging root holds there",
+}
+
+
+@pytest.mark.parametrize("change", sorted(READ_CONTEXT_CHANGES))
+def test_the_staging_root_fails_its_proof_after_its_read_context_changed(tmp_path, change):
+    """The copied read context is proved at each hand-off too, entry by entry (PR #504 R1-F4).
+
+    Every change keeps the modes the record says, so what refuses it is
+    the read context's own proof, not the permission check.
+    """
+    review = review_repo(tmp_path)
+    staging, staged, _ = stage(tmp_path, review)
+    copied = Path(staged.root.path) / STAGED_READ_CONTEXT
+    target = copied / "README.md"
+    if change == "added":
+        (copied / "files" / "planted.md").write_text("planted\n")
+        (copied / "files" / "planted.md").chmod(0o600)
+    elif change == "changed":
+        target.write_text("another read context\n")
+    elif change == "removed":
+        target.unlink()
+    elif change == "file to directory":
+        target.unlink()
+        target.mkdir()
+        target.chmod(PRIVATE_DIRECTORY_MODE)
+    elif change == "directory to file":
+        shutil.rmtree(copied / "files")
+        (copied / "files").write_text("the issue\n")
+        (copied / "files").chmod(0o600)
+    elif change == "file to link":
+        target.unlink()
+        target.symlink_to("files/issue.md")
+    else:
+        target.unlink()
+        os.mkfifo(target, 0o600)
+    with pytest.raises(SandboxLaunchRefusedError, match="staging root is refused") as refused:
+        staging.reprove(staged)
+    assert READ_CONTEXT_CHANGES[change] in str(refused.value)
+
+
+PERMISSION_CHANGES = [
+    # A file a non-owner container user can no longer read: the tree proof
+    # reads only the owner's execute bit, so this is the permission check's.
+    ("tree/src/c.py", 0o600),
+    ("tree/src/c.py", 0o664),
+    ("tree/src", 0o700),
+    ("tree", 0o711),
+    ("seed/seed.pack", 0o644),
+    ("seed", 0o755),
+    ("read-context/README.md", 0o644),
+    ("read-context/files", 0o755),
+    ("owner", 0o644),
+    ("", 0o750),
+]
+
+
+@pytest.mark.parametrize(("where", "mode"), PERMISSION_CHANGES)
+def test_the_staging_root_fails_its_proof_after_a_permission_changed(tmp_path, where, mode):
+    """Every entry has exactly the mode its ownership record says (PR #504 R1-F5)."""
+    review = review_repo(tmp_path)
+    staging, staged, _ = stage(tmp_path, review)
+    root = Path(staged.root.path)
+    (root / where if where else root).chmod(mode)
+    with pytest.raises(SandboxLaunchRefusedError, match=f"has mode {mode:04o}, not "):
+        staging.reprove(staged)
+
+
+@pytest.mark.parametrize("umask", [0o077, 0o002, 0o022])
+def test_the_ownership_record_is_what_every_staged_entry_has_whatever_the_umask(tmp_path, umask):
+    previous = os.umask(umask)
+    try:
+        review = review_repo(tmp_path)
+        staging, staged, _ = stage(tmp_path, review)
+    finally:
+        os.umask(previous)
+    own = staged.ownership
+    root = Path(staged.root.path)
+    assert (own.uid, own.gid) == (os.geteuid(), os.getegid())
+    for path in [root, *root.rglob("*")]:
+        info = path.lstat()
+        assert (info.st_uid, info.st_gid) == (own.uid, own.gid), path
+        if stat.S_ISLNK(info.st_mode):
+            continue
+        mode = stat.S_IMODE(info.st_mode)
+        parts = path.relative_to(root).parts
+        if parts and parts[0] == STAGED_TREE:
+            allowed = (
+                {own.tree_directory_mode}
+                if path.is_dir()
+                else {own.tree_file_mode, own.tree_executable_mode}
+            )
+        else:
+            allowed = {own.private_directory_mode if path.is_dir() else own.private_file_mode}
+        assert mode in allowed, (path, oct(mode))
+    staging.reprove(staged)
+
+
+def test_the_owner_record_names_the_launch_and_its_journal_entry(tmp_path):
+    review = review_repo(tmp_path)
+    staging, staged, _ = stage(tmp_path, review)
+    record = (Path(staged.root.path) / STAGED_OWNER).read_bytes()
+    assert record == owner_record(KEY, staged.owner, NONCE)
+    assert json.loads(record) == {
+        "schema": 1,
+        "key": KEY,
+        "run": "run-1",
+        "issue": 292,
+        "phase": "REVIEW",
+        "launch": "L-1",
+        "nonce": NONCE,
+    }
+    (Path(staged.root.path) / STAGED_OWNER).write_bytes(owner_record(KEY, staged.owner, "n-other"))
+    with pytest.raises(SandboxLaunchRefusedError, match="owner record of another launch"):
+        staging.reprove(staged)
+
+
+@pytest.mark.parametrize(
+    "where", ["/autoforge", "/autoforge/sandbox", f"/sandbox/{KEY}", "/stage", "/stage/L-1"]
+)
+def test_a_mount_in_the_layout_refuses_the_staging_root_before_anything_is_written_in_it(
+    tmp_path, monkeypatch, where
+):
+    """Each directory is checked before anything is created in it (PR #504 R1-F2)."""
+    review = review_repo(tmp_path)
+    staging = staging_for(review.repo)
+    seed, gi = bound(staging, review_input(review))
+    mounted_at(monkeypatch, where)
+    root = staging.staging_root(owner_of(gi))
+    assert root is not None
+    with pytest.raises(SandboxLaunchRefusedError, match="is a mount point"):
+        staging.make_staging_root(root, seed, gi, owner=owner_of(gi), nonce=NONCE)
+    full = Path(root.path)
+    mounted = next(path for path in (full, *full.parents) if str(path).endswith(where))
+    assert mounted.is_dir() and list(mounted.iterdir()) == []
+
+
+@pytest.mark.parametrize("where", ["/L-1/seed", "/L-1/read-context", "/L-1/tree"])
+def test_a_mount_below_the_new_staging_root_is_refused_before_it_is_written(
+    tmp_path, monkeypatch, where
+):
+    review = review_repo(tmp_path)
+    staging = staging_for(review.repo)
+    seed, gi = bound(staging, review_input(review))
+    mounted_at(monkeypatch, where)
+    root = staging.staging_root(owner_of(gi))
+    assert root is not None
+    with pytest.raises(SandboxLaunchRefusedError, match="mounted at"):
+        staging.make_staging_root(
+            root, seed, gi, str(read_context(tmp_path)), owner=owner_of(gi), nonce=NONCE
+        )
+    assert list(Path(root.path + where.removeprefix("/L-1")).iterdir()) == []
 
 
 def test_a_seed_whose_digest_differs_from_the_inputs_is_never_written_into_a_staging_root(
@@ -352,15 +545,15 @@ def test_a_seed_whose_digest_differs_from_the_inputs_is_never_written_into_a_sta
     assert root is not None
     for refused_input in (other, gi, None):
         with pytest.raises(SandboxLaunchRefusedError, match="seed is not written"):
-            staging.make_staging_root(root, seed, refused_input)
+            staging.make_staging_root(root, seed, refused_input, owner=OWNER, nonce=NONCE)
     with pytest.raises(SandboxLaunchRefusedError, match="seed is not written"):
-        staging.make_staging_root(root, NO_SEED, bound_input)
+        staging.make_staging_root(root, NO_SEED, bound_input, owner=OWNER, nonce=NONCE)
     assert not Path(root.path).exists()
     # Swapped after the input was bound: the copy is hashed, and refused.
     manifest = Path(seed.directory) / SEED_MANIFEST_NAME
     manifest.write_bytes(manifest.read_bytes().replace(b'"issue":292', b'"issue":293'))
     with pytest.raises(SandboxLaunchRefusedError):
-        staging.make_staging_root(root, seed, bound_input)
+        staging.make_staging_root(root, seed, bound_input, owner=OWNER, nonce=NONCE)
     assert not (Path(root.path) / STAGED_TREE).exists()
 
 
@@ -375,7 +568,7 @@ def test_a_staging_root_is_created_under_l1_and_never_reused(tmp_path):
     ]
     gi = review_input(review).with_seed_manifest(seed.identity)
     with pytest.raises(SandboxLaunchRefusedError, match="never reused"):
-        staging.make_staging_root(staged.root, seed, gi)
+        staging.make_staging_root(staged.root, seed, gi, owner=OWNER, nonce=NONCE)
 
 
 @pytest.mark.parametrize("planted", ["sandbox key", "stage"])
@@ -409,7 +602,7 @@ def test_a_staging_root_that_is_not_this_issues_own_is_refused(tmp_path):
         "/tmp/not-a-staging-root",
     ):
         with pytest.raises(SandboxLaunchRefusedError):
-            staging.make_staging_root(root, seed, gi)  # type: ignore[arg-type]
+            staging.make_staging_root(root, seed, gi, owner=OWNER, nonce=NONCE)  # type: ignore[arg-type]
     for key in ("..", "a/b", ""):
         with pytest.raises(SandboxLaunchRefusedError):
             SourceStaging(staging.common_dir, key, SeedSettings(), StagingMethod.BIND)
@@ -421,19 +614,23 @@ def test_removing_the_staging_root_is_idempotent_and_scoped_to_its_launch(tmp_pa
     review = review_repo(tmp_path)
     staging, first, _ = stage(tmp_path / "a", review, "L-1")
     _, second, _ = stage(tmp_path / "b", review, "L-2")
-    assert staging.remove_staging_root(first.root) is Removal.REMOVED
+    assert staging.remove_staging_root(first.root, first.owner, first.nonce) is Removal.REMOVED
     assert not Path(first.root.path).exists()
     assert Path(second.root.path).exists()  # another launch's is untouched
-    assert staging.remove_staging_root(first.root) is Removal.REMOVED
+    assert staging.remove_staging_root(first.root, first.owner, first.nonce) is Removal.REMOVED
     never = StagingRoot(staging.common_dir, KEY, "L-9")
-    assert staging.remove_staging_root(never) is Removal.REMOVED
+    nobody = dataclasses.replace(OWNER, launch="L-9")
+    assert staging.remove_staging_root(never, nobody, NONCE) is Removal.REMOVED
     other = SourceStaging(staging.common_dir, "999", SeedSettings(), StagingMethod.BIND)
-    assert other.remove_staging_root(StagingRoot(staging.common_dir, "999", "L-1")) is (
-        Removal.REMOVED
-    )
+    assert other.remove_staging_root(
+        StagingRoot(staging.common_dir, "999", "L-1"), OWNER, NONCE
+    ) is (Removal.REMOVED)
+    # Another launch's root is never removed for this one's entry.
+    with pytest.raises(SandboxLaunchRefusedError, match="not launch L-1's"):
+        staging.remove_staging_root(second.root, OWNER, NONCE)
     # A bind-form leftover is removed after the runtime's form became copy-in.
     copy = SourceStaging(staging.common_dir, KEY, SeedSettings(), StagingMethod.COPY)
-    assert copy.remove_staging_root(second.root) is Removal.REMOVED
+    assert copy.remove_staging_root(second.root, second.owner, second.nonce) is Removal.REMOVED
     assert not Path(second.root.path).exists()
 
 
@@ -446,8 +643,339 @@ def test_what_is_not_the_launchs_directory_at_its_path_is_left_and_uncertain(tmp
     (target / "keep").write_text("keep\n")
     root.rename(root.with_name("away"))
     root.symlink_to(target)
-    assert staging.remove_staging_root(staged.root) is Removal.UNCERTAIN
+    assert staging.remove_staging_root(staged.root, staged.owner, staged.nonce) is (
+        Removal.UNCERTAIN
+    )
     assert (target / "keep").read_text() == "keep\n"
+
+
+# -- the launch's identity (PR #504 R1-F3) ----------------------------------------------------
+
+ANOTHER = [("run", "run-2"), ("issue", 293), ("phase", "FIX"), ("launch", "L-2")]
+
+
+@pytest.mark.parametrize(("field", "value"), ANOTHER)
+def test_a_seed_for_another_launch_than_its_owner_is_refused_before_it_is_built(
+    tmp_path, temporary, field, value
+):
+    review = review_repo(tmp_path)
+    staging = staging_for(review.repo)
+    gi = review_input(review)
+    owner = dataclasses.replace(owner_of(gi), **{field: value})
+    with pytest.raises(SandboxLaunchRefusedError, match=f"seed is refused: the launch's {field} "):
+        staging.seed(LaunchInputs(owner, workspace="/nowhere", git_input=gi))
+    assert list(temporary.iterdir()) == []  # nothing was built
+
+
+@pytest.mark.parametrize(("field", "value"), ANOTHER)
+def test_a_staging_root_for_another_launch_than_its_input_is_refused_before_it_is_created(
+    tmp_path, field, value
+):
+    review = review_repo(tmp_path)
+    staging = staging_for(review.repo)
+    seed, gi = bound(staging, review_input(review))
+    owner = dataclasses.replace(owner_of(gi), **{field: value})
+    root = staging.staging_root(owner)
+    assert root is not None
+    with pytest.raises(SandboxLaunchRefusedError, match=f"the launch's {field} is "):
+        staging.make_staging_root(root, seed, gi, owner=owner, nonce=NONCE)
+    assert not (common_of(review.repo) / "autoforge").exists()
+
+
+def test_a_staging_root_under_another_launchs_id_or_for_another_launchs_seed_is_refused(tmp_path):
+    """Nothing is created: the root's launch id, the owner, the input and the seed agree first."""
+    review = review_repo(tmp_path)
+    staging = staging_for(review.repo)
+    seed, gi = bound(staging, review_input(review))
+    owner = owner_of(gi)
+    other_root = StagingRoot(staging.common_dir, KEY, "L-2")
+    with pytest.raises(SandboxLaunchRefusedError, match="is launch L-2's, not launch L-1's"):
+        staging.make_staging_root(other_root, seed, gi, owner=owner, nonce=NONCE)
+    # L-1's seed bound into L-2's input: its manifest names L-1.
+    other_input = review_input(review, "L-2").with_seed_manifest(seed.identity)
+    other_owner = owner_of(other_input)
+    with pytest.raises(SandboxLaunchRefusedError, match="manifest names the launch's launch 'L-1'"):
+        staging.make_staging_root(other_root, seed, other_input, owner=other_owner, nonce=NONCE)
+    root = staging.staging_root(owner)
+    assert root is not None
+    for nonce in ("", "a b", "../n", "n" * 300):
+        with pytest.raises(SandboxLaunchRefusedError, match="nonce"):
+            staging.make_staging_root(root, seed, gi, owner=owner, nonce=nonce)
+    assert not (common_of(review.repo) / "autoforge").exists()
+
+
+def test_removal_leaves_a_directory_substituted_at_the_staging_roots_path(tmp_path):
+    """Only the directory that holds its entry's owner record is removed (PR #504 R1-F1)."""
+    review = review_repo(tmp_path)
+    staging, staged, _ = stage(tmp_path, review)
+    root = Path(staged.root.path)
+    root.rename(root.with_name("away"))
+    # A real directory of someone else's, owned by the operator, at the path.
+    root.mkdir(mode=0o700)
+    (root / STAGED_TREE).mkdir()
+    (root / STAGED_TREE / "operator.txt").write_text("someone else's\n")
+    assert staging.remove_staging_root(staged.root, staged.owner, staged.nonce) is (
+        Removal.UNCERTAIN
+    )
+    assert (root / STAGED_TREE / "operator.txt").read_text() == "someone else's\n"
+    # One whose owner record names another journal entry is not this one's either.
+    (root / STAGED_OWNER).write_bytes(owner_record(KEY, staged.owner, "n-other"))
+    assert staging.remove_staging_root(staged.root, staged.owner, staged.nonce) is (
+        Removal.UNCERTAIN
+    )
+    assert (root / STAGED_TREE / "operator.txt").exists()
+    # Nor another launch's staging root moved to this launch's path.
+    shutil.rmtree(root)
+    _, second, _ = stage(tmp_path / "b", review, "L-2")
+    Path(second.root.path).rename(root)
+    assert staging.remove_staging_root(staged.root, staged.owner, staged.nonce) is (
+        Removal.UNCERTAIN
+    )
+    assert (root / STAGED_TREE / "README").exists()
+    # The launch's own, back at its path, is removed.
+    shutil.rmtree(root)
+    root.with_name("away").rename(root)
+    assert staging.remove_staging_root(staged.root, staged.owner, staged.nonce) is Removal.REMOVED
+    assert not root.exists()
+
+
+@pytest.mark.parametrize(
+    "where", ["tree/src", "tree/README", "tree/src/c.py", "read-context/files", "seed"]
+)
+def test_removal_removes_nothing_when_a_mount_is_below_the_staging_root(
+    tmp_path, monkeypatch, where
+):
+    """Every entry is checked before anything is removed: a mount leaves it all in place."""
+    review = review_repo(tmp_path)
+    staging, staged, _ = stage(tmp_path, review)
+    root = Path(staged.root.path)
+    before = snapshot(root)
+    mounted_at(monkeypatch, where)
+    assert staging.remove_staging_root(staged.root, staged.owner, staged.nonce) is (
+        Removal.UNCERTAIN
+    )
+    assert snapshot(root) == before
+
+
+@pytest.mark.parametrize("where", ["/stage", "/stage/L-1"])
+def test_removal_leaves_a_staging_root_that_is_or_lies_below_a_mount_point(
+    tmp_path, monkeypatch, where
+):
+    review = review_repo(tmp_path)
+    staging, staged, _ = stage(tmp_path, review)
+    before = snapshot(Path(staged.root.path))
+    mounted_at(monkeypatch, where)
+    assert staging.remove_staging_root(staged.root, staged.owner, staged.nonce) is (
+        Removal.UNCERTAIN
+    )
+    assert snapshot(Path(staged.root.path)) == before
+
+
+def test_a_mount_met_while_removing_stops_the_removal_before_it_descends(tmp_path, monkeypatch):
+    """A directory mounted after the check is never descended into; what is left is still the
+    launch's (its owner record goes last), and a later removal finishes it."""
+    review = review_repo(tmp_path)
+    staging, staged, _ = stage(tmp_path, review)
+    root = Path(staged.root.path)
+    real = source_staging._mount_id
+
+    def mount_id(fd: int, where: str) -> int:
+        # The removal opens each directory by its name alone; the check
+        # before it names entries by their path below the root.
+        return real(fd, where) + (1 if where == "src" else 0)
+
+    monkeypatch.setattr(source_staging, "_mount_id", mount_id)
+    assert staging.remove_staging_root(staged.root, staged.owner, staged.nonce) is (
+        Removal.UNCERTAIN
+    )
+    assert (root / STAGED_TREE / "src" / "c.py").exists()
+    assert (root / STAGED_OWNER).exists()
+    monkeypatch.setattr(source_staging, "_mount_id", real)
+    assert staging.remove_staging_root(staged.root, staged.owner, staged.nonce) is Removal.REMOVED
+    assert not root.exists()
+
+
+def _reconciled(tmp_path: Path, staging: SourceStaging, repo: Path, roots):
+    """Reconcile journal entries for ``roots`` (launch ids) through the fake backend."""
+    entries = [
+        LifecycleObject(
+            dataclasses.replace(OWNER, launch=launch),
+            ObjectKind.STAGING_ROOT,
+            StagingRoot(staging.common_dir, KEY, launch).path,
+            NONCE,
+        )
+        for launch in roots
+    ]
+    events: list[tuple] = []
+    journal = Journal(events, lambda: False)
+    journal.entries.extend(entries)
+    backend = StagingBackend(events, staging, _host(repo, tmp_path))
+    still_open = reconcile(backend, journal, RUNTIME)
+    assert list(still_open) == journal.entries
+    return {obj.owner.launch for obj in still_open}
+
+
+def test_reconciliation_removes_a_launchs_leftovers_and_leaves_what_is_not_its_own(tmp_path):
+    review = review_repo(tmp_path)
+    staging, staged, _ = stage(tmp_path, review, "L-1")  # a crash after the root was written
+    path = {
+        f"L-{n}": Path(StagingRoot(staging.common_dir, KEY, f"L-{n}").path) for n in range(1, 6)
+    }
+    # A crash right after the directory was made: it holds nothing.
+    path["L-2"].mkdir(mode=0o700)
+    # A crash right after its owner record was written.
+    path["L-3"].mkdir(mode=0o700)
+    (path["L-3"] / STAGED_OWNER).write_bytes(
+        owner_record(KEY, dataclasses.replace(OWNER, launch="L-3"), NONCE)
+    )
+    # A real directory substituted at a launch's path.
+    (path["L-4"] / STAGED_TREE).mkdir(parents=True)
+    (path["L-4"] / STAGED_TREE / "keep.txt").write_text("keep\n")
+    # Something else than a directory there.
+    path["L-5"].write_text("keep\n")
+    still_open = _reconciled(tmp_path, staging, review.repo, ["L-1", "L-2", "L-3", "L-4", "L-5"])
+    assert still_open == {"L-4", "L-5"}
+    for launch in ("L-1", "L-2", "L-3"):
+        assert not path[launch].exists()
+    assert (path["L-4"] / STAGED_TREE / "keep.txt").read_text() == "keep\n"
+    assert path["L-5"].read_text() == "keep\n"
+
+
+def test_reconciliation_descends_into_no_mount_below_a_leftover(tmp_path, monkeypatch):
+    review = review_repo(tmp_path)
+    staging, staged, _ = stage(tmp_path, review, "L-1")
+    root = Path(staged.root.path)
+    before = snapshot(root)
+    mounted_at(monkeypatch, "tree/src")
+    assert _reconciled(tmp_path, staging, review.repo, ["L-1"]) == {"L-1"}
+    assert snapshot(root) == before
+
+
+# -- real mounts, in a user and mount namespace of the test's own (PR #504 R1-F1, R1-F2) ----
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+MOUNT_SCENARIOS = ("directory", "file", "tmpfs", "root", "layout")
+_CHILD = (
+    "import json, sys\n"
+    "from pathlib import Path\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from tests.test_source_staging import real_mount_scenario\n"
+    "print(json.dumps(real_mount_scenario(Path(sys.argv[2]), sys.argv[3])))\n"
+)
+
+
+def _namespaces(tmp_path: Path) -> list[str] | None:
+    """``unshare``'s argv for a user and mount namespace, or ``None`` when this host refuses one."""
+    unshare = shutil.which("unshare")
+    if unshare is None or shutil.which("mount") is None:
+        return None
+    argv = [unshare, "--user", "--map-root-user", "--mount"]
+    probe = tmp_path / "probe"
+    (probe / "a").mkdir(parents=True)
+    (probe / "b").mkdir()
+    res = subprocess.run(
+        [*argv, "mount", "--bind", str(probe / "a"), str(probe / "b")],
+        capture_output=True,
+        timeout=60,
+    )
+    shutil.rmtree(probe)
+    return argv if res.returncode == 0 else None
+
+
+def _mount(*args: str) -> None:
+    subprocess.run(["mount", *args], check=True, capture_output=True, timeout=60)
+
+
+def real_mount_scenario(tmp: Path, scenario: str) -> dict[str, object]:
+    """Stage, mount, prove and remove, inside the namespace (the child process runs this).
+
+    The bind mounts come from the staging root's own filesystem (one
+    device, another mount); the tmpfs is another device. The namespace and
+    every mount in it end with the child.
+    """
+    tempfile.tempdir = str(tmp / "temporary")
+    Path(tempfile.tempdir).mkdir(exist_ok=True)
+    review = review_repo(tmp)
+    outside = tmp / "outside"
+    (outside / "dir").mkdir(parents=True)
+    (outside / "dir" / "keep.txt").write_text("keep\n")
+    (outside / "file.txt").write_text("keep\n")
+    report: dict[str, object] = {}
+    if scenario == "layout":
+        staging = staging_for(review.repo)
+        seed, gi = bound(staging, review_input(review))
+        stage_dir = common_of(review.repo) / "autoforge" / "sandbox" / KEY / "stage"
+        stage_dir.mkdir(parents=True)
+        _mount("--bind", str(outside / "dir"), str(stage_dir))
+        root = staging.staging_root(owner_of(gi))
+        assert root is not None
+        try:
+            staging.make_staging_root(root, seed, gi, owner=owner_of(gi), nonce=NONCE)
+            report["made"] = "made"
+        except SandboxLaunchRefusedError as exc:
+            report["made"] = str(exc)
+        report["outside"] = sorted(os.listdir(outside / "dir"))
+        return report
+    staging, staged, _ = stage(tmp, review)
+    root = Path(staged.root.path)
+    if scenario == "directory":
+        _mount("--bind", str(outside / "dir"), str(root / STAGED_TREE / "src"))
+    elif scenario == "file":
+        _mount("--bind", str(outside / "file.txt"), str(root / STAGED_TREE / "README"))
+    elif scenario == "tmpfs":
+        _mount("-t", "tmpfs", "tmpfs", str(root / STAGED_TREE / "src"))
+        (root / STAGED_TREE / "src" / "keep.txt").write_text("keep\n")
+    else:
+        _mount("--bind", str(outside / "dir"), str(root))
+    try:
+        staging.reprove(staged)
+        report["reprove"] = "proved"
+    except SandboxLaunchRefusedError as exc:
+        report["reprove"] = str(exc)
+    report["removal"] = staging.remove_staging_root(staged.root, staged.owner, staged.nonce).value
+    report["outside"] = sorted(os.listdir(outside / "dir"))
+    report["outside file"] = (outside / "file.txt").read_text()
+    report["tmpfs"] = sorted(os.listdir(root / STAGED_TREE / "src")) if scenario == "tmpfs" else []
+    report["owner record"] = (root / STAGED_OWNER).exists()
+    return report
+
+
+@pytest.mark.parametrize("scenario", MOUNT_SCENARIOS)
+def test_real_mounts_are_refused_and_never_removed_through(tmp_path, scenario):
+    """Real mounts, from the same filesystem and another, on a directory and on a file.
+
+    Skipped, and so untested, where the host refuses an unprivileged user
+    namespace; the same checks run on simulated mount ids above.
+    """
+    argv = _namespaces(tmp_path)
+    if argv is None:
+        pytest.skip("this host gives no unprivileged user and mount namespace: untested here")
+    res = subprocess.run(
+        [*argv, sys.executable, "-c", _CHILD, str(REPO_ROOT), str(tmp_path), scenario],
+        capture_output=True,
+        timeout=300,
+        cwd=str(REPO_ROOT),
+    )
+    assert res.returncode == 0, res.stderr.decode(errors="replace")[-4000:]
+    report = json.loads(res.stdout.decode().strip().splitlines()[-1])
+    if scenario == "layout":
+        assert "is a mount point" in str(report["made"])
+        assert report["outside"] == ["keep.txt"]  # nothing was created in the mount
+        return
+    expected = {
+        "directory": "mounted at tree/src below it",
+        "file": "mounted at tree/README below it",
+        "tmpfs": "mounted at tree/src below it",
+        "root": "is a mount point",
+    }[scenario]
+    assert expected in str(report["reprove"])
+    assert report["removal"] == Removal.UNCERTAIN.value
+    assert report["outside"] == ["keep.txt"]
+    assert report["outside file"] == "keep\n"
+    if scenario == "tmpfs":
+        assert report["tmpfs"] == ["keep.txt"]
+    if scenario != "root":
+        assert report["owner record"] is True  # nothing of the launch's was removed either
 
 
 # -- the copy-in form (D12) ---------------------------------------------------------------------
@@ -459,7 +987,9 @@ def test_the_copy_in_form_gets_the_seed_alone_and_keeps_no_snapshot(tmp_path):
     seed, gi = bound(staging, review_input(review))
     assert staging.staging_root(OWNER) is None
     with pytest.raises(SandboxLaunchRefusedError, match="copy-in form stages nothing"):
-        staging.make_staging_root(StagingRoot(staging.common_dir, KEY, "L-1"), seed, gi)
+        staging.make_staging_root(
+            StagingRoot(staging.common_dir, KEY, "L-1"), seed, gi, owner=OWNER, nonce=NONCE
+        )
     assert not (common_of(review.repo) / "autoforge").exists()
     assert sorted(os.listdir(seed.directory)) == sorted([SEED_MANIFEST_NAME, SEED_PACK_NAME])
     # The seed carries the exact tree: a stager writes it from the pack alone.
@@ -537,9 +1067,9 @@ def test_hostile_attributes_lfs_and_a_gitlink_stage_as_the_committed_bytes(tmp_p
     built = staging.build(gi)
     seed = as_seed(built)
     gi = gi.with_seed_manifest(seed.identity)
-    root = staging.staging_root(dataclasses.replace(OWNER, phase="ANALYZE_EXECUTE"))
+    root = staging.staging_root(owner_of(gi))
     assert root is not None
-    staged = staging.make_staging_root(root, seed, gi)
+    staged = staging.make_staging_root(root, seed, gi, owner=owner_of(gi), nonce=NONCE)
     staging.reprove(staged)
 
     tree_root = Path(staged.root.path) / STAGED_TREE
@@ -635,6 +1165,124 @@ def test_a_partial_clone_holding_every_needed_object_seeds_with_its_diagnostic(t
     assert not store.connections.exists()
 
 
+def ignoring_no_lazy_fetch(requests: list | None = None):
+    """A runner as a git older than 2.44 sees it: ``GIT_NO_LAZY_FETCH`` is not there."""
+
+    def run(request):
+        request.env = {k: v for k, v in (request.env or {}).items() if k != "GIT_NO_LAZY_FETCH"}
+        if requests is not None:
+            requests.append(request)
+        return execute(request)
+
+    return run
+
+
+def test_a_git_that_ignores_no_lazy_fetch_still_fetches_nothing_for_the_seed(tmp_path):
+    """No promisor remote is configured where the store's objects are read (PR #504 R1-F6)."""
+    store = partial_clone(tmp_path, checkout=False)
+    common = common_of(store.clone)
+    run_git(store.clone, "tag", "v1", store.commit)
+    before = snapshot(common)
+    staging = SourceStaging(
+        common,
+        KEY,
+        SeedSettings(history_tags=True),
+        StagingMethod.BIND,
+        runner=ignoring_no_lazy_fetch(),
+        git_lock=RecordingLock(),
+    )
+    with pytest.raises(SandboxLaunchRefusedError, match="seed is refused"):
+        staging.build(git_input("ANALYZE_EXECUTE", store.commit, store.commit))
+    assert not store.connections.exists()
+    assert snapshot(common) == before
+
+
+def test_a_git_that_ignores_no_lazy_fetch_still_fetches_nothing_for_the_staging_root(tmp_path):
+    """The bind form's tree reads the store the same way: a blob it lacks refuses the tree."""
+    store = partial_clone(tmp_path, checkout=True)  # HEAD's blobs are fetched
+    clone = store.clone
+    common = common_of(clone)
+    # A commit of the clone's own: its blob is a loose object of the store,
+    # which the promisor remote does not have.
+    commit = commit_files(clone, "local", {"local.txt": b"only here\n"})
+    blob = out(clone, "rev-parse", f"{commit}:local.txt")
+    staging = SourceStaging(
+        common,
+        KEY,
+        SeedSettings(),
+        StagingMethod.BIND,
+        runner=ignoring_no_lazy_fetch(),
+        git_lock=RecordingLock(),
+    )
+    seed, gi = bound(staging, git_input("ANALYZE_EXECUTE", commit, commit))
+    # The blob leaves the store after the seed was built and checked.
+    (common / "objects" / blob[:2] / blob[2:]).unlink()
+    before = snapshot(common)
+    root = staging.staging_root(owner_of(gi))
+    assert root is not None
+    with pytest.raises(SandboxLaunchRefusedError, match="tree could not be written"):
+        staging.make_staging_root(root, seed, gi, owner=owner_of(gi), nonce=NONCE)
+    assert not store.connections.exists()
+    after = {k: v for k, v in snapshot(common).items() if not k.startswith("autoforge")}
+    assert after == before
+
+
+def _git_dir_of(request) -> str:
+    command = list(request.command)
+    if "--git-dir" in command:
+        return command[command.index("--git-dir") + 1]
+    return (request.env or {}).get("GIT_DIR", "")
+
+
+def test_every_git_that_reads_the_stores_objects_runs_in_a_directory_of_the_controllers(
+    tmp_path,
+):
+    """The seed step, the staging root's tree and its reproof (PR #504 R1-F6).
+
+    Each git that reads an object reads the store as an alternate from a
+    private git directory with no configuration of the operator's; the
+    store itself is asked only for its tag refs and two configuration
+    values, which read no object.
+    """
+    review = review_repo(tmp_path)
+    requests: list = []
+    staging = SourceStaging(
+        common_of(review.repo),
+        KEY,
+        SeedSettings(history_tags=True),
+        StagingMethod.BIND,
+        runner=ignoring_no_lazy_fetch(requests),
+        git_lock=RecordingLock(),
+    )
+    seed, gi = bound(staging, review_input(review))
+    root = staging.staging_root(owner_of(gi))
+    assert root is not None
+    staged = staging.make_staging_root(root, seed, gi, owner=owner_of(gi), nonce=NONCE)
+    staging.reprove(staged)
+    common = staging.common_dir
+    in_store = [r for r in requests if _git_dir_of(r) == common]
+    private = [r for r in requests if _git_dir_of(r) != common]
+    assert private and in_store
+    for request in in_store:
+        command = list(request.command)
+        sub = command[command.index("--git-dir") + 2 :]
+        assert sub[0] in ("config", "for-each-ref"), sub
+        assert "objecttype" not in " ".join(sub)
+    for request in private:
+        env = request.env
+        assert env["GIT_DIR"] == _git_dir_of(request)
+        assert not env["GIT_DIR"].startswith(common)
+        assert common not in request.command
+        assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert env["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert env["HOME"] == env["GIT_DIR"]
+        alternate = env.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        assert alternate in (None, f'"{common}/objects"')
+    # The tree's and the reproof's git read the store through the alternate.
+    reads = [r for r in private if "-C" in r.command]
+    assert reads and all(r.env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] for r in reads)
+
+
 def test_the_existing_materialize_path_still_fetches_a_partial_clones_blob_lazily(tmp_path):
     """Documents a defect of the existing shared-store path, deliberately not fixed here.
 
@@ -642,10 +1290,11 @@ def test_the_existing_materialize_path_still_fetches_a_partial_clones_blob_lazil
     the hardened ``local_git_request``, which does not set
     ``GIT_NO_LAZY_FETCH``: in a partial clone, reading a missing blob
     contacts the promisor remote and writes the fetched objects to the
-    shared store. ADR 0013 §7 has #292 record this and file it as an issue
-    of its own. The seed step and the staging root do not inherit it (the
-    tests above). When the existing path is fixed, this test is turned
-    around to assert no connection.
+    shared store. ADR 0013 §7 has #292 record this and leave it to an
+    issue of its own (PR #504's R1-F7 asks for that follow-up). The seed
+    step and the staging root do not inherit it (the tests above). When the
+    existing path is fixed, this test is turned around to assert no
+    connection.
     """
     store = partial_clone(tmp_path, checkout=False)
     with materialize(execute, str(store.clone), store.commit, "sha1", prefix="existing-") as tree:
@@ -748,7 +1397,12 @@ class StagingBackend:
             root = self.staging.staging_root(self.inputs.owner)
             assert root is not None and root.path == obj.name
             self.staged = self.staging.make_staging_root(
-                root, seed, self.inputs.git_input, self.inputs.read_context
+                root,
+                seed,
+                self.inputs.git_input,
+                self.inputs.read_context,
+                owner=obj.owner,
+                nonce=obj.nonce,
             )
             self.events.append(("host", "staging root written and proved"))
             if self.on_staged is not None:
@@ -802,7 +1456,7 @@ class StagingBackend:
         if obj.kind is ObjectKind.STAGING_ROOT:
             root = self.staging.staging_root(obj.owner)
             assert root is not None
-            outcome = self.staging.remove_staging_root(root)
+            outcome = self.staging.remove_staging_root(root, obj.owner, obj.nonce)
             self.events.append(("host", "staging root removed", outcome))
             return outcome
         self.events.append(("runtime", "rm", obj.kind))
@@ -812,8 +1466,20 @@ class StagingBackend:
     def runtime_check(self) -> RuntimeReport:  # pragma: no cover
         return RUNTIME
 
-    def reconcile(self, entries, runtime):  # pragma: no cover
-        return ()
+    def reconcile(self, entries, runtime) -> tuple[LifecycleObject, ...]:
+        """Remove-only: a staging root through the production removal, in either form."""
+        gone = []
+        for obj in entries:
+            if obj.kind is ObjectKind.STAGING_ROOT:
+                root = StagingRoot(self.staging.common_dir, self.staging.key, obj.owner.launch)
+                outcome = self.staging.remove_staging_root(root, obj.owner, obj.nonce)
+                self.events.append(("host", "staging root reconciled", outcome))
+                if outcome is Removal.REMOVED:
+                    gone.append(obj)
+                continue
+            self.events.append(("runtime", "rm", obj.kind))
+            gone.append(obj)
+        return tuple(gone)
 
     def probe(self, *, home, environ) -> ProbeResult:  # pragma: no cover
         return ProbeResult(True, "", "fake")
@@ -964,9 +1630,9 @@ def test_the_staged_tree_is_the_carried_commits_for_a_relaunch(tmp_path):
     staging = staging_for(review.repo)
     gi = git_input("FIX", review.head, review.merge_base, carried=carried)
     seed, gi = bound(staging, gi)
-    root = staging.staging_root(dataclasses.replace(OWNER, phase="FIX"))
+    root = staging.staging_root(owner_of(gi))
     assert root is not None
-    staged = staging.make_staging_root(root, seed, gi)
+    staged = staging.make_staging_root(root, seed, gi, owner=owner_of(gi), nonce=NONCE)
     assert staged.commit == carried
     assert (Path(root.path) / STAGED_TREE / "fix.txt").read_bytes() == b"fixed\n"
     staging.reprove(staged)

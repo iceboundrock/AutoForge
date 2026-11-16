@@ -70,8 +70,14 @@ lazy fetch, so a missing object refuses the seed rather than reaching the
 promisor remote.
 
 Every git process is the controller's hardened local request
-(:func:`~autoforge.git_transport.local_git_request`) with
-``GIT_NO_LAZY_FETCH`` set (:func:`no_lazy_fetch`): reading the shared store
+(:func:`~autoforge.git_transport.local_git_request`). Each one that reads
+an object of the shared store runs in a controller-owned git directory
+that reads the store as its alternate and no configuration of the
+operator's or the store's (:func:`isolated_store`): no promisor remote is
+configured there, so no git version fetches a missing object lazily, and
+``GIT_NO_LAZY_FETCH`` (which only git 2.44 and later read) is set as a
+second guard. The store itself is asked only for its tag refs and two
+configuration values, which read no object. Reading the shared store
 never contacts a remote and never writes it. Executor layer: git only, no
 workflow, no journal, no state.
 """
@@ -127,9 +133,13 @@ SETTING_TAGS = "sandbox.container.history_tags"
 SETTING_MAX_BYTES = "sandbox.container.seed_max_bytes"
 SETTING_MAX_OBJECTS = "sandbox.container.seed_max_objects"
 
-# Every git process of the seed step reads the shared store with no lazy
-# fetch: a partial clone's missing object is "missing", never fetched from
-# its promisor remote (git 2.44 and later read this variable).
+# A partial clone's missing object is "missing", never fetched from its
+# promisor remote. Only git 2.44 and later read this variable, and no
+# minimum git is enforced, so it is never what that rests on: every git
+# process that reads the shared store's objects runs in a controller-owned
+# git directory (:func:`isolated_store`) where no promisor remote can be
+# configured, which no git version fetches lazily from. The variable is
+# kept as a second guard.
 NO_LAZY_FETCH = {"GIT_NO_LAZY_FETCH": "1"}
 
 # Listing, packing and indexing a large tree are bounded by time, as the
@@ -164,14 +174,59 @@ def _refused(text: str) -> SandboxLaunchRefusedError:
     return SandboxLaunchRefusedError(f"the launch's seed is refused: {text}")
 
 
-def no_lazy_fetch(runner: Runner) -> Runner:
-    """``runner`` with ``GIT_NO_LAZY_FETCH=1`` layered over every request's environment."""
+def _isolated_env(git_dir: Path, objects: Path | None = None) -> dict[str, str]:
+    """The environment of a git process in the controller-owned git directory ``git_dir``.
+
+    ``GIT_DIR`` names it, so no other repository is discovered. No system
+    or global configuration is read, by variable and again by a ``HOME``
+    and ``XDG_CONFIG_HOME`` that hold none (a git older than
+    ``GIT_CONFIG_GLOBAL`` reads ``$HOME``): the only configuration is the
+    one :func:`_private_git_dir` wrote, which names no remote. So no
+    ``remote.<name>.promisor`` and no ``extensions.partialClone`` applies,
+    and git, of any version, has no promisor remote to fetch a missing
+    object from. ``objects``, when given, is read as the directory's only
+    alternate (the shared store's ``objects``), never written.
+    """
+    env = {
+        "GIT_DIR": str(git_dir),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "HOME": str(git_dir),
+        "XDG_CONFIG_HOME": str(git_dir / "no-xdg-config"),
+        **NO_LAZY_FETCH,
+    }
+    if objects is not None:
+        env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = alternate_entry(objects)
+    return env
+
+
+@contextmanager
+def isolated_store(
+    common: str | Path, object_format: str, runner: Runner
+) -> Iterator[tuple[Path, Runner]]:
+    """The shared store of ``common``, read through a git directory of the controller's own.
+
+    Yields that directory and ``runner`` with :func:`_isolated_env` layered
+    over every request's environment, for a reader that names its
+    repository itself (:func:`~autoforge.materialize.materialize_into` and
+    :func:`~autoforge.materialize.prove_tree` take the directory as
+    theirs). The store's objects are its only alternate; the store's
+    configuration, promisor remote, hooks and ``shallow`` grafts never
+    apply, and nothing is written to it. A missing object is "missing"
+    whatever the git version (#292, PR #504 R1-F6). The directory is made
+    by ``mkdtemp`` (mode 0700), outside every repository, and removed after.
+    """
+    root = _private_git_dir(object_format, "autoforge-store-read-")
+    env = _isolated_env(root, Path(common) / "objects")
 
     def run(request: ExecutionRequest) -> ExecutionResult:
-        request.env = {**(request.env or {}), **NO_LAZY_FETCH}
+        request.env = {**(request.env or {}), **env}
         return runner(request)
 
-    return run
+    try:
+        yield root, run
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 # -- the settings ---------------------------------------------------------------------
@@ -503,6 +558,31 @@ class _Git:
             raise _refused(f"{what} {_ended(res)}{_detail(res)}")
         return collector
 
+    def kinds(self, ids: Iterable[str], what: str) -> dict[str, str]:
+        """The type of each of ``ids``, ``"missing"`` for one the store lacks; no content read."""
+        wanted = list(dict.fromkeys(ids))
+        if not wanted:
+            return {}
+        width = _HEX_LENGTH[self.object_format] + len(" missing\n")
+        collector = self.stream(
+            ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            what,
+            limit=len(wanted) * width,
+            stdin=("\n".join(wanted) + "\n").encode("ascii"),
+        )
+        if collector is None:
+            raise _refused(f"{what}: git's answer passed its bound")
+        lines = bytes(collector.data).decode("ascii", "replace").splitlines()
+        if len(lines) != len(wanted):
+            raise _refused(f"{what}: git answered {len(lines)} lines for {len(wanted)} objects")
+        found: dict[str, str] = {}
+        for oid, line in zip(wanted, lines, strict=True):
+            named, _, kind = line.partition(" ")
+            if named != oid or (kind != "missing" and kind not in _OBJECT_TYPES):
+                raise _refused(f"{what}: git's answer for {oid} is not its type")
+            found[oid] = kind
+        return found
+
     def objects(self, ids: Iterable[str], what: str) -> Iterator[tuple[str, str, bytes]]:
         """``(id, type, content)`` of each of ``ids``, re-hashed to its id (ADR 0004 D7.5).
 
@@ -590,17 +670,13 @@ def _walk_dir(common: Path, object_format: str, runner: Runner) -> Iterator[_Git
 
     The walks run here rather than in the store, so the store's own
     configuration (a promisor remote, its ``shallow`` grafts, its hooks) is
-    never read by them, and nothing is ever written to it.
+    never read by them, and nothing is ever written to it; nor is any
+    configuration of the operator's (:func:`_isolated_env`), so no git
+    version fetches a missing object lazily.
     """
     root = _private_git_dir(object_format, "autoforge-seed-walk-")
     try:
-        objects = Path(common) / "objects"
-        yield _Git(
-            runner,
-            root,
-            object_format,
-            {"GIT_ALTERNATE_OBJECT_DIRECTORIES": alternate_entry(objects)},
-        )
+        yield _Git(runner, root, object_format, _isolated_env(root, Path(common) / "objects"))
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -749,21 +825,27 @@ def _deepen(
 def _select_tags(
     store: _Git, walk: _Git, commits: frozenset[str], object_format: str
 ) -> tuple[tuple[SeedTag, ...], frozenset[str]]:
-    """D11's tags: each store tag that peels to a seeded commit, and its chain's tag objects."""
+    """D11's tags: each store tag that peels to a seeded commit, and its chain's tag objects.
+
+    The store is asked for its tag refs' names and ids alone, which git
+    answers from the refs without reading an object; every object is read
+    through ``walk``, the controller's own git directory, so a missing one
+    is never fetched lazily (PR #504 R1-F6).
+    """
     collector = store.stream(
-        ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(objecttype)", _TAG_REF_PREFIX],
+        ["for-each-ref", "--format=%(refname)%00%(objectname)", _TAG_REF_PREFIX],
         "listing the shared store's tags",
         64 * 1024 * 1024,
     )
     if collector is None:
         raise _refused(f"the shared store's tags are too many to list ({SETTING_TAGS})")
     pattern = _OID[object_format]
-    listed: list[tuple[str, str, str]] = []
+    refs: list[tuple[str, str]] = []
     for line in bytes(collector.data).split(b"\n"):
         if not line:
             continue
         fields = line.split(b"\0")
-        if len(fields) != 3:
+        if len(fields) != 2:
             raise _refused(f"the shared store's tag list is unreadable ({SETTING_TAGS})")
         try:
             ref = fields[0].decode("utf-8")
@@ -774,7 +856,15 @@ def _select_tags(
         oid = fields[1].decode("ascii", "replace")
         if not ref.startswith(_TAG_REF_PREFIX) or not pattern.fullmatch(oid):
             raise _refused(f"the shared store's tag list is unreadable ({SETTING_TAGS})")
-        listed.append((ref, oid, fields[2].decode("ascii", "replace")))
+        refs.append((ref, oid))
+    kinds = walk.kinds((oid for _, oid in refs), "reading the types of the shared store's tags")
+    for ref, oid in refs:
+        if kinds[oid] == "missing":
+            raise _refused(
+                f"the tag {redact(ref)[:120]} names {oid}, which the shared store lacks; a "
+                f"partial clone's missing object is never fetched ({SETTING_TAGS})"
+            )
+    listed = [(ref, oid, kinds[oid]) for ref, oid in refs]
     # Each tag's chain, peeled one level at a time for every tag at once: one
     # read of the store per level, not one per tag object.
     chains: dict[str, list[str]] = {ref: [] for ref, _, _ in listed}
@@ -1298,7 +1388,7 @@ def check_seed(
     quarantine = _private_git_dir(git_input.object_format, "autoforge-seed-check-")
     try:
         _check_quarantined(
-            _Git(run, quarantine, git_input.object_format),
+            _Git(run, quarantine, git_input.object_format, _isolated_env(quarantine)),
             Path(directory) / SEED_PACK_NAME,
             manifest,
             selection,

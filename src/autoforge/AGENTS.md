@@ -132,14 +132,19 @@ seed_pack.py        a container launch's seed (ADR 0013 D4, D11): what it holds,
                     parents as shallow boundaries, the history settings, the tags that
                     peel to a seeded commit), the pack and its manifest, the seed's own
                     checks (index-pack --strict in a quarantine, exact commits and tag
-                    objects, closure, bounds) and D2's support diagnostics; git with no
-                    lazy fetch, writes nothing to the store; executor layer (#292)
+                    objects, closure, bounds) and D2's support diagnostics; reads the
+                    store's objects only from a private git directory with no promisor
+                    (isolated_store), so no git fetches lazily; writes nothing to the
+                    store; executor layer (#292)
 source_staging.py   the host side of a container launch's source, both forms (ADR 0013 D2,
-                    D12): SourceStaging's seed step, the bind form's staging root (created
-                    under L1 through safefs, the seed copied while its digest is the
-                    input's, the tree written by materialize_into), its re-proof before
-                    each hand-off, its idempotent removal, the ownership data #271 needs;
-                    no runtime, no journal; unreachable before #271 (#292)
+                    D12): SourceStaging's seed step, the bind form's staging root (bound
+                    to its launch and journal entry by an owner record, created under L1
+                    through safefs with no mount in its layout, the seed copied while its
+                    digest is the input's, the tree written by materialize_into), its
+                    re-proof before each hand-off (mount ids, owners and modes, seed, read
+                    context, tree), its removal of only the launch's own directory, never
+                    through a mount, the ownership data #271 needs; no runtime, no
+                    journal; unreachable before #271 (#292)
 sandbox_policy.py   which host resources a launch gets by launch class (ADR 0005 §2.5):
                     LaunchFacts from the engine, ProviderRequirements from an adapter,
                     the SandboxPlan, the path-valued environment rewrite (D8.2),

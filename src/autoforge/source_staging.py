@@ -11,8 +11,9 @@ forms, and #271's probe chooses between them per runtime:
   bound read-only at ``/source`` into the launch's stager container and its
   launch container. It holds the materialized tree (:data:`STAGED_TREE`,
   the seed commit's, or the carried commit's for a relaunch), the seed pack
-  and its manifest (:data:`STAGED_SEED`) and a copy of the launch's read
-  context (:data:`STAGED_READ_CONTEXT`);
+  and its manifest (:data:`STAGED_SEED`), a copy of the launch's read
+  context (:data:`STAGED_READ_CONTEXT`) and its owner record
+  (:data:`STAGED_OWNER`);
 - **the copy-in form**, everywhere else: the seed alone, which the stage
   step copies into the stager container. Nothing is staged on the host
   beside it and no tree is kept, because the seed already carries the
@@ -28,34 +29,65 @@ lifecycle journaled the staging root and before any container's create);
 handed to a container's create; and :meth:`~SourceStaging.remove_staging_root`,
 the release's and reconciliation's.
 
+**The launch's identity** (PR #504 R1-F3). A seed is built only for the
+launch its git input names: the launch's owner (run, issue, phase and
+launch id) must be the input's, and a staging root is written only under
+that launch's id. A mismatch is refused before anything is built or
+created.
+
 **The staging root.**
 
 - It is created through :mod:`autoforge.safefs` under L1 (the shared-Git
   lock, ADR 0008 D12.1): every directory from the common dir down is
-  reached one component at a time, never through a link, and the launch's
-  own directory is made exclusively, mode ``0700``. One that exists already
-  is refused: a staging root is never reused or re-proved for another
-  launch (ADR 0013 D3, D6), and reconciliation removes a leftover.
+  reached one component at a time, never through a link, and must be on
+  the common dir's own mount (no mount nests in its layout), checked
+  before anything is created inside it. The launch's own directory is made
+  exclusively, mode ``0700``, and the first thing written into it is its
+  owner record: the sandbox key, the launch's owner and the nonce its
+  journal entry carries (:class:`~autoforge.sandbox_backend.LifecycleObject`),
+  which binds the directory to that entry. One that exists already is
+  refused: a staging root is never reused or re-proved for another launch
+  (ADR 0013 D3, D6), and reconciliation removes a leftover.
 - The seed is copied into it only while its manifest still hashes to the
-  digest the launch's git input binds, read from the bytes copied; the
-  pack's SHA-256 is the manifest's. A seed whose digest differs is never
-  written there (D4's hand-off).
+  digest the launch's git input binds, read from the bytes copied, and
+  names that input's launch; the pack's SHA-256 is the manifest's. A seed
+  whose digest differs is never written there (D4's hand-off).
+- The read context is copied as directories and regular files only, and
+  what was copied (each entry's path, its kind and a file's SHA-256) is
+  recorded (:class:`ContextEntry`).
 - The tree is written by :func:`~autoforge.materialize.materialize_into`,
   the writer and hash-back proof of ADR 0006 D6.2 and D6.3, from blobs:
   nothing is checked out, so no attribute, filter driver, LFS smudge or
   hook of the repository applies, and a gitlink is an empty directory. Its
-  git runs with no lazy fetch (:func:`~autoforge.seed_pack.no_lazy_fetch`).
-- A read-only bind does not make the host directory immutable, so the
-  tree is proved again right before each hand-off
-  (:meth:`~SourceStaging.reprove`): the staging root is reached again from
-  the common dir, must be the very directory created (its device and inode,
-  so a directory substituted at its path is refused), hold exactly its
-  three entries, have nothing mounted below it, hold the same seed, and
-  hash back to the commit's tree read afresh from the store. A byte, a
-  mode or an entry changed since the first proof fails it.
+  git reads the store through a git directory of the controller's own
+  (:func:`~autoforge.seed_pack.isolated_store`), so no git version fetches
+  a partial clone's missing object lazily.
+- A read-only bind does not make the host directory immutable, so it is
+  proved again right before each hand-off (:meth:`~SourceStaging.reprove`):
+  the staging root is reached again from the common dir with no mount in
+  its layout, must be the very directory created (its device and inode, so
+  a directory substituted at its path is refused), hold exactly its four
+  entries and the same owner record, have every entry below it on its own
+  mount (by the kernel's mount id, so a bind mount from the same
+  filesystem and a file mount are found as well as another device), owned
+  as recorded and with the permission bits its record says, hold the same
+  seed and the same read context, and hash back to the commit's tree read
+  afresh from the store. A byte, a mode, an owner or an entry changed since
+  the first proof fails it. The bind form needs the kernel's mount ids
+  (Linux's ``/proc/self/fdinfo``); without them it is refused.
 - What a container's user needs to read it is recorded as data
-  (:class:`SourceOwnership`): the host owner and the modes, as written.
-  Nothing here changes ownership for any backend (#271 decides).
+  (:class:`SourceOwnership`): the host owner and the modes, as written, and
+  every proof checks the staging root against that record. Nothing here
+  changes ownership for any backend (#271 decides).
+- Its removal (:meth:`~SourceStaging.remove_staging_root`) removes only the
+  directory its journal entry names: one holding the owner record of that
+  entry's launch and nonce, or nothing at all (a crash right after the
+  directory was made). Anything else at its path, a directory substituted
+  there included, is left in place and uncertain. Nothing mounted in it is
+  ever descended into: a mount anywhere below it leaves it all in place,
+  uncertain, before anything is removed, and the removal itself opens each
+  directory without following a link and checks its mount before removing
+  what is in it.
 
 Executor layer: no workflow, no journal, no state; the order, the journal
 and every decision are the engine's lifecycle's
@@ -64,12 +96,11 @@ and every decision are the engine's lifecycle's
 
 from __future__ import annotations
 
-import errno
 import hashlib
+import json
 import os
 import posixpath
 import re
-import shutil
 import stat
 from collections.abc import Callable
 from contextlib import AbstractContextManager
@@ -86,11 +117,11 @@ from .errors import (
     SandboxLaunchRefusedError,
 )
 from .executor import execute
-from .git_input import SEED_MANIFEST_NAME, LaunchGitInput, seed_problem
+from .git_input import MAX_SEED_MANIFEST_BYTES, SEED_MANIFEST_NAME, LaunchGitInput, seed_problem
 from .locking import SharedGitLock
-from .safefs import SafeRoot, StateError, split_relpath
+from .safefs import SafeRoot, StateError, WalkEntry, split_relpath
 from .sandbox_backend import NO_SEED, LaunchInputs, LaunchOwner, Removal, Seed
-from .sandbox_container import SANDBOX_LAYOUT, STAGE_DIR, StagingMethod, StagingRoot
+from .sandbox_container import StagingMethod, StagingRoot
 from .seed_pack import (
     SEED_FILES,
     SEED_PACK_NAME,
@@ -99,19 +130,21 @@ from .seed_pack import (
     SeedSettings,
     build_seed,
     discard,
-    no_lazy_fetch,
+    isolated_store,
     parse_manifest,
 )
 
-# The staging root's entries (D12): the materialized tree, the seed pack and
-# its manifest, and the copy of the launch's read context.
+# The staging root's entries (D12): its owner record, the materialized
+# tree, the seed pack and its manifest, and the copy of the read context.
+STAGED_OWNER = "owner"
 STAGED_TREE = "tree"
 STAGED_SEED = "seed"
 STAGED_READ_CONTEXT = "read-context"
-STAGED_ENTRIES = (STAGED_READ_CONTEXT, STAGED_SEED, STAGED_TREE)
+STAGED_ENTRIES = (STAGED_OWNER, STAGED_READ_CONTEXT, STAGED_SEED, STAGED_TREE)
 
-# The mode safefs creates every directory of the staging root's own layout
-# with, and the mode its copied files get: the operator's alone.
+# The mode the staging root, its seed and read-context directories are
+# set to, and the mode its owner record, seed and read-context files get:
+# the operator's alone.
 PRIVATE_DIRECTORY_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 
@@ -120,10 +153,25 @@ PRIVATE_FILE_MODE = 0o600
 MAX_READ_CONTEXT_ENTRIES = 1000
 MAX_READ_CONTEXT_BYTES = 64 * 1024 * 1024
 
+# The owner record: one line of JSON, far below this bound.
+OWNER_RECORD_SCHEMA = 1
+MAX_OWNER_RECORD_BYTES = 4096
+
 # One path component of a staging root's key and launch id, as #270's
-# StagingRoot check accepts it.
+# StagingRoot check accepts it; a journal entry's nonce.
 _COMPONENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_NONCE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}")
 _CHUNK_BYTES = 1024 * 1024
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+# Non-blocking, so a FIFO swapped in cannot stall a read.
+_READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+_NEW_FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+# A descriptor of an entry itself, whatever it is, for its mount id: opened
+# without following a link, reading nothing (Linux only; 0 elsewhere).
+_O_PATH = getattr(os, "O_PATH", 0)
+_FDINFO_BYTES = 4096
+_OWNER_RWX = stat.S_IRWXU
+_IDENTITY_FIELDS = ("run", "issue", "phase", "launch")
 
 GitLock = Callable[[str], AbstractContextManager[object]]
 
@@ -136,14 +184,17 @@ def _refused(text: str) -> SandboxLaunchRefusedError:
 class SourceOwnership:
     """Who owns the staged files on the host, and their modes: data for #271, never acted on here.
 
-    ``uid`` and ``gid`` own every file and directory of the staging root
-    (the operator's, which a rootless runtime maps to the container's root);
-    ``private_directory_mode`` is the staging root's own and its seed and
-    read-context directories'; ``private_file_mode`` the seed's and the read
-    context's files'; the tree's directories, files and executable files have
+    ``uid`` and ``gid`` own every entry of the staging root (the
+    operator's, which a rootless runtime maps to the container's root);
+    ``private_directory_mode`` is the staging root's own and every directory
+    of its seed and read context; ``private_file_mode`` its owner record's
+    and every file of its seed and read context; the tree's directories,
+    files and executable files have exactly
     :data:`~autoforge.materialize.DIRECTORY_MODE`,
     :data:`~autoforge.materialize.FILE_MODE` and
     :data:`~autoforge.materialize.EXECUTABLE_MODE`, whatever the umask.
+    Every proof of the staging root checks each entry against this record
+    (PR #504 R1-F5), so what it says is what is handed off.
     """
 
     uid: int
@@ -156,23 +207,37 @@ class SourceOwnership:
 
 
 @dataclass(frozen=True)
+class ContextEntry:
+    """One entry of a staged read context: its path, ``"dir"`` or ``"file"``, a file's SHA-256."""
+
+    path: str
+    kind: str
+    sha256: str = ""
+
+
+@dataclass(frozen=True)
 class StagedSource:
     """A staging root the create step wrote and proved (the bind form).
 
-    ``commit`` is the commit whose tree :data:`STAGED_TREE` holds, ``tree``
-    that tree's id; ``seed_digest`` the digest of the seed copied into
-    :data:`STAGED_SEED`; ``identity`` the ``(st_dev, st_ino)`` of the
-    directory created, which every later proof requires its path to still
-    name.
+    ``owner`` and ``nonce`` are the launch and the journal entry its owner
+    record names; ``commit`` is the commit whose tree :data:`STAGED_TREE`
+    holds, ``tree`` that tree's id; ``seed_digest`` the digest of the seed
+    copied into :data:`STAGED_SEED`; ``read_context`` what was copied into
+    :data:`STAGED_READ_CONTEXT`; ``identity`` the ``(st_dev, st_ino)`` of
+    the directory created, which every later proof requires its path to
+    still name.
     """
 
     root: StagingRoot
+    owner: LaunchOwner
+    nonce: str
     commit: str
     tree: str
     object_format: str
     files: int
     gitlinks: int
     seed_digest: str
+    read_context: tuple[ContextEntry, ...]
     identity: tuple[int, int]
     ownership: SourceOwnership
 
@@ -180,6 +245,29 @@ class StagedSource:
 def staged_commit(git_input: LaunchGitInput) -> str:
     """The commit a launch's tree is: the carried commit of a relaunch, else the seed (D4)."""
     return git_input.carried or git_input.seed
+
+
+def owner_record(key: str, owner: LaunchOwner, nonce: str) -> bytes:
+    """A staging root's owner record: the sandbox key, the launch's owner, its entry's nonce."""
+    record = {
+        "schema": OWNER_RECORD_SCHEMA,
+        "key": key,
+        "run": owner.run,
+        "issue": owner.issue,
+        "phase": owner.phase,
+        "launch": owner.launch,
+        "nonce": nonce,
+    }
+    return (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def identity_problem(owner: LaunchOwner, git_input: LaunchGitInput) -> str:
+    """Why ``owner`` is not the launch ``git_input`` names, or "" (PR #504 R1-F3)."""
+    for name in _IDENTITY_FIELDS:
+        have, bound = getattr(owner, name), getattr(git_input, name)
+        if have != bound:
+            return f"the launch's {name} is {have!r}, and its git input binds {bound!r}"
+    return ""
 
 
 class SourceStaging:
@@ -222,12 +310,16 @@ class SourceStaging:
 
         Before any journal entry: a refusal leaves nothing to reconcile.
         Both forms build the same seed; only what the create step stages
-        beside it differs.
+        beside it differs. Refused, with nothing built, when the launch's
+        owner is not the launch its git input names.
         """
         if inputs.git_input is None:
             raise SandboxLaunchRefusedError(
                 "the launch's seed is refused: the launch carries no git input to seed from"
             )
+        problem = identity_problem(inputs.owner, inputs.git_input)
+        if problem:
+            raise SandboxLaunchRefusedError(f"the launch's seed is refused: {problem}")
         built = self.build(inputs.git_input)
         return as_seed(built)
 
@@ -255,54 +347,77 @@ class SourceStaging:
         seed: Seed,
         git_input: LaunchGitInput | None,
         read_context: str = "",
+        *,
+        owner: LaunchOwner,
+        nonce: str,
     ) -> StagedSource:
         """Write ``root`` and prove it (the create step, after its journal entry).
 
-        Refused, with nothing written, when the form stages no tree, the
-        root is not this staging's own, or the seed's manifest is not the
-        one ``git_input`` binds. The launch's directory is created
-        exclusively under L1; then the seed (re-hashed as it is copied), the
-        read context and the tree are written into it and the tree proved.
-        A failure after the directory exists leaves it for the release (or
-        reconciliation) to remove, as its journal entry says.
+        ``owner`` and ``nonce`` are the launch and the journal entry the
+        staging root belongs to. Refused, with nothing written, when the
+        form stages no tree, the root is not this staging's own or not
+        ``owner``'s, ``owner`` is not the launch ``git_input`` names, a
+        directory of its layout is a mount point, or the seed's manifest is
+        not the one ``git_input`` binds. The launch's directory is created
+        exclusively under L1 and its owner record written first; then the
+        seed (re-hashed as it is copied), the read context and the tree are
+        written into it, the tree proved and every entry checked against
+        the ownership record, with nothing mounted below it. A failure after
+        the directory exists leaves it for the release (or reconciliation)
+        to remove, as its journal entry says.
         """
         self._check_root(root)
+        self._check_owner(root, owner, nonce, git_input)
         problem = seed_problem(seed.directory, git_input) if seed != NO_SEED else "no seed"
+        if not problem:
+            assert git_input is not None
+            problem = _seed_launch_problem(seed.directory, git_input)
         if problem:
             raise _refused(f"its seed is not written into it: {problem}")
         assert git_input is not None
         commit = staged_commit(git_input)
-        self._create(root)
+        identity = self._create(root, owner_record(self.key, owner, nonce))
         try:
-            with SafeRoot.open(self.common_dir) as common, common.subroot(root.layout) as staged:
-                identity = staged.identity
-                info = os.fstat(staged.fd)
-                digest = self._copy_seed(staged, seed, git_input.seed_manifest_digest)
-                self._copy_read_context(staged, read_context)
-                staged.ensure_dir(STAGED_TREE)
-                with staged.subroot(STAGED_TREE) as tree_root:
-                    os.fchmod(tree_root.fd, materialize_mod.DIRECTORY_MODE)
-                    tree = materialize_mod.materialize_into(
-                        no_lazy_fetch(self._runner),
-                        self.common_dir,
-                        commit,
-                        git_input.object_format,
-                        tree_root,
+            with SafeRoot.open(self.common_dir) as common, self._layout(common, root) as staged:
+                if staged.identity != identity:
+                    raise _refused(
+                        f"{root.path} is no longer the directory created for the launch "
+                        "(a directory was substituted at its path)"
                     )
+                mount = _mount_id(staged.fd, root.path)
+                digest = self._copy_seed(staged, seed, git_input, mount)
+                context = self._copy_read_context(staged, read_context, mount)
+                tree_mode = materialize_mod.DIRECTORY_MODE
+                with _subdir(staged, STAGED_TREE, mount, tree_mode) as tree_root:
+                    with isolated_store(self.common_dir, git_input.object_format, self._runner) as (
+                        repo,
+                        run,
+                    ):
+                        tree = materialize_mod.materialize_into(
+                            run, str(repo), commit, git_input.object_format, tree_root
+                        )
+                info = os.fstat(staged.fd)
+                ownership = SourceOwnership(uid=info.st_uid, gid=info.st_gid)
+                _check_contents(staged, ownership, mount)
+                with staged.subroot(STAGED_READ_CONTEXT) as copied:
+                    _check_read_context(copied, context)
         except (MaterializationError, CandidateNotMaterializableError) as exc:
             raise _refused(f"its tree could not be written and proved: {exc}") from exc
         except (StateError, OSError) as exc:
             raise _refused(f"it could not be written ({type(exc).__name__}: {exc})") from exc
         return StagedSource(
             root=root,
+            owner=owner,
+            nonce=nonce,
             commit=commit,
             tree=tree.tree,
             object_format=git_input.object_format,
             files=tree.files,
             gitlinks=tree.gitlinks,
             seed_digest=digest,
+            read_context=context,
             identity=identity,
-            ownership=SourceOwnership(uid=info.st_uid, gid=info.st_gid),
+            ownership=ownership,
         )
 
     def _check_root(self, root: StagingRoot, *, staging: bool = True) -> None:
@@ -320,34 +435,77 @@ class SourceStaging:
         except StateError as exc:
             raise _refused(str(exc)) from exc
 
-    def _create(self, root: StagingRoot) -> None:
-        """The launch's directory, made exclusively below the layout, under L1."""
-        parent = posixpath.join(SANDBOX_LAYOUT, self.key, STAGE_DIR)
+    def _check_owner(
+        self,
+        root: StagingRoot,
+        owner: LaunchOwner,
+        nonce: str,
+        git_input: LaunchGitInput | None = None,
+    ) -> None:
+        """``root`` is ``owner``'s, ``nonce`` a journal entry's, ``owner`` the input's launch."""
+        if not isinstance(owner, LaunchOwner):
+            raise _refused("a staging root's owner is the launch's LaunchOwner")
+        if owner.launch != root.launch:
+            raise _refused(f"{root.path} is launch {root.launch}'s, not launch {owner.launch}'s")
+        if not isinstance(nonce, str) or not _NONCE_RE.fullmatch(nonce):
+            raise _refused(f"{nonce!r} is not a journal entry's nonce")
+        if git_input is not None:
+            problem = identity_problem(owner, git_input)
+            if problem:
+                raise _refused(problem)
+
+    def _layout(self, common: SafeRoot, root: StagingRoot) -> SafeRoot:
+        """``root``'s directory, reached from the common dir with no mount in its layout."""
+        return _open_layout(common, split_relpath(root.layout), create=False)
+
+    def _create(self, root: StagingRoot, record: bytes) -> tuple[int, int]:
+        """The launch's directory, made exclusively below the layout under L1; its identity.
+
+        Each directory of the layout is checked to be on the common dir's
+        mount before anything is created in it. The new directory is set to
+        mode ``0700`` and to the operator's own group (a setgid parent of a
+        shared repository would give it another), and its owner record is
+        the first thing written into it.
+        """
+        parts = split_relpath(root.layout)
         try:
             with self._git_lock("create a launch's staging root"):
-                with SafeRoot.open(self.common_dir) as common:
-                    common.ensure_dir(parent)
-                    with common.subroot(parent) as stage:
-                        os.mkdir(root.launch, PRIVATE_DIRECTORY_MODE, dir_fd=stage.fd)
+                with (
+                    SafeRoot.open(self.common_dir) as common,
+                    _open_layout(common, parts[:-1], create=True) as stage,
+                ):
+                    os.mkdir(root.launch, PRIVATE_DIRECTORY_MODE, dir_fd=stage.fd)
+                    with stage.subroot(root.launch) as made:
+                        if _mount_id(made.fd, root.path) != _mount_id(stage.fd, str(stage.path)):
+                            raise _refused(f"{root.path} is a mount point")
+                        os.fchmod(made.fd, PRIVATE_DIRECTORY_MODE)
+                        if os.fstat(made.fd).st_gid != os.getegid():
+                            os.fchown(made.fd, -1, os.getegid())
+                        _write_new(made.fd, STAGED_OWNER, record)
+                        return made.identity
         except FileExistsError as exc:
             raise _refused(
                 f"{root.path} exists already; a staging root is never reused, and "
                 "reconciliation removes a leftover"
             ) from exc
+        except SandboxLaunchRefusedError:
+            raise
         except (GitLockTimeout, LockError) as exc:
             raise _refused(f"the shared-Git lock was not obtained ({exc})") from exc
         except (AutoForgeError, OSError) as exc:
             raise _refused(f"it could not be created ({type(exc).__name__}: {exc})") from exc
 
-    def _copy_seed(self, staged: SafeRoot, seed: Seed, digest: str) -> str:
-        """Copy the seed's two files: the manifest must hash to ``digest``, the pack to its own."""
-        staged.ensure_dir(STAGED_SEED)
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
-        src_dir = os.open(seed.directory, flags | os.O_DIRECTORY)
+    def _copy_seed(
+        self, staged: SafeRoot, seed: Seed, git_input: LaunchGitInput, mount: int
+    ) -> str:
+        """Copy the seed's two files: the manifest must hash to the input's digest and name its
+        launch, the pack hash to the manifest's."""
+        digest = git_input.seed_manifest_digest
+        src_dir = os.open(seed.directory, _DIR_FLAGS)
         try:
             if sorted(os.listdir(src_dir)) != sorted(SEED_FILES):
                 raise _refused("its seed's directory does not hold exactly the seed's two files")
-            with staged.subroot(STAGED_SEED) as out:
+            with _subdir(staged, STAGED_SEED, mount, PRIVATE_DIRECTORY_MODE) as out:
                 manifest, manifest_sha = _copy_file(src_dir, out, SEED_MANIFEST_NAME)
                 if "sha256:" + manifest_sha != digest:
                     raise _refused(
@@ -357,50 +515,64 @@ class SourceStaging:
                 pack_sha = _copy_file(src_dir, out, SEED_PACK_NAME, keep=False)[1]
         finally:
             os.close(src_dir)
-        if parse_manifest(manifest).pack_sha256 != pack_sha:
+        parsed = parse_manifest(manifest)
+        if parsed.pack_sha256 != pack_sha:
             raise _refused("the seed pack copied is not the one its manifest names")
+        for name in _IDENTITY_FIELDS:
+            if getattr(parsed, name) != getattr(git_input, name):
+                raise _refused(f"the seed manifest copied names another launch's {name}")
         return digest
 
-    def _copy_read_context(self, staged: SafeRoot, read_context: str) -> None:
-        """A copy of the launch's read context: its directories and regular files, nothing else."""
-        staged.ensure_dir(STAGED_READ_CONTEXT)
-        if not read_context:
-            return
-        total = 0
-        with (
-            SafeRoot.open(read_context) as source,
-            staged.subroot(STAGED_READ_CONTEXT) as out,
-        ):
-            for entry in source.walk(max_entries=MAX_READ_CONTEXT_ENTRIES):
-                if entry.is_dir:
-                    out.ensure_dir(entry.relpath)
-                    continue
-                if not entry.is_regular:
-                    raise _refused(
-                        f"the read context's {entry.relpath} is neither a file nor a directory"
-                    )
-                total += entry.st.st_size
-                if total > MAX_READ_CONTEXT_BYTES:
-                    raise _refused(f"the read context is over {MAX_READ_CONTEXT_BYTES} bytes")
-                data = source.read_bytes(entry.relpath, limit=MAX_READ_CONTEXT_BYTES)
-                if data is None:
-                    raise _refused(f"the read context's {entry.relpath} vanished while copied")
-                out.create_exclusive(entry.relpath, data, mode=PRIVATE_FILE_MODE)
+    def _copy_read_context(
+        self, staged: SafeRoot, read_context: str, mount: int
+    ) -> tuple[ContextEntry, ...]:
+        """A copy of the launch's read context: its directories and regular files; what it holds."""
+        copied: list[ContextEntry] = []
+        with _subdir(staged, STAGED_READ_CONTEXT, mount, PRIVATE_DIRECTORY_MODE) as out:
+            if not read_context:
+                return ()
+            total = 0
+            with SafeRoot.open(read_context) as source:
+                for entry in source.walk(max_entries=MAX_READ_CONTEXT_ENTRIES):
+                    if entry.is_dir:
+                        with _subdir(out, entry.relpath, mount, PRIVATE_DIRECTORY_MODE):
+                            pass
+                        copied.append(ContextEntry(entry.relpath, "dir"))
+                        continue
+                    if not entry.is_regular:
+                        raise _refused(
+                            f"the read context's {entry.relpath} is neither a file nor a directory"
+                        )
+                    total += entry.st.st_size
+                    if total > MAX_READ_CONTEXT_BYTES:
+                        raise _refused(f"the read context is over {MAX_READ_CONTEXT_BYTES} bytes")
+                    data = source.read_bytes(entry.relpath, limit=MAX_READ_CONTEXT_BYTES)
+                    if data is None:
+                        raise _refused(f"the read context's {entry.relpath} vanished while copied")
+                    parent, name = posixpath.split(entry.relpath)
+                    with out.subroot(parent) if parent else out.dup() as directory:
+                        _write_new(directory.fd, name, data)
+                    digest = hashlib.sha256(data).hexdigest()
+                    copied.append(ContextEntry(entry.relpath, "file", digest))
+        return tuple(sorted(copied, key=lambda item: item.path))
 
     # -- the hand-off ---------------------------------------------------------------
     def reprove(self, staged: StagedSource) -> None:
         """Prove ``staged`` again, immediately before a container's create binds it (D2, D12).
 
-        Refused when its path no longer names the directory created, its
-        entries are not exactly its three, something is mounted below it,
-        its seed is not the one copied, or its tree does not hash back to
-        the commit's tree read afresh from the store.
+        Refused when a directory of its layout is a mount point, its path no
+        longer names the directory created, its entries are not exactly its
+        four, its owner record is not the launch's, an entry below it is on
+        another mount, has another owner or other permission bits than its
+        record says, its seed or read context is not the one copied, or its
+        tree does not hash back to the commit's tree read afresh from the
+        store.
         """
         self._check_root(staged.root)
         try:
             with (
                 SafeRoot.open(self.common_dir) as common,
-                common.subroot(staged.root.layout) as root,
+                self._layout(common, staged.root) as root,
             ):
                 if root.identity != staged.identity:
                     raise _refused(
@@ -411,18 +583,27 @@ class SourceStaging:
                 if held != sorted(STAGED_ENTRIES):
                     raise _refused(
                         f"{staged.root.path} holds {', '.join(held) or 'nothing'}, not exactly "
-                        f"{', '.join(STAGED_ENTRIES)}"
+                        f"{', '.join(sorted(STAGED_ENTRIES))}"
                     )
-                _no_mount_below(root)
+                problem = _owner_record_problem(
+                    root.fd, owner_record(self.key, staged.owner, staged.nonce)
+                )
+                if problem:
+                    raise _refused(f"{staged.root.path} {problem}")
+                _check_contents(root, staged.ownership, _mount_id(root.fd, staged.root.path))
                 with root.subroot(STAGED_SEED) as seed:
                     self._reprove_seed(seed, staged.seed_digest)
-                with root.subroot(STAGED_TREE) as tree:
+                with root.subroot(STAGED_READ_CONTEXT) as copied:
+                    _check_read_context(copied, staged.read_context)
+                with (
+                    root.subroot(STAGED_TREE) as tree,
+                    isolated_store(self.common_dir, staged.object_format, self._runner) as (
+                        repo,
+                        run,
+                    ),
+                ):
                     proved = materialize_mod.prove_tree(
-                        no_lazy_fetch(self._runner),
-                        self.common_dir,
-                        staged.commit,
-                        staged.object_format,
-                        tree,
+                        run, str(repo), staged.commit, staged.object_format, tree
                     )
         except FileNotFoundError as exc:
             raise _refused(f"{staged.root.path} is gone") from exc
@@ -443,39 +624,76 @@ class SourceStaging:
             raise _refused("its seed pack is not the one its manifest names")
 
     # -- the release and reconciliation -------------------------------------------
-    def remove_staging_root(self, root: StagingRoot) -> Removal:
-        """Remove ``root``; :attr:`Removal.REMOVED` only when it is verified gone. Idempotent.
+    def remove_staging_root(self, root: StagingRoot, owner: LaunchOwner, nonce: str) -> Removal:
+        """Remove ``root`` if it is the one ``owner``'s journal entry ``nonce`` names. Idempotent.
 
-        Reached from the common dir one component at a time; the launch's
-        directory is removed relative to its parent's descriptor, never
-        following a link. A path that holds something other than a directory
-        is left in place and uncertain: it is not what the launch made. In
-        either form: reconciliation may remove a bind-form leftover once the
-        runtime's form changed.
+        :attr:`Removal.REMOVED` only when it is verified gone. Reached from
+        the common dir one component at a time with no mount in its layout;
+        the launch's directory is removed relative to its parent's
+        descriptor, never following a link, and only when it is the
+        operator's, not itself a mount point, and either empty (a crash
+        right after it was made) or holding the owner record of exactly
+        that launch and nonce. A path that holds anything else, a directory
+        substituted there included, is left in place and uncertain: it is
+        not what the launch made. Before anything is removed, every entry
+        below it must be on its own mount; one that is not leaves it all in
+        place, uncertain. The removal opens each directory without following
+        a link and checks its mount before removing what is in it, and
+        removes the owner record last, so a removal cut short is still
+        recognized as the launch's. In either form: reconciliation may
+        remove a bind-form leftover once the runtime's form changed.
         """
         self._check_root(root, staging=False)
-        parent = root.layout.rsplit("/", 1)[0]
+        self._check_owner(root, owner, nonce)
+        record = owner_record(self.key, owner, nonce)
+        parts = split_relpath(root.layout)
         try:
             with SafeRoot.open(self.common_dir) as common:
                 try:
-                    stage = common.subroot(parent)
+                    stage = _open_layout(common, parts[:-1], create=False)
                 except FileNotFoundError:
                     return Removal.REMOVED
                 with stage:
-                    try:
-                        info = os.lstat(root.launch, dir_fd=stage.fd)
-                    except FileNotFoundError:
-                        return Removal.REMOVED
-                    if not stat.S_ISDIR(info.st_mode):
-                        return Removal.UNCERTAIN
-                    shutil.rmtree(root.launch, dir_fd=stage.fd)
-                    try:
-                        os.lstat(root.launch, dir_fd=stage.fd)
-                    except FileNotFoundError:
-                        return Removal.REMOVED
-                    return Removal.UNCERTAIN
-        except (StateError, OSError):
+                    return _remove_launch_dir(stage, root.launch, record)
+        except (SandboxLaunchRefusedError, StateError, OSError):
             return Removal.UNCERTAIN
+
+
+def _seed_launch_problem(directory: str, git_input: LaunchGitInput) -> str:
+    """Why the seed manifest in ``directory`` names another launch than ``git_input``, or "".
+
+    Read before the staging root is created, so a seed bound into another
+    launch's input is refused with nothing made (PR #504 R1-F3); the copy
+    is checked again as it is written.
+    """
+    try:
+        dir_fd = os.open(directory, _DIR_FLAGS)
+        try:
+            fd = os.open(SEED_MANIFEST_NAME, _READ_FLAGS, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return "its seed manifest is not a regular file"
+            os.set_blocking(fd, True)
+            raw = bytearray()
+            while chunk := os.read(fd, MAX_SEED_MANIFEST_BYTES + 1 - len(raw)):
+                raw += chunk
+                if len(raw) > MAX_SEED_MANIFEST_BYTES:
+                    return "its seed manifest is over its bound"
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        return f"its seed manifest cannot be read ({exc.strerror or exc})"
+    manifest = parse_manifest(bytes(raw))
+    for name in _IDENTITY_FIELDS:
+        named, bound = getattr(manifest, name), getattr(git_input, name)
+        if named != bound:
+            return (
+                f"its seed manifest names the launch's {name} {named!r}, and the launch's git "
+                f"input binds {bound!r}"
+            )
+    return ""
 
 
 def as_seed(built: BuiltSeed) -> Seed:
@@ -487,22 +705,343 @@ def as_seed(built: BuiltSeed) -> Seed:
     )
 
 
+# -- mounts ------------------------------------------------------------------------------
+
+
+def _mount_id(fd: int, where: str) -> int:
+    """The kernel's id of the mount ``fd`` is on (``mnt_id`` of ``/proc/self/fdinfo``).
+
+    Two directories of one filesystem bound at two places have one device
+    and two mount ids, so this is what tells a bind mount from the same
+    filesystem, and a file mount, from an ordinary entry. Refused when the
+    host does not report it: then no mount nesting can be ruled out.
+    """
+    try:
+        with open(f"/proc/self/fdinfo/{fd}", "rb") as handle:
+            info = handle.read(_FDINFO_BYTES)
+    except OSError as exc:
+        raise _refused(
+            f"the mount of {where} cannot be read from /proc/self/fdinfo "
+            f"({exc.strerror or exc}), so a mount nested in it cannot be ruled out"
+        ) from exc
+    for line in info.splitlines():
+        name, _, value = line.partition(b":")
+        if name == b"mnt_id" and value.strip().isdigit():
+            return int(value.strip())
+    raise _refused(
+        f"/proc/self/fdinfo names no mount for {where}, so a mount nested in it cannot be ruled out"
+    )
+
+
+def _mount_id_at(dir_fd: int, name: str, seen: os.stat_result, where: str) -> int:
+    """The mount id of the entry ``name`` of ``dir_fd``, which must still be the one ``seen``."""
+    if not _O_PATH:
+        raise _refused(
+            f"this host cannot open {where} without reading it (no O_PATH), so a mount at it "
+            "cannot be ruled out"
+        )
+    fd = os.open(name, _O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    try:
+        now = os.fstat(fd)
+        if (now.st_dev, now.st_ino) != (seen.st_dev, seen.st_ino):
+            raise _refused(f"{where} changed while it was checked")
+        return _mount_id(fd, where)
+    finally:
+        os.close(fd)
+
+
+def _open_layout(common: SafeRoot, parts: tuple[str, ...], *, create: bool) -> SafeRoot:
+    """The directory ``parts`` names below ``common``, each directory on the way on its mount.
+
+    Reached one component at a time, never through a link. Each directory
+    is checked to be on the common dir's own mount before the next is
+    opened, and with ``create`` before the next is created in it, so
+    nothing is ever created inside a mount nested in the layout. The caller
+    closes the result. ``FileNotFoundError`` when one is missing and
+    ``create`` is off.
+    """
+    want = _mount_id(common.fd, str(common.path))
+    current = common.dup()
+    try:
+        for part in parts:
+            if create:
+                current.ensure_dir(part)
+            found = current.subroot(part)
+            current.close()
+            current = found
+            if _mount_id(current.fd, str(current.path)) != want:
+                raise _refused(
+                    f"{current.path} is a mount point; every directory of a staging root's "
+                    "layout is on the git common dir's own mount"
+                )
+        return current
+    except BaseException:
+        current.close()
+        raise
+
+
+def _subdir(parent: SafeRoot, relpath: str, mount: int, mode: int) -> SafeRoot:
+    """``relpath`` below ``parent``, made if missing, on ``mount``, set to ``mode``.
+
+    The caller closes it.
+    """
+    parent.ensure_dir(relpath)
+    found = parent.subroot(relpath)
+    try:
+        if _mount_id(found.fd, str(found.path)) != mount:
+            raise _refused(f"something is mounted at {found.path}")
+        os.fchmod(found.fd, mode)
+    except BaseException:
+        found.close()
+        raise
+    return found
+
+
+# -- what a staging root holds ---------------------------------------------------------
+
+
+def _check_contents(root: SafeRoot, ownership: SourceOwnership, mount: int) -> None:
+    """Every entry of the staging root is on ``mount``, owned and with the mode ``ownership`` says.
+
+    The root itself too. An entry on another mount is found by its mount
+    id whatever it is (a directory or a file, from the same filesystem or
+    not), and is not descended into.
+    """
+    info = os.fstat(root.fd)
+    problem = _owned_problem(info, ownership) or _mode_problem(
+        info, (ownership.private_directory_mode,)
+    )
+    if problem:
+        raise _refused(f"{root.path} {problem}")
+    for entry in root.walk():
+        if _mount_id_at(entry.dir_fd, entry.name, entry.st, entry.relpath) != mount:
+            raise _refused(f"something is mounted at {entry.relpath} below it")
+        problem = _entry_problem(entry, ownership)
+        if problem:
+            raise _refused(f"its {entry.relpath} {problem}")
+
+
+def _owned_problem(info: os.stat_result, ownership: SourceOwnership) -> str:
+    if (info.st_uid, info.st_gid) != (ownership.uid, ownership.gid):
+        return (
+            f"is owned by {info.st_uid}:{info.st_gid}, not {ownership.uid}:{ownership.gid} "
+            "as recorded"
+        )
+    return ""
+
+
+def _mode_problem(info: os.stat_result, allowed: tuple[int, ...]) -> str:
+    mode = stat.S_IMODE(info.st_mode)
+    if mode not in allowed:
+        wanted = " or ".join(f"{item:04o}" for item in allowed)
+        return f"has mode {mode:04o}, not {wanted} as recorded"
+    return ""
+
+
+def _entry_problem(entry: WalkEntry, ownership: SourceOwnership) -> str:
+    """Why ``entry`` is not what its place in the staging root holds, or ""."""
+    problem = _owned_problem(entry.st, ownership)
+    if problem:
+        return problem
+    top = entry.relpath.split("/", 1)[0]
+    private_dir: tuple[int, ...] = (ownership.private_directory_mode,)
+    private_file: tuple[int, ...] = (ownership.private_file_mode,)
+    allowed: tuple[int, ...] | None
+    if entry.relpath == STAGED_OWNER:
+        allowed = private_file if entry.is_regular else None
+    elif entry.relpath in (STAGED_SEED, STAGED_READ_CONTEXT):
+        allowed = private_dir if entry.is_dir else None
+    elif top == STAGED_SEED:
+        allowed = private_file if entry.is_regular else None
+    elif top == STAGED_READ_CONTEXT:
+        allowed = private_dir if entry.is_dir else private_file if entry.is_regular else None
+    elif top == STAGED_TREE:
+        if entry.is_symlink:
+            return ""
+        if entry.is_dir:
+            allowed = (ownership.tree_directory_mode,)
+        elif entry.is_regular:
+            allowed = (ownership.tree_file_mode, ownership.tree_executable_mode)
+        else:
+            allowed = None
+    else:
+        return "is not an entry of a staging root"
+    if allowed is None:
+        return "is not of the kind a staging root holds there"
+    return _mode_problem(entry.st, allowed)
+
+
+def _check_read_context(copied: SafeRoot, expected: tuple[ContextEntry, ...]) -> None:
+    """The staged read context holds exactly ``expected``: its entries, kinds and bytes (R1-F4)."""
+    found: list[ContextEntry] = []
+    total = 0
+    for entry in copied.walk(max_entries=MAX_READ_CONTEXT_ENTRIES):
+        if entry.is_dir:
+            found.append(ContextEntry(entry.relpath, "dir"))
+            continue
+        if not entry.is_regular:
+            raise _refused(f"its read context's {entry.relpath} is neither a file nor a directory")
+        total += entry.st.st_size
+        if total > MAX_READ_CONTEXT_BYTES:
+            raise _refused(f"its read context is over {MAX_READ_CONTEXT_BYTES} bytes")
+        digest = _hash_file(entry.dir_fd, entry.name, seen=entry.st)[1]
+        found.append(ContextEntry(entry.relpath, "file", digest))
+    difference = _context_difference(expected, sorted(found, key=lambda item: item.path))
+    if difference:
+        raise _refused(f"its read context is not the one copied: {difference}")
+
+
+def _context_difference(expected: tuple[ContextEntry, ...], found: list[ContextEntry]) -> str:
+    want = {item.path: item for item in expected}
+    have = {item.path: item for item in found}
+    for path in sorted(set(want) | set(have)):
+        before, now = want.get(path), have.get(path)
+        if before is None:
+            return f"{path} was added"
+        if now is None:
+            return f"{path} was removed"
+        if before.kind != now.kind:
+            return f"{path} was a {before.kind} and is a {now.kind} now"
+        if before.sha256 != now.sha256:
+            return f"{path} was changed"
+    return ""
+
+
+def _owner_record_problem(dir_fd: int, record: bytes) -> str:
+    """Why the owner record in ``dir_fd`` is not exactly ``record``, or ""."""
+    try:
+        fd = os.open(STAGED_OWNER, _READ_FLAGS, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return "holds no owner record"
+    except OSError as exc:
+        return f"has an owner record that cannot be read ({exc.strerror or exc})"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return "has an owner record that is not a regular file"
+        os.set_blocking(fd, True)
+        data = bytearray()
+        while chunk := os.read(fd, MAX_OWNER_RECORD_BYTES + 1 - len(data)):
+            data += chunk
+            if len(data) > MAX_OWNER_RECORD_BYTES:
+                break
+    finally:
+        os.close(fd)
+    if bytes(data) != record:
+        return "has an owner record of another launch or journal entry"
+    return ""
+
+
+# -- removal -------------------------------------------------------------------------------
+
+
+def _remove_launch_dir(stage: SafeRoot, name: str, record: bytes) -> Removal:
+    """Remove the launch's directory ``name`` of ``stage`` if it is provably the launch's."""
+    try:
+        seen = os.lstat(name, dir_fd=stage.fd)
+    except FileNotFoundError:
+        return Removal.REMOVED
+    if not stat.S_ISDIR(seen.st_mode):
+        return Removal.UNCERTAIN
+    mount = _mount_id(stage.fd, str(stage.path))
+    with stage.subroot(name) as launch:
+        info = os.fstat(launch.fd)
+        if (info.st_dev, info.st_ino) != (seen.st_dev, seen.st_ino):
+            return Removal.UNCERTAIN
+        if info.st_uid != os.geteuid():
+            return Removal.UNCERTAIN
+        if _mount_id(launch.fd, str(launch.path)) != mount:
+            return Removal.UNCERTAIN
+        if os.listdir(launch.fd):
+            if _owner_record_problem(launch.fd, record):
+                return Removal.UNCERTAIN
+            for entry in launch.walk():
+                if _mount_id_at(entry.dir_fd, entry.name, entry.st, entry.relpath) != mount:
+                    return Removal.UNCERTAIN
+            if not info.st_mode & stat.S_IWUSR or not info.st_mode & stat.S_IXUSR:
+                os.fchmod(launch.fd, PRIVATE_DIRECTORY_MODE)
+            _remove_below(launch.fd, mount, keep=STAGED_OWNER)
+            os.unlink(STAGED_OWNER, dir_fd=launch.fd)
+    os.rmdir(name, dir_fd=stage.fd)
+    try:
+        os.lstat(name, dir_fd=stage.fd)
+    except FileNotFoundError:
+        return Removal.REMOVED
+    return Removal.UNCERTAIN
+
+
+def _remove_below(root_fd: int, mount: int, *, keep: str) -> None:
+    """Remove every entry below ``root_fd`` but ``keep`` at its top, never crossing a mount.
+
+    Depth first, by descriptors, iteratively: each directory is opened
+    without following a link, must still be the entry listed, and must be
+    on ``mount`` before anything in it is listed or removed; a directory
+    that is not stops the removal (raises), leaving what is in it. An
+    entry that is not a directory is unlinked, never followed.
+    """
+    frames: list[tuple[int, list[str], str]] = [
+        (os.dup(root_fd), [item for item in os.listdir(root_fd) if item != keep], "")
+    ]
+    try:
+        while frames:
+            fd, pending, name = frames[-1]
+            if pending:
+                child = pending.pop()
+                seen = os.lstat(child, dir_fd=fd)
+                if not stat.S_ISDIR(seen.st_mode):
+                    os.unlink(child, dir_fd=fd)
+                    continue
+                sub = os.open(child, _DIR_FLAGS, dir_fd=fd)
+                try:
+                    info = os.fstat(sub)
+                    if (info.st_dev, info.st_ino) != (seen.st_dev, seen.st_ino):
+                        raise _refused(f"{child} changed while it was removed")
+                    if _mount_id(sub, child) != mount:
+                        raise _refused(f"something is mounted at {child}; it is not removed")
+                    if (info.st_mode & _OWNER_RWX) != _OWNER_RWX:
+                        os.fchmod(sub, PRIVATE_DIRECTORY_MODE)
+                    children = os.listdir(sub)
+                except BaseException:
+                    os.close(sub)
+                    raise
+                frames.append((sub, children, child))
+                continue
+            frames.pop()
+            os.close(fd)
+            if frames:
+                os.rmdir(name, dir_fd=frames[-1][0])
+    finally:
+        for fd, _, _ in frames:
+            os.close(fd)
+
+
+# -- files ---------------------------------------------------------------------------------
+
+
+def _write_new(dir_fd: int, name: str, data: bytes) -> None:
+    """Create ``name`` in ``dir_fd`` exclusively, holding ``data``, mode ``0600``."""
+    fd = os.open(name, _NEW_FILE_FLAGS, PRIVATE_FILE_MODE, dir_fd=dir_fd)
+    try:
+        os.fchmod(fd, PRIVATE_FILE_MODE)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _copy_file(src_dir: int, out: SafeRoot, name: str, *, keep: bool = True) -> tuple[bytes, str]:
     """Copy ``name`` into ``out`` exclusively, hashing it; its bytes too when ``keep``."""
-    src = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=src_dir)
+    src = os.open(name, _READ_FLAGS, dir_fd=src_dir)
     try:
         if not stat.S_ISREG(os.fstat(src).st_mode):
             raise _refused(f"its seed's {name} is not a regular file")
         os.set_blocking(src, True)
-        dst = os.open(
-            name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-            PRIVATE_FILE_MODE,
-            dir_fd=out.fd,
-        )
+        dst = os.open(name, _NEW_FILE_FLAGS, PRIVATE_FILE_MODE, dir_fd=out.fd)
         digest = hashlib.sha256()
         kept = bytearray()
         try:
+            os.fchmod(dst, PRIVATE_FILE_MODE)
             while chunk := os.read(src, _CHUNK_BYTES):
                 digest.update(chunk)
                 if keep:
@@ -518,11 +1057,20 @@ def _copy_file(src_dir: int, out: SafeRoot, name: str, *, keep: bool = True) -> 
     return bytes(kept), digest.hexdigest()
 
 
-def _hash_file(dir_fd: int, name: str, *, keep: bool = False) -> tuple[bytes, str]:
-    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+def _hash_file(
+    dir_fd: int, name: str, *, keep: bool = False, seen: os.stat_result | None = None
+) -> tuple[bytes, str]:
+    """SHA-256 of the regular file ``name`` of ``dir_fd`` (its bytes too when ``keep``).
+
+    With ``seen``, the file opened must still be that entry.
+    """
+    fd = os.open(name, _READ_FLAGS, dir_fd=dir_fd)
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise _refused(f"its seed's {name} is not a regular file")
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise _refused(f"its {name} is not a regular file")
+        if seen is not None and (info.st_dev, info.st_ino) != (seen.st_dev, seen.st_ino):
+            raise _refused(f"its {name} changed while it was proved")
         os.set_blocking(fd, True)
         digest = hashlib.sha256()
         kept = bytearray()
@@ -533,19 +1081,3 @@ def _hash_file(dir_fd: int, name: str, *, keep: bool = False) -> tuple[bytes, st
     finally:
         os.close(fd)
     return bytes(kept), digest.hexdigest()
-
-
-def _no_mount_below(root: SafeRoot) -> None:
-    """Nothing below ``root`` is on another device: no mount nests in the staging root."""
-    device = os.fstat(root.fd).st_dev
-    for entry in root.walk():
-        if entry.is_dir and entry.st.st_dev != device:
-            raise _refused(f"something is mounted at {entry.relpath} below it")
-    try:
-        parent = os.stat("..", dir_fd=root.fd, follow_symlinks=False)
-    except OSError as exc:  # pragma: no cover - the root was just opened
-        if exc.errno != errno.ENOENT:
-            raise
-        return
-    if parent.st_dev != device:
-        raise _refused("it is itself a mount point")

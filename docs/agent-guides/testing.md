@@ -1239,13 +1239,36 @@ exactly when `tests/sandbox_host.py` measures the host capable
   the checkout's HEAD, index, status and files unchanged; no untracked,
   ignored, `.git` or home file is staged. A byte, a mode, an entry or the
   seed changed on the host, a directory substituted at the path (a
-  faithful copy included), a link planted there and a nested mount each
-  fail the re-proof. A seed whose digest is not the input's is never
-  written into a staging root; the root is created under L1 and never
-  reused; a link in its layout is refused and nothing is written through
-  it; removal is idempotent, leaves another launch's root, and leaves what
-  is not the launch's directory in place as uncertain. The copy-in form
-  stages nothing on the host. Hostile input on the host path: a
+  faithful copy included), a link planted there, another journal entry's
+  owner record, a read-context entry added, changed, removed or
+  substituted (a directory, a link, a FIFO), and a permission bit of any
+  entry that is not the one its ownership record says (a tree file a
+  non-owner can no longer read included) each fail the re-proof; the
+  record holds for every entry whatever the umask. Mounts are found by
+  the kernel's mount id: simulated, below the root (a directory, a file,
+  a seed or read-context entry) and in its layout, they fail the re-proof
+  and refuse a new root before anything is written in the mounted
+  directory; real ones, made in a user and mount namespace of the test's
+  own (a bind mount from the same filesystem on a directory and on a file,
+  a tmpfs, a bind mount over the root, one over the layout's `stage`),
+  are refused the same way and never removed through, and are skipped as
+  untested where the host refuses that namespace. A seed whose digest is
+  not the input's is never written into a staging root, and a seed, a
+  staging root or a root's launch id that does not agree with the
+  launch's owner and git input (its run, issue, phase or launch id) is
+  refused before anything is built or created; the root is created under
+  L1 and never reused; a link in its layout is refused and nothing is
+  written through it. Removal is idempotent and leaves another launch's
+  root; it leaves in place, as uncertain, what is not the launch's
+  directory (a link, a real directory substituted at the path, one
+  holding another entry's owner record, another launch's root moved
+  there) and a root with a mount anywhere below it, removing nothing, and
+  a directory mounted after that check stops the removal before it
+  descends, with the owner record kept for a later removal to finish.
+  Reconciliation through the lifecycle's `reconcile()` removes a crash's
+  leftovers (an empty directory, one holding only its owner record, a
+  whole root) and leaves the rest open. The copy-in form stages nothing
+  on the host. Hostile input on the host path: a
   `.gitattributes` naming a filter driver, `ident`, `eol=crlf`, `text` and
   LFS, with the driver and a fake `git-lfs` in the operator's global
   configuration writing a sentinel, and a gitlink: the staged bytes and
@@ -1253,9 +1276,15 @@ exactly when `tests/sandbox_host.py` measures the host capable
   pointer stays a pointer, the gitlink is an empty directory, and the
   diagnostics name each case (and a sparse checkout). A partial-clone
   store whose blob the seed needs is a typed refusal with no connection to
-  its recording promisor remote and a byte-identical store; one more test
-  pins that the existing `materialize()` path does fetch it lazily (a
-  defect of that path, filed on its own, not fixed by #292). Through
+  its recording promisor remote and a byte-identical store, and so is one
+  whose blob only the staging root's tree needs, both also through a git
+  that ignores `GIT_NO_LAZY_FETCH` (as one older than 2.44 does): every
+  git that reads the store's objects, in the seed step, the tree and its
+  re-proof, runs in a private git directory with no configuration of the
+  operator's, and the store itself is asked only for its tag refs and two
+  configuration values. One more test pins that the existing
+  `materialize()` path does fetch it lazily (a defect of that path, not
+  fixed by #292 and left to a follow-up issue of its own). Through
   `LaunchLifecycle` on a container-shaped fake whose source is the real
   `SourceStaging` and whose creates render #270's real options: the seed
   is checked before any journal entry, the staging root's entry precedes

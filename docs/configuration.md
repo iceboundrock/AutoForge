@@ -1443,9 +1443,15 @@ for `REVIEW` and `FIX`), taken from the shared object store:
   `<git common dir>/autoforge/sandbox/<key>/stage/<launch id>` and binds
   read-only at `/source`. It is proved byte for byte against the commit's
   tree when it is written, and again right before each container is
-  created; a byte, a mode or an entry changed in between refuses the
-  launch. It is removed right after the launch's run step. Elsewhere,
-  nothing is staged on the host: the seed pack is copied in.
+  created, with its copy of the read context, its seed, and each entry's
+  owner and permissions; a byte, a mode or an entry changed in between,
+  or anything mounted inside it, refuses the launch. Every directory from
+  the git common dir down to it must be on the common dir's own mount, so
+  a separate filesystem or a bind mount at `<git common dir>/autoforge`
+  refuses this form. The check reads Linux's mount ids. It is removed
+  right after the launch's run step, and only when it is still the
+  directory that launch made. Elsewhere, nothing is staged on the host:
+  the seed pack is copied in.
 - The agent works in a private writable volume at `/workspace`, seeded
   from the snapshot's pack. Nothing is a writable mount of your checkout,
   and nothing the agent writes reaches the host except a commit the
@@ -1483,7 +1489,7 @@ with the launch (#271):
 | Git LFS | unsupported for content | the pointer files, byte for byte |
 | a filter or conversion attribute | not applied | the committed bytes |
 | a sparse checkout | unsupported | the commit's whole tree |
-| a partial clone (`--filter`) | unsupported for missing objects | the store is read with no lazy fetch: an object it lacks refuses the seed, and the promisor remote is never contacted |
+| a partial clone (`--filter`) | unsupported for missing objects | the store is read with no lazy fetch, whatever your git version: an object it lacks refuses the seed or the snapshot, and the promisor remote is never contacted |
 
 ## Parallel EPIC scheduler
 

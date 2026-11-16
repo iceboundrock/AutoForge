@@ -905,27 +905,46 @@ reached by nothing before #271:
   names the manifest's boundaries, exact commits, exact tag objects, each
   tag peeling to a commit of the pack, and the closure. Every refusal is
   `SandboxLaunchRefusedError`, a setup failure before any journal entry.
-  Nothing is checked out, so no attribute, filter or hook applies, and
-  every git process runs with `GIT_NO_LAZY_FETCH` (`no_lazy_fetch()`): a
-  partial clone's missing object refuses the seed and never reaches the
-  promisor remote. The seed's diagnostics (D2's table) ride on
-  `sandbox_backend.Seed.diagnostics` for #271 to report.
+  Nothing is checked out, so no attribute, filter or hook applies. Every
+  git that reads an object of the shared store runs in a private git
+  directory that reads the store as its alternate and no configuration of
+  the store's or the operator's (`isolated_store()`): no promisor remote
+  is configured there, so no git version fetches a partial clone's
+  missing object lazily, and the object refuses the seed instead.
+  `GIT_NO_LAZY_FETCH`, which only git 2.44 and later read, is set as a
+  second guard. The store itself is asked only for its tag refs' names and
+  ids and two configuration values, which read no object. The seed's
+  diagnostics (D2's table) ride on `sandbox_backend.Seed.diagnostics` for
+  #271 to report.
 - **`source_staging.py`**'s `SourceStaging` is what a container backend
   calls for its source, in the form #271's probe chose
   (`sandbox_container.StagingMethod`): `seed()` in the seed step;
   `make_staging_root()` in the create step, bind form only, after the
-  lifecycle journaled the root: the launch's directory created
-  exclusively through `safefs` under L1, the seed copied only while its
-  manifest hashes to the input's digest, the read context copied, and the
+  lifecycle journaled the root: refused before anything is created unless
+  the launch's owner (run, issue, phase, launch id), its git input, its
+  seed's manifest and the root's launch id agree; the layout reached
+  through `safefs` with every directory checked to be on the common dir's
+  own mount (by the kernel's mount id) before anything is created in it;
+  the launch's directory created exclusively under L1, its owner record
+  (the sandbox key, the owner and its journal entry's nonce) written
+  first; the seed copied only while its manifest hashes to the input's
+  digest; the read context copied and recorded entry by entry; and the
   tree written by `materialize.materialize_into()` (the same writer and
-  hash-back proof as the pre-merge export, into a directory held open);
-  `reprove()` right before each create that binds it (the same directory
-  by device and inode, its three entries, nothing mounted below, the same
-  seed, the tree proved again by `materialize.prove_tree()`); and
-  `remove_staging_root()`, idempotent, for the release and reconciliation.
-  The copy-in form stages nothing on the host. `StagedSource.ownership`
-  records the owner and modes the staged files have, for #271; nothing
-  here changes ownership.
+  hash-back proof as the pre-merge export, into a directory held open,
+  reading the store through `isolated_store()`); `reprove()` right before
+  each create that binds it (no mount in the layout, the same directory by
+  device and inode, its four entries, the same owner record, every entry
+  below it on its own mount, owned and with the exact mode
+  `StagedSource.ownership` records, the same seed, the same read context,
+  the tree proved again by `materialize.prove_tree()`); and
+  `remove_staging_root()`, idempotent, for the release and reconciliation:
+  it removes only a directory that is empty or holds its entry's owner
+  record, refuses (uncertain) when a mount is anywhere below it before
+  removing anything, and never descends into a directory on another mount.
+  The bind form needs Linux's mount ids (`/proc/self/fdinfo`). The copy-in
+  form stages nothing on the host. `StagedSource.ownership` records the
+  owner and modes every staged entry has, for #271; nothing here changes
+  ownership for a backend.
 
 #### Launch routing (ADR 0005, #168)
 
