@@ -567,6 +567,14 @@ _PR_HEAD_KEYS = ("kind", "pr_url")
 _DEFINITION_KEYS = ("index", "argv", "definition_digest", "scope")
 _POLICY_KEYS = ("policy_digest", "mode", "timeout_seconds")
 _ENFORCEMENT_KEYS = ("enforced", "backend", "backend_version", "network", "teardown")
+# What a container launch's record copies besides (ADR 0006 D8.2 as amended
+# by #267): the runtime's product and version, the image id and the staging
+# method. Present exactly when ``backend`` is the container's, so a bwrap
+# record is what it was.
+CONTAINER_BACKEND = "container"
+_CONTAINER_ENFORCEMENT_KEYS = ("runtime", "runtime_version", "image_id", "staging")
+STAGING_METHODS = ("bind", "copy", "")
+MAX_IMAGE_ID_CHARS = 80
 _LEFTOVER_KEYS = (
     "descendants_killed",
     "group_survived_kill",
@@ -681,13 +689,19 @@ def _parse_policy(raw: object, what: str) -> dict:
 
 
 def _parse_enforcement(raw: object, what: str) -> None:
-    _exact(raw, _ENFORCEMENT_KEYS, what)
+    container = isinstance(raw, dict) and raw.get("backend") == CONTAINER_BACKEND
+    _exact(raw, _ENFORCEMENT_KEYS + (_CONTAINER_ENFORCEMENT_KEYS if container else ()), what)
     assert isinstance(raw, dict)
     _bool(raw["enforced"], f"{what}.enforced")
     _str(raw["backend"], f"{what}.backend", MAX_BACKEND_CHARS)
     _str(raw["backend_version"], f"{what}.backend_version", MAX_BACKEND_CHARS)
     _enum(raw["network"], f"{what}.network", NETWORKS)
     _str(raw["teardown"], f"{what}.teardown", MAX_TEARDOWN_CHARS)
+    if container:
+        _str(raw["runtime"], f"{what}.runtime", MAX_BACKEND_CHARS)
+        _str(raw["runtime_version"], f"{what}.runtime_version", MAX_BACKEND_CHARS)
+        _str(raw["image_id"], f"{what}.image_id", MAX_IMAGE_ID_CHARS)
+        _enum(raw["staging"], f"{what}.staging", STAGING_METHODS)
 
 
 def _parse_output(raw: object, what: str) -> None:
@@ -1129,13 +1143,22 @@ def enforcement_facts(facts: SandboxFacts | None) -> dict:
             "network": "",
             "teardown": "",
         }
-    return {
+    copied: dict[str, object] = {
         "enforced": bool(facts.enforced),
         "backend": _clip(redact(facts.backend), MAX_BACKEND_CHARS),
         "backend_version": _clip(redact(facts.backend_version), MAX_BACKEND_CHARS),
         "network": facts.network if facts.network in NETWORKS else "",
         "teardown": _clip(redact(facts.teardown), MAX_TEARDOWN_CHARS),
     }
+    if copied["backend"] == CONTAINER_BACKEND:
+        # D8.2 as amended: a container's runtime, image and staging method.
+        copied.update(
+            runtime=_clip(redact(facts.runtime), MAX_BACKEND_CHARS),
+            runtime_version=_clip(redact(facts.runtime_version), MAX_BACKEND_CHARS),
+            image_id=_clip(redact(facts.image_id), MAX_IMAGE_ID_CHARS),
+            staging=facts.staging if facts.staging in STAGING_METHODS else "",
+        )
+    return copied
 
 
 def _escape(char: str) -> str:

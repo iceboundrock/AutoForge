@@ -1154,7 +1154,15 @@ def _enforcement_text(view: RecordView) -> str:
         return "not sandboxed (no outer sandbox; host network)"
     backend = escape_inline(" ".join(x for x in (facts["backend"], facts["backend_version"]) if x))
     network = "isolated network" if facts["network"] == "isolated" else "host network"
-    return f"sandbox enforced ({backend or 'backend not named'}; {network})"
+    container = ""
+    if "image_id" in facts:
+        # ADR 0006 D8.2 as amended: a container's runtime, image and staging.
+        runtime = " ".join(x for x in (facts["runtime"], facts["runtime_version"]) if x)
+        container = escape_inline(
+            f"; {runtime or 'runtime not named'}, image {facts['image_id'] or 'not named'}, "
+            f"{facts['staging'] or 'staging not named'}"
+        )
+    return f"sandbox enforced ({backend or 'backend not named'}; {network}{container})"
 
 
 def _provenance_text(candidate: EvidenceCandidate) -> str:
