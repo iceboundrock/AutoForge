@@ -237,6 +237,17 @@ on a real runtime yet. When it is selectable, expect this:
   inside your checkout, a worktree, the repository's `.git`, or
   AutoForge's state, run logs or lock, wherever you configured them, is
   refused: keep it in a directory of its own.
+- **The repository is a snapshot of one commit, not your checkout.** The
+  staged copy is the commit the phase bound, written from the shared
+  object store and proved byte for byte before each container that reads
+  it is created (#292). An edit in your checkout, committed or not, and an
+  untracked or ignored file never reach a container unless the controller
+  snapshots a commit that holds them; the repository's `.git`, hooks and
+  configuration never do. The agent writes only to a private volume; its work leaves
+  only as a commit the controller imports and verifies. With
+  `sandbox.container.history_tags` on, a local tag you never pushed reaches
+  the container when it points into the seeded history
+  ([The container backend's seed](configuration.md#the-container-backends-seed-sandboxcontainer)).
 - **The model credential reaches only the agent's own container,** as an
   environment variable whose value is on no command line, or as a
   read-only file (a file must be readable by others, in a directory only

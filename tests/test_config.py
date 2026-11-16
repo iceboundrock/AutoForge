@@ -483,6 +483,59 @@ def test_the_sandbox_section_rejects_anything_else(tmp_path, body, error):
         load_config_file(p)
 
 
+# -- #292: the container backend's seed settings --------------------------------------
+def test_the_container_seed_settings_default_to_the_base_at_depth_one_and_no_tag():
+    container = default_config().sandbox.container
+    settings = container.seed_settings()
+    assert (settings.history_depth, settings.history_tags) == (0, False)
+    assert (settings.max_bytes, settings.max_objects) == (2 * 1024**3, 1_000_000)
+
+
+@pytest.mark.parametrize(
+    ("name", "text"),
+    [
+        (
+            "cfg.json",
+            '{"version": 1, "sandbox": {"container": {"history_depth": "full",'
+            ' "history_tags": true, "seed_max_bytes": 4096, "seed_max_objects": 50}}}',
+        ),
+        (
+            "cfg.yaml",
+            "version: 1\nsandbox:\n  container:\n    history_depth: full\n"
+            "    history_tags: true\n    seed_max_bytes: 4096\n    seed_max_objects: 50\n",
+        ),
+    ],
+)
+def test_the_container_seed_settings_are_read(tmp_path, name, text):
+    p = tmp_path / name
+    p.write_text(text, encoding="utf-8")
+    settings = load_config_file(p).sandbox.container.seed_settings()
+    assert (settings.history_depth, settings.history_tags) == ("full", True)
+    assert (settings.max_bytes, settings.max_objects) == (4096, 50)
+    p.write_text('{"version": 1, "sandbox": {"container": {"history_depth": 7}}}')
+    assert load_config_file(p).sandbox.container.history_depth == 7
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        ('{"history_depth": -1}', "'sandbox.container.history_depth' must be a number"),
+        ('{"history_depth": "deep"}', "'sandbox.container.history_depth' must be a number"),
+        ('{"history_depth": true}', "'sandbox.container.history_depth' must be a number"),
+        ('{"history_tags": "yes"}', "'sandbox.container.history_tags' must be a boolean"),
+        ('{"seed_max_bytes": 0}', "'sandbox.container.seed_max_bytes' must be a positive"),
+        ('{"seed_max_objects": "many"}', "'sandbox.container.seed_max_objects' must be an integer"),
+        ('{"transfer": "copy"}', "unknown key.*sandbox.container.*transfer"),
+        ("[]", "'sandbox.container' must be a mapping"),
+    ],
+)
+def test_the_container_seed_settings_reject_anything_else(tmp_path, body, error):
+    p = tmp_path / "cfg.json"
+    p.write_text(f'{{"version": 1, "sandbox": {{"container": {body}}}}}', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=error):
+        load_config_file(p)
+
+
 def test_safety_gate_opens_from_safety_allow_merge_only(tmp_path):
     p = tmp_path / "cfg.json"
     p.write_text('{"version": 1, "safety": {"allow_merge": true}}', encoding="utf-8")

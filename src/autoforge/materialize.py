@@ -40,6 +40,14 @@ uses it, and candidate validation (#172) will.
   the listing names for it and the root to the commit's tree, with no entry
   extra or missing. A mismatch is a
   :class:`~autoforge.errors.MaterializationError` naming the entry.
+- **Kept and proved again (#292).** :func:`materialize_into` runs the same
+  writer and proof into an empty directory the caller created and holds
+  open (a container launch's staging root, ADR 0013 D12), which outlives
+  the call; :func:`prove_tree` runs the proof again over such a directory,
+  the tree read afresh from the store, so a directory changed after its
+  first proof is caught before it is handed on. Files and directories are
+  written with :data:`FILE_MODE`, :data:`EXECUTABLE_MODE` and
+  :data:`DIRECTORY_MODE` whatever the umask.
 - **Comparison (PR #444 R3-F1, R4-F1; #488).** :func:`tree_differences`
   compares a working tree the controller did not write (an agent worktree)
   with a commit's tree the same way, blob by blob, and lists what differs
@@ -87,6 +95,7 @@ from .errors import CandidateNotMaterializableError, MaterializationError
 from .executor import ExecutionRequest, ExecutionResult
 from .git_transport import local_git_request
 from .redaction import redact
+from .safefs import SafeRoot
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 
@@ -121,6 +130,14 @@ _TYPES = {
     _TREE: b"tree",
     _GITLINK: b"commit",
 }
+
+# The permission bits every export is written with, whatever the umask: a
+# directory (a tree, or a gitlink's empty directory), a file, an executable
+# file. The proof reads only the owner's execute bit, so these are what a
+# consumer of an export, a container's user included, finds on disk.
+DIRECTORY_MODE = 0o755
+FILE_MODE = 0o644
+EXECUTABLE_MODE = 0o755
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _NEW_FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -370,11 +387,11 @@ class _Writer:
     for its parent, never through a path a link could redirect.
     """
 
-    def __init__(self, root: Path, listing: _Listing, commit: str) -> None:
+    def __init__(self, root: Path | int, listing: _Listing, commit: str) -> None:
         self._entries = listing.entries
         self._commit = commit
         self._next = 0
-        self._stack: list[tuple[bytes, int]] = [(b"", os.open(root, _DIR_FLAGS))]
+        self._stack: list[tuple[bytes, int]] = [(b"", _open_root(root))]
         self._blob: _Entry | None = None
         self._fd: int | None = None
         self._link: bytearray | None = None
@@ -398,12 +415,12 @@ class _Writer:
     def _directory(self, entry: _Entry) -> None:
         parent = self._parent_fd(entry)
         try:
-            os.mkdir(entry.name, 0o755, dir_fd=parent)
+            os.mkdir(entry.name, DIRECTORY_MODE, dir_fd=parent)
             fd = os.open(entry.name, _DIR_FLAGS, dir_fd=parent)
         except OSError as exc:
             raise self._fail(entry, "creating the directory", exc) from exc
         try:
-            os.fchmod(fd, 0o755)
+            os.fchmod(fd, DIRECTORY_MODE)
         except OSError as exc:
             os.close(fd)
             raise self._fail(entry, "creating the directory", exc) from exc
@@ -460,7 +477,7 @@ class _Writer:
                 os.symlink(bytes(self._link), entry.name, dir_fd=self._parent_fd(entry))
             else:
                 assert self._fd is not None
-                os.fchmod(self._fd, 0o755 if entry.mode == _EXECUTABLE else 0o644)
+                os.fchmod(self._fd, EXECUTABLE_MODE if entry.mode == _EXECUTABLE else FILE_MODE)
         except OSError as exc:
             raise self._fail(entry, "creating", exc) from exc
         finally:
@@ -627,7 +644,19 @@ def _stream_blobs(
         raise MaterializationError(f"commit {commit}: git sent fewer blobs than the tree lists")
 
 
-def _write(runner: Runner, repo: str, commit: str, listing: _Listing, root: Path) -> None:
+def _open_root(root: Path | int) -> int:
+    """A descriptor of the export's root: an open directory's duplicated, or the path opened.
+
+    A path is opened without following its last component; a descriptor is
+    one the caller opened one component at a time (a
+    :class:`~autoforge.safefs.SafeRoot`'s), so no component of it is a link.
+    """
+    if isinstance(root, int):
+        return os.dup(root)
+    return os.open(root, _DIR_FLAGS)
+
+
+def _write(runner: Runner, repo: str, commit: str, listing: _Listing, root: Path | int) -> None:
     """Write ``listing`` below ``root``, the blobs streamed from the store."""
     writer = _Writer(root, listing, commit)
     try:
@@ -702,7 +731,7 @@ def _join(parent: bytes, name: bytes) -> bytes:
     return parent + b"/" + name if parent else name
 
 
-def _prove(root: Path, listing: _Listing, commit: str, object_format: str) -> None:
+def _prove(root: Path | int, listing: _Listing, commit: str, object_format: str) -> None:
     """Prove that ``root`` holds exactly ``listing``'s tree (D6.3), or raise."""
     expected = {listed.path: listed for listed in listing.entries}
     children: dict[bytes, set[bytes]] = {b"": set()}
@@ -730,7 +759,7 @@ def _prove(root: Path, listing: _Listing, commit: str, object_format: str) -> No
 
     path = b""
     try:
-        enter(b"", os.open(root, _DIR_FLAGS))
+        enter(b"", _open_root(root))
         while frames:
             top = frames[-1]
             if not top.pending:
@@ -1470,6 +1499,31 @@ def tree_differences(
     return [difference for difference in found if difference.path not in held]
 
 
+def _materialized(
+    runner: Runner, repo: str, commit: str, object_format: str, root: Path | int, shown: Path
+) -> MaterializedTree:
+    """Write ``commit``'s tree below ``root``, prove it (D6.2, D6.3); its record at ``shown``."""
+    tree = _commit_tree(runner, repo, commit, object_format)
+    listing = _list_tree(runner, repo, commit, tree, object_format)
+    _write(runner, repo, commit, listing, root)
+    _prove(root, listing, commit, object_format)
+    return _record(commit, tree, object_format, shown, listing)
+
+
+def _record(
+    commit: str, tree: str, object_format: str, root: Path, listing: _Listing
+) -> MaterializedTree:
+    modes = [entry.mode for entry in listing.entries]
+    return MaterializedTree(
+        commit=commit,
+        tree=tree,
+        object_format=object_format,
+        root=root,
+        files=sum(mode not in (_TREE, _GITLINK) for mode in modes),
+        gitlinks=modes.count(_GITLINK),
+    )
+
+
 @contextmanager
 def materialize(
     runner: Runner, repo: str, commit: str, object_format: str, *, prefix: str
@@ -1488,18 +1542,53 @@ def materialize(
     """
     root = Path(tempfile.mkdtemp(prefix=prefix))
     try:
-        tree = _commit_tree(runner, repo, commit, object_format)
-        listing = _list_tree(runner, repo, commit, tree, object_format)
-        _write(runner, repo, commit, listing, root)
-        _prove(root, listing, commit, object_format)
-        modes = [entry.mode for entry in listing.entries]
-        yield MaterializedTree(
-            commit=commit,
-            tree=tree,
-            object_format=object_format,
-            root=root,
-            files=sum(mode not in (_TREE, _GITLINK) for mode in modes),
-            gitlinks=modes.count(_GITLINK),
-        )
+        yield _materialized(runner, repo, commit, object_format, root, root)
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def materialize_into(
+    runner: Runner, repo: str, commit: str, object_format: str, root: SafeRoot
+) -> MaterializedTree:
+    """Write ``commit``'s tree into the empty directory ``root`` holds open, and prove it.
+
+    The same writer and proof as :func:`materialize` (D6.2, D6.3), into a
+    directory the caller created and keeps: a launch's staging root (ADR
+    0013 D12; #292), which outlives this call and so cannot be the
+    temporary directory :func:`materialize` removes. Every entry is created
+    relative to ``root``'s descriptor, never through its path. A directory
+    that already holds an entry is refused before anything is written.
+    Nothing is removed on a failure: the caller owns the directory.
+
+    Raises as :func:`materialize` does.
+    """
+    try:
+        held = os.listdir(root.fd)
+    except OSError as exc:
+        raise MaterializationError(
+            f"commit {commit}: the directory {root.path} cannot be listed: {exc.strerror or exc}"
+        ) from exc
+    if held:
+        raise MaterializationError(
+            f"commit {commit}: the directory {root.path} is not empty, so its tree is not "
+            "written there"
+        )
+    return _materialized(runner, repo, commit, object_format, root.fd, root.path)
+
+
+def prove_tree(
+    runner: Runner, repo: str, commit: str, object_format: str, root: SafeRoot
+) -> MaterializedTree:
+    """Prove again that ``root`` holds exactly ``commit``'s tree (D6.3), or raise.
+
+    The tree is read afresh from ``repo``'s store, the commit re-hashed to
+    its id, and the directory walked through ``root``'s descriptor with the
+    proof :func:`materialize` runs after its write. A directory proved once
+    and changed since (a byte, a mode, an entry added, removed or replaced)
+    fails here: a proof says what a directory held when it ran, never what
+    it holds later (ADR 0013 D2).
+    """
+    tree = _commit_tree(runner, repo, commit, object_format)
+    listing = _list_tree(runner, repo, commit, tree, object_format)
+    _prove(root.fd, listing, commit, object_format)
+    return _record(commit, tree, object_format, root.path, listing)

@@ -50,6 +50,13 @@ from .errors import ConfigurationError, SandboxPolicyError, ValidationDefinition
 from .evidence import SCOPE, check_definitions, check_scope
 from .executor import MAX_DEADLINE_SECONDS, is_env_pattern
 from .sandbox import check_declared_path
+from .seed_pack import (
+    DEFAULT_SEED_MAX_BYTES,
+    DEFAULT_SEED_MAX_OBJECTS,
+    FULL_HISTORY,
+    HistoryDepth,
+    SeedSettings,
+)
 
 CONFIG_VERSION = 1
 
@@ -737,7 +744,47 @@ SANDBOX_PREFERRED = "preferred"
 SANDBOX_REQUIRED = "required"
 SANDBOX_MODES = (SANDBOX_DISABLED, SANDBOX_PREFERRED, SANDBOX_REQUIRED)
 SANDBOX_NETWORKS = ("host", "isolated")
-SANDBOX_KEYS = ("mode", "validation_network", "premerge_network", "read_only_paths")
+SANDBOX_KEYS = ("mode", "validation_network", "premerge_network", "read_only_paths", "container")
+CONTAINER_SANDBOX_KEYS = ("history_depth", "history_tags", "seed_max_bytes", "seed_max_objects")
+
+
+@dataclass
+class ContainerSandboxConfig:
+    """The container backend's seed settings (``sandbox.container``; ADR 0013 D4, D11, D19; #292).
+
+    Read only by a container launch's seed step, which no launch reaches
+    before #273 makes the backend selectable; bwrap and ``disabled`` launches
+    are unaffected. They are the operator's alone: no repository file and no
+    agent sets them, and none enters the recorded configuration's
+    fingerprint (D19).
+
+    - ``history_depth``: how many commits below the seed's lower boundary
+      (the base, or a review's merge base) the agent's repository gets, or
+      ``full`` for every ancestor; 0, the default, gives the base at depth
+      one plus the commits the phase names (D11).
+    - ``history_tags``: whether the shared store's tags that peel to a
+      seeded commit come with it, a local tag never pushed included;
+      ``false`` by default.
+    - ``seed_max_bytes`` and ``seed_max_objects``: the seed pack's bounds. A
+      seed over either is refused before anything of the launch is created,
+      naming the setting (and a history setting that made it larger). The
+      defaults, 2 GiB and 1,000,000 objects, admit a large repository's
+      whole tree at depth one.
+    """
+
+    history_depth: HistoryDepth = 0
+    history_tags: bool = False
+    seed_max_bytes: int = DEFAULT_SEED_MAX_BYTES
+    seed_max_objects: int = DEFAULT_SEED_MAX_OBJECTS
+
+    def seed_settings(self) -> SeedSettings:
+        """The settings the seed step builds and checks a seed under."""
+        return SeedSettings(
+            history_depth=self.history_depth,
+            history_tags=self.history_tags,
+            max_bytes=self.seed_max_bytes,
+            max_objects=self.seed_max_objects,
+        )
 
 
 @dataclass
@@ -781,12 +828,16 @@ class SandboxConfig:
     first launch. There are no operator-declared writable paths.
 
     The networks and the paths are read only when a launch is enforced.
+    ``container`` holds the container backend's seed settings
+    (:class:`ContainerSandboxConfig`), which nothing reads before that
+    backend is selectable.
     """
 
     mode: str = SANDBOX_DISABLED
     validation_network: str = "host"
     premerge_network: str = "host"
     read_only_paths: list[str] = field(default_factory=list)
+    container: ContainerSandboxConfig = field(default_factory=ContainerSandboxConfig)
 
     @property
     def enabled(self) -> bool:
@@ -1209,6 +1260,18 @@ def _as_bool(raw: object, source: str, key: str) -> bool:
     raise ConfigurationError(f"{source}: {key!r} must be a boolean (true/false), got {raw!r}")
 
 
+def _as_history_depth(raw: object, source: str) -> HistoryDepth:
+    """``sandbox.container.history_depth``: a number of commits (0 or more) or ``full``."""
+    if raw == FULL_HISTORY:
+        return FULL_HISTORY
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        return raw
+    raise ConfigurationError(
+        f"{source}: 'sandbox.container.history_depth' must be a number of commits (0 or more) "
+        f"or 'full', got {raw!r}"
+    )
+
+
 def _as_int(raw: object, source: str, key: str) -> int:
     """Accept only a real integer (bool excluded); raise ConfigurationError otherwise."""
     if isinstance(raw, int) and not isinstance(raw, bool):
@@ -1624,6 +1687,23 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
             setattr(base.sandbox, key, value)
     if "read_only_paths" in sandbox:
         base.sandbox.read_only_paths = _as_read_only_paths(sandbox["read_only_paths"], source)
+    container = _section(
+        sandbox, "container", source, CONTAINER_SANDBOX_KEYS, label="sandbox.container"
+    )
+    if "history_depth" in container:
+        base.sandbox.container.history_depth = _as_history_depth(container["history_depth"], source)
+    if "history_tags" in container:
+        base.sandbox.container.history_tags = _as_bool(
+            container["history_tags"], source, "sandbox.container.history_tags"
+        )
+    for key in ("seed_max_bytes", "seed_max_objects"):
+        if key in container:
+            value = _as_int(container[key], source, f"sandbox.container.{key}")
+            if value < 1:
+                raise ConfigurationError(
+                    f"{source}: 'sandbox.container.{key}' must be a positive number, got {value}"
+                )
+            setattr(base.sandbox.container, key, value)
     validation = _section(data, "validation", source, VALIDATION_KEYS)
     if "commands" in validation:
         base.validation.commands = _as_definitions(

@@ -882,6 +882,51 @@ withheld. Or a `SandboxPolicyError` naming variables and kinds. It reads
 no file and holds the value only in the projection's `Secret`. Nothing
 calls it before #271 builds the launch container's create from it.
 
+**The seed and the staged source (ADR 0013 D2, D4, D11, D12; #292)**, in
+two executor-layer modules that hold no runtime, write no journal and are
+reached by nothing before #271:
+
+- **`seed_pack.py`** builds a launch's seed from its git input alone,
+  never from a revision read again: `select_seed()` reads, from the shared
+  store, the commits D11 names (the bound seed and carried commit, every
+  commit above the lower boundary, and as shallow boundaries the lower
+  boundary and each out-of-range parent; more only by
+  `sandbox.container.history_depth`), and with `history_tags` the store's
+  tags that peel to a seeded commit with their chains' tag objects; then
+  `build_seed()` packs exactly those objects (`rev-list --objects` and
+  `pack-objects` in a private git directory whose only store is the shared
+  one, as an alternate, with the boundaries in its `shallow` file), writes
+  the manifest (the launch's identity, the boundaries, the tags, the
+  history settings, the pack's size, count and SHA-256; its digest is what
+  the git input binds), and runs `check_seed()`: the files and the
+  manifest strictly, the bounds (`seed_max_bytes`, `seed_max_objects`;
+  a refusal names them and a history setting that grew the seed), then
+  `index-pack --strict` into a quarantine of its own whose `shallow` file
+  names the manifest's boundaries, exact commits, exact tag objects, each
+  tag peeling to a commit of the pack, and the closure. Every refusal is
+  `SandboxLaunchRefusedError`, a setup failure before any journal entry.
+  Nothing is checked out, so no attribute, filter or hook applies, and
+  every git process runs with `GIT_NO_LAZY_FETCH` (`no_lazy_fetch()`): a
+  partial clone's missing object refuses the seed and never reaches the
+  promisor remote. The seed's diagnostics (D2's table) ride on
+  `sandbox_backend.Seed.diagnostics` for #271 to report.
+- **`source_staging.py`**'s `SourceStaging` is what a container backend
+  calls for its source, in the form #271's probe chose
+  (`sandbox_container.StagingMethod`): `seed()` in the seed step;
+  `make_staging_root()` in the create step, bind form only, after the
+  lifecycle journaled the root: the launch's directory created
+  exclusively through `safefs` under L1, the seed copied only while its
+  manifest hashes to the input's digest, the read context copied, and the
+  tree written by `materialize.materialize_into()` (the same writer and
+  hash-back proof as the pre-merge export, into a directory held open);
+  `reprove()` right before each create that binds it (the same directory
+  by device and inode, its three entries, nothing mounted below, the same
+  seed, the tree proved again by `materialize.prove_tree()`); and
+  `remove_staging_root()`, idempotent, for the release and reconciliation.
+  The copy-in form stages nothing on the host. `StagedSource.ownership`
+  records the owner and modes the staged files have, for #271; nothing
+  here changes ownership.
+
 #### Launch routing (ADR 0005, #168)
 
 When the outer sandbox is enforced (`sandbox.mode: required`, or

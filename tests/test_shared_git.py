@@ -655,6 +655,10 @@ GUARDED = {
     # The quarantine's own index of an exported pack: written beside the pack
     # in the controller's temporary directory, nothing in the common dir (#269).
     ("candidate_artifact.py", "_index_in_quarantine"): "index-pack",
+    # A seed's own check (ADR 0013 D4, #292): its pack indexed into a private
+    # git directory in the controller's temporary directory, with no
+    # alternate, nothing in the common dir.
+    ("seed_pack.py", "_check_quarantined"): "index-pack",
     ("engine.py", "_ensure_agent_worktree_unlocked"): "worktree",
     # A private GIT_DIR and no local ref: nothing in the common dir (D12.1).
     ("git_transport.py", "push"): "push",

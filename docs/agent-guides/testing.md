@@ -1206,6 +1206,64 @@ exactly when `tests/sandbox_host.py` measures the host capable
   every one). A refused route starts no CLI; a replacement launch that
   shares the first one's workspace and cache volume finds an empty store,
   the rotated key and nothing the first wrote.
+- `tests/test_seed_pack.py` (#292) is ADR 0013 §7's seed list, with real
+  git in `tmp_path` stores (both object formats where the format matters)
+  and no runtime. Each seed is read back as a stager would: indexed into a
+  fresh repository whose `shallow` file names the manifest's boundaries.
+  A base seed is the base at depth one, its whole tree, no tag, ref or
+  reflog even when the store has tags on it; a `REVIEW` seed holds the
+  bound HEAD, the merge base and the commits between, and `git diff` from
+  the merge base to the HEAD inside it is the host's; a PR branch that
+  merged its base has the merge base and the fork point as boundaries, and
+  every commit diffs against each parent; a force-pushed head gets a seed
+  of its own revision and none of the earlier candidate's commits; a
+  relaunch carries its carried commit; an export command's seed is one
+  commit; `history_depth` 1 and `full` add exactly those commits;
+  building writes nothing to the store. With `history_tags` off no tag
+  object is packed; on, the manifest names exactly the tags peeling to a
+  seeded commit (a tag of a tag included), the pack holds exactly their
+  chains' tag objects, and a tag to a commit outside the seed, a tree or
+  a blob is left out. The bounds refuse naming the setting, and the
+  history setting or the tags that made the seed larger. The seed's own
+  checks each refuse a pack built wrong one way from the same store: a
+  corrupt object and a missing tree or blob (`index-pack --strict`), a
+  missing seed or carried commit, a commit D11 does not name or lacks, a
+  tag object the tag set does not reach or misses, a tag peeling to no
+  commit of the pack, the size and count bounds, a pack whose bytes are
+  not the manifest's, a manifest that disagrees, and a directory holding
+  more or a link.
+- `tests/test_source_staging.py` (#292) covers both staging forms with no
+  runtime. The bind form's staging root holds the tree a control
+  `materialize()` writes, the seed the input binds and the read context;
+  two stagings of one base are byte-identical (modes and links) and leave
+  the checkout's HEAD, index, status and files unchanged; no untracked,
+  ignored, `.git` or home file is staged. A byte, a mode, an entry or the
+  seed changed on the host, a directory substituted at the path (a
+  faithful copy included), a link planted there and a nested mount each
+  fail the re-proof. A seed whose digest is not the input's is never
+  written into a staging root; the root is created under L1 and never
+  reused; a link in its layout is refused and nothing is written through
+  it; removal is idempotent, leaves another launch's root, and leaves what
+  is not the launch's directory in place as uncertain. The copy-in form
+  stages nothing on the host. Hostile input on the host path: a
+  `.gitattributes` naming a filter driver, `ident`, `eol=crlf`, `text` and
+  LFS, with the driver and a fake `git-lfs` in the operator's global
+  configuration writing a sentinel, and a gitlink: the staged bytes and
+  the pack's blobs are the blobs', the sentinel is never written, the
+  pointer stays a pointer, the gitlink is an empty directory, and the
+  diagnostics name each case (and a sparse checkout). A partial-clone
+  store whose blob the seed needs is a typed refusal with no connection to
+  its recording promisor remote and a byte-identical store; one more test
+  pins that the existing `materialize()` path does fetch it lazily (a
+  defect of that path, filed on its own, not fixed by #292). Through
+  `LaunchLifecycle` on a container-shaped fake whose source is the real
+  `SourceStaging` and whose creates render #270's real options: the seed
+  is checked before any journal entry, the staging root's entry precedes
+  the root, the root is re-proved before each create that binds it,
+  `/source` is a read-only bind and `/workspace` a writable volume, and
+  the release removes the root; the copy-in form's stager gets the seed's
+  two files alone; a seed over its bound journals and creates nothing; a
+  tree changed between its proof and the hand-off creates no container.
 
 The existing executor and duplex suites are the no-description regression:
 they run unchanged.

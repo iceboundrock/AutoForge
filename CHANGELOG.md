@@ -5,6 +5,18 @@ so.
 
 ## Unreleased
 
+### `sandbox.container` takes the container backend's seed settings (#292)
+
+The configuration now accepts `sandbox.container.history_depth` (0 or more,
+or `full`; default 0), `history_tags` (default `false`), `seed_max_bytes`
+(default 2 GiB) and `seed_max_objects` (default 1,000,000), and refuses
+any other key under `sandbox.container`. They shape the history a
+container launch's repository gets and bound its size. Nothing reads them
+yet: the container backend is not selectable before #273, and bwrap
+launches are unchanged. See "The container backend's seed" in
+`docs/configuration.md` for what a container launch will see: a snapshot
+of the commit the phase bound, never your checkout.
+
 ### A worktree git checked out under the commit's own `eol=crlf` no longer stops `unblock` (#488)
 
 An `unblock` into `REVIEW`, and `unblock --rereview`, compare every tracked

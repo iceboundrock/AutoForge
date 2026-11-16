@@ -159,6 +159,7 @@ COVERAGE: Mapping[str, Entry] = {
         "test_validation_gates",
         "test_merge_certificate",
         "test_engine",
+        "test_source_staging",
     ),
     "src/autoforge/ownership.py": ("test_cli", "test_engine"),
     "src/autoforge/pi_rpc.py": ("test_providers", "test_live_pi_support"),
@@ -195,6 +196,9 @@ COVERAGE: Mapping[str, Entry] = {
     # the packaged helper manifest (#150)
     "src/autoforge/sdk_helpers/": ("test_sdk_profiles", "test_packaging", "test_claude_sdk"),
     "src/autoforge/sdk_policy.py": ("test_cli",),
+    # #292: the seed and the staging root, unreachable before #271.
+    "src/autoforge/seed_pack.py": ("test_source_staging", "test_config"),
+    "src/autoforge/source_staging.py": ("test_seed_pack",),
     # the engine's sinks and the CLI's stop lines import it (#369)
     "src/autoforge/stop_classification.py": ("test_cli", "test_engine"),
     "src/autoforge/worker.py": ("test_scheduler", "test_epic_commands", "test_epic_recovery"),

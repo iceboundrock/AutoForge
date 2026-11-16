@@ -97,7 +97,7 @@ install the extra.
 
 An unknown key, whether at the top level, in any section (`execution`,
 `safety`, `github`, `merge`, `review`, `review.replan`, `workflow`,
-`sandbox`, `scheduler`) or in a profile mapping, is a configuration error naming the section, the
+`sandbox`, `sandbox.container`, `scheduler`) or in a profile mapping, is a configuration error naming the section, the
 offending key and the keys that section knows, e.g.
 `unknown key(s) under 'workflow': max_review_round (known: max_review_rounds, ...)`.
 A typo cannot be a silent no-op that leaves the built-in default in force:
@@ -213,7 +213,7 @@ probe file it creates and removes there.
 | `github` | the `gh` binary (a relative path, and a relative `PATH` entry a bare name is found through, is resolved against the directory AutoForge starts in: every `gh` runs in an empty directory of its own) and its timeout | [GitHub safety](agent-guides/github-safety.md#controller-owned-effects) |
 | `validation` | REMOTE candidate validation (#172): `commands` (argv lists, empty by default), `scope` (`candidate-tree`, the only value) | [Candidate validation](#candidate-validation) below, [State and recovery](agent-guides/state-and-recovery.md#validation-evidence) |
 | `scheduler` | the parallel EPIC scheduler (#182, `autoforge epic`): `max_parallel` (1-4, default 2; `epic run --max-parallel` overrides it), `poll_interval_seconds` (15-3600, default 60), `stop_grace_seconds` (10-600, default 30) | [Parallel EPIC scheduler](#parallel-epic-scheduler) below, [Workflow](agent-guides/workflow.md#scheduler-execution-policy) |
-| `sandbox` | the outer sandbox (#168, #169): `mode` (`disabled`, the default, `preferred` or `required`), `validation_network` and `premerge_network` (`host`, the default, or `isolated`), `read_only_paths` | [Outer sandbox](#outer-sandbox) below, [Architecture](agent-guides/architecture.md#launch-routing-adr-0005-168) |
+| `sandbox` | the outer sandbox (#168, #169): `mode` (`disabled`, the default, `preferred` or `required`), `validation_network` and `premerge_network` (`host`, the default, or `isolated`), `read_only_paths`; the container backend's seed settings under `sandbox.container` (`history_depth` 0, `history_tags` false, `seed_max_bytes` 2 GiB, `seed_max_objects` 1,000,000; read by nothing before that backend is selectable) | [Outer sandbox](#outer-sandbox) below, [The container backend's seed](#the-container-backends-seed-sandboxcontainer), [Architecture](agent-guides/architecture.md#launch-routing-adr-0005-168) |
 
 ## Profiles
 
@@ -1409,6 +1409,81 @@ one.
 
 A writable credential directory is shared by every launch that projects
 it, across issues and roles, so dedicate it to AutoForge's launches.
+
+### The container backend's seed (`sandbox.container`)
+
+The container backend
+([ADR 0013](adr/0013-container-sandbox-backend-lifecycle-trust-boundaries-and-rollout.md))
+is not selectable yet (#273): every enforced launch is bwrap's, and these
+keys are validated but read by nothing. They are here because the seed
+they shape is built and checked now (#292), and because what a container
+launch will see differs from what a bwrap launch sees today.
+
+```yaml
+sandbox:
+  container:
+    history_depth: 0            # 0 or more | full
+    history_tags: false
+    seed_max_bytes: 2147483648  # 2 GiB
+    seed_max_objects: 1000000
+```
+
+**A snapshot of a commit, never a live bind of your checkout.** A bwrap
+launch works in the issue's worktree on the host. A container launch
+never sees your checkout, any worktree, the git common dir or your home.
+It gets one exact commit, the one the phase bound before the launch (the
+verified base for `ANALYZE_EXECUTE`, the reviewed HEAD and its merge base
+for `REVIEW` and `FIX`), taken from the shared object store:
+
+- An edit in your checkout, committed or not, does not reach a container
+  unless the controller snapshots a commit that holds it. Untracked and
+  ignored files, `.git`, hooks and configuration never do.
+- Where the runtime is proven to share your filesystem, the snapshot is a
+  directory the controller writes under
+  `<git common dir>/autoforge/sandbox/<key>/stage/<launch id>` and binds
+  read-only at `/source`. It is proved byte for byte against the commit's
+  tree when it is written, and again right before each container is
+  created; a byte, a mode or an entry changed in between refuses the
+  launch. It is removed right after the launch's run step. Elsewhere,
+  nothing is staged on the host: the seed pack is copied in.
+- The agent works in a private writable volume at `/workspace`, seeded
+  from the snapshot's pack. Nothing is a writable mount of your checkout,
+  and nothing the agent writes reaches the host except a commit the
+  controller imports and verifies.
+
+**What the agent's repository holds.** By default, the commit the phase
+names, the commits between it and its base (or the review's merge base),
+and the base itself with its whole tree, as a shallow repository with a
+detached `HEAD` and no ref, tag, remote or reflog. `git diff` from the merge
+base to the reviewed HEAD is the pull request's diff.
+
+- **`history_depth`** adds that many commits below the base, or every
+  ancestor with `full`. A deeper history costs a larger seed per launch.
+- **`history_tags: true`** adds the store's tags that peel to a seeded
+  commit, with their tag objects. That includes a local tag you never
+  pushed, with its name and, for an annotated tag, its message and tagger.
+- **`seed_max_bytes`** and **`seed_max_objects`** bound the seed pack. A
+  `REVIEW` seed can be another actor's push, so the run's own history does
+  not bound it. A seed over either is refused before any container or
+  volume is created, and the refusal names the setting, and a history
+  setting that made the seed larger. The defaults admit a large
+  repository's whole tree at depth one (a Linux kernel checkout is about
+  90,000 objects).
+
+**What staging supports.** The seed and the snapshot are written from git
+objects, never checked out, so no filter driver, `ident`, `eol`, `text`
+or `working-tree-encoding` attribute, LFS smudge or hook of the
+repository runs on the host; every file is its blob's bytes. Each case
+below gets a diagnostic with the seed, which the container backend reports
+with the launch (#271):
+
+| Case | Support | What the launch gets |
+|---|---|---|
+| a submodule (gitlink) | supported as an empty directory | an empty directory; the submodule's commit is never fetched or staged |
+| Git LFS | unsupported for content | the pointer files, byte for byte |
+| a filter or conversion attribute | not applied | the committed bytes |
+| a sparse checkout | unsupported | the commit's whole tree |
+| a partial clone (`--filter`) | unsupported for missing objects | the store is read with no lazy fetch: an object it lacks refuses the seed, and the promisor remote is never contacted |
 
 ## Parallel EPIC scheduler
 
