@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from autoforge import source_staging
+from autoforge import safefs, source_staging
 from autoforge.errors import SandboxLaunchRefusedError
 from autoforge.executor import execute
 from autoforge.git_input import SEED_MANIFEST_NAME, LaunchGitInput, seed_manifest_digest
@@ -533,6 +533,57 @@ def test_a_mount_below_the_new_staging_root_is_refused_before_it_is_written(
     assert list(Path(root.path + where.removeprefix("/L-1")).iterdir()) == []
 
 
+@pytest.mark.parametrize("where", ["tree/src", "read-context/files"])
+def test_a_mount_at_a_directory_made_while_writing_is_refused_before_it_is_written(
+    tmp_path, monkeypatch, where
+):
+    """Each directory made below the root, the tree writer's included, is checked on its held
+    descriptor before its mode is set or anything is made in it (PR #504 R2-F1)."""
+    review = review_repo(tmp_path)
+    staging = staging_for(review.repo)
+    seed, gi = bound(staging, review_input(review))
+    context = str(read_context(tmp_path))
+    mounted_at(monkeypatch, where)
+    root = staging.staging_root(owner_of(gi))
+    assert root is not None
+    old = os.umask(0o077)
+    try:
+        with pytest.raises(SandboxLaunchRefusedError, match=f"something is mounted at .*/{where}"):
+            staging.make_staging_root(root, seed, gi, context, owner=owner_of(gi), nonce=NONCE)
+    finally:
+        os.umask(old)
+    made = Path(root.path) / where
+    assert list(made.iterdir()) == []
+    assert stat.S_IMODE(made.stat().st_mode) == 0o700  # its mkdir's under the umask, never set
+
+
+def test_a_mount_at_a_read_context_directory_after_its_check_receives_nothing(
+    tmp_path, monkeypatch
+):
+    """A file is written only through its directory reached again and checked on its descriptor
+    (PR #504 R2-F1): a mount made at ``read-context/files`` after it was made is refused."""
+    review = review_repo(tmp_path)
+    staging = staging_for(review.repo)
+    seed, gi = bound(staging, review_input(review))
+    context = str(read_context(tmp_path))
+    real = source_staging._mount_id
+    checked: list[str] = []
+
+    def mount_id(fd: int, where: str) -> int:
+        if not str(where).endswith("read-context/files"):
+            return real(fd, where)
+        checked.append(where)
+        return real(fd, where) + (1 if len(checked) > 1 else 0)
+
+    monkeypatch.setattr(source_staging, "_mount_id", mount_id)
+    root = staging.staging_root(owner_of(gi))
+    assert root is not None
+    with pytest.raises(SandboxLaunchRefusedError, match="something is mounted at .*/files"):
+        staging.make_staging_root(root, seed, gi, context, owner=owner_of(gi), nonce=NONCE)
+    assert len(checked) == 2  # made and checked once, refused when reached again
+    assert list((Path(root.path) / "read-context" / "files").iterdir()) == []
+
+
 def test_a_seed_whose_digest_differs_from_the_inputs_is_never_written_into_a_staging_root(
     tmp_path,
 ):
@@ -851,6 +902,198 @@ def test_reconciliation_descends_into_no_mount_below_a_leftover(tmp_path, monkey
     assert snapshot(root) == before
 
 
+# -- the owner record's publication, cut short (PR #504 R2-F2) ------------------------------------
+
+# Where the controller is killed while it publishes a launch's owner record,
+# and what its directory then holds: each entry by name (``tmp`` for
+# safefs's named temporary) and its bytes, given the record. ``unnamed``
+# points take the O_TMPFILE path, ``named`` ones the named temporary a
+# filesystem without O_TMPFILE gets.
+INTERRUPTIONS: dict[str, Callable[[bytes], list[tuple[str, bytes]]]] = {
+    "made, nothing written": lambda record: [],
+    "unnamed, part written": lambda record: [],
+    "unnamed, whole and not linked": lambda record: [],
+    "named, part written": lambda record: [("tmp", record[:8])],
+    "named, whole and not linked": lambda record: [("tmp", record)],
+    "named, linked and not removed": lambda record: [(STAGED_OWNER, record), ("tmp", record)],
+    "published": lambda record: [(STAGED_OWNER, record)],
+}
+_INTERRUPT_CHILD = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from tests.test_source_staging import interrupted_staging\n"
+    "interrupted_staging(Path(sys.argv[2]), *sys.argv[3:])\n"
+)
+NOT_REACHED, NO_TMPFILE = 3, 4
+
+
+def interrupted_staging(tmp: Path, head: str, merge_base: str, launch: str, point: str) -> None:
+    """Stage ``launch`` and end this process at ``point`` (the child process runs this).
+
+    The end is ``os._exit``, as a kill is: no ``finally``, no handler and
+    no clean-up of the controller's runs. :data:`NOT_REACHED` says the point
+    was never met, :data:`NO_TMPFILE` that an ``unnamed`` point cannot be
+    met on this filesystem.
+    """
+    tempfile.tempdir = str(tmp / "temporary")
+    staging = staging_for(tmp / "repo")
+    seed, gi = bound(staging, git_input("REVIEW", head, merge_base, launch=launch))
+    root = staging.staging_root(owner_of(gi))
+    assert root is not None
+    real_write, real_link, real_unlink, real_fdopen = os.write, os.link, os.unlink, os.fdopen
+    create_exclusive = safefs.SafeRoot.create_exclusive
+
+    def killed(*_args, **_kwargs):
+        os._exit(0)
+
+    if point.startswith("named"):
+        safefs._O_TMPFILE = 0  # as on a filesystem without O_TMPFILE
+    elif point.startswith("unnamed"):
+        safefs.SafeRoot._durable_tmp_at = lambda *_a, **_k: os._exit(NO_TMPFILE)  # type: ignore[method-assign]
+    if point == "made, nothing written":
+        safefs.SafeRoot.create_exclusive = killed  # type: ignore[method-assign]
+    elif point == "published":
+
+        def published(self, *args, **kwargs):
+            create_exclusive(self, *args, **kwargs)
+            os._exit(0)
+
+        safefs.SafeRoot.create_exclusive = published  # type: ignore[method-assign]
+    elif point == "unnamed, part written":
+
+        def write(fd, data):
+            if bytes(data[:9]) == b'{"issue":':
+                real_write(fd, bytes(data[:8]))
+                os._exit(0)
+            return real_write(fd, data)
+
+        os.write = write
+    elif point == "named, part written":
+
+        class Cut:
+            def __init__(self, fd: int) -> None:
+                self.fd = fd
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def write(self, data):
+                real_write(self.fd, bytes(data[:8]))
+                os._exit(0)
+
+        def fdopen(fd, mode="r", *args, **kwargs):
+            if mode == "wb":
+                return Cut(fd)
+            return real_fdopen(fd, mode, *args, **kwargs)
+
+        os.fdopen = fdopen
+    elif point.endswith("whole and not linked"):
+
+        def link(src, dst, *args, **kwargs):
+            if dst == STAGED_OWNER:
+                os._exit(0)
+            return real_link(src, dst, *args, **kwargs)
+
+        os.link = link
+    elif point == "named, linked and not removed":
+
+        def unlink(name, *args, **kwargs):
+            if safefs.is_temporary_name(str(name)):
+                os._exit(0)
+            return real_unlink(name, *args, **kwargs)
+
+        os.unlink = unlink
+    staging.make_staging_root(root, seed, gi, owner=owner_of(gi), nonce=NONCE)
+    os._exit(NOT_REACHED)
+
+
+@pytest.mark.parametrize("point", list(INTERRUPTIONS))
+def test_an_owner_record_publication_cut_short_leaves_what_reconciliation_removes(tmp_path, point):
+    """Killed anywhere in its owner record's publication, a staging root is never left with a
+    partial record, and lifecycle reconciliation removes what is left and closes its entry."""
+    review = review_repo(tmp_path)
+    launch = "L-7"
+    res = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _INTERRUPT_CHILD,
+            str(REPO_ROOT),
+            str(tmp_path),
+            review.head,
+            review.merge_base,
+            launch,
+            point,
+        ],
+        capture_output=True,
+        timeout=300,
+        cwd=str(REPO_ROOT),
+    )
+    if res.returncode == NO_TMPFILE:
+        pytest.skip("this filesystem has no O_TMPFILE: the unnamed publication is untested here")
+    assert res.returncode == 0, res.stderr.decode(errors="replace")[-4000:]
+    staging = staging_for(review.repo)
+    path = Path(StagingRoot(staging.common_dir, KEY, launch).path)
+    record = owner_record(KEY, dataclasses.replace(OWNER, launch=launch), NONCE)
+    held = sorted(
+        ("tmp" if safefs.is_temporary_name(name) else name, (path / name).read_bytes())
+        for name in os.listdir(path)
+    )
+    assert held == INTERRUPTIONS[point](record)
+    assert _reconciled(tmp_path, staging, review.repo, [launch]) == set()
+    assert not path.exists()
+
+
+TEMPORARY = ".af-tmp-1f-0123456789abcdef"
+NOT_ITS_OWN: dict[str, Callable[[bytes], dict[str, bytes | None]]] = {
+    "a partial owner record": lambda record: {STAGED_OWNER: record[:8]},
+    "an empty owner record": lambda record: {STAGED_OWNER: b""},
+    "a temporary of another entry's record": lambda record: {
+        TEMPORARY: owner_record(KEY, OWNER, "n-other")
+    },
+    "a temporary longer than the record": lambda record: {TEMPORARY: record + b"\n"},
+    "a temporary beside another entry": lambda record: {TEMPORARY: record[:8], STAGED_TREE: None},
+    "two temporaries": lambda record: {TEMPORARY: record[:8], ".af-tmp-1f-fedcba9876543210": b""},
+    "a name that is not safefs's temporary": lambda record: {".af-tmp-x": record[:8]},
+}
+
+
+@pytest.mark.parametrize("case", list(NOT_ITS_OWN))
+def test_removal_accepts_no_owner_record_a_publication_never_leaves(tmp_path, case):
+    """Only the launch's own leftovers are removed: a partial or foreign record is not one."""
+    review = review_repo(tmp_path)
+    staging = staging_for(review.repo)
+    root = StagingRoot(staging.common_dir, KEY, "L-1")
+    path = Path(root.path)
+    path.mkdir(parents=True, mode=0o700)
+    for name, data in NOT_ITS_OWN[case](owner_record(KEY, OWNER, NONCE)).items():
+        if data is None:
+            (path / name).mkdir()
+        else:
+            (path / name).write_bytes(data)
+    before = snapshot(path)
+    assert staging.remove_staging_root(root, OWNER, NONCE) is Removal.UNCERTAIN
+    assert snapshot(path) == before
+
+
+def test_removal_leaves_a_temporary_with_another_name(tmp_path):
+    """A temporary that is a hard link of a file elsewhere is not the publication's own."""
+    review = review_repo(tmp_path)
+    staging = staging_for(review.repo)
+    root = StagingRoot(staging.common_dir, KEY, "L-1")
+    path = Path(root.path)
+    path.mkdir(parents=True, mode=0o700)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_bytes(owner_record(KEY, OWNER, NONCE)[:8])
+    os.link(elsewhere, path / TEMPORARY)
+    assert staging.remove_staging_root(root, OWNER, NONCE) is Removal.UNCERTAIN
+    assert (path / TEMPORARY).exists() and elsewhere.read_bytes() == b'{"issue"'
+
+
 # -- real mounts, in a user and mount namespace of the test's own (PR #504 R1-F1, R1-F2) ----
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -901,6 +1144,8 @@ def real_mount_scenario(tmp: Path, scenario: str) -> dict[str, object]:
     (outside / "dir" / "keep.txt").write_text("keep\n")
     (outside / "file.txt").write_text("keep\n")
     report: dict[str, object] = {}
+    if scenario in WRITE_MOUNTS:
+        return _mounted_while_written(tmp, review, outside / "dir", scenario)
     if scenario == "layout":
         staging = staging_for(review.repo)
         seed, gi = bound(staging, review_input(review))
@@ -938,6 +1183,107 @@ def real_mount_scenario(tmp: Path, scenario: str) -> dict[str, object]:
     report["tmpfs"] = sorted(os.listdir(root / STAGED_TREE / "src")) if scenario == "tmpfs" else []
     report["owner record"] = (root / STAGED_OWNER).exists()
     return report
+
+
+# A bind mount from the staging root's own filesystem made while the root is
+# written (PR #504 R2-F1): at a directory's path between its mkdir and its
+# open, by the tree's writer and by the read context's copy, and at a
+# read-context directory's path after it was made and checked, before a
+# file is written through it.
+WRITE_MOUNTS = {
+    "tree/src at its mkdir": "tree/src",
+    "read-context/files at its mkdir": "read-context/files",
+    "read-context/files after its check": "read-context/files",
+}
+
+
+def _outside_state(directory: Path) -> list[tuple[str, int, str]]:
+    """``directory`` and what it holds: each entry's name, permission bits and text."""
+    found = [("", stat.S_IMODE(directory.stat().st_mode), "")]
+    for path in sorted(directory.iterdir()):
+        text = path.read_text(errors="replace") if path.is_file() else "<not a file>"
+        found.append((path.name, stat.S_IMODE(path.lstat().st_mode), text))
+    return found
+
+
+def _mounted_while_written(
+    tmp: Path, review: Review, outside: Path, scenario: str
+) -> dict[str, object]:
+    staging = staging_for(review.repo)
+    seed, gi = bound(staging, review_input(review))
+    context = str(read_context(tmp))
+    root = staging.staging_root(owner_of(gi))
+    assert root is not None
+    outside.chmod(0o700)
+    report: dict[str, object] = {"before": _outside_state(outside)}
+    target = Path(root.path) / WRITE_MOUNTS[scenario]
+    mounted: list[str] = []
+
+    def mount() -> None:
+        if not mounted:
+            _mount("--bind", str(outside), str(target))
+            mounted.append(str(target))
+
+    if scenario.endswith("at its mkdir"):
+        module, name, real = os, "mkdir", os.mkdir
+
+        def mkdir(path, *args, **kwargs):
+            real(path, *args, **kwargs)
+            if target.is_dir():
+                mount()
+
+        patched = mkdir
+    else:
+        module, name, real = source_staging, "_descend", source_staging._descend
+
+        def descend(parent, relpath, mount_id):
+            if relpath == "files":
+                mount()
+            return real(parent, relpath, mount_id)
+
+        patched = descend
+    setattr(module, name, patched)
+    try:
+        staging.make_staging_root(root, seed, gi, context, owner=owner_of(gi), nonce=NONCE)
+        report["made"] = "made"
+    except SandboxLaunchRefusedError as exc:
+        report["made"] = str(exc)
+    finally:
+        setattr(module, name, real)
+    report["mounted"] = mounted
+    report["after"] = _outside_state(outside)
+    report["removal"] = staging.remove_staging_root(root, owner_of(gi), NONCE).value
+    report["after removal"] = _outside_state(outside)
+    return report
+
+
+@pytest.mark.parametrize("scenario", list(WRITE_MOUNTS))
+def test_a_real_mount_made_while_the_root_is_written_receives_nothing(tmp_path, scenario):
+    """PR #504 R2-F1, with real mounts: the directory outside is left as it was, its entries,
+    bytes and permission bits, by the write that met the mount and by the removal after it.
+
+    Skipped, and so untested, where the host refuses an unprivileged user
+    namespace; the same checks run on simulated mount ids above.
+    """
+    argv = _namespaces(tmp_path)
+    if argv is None:
+        pytest.skip("this host gives no unprivileged user and mount namespace: untested here")
+    res = subprocess.run(
+        [*argv, sys.executable, "-c", _CHILD, str(REPO_ROOT), str(tmp_path), scenario],
+        capture_output=True,
+        timeout=300,
+        cwd=str(REPO_ROOT),
+    )
+    assert res.returncode == 0, res.stderr.decode(errors="replace")[-4000:]
+    report = json.loads(res.stdout.decode().strip().splitlines()[-1])
+    assert report["mounted"], "the mount was never made"
+    before = [tuple(item) for item in report["before"]]
+    assert [(name, text) for name, _, text in before] == [("", ""), ("keep.txt", "keep\n")]
+    assert before[0][1] == 0o700  # the writer would have set 0755 on a directory it wrote
+    assert [tuple(item) for item in report["after"]] == before
+    assert f"something is mounted at {report['mounted'][0]}" in str(report["made"])
+    assert report["removal"] == Removal.UNCERTAIN.value
+    assert [tuple(item) for item in report["after removal"]] == before
 
 
 @pytest.mark.parametrize("scenario", MOUNT_SCENARIOS)

@@ -512,6 +512,39 @@ def test_an_append_refuses_an_inode_unlinked_before_the_inspection(tmp_path, mon
     assert [e.name for e in root_dir.iterdir()] == [], "a journal or a temporary was created"
 
 
+def test_the_named_temporary_is_recognized_by_its_shape_alone(tmp_path, monkeypatch):
+    """``is_temporary_name`` (#292): every name ``_tmp_name`` makes, and the one a named
+    write leaves when it is cut short, and nothing a write would publish."""
+    import autoforge.safefs as safefs
+
+    for _ in range(64):
+        assert safefs.is_temporary_name(safefs._tmp_name())
+    for name in (
+        "owner",
+        ".af-tmp-",
+        ".af-tmp-1f",
+        ".af-tmp-1f-0123456789abcde",
+        ".af-tmp-1f-0123456789abcdef0",
+        ".af-tmp-1F-0123456789ABCDEF",
+        "x.af-tmp-1f-0123456789abcdef",
+        ".af-tmp-1f-0123456789abcdef/x",
+    ):
+        assert not safefs.is_temporary_name(name), name
+    monkeypatch.setattr(safefs, "_O_TMPFILE", 0)
+    created: list[str] = []
+    real_open = safefs.open_regular_at
+
+    def recording(parent, name, flags, **kwargs):
+        created.append(name)
+        return real_open(parent, name, flags, **kwargs)
+
+    monkeypatch.setattr(safefs, "open_regular_at", recording)
+    with SafeRoot.open(tmp_path) as root:
+        root.create_exclusive("owner", b"bytes\n")
+    assert len(created) == 1 and safefs.is_temporary_name(created[0])
+    assert os.listdir(tmp_path) == ["owner"]
+
+
 def test_a_temporary_hard_linked_out_during_the_write_is_never_published(tmp_path, monkeypatch):
     """R10-F2: the create-then-write window on the *named* temporary.
 

@@ -927,19 +927,29 @@ reached by nothing before #271:
   own mount (by the kernel's mount id) before anything is created in it;
   the launch's directory created exclusively under L1, its owner record
   (the sandbox key, the owner and its journal entry's nonce) written
-  first; the seed copied only while its manifest hashes to the input's
-  digest; the read context copied and recorded entry by entry; and the
-  tree written by `materialize.materialize_into()` (the same writer and
-  hash-back proof as the pre-merge export, into a directory held open,
-  reading the store through `isolated_store()`); `reprove()` right before
+  first and published atomically through `safefs`'s exclusive create
+  (whole and fsynced before it has its name, PR #504 R2-F2); every
+  directory written in it, the tree writer's included, made exclusively
+  and checked on its held descriptor (on the root's mount, empty) before
+  its mode is set or anything is made in it, and a file written only
+  through a directory reached and checked that way (R2-F1); the seed
+  copied only while its manifest hashes to the input's digest; the read
+  context copied and recorded entry by entry; and the tree written by
+  `materialize.materialize_into()` (the same writer and hash-back proof as
+  the pre-merge export, into a directory held open, reading the store
+  through `isolated_store()`, with the staging root's check of each
+  directory passed as its `check_directory`); `reprove()` right before
   each create that binds it (no mount in the layout, the same directory by
   device and inode, its four entries, the same owner record, every entry
   below it on its own mount, owned and with the exact mode
   `StagedSource.ownership` records, the same seed, the same read context,
   the tree proved again by `materialize.prove_tree()`); and
   `remove_staging_root()`, idempotent, for the release and reconciliation:
-  it removes only a directory that is empty or holds its entry's owner
-  record, refuses (uncertain) when a mount is anywhere below it before
+  it removes only a directory that is empty, holds its entry's owner
+  record, or holds only `safefs`'s named temporary of that record's
+  interrupted publication with a prefix of exactly its bytes (a host
+  without `O_TMPFILE`), never one with a partial or foreign record,
+  refuses (uncertain) when a mount is anywhere below it before
   removing anything, and never descends into a directory on another mount.
   The bind form needs Linux's mount ids (`/proc/self/fdinfo`). The copy-in
   form stages nothing on the host. `StagedSource.ownership` records the

@@ -142,6 +142,7 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import secrets
 import stat
 from collections.abc import Iterator
@@ -1696,6 +1697,22 @@ def _fsync_fd(fd: int) -> None:
 def _tmp_name() -> str:
     """A temporary name that two controllers, and two attempts by one, never share."""
     return f".af-tmp-{os.getpid():x}-{secrets.token_hex(8)}"
+
+
+_TMP_NAME_RE = re.compile(r"\.af-tmp-[0-9a-f]+-[0-9a-f]{16}")
+
+
+def is_temporary_name(name: str) -> bool:
+    """Whether ``name`` is one :func:`_tmp_name` makes.
+
+    The named temporary of a write that cannot use ``O_TMPFILE``: a crash
+    between its create and its publication (a process killed, a reboot)
+    leaves it beside the target, holding what was written of the bytes so
+    far, under no name the write meant to publish. A caller that must
+    recognize such a leftover in a directory of its own (a launch's
+    staging root, #292) asks this rather than spelling the name's shape.
+    """
+    return _TMP_NAME_RE.fullmatch(name) is not None
 
 
 def _proc_fd_path(fd: int) -> str:

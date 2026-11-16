@@ -45,9 +45,20 @@ created.
   exclusively, mode ``0700``, and the first thing written into it is its
   owner record: the sandbox key, the launch's owner and the nonce its
   journal entry carries (:class:`~autoforge.sandbox_backend.LifecycleObject`),
-  which binds the directory to that entry. One that exists already is
-  refused: a staging root is never reused or re-proved for another launch
-  (ADR 0013 D3, D6), and reconciliation removes a leftover.
+  which binds the directory to that entry. The record is published
+  atomically (PR #504 R2-F2): its bytes are written and fsynced whole
+  before it gets its name (:meth:`~autoforge.safefs.SafeRoot.create_exclusive`),
+  so an interruption leaves no record or the whole one, never a part. One
+  that exists already is refused: a staging root is never reused or
+  re-proved for another launch (ADR 0013 D3, D6), and reconciliation
+  removes a leftover.
+- Every directory written in it, its own, its seed's and read context's,
+  and each one the tree's writer makes, is made exclusively and checked on
+  the descriptor it is held by, before its mode is set or anything is made
+  in it: on the staging root's own mount and empty (PR #504 R2-F1). A mount
+  made at its path between its ``mkdir`` and its open is refused there,
+  with nothing written through it, and a file is written only through a
+  directory held and checked that way, reached one component at a time.
 - The seed is copied into it only while its manifest still hashes to the
   digest the launch's git input binds, read from the bytes copied, and
   names that input's launch; the pack's SHA-256 is the manifest's. A seed
@@ -82,8 +93,11 @@ created.
 - Its removal (:meth:`~SourceStaging.remove_staging_root`) removes only the
   directory its journal entry names: one holding the owner record of that
   entry's launch and nonce, or nothing at all (a crash right after the
-  directory was made). Anything else at its path, a directory substituted
-  there included, is left in place and uncertain. Nothing mounted in it is
+  directory was made), or, where the record went through a named
+  temporary (no ``O_TMPFILE``), that temporary alone holding a prefix of
+  exactly that record (a crash before it was published). Anything else at
+  its path, a directory substituted there or a partial or foreign owner
+  record included, is left in place and uncertain. Nothing mounted in it is
   ever descended into: a mount anywhere below it leaves it all in place,
   uncertain, before anything is removed, and the removal itself opens each
   directory without following a link and checks its mount before removing
@@ -119,7 +133,7 @@ from .errors import (
 from .executor import execute
 from .git_input import MAX_SEED_MANIFEST_BYTES, SEED_MANIFEST_NAME, LaunchGitInput, seed_problem
 from .locking import SharedGitLock
-from .safefs import SafeRoot, StateError, WalkEntry, split_relpath
+from .safefs import SafeRoot, StateError, WalkEntry, is_temporary_name, split_relpath
 from .sandbox_backend import NO_SEED, LaunchInputs, LaunchOwner, Removal, Seed
 from .sandbox_container import StagingMethod, StagingRoot
 from .seed_pack import (
@@ -362,9 +376,10 @@ class SourceStaging:
         exclusively under L1 and its owner record written first; then the
         seed (re-hashed as it is copied), the read context and the tree are
         written into it, the tree proved and every entry checked against
-        the ownership record, with nothing mounted below it. A failure after
-        the directory exists leaves it for the release (or reconciliation)
-        to remove, as its journal entry says.
+        the ownership record, with nothing mounted below it. Every directory
+        is checked on its held descriptor before anything is written in it.
+        A failure after the directory exists leaves it for the release (or
+        reconciliation) to remove, as its journal entry says.
         """
         self._check_root(root)
         self._check_owner(root, owner, nonce, git_input)
@@ -388,13 +403,18 @@ class SourceStaging:
                 digest = self._copy_seed(staged, seed, git_input, mount)
                 context = self._copy_read_context(staged, read_context, mount)
                 tree_mode = materialize_mod.DIRECTORY_MODE
-                with _subdir(staged, STAGED_TREE, mount, tree_mode) as tree_root:
+                with _new_dir(staged, STAGED_TREE, mount, tree_mode) as tree_root:
                     with isolated_store(self.common_dir, git_input.object_format, self._runner) as (
                         repo,
                         run,
                     ):
                         tree = materialize_mod.materialize_into(
-                            run, str(repo), commit, git_input.object_format, tree_root
+                            run,
+                            str(repo),
+                            commit,
+                            git_input.object_format,
+                            tree_root,
+                            check_directory=_tree_directory_check(tree_root, mount),
                         )
                 info = os.fstat(staged.fd)
                 ownership = SourceOwnership(uid=info.st_uid, gid=info.st_gid)
@@ -462,10 +482,12 @@ class SourceStaging:
         """The launch's directory, made exclusively below the layout under L1; its identity.
 
         Each directory of the layout is checked to be on the common dir's
-        mount before anything is created in it. The new directory is set to
-        mode ``0700`` and to the operator's own group (a setgid parent of a
+        mount before anything is created in it. The new directory, checked
+        on its descriptor to be on that mount and empty, is set to mode
+        ``0700`` and to the operator's own group (a setgid parent of a
         shared repository would give it another), and its owner record is
-        the first thing written into it.
+        the first thing written into it, published atomically
+        (:func:`_publish_owner_record`).
         """
         parts = split_relpath(root.layout)
         try:
@@ -478,10 +500,15 @@ class SourceStaging:
                     with stage.subroot(root.launch) as made:
                         if _mount_id(made.fd, root.path) != _mount_id(stage.fd, str(stage.path)):
                             raise _refused(f"{root.path} is a mount point")
+                        if os.listdir(made.fd):
+                            raise _refused(
+                                f"{root.path} holds entries already, so it is not the directory "
+                                "just made"
+                            )
                         os.fchmod(made.fd, PRIVATE_DIRECTORY_MODE)
                         if os.fstat(made.fd).st_gid != os.getegid():
                             os.fchown(made.fd, -1, os.getegid())
-                        _write_new(made.fd, STAGED_OWNER, record)
+                        _publish_owner_record(made, record)
                         return made.identity
         except FileExistsError as exc:
             raise _refused(
@@ -505,7 +532,7 @@ class SourceStaging:
         try:
             if sorted(os.listdir(src_dir)) != sorted(SEED_FILES):
                 raise _refused("its seed's directory does not hold exactly the seed's two files")
-            with _subdir(staged, STAGED_SEED, mount, PRIVATE_DIRECTORY_MODE) as out:
+            with _new_dir(staged, STAGED_SEED, mount, PRIVATE_DIRECTORY_MODE) as out:
                 manifest, manifest_sha = _copy_file(src_dir, out, SEED_MANIFEST_NAME)
                 if "sha256:" + manifest_sha != digest:
                     raise _refused(
@@ -526,16 +553,27 @@ class SourceStaging:
     def _copy_read_context(
         self, staged: SafeRoot, read_context: str, mount: int
     ) -> tuple[ContextEntry, ...]:
-        """A copy of the launch's read context: its directories and regular files; what it holds."""
+        """A copy of the launch's read context: its directories and regular files; what it holds.
+
+        Each entry is written through its parent directory reached again from
+        the copy's root one component at a time, every directory on the way
+        checked on its descriptor to be on ``mount`` (:func:`_descend`), and
+        each directory is made by :func:`_new_dir`: a mount made at a copied
+        directory's path at any time receives nothing.
+        """
         copied: list[ContextEntry] = []
-        with _subdir(staged, STAGED_READ_CONTEXT, mount, PRIVATE_DIRECTORY_MODE) as out:
+        with _new_dir(staged, STAGED_READ_CONTEXT, mount, PRIVATE_DIRECTORY_MODE) as out:
             if not read_context:
                 return ()
             total = 0
             with SafeRoot.open(read_context) as source:
                 for entry in source.walk(max_entries=MAX_READ_CONTEXT_ENTRIES):
+                    parent, name = posixpath.split(entry.relpath)
                     if entry.is_dir:
-                        with _subdir(out, entry.relpath, mount, PRIVATE_DIRECTORY_MODE):
+                        with (
+                            _descend(out, parent, mount) as directory,
+                            _new_dir(directory, name, mount, PRIVATE_DIRECTORY_MODE),
+                        ):
                             pass
                         copied.append(ContextEntry(entry.relpath, "dir"))
                         continue
@@ -549,8 +587,7 @@ class SourceStaging:
                     data = source.read_bytes(entry.relpath, limit=MAX_READ_CONTEXT_BYTES)
                     if data is None:
                         raise _refused(f"the read context's {entry.relpath} vanished while copied")
-                    parent, name = posixpath.split(entry.relpath)
-                    with out.subroot(parent) if parent else out.dup() as directory:
+                    with _descend(out, parent, mount) as directory:
                         _write_new(directory.fd, name, data)
                     digest = hashlib.sha256(data).hexdigest()
                     copied.append(ContextEntry(entry.relpath, "file", digest))
@@ -632,10 +669,13 @@ class SourceStaging:
         the launch's directory is removed relative to its parent's
         descriptor, never following a link, and only when it is the
         operator's, not itself a mount point, and either empty (a crash
-        right after it was made) or holding the owner record of exactly
-        that launch and nonce. A path that holds anything else, a directory
-        substituted there included, is left in place and uncertain: it is
-        not what the launch made. Before anything is removed, every entry
+        right after it was made), holding the owner record of exactly
+        that launch and nonce, or holding only the named temporary of that
+        record's interrupted publication, its bytes a prefix of exactly that
+        record (:func:`_publication_leftover_problem`). A path that holds
+        anything else, a directory substituted there or a partial owner
+        record included, is left in place and uncertain: it is not what the
+        launch made. Before anything is removed, every entry
         below it must be on its own mount; one that is not leaves it all in
         place, uncertain. The removal opens each directory without following
         a link and checks its mount before removing what is in it, and
@@ -780,21 +820,83 @@ def _open_layout(common: SafeRoot, parts: tuple[str, ...], *, create: bool) -> S
         raise
 
 
-def _subdir(parent: SafeRoot, relpath: str, mount: int, mode: int) -> SafeRoot:
-    """``relpath`` below ``parent``, made if missing, on ``mount``, set to ``mode``.
+def _new_directory_problem(fd: int, mount: int, where: str) -> str:
+    """Why the directory just made, held open as ``fd``, must not be written, or "" (R2-F1).
 
-    The caller closes it.
+    Checked on the descriptor, before the directory's mode is set or
+    anything is made in it: it must be on ``mount`` (a mount made at its
+    path between its ``mkdir`` and its open is another mount, whatever
+    filesystem it is from) and empty, as a directory just made is (one
+    renamed to its path in that instant is not the one made).
     """
-    parent.ensure_dir(relpath)
-    found = parent.subroot(relpath)
+    if _mount_id(fd, where) != mount:
+        return f"something is mounted at {where}"
+    if os.listdir(fd):
+        return f"{where} holds entries already, so it is not the directory just made"
+    return ""
+
+
+def _new_dir(parent: SafeRoot, name: str, mount: int, mode: int) -> SafeRoot:
+    """The directory ``name``, made in ``parent`` and held open, set to ``mode``.
+
+    ``parent`` is a directory held and checked already. The directory is
+    made exclusively, opened without following a link, and checked on that
+    descriptor (:func:`_new_directory_problem`) before its mode is set or
+    anything is made in it. The caller closes it.
+    """
+    os.mkdir(name, mode, dir_fd=parent.fd)
+    made = parent.subroot(name)
     try:
-        if _mount_id(found.fd, str(found.path)) != mount:
-            raise _refused(f"something is mounted at {found.path}")
-        os.fchmod(found.fd, mode)
+        problem = _new_directory_problem(made.fd, mount, str(made.path))
+        if problem:
+            raise _refused(problem)
+        os.fchmod(made.fd, mode)
     except BaseException:
-        found.close()
+        made.close()
         raise
-    return found
+    return made
+
+
+def _descend(parent: SafeRoot, relpath: str, mount: int) -> SafeRoot:
+    """The directory ``relpath`` below ``parent`` (``parent`` itself for ""), held open.
+
+    ``parent`` is a directory held and checked already. Reached one
+    component at a time, never through a link, each directory checked on
+    its own descriptor to be on ``mount`` before the next is opened, so
+    what the caller writes through the result lands on no other mount,
+    whatever was mounted at its path since it was made. The caller closes
+    it.
+    """
+    current = parent.dup()
+    try:
+        for part in split_relpath(relpath) if relpath else ():
+            found = current.subroot(part)
+            current.close()
+            current = found
+            if _mount_id(current.fd, str(current.path)) != mount:
+                raise _refused(f"something is mounted at {current.path}")
+        return current
+    except BaseException:
+        current.close()
+        raise
+
+
+def _tree_directory_check(tree: SafeRoot, mount: int) -> materialize_mod.DirectoryCheck:
+    """The check the tree's writer runs on each directory it uses (R2-F1).
+
+    :func:`_new_directory_problem` on the directory's descriptor, before
+    the writer sets its mode or makes anything in it; a refusal is the
+    reason, which the writer raises as its own error.
+    """
+
+    def check(fd: int, path: bytes) -> str:
+        where = str(tree.path / os.fsdecode(path)) if path else str(tree.path)
+        try:
+            return _new_directory_problem(fd, mount, where)
+        except SandboxLaunchRefusedError as exc:
+            return str(exc)
+
+    return check
 
 
 # -- what a staging root holds ---------------------------------------------------------
@@ -907,28 +1009,93 @@ def _context_difference(expected: tuple[ContextEntry, ...], found: list[ContextE
     return ""
 
 
+def _read_record(dir_fd: int, name: str) -> tuple[os.stat_result, bytes]:
+    """The ``fstat`` of the entry ``name`` of ``dir_fd`` and, for a regular file, its bytes.
+
+    Opened without following a link or blocking; at most one byte past
+    :data:`MAX_OWNER_RECORD_BYTES` is read. Raises :class:`OSError`.
+    """
+    fd = os.open(name, _READ_FLAGS, dir_fd=dir_fd)
+    try:
+        info = os.fstat(fd)
+        data = bytearray()
+        if stat.S_ISREG(info.st_mode):
+            os.set_blocking(fd, True)
+            while chunk := os.read(fd, MAX_OWNER_RECORD_BYTES + 1 - len(data)):
+                data += chunk
+                if len(data) > MAX_OWNER_RECORD_BYTES:
+                    break
+    finally:
+        os.close(fd)
+    return info, bytes(data)
+
+
 def _owner_record_problem(dir_fd: int, record: bytes) -> str:
     """Why the owner record in ``dir_fd`` is not exactly ``record``, or ""."""
     try:
-        fd = os.open(STAGED_OWNER, _READ_FLAGS, dir_fd=dir_fd)
+        info, data = _read_record(dir_fd, STAGED_OWNER)
     except FileNotFoundError:
         return "holds no owner record"
     except OSError as exc:
         return f"has an owner record that cannot be read ({exc.strerror or exc})"
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return "has an owner record that is not a regular file"
-        os.set_blocking(fd, True)
-        data = bytearray()
-        while chunk := os.read(fd, MAX_OWNER_RECORD_BYTES + 1 - len(data)):
-            data += chunk
-            if len(data) > MAX_OWNER_RECORD_BYTES:
-                break
-    finally:
-        os.close(fd)
-    if bytes(data) != record:
+    if not stat.S_ISREG(info.st_mode):
+        return "has an owner record that is not a regular file"
+    if data != record:
         return "has an owner record of another launch or journal entry"
     return ""
+
+
+def _publication_leftover_problem(dir_fd: int, names: list[str], record: bytes) -> str:
+    """Why ``names``, the entries of a launch's directory with no owner record, are not what an
+    interrupted publication of ``record`` leaves, or "" (PR #504 R2-F2).
+
+    :func:`_publish_owner_record` gives the record its name only once its
+    bytes are whole and fsynced. Where the filesystem has no ``O_TMPFILE``,
+    those bytes are written first into a named temporary of
+    :mod:`~autoforge.safefs`'s (:func:`~autoforge.safefs.is_temporary_name`),
+    and a crash before the publication leaves that temporary alone in the
+    directory, holding a prefix of the record: none of it, part or all.
+    That is the launch's: one entry of that name, a regular file of the
+    operator's with one name, whose bytes are a prefix of exactly
+    ``record``. Anything else, a second entry, another launch's or entry's
+    bytes, is not, and neither is a partial owner record, which no
+    publication ever leaves.
+    """
+    if len(names) != 1 or not is_temporary_name(names[0]):
+        return "holds no owner record"
+    try:
+        info, data = _read_record(dir_fd, names[0])
+    except OSError as exc:
+        return f"holds a temporary that cannot be read ({exc.strerror or exc})"
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid():
+        return "holds a temporary that is not its owner record's"
+    if not record.startswith(data):
+        return "holds a temporary that is not part of its own owner record"
+    return ""
+
+
+def _publish_owner_record(launch: SafeRoot, record: bytes) -> None:
+    """Publish ``record`` as :data:`STAGED_OWNER` in the launch's directory, atomically (R2-F2).
+
+    Through :meth:`~autoforge.safefs.SafeRoot.create_exclusive`: the bytes
+    are written and fsynced into an inode that gets its name only once they
+    are whole (Linux ``O_TMPFILE``, else a named temporary linked to the
+    name), and the name is made durable. An interruption leaves no record,
+    or, without ``O_TMPFILE``, the temporary (which removal recognizes,
+    :func:`_publication_leftover_problem`), or the whole record; never a
+    partial record under its name. Its mode is then set to exactly
+    :data:`PRIVATE_FILE_MODE` whatever the umask.
+    """
+    launch.create_exclusive(STAGED_OWNER, record, mode=PRIVATE_FILE_MODE)
+    fd = os.open(STAGED_OWNER, _READ_FLAGS, dir_fd=launch.fd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise _refused(f"{launch.path}/{STAGED_OWNER} is not the owner record published")
+        if stat.S_IMODE(info.st_mode) != PRIVATE_FILE_MODE:
+            os.fchmod(fd, PRIVATE_FILE_MODE)
+    finally:
+        os.close(fd)
 
 
 # -- removal -------------------------------------------------------------------------------
@@ -951,8 +1118,12 @@ def _remove_launch_dir(stage: SafeRoot, name: str, record: bytes) -> Removal:
             return Removal.UNCERTAIN
         if _mount_id(launch.fd, str(launch.path)) != mount:
             return Removal.UNCERTAIN
-        if os.listdir(launch.fd):
-            if _owner_record_problem(launch.fd, record):
+        names = os.listdir(launch.fd)
+        if names:
+            owned = STAGED_OWNER in names
+            if owned and _owner_record_problem(launch.fd, record):
+                return Removal.UNCERTAIN
+            if not owned and _publication_leftover_problem(launch.fd, names, record):
                 return Removal.UNCERTAIN
             for entry in launch.walk():
                 if _mount_id_at(entry.dir_fd, entry.name, entry.st, entry.relpath) != mount:
@@ -960,7 +1131,8 @@ def _remove_launch_dir(stage: SafeRoot, name: str, record: bytes) -> Removal:
             if not info.st_mode & stat.S_IWUSR or not info.st_mode & stat.S_IXUSR:
                 os.fchmod(launch.fd, PRIVATE_DIRECTORY_MODE)
             _remove_below(launch.fd, mount, keep=STAGED_OWNER)
-            os.unlink(STAGED_OWNER, dir_fd=launch.fd)
+            if owned:
+                os.unlink(STAGED_OWNER, dir_fd=launch.fd)
     os.rmdir(name, dir_fd=stage.fd)
     try:
         os.lstat(name, dir_fd=stage.fd)

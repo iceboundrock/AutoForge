@@ -138,9 +138,11 @@ seed_pack.py        a container launch's seed (ADR 0013 D4, D11): what it holds,
                     store; executor layer (#292)
 source_staging.py   the host side of a container launch's source, both forms (ADR 0013 D2,
                     D12): SourceStaging's seed step, the bind form's staging root (bound
-                    to its launch and journal entry by an owner record, created under L1
-                    through safefs with no mount in its layout, the seed copied while its
-                    digest is the input's, the tree written by materialize_into), its
+                    to its launch and journal entry by an owner record published
+                    atomically, created under L1 through safefs with no mount in its
+                    layout, each directory checked on its held descriptor before it is
+                    written, the seed copied while its digest is the input's, the tree
+                    written by materialize_into), its
                     re-proof before each hand-off (mount ids, owners and modes, seed, read
                     context, tree), its removal of only the launch's own directory, never
                     through a mount, the ownership data #271 needs; no runtime, no
@@ -196,8 +198,10 @@ review_provenance.py  status's read-only report of an unjournaled review comment
 premerge.py         controller-produced pre-merge evidence (check definitions, tree export)
 materialize.py      byte-exact export of a candidate commit from the shared object store
                     and its hash-back proof; the pre-merge export's writer (ADR 0006 D6, #171),
-                    also into a directory the caller holds open, and a proof run again
-                    (materialize_into, prove_tree: a launch's staging root, #292);
+                    also into a directory the caller holds open, each directory it
+                    writes checked first by the caller's check_directory, and a proof
+                    run again (materialize_into, prove_tree: a launch's staging root,
+                    #292);
                     a working tree's blob-by-blob comparison with a commit, a gitlink
                     matching only as an empty directory (tree_differences), and on
                     request a file in the CRLF form the commit's own eol=crlf gives it,

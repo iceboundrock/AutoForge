@@ -35,9 +35,11 @@ from autoforge.materialize import (
     MaterializedTree,
     TreeDifference,
     materialize,
+    materialize_into,
     read_object_format,
     tree_differences,
 )
+from autoforge.safefs import SafeRoot
 
 from .conftest import GIT_IDENT, rewrite_loose_object, watched_fifo
 
@@ -385,8 +387,8 @@ def test_tampering_between_the_write_and_the_proof_is_refused(
     change, named = TAMPERS[tamper]
     write = materialize_mod._write
 
-    def write_then_tamper(runner, repo_, commit_, listing, root):
-        write(runner, repo_, commit_, listing, root)
+    def write_then_tamper(runner, repo_, commit_, listing, root, *check):
+        write(runner, repo_, commit_, listing, root, *check)
         change(root)
 
     monkeypatch.setattr(materialize_mod, "_write", write_then_tamper)
@@ -474,6 +476,74 @@ class _FullDiskOs(_OsProxy):
     @staticmethod
     def write(fd, data):
         raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+
+def test_the_callers_check_runs_on_each_directory_before_anything_is_written_in_it(tmp_path):
+    """``materialize_into``'s check (#292, PR #504 R2-F1): every directory the writer uses, on
+    its held descriptor, before its mode is set or anything is made in it; one refused stays
+    as its ``mkdir`` left it, empty, and the writer stops there."""
+    repo = _init(tmp_path / "repo")
+    absent = "e" * 40
+    commit = _commit(
+        repo,
+        _tree(
+            repo,
+            {
+                "README": b"top\n",
+                "src": {"a.py": b"a\n", "deep": {"b.py": b"b\n"}},
+                "vendor": {"lib": Gitlink(absent)},
+                "z.txt": b"last\n",
+            },
+        ),
+    )
+    seen: list[tuple[bytes, list[str], int]] = []
+
+    def recording(refuse: bytes):
+        def check(fd: int, path: bytes) -> str:
+            info = os.fstat(fd)
+            assert stat.S_ISDIR(info.st_mode)
+            seen.append((path, sorted(os.listdir(fd)), stat.S_IMODE(info.st_mode)))
+            return "refused by the test" if path == refuse else ""
+
+        return check
+
+    old = os.umask(0o077)
+    try:
+        whole = tmp_path / "whole"
+        whole.mkdir(mode=0o700)
+        with SafeRoot.open(whole) as root:
+            tree = materialize_into(
+                execute, str(repo), commit, "sha1", root, check_directory=recording(b"none")
+            )
+        assert tree.files == 4 and tree.gitlinks == 1
+        # Each directory is checked empty, with its mkdir's mode (never set yet).
+        assert seen == [
+            (b"", [], 0o700),
+            (b"src", [], 0o700),
+            (b"src/deep", [], 0o700),
+            (b"vendor", [], 0o700),
+            (b"vendor/lib", [], 0o700),
+        ]
+        assert stat.S_IMODE((whole / "src" / "deep").stat().st_mode) == 0o755
+        seen.clear()
+        cut = tmp_path / "cut"
+        cut.mkdir(mode=0o700)
+        with SafeRoot.open(cut) as root:
+            with pytest.raises(
+                MaterializationError,
+                match="the directory src/deep was refused before anything was written in it: "
+                "refused by the test",
+            ):
+                materialize_into(
+                    execute, str(repo), commit, "sha1", root, check_directory=recording(b"src/deep")
+                )
+    finally:
+        os.umask(old)
+    assert [path for path, _, _ in seen] == [b"", b"src", b"src/deep"]
+    deep = cut / "src" / "deep"
+    assert list(deep.iterdir()) == []
+    assert stat.S_IMODE(deep.stat().st_mode) == 0o700  # its mode was never set
+    assert not (cut / "src" / "deep" / "b.py").exists() and not (cut / "vendor").exists()
 
 
 def test_a_full_disk_is_a_materialization_failure(tmp_path, monkeypatch, exports):

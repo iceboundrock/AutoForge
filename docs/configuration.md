@@ -1445,7 +1445,8 @@ for `REVIEW` and `FIX`), taken from the shared object store:
   tree when it is written, and again right before each container is
   created, with its copy of the read context, its seed, and each entry's
   owner and permissions; a byte, a mode or an entry changed in between,
-  or anything mounted inside it, refuses the launch. Every directory from
+  or anything mounted inside it, refuses the launch, and a directory
+  mounted inside it while it is written receives nothing. Every directory from
   the git common dir down to it must be on the common dir's own mount, so
   a separate filesystem or a bind mount at `<git common dir>/autoforge`
   refuses this form. The check reads Linux's mount ids. It is removed

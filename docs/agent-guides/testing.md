@@ -1248,10 +1248,16 @@ exactly when `tests/sandbox_host.py` measures the host capable
   the kernel's mount id: simulated, below the root (a directory, a file,
   a seed or read-context entry) and in its layout, they fail the re-proof
   and refuse a new root before anything is written in the mounted
-  directory; real ones, made in a user and mount namespace of the test's
-  own (a bind mount from the same filesystem on a directory and on a file,
-  a tmpfs, a bind mount over the root, one over the layout's `stage`),
-  are refused the same way and never removed through, and are skipped as
+  directory, and a directory made while the root is written (the tree
+  writer's `tree/src`, the read context's `files`, and that one again
+  after its check, before a file is written through it) is refused on its
+  descriptor, left empty with its `mkdir`'s mode (PR #504 R2-F1); real
+  ones, made in a user and mount namespace of the test's own (a bind
+  mount from the same filesystem on a directory and on a file, a tmpfs, a
+  bind mount over the root, one over the layout's `stage`, and a bind
+  mount made at those three directories while the root is written), are
+  refused the same way and never removed through, the directory outside
+  keeping its entries, bytes and permission bits, and are skipped as
   untested where the host refuses that namespace. A seed whose digest is
   not the input's is never written into a staging root, and a seed, a
   staging root or a root's launch id that does not agree with the
@@ -1267,7 +1273,17 @@ exactly when `tests/sandbox_host.py` measures the host capable
   descends, with the owner record kept for a later removal to finish.
   Reconciliation through the lifecycle's `reconcile()` removes a crash's
   leftovers (an empty directory, one holding only its owner record, a
-  whole root) and leaves the rest open. The copy-in form stages nothing
+  whole root) and leaves the rest open. A child process killed
+  (`os._exit`, no handler runs) at each point of the owner record's
+  publication, on the `O_TMPFILE` path and on the named temporary a
+  filesystem without it gets (made with nothing written, part written,
+  whole and not linked, linked with its temporary not yet removed,
+  published), never leaves a partial record, and reconciliation removes
+  what it left and closes the entry (PR #504 R2-F2); a partial or empty
+  owner record, a temporary holding another entry's bytes or more than
+  the record, one beside another entry, two of them, a name that is not
+  `safefs`'s and a temporary with a second name are left in place,
+  uncertain. The copy-in form stages nothing
   on the host. Hostile input on the host path: a
   `.gitattributes` naming a filter driver, `ident`, `eol=crlf`, `text` and
   LFS, with the driver and a fake `git-lfs` in the operator's global
@@ -1791,7 +1807,10 @@ a stated reason it has none. The coverage that must keep working:
   directory before the strict import (it exports after it), and anything
   but a full commit id are not materializable; a replacement object changes
   nothing; the directory is removed after a pass, a failure and an
-  exception. Its comparison of a working tree with a commit
+  exception. `materialize_into()`'s caller check runs on every directory
+  the writer uses (the root, each tree and gitlink), on its descriptor,
+  empty and before its mode is set, and one it refuses is left empty with
+  its `mkdir`'s mode, nothing written past it (PR #504 R2-F1). Its comparison of a working tree with a commit
   (`tree_differences`, PR #444 R3-F1) lists a changed byte, a flipped
   execute bit, a retargeted link, a deletion and a retyped file by raw
   path, and takes a gitlink as the commit's only as an empty real
