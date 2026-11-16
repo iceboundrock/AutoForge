@@ -3238,6 +3238,52 @@ class ControllerEngine:
         self._sandbox_entry()
         self._sandbox_enforced()
 
+    def _command_backend_gate(self, previous: Phase) -> None:
+        """Refuse a step that would run repository commands in no container (ADR 0013 D15).
+
+        Under a backend that seeds (the container backend), every
+        repository-defined command (``validation.commands`` for a phase that
+        validates its candidate, ``merge.verification_commands`` before a
+        merge) runs inside a container over the verified tree, or not at
+        all: never on the host. That routing is not built yet (#271), so a
+        step that would run one is refused here, right after the
+        capability gate and before anything of the step is saved, charged
+        or launched. A step that runs none, and every step under bwrap or
+        ``disabled``, is untouched.
+        """
+        refusal = self._command_backend_refusal(self._step_commands(previous))
+        if refusal:
+            raise SandboxCapabilityError(
+                f"{refusal}. Nothing was launched, saved or charged; the run is as it was",
+                "repository-commands",
+            )
+
+    def _step_commands(self, previous: Phase) -> str:
+        """The repository commands a REMOTE step of ``previous`` may run, said; "" for none."""
+        if previous in (Phase.READY_FOR_MERGE, Phase.MERGE):
+            commands = self.config.merge.verification_commands
+            setting = "merge.verification_commands"
+        elif previous in (Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX, Phase.REPLAN_REEXECUTE):
+            commands = self.config.validation.commands
+            setting = "validation.commands"
+        else:
+            return ""
+        return f"{len(commands)} of {setting}" if commands else ""
+
+    def _command_backend_refusal(self, commands: str) -> str:
+        """Why ``commands`` cannot run under the launch backend; "" when they can or are none."""
+        if not commands or not self.config.sandbox.enabled:
+            return ""
+        backend = launch_backend()
+        if backend.kind is BackendKind.BWRAP:
+            return ""
+        return (
+            f"the {backend.kind.value} backend does not run repository-defined commands yet: "
+            f"this step would run {commands}, which under this backend run only in a "
+            "container over the verified tree, never on the host (ADR 0013 D15), and that "
+            "routing is not built (#271); remove them or use the bwrap backend"
+        )
+
     def _operator_path_problem(self) -> str:
         """An operator read-only path that overlaps this run's denied roots; "" if none."""
         paths = tuple(self.config.sandbox.read_only_paths)
@@ -3347,6 +3393,13 @@ class ControllerEngine:
         """
         if not self._sandbox_enforced():
             return None
+        # The step's gate refused this already (_command_backend_gate); a
+        # caller that came here another way is refused before the compile.
+        refusal = self._command_backend_refusal(
+            f"a repository-defined command ({launch_class.value})"
+        )
+        if refusal:
+            raise SandboxLaunchRefusedError(refusal)
         facts = LaunchFacts(
             launch_class=launch_class,
             workspace=cwd,
@@ -6283,6 +6336,7 @@ class ControllerEngine:
         # record, no plan snapshot, no step or attempt charged.
         if self._step_may_launch(previous, allow_merge):
             self._sandbox_gate()
+            self._command_backend_gate(previous)
         # #479 (R3-F2 of PR #481): a reply the state keeps for this phase entry
         # is this step's to settle, whatever ends it, a stop below included.
         self._forget_delivered()

@@ -228,3 +228,74 @@ def test_a_setup_failure_after_the_gate_never_runs_unenforced(
     assert not [line for line in said if "logical isolation only" in line]
     for execution in _executions(eng):
         assert execution["execution"].get("sandbox", {}).get("fallback") is None
+
+
+# -- repository commands under a backend that seeds (ADR 0013 D15; #271) ----------
+class _ContainerKind:
+    """A backend that names itself the container backend: nothing of it is run here."""
+
+    def __init__(self) -> None:
+        from autoforge.sandbox_backend import BwrapBackend
+
+        self._bwrap = BwrapBackend()
+
+    @property
+    def kind(self):
+        from autoforge.sandbox import BackendKind
+
+        return BackendKind.CONTAINER
+
+    def runtime_check(self):
+        from autoforge.sandbox import BackendKind
+        from autoforge.sandbox_backend import RuntimeReport
+
+        return RuntimeReport(BackendKind.CONTAINER, product="Podman", rootless=True, store="s")
+
+    def reconcile(self, entries, runtime):
+        return ()
+
+    def __getattr__(self, name):
+        return getattr(self._bwrap, name)
+
+
+@pytest.mark.parametrize("setting", ["validation", "none"])
+def test_a_step_that_would_run_repository_commands_under_the_container_backend_is_refused(
+    tmp_state_dir, fake_github, sandbox_probe, monkeypatch, setting
+):
+    cfg = _cfg("required")
+    if setting == "validation":
+        cfg.validation.commands = [["make", "test"], ["make", "lint"]]
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, cfg=cfg, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    monkeypatch.setattr(engine_module, "launch_backend", lambda: _ContainerKind())
+    if setting == "none":
+        # No command to run: the gate lets the step through to its launch.
+        eng._command_backend_gate(Phase.ANALYZE_EXECUTE)  # noqa: SLF001
+        return
+    before = _snapshot(eng)
+    with pytest.raises(SandboxCapabilityError) as caught:
+        eng.step()
+    assert caught.value.capability == "repository-commands"
+    message = str(caught.value)
+    assert "2 of validation.commands" in message and "never on the host" in message
+    assert "Nothing was launched, saved or charged" in message
+    assert _snapshot(eng) == before, "refused before anything of the step"
+
+
+def test_merge_verification_commands_under_the_container_backend_are_refused_too(
+    tmp_state_dir, fake_github, sandbox_probe, monkeypatch
+):
+    cfg = _cfg("required")
+    cfg.merge.verification_commands = [["make", "check"]]
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, cfg=cfg, origin=True)
+    monkeypatch.setattr(engine_module, "launch_backend", lambda: _ContainerKind())
+    with pytest.raises(SandboxCapabilityError, match="1 of merge.verification_commands"):
+        eng._command_backend_gate(Phase.READY_FOR_MERGE)  # noqa: SLF001
+    # The backstop: a repository command that reaches its sandbox another way.
+    with pytest.raises(SandboxLaunchRefusedError, match="does not run repository-defined"):
+        eng._command_sandbox(  # noqa: SLF001
+            engine_module.LaunchClass.EXPORT_COMMAND, str(tmp_state_dir), {}, "isolated"
+        )
+    # bwrap runs them as before.
+    monkeypatch.setattr(engine_module, "launch_backend", engine_module.default_backend)
+    eng._command_backend_gate(Phase.READY_FOR_MERGE)  # noqa: SLF001
