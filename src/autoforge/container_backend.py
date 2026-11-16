@@ -114,7 +114,7 @@ from .candidate_artifact import (
     CandidateManifest,
 )
 from .container_auth import CredentialPlan, command_environment
-from .container_image import HELPER_DIR, HELPERS, ImageRef, entrypoint_problem
+from .container_image import CLI_COMMANDS, HELPER_DIR, HELPERS, ImageRef, entrypoint_problem
 from .container_runtime import RuntimeClient, RuntimeIdentity
 from .errors import (
     CandidateNotMaterializableError,
@@ -206,6 +206,8 @@ TEARDOWN = "agent processes killed at close; the container removed at the releas
 WATCH = "PID 1 is the image's watcher, with the container's deadline (#272 adds the death-watch)"
 
 _NOT_FOUND = re.compile(r"no such|not found|does not exist|no container|no volume", re.I)
+# A version as a CLI's ``--version`` prints it, among other words.
+_VERSION_TOKEN = re.compile(r"(?<![0-9.])[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?")
 _EXISTS = re.compile(r"already in use|already exists|conflict", re.I)
 _DENIED = re.compile(r"permission denied|access denied|not permitted|unauthori[sz]ed", re.I)
 # The runtimes' own exit statuses for an ``exec`` that never ran its command.
@@ -526,6 +528,10 @@ class ContainerBackend:
         # Launch containers whose agent processes were not proved gone at a
         # close: no later process of the launch starts in one.
         self._tainted: set[str] = set()
+        # Each agent CLI's version as a launch container of the image
+        # reported it (D7), by image id: the image is content-addressed, so
+        # what one container of it reports, every container of it holds.
+        self._versions: dict[str, tuple[tuple[str, str], ...]] = {}
         self._staging: SourceStaging | None = None
         self._staged: dict[str, StagedSource] = {}
 
@@ -556,19 +562,24 @@ class ContainerBackend:
             raise _refused("no image is configured (sandbox.container.image, ADR 0013 D7)")
         return self._image.id
 
-    def _facts(self, launch: LaunchDescription, enforced: bool = True) -> SandboxFacts:
+    def _facts(self, launch: LaunchDescription, handle: LaunchHandle | None = None) -> SandboxFacts:
+        """The launch's facts (ADR 0013 D16): the runtime, the image and its CLIs' versions
+        as read inside, the staging form, and the seed's diagnostics (D2)."""
         identity = self._identity
+        image = self._image
         return SandboxFacts(
-            enforced=enforced,
+            enforced=True,
             backend=BackendKind.CONTAINER.value,
             teardown=TEARDOWN,
             network=network_for(ContainerRole.LAUNCH, launch.network).value,
             runtime=identity.name if identity else "",
             runtime_version=identity.version if identity else "",
             rootless=identity.rootless if identity else None,
-            image_id=self._image.digest if self._image else "",
+            image_id=image.digest if image else "",
             staging=self._method.value if self._method else "",
             watch=WATCH,
+            diagnostics=handle.seed.diagnostics if handle is not None else (),
+            cli_versions=self._versions.get(image.id, ()) if image else (),
         )
 
     # -- at a command's entry (D16) ---------------------------------------------------
@@ -973,9 +984,12 @@ class ContainerBackend:
         run step. A copy that fails refuses the launch.
         """
         self._start(container.name)
+        inputs = self._inputs_of(container)
+        if not _is_command(inputs):
+            self._detect_versions(container.name)
         if self.method is not StagingMethod.COPY:
             return
-        read_context = self._inputs_of(container).read_context
+        read_context = inputs.read_context
         if not read_context:
             return
         with tempfile.TemporaryDirectory(prefix="autoforge-read-context-") as scratch:
@@ -989,6 +1003,41 @@ class ContainerBackend:
             )
         if res.exit_code != 0:
             raise _refused(f"the read context was not copied into the container: {_detail(res)}")
+
+    def _detect_versions(self, container: str) -> None:
+        """Each agent CLI the image pinned, its ``--version`` read inside ``container`` (D7).
+
+        As the agent, in the launch container, never from a host
+        installation. A CLI that does not run, or that reports a version
+        other than the one the image's inputs pinned, refuses the launch:
+        the image is not what its key says. Read once per image id.
+        """
+        image = self._image
+        if image is None or not image.clis or image.id in self._versions:
+            return
+        found: list[tuple[str, str]] = []
+        for key, pinned in image.clis:
+            command = CLI_COMMANDS[key]
+            res = self._exec(
+                container,
+                ["env", f"HOME={HOME_TARGET}", command, "--version"],
+                timeout=CALL_TIMEOUT_SECONDS,
+            )
+            lines = (res.stdout or "").strip().splitlines()
+            line = redact(lines[0].strip())[:120] if lines else ""
+            if res.exit_code != 0 or res.timed_out:
+                raise _refused(
+                    f"the image's {command} --version did not run in the launch container "
+                    f"({_detail(res) or f'it ended with {res.exit_code}'}); no launch uses an "
+                    "image whose CLI does not run (ADR 0013 D7)"
+                )
+            if pinned not in _VERSION_TOKEN.findall(line):
+                raise _refused(
+                    f"the image's {command} reports {line!r} inside the launch container, not "
+                    f"the pinned {pinned}; the image is not what its key says (ADR 0013 D7)"
+                )
+            found.append((command, line))
+        self._versions[image.id] = tuple(found)
 
     def prepare(
         self,
@@ -1054,7 +1103,7 @@ class ContainerBackend:
             config_dir, {name: environment[name] for name in names}
         )
         return ContainerLaunch(
-            self, container.name, argv, spawn_env, config_dir, self._facts(launch)
+            self, container.name, argv, spawn_env, config_dir, self._facts(launch, handle)
         )
 
     def _run_environment(self, inputs: LaunchInputs, env: Mapping[str, str]) -> dict[str, str]:

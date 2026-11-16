@@ -1101,3 +1101,75 @@ def test_the_plan_admits_the_staging_root_at_source_in_the_bind_form_only(tmp_pa
     else:
         with pytest.raises(SandboxPolicyError, match="copy-in form binds nothing"):
             world.backend.plan(request)
+
+
+# -- the launch's facts: CLI versions read inside, the seed's diagnostics (D2, D7) ------
+
+
+def _versioned_world(tmp_path: Path, **answers) -> World:
+    world = make_world(tmp_path)
+    world.backend._image = ImageRef(  # noqa: SLF001
+        IMAGE.id, IMAGE.key, clis=(("claude_code", "2.0.14"), ("pi", "1.0.2"))
+    )
+    world.backend.staging_method()
+    return world
+
+
+def test_each_pinned_cli_version_is_read_inside_the_launch_container(tmp_path):
+    world = _versioned_world(tmp_path)
+    gi = launch_input(world)
+    script_helpers(
+        world,
+        gi,
+        head=[1, ""],
+        claude=[0, "2.0.14 (Claude Code)\n"],
+        pi=[0, "1.0.2\n"],
+    )
+    result, _, _ = run_launch(world, inputs_for(world, gi), Journal(), ["true"])
+    assert result.sandbox is not None
+    assert result.sandbox.cli_versions == (("claude", "2.0.14 (Claude Code)"), ("pi", "1.0.2"))
+    assert result.sandbox.record()["cli_versions"] == {
+        "claude": "2.0.14 (Claude Code)",
+        "pi": "1.0.2",
+    }
+    launch = object_name(inputs_for(world, gi).owner, ObjectKind.LAUNCH_CONTAINER)
+    versions = [e for e in world.state()["execs"] if "--version" in e["command"]]
+    assert [e["container"] for e in versions] == [launch, launch]
+    assert all(e["opts"]["user"] == ["10001:10001"] for e in versions), "as the agent"
+
+
+@pytest.mark.parametrize(
+    "answer, match",
+    [([0, "2.0.15 (Claude Code)\n"], "not the pinned 2.0.14"), ([127, ""], "did not run")],
+)
+def test_an_image_whose_cli_is_not_its_pinned_version_is_refused(tmp_path, answer, match):
+    world = _versioned_world(tmp_path)
+    gi = launch_input(world)
+    script_helpers(world, gi, claude=answer, pi=[0, "1.0.2\n"])
+    marker = tmp_path / "ran"
+    with pytest.raises(SandboxLaunchRefusedError, match=match):
+        run_launch(world, inputs_for(world, gi), Journal(), ["touch", str(marker)])
+    assert not marker.exists()
+    assert world.state()["containers"] == {} and world.state()["volumes"] == {}
+
+
+def test_a_repository_command_reads_no_cli_version(tmp_path):
+    world = _versioned_world(tmp_path)
+    gi = launch_input(world, command=True)
+    script_helpers(world, gi, claude=[1, ""], pi=[1, ""])
+    _prepared(world, inputs_for(world, gi, export=False), {})
+    assert not any("--version" in e["command"] for e in world.state().get("execs", []))
+
+
+def test_the_facts_carry_the_seeds_diagnostics(tmp_path):
+    from autoforge.sandbox_backend import LaunchHandle, Seed
+
+    world = make_world(tmp_path)
+    world.backend.staging_method()
+    gi = launch_input(world)
+    diagnostics = ("a gitlink: vendor/lib is an empty directory", "Git LFS: content unsupported")
+    handle = LaunchHandle(inputs_for(world, gi), Seed(diagnostics=diagnostics))
+    facts = world.backend._facts(PLANNED, handle)  # noqa: SLF001
+    assert facts.diagnostics == diagnostics
+    assert facts.record()["diagnostics"] == list(diagnostics)
+    assert "diagnostics" not in world.backend._facts(PLANNED).record()  # noqa: SLF001

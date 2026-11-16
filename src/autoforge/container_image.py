@@ -59,6 +59,7 @@ state.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -107,6 +108,9 @@ CLI_PACKAGES: Mapping[str, str] = {
     "opencode": "opencode-ai",
     "pi": "@earendil-works/pi-coding-agent",
 }
+# The command each package installs, whose ``--version`` the launch
+# container reports (D7: versions are detected inside the container).
+CLI_COMMANDS: Mapping[str, str] = {"claude_code": "claude", "opencode": "opencode", "pi": "pi"}
 KEY_LABEL = "io.autoforge.image-key"
 SCHEMA_LABEL = "io.autoforge.image-schema"
 CONTAINERFILE = "Containerfile"
@@ -175,6 +179,10 @@ class ImageInputs:
                 problem = package_problem(item)
                 if problem:
                     raise ValueError(f"{SETTING_IMAGE}.{key}: {problem}")
+
+    def clis(self) -> tuple[tuple[str, str], ...]:
+        """Each agent CLI the image carries, with its pinned version, in a stable order."""
+        return tuple((key, getattr(self, key)) for key in CLI_PACKAGES if getattr(self, key))
 
     def packages(self) -> tuple[str, ...]:
         """Every npm package the image installs, pinned, in a stable order."""
@@ -289,10 +297,16 @@ def build_argv(product: RuntimeProduct, context: str, iidfile: str, key: str) ->
 
 @dataclass(frozen=True)
 class ImageRef:
-    """The image a launch names: its content-addressed id (64 hex digits) and its key."""
+    """The image a launch names: its content-addressed id (64 hex digits) and its key.
+
+    ``clis`` are the agent CLIs its inputs pinned, ``(key, version)`` with
+    :data:`CLI_PACKAGES`' keys: the backend reads each one's version inside
+    a launch container and refuses an image that does not report it.
+    """
 
     id: str
     key: str
+    clis: tuple[tuple[str, str], ...] = ()
 
     @property
     def digest(self) -> str:
@@ -406,4 +420,5 @@ class ImageBuilder:
     def ensure(self, inputs: ImageInputs) -> ImageRef:
         """The image for ``inputs``: the cached one for its key, or a new build."""
         key = image_key(KeyInputs.current(inputs))
-        return self.find(key) or self.build(inputs, key)
+        image = self.find(key) or self.build(inputs, key)
+        return dataclasses.replace(image, clis=inputs.clis())

@@ -159,6 +159,8 @@ def test_an_unchanged_configuration_reuses_its_image_and_a_change_builds_another
     build, bin_dir = builder(tmp_path)
     first = build.ensure(INPUTS)
     assert len(first.id) == 64 and first.digest == f"sha256:{first.id}"
+    # The pinned CLIs go with the image, for the in-container version check.
+    assert first.clis == INPUTS.clis() and first.clis
     again = build.ensure(INPUTS)
     assert again == first
     builds = fake.state(bin_dir)["builds"]

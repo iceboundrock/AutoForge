@@ -483,12 +483,29 @@ class SandboxFacts:
     image_id: str = ""
     staging: str = ""
     watch: str = ""
+    # A container launch's seed diagnostics (ADR 0013 D2: a submodule, Git
+    # LFS, a filter or conversion attribute, a sparse checkout, a partial
+    # clone), one line each, and each agent CLI's version as the launch
+    # container itself reported it (D7), as ``(cli, first line)``.
+    diagnostics: tuple[str, ...] = ()
+    cli_versions: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         names = tuple(_bounded(name, _MAX_FACT_NAME) for name in self.unset_env)
         if len(names) > _MAX_FACT_NAMES:
             names = names[:_MAX_FACT_NAMES] + (f"... {len(names) - _MAX_FACT_NAMES} more",)
         object.__setattr__(self, "unset_env", names)
+        object.__setattr__(
+            self, "diagnostics", tuple(_bounded(d) for d in self.diagnostics[:_MAX_FACT_NAMES])
+        )
+        object.__setattr__(
+            self,
+            "cli_versions",
+            tuple(
+                (_bounded(cli, _MAX_FACT_NAME), _bounded(version, _MAX_FACT_NAME))
+                for cli, version in self.cli_versions[:_MAX_FACT_NAMES]
+            ),
+        )
         object.__setattr__(self, "backend_version", _bounded(self.backend_version, 64))
         object.__setattr__(self, "setup_failure", _bounded(self.setup_failure))
         object.__setattr__(
@@ -535,6 +552,10 @@ class SandboxFacts:
                 out[name] = getattr(self, name)
         if self.rootless is not None:
             out["rootless"] = self.rootless
+        if self.diagnostics:
+            out["diagnostics"] = list(self.diagnostics)
+        if self.cli_versions:
+            out["cli_versions"] = dict(self.cli_versions)
         return out
 
 
