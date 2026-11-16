@@ -23,7 +23,19 @@ these show, for both staging forms:
 - the shared-filesystem probe both ways, ``transfer: copy``, and no probe
   without a journal bound to the proved runtime;
 - under this backend nothing runs on the host: a launch with no container
-  is refused, and the run step's argv is the runtime's ``exec``.
+  is refused, and the run step's argv is the runtime's ``exec``;
+- the run step's environment is the credential plan's allow-list (an
+  agent) or the command's (a repository command), never the launch's
+  environment filtered: an unrelated credential, a database URL and an
+  inherited provider setting never reach a call, an argv or the command;
+- ownership is proved before anything is used or removed: an export
+  directory that was there already, or that this step made and did not
+  record, is never removed; a volume Docker hands back for a name it held
+  is refused; a probe object whose create lost its answer is removed by its
+  nonce before its entry closes, and stays open when that is not proved;
+- a staging form proved on one store is not reused once the store moved;
+- a close whose kill is refused, times out or leaves a survivor is
+  uncertain, and no later process of the launch starts in that container.
 """
 
 from __future__ import annotations
@@ -39,17 +51,19 @@ from pathlib import Path
 import pytest
 
 from autoforge.candidate_artifact import ARTIFACT_MANIFEST, ARTIFACT_PACK, import_artifact
+from autoforge.container_auth import CredentialKind, CredentialRoutes, EnvRoute, plan_credentials
 from autoforge.container_backend import (
     LABEL_NONCE,
     NO_PROBE_JOURNAL,
     ContainerBackend,
     ProbeObject,
+    export_owner_path,
     object_name,
     run_hash,
 )
 from autoforge.container_image import ImageRef
 from autoforge.container_runtime import RuntimeClient, detect
-from autoforge.errors import SandboxLaunchRefusedError
+from autoforge.errors import SandboxCleanupUncertainError, SandboxLaunchRefusedError
 from autoforge.executor import ExecutionRequest, execute
 from autoforge.git_input import LaunchGitInput
 from autoforge.git_transport import GitRemote, GitTransport
@@ -70,6 +84,7 @@ from autoforge.sandbox_container import (
     StagingMethod,
 )
 from autoforge.sandbox_lifecycle import LaunchLifecycle
+from autoforge.sandbox_policy import LaunchClass, ProviderRequirements
 from autoforge.seed_pack import SeedSettings
 
 from . import container_fake as fake
@@ -78,6 +93,44 @@ from .test_source_staging import KEY, RecordingLock, read_context, staging_for
 
 IMAGE = ImageRef("a" * 64, "sha256:" + "b" * 64)
 PLANNED = LaunchDescription(mounts=())
+
+# A provider's declaration (#290) for the fake world's agent launches: one
+# key, one setting, one isolation variable.
+ROUTES = CredentialRoutes(
+    scope="test",
+    routes=(EnvRoute("AF_TEST_KEY", CredentialKind.API_KEY),),
+    settings=("AF_TEST_SETTING",),
+    isolation=(("AF_TEST_ISOLATION", "on"),),
+)
+PROJECTED = "sk-test-projected-value-0123456789"
+# The launch's environment, as the engine's allow-list leaves it: the
+# provider's key and setting, and what no rule may forward.
+LAUNCH_ENV = {
+    "AF_TEST_KEY": PROJECTED,
+    "AF_TEST_SETTING": "visible-inside",
+    "AF_TEST_ISOLATION": "off",
+    "AWS_SECRET_ACCESS_KEY": "aws-secret-sentinel",
+    "DATABASE_URL": "postgres://user:db-password-sentinel@db/x",
+    "OPENCODE_CONFIG": "/repo/opencode.json",
+    "LC_TIME": "C",
+    "GIT_AUTHOR_NAME": "Agent",
+}
+LEAKED = ("aws-secret-sentinel", "db-password-sentinel", "/repo/opencode.json")
+
+
+def planner(env: dict[str, str] | None = None):
+    """``credentials`` for the backend: #290's real plan over ``env``."""
+
+    def plan(launch: LaunchDescription):
+        return plan_credentials(
+            "test",
+            ROUTES,
+            ProviderRequirements(),
+            LAUNCH_ENV if env is None else env,
+            launch_class=LaunchClass.REMOTE_AGENT,
+        )
+
+    return plan
 
 
 @pytest.fixture(autouse=True)
@@ -145,22 +198,25 @@ class World:
         return fake.state(self.bin)
 
 
-def make_world(tmp_path: Path, *, transfer: str = "copy", **state) -> World:
+def make_world(
+    tmp_path: Path,
+    *,
+    transfer: str = "copy",
+    runtime: str = "podman",
+    credentials=None,
+    **state,
+) -> World:
     review = review_repo(tmp_path)
     common = out(review.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
     bin_dir = tmp_path / "bin"
-    fake.install(
-        bin_dir,
-        "podman",
-        {
-            "version": fake.PODMAN_VERSION,
-            "info": fake.podman_info(),
-            "images": {IMAGE.id: {}},
-            **state,
-        },
+    reports = (
+        {"version": fake.PODMAN_VERSION, "info": fake.podman_info()}
+        if runtime == "podman"
+        else {"version": fake.DOCKER_VERSION, "info": fake.docker_info()}
     )
+    fake.install(bin_dir, runtime, {**reports, "images": {IMAGE.id: {}}, **state})
     env = {"PATH": os.pathsep.join([str(bin_dir), "/usr/bin", "/bin"]), "HOME": str(tmp_path)}
-    client = RuntimeClient(detect("podman", env), env)
+    client = RuntimeClient(detect(runtime, env), env)
     host = HostContext(
         home=str(tmp_path / "home"),
         environ={},
@@ -177,14 +233,15 @@ def make_world(tmp_path: Path, *, transfer: str = "copy", **state) -> World:
         seed_settings=SeedSettings(),
         image=IMAGE,
         transfer=transfer,
+        credentials=planner() if credentials is None else credentials,
         staging=lambda method: staging_for(review.repo, method, lock=lock),
     )
-    runtime = backend.runtime_check()
-    return World(tmp_path, bin_dir, review, common, backend, runtime, host)
+    report = backend.runtime_check()
+    return World(tmp_path, bin_dir, review, common, backend, report, host)
 
 
 def launch_input(
-    world: World, launch: str = "L-1", phase: str = "ANALYZE_EXECUTE"
+    world: World, launch: str = "L-1", phase: str = "ANALYZE_EXECUTE", *, command: bool = False
 ) -> LaunchGitInput:
     review = world.review
     return LaunchGitInput(
@@ -195,9 +252,9 @@ def launch_input(
         repository="owner/repo",
         object_format="sha1",
         seed=review.head,
-        lower=review.head,
+        lower="" if command else review.head,
         carried="",
-        export_command=False,
+        export_command=command,
         entry_label="entry-1",
     )
 
@@ -242,7 +299,7 @@ def run_launch(world: World, inputs: LaunchInputs, journal: Journal, command: li
                 ExecutionRequest(
                     command=command,
                     env_allowlist=(),
-                    env={"AF_TEST_VALUE": "visible-inside"},
+                    env=LAUNCH_ENV,
                     sandbox=bind(PLANNED, world.backend, handle),
                     timeout_seconds=req.pop("timeout_seconds", 60),
                     **req,
@@ -281,7 +338,7 @@ def test_an_agent_launch_runs_every_step_in_order_and_leaves_nothing(tmp_path, t
     journal = Journal()
     inputs = inputs_for(world, gi)
     result, exported, lifecycle = run_launch(
-        world, inputs, journal, ["sh", "-c", 'echo "out:$AF_TEST_VALUE"; echo err >&2; exit 3']
+        world, inputs, journal, ["sh", "-c", 'echo "out:$AF_TEST_SETTING"; echo err >&2; exit 3']
     )
     # The command ran as the agent, its output streamed back, its end its own.
     assert (
@@ -609,6 +666,13 @@ def test_the_probe_refuses_an_image_the_runtime_does_not_hold(tmp_path):
     assert not result.supported and IMAGE.id in result.reason
 
 
+def test_the_probe_refuses_an_image_whose_entrypoint_would_replace_the_watcher(tmp_path):
+    world = make_world(tmp_path, entrypoints={IMAGE.id: ["/docker-entrypoint.sh"]})
+    result = world.backend.probe(home=str(tmp_path), environ={})
+    assert not result.supported and "watcher's place" in result.reason
+    assert not any(c[0] in ("create", "volume") for c in world.calls())
+
+
 # -- the run step: nothing on the host (D15) ---------------------------------------------
 
 
@@ -625,12 +689,8 @@ def test_a_launch_with_no_container_is_refused_and_never_run_on_the_host(tmp_pat
     assert not (tmp_path / "ran").exists()
 
 
-def test_the_run_steps_argv_is_the_runtimes_exec_with_values_never_on_it(tmp_path):
-    world = make_world(tmp_path)
-    world.backend.staging_method()
-    gi = launch_input(world)
-    script_helpers(world, gi)
-    inputs = inputs_for(world, gi, export=False)
+def _prepared(world: World, inputs: LaunchInputs, env: dict[str, str]):
+    """The run step's argv and client environment for one process of ``inputs``'s launch."""
     lifecycle = LaunchLifecycle(
         world.backend, Journal(), inputs, world.runtime, change_producing=False
     )
@@ -638,25 +698,359 @@ def test_the_run_steps_argv_is_the_runtimes_exec_with_values_never_on_it(tmp_pat
 
         def run():
             handle = lifecycle.establish(PLANNED)
-            prepared = world.backend.prepare(
-                PLANNED, handle, ["claude", "-p"], cwd=None,
-                env={
-                    "ANTHROPIC_API_KEY": "sk-ant-fake-value", "PATH": "/x", "HOME": "/h",
-                    "LANG": "C.UTF-8", "TMPDIR": "/t", "DOCKER_HOST": "tcp://x",
-                },
-            )  # fmt: skip
+            prepared = world.backend.prepare(PLANNED, handle, ["claude", "-p"], cwd=None, env=env)
             try:
                 return prepared.argv, prepared.spawn_env
             finally:
                 prepared.close()
 
-        argv, spawn_env = lifecycle.launch(run)
+        return lifecycle.launch(run)
+
+
+def test_the_run_steps_argv_is_the_runtimes_exec_with_values_never_on_it(tmp_path):
+    env = {**LAUNCH_ENV, "PATH": "/x", "HOME": "/h", "LANG": "C.UTF-8", "TMPDIR": "/t",
+           "DOCKER_HOST": "tcp://x"}  # fmt: skip
+    world = make_world(tmp_path, credentials=planner(env))
+    world.backend.staging_method()
+    gi = launch_input(world)
+    script_helpers(world, gi)
+    inputs = inputs_for(world, gi, export=False)
+    argv, spawn_env = _prepared(world, inputs, env)
     assert argv[0] == str(world.bin / "podman") and argv[1] == "exec"
-    assert "--env=ANTHROPIC_API_KEY" in argv and not any("sk-ant-fake-value" in a for a in argv)
-    assert spawn_env["ANTHROPIC_API_KEY"] == "sk-ant-fake-value"
-    # The client's own (this world's client holds PATH and HOME) and the
-    # runtime's variables never pass; the rest pass by name.
-    for reserved in ("PATH", "HOME", "DOCKER_HOST"):
-        assert f"--env={reserved}" not in argv
+    # The projected key went with the launch container's create, by name,
+    # its value in that create's client environment alone; the exec does
+    # not carry it.
+    launch = object_name(inputs.owner, ObjectKind.LAUNCH_CONTAINER)
+    create = next(
+        c for c in fake.calls(world.bin) if c["argv"][:2] == ["create", f"--name={launch}"]
+    )
+    assert "--env=AF_TEST_KEY" in create["argv"] and "AF_TEST_KEY" in create["env"]
+    assert "--env=AF_TEST_KEY" not in argv and "AF_TEST_KEY" not in spawn_env
+    assert not any(PROJECTED in a for call in world.calls() for a in call)
+    # The plan's allow-list passes by name, valued in the client's environment.
+    assert "--env=AF_TEST_SETTING" in argv and spawn_env["AF_TEST_SETTING"] == "visible-inside"
     assert "--env=LANG" in argv and spawn_env["LANG"] == "C.UTF-8"
+    assert "--env=GIT_AUTHOR_NAME" in argv and "--env=LC_TIME" in argv
+    # The isolation is the plan's own, whatever the launch's environment held.
+    assert spawn_env["AF_TEST_ISOLATION"] == "on"
+    # The client's own names and the runtime's never pass; HOME is the
+    # private home, set inside by env, never the host's.
+    for reserved in ("PATH", "HOME", "DOCKER_HOST", "TMPDIR"):
+        assert f"--env={reserved}" not in argv
     assert argv[argv.index("env") + 1] == "HOME=/home/agent" and argv[-2:] == ["claude", "-p"]
+    # Nothing else of the launch's environment: by name or by value.
+    for name in ("AWS_SECRET_ACCESS_KEY", "DATABASE_URL", "OPENCODE_CONFIG"):
+        assert f"--env={name}" not in argv and name not in spawn_env
+    assert not any(value in a for a in argv for value in LEAKED)
+
+
+def test_an_unrelated_credential_or_setting_never_reaches_a_call_or_the_command(tmp_path):
+    """End to end, through the lifecycle and the executor: what the command sees inside."""
+    world = make_world(tmp_path)
+    world.backend.staging_method()
+    gi = launch_input(world)
+    script_helpers(world, gi, head=[1, ""])
+    result, _, _ = run_launch(world, inputs_for(world, gi), Journal(), ["env"])
+    inside = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    assert inside["AF_TEST_SETTING"] == "visible-inside" and inside["AF_TEST_ISOLATION"] == "on"
+    assert inside["AF_TEST_KEY"] == PROJECTED and inside["HOME"] == "/home/agent"
+    for name in ("AWS_SECRET_ACCESS_KEY", "DATABASE_URL", "OPENCODE_CONFIG"):
+        assert name not in inside
+    for call in fake.calls(world.bin):
+        assert not any(value in a for a in call["argv"] for value in (*LEAKED, PROJECTED))
+        assert not {"AWS_SECRET_ACCESS_KEY", "DATABASE_URL", "OPENCODE_CONFIG"} & set(call["env"])
+        # The key is in the client's environment of the launch container's create alone.
+        if "AF_TEST_KEY" in call["env"]:
+            assert call["argv"][0] == "create" and "--env=AF_TEST_KEY" in call["argv"]
+
+
+def test_a_repository_command_gets_no_credential_and_no_provider_setting(tmp_path):
+    def never(launch):
+        raise AssertionError("a repository command asks for no credential plan")
+
+    world = make_world(tmp_path, credentials=never)
+    world.backend.staging_method()
+    gi = launch_input(world, command=True)
+    script_helpers(world, gi)
+    inputs = inputs_for(world, gi, export=False)
+    argv, spawn_env = _prepared(world, inputs, {**LAUNCH_ENV, "LANG": "C.UTF-8"})
+    launch = object_name(inputs.owner, ObjectKind.LAUNCH_CONTAINER)
+    create = next(c for c in world.calls() if c[:2] == ["create", f"--name={launch}"])
+    assert not any(a.startswith("--env=") for a in create), "no projection for a command"
+    names = sorted(a.removeprefix("--env=") for a in argv if a.startswith("--env="))
+    assert names == ["LANG", "LC_TIME"]
+    for name in ("AF_TEST_KEY", "AF_TEST_SETTING", "AF_TEST_ISOLATION", "GIT_AUTHOR_NAME"):
+        assert name not in spawn_env
+
+
+def test_an_agent_launch_without_a_credential_plan_makes_nothing(tmp_path):
+    world = make_world(tmp_path)
+    world.backend._credentials = None  # noqa: SLF001
+    world.backend.staging_method()
+    gi = launch_input(world)
+    script_helpers(world, gi)
+    with pytest.raises(SandboxLaunchRefusedError, match="credential plan"):
+        run_launch(world, inputs_for(world, gi), Journal(), ["true"])
+    assert not any(c[0] in ("create", "volume") for c in world.calls())
+    world = make_world(tmp_path / "refused", credentials=planner({}))
+    world.backend.staging_method()
+    gi = launch_input(world)
+    script_helpers(world, gi)
+    with pytest.raises(SandboxLaunchRefusedError, match="AF_TEST_KEY"):
+        run_launch(world, inputs_for(world, gi), Journal(), ["true"])
+    assert not any(c[0] in ("create", "volume") for c in world.calls())
+
+
+# -- ownership before use or removal (D6) ------------------------------------------------
+
+
+def _exporting(world: World) -> LaunchGitInput:
+    gi = launch_input(world)
+    script_helpers(world, gi, head=[0, json.dumps({"exporter": "head", "candidate": gi.seed})])
+    pack = world.tmp / "candidate.pack"
+    pack.write_bytes(
+        subprocess.run(
+            ["git", "-C", str(world.review.repo), "pack-objects", "--stdout", "--revs"],
+            input=f"{gi.seed}\n^{gi.seed}\n".encode(),
+            capture_output=True,
+            check=True,
+        ).stdout
+    )
+    fake.update(world.bin, pack_file=str(pack))
+    return gi
+
+
+def test_an_export_directory_that_was_there_is_never_removed(tmp_path):
+    world = make_world(tmp_path)
+    world.backend.staging_method()
+    gi = _exporting(world)
+    inputs = inputs_for(world, gi)
+    planted = Path(inputs.export_dir)
+    planted.mkdir(parents=True)
+    (planted / "sentinel").write_text("not the launch's\n")
+    journal = Journal()
+    lifecycle = LaunchLifecycle(
+        world.backend, journal, inputs, world.runtime, change_producing=True
+    )
+    with pytest.raises(SandboxCleanupUncertainError, match="export directory"):
+        with lifecycle:
+            lifecycle.launch(lambda: lifecycle.establish(PLANNED))
+            exported = lifecycle.export()
+            assert exported is not None and "exists already" in exported.failure
+            lifecycle.saved()
+    assert (planted / "sentinel").read_text() == "not the launch's\n"
+    assert any(o.kind is ObjectKind.EXPORT_DIR for o in journal.open), "its entry stays open"
+    assert not os.path.exists(export_owner_path(str(planted)))
+
+
+@pytest.mark.parametrize("record", ["none", "partial", "another nonce", "another inode"])
+def test_an_export_directory_not_proved_the_entrys_is_left_in_place(tmp_path, record):
+    world = make_world(tmp_path)
+    owner = LaunchOwner("run-1", 292, "FIX", "L-1")
+    directory = tmp_path / "export" / "L-1-0123"
+    entry = LifecycleObject(owner, ObjectKind.EXPORT_DIR, str(directory), "nonce-1")
+    directory.mkdir(parents=True)
+    (directory / "sentinel").write_text("keep\n")
+    info = os.lstat(directory)
+    owned = {
+        "schema": 1, "run": "run-1", "issue": 292, "phase": "FIX", "launch": "L-1",
+        "nonce": "nonce-1", "path": str(directory), "device": info.st_dev, "inode": info.st_ino,
+    }  # fmt: skip
+    record_path = Path(export_owner_path(str(directory)))
+    if record == "partial":
+        record_path.write_text(json.dumps(owned)[:20])
+    elif record == "another nonce":
+        record_path.write_text(json.dumps({**owned, "nonce": "nonce-2"}))
+    elif record == "another inode":
+        record_path.write_text(json.dumps({**owned, "inode": info.st_ino + 1}))
+    assert world.backend.remove(entry) is Removal.UNCERTAIN
+    assert (directory / "sentinel").read_text() == "keep\n"
+    # The entry's own record over the same directory: removed, record last.
+    record_path.write_text(json.dumps(owned))
+    assert world.backend.remove(entry) is Removal.REMOVED
+    assert not directory.exists() and not record_path.exists()
+    # A removal cut short after the directory went: its record goes now.
+    record_path.write_text(json.dumps(owned))
+    assert world.backend.remove(entry) is Removal.REMOVED and not record_path.exists()
+
+
+def test_docker_handing_back_a_volume_it_held_is_refused_and_never_adopted(tmp_path):
+    world = make_world(tmp_path, runtime="docker")
+    assert world.runtime.product == "Docker Engine"
+    world.backend.staging_method()
+    gi = launch_input(world)
+    script_helpers(world, gi)
+    inputs = inputs_for(world, gi)
+    name = object_name(inputs.owner, ObjectKind.VOLUME)
+    foreign = {LABEL_NONCE: "a-foreign-nonce", "io.autoforge.launch": gi.launch}
+    fake.update(world.bin, volumes={name: {"labels": foreign}})
+    journal = Journal()
+    with pytest.raises(SandboxLaunchRefusedError, match="already in use"):
+        run_launch(world, inputs, journal, ["true"])
+    # Docker's create succeeded; the volume it returned was not this entry's,
+    # so nothing mounted it, and its removal (by nonce) left it in place.
+    assert ["volume", "create"] == next(c for c in world.calls() if c[0] == "volume")[:2]
+    assert not any(c[0] == "create" for c in world.calls())
+    assert world.state()["volumes"] == {name: {"labels": foreign}}
+    assert any(o.name == name for o in journal.open), "its entry stays open"
+
+
+def test_a_create_that_took_effect_and_lost_its_answer_is_reconciled_by_nonce(tmp_path):
+    world = make_world(tmp_path, fail_after={"create": [1, "Error: context deadline exceeded"]})
+    world.backend.staging_method()
+    gi = launch_input(world)
+    script_helpers(world, gi)
+    journal = Journal()
+    with pytest.raises(SandboxLaunchRefusedError, match="deadline exceeded"):
+        run_launch(world, inputs_for(world, gi), journal, ["true"])
+    assert world.state()["containers"] == {} and world.state()["volumes"] == {}
+    assert journal.open == []
+
+
+# -- the probe's objects (D6 item 9) ------------------------------------------------------
+
+
+def test_a_probe_create_that_lost_its_answer_is_removed_before_its_entry_closes(tmp_path):
+    world = make_world(
+        tmp_path,
+        transfer="auto",
+        fail_after={"volume create": [1, "Error: context deadline exceeded"]},
+    )
+    journal = ProbeJournal(ProbeRoot(world.host.git_common_dir, "probe-1"), world.runtime)
+    world.backend._probe_journal = journal  # noqa: SLF001
+    with pytest.raises(SandboxLaunchRefusedError, match="deadline exceeded"):
+        world.backend.staging_method()
+    # The volume existed though its create "failed": it was removed by its
+    # nonce, and only then was its entry closed; the container never was.
+    assert any(c[:3] == ["volume", "rm", "--force"] for c in world.calls())
+    assert world.state()["volumes"] == {}
+    assert {o.name for batch in journal.closed for o in batch} == {
+        o.name for o in journal.recorded[0]
+    }
+
+
+def test_a_probe_object_not_proved_gone_keeps_its_entry_open(tmp_path):
+    world = make_world(
+        tmp_path,
+        transfer="auto",
+        fail_after={"volume create": [1, "Error: context deadline exceeded"]},
+        fail={"volume inspect": [1, "Error: connection refused"]},
+    )
+    journal = ProbeJournal(ProbeRoot(world.host.git_common_dir, "probe-1"), world.runtime)
+    world.backend._probe_journal = journal  # noqa: SLF001
+    with pytest.raises(SandboxLaunchRefusedError):
+        world.backend.staging_method()
+    volume, container = journal.recorded[0]
+    closed = {o.name for batch in journal.closed for o in batch}
+    assert container.name in closed and volume.name not in closed
+    assert volume.name in world.state()["volumes"]
+
+
+# -- the staging form is bound to the store it was proved on (D6 item 10, D12) ----------
+
+
+def test_a_bind_proved_on_one_store_is_not_reused_once_the_store_moved(tmp_path):
+    first = fake.podman_info(graph_root="/home/op/.local/share/containers/storage")
+    moved = fake.podman_info(graph_root="/srv/elsewhere/storage")
+    world = make_world(tmp_path, transfer="auto", infos=[first, moved])
+    journal = ProbeJournal(ProbeRoot(world.host.git_common_dir, "probe-1"), world.runtime)
+    world.backend._probe_journal = journal  # noqa: SLF001
+    assert world.backend.staging_method() is StagingMethod.BIND
+    assert world.backend.method is StagingMethod.BIND
+    report = world.backend.runtime_check()
+    assert report.store != world.runtime.store, "the second check reports the moved store"
+    with pytest.raises(SandboxLaunchRefusedError, match="probe has not run"):
+        world.backend.method  # noqa: B018
+    # The old journal is bound to the old store: no probe, no bind.
+    probes = len(journal.recorded)
+    with pytest.raises(SandboxLaunchRefusedError, match="another runtime"):
+        world.backend.staging_method()
+    assert len(journal.recorded) == probes
+    # On the moved store, a probe of its own decides: here, copy-in.
+    fake.update(world.bin, shares_filesystem=False)
+    world.backend._probe_journal = ProbeJournal(  # noqa: SLF001
+        ProbeRoot(world.host.git_common_dir, "probe-2"), report
+    )
+    assert world.backend.staging_method() is StagingMethod.COPY
+    gi = launch_input(world)
+    with pytest.raises(SandboxLaunchRefusedError, match="decided on another runtime"):
+        world.backend._method_report = world.runtime  # noqa: SLF001
+        world.backend.seed(inputs_for(world, gi), PLANNED)
+
+
+# -- the run step's close (D13) -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "teardown, match",
+    [
+        ([125, ""], "ended with 125"),
+        ([1, json.dumps({"teardown": "survivors", "survivors": 2})], "2 process"),
+        ([0, json.dumps({"teardown": "proved", "survivors": 0}), 5], "did not end in time"),
+    ],
+)
+def test_a_close_whose_teardown_is_not_proved_is_uncertain_and_no_process_follows(
+    tmp_path, monkeypatch, teardown, match
+):
+    from autoforge import container_backend
+
+    monkeypatch.setattr(container_backend, "KILL_TIMEOUT_SECONDS", 1)
+    world = make_world(tmp_path, teardown=teardown)
+    world.backend.staging_method()
+    gi = launch_input(world)
+    script_helpers(world, gi, head=[1, ""])
+    marker = tmp_path / "second-process-ran"
+    lifecycle = LaunchLifecycle(
+        world.backend, Journal(), inputs_for(world, gi), world.runtime, change_producing=True
+    )
+    seen: dict[str, BaseException] = {}
+    with lifecycle:
+
+        def run():
+            # Pi's shape: an auth check, then the agent, in one launch.
+            for name, command in (("first", ["true"]), ("second", ["touch", str(marker)])):
+                handle = lifecycle.establish(PLANNED)
+                try:
+                    execute(
+                        ExecutionRequest(
+                            command=command, env_allowlist=(), env=LAUNCH_ENV,
+                            sandbox=bind(PLANNED, world.backend, handle), timeout_seconds=30,
+                        )
+                    )  # fmt: skip
+                except (SandboxCleanupUncertainError, SandboxLaunchRefusedError) as exc:
+                    seen[name] = exc
+
+        lifecycle.launch(run)
+        lifecycle.export()
+        lifecycle.saved()
+    assert isinstance(seen["first"], SandboxCleanupUncertainError)
+    assert match in str(seen["first"])
+    assert isinstance(seen["second"], SandboxLaunchRefusedError)
+    assert "not proved gone" in str(seen["second"])
+    assert not marker.exists(), "no later process of the launch ran"
+    # The release still removed the container, and with it what it held.
+    assert world.state()["containers"] == {}
+
+
+def test_a_close_with_an_exception_already_ending_the_launch_adds_a_note(tmp_path):
+    world = make_world(tmp_path, teardown=[125, ""])
+    world.backend.staging_method()
+    gi = launch_input(world)
+    script_helpers(world, gi)
+    lifecycle = LaunchLifecycle(
+        world.backend, Journal(), inputs_for(world, gi, export=False), world.runtime,
+        change_producing=False,
+    )  # fmt: skip
+    with lifecycle:
+
+        def run():
+            handle = lifecycle.establish(PLANNED)
+            prepared = world.backend.prepare(PLANNED, handle, ["true"], cwd=None, env=LAUNCH_ENV)
+            try:
+                raise KeyboardInterrupt
+            finally:
+                prepared.close()
+
+        with pytest.raises(KeyboardInterrupt) as ended:
+            lifecycle.launch(run)
+    assert any("not proved gone" in note for note in ended.value.__notes__)

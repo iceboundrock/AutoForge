@@ -9,15 +9,29 @@ per ``info`` call, so a store can move between calls), its volumes,
 containers and images with their labels, and scripted answers:
 
 - ``fail``: ``{verb: [exit, stderr]}`` makes a verb fail (``create``,
-  ``volume create``, ``start``, ``version``, ...);
+  ``volume create``, ``volume inspect``, ``container inspect``, ``start``,
+  ``version``, ...);
+- ``fail_after``: ``{verb: [exit, stderr]}`` makes a create take effect and
+  then fail, as a call whose answer was lost (a timeout, a dropped
+  connection) does (``volume create``, ``create``);
+- ``volume create`` of a name the runtime holds: Podman refuses it; Docker
+  (the fake installed as ``docker``) succeeds and returns the volume it
+  holds, its labels unchanged, as Docker Engine does;
+- ``entrypoints``: ``{image id: entrypoint}``, what ``image inspect`` shows
+  as ``.Config.Entrypoint`` (``null`` for an image not listed); a build
+  inherits ``base_entrypoint`` unless its Containerfile clears it with
+  ``ENTRYPOINT []``, and sets ``built_entrypoint`` whatever it says;
+- ``teardown``: ``[exit, stdout, seconds]``, the answer of the run step's
+  kill-and-prove exec (default: proved at once); ``seconds`` makes it hang;
 - ``exec``: ``{helper word: [exit, stdout]}``, the answer of an ``exec``
   whose command holds that word (``stage``, ``prove``, ``head``); an exec
   with ``receive`` hashes its standard input; ``pack`` writes the file
   ``pack_file`` names; an exec of ``python3 -I -c`` with ``/source/nonce``
   reads the nonce through the container's bind (``shares_filesystem``
   false: nothing to read); any other exec runs its command on the host
-  (the run step's stand-in) with the exec's ``--env`` names taken from
-  the client's environment.
+  (the run step's stand-in) with the container's create-time variables
+  (``--env`` of the create, valued from the create's client environment)
+  and the exec's ``--env`` names taken from the client's environment.
 
 Every call is appended to ``calls.jsonl``: its argv, its working
 directory, the names of its environment and, for a client configuration
@@ -70,6 +84,19 @@ def _fail(state: dict, verb: str) -> None:
         sys.exit(failure[0])
 
 
+def _fail_after(state: dict, verb: str) -> int:
+    """The create took effect: fail now if scripted to, as a lost answer does."""
+    failure = state.get("fail_after", {}).get(verb)
+    if failure:
+        sys.stderr.write(failure[1] + "\n")
+        return int(failure[0])
+    return 0
+
+
+def _docker() -> bool:
+    return Path(__file__).name == "docker"
+
+
 def _options(args: list[str]) -> tuple[dict[str, list[str]], list[str]]:
     opts: dict[str, list[str]] = {}
     rest: list[str] = []
@@ -116,13 +143,21 @@ def main(argv: list[str]) -> int:
             opts, rest = _options(args)
             name = rest[0]
             if name in state["volumes"]:
+                if _docker():
+                    # Docker Engine re-uses a volume of that name, as it is.
+                    print(name)
+                    return 0
                 sys.stderr.write(f"Error: volume with name {name} already exists\n")
                 return 125
             state["volumes"][name] = {"labels": _labels(opts.get("label", []))}
             _save(state)
+            failed = _fail_after(state, "volume create")
+            if failed:
+                return failed
             print(name)
             return 0
         if sub == "inspect":
+            _fail(state, "volume inspect")
             name = args[-1]
             if name not in state["volumes"]:
                 _not_found("volume", name)
@@ -139,6 +174,7 @@ def main(argv: list[str]) -> int:
             _save(state)
             return 0
     if verb == "container" and argv[1] == "inspect":
+        _fail(state, "container inspect")
         args = argv[2:]
         name = args[-1]
         if name not in state["containers"]:
@@ -169,7 +205,7 @@ def main(argv: list[str]) -> int:
             "options": argv[1:],
         }
         _save(state)
-        return 0
+        return _fail_after(state, "create")
     if verb == "start":
         _fail(state, "start")
         name = argv[1]
@@ -193,7 +229,10 @@ def main(argv: list[str]) -> int:
             if image not in state["images"]:
                 _not_found("image", image)
             fmt = args[args.index("--format") + 1]
-            print(json.dumps(state["images"][image]) if "Labels" in fmt else image)
+            if "Entrypoint" in fmt:
+                print(json.dumps(state.get("entrypoints", {}).get(image)))
+            else:
+                print(json.dumps(state["images"][image]) if "Labels" in fmt else image)
             return 0
         filters = [args[i + 1] for i, a in enumerate(args) if a == "--filter"]
         want = filters[0].split("=", 1)[1] if filters else ""
@@ -213,6 +252,13 @@ def main(argv: list[str]) -> int:
         image = hashlib.sha256(json.dumps(files).encode() + str(len(state["builds"])).encode())
         image_id = image.hexdigest()
         state["images"][image_id] = _labels(opts.get("label", []))
+        # The base's entrypoint (``base_entrypoint``) is inherited unless the
+        # Containerfile clears it; ``built_entrypoint`` is one a build sets.
+        containerfile = Path(opts["file"][0]).read_text().splitlines()
+        inherited = None if "ENTRYPOINT []" in containerfile else state.get("base_entrypoint")
+        entrypoint = state.get("built_entrypoint") or inherited
+        if entrypoint:
+            state.setdefault("entrypoints", {})[image_id] = entrypoint
         _save(state)
         Path(opts["iidfile"][0]).write_text("sha256:" + image_id)
         return 0
@@ -260,7 +306,13 @@ def _exec(state: dict, args: list[str]) -> int:
         sys.stdout.write(Path(source, "nonce").read_text())
         return 0
     if "os.kill(-1" in joined:
-        return 0
+        answer = state.get("teardown") or [0, json.dumps({"teardown": "proved", "survivors": 0})]
+        if len(answer) > 2:
+            import time
+
+            time.sleep(answer[2])
+        sys.stdout.write(answer[1])
+        return answer[0]
     if command and command[-1] == "/home/agent/read-context":
         import io
         import tarfile
@@ -271,7 +323,10 @@ def _exec(state: dict, args: list[str]) -> int:
         state.setdefault("read_contexts", []).append({"container": name, "names": names})
         _save(state)
         return 0
-    env = {n: os.environ[n] for n in opts.get("env", []) if n in os.environ}
+    # What the container was created with, as an exec inherits it; then the
+    # exec's own names, valued from the client's environment.
+    env = {n: v for n, v in container.get("env_values", {}).items() if v}
+    env.update({n: os.environ[n] for n in opts.get("env", []) if n in os.environ})
     env["PATH"] = os.environ.get("PATH", "")
     if command and command[0] == "env":
         command = command[1:]

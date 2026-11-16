@@ -44,6 +44,15 @@ owns, mode ``0700``: a new volume is filled from the image's directory at
 its first mount, owner included, so the stager, running as the agent, can
 write a fresh volume without any process running as root.
 
+**No entrypoint.** A create gives PID 1's command (the watcher) after the
+image's id, which a runtime appends to the image's entrypoint: a base
+image with one would run its own program as PID 1, the watcher only as its
+arguments, and the container's deadline and supervision would be gone. So
+the ``Containerfile`` clears the base's (``ENTRYPOINT []``), and an image is
+used only once its own configuration shows no entrypoint
+(:func:`entrypoint_problem`): after its build, when the cache offers it,
+and at the backend's probe.
+
 Executor layer: the runtime CLI only, through the client; no workflow, no
 state.
 """
@@ -250,6 +259,10 @@ def render_containerfile(inputs: ImageInputs, key: str) -> str:
         )
         steps.append("npm cache clean --force")
     lines.append("RUN " + " && \\\n    ".join(steps))
+    # The base's entrypoint is cleared, so that PID 1 is the create's
+    # command, the watcher; CMD too, so that nothing of the base's runs.
+    lines.append("ENTRYPOINT []")
+    lines.append("CMD []")
     lines.append(f'LABEL {KEY_LABEL}="{key}" {SCHEMA_LABEL}="{IMAGE_SCHEMA}"')
     return "\n".join(lines) + "\n"
 
@@ -293,6 +306,30 @@ def parse_image_id(text: str) -> str:
     return match.group(1) if match else ""
 
 
+def entrypoint_problem(client: RuntimeClient, image_id: str) -> str:
+    """Why the image ``image_id`` could run something other than its create's command; "".
+
+    Read from the image's own configuration: an entrypoint that is not
+    empty (``null``, ``[]`` or ``""``) would be PID 1 in the watcher's
+    place, with the watcher as its arguments. One the runtime cannot show
+    is not proved empty either.
+    """
+    res = client.run(["image", "inspect", "--format", "{{json .Config.Entrypoint}}", image_id])
+    if res.exit_code != 0:
+        return f"the runtime did not show the image {image_id}'s entrypoint"
+    try:
+        entrypoint = json.loads(res.stdout or "")
+    except ValueError:
+        return f"the runtime showed no readable entrypoint for the image {image_id}"
+    if entrypoint in (None, [], ""):
+        return ""
+    shown = redact(json.dumps(entrypoint))[:200]
+    return (
+        f"the image {image_id} has the entrypoint {shown}, which would run as PID 1 in the "
+        "watcher's place; AutoForge's image clears it (ADR 0013 D7, D13)"
+    )
+
+
 class ImageBuilder:
     """The image for one configuration, reused when its key is unchanged, built otherwise."""
 
@@ -323,7 +360,11 @@ class ImageBuilder:
             return None
         for line in res.stdout.splitlines():
             image_id = parse_image_id(line)
-            if image_id and self._labels(image_id).get(KEY_LABEL) == key:
+            if (
+                image_id
+                and self._labels(image_id).get(KEY_LABEL) == key
+                and not entrypoint_problem(self._client, image_id)
+            ):
                 return ImageRef(image_id, key)
         return None
 
@@ -357,6 +398,9 @@ class ImageBuilder:
             shutil.rmtree(context, ignore_errors=True)
         if not image_id or self._labels(image_id).get(KEY_LABEL) != key:
             raise _refused("the image build named no image that carries its key")
+        problem = entrypoint_problem(self._client, image_id)
+        if problem:
+            raise _refused(f"the built image is not used: {problem}")
         return ImageRef(image_id, key)
 
     def ensure(self, inputs: ImageInputs) -> ImageRef:

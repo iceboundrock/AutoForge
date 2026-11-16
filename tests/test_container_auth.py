@@ -36,6 +36,7 @@ import pytest
 from autoforge.child_env import undoes_isolation
 from autoforge.config import ExecutionConfig, ProfileConfig
 from autoforge.container_auth import (
+    COMMAND_PASSED_NAMES,
     PASSED_NAMES,
     CredentialKind,
     CredentialPlan,
@@ -44,6 +45,7 @@ from autoforge.container_auth import (
     Mechanism,
     PrivateStore,
     Refresh,
+    command_environment,
     credential_looking,
     plan_credentials,
 )
@@ -1122,3 +1124,24 @@ def _launch_refused(container, provider, profile, env, launch_class):
     )
     inside = {**plan.container_environment(), **client_environment({}, plan.projection)}
     _run(container, provider, profile, inside)
+
+
+def test_a_repository_commands_environment_is_a_positive_allow_list_with_no_credential():
+    env = {
+        "ANTHROPIC_API_KEY": "sk-ant-sentinel",
+        "OPENAI_API_KEY": "sk-sentinel",
+        "AWS_SECRET_ACCESS_KEY": "aws-sentinel",
+        "DATABASE_URL": "postgres://u:p@h/d",
+        "OPENCODE_CONFIG": "/repo/opencode.json",
+        "CLAUDE_CONFIG_DIR": "/home/op/.claude",
+        "GIT_AUTHOR_EMAIL": "op@example.invalid",
+        "HOME": "/home/op",
+        "LANG": "C.UTF-8",
+        "TZ": "UTC",
+        "TERM": "",
+    }
+    environment = command_environment(env)
+    assert environment == {"HOME": "/home/agent", "LANG": "C.UTF-8", "TZ": "UTC"}
+    assert COMMAND_PASSED_NAMES < PASSED_NAMES
+    assert not any(credential_looking(name) for name in COMMAND_PASSED_NAMES)
+    assert not any(name.startswith("GIT_") for name in COMMAND_PASSED_NAMES)

@@ -93,6 +93,8 @@ def test_the_containerfile_is_rendered_from_the_typed_inputs_alone():
         assert package in text
     assert "chown 10001:10001 /workspace /cache" in text
     assert f'{KEY_LABEL}="sha256:{"e" * 64}"' in text
+    # The base's entrypoint is cleared: PID 1 is the create's command.
+    assert "\nENTRYPOINT []\nCMD []\n" in text
     bare = render_containerfile(ImageInputs(base=BASE), "k")
     assert "npm" not in bare
 
@@ -177,3 +179,35 @@ def test_a_failed_build_is_a_refusal_naming_the_image(tmp_path):
     with pytest.raises(SandboxCapabilityError, match="image build exited 1") as refused:
         build.ensure(INPUTS)
     assert refused.value.capability == "image"
+
+
+def test_the_base_images_entrypoint_never_replaces_the_watcher(tmp_path):
+    # The base has an entrypoint; the Containerfile clears it, so the built
+    # image is used.
+    build, bin_dir = builder(tmp_path, base_entrypoint=["/usr/local/bin/hijack"])
+    image = build.ensure(INPUTS)
+    assert fake.state(bin_dir).get("entrypoints", {}).get(image.id) is None
+    # A cached image that carries the key and an entrypoint is not reused.
+    labels = fake.state(bin_dir)["images"][image.id]
+    fake.update(
+        bin_dir,
+        images={"c" * 64: labels},
+        entrypoints={"c" * 64: ["/bin/sh", "-c", "exec evil"]},
+    )
+    again = build.ensure(INPUTS)
+    assert again.id != "c" * 64
+    # A build whose image keeps an entrypoint is refused.
+    build, _ = builder(tmp_path / "forced", built_entrypoint=["/bin/sh"])
+    with pytest.raises(SandboxCapabilityError, match="PID 1 in the watcher's place"):
+        build.ensure(INPUTS)
+
+
+@pytest.mark.parametrize(
+    "shown, problem",
+    [(None, False), ([], False), ("", False), (["/bin/sh"], True), ("/init", True)],
+)
+def test_entrypoint_problem_reads_the_images_own_configuration(tmp_path, shown, problem):
+    build, bin_dir = builder(tmp_path, images={"d" * 64: {}}, entrypoints={"d" * 64: shown})
+    found = container_image.entrypoint_problem(build._client, "d" * 64)  # noqa: SLF001
+    assert bool(found) is problem
+    assert container_image.entrypoint_problem(build._client, "e" * 64)  # noqa: SLF001

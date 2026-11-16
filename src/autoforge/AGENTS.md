@@ -110,7 +110,9 @@ container_auth.py   each provider's model credential under the container backend
                     or stored login never projected; of the rest of the environment only
                     a positive allow-list passed, every store variable set to a fresh
                     place in the private home, OpenCode's integration isolation set
-                    rather than inherited (ADR 0013 D7); agent launches only; pure,
+                    rather than inherited (ADR 0013 D7); agent launches only, and a
+                    repository command's environment (the private home, locale, time
+                    zone, terminal; no credential or provider setting); pure,
                     unreachable before #271 (#290)
 container_runtime.py  the container backend's runtime (ADR 0013 D8, D13, D16): detection
                     (the setting, else Podman on PATH, else Docker; once, no fall-through),
@@ -130,10 +132,13 @@ container_backend.py  the container module (ADR 0013 D13): ContainerBackend, the
                     names and labels, a removal only of the entry's own nonce, the stager
                     container's copy-in on a helper's standard input, the stager's and the
                     prover's execs with the engine's tree id and ref set, the run step's
-                    exec (values never on an argv; close() kills the agent's processes),
-                    the read context copied in for copy-in, the exporter's artifact, the
-                    shared-filesystem probe through #272's probe journal; executor layer,
-                    unreachable before #272 and #273 (#271)
+                    exec (values never on an argv; the credential plan's allow-list or a
+                    command's, nothing else; close() kills the agent's processes and proves
+                    them gone), every create proved by its labels, the export directory by
+                    its owner record, the read context copied in for copy-in, the
+                    exporter's artifact, the shared-filesystem probe through #272's probe
+                    journal and bound to the runtime report it was proved on; executor
+                    layer, unreachable before #272 and #273 (#271)
 container_stager.py, container_prover.py, container_exporter.py, container_watch.py
                     AutoForge's helpers in the image (ADR 0013 D2, D5, D6): the stager
                     (git init, strict index of the seed, its tags, the checkout with every
