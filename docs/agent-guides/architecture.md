@@ -892,7 +892,15 @@ reached by nothing before #271:
   commit above the lower boundary, and as shallow boundaries the lower
   boundary and each out-of-range parent; more only by
   `sandbox.container.history_depth`), and with `history_tags` the store's
-  tags that peel to a seeded commit with their chains' tag objects; then
+  tags that peel to a seeded commit with their chains' tag objects. The
+  range is proven, never taken from git (ADR 0004 D7.5): git's
+  `rev-list <seed> --not <lower>` only names the commits to read, the
+  range is walked from the seed through the parent links of re-hashed
+  commits, the lower boundary is an ancestor of the seed only when that
+  walk reaches it, and a parent the walk stops at stays out only when a
+  walk from the lower boundary through re-hashed links reaches it. So a
+  rewritten ancestor of the lower boundary, which is never packed, can
+  refuse the seed or enlarge it but never hide a commit from it. Then
   `build_seed()` packs exactly those objects (`rev-list --objects` and
   `pack-objects` in a private git directory whose only store is the shared
   one, as an alternate, with the boundaries in its `shallow` file), writes

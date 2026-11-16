@@ -46,7 +46,7 @@ from autoforge.seed_pack import (
     select_seed,
 )
 
-from .conftest import GIT_IDENT
+from .conftest import GIT_IDENT, rewrite_loose_object
 
 FORMATS = ["sha1", "sha256"]
 
@@ -403,6 +403,136 @@ def test_a_missing_bound_revision_is_refused_before_anything_is_written(tmp_path
     ):
         with pytest.raises(SandboxLaunchRefusedError, match=why):
             build(review.repo, gi)
+    assert list(seeds.iterdir()) == []
+
+
+# -- the range is proven, not enumerated (ADR 0004 D7.5, PR #504 R3-F1) -----------------------
+
+
+@dataclasses.dataclass
+class Shrinkable:
+    """``a`` (a root) <- ``b`` <- ``p0`` <- ``p1``, and ``head`` merging ``p1`` and ``b``.
+
+    Bound as ``REVIEW`` with ``b`` as the merge base, the range is ``head``,
+    ``p1`` and ``p0``; ``a`` lies below the lower boundary and is never seeded.
+    """
+
+    repo: Path
+    a: str
+    b: str
+    p0: str
+    p1: str
+    head: str
+
+    def forge_a_claiming_p1_as_its_parent(self) -> None:
+        """Rewrite ``a``'s loose object under its own id so git reads ``p1`` as its parent."""
+        raw = run_git(self.repo, "cat-file", "commit", self.a)
+        tree_line, rest = raw.split(b"\n", 1)
+        forged = tree_line + b"\n" + f"parent {self.p1}\n".encode() + rest
+        rewrite_loose_object(common_of(self.repo) / "objects", self.a, "commit", forged)
+
+
+def shrinkable_repo(tmp_path: Path, object_format: str) -> Shrinkable:
+    repo = init_repo(tmp_path / "repo", object_format)
+    a = commit_files(repo, "a", {"README": b"a\n"})
+    b = commit_files(repo, "b", {"src/b.py": b"print('b')\n"})
+    p0 = commit_files(repo, "p0", {"src/p0.py": b"print('p0')\n"})
+    p1 = commit_files(repo, "p1", {"src/p1.py": b"print('p1')\n"})
+    head = out(repo, "commit-tree", f"{p1}^{{tree}}", "-p", p1, "-p", b, "-m", "head")
+    return Shrinkable(repo, a, b, p0, p1, head)
+
+
+@pytest.mark.parametrize("object_format", FORMATS)
+def test_a_rewritten_ancestor_of_the_merge_base_cannot_shrink_the_seed(
+    tmp_path, seeds, object_format
+):
+    """A rewritten commit below the lower boundary that claims a commit of the range as its
+    parent makes git's own range leave that commit and the ones below it out; the seed is
+    never built from that range, and nothing incomplete passes its own checks."""
+    graph = shrinkable_repo(tmp_path, object_format)
+    gi = git_input("REVIEW", graph.head, graph.b, object_format=object_format)
+
+    honest = build(graph.repo, gi)
+    assert honest.selection.commits == {graph.head, graph.p1, graph.p0, graph.b}
+    assert honest.manifest.boundaries == (graph.b,)
+    discard(honest.directory)
+
+    graph.forge_a_claiming_p1_as_its_parent()
+    # The attack: git's own range of the same bound pair now holds the head alone.
+    assert out(graph.repo, "rev-list", graph.head, "--not", graph.b) == graph.head
+
+    with pytest.raises(SandboxLaunchRefusedError, match=graph.p1) as refused:
+        build(graph.repo, gi)
+    assert "not proven" in str(refused.value)
+    with pytest.raises(SandboxLaunchRefusedError, match=graph.p1):
+        select_seed(common_of(graph.repo), gi, SeedSettings(), execute)
+    assert list(seeds.iterdir()) == []
+
+
+@dataclasses.dataclass
+class TwiceMerged:
+    """A PR forked at ``fork`` that merged ``main`` at ``first`` and then at ``second``."""
+
+    repo: Path
+    fork: str
+    between: str
+    first: str
+    second: str
+    pr_commits: tuple[str, ...]
+
+
+def twice_merged_repo(tmp_path: Path) -> TwiceMerged:
+    repo = init_repo(tmp_path / "repo")
+    commit_files(repo, "c0", {"README": b"zero\n"})
+    fork = commit_files(repo, "fork", {"src/a.py": b"print('a')\n"})
+    run_git(repo, "checkout", "-q", "-b", "pr")
+    p1 = commit_files(repo, "p1", {"src/p1.py": b"print('p1')\n"})
+    run_git(repo, "checkout", "-q", "main")
+    between = commit_files(repo, "x1", {"docs/x1.md": b"x1\n"})
+    first = commit_files(repo, "x2", {"docs/x2.md": b"x2\n"})
+    run_git(repo, "checkout", "-q", "pr")
+    run_git(repo, "merge", "-q", "--no-edit", "main")
+    m1 = out(repo, "rev-parse", "HEAD")
+    p2 = commit_files(repo, "p2", {"src/p2.py": b"print('p2')\n"})
+    run_git(repo, "checkout", "-q", "main")
+    commit_files(repo, "x3", {"docs/x3.md": b"x3\n"})
+    second = commit_files(repo, "x4", {"docs/x4.md": b"x4\n"})
+    run_git(repo, "checkout", "-q", "pr")
+    run_git(repo, "merge", "-q", "--no-edit", "main")
+    m2 = out(repo, "rev-parse", "HEAD")
+    head = commit_files(repo, "p3", {"src/p3.py": b"print('p3')\n"})
+    assert out(repo, "merge-base", head, "main") == second
+    return TwiceMerged(repo, fork, between, first, second, (p1, m1, p2, m2, head))
+
+
+def test_outside_parents_below_one_another_are_each_proven_below_the_merge_base(tmp_path):
+    """The fork point lies below the first merged commit: the proof walks through one
+    outside parent to reach the other, and the seed is the authentic range."""
+    graph = twice_merged_repo(tmp_path)
+    head = graph.pr_commits[-1]
+    built = build(graph.repo, git_input("REVIEW", head, graph.second))
+
+    assert set(built.manifest.boundaries) == {graph.fork, graph.first, graph.second}
+    assert built.selection.commits == {*graph.pr_commits, graph.fork, graph.first, graph.second}
+    staged = stage_seed(built.directory, tmp_path / "staged")
+    assert commits_of(staged) == built.selection.commits
+    assert out(staged, "fsck", "--strict", "--no-dangling") == ""
+
+
+def test_a_rewritten_commit_on_the_way_to_an_outside_parent_refuses_the_seed(tmp_path, seeds):
+    """Proving an outside parent below the merge base reads only re-hashed commits: one whose
+    stored bytes are not its own refuses the seed rather than prove or hide anything."""
+    graph = twice_merged_repo(tmp_path)
+    head = graph.pr_commits[-1]
+    raw = run_git(graph.repo, "cat-file", "commit", graph.between)
+    rewrite_loose_object(
+        common_of(graph.repo) / "objects",
+        graph.between,
+        "commit",
+        raw.replace(b"x1\n", b"x1, rewritten\n"),
+    )
+    with pytest.raises(SandboxLaunchRefusedError, match="do not hash to its id"):
+        build(graph.repo, git_input("REVIEW", head, graph.second))
     assert list(seeds.iterdir()) == []
 
 

@@ -129,11 +129,12 @@ candidate_source.py the engine's candidate source (ADR 0013 D5): each phase's bo
                     and disabled, the imported artifact otherwise) (#269)
 seed_pack.py        a container launch's seed (ADR 0013 D4, D11): what it holds, read from
                     the shared store (the bound revision, its merge base and out-of-range
-                    parents as shallow boundaries, the history settings, the tags that
-                    peel to a seeded commit), the pack and its manifest, the seed's own
-                    checks (index-pack --strict in a quarantine, exact commits and tag
-                    objects, closure, bounds) and D2's support diagnostics; reads the
-                    store's objects only from a private git directory with no promisor
+                    parents as shallow boundaries, the range proven from re-hashed parent
+                    links rather than taken from git, ADR 0004 D7.5; the history settings,
+                    the tags that peel to a seeded commit), the pack and its manifest, the
+                    seed's own checks (index-pack --strict in a quarantine, exact commits
+                    and tag objects, closure, bounds) and D2's support diagnostics; reads
+                    the store's objects only from a private git directory with no promisor
                     (isolated_store), so no git fetches lazily; writes nothing to the
                     store; executor layer (#292)
 source_staging.py   the host side of a container launch's source, both forms (ADR 0013 D2,

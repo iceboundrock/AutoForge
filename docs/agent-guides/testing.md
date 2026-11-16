@@ -1215,7 +1215,13 @@ exactly when `tests/sandbox_host.py` measures the host capable
   bound HEAD, the merge base and the commits between, and `git diff` from
   the merge base to the HEAD inside it is the host's; a PR branch that
   merged its base has the merge base and the fork point as boundaries, and
-  every commit diffs against each parent; a force-pushed head gets a seed
+  every commit diffs against each parent, and one that merged it twice
+  has each parent outside the range proven below the merge base, the
+  fork point through the first merged commit; a rewritten ancestor of the
+  merge base that claims a commit of the range as its parent (both object
+  formats) shrinks git's own range but refuses the seed, naming that
+  commit, and a rewritten commit on the proof's way refuses it on its id,
+  with nothing written either time (PR #504 R3-F1); a force-pushed head gets a seed
   of its own revision and none of the earlier candidate's commits; a
   relaunch carries its carried commit; an export command's seed is one
   commit; `history_depth` 1 and `full` add exactly those commits;

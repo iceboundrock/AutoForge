@@ -33,6 +33,18 @@ shared store:
   refs: a pack holds objects, and the manifest names no ref but the tags;
 - for an export command, the commit it validates and its tree, no history.
 
+**The range is proven, not enumerated** (ADR 0004 D7.5,
+:func:`_proven_range`). Git decides what ``rev-list <seed> --not <lower>``
+leaves out by reading the lower boundary's ancestors, which are never
+packed, so a rewritten one could hide commits of the range from a seed
+that still passes its own checks. Git's answer therefore only names the
+commits to read: the range is walked from the seed through the parent
+links of re-hashed commits, the lower boundary is an ancestor of the seed
+only when that walk reaches it, and a parent the walk stops at stays out
+only when a walk from the lower boundary through re-hashed parent links
+reaches it. A rewritten or withheld object can enlarge the seed or refuse
+it, never shrink it.
+
 **The pack** is ``pack-objects`` of exactly the objects the walk lists, in
 a controller-owned git directory whose only object store is the shared
 store, as an alternate, and whose ``shallow`` file names the boundaries:
@@ -724,7 +736,12 @@ def _history_note(settings: SeedSettings) -> str:
 
 def _check_bound_revision(git: _Git, git_input: LaunchGitInput) -> None:
     """D4: the seed (and carried commit) and the lower boundary are commits the store holds,
-    the lower boundary an ancestor of the seed, the carried commit a descendant of it."""
+    the lower boundary an ancestor of the seed, the carried commit a descendant of it.
+
+    Git's ancestry answers here can only refuse, early and naming the pair:
+    a "yes" is proven again by the range walk from re-hashed parent links
+    (:func:`_proven_range`, ADR 0004 D7.5), never taken from git.
+    """
     wanted = [git_input.seed, *([git_input.lower] if git_input.lower else [])]
     if git_input.carried:
         wanted.append(git_input.carried)
@@ -1001,6 +1018,187 @@ def _diagnostics(
     return tuple(found)
 
 
+def _proven_range(
+    walk: _Git, git_input: LaunchGitInput, tips: tuple[str, ...], settings: SeedSettings
+) -> tuple[set[str], set[str], dict[str, list[str] | None]]:
+    """The commits above the lower boundary and their outside parents, proven (ADR 0004 D7.5).
+
+    ``rev-list <tips> --not <lower>`` decides what it leaves out by reading
+    the lower boundary's ancestors, which no re-hash of what it returns
+    sees: a rewritten ancestor that claims a commit of the range as its
+    parent makes git leave that commit, and every commit below it, out, and
+    a seed built from that answer passes its own checks, which pack and
+    check the same selection (PR #504 R3-F1). So git's answer only names
+    the commits to read, never the range:
+
+    - **Inclusion follows authenticated links.** Every commit git lists is
+      read and re-hashed (a mismatch refuses), and the range is walked from
+      the tips through the parent links those bytes name. A commit the walk
+      reaches is in the range when git listed it; the walk stops at the
+      lower boundary and at each commit git did not list, an *outside
+      parent*.
+    - **Ancestry is the walk's.** The lower boundary is an ancestor of the
+      seed only when the walk from the seed reaches it, and the carried
+      commit descends from the seed only when the walk from the carried
+      commit reaches the seed.
+    - **Exclusion is proven** (:func:`_prove_below`): an outside parent stays
+      out only when a walk from the lower boundary through re-hashed parent
+      links reaches it.
+
+    A commit git wrongly leaves out is an outside parent that walk never
+    reaches, and a rewritten commit on the way fails its re-hash: either
+    refuses the seed. So no rewritten or withheld object hides a commit
+    from the seed; one can only make it larger (a commit git wrongly lists
+    is seeded too) or refuse it.
+
+    Returns the range, its outside parents (never the lower boundary), and
+    the authenticated parents of the range's commits, the lower boundary
+    and the outside parents.
+    """
+    object_format = git_input.object_format
+    lower = git_input.lower
+    collector = walk.stream(
+        ["rev-list", *tips, "--not", lower],
+        "listing the commits above the lower boundary",
+        _line_limit(settings, object_format),
+    )
+    if collector is None:
+        raise _too_many(settings.max_objects + 1, settings, "the range above the lower boundary")
+    listed = set(_ids(collector, object_format, "listing the range"))
+    parents = _read_commits(walk, [*sorted(listed), *tips, lower], "reading the range's commits")
+    if any(read is None for read in parents.values()):
+        missing = sorted(oid for oid, read in parents.items() if read is None)
+        raise _refused(f"the range's commit {missing[0]} is not in the shared store")
+    in_range: set[str] = set()
+    outside: set[str] = set()
+    seen = set(tips)
+    pending = list(tips)
+    while pending:
+        oid = pending.pop()
+        if oid == lower:
+            continue
+        if oid not in listed:
+            outside.add(oid)
+            continue
+        in_range.add(oid)
+        for parent in parents[oid] or []:
+            if parent not in seen:
+                seen.add(parent)
+                pending.append(parent)
+
+    def reaches(start: str, target: str) -> bool:
+        """Whether ``target`` is ``start`` or an ancestor of it through the range's links."""
+        stack, visited = [start], {start}
+        while stack:
+            oid = stack.pop()
+            if oid == target:
+                return True
+            if oid not in in_range:
+                continue
+            for parent in parents[oid] or []:
+                if parent not in visited:
+                    visited.add(parent)
+                    stack.append(parent)
+        return False
+
+    if not reaches(git_input.seed, lower):
+        raise _refused(
+            f"the bound lower boundary {lower} is not an ancestor of the seed {git_input.seed} "
+            "by parent links read from re-hashed commits"
+        )
+    if git_input.carried and not reaches(git_input.carried, git_input.seed):
+        raise _refused(
+            f"the carried commit {git_input.carried} does not descend from the seed "
+            f"{git_input.seed} by parent links read from re-hashed commits"
+        )
+    found = _read_commits(walk, sorted(outside), "reading the range's boundary parents")
+    lacking = sorted(oid for oid, read in found.items() if read is None)
+    if lacking:
+        raise _refused(
+            f"the parent {lacking[0]} of a commit above the lower boundary is not in the shared "
+            "store, so the seed would miss a parent tree"
+        )
+    parents.update(found)
+    _prove_below(walk, lower, outside, parents, settings)
+    return in_range, outside, parents
+
+
+def _prove_below(
+    walk: _Git,
+    lower: str,
+    outside: set[str],
+    known: dict[str, list[str] | None],
+    settings: SeedSettings,
+) -> None:
+    """Refuse unless each of ``outside`` is an ancestor of ``lower`` by re-hashed links (D7.5).
+
+    Git only names what to read: the history from ``lower`` down to a
+    common ancestor of ``outside`` (``merge-base --octopus``), which holds
+    every commit on a path from ``lower`` to one of them, whichever lies
+    below which. Each is read and re-hashed (a mismatch refuses). The walk
+    from ``lower`` then follows only the parent links of commits whose
+    bytes hash to their ids (those and ``known``'s, read so already); a
+    commit nothing authenticated was read for ends a path. An outside
+    parent the walk does not reach is not proven below the lower boundary,
+    and the seed is refused: a wrong answer of git's can only fail the
+    proof or bound it, never make the walk reach a commit. Reading more
+    than the seed's object bound of history for it is refused, naming the
+    setting.
+    """
+    if not outside:
+        return
+    object_format = walk.object_format
+    pattern = _OID[object_format]
+    common = walk.run(
+        ["merge-base", "--octopus", *sorted(outside)],
+        "finding a common ancestor of the range's outside parents",
+        allow=(0, 1),
+    )
+    bottom = common.stdout.split()
+    if not all(pattern.fullmatch(oid) for oid in bottom):
+        raise _refused(
+            "finding a common ancestor of the range's outside parents: git answered something "
+            "that is not an object id"
+        )
+    collector = walk.stream(
+        ["rev-list", lower, *(["--not", *bottom] if bottom else [])],
+        "listing the history from the lower boundary down to the range's outside parents",
+        _line_limit(settings, object_format),
+    )
+    if collector is None:
+        raise _refused(
+            f"proving the range's outside parents ancestors of the lower boundary {lower} reads "
+            f"more than {settings.max_objects} commits of its history ({SETTING_MAX_OBJECTS})"
+        )
+    below = set(_ids(collector, object_format, "listing the history below the lower boundary"))
+    links = dict(known)
+    links.update(
+        _read_commits(
+            walk, sorted(below - set(known)), "reading the history below the lower boundary"
+        )
+    )
+    reached: set[str] = set()
+    seen = {lower}
+    pending = [lower]
+    while pending:
+        oid = pending.pop()
+        if oid in outside:
+            reached.add(oid)
+        for parent in links.get(oid) or []:
+            if parent not in seen:
+                seen.add(parent)
+                pending.append(parent)
+    unproven = sorted(outside - reached)
+    if unproven:
+        raise _refused(
+            f"the range above the lower boundary {lower} stops at {unproven[0]}, a parent of one "
+            "of its commits that is not proven an ancestor of the lower boundary: no walk from "
+            "it through parent links read from re-hashed commits reaches it, so leaving it out "
+            "could hide commits of the range (a rewritten ancestor of the lower boundary, or "
+            "history the shared store does not hold)"
+        )
+
+
 def select_seed(
     common: Path, git_input: LaunchGitInput, settings: SeedSettings, runner: Runner | None = None
 ) -> SeedSelection:
@@ -1025,30 +1223,8 @@ def _select(
             boundaries=(git_input.seed,),
             diagnostics=diagnostics,
         )
-    collector = walk.stream(
-        ["rev-list", *tips, "--not", git_input.lower],
-        "listing the commits above the lower boundary",
-        _line_limit(settings, object_format),
-    )
-    if collector is None:
-        raise _too_many(settings.max_objects + 1, settings, "the range above the lower boundary")
-    in_range = set(_ids(collector, object_format, "listing the range"))
-    parents = _read_commits(walk, [*in_range, git_input.lower], "reading the range's commits")
-    if any(read is None for read in parents.values()):
-        missing = sorted(oid for oid, read in parents.items() if read is None)
-        raise _refused(f"the range's commit {missing[0]} is not in the shared store")
-    outside = {
-        parent for oid in in_range for parent in (parents[oid] or []) if parent not in in_range
-    }
+    in_range, outside, parents = _proven_range(walk, git_input, tips, settings)
     base = outside | {git_input.lower}
-    found = _read_commits(walk, outside - set(parents), "reading the range's boundary parents")
-    lacking = sorted(oid for oid, read in found.items() if read is None)
-    if lacking:
-        raise _refused(
-            f"the parent {lacking[0]} of a commit above the lower boundary is not in the shared "
-            "store, so the seed would miss a parent tree"
-        )
-    parents.update(found)
     included = in_range | base
     if len(included) > settings.max_objects:
         raise _too_many(len(included), settings, "the seed's commits")
