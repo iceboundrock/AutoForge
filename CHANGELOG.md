@@ -5,6 +5,24 @@ so.
 
 ## Unreleased
 
+### The container backend's runtime, staging and image settings (#271)
+
+`sandbox.container` now also accepts `runtime` (`podman` or `docker`;
+unset, detected), `transfer` (`auto`, the default, or `copy`) and `image`
+(a base image by digest, each agent CLI's exact version, and the MCP
+servers and Skills to install, each `name@version`), and refuses a tag-only
+base, a version range and any key it does not know. Nothing reads them
+yet: the container backend becomes selectable only with #272 and #273, and
+bwrap launches are unchanged. See "The container backend's runtime and
+image" in `docs/configuration.md`.
+
+One change reaches the host now: the bind form's staging root, which the
+container backend's `/source` will be, is written readable by every UID
+(`0755` directories, `0644` files) instead of `0700` and `0600`, so that
+the agent's UID inside a rootless container can read it. It still lies
+below the controller's `0700` sandbox directories, so no other user on the
+host reaches it, and nothing writes one before the backend is selectable.
+
 ### `sandbox.container` takes the container backend's seed settings (#292)
 
 The configuration now accepts `sandbox.container.history_depth` (0 or more,

@@ -525,11 +525,79 @@ def test_the_container_seed_settings_are_read(tmp_path, name, text):
         ('{"history_tags": "yes"}', "'sandbox.container.history_tags' must be a boolean"),
         ('{"seed_max_bytes": 0}', "'sandbox.container.seed_max_bytes' must be a positive"),
         ('{"seed_max_objects": "many"}', "'sandbox.container.seed_max_objects' must be an integer"),
-        ('{"transfer": "copy"}', "unknown key.*sandbox.container.*transfer"),
+        ('{"privileged": true}', "unknown key.*sandbox.container.*privileged"),
         ("[]", "'sandbox.container' must be a mapping"),
     ],
 )
 def test_the_container_seed_settings_reject_anything_else(tmp_path, body, error):
+    p = tmp_path / "cfg.json"
+    p.write_text(f'{{"version": 1, "sandbox": {{"container": {body}}}}}', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=error):
+        load_config_file(p)
+
+
+# -- #271: the container backend's runtime, transfer and image -----------------------
+BASE = "registry.example/toolchain@sha256:" + "c" * 64
+
+
+def test_the_container_runtime_transfer_and_image_default_to_detection_auto_and_none():
+    container = default_config().sandbox.container
+    assert (container.runtime, container.transfer, container.image) == (None, "auto", None)
+
+
+@pytest.mark.parametrize(
+    ("name", "text"),
+    [
+        (
+            "cfg.json",
+            '{"version": 1, "sandbox": {"container": {"runtime": "docker", "transfer": "copy",'
+            f' "image": {{"base": "{BASE}", "claude_code": "2.0.14", "pi": "1.0.1",'
+            ' "mcp_servers": ["@scope/server-files@1.2.3"], "skills": ["review-skill@0.1.0"]}}}}',
+        ),
+        (
+            "cfg.yaml",
+            "version: 1\nsandbox:\n  container:\n    runtime: docker\n    transfer: copy\n"
+            f"    image:\n      base: {BASE}\n      claude_code: 2.0.14\n      pi: 1.0.1\n"
+            "      mcp_servers: ['@scope/server-files@1.2.3']\n"
+            "      skills: [review-skill@0.1.0]\n",
+        ),
+    ],
+)
+def test_the_container_runtime_transfer_and_image_are_read(tmp_path, name, text):
+    p = tmp_path / name
+    p.write_text(text, encoding="utf-8")
+    container = load_config_file(p).sandbox.container
+    assert (container.runtime, container.transfer) == ("docker", "copy")
+    image = container.image
+    assert image is not None and image.base == BASE and image.opencode == ""
+    assert image.packages() == (
+        "@anthropic-ai/claude-code@2.0.14",
+        "@earendil-works/pi-coding-agent@1.0.1",
+        "@scope/server-files@1.2.3",
+        "review-skill@0.1.0",
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        ('{"runtime": "crio"}', "'sandbox.container.runtime' must be one of podman, docker"),
+        ('{"transfer": "bind"}', "'sandbox.container.transfer' must be one of auto, copy"),
+        ('{"image": {"claude_code": "2.0.14"}}', "image.base' is required"),
+        ('{"image": {"base": "ubuntu:24.04"}}', "named by digest"),
+        ('{"image": {"base": "ubuntu:latest@sha256:abc"}}', "named by digest"),
+        (f'{{"image": {{"base": "{BASE}", "opencode": "^1.2"}}}}', "exact version"),
+        (f'{{"image": {{"base": "{BASE}", "pi": "latest"}}}}', "exact version"),
+        (f'{{"image": {{"base": "{BASE}", "mcp_servers": ["server"]}}}}', "pinned as name@version"),
+        (
+            f'{{"image": {{"base": "{BASE}", "skills": ["git+https://x/y@1.0.0"]}}}}',
+            "no path, URL or git reference",
+        ),
+        (f'{{"image": {{"base": "{BASE}", "dockerfile": "Dockerfile"}}}}', "unknown key"),
+        (f'{{"image": {{"base": "{BASE}", "run_flags": ["--privileged"]}}}}', "unknown key"),
+    ],
+)
+def test_the_container_runtime_transfer_and_image_reject_anything_else(tmp_path, body, error):
     p = tmp_path / "cfg.json"
     p.write_text(f'{{"version": 1, "sandbox": {{"container": {body}}}}}', encoding="utf-8")
     with pytest.raises(ConfigurationError, match=error):

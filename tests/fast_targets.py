@@ -186,6 +186,15 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/container_measure.py": ("test_sandbox_container", "test_sandbox_backend"),
     # #290: each provider's credential mapping, unreachable before #271.
     "src/autoforge/container_auth.py": ("test_sandbox_container",),
+    # #271: the container module, its runtime, image and in-image helpers,
+    # unreachable before #272 and #273.
+    "src/autoforge/container_backend.py": ("test_container_backend", "test_container_backend_real"),
+    "src/autoforge/container_runtime.py": ("test_container_runtime", "test_container_backend"),
+    "src/autoforge/container_image.py": ("test_container_image", "test_config"),
+    "src/autoforge/container_stager.py": ("test_container_helpers", "test_container_image"),
+    "src/autoforge/container_prover.py": ("test_container_helpers", "test_container_image"),
+    "src/autoforge/container_exporter.py": ("test_container_helpers", "test_container_image"),
+    "src/autoforge/container_watch.py": ("test_container_helpers", "test_container_image"),
     "src/autoforge/sandbox_lifecycle.py": ("test_sandbox_gate", "test_engine_sandbox"),
     "src/autoforge/sandbox_pin.py": ("test_cli", "test_state", "test_worker", "test_engine"),
     "src/autoforge/sandbox_policy.py": ("test_engine_sandbox", "test_engine"),
@@ -209,6 +218,7 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/ci_durations.py": (),
     "tests/claude_fake.py": (),
     "tests/credential_fake.py": (),
+    "tests/container_fake.py": ("test_container_runtime", "test_container_backend"),
     "tests/dist_check.py": (),
     "tests/epic_cli.py": ("test_epic_recovery",),
     "tests/evaluation.py": ("test_evaluation_fixture",),

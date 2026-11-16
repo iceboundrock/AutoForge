@@ -666,6 +666,12 @@ GUARDED = {
     # private GIT_DIR, index and object directory in the controller's
     # temporary directory, nothing in the common dir (#488, PR #503 R1-F1).
     ("materialize.py", "_eol_conversions"): "update-index",
+    # AutoForge's helpers in the container image (#271): they run inside the
+    # stager container, on its /workspace volume and its private /tmp, where
+    # no host path but the read-only /source exists; never the common dir.
+    ("container_stager.py", "_index"): "index-pack",
+    ("container_stager.py", "stage_agent"): "update-ref",
+    ("container_prover.py", "__init__"): "index-pack",
 }
 
 

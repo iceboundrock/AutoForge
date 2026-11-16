@@ -69,8 +69,9 @@ from autoforge.seed_pack import (
     SeedSettings,
 )
 from autoforge.source_staging import (
-    PRIVATE_DIRECTORY_MODE,
+    STAGED_DIRECTORY_MODE,
     STAGED_ENTRIES,
+    STAGED_FILE_MODE,
     STAGED_OWNER,
     STAGED_READ_CONTEXT,
     STAGED_SEED,
@@ -217,7 +218,7 @@ def test_the_bind_form_writes_the_proved_tree_its_seed_and_the_read_context(tmp_
 
     assert root == common / "autoforge" / "sandbox" / KEY / "stage" / "L-1"
     assert sorted(os.listdir(root)) == sorted(STAGED_ENTRIES)
-    assert stat.S_IMODE(root.stat().st_mode) == PRIVATE_DIRECTORY_MODE
+    assert stat.S_IMODE(root.stat().st_mode) == STAGED_DIRECTORY_MODE
     # The tree is the reviewed HEAD's, byte for byte, and nothing else: no
     # .git, no file of the checkout's that the commit does not hold.
     assert staged.commit == review.head
@@ -396,7 +397,7 @@ def test_the_staging_root_fails_its_proof_after_its_read_context_changed(tmp_pat
     target = copied / "README.md"
     if change == "added":
         (copied / "files" / "planted.md").write_text("planted\n")
-        (copied / "files" / "planted.md").chmod(0o600)
+        (copied / "files" / "planted.md").chmod(STAGED_FILE_MODE)
     elif change == "changed":
         target.write_text("another read context\n")
     elif change == "removed":
@@ -404,17 +405,17 @@ def test_the_staging_root_fails_its_proof_after_its_read_context_changed(tmp_pat
     elif change == "file to directory":
         target.unlink()
         target.mkdir()
-        target.chmod(PRIVATE_DIRECTORY_MODE)
+        target.chmod(STAGED_DIRECTORY_MODE)
     elif change == "directory to file":
         shutil.rmtree(copied / "files")
         (copied / "files").write_text("the issue\n")
-        (copied / "files").chmod(0o600)
+        (copied / "files").chmod(STAGED_FILE_MODE)
     elif change == "file to link":
         target.unlink()
         target.symlink_to("files/issue.md")
     else:
         target.unlink()
-        os.mkfifo(target, 0o600)
+        os.mkfifo(target, STAGED_FILE_MODE)
     with pytest.raises(SandboxLaunchRefusedError, match="staging root is refused") as refused:
         staging.reprove(staged)
     assert READ_CONTEXT_CHANGES[change] in str(refused.value)
@@ -427,12 +428,15 @@ PERMISSION_CHANGES = [
     ("tree/src/c.py", 0o664),
     ("tree/src", 0o700),
     ("tree", 0o711),
-    ("seed/seed.pack", 0o644),
-    ("seed", 0o755),
-    ("read-context/README.md", 0o644),
-    ("read-context/files", 0o755),
-    ("owner", 0o644),
-    ("", 0o750),
+    # The staged entries are readable by every container user (#271): the
+    # operator's private modes, which would hide them from the agent, fail.
+    ("seed/seed.pack", 0o600),
+    ("seed", 0o700),
+    ("read-context/README.md", 0o600),
+    ("read-context/files", 0o700),
+    ("owner", 0o600),
+    ("", 0o700),
+    ("", 0o775),
 ]
 
 
@@ -472,7 +476,7 @@ def test_the_ownership_record_is_what_every_staged_entry_has_whatever_the_umask(
                 else {own.tree_file_mode, own.tree_executable_mode}
             )
         else:
-            allowed = {own.private_directory_mode if path.is_dir() else own.private_file_mode}
+            allowed = {own.staged_directory_mode if path.is_dir() else own.staged_file_mode}
         assert mode in allowed, (path, oct(mode))
     staging.reprove(staged)
 

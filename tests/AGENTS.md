@@ -488,7 +488,23 @@ delivery and their measurement (#270) the measurement on the host is its own neg
 each provider's credential mapping    test_container_security_real.py (opt-in, a real rootless
 (#290)                                runtime and image named by AUTOFORGE_CONTAINER_TEST_*),
                                       test_container_auth.py (fake credentials, no runtime;
-                                      fake claude, opencode and pi in credential_fake.py)
+                                      fake claude, opencode and pi in credential_fake.py);
+the container module, its runtime,    test_container_runtime.py, test_container_image.py,
+image and in-image helpers (#271)     test_container_backend.py (the fake runtime CLI of
+                                      container_fake.py: detection with no fall-through,
+                                      identity from the report, the store read at every
+                                      call, the empty client configuration, refused
+                                      endpoints; the lifecycle in both staging forms through
+                                      LaunchLifecycle and the executor, collisions, denials,
+                                      nonce-checked removal, the probe both ways; the image
+                                      key, context and cache), test_container_helpers.py (the
+                                      stager, prover and exporter on the host on real seeds:
+                                      hostile attributes and filters with a negative control,
+                                      each injected fault, the ref set, the tree proof, an
+                                      export imported strictly), test_container_backend_real.py
+                                      (opt-in, a real rootless runtime and a base by digest
+                                      named by AUTOFORGE_CONTAINER_TEST_*; a skip is never
+                                      a pass)
 config, CLI, doctor, CI drift guards  test_config.py, test_cli.py, test_doctor.py, test_ci_workflow.py, test_gitignore.py
 every workflow's actions pinned to a  test_workflow_pins.py (a tag, branch, short SHA, Docker
 commit with its release (#288)        image, local action or missing release fails, a tag in

@@ -793,6 +793,30 @@ class StagingRoot:
 
 
 @dataclass(frozen=True)
+class ProbeRoot:
+    """A shared-filesystem probe's staging root (ADR 0013 D6 item 9, D12; #271): never a path alone.
+
+    ``<common_dir>/autoforge/sandbox/probe/<probe>/stage``: the probe's own
+    directory (``probe``, its id), which the probe's journal owns (#272),
+    and in it the directory the probe's container (an offline helper, the
+    stager's role) binds read-only at ``/source`` to read the nonce back.
+    Checked as a launch's staging root is (:func:`check_spec`), and never
+    bound into a launch container.
+    """
+
+    common_dir: str
+    probe: str
+
+    @property
+    def layout(self) -> str:
+        return posixpath.join(SANDBOX_LAYOUT, PROBE_DIR, self.probe, STAGE_DIR)
+
+    @property
+    def path(self) -> str:
+        return posixpath.join(self.common_dir, self.layout)
+
+
+@dataclass(frozen=True)
 class ContainerSpec:
     """Everything a create configures that the policy decides: no raw flag, mount or option.
 
@@ -810,7 +834,7 @@ class ContainerSpec:
     workspace_volume: str
     staging: StagingMethod = StagingMethod.BIND
     cache_volume: str = ""
-    source: StagingRoot | None = None
+    source: StagingRoot | ProbeRoot | None = None
     projection: Projection = NO_PROJECTION
     home_size_bytes: int | None = None
     tmp_size_bytes: int | None = None
@@ -845,7 +869,7 @@ def _check_staging_root(root: object, host: HostContext) -> str:
     Returns its path.
     """
     rule = _RULE_BIND
-    if not isinstance(root, StagingRoot):
+    if not isinstance(root, (StagingRoot, ProbeRoot)):
         raise _refuse(
             str(root),
             rule,
@@ -863,10 +887,15 @@ def _check_staging_root(root: object, host: HostContext) -> str:
             rule,
             f"the staging root is not in the controller's own git common dir {common}",
         )
-    for label, name in (("sandbox key", root.key), ("launch id", root.launch)):
+    names = (
+        (("probe id", root.probe),)
+        if isinstance(root, ProbeRoot)
+        else (("sandbox key", root.key), ("launch id", root.launch))
+    )
+    for label, name in names:
         if not isinstance(name, str) or not _NAME_RE.match(name):
             raise _refuse(repr(name), rule, f"the staging root's {label} is not one path component")
-    if root.key == PROBE_DIR:
+    if isinstance(root, StagingRoot) and root.key == PROBE_DIR:
         raise _refuse(root.path, rule, "the probes' directory is never a launch's sandbox key")
     path = root.path
     _check_mount_text(path, path, rule)
@@ -971,6 +1000,13 @@ def check_spec(spec: ContainerSpec, host: HostContext) -> None:
             raise _refuse(str(spec.source), _RULE_BIND, "the copy-in form binds nothing")
         if spec.role is ContainerRole.EXPORTER:
             raise _refuse(str(spec.source), _RULE_BIND, "the exporter binds nothing")
+        if isinstance(spec.source, ProbeRoot) and spec.role is not ContainerRole.STAGER:
+            raise _refuse(
+                str(spec.source),
+                _RULE_BIND,
+                "a probe's staging root is bound only into the probe's own offline helper "
+                "container, never into a launch container",
+            )
         source = _check_staging_root(spec.source, host)
     for size in (spec.home_size_bytes, spec.tmp_size_bytes):
         if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size < 1):
@@ -1097,6 +1133,37 @@ def create_argv(
     return argv
 
 
+def build_argv(
+    product: RuntimeProduct,
+    containerfile: str,
+    context: str,
+    iidfile: str,
+    labels: Mapping[str, str],
+) -> list[str]:
+    """``build`` and its arguments (ADR 0013 D7, #271): the context the controller wrote, alone.
+
+    No ``--build-arg``, ``--secret``, ``--ssh``, ``--volume``, ``--network``
+    or ``--add-host``: the build container gets the runtime's default
+    network for its downloads and no host path but the context. Podman
+    never pulls (the base must be local, by digest); Docker pulls only a
+    base it does not hold, with the client's empty configuration.
+    """
+    argv = ["build", f"--file={containerfile}", f"--iidfile={iidfile}"]
+    if product is RuntimeProduct.PODMAN:
+        argv.append("--pull=never")
+    for key, value in sorted(labels.items()):
+        if not _LABEL_KEY_RE.match(key) or any(ch in value for ch in "\0\n\r"):
+            raise _refuse(repr(key), _RULE_SPEC, "not a label")
+        argv.append(f"--label={key}={value}")
+    argv.append(context)
+    return argv
+
+
+def check_exec_env_name(name: str) -> None:
+    """A variable an exec may name: a valid name the runtime client does not read itself."""
+    _check_env_name(name)
+
+
 def _refuse_values_on_argv(argv: list[str], projection: Projection) -> None:
     for env in projection.env:
         value = env.value.reveal()
@@ -1109,13 +1176,21 @@ def _refuse_values_on_argv(argv: list[str], projection: Projection) -> None:
 
 
 def exec_argv(
-    product: RuntimeProduct, container: str, command: Iterable[str], *, workdir: str = ""
+    product: RuntimeProduct,
+    container: str,
+    command: Iterable[str],
+    *,
+    workdir: str = "",
+    env_names: Iterable[str] = (),
 ) -> list[str]:
     """``exec`` and its arguments: ``command`` as the agent, in the launch container.
 
-    The agent's UID and GID, numeric; no environment option (the projection
-    is the create's, and an ``exec -e NAME=VALUE`` would put a value on an
-    argv), no ``--privileged``.
+    The agent's UID and GID, numeric; no ``--privileged``. ``env_names``
+    are the launch's variables, each named alone (``--env=NAME``, #271):
+    the runtime client takes the value from its own environment, so no
+    value is on an argv, as for the create's projection (``exec -e
+    NAME=VALUE`` would put one there). A name the runtime client reads for
+    itself is refused (:func:`check_exec_env_name`).
     """
     if not isinstance(container, str) or not _NAME_RE.match(container):
         raise _refuse(repr(container), _RULE_SPEC, "not a container name")
@@ -1127,8 +1202,11 @@ def exec_argv(
         "--interactive",
         f"--user={AGENT_UID}:{AGENT_GID}",
         f"--workdir={workdir}",
-        container,
     ]
+    for name in env_names:
+        check_exec_env_name(name)
+        argv.append(f"--env={name}")
+    argv.append(container)
     for word in command:
         if not isinstance(word, str) or "\0" in word:
             raise _refuse(repr(word), _RULE_SPEC, "not a command word")
