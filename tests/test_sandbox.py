@@ -1977,3 +1977,99 @@ def test_the_probe_says_a_python_without_memfd_create_cannot_enforce(
     assert result.describe().startswith(
         "unsupported: this host cannot provide a Python with os.memfd_create"
     )
+
+
+# ------------------------------------------------------------------ /source (C7 as amended)
+
+
+def _staging(tmp_path: Path) -> tuple[str, str, str]:
+    """A common dir's ``autoforge`` denied root, the issue's stage dir, one launch's root."""
+    base = _base(tmp_path)
+    denied = _dir(base / "repo" / ".git" / "autoforge")
+    stage = _dir(Path(denied) / "sandbox" / "7" / "stage")
+    root = _dir(Path(stage) / "L-1")
+    _file(Path(root) / "tree" / "README.md")
+    return denied, stage, root
+
+
+def _staged(root: str, **kw: object) -> ProjectionRequest:
+    kw.setdefault("target", sandbox.SOURCE_TARGET)
+    kw.setdefault("carve_out", True)
+    kw.setdefault("label", "the staging root")
+    return P(root, **kw)
+
+
+def test_the_container_compiler_admits_the_engines_staging_root_at_source(tmp_path, no_spawn):
+    denied, stage, root = _staging(tmp_path)
+    work = _dir(_base(tmp_path) / "work")
+    request = _request(tmp_path, projections=(P(work, RW), _staged(root)), denied_roots=(denied,))
+    described = sandbox.compile_container_launch(request, stage_dir=stage)
+    source = [m for m in described.mounts if m.target == sandbox.SOURCE_TARGET]
+    assert source == [Bind(root, sandbox.SOURCE_TARGET, RO, True)]
+    assert not any(isinstance(m, Bind) and m.target == root for m in described.mounts)
+    # The rest is compile_launch's: the same request without /source compiles the same.
+    plain = compile_launch(_request(tmp_path, projections=(P(work, RW),), denied_roots=(denied,)))
+    assert [m for m in described.mounts if m.target != sandbox.SOURCE_TARGET] == list(plain.mounts)
+
+
+def test_the_bwrap_compiler_still_refuses_a_source_target(tmp_path, no_spawn):
+    denied, stage, root = _staging(tmp_path)
+    with pytest.raises(SandboxPolicyError) as refused:
+        compile_launch(_request(tmp_path, projections=(_staged(root),), denied_roots=(denied,)))
+    assert refused.value.rule == "C7 relocations"
+
+
+@pytest.mark.parametrize(
+    "case, rule",
+    [
+        ("declared", "C7 relocations"),
+        ("writable", "C7 relocations"),
+        ("copy-in", "C7 relocations"),
+        ("another source", "C7 relocations"),
+        ("the stage dir itself", "C7 relocations"),
+        ("twice", "C7 relocations"),
+        ("not a carve-out", "C4 denied roots"),
+        ("a link below the anchor", "C2 no link in a controller-owned path"),
+        ("a file", "C3 kinds"),
+        ("a target inside /source", "C6 overlaps"),
+        ("a target containing /source", "C6 overlaps"),
+        ("a host path at /source", "C6 overlaps"),
+        ("a source inside the staging root", "C6 overlaps"),
+    ],
+)
+def test_the_container_compiler_refuses_every_other_source(tmp_path, no_spawn, case, rule):
+    denied, stage, root = _staging(tmp_path)
+    base = _base(tmp_path)
+    projections: list[ProjectionRequest] = [_staged(root)]
+    stage_dir: str | None = stage
+    if case == "declared":
+        projections = [_staged(root, origin=DECLARED, carve_out=False)]
+    elif case == "writable":
+        projections = [_staged(root, access=RW)]
+    elif case == "copy-in":
+        stage_dir = None
+    elif case == "another source":
+        projections = [_staged(_dir(base / "elsewhere" / "L-1"))]
+    elif case == "the stage dir itself":
+        projections = [_staged(stage)]
+    elif case == "twice":
+        projections = [_staged(root), _staged(_dir(Path(stage) / "L-2"))]
+    elif case == "not a carve-out":
+        projections = [_staged(root, carve_out=False)]
+    elif case == "a link below the anchor":
+        os.symlink(root, Path(stage) / "L-link")
+        projections = [_staged(str(Path(stage) / "L-link"))]
+    elif case == "a file":
+        projections = [_staged(_file(Path(stage) / "L-file"))]
+    elif case == "a target inside /source":
+        projections.append(P(_dir(base / "tool"), target=f"{sandbox.SOURCE_TARGET}/tool"))
+    elif case == "a target containing /source":
+        projections.append(P(_dir(base / "tool"), target="/"))
+    elif case == "a host path at /source":
+        projections.append(P("/source/x"))
+    elif case == "a source inside the staging root":
+        projections.append(P(str(Path(root) / "tree"), carve_out=True))
+    request = _request(tmp_path, projections=tuple(projections), denied_roots=(denied,))
+    with pytest.raises(SandboxPolicyError) as refused:
+        sandbox.compile_container_launch(request, stage_dir=stage_dir)
+    assert refused.value.rule == rule, refused.value

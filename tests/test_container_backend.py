@@ -63,7 +63,11 @@ from autoforge.container_backend import (
 )
 from autoforge.container_image import ImageRef
 from autoforge.container_runtime import RuntimeClient, detect
-from autoforge.errors import SandboxCleanupUncertainError, SandboxLaunchRefusedError
+from autoforge.errors import (
+    SandboxCleanupUncertainError,
+    SandboxLaunchRefusedError,
+    SandboxPolicyError,
+)
 from autoforge.executor import ExecutionRequest, execute
 from autoforge.git_input import LaunchGitInput
 from autoforge.git_transport import GitRemote, GitTransport
@@ -1054,3 +1058,46 @@ def test_a_close_with_an_exception_already_ending_the_launch_adds_a_note(tmp_pat
         with pytest.raises(KeyboardInterrupt) as ended:
             lifecycle.launch(run)
     assert any("not proved gone" in note for note in ended.value.__notes__)
+
+
+# -- the plan step: ADR 0005 C7 as amended ----------------------------------------------
+
+
+@pytest.mark.parametrize("transfer", ["auto", "copy"])
+def test_the_plan_admits_the_staging_root_at_source_in_the_bind_form_only(tmp_path, transfer):
+    from autoforge.sandbox import (
+        SOURCE_TARGET,
+        Access,
+        Bind,
+        Origin,
+        ProjectionRequest,
+        SandboxRequest,
+    )
+    from autoforge.sandbox_container import StagingRoot
+
+    world = make_world(tmp_path, transfer=transfer)
+    if transfer == "auto":
+        root = ProbeRoot(world.host.git_common_dir, "probe-1")
+        world.backend._probe_journal = ProbeJournal(root, world.runtime)  # noqa: SLF001
+    method = world.backend.staging_method()
+    staging = StagingRoot(world.host.git_common_dir, KEY, "L-1").path
+    os.makedirs(staging)
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    request = SandboxRequest(
+        home=os.path.realpath(home),
+        controller_env={},
+        system_runtime=False,
+        denied_roots=(os.path.join(world.host.git_common_dir, "autoforge"),),
+        projections=(
+            ProjectionRequest(
+                staging, Access.READ_ONLY, Origin.ENGINE, target=SOURCE_TARGET, carve_out=True
+            ),
+        ),
+    )
+    if method is StagingMethod.BIND:
+        planned = world.backend.plan(request)
+        assert Bind(staging, SOURCE_TARGET, Access.READ_ONLY, True) in planned.mounts
+    else:
+        with pytest.raises(SandboxPolicyError, match="copy-in form binds nothing"):
+            world.backend.plan(request)

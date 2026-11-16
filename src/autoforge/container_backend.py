@@ -92,6 +92,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import posixpath
 import re
 import secrets
 import shutil
@@ -126,7 +127,13 @@ from .executor import ExecutionRequest, ExecutionResult, execute
 from .git_input import SEED_MANIFEST_NAME
 from .redaction import redact
 from .safefs import SafeRoot
-from .sandbox import BackendKind, LaunchDescription, SandboxFacts, SandboxRequest, compile_launch
+from .sandbox import (
+    BackendKind,
+    LaunchDescription,
+    SandboxFacts,
+    SandboxRequest,
+    compile_container_launch,
+)
 from .sandbox_backend import (
     NETWORK_NONE,
     Artifact,
@@ -727,8 +734,17 @@ class ContainerBackend:
 
     # -- one launch (D13) ----------------------------------------------------------
     def plan(self, request: SandboxRequest) -> LaunchDescription:
-        """The compiled launch, as the policy compiler refuses or admits it: pure."""
-        return compile_launch(request)
+        """The compiled launch, as the container's policy compiler refuses or admits it: pure.
+
+        :func:`~autoforge.sandbox.compile_container_launch`: ADR 0005 C7 as
+        amended admits the engine's own staging root at ``/source``, in the
+        bind form only, read-only, from the issue's staging directory under
+        the controller's common dir, and nothing else there.
+        """
+        stage_dir = None
+        if self.method is StagingMethod.BIND:
+            stage_dir = posixpath.dirname(StagingRoot(self._common, self._key, "launch").path)
+        return compile_container_launch(request, stage_dir=stage_dir)
 
     def seed(self, inputs: LaunchInputs, launch: LaunchDescription) -> Seed:
         self.method  # noqa: B018 - the staging form is decided before any seed

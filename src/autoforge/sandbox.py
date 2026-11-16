@@ -35,7 +35,10 @@ into a description, applying ADR 0005's rules before anything is spawned:
   with a declared projection is refused; engine entries nest and are
   ordered parents first;
 - **C7** a projection appears at its host path unless its target lies in
-  the private home;
+  the private home; under the container backend only
+  (:func:`compile_container_launch`, ADR 0005 §11's amendment of C7), the
+  engine's own staging root also appears at :data:`SOURCE_TARGET`,
+  read-only, and nothing else does;
 - **D4.3** the forbidden sources (the operator's home and its ancestors, the
   GitHub and git credential and configuration locations, ``~/.ssh``,
   ``~/.gnupg``, keyrings and password stores, ``/run`` and
@@ -68,6 +71,7 @@ reads it (D16.1).
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import os
 import posixpath
@@ -90,6 +94,9 @@ _OWNED_ENV = frozenset({"HOME", "TMPDIR", "XDG_RUNTIME_DIR", *(name for name, _ 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 PRIVATE_TMP = "/tmp"
+# Where a container launch sees its staging root (ADR 0005 C7 as amended by
+# #267; ADR 0013 D12): read-only, the engine's own, on a bind runtime only.
+SOURCE_TARGET = "/source"
 # The kernel filesystems the backend mounts itself; no projection goes there.
 _KERNEL_ROOTS = ("/proc", "/dev", "/sys")
 # The host's system runtime (ADR 0005 §2.5): read-only, and the top-level
@@ -1075,6 +1082,130 @@ def compile_launch(request: SandboxRequest) -> LaunchDescription:
         sys=request.sys,
         covered=tuple(covered),
     )
+
+
+def compile_container_launch(
+    request: SandboxRequest, *, stage_dir: str | None
+) -> LaunchDescription:
+    """:func:`compile_launch` for the container backend: C7 as amended admits ``/source``.
+
+    ADR 0005 D4.2's C7, amended by #267 for the container backend alone:
+    the launch's staging root appears at :data:`SOURCE_TARGET` instead of
+    at its host path. ``stage_dir`` is the issue's staging directory
+    (``<git common dir>/autoforge/sandbox/<key>/stage``) on a runtime whose
+    bind was proved (ADR 0013 D12), ``None`` in the copy-in form, which
+    binds nothing at ``/source``. The relocation is admitted only as the
+    engine's: an :attr:`Origin.ENGINE` carve-out, read-only, whose source
+    is a launch directory directly in ``stage_dir``. Each of these is
+    refused, naming its rule:
+
+    - a ``/source`` a provider or an operator declares (C7);
+    - a writable ``/source`` (C7);
+    - another source at ``/source``, or one in the copy-in form (C7);
+    - a source reached through a link below the controller's anchor, or
+      not a directory (C2, C3);
+    - a ``/source`` that is not a carve-out of the denied root it lies in
+      (C4, C5);
+    - any other mount whose target equals, contains or lies inside
+      ``/source``, or a projection whose source equals, contains or lies
+      inside the staging root (C6).
+
+    Every other rule of :func:`compile_launch` applies to the rest of the
+    request unchanged, and D4.3's forbidden sources apply to the staging
+    root as to every projection. The bwrap compiler gains nothing: it still
+    refuses a ``/source`` target, as any relocation outside the private home.
+    """
+    source_requests = [
+        req
+        for req in request.projections
+        if req.target is not None and _clean(req.target) and req.target == SOURCE_TARGET
+    ]
+    rest = [req for req in request.projections if req not in source_requests]
+    for req in rest:
+        label = req.label or f"{req.origin.value} projection"
+        target = req.target if req.target is not None else req.source
+        if _clean(target) and _related(target, SOURCE_TARGET):
+            raise _refuse(
+                target,
+                "C6 overlaps",
+                f"{label}'s target equals, contains or lies inside {SOURCE_TARGET}, which shows "
+                "the launch's staging root alone",
+            )
+    if len(source_requests) > 1:
+        raise _refuse(SOURCE_TARGET, "C7 relocations", f"{SOURCE_TARGET} is projected once")
+    staged: _Proj | None = None
+    if source_requests:
+        staged = _staging_projection(source_requests[0], request, stage_dir)
+    description = compile_launch(dataclasses.replace(request, projections=tuple(rest)))
+    if staged is None:
+        return description
+    for mount in description.mounts:
+        sources: list[str] = []
+        if isinstance(mount, Bind):
+            sources = [mount.source]
+        elif isinstance(mount, Overlay):
+            sources = [mount.lower, mount.upper, mount.work]
+        for path in sources:
+            if _related(path, staged.source):
+                raise _refuse(
+                    path,
+                    "C6 overlaps",
+                    f"another projection's source equals, contains or lies inside the staging "
+                    f"root {staged.source}",
+                )
+        if _related(mount.target, SOURCE_TARGET):
+            raise _refuse(
+                mount.target,
+                "C6 overlaps",
+                f"a mount's target equals, contains or lies inside {SOURCE_TARGET}",
+            )
+    entries = [*description.mounts, Bind(staged.source, SOURCE_TARGET, Access.READ_ONLY, True)]
+    entries.sort(key=lambda entry: (_parts(entry.target), isinstance(entry, Link)))
+    return dataclasses.replace(description, mounts=tuple(entries))
+
+
+def _staging_projection(
+    req: ProjectionRequest, request: SandboxRequest, stage_dir: str | None
+) -> _Proj:
+    """The ``/source`` request checked against C7 as amended, C1 to C6 and D4.3."""
+    label = req.label or "the staging root"
+    if req.origin is not Origin.ENGINE:
+        raise _refuse(
+            req.source,
+            "C7 relocations",
+            f"{label}: {SOURCE_TARGET} shows the engine's staging root alone; a provider or an "
+            "operator never declares it",
+        )
+    if req.access is not Access.READ_ONLY:
+        raise _refuse(req.source, "C7 relocations", f"{label}: {SOURCE_TARGET} is read-only")
+    if stage_dir is None:
+        raise _refuse(
+            req.source,
+            "C7 relocations",
+            f"{label}: the copy-in form binds nothing at {SOURCE_TARGET} (ADR 0013 D12)",
+        )
+    source = _resolve_engine(req.source, label)
+    anchor = _resolve_engine(stage_dir, "the staging directory")
+    if posixpath.dirname(source) != anchor or source == anchor:
+        raise _refuse(
+            source,
+            "C7 relocations",
+            f"{label}: {SOURCE_TARGET} shows a launch's own staging root in {anchor}, not "
+            "another source",
+        )
+    if not _kind_of(source, label):
+        raise _refuse(source, "C3 kinds", f"{label} is not a directory")
+    rules = _Rules(request.home, os.path.realpath(request.home))
+    rules.forbidden = _forbidden_sources(request.home, request.controller_env)
+    _check_forbidden(source, rules, label)
+    denied = sorted({_resolve_loose(p) for p in request.denied_roots})
+    if any(_inside(source, root) for root in denied) and not req.carve_out:
+        raise _refuse(
+            source,
+            "C4 denied roots",
+            f"{label} lies in a denied root and is projected only as the engine's carve-out",
+        )
+    return _Proj(source, SOURCE_TARGET, Access.READ_ONLY, Origin.ENGINE, True, True, label)
 
 
 def _check_unique(entries: list[Mount]) -> None:
