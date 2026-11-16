@@ -42,6 +42,11 @@ TEMPLATE_FILES = (
     # (ADR 0013 D4; #269): the host worktree is not its workspace, and
     # uncommitted work is discarded between launches.
     "worktree_state_container.md",
+    # Every phase's note, under a backend that seeds (ADR 0013 D2, D4, D11;
+    # #271): the seeded copy's history depth and the settings that give more,
+    # what staging supports, and that uncommitted work is discarded; rendered
+    # into common.md's {{SANDBOX_SECTION}}, "" for bwrap and disabled.
+    "seed_history_container.md",
     # The FIX prompt's acceptance_action resolution (#211), rendered into
     # fix.md's {{ACCEPTANCE_ACTIONS}} when safety.acceptance_actions offers it.
     "acceptance_actions.md",

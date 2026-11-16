@@ -797,6 +797,8 @@ WORKTREE_STATE_TEMPLATE = "worktree_state.md"
 # A seeded launch's ``{{WORKTREE_STATE}}`` (ADR 0013 D4; #269): its workspace
 # is private and seeded, and nothing uncommitted is carried between launches.
 WORKTREE_STATE_CONTAINER_TEMPLATE = "worktree_state_container.md"
+# Every phase's note under a backend that seeds (#271).
+SEED_HISTORY_CONTAINER_TEMPLATE = "seed_history_container.md"
 # How much of the worktree's `git status` such a prompt quotes: the first
 # entries, each path cut to a bound, then how many more there are.
 MAX_WORKTREE_STATE_ENTRIES = 50
@@ -4745,6 +4747,46 @@ class ControllerEngine:
             )
         return variables
 
+    def _sandbox_section(self) -> str:
+        """``{{SANDBOX_SECTION}}``: a seeded launch's note, "" for bwrap and ``disabled``.
+
+        Under a backend that seeds (ADR 0013 D4, D11; #271): the seeded
+        copy's history depth and whether tags come with it, as the
+        operator's ``sandbox.container`` settings make the seed, the
+        settings that give more, what staging supports (D2), and that
+        uncommitted work is discarded. A host that cannot enforce renders
+        none; its launch is refused where its sandbox is established.
+        """
+        try:
+            seeds = self._launch_seeds()
+        except AutoForgeError:
+            seeds = False
+        if not seeds:
+            return ""
+        settings = self.config.sandbox.container
+        depth = settings.history_depth
+        if depth == "full":
+            history = "It holds every ancestor of the commit it was seeded from."
+        elif depth == 0:
+            history = (
+                "It holds the base commit at depth one, without its parents, and the "
+                "commits this phase names above it: history below the base is cut off."
+            )
+        else:
+            history = (
+                f"It holds {depth} commit(s) below the base and the commits this phase names "
+                "above it: older history is cut off there."
+            )
+        tags = (
+            "The tags that point at a commit it holds come with it."
+            if settings.history_tags
+            else "No tag comes with it."
+        )
+        return render(
+            load_template(SEED_HISTORY_CONTAINER_TEMPLATE),
+            {"HISTORY_DEPTH": history, "HISTORY_TAGS": tags},
+        )
+
     # -- what the worktree holds uncommitted (#187) ---------------------------
     def _read_worktree_state(self, cwd: str) -> tuple[str, str]:
         """``{{WORKTREE_STATE}}`` for a write phase's launch in ``cwd``, and the run log's note.
@@ -5246,7 +5288,11 @@ class ControllerEngine:
             raise StateTransitionError(f"unknown template {template}")
         prompt = render_phase(
             template,
-            {**self._prompt_variables(), "PROVIDER_SECTION": self._provider_section(phase)},
+            {
+                **self._prompt_variables(),
+                "PROVIDER_SECTION": self._provider_section(phase),
+                "SANDBOX_SECTION": self._sandbox_section(),
+            },
             common_template=COMMON_TEMPLATE,
         )
         if correction_error is not None:

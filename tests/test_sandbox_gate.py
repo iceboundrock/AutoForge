@@ -299,3 +299,49 @@ def test_merge_verification_commands_under_the_container_backend_are_refused_too
     # bwrap runs them as before.
     monkeypatch.setattr(engine_module, "launch_backend", engine_module.default_backend)
     eng._command_backend_gate(Phase.READY_FOR_MERGE)  # noqa: SLF001
+
+
+# -- the seeded copy's prompt section (ADR 0013 D2, D4, D11; #271) ---------------
+@pytest.mark.parametrize(
+    "depth, tags, says",
+    [
+        (0, False, ("base commit at depth one", "No tag comes with it.")),
+        (3, True, ("3 commit(s) below the base", "tags that point at a commit")),
+        ("full", False, ("every ancestor",)),
+    ],
+)
+def test_a_seeded_launchs_prompt_says_how_deep_its_history_is_and_what_gives_more(
+    tmp_state_dir, fake_github, sandbox_probe, monkeypatch, depth, tags, says
+):
+    cfg = _cfg("required")
+    cfg.sandbox.container.history_depth = depth
+    cfg.sandbox.container.history_tags = tags
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, cfg=cfg, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    assert eng._sandbox_section() == ""  # noqa: SLF001 - bwrap seeds nothing
+    monkeypatch.setattr(engine_module, "launch_backend", lambda: _ContainerKind())
+    section = " ".join(eng._sandbox_section().split())  # noqa: SLF001
+    for phrase in (
+        *says,
+        "It has no remote",
+        "sandbox.container.history_depth",
+        "sandbox.container.history_tags",
+        "a submodule (a gitlink) is an empty directory",
+        "a Git LFS file is its pointer file",
+        "a sparse checkout is not applied",
+        "Whatever you leave uncommitted when the launch ends is discarded",
+    ):
+        assert phrase in section, phrase
+    assert "{{" not in section
+    prompt = eng.render_prompt_for(Phase.ANALYZE_EXECUTE)
+    assert "Your repository is a seeded copy" in prompt
+
+
+def test_a_bwrap_or_disabled_prompt_has_no_seeded_copy_section(
+    tmp_state_dir, fake_github, sandbox_probe
+):
+    eng = make_engine(
+        tmp_state_dir, implement, github=fake_github, cfg=_cfg("disabled"), origin=True
+    )
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    assert "seeded copy" not in eng.render_prompt_for(Phase.ANALYZE_EXECUTE)
