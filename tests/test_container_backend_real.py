@@ -18,6 +18,11 @@ test skips with the reason, never passes;
 ``AUTOFORGE_REQUIRE_CONTAINER_RUNTIME=1`` makes those a failure instead.
 Every object a test creates carries its launch's names and is removed by
 the lifecycle; the image AutoForge builds is left in the store, keyed.
+
+The entrypoint test (R1-F8 of PR #506) builds a base of its own from
+``AUTOFORGE_CONTAINER_TEST_BASE`` with a nontrivial ``ENTRYPOINT`` and
+names it by digest, which a local build has only on Podman: on Docker it
+skips, untested.
 """
 
 from __future__ import annotations
@@ -41,7 +46,7 @@ from autoforge.sandbox_container import HostContext, ProbeRoot, StagingMethod
 from autoforge.sandbox_lifecycle import LaunchLifecycle
 from autoforge.seed_pack import SeedSettings
 
-from .test_container_backend import PLANNED, Journal, ProbeJournal, inputs_for
+from .test_container_backend import PLANNED, Journal, ProbeJournal, inputs_for, planner
 from .test_seed_pack import out, review_repo
 from .test_source_staging import KEY, RecordingLock, staging_for
 
@@ -86,15 +91,16 @@ def world(tmp_path, client):
         checkouts=(str(review.repo),),
     )
 
-    def backend(transfer: str) -> ContainerBackend:
+    def backend(transfer: str, built=None) -> ContainerBackend:
         made = ContainerBackend(
             client,
             host=host,
             common_dir=common,
             sandbox_key=KEY,
             seed_settings=SeedSettings(),
-            image=image,
+            image=built or image,
             transfer=transfer,
+            credentials=planner(),
             staging=lambda method: staging_for(review.repo, method, lock=RecordingLock()),
         )
         runtime = made.runtime_check()
@@ -182,3 +188,67 @@ def test_an_agent_commit_is_exported_and_imported_with_the_same_id(world, transf
     )
     assert inputs.owner.launch not in listing.stdout
     assert json.loads(json.dumps(result.sandbox.record()))["backend"] == "container"
+
+
+def _launch_output(backend, review, tmp_path, launch: str, command: list[str]):
+    """One agent launch's command output through the lifecycle, on a real runtime."""
+    runtime = backend.runtime_check()
+    backend.staging_method()
+    gi = LaunchGitInput(
+        phase="FIX", run="run-real", issue=271, launch=launch, repository="owner/repo",
+        object_format="sha1", seed=review.head, lower=review.merge_base, carried="",
+        export_command=False, entry_label="entry-1",
+    )  # fmt: skip
+
+    class _World:
+        tmp = tmp_path
+
+    inputs = inputs_for(_World, gi, export=False)  # type: ignore[arg-type]
+    lifecycle = LaunchLifecycle(backend, Journal(), inputs, runtime, change_producing=False)
+    with lifecycle:
+
+        def run():
+            handle = lifecycle.establish(PLANNED)
+            return execute(
+                ExecutionRequest(
+                    command=command,
+                    env_allowlist=(),
+                    sandbox=bind(PLANNED, backend, handle),
+                    timeout_seconds=300,
+                )
+            )
+
+        return lifecycle.launch(run)
+
+
+def test_a_base_images_entrypoint_never_replaces_the_watcher(world, client):
+    """PID 1 of a launch container is the watcher, though the base has an entrypoint."""
+    review, _, make_backend, tmp_path = world
+    identity = client.identity()
+    if identity.product.value != "Podman":
+        _unavailable("a locally built base has a digest to name it by only on Podman")
+    context = tmp_path / "hijacking-base"
+    context.mkdir()
+    (context / "Containerfile").write_text(
+        f"FROM {BASE}\n"
+        'ENTRYPOINT ["/bin/sh", "-c", "echo hijacked > /tmp/hijacked; exec sleep 100000"]\n'
+    )
+    iid = tmp_path / "hijacking.iid"
+    built = client.run(
+        ["build", "--pull=never", f"--iidfile={iid}", f"--file={context / 'Containerfile'}",
+         "--tag=localhost/autoforge-test-entrypoint:latest", str(context)],
+        timeout_seconds=1800,
+    )  # fmt: skip
+    assert built.exit_code == 0, built.stderr
+    digest = client.run(
+        ["image", "inspect", "--format", "{{.Digest}}", iid.read_text().strip()]
+    ).stdout.strip()
+    base = f"localhost/autoforge-test-entrypoint@{digest}"
+    image = ImageBuilder(client, identity.product).ensure(ImageInputs(base=base))
+    backend = make_backend("copy", image)
+    result = _launch_output(
+        backend, review, tmp_path, "L-entrypoint",
+        ["sh", "-c", "tr '\\0' ' ' < /proc/1/cmdline; test ! -e /tmp/hijacked && echo clean"],
+    )  # fmt: skip
+    assert result.exit_code == 0, result.stderr
+    assert "container_watch.py" in result.stdout and "clean" in result.stdout
