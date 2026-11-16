@@ -882,6 +882,88 @@ withheld. Or a `SandboxPolicyError` naming variables and kinds. It reads
 no file and holds the value only in the projection's `Secret`. Nothing
 calls it before #271 builds the launch container's create from it.
 
+**The seed and the staged source (ADR 0013 D2, D4, D11, D12; #292)**, in
+two executor-layer modules that hold no runtime, write no journal and are
+reached by nothing before #271:
+
+- **`seed_pack.py`** builds a launch's seed from its git input alone,
+  never from a revision read again: `select_seed()` reads, from the shared
+  store, the commits D11 names (the bound seed and carried commit, every
+  commit above the lower boundary, and as shallow boundaries the lower
+  boundary and each out-of-range parent; more only by
+  `sandbox.container.history_depth`), and with `history_tags` the store's
+  tags that peel to a seeded commit with their chains' tag objects. The
+  range is proven, never taken from git (ADR 0004 D7.5): git's
+  `rev-list <seed> --not <lower>` only names the commits to read, the
+  range is walked from the seed through the parent links of re-hashed
+  commits, the lower boundary is an ancestor of the seed only when that
+  walk reaches it, and a parent the walk stops at stays out only when a
+  walk from the lower boundary through re-hashed links reaches it. So a
+  rewritten ancestor of the lower boundary, which is never packed, can
+  refuse the seed or enlarge it but never hide a commit from it. Then
+  `build_seed()` packs exactly those objects (`rev-list --objects` and
+  `pack-objects` in a private git directory whose only store is the shared
+  one, as an alternate, with the boundaries in its `shallow` file), writes
+  the manifest (the launch's identity, the boundaries, the tags, the
+  history settings, the pack's size, count and SHA-256; its digest is what
+  the git input binds), and runs `check_seed()`: the files and the
+  manifest strictly, the bounds (`seed_max_bytes`, `seed_max_objects`;
+  a refusal names them and a history setting that grew the seed), then
+  `index-pack --strict` into a quarantine of its own whose `shallow` file
+  names the manifest's boundaries, exact commits, exact tag objects, each
+  tag peeling to a commit of the pack, and the closure. Every refusal is
+  `SandboxLaunchRefusedError`, a setup failure before any journal entry.
+  Nothing is checked out, so no attribute, filter or hook applies. Every
+  git that reads an object of the shared store runs in a private git
+  directory that reads the store as its alternate and no configuration of
+  the store's or the operator's (`isolated_store()`): no promisor remote
+  is configured there, so no git version fetches a partial clone's
+  missing object lazily, and the object refuses the seed instead.
+  `GIT_NO_LAZY_FETCH`, which only git 2.44 and later read, is set as a
+  second guard. The store itself is asked only for its tag refs' names and
+  ids and two configuration values, which read no object. The seed's
+  diagnostics (D2's table) ride on `sandbox_backend.Seed.diagnostics` for
+  #271 to report.
+- **`source_staging.py`**'s `SourceStaging` is what a container backend
+  calls for its source, in the form #271's probe chose
+  (`sandbox_container.StagingMethod`): `seed()` in the seed step;
+  `make_staging_root()` in the create step, bind form only, after the
+  lifecycle journaled the root: refused before anything is created unless
+  the launch's owner (run, issue, phase, launch id), its git input, its
+  seed's manifest and the root's launch id agree; the layout reached
+  through `safefs` with every directory checked to be on the common dir's
+  own mount (by the kernel's mount id) before anything is created in it;
+  the launch's directory created exclusively under L1, its owner record
+  (the sandbox key, the owner and its journal entry's nonce) written
+  first and published atomically through `safefs`'s exclusive create
+  (whole and fsynced before it has its name, PR #504 R2-F2); every
+  directory written in it, the tree writer's included, made exclusively
+  and checked on its held descriptor (on the root's mount, empty) before
+  its mode is set or anything is made in it, and a file written only
+  through a directory reached and checked that way (R2-F1); the seed
+  copied only while its manifest hashes to the input's digest; the read
+  context copied and recorded entry by entry; and the tree written by
+  `materialize.materialize_into()` (the same writer and hash-back proof as
+  the pre-merge export, into a directory held open, reading the store
+  through `isolated_store()`, with the staging root's check of each
+  directory passed as its `check_directory`); `reprove()` right before
+  each create that binds it (no mount in the layout, the same directory by
+  device and inode, its four entries, the same owner record, every entry
+  below it on its own mount, owned and with the exact mode
+  `StagedSource.ownership` records, the same seed, the same read context,
+  the tree proved again by `materialize.prove_tree()`); and
+  `remove_staging_root()`, idempotent, for the release and reconciliation:
+  it removes only a directory that is empty, holds its entry's owner
+  record, or holds only `safefs`'s named temporary of that record's
+  interrupted publication with a prefix of exactly its bytes (a host
+  without `O_TMPFILE`), never one with a partial or foreign record,
+  refuses (uncertain) when a mount is anywhere below it before
+  removing anything, and never descends into a directory on another mount.
+  The bind form needs Linux's mount ids (`/proc/self/fdinfo`). The copy-in
+  form stages nothing on the host. `StagedSource.ownership` records the
+  owner and modes every staged entry has, for #271; nothing here changes
+  ownership for a backend.
+
 #### Launch routing (ADR 0005, #168)
 
 When the outer sandbox is enforced (`sandbox.mode: required`, or

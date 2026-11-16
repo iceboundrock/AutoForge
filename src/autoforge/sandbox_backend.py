@@ -300,12 +300,17 @@ class Seed:
     (``sha256:<hex>`` of :data:`~autoforge.git_input.SEED_MANIFEST_NAME` in
     ``directory``), which the launch's git input binds at the step's end;
     ``directory`` the controller-owned temporary directory that holds the
-    seed until the launch's steps have used it. Both are empty for a
-    backend that seeds nothing (:data:`NO_SEED`).
+    seed until the launch's steps have used it; ``diagnostics`` what staging
+    supports of the seed's tree and store (ADR 0013 D2's table: a submodule,
+    Git LFS, a filter or conversion attribute, a sparse checkout, a partial
+    clone), one line each, for the launch's facts and its agent's prompt
+    (#292 states them, #271 carries them). All are empty for a backend that
+    seeds nothing (:data:`NO_SEED`).
     """
 
     identity: str = ""
     directory: str = ""
+    diagnostics: tuple[str, ...] = ()
 
 
 NO_SEED = Seed()

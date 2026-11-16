@@ -22,7 +22,7 @@
   },
   "equalized_settings": {
     "config": "real_run_config.yaml",
-    "digest": "1f0758976ea2e07adcdf80f958c6a0f711162717aa9017472b8258bc5ef7d96d",
+    "digest": "00c4def539ba6327ec16de60066b397dd8d107767777fdf8b4aa9547926cf2a5",
     "hold_equal": [
       "repository tasks and base commits",
       "models and providers",

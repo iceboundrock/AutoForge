@@ -1206,6 +1206,115 @@ exactly when `tests/sandbox_host.py` measures the host capable
   every one). A refused route starts no CLI; a replacement launch that
   shares the first one's workspace and cache volume finds an empty store,
   the rotated key and nothing the first wrote.
+- `tests/test_seed_pack.py` (#292) is ADR 0013 §7's seed list, with real
+  git in `tmp_path` stores (both object formats where the format matters)
+  and no runtime. Each seed is read back as a stager would: indexed into a
+  fresh repository whose `shallow` file names the manifest's boundaries.
+  A base seed is the base at depth one, its whole tree, no tag, ref or
+  reflog even when the store has tags on it; a `REVIEW` seed holds the
+  bound HEAD, the merge base and the commits between, and `git diff` from
+  the merge base to the HEAD inside it is the host's; a PR branch that
+  merged its base has the merge base and the fork point as boundaries, and
+  every commit diffs against each parent, and one that merged it twice
+  has each parent outside the range proven below the merge base, the
+  fork point through the first merged commit; a rewritten ancestor of the
+  merge base that claims a commit of the range as its parent (both object
+  formats) shrinks git's own range but refuses the seed, naming that
+  commit, and a rewritten commit on the proof's way refuses it on its id,
+  with nothing written either time (PR #504 R3-F1); a force-pushed head gets a seed
+  of its own revision and none of the earlier candidate's commits; a
+  relaunch carries its carried commit; an export command's seed is one
+  commit; `history_depth` 1 and `full` add exactly those commits;
+  building writes nothing to the store. With `history_tags` off no tag
+  object is packed; on, the manifest names exactly the tags peeling to a
+  seeded commit (a tag of a tag included), the pack holds exactly their
+  chains' tag objects, and a tag to a commit outside the seed, a tree or
+  a blob is left out. The bounds refuse naming the setting, and the
+  history setting or the tags that made the seed larger. The seed's own
+  checks each refuse a pack built wrong one way from the same store: a
+  corrupt object and a missing tree or blob (`index-pack --strict`), a
+  missing seed or carried commit, a commit D11 does not name or lacks, a
+  tag object the tag set does not reach or misses, a tag peeling to no
+  commit of the pack, the size and count bounds, a pack whose bytes are
+  not the manifest's, a manifest that disagrees, and a directory holding
+  more or a link.
+- `tests/test_source_staging.py` (#292) covers both staging forms with no
+  runtime. The bind form's staging root holds the tree a control
+  `materialize()` writes, the seed the input binds and the read context;
+  two stagings of one base are byte-identical (modes and links) and leave
+  the checkout's HEAD, index, status and files unchanged; no untracked,
+  ignored, `.git` or home file is staged. A byte, a mode, an entry or the
+  seed changed on the host, a directory substituted at the path (a
+  faithful copy included), a link planted there, another journal entry's
+  owner record, a read-context entry added, changed, removed or
+  substituted (a directory, a link, a FIFO), and a permission bit of any
+  entry that is not the one its ownership record says (a tree file a
+  non-owner can no longer read included) each fail the re-proof; the
+  record holds for every entry whatever the umask. Mounts are found by
+  the kernel's mount id: simulated, below the root (a directory, a file,
+  a seed or read-context entry) and in its layout, they fail the re-proof
+  and refuse a new root before anything is written in the mounted
+  directory, and a directory made while the root is written (the tree
+  writer's `tree/src`, the read context's `files`, and that one again
+  after its check, before a file is written through it) is refused on its
+  descriptor, left empty with its `mkdir`'s mode (PR #504 R2-F1); real
+  ones, made in a user and mount namespace of the test's own (a bind
+  mount from the same filesystem on a directory and on a file, a tmpfs, a
+  bind mount over the root, one over the layout's `stage`, and a bind
+  mount made at those three directories while the root is written), are
+  refused the same way and never removed through, the directory outside
+  keeping its entries, bytes and permission bits, and are skipped as
+  untested where the host refuses that namespace. A seed whose digest is
+  not the input's is never written into a staging root, and a seed, a
+  staging root or a root's launch id that does not agree with the
+  launch's owner and git input (its run, issue, phase or launch id) is
+  refused before anything is built or created; the root is created under
+  L1 and never reused; a link in its layout is refused and nothing is
+  written through it. Removal is idempotent and leaves another launch's
+  root; it leaves in place, as uncertain, what is not the launch's
+  directory (a link, a real directory substituted at the path, one
+  holding another entry's owner record, another launch's root moved
+  there) and a root with a mount anywhere below it, removing nothing, and
+  a directory mounted after that check stops the removal before it
+  descends, with the owner record kept for a later removal to finish.
+  Reconciliation through the lifecycle's `reconcile()` removes a crash's
+  leftovers (an empty directory, one holding only its owner record, a
+  whole root) and leaves the rest open. A child process killed
+  (`os._exit`, no handler runs) at each point of the owner record's
+  publication, on the `O_TMPFILE` path and on the named temporary a
+  filesystem without it gets (made with nothing written, part written,
+  whole and not linked, linked with its temporary not yet removed,
+  published), never leaves a partial record, and reconciliation removes
+  what it left and closes the entry (PR #504 R2-F2); a partial or empty
+  owner record, a temporary holding another entry's bytes or more than
+  the record, one beside another entry, two of them, a name that is not
+  `safefs`'s and a temporary with a second name are left in place,
+  uncertain. The copy-in form stages nothing
+  on the host. Hostile input on the host path: a
+  `.gitattributes` naming a filter driver, `ident`, `eol=crlf`, `text` and
+  LFS, with the driver and a fake `git-lfs` in the operator's global
+  configuration writing a sentinel, and a gitlink: the staged bytes and
+  the pack's blobs are the blobs', the sentinel is never written, the
+  pointer stays a pointer, the gitlink is an empty directory, and the
+  diagnostics name each case (and a sparse checkout). A partial-clone
+  store whose blob the seed needs is a typed refusal with no connection to
+  its recording promisor remote and a byte-identical store, and so is one
+  whose blob only the staging root's tree needs, both also through a git
+  that ignores `GIT_NO_LAZY_FETCH` (as one older than 2.44 does): every
+  git that reads the store's objects, in the seed step, the tree and its
+  re-proof, runs in a private git directory with no configuration of the
+  operator's, and the store itself is asked only for its tag refs and two
+  configuration values. One more test pins that the existing
+  `materialize()` path does fetch it lazily (a defect of that path, not
+  fixed by #292 and left to a follow-up issue of its own). Through
+  `LaunchLifecycle` on a container-shaped fake whose source is the real
+  `SourceStaging` and whose creates render #270's real options: the seed
+  is checked before any journal entry, the staging root's entry precedes
+  the root, the root is re-proved before each create that binds it,
+  `/source` is a read-only bind and `/workspace` a writable volume, and
+  the release removes the root; the copy-in form's stager gets the seed's
+  two files alone; a seed over its bound journals and creates nothing; a
+  tree changed between its proof and the hand-off creates no container.
 
 The existing executor and duplex suites are the no-description regression:
 they run unchanged.
@@ -1704,7 +1813,10 @@ a stated reason it has none. The coverage that must keep working:
   directory before the strict import (it exports after it), and anything
   but a full commit id are not materializable; a replacement object changes
   nothing; the directory is removed after a pass, a failure and an
-  exception. Its comparison of a working tree with a commit
+  exception. `materialize_into()`'s caller check runs on every directory
+  the writer uses (the root, each tree and gitlink), on its descriptor,
+  empty and before its mode is set, and one it refuses is left empty with
+  its `mkdir`'s mode, nothing written past it (PR #504 R2-F1). Its comparison of a working tree with a commit
   (`tree_differences`, PR #444 R3-F1) lists a changed byte, a flipped
   execute bit, a retargeted link, a deletion and a retyped file by raw
   path, and takes a gitlink as the commit's only as an empty real

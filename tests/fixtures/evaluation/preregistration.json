@@ -25,6 +25,12 @@
       "change": "The prompt label moves from `v17` to `v18`, which moves the settings digest and the digests that hold it",
       "why": "#433 changed the prompts: a FIX agent that must report `blocked` may list the findings it fixed and the ones it left, and the controller publishes the commits it verifies; a REVIEW agent is told how such a partial fix is carried to it. Every arm runs one controller commit with one label, so what is compared does not move, and no threshold, task or other setting changes",
       "real_runs_before": "None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since"
+    },
+    {
+      "date": "2026-11-16",
+      "change": "Four keys are added under `sandbox.container`, which moves the settings digest and the digests that hold it",
+      "why": "#292 adds the container backend's seed settings (`history_depth`, `history_tags`, `seed_max_bytes`, `seed_max_objects`). Nothing reads them before that backend is selectable, `real_run_config.yaml` sets none, and every launch of every arm is what it was, so what is compared does not move, and no threshold, task or other setting changes",
+      "real_runs_before": "None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added to the repository since"
     }
   ],
   "statistics": {

@@ -565,9 +565,9 @@ An amendment changes the files of section 1 and these digests in one reviewed ch
 **and states whether any real run had been made.** A record carries the digests it was made under, and a
 report refuses to decide over records of another, so criteria cannot move under results.
 
-- `manifest.json`: `55db3cf5afd04fe3bbc2b19b6f40f709624464e4a1b660cd4a7de40daec469b9`
-- `preregistration.json`: `fc2b8fcf95769b0f1df308658ab8874bb85354bc971af05b089c99c986f6bd9a`
-- `real_run_config.yaml`: `1f0758976ea2e07adcdf80f958c6a0f711162717aa9017472b8258bc5ef7d96d`
+- `manifest.json`: `7b76d1faac1d008bfcee143153f58b9b8220d704791ead89fe08435aa8ee90f1`
+- `preregistration.json`: `59556c0ca4587dd5b90851a25e05fa52c8964c6a67091add39da8e0b79fc8060`
+- `real_run_config.yaml`: `00c4def539ba6327ec16de60066b397dd8d107767777fdf8b4aa9547926cf2a5`
 
 | Date | Change | Why | Real runs before it |
 |---|---|---|---|
@@ -575,3 +575,4 @@ report refuses to decide over records of another, so criteria cannot move under 
 | 2026-11-06 | The prompt label moves from `v16` to `v17` and the configuration gains `safety.pr_body_updates`, which moves the settings digest and the digests that hold it. | #423 changed the prompt and the setting: a FIX agent may ask the controller to replace the description of the run's own PR, on by default. Every arm runs one controller commit with one label and the same setting, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |
 | 2026-11-07 | Two allow-list keys are added under `execution`, which moves the settings digest and the digests that hold it. | #286 gives agent launches and repository commands an allow-list key each. `real_run_config.yaml` sets neither, so every launch of every arm gets the names it got before, and no threshold, task or other setting changes. `tests/evaluation.py` reads the repository commands' names, as the engine now does, so its copy of the validation policy stays the engine's. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |
 | 2026-11-11 | The prompt label moves from `v17` to `v18`, which moves the settings digest and the digests that hold it. | #433 changed the prompts: a FIX agent that must report `blocked` may list the findings it fixed and the ones it left, and the controller publishes the commits it verifies; a REVIEW agent is told how such a partial fix is carried to it. Every arm runs one controller commit with one label, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |
+| 2026-11-16 | Four keys are added under `sandbox.container`, which moves the settings digest and the digests that hold it. | #292 adds the container backend's seed settings (`history_depth`, `history_tags`, `seed_max_bytes`, `seed_max_objects`). Nothing reads them before that backend is selectable, `real_run_config.yaml` sets none, and every launch of every arm is what it was, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added to the repository since. |

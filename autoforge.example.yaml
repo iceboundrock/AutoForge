@@ -555,3 +555,19 @@ sandbox:
   # the gh and git configuration, keyrings, /run, /proc, /dev, /sys. A token
   # in a listed file (~/.npmrc) is readable by every tool in the sandbox.
   read_only_paths: []         # e.g. ["/opt/toolchain", "/home/me/.npmrc"]
+  # The container backend's seed (ADR 0013 D4, D11; #292). Read by nothing
+  # until that backend is selectable (#273); bwrap launches are unaffected.
+  # A container never sees your checkout: it gets a snapshot of the commit
+  # the phase bound, from the shared object store, so uncommitted edits are
+  # never its input (docs/configuration.md, "The container backend's seed").
+  container:
+    # Commits below the base (or a review's merge base) the agent's
+    # repository gets: 0 is the base at depth one; `full` is every ancestor.
+    history_depth: 0          # 0 or more | full
+    # Tags that peel to a seeded commit, a local tag you never pushed
+    # included. Off: no tag at all.
+    history_tags: false
+    # The seed pack's bounds: a seed over either is refused before anything
+    # of the launch is created, naming the setting.
+    seed_max_bytes: 2147483648   # 2 GiB
+    seed_max_objects: 1000000
