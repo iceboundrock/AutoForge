@@ -1173,3 +1173,12 @@ def test_the_facts_carry_the_seeds_diagnostics(tmp_path):
     assert facts.diagnostics == diagnostics
     assert facts.record()["diagnostics"] == list(diagnostics)
     assert "diagnostics" not in world.backend._facts(PLANNED).record()  # noqa: SLF001
+
+
+def test_the_backends_policy_inputs_name_what_it_runs_on_and_nothing_unknown(tmp_path):
+    world = make_world(tmp_path)
+    inputs = dict(world.backend.policy_inputs())
+    assert inputs["backend"] == "container" and inputs["runtime"] == "Podman"
+    assert inputs["image"] == IMAGE.digest and inputs["staging"] == ""
+    world.backend.staging_method()
+    assert dict(world.backend.policy_inputs())["staging"] == "copy"

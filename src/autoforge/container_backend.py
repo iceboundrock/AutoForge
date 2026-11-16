@@ -1250,6 +1250,22 @@ class ContainerBackend:
             self._tainted.discard(obj.name)
         return outcome
 
+    def policy_inputs(self) -> tuple[tuple[str, str], ...]:
+        """P's container inputs (ADR 0006 D8.1 as amended): "" for what is not known yet."""
+        identity = self._identity
+        method = ""
+        if self._method is not None and identity is not None:
+            if self._method_report == identity.report():
+                method = self._method.value
+        return (
+            ("backend", BackendKind.CONTAINER.value),
+            ("runtime", identity.name if identity else ""),
+            ("image", self._image.digest if self._image else ""),
+            ("staging", method),
+            # The tree is proved inside the container by the prover (D6.3 as amended).
+            ("materialization", "container-prover"),
+        )
+
     # -- the runtime's calls ------------------------------------------------------
     def _call(self, args: list[str], **kwargs: object) -> ExecutionResult:
         return self._client.run(args, **kwargs)  # type: ignore[arg-type]

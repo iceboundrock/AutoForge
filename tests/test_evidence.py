@@ -1312,3 +1312,36 @@ def test_a_full_failure_stays_terminal_whatever_passes_beside_it():
     assert found.failed is not None and found.failed.seq == 1 and not found.complete
     overridden = ev.find_evidence(records, remote(), (WHOLE,), policy(), 1)
     assert overridden.records == () and not overridden.decided
+
+
+def test_a_containers_backend_inputs_join_p_and_a_bwrap_digest_is_unchanged():
+    """ADR 0006 D8.1 as amended (#267, #271): a container launch's P covers the backend,
+    the runtime, the image and the staging method; bwrap's P is what it was."""
+    from autoforge.evidence import POLICY_ENCODING, _sha256
+
+    plain = policy()
+    assert plain.digest == _sha256(
+        {
+            "version": POLICY_ENCODING,
+            "mode": plain.mode,
+            "template": plain.template_digest,
+            "env_allowlist": plain.env_names_digest,
+            "timeout_seconds": plain.timeout_seconds,
+            "contain_orphans": plain.contain_orphans,
+            "method": plain.method,
+        }
+    ), "a bwrap P is computed exactly as before"
+    container = policy(
+        backend_inputs=(
+            ("backend", "container"),
+            ("runtime", "Podman"),
+            ("image", "sha256:" + "a" * 64),
+            ("staging", "bind"),
+        )
+    )
+    assert container.digest != plain.digest
+    for name, other in (("image", "sha256:" + "b" * 64), ("staging", "copy"), ("runtime", "")):
+        changed = dict(container.backend_inputs)
+        changed[name] = other
+        assert policy(backend_inputs=tuple(changed.items())).digest != container.digest
+    assert "image sha256:" in container.describe() and "image" not in plain.describe()

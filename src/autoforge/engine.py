@@ -4754,14 +4754,12 @@ class ControllerEngine:
         copy's history depth and whether tags come with it, as the
         operator's ``sandbox.container`` settings make the seed, the
         settings that give more, what staging supports (D2), and that
-        uncommitted work is discarded. A host that cannot enforce renders
-        none; its launch is refused where its sandbox is established.
+        uncommitted work is discarded. Read from the configuration and the
+        backend's kind alone, never by probing the host, so a dry run's
+        prompt probes nothing: a host that cannot enforce is refused where
+        the launch's sandbox is established, before this prompt is used.
         """
-        try:
-            seeds = self._launch_seeds()
-        except AutoForgeError:
-            seeds = False
-        if not seeds:
+        if not self.config.sandbox.enabled or launch_backend().kind is BackendKind.BWRAP:
             return ""
         settings = self.config.sandbox.container
         depth = settings.history_depth
@@ -6994,6 +6992,9 @@ class ControllerEngine:
             timeout_seconds=cfg.execution.command_timeout_seconds,
             contain_orphans=True,
             method=MATERIALIZATION_METHOD,
+            # A container's backend, runtime, image and staging (ADR 0006 D8.1
+            # as amended); bwrap names none, so its P is what it was.
+            backend_inputs=launch_backend().policy_inputs() if cfg.sandbox.enabled else (),
         )
 
     def _launch_validator(

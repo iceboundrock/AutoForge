@@ -278,6 +278,10 @@ class Policy:
     timeout_seconds: int
     contain_orphans: bool
     method: str
+    # The backend's own inputs (ADR 0006 D8.1 as amended by #267): for a
+    # container, the backend, the runtime's product, the image id and the
+    # staging method; empty for bwrap, whose digest is exactly what it was.
+    backend_inputs: tuple[tuple[str, str], ...] = ()
 
     @property
     def template_digest(self) -> str:
@@ -289,17 +293,21 @@ class Policy:
 
     @property
     def digest(self) -> str:
-        return _sha256(
-            {
-                "version": POLICY_ENCODING,
-                "mode": self.mode,
-                "template": self.template_digest,
-                "env_allowlist": self.env_names_digest,
-                "timeout_seconds": self.timeout_seconds,
-                "contain_orphans": self.contain_orphans,
-                "method": self.method,
-            }
-        )
+        inputs: dict[str, object] = {
+            "version": POLICY_ENCODING,
+            "mode": self.mode,
+            "template": self.template_digest,
+            "env_allowlist": self.env_names_digest,
+            "timeout_seconds": self.timeout_seconds,
+            "contain_orphans": self.contain_orphans,
+            "method": self.method,
+        }
+        # Only a backend that names inputs adds them: a record made under one
+        # backend never applies under another, and a changed image withdraws
+        # evidence; a bwrap record's digest is unchanged.
+        if self.backend_inputs:
+            inputs["backend"] = dict(self.backend_inputs)
+        return _sha256(inputs)
 
     @property
     def requires_enforcement(self) -> bool:
@@ -319,10 +327,15 @@ class Policy:
 
     def describe(self) -> str:
         """One line for the dry-run plan and ``status``."""
-        return (
+        text = (
             f"mode {self.mode}, digest {self.digest[:16]}..., timeout {self.timeout_seconds}s, "
             f"method {self.method}"
         )
+        if self.backend_inputs:
+            text += ", " + ", ".join(
+                f"{name} {value or '?'}" for name, value in self.backend_inputs
+            )
+        return text
 
 
 # -- candidates (D2.1-D2.7) ------------------------------------------------------------
