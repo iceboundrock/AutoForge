@@ -1553,6 +1553,28 @@ image; any change, an AutoForge upgrade included, builds a new one.
 an installed MCP server or Skill stays disabled until a reviewed policy
 amendment enables it (ADR 0013 D7).
 
+The image clears the base's `ENTRYPOINT` and `CMD`, so a container's
+first process is AutoForge's watcher, never a program of the base's; an
+image that still shows an entrypoint is refused when it is built, when the
+cache offers it, and when the backend checks it. Each pinned CLI's version
+is read inside the container, as the agent, and an image whose `claude`,
+`opencode` or `pi` reports another version than the one set here is
+refused. The launch's facts in the run log carry what each reported.
+
+**What a container launch receives of AutoForge's environment.** An agent
+launch receives its model credential, projected by the provider's own
+mapping (#290), and of the rest only a fixed list: the locale, the time
+zone, the terminal, the git author identity and the provider's declared
+settings; `HOME` and the CLI's own stores are fresh places in its private
+home. Nothing else is forwarded, whatever its name. A repository command
+receives the locale, the time zone and the terminal, and no credential.
+
+**Repository commands are refused under this backend for now.** Under the
+container backend, `validation.commands` and `merge.verification_commands`
+run only in a container over the verified tree, never on the host, and
+that routing is not built yet. A step that would run one is refused before
+anything of it is saved or launched, naming the setting.
+
 **How the agent reads `/source`.** In the bind form the staging root's own
 directory and everything in it are readable by every UID (`0755` and
 `0644`) and writable by none but you: under a rootless runtime you are the

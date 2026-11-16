@@ -16,6 +16,14 @@ yet: the container backend becomes selectable only with #272 and #273, and
 bwrap launches are unchanged. See "The container backend's runtime and
 image" in `docs/configuration.md`.
 
+When the backend becomes selectable, it will build the image with the
+base's `ENTRYPOINT` and `CMD` cleared, and refuse an image whose pinned
+CLIs report other versions inside the container. It will forward nothing
+of AutoForge's environment beyond the provider's credential mapping
+(#290), and refuse a step that would run `validation.commands` or
+`merge.verification_commands`, since running them in a container is not
+built yet.
+
 One change reaches the host now: the bind form's staging root, which the
 container backend's `/source` will be, is written readable by every UID
 (`0755` directories, `0644` files) instead of `0700` and `0600`, so that
