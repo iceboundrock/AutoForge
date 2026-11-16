@@ -30,7 +30,8 @@ loopback skips.
 say a host is capable, so these tests run only when the operator names a
 runtime and an image: ``AUTOFORGE_CONTAINER_TEST_RUNTIME`` (``podman`` or
 ``docker``, on ``PATH`` or as a path) and ``AUTOFORGE_CONTAINER_TEST_IMAGE``
-(present locally, with ``python3``; nothing is pulled). A short setup
+(present locally, with ``python3``; nothing is pulled; on Podman the agent's
+home is built onto it, as AutoForge's image holds it). A short setup
 container stands in for the stager (#271) and hands the agent's UID the
 fresh workspace volume. Otherwise, and on a
 runtime that is not rootless or cannot start a container, each test skips
@@ -49,6 +50,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import uuid
 from collections.abc import Iterator
@@ -57,6 +59,7 @@ from pathlib import Path
 
 import pytest
 
+from autoforge.container_image import home_steps
 from autoforge.sandbox_container import (
     AGENT_GID,
     AGENT_UID,
@@ -214,7 +217,30 @@ def runtime() -> Runtime:
     )
     if found.returncode != 0:
         _unavailable(f"the image {image} is not present locally (nothing is pulled)")
+    if product is RuntimeProduct.PODMAN:
+        image = _with_home(executable, image, env)
     return Runtime(product, executable, image, env, keyed)
+
+
+def _with_home(executable: str, image: str, env: dict[str, str]) -> str:
+    """``image`` with the agent's home as AutoForge's image holds it (``home_steps``).
+
+    A Podman launch's home tmpfs is the home's parent, copied up from the
+    image (``_home_tmpfs``); a bare base has no home of the agent's to copy.
+    Built locally from the base already present, nothing pulled; its id.
+    """
+    with tempfile.TemporaryDirectory() as context:
+        containerfile = Path(context) / "Containerfile"
+        containerfile.write_text(f"FROM {image}\nUSER 0:0\nRUN " + " && ".join(home_steps()) + "\n")
+        iid = Path(context) / "iid"
+        built = subprocess.run(
+            [executable, "build", "--pull=never", f"--iidfile={iid}",
+             f"--file={containerfile}", context],
+            env=env, capture_output=True, text=True, timeout=_TIMEOUT,
+        )  # fmt: skip
+        if built.returncode != 0:
+            raise AssertionError(f"building the home onto {image} failed: {built.stderr[-2000:]}")
+        return iid.read_text().strip()
 
 
 def _serve(server: socket.socket, nonce: bytes) -> None:

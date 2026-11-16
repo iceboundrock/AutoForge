@@ -42,6 +42,7 @@ from autoforge.sandbox_container import (
     CACHE_TARGET,
     CGROUP_TARGET,
     DEV_LINKS,
+    HOME_PARENT,
     HOME_TARGET,
     HOST_ALIASES,
     HOST_UID_MAP,
@@ -61,6 +62,7 @@ from autoforge.sandbox_container import (
     Expectation,
     FileCredential,
     HostContext,
+    MountKind,
     Projection,
     RuntimeProduct,
     Secret,
@@ -351,9 +353,18 @@ def test_the_writable_places_are_the_volumes_the_home_and_temp(staging, credenti
     for product, spec in _every_spec(staging, credential):
         options = _options(_argv(spec, host, product))
         tmpfs = sorted(o.split("=", 1)[1].split(":", 1)[0] for o in options if "--tmpfs" in o)
-        assert tmpfs == sorted([HOME_TARGET, TMP_TARGET])
-        home = next(o for o in options if o.startswith(f"--tmpfs={HOME_TARGET}:"))
-        assert f"uid={AGENT_UID}" in home and f"gid={AGENT_GID}" in home and "mode=0700" in home
+        if product is RuntimeProduct.PODMAN:
+            # Rootless Podman refuses uid=/gid= (_home_tmpfs): the tmpfs is the home's
+            # parent, and the image's own home, the agent's and 0700, is copied up.
+            assert tmpfs == sorted([HOME_PARENT, TMP_TARGET])
+            home = next(o for o in options if o.startswith(f"--tmpfs={HOME_PARENT}:"))
+            assert "tmpcopyup" in home and "mode=0755" in home
+            assert "uid=" not in home and "gid=" not in home
+        else:
+            assert tmpfs == sorted([HOME_TARGET, TMP_TARGET])
+            home = next(o for o in options if o.startswith(f"--tmpfs={HOME_TARGET}:"))
+            assert f"uid={AGENT_UID}" in home and f"gid={AGENT_GID}" in home
+            assert "mode=0700" in home and "tmpcopyup" not in home
         mounts = [o.removeprefix("--mount=") for o in options if o.startswith("--mount=")]
         writable = sorted(m.split("target=")[1] for m in mounts if "readonly=true" not in m)
         expected = [] if spec.role is ContainerRole.EXPORTER else [WORKSPACE_TARGET]
@@ -1180,7 +1191,8 @@ MOUNTINFO = "\n".join(
         f"512 500 0:59 {USERDATA}/resolv.conf /etc/resolv.conf rw,nosuid,nodev - tmpfs tmpfs rw",
         f"513 500 0:59 {USERDATA}/.containerenv /run/.containerenv rw - tmpfs tmpfs rw",
         "514 500 0:60 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw,mode=1777",
-        "515 500 0:61 / /home/agent rw,nosuid,nodev - tmpfs tmpfs rw,mode=700,uid=110001",
+        # Podman's home: a tmpfs at its parent, copied up from the image (_home_tmpfs).
+        "515 500 0:61 / /home rw,nosuid,nodev - tmpfs tmpfs rw,mode=755",
         f"516 500 8:2 {VOLUME_DATA} /workspace rw,relatime - ext4 /dev/sda2 rw",
         f"517 500 8:1 {STAGED} /source ro,relatime - ext4 /dev/sda1 rw",
         "518 501 0:51 /bus /proc/bus ro,nosuid,nodev,noexec,relatime - proc proc rw",
@@ -1267,7 +1279,7 @@ LISTINGS = {
     "/dev/shm": _EMPTY,
     "/sys/firmware": _EMPTY,
     "/tmp": _EMPTY,
-    HOME_TARGET: _EMPTY,
+    HOME_PARENT: {"count": 1, "names": ["agent"], "kinds": {"agent": "dir"}, "links": {}},
     "/proc/acpi": _EMPTY,
 }
 # The staging root's device and inode, as the host reads it and as /source
@@ -1508,7 +1520,7 @@ _HELD = {"count": 2, "names": ["bus", "podman.sock"]}
         {**LISTINGS, "/sys/firmware": _HELD},
         {**LISTINGS, "/dev/shm": {"count": 1, "names": ["sem.host"]}},
         {**LISTINGS, "/tmp": {"count": 1, "names": [".X11-unix"]}},
-        {**LISTINGS, HOME_TARGET: {"count": 1, "names": [".ssh"]}},
+        {**LISTINGS, HOME_PARENT: {"count": 2, "names": ["agent", "operator"]}},
         # The host's message queues or its terminals where the IPC namespace's own and
         # the container's own devpts are.
         {**LISTINGS, "/dev/mqueue": {"count": 1, "names": ["host-queue"]}},
@@ -1581,9 +1593,44 @@ def test_the_runtimes_dev_as_each_runtime_makes_it_is_admitted():
     assert judge({**GOOD, "mountinfo": mountinfo, "listings": listings}, _expect()) == ()
 
 
+# Docker's home: a tmpfs over the home itself, owned by the agent (_home_tmpfs).
+_DOCKER_HOME = "515 500 0:61 / /home/agent rw,nosuid,nodev - tmpfs tmpfs rw,mode=700,uid=110001"
+_DOCKER_MOUNTINFO = MOUNTINFO.replace(
+    "515 500 0:61 / /home rw,nosuid,nodev - tmpfs tmpfs rw,mode=755", _DOCKER_HOME
+)
+_DOCKER_LISTINGS = {
+    **{key: value for key, value in LISTINGS.items() if key != HOME_PARENT},
+    HOME_TARGET: _EMPTY,
+}
+
+
+def test_a_docker_home_is_a_tmpfs_of_its_own_and_a_podman_home_is_in_one():
+    """Docker's tmpfs is the home, holding the projection's mount points; Podman's is the
+    home's parent, holding the home alone (the image's, copied up)."""
+    spec = _launch(source=StagingRoot("/code/.git", "270", LAUNCH_ID))
+    by_product = {
+        product: Expectation.for_spec(spec, product=product, operator_uid=1000, subordinate=())
+        for product in RuntimeProduct
+    }
+    docker = {m.target: m for m in by_product[RuntimeProduct.DOCKER].mounts}
+    podman = {m.target: m for m in by_product[RuntimeProduct.PODMAN].mounts}
+    assert docker[HOME_TARGET].kind is MountKind.TMPFS and HOME_PARENT not in docker
+    assert podman[HOME_PARENT].kind is MountKind.TMPFS and HOME_TARGET not in podman
+    assert podman[HOME_PARENT].entries == {"agent"}
+    expect = dataclasses.replace(_expect(), mounts=by_product[RuntimeProduct.DOCKER].mounts)
+    expect = _identified(expect, {SOURCE_TARGET: SOURCE_ID})
+    docker_obs = {**GOOD, "mountinfo": _DOCKER_MOUNTINFO, "listings": _DOCKER_LISTINGS}
+    assert judge(docker_obs, expect) == ()
+    # Podman's layout where Docker's is expected: the home is no mount, /home one too many.
+    assert {f.detail for f in judge(GOOD, expect)} >= {
+        f"{HOME_TARGET} is not mounted",
+        f"{HOME_PARENT}: the policy made no mount there",
+    }
+
+
 def test_the_home_tmpfs_may_hold_the_projections_mount_points(credential):
     """The runtime makes each projected file's first directory in the home: admitted, and
-    nothing beside it."""
+    nothing beside it. On Docker, where the tmpfs is the home itself."""
     spec = _launch(
         source=StagingRoot("/code/.git", "270", LAUNCH_ID),
         projection=Projection(files=(FileCredential(credential, ".config/p/key"),)),
@@ -1591,7 +1638,7 @@ def test_the_home_tmpfs_may_hold_the_projections_mount_points(credential):
     expect = dataclasses.replace(
         _expect(),
         mounts=Expectation.for_spec(
-            spec, product=RuntimeProduct.PODMAN, operator_uid=1000, subordinate=()
+            spec, product=RuntimeProduct.DOCKER, operator_uid=1000, subordinate=()
         ).mounts,
     )
     expect = _identified(expect, {SOURCE_TARGET: SOURCE_ID})
@@ -1599,10 +1646,14 @@ def test_the_home_tmpfs_may_hold_the_projections_mount_points(credential):
     assert home.entries == {".config"}
     bound = f"600 515 8:1 /op/.config/provider/key {HOME_TARGET}/.config/p/key ro - ext4 x rw"
     identities = {**IDENTITIES, f"{HOME_TARGET}/.config/p/key": list(host_identity(credential))}
-    observation = {**GOOD, "mountinfo": f"{MOUNTINFO}\n{bound}", "identities": identities}
-    held = {**LISTINGS, HOME_TARGET: {"count": 1, "names": [".config"]}}
+    observation = {
+        **GOOD,
+        "mountinfo": f"{_DOCKER_MOUNTINFO}\n{bound}",
+        "identities": identities,
+    }
+    held = {**_DOCKER_LISTINGS, HOME_TARGET: {"count": 1, "names": [".config"]}}
     assert judge({**observation, "listings": held}, expect) == ()
-    held = {**LISTINGS, HOME_TARGET: {"count": 2, "names": [".config", ".netrc"]}}
+    held = {**_DOCKER_LISTINGS, HOME_TARGET: {"count": 2, "names": [".config", ".netrc"]}}
     findings = judge({**observation, "listings": held}, expect)
     assert [f.detail for f in findings] == [
         f"{HOME_TARGET}: it holds .netrc, which a fresh one would not"

@@ -42,7 +42,7 @@ from autoforge.executor import ExecutionRequest, execute
 from autoforge.git_input import LaunchGitInput
 from autoforge.git_transport import GitRemote, GitTransport
 from autoforge.sandbox_backend import bind
-from autoforge.sandbox_container import HostContext, ProbeRoot, StagingMethod
+from autoforge.sandbox_container import HostContext, ProbeRoot, RuntimeProduct, StagingMethod
 from autoforge.sandbox_lifecycle import LaunchLifecycle
 from autoforge.seed_pack import SeedSettings
 
@@ -225,7 +225,7 @@ def test_a_base_images_entrypoint_never_replaces_the_watcher(world, client):
     """PID 1 of a launch container is the watcher, though the base has an entrypoint."""
     review, _, make_backend, tmp_path = world
     identity = client.identity()
-    if identity.product.value != "Podman":
+    if identity.product is not RuntimeProduct.PODMAN:
         _unavailable("a locally built base has a digest to name it by only on Podman")
     context = tmp_path / "hijacking-base"
     context.mkdir()

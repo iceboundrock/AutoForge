@@ -81,9 +81,20 @@ from . import (
 from .container_runtime import RuntimeClient
 from .errors import SandboxCapabilityError
 from .redaction import redact
-from .sandbox_container import AGENT_GID, AGENT_UID, CACHE_TARGET, WORKSPACE_TARGET, RuntimeProduct
+from .sandbox_container import (
+    AGENT_GID,
+    AGENT_UID,
+    CACHE_TARGET,
+    HOME_MODE,
+    HOME_PARENT,
+    HOME_TARGET,
+    WORKSPACE_TARGET,
+    RuntimeProduct,
+)
 
-IMAGE_SCHEMA = 1
+# 2: the image holds the agent's home, empty, under an otherwise empty
+# HOME_PARENT, which a Podman launch's tmpfs copies up (PR #506).
+IMAGE_SCHEMA = 2
 SETTING_IMAGE = "sandbox.container.image"
 IMAGE_KEYS = ("base", "claude_code", "opencode", "pi", "mcp_servers", "skills")
 # Where the helpers live in the image, and the file name each has there.
@@ -241,6 +252,24 @@ def image_key(key_inputs: KeyInputs) -> str:
     return "sha256:" + hashlib.sha256(key_inputs.canonical()).hexdigest()
 
 
+def home_steps() -> list[str]:
+    """The build's steps for the agent's home: empty, the agent's, 0700, alone in its parent.
+
+    A Podman launch mounts its tmpfs at :data:`HOME_PARENT` and copies this
+    up, which is how the home comes to be the agent's there
+    (:func:`autoforge.sandbox_container._home_tmpfs`); whatever the base keeps
+    under :data:`HOME_PARENT` is removed, so that the tmpfs holds the home
+    alone. A Docker launch mounts its tmpfs over the home itself.
+    """
+    return [
+        f"mkdir -p {HOME_PARENT}",
+        f"find {HOME_PARENT} -mindepth 1 -delete",
+        f"mkdir {HOME_TARGET}",
+        f"chown {AGENT_UID}:{AGENT_GID} {HOME_TARGET}",
+        f"chmod {HOME_MODE:04o} {HOME_TARGET}",
+    ]
+
+
 def render_containerfile(inputs: ImageInputs, key: str) -> str:
     """The ``Containerfile`` from the typed inputs alone: no ``ARG``, ``ENV`` or repository file."""
     lines = [
@@ -260,6 +289,7 @@ def render_containerfile(inputs: ImageInputs, key: str) -> str:
         f"mkdir -p {WORKSPACE_TARGET} {CACHE_TARGET}",
         f"chown {AGENT_UID}:{AGENT_GID} {WORKSPACE_TARGET} {CACHE_TARGET}",
         f"chmod 0700 {WORKSPACE_TARGET} {CACHE_TARGET}",
+        *home_steps(),
     ]
     if packages:
         steps.append(

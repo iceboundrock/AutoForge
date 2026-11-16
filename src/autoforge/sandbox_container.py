@@ -107,6 +107,15 @@ SOURCE_TARGET = "/source"
 WORKSPACE_TARGET = "/workspace"
 CACHE_TARGET = "/cache"
 HOME_TARGET = "/home/agent"
+# Where the home's tmpfs is mounted on Podman: its parent. A rootless
+# Podman's tmpfs root is always owned by the container's root, whatever the
+# options: ``uid=``/``gid=`` are refused, and ``U`` and ``chown`` give it the
+# create's user, the watcher. So the tmpfs is the parent, copied up from the
+# image (``tmpcopyup``), where AutoForge's image holds the home itself,
+# empty, owned by the agent and 0700 (:mod:`autoforge.container_image`).
+# Measured on rootless Podman 6.1.3 (PR #506).
+HOME_PARENT = posixpath.dirname(HOME_TARGET)
+HOME_MODE = 0o700
 TMP_TARGET = "/tmp"
 # Temp the runtime itself provides, per IPC namespace, that the agent may
 # find writable: shared memory and POSIX message queues. Allowed, never
@@ -1017,13 +1026,37 @@ def check_spec(spec: ContainerSpec, host: HostContext) -> None:
             raise _refuse(item.source, _RULE_BIND, "a credential file overlaps the staging root")
 
 
-def _tmpfs(target: str, mode: int, size: int | None, owner: tuple[int, int] | None) -> str:
+def _tmpfs(
+    target: str,
+    mode: int,
+    size: int | None,
+    owner: tuple[int, int] | None = None,
+    *,
+    copy_up: bool = False,
+) -> str:
     options = ["rw", "exec", "nosuid", "nodev", f"mode={mode:04o}"]
     if owner is not None:
         options += [f"uid={owner[0]}", f"gid={owner[1]}"]
+    if copy_up:
+        options.append("tmpcopyup")
     if size is not None:
         options.append(f"size={size}")
     return f"--tmpfs={target}:{','.join(options)}"
+
+
+def _home_tmpfs(product: RuntimeProduct, size: int | None) -> str:
+    """The agent's private home, a fresh tmpfs owned by the agent, 0700, on either runtime.
+
+    Docker hands ``uid=``/``gid=`` to the kernel's tmpfs, which owns its
+    root by them. Rootless Podman refuses them, and its other ways give the
+    tmpfs to the create's user, the watcher; so there the tmpfs is
+    :data:`HOME_PARENT`, 0755, copied up from the image, which holds the home
+    as the agent's (:data:`HOME_PARENT` holds nothing else in AutoForge's
+    image). The size bounds the home either way.
+    """
+    if product is RuntimeProduct.PODMAN:
+        return _tmpfs(HOME_PARENT, 0o755, size, copy_up=True)
+    return _tmpfs(HOME_TARGET, HOME_MODE, size, (AGENT_UID, AGENT_GID))
 
 
 def _volume(name: str, target: str, *, read_only: bool = False) -> str:
@@ -1077,7 +1110,7 @@ def create_options(product: RuntimeProduct, spec: ContainerSpec) -> list[str]:
         _network_option(product, spec.network),
         "--pull=never",
         _tmpfs(TMP_TARGET, 0o1777, spec.tmp_size_bytes, None),
-        _tmpfs(HOME_TARGET, 0o700, spec.home_size_bytes, (AGENT_UID, AGENT_GID)),
+        _home_tmpfs(product, spec.home_size_bytes),
         _volume(
             spec.workspace_volume,
             WORKSPACE_TARGET,
@@ -1368,9 +1401,17 @@ class Expectation:
         if not exporter:
             writable.add(WORKSPACE_TARGET)
         # The home holds the projection's files, each under its first component.
+        # On Podman the tmpfs is the home's parent, which holds the home alone
+        # (:func:`_home_tmpfs`); the home's own content is then not listed.
         home = frozenset(item.target.split("/")[0] for item in spec.projection.files)
+        if product is RuntimeProduct.PODMAN:
+            home_mount = PolicyMount(
+                HOME_PARENT, MountKind.TMPFS, entries=frozenset({posixpath.basename(HOME_TARGET)})
+            )
+        else:
+            home_mount = PolicyMount(HOME_TARGET, MountKind.TMPFS, entries=home)
         mounts = [
-            PolicyMount(HOME_TARGET, MountKind.TMPFS, entries=home),
+            home_mount,
             PolicyMount(TMP_TARGET, MountKind.TMPFS),
             PolicyMount(
                 WORKSPACE_TARGET, MountKind.VOLUME, spec.workspace_volume, read_only=exporter

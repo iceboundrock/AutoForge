@@ -22,6 +22,7 @@ from autoforge.container_image import (
     ImageInputs,
     KeyInputs,
     build_argv,
+    home_steps,
     image_key,
     parse_image_id,
     render_containerfile,
@@ -97,6 +98,23 @@ def test_the_containerfile_is_rendered_from_the_typed_inputs_alone():
     assert "\nENTRYPOINT []\nCMD []\n" in text
     bare = render_containerfile(ImageInputs(base=BASE), "k")
     assert "npm" not in bare
+
+
+def test_the_image_holds_the_agents_home_alone_in_its_parent():
+    """A Podman launch copies the image's /home up into its tmpfs (_home_tmpfs): the home
+    is there, the agent's and 0700, and whatever the base kept beside it is removed."""
+    text = render_containerfile(ImageInputs(base=BASE), "k")
+    steps = home_steps()
+    assert steps == [
+        "mkdir -p /home",
+        "find /home -mindepth 1 -delete",
+        "mkdir /home/agent",
+        "chown 10001:10001 /home/agent",
+        "chmod 0700 /home/agent",
+    ]
+    for step in steps:
+        assert step in text
+    assert text.index("chown 10001:10001 /workspace") < text.index("mkdir /home/agent")
 
 
 def test_the_context_holds_the_containerfile_and_the_helpers_and_nothing_else():
