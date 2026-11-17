@@ -131,6 +131,42 @@ def _refused(text: str, capability: str = CAPABILITY_RUNTIME) -> SandboxCapabili
     return SandboxCapabilityError(text, capability=capability)
 
 
+# -- SELinux ---------------------------------------------------------------------------
+
+# Where the kernel says whether SELinux is enforcing ("1") or permissive
+# ("0"); absent when SELinux is not enabled.
+SELINUX_ENFORCE = "/sys/fs/selinux/enforce"
+
+
+def selinux_enforcing(path: str = SELINUX_ENFORCE) -> bool | None:
+    """Whether the host's SELinux is enforcing: ``None`` when that could not be read.
+
+    No file is SELinux off, which is not enforcing.
+    """
+    try:
+        with open(path, encoding="ascii") as handle:
+            value = handle.read(8).strip()
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return None
+    return {"1": True, "0": False}.get(value)
+
+
+def _labels_containers(product: RuntimeProduct, info: object) -> bool:
+    """Whether the runtime says it gives its containers SELinux labels.
+
+    Docker lists ``name=selinux`` among its security options when its
+    daemon labels; Podman reports ``host.security.selinuxEnabled``.
+    """
+    if product is RuntimeProduct.DOCKER:
+        options = _field(info, "SecurityOptions")
+        return isinstance(options, list) and any(
+            isinstance(opt, str) and "name=selinux" in opt.split(",") for opt in options
+        )
+    return _field(info, "host.security.selinuxEnabled") is True
+
+
 # -- detection (D8) --------------------------------------------------------------------
 
 
@@ -336,12 +372,16 @@ def parse_identity(
     named: RuntimeProduct,
     executable: str,
     endpoint: str,
+    selinux: bool | None = False,
 ) -> RuntimeIdentity:
     """The runtime's identity from its own ``version`` and ``info`` JSON (D8, D16).
 
     Refused as unverified when either does not parse, when the reports are
     neither runtime's shape or both, when a field the identity needs is
     missing, for Docker Desktop, and for a Podman whose service is remote.
+    Refused too when the runtime labels its containers for SELinux and the
+    host's SELinux is enforcing, or may be (``selinux``,
+    :func:`selinux_enforcing`).
     """
     try:
         version = json.loads(version_json)
@@ -393,6 +433,15 @@ def parse_identity(
                 "the container backend drives only the local runtime (ADR 0013 D16)",
                 CAPABILITY_ENDPOINT,
             )
+    if selinux is not False and _labels_containers(product, info):
+        state = "is enforcing" if selinux else f"may be enforcing ({SELINUX_ENFORCE} is unread)"
+        raise _refused(
+            f"the host's SELinux {state} and {PRODUCT_NAMES[product]} labels its "
+            "containers, so a container could read neither the launch's staged source nor "
+            "a projected credential file, which keep the host's labels: the container "
+            "backend relabels nothing (ADR 0013), and it does not support an SELinux "
+            "enforcing host"
+        )
     store: list[tuple[str, str]] = []
     for key in STORE_FIELDS[product]:
         value = _text(_field(info, key))
@@ -549,4 +598,5 @@ class RuntimeClient:
             named=self.choice.named,
             executable=self.executable,
             endpoint=self.endpoint,
+            selinux=selinux_enforcing(),
         )

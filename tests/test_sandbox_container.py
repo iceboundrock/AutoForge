@@ -41,6 +41,7 @@ from autoforge.sandbox_container import (
     AGENT_UID,
     CACHE_TARGET,
     CGROUP_TARGET,
+    CRUN_EMPTY_DIRECTORY,
     DEV_LINKS,
     HOME_PARENT,
     HOME_TARGET,
@@ -1508,6 +1509,57 @@ def test_a_mount_is_judged_by_its_source_type_and_options_not_its_name(mountinfo
 
 
 _HELD = {"count": 2, "names": ["bus", "podman.sock"]}
+
+# crun's masks: its empty directory, from the tmpfs of its state directory (here
+# XDG_RUNTIME_DIR), bound read-only over each directory it masks.
+_CRUN_MASK = "0:66 /crun/.empty-directory /proc/scsi ro,nosuid,nodev - tmpfs tmpfs rw,mode=700"
+
+
+def test_cruns_empty_directory_is_admitted_as_a_mask_read_only_and_empty():
+    findings = judge(
+        {**GOOD, "mountinfo": MOUNTINFO + f"\n630 501 {_CRUN_MASK}",
+         "listings": {**LISTINGS, "/proc/scsi": _EMPTY}},
+        _expect(),
+    )  # fmt: skip
+    assert findings == ()
+
+
+@pytest.mark.parametrize(
+    "line, listing",
+    [
+        (_CRUN_MASK.replace(" ro,nosuid", " rw,nosuid"), _EMPTY),
+        (_CRUN_MASK, _HELD),
+        (_CRUN_MASK, None),
+        (_CRUN_MASK.replace("/crun/.empty-directory", "/crun/other"), _EMPTY),
+    ],
+)
+def test_cruns_empty_directory_writable_holding_anything_or_unlisted_is_named(line, listing):
+    listings = {**LISTINGS, "/proc/scsi": listing} if listing is not None else LISTINGS
+    _assert_named(
+        {"mountinfo": MOUNTINFO + f"\n630 501 {line}", "listings": listings},
+        ContainerCapability.MOUNTS,
+    )
+
+
+def test_the_measurement_and_the_judge_name_the_same_empty_directory():
+    assert container_measure.CRUN_EMPTY_DIRECTORY == CRUN_EMPTY_DIRECTORY
+
+
+def test_the_measurement_lists_cruns_empty_directory_as_it_lists_a_fresh_tmpfs(tmp_path):
+    empty, held, other = (tmp_path / name for name in ("empty", "held", "other"))
+    for directory in (empty, held, other):
+        directory.mkdir()
+    (held / "x").write_text("")
+    mountinfo = "\n".join(
+        [
+            f"1 0 0:66 /crun/.empty-directory {empty} ro - tmpfs tmpfs rw",
+            f"2 0 0:66 /user/1000/crun/.empty-directory {held} ro - tmpfs tmpfs rw",
+            f"3 0 0:66 /crun/other {other} ro - tmpfs tmpfs rw",
+        ]
+    )
+    listed = container_measure._listings(mountinfo)
+    assert listed[str(empty)]["names"] == [] and listed[str(held)]["names"] == ["x"]
+    assert str(other) not in listed
 
 
 @pytest.mark.parametrize(

@@ -228,7 +228,9 @@ on a real runtime yet. When it is selectable, expect this:
   (`/etc/subuid`), never to yours, with every capability dropped,
   `no-new-privileges`, a read-only root filesystem, the runtime's default
   seccomp profile and a PID limit. The runtime itself, and an escape from
-  a container, still carry your UID's authority.
+  a container, still carry your UID's authority. A host whose SELinux is
+  enforcing a runtime's labels is refused as well, since AutoForge
+  relabels none of your files.
 - **No host path but two kinds, read-only:** the launch's staged copy of
   the repository, and a model credential file where one is delivered. Your
   home, `~/.ssh`, gh's and git's credentials, the repository's `.git` and

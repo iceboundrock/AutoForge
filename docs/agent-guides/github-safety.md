@@ -2312,8 +2312,13 @@ claim about Docker or Podman. The actors are ADR 0005 §2.2's.
 **Rootless only (D10).** A runtime that does not report itself rootless
 (Docker Engine as root, rootful Podman, Docker Desktop's engine) is refused
 at the runtime check, before reconciliation and before anything of the
-step is saved or launched (`sandbox_backend.runtime_refusal`). The trust
-boundary under a rootless runtime:
+step is saved or launched (`sandbox_backend.runtime_refusal`). So is a
+runtime that labels its containers for SELinux (Podman's
+`host.security.selinuxEnabled`, Docker's `name=selinux`) on a host whose
+`/sys/fs/selinux/enforce` is not `0`: the backend relabels nothing, and on
+rootless Podman 6.1.3 an enforcing host denied the container every read of
+the staged source and a projected credential file (`container_t` reading
+`user_tmp_t`, PR #506). The trust boundary under a rootless runtime:
 
 - the runtime, and every container, run as the operator's UID on the host,
   which is what container root maps to. A container escape, a runtime bug
@@ -2692,9 +2697,9 @@ inside and `sandbox_container.judge()` checks, which is what the probe
 | keyrings, D-Bus, path-named IPC sockets, `/run`, `$XDG_RUNTIME_DIR` | absent; the container's own IPC namespace; no host keyring key | refused as bind sources; the runtime's session keyring and seccomp; the keyring measured |
 | `/var`, `/opt`, `/srv`, `/mnt`, `/media`, other homes | the image's, read-only | `--read-only`; mounts and writability measured |
 | unrelated repositories and files | absent | no host path but the closed set |
-| `/proc` | a new procfs in the container's own PID namespace, as the runtime masks it | the runtime; never `--pid=host`; every mount below it measured (a read-only view of the same procfs, a read-only tmpfs listed empty, or the null device only) |
+| `/proc` | a new procfs in the container's own PID namespace, as the runtime masks it | the runtime; never `--pid=host`; every mount below it measured (a read-only view of the same procfs, a read-only tmpfs listed empty, crun's empty directory bound read-only and listed empty, or the null device only) |
 | `/dev` | the runtime's minimal device set; no device added | never `--device` or `--privileged`; its listing measured, since the sentinel search leaves `/dev` out: nothing but the runtime's device nodes and its own `pts`, `shm` and `mqueue`, each a mount of its own of the right kind, and the OCI links (`fd`, `stdin`, `stdout`, `stderr`, `core`, `ptmx`) to their fixed targets, so a host tmpfs bound there is refused; every mount below it measured (a `devpts` holding only `ptmx`, an `mqueue` and the `shm` tmpfs listed empty, and the host's `null`, `zero`, `full`, `tty`, `random` and `urandom` nodes under their own names only) |
-| `/sys` | read-only, as the runtime mounts it for an unprivileged container | the runtime; a read-only sysfs of its own measured, and every mount below it (a read-only view of the same sysfs, a read-only tmpfs listed empty, the null device, or the container's own cgroup v2 tree, once, read-only and rooted at its namespace's root, at `/sys/fs/cgroup`; any other cgroup mount is refused, cgroup v1's controllers included, where a rootless runtime enforces no PID limit anyway) |
+| `/sys` | read-only, as the runtime mounts it for an unprivileged container | the runtime; a read-only sysfs of its own measured, and every mount below it (a read-only view of the same sysfs, a read-only tmpfs listed empty, crun's empty directory bound read-only and listed empty, the null device, or the container's own cgroup v2 tree, once, read-only and rooted at its namespace's root, at `/sys/fs/cgroup`; any other cgroup mount is refused, cgroup v1's controllers included, where a rootless runtime enforces no PID limit anyway) |
 | network | the bridge or `none`, as the table above | D9; loopback, abstract socket, interfaces and routes measured |
 
 And the properties the policy adds, each measured:

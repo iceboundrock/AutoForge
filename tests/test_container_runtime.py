@@ -20,11 +20,13 @@ import pytest
 from autoforge.container_runtime import (
     CAPABILITY_ENDPOINT,
     CAPABILITY_IDENTITY,
+    CAPABILITY_RUNTIME,
     CLIENT_ENV_ALLOWLIST,
     RuntimeClient,
     detect,
     endpoint_refusal,
     parse_identity,
+    selinux_enforcing,
 )
 from autoforge.errors import SandboxCapabilityError
 from autoforge.sandbox_backend import runtime_refusal
@@ -179,6 +181,71 @@ def test_a_report_that_is_not_verified_is_refused(version, info, match):
             endpoint="unix:///run/user/1000/docker.sock",
         )
     assert refused.value.capability in (CAPABILITY_IDENTITY, CAPABILITY_ENDPOINT)
+
+
+_PODMAN_SELINUX = {
+    **fake.podman_info(),
+    "host": {"security": {"rootless": True, "selinuxEnabled": True}, "serviceIsRemote": False},
+}
+_DOCKER_SELINUX = {
+    **fake.docker_info(),
+    "SecurityOptions": ["name=seccomp,profile=builtin", "name=selinux", "name=rootless"],
+}
+
+
+def _identity(product: RuntimeProduct, info: dict, selinux: bool | None):
+    version = fake.PODMAN_VERSION if product is RuntimeProduct.PODMAN else fake.DOCKER_VERSION
+    return parse_identity(
+        __import__("json").dumps(version),
+        __import__("json").dumps(info),
+        named=product,
+        executable=f"/usr/bin/{product.value}",
+        endpoint="unix:///run/user/1000/x.sock",
+        selinux=selinux,
+    )
+
+
+@pytest.mark.parametrize(
+    "product, info",
+    [(RuntimeProduct.PODMAN, _PODMAN_SELINUX), (RuntimeProduct.DOCKER, _DOCKER_SELINUX)],
+)
+@pytest.mark.parametrize("selinux, match", [(True, "is enforcing"), (None, "may be enforcing")])
+def test_a_runtime_that_labels_its_containers_on_an_enforcing_host_is_refused(
+    product, info, selinux, match
+):
+    """An enforcing SELinux keeps a labelled container from reading the staged source and
+    a projected credential file (measured on Podman 6.1.3, PR #506), and the backend
+    relabels nothing: refused, with the reason, before anything is created."""
+    with pytest.raises(SandboxCapabilityError, match=match) as refused:
+        _identity(product, info, selinux)
+    assert refused.value.capability == CAPABILITY_RUNTIME
+    assert "relabels nothing" in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "product, info, selinux",
+    [
+        # Permissive, or SELinux off: nothing is denied.
+        (RuntimeProduct.PODMAN, _PODMAN_SELINUX, False),
+        (RuntimeProduct.DOCKER, _DOCKER_SELINUX, False),
+        # Enforcing, but the runtime labels nothing (a daemon without --selinux-enabled).
+        (RuntimeProduct.PODMAN, fake.podman_info(), True),
+        (RuntimeProduct.DOCKER, fake.docker_info(), True),
+    ],
+)
+def test_selinux_is_refused_only_where_it_enforces_a_runtimes_labels(product, info, selinux):
+    assert _identity(product, info, selinux).product is product
+
+
+@pytest.mark.parametrize(
+    "content, expected", [("1\n", True), ("0\n", False), ("", None), ("x", None)]
+)
+def test_the_hosts_selinux_mode_is_read_from_the_kernel(tmp_path, content, expected):
+    enforce = tmp_path / "enforce"
+    enforce.write_text(content)
+    assert selinux_enforcing(str(enforce)) is expected
+    assert selinux_enforcing(str(tmp_path / "absent")) is False
+    assert selinux_enforcing(str(tmp_path)) is None
 
 
 # -- the client (D13) -----------------------------------------------------------------

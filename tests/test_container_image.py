@@ -9,6 +9,7 @@ otherwise, and no repository build file is read.
 from __future__ import annotations
 
 import dataclasses
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from autoforge.container_image import (
     ImageBuilder,
     ImageInputs,
     KeyInputs,
+    account_steps,
     build_argv,
     home_steps,
     image_key,
@@ -115,6 +117,37 @@ def test_the_image_holds_the_agents_home_alone_in_its_parent():
     for step in steps:
         assert step in text
     assert text.index("chown 10001:10001 /workspace") < text.index("mkdir /home/agent")
+
+
+@pytest.mark.parametrize("taken", [False, True])
+def test_the_image_names_the_agent_and_the_watcher_unless_its_base_does(tmp_path, taken):
+    """Podman binds a /etc/passwd and /etc/group of its own over an image that does not
+    name the create's user: the image names the agent and the watcher, once, and keeps a
+    base's own entry for either ID."""
+    etc = tmp_path / "etc"
+    etc.mkdir()
+    base_passwd = "root:x:0:0:root:/root:/bin/sh\n"
+    base_group = "root:x:0:\n"
+    if taken:
+        base_passwd += "app:x:10001:10001::/app:/bin/sh\nrun:x:10002:10002::/:/bin/sh\n"
+        base_group += "app:x:10001:\nrun:x:10002:\n"
+    (etc / "passwd").write_text(base_passwd)
+    (etc / "group").write_text(base_group)
+    script = " && ".join(step.replace("/etc/", f"{etc}/") for step in account_steps())
+    for _ in range(2):
+        subprocess.run(["sh", "-eu", "-c", script], check=True)
+    passwd, group = (etc / "passwd").read_text(), (etc / "group").read_text()
+    if taken:
+        assert (passwd, group) == (base_passwd, base_group)
+    else:
+        assert passwd == base_passwd + (
+            "autoforge-agent:x:10001:10001::/home/agent:/bin/sh\n"
+            "autoforge-watcher:x:10002:10002::/:/bin/sh\n"
+        )
+        assert group == base_group + "autoforge-agent:x:10001:\nautoforge-watcher:x:10002:\n"
+    text = render_containerfile(ImageInputs(base=BASE), "k")
+    for step in account_steps():
+        assert step in text
 
 
 def test_the_context_holds_the_containerfile_and_the_helpers_and_nothing_else():

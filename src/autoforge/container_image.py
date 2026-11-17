@@ -88,13 +88,17 @@ from .sandbox_container import (
     HOME_MODE,
     HOME_PARENT,
     HOME_TARGET,
+    WATCHER_GID,
+    WATCHER_UID,
     WORKSPACE_TARGET,
     RuntimeProduct,
 )
 
 # 2: the image holds the agent's home, empty, under an otherwise empty
 # HOME_PARENT, which a Podman launch's tmpfs copies up (PR #506).
-IMAGE_SCHEMA = 2
+# 3: the image names the agent's and the watcher's users and groups, so that
+# Podman binds no /etc/passwd or /etc/group of its own (PR #506).
+IMAGE_SCHEMA = 3
 SETTING_IMAGE = "sandbox.container.image"
 IMAGE_KEYS = ("base", "claude_code", "opencode", "pi", "mcp_servers", "skills")
 # Where the helpers live in the image, and the file name each has there.
@@ -270,6 +274,30 @@ def home_steps() -> list[str]:
     ]
 
 
+def account_steps() -> list[str]:
+    """The build's steps that name the agent's and the watcher's users and groups.
+
+    Podman, given a ``--user`` its image's ``/etc/passwd`` or ``/etc/group``
+    does not name, writes its own copy with that user or group added and
+    binds it over the image's: a mount the policy does not make. So the
+    image names them, unless its base already does under another name.
+    """
+    steps: list[str] = []
+    for name, uid, gid, home in (
+        ("autoforge-agent", AGENT_UID, AGENT_GID, HOME_TARGET),
+        ("autoforge-watcher", WATCHER_UID, WATCHER_GID, "/"),
+    ):
+        steps.append(
+            f"{{ grep -q '^[^:]*:[^:]*:{gid}:' /etc/group || "
+            f"echo '{name}:x:{gid}:' >> /etc/group; }}"
+        )
+        steps.append(
+            f"{{ grep -q '^[^:]*:[^:]*:{uid}:' /etc/passwd || "
+            f"echo '{name}:x:{uid}:{gid}::{home}:/bin/sh' >> /etc/passwd; }}"
+        )
+    return steps
+
+
 def render_containerfile(inputs: ImageInputs, key: str) -> str:
     """The ``Containerfile`` from the typed inputs alone: no ``ARG``, ``ENV`` or repository file."""
     lines = [
@@ -289,6 +317,7 @@ def render_containerfile(inputs: ImageInputs, key: str) -> str:
         f"mkdir -p {WORKSPACE_TARGET} {CACHE_TARGET}",
         f"chown {AGENT_UID}:{AGENT_GID} {WORKSPACE_TARGET} {CACHE_TARGET}",
         f"chmod 0700 {WORKSPACE_TARGET} {CACHE_TARGET}",
+        *account_steps(),
         *home_steps(),
     ]
     if packages:

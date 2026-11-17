@@ -160,6 +160,12 @@ DEV_LINKS: Mapping[str, str] = MappingProxyType(
 # root. A rootless runtime enforces no PID limit on cgroup v1, so its
 # controller mounts are refused with the rest.
 CGROUP_TARGET = "/sys/fs/cgroup"
+# crun masks a directory below /proc or /sys with a bind of the empty
+# directory it keeps in its state directory (a tmpfs): this tail of the
+# mount's root. The measurement lists it (``container_measure`` keeps the
+# same value, since it imports nothing of the package). Measured on rootless
+# Podman 6.1.3 with crun (PR #506).
+CRUN_EMPTY_DIRECTORY = "crun/.empty-directory"
 
 # The controller's sandbox directories (ADR 0005 D8.4, as
 # ``sandbox_policy.SANDBOX_DIR``) and, in an issue's, its launches' staging
@@ -1651,8 +1657,9 @@ def _kernel_mount_problem(mount: _Mount, devices: Mapping[str, str], contents: o
     """What is wrong with a mount below ``/proc`` or ``/sys`` ("" for nothing).
 
     The runtime masks and narrows its own procfs and sysfs: a read-only
-    view of the same filesystem, an empty read-only tmpfs (listed empty), or
-    the null device over a path; and it mounts the container's own cgroup
+    view of the same filesystem, an empty read-only tmpfs (listed empty),
+    crun's empty directory, read-only (listed empty), or the null device
+    over a path; and it mounts the container's own cgroup
     tree, once, read-only, at :data:`CGROUP_TARGET`. Nothing else, and no
     host filesystem, is admitted there.
     """
@@ -1662,6 +1669,12 @@ def _kernel_mount_problem(mount: _Mount, devices: Mapping[str, str], contents: o
     if mount.fstype == own and mount.device == devices.get(kernel) and read_only:
         return ""
     if mount.fstype == "tmpfs" and mount.root == "/" and read_only:
+        return _contents_problem(contents)
+    # crun masks a directory with a bind of its own empty directory, from the
+    # tmpfs of its state directory: admitted read-only and listed empty.
+    if mount.fstype == "tmpfs" and _ends_with(mount.root, CRUN_EMPTY_DIRECTORY):
+        if not read_only:
+            return f"crun's empty directory {mount.root}, mounted read-write"
         return _contents_problem(contents)
     if mount.root == "/null" and (
         mount.fstype == "devtmpfs"

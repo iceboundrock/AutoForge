@@ -1525,9 +1525,13 @@ sandbox:
   `CONTAINER_CONNECTION`: AutoForge runs the runtime's CLI with an empty
   client configuration, where no context or connection is defined, so name
   a rootless Docker's socket with `DOCKER_HOST=unix:///...` instead.
+  A runtime that labels its containers for SELinux on a host where SELinux
+  is enforcing is refused too: AutoForge relabels no host file, so a
+  labelled container could read neither the staged source nor a projected
+  credential file. Run such a host permissive, or use the `bwrap` backend.
 - **`transfer: copy`** forces copy-in: the seed is streamed into the
   container and nothing is bound from the host, for example to avoid
-  SELinux relabelling or UID-mapping problems. With `auto`, a probe writes
+  UID-mapping problems. With `auto`, a probe writes
   a nonce file on the host and reads it back from inside a container that
   binds it read-only; only that proof gives the bind form. No value forces
   a bind.
