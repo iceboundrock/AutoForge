@@ -5,6 +5,21 @@ so.
 
 ## Unreleased
 
+### Claude Code 2.1.326's background agents no longer fail a run (#507)
+
+Claude Code 2.1.326 sends a turn's result while a background agent the
+agent started is still running, and the agent's records keep arriving
+after it. AutoForge read the first of them as the start of another turn,
+so a run that then exited cleanly failed with `claude: exited inside a turn
+that has no result event` and automatic recovery refused it. Those records
+now open no turn. A reply followed by them no longer stops the CLI early:
+the run waits for the turn the agent's end gives it, as it did on earlier
+versions. 2.1.326 also stops every background task ten minutes after the
+last turn and exits without another. Every `claude` launch now sets
+`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`, overriding any value you set, so
+the profile's `idle_timeout_seconds` and `max_runtime_seconds` bound that
+wait instead.
+
 ### `sandbox.container` takes the container backend's seed settings (#292)
 
 The configuration now accepts `sandbox.container.history_depth` (0 or more,

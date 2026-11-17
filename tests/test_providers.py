@@ -2462,6 +2462,65 @@ def test_the_controller_set_environment_reaches_the_claude_stream_launch(tmp_pat
     assert sorted(set(duplex.env) - set(env)) == sorted(ClaudeCodeProvider.isolation_names)
 
 
+def test_a_claude_launch_turns_the_clis_background_wait_ceiling_off(tmp_path, monkeypatch):
+    """#507: 2.1.326 stops every background task ten minutes after the last
+    turn and exits without another; every launch sets the ceiling to 0, over
+    the operator's own value, so the controller's limits bound the wait."""
+    from autoforge import providers
+    from autoforge.providers import ClaudeSdkProvider
+    from tests import claude_fake
+
+    seen = []
+    real = providers.start_duplex
+
+    def spy(req):
+        seen.append(req)
+        return real(req)
+
+    monkeypatch.setattr(providers, "start_duplex", spy)
+    monkeypatch.setenv("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "60000")
+    _home, profile = claude_fake.fake_claude(tmp_path, [claude_fake.result("done")])
+    req = AgentRequest(
+        "FIX", "p", str(tmp_path), profile, 900, 30, env_allowlist=("PATH", "HOME", "CLAUDE_*")
+    )
+    assert ClaudeCodeProvider().execute(req).ok
+    (duplex,) = seen
+    assert duplex.env is not None
+    assert duplex.env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] == "0"
+    # Not claude-sdk's: its pinned Claude Code predates the ceiling.
+    assert "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS" not in ClaudeSdkProvider.isolation_names
+
+
+def test_a_reply_followed_by_a_background_agents_records_stands_at_a_clean_exit(tmp_path):
+    """#507, through the driver: the run of #501 had its turn's result, then a
+    background agent's records, then exit 0. It failed as a turn without its
+    result; it is a clean exit with the reply as its output."""
+    from tests import claude_fake
+
+    agent = [
+        claude_fake.line({**json.loads(record), "parent_tool_use_id": "a1"})
+        for record in (
+            claude_fake.tool_use("s1", "Bash", description="Read"),
+            claude_fake.tool_result("s1"),
+        )
+    ]
+    _home, profile = claude_fake.fake_claude(
+        tmp_path,
+        [
+            claude_fake.init(),
+            claude_fake.tool_use("a1", "Agent", description="Audit"),
+            claude_fake.tool_result("a1"),
+            claude_fake.result("done"),
+            *agent,
+        ],
+    )
+    req = AgentRequest("FIX", "p", str(tmp_path), profile, 900, 30, env_allowlist=("PATH", "HOME"))
+    res = ClaudeCodeProvider().execute(req)
+    assert res.ok, res.error
+    assert res.stdout == "done"
+    assert res.provider_summary["subagent_records_after_result"] == 2
+
+
 def test_a_progress_sink_that_raises_never_fails_the_claude_run(tmp_path):
     from tests import claude_fake
 
@@ -2887,6 +2946,7 @@ def test_claude_and_opencode_set_variables_of_their_own():
     #165)."""
     assert PiProvider.isolation_names == ()
     assert ClaudeCodeProvider.isolation_names == (
+        "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS",
         "CLAUDE_CODE_SHELL",
         "CLAUDE_CODE_SHELL_PREFIX",
         "CLAUDE_ENV_FILE",

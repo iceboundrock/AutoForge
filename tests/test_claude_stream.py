@@ -682,6 +682,74 @@ def test_a_result_sent_at_once_and_results_held_back_mix_in_one_run():
     assert stream.summary()["results"] == 3
 
 
+def _subagent(record: dict, parent: object = "a1") -> dict:
+    """``record`` as a background agent's own, naming the call that started it."""
+    return {**record, "parent_tool_use_id": parent}
+
+
+def _early_result_run(*after: dict) -> tuple[dict, ...]:
+    """A turn that starts a background agent and gets its result at once, as
+    claude 2.1.326 sends it (#507), then ``after``."""
+    return (
+        _INIT,
+        _assistant(_tool_use("a1", "Agent", description="Audit the tests")),
+        {"type": "system", "subtype": "task_started", "task_id": "a"},
+        _tool_result("a1"),
+        _result(),
+        *after,
+    )
+
+
+_AGENT_WORK = (
+    _subagent(_assistant(_tool_use("s1", "Bash", description="Read the tests"))),
+    _subagent(_tool_result("s1")),
+    _subagent(_assistant({"type": "text", "text": "found two"})),
+)
+
+
+def test_a_background_agents_records_after_a_result_open_no_turn():
+    """#507: on 2.1.326 a background agent goes on writing records after the
+    result of the turn that started it. They are the agent's, so the stream
+    that ends then has every turn closed, not a turn without its result."""
+    stream, events = _run(*_early_result_run(*_AGENT_WORK))
+    assert stream.failure is None and not stream.exited_early
+    assert stream.text == TEXT
+    summary = stream.summary()
+    assert (summary["turns"], summary["results"], summary["open_tool_calls"]) == (1, 1, 0)
+    assert summary["subagent_records_after_result"] == 3
+    assert summary["records_after_result"] == 0 and summary["tool_calls"] == 2
+    # Observed like any other record: the agent's call is progress.
+    assert any(e.kind is ProgressKind.TOOL_STARTED and e.detail == "Read the tests" for e in events)
+
+
+@pytest.mark.parametrize("parent", [None, "", 7], ids=["null", "empty", "not-a-string"])
+def test_a_record_naming_no_starting_call_still_opens_a_turn(parent):
+    """Only a record naming the call that started its agent is the agent's: any
+    other ``assistant`` record after a result opens a turn as before."""
+    stream, _ = _run(_result(), _subagent(_assistant({"type": "text", "text": "and"}), parent))
+    assert stream.failure == "claude: exited inside a turn that has no result event"
+
+
+def test_a_background_agents_record_after_a_reply_makes_it_stale_until_a_later_result():
+    """#507: a reply read while a background agent still works no longer
+    decides the run, as a held-back result kept it unread on 2.1.293; the
+    turn the agent's end gives the parent decides again."""
+    assert _replied_after(*_early_result_run())
+    assert not _replied_after(*_early_result_run(*_AGENT_WORK))
+    notice = {"type": "system", "subtype": "task_notification"}
+    assert _replied_after(*_early_result_run(*_AGENT_WORK, notice, *_later_turn(TEXT)))
+    assert not _replied_after(
+        *_early_result_run(*_AGENT_WORK, notice, *_later_turn("Still waiting."))
+    )
+
+
+def test_a_background_agents_records_inside_a_turn_change_nothing():
+    """While the turn is open its records count as before (2.1.293's shape)."""
+    stream, _ = _held_run((_result(result="w"), _result(result="c"), _result(result=TEXT)))
+    assert stream.failure is None and stream.text == TEXT
+    assert stream.summary()["subagent_records_after_result"] == 0
+
+
 @pytest.mark.parametrize(
     ("records", "turns", "results", "open_calls"),
     [

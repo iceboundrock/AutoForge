@@ -44,6 +44,22 @@ and every ``system/init`` and ``result`` is the main conversation's
 The turn count rests on that: a subagent's own ``system/init`` or
 ``result`` would throw it off.
 
+Claude Code 2.1.326 no longer holds a turn's ``result`` back for a
+background agent (#507: a run's ``result`` arrived while four background
+agents kept writing records for ten more minutes; the build's own
+documentation of the result's usage says a background subagent's calls
+"finish after a result"). A background agent's record that arrives with
+every turn closed (it carries a non-empty ``parent_tool_use_id``) therefore
+opens no turn: it is the agent's, not the main conversation's, and is
+observed like any other record. It does make the reply in hand stale, as a
+held-back result kept it unread on 2.1.293: :attr:`ClaudeStream.replied`
+stays false until a later turn's own ``result`` decides again. 2.1.326 also
+stops every background task ten minutes after the last turn and exits 0
+without another turn (``CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS``, default
+600000; 0 turns it off, read from the build), which the adapter turns off so
+that the controller's own limits bound the wait
+(:data:`autoforge.providers.CLAUDE_LIFECYCLE_ENV`).
+
 The outcome:
 
 * The last ``result`` record's ``result`` string is the final assistant
@@ -136,7 +152,8 @@ between turns kept alive by something the agent left pending, the state the
 paragraph above reads ``results`` equal to ``turns`` as, with a reply that
 needs no further turn. A record that opens a turn ends it, until that turn's
 own ``result`` decides again; a notice between turns does not. A background
-agent's held-back results keep it false until they have arrived. A
+agent's held-back results keep it false until they have arrived, and so
+does a background agent's record after the reply (#507). A
 ``tool_result`` skipped past the per-line bound leaves its call open and so
 keeps it false too: the run then waits for the CLI, as it did before #439.
 :attr:`ClaudeStream.reply_proven` is the stricter fact a reply delivered
@@ -230,6 +247,13 @@ _MAX_COST_USD = Decimal(1_000_000)
 # Two of the fixed reasons :attr:`ClaudeStream.failure_kind` takes (#434).
 _PROTOCOL_VIOLATION = "claude: stream-json protocol violation"
 _ENDED_EARLY = "claude: stdout ended before a result event"
+
+
+def _is_subagent(kind: str, record: dict) -> bool:
+    """Whether ``record`` is a background agent's own (module docstring): an
+    ``assistant`` or ``user`` record naming the call that started the agent."""
+    parent = record.get("parent_tool_use_id")
+    return kind in ("assistant", "user") and isinstance(parent, str) and parent != ""
 
 
 def _count(value: object) -> int | None:
@@ -341,6 +365,8 @@ class ClaudeStream:
         self._oversize = 0
         self._unknown = 0
         self._after_result = 0
+        # Background agents' records that arrived with every turn closed (#507).
+        self._subagent_after_result = 0
         self._tool_calls = 0
         # ``system/init`` records seen: the CLI started a session (#434).
         self._inits = 0
@@ -427,6 +453,16 @@ class ClaudeStream:
                 self._protocol("a result event outside a turn")
             return
         is_init = kind == "system" and record.get("subtype") == "init"
+        if self._results == self._turns and _is_subagent(kind, record):
+            # A background agent's own record after the turn's result (#507):
+            # it opens no turn of the main conversation, whose every
+            # ``system/init`` and ``result`` are its own, but the work it shows
+            # is still going, so the reply in hand no longer decides the run
+            # (:attr:`replied`) until a later turn's own ``result`` does.
+            self._subagent_after_result += 1
+            self._text_is_reply = False
+            self._observe(kind, record)
+            return
         if self._results == self._turns:
             if kind not in ("assistant", "user") and not is_init:
                 self._after_result += 1
@@ -526,6 +562,7 @@ class ClaudeStream:
             "oversize_records": self._oversize,
             "unknown_events": self._unknown,
             "records_after_result": self._after_result,
+            "subagent_records_after_result": self._subagent_after_result,
             "tool_calls": self._tool_calls,
             "tool_errors": self._tool_errors,
             "api_retries": self._retries,

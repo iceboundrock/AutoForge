@@ -1003,6 +1003,15 @@ repository's runs in a launch:
   empty, whatever your shell sets. A command that relies on one of your
   functions or aliases fails in a launch; put what it needs in a script on
   `PATH` instead.
+- Every Claude launch sets `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`, whatever
+  your shell sets (#507). Claude Code 2.1.326 otherwise stops every
+  background task ten minutes after the agent's last turn and exits without
+  giving the agent another, so the work the agent waited for is lost. With
+  the ceiling off, the profile's `idle_timeout_seconds` and
+  `max_runtime_seconds` bound that wait. The variable is not on the refusal
+  list below, because it carries no credential and no shell code. A value in
+  your Claude Code settings' `env` still takes effect and brings the ceiling
+  back.
 - A Bash tool command runs with the `PATH` the launch gives Claude Code,
   login shell or not. A login shell reads `/etc/profile`, and some
   distributions' (Debian's) set `PATH` outright, so the same file sets the
