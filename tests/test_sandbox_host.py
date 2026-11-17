@@ -50,6 +50,22 @@ def _a_python_with_memfd(monkeypatch) -> None:
         monkeypatch.setattr(os, "memfd_create", lambda *_args: -1, raising=False)
 
 
+@pytest.fixture
+def linux_host(monkeypatch) -> None:
+    """A measurement taken as on Linux, whichever host runs the test (PR #509 R1-F1).
+
+    :func:`sandbox_host.measure` records ``sys.platform``, and off Linux
+    :attr:`~sandbox_host.HostReport.missing` is only "a Linux kernel", so on
+    the ``test-macos`` job (#501) a test of what a Linux host lacks would
+    measure macOS instead. ``bwrap`` is a fake on ``PATH`` and the Landlock
+    ABI a stand-in already; with the platform simulated too, what the test
+    measures is the Linux branch on every host.
+    :func:`test_a_host_off_linux_is_measured_as_lacking_only_a_linux_kernel`
+    measures the other branch.
+    """
+    monkeypatch.setattr(sandbox_host.sys, "platform", "linux")
+
+
 def _path_with(tmp_path: Path, monkeypatch, script: str | None) -> Path:
     """A ``PATH`` whose only ``bwrap`` is ``script`` (none when ``None``), and ``true``."""
     bin_dir = tmp_path / "bin"
@@ -81,6 +97,7 @@ def _report(**changes) -> sandbox_host.HostReport:
     return sandbox_host.HostReport(**fields)
 
 
+@pytest.mark.usefixtures("linux_host")
 def test_an_old_bwrap_without_namespaces_or_landlock_is_measured_incapable(tmp_path, monkeypatch):
     bin_dir = _path_with(tmp_path, monkeypatch, OLD_BWRAP)
     monkeypatch.setattr(sandbox_host, "landlock_abi", lambda: (4, ""))
@@ -103,6 +120,7 @@ def test_an_old_bwrap_without_namespaces_or_landlock_is_measured_incapable(tmp_p
     assert "`make test-sandbox`" in text
 
 
+@pytest.mark.usefixtures("linux_host")
 def test_a_capable_host_is_measured_capable_and_the_tests_said_required(tmp_path, monkeypatch):
     _path_with(tmp_path, monkeypatch, CAPABLE_BWRAP)
     monkeypatch.setattr(sandbox_host, "landlock_abi", lambda: (6, ""))
@@ -115,6 +133,7 @@ def test_a_capable_host_is_measured_capable_and_the_tests_said_required(tmp_path
     assert "AUTOFORGE_REQUIRE_SANDBOX_BACKEND=auto" in text
 
 
+@pytest.mark.usefixtures("linux_host")
 def test_a_python_without_memfd_create_is_measured_incapable(tmp_path, monkeypatch):
     """PR #425 R1-F2 (#389): a capable kernel and ``bwrap`` do not make a host
     capable for a Python that has no ``os.memfd_create`` (uv's CPython 3.12.13
@@ -154,6 +173,7 @@ def test_auto_skips_on_a_python_without_memfd_create(tmp_path, tmp_path_factory,
     assert "measured: this host cannot enforce the outer sandbox: it lacks a Python with" in text
 
 
+@pytest.mark.usefixtures("linux_host")
 def test_a_host_without_bwrap_is_measured_and_named(tmp_path, monkeypatch):
     _path_with(tmp_path, monkeypatch, None)
     monkeypatch.setattr(sandbox_host, "landlock_abi", lambda: (6, ""))
@@ -196,6 +216,28 @@ def test_a_kernel_that_gives_no_landlock_abi_is_measured_with_its_answer(
 
 def test_only_linux_has_a_backend():
     assert _report(platform="darwin").missing == ["a Linux kernel"]
+
+
+def test_a_host_off_linux_is_measured_as_lacking_only_a_linux_kernel(tmp_path, monkeypatch):
+    """The branch the ``test-macos`` job's own host takes (PR #509 R1-F1),
+    measured on every host: off Linux, a ``bwrap`` and a Landlock stand-in
+    that would make a Linux host capable change nothing, the measurement
+    records the platform it was given, and the kernel's Landlock call is not
+    made at all."""
+    monkeypatch.setattr(sandbox_host.sys, "platform", "darwin")
+    _path_with(tmp_path, monkeypatch, CAPABLE_BWRAP)
+
+    def no_call(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("the Landlock call is Linux's")
+
+    monkeypatch.setattr(sandbox_host.ctypes, "CDLL", no_call)
+    assert sandbox_host.landlock_abi() == (0, "")
+    report = sandbox_host.measure()
+    assert report.platform == "darwin" and report.landlock_abi == 0
+    assert report.missing == ["a Linux kernel"] and not report.capable
+    text = report.markdown()
+    assert "| platform | darwin, kernel " in text
+    assert "This host cannot enforce the outer sandbox: it lacks a Linux kernel." in text
 
 
 def test_the_measurement_is_printed_and_appended_to_the_ci_job_summary(
