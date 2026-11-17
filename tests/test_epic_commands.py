@@ -691,7 +691,9 @@ def test_status_while_a_scheduler_runs_shows_the_hung_worker_and_a_spawn_failure
     running = rows[2]
     assert running["category"] == "running" and running["live"]
     worker = running["claim"]["worker"]
-    assert worker["pid"] == child.pid and worker["process_start_time"] is not None
+    assert worker["pid"] == child.pid
+    # Read from /proc/<pid>/stat, so None on a host without procfs (macOS, #501).
+    assert (worker["process_start_time"] is not None) is os.path.isdir("/proc/self")
     assert worker["log"].endswith("/workers/1.log")
     assert "worker diagnostics (never signalled; a PID may be reused): pid" in seen["text"]
     assert rows[3]["category"] == "held" and rows[3]["hold_reason"] == "spawn-failed"

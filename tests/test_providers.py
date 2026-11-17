@@ -36,7 +36,7 @@ from autoforge.providers import (
     opencode_isolation_env,
     provider_for,
 )
-from tests.conftest import DECODER_LIMIT_RECORDS
+from tests.conftest import DECODER_LIMIT_RECORDS, NOTHING_LEFT
 
 
 def _text(profile: ProfileConfig) -> ProfileConfig:
@@ -2318,7 +2318,7 @@ def test_a_helper_that_exits_within_the_grace_is_neither_killed_nor_reported(tmp
     elapsed = time.monotonic() - started
     assert res.ok and res.exit_code == 0 and not res.timed_out
     assert res.provider_failure is None and res.stdout == "done"
-    assert res.leftovers == ""
+    assert res.leftovers == NOTHING_LEFT  # "" but where no subreaper can check (#501)
     assert elapsed < 5, elapsed
 
 
@@ -2374,7 +2374,7 @@ def test_what_stdout_carries_after_the_cli_exits_is_still_validated(
     )
     assert res.provider_failure == failure and res.stdout == ""
     assert res.exit_code == 0 and not res.timed_out
-    assert res.leftovers == ""
+    assert res.leftovers == NOTHING_LEFT  # "" but where no subreaper can check (#501)
 
 
 def test_an_oversize_tool_result_line_is_skipped_and_counted(tmp_path, monkeypatch):

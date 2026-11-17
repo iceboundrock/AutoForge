@@ -473,21 +473,33 @@ def test_the_entry_budget_is_enforced_while_listing_not_after_materialising(tmp_
 
 
 def test_the_walk_is_iterative_so_depth_is_bounded_by_the_budget_not_the_stack(tmp_path):
+    import resource
     import sys
 
+    depth = 300
     root = tmp_path / "deep"
     p = root
-    for _ in range(300):
+    for _ in range(depth):
         p = p / "d"
     p.mkdir(parents=True)
+    # The walk holds a descriptor for each level it is in: past macOS's
+    # default soft limit of 256 (#501), so the limit is raised for the walk.
+    limits = resource.getrlimit(resource.RLIMIT_NOFILE)
+    soft, hard = limits
+    need = depth + 256  # and what the run itself holds open
+    if soft != resource.RLIM_INFINITY and soft < need:
+        if hard != resource.RLIM_INFINITY and hard < need:
+            pytest.skip(f"the walk needs {need} descriptors; the hard limit here is {hard}")
+        resource.setrlimit(resource.RLIMIT_NOFILE, (need, hard))
     fs = SafeRoot.open(root)
     old = sys.getrecursionlimit()
     sys.setrecursionlimit(120)
     try:
-        assert sum(1 for _ in fs.walk(max_entries=10_000)) == 300
+        assert sum(1 for _ in fs.walk(max_entries=10_000)) == depth
     finally:
         sys.setrecursionlimit(old)
         fs.close()
+        resource.setrlimit(resource.RLIMIT_NOFILE, limits)
 
 
 def test_create_exclusive_publishes_by_link_so_a_failure_leaves_no_final_name(

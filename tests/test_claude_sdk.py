@@ -33,7 +33,7 @@ from pathlib import Path
 
 import pytest
 
-from autoforge import claude_sdk
+from autoforge import claude_sdk, executor
 from autoforge.claude_sdk import (
     Ask,
     ClaudeSdkSession,
@@ -940,7 +940,8 @@ def test_a_terminal_field_of_the_wrong_type_is_a_provider_failure(
     assert result.provider_failure.startswith("claude-sdk: ")
     assert result.stdout == "" and not result.reply_delivered
     assert not result.timed_out and result.exit_code == 0 and took < 30
-    assert not result.may_have_survivor and not result.orphans_unchecked
+    assert not result.may_have_survivor
+    assert result.orphans_unchecked is not executor.orphan_containment_available()
 
 
 _NO_KIND = "not an object with a string kind"
@@ -969,7 +970,8 @@ def test_a_result_of_malformed_or_injected_origin_is_a_provider_failure(
     assert result.provider_failure.startswith("claude-sdk: ")
     assert result.stdout == "" and not result.reply_delivered
     assert not result.timed_out and result.exit_code == 0 and took < 30
-    assert not result.may_have_survivor and not result.orphans_unchecked
+    assert not result.may_have_survivor
+    assert result.orphans_unchecked is not executor.orphan_containment_available()
 
 
 @pytest.mark.parametrize("origin", [None, {"kind": "human", "undocumented": 1}])
@@ -1581,8 +1583,12 @@ def test_ctrl_c_during_a_wait_tears_the_helper_down(tmp_path, sdk_python, launch
         others.append(Path(tempfile.mkdtemp(prefix="autoforge-claude-sdk-")))
         raise KeyboardInterrupt
 
+    # A process that leaves the helper's group, which only a child subreaper
+    # catches: started, and looked for, only where there is one (#501).
+    contained = executor.orphan_containment_available()
     marker = f"sleep 302.{os.getpid()}"
-    prompt = fake.script(steps=[{"spawn": ["sh", "-c", marker]}, _bash()])
+    spawned = [{"spawn": ["sh", "-c", marker]}] if contained else []
+    prompt = fake.script(steps=[*spawned, _bash()])
     adapter, req = _request(tmp_path, sdk_python, prompt, PROMPT, Scripted(interrupt))
     try:
         with pytest.raises(KeyboardInterrupt):
@@ -1594,8 +1600,9 @@ def test_ctrl_c_during_a_wait_tears_the_helper_down(tmp_path, sdk_python, launch
     finally:
         for other in others:
             shutil.rmtree(other, ignore_errors=True)
-    found = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True).stdout
-    assert not found.strip()
+    if contained:
+        found = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True).stdout
+        assert not found.strip()
 
 
 def test_the_launch_is_refused_before_anything_starts(tmp_path, sdk_python, monkeypatch):

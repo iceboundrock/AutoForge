@@ -910,12 +910,31 @@ def test_a_failed_reinspection_after_the_temporary_is_named_unlinks_the_name(tmp
     assert [e.name for e in root_dir.iterdir()] == ["state.json"], "a temporary was left"
 
 
-def _plant_a_name_during_the_write(monkeypatch, outside_fd: int, planted_name: str):
+def _plant_a_name_during_the_write(
+    monkeypatch, outside_fd: int, planted_name: str, named_in: os.PathLike | None = None
+):
     """The race both temporaries guard against: a second name for the
-    controller's inode appears before the pre-publish inspection."""
+    controller's inode appears before the pre-publish inspection.
+
+    An unnamed temporary is linked through this process's ``/proc/<pid>/fd``,
+    the only way to name it (Linux, where the unnamed cases run). A named
+    one is linked by its ``.af-tmp-*`` name in ``named_in``, which works on
+    every host, macOS's included, which has no procfs (#501).
+    """
 
     def name_it(fd):
-        os.link(f"/proc/self/fd/{fd}", planted_name, dst_dir_fd=outside_fd, follow_symlinks=True)
+        if named_in is None:
+            os.link(
+                f"/proc/self/fd/{fd}", planted_name, dst_dir_fd=outside_fd, follow_symlinks=True
+            )
+            return
+        own = os.fstat(fd)
+        (name,) = [
+            entry.name
+            for entry in os.scandir(named_in)
+            if entry.name.startswith(".af-tmp-") and entry.inode() == own.st_ino
+        ]
+        os.link(os.path.join(named_in, name), planted_name, dst_dir_fd=outside_fd)
 
     return _during_the_write(monkeypatch, name_it)
 
@@ -985,7 +1004,8 @@ def test_a_refused_temporary_that_cannot_be_emptied_is_a_typed_error_that_leaves
 
     monkeypatch.setattr(safefs.os, "ftruncate", refusing_ftruncate)
     if race == "during the write":
-        model = _plant_a_name_during_the_write(monkeypatch, outside_fd, "stolen-tmp")
+        named_in = root_dir if temporary == "named" else None
+        model = _plant_a_name_during_the_write(monkeypatch, outside_fd, "stolen-tmp", named_in)
     else:
         model = _plant_a_name_after_the_link(monkeypatch, outside_fd, "stolen-tmp")
     try:

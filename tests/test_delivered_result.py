@@ -47,7 +47,16 @@ from autoforge.result_parser import BlockShape, reply_block_shape
 from autoforge.state import load_state
 from autoforge.transitions import Phase
 
-from .conftest import ISSUE, PR, analyze_payload, block, commit_in, implement, make_engine
+from .conftest import (
+    ISSUE,
+    PR,
+    analyze_payload,
+    block,
+    commit_in,
+    implement,
+    make_engine,
+    needs_child_subreaper,
+)
 
 # -- the rule ------------------------------------------------------------------------
 
@@ -1626,6 +1635,7 @@ def _claude(tmp_path, eng, lines, *, exit_code=0, idle=None):
     return home
 
 
+@needs_child_subreaper
 def test_a_claude_cli_that_exits_badly_after_its_reply_has_the_reply_accepted(
     tmp_path, tmp_state_dir, fake_github
 ):
@@ -1650,6 +1660,7 @@ def test_a_claude_cli_that_exits_badly_after_its_reply_has_the_reply_accepted(
     assert _settled(eng)["outcome"] == "accepted"
 
 
+@needs_child_subreaper
 def test_a_claude_reply_with_a_call_still_open_is_never_accepted(
     tmp_path, tmp_state_dir, fake_github, monkeypatch
 ):
@@ -1675,6 +1686,7 @@ def test_a_claude_reply_with_a_call_still_open_is_never_accepted(
     assert load_state(eng.paths.state_file).phase == Phase.REVIEW
 
 
+@needs_child_subreaper
 def test_a_claude_reply_overtaken_by_a_later_turn_is_stale_and_never_accepted(
     tmp_path, tmp_state_dir, fake_github, monkeypatch
 ):
@@ -1713,6 +1725,7 @@ def _line_past_the_bound(monkeypatch) -> str:
     return claude_fake.tool_use("t2", "Edit", file_path="src/a.py", new_string="x" * 50_000)
 
 
+@needs_child_subreaper
 def test_a_claude_reply_followed_by_a_line_past_the_bound_is_never_accepted(
     tmp_path, tmp_state_dir, fake_github, monkeypatch
 ):
@@ -1803,6 +1816,7 @@ def _untracked_call(monkeypatch, how: str) -> list:
 
 
 @pytest.mark.parametrize("how", ["no-id", "past-the-bound"])
+@needs_child_subreaper
 def test_a_claude_reply_after_a_call_it_could_not_track_is_never_accepted(
     tmp_path, tmp_state_dir, fake_github, monkeypatch, how
 ):
@@ -1892,6 +1906,7 @@ def _pi_engine(tmp_path_factory, tmp_state_dir, gh, turn, **profile_fields):
     return eng, fake
 
 
+@needs_child_subreaper
 def test_a_pi_that_hangs_on_shutdown_after_a_settled_run_has_its_reply_accepted(
     tmp_path_factory, tmp_state_dir, fake_github
 ):
@@ -1914,6 +1929,7 @@ def test_a_pi_that_hangs_on_shutdown_after_a_settled_run_has_its_reply_accepted(
     assert load_state(eng.paths.state_file).current_pr_url == PR
 
 
+@needs_child_subreaper
 def test_a_pi_that_exits_badly_after_a_settled_run_has_its_reply_accepted(
     tmp_path_factory, tmp_state_dir, fake_github
 ):
@@ -1931,6 +1947,7 @@ def test_a_pi_that_exits_badly_after_a_settled_run_has_its_reply_accepted(
     [({"close_exit": 7}, ExecutionError), ({"linger": 60}, ExecutionTimeoutError)],
     ids=["exit", "idle-kill"],
 )
+@needs_child_subreaper
 def test_a_pi_reply_with_a_tool_execution_left_open_is_never_accepted(
     tmp_path_factory, tmp_state_dir, fake_github, ending, error
 ):
@@ -1977,6 +1994,7 @@ _SHARED_ID = [
     [({"close_exit": 7}, ExecutionError), ({"linger": 60}, ExecutionTimeoutError)],
     ids=["exit", "idle-kill"],
 )
+@needs_child_subreaper
 def test_a_pi_reply_after_a_start_reusing_an_open_id_is_never_accepted(
     tmp_path_factory, tmp_state_dir, fake_github, ending, error
 ):
@@ -2040,6 +2058,7 @@ _LATER_TURN = [
     [({"close_exit": 7}, ExecutionError), ({"linger": 60}, ExecutionTimeoutError)],
     ids=["exit", "idle-kill"],
 )
+@needs_child_subreaper
 def test_a_pi_reply_overtaken_by_a_later_turn_in_its_shutdown_is_never_accepted(
     tmp_path_factory, tmp_state_dir, fake_github, ending, error
 ):
@@ -2079,6 +2098,7 @@ _UNREADABLE_SHUTDOWN = {
 @pytest.mark.parametrize(
     "record", list(_UNREADABLE_SHUTDOWN.values()), ids=list(_UNREADABLE_SHUTDOWN)
 )
+@needs_child_subreaper
 def test_a_pi_reply_followed_by_an_unreadable_shutdown_record_is_never_accepted(
     tmp_path_factory, tmp_state_dir, fake_github, record
 ):

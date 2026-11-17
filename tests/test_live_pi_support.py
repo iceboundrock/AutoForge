@@ -42,6 +42,7 @@ from tests.conftest import (
     git_out,
     git_repo,
     github_origin,
+    needs_child_subreaper,
     review_result,
     state_tree,
 )
@@ -422,6 +423,7 @@ def _worktrees(tmp_path) -> Path:
     return tmp_path / "smoke" / "repo" / ".git" / "autoforge" / "worktrees"
 
 
+@needs_child_subreaper
 def test_the_remote_smoke_flow_passes_on_the_api_key_route_against_a_fake_pi(tmp_path, rehearsal):
     """REMOTE counterpart of the acceptance route's rehearsal: the real
     `autoforge doctor` passes its Pi rows while its GitHub rows fail against
@@ -474,6 +476,7 @@ def test_the_remote_smoke_flow_passes_on_the_api_key_route_against_a_fake_pi(tmp
     assert not (tmp_path / "smoke" / "repo" / ".autoforge").exists()
 
 
+@needs_child_subreaper
 def test_the_remote_smoke_flow_passes_on_the_optional_oauth_route_against_a_fake_pi(
     tmp_path, rehearsal
 ):
@@ -528,6 +531,7 @@ def test_a_forward_naming_an_unset_key_fails_remote_step_2(tmp_path, rehearsal):
     assert rehearsal.fake.launches() == []
 
 
+@needs_child_subreaper
 def test_a_provider_refusal_of_the_remote_review_is_named_and_the_later_checks_still_run(
     tmp_path, rehearsal
 ):
@@ -646,6 +650,7 @@ def test_a_remote_review_answer_without_a_valid_control_result_fails_step_4(tmp_
     assert _SECRET not in report.render()
 
 
+@needs_child_subreaper
 def test_a_remote_review_that_writes_into_its_worktree_fails_the_side_effect_step(
     tmp_path, rehearsal
 ):
@@ -665,6 +670,7 @@ def test_a_remote_review_that_writes_into_its_worktree_fails_the_side_effect_ste
     assert (worktree / "greet.py").read_text() == writes["greet.py"]
 
 
+@needs_child_subreaper
 def test_a_new_session_entry_fails_the_remote_side_effect_step(tmp_path, rehearsal):
     settings = rehearsal.settings("api_key")
 
@@ -677,6 +683,27 @@ def test_a_new_session_entry_fails_the_remote_side_effect_step(tmp_path, rehears
     assert (
         report.outcomes[STEPS[5]][1] == f"1 new entr(ies) under {tmp_path / 'agent' / 'sessions'}"
     )
+
+
+def test_a_pi_launch_this_platform_cannot_contain_fails_the_side_effect_step(tmp_path):
+    """PR #509 R1-F1: where there is no child subreaper (macOS, #501), every
+    Pi launch is ``orphans_unchecked``, and step 6 fails it for that alone,
+    which is why the flows above run only where there is one. Read here on
+    every host, from a result that says so."""
+    from types import SimpleNamespace
+
+    from tests.live_pi import _launch_side_effects
+
+    sessions, workdir = tmp_path / "sessions", tmp_path / "work"
+    sessions.mkdir()
+    workdir.mkdir()
+    facts = {"group_survived_kill": False, "orphan_survived_kill": False}
+    contained = SimpleNamespace(results=[SimpleNamespace(**facts, orphans_unchecked=False)])
+    unchecked = SimpleNamespace(results=[SimpleNamespace(**facts, orphans_unchecked=True)])
+    assert _launch_side_effects(sessions, frozenset(), workdir, contained) == []
+    assert _launch_side_effects(sessions, frozenset(), workdir, unchecked) == [
+        "this platform cannot contain Pi's detached tool processes"
+    ]
 
 
 @pytest.mark.parametrize("auth", ["api_key", "oauth"])
@@ -867,6 +894,7 @@ def test_the_origin_is_seeded_and_published_to_alone_whatever_rewrites_the_url(
     assert refs.splitlines() == [f"refs/heads/feature {first}", f"refs/heads/main {second}"]
 
 
+@needs_child_subreaper
 def test_the_remote_flow_seeds_its_own_origin_whatever_the_operators_gitconfig_rewrites(
     tmp_path, rehearsal, monkeypatch
 ):
@@ -1065,6 +1093,7 @@ def test_the_remote_flows_own_git_runs_no_hook_monitor_or_signer_the_operator_co
     _assert_landed_in_the_smoke_checkout(repo, worktree, answer, head, commit)
 
 
+@needs_child_subreaper
 def test_the_remote_flow_passes_beside_the_checkout_git_dir_names_and_runs_no_planted_hook(
     tmp_path, rehearsal, monkeypatch
 ):

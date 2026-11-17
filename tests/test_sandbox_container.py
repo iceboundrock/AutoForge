@@ -78,6 +78,8 @@ from autoforge.sandbox_container import (
 )
 from autoforge.sandbox_policy import SANDBOX_DIR
 
+from .conftest import bind_unix
+
 REPO = Path(__file__).resolve().parent.parent
 MEASURE = REPO / "src" / "autoforge" / "container_measure.py"
 # Fake credentials: never real, and shaped so that a leak is unmistakable.
@@ -89,6 +91,25 @@ LABELS = {"io.autoforge.run": "run-1", "io.autoforge.nonce": "n-1"}
 
 
 LAUNCH_ID = "ANALYZE_EXECUTE-1"
+
+
+@pytest.fixture(autouse=True)
+def _acls_read_where_they_cannot_be(monkeypatch) -> None:
+    """A directory's ACLs read as none on a host that cannot read them (PR #509 R1-F1).
+
+    Without ``os.listxattr`` (macOS, #501) no directory is private, so every
+    credential file is refused for that, whatever else a test is about.
+    There, the ACLs read as none, as Linux reads those of the directories
+    these tests make. The tests of what the ACLs decide set
+    ``os.listxattr`` themselves, or delete it
+    (:func:`test_a_directorys_acls_unreadable_on_this_platform_make_it_not_private`).
+    """
+    if getattr(os, "listxattr", None) is None:
+
+        def none(path, *, follow_symlinks=True) -> list[str]:
+            return []
+
+        monkeypatch.setattr(os, "listxattr", none, raising=False)
 
 
 @pytest.fixture
@@ -923,7 +944,7 @@ def test_a_runtime_socket_is_never_bound(host, tmp_path):
     forbidden sources."""
     sock_path = Path(host.environ["XDG_RUNTIME_DIR"]) / "docker.sock"
     with socket.socket(socket.AF_UNIX) as server:
-        server.bind(str(sock_path))
+        bind_unix(server, sock_path)  # however long tmp_path is (macOS, #501)
         spec = _launch(projection=Projection(files=(FileCredential(str(sock_path), "s"),)))
         with pytest.raises(SandboxPolicyError, match="regular file"):
             check_spec(spec, host)
@@ -2100,6 +2121,14 @@ def test_the_measurement_records_each_attempt_as_it_ended(monkeypatch):
     assert quiet["attempts"] == [
         {"address": "127.0.0.1", "result": "connected", "received": "", "eof": False}
     ]
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="the abstract socket namespace is Linux's"
+)
+def test_the_measurement_records_an_abstract_socket_no_one_listens_on_as_refused():
+    """The abstract name no peer listens on is refused (split from the test
+    above so that its TCP attempts run on macOS too, PR #509 R1-F1)."""
     assert container_measure._abstract(f"autoforge-test-270-none-{os.getpid()}") == {
         "result": "ECONNREFUSED"
     }
