@@ -153,6 +153,24 @@ def selinux_enforcing(path: str = SELINUX_ENFORCE) -> bool | None:
     return {"1": True, "0": False}.get(value)
 
 
+def selinux_problem(product: RuntimeProduct, info: object, selinux: bool | None) -> str:
+    """Why an SELinux host refuses the runtime ("" when it does not).
+
+    ``info`` is the runtime's own ``info`` report, ``selinux`` what
+    :func:`selinux_enforcing` read.
+    """
+    if selinux is False or not _labels_containers(product, info):
+        return ""
+    state = "is enforcing" if selinux else f"may be enforcing ({SELINUX_ENFORCE} is unread)"
+    return (
+        f"the host's SELinux {state} and {PRODUCT_NAMES[product]} labels its "
+        "containers, so a container could read neither the launch's staged source nor "
+        "a projected credential file, which keep the host's labels: the container "
+        "backend relabels nothing (ADR 0013), and it does not support an SELinux "
+        "enforcing host"
+    )
+
+
 def _labels_containers(product: RuntimeProduct, info: object) -> bool:
     """Whether the runtime says it gives its containers SELinux labels.
 
@@ -433,15 +451,9 @@ def parse_identity(
                 "the container backend drives only the local runtime (ADR 0013 D16)",
                 CAPABILITY_ENDPOINT,
             )
-    if selinux is not False and _labels_containers(product, info):
-        state = "is enforcing" if selinux else f"may be enforcing ({SELINUX_ENFORCE} is unread)"
-        raise _refused(
-            f"the host's SELinux {state} and {PRODUCT_NAMES[product]} labels its "
-            "containers, so a container could read neither the launch's staged source nor "
-            "a projected credential file, which keep the host's labels: the container "
-            "backend relabels nothing (ADR 0013), and it does not support an SELinux "
-            "enforcing host"
-        )
+    problem = selinux_problem(product, info, selinux)
+    if problem:
+        raise _refused(problem)
     store: list[tuple[str, str]] = []
     for key in STORE_FIELDS[product]:
         value = _text(_field(info, key))

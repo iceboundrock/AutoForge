@@ -298,6 +298,22 @@ def account_steps() -> list[str]:
     return steps
 
 
+def layout_steps() -> list[str]:
+    """The build's steps for the places a launch mounts over and the users it runs as.
+
+    The workspace and cache are the agent's, so that a fresh volume mounted
+    there is copied up from them with that owner; then the users and groups
+    (:func:`account_steps`) and the home (:func:`home_steps`).
+    """
+    return [
+        f"mkdir -p {WORKSPACE_TARGET} {CACHE_TARGET}",
+        f"chown {AGENT_UID}:{AGENT_GID} {WORKSPACE_TARGET} {CACHE_TARGET}",
+        f"chmod 0700 {WORKSPACE_TARGET} {CACHE_TARGET}",
+        *account_steps(),
+        *home_steps(),
+    ]
+
+
 def render_containerfile(inputs: ImageInputs, key: str) -> str:
     """The ``Containerfile`` from the typed inputs alone: no ``ARG``, ``ENV`` or repository file."""
     lines = [
@@ -314,11 +330,7 @@ def render_containerfile(inputs: ImageInputs, key: str) -> str:
         *checks,
         f"chmod 0755 {HELPER_DIR}",
         f"chmod 0644 {HELPER_DIR}/*.py",
-        f"mkdir -p {WORKSPACE_TARGET} {CACHE_TARGET}",
-        f"chown {AGENT_UID}:{AGENT_GID} {WORKSPACE_TARGET} {CACHE_TARGET}",
-        f"chmod 0700 {WORKSPACE_TARGET} {CACHE_TARGET}",
-        *account_steps(),
-        *home_steps(),
+        *layout_steps(),
     ]
     if packages:
         steps.append(
