@@ -18,6 +18,14 @@ that leaves its group can outlive the launch (`orphans_unchecked`). Intel
 Macs stay untested, the built wheel is installed and run in CI on Linux
 only, and the package's classifiers still name Linux alone.
 
+The first macOS run found one fault in the controller itself: when several
+issue engines prepared their sandbox directories at once in a new common
+dir, macOS sometimes reported an entry below it missing as it was being
+created, and the shared-Git lock (L1) refused the launch, saying the
+common dir did not exist. The lock file is now walked to again, up to five
+times, while the coordination root exists. A missing root is still refused
+at once.
+
 ### `sandbox.container` takes the container backend's seed settings (#292)
 
 The configuration now accepts `sandbox.container.history_depth` (0 or more,

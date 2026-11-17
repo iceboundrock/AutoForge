@@ -116,6 +116,15 @@ needs_child_subreaper = pytest.mark.skipif(
     reason="the child subreaper is Linux-only: here every contained launch is orphans_unchecked",
 )
 
+# Whether this host takes a path past provenance.MAX_PATH_CHARS (1024), which
+# the tests of a path shown cut must create: Linux's PATH_MAX is 4096, and
+# macOS's 1024 refuses one that long with ENAMETOOLONG (#501).
+LONG_PATHS = os.pathconf(tempfile.gettempdir(), "PC_PATH_MAX") > 2048
+needs_long_paths = pytest.mark.skipif(
+    not LONG_PATHS,
+    reason="this host's PATH_MAX (1024 on macOS) refuses a path past MAX_PATH_CHARS",
+)
+
 EPIC = "https://github.com/owner/repo/issues/1"
 ISSUE = "https://github.com/owner/repo/issues/2"
 ISSUE3 = "https://github.com/owner/repo/issues/3"

@@ -44,8 +44,11 @@ read it before adding tests for a listed area.
   (`test-macos`, #501), which has no `/proc`, no child subreaper, no
   `O_TMPFILE`, `O_PATH`, `memfd_create`, `pidfd_open`, `listxattr`,
   `sched_getaffinity`, `F_SETPIPE_SZ` or abstract sockets, no outer-sandbox
-  backend, a temporary directory under the `/var` link and a default limit
-  of 256 descriptors. A test of behaviour only Linux has skips elsewhere
+  backend, a temporary directory under the `/var` link (and `/tmp` a link
+  too), a default limit of 256 descriptors, a `PATH_MAX` of 1024
+  (conftest's `needs_long_paths`), APFS, which refuses a file name that is
+  not UTF-8, BSD `find`, a `PENDIN` bit the kernel sets in a terminal's
+  local modes, and a Python that is not an ELF executable. A test of behaviour only Linux has skips elsewhere
   with a reason that names what is missing (`_linux_only` in
   `tests/test_executor.py`; conftest's `needs_child_subreaper` for a
   test whose subject only a contained launch shows, while one about

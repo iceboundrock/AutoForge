@@ -61,6 +61,7 @@ from tests.conftest import (
     implement,
     is_shell_probe,
     make_engine,
+    needs_long_paths,
     no_credential_looking_names,
     pr_body_update,
     publish_pr_head,
@@ -2499,7 +2500,9 @@ def _long_dir(base: Path, length: int) -> str:
     return "/".join(parts)
 
 
-@pytest.mark.parametrize("case", ["newline", "escape", "long"])
+@pytest.mark.parametrize(
+    "case", ["newline", "escape", pytest.param("long", marks=needs_long_paths)]
+)
 def test_an_odd_state_dir_or_config_never_reaches_the_diagnostic_raw(
     tmp_path, capsys, monkeypatch, fakes, case
 ):
@@ -2542,6 +2545,7 @@ def test_an_odd_state_dir_or_config_never_reaches_the_diagnostic_raw(
     assert state_tree(tmp_path / state_dir) == before
 
 
+@needs_long_paths
 def test_a_credential_crossing_a_path_cut_never_reaches_the_diagnostic(
     tmp_path, capsys, monkeypatch, fakes
 ):

@@ -693,6 +693,44 @@ def test_a_linked_directory_above_a_lock_file_is_refused(root, tmp_path, which):
     assert list(elsewhere.iterdir()) == []
 
 
+def _missing_for(monkeypatch, times: int) -> list[int]:
+    """Make the walk to a lock file answer ENOENT ``times`` times, as macOS
+    can for an entry other processes are creating at once (#501)."""
+    calls: list[int] = []
+    real = locking._open_lock_file_once
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) <= times:
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(locking, "_open_lock_file_once", flaky)
+    return calls
+
+
+def test_an_entry_reported_missing_while_it_is_created_is_walked_to_again(root, monkeypatch):
+    calls = _missing_for(monkeypatch, locking._LOCK_CREATE_ATTEMPTS - 1)
+    SharedGitLock(root).acquire().release()
+    assert len(calls) == locking._LOCK_CREATE_ATTEMPTS
+    assert shared_git_lock_path(root).is_file()
+
+
+def test_an_entry_still_missing_after_every_attempt_is_refused(root, monkeypatch):
+    calls = _missing_for(monkeypatch, locking._LOCK_CREATE_ATTEMPTS)
+    with pytest.raises(LockError, match="reported missing while it was created, 5 times"):
+        SharedGitLock(root).acquire()
+    assert len(calls) == locking._LOCK_CREATE_ATTEMPTS
+
+
+def test_a_missing_coordination_root_is_refused_at_once(tmp_path, monkeypatch):
+    calls = _missing_for(monkeypatch, 0)
+    with pytest.raises(LockError, match="does not exist"):
+        SharedGitLock(tmp_path / "absent").acquire()
+    assert len(calls) == 1
+    assert not (tmp_path / "absent").exists()
+
+
 def test_lock_files_are_created_once_and_never_written_truncated_or_unlinked(root):
     namespace = issue_namespace(root, 7)
     with IssueRunLock(namespace), SharedGitLock(root):
