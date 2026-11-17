@@ -180,6 +180,10 @@ def main(argv: list[str]) -> int:
         if name not in state["containers"]:
             _not_found("container", name)
         fmt = args[args.index("--format") + 1]
+        if "Labels" in fmt and ".Config.Labels" not in fmt:
+            # As the real runtimes: a container's labels are in its config only.
+            sys.stderr.write(f"Error: template: inspect: can't evaluate field Labels in {fmt}\n")
+            return 125
         print(json.dumps(state["containers"][name]["labels"]) if "Labels" in fmt else name)
         return 0
     if verb == "create":

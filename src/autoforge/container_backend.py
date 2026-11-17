@@ -1359,7 +1359,11 @@ class ContainerBackend:
     def _labels(self, kind: str, name: str) -> dict[str, str] | None:
         """``name``'s labels, ``{}`` when it is gone, ``None`` when the runtime cannot say."""
         what = "volume" if kind == "volume" else "container"
-        res = self._call([what, "inspect", "--format", "{{json .Labels}}", name])
+        # A volume's labels are its own field; a container's are its config's, on
+        # Docker and Podman both (a container has no top-level ``Labels``: Podman
+        # 6.1.3 refuses that template, so no container was ever proved, PR #506).
+        field = ".Labels" if kind == "volume" else ".Config.Labels"
+        res = self._call([what, "inspect", "--format", "{{json " + field + "}}", name])
         if res.exit_code != 0:
             return {} if _NOT_FOUND.search(res.stderr or res.stdout or "") else None
         try:
