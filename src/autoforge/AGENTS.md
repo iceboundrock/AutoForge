@@ -110,8 +110,45 @@ container_auth.py   each provider's model credential under the container backend
                     or stored login never projected; of the rest of the environment only
                     a positive allow-list passed, every store variable set to a fresh
                     place in the private home, OpenCode's integration isolation set
-                    rather than inherited (ADR 0013 D7); agent launches only; pure,
+                    rather than inherited (ADR 0013 D7); agent launches only, and a
+                    repository command's environment (the private home, locale, time
+                    zone, terminal; no credential or provider setting); pure,
                     unreachable before #271 (#290)
+container_runtime.py  the container backend's runtime (ADR 0013 D8, D13, D16): detection
+                    (the setting, else Podman on PATH, else Docker; once, no fall-through),
+                    the runtime CLI client (allow-listed environment, a fresh empty client
+                    configuration per call, a non-local DOCKER_HOST, CONTAINER_HOST, Docker
+                    context or Podman connection refused), and the runtime's identity from
+                    its own version and info, never its name (product, version, API,
+                    rootless, endpoint, the store fields), read at every call (#271)
+container_image.py  the image (ADR 0013 D7): the operator's typed inputs (a base by
+                    digest, exact CLI versions, pinned MCP servers and Skills), the content
+                    key over them and AutoForge's helpers and version, the Containerfile
+                    and build context the controller writes (no repository build file),
+                    the build in the runtime's build container and the label-keyed cache;
+                    a launch names the image by id (#271)
+container_backend.py  the container module (ADR 0013 D13): ContainerBackend, the
+                    SandboxBackend on a rootless runtime; run-, issue- and launch-scoped
+                    names and labels, a removal only of the entry's own nonce, the stager
+                    container's copy-in on a helper's standard input, the stager's and the
+                    prover's execs with the engine's tree id and ref set, the run step's
+                    exec (values never on an argv; the credential plan's allow-list or a
+                    command's, nothing else; close() kills the agent's processes and proves
+                    them gone), every create proved by its labels, the export directory by
+                    its owner record, the read context copied in for copy-in, the
+                    exporter's artifact, the shared-filesystem probe through #272's probe
+                    journal and bound to the runtime report it was proved on; executor
+                    layer, unreachable before #272 and #273 (#271)
+container_stager.py, container_prover.py, container_exporter.py, container_watch.py
+                    AutoForge's helpers in the image (ADR 0013 D2, D5, D6): the stager
+                    (git init, strict index of the seed, its tags, the checkout with every
+                    conversion attribute unset, no system or global configuration, no hook,
+                    no LFS smudge), the prover (the tree re-hashed from the seed's objects
+                    against the controller's tree id; the seeded repository's ref set,
+                    reflogs, shallow, alternates, remotes, hooks and configuration), the
+                    exporter (HEAD read as files, the candidate's pack from a private git
+                    directory), PID 1's watcher with its deadline; standard library only,
+                    each imports nothing of the package (#271)
 git_input.py        a launch's git input (ADR 0013 D4): the bound revision, typed and
                     immutable (phase, launch, repository, object format, seed, lower
                     boundary, carried commit, seed manifest digest), its entry and
@@ -146,8 +183,9 @@ source_staging.py   the host side of a container launch's source, both forms (AD
                     written by materialize_into), its
                     re-proof before each hand-off (mount ids, owners and modes, seed, read
                     context, tree), its removal of only the launch's own directory, never
-                    through a mount, the ownership data #271 needs; no runtime, no
-                    journal; unreachable before #271 (#292)
+                    through a mount, the ownership data #271 needs (its entries readable by
+                    every container UID, 0755/0644, below 0700 sandbox directories, #271);
+                    no runtime, no journal; unreachable before #272 and #273 (#292)
 sandbox_policy.py   which host resources a launch gets by launch class (ADR 0005 §2.5):
                     LaunchFacts from the engine, ProviderRequirements from an adapter,
                     the SandboxPlan, the path-valued environment rewrite (D8.2),
@@ -428,6 +466,13 @@ sandbox_container.py, container_measure.py        -> the same, + ADR 0013 D9, D1
 container_auth.py, providers.py
 (credential_routes)                               -> the same, + docs/agent-guides/github-
                                                      safety.md (Provider credential mapping)
+container_backend.py, container_runtime.py,
+container_image.py, container_stager.py,
+container_prover.py, container_exporter.py,
+container_watch.py                                -> the same, + ADR 0013 D2, D5, D6 item 9,
+                                                     D7, D8, D12, D13, D15 and D16, and
+                                                     docs/configuration.md (The container
+                                                     backend's runtime and image)
 sandbox_policy.py, providers.py
 (sandbox_requirements), engine.py (launch
 routing, sandbox directories, the pre-launch

@@ -136,6 +136,8 @@ machine-readable block:
 
 {{PROVIDER_SECTION}}
 
+{{SANDBOX_SECTION}}
+
 ## Context variables
 
 - Repository: {{REPOSITORY}}

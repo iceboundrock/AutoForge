@@ -293,6 +293,9 @@ class FakeBackend:
     def kind(self) -> BackendKind:
         return BackendKind.CONTAINER
 
+    def policy_inputs(self) -> tuple[tuple[str, str], ...]:
+        return (("backend", "container"), ("staging", self.staging))
+
     def runtime_check(self) -> RuntimeReport:
         self.events.append(("runtime", "check"))
         self._maybe_fail("runtime check")

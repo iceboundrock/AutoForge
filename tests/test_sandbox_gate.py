@@ -228,3 +228,120 @@ def test_a_setup_failure_after_the_gate_never_runs_unenforced(
     assert not [line for line in said if "logical isolation only" in line]
     for execution in _executions(eng):
         assert execution["execution"].get("sandbox", {}).get("fallback") is None
+
+
+# -- repository commands under a backend that seeds (ADR 0013 D15; #271) ----------
+class _ContainerKind:
+    """A backend that names itself the container backend: nothing of it is run here."""
+
+    def __init__(self) -> None:
+        from autoforge.sandbox_backend import BwrapBackend
+
+        self._bwrap = BwrapBackend()
+
+    @property
+    def kind(self):
+        from autoforge.sandbox import BackendKind
+
+        return BackendKind.CONTAINER
+
+    def runtime_check(self):
+        from autoforge.sandbox import BackendKind
+        from autoforge.sandbox_backend import RuntimeReport
+
+        return RuntimeReport(BackendKind.CONTAINER, product="Podman", rootless=True, store="s")
+
+    def reconcile(self, entries, runtime):
+        return ()
+
+    def __getattr__(self, name):
+        return getattr(self._bwrap, name)
+
+
+@pytest.mark.parametrize("setting", ["validation", "none"])
+def test_a_step_that_would_run_repository_commands_under_the_container_backend_is_refused(
+    tmp_state_dir, fake_github, sandbox_probe, monkeypatch, setting
+):
+    cfg = _cfg("required")
+    if setting == "validation":
+        cfg.validation.commands = [["make", "test"], ["make", "lint"]]
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, cfg=cfg, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    monkeypatch.setattr(engine_module, "launch_backend", lambda: _ContainerKind())
+    if setting == "none":
+        # No command to run: the gate lets the step through to its launch.
+        eng._command_backend_gate(Phase.ANALYZE_EXECUTE)  # noqa: SLF001
+        return
+    before = _snapshot(eng)
+    with pytest.raises(SandboxCapabilityError) as caught:
+        eng.step()
+    assert caught.value.capability == "repository-commands"
+    message = str(caught.value)
+    assert "2 of validation.commands" in message and "never on the host" in message
+    assert "Nothing was launched, saved or charged" in message
+    assert _snapshot(eng) == before, "refused before anything of the step"
+
+
+def test_merge_verification_commands_under_the_container_backend_are_refused_too(
+    tmp_state_dir, fake_github, sandbox_probe, monkeypatch
+):
+    cfg = _cfg("required")
+    cfg.merge.verification_commands = [["make", "check"]]
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, cfg=cfg, origin=True)
+    monkeypatch.setattr(engine_module, "launch_backend", lambda: _ContainerKind())
+    with pytest.raises(SandboxCapabilityError, match="1 of merge.verification_commands"):
+        eng._command_backend_gate(Phase.READY_FOR_MERGE)  # noqa: SLF001
+    # The backstop: a repository command that reaches its sandbox another way.
+    with pytest.raises(SandboxLaunchRefusedError, match="does not run repository-defined"):
+        eng._command_sandbox(  # noqa: SLF001
+            engine_module.LaunchClass.EXPORT_COMMAND, str(tmp_state_dir), {}, "isolated"
+        )
+    # bwrap runs them as before.
+    monkeypatch.setattr(engine_module, "launch_backend", engine_module.default_backend)
+    eng._command_backend_gate(Phase.READY_FOR_MERGE)  # noqa: SLF001
+
+
+# -- the seeded copy's prompt section (ADR 0013 D2, D4, D11; #271) ---------------
+@pytest.mark.parametrize(
+    "depth, tags, says",
+    [
+        (0, False, ("base commit at depth one", "No tag comes with it.")),
+        (3, True, ("3 commit(s) below the base", "tags that point at a commit")),
+        ("full", False, ("every ancestor",)),
+    ],
+)
+def test_a_seeded_launchs_prompt_says_how_deep_its_history_is_and_what_gives_more(
+    tmp_state_dir, fake_github, sandbox_probe, monkeypatch, depth, tags, says
+):
+    cfg = _cfg("required")
+    cfg.sandbox.container.history_depth = depth
+    cfg.sandbox.container.history_tags = tags
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, cfg=cfg, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    assert eng._sandbox_section() == ""  # noqa: SLF001 - bwrap seeds nothing
+    monkeypatch.setattr(engine_module, "launch_backend", lambda: _ContainerKind())
+    section = " ".join(eng._sandbox_section().split())  # noqa: SLF001
+    for phrase in (
+        *says,
+        "It has no remote",
+        "sandbox.container.history_depth",
+        "sandbox.container.history_tags",
+        "a submodule (a gitlink) is an empty directory",
+        "a Git LFS file is its pointer file",
+        "a sparse checkout is not applied",
+        "Whatever you leave uncommitted when the launch ends is discarded",
+    ):
+        assert phrase in section, phrase
+    assert "{{" not in section
+    prompt = eng.render_prompt_for(Phase.ANALYZE_EXECUTE)
+    assert "Your repository is a seeded copy" in prompt
+
+
+def test_a_bwrap_or_disabled_prompt_has_no_seeded_copy_section(
+    tmp_state_dir, fake_github, sandbox_probe
+):
+    eng = make_engine(
+        tmp_state_dir, implement, github=fake_github, cfg=_cfg("disabled"), origin=True
+    )
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    assert "seeded copy" not in eng.render_prompt_for(Phase.ANALYZE_EXECUTE)

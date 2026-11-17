@@ -46,6 +46,7 @@ from pathlib import Path
 
 from . import __prompt_version__
 from .child_env import credential_looking_entry, entry_covers, refuse_forbidden_env
+from .container_image import IMAGE_KEYS, ImageInputs
 from .errors import ConfigurationError, SandboxPolicyError, ValidationDefinitionError
 from .evidence import SCOPE, check_definitions, check_scope
 from .executor import MAX_DEADLINE_SECONDS, is_env_pattern
@@ -745,7 +746,17 @@ SANDBOX_REQUIRED = "required"
 SANDBOX_MODES = (SANDBOX_DISABLED, SANDBOX_PREFERRED, SANDBOX_REQUIRED)
 SANDBOX_NETWORKS = ("host", "isolated")
 SANDBOX_KEYS = ("mode", "validation_network", "premerge_network", "read_only_paths", "container")
-CONTAINER_SANDBOX_KEYS = ("history_depth", "history_tags", "seed_max_bytes", "seed_max_objects")
+CONTAINER_SANDBOX_KEYS = (
+    "runtime",
+    "transfer",
+    "image",
+    "history_depth",
+    "history_tags",
+    "seed_max_bytes",
+    "seed_max_objects",
+)
+CONTAINER_RUNTIMES = ("podman", "docker")
+CONTAINER_TRANSFERS = ("auto", "copy")
 
 
 @dataclass
@@ -770,8 +781,24 @@ class ContainerSandboxConfig:
       naming the setting (and a history setting that made it larger). The
       defaults, 2 GiB and 1,000,000 objects, admit a large repository's
       whole tree at depth one.
+    - ``runtime`` (#271): ``podman`` or ``docker``, the runtime the backend
+      drives; unset (``None``), Podman when ``podman`` is on the
+      controller's ``PATH``, else Docker, detected once with no fall-through
+      (ADR 0013 D8). The runtime's identity is what it reports, never this
+      name.
+    - ``transfer`` (#271): ``auto`` (the default), a read-only bind of the
+      staging root where the shared-filesystem probe proved one, else
+      copy-in; ``copy`` forces copy-in. No value forces a bind (D12).
+    - ``image`` (#271): the image's inputs
+      (:class:`~autoforge.container_image.ImageInputs`): the base by digest,
+      each agent CLI's exact version, and the MCP servers and Skills to
+      install, each ``name@version``; ``None`` when unset, and then no
+      container launch has an image (D7).
     """
 
+    runtime: str | None = None
+    transfer: str = "auto"
+    image: ImageInputs | None = None
     history_depth: HistoryDepth = 0
     history_tags: bool = False
     seed_max_bytes: int = DEFAULT_SEED_MAX_BYTES
@@ -1253,6 +1280,31 @@ def _as_definitions(raw: object, source: str, key: str) -> list[list[str]]:
     return commands
 
 
+def _as_image(section: dict, source: str) -> ImageInputs:
+    """``sandbox.container.image``: the image's inputs, each checked (ADR 0013 D7)."""
+    if "base" not in section:
+        raise ConfigurationError(
+            f"{source}: 'sandbox.container.image.base' is required: the base image by digest"
+        )
+    values: dict[str, object] = {}
+    for key in ("base", "claude_code", "opencode", "pi"):
+        if key in section:
+            value = section[key]
+            if not isinstance(value, str):
+                raise ConfigurationError(
+                    f"{source}: 'sandbox.container.image.{key}' must be a string, got {value!r}"
+                )
+            values[key] = value
+    for key in ("mcp_servers", "skills"):
+        if key in section:
+            items = _as_str_list(section[key], source, f"sandbox.container.image.{key}")
+            values[key] = tuple(items)
+    try:
+        return ImageInputs(**values)  # type: ignore[arg-type]
+    except ValueError as exc:
+        raise ConfigurationError(f"{source}: {exc}") from None
+
+
 def _as_bool(raw: object, source: str, key: str) -> bool:
     """Accept only a real boolean — never coerce strings like "false" to True."""
     if isinstance(raw, bool):
@@ -1690,6 +1742,18 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
     container = _section(
         sandbox, "container", source, CONTAINER_SANDBOX_KEYS, label="sandbox.container"
     )
+    for key, allowed in (("runtime", CONTAINER_RUNTIMES), ("transfer", CONTAINER_TRANSFERS)):
+        if key in container:
+            value = container[key]
+            if not isinstance(value, str) or value not in allowed:
+                raise ConfigurationError(
+                    f"{source}: 'sandbox.container.{key}' must be one of "
+                    f"{', '.join(allowed)}, got {value!r}"
+                )
+            setattr(base.sandbox.container, key, value)
+    image = _section(container, "image", source, IMAGE_KEYS, label="sandbox.container.image")
+    if image:
+        base.sandbox.container.image = _as_image(image, source)
     if "history_depth" in container:
         base.sandbox.container.history_depth = _as_history_depth(container["history_depth"], source)
     if "history_tags" in container:

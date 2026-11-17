@@ -42,8 +42,8 @@ created.
   reached one component at a time, never through a link, and must be on
   the common dir's own mount (no mount nests in its layout), checked
   before anything is created inside it. The launch's own directory is made
-  exclusively, mode ``0700``, and the first thing written into it is its
-  owner record: the sandbox key, the launch's owner and the nonce its
+  exclusively, mode ``0755`` (:data:`STAGED_DIRECTORY_MODE`), and the first
+  thing written into it is its owner record: the sandbox key, the launch's owner and the nonce its
   journal entry carries (:class:`~autoforge.sandbox_backend.LifecycleObject`),
   which binds the directory to that entry. The record is published
   atomically (PR #504 R2-F2): its bytes are written and fsynced whole
@@ -157,10 +157,16 @@ STAGED_READ_CONTEXT = "read-context"
 STAGED_ENTRIES = (STAGED_OWNER, STAGED_READ_CONTEXT, STAGED_SEED, STAGED_TREE)
 
 # The mode the staging root, its seed and read-context directories are
-# set to, and the mode its owner record, seed and read-context files get:
-# the operator's alone.
-PRIVATE_DIRECTORY_MODE = 0o700
-PRIVATE_FILE_MODE = 0o600
+# set to, and the mode its owner record, seed and read-context files get
+# (#271's decision on how the agent reads /source): the operator's to
+# write, and readable by every other UID. Under a rootless runtime the
+# operator is the container's root and the agent's UID (AGENT_UID, a
+# subordinate UID) is "other" inside, so the agent reads /source, its read
+# context included, and writes nothing there (the bind is read-only too).
+# On the host the staging root lies below the controller's sandbox
+# directories, which safefs makes 0700: no other host user reaches it.
+STAGED_DIRECTORY_MODE = 0o755
+STAGED_FILE_MODE = 0o644
 
 # A read context is a handful of bounded documents (ADR 0004 D10); a copy
 # past these is refused rather than made.
@@ -200,8 +206,8 @@ class SourceOwnership:
 
     ``uid`` and ``gid`` own every entry of the staging root (the
     operator's, which a rootless runtime maps to the container's root);
-    ``private_directory_mode`` is the staging root's own and every directory
-    of its seed and read context; ``private_file_mode`` its owner record's
+    ``staged_directory_mode`` is the staging root's own and every directory
+    of its seed and read context; ``staged_file_mode`` its owner record's
     and every file of its seed and read context; the tree's directories,
     files and executable files have exactly
     :data:`~autoforge.materialize.DIRECTORY_MODE`,
@@ -213,8 +219,8 @@ class SourceOwnership:
 
     uid: int
     gid: int
-    private_directory_mode: int = PRIVATE_DIRECTORY_MODE
-    private_file_mode: int = PRIVATE_FILE_MODE
+    staged_directory_mode: int = STAGED_DIRECTORY_MODE
+    staged_file_mode: int = STAGED_FILE_MODE
     tree_directory_mode: int = materialize_mod.DIRECTORY_MODE
     tree_file_mode: int = materialize_mod.FILE_MODE
     tree_executable_mode: int = materialize_mod.EXECUTABLE_MODE
@@ -484,7 +490,7 @@ class SourceStaging:
         Each directory of the layout is checked to be on the common dir's
         mount before anything is created in it. The new directory, checked
         on its descriptor to be on that mount and empty, is set to mode
-        ``0700`` and to the operator's own group (a setgid parent of a
+        ``0755`` and to the operator's own group (a setgid parent of a
         shared repository would give it another), and its owner record is
         the first thing written into it, published atomically
         (:func:`_publish_owner_record`).
@@ -496,7 +502,7 @@ class SourceStaging:
                     SafeRoot.open(self.common_dir) as common,
                     _open_layout(common, parts[:-1], create=True) as stage,
                 ):
-                    os.mkdir(root.launch, PRIVATE_DIRECTORY_MODE, dir_fd=stage.fd)
+                    os.mkdir(root.launch, STAGED_DIRECTORY_MODE, dir_fd=stage.fd)
                     with stage.subroot(root.launch) as made:
                         if _mount_id(made.fd, root.path) != _mount_id(stage.fd, str(stage.path)):
                             raise _refused(f"{root.path} is a mount point")
@@ -505,7 +511,7 @@ class SourceStaging:
                                 f"{root.path} holds entries already, so it is not the directory "
                                 "just made"
                             )
-                        os.fchmod(made.fd, PRIVATE_DIRECTORY_MODE)
+                        os.fchmod(made.fd, STAGED_DIRECTORY_MODE)
                         if os.fstat(made.fd).st_gid != os.getegid():
                             os.fchown(made.fd, -1, os.getegid())
                         _publish_owner_record(made, record)
@@ -532,7 +538,7 @@ class SourceStaging:
         try:
             if sorted(os.listdir(src_dir)) != sorted(SEED_FILES):
                 raise _refused("its seed's directory does not hold exactly the seed's two files")
-            with _new_dir(staged, STAGED_SEED, mount, PRIVATE_DIRECTORY_MODE) as out:
+            with _new_dir(staged, STAGED_SEED, mount, STAGED_DIRECTORY_MODE) as out:
                 manifest, manifest_sha = _copy_file(src_dir, out, SEED_MANIFEST_NAME)
                 if "sha256:" + manifest_sha != digest:
                     raise _refused(
@@ -562,7 +568,7 @@ class SourceStaging:
         directory's path at any time receives nothing.
         """
         copied: list[ContextEntry] = []
-        with _new_dir(staged, STAGED_READ_CONTEXT, mount, PRIVATE_DIRECTORY_MODE) as out:
+        with _new_dir(staged, STAGED_READ_CONTEXT, mount, STAGED_DIRECTORY_MODE) as out:
             if not read_context:
                 return ()
             total = 0
@@ -572,7 +578,7 @@ class SourceStaging:
                     if entry.is_dir:
                         with (
                             _descend(out, parent, mount) as directory,
-                            _new_dir(directory, name, mount, PRIVATE_DIRECTORY_MODE),
+                            _new_dir(directory, name, mount, STAGED_DIRECTORY_MODE),
                         ):
                             pass
                         copied.append(ContextEntry(entry.relpath, "dir"))
@@ -911,7 +917,7 @@ def _check_contents(root: SafeRoot, ownership: SourceOwnership, mount: int) -> N
     """
     info = os.fstat(root.fd)
     problem = _owned_problem(info, ownership) or _mode_problem(
-        info, (ownership.private_directory_mode,)
+        info, (ownership.staged_directory_mode,)
     )
     if problem:
         raise _refused(f"{root.path} {problem}")
@@ -946,8 +952,8 @@ def _entry_problem(entry: WalkEntry, ownership: SourceOwnership) -> str:
     if problem:
         return problem
     top = entry.relpath.split("/", 1)[0]
-    private_dir: tuple[int, ...] = (ownership.private_directory_mode,)
-    private_file: tuple[int, ...] = (ownership.private_file_mode,)
+    private_dir: tuple[int, ...] = (ownership.staged_directory_mode,)
+    private_file: tuple[int, ...] = (ownership.staged_file_mode,)
     allowed: tuple[int, ...] | None
     if entry.relpath == STAGED_OWNER:
         allowed = private_file if entry.is_regular else None
@@ -1084,16 +1090,16 @@ def _publish_owner_record(launch: SafeRoot, record: bytes) -> None:
     or, without ``O_TMPFILE``, the temporary (which removal recognizes,
     :func:`_publication_leftover_problem`), or the whole record; never a
     partial record under its name. Its mode is then set to exactly
-    :data:`PRIVATE_FILE_MODE` whatever the umask.
+    :data:`STAGED_FILE_MODE` whatever the umask.
     """
-    launch.create_exclusive(STAGED_OWNER, record, mode=PRIVATE_FILE_MODE)
+    launch.create_exclusive(STAGED_OWNER, record, mode=STAGED_FILE_MODE)
     fd = os.open(STAGED_OWNER, _READ_FLAGS, dir_fd=launch.fd)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise _refused(f"{launch.path}/{STAGED_OWNER} is not the owner record published")
-        if stat.S_IMODE(info.st_mode) != PRIVATE_FILE_MODE:
-            os.fchmod(fd, PRIVATE_FILE_MODE)
+        if stat.S_IMODE(info.st_mode) != STAGED_FILE_MODE:
+            os.fchmod(fd, STAGED_FILE_MODE)
     finally:
         os.close(fd)
 
@@ -1129,7 +1135,7 @@ def _remove_launch_dir(stage: SafeRoot, name: str, record: bytes) -> Removal:
                 if _mount_id_at(entry.dir_fd, entry.name, entry.st, entry.relpath) != mount:
                     return Removal.UNCERTAIN
             if not info.st_mode & stat.S_IWUSR or not info.st_mode & stat.S_IXUSR:
-                os.fchmod(launch.fd, PRIVATE_DIRECTORY_MODE)
+                os.fchmod(launch.fd, STAGED_DIRECTORY_MODE)
             _remove_below(launch.fd, mount, keep=STAGED_OWNER)
             if owned:
                 os.unlink(STAGED_OWNER, dir_fd=launch.fd)
@@ -1170,7 +1176,7 @@ def _remove_below(root_fd: int, mount: int, *, keep: str) -> None:
                     if _mount_id(sub, child) != mount:
                         raise _refused(f"something is mounted at {child}; it is not removed")
                     if (info.st_mode & _OWNER_RWX) != _OWNER_RWX:
-                        os.fchmod(sub, PRIVATE_DIRECTORY_MODE)
+                        os.fchmod(sub, STAGED_DIRECTORY_MODE)
                     children = os.listdir(sub)
                 except BaseException:
                     os.close(sub)
@@ -1190,10 +1196,10 @@ def _remove_below(root_fd: int, mount: int, *, keep: str) -> None:
 
 
 def _write_new(dir_fd: int, name: str, data: bytes) -> None:
-    """Create ``name`` in ``dir_fd`` exclusively, holding ``data``, mode ``0600``."""
-    fd = os.open(name, _NEW_FILE_FLAGS, PRIVATE_FILE_MODE, dir_fd=dir_fd)
+    """Create ``name`` in ``dir_fd`` exclusively, holding ``data``, mode ``STAGED_FILE_MODE``."""
+    fd = os.open(name, _NEW_FILE_FLAGS, STAGED_FILE_MODE, dir_fd=dir_fd)
     try:
-        os.fchmod(fd, PRIVATE_FILE_MODE)
+        os.fchmod(fd, STAGED_FILE_MODE)
         view = memoryview(data)
         while view:
             view = view[os.write(fd, view) :]
@@ -1209,11 +1215,11 @@ def _copy_file(src_dir: int, out: SafeRoot, name: str, *, keep: bool = True) -> 
         if not stat.S_ISREG(os.fstat(src).st_mode):
             raise _refused(f"its seed's {name} is not a regular file")
         os.set_blocking(src, True)
-        dst = os.open(name, _NEW_FILE_FLAGS, PRIVATE_FILE_MODE, dir_fd=out.fd)
+        dst = os.open(name, _NEW_FILE_FLAGS, STAGED_FILE_MODE, dir_fd=out.fd)
         digest = hashlib.sha256()
         kept = bytearray()
         try:
-            os.fchmod(dst, PRIVATE_FILE_MODE)
+            os.fchmod(dst, STAGED_FILE_MODE)
             while chunk := os.read(src, _CHUNK_BYTES):
                 digest.update(chunk)
                 if keep:

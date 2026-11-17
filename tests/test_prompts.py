@@ -1378,3 +1378,23 @@ def test_a_dry_run_plan_names_the_pending_worktree_read(engine):
     plan = engine.plan_step()
     assert plan.variables["WORKTREE_STATE"] == WORKTREE_STATE_PENDING
     assert WORKTREE_STATE_PENDING in plan.prompt_full
+
+
+def test_the_seeded_copy_template_names_the_history_settings_and_what_staging_supports():
+    """#271 (ADR 0013 D2, D4, D11): a seeded launch is told how deep its copy is and
+    which settings give more, what a gitlink, an LFS file and a sparse checkout
+    become, and that uncommitted work is discarded."""
+    template = prompts.load_template("seed_history_container.md")
+    assert prompts.required_variables(template) == {"HISTORY_DEPTH", "HISTORY_TAGS"}
+    assert "SANDBOX_SECTION" in prompts.required_variables(prompts.load_template("common.md"))
+    text = " ".join(template.split())
+    for phrase in (
+        "sandbox.container.history_depth",
+        "sandbox.container.history_tags",
+        "It has no remote",
+        "a submodule (a gitlink) is an empty directory",
+        "a Git LFS file is its pointer file",
+        "a sparse checkout is not applied",
+        "Whatever you leave uncommitted when the launch ends is discarded",
+    ):
+        assert phrase in text, phrase

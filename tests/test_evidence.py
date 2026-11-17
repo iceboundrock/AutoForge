@@ -1312,3 +1312,66 @@ def test_a_full_failure_stays_terminal_whatever_passes_beside_it():
     assert found.failed is not None and found.failed.seq == 1 and not found.complete
     overridden = ev.find_evidence(records, remote(), (WHOLE,), policy(), 1)
     assert overridden.records == () and not overridden.decided
+
+
+def test_a_containers_backend_inputs_join_p_and_a_bwrap_digest_is_unchanged():
+    """ADR 0006 D8.1 as amended (#267, #271): a container launch's P covers the backend,
+    the runtime, the image and the staging method; bwrap's P is what it was."""
+    from autoforge.evidence import POLICY_ENCODING, _sha256
+
+    plain = policy()
+    assert plain.digest == _sha256(
+        {
+            "version": POLICY_ENCODING,
+            "mode": plain.mode,
+            "template": plain.template_digest,
+            "env_allowlist": plain.env_names_digest,
+            "timeout_seconds": plain.timeout_seconds,
+            "contain_orphans": plain.contain_orphans,
+            "method": plain.method,
+        }
+    ), "a bwrap P is computed exactly as before"
+    container = policy(
+        backend_inputs=(
+            ("backend", "container"),
+            ("runtime", "Podman"),
+            ("image", "sha256:" + "a" * 64),
+            ("staging", "bind"),
+        )
+    )
+    assert container.digest != plain.digest
+    for name, other in (("image", "sha256:" + "b" * 64), ("staging", "copy"), ("runtime", "")):
+        changed = dict(container.backend_inputs)
+        changed[name] = other
+        assert policy(backend_inputs=tuple(changed.items())).digest != container.digest
+    assert "image sha256:" in container.describe() and "image" not in plain.describe()
+
+
+def test_a_container_records_enforcement_facts_carry_its_runtime_image_and_staging():
+    """ADR 0006 D8.2 as amended (#267, #271): a container launch's record copies the
+    runtime's product and version, the image id and the staging method; a bwrap
+    record copies what it did, and a stray container key in one is refused."""
+    from autoforge.evidence import _parse_enforcement, enforcement_facts
+    from autoforge.sandbox import SandboxFacts
+
+    container = SandboxFacts(
+        enforced=True, backend="container", teardown="removed", network="isolated",
+        runtime="Podman", runtime_version="5.8.7", image_id="sha256:" + "a" * 64,
+        staging="bind", watch="w", diagnostics=("x",), cli_versions=(("claude", "2.0.14"),),
+    )  # fmt: skip
+    copied = enforcement_facts(container)
+    assert copied == {
+        "enforced": True, "backend": "container", "backend_version": "", "network": "isolated",
+        "teardown": "removed", "runtime": "Podman", "runtime_version": "5.8.7",
+        "image_id": "sha256:" + "a" * 64, "staging": "bind",
+    }  # fmt: skip
+    _parse_enforcement(copied, "record.enforcement")
+    bwrap = enforcement_facts(SandboxFacts(enforced=True, backend="bwrap", network="host"))
+    assert set(bwrap) == {"enforced", "backend", "backend_version", "network", "teardown"}
+    _parse_enforcement(bwrap, "record.enforcement")
+    with pytest.raises(Exception, match="unknown key"):
+        _parse_enforcement({**bwrap, "image_id": "sha256:x"}, "record.enforcement")
+    with pytest.raises(Exception, match="missing key"):
+        _parse_enforcement({k: v for k, v in copied.items() if k != "staging"}, "r.enforcement")
+    with pytest.raises(Exception, match="staging"):
+        _parse_enforcement({**copied, "staging": "rsync"}, "record.enforcement")

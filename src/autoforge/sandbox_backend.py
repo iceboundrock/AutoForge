@@ -482,6 +482,17 @@ class SandboxBackend(Protocol):
         """
         ...
 
+    def policy_inputs(self) -> tuple[tuple[str, str], ...]:
+        """What of the backend a validation set's policy P covers (ADR 0006 D8.1 as amended).
+
+        ``(name, value)`` pairs, read-only: for a container, the backend,
+        the runtime's product, the image id, the staging method and the
+        materialization the tree is proved by, each "" while unknown, so
+        evidence is withdrawn rather than granted. Empty for bwrap, whose P
+        is what it was.
+        """
+        ...
+
 
 def _no_object(obj: LifecycleObject) -> SandboxLaunchRefusedError:
     return SandboxLaunchRefusedError(
@@ -567,6 +578,9 @@ class BwrapBackend:
     def remove(self, obj: LifecycleObject) -> Removal:
         # Never "removed": bwrap made no such object, so it can prove nothing.
         return Removal.UNCERTAIN
+
+    def policy_inputs(self) -> tuple[tuple[str, str], ...]:
+        return ()
 
 
 BWRAP = BwrapBackend()

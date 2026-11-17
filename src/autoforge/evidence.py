@@ -278,6 +278,10 @@ class Policy:
     timeout_seconds: int
     contain_orphans: bool
     method: str
+    # The backend's own inputs (ADR 0006 D8.1 as amended by #267): for a
+    # container, the backend, the runtime's product, the image id and the
+    # staging method; empty for bwrap, whose digest is exactly what it was.
+    backend_inputs: tuple[tuple[str, str], ...] = ()
 
     @property
     def template_digest(self) -> str:
@@ -289,17 +293,21 @@ class Policy:
 
     @property
     def digest(self) -> str:
-        return _sha256(
-            {
-                "version": POLICY_ENCODING,
-                "mode": self.mode,
-                "template": self.template_digest,
-                "env_allowlist": self.env_names_digest,
-                "timeout_seconds": self.timeout_seconds,
-                "contain_orphans": self.contain_orphans,
-                "method": self.method,
-            }
-        )
+        inputs: dict[str, object] = {
+            "version": POLICY_ENCODING,
+            "mode": self.mode,
+            "template": self.template_digest,
+            "env_allowlist": self.env_names_digest,
+            "timeout_seconds": self.timeout_seconds,
+            "contain_orphans": self.contain_orphans,
+            "method": self.method,
+        }
+        # Only a backend that names inputs adds them: a record made under one
+        # backend never applies under another, and a changed image withdraws
+        # evidence; a bwrap record's digest is unchanged.
+        if self.backend_inputs:
+            inputs["backend"] = dict(self.backend_inputs)
+        return _sha256(inputs)
 
     @property
     def requires_enforcement(self) -> bool:
@@ -319,10 +327,15 @@ class Policy:
 
     def describe(self) -> str:
         """One line for the dry-run plan and ``status``."""
-        return (
+        text = (
             f"mode {self.mode}, digest {self.digest[:16]}..., timeout {self.timeout_seconds}s, "
             f"method {self.method}"
         )
+        if self.backend_inputs:
+            text += ", " + ", ".join(
+                f"{name} {value or '?'}" for name, value in self.backend_inputs
+            )
+        return text
 
 
 # -- candidates (D2.1-D2.7) ------------------------------------------------------------
@@ -554,6 +567,14 @@ _PR_HEAD_KEYS = ("kind", "pr_url")
 _DEFINITION_KEYS = ("index", "argv", "definition_digest", "scope")
 _POLICY_KEYS = ("policy_digest", "mode", "timeout_seconds")
 _ENFORCEMENT_KEYS = ("enforced", "backend", "backend_version", "network", "teardown")
+# What a container launch's record copies besides (ADR 0006 D8.2 as amended
+# by #267): the runtime's product and version, the image id and the staging
+# method. Present exactly when ``backend`` is the container's, so a bwrap
+# record is what it was.
+CONTAINER_BACKEND = "container"
+_CONTAINER_ENFORCEMENT_KEYS = ("runtime", "runtime_version", "image_id", "staging")
+STAGING_METHODS = ("bind", "copy", "")
+MAX_IMAGE_ID_CHARS = 80
 _LEFTOVER_KEYS = (
     "descendants_killed",
     "group_survived_kill",
@@ -668,13 +689,19 @@ def _parse_policy(raw: object, what: str) -> dict:
 
 
 def _parse_enforcement(raw: object, what: str) -> None:
-    _exact(raw, _ENFORCEMENT_KEYS, what)
+    container = isinstance(raw, dict) and raw.get("backend") == CONTAINER_BACKEND
+    _exact(raw, _ENFORCEMENT_KEYS + (_CONTAINER_ENFORCEMENT_KEYS if container else ()), what)
     assert isinstance(raw, dict)
     _bool(raw["enforced"], f"{what}.enforced")
     _str(raw["backend"], f"{what}.backend", MAX_BACKEND_CHARS)
     _str(raw["backend_version"], f"{what}.backend_version", MAX_BACKEND_CHARS)
     _enum(raw["network"], f"{what}.network", NETWORKS)
     _str(raw["teardown"], f"{what}.teardown", MAX_TEARDOWN_CHARS)
+    if container:
+        _str(raw["runtime"], f"{what}.runtime", MAX_BACKEND_CHARS)
+        _str(raw["runtime_version"], f"{what}.runtime_version", MAX_BACKEND_CHARS)
+        _str(raw["image_id"], f"{what}.image_id", MAX_IMAGE_ID_CHARS)
+        _enum(raw["staging"], f"{what}.staging", STAGING_METHODS)
 
 
 def _parse_output(raw: object, what: str) -> None:
@@ -1116,13 +1143,22 @@ def enforcement_facts(facts: SandboxFacts | None) -> dict:
             "network": "",
             "teardown": "",
         }
-    return {
+    copied: dict[str, object] = {
         "enforced": bool(facts.enforced),
         "backend": _clip(redact(facts.backend), MAX_BACKEND_CHARS),
         "backend_version": _clip(redact(facts.backend_version), MAX_BACKEND_CHARS),
         "network": facts.network if facts.network in NETWORKS else "",
         "teardown": _clip(redact(facts.teardown), MAX_TEARDOWN_CHARS),
     }
+    if copied["backend"] == CONTAINER_BACKEND:
+        # D8.2 as amended: a container's runtime, image and staging method.
+        copied.update(
+            runtime=_clip(redact(facts.runtime), MAX_BACKEND_CHARS),
+            runtime_version=_clip(redact(facts.runtime_version), MAX_BACKEND_CHARS),
+            image_id=_clip(redact(facts.image_id), MAX_IMAGE_ID_CHARS),
+            staging=facts.staging if facts.staging in STAGING_METHODS else "",
+        )
+    return copied
 
 
 def _escape(char: str) -> str:

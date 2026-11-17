@@ -30,7 +30,8 @@ loopback skips.
 say a host is capable, so these tests run only when the operator names a
 runtime and an image: ``AUTOFORGE_CONTAINER_TEST_RUNTIME`` (``podman`` or
 ``docker``, on ``PATH`` or as a path) and ``AUTOFORGE_CONTAINER_TEST_IMAGE``
-(present locally, with ``python3``; nothing is pulled). A short setup
+(present locally, with ``python3``; nothing is pulled; AutoForge's image
+layout, ``layout_steps``, is built onto it). A short setup
 container stands in for the stager (#271) and hands the agent's UID the
 fresh workspace volume. Otherwise, and on a
 runtime that is not rootless or cannot start a container, each test skips
@@ -49,6 +50,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import uuid
 from collections.abc import Iterator
@@ -57,6 +59,8 @@ from pathlib import Path
 
 import pytest
 
+from autoforge.container_image import layout_steps
+from autoforge.container_runtime import selinux_enforcing, selinux_problem
 from autoforge.sandbox_container import (
     AGENT_GID,
     AGENT_UID,
@@ -198,6 +202,9 @@ def runtime() -> Runtime:
         rootless = any("rootless" in opt for opt in report.get("SecurityOptions", []))
     if not rootless:
         _unavailable(f"{name} is not rootless, which ADR 0013 D10 refuses")
+    selinux = selinux_problem(product, report, selinux_enforcing())
+    if selinux:
+        _unavailable(selinux)
     machine = platform.machine()
     if machine not in _SYS_KEYCTL:
         _unavailable(f"no keyring helper for {machine}")
@@ -214,7 +221,32 @@ def runtime() -> Runtime:
     )
     if found.returncode != 0:
         _unavailable(f"the image {image} is not present locally (nothing is pulled)")
+    image = _with_layout(executable, image, env)
     return Runtime(product, executable, image, env, keyed)
+
+
+def _with_layout(executable: str, image: str, env: dict[str, str]) -> str:
+    """``image`` laid out as AutoForge's image is (``layout_steps``).
+
+    A fresh volume is copied up from the image's workspace, with its owner;
+    Podman binds a passwd of its own for a user the image does not name; and
+    a Podman launch's home tmpfs is copied up from the image's home
+    (``_home_tmpfs``). A bare base has none of these. Built locally from the
+    base already present, nothing pulled; its id.
+    """
+    with tempfile.TemporaryDirectory() as context:
+        containerfile = Path(context) / "Containerfile"
+        steps = " && ".join(layout_steps())
+        containerfile.write_text(f"FROM {image}\nUSER 0:0\nRUN {steps}\n")
+        iid = Path(context) / "iid"
+        built = subprocess.run(
+            [executable, "build", "--pull=never", f"--iidfile={iid}",
+             f"--file={containerfile}", context],
+            env=env, capture_output=True, text=True, timeout=_TIMEOUT,
+        )  # fmt: skip
+        if built.returncode != 0:
+            raise AssertionError(f"building the layout onto {image} failed: {built.stderr[-2000:]}")
+        return iid.read_text().strip()
 
 
 def _serve(server: socket.socket, nonce: bytes) -> None:

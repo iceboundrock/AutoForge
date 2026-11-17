@@ -213,7 +213,7 @@ probe file it creates and removes there.
 | `github` | the `gh` binary (a relative path, and a relative `PATH` entry a bare name is found through, is resolved against the directory AutoForge starts in: every `gh` runs in an empty directory of its own) and its timeout | [GitHub safety](agent-guides/github-safety.md#controller-owned-effects) |
 | `validation` | REMOTE candidate validation (#172): `commands` (argv lists, empty by default), `scope` (`candidate-tree`, the only value) | [Candidate validation](#candidate-validation) below, [State and recovery](agent-guides/state-and-recovery.md#validation-evidence) |
 | `scheduler` | the parallel EPIC scheduler (#182, `autoforge epic`): `max_parallel` (1-4, default 2; `epic run --max-parallel` overrides it), `poll_interval_seconds` (15-3600, default 60), `stop_grace_seconds` (10-600, default 30) | [Parallel EPIC scheduler](#parallel-epic-scheduler) below, [Workflow](agent-guides/workflow.md#scheduler-execution-policy) |
-| `sandbox` | the outer sandbox (#168, #169): `mode` (`disabled`, the default, `preferred` or `required`), `validation_network` and `premerge_network` (`host`, the default, or `isolated`), `read_only_paths`; the container backend's seed settings under `sandbox.container` (`history_depth` 0, `history_tags` false, `seed_max_bytes` 2 GiB, `seed_max_objects` 1,000,000; read by nothing before that backend is selectable) | [Outer sandbox](#outer-sandbox) below, [The container backend's seed](#the-container-backends-seed-sandboxcontainer), [Architecture](agent-guides/architecture.md#launch-routing-adr-0005-168) |
+| `sandbox` | the outer sandbox (#168, #169): `mode` (`disabled`, the default, `preferred` or `required`), `validation_network` and `premerge_network` (`host`, the default, or `isolated`), `read_only_paths`; the container backend's seed settings under `sandbox.container` (`history_depth` 0, `history_tags` false, `seed_max_bytes` 2 GiB, `seed_max_objects` 1,000,000) and its runtime, staging and image (`runtime` detected, `transfer` `auto`, `image` unset); read by nothing before that backend is selectable | [Outer sandbox](#outer-sandbox) below, [The container backend's seed](#the-container-backends-seed-sandboxcontainer), [The container backend's runtime and image](#the-container-backends-runtime-and-image-sandboxcontainer), [Architecture](agent-guides/architecture.md#launch-routing-adr-0005-168) |
 
 ## Profiles
 
@@ -1491,6 +1491,102 @@ with the launch (#271):
 | a filter or conversion attribute | not applied | the committed bytes |
 | a sparse checkout | unsupported | the commit's whole tree |
 | a partial clone (`--filter`) | unsupported for missing objects | the store is read with no lazy fetch, whatever your git version: an object it lacks refuses the seed or the snapshot, and the promisor remote is never contacted |
+
+### The container backend's runtime and image (`sandbox.container`)
+
+Like the seed settings above, these keys are validated now and read by
+nothing until the backend is selectable (#272, #273). They are the
+operator's alone: no repository file and no agent sets them.
+
+```yaml
+sandbox:
+  container:
+    runtime: podman             # podman | docker; unset: detected
+    transfer: auto              # auto | copy
+    image:
+      base: registry.example/toolchain@sha256:<64 hex digits>
+      claude_code: 2.0.14       # each CLI optional, an exact version
+      opencode: 1.18.34
+      pi: 1.0.1
+      mcp_servers: ["@scope/server-files@1.2.3"]
+      skills: ["review-skill@0.1.0"]
+```
+
+- **`runtime`** names the runtime AutoForge drives. Unset, it uses Podman
+  when `podman` is on the controller's `PATH`, and Docker otherwise. The
+  choice is made once: a runtime that is found and then fails its check
+  refuses the step, naming the runtime and this setting, and the other
+  runtime is never tried. What the runtime *is* comes from its own
+  `version` and `info`, never from this name: a `docker` that is Podman's
+  compatibility wrapper is reported as Podman. A runtime that is not
+  rootless, Docker Desktop, a remote Podman service, and a `DOCKER_HOST` or
+  `CONTAINER_HOST` naming anything but a local Unix socket are refused, and
+  so are `DOCKER_CONTEXT` (other than `default`) and
+  `CONTAINER_CONNECTION`: AutoForge runs the runtime's CLI with an empty
+  client configuration, where no context or connection is defined, so name
+  a rootless Docker's socket with `DOCKER_HOST=unix:///...` instead.
+  A runtime that labels its containers for SELinux on a host where SELinux
+  is enforcing is refused too: AutoForge relabels no host file, so a
+  labelled container could read neither the staged source nor a projected
+  credential file. Run such a host permissive, or use the `bwrap` backend.
+- **`transfer: copy`** forces copy-in: the seed is streamed into the
+  container and nothing is bound from the host, for example to avoid
+  UID-mapping problems. With `auto`, a probe writes
+  a nonce file on the host and reads it back from inside a container that
+  binds it read-only; only that proof gives the bind form. No value forces
+  a bind.
+- **`image`** is everything the image is built from. `base` is required
+  and named by digest: a tag alone is mutable, and is refused. The base
+  must hold `python3`, `git`, `sh`, the toolchains the repository needs
+  and, when anything is installed, `npm`; pull it yourself first if its
+  registry needs authentication, since AutoForge's runtime calls carry no
+  credential. `claude_code`, `opencode` and `pi` are exact versions of
+  `@anthropic-ai/claude-code`, `opencode-ai` and
+  `@earendil-works/pi-coding-agent`; `mcp_servers` and `skills` are npm
+  packages, each `name@version`. No range, tag, URL, path or git reference
+  is accepted, and no key takes a runtime flag, a mount or a
+  `Dockerfile`: no repository `Dockerfile`, `devcontainer.json` or build
+  script is ever read.
+
+AutoForge builds the image itself, in the runtime's build container, from
+a context it writes (a `Containerfile` rendered from these keys and its
+own helpers), names it by its content id, and labels it with a key over
+every input and its own version. An unchanged configuration reuses that
+image; any change, an AutoForge upgrade included, builds a new one.
+**Installing is not enabling:** every launch keeps its isolation flags, so
+an installed MCP server or Skill stays disabled until a reviewed policy
+amendment enables it (ADR 0013 D7).
+
+The image clears the base's `ENTRYPOINT` and `CMD`, so a container's
+first process is AutoForge's watcher, never a program of the base's; an
+image that still shows an entrypoint is refused when it is built, when the
+cache offers it, and when the backend checks it. Each pinned CLI's version
+is read inside the container, as the agent, and an image whose `claude`,
+`opencode` or `pi` reports another version than the one set here is
+refused. The launch's facts in the run log carry what each reported.
+
+**What a container launch receives of AutoForge's environment.** An agent
+launch receives its model credential, projected by the provider's own
+mapping (#290), and of the rest only a fixed list: the locale, the time
+zone, the terminal, the git author identity and the provider's declared
+settings; `HOME` and the CLI's own stores are fresh places in its private
+home. Nothing else is forwarded, whatever its name. A repository command
+receives the locale, the time zone and the terminal, and no credential.
+
+**Repository commands are refused under this backend for now.** Under the
+container backend, `validation.commands` and `merge.verification_commands`
+run only in a container over the verified tree, never on the host, and
+that routing is not built yet. A step that would run one is refused before
+anything of it is saved or launched, naming the setting.
+
+**How the agent reads `/source`.** In the bind form the staging root's own
+directory and everything in it are readable by every UID (`0755` and
+`0644`) and writable by none but you: under a rootless runtime you are the
+container's root and the agent's UID is another, so it reads its read
+context and snapshot there. On the host the staging root lies below the
+controller's `0700` sandbox directories, so no other user reaches it. In
+the copy-in form the read context is copied into the agent's private home
+at `/home/agent/read-context`.
 
 ## Parallel EPIC scheduler
 

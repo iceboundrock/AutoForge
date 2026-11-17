@@ -75,6 +75,11 @@ _MAX_REPORTED = 20
 # How many entries of one listed filesystem are named, with their kinds: a
 # runtime's /dev holds about fifteen; a count above what was named fails.
 _MAX_LISTED = 64
+# The directory crun keeps empty in its state directory (a tmpfs) and binds
+# over each directory below /proc and /sys it masks; mountinfo shows that
+# tmpfs and this root. It is listed like a fresh tmpfs: an empty one holds
+# nothing. Measured on rootless Podman 6.1.3 with crun (PR #506).
+CRUN_EMPTY_DIRECTORY = "crun/.empty-directory"
 # The filesystems listed when mounted from their own root: a fresh one and a
 # host one bound in whole look alike in mountinfo, and only what they hold
 # tells them apart.
@@ -336,6 +341,11 @@ def _kind(path: str) -> tuple[str, str | None]:
         return kind, f"unread ({_error(exc)})"
 
 
+def _is_empty_directory(root: str) -> bool:
+    """Whether a mount's root is crun's empty directory, which it binds over what it masks."""
+    return root.endswith("/" + CRUN_EMPTY_DIRECTORY)
+
+
 def _listings(mountinfo: str) -> dict[str, dict[str, object]]:
     """What each tmpfs, mqueue and devpts mounted from its own root holds, by mount point.
 
@@ -348,7 +358,7 @@ def _listings(mountinfo: str) -> dict[str, dict[str, object]]:
     """
     contents: dict[str, dict[str, object]] = {}
     for root, point, fstype in _mount_lines(mountinfo):
-        if fstype not in _LISTED_TYPES or root != "/":
+        if fstype not in _LISTED_TYPES or not (root == "/" or _is_empty_directory(root)):
             continue
         try:
             names = sorted(os.listdir(point))

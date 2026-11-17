@@ -36,6 +36,7 @@ import pytest
 from autoforge.child_env import undoes_isolation
 from autoforge.config import ExecutionConfig, ProfileConfig
 from autoforge.container_auth import (
+    COMMAND_PASSED_NAMES,
     PASSED_NAMES,
     CredentialKind,
     CredentialPlan,
@@ -44,9 +45,11 @@ from autoforge.container_auth import (
     Mechanism,
     PrivateStore,
     Refresh,
+    command_environment,
     credential_looking,
     plan_credentials,
 )
+from autoforge.container_image import home_steps
 from autoforge.errors import SandboxPolicyError
 from autoforge.executor import ExecutionRequest, ExecutionResult, execute, select_environment
 from autoforge.providers import (
@@ -66,6 +69,8 @@ from autoforge.providers import (
 )
 from autoforge.redaction import redact
 from autoforge.sandbox_container import (
+    AGENT_UID,
+    HOME_PARENT,
     HOME_TARGET,
     ContainerNetwork,
     ContainerRole,
@@ -456,14 +461,23 @@ def test_every_store_variable_names_a_place_in_the_private_home(provider, profil
         assert value not in received.values()
 
 
-def test_the_private_home_is_a_tmpfs_each_create_makes_anew():
+@pytest.mark.parametrize("product", list(RuntimeProduct))
+def test_the_private_home_is_a_tmpfs_each_create_makes_anew(product):
     """Where every store lies: the launch container's create mounts a tmpfs of its own
-    there, mode 0700 and the agent's, and binds nothing at it or below it."""
+    there, the agent's and 0700, and binds nothing at it or below it. On Docker the
+    tmpfs is the home; on rootless Podman, which refuses uid=/gid=, it is the home's
+    parent, into which the image's own home (the agent's, 0700) is copied up."""
     spec = ContainerSpec(ContainerRole.LAUNCH, ContainerNetwork.NONE, "af-vol-290")
-    options = create_options(RuntimeProduct.PODMAN, spec)
-    homes = [o for o in options if o.startswith(f"--tmpfs={HOME_TARGET}:")]
-    assert len(homes) == 1 and "mode=0700" in homes[0]
-    assert not any(o.startswith("--mount") and HOME_TARGET in o for o in options)
+    options = create_options(product, spec)
+    target = HOME_PARENT if product is RuntimeProduct.PODMAN else HOME_TARGET
+    homes = [o for o in options if o.startswith("--tmpfs=/home")]
+    assert len(homes) == 1 and homes[0].startswith(f"--tmpfs={target}:")
+    if product is RuntimeProduct.PODMAN:
+        assert "tmpcopyup" in homes[0] and "uid=" not in homes[0]
+        assert any(step.startswith(f"chmod 0700 {HOME_TARGET}") for step in home_steps())
+    else:
+        assert "mode=0700" in homes[0] and f"uid={AGENT_UID}" in homes[0]
+    assert not any(o.startswith("--mount") and HOME_PARENT in o for o in options)
 
 
 # -- integrations stay off: the isolation is set, never inherited (ADR 0013 D7) -------
@@ -1122,3 +1136,24 @@ def _launch_refused(container, provider, profile, env, launch_class):
     )
     inside = {**plan.container_environment(), **client_environment({}, plan.projection)}
     _run(container, provider, profile, inside)
+
+
+def test_a_repository_commands_environment_is_a_positive_allow_list_with_no_credential():
+    env = {
+        "ANTHROPIC_API_KEY": "sk-ant-sentinel",
+        "OPENAI_API_KEY": "sk-sentinel",
+        "AWS_SECRET_ACCESS_KEY": "aws-sentinel",
+        "DATABASE_URL": "postgres://u:p@h/d",
+        "OPENCODE_CONFIG": "/repo/opencode.json",
+        "CLAUDE_CONFIG_DIR": "/home/op/.claude",
+        "GIT_AUTHOR_EMAIL": "op@example.invalid",
+        "HOME": "/home/op",
+        "LANG": "C.UTF-8",
+        "TZ": "UTC",
+        "TERM": "",
+    }
+    environment = command_environment(env)
+    assert environment == {"HOME": "/home/agent", "LANG": "C.UTF-8", "TZ": "UTC"}
+    assert COMMAND_PASSED_NAMES < PASSED_NAMES
+    assert not any(credential_looking(name) for name in COMMAND_PASSED_NAMES)
+    assert not any(name.startswith("GIT_") for name in COMMAND_PASSED_NAMES)

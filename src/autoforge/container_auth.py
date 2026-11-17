@@ -17,7 +17,8 @@ to the launch's environment:
 
 - **Agent launches only.** A repository command (``validation.commands``,
   ``merge.verification_commands``) gets no model credential (ADR 0005
-  §2.5, #286): :func:`plan_credentials` refuses its launch class.
+  §2.5, #286): :func:`plan_credentials` refuses its launch class, and its
+  container receives :func:`command_environment` alone.
 - **One credential, chosen by the operator.** Exactly one of the profile's
   supported routes must be present. Two would let the CLI's own precedence
   choose between them, so a subscription token beside a paid API key never
@@ -135,6 +136,15 @@ PASSED_NAMES = frozenset(
         "GIT_COMMITTER_NAME",
         "GIT_COMMITTER_EMAIL",
     }
+)
+
+# What a repository command's container (``validation.commands``,
+# ``merge.verification_commands``) receives of the launch's environment, by
+# exact name: the locale, the time zone and the terminal type. No model
+# credential, no store, no provider setting and no git identity: it runs
+# the candidate's own code and commits nothing (ADR 0005 §2.5, #286).
+COMMAND_PASSED_NAMES = frozenset(
+    name for name in PASSED_NAMES if not name.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))
 )
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
@@ -343,6 +353,24 @@ class CredentialPlan:
 
 def _refuse(subject: str, detail: str) -> SandboxPolicyError:
     return SandboxPolicyError(subject, _RULE, detail)
+
+
+def command_environment(env: Mapping[str, str]) -> dict[str, str]:
+    """A repository command's container environment: never a model credential (#286).
+
+    ``HOME`` set to the private home, whatever ``env`` held, and of ``env``
+    only the names :data:`COMMAND_PASSED_NAMES` lists: a positive allow-list,
+    so a provider's key, a cloud credential, a database URL or a provider
+    setting is withheld by not being listed, whatever its name. The
+    container backend (#271) passes this, and nothing else of the launch's
+    environment, to a command's run step; the command's container is
+    created with no projection.
+    """
+    environment = {"HOME": HOME_TARGET}
+    environment.update(
+        (name, value) for name, value in env.items() if value and name in COMMAND_PASSED_NAMES
+    )
+    return environment
 
 
 def _present(env: Mapping[str, str], name: str) -> bool:
