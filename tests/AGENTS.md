@@ -40,6 +40,17 @@ read it before adding tests for a listed area.
   still write to (conftest's commits pass `NO_AUTO_MAINTENANCE`); an
   AF_UNIX path past `sun_path`'s 107 bytes (bind it with
   `conftest.bind_unix`).
+- Never assume Linux. CI also runs the suite on macOS, Apple Silicon
+  (`test-macos`, #501), which has no `/proc`, no child subreaper, no
+  `O_TMPFILE`, `memfd_create`, `pidfd_open`, `sched_getaffinity` or
+  `F_SETPIPE_SZ`, and no outer-sandbox backend. A test of behaviour only
+  Linux has skips elsewhere with a reason that names what is missing
+  (`_linux_only` in `tests/test_executor.py`). A test of behaviour both
+  have reads it in a way that works on both, as `_process_state` there
+  reads a process's state through `ps` where there is no procfs: a missing
+  `/proc` is never an answer. A stand-in for a system call answers as the
+  host's call does, not as Linux's (conftest's `fsync_without_the_disk`
+  hands the real `fsync` every descriptor it has no disk to skip for).
 
 ## Fixtures and fakes (`tests/conftest.py`)
 

@@ -12,14 +12,16 @@ labels:
 The first prerelease, `0.1.0a0` (published on PyPI on 2026-10-28), claims
 Linux x86_64 with CPython 3.11 and 3.12 only
 ([#256 D3](https://github.com/iceboundrock/AutoForge/issues/256#issuecomment-6375246718)).
-macOS on Apple Silicon has since been run by the maintainer (below).
-Intel macOS, Linux ARM64 and Python 3.13 and later are later, separately
-tracked work, and stay untested until CI or a recorded run proves them.
+macOS on Apple Silicon has since been run by the maintainer and is tested
+in CI (below). Intel macOS, Linux ARM64 and Python 3.13 and later are later,
+separately tracked work, and stay untested until CI or a recorded run proves
+them.
 
 The CI jobs cited below are those of
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), all on GitHub's
-`ubuntu-latest` (x86_64) runner. They are required on `main` through the
-aggregate `ci` check ([Development](development.md#continuous-integration)).
+`ubuntu-latest` (x86_64) runner except `test-macos`, which runs on
+`macos-latest` (arm64, Apple Silicon). They are required on `main` through
+the aggregate `ci` check ([Development](development.md#continuous-integration)).
 A release is supported only once its own artifacts pass the same checks
 ([Releasing](releasing.md)). `0.1.0a0`'s did, on Linux x86_64. Its release
 build, on CPython 3.12, checked the sdist, built the wheel from it, checked
@@ -50,7 +52,7 @@ then-current releases of each tool.
 |---|---|---|
 | Linux x86_64 | **supported** | `test (py3.11)`, `test (py3.12)`: the suite, with real git, local processes, file locks and process containment. `dist (py3.11)`, `dist (py3.12)`: the built wheel installed outside the checkout and run. Both on `ubuntu-latest`. |
 | Linux ARM64 (aarch64) and other architectures | untested | No CI job or recorded run. AutoForge is pure Python with no architecture-specific code, but nothing has proved it on such a host. |
-| macOS on Apple Silicon | **supported**, with the limits here; not by the first prerelease | Run by the maintainer, not in CI; [#482](https://github.com/iceboundrock/AutoForge/pull/482) fixed the stop Apple's git caused at every launch. The code has fallbacks (no child subreaper, so a process that leaves its group may outlive the invocation and is reported as `orphans_unchecked`; an `O_TMPFILE` fallback; a darwin `statfs` branch), but there is no outer sandbox (`sandbox.mode: required` is refused) and process containment is weaker than on Linux ([ADR 0002](adr/0002-executor-nothing-outlives-the-invocation.md), [Security boundaries](security.md#other-limits)). No parity with Linux is claimed. |
+| macOS on Apple Silicon | **supported**, with the limits here; not by the first prerelease | `test-macos (py3.11)`, `test-macos (py3.12)`: the suite on `macos-latest` (arm64), with real git, local processes and file locks; the tests of Linux-only behaviour (the child subreaper, `/proc`, `O_TMPFILE`, the outer sandbox's backend) skip there. No `dist` job runs on macOS, so the built wheel is installed and run only on Linux. Also run by the maintainer; [#482](https://github.com/iceboundrock/AutoForge/pull/482) fixed the stop Apple's git caused at every launch. The code has fallbacks (no child subreaper, so a process that leaves its group may outlive the invocation and is reported as `orphans_unchecked`; an `O_TMPFILE` fallback; a darwin `statfs` branch), but there is no outer sandbox (`sandbox.mode: required` is refused) and process containment is weaker than on Linux ([ADR 0002](adr/0002-executor-nothing-outlives-the-invocation.md), [Security boundaries](security.md#other-limits)). No parity with Linux is claimed. |
 | macOS on Intel | untested | No CI job or recorded run. The same code paths as Apple Silicon, with the same limits. |
 | Windows | **unsupported** | `src/autoforge/locking.py` imports `fcntl` unconditionally (POSIX `flock`), so AutoForge does not start, and the executor's process containment is POSIX-only. |
 | WSL2 | untested | Not measured ([ADR 0005 §4](adr/0005-outer-sandbox-and-host-resource-capability-model.md#4-platform-behaviour)). |
@@ -63,8 +65,8 @@ the `sandbox` job's summary on every run.
 
 | Interpreter | Status | Evidence or reason |
 |---|---|---|
-| CPython 3.11 | **supported** | `test (py3.11)`, `dist (py3.11)` |
-| CPython 3.12 | **supported** | `test (py3.12)`, `dist (py3.12)` |
+| CPython 3.11 | **supported** | `test (py3.11)`, `dist (py3.11)`; on macOS, `test-macos (py3.11)` |
+| CPython 3.12 | **supported** | `test (py3.12)`, `dist (py3.12)`; on macOS, `test-macos (py3.12)` |
 | CPython 3.13, 3.14 and later | untested | Not in the CI matrix. |
 | PyPy and other implementations | untested | Not in the CI matrix. |
 | CPython 3.10 and older | **unsupported** | Below `requires-python`; the code uses 3.11's standard library (`tomllib`, among others). |
@@ -82,7 +84,7 @@ builds and Fedora's 3.14.8, measured on the same host, have both
 
 The supported interpreters are the CI matrix: the Makefile's
 `CI_PYTHON_VERSIONS`, which `tests/test_ci_workflow.py` keeps equal to the
-workflow's `test` and `dist` matrices, and `tests/test_packaging.py` to the
+workflow's `test`, `test-macos` and `dist` matrices, and `tests/test_packaging.py` to the
 package's `Programming Language :: Python :: 3.X` classifiers.
 
 `requires-python = ">=3.11"` in `pyproject.toml` is installer metadata,
@@ -111,6 +113,7 @@ passed on that interpreter on one machine, and claims nothing about 3.14.
 | Version | Status | Evidence or reason |
 |---|---|---|
 | the version `ubuntu-latest` ships | **supported** | `test (py3.11)`, `test (py3.12)` run real git (worktrees, bare origins, fetches and pushes over `file://`); `dist (py3.11)`, `dist (py3.12)` print the version they used. |
+| the git `macos-latest` puts first on its `PATH` | **supported** | `test-macos (py3.11)`, `test-macos (py3.12)` run real git as the Linux jobs do. The job does not record which git that is, Apple's or another build, or its version, so it is no evidence for Apple's git in particular; the parsing of the `unknown` scope Apple's git prints (#482) is tested on every platform from recorded output. |
 | 2.55.0, 2.56.0 | **supported** | Recorded runs on the maintainer's host (Fedora 44): the measurements of [ADR 0004](adr/0004-authority-boundary-and-typed-external-effects.md), [ADR 0005](adr/0005-outer-sandbox-and-host-resource-capability-model.md) and [ADR 0006](adr/0006-candidate-validation-evidence-and-review-certificates.md), and `make check`. |
 | any other | untested | No minimum is enforced or known: `doctor` checks only that `git --version` runs (`git available`). |
 
@@ -262,7 +265,7 @@ reason in parentheses says what the kernel answered when asked for its ABI:
 
 | Requirement | Status | Evidence or reason |
 |---|---|---|
-| The state directory (`.autoforge/` by default, or `--state-dir` / `state_dir`) on a filesystem with hard links | **supported** on the runner's filesystem (`test (py3.11)`, `test (py3.12)`) and on XFS (the maintainer's host, `make check`) | Run logs and other controller files are published with `link(2)` so that a crash never leaves one half-written, and there is no non-atomic fallback. |
+| The state directory (`.autoforge/` by default, or `--state-dir` / `state_dir`) on a filesystem with hard links | **supported** on the Linux runner's filesystem (`test (py3.11)`, `test (py3.12)`), on the macOS runner's (`test-macos (py3.11)`, `test-macos (py3.12)`) and on XFS (the maintainer's host, `make check`) | Run logs and other controller files are published with `link(2)` so that a crash never leaves one half-written, and there is no non-atomic fallback. |
 | A state directory on vfat/exFAT, or on a FUSE, SMB/CIFS or overlay mount without hard links | **unsupported** | `doctor`'s `state dir writable` row fails and names the requirement; a run refuses the directory the same way. |
 | The worktrees (`<git common dir>/autoforge/worktrees/<n>` by default) | as the repository's own filesystem | Created with `git worktree`; under `required`, `doctor`'s `outer sandbox: hard links in writable trees` row reports regular files with more than one link there. |
 

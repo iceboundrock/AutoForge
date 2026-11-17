@@ -1026,16 +1026,22 @@ def _feed(w: int, rest: bytes, close: bool) -> None:
 
 def test_the_input_pipe_takes_more_than_the_pipe_buffer_holds(monkeypatch):
     """#259: a pipe of 4 KiB, as a host over ``fs.pipe-user-pages-soft`` makes
-    them, still yields all of a test's typed input, then its end."""
+    them, still yields all of a test's typed input, then its end.
+
+    Only Linux can shrink a pipe (``F_SETPIPE_SZ``). Elsewhere (macOS, #501)
+    the input is made larger than any buffer a pipe grows to there (64 KiB)
+    instead, so it still does not fit."""
     real_pipe = os.pipe
+    shrink = getattr(fcntl, "F_SETPIPE_SZ", None)
 
     def small_pipe():
         r, w = real_pipe()
-        fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, 4096)  # shrinking is always permitted
+        if shrink is not None:
+            fcntl.fcntl(w, shrink, 4096)  # shrinking is always permitted
         return r, w
 
     monkeypatch.setattr(os, "pipe", small_pipe)
-    data = b"x" * 20000 + b"\nc\n"
+    data = b"x" * (20000 if shrink is not None else 1 << 20) + b"\nc\n"
     got: list[bytes] = []
 
     def read_all():

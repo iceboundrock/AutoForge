@@ -21,6 +21,12 @@ runs exactly ``make dist-check`` with that interpreter, and
 ``test_the_dist_job_checks_the_installed_artifacts_on_every_ci_python`` pins
 both sides.
 
+``test-macos`` (#501) runs the suite on macOS, Apple Silicon (``macos-latest``,
+an arm64 runner): ``make test``'s command after the locked install, on every
+interpreter of the matrix, required through ``ci`` like the rest.
+``test_the_macos_job_runs_make_test_on_every_ci_python_on_apple_silicon`` pins
+it, and ``docs/compatibility.md`` cites it for the macOS row.
+
 The ``test`` job also writes the duration report (#344): ``make test``'s
 command with a JUnit report added, then steps that summarize it, compare it
 with main's recent runs and upload it. Those steps are report only, and
@@ -85,6 +91,10 @@ DIST_JOB = "dist"
 DIST_TARGET = "dist-check"
 DIST_JOB_COMMANDS = ["make dist-check DIST_PYTHON=${{ matrix.python-version }}"]
 DIST_EXPANSION = "uv run --no-project --python {version} python -I tests/dist_check.py"
+# The job that runs the suite on macOS, Apple Silicon (#501), and its runner:
+# `macos-latest` is GitHub's arm64 macOS image.
+MACOS_JOB = "test-macos"
+MACOS_RUNNER = "macos-latest"
 # The `test` job (#344): `make test`'s command with this JUnit report added, and
 # the duration report's one command, which reads it (tests/ci_durations.py).
 TEST_JOB = "test"
@@ -231,14 +241,26 @@ def _make_dry_run(
 
     ``directory`` is where make runs (and reads its Makefile from); ``--silent``
     also drops the "Nothing to be done" notice, so a target that expands to
-    nothing yields an empty list rather than prose. ``assignments`` are
+    nothing yields an empty list rather than prose, and
+    ``--no-print-directory`` keeps ``-C`` from adding "Entering directory"
+    lines on any make, the macOS runner's GNU make 3.81 included (#501),
+    rather than relying on ``--silent`` to suppress them. ``assignments`` are
     ``NAME=value`` overrides on make's command line, as a CI step passes them.
     """
     make = shutil.which("make")
     if make is None:
         pytest.skip("GNU make is not installed; the Makefile cannot be expanded here")
     result = subprocess.run(
-        [make, "--dry-run", "--silent", "-C", str(directory), target, *assignments],
+        [
+            make,
+            "--dry-run",
+            "--silent",
+            "--no-print-directory",
+            "-C",
+            str(directory),
+            target,
+            *assignments,
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -414,6 +436,36 @@ def test_the_test_job_runs_make_test_with_only_a_junit_report_added():
     assert words[:6] == ["uv", "run", "--no-project", "python", "-I", "tests/ci_durations.py"]
     args = ci_durations.parser().parse_args(words[6:])
     assert (args.command, args.dir) == ("report", DURATIONS_DIR)
+
+
+def test_the_macos_job_runs_make_test_on_every_ci_python_on_apple_silicon():
+    """The suite runs on macOS, Apple Silicon, on every commit (#501).
+
+    The job runs on `macos-latest`, GitHub's arm64 macOS runner, and runs
+    exactly what the `test` job's pytest step runs before its report option:
+    the locked install, then `make test`'s one command, with nothing selected
+    away. Its interpreters are the `test` matrix's and the Makefile's
+    CI_PYTHON_VERSIONS, with fail-fast off so one interpreter's failure does
+    not cancel the other's run. It runs on no condition and never continues on
+    error, and `ci` needs it, so a green `ci` means it passed: that is what
+    docs/compatibility.md cites for the macOS row.
+    """
+    code = _code()
+    assert MACOS_JOB in _job_names(code), "the CI workflow has no job for macOS"
+    job = _job(code, MACOS_JOB)
+    assert f"runs-on: {MACOS_RUNNER}" in job
+    assert "name: test-macos (py${{ matrix.python-version }})" in job.splitlines()[1]
+    (pytest_command,) = _make_recipes()["test"]
+    assert _RUN_LINE.findall(job) == ["uv sync --locked --group dev", pytest_command]
+    versions = _make_variable(MATRIX_MAKE_VARIABLE)
+    assert _matrix_python_versions(job) == versions == _matrix_python_versions(code), (
+        "the macOS job must cover exactly the interpreters the test matrix covers"
+    )
+    assert "fail-fast: false" in job
+    assert "if:" not in job, "a conditional macOS job could skip on a commit of main"
+    assert "continue-on-error:" not in job, "a macOS failure must fail the job"
+    needs = re.search(r"needs:\s*\[([^\]]*)\]", _job(code, "ci"))
+    assert needs and MACOS_JOB in [n.strip() for n in needs.group(1).split(",")]
 
 
 def test_the_duration_report_never_decides_the_job_or_the_required_check():

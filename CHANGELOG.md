@@ -5,6 +5,19 @@ so.
 
 ## Unreleased
 
+### macOS on Apple Silicon is tested in CI on every commit (#501)
+
+The test suite now also runs on GitHub's `macos-latest` runner (arm64),
+on Python 3.11 and 3.12, for every pull request and every push to `main`,
+and the required `ci` check needs it to pass. Until now the macOS claim
+rested on the maintainer's own runs, so a regression only macOS shows,
+such as the stop Apple's git caused at every launch (#482), surfaced the
+next time someone ran AutoForge on a Mac. What macOS gets is unchanged:
+no outer sandbox (`sandbox.mode: required` is refused), and a process
+that leaves its group can outlive the launch (`orphans_unchecked`). Intel
+Macs stay untested, the built wheel is installed and run in CI on Linux
+only, and the package's classifiers still name Linux alone.
+
 ### `sandbox.container` takes the container backend's seed settings (#292)
 
 The configuration now accepts `sandbox.container.history_depth` (0 or more,

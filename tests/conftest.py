@@ -2657,21 +2657,24 @@ def fsync_without_the_disk(fd) -> None:
     """``os.fsync`` without the wait for the disk: it refuses what fsync refuses.
 
     An open descriptor of a regular file, a directory or a block device is
-    accepted and nothing is written back; a closed descriptor or an
-    ``O_PATH`` one raises ``EBADF``, and a pipe, a socket or a character
-    device ``EINVAL``, as ``fsync(2)`` does (``tests/test_safefs.py`` pins
-    each answer to the real call's).
+    accepted and nothing is written back. Any other descriptor (an
+    ``O_PATH`` one, a pipe, a socket, a character device) holds nothing a
+    disk is waited for, so the real call answers it, as this host's
+    ``fsync(2)`` does: Linux refuses an ``O_PATH`` one with ``EBADF`` and
+    the others with ``EINVAL``, and another platform answers as it does
+    (macOS, #501). A closed descriptor raises ``EBADF``.
+    ``tests/test_safefs.py`` pins each answer to the real call's.
     """
-    import errno
     import fcntl
+    import posix
     import stat
 
     fd = fd if isinstance(fd, int) else fd.fileno()
-    if fcntl.fcntl(fd, fcntl.F_GETFL) & getattr(os, "O_PATH", 0):
-        raise OSError(errno.EBADF, os.strerror(errno.EBADF))
-    mode = os.fstat(fd).st_mode
-    if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISBLK(mode)):
-        raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+    if not fcntl.fcntl(fd, fcntl.F_GETFL) & getattr(os, "O_PATH", 0):
+        mode = os.fstat(fd).st_mode
+        if stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISBLK(mode):
+            return
+    posix.fsync(fd)
 
 
 @pytest.fixture(autouse=True)

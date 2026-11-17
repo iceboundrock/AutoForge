@@ -570,6 +570,15 @@ def test_provenance_has_every_fact_a_resume_compares_and_no_machine_id(monkeypat
     assert machine_id not in json.dumps(facts)
 
 
+def test_without_an_affinity_mask_every_cpu_is_usable(monkeypatch):
+    """A platform with no ``os.sched_getaffinity`` (macOS, #501) sets no mask,
+    so every CPU counts as usable, and the provenance is still recorded."""
+    monkeypatch.delattr(os, "sched_getaffinity", raising=False)
+    monkeypatch.setattr(os, "cpu_count", lambda: 3)
+    facts = parallel_bench.provenance()
+    assert (facts["cpus_usable"], facts["cpu_affinity"]) == (3, [0, 1, 2])
+
+
 def test_a_worktree_with_changes_is_refused_before_anything_runs(tmp_path, monkeypatch, capsys):
     out = tmp_path / "out"
     made = _fake_runs(monkeypatch, changes=[" M src/autoforge/engine.py", "?? tests/test_new.py"])

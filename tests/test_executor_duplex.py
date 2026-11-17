@@ -36,7 +36,7 @@ from autoforge.executor_duplex import (
     start_duplex,
 )
 
-from .test_executor import _baseline_fds, _open_fds, _refuse_setup_step
+from .test_executor import _baseline_fds, _gone, _open_fds, _refuse_setup_step
 
 PY = sys.executable
 
@@ -91,24 +91,6 @@ def _records_until_eof(chunks: list[bytes], delay: float = 0.0, **kw) -> list:
         res = child.finish()
     assert res.exit_code == 0 and not res.timed_out, res
     return got
-
-
-def _gone(pid: int, within: float) -> bool:
-    """True once ``pid`` no longer runs (a zombie awaiting init counts as gone)."""
-    deadline = time.monotonic() + within
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
-        try:
-            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-        except OSError:
-            return True
-        if state == "Z":
-            return True
-        time.sleep(0.05)
-    return False
 
 
 def _kill_quietly(pid: int) -> None:

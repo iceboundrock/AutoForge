@@ -102,7 +102,7 @@ what each phase verifies on GitHub is in
 
 | You need | Notes |
 |---|---|
-| Linux on x86_64, or macOS on Apple Silicon | Linux x86_64 is tested in CI. macOS on Apple Silicon has been tested by the maintainer ([#482](https://github.com/iceboundrock/AutoForge/pull/482) fixed a macOS-only stop); it has no outer sandbox (`sandbox.mode: required` is refused) and weaker process containment than Linux. Intel Macs, Linux ARM64 and WSL2 are untested. Windows does not work (the lock uses POSIX `fcntl`). |
+| Linux on x86_64, or macOS on Apple Silicon | Both are tested in CI on every commit. macOS on Apple Silicon has also been run by the maintainer ([#482](https://github.com/iceboundrock/AutoForge/pull/482) fixed a macOS-only stop); it has no outer sandbox (`sandbox.mode: required` is refused) and weaker process containment than Linux. Intel Macs, Linux ARM64 and WSL2 are untested. Windows does not work (the lock uses POSIX `fcntl`). |
 | CPython 3.11 or 3.12 | The interpreters CI tests. 3.13 and later are untested; `uv` can fetch 3.12 for you. |
 | [`uv`](https://docs.astral.sh/uv/getting-started/installation/) | Installs AutoForge into its own environment. |
 | `git`, with a global `user.name` and `user.email` | The implementer commits as you. |

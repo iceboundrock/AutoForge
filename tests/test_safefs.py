@@ -2028,9 +2028,11 @@ def test_this_module_writes_through_the_real_fsync():
 
 def test_the_fsync_stand_in_refuses_exactly_what_fsync_refuses(tmp_path):
     """Where the other modules' writes skip the flush (#341), each call is still
-    refused or accepted as ``fsync(2)`` answers it, on this host: a closed or
-    ``O_PATH`` descriptor, a pipe, a socket and a character device are refused,
-    a file of either access mode and a directory are not."""
+    refused or accepted as ``fsync(2)`` answers it, on this host: a file of
+    either access mode and a directory are accepted and a closed descriptor
+    is refused everywhere; on Linux an ``O_PATH`` descriptor, a pipe, a socket
+    and a character device are refused, and another platform answers them as
+    it does (macOS, #501)."""
     import socket
 
     from tests.conftest import fsync_without_the_disk
