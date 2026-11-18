@@ -55,14 +55,21 @@
     base's, and has outcomes that are not a pass (D7.5). D3, D5, D11, D19,
     D20 and §4.2 follow.
   - *Corrected after the acceptance,* at review round 2 of PR #512. Each
-    correction makes an accepted decision implementable, and none reopens
-    one:
+    correction makes an accepted decision implementable. None reopens
+    one, though the third widens a cost the maintainer accepted, as it
+    says:
     - a result whose own `status` stops the step is accepted in the stop
       save today's code makes, with no plan, and its Memory proposals with
       it (D4.6);
     - every task still open when its step concludes, is routed elsewhere
       or is unblocked is canceled in that save, its process stopped after
-      it, and a reply it delivers later discarded (D3.1).
+      it, and a reply it delivers later discarded (D3.1);
+    - a candidate that changed any checker input is `inconclusive`
+      (`checker-altered`), never `verified`, even when the base's checkers
+      pass on its replaced tree. That holds §4.2's requirement, which the
+      maintainer accepted with the rest. It widens the cost answer 7
+      accepted, from a candidate that needs a checker change to any
+      candidate that makes one, a new test included (D7.5).
   - *Recorded here:* the task identities (D2), lifecycle and transition
     table (D3), the `TaskResult` / `PhaseResult` split (D4), the
     launch-intent protocol (D5), the reducer's input and output types for
@@ -547,9 +554,9 @@ until stage 4 accepts it or stage 2 or 3 refuses it (D3).
 
 In the single-agent path, `_check_reply` spans stages 1 to 3: the strict
 import, then the parse, then the phase's checks. The plan save, or a stop
-result's stop save, is stages 4 and 5. A reply delivered before a failed launch end
-is kept after its checks (ADR 0012 D12). That kept reply is a saved
-receipt still at stage 3, re-checked after a restart. No launch path
+result's stop save, is stages 4 and 5. A reply delivered before a failed
+launch end is kept after its checks (ADR 0012 D12). That kept reply is a
+saved receipt still at stage 3, re-checked after a restart. No launch path
 changes.
 
 **D4.2. Another role's reply is never parsed as a phase result.** It is
@@ -612,7 +619,7 @@ and a plan would order no effect. `decide_next_phase` never enters
 
 - **The stop save is the acceptance save.** For such a result it is stage
   5. It holds the stop, the task `ACCEPTED`, every other open task
-  `CANCELED` (`step-concluded`, D3) and the result's Memory proposals
+  `CANCELED` (`step-concluded`, D3.1) and the result's Memory proposals
   (D9.8), all in one save. Stage 3 for such a result is what the phase
   checks of a stop today: the parse, the PR owner check (ADR 0004 D9.4a)
   and the checkout check. No candidate check runs, because nothing is
@@ -651,10 +658,10 @@ Nothing is launched before that save is durable.
 
 **D5.2. After a launch, a reply is kept before anything follows from it,
 in two cases.** A reply delivered before a failed end is kept today, after
-its checks (ADR 0012 D12). Under #319, every task attempt keeps its
-receipt, after its parse (D4.1, stage 2), in the save that first records
-it on disk as past `RUNNING`.
-The receipt holds:
+its checks (ADR 0012 D12). Once #332 lands, every attempt keeps its
+receipt: the single-agent producer's (D5.3), and every task attempt's
+under #319. The receipt is kept after its parse (D4.1, stage 2), in the
+save that first records the attempt on disk as past `RUNNING`. It holds:
 
 - its binding;
 - the reply's digest;
@@ -732,7 +739,9 @@ ReducerInput                 frozen and typed; no agent text beyond bounded type
   verification               the step's current candidate (D7.3), candidate checks,
                              import outcomes, the ValidationRecords of the candidates
                              in play, and each one's independent outcome under the
-                             frozen plan: verified, failed, inconclusive or not-run (D7.5)
+                             frozen plan: verified, failed, inconclusive with its cause
+                             (for checker-altered: the changed paths and the replaced
+                             tree's run), or not-run (D7.5)
   budgets                    step_count and workflow.max_total_steps, the step's
                              attempts and D11 allowance, launches per role
 
@@ -935,15 +944,16 @@ could not touch? It has four outcomes, and only one of them counts.
    head, which an earlier agent wrote.
 
    The run's tree is the candidate's tree with every path that matches a
-   pattern replaced from the base. A path the base holds keeps the base's bytes,
-   and a path the base lacks is removed. So the candidate's edits,
+   pattern replaced from the base. A path the base holds keeps the base's
+   bytes, and a path the base lacks is removed. So the candidate's edits,
    deletions and additions to its checkers never reach the run: a changed
    `pyproject.toml`, an edited test, or a new `conftest.py` that skips the
    base's tests. The candidate contributes only what matches no pattern,
    the code under test. The evaluation's protected paths (evaluation
-   protocol §3.4) are the model. The controller records every
-   checker-input path the candidate changed (`checker-altered`), whatever
-   the outcome.
+   protocol §3.4) are the model. A candidate that changed any path
+   matching a pattern, by an edit, a deletion or an addition, is
+   **checker-altered**, and its run's tree is not its own tree. The
+   controller records every such path, whatever the outcome.
 3. **A pass is read from a report, never from the exit code alone.**
    - **The report.** Each independent definition names a report format
      the controller parses (#319 names the formats, JUnit XML first). The
@@ -958,24 +968,64 @@ could not touch? It has four outcomes, and only one of them counts.
      none is missing, skipped, deselected, expected to fail or in error.
      A test that failed or was skipped on the base is reported, and not
      required.
-4. **Outcomes.**
-   - `verified`: every definition of a non-empty plan passed by item 3.
-   - `failed`: a definition or a baseline test failed, on a candidate
-     that changed no checker input.
-   - `inconclusive`: anything else. That covers a report that is missing
-     or does not parse, an empty report, and a baseline test that is
-     missing, skipped, deselected, expected to fail or in error. It covers
-     a timeout and an interrupted run (ADR 0006's marker), and a baseline
-     that could not be recorded or lists no passed test. It also covers a
-     failure on a candidate whose checker inputs were replaced, since that
-     failure may be the replacement's.
+4. **Outcomes.** `verified` and `failed` are said only of a tree that
+   ran as it is. So a checker-altered candidate is never either, whatever
+   its run shows.
+   - `verified`: the candidate is not checker-altered, and every
+     definition of a non-empty plan passed by item 3.
+   - `failed`: the candidate is not checker-altered, and a definition or
+     a baseline test failed.
+   - `inconclusive`: anything else, with its cause, which is one of these:
+     - `checker-altered`: the candidate is checker-altered. The outcome
+       names the changed paths and what the run on the replaced tree
+       showed: `passed` by item 3, `failed`, or the cause below that it
+       met. A failure there may be the replacement's, and a pass is of a
+       tree that is not the candidate's;
+     - a report that is missing or does not parse, or an empty report;
+     - a baseline test that is missing, skipped, deselected, expected to
+       fail or in error;
+     - a timeout, or an interrupted run (ADR 0006's marker);
+     - a baseline that could not be recorded or lists no passed test.
    - `not-run`: the plan is empty. `validation.commands` is empty by
      default, and an empty set, which is complete evidence for ordinary
      validation (ADR 0006 D3.6), is never independent verification.
 
-   Only `verified` counts, for D7.6 and D7.7. The step's conclusion and
-   the reducer's input name the outcome. `not-run` and `inconclusive` are
-   never rendered, logged or reported as a pass.
+   Only `verified` counts, for D7.6 and D7.7. An `inconclusive` qualifies
+   no candidate for either, whatever the replaced tree's run showed. That
+   tree is not a commit, and it is never kept, concluded with or
+   published. A checker-altered candidate stays the step's current
+   candidate (D7.3). Ordinary validation (ADR 0006) and the review judge
+   it as they judge any candidate, and whether the step concludes with it
+   is #332's policy, never silent (D7.7).
+
+   **How `checker-altered` is reported** (§5, answer 7). It is told apart
+   from every other `inconclusive`, so that a legitimate change to
+   `pyproject.toml` or a test does not read as a broken run:
+   - the outcome record holds the cause, the changed paths as a sorted
+     list, and the replaced tree's run. #319 bounds the list, and a cut
+     leaves a count of the paths it omits, never silence;
+   - the reducer's input carries the same for every candidate in play
+     (D6);
+   - the step's conclusion names its candidate's outcome with them;
+   - `status` shows them for the step's current candidate.
+
+   `not-run` and `inconclusive` are never rendered, logged or reported as
+   a pass, and neither is a checker-altered candidate whose replaced tree
+   passed.
+
+   **The cost.** A candidate that adds or edits a test, as most do, is
+   checker-altered. It is never `verified`, so D7.7 keeps only a
+   candidate that changed no checker input. For `FIX`, a PR that already
+   changed a checker input makes every candidate of the step
+   checker-altered, because the base is the merge base. This is wider
+   than the cost described in question 7, which the maintainer answered
+   (§5): a candidate that *needs* a change to a checker input. The
+   narrower rule let a candidate that changed only checker inputs be
+   `verified` once the base's files replaced them: a skipping
+   `conftest.py`, say, kept as verified with it in the commit. §4.2 forbade that, so review round 2 of PR #512 found
+   the two contradicting. The replaced tree's run keeps the distinction
+   answer 7 asks for. A later record may narrow the rule, with an
+   argument that the narrower rule cannot be gamed.
 5. **An empty plan with roles is refused.** A configuration that enables
    #319's roles while its plan holds no independent definition is refused
    at load (D18). Without one, no counterexample could ever be reproduced
@@ -987,10 +1037,10 @@ could not touch? It has four outcomes, and only one of them counts.
    cannot keep the candidate's *code* out of the process. The baseline
    catches the plain forms: a missing or skipped test, and an empty or
    absent report. It does not catch a forged report that lists the right
-   tests as passed. `verified` therefore means that the candidate passed
-   the base's checkers under the base's configuration, and that every
-   test that passed on the base was reported passing. It does not prove
-   the candidate honest. The review (D7.9) stays the independent
+   tests as passed. `verified` therefore means that the candidate, which
+   changed no checker input, passed the base's checkers as it is, and
+   that every test that passed on the base was reported passing. It does
+   not prove the candidate honest. The review (D7.9) stays the independent
    judgment, and the merge gate is unchanged. The maintainer accepted
    this residual for #319 (§5, answer 7): `verified` qualifies a candidate
    to be kept (D7.7) or to reproduce a counterexample (D7.6), nothing
@@ -1003,7 +1053,9 @@ of the frozen plan on the pinned candidate in D7.5's tree and recording
 the failure (`failed`). A test the agent wrote that agrees with its own
 output proves nothing (the evaluation's `invented_expected_answer`
 fixture), and D7.5's tree never runs it. An `inconclusive` or `not-run`
-reproduction leaves the counterexample unverified.
+reproduction leaves the counterexample unverified. So no counterexample is
+ever reproduced on a checker-altered candidate: a failure there may be the
+replacement's.
 
 **D7.7. The last independently verified candidate is kept, and stays
 reachable.** The controller records the step's last candidate whose outcome
@@ -1206,8 +1258,9 @@ One attempt, each stage durable before the next begins:
    container launch's exported artifact.
 3. **Receipt and parse** (D4.1, stages 1 and 2). A clean exit's reply is
    held in process. A failed end's reply is kept in the checkpoint after
-   its checks (ADR 0012 D12). Under #319, every attempt's receipt is saved
-   after its parse (D5.2).
+   its checks (ADR 0012 D12). Once #332 lands, every attempt's receipt is
+   saved after its parse, the single-agent producer's included (D5.2,
+   D5.3).
 4. **Verification** (stage 3). This is the strict import, then the
    candidate checks, then each `ValidationRecord`, each in its own save
    under ADR 0006's markers. Under #319 the save that records the step's
@@ -1251,7 +1304,7 @@ The crash windows of one attempt, and what the next command does:
 | W2. after the intent save, before the process starts | the attempt charged, its `AttemptID` spent with no receipt | the entry's reconciliation, then a charged launch with the next `AttemptID` | one more | unchanged |
 | W3. while the agent runs | as in W2; the worktree may hold commits | the lock, the worktree's state, the strict import, the entry's reconciliation, a charged launch with the next `AttemptID`, told what the worktree holds | one more | unchanged: nothing was observed |
 | W4. the reply received, not kept (a clean exit: stages 1 to 3 run in process), until #332 closes it (D5.3) | as in W3 | as in W3 | one more | unchanged |
-| W5. the reply kept before acceptance: a failed end's reply after its checks (ADR 0012 D12); under #319, a receipt after its parse | the kept reply or receipt; a validator's marker, perhaps | the kept reply re-checked, the receipt re-verified (a parse refusal's receipt: its correction); an interrupted validator recorded (ADR 0006) | none, or the correction's | the records saved with each verification record |
+| W5. the reply kept before acceptance: a failed end's reply after its checks (ADR 0012 D12); once #332 lands, a receipt after its parse | the kept reply or receipt; a validator's marker, perhaps | the kept reply re-checked, the receipt re-verified (a parse refusal's receipt: its correction); an interrupted validator recorded (ADR 0006) | none, or the correction's | the records saved with each verification record |
 | W6. verified, before the acceptance save | the records | the kept reply or receipt re-checked, or W4's relaunch, reusing the same candidate's records | none, or W4's | the records derived from them, already saved; none makes a task stale (D7.3) |
 | W7. the acceptance saved: for the producing task, its plan, or a stop result's stop save (D4.6) | the task `ACCEPTED`; the plan and its `intended` effects, or the stop with no plan | the journal completes the effects; a stop stands, with nothing to complete | none | the accepted result's proposals, already saved |
 | W8. the effects observed, before the transition | all of the above | the transition | none | unchanged |
@@ -1484,8 +1537,9 @@ That comment assigns nothing. The acceptance added no item to the list and
 moved none to another owner. It settled item 5's condition, and its bump
 is announced on #23 by #332 when it is ready (§5, answer 6). Item 4 gained
 detail from the answers and the corrections that followed them: the kept
-candidate's ref and a canceled task's reason. #332 and #319 bring
-item 4's full schema to #23 with their bump.
+candidate's ref, a canceled task's reason, and an outcome's cause with the
+changed paths. #332 and #319 bring item 4's full schema to #23 with their
+bump.
 
 1. **Issue Working Memory** (#317, #333): one field of the state. A file of
    the previous protocol loads with empty Memory; an older-labelled file
@@ -1509,8 +1563,9 @@ item 4's full schema to #23 with their bump.
    - the receipts: the binding, the reply's digest, and the parsed result
      or the code of its parse refusal (D5.2);
    - the step's current candidate;
-   - the frozen plan's baseline and each candidate's independent outcome
-     (D7.5);
+   - the frozen plan's baseline and each candidate's independent outcome,
+     with an `inconclusive` outcome's cause and, for `checker-altered`,
+     the changed paths and the replaced tree's run (D7.5);
    - the last verified candidate, and the name of the ref that keeps it
      reachable (D7.7).
 5. **Every reply kept** (D5.3): #332 closes the clean-exit window for both
@@ -1672,16 +1727,27 @@ Each is a deterministic test with fakes, offline, in `make check`.
   - a `CONTROL_RESULT` block in a role's reply refused;
   - a counterexample unverified until reproduced, and still unverified
     when its reproduction is `inconclusive` or `not-run`;
-  - D7.5's outcomes, none of them `verified`:
-    - a candidate that edits `pyproject.toml`'s pytest options;
-    - one that adds a `conftest.py` that skips the base's tests, at the
-      root or in a subdirectory;
-    - one that edits an existing test;
-    - one that adds a `sitecustomize.py` or a `.pth` file;
+  - D7.5's outcomes for a candidate that changed no checker input:
+    `verified` when it passes, `failed` when a baseline test fails;
+  - D7.5's checker-altered candidates, each `inconclusive` with the cause
+    `checker-altered` and its changed paths, never `verified` or
+    `failed`, never kept (D7.7), and no counterexample reproduced on any:
+    - a candidate whose only change is a checker input, its replaced
+      tree's run passing (`passed`): `pyproject.toml`'s pytest options
+      edited; a `conftest.py` that skips the base's tests added, at the
+      root or in a subdirectory; a `sitecustomize.py` or a `.pth` file
+      added;
+    - the same alterations with code under test that fails a baseline
+      test, its replaced tree's run failing (`failed`);
+    - a candidate that edits an existing test, and one that adds a test,
+      each with a passing and a failing replaced tree;
+    - the cause, the changed paths and the replaced tree's run named in
+      the step's conclusion, the reducer's input and `status`, with the
+      list's bound kept and a count of the paths it omits;
+  - D7.5's other outcomes, none of them `verified`:
     - a run that exits 0 with no report, with an empty report, or with a
       baseline test missing, skipped, deselected or expected to fail;
     - a timeout or an interrupted run;
-    - a failure after checker inputs were replaced (`inconclusive`);
     - an empty plan (`not-run`);
   - a configuration with roles and no independent definition refused at
     load;
