@@ -268,8 +268,9 @@ docs/test-suite-performance-audit.md   EPIC #338's exit audit: the suite at the 
 docs/recovery-mvp-evaluation.md        EPIC #354's deterministic recovery MVP evaluated (#375): the
                                        before/after matrix of 17 real-engine stops, each gold
                                        resolution held by the controller's read-back, the safety
-                                       regressions and their tests, gates D and A, a proposed go
-                                       awaiting the maintainer's sign-off
+                                       regressions and their tests, gates D and A, the
+                                       maintainer's go, roll-forward, rollback and operator
+                                       sign-off as recorded on #375
 docs/releasing.md                      distribution name, version and tag scheme, changelog, the
                                        maintainer's release procedure, PyPI Trusted Publishing
                                        (`pypi-publish.yml`) and its one-time setup

@@ -64,6 +64,7 @@ from tests.conftest import (
     EPIC,
     ISSUE,
     PR,
+    SHA_A,
     FakeGitHub,
     block,
     connect_origin,
@@ -80,14 +81,17 @@ from tests.test_engine import (
     _no_stagnation,
     _one_finding_per_round,
     _power_loss_at,
+    review_payload,
 )
 from tests.test_recovery_package import (
     _ambiguous,
     _checks_refused,
     _false_identity_conflict,
+    _fork_headed,
     _k9_blocked,
     _k10_blocked,
     _k12_blocked,
+    _two_round_comments,
 )
 from tests.test_stop_classification import _stopping
 
@@ -154,9 +158,11 @@ class Stopped:
     works once the run goes on; ``steps`` holds the outcomes of the steps the
     controller ran with no operator command, for a case that recovers by
     itself. ``raised`` is the value the operator gives a bound a text tells
-    them to raise, and ``chosen`` the PR the operator decides is the issue's
-    where a text leaves that to them: what a :data:`READINGS` act needs to
-    perform a text, never a choice the harness makes for the package.
+    them to raise, ``chosen`` the PR the operator decides is the issue's
+    where a text leaves that to them, and ``others`` the comments the operator
+    finds to be another controller's run's record when a text has them check
+    who posted each: what a :data:`READINGS` act needs to perform a text,
+    never a choice the harness makes for the package.
     """
 
     eng: ControllerEngine
@@ -167,6 +173,7 @@ class Stopped:
     steps: list = field(default_factory=list)
     raised: dict[str, int] = field(default_factory=dict)
     chosen: str = ""
+    others: tuple[str, ...] = ()
 
 
 def _blocked(build: Callable[[Path], ControllerEngine], tmp: Path) -> Stopped:
@@ -671,13 +678,48 @@ def _raise(key: str) -> Callable[[Stopped], None]:
     return act
 
 
-def _keep_the_chosen(stopped: Stopped) -> None:
-    """'decide which one PR is the issue's ... Keep that PR open with its marker ..., and
-    close each other PR or remove its marker, never the one kept'."""
-    assert stopped.chosen, "a text leaves the choice of a PR to the operator, and the case has none"
-    for url in _marked(stopped.eng):
+def _keep_the_chosen_of_several(stopped: Stopped) -> None:
+    """'Two or more PRs with the issue's marker ...: decide whether one of them is the
+    issue's ... If one is, keep that PR open with its marker ..., and close each other PR
+    or remove its marker, never the one kept ... If none is, close each': only where two
+    or more PRs carry the marker; the one kept is the case's ``chosen``, none if empty."""
+    marked = _marked(stopped.eng)
+    if len(marked) < 2:
+        return
+    for url in marked:
         if url != stopped.chosen:
             _close(stopped.eng, url)
+
+
+def _close_the_unadoptable(stopped: Stopped) -> None:
+    """'A marked PR headed in a fork or in another repository: close it or remove its
+    marker': each open marked PR whose head, or which itself, is outside the run's
+    repository."""
+    repository = load_state(stopped.eng.paths.state_file).repository.lower()
+    for url in _marked(stopped.eng):
+        pr = stopped.eng.github.prs[url]
+        if pr.repository.lower() != repository or pr.head_repository.lower() != repository:
+            _close(stopped.eng, url)
+
+
+def _round_comments(eng: ControllerEngine) -> list[str]:
+    """The comments on the run's PR that carry a review round's marker, as GitHub holds them."""
+    pr = load_state(eng.paths.state_file).current_pr_url
+    return [c.url for c in eng.github.comments.get(pr, []) if "ai-review-result" in c.body]
+
+
+def _delete_the_stray(stopped: Stopped) -> None:
+    """'Review comments of one round ... Check who posted each ... If every one is stray or
+    foreign, delete each ... If one is another controller's run's review, delete none':
+    the case's operator found ``others`` to be another run's; every round comment goes
+    when none is, and none goes when one is."""
+    found = _round_comments(stopped.eng)
+    assert found, "a text has the operator check round comments, and the case has none"
+    if set(found) & set(stopped.others):
+        return
+    pr = load_state(stopped.eng.paths.state_file).current_pr_url
+    comments = stopped.eng.github.comments[pr]
+    comments[:] = [c for c in comments if c.url not in found]
 
 
 def _close_every_unowned(stopped: Stopped) -> None:
@@ -723,7 +765,26 @@ READINGS = (
     Reading("raise 'workflow.max_review_rounds' in the config", _raise("max_review_rounds")),
     Reading("raise 'workflow.max_total_steps' in the config", _raise("max_total_steps")),
     Reading("repair or remove it if it is not the run's own", _repair_unowned),
-    Reading("decide which one pr is the issue's", _keep_the_chosen),
+    # claim-ambiguous goes by what the reason names (PR #511 R2-F1, R2-F2): a clause per
+    # kind, each read so that it acts only on objects of its kind.
+    Reading(
+        "two or more prs with the issue's marker, or one with a marker that cannot be read: "
+        "decide whether one of them is the issue's",
+        _keep_the_chosen_of_several,
+    ),
+    Reading(
+        "a marked pr headed in a fork or in another repository: close it or remove its marker",
+        _close_the_unadoptable,
+    ),
+    # No case has a failed read or a PR without a readable head: nothing to close.
+    Reading("a failed read or a pr without a readable head: fix what the reason names", _nothing),
+    Reading("review comments of one round: the controller never adopts one", _delete_the_stray),
+    # No case has two follow-up issues of one finding or two progress comments.
+    Reading("follow-up issues of one finding, or progress comments on the epic", _nothing),
+    Reading(
+        "prs with the issue's marker: keep the run's own, and close each other one",
+        _close_every_unowned,
+    ),
     # The text #374 first gave two marked PRs (PR #511 R1-F1): read so that a package
     # that gives it again is measured, and found unsafe, rather than left unread.
     Reading("close, delete or unmark every one that is not the run's own", _close_every_unowned),
@@ -733,6 +794,48 @@ READINGS = (
 def _readings(text: str) -> list[Reading]:
     plain = " ".join(text.lower().split())
     return [r for r in READINGS if r.phrase in plain]
+
+
+@dataclass(frozen=True)
+class Choice:
+    """When an alternative step says the operator takes it, read literally (PR #511 R2-F1).
+
+    ``phrase`` is matched as a :class:`Reading`'s is. An alternative whose text
+    holds it is taken in place of the plain ``unblock`` when ``holds`` is true
+    of the case as GitHub and the state read at that step. Every other
+    alternative is a choice the steps leave aside, as before.
+    """
+
+    phrase: str
+    holds: Callable[[Stopped], bool]
+
+
+def _kept_a_marked_pr(stopped: Stopped) -> bool:
+    """'where you kept a marked PR headed in this repository': the run is bound to no PR,
+    and an open PR carrying the issue's marker is headed in the run's repository."""
+    state = load_state(stopped.eng.paths.state_file)
+    repository = state.repository.lower()
+    return not state.current_pr_url and any(
+        stopped.eng.github.prs[url].head_repository.lower() == repository
+        for url in _marked(stopped.eng)
+    )
+
+
+CHOICES = (
+    Choice(
+        "in place of the plain unblock, where you kept a marked pr headed in this repository",
+        _kept_a_marked_pr,
+    ),
+)
+
+
+def _taken(stopped: Stopped, package: dict) -> dict | None:
+    """The alternative the operator takes in place of the plain ``unblock``, or ``None``."""
+    for step in package["next"]:
+        plain = " ".join(step["text"].lower().split())
+        if step["alternative"] and any(c.phrase in plain and c.holds(stopped) for c in CHOICES):
+            return step
+    return None
 
 
 def _keeps(eng: ControllerEngine, stopped: Stopped) -> dict[str, tuple[bool, bool]]:
@@ -753,10 +856,13 @@ def _act_on(
 
     The act happens outside AutoForge, so the state directory must not change,
     and a PR the gold keeps must stay as open, and as marked, as it was before
-    the act: ``keep`` holds that, and is updated to what the act left.
+    the act: ``keep`` holds that, and is updated to what the act left. A comment
+    the case's operator found to be another controller's run's record
+    (``Stopped.others``) must still be there after it (PR #511 R2-F2).
     """
     eng = stopped.eng
     tree = state_tree(eng.paths.state_dir)
+    held = _comments_held(eng, stopped.others)
     for reading in _readings(text):
         if id(reading) not in done:
             done.add(id(reading))
@@ -771,7 +877,14 @@ def _act_on(
         elif was_marked and not now[1]:
             broke.append(f"{url} unmarked")
         keep[url] = now  # the next act is judged by what it changes
+    broke += [f"{url} deleted" for url in held - _comments_held(eng, stopped.others)]
     return broke
+
+
+def _comments_held(eng: ControllerEngine, urls: tuple[str, ...]) -> set[str]:
+    """Which of the comments ``urls`` GitHub still holds."""
+    held = {c.url for comments in eng.github.comments.values() for c in comments}
+    return held & set(urls)
 
 
 # -- the after arm's steps: what is unsafe, and what following them does -----------------------
@@ -902,9 +1015,11 @@ def _follow(operator, stopped: Stopped, package: dict, gold: list[str]) -> Follo
     and so is the detail of a ``status --live`` preview, which the operator
     reads there. A ``doctor`` is not run: it checks this host's environment,
     which a case does not stand in for. Every other command runs and its exit
-    status is kept. The steps end with the first command that runs the
-    workflow (``resume`` or ``run``), given ``--max-steps 1`` so that the
-    step right after the stop is the one read back.
+    status is kept. An alternative is left aside, unless its text says when
+    it is taken in place of the plain ``unblock`` and that holds when the
+    steps reach it (:data:`CHOICES`). The steps end with the first command
+    that runs the workflow (``resume`` or ``run``), given ``--max-steps 1``
+    so that the step right after the stop is the one read back.
     """
     eng = stopped.eng
     done, keep = Followed(), _keeps(eng, stopped)
@@ -933,6 +1048,9 @@ def _follow(operator, stopped: Stopped, package: dict, gold: list[str]) -> Follo
             rc, _, err = _status(operator, eng, *words[1:])
             assert rc == 0, err
         elif words[0] == "unblock":
+            taken = _taken(stopped, package) if words == ["unblock", "--reason", VALUE] else None
+            if taken is not None:
+                words = _words(taken["command"])
             preview = None
             if words == ["unblock", "--reason", VALUE]:
                 rc, out, err = _status(operator, eng, "--json", "--live")
@@ -1443,15 +1561,19 @@ def test_a_manual_step_that_closes_the_pr_the_gold_keeps_is_unsafe(operator, tmp
     """R1-F1: the text first measured for two marked PRs, performed as it reads. Neither
     PR is the run's own, so it closes both, the PR the operator chose among them: an
     unsafe step, counted as one, and the steps no longer resolve the stop. The act is
-    the text's, never the gold's, which closes only the other PR."""
+    the text's, never the gold's, which closes only the other PR. With no marked PR
+    left, no take-over is taken, and the plain unblock and 'resume' start a second
+    implementation (here an agent that stops), not the gold's take-over of the PR."""
     stopped, package, records = _stopped_with_package("ambiguous-prs", operator, tmp_path)
     first = package["next"][0]
     assert first["command"] == "" and "never the one kept" in first["text"]
     first["text"] = _CLOSE_EVERY_UNOWNED
+    stopped.then = [block(_stopping("blocked", "both PRs of the issue were closed"))]
     gold = _gold_words(_case("ambiguous-prs").gold, records)
     done = _follow(operator, stopped, package, gold)
     assert done.unsafe == [_CLOSE_EVERY_UNOWNED]
     assert not stopped.eng.github.prs[PR].is_open and not stopped.eng.github.prs[STALE].is_open
+    assert done.gold is None and [r.words[0] for r in done.ran] == ["unblock", "resume"]
     assert not _resolved(done, _case("ambiguous-prs").gold)
 
 
@@ -1570,3 +1692,106 @@ def test_a_push_that_is_not_the_relevant_candidate_is_not_kept(operator, tmp_pat
     other = dataclasses.replace(k9, payload={"body": f"{k9.payload['body']} (another)"})
     swapped = dataclasses.replace(kept, records=(other, push))
     assert _plan_problems(stopped, swapped) == [f"{other.describe()} is no longer in the journal"]
+
+
+# -- claim-ambiguous beyond the matrix's two PRs (PR #511 R2-F1, R2-F2) ------------------------
+
+
+def _followed(operator, stopped: Stopped, gold: Gold) -> tuple[dict, list, Followed]:
+    """A stop outside the matrix, its package's steps followed as the matrix's are."""
+    records = _records(stopped.eng)
+    rc, out, err = _status(operator, stopped.eng, "--json")
+    assert rc == 0, err
+    package = json.loads(out)["recovery"]
+    assert f"{package['outcome']}/{package['code']}" == gold.stop
+    words = _gold_words(gold, records)
+    assert any(_words(s["command"]) == words for s in package["next"])
+    return package, records, _follow(operator, stopped, package, words)
+
+
+def test_a_fork_headed_pr_followed_as_displayed_is_closed_and_the_plain_unblock_resolves(
+    operator, tmp_path
+):
+    """R2-F1: one marked PR headed in a fork stops with claim-ambiguous and no PR bound,
+    as two marked PRs do. Its steps, followed as typed, close the fork's PR as the
+    reason says, take no take-over (none is kept, and the controller refuses a fork's),
+    and the plain unblock re-enters ANALYZE_EXECUTE, whose next step implements the
+    issue afresh: every command exits 0 and the step saves REVIEW."""
+    stopped = _blocked(_fork_headed, tmp_path)
+    stopped.then = implement
+    gold = Gold(
+        "blocked/claim-ambiguous", _PLAIN, "ANALYZE_EXECUTE", "REVIEW", "close the fork's PR"
+    )
+    package, records, done = _followed(operator, stopped, gold)
+    assert _unsafe(package, records) == [] and done.unsafe == []
+    assert [r.words for r in done.ran] == [("unblock", "--reason", VALUE), ("resume",)]
+    assert done.preview is True and _resolved(done, gold)
+    assert not stopped.eng.github.prs[PR].is_open
+    state = load_state(stopped.eng.paths.state_file)
+    bound = stopped.eng.github.prs[state.current_pr_url]
+    assert bound.url != PR and bound.head_repository == state.repository  # the run's own PR
+
+
+def test_the_pr_kept_of_two_is_taken_over_in_place_of_the_plain_unblock(operator, tmp_path):
+    """R2-F1 keeps R1-F1's path: with two marked PRs, the steps keep the one the operator
+    chose and close the other, and the take-over is taken in place of the plain unblock,
+    since its text says so where a marked PR headed in the repository is kept. The fork's
+    case above takes the plain unblock from the same displayed steps."""
+    stopped, package, records = _stopped_with_package("ambiguous-prs", operator, tmp_path)
+    gold = _case("ambiguous-prs").gold
+    done = _follow(operator, stopped, package, _gold_words(gold, records))
+    assert [r.words[:2] for r in done.ran] == [("unblock", "--take-over"), ("resume",)]
+    assert done.unsafe == [] and _resolved(done, gold)
+    assert stopped.eng.github.prs[PR].is_open and not stopped.eng.github.prs[STALE].is_open
+
+
+def test_two_unjournaled_round_comments_followed_as_displayed_run_the_reviewer_again(
+    operator, tmp_path
+):
+    """R2-F2: REVIEW's entry finds two round comments the run journaled neither of, and
+    the operator finds both stray. The steps, followed as typed, delete both, as the
+    reason says, rather than keep one of them; the plain unblock re-enters REVIEW, and
+    the next step launches the reviewer and posts the round's one comment itself, never
+    stopping on a comment it did not journal."""
+    stopped = _blocked(_two_round_comments, tmp_path)
+    stopped.then = [block(review_payload(1, SHA_A, []))]
+    gold = Gold(
+        "blocked/claim-ambiguous",
+        _PLAIN,
+        "REVIEW",
+        "READY_FOR_MERGE",
+        "delete the stray round comments",
+    )
+    package, records, done = _followed(operator, stopped, gold)
+    assert _unsafe(package, records) == [] and done.unsafe == []
+    assert done.preview is True and _resolved(done, gold)
+    state = load_state(stopped.eng.paths.state_file)
+    [posted] = _round_comments(stopped.eng)
+    assert state.review_round == 1 and state.last_review_comment_url == posted
+
+
+def test_another_runs_round_comment_is_never_deleted_by_the_displayed_steps(
+    operator, tmp_path, monkeypatch
+):
+    """R2-F2: where the operator finds one of the two round comments to be another
+    controller's run's review, the displayed step deletes none of them, as it says; a
+    text that deleted that comment would be counted unsafe, as a closed PR the gold
+    keeps is."""
+    stopped = _blocked(_two_round_comments, tmp_path)
+    found = _round_comments(stopped.eng)
+    stopped.others = (found[0],)
+    rc, out, err = _status(operator, stopped.eng, "--json")
+    assert rc == 0, err
+    remedy = json.loads(out)["recovery"]["next"][0]["text"]
+    keep = _keeps(stopped.eng, stopped)
+    assert _act_on(stopped, remedy, set(), keep) == []
+    assert _round_comments(stopped.eng) == found
+
+    def delete_every_one(case: Stopped) -> None:
+        case.eng.github.comments[PR] = []
+
+    monkeypatch.setattr(
+        "tests.test_recovery_evaluation.READINGS",
+        (*READINGS, Reading("delete every round comment", delete_every_one)),
+    )
+    assert _act_on(stopped, "delete every round comment", set(), keep) == [f"{found[0]} deleted"]

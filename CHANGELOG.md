@@ -5,7 +5,7 @@ so.
 
 ## Unreleased
 
-### Two marked PRs: `status` says to keep the one you choose and take it over (#375)
+### `claim-ambiguous`: `status` goes by what the reason names (#375)
 
 When more than one open PR carries the issue's implementation marker and
 the run recorded none of them (`claim-ambiguous` with no PR bound), the
@@ -14,11 +14,20 @@ that is not the run's own, then 'unblock'". None of them is the run's own,
 so read as it stands that closed every PR, the one the issue needs among
 them, and the plain `unblock` it named refuses a marked PR the run has no
 record of. It now says to decide which PR is the issue's, keep that one
-open with its marker, close or unmark the others, and run
-`unblock --take-over <PR URL>`, naming no PR itself. A run bound to a PR is
-told to keep its own object and unblock as before. Only the advice
-changed: `unblock` decides exactly as it did. The deterministic recovery
-MVP's evaluation (`docs/recovery-mvp-evaluation.md`) found it.
+open with its marker, close or unmark the others, and take it over with
+`unblock --take-over <PR URL>`, naming no PR itself. The take-over is shown
+as the alternative to the plain `unblock`, because the same code also
+names a single marked PR headed in a fork, which is never taken over: for
+that one the package says to close it or remove its marker, then
+`unblock`.
+
+With a PR bound, the package no longer tells the operator to keep one of
+two review comments of a round: the controller adopts neither, so the one
+kept stopped the next step again. It now says what the reason says: delete
+every stray comment, then `unblock`, or, when one is another controller's
+run's review, delete none and do not `unblock`. Only the advice changed:
+`unblock` decides exactly as it did. The deterministic recovery MVP's
+evaluation (`docs/recovery-mvp-evaluation.md`) and its review found these.
 
 ### macOS on Apple Silicon is tested in CI on every commit (#501)
 

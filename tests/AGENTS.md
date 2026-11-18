@@ -615,7 +615,10 @@ the recovery MVP evaluation (#375)    test_recovery_evaluation.py (the matrix of
                                       summary counted from the matrix, the strata covered,
                                       every test the record names exists; the measures held
                                       against a closed PR, an omitted or failed next step, a
-                                      lost or doubled effect, a moved PR head, PR #511 R1)
+                                      lost or doubled effect, a moved PR head, PR #511 R1; a
+                                      fork's marked PR and two unjournaled round comments
+                                      followed through the next step, another run's comment
+                                      never deleted, PR #511 R2)
 the evaluation protocol (#318)        test_evaluation.py (the pins, what arms hold equal, the
                                       statistics and decision on synthetic records, what never
                                       runs in CI; the protocol held to its files),
