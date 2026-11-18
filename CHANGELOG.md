@@ -35,7 +35,11 @@ so a run that then exited cleanly failed with `claude: exited inside a turn
 that has no result event` and automatic recovery refused it. Those records
 now open no turn. A reply followed by them no longer stops the CLI early:
 the run waits for the turn the agent's end gives it, as it did on earlier
-versions. 2.1.326 also stops every background task ten minutes after the
+versions. That wait needs the first of those records within 10 seconds of
+the reply. A background agent that writes nothing in that time (one
+waiting on its model, say) leaves the reply deciding the run, which stops
+the CLI then and does not wait for the agent's work, as with any reply
+(#439). 2.1.326 also stops every background task ten minutes after the
 last turn and exits without another. Every `claude` launch now sets
 `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`, overriding any value you set, so
 the profile's `idle_timeout_seconds` and `max_runtime_seconds` bound that

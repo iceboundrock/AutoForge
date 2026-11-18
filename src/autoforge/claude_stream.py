@@ -53,7 +53,12 @@ every turn closed (it carries a non-empty ``parent_tool_use_id``) therefore
 opens no turn: it is the agent's, not the main conversation's, and is
 observed like any other record. It does make the reply in hand stale, as a
 held-back result kept it unread on 2.1.293: :attr:`ClaudeStream.replied`
-stays false until a later turn's own ``result`` decides again. 2.1.326 also
+stays false until a later turn's own ``result`` decides again. That holds
+only from the first such record on: until it arrives the reply decides the
+run, so a background agent that writes nothing within the driver's reply
+grace after the ``result`` (one waiting on its model) is not waited for, as
+no pending work is past that grace (#439,
+:data:`autoforge.providers.CLAUDE_REPLIED_EXIT_GRACE_SECONDS`). 2.1.326 also
 stops every background task ten minutes after the last turn and exits 0
 without another turn (``CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS``, default
 600000; 0 turns it off, read from the build), which the adapter turns off so
