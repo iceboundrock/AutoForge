@@ -176,9 +176,25 @@ class Stopped:
     others: tuple[str, ...] = ()
 
 
+def _own_state_dir(tmp: Path) -> Path:
+    """``tmp``, held to being a case's own state directory: one not made yet, in a
+    directory that is no checkout yet. ``make_engine`` makes the run's checkout in the
+    state directory's parent, the agent worktree goes in that checkout's git
+    directory, and ``attach_origin`` puts the bare origin next to it. A test's
+    ``tmp_path`` itself as the state directory puts all three in the session's base
+    directory, shared by every test that did the same, so one test's branch and
+    pushes reach the next and an outcome depends on the order the tests ran in
+    (PR #511 R3-F1). ``tmp_state_dir`` and ``mktemp(...) / ".autoforge"`` are such
+    directories."""
+    assert not tmp.exists(), f"{tmp} exists: a case needs a state directory of its own"
+    assert not (tmp.parent / ".git").exists(), f"{tmp.parent} already is another case's checkout"
+    return tmp
+
+
 def _blocked(build: Callable[[Path], ControllerEngine], tmp: Path) -> Stopped:
     """A scenario whose last step stopped in BLOCKED or FAILED: that step's stop line,
     which the CLI prints, and the reason the stop saved."""
+    tmp = _own_state_dir(tmp)
     outcomes: list = []
     real = ControllerEngine.step
 
@@ -1317,7 +1333,7 @@ class Measured:
 def _measure(case: Case, operator, fresh: Callable[[], Path]) -> Measured:
     """Build the case, read both arms, follow the package, and perform the gold."""
     gold = case.gold
-    stopped = case.build(fresh())
+    stopped = case.build(_own_state_dir(fresh()))
     eng = stopped.eng
     row = dict.fromkeys(MEASURED, NONE)
     row["Gold stop"] = gold.stop
@@ -1370,7 +1386,7 @@ def _measure(case: Case, operator, fresh: Callable[[], Path]) -> Measured:
     if not resolved:
         # The displayed steps did not resolve it: perform the gold on a fresh copy, so
         # that every gold label is held by the controller's own read-back.
-        _holds(gold, *_perform(operator, case.build(fresh()), gold, words))
+        _holds(gold, *_perform(operator, case.build(_own_state_dir(fresh())), gold, words))
     return measured
 
 
@@ -1546,25 +1562,41 @@ def _case(name: str) -> Case:
 
 
 def _stopped_with_package(name: str, operator, tmp: Path) -> tuple[Stopped, dict, list]:
-    stopped = _case(name).build(tmp)
+    stopped = _case(name).build(_own_state_dir(tmp))
     records = _records(stopped.eng)
     rc, out, err = _status(operator, stopped.eng, "--json")
     assert rc == 0, err
     return stopped, json.loads(out)["recovery"], records
 
 
+def test_a_case_keeps_its_checkout_origin_and_worktree_in_the_tests_own_directory(tmp_path):
+    """R3-F1: a case's checkout, bare origin and agent worktree are all in the test's own
+    directory, never in the session's base directory, where the next test to build a
+    case would find them and resume on their branch. A state directory that would put
+    them anywhere shared is refused before anything is built."""
+    with pytest.raises(AssertionError, match="needs a state directory of its own"):
+        _blocked(_fork_headed, tmp_path)
+    own = tmp_path.resolve()
+    eng = _case("agent-blocked").build(tmp_path / ".autoforge").eng
+    assert Path(eng.workdir).resolve() == own
+    assert eng.origin.bare.resolve().parent == own
+    assert eng.agent_worktree_path().resolve().is_relative_to(own)
+    with pytest.raises(AssertionError, match="already is another case's checkout"):
+        _blocked(_fork_headed, tmp_path / "again")
+
+
 #: The step #374 first gave two marked PRs that the run recorded neither of.
 _CLOSE_EVERY_UNOWNED = "close, delete or unmark every one that is not the run's own, then 'unblock'"
 
 
-def test_a_manual_step_that_closes_the_pr_the_gold_keeps_is_unsafe(operator, tmp_path):
+def test_a_manual_step_that_closes_the_pr_the_gold_keeps_is_unsafe(operator, tmp_state_dir):
     """R1-F1: the text first measured for two marked PRs, performed as it reads. Neither
     PR is the run's own, so it closes both, the PR the operator chose among them: an
     unsafe step, counted as one, and the steps no longer resolve the stop. The act is
     the text's, never the gold's, which closes only the other PR. With no marked PR
     left, no take-over is taken, and the plain unblock and 'resume' start a second
     implementation (here an agent that stops), not the gold's take-over of the PR."""
-    stopped, package, records = _stopped_with_package("ambiguous-prs", operator, tmp_path)
+    stopped, package, records = _stopped_with_package("ambiguous-prs", operator, tmp_state_dir)
     first = package["next"][0]
     assert first["command"] == "" and "never the one kept" in first["text"]
     first["text"] = _CLOSE_EVERY_UNOWNED
@@ -1577,10 +1609,10 @@ def test_a_manual_step_that_closes_the_pr_the_gold_keeps_is_unsafe(operator, tmp
     assert not _resolved(done, _case("ambiguous-prs").gold)
 
 
-def test_a_manual_step_with_no_reading_fails_the_case(operator, tmp_path):
+def test_a_manual_step_with_no_reading_fails_the_case(operator, tmp_state_dir):
     """R1-F1: a step with no command that no reading covers is never performed as the
     gold's act: the case fails, naming the text, and nothing on GitHub changed."""
-    stopped, package, records = _stopped_with_package("ambiguous-prs", operator, tmp_path)
+    stopped, package, records = _stopped_with_package("ambiguous-prs", operator, tmp_state_dir)
     package["next"][0]["text"] = "put things right"
     before = _github_writes(stopped.eng.github)
     gold = _gold_words(_case("ambiguous-prs").gold, records)
@@ -1589,10 +1621,10 @@ def test_a_manual_step_with_no_reading_fails_the_case(operator, tmp_path):
     assert _github_writes(stopped.eng.github) == before
 
 
-def test_a_package_that_omits_the_next_step_does_not_resolve(operator, tmp_path):
+def test_a_package_that_omits_the_next_step_does_not_resolve(operator, tmp_state_dir):
     """R1-F2: the unblock runs and saves the gold phase, but the package shows no
     'resume', so no workflow step runs after it: not a resolution."""
-    stopped, package, records = _stopped_with_package("agent-blocked", operator, tmp_path)
+    stopped, package, records = _stopped_with_package("agent-blocked", operator, tmp_state_dir)
     gold = _case("agent-blocked").gold
     package["next"] = [s for s in package["next"] if _words(s["command"])[:1] != ["resume"]]
     done = _follow(operator, stopped, package, _gold_words(gold, records))
@@ -1600,11 +1632,11 @@ def test_a_package_that_omits_the_next_step_does_not_resolve(operator, tmp_path)
     assert done.next is None and not _resolved(done, gold)
 
 
-def test_a_resume_that_fails_with_the_phase_unchanged_does_not_resolve(operator, tmp_path):
+def test_a_resume_that_fails_with_the_phase_unchanged_does_not_resolve(operator, tmp_state_dir):
     """R1-F2: GitHub answers 502 to the PR the resumed step opens: 'resume' exits 1 and
     leaves ANALYZE_EXECUTE, which is neither BLOCKED nor FAILED. Its exit status and the
     phase it saved, not REVIEW, make it no resolution; so does any failed command."""
-    stopped, package, records = _stopped_with_package("agent-blocked", operator, tmp_path)
+    stopped, package, records = _stopped_with_package("agent-blocked", operator, tmp_state_dir)
     gold = _case("agent-blocked").gold
     stopped.eng.github.write_failures.append(
         ("create_pull_request", GitHubUnavailableError("gh: HTTP 502"), False)
@@ -1645,11 +1677,13 @@ def test_a_plan_whose_effect_is_lost_or_doubled_is_not_kept(operator, tmp_path_f
         ]
 
 
-def test_a_pr_head_moved_off_the_candidate_is_not_kept(operator, tmp_path):
+def test_a_pr_head_moved_off_the_candidate_is_not_kept(operator, tmp_state_dir):
     """R1-F3: the plan completed and the run went on; then another push puts the PR's
     branch back on the reviewed head. The PR head GitHub reports, the origin's ref and
     the candidate disagree, so the plan is not kept."""
-    stopped, package, records = _stopped_with_package("k10-operator-actions", operator, tmp_path)
+    stopped, package, records = _stopped_with_package(
+        "k10-operator-actions", operator, tmp_state_dir
+    )
     plan = _plan_at_stop(stopped, package, records)
     gold = _case("k10-operator-actions").gold
     assert _resolved(_follow(operator, stopped, package, _gold_words(gold, records)), gold)
@@ -1710,14 +1744,14 @@ def _followed(operator, stopped: Stopped, gold: Gold) -> tuple[dict, list, Follo
 
 
 def test_a_fork_headed_pr_followed_as_displayed_is_closed_and_the_plain_unblock_resolves(
-    operator, tmp_path
+    operator, tmp_state_dir
 ):
     """R2-F1: one marked PR headed in a fork stops with claim-ambiguous and no PR bound,
     as two marked PRs do. Its steps, followed as typed, close the fork's PR as the
     reason says, take no take-over (none is kept, and the controller refuses a fork's),
     and the plain unblock re-enters ANALYZE_EXECUTE, whose next step implements the
     issue afresh: every command exits 0 and the step saves REVIEW."""
-    stopped = _blocked(_fork_headed, tmp_path)
+    stopped = _blocked(_fork_headed, tmp_state_dir)
     stopped.then = implement
     gold = Gold(
         "blocked/claim-ambiguous", _PLAIN, "ANALYZE_EXECUTE", "REVIEW", "close the fork's PR"
@@ -1732,12 +1766,12 @@ def test_a_fork_headed_pr_followed_as_displayed_is_closed_and_the_plain_unblock_
     assert bound.url != PR and bound.head_repository == state.repository  # the run's own PR
 
 
-def test_the_pr_kept_of_two_is_taken_over_in_place_of_the_plain_unblock(operator, tmp_path):
+def test_the_pr_kept_of_two_is_taken_over_in_place_of_the_plain_unblock(operator, tmp_state_dir):
     """R2-F1 keeps R1-F1's path: with two marked PRs, the steps keep the one the operator
     chose and close the other, and the take-over is taken in place of the plain unblock,
     since its text says so where a marked PR headed in the repository is kept. The fork's
     case above takes the plain unblock from the same displayed steps."""
-    stopped, package, records = _stopped_with_package("ambiguous-prs", operator, tmp_path)
+    stopped, package, records = _stopped_with_package("ambiguous-prs", operator, tmp_state_dir)
     gold = _case("ambiguous-prs").gold
     done = _follow(operator, stopped, package, _gold_words(gold, records))
     assert [r.words[:2] for r in done.ran] == [("unblock", "--take-over"), ("resume",)]
@@ -1746,14 +1780,14 @@ def test_the_pr_kept_of_two_is_taken_over_in_place_of_the_plain_unblock(operator
 
 
 def test_two_unjournaled_round_comments_followed_as_displayed_run_the_reviewer_again(
-    operator, tmp_path
+    operator, tmp_state_dir
 ):
     """R2-F2: REVIEW's entry finds two round comments the run journaled neither of, and
     the operator finds both stray. The steps, followed as typed, delete both, as the
     reason says, rather than keep one of them; the plain unblock re-enters REVIEW, and
     the next step launches the reviewer and posts the round's one comment itself, never
     stopping on a comment it did not journal."""
-    stopped = _blocked(_two_round_comments, tmp_path)
+    stopped = _blocked(_two_round_comments, tmp_state_dir)
     stopped.then = [block(review_payload(1, SHA_A, []))]
     gold = Gold(
         "blocked/claim-ambiguous",
@@ -1771,13 +1805,13 @@ def test_two_unjournaled_round_comments_followed_as_displayed_run_the_reviewer_a
 
 
 def test_another_runs_round_comment_is_never_deleted_by_the_displayed_steps(
-    operator, tmp_path, monkeypatch
+    operator, tmp_state_dir, monkeypatch
 ):
     """R2-F2: where the operator finds one of the two round comments to be another
     controller's run's review, the displayed step deletes none of them, as it says; a
     text that deleted that comment would be counted unsafe, as a closed PR the gold
     keeps is."""
-    stopped = _blocked(_two_round_comments, tmp_path)
+    stopped = _blocked(_two_round_comments, tmp_state_dir)
     found = _round_comments(stopped.eng)
     stopped.others = (found[0],)
     rc, out, err = _status(operator, stopped.eng, "--json")
