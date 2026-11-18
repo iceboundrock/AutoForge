@@ -413,9 +413,21 @@ def _cpuinfo() -> str:
         return ""
 
 
+def _cpu_affinity() -> list[int]:
+    """The CPUs this process may run on.
+
+    Its affinity mask where the platform has one (Linux); every CPU where it
+    has none (macOS, #501), since nothing there narrows the set.
+    """
+    getaffinity = getattr(os, "sched_getaffinity", None)
+    if getaffinity is not None:
+        return sorted(getaffinity(0))
+    return list(range(os.cpu_count() or 1))
+
+
 def provenance() -> dict[str, object]:
     """Where and on what the numbers were measured."""
-    affinity = sorted(os.sched_getaffinity(0))
+    affinity = _cpu_affinity()
     return {
         "measured_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "commit": _command("git", "rev-parse", "HEAD"),

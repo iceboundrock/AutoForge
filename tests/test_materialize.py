@@ -56,6 +56,23 @@ def exports(tmp_path, monkeypatch) -> Path:
     return where
 
 
+def _raw_name(directory: Path) -> bytes:
+    """A file name that is not UTF-8 (``caf\\xe9-\\xff.bin``) where the file
+    system under ``directory`` takes one, as Linux's do. APFS refuses it with
+    ``EILSEQ`` (macOS, #501), so no tree holding it can be exported there;
+    there the name is its UTF-8 spelling, still not ASCII."""
+    latin = b"caf\xe9-\xff.bin"
+    probe = os.path.join(os.fsencode(directory), latin)
+    try:
+        os.close(os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except OSError as exc:
+        if exc.errno != errno.EILSEQ:
+            raise
+        return "café-ÿ.bin".encode()
+    os.unlink(probe)
+    return latin
+
+
 def _git(repo: Path, *args: str, data: bytes | None = None, env: dict | None = None) -> bytes:
     clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     return subprocess.run(
@@ -224,7 +241,7 @@ def test_modes_links_gitlinks_and_empty_trees_are_written_as_the_tree_lists_them
 ):
     repo = _init(tmp_path / "repo", object_format)
     absent = "e" * (40 if object_format == "sha1" else 64)  # never in the store
-    latin = b"caf\xe9-\xff.bin"  # not valid UTF-8
+    latin = _raw_name(exports)  # not valid UTF-8 where the file system takes one
     commit = _commit(
         repo,
         _tree(
@@ -629,7 +646,7 @@ def test_a_directory_is_compared_with_the_tree_blob_by_blob(tmp_path, exports, o
     paths, in listing order."""
     repo = _init(tmp_path / "repo", object_format)
     absent = "e" * (40 if object_format == "sha1" else 64)
-    latin = b"caf\xe9-\xff.bin"
+    latin = _raw_name(exports)
     commit = _commit(
         repo,
         _tree(

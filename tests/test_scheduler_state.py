@@ -89,7 +89,7 @@ from autoforge.scheduler_state import (
 from autoforge.state import AutoForgeState, save_state
 from autoforge.transitions import Phase, Settlement
 
-from .conftest import deep_dir
+from .conftest import deep_dir, needs_long_paths
 
 TS = "2026-10-18T00:00:00+00:00"
 REPO_ID = 700_001
@@ -1093,7 +1093,9 @@ def test_each_uncertain_trigger_keeps_its_claim_open_and_holds_the_issue(common,
     assert _item(_reconcile(common), 7).classification == item.classification
 
 
-@pytest.mark.parametrize("length", [900, 1169], ids=["whole", "cut"])
+@pytest.mark.parametrize(
+    "length", [900, pytest.param(1169, marks=needs_long_paths)], ids=["whole", "cut"]
+)
 def test_a_namespace_state_refused_for_its_protocol_keeps_the_controller_however_long_its_path(
     tmp_path, length
 ):

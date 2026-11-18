@@ -6,6 +6,7 @@ import os
 import random
 import select
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -516,6 +517,24 @@ def _orphan_pid(res) -> int:
     return int(res.stdout.split()[2])
 
 
+def _process_state(pid: int) -> str | None:
+    """``pid``'s state letter (``Z`` for a zombie), or None once it is gone.
+
+    Read from ``/proc/<pid>/stat`` where there is a procfs, and from ``ps``
+    where there is none (macOS, #501), so that a platform without ``/proc``
+    never reads as one whose process has exited.
+    """
+    if os.path.isdir("/proc/self"):
+        try:
+            return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            return None
+    ps = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False
+    )
+    return ps.stdout.strip()[:1] or None
+
+
 def _gone(pid: int, within: float) -> bool:
     """True once ``pid`` no longer runs (an orphan lingers as a zombie until
     init reaps it, which is dead enough)."""
@@ -525,11 +544,7 @@ def _gone(pid: int, within: float) -> bool:
             os.kill(pid, 0)
         except ProcessLookupError:
             return True
-        try:
-            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-        except OSError:
-            return True
-        if state == "Z":
+        if _process_state(pid) in (None, "Z"):
             return True
         time.sleep(0.05)
     return False

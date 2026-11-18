@@ -592,21 +592,26 @@ gate and the required `ci` check decide as before.
 The same checks run hosted on every pull request and every push to
 `main` (`.github/workflows/ci.yml`), each after a locked install
 (`uv sync --locked`): `pytest` on Python 3.11 and 3.12, and `ruff check` /
-`ruff format --check` / `mypy` once. A third job, `sandbox`, runs the outer
-sandbox's real backend on the runner (`make test-sandbox-measured`,
-[The outer sandbox](#the-outer-sandbox)). A fourth, `dist`, builds the sdist
-and the wheel and installs and runs the wheel, on 3.11 and 3.12
-(`make dist-check`, [The built distributions](#the-built-distributions)).
+`ruff format --check` / `mypy` once. `test-macos` runs that `pytest` again,
+on both interpreters, on `macos-latest`, GitHub's arm64 macOS runner, so
+a change that breaks macOS on Apple Silicon fails its own PR (#501); the
+tests of Linux-only behaviour skip there, and it writes no duration report.
+A further job, `sandbox`, runs the outer sandbox's real backend on the
+Linux runner (`make test-sandbox-measured`,
+[The outer sandbox](#the-outer-sandbox)). Another, `dist`, builds the sdist
+and the wheel and installs and runs the wheel, on 3.11 and 3.12, on Linux
+only (`make dist-check`, [The built distributions](#the-built-distributions)).
 `make check` runs the same commands
 plus the lockfile check, but only on the interpreter the local environment
 resolves (`.python-version`); `make check-matrix` runs `pytest` on each CI
 interpreter in its own isolated environment (`uv run --isolated --locked
 --python <v>`), leaving `.venv` alone. The versions live in the Makefile's
 `CI_PYTHON_VERSIONS`; `tests/test_ci_workflow.py` fails when that list, the
-workflow's matrix, or the mirrored commands drift apart, or when the
-`sandbox` job stops running exactly `make test-sandbox-measured` over every
-real-backend module, or the `dist` job stops running `make dist-check` on
-every CI interpreter.
+workflow's matrices, or the mirrored commands drift apart, when the
+`test-macos` job stops running `make test`'s command on every CI interpreter
+on `macos-latest`, when the `sandbox` job stops running exactly
+`make test-sandbox-measured` over every real-backend module, or when the
+`dist` job stops running `make dist-check` on every CI interpreter.
 
 The repository's other workflow, `pypi-publish`
 (`.github/workflows/pypi-publish.yml`), is not CI: it never runs on a pull
@@ -694,8 +699,8 @@ schedule, which is the maintainer's decision, and each would still be one
 for a human to merge.
 
 A pin fixes an action's code, not what that code fetches when it runs. In
-`test`, `static` and `sandbox`, setup-uv installs the uv it resolves at run
-time (no `version` is given there; only `dist` and the release build pin uv
+`test`, `test-macos`, `static` and `sandbox`, setup-uv installs the uv it
+resolves at run time (no `version` is given there; only `dist` and the release build pin uv
 by version and checksum), and the publish action pulls a container image by
 a tag ([Releasing](releasing.md#the-workflow)).
 

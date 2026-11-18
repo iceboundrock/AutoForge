@@ -594,6 +594,21 @@ def controller_lock_live(coordination_root: str | Path) -> bool:
         os.close(fd)  # also drops the shared probe lock
 
 
+#: How many times :func:`_open_lock_file` walks to a lock file it creates when
+#: an entry below an existing coordination root is reported missing.
+_LOCK_CREATE_ATTEMPTS = 5
+
+
+def _open_lock_file_once(
+    root: Path, parts: tuple[str, ...], flags: int, *, create: bool, where: str
+) -> int:
+    with SafeRoot.open(root) as anchor:
+        if len(parts) == 1:
+            return open_regular_at(anchor.fd, parts[0], flags, mode=0o644, where=where)
+        with anchor.subroot("/".join(parts[:-1]), create=create) as parent:
+            return open_regular_at(parent.fd, parts[-1], flags, mode=0o644, where=where)
+
+
 def _open_lock_file(root: Path, relpath: str, *, create: bool, what: str) -> int:
     """A hardened descriptor of the lock file ``relpath`` below the coordination root.
 
@@ -610,19 +625,29 @@ def _open_lock_file(root: Path, relpath: str, *, create: bool, what: str) -> int
     parts = split_relpath(relpath)
     path = root.joinpath(*parts)
     flags = (os.O_RDWR | os.O_CREAT) if create else os.O_RDONLY
-    try:
-        with SafeRoot.open(root) as anchor:
-            if len(parts) == 1:
-                fd = open_regular_at(anchor.fd, parts[0], flags, mode=0o644, where=str(path))
-            else:
-                with anchor.subroot("/".join(parts[:-1]), create=create) as parent:
-                    fd = open_regular_at(parent.fd, parts[-1], flags, mode=0o644, where=str(path))
-    except FileNotFoundError:
-        if not create:
-            raise
-        raise LockError(f"cannot use {path} as {what}: {root} does not exist") from None
-    except (StateError, OSError) as exc:
-        raise LockError(f"cannot use {path} as {what}: {exc}") from exc
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            fd = _open_lock_file_once(root, parts, flags, create=create, where=str(path))
+            break
+        except FileNotFoundError:
+            if not create:
+                raise
+            if not os.path.isdir(root):
+                raise LockError(f"cannot use {path} as {what}: {root} does not exist") from None
+            # macOS can answer ENOENT for an entry below an existing root
+            # that other processes are creating at the same moment (#501):
+            # the walk, which creates what is missing, is made again, a
+            # bounded number of times.
+            if attempt < _LOCK_CREATE_ATTEMPTS:
+                continue
+            raise LockError(
+                f"cannot use {path} as {what}: an entry below {root} was reported missing "
+                f"while it was created, {attempt} times"
+            ) from None
+        except (StateError, OSError) as exc:
+            raise LockError(f"cannot use {path} as {what}: {exc}") from exc
     try:
         st = os.fstat(fd)
     except OSError as exc:

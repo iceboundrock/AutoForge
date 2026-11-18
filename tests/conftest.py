@@ -44,7 +44,11 @@ from autoforge.evidence import (  # noqa: E402
     binding,
     find_evidence,
 )
-from autoforge.executor import ExecutionResult, select_environment  # noqa: E402
+from autoforge.executor import (  # noqa: E402
+    ExecutionResult,
+    describe_leftovers,
+    select_environment,
+)
 from autoforge.git_transport import (  # noqa: E402
     NO_AUTO_MAINTENANCE,
     CommitRecord,
@@ -78,6 +82,48 @@ from autoforge.result_parser import BEGIN, END  # noqa: E402
 from autoforge.state import utcnow_iso  # noqa: E402
 from autoforge.validation import parse_issue_url  # noqa: E402
 from tests import tmp_path_retention  # noqa: E402
+
+# macOS's temporary directory is under /var, a link to /private/var (#501).
+# The controller refuses a controller-owned path that passes through a link
+# (C2, src/autoforge/sandbox.py), such as a launch's own directory from
+# tempfile.mkdtemp, and only a launch with a sandbox backend checks it: no
+# macOS host has one, but the tests that launch with a fake backend run
+# there too. So the process's temporary directory is the resolved one, as
+# pytest's tmp_path already is (PR #509 R1-F1). Where it is no link, as on
+# Linux, nothing changes.
+tempfile.tempdir = os.path.realpath(tempfile.gettempdir())
+
+# Whether the controller can make itself a child subreaper here, which only
+# Linux can (ADR 0002 §4b). Elsewhere, macOS included (#501), a contained
+# launch runs uncontained: its result carries orphans_unchecked, its
+# leftovers sentence says so (NOTHING_LEFT is that sentence for a launch
+# that left nothing behind), a reply it delivered before a failed end is
+# refused for it, and the automatic recovery relaunches no failed launch
+# over it. A test whose subject only containment shows takes
+# needs_child_subreaper; a test whose subject is something else expects
+# what this host gives (PR #509 R1-F1). The rule itself is tested on every
+# host, with the fact set by hand.
+CHILD_SUBREAPER = sys.platform.startswith("linux")
+ORPHANS_UNCHECKED_NOTE = describe_leftovers(
+    descendants_killed=False,
+    group_survived_kill=False,
+    capture_abandoned=False,
+    orphans_unchecked=True,
+)
+NOTHING_LEFT = "" if CHILD_SUBREAPER else ORPHANS_UNCHECKED_NOTE
+needs_child_subreaper = pytest.mark.skipif(
+    not CHILD_SUBREAPER,
+    reason="the child subreaper is Linux-only: here every contained launch is orphans_unchecked",
+)
+
+# Whether this host takes a path past provenance.MAX_PATH_CHARS (1024), which
+# the tests of a path shown cut must create: Linux's PATH_MAX is 4096, and
+# macOS's 1024 refuses one that long with ENAMETOOLONG (#501).
+LONG_PATHS = os.pathconf(tempfile.gettempdir(), "PC_PATH_MAX") > 2048
+needs_long_paths = pytest.mark.skipif(
+    not LONG_PATHS,
+    reason="this host's PATH_MAX (1024 on macOS) refuses a path past MAX_PATH_CHARS",
+)
 
 EPIC = "https://github.com/owner/repo/issues/1"
 ISSUE = "https://github.com/owner/repo/issues/2"
@@ -2017,9 +2063,10 @@ def watched_fifo(path: Path) -> Iterator[list[str]]:
 def bind_unix(sock, path: Path) -> None:
     """Bind the AF_UNIX ``sock`` at ``path``, however long ``path`` is.
 
-    ``sun_path`` holds 107 bytes, and a path under ``tmp_path`` can be
-    longer: under a long ``TMPDIR``, or under pytest-xdist, whose workers
-    add ``popen-gw<N>`` to every one (#340). Bound by its name from its
+    ``sun_path`` holds 107 bytes (103 on macOS, whose ``tmp_path`` is
+    already long, #501), and a path under ``tmp_path`` can be longer: under
+    a long ``TMPDIR``, or under pytest-xdist, whose workers add
+    ``popen-gw<N>`` to every one (#340). Bound by its name from its
     directory, the socket is at the same place. A probe that connects to it
     does the same (``os.chdir`` to the directory, then the name).
     """
@@ -2657,21 +2704,24 @@ def fsync_without_the_disk(fd) -> None:
     """``os.fsync`` without the wait for the disk: it refuses what fsync refuses.
 
     An open descriptor of a regular file, a directory or a block device is
-    accepted and nothing is written back; a closed descriptor or an
-    ``O_PATH`` one raises ``EBADF``, and a pipe, a socket or a character
-    device ``EINVAL``, as ``fsync(2)`` does (``tests/test_safefs.py`` pins
-    each answer to the real call's).
+    accepted and nothing is written back. Any other descriptor (an
+    ``O_PATH`` one, a pipe, a socket, a character device) holds nothing a
+    disk is waited for, so the real call answers it, as this host's
+    ``fsync(2)`` does: Linux refuses an ``O_PATH`` one with ``EBADF`` and
+    the others with ``EINVAL``, and another platform answers as it does
+    (macOS, #501). A closed descriptor raises ``EBADF``.
+    ``tests/test_safefs.py`` pins each answer to the real call's.
     """
-    import errno
     import fcntl
+    import posix
     import stat
 
     fd = fd if isinstance(fd, int) else fd.fileno()
-    if fcntl.fcntl(fd, fcntl.F_GETFL) & getattr(os, "O_PATH", 0):
-        raise OSError(errno.EBADF, os.strerror(errno.EBADF))
-    mode = os.fstat(fd).st_mode
-    if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISBLK(mode)):
-        raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+    if not fcntl.fcntl(fd, fcntl.F_GETFL) & getattr(os, "O_PATH", 0):
+        mode = os.fstat(fd).st_mode
+        if stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISBLK(mode):
+            return
+    posix.fsync(fd)
 
 
 @pytest.fixture(autouse=True)

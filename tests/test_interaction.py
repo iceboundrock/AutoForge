@@ -1026,16 +1026,22 @@ def _feed(w: int, rest: bytes, close: bool) -> None:
 
 def test_the_input_pipe_takes_more_than_the_pipe_buffer_holds(monkeypatch):
     """#259: a pipe of 4 KiB, as a host over ``fs.pipe-user-pages-soft`` makes
-    them, still yields all of a test's typed input, then its end."""
+    them, still yields all of a test's typed input, then its end.
+
+    Only Linux can shrink a pipe (``F_SETPIPE_SZ``). Elsewhere (macOS, #501)
+    the input is made larger than any buffer a pipe grows to there (64 KiB)
+    instead, so it still does not fit."""
     real_pipe = os.pipe
+    shrink = getattr(fcntl, "F_SETPIPE_SZ", None)
 
     def small_pipe():
         r, w = real_pipe()
-        fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, 4096)  # shrinking is always permitted
+        if shrink is not None:
+            fcntl.fcntl(w, shrink, 4096)  # shrinking is always permitted
         return r, w
 
     monkeypatch.setattr(os, "pipe", small_pipe)
-    data = b"x" * 20000 + b"\nc\n"
+    data = b"x" * (20000 if shrink is not None else 1 << 20) + b"\nc\n"
     got: list[bytes] = []
 
     def read_all():
@@ -1251,6 +1257,14 @@ class _Typist(io.StringIO):
             pass
 
 
+def _settings(attrs: list) -> list:
+    """A terminal's settings, as ``tcgetattr`` gives them, without ``PENDIN``:
+    macOS sets it in the local modes as canonical mode comes back on, so that
+    the kernel retypes what is pending (#501), and clears it once it has. It
+    is the kernel's state, never a setting the resolver could leave changed."""
+    return [*attrs[:3], attrs[3] & ~getattr(termios, "PENDIN", 0), *attrs[4:]]
+
+
 @dataclasses.dataclass
 class _Session:
     result: object
@@ -1285,7 +1299,7 @@ def _at_terminal(resolve, *typed: bytes, read_only: bool = False, at_prompt=None
     output = _Typist(master, slave, typed, at_prompt and (lambda n: at_prompt(slave, n)))
     try:
         result = resolve(TerminalResolver(input_fd=fd, output=output))
-        restored = termios.tcgetattr(slave) == before
+        restored = _settings(termios.tcgetattr(slave)) == _settings(before)
     finally:
         if fd != slave:
             os.close(fd)
@@ -1400,9 +1414,13 @@ def test_a_line_read_while_the_terminals_own_editing_came_back_on_is_refused():
             canonical.append(mode)
 
     long = "数" * 1500
+    # Linux keeps the first 4095 bytes of a canonical line, so the line read
+    # through it is cut. macOS keeps none of a line past MAX_CANON (1024), its
+    # newline included (#501), so that line never arrives: there it is short.
+    first = long if sys.platform.startswith("linux") else "数" * 100
     session = _at_terminal(
         _deliver(permission),
-        b"n " + long.encode() + b"\n",
+        b"n " + first.encode() + b"\n",
         b"n " + long.encode() + b"\n",
         at_prompt=at_prompt,
     )
@@ -1430,6 +1448,11 @@ def test_output_flow_control_that_came_back_on_is_taken_back_and_suspends_nothin
     assert session.restored
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="macOS's pseudo-terminal takes the echo while its output is suspended (TCOOFF), "
+    "so no echo is left untaken to bound",
+)
 def test_the_resolver_reads_no_more_keys_while_the_terminal_does_not_take_its_output():
     """What a terminal whose output is suspended has not taken stays bounded
     (R3-F1): past _MAX_UNSHOWN_BYTES of echo the resolver reads no more keys,
@@ -1557,12 +1580,12 @@ def test_the_terminal_settings_come_back_when_the_resolver_is_interrupted_or_exp
             TerminalResolver(input_fd=slave, output=Interrupting()).resolve(
                 permission(b), FAR_REAL()
             )
-        assert termios.tcgetattr(slave) == before
+        assert _settings(termios.tcgetattr(slave)) == _settings(before)
         result = TerminalResolver(input_fd=slave, output=io.StringIO()).resolve(
             permission(b), time.monotonic() + 0.2
         )
         assert result == Unavailable(UnavailableReason.EXPIRED)
-        assert termios.tcgetattr(slave) == before
+        assert _settings(termios.tcgetattr(slave)) == _settings(before)
     finally:
         os.close(master)
         os.close(slave)
@@ -1575,6 +1598,10 @@ from autoforge.cli import TerminalResolver
 from autoforge.interaction import Capabilities, InteractionBroker
 from autoforge.sdk_policy import InteractionSettings, input_digest
 
+def settings(attrs):
+    # PENDIN is the kernel's (macOS sets it as canonical mode comes back on).
+    return [*attrs[:3], attrs[3] & ~getattr(termios, "PENDIN", 0), *attrs[4:]]
+
 signal.signal(signal.SIGINT, signal.default_int_handler)
 fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 before = termios.tcgetattr(0)
@@ -1585,7 +1612,7 @@ request = broker.permission("toolu_01", "Bash", "command: make test", input_dige
 try:
     broker.handle(request, time.monotonic() + 60)
 except KeyboardInterrupt:
-    print("interrupted", termios.tcgetattr(0) == before, flush=True)
+    print("interrupted", settings(termios.tcgetattr(0)) == settings(before), flush=True)
 """
 
 
@@ -1629,6 +1656,10 @@ from autoforge.cli import TerminalResolver
 from autoforge.interaction import Capabilities, InteractionBroker, Unattended
 from autoforge.sdk_policy import InteractionSettings, input_digest
 
+def settings(attrs):
+    # PENDIN is the kernel's (macOS sets it as canonical mode comes back on).
+    return [*attrs[:3], attrs[3] & ~getattr(termios, "PENDIN", 0), *attrs[4:]]
+
 broker = InteractionBroker(
     InteractionSettings(policy="prompt"), Capabilities(live_permissions=True), Unattended()
 )
@@ -1637,7 +1668,7 @@ before = termios.tcgetattr(0)
 started = time.monotonic()
 result = TerminalResolver().resolve(request, started + float(sys.argv[2]))
 print(json.dumps({"result": repr(result), "seconds": time.monotonic() - started,
-                  "restored": termios.tcgetattr(0) == before}), flush=True)
+                  "restored": settings(termios.tcgetattr(0)) == settings(before)}), flush=True)
 """
 
 
@@ -1646,7 +1677,16 @@ print(json.dumps({"result": repr(result), "seconds": time.monotonic() - started,
     [
         ("stop key", b"\x13y\r", 20.0, Allow(AllowScope.ONCE)),
         ("stop key", b"\x13y", 1.0, Unavailable(UnavailableReason.EXPIRED)),
-        ("stop key before", b"y\r", 20.0, Allow(AllowScope.ONCE)),
+        pytest.param(
+            "stop key before",
+            b"y\r",
+            20.0,
+            Allow(AllowScope.ONCE),
+            marks=pytest.mark.skipif(
+                not sys.platform.startswith("linux"),
+                reason="turning IXON off restarts output a stop key suspended on Linux only",
+            ),
+        ),
         ("tcflow", b"y\r", 20.0, Allow(AllowScope.ONCE)),
         ("tcflow", b"maybe\ry", 1.0, Unavailable(UnavailableReason.EXPIRED)),
     ],
