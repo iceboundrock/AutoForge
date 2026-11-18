@@ -232,7 +232,16 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        comparison, the remote contract R1 to R10, the
                                        signed-off no-go for a production adapter,
                                        what reopens it and the SSH-first direction
-                                       for a reopening, which is not a go)
+                                       for a reopening, which is not a go);
+                                       task state below a phase and Issue Memory
+                                       (proposed, nothing implemented): task
+                                       identities, states and transitions, the
+                                       TaskResult / PhaseResult split, launch intent,
+                                       the reducer's types, roles and one mutating
+                                       worker, four memory layers and their trust
+                                       boundary, Memory inside state.json, the
+                                       commit order and crash windows, fresh-context
+                                       proofs, the first scope)
 docs/README.md                         human-oriented documentation index, by intent
 docs/non-code-rules.md                 writing and publishing rules for every non-code artifact
 docs/getting-started.md                operator guide: a first run from nothing, step by step, and the
@@ -350,6 +359,11 @@ matches none of them needs only this file and the scoped `AGENTS.md`.
   runtime endpoint over TCP or SSH), read
   `docs/adr/0014-remote-execution-sandboxes-contract-and-no-go.md` in
   addition to ADR 0013.
+- If implementing Issue Working Memory (#317, #333), a persisted task or
+  the task reducer (#332), or roles below a phase (#319), or changing what
+  a launch is shown of earlier launches or how an adapter starts a fresh
+  session, read `docs/adr/0015-task-state-issue-memory-and-crash-order.md`
+  in addition to `docs/evaluation-protocol.md`.
 - If adding or changing tests, or changing behaviour in a high-priority
   coverage area, read `tests/AGENTS.md` and `docs/agent-guides/testing.md`.
 - If changing `tests/evaluation.py`, `tests/evaluation_fixture.py` or
