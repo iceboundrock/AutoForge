@@ -41,9 +41,10 @@ waiting on its model, say) leaves the reply deciding the run, which stops
 the CLI then and does not wait for the agent's work, as with any reply
 (#439). 2.1.326 also stops every background task ten minutes after the
 last turn and exits without another. Every `claude` launch now sets
-`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`, overriding any value you set, so
+`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`, whatever your shell sets, so
 the profile's `idle_timeout_seconds` and `max_runtime_seconds` bound that
-wait instead.
+wait instead. A value in your Claude Code settings' `env` still brings the
+ceiling back ([configuration](docs/configuration.md)).
 
 ### `sandbox.container` takes the container backend's seed settings (#292)
 
