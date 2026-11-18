@@ -603,6 +603,22 @@ status --live (#374)                  read back by a fresh CLI engine: K10, K9 a
                                       cut; a verified PR description edited since; the whole
                                       human status naming only the package's commands, in
                                       every scenario and with the saved reason, PR #470 R4-F1)
+the recovery MVP evaluation (#375)    test_recovery_evaluation.py (the matrix of
+                                      docs/recovery-mvp-evaluation.md: each case a real stop
+                                      read in both arms, the package's displayed steps run as
+                                      typed with each exit status checked, a step without a
+                                      command performed as its text reads, its gold resolution
+                                      and the next step performed and read back, a saved plan
+                                      held against the journal, GitHub and the origin; no
+                                      status writes, sends or launches, and no displayed step
+                                      ADR 0012 denies or that closes a PR the gold keeps; the
+                                      summary counted from the matrix, the strata covered,
+                                      every test the record names exists; the measures held
+                                      against a closed PR, an omitted or failed next step, a
+                                      lost or doubled effect, a moved PR head, PR #511 R1; a
+                                      fork's marked PR and two unjournaled round comments
+                                      followed through the next step, another run's comment
+                                      never deleted, PR #511 R2)
 the evaluation protocol (#318)        test_evaluation.py (the pins, what arms hold equal, the
                                       statistics and decision on synthetic records, what never
                                       runs in CI; the protocol held to its files),
