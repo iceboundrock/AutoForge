@@ -5,6 +5,27 @@ so.
 
 ## Unreleased
 
+### macOS on Apple Silicon is tested in CI on every commit (#501)
+
+The test suite now also runs on GitHub's `macos-latest` runner (arm64),
+on Python 3.11 and 3.12, for every pull request and every push to `main`,
+and the required `ci` check needs it to pass. Until now the macOS claim
+rested on the maintainer's own runs, so a regression only macOS shows,
+such as the stop Apple's git caused at every launch (#482), surfaced the
+next time someone ran AutoForge on a Mac. What macOS gets is unchanged:
+no outer sandbox (`sandbox.mode: required` is refused), and a process
+that leaves its group can outlive the launch (`orphans_unchecked`). Intel
+Macs stay untested, the built wheel is installed and run in CI on Linux
+only, and the package's classifiers still name Linux alone.
+
+The first macOS run found one fault in the controller itself: when several
+issue engines prepared their sandbox directories at once in a new common
+dir, macOS sometimes reported an entry below it missing as it was being
+created, and the shared-Git lock (L1) refused the launch, saying the
+common dir did not exist. The lock file is now walked to again, up to five
+times, while the coordination root exists. A missing root is still refused
+at once.
+
 ### Claude Code 2.1.326's background agents no longer fail a run (#507)
 
 Claude Code 2.1.326 sends a turn's result while a background agent the

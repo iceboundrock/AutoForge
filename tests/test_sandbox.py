@@ -585,6 +585,10 @@ def test_a_device_is_refused(tmp_path: Path) -> None:
     assert "character device" in str(info.value)
 
 
+@pytest.mark.skipif(
+    os.path.realpath("/tmp") != "/tmp",
+    reason="/tmp is a link here (to /private/tmp on macOS): the host's /tmp is not the launch's",
+)
 def test_the_private_temp_cannot_be_projected_over(tmp_path: Path) -> None:
     # A home outside /tmp, so /tmp itself is not refused as the home's ancestor.
     request = SandboxRequest(

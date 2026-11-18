@@ -100,6 +100,7 @@ from tests.conftest import (
     MERGE_BASE,
     MERGE_BASE_B,
     NO_CHANGE_RATIONALE,
+    NOTHING_LEFT,
     PR,
     SHA_A,
     SHA_B,
@@ -7427,7 +7428,9 @@ def test_failing_verification_command_names_its_leftover_in_the_block_reason(
     assert "pre-merge verification command" in reason and "failed with exit 3" in reason
     assert f"reviewed HEAD {sha[:12]}" in reason
     assert "not corroborated locally (the child exited but left processes behind" in reason, reason
-    assert "so the group was killed). Output tail: checks ran" in reason
+    # Where no subreaper can look for an orphan (#501), the sentence says that too.
+    killed = "so the group was killed" + (f"; {NOTHING_LEFT}" if NOTHING_LEFT else "")
+    assert f"{killed}). Output tail: checks ran" in reason
     assert eng.state.premerge_verified_head_sha == ""
     run_dir = eng.paths.logs_dir / eng.state.run_id
     step = next(p for p in run_dir.iterdir() if "premerge-verification" in p.name)
@@ -12682,9 +12685,11 @@ def test_a_claude_turn_a_server_error_ended_is_relaunched_after_reconciling(
     steps = sorted(p for p in run_dir.iterdir() if p.is_dir())
     executions = [json.loads((p / "execution.json").read_text(encoding="utf-8")) for p in steps]
     assert [e["exit_code"] for e in executions] == [1, 1, 0]
+    # Where no subreaper can look for an orphan (#501), each error says that too.
+    unchecked = f" ({NOTHING_LEFT})" if NOTHING_LEFT else ""
     assert [e["error"] for e in executions[:2]] == [
-        f"{_api_error_text(529, OVERLOADED)} (transient: claude: API error 529)",
-        f"{_api_error_text(503, UNAVAILABLE)} (transient: claude: API error 503)",
+        f"{_api_error_text(529, OVERLOADED)} (transient: claude: API error 529){unchecked}",
+        f"{_api_error_text(503, UNAVAILABLE)} (transient: claude: API error 503){unchecked}",
     ]
     progress = (steps[0] / "progress.log").read_text(encoding="utf-8")
     assert "provider retry (attempt 1 of 1)" in progress
@@ -16318,10 +16323,13 @@ def test_a_credential_helper_planted_before_candidate_validation_never_reaches_t
     assert {r["candidate"]["commit"] for r in s.validation_records} == {head}
     # Every credential.helper git reads in the export is the controller's
     # command-scope reset (the host's /etc/gitconfig, which no agent writes,
-    # aside), and git reads no repository scope there at all.
+    # aside, and Apple git's own file, the unknown scope held to the system
+    # scope's rules, #482), and git reads no repository scope there at all.
     [seen] = env_probe_records(git_record)
     helpers = [line.split("\t") for line in seen["helpers"]]
-    assert [h for h in helpers if h[0] != "system"] == [["command", "command line:", ""]]
+    assert [h for h in helpers if h[0] not in ("system", "unknown")] == [
+        ["command", "command line:", ""]
+    ]
     assert not [line for line in seen["listing"] if line.split("\t")[0] in ("local", "worktree")]
     assert _PLANTED not in json.dumps(seen)
     [env] = env_probe_records(env_record)

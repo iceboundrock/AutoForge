@@ -196,6 +196,22 @@ def test_publish_reverifies_exactly_the_recorded_files_and_uploads_them_with_att
     assert "skip-existing" not in upload
 
 
+def _gnu_find() -> bool:
+    try:
+        out = subprocess.run(["find", "--version"], capture_output=True, text=True, timeout=30)
+    except OSError:
+        return False
+    return "GNU findutils" in out.stdout
+
+
+# The publish job runs on ubuntu-latest, and its script takes GNU find's
+# -printf. BSD find (macOS, #501) refuses it, so every run of the script would
+# fail there, a refusal included: it would pass for the wrong reason.
+needs_gnu_find = pytest.mark.skipif(
+    not _gnu_find(), reason="the publish job's script runs GNU find (-printf), as ubuntu-latest has"
+)
+
+
 def _reverify(tmp_path: Path, recorded: str, version: str) -> subprocess.CompletedProcess[str]:
     """Run the publish job's re-verify script as GitHub does (bash -e) in `tmp_path`."""
     (verify,) = [s for s in _steps("publish") if "run" in s]
@@ -211,6 +227,7 @@ def _reverify(tmp_path: Path, recorded: str, version: str) -> subprocess.Complet
     )
 
 
+@needs_gnu_find
 @pytest.mark.parametrize("trailing_newline", [False, True])
 def test_the_reverify_step_accepts_exactly_the_recorded_files(
     tmp_path: Path, trailing_newline: bool

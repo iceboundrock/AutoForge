@@ -57,6 +57,16 @@ from autoforge.transitions import Phase
 from tests.conftest import make_engine
 from tests.test_config import pyyaml_hidden
 
+# A test that runs an interpreter to see a ._pth file run its hooks, and that
+# doctor finds the file, reproduces the lookup of CPython built as an ELF
+# executable, the one doctor reads (interpreter_pth_files). A macOS framework
+# build is no ELF file, so doctor skips its probe there instead, and its own
+# lookup differs (#501).
+needs_elf_python = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="reproduces the ._pth lookup of CPython built as an ELF executable",
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = REPO_ROOT / "autoforge.example.yaml"
 PYTHON = "/opt/autoforge-claude-sdk/bin/python"
@@ -749,6 +759,7 @@ def test_the_claude_probe_finds_no_sdk_in_an_environment_without_one(tmp_path):
     assert list(markers.iterdir()) == []
 
 
+@needs_elf_python
 def test_a_copied_environments_base_pth_file_runs_hooks_under_s_and_is_seen(tmp_path):
     """R2-F1 of #150's review, for real: in an environment made with ``venv
     --copies``, a ``._pth`` file beside the base interpreter imports
@@ -765,6 +776,7 @@ def test_a_copied_environments_base_pth_file_runs_hooks_under_s_and_is_seen(tmp_
     assert interpreter_pth_files(str(python), str(tmp_path)) == PthFiles(())
 
 
+@needs_elf_python
 @pytest.mark.parametrize("name", PYTHON_STARTUP_NAMES)
 def test_a_launcher_variable_makes_python_read_a_pth_file_under_s(tmp_path, name):
     """R3-F1 of #150's review, for real: with ``name`` naming a path beside

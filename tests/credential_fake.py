@@ -71,7 +71,11 @@ import hashlib, json, os, sys
 
 report, root, cli = REPORT, ROOT, CLI
 argv = sys.argv[1:]
-env = os.environ
+env = dict(os.environ)
+# macOS sets __CF_USER_TEXT_ENCODING in a process's own environment as it
+# starts it (#501): the launch never passed it, so it is not what the CLI got.
+if sys.platform == "darwin":
+    env.pop("__CF_USER_TEXT_ENCODING", None)
 # The launch runs in /workspace (exec_argv); the executor starts it in root/workspace.
 cwd = "/workspace"
 WRITABLE = ("/home/agent", "/tmp", "/workspace", "/cache")

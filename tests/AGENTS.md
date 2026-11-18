@@ -38,8 +38,32 @@ read it before adding tests for a listed area.
   `/proc` for a child that had not yet said it runs; a snapshot of a
   repository that `git commit`'s detached automatic maintenance could
   still write to (conftest's commits pass `NO_AUTO_MAINTENANCE`); an
-  AF_UNIX path past `sun_path`'s 107 bytes (bind it with
+  AF_UNIX path past `sun_path`'s 107 bytes, 103 on macOS (bind it with
   `conftest.bind_unix`).
+- Never assume Linux. CI also runs the suite on macOS, Apple Silicon
+  (`test-macos`, #501), which has no `/proc`, no child subreaper, no
+  `O_TMPFILE`, `O_PATH`, `memfd_create`, `pidfd_open`, `listxattr`,
+  `sched_getaffinity`, `F_SETPIPE_SZ` or abstract sockets, no outer-sandbox
+  backend, a temporary directory under the `/var` link (and `/tmp` a link
+  too), a default limit of 256 descriptors, a `PATH_MAX` of 1024
+  (conftest's `needs_long_paths`), APFS, which refuses a file name that is
+  not UTF-8, BSD `find`, a `PENDIN` bit the kernel sets in a terminal's
+  local modes, and a Python that is not an ELF executable. A test of behaviour only Linux has skips elsewhere
+  with a reason that names what is missing (`_linux_only` in
+  `tests/test_executor.py`; conftest's `needs_child_subreaper` for a
+  test whose subject only a contained launch shows, while one about
+  something else expects `NOTHING_LEFT` as its launch's leftovers, and
+  `CHILD_SUBREAPER` says which this host is). A test of Linux's branch of
+  code that reads `sys.platform`, with everything else it depends on faked,
+  simulates Linux instead of skipping, so that macOS keeps the coverage
+  (`linux_host` in `tests/test_sandbox_host.py`), and the other branch has
+  a test of its own. A test of behaviour both have reads it in a way that
+  works on both, as `_process_state` there reads a process's state through
+  `ps` where there is no procfs, and `_processes_naming` in
+  `tests/test_scheduler.py` lists the processes through `ps`: a missing
+  `/proc` is never an answer. A stand-in for a system call answers as the
+  host's call does, not as Linux's (conftest's `fsync_without_the_disk`
+  hands the real `fsync` every descriptor it has no disk to skip for).
 
 ## Fixtures and fakes (`tests/conftest.py`)
 

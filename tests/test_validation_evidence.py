@@ -680,10 +680,13 @@ def test_a_helper_planted_by_the_producer_never_reaches_its_validation_command(
     assert saved(eng).validation_records == list(run.records)
     # Every credential.helper git reads in the export is the controller's
     # command-scope reset (the host's /etc/gitconfig, which no agent writes,
-    # aside), and git reads no repository scope there at all.
+    # aside, and Apple git's own file, the unknown scope held to the system
+    # scope's rules, #482), and git reads no repository scope there at all.
     [seen] = env_probe_records(git_record)
     helpers = [line.split("\t") for line in seen["helpers"]]
-    assert [h for h in helpers if h[0] != "system"] == [["command", "command line:", ""]]
+    assert [h for h in helpers if h[0] not in ("system", "unknown")] == [
+        ["command", "command line:", ""]
+    ]
     assert not [line for line in seen["listing"] if line.split("\t")[0] in ("local", "worktree")]
     assert PLANTED not in json.dumps(seen)
     listed = [line.split("\t") for line in seen["listing"]]

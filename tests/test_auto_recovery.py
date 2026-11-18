@@ -58,7 +58,7 @@ from autoforge.result_parser import closes_other_issue, published_markdown_probl
 from autoforge.state import load_state
 from autoforge.transitions import Phase
 
-from .conftest import EPIC, ISSUE, PR, block, implement, make_engine
+from .conftest import EPIC, ISSUE, PR, block, implement, make_engine, needs_child_subreaper
 
 RUN = "af-20261112T090718Z-b718a8"
 GOOD = Bounds(relaunches_used=0, step_budget_left=10, invocation_steps_left=5)
@@ -984,6 +984,7 @@ def test_a_claude_exit_whose_cause_nothing_typed_tells_is_never_relaunched(
     assert load_state(eng.paths.state_file).phase == Phase.REVIEW
 
 
+@needs_child_subreaper
 def test_a_claude_cli_that_died_inside_a_running_session_is_relaunched_once(
     tmp_path, tmp_state_dir, fake_github
 ):
@@ -1217,6 +1218,7 @@ def test_a_claude_usage_limit_without_its_result_is_a_usage_limit_never_relaunch
     assert load_state(eng.paths.state_file).phase == Phase.REVIEW
 
 
+@needs_child_subreaper
 def test_the_same_session_without_the_typed_api_error_is_still_relaunched(
     tmp_path, tmp_state_dir, fake_github
 ):

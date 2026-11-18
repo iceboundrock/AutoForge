@@ -41,7 +41,7 @@ from autoforge.scheduler_state import (
 from autoforge.state import AutoForgeState, save_state
 from autoforge.transitions import Phase
 
-from .conftest import EPIC, deep_dir, git_repo
+from .conftest import EPIC, deep_dir, git_repo, needs_long_paths
 
 
 def _issue_url(n: int) -> str:
@@ -367,7 +367,9 @@ def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, 
     assert _tree(sd) == before, "never quarantined, created or written"
 
 
-@pytest.mark.parametrize("length", [900, 1135], ids=["whole", "cut"])
+@pytest.mark.parametrize(
+    "length", [900, pytest.param(1135, marks=needs_long_paths)], ids=["whole", "cut"]
+)
 def test_a_refused_standalone_state_keeps_the_controller_however_long_its_path(tmp_path, length):
     """#265 R3-F1: a state file path of 900 characters (shown whole) or of
     1,135 (shown cut to MAX_PATH_CHARS) took the loader's path-first message

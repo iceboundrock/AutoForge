@@ -102,6 +102,17 @@ RUNTIME = RuntimeReport(
 )
 PLANNED = LaunchDescription(mounts=())
 
+# A staging root is proved free of nested mounts by the kernel's mount ids,
+# read from /proc/self/fdinfo, of entries opened with O_PATH: Linux's alone.
+# Elsewhere (macOS, #501) every staging root is refused for that, as
+# test_a_host_that_reports_no_mount_id_refuses_the_staging_root shows on
+# every host, so a test that stages one runs only where both exist
+# (PR #509 R1-F1).
+_needs_mount_ids = pytest.mark.skipif(
+    not (os.path.isdir("/proc/self/fdinfo") and hasattr(os, "O_PATH")),
+    reason="mount ids need /proc/self/fdinfo and O_PATH, which only Linux has",
+)
+
 
 @pytest.fixture(autouse=True)
 def temporary(tmp_path, monkeypatch) -> Path:
@@ -209,6 +220,7 @@ def checkout_state(repo: Path) -> tuple:
 # -- the bind form's staging root (D2, D12) --------------------------------------------------
 
 
+@_needs_mount_ids
 def test_the_bind_form_writes_the_proved_tree_its_seed_and_the_read_context(tmp_path):
     review = review_repo(tmp_path)
     staging, staged, seed = stage(tmp_path, review)
@@ -241,6 +253,7 @@ def test_the_bind_form_writes_the_proved_tree_its_seed_and_the_read_context(tmp_
     staging.reprove(staged)  # proves as written
 
 
+@_needs_mount_ids
 def test_two_stagings_of_one_base_are_byte_identical_and_leave_the_checkout_unchanged(tmp_path):
     review = review_repo(tmp_path)
     repo = review.repo
@@ -267,6 +280,7 @@ def test_two_stagings_of_one_base_are_byte_identical_and_leave_the_checkout_unch
     assert checkout_state(repo) == before
 
 
+@_needs_mount_ids
 def test_the_snapshot_holds_no_git_dir_home_content_or_untracked_or_ignored_file(
     tmp_path, monkeypatch
 ):
@@ -295,6 +309,7 @@ def test_the_snapshot_holds_no_git_dir_home_content_or_untracked_or_ignored_file
 
 
 @pytest.mark.parametrize("change", ["byte", "mode", "extra", "removed", "seed"])
+@_needs_mount_ids
 def test_the_staging_root_fails_its_proof_after_the_host_changed_it(tmp_path, change):
     review = review_repo(tmp_path)
     staging, staged, _ = stage(tmp_path, review)
@@ -317,6 +332,7 @@ def test_the_staging_root_fails_its_proof_after_the_host_changed_it(tmp_path, ch
         staging.reprove(staged)
 
 
+@_needs_mount_ids
 def test_a_directory_substituted_at_the_staging_roots_path_is_refused(tmp_path):
     """Even a faithful copy: the path must name the very directory created and proved."""
     review = review_repo(tmp_path)
@@ -354,6 +370,7 @@ def mounted_at(monkeypatch, *suffixes: str) -> None:
 @pytest.mark.parametrize(
     "where", ["tree/src", "tree/README", "tree/src/c.py", "seed/seed.pack", "read-context/files"]
 )
+@_needs_mount_ids
 def test_a_mount_below_the_staging_root_fails_its_proof(tmp_path, monkeypatch, where):
     """A directory or a file on another mount below the root, from any filesystem, is refused."""
     review = review_repo(tmp_path)
@@ -364,6 +381,7 @@ def test_a_mount_below_the_staging_root_fails_its_proof(tmp_path, monkeypatch, w
 
 
 @pytest.mark.parametrize("where", ["/autoforge/sandbox", f"/{KEY}", "/stage", "/stage/L-1"])
+@_needs_mount_ids
 def test_a_mount_in_the_staging_roots_layout_fails_its_proof(tmp_path, monkeypatch, where):
     review = review_repo(tmp_path)
     staging, staged, _ = stage(tmp_path, review)
@@ -384,6 +402,7 @@ READ_CONTEXT_CHANGES = {
 
 
 @pytest.mark.parametrize("change", sorted(READ_CONTEXT_CHANGES))
+@_needs_mount_ids
 def test_the_staging_root_fails_its_proof_after_its_read_context_changed(tmp_path, change):
     """The copied read context is proved at each hand-off too, entry by entry (PR #504 R1-F4).
 
@@ -437,6 +456,7 @@ PERMISSION_CHANGES = [
 
 
 @pytest.mark.parametrize(("where", "mode"), PERMISSION_CHANGES)
+@_needs_mount_ids
 def test_the_staging_root_fails_its_proof_after_a_permission_changed(tmp_path, where, mode):
     """Every entry has exactly the mode its ownership record says (PR #504 R1-F5)."""
     review = review_repo(tmp_path)
@@ -448,6 +468,7 @@ def test_the_staging_root_fails_its_proof_after_a_permission_changed(tmp_path, w
 
 
 @pytest.mark.parametrize("umask", [0o077, 0o002, 0o022])
+@_needs_mount_ids
 def test_the_ownership_record_is_what_every_staged_entry_has_whatever_the_umask(tmp_path, umask):
     previous = os.umask(umask)
     try:
@@ -477,6 +498,7 @@ def test_the_ownership_record_is_what_every_staged_entry_has_whatever_the_umask(
     staging.reprove(staged)
 
 
+@_needs_mount_ids
 def test_the_owner_record_names_the_launch_and_its_journal_entry(tmp_path):
     review = review_repo(tmp_path)
     staging, staged, _ = stage(tmp_path, review)
@@ -499,6 +521,7 @@ def test_the_owner_record_names_the_launch_and_its_journal_entry(tmp_path):
 @pytest.mark.parametrize(
     "where", ["/autoforge", "/autoforge/sandbox", f"/sandbox/{KEY}", "/stage", "/stage/L-1"]
 )
+@_needs_mount_ids
 def test_a_mount_in_the_layout_refuses_the_staging_root_before_anything_is_written_in_it(
     tmp_path, monkeypatch, where
 ):
@@ -517,6 +540,7 @@ def test_a_mount_in_the_layout_refuses_the_staging_root_before_anything_is_writt
 
 
 @pytest.mark.parametrize("where", ["/L-1/seed", "/L-1/read-context", "/L-1/tree"])
+@_needs_mount_ids
 def test_a_mount_below_the_new_staging_root_is_refused_before_it_is_written(
     tmp_path, monkeypatch, where
 ):
@@ -534,6 +558,7 @@ def test_a_mount_below_the_new_staging_root_is_refused_before_it_is_written(
 
 
 @pytest.mark.parametrize("where", ["tree/src", "read-context/files"])
+@_needs_mount_ids
 def test_a_mount_at_a_directory_made_while_writing_is_refused_before_it_is_written(
     tmp_path, monkeypatch, where
 ):
@@ -557,6 +582,7 @@ def test_a_mount_at_a_directory_made_while_writing_is_refused_before_it_is_writt
     assert stat.S_IMODE(made.stat().st_mode) == 0o700  # its mkdir's under the umask, never set
 
 
+@_needs_mount_ids
 def test_a_mount_at_a_read_context_directory_after_its_check_receives_nothing(
     tmp_path, monkeypatch
 ):
@@ -608,6 +634,7 @@ def test_a_seed_whose_digest_differs_from_the_inputs_is_never_written_into_a_sta
     assert not (Path(root.path) / STAGED_TREE).exists()
 
 
+@_needs_mount_ids
 def test_a_staging_root_is_created_under_l1_and_never_reused(tmp_path):
     review = review_repo(tmp_path)
     root_path = common_of(review.repo) / "autoforge" / "sandbox" / KEY / "stage" / "L-1"
@@ -623,6 +650,7 @@ def test_a_staging_root_is_created_under_l1_and_never_reused(tmp_path):
 
 
 @pytest.mark.parametrize("planted", ["sandbox key", "stage"])
+@_needs_mount_ids
 def test_a_link_in_the_staging_roots_layout_is_refused_and_nothing_written_through_it(
     tmp_path, planted
 ):
@@ -661,6 +689,7 @@ def test_a_staging_root_that_is_not_this_issues_own_is_refused(tmp_path):
         staging.staging_root(dataclasses.replace(OWNER, launch="a/b"))
 
 
+@_needs_mount_ids
 def test_removing_the_staging_root_is_idempotent_and_scoped_to_its_launch(tmp_path):
     review = review_repo(tmp_path)
     staging, first, _ = stage(tmp_path / "a", review, "L-1")
@@ -685,6 +714,7 @@ def test_removing_the_staging_root_is_idempotent_and_scoped_to_its_launch(tmp_pa
     assert not Path(second.root.path).exists()
 
 
+@_needs_mount_ids
 def test_what_is_not_the_launchs_directory_at_its_path_is_left_and_uncertain(tmp_path):
     review = review_repo(tmp_path)
     staging, staged, _ = stage(tmp_path, review)
@@ -755,6 +785,7 @@ def test_a_staging_root_under_another_launchs_id_or_for_another_launchs_seed_is_
     assert not (common_of(review.repo) / "autoforge").exists()
 
 
+@_needs_mount_ids
 def test_removal_leaves_a_directory_substituted_at_the_staging_roots_path(tmp_path):
     """Only the directory that holds its entry's owner record is removed (PR #504 R1-F1)."""
     review = review_repo(tmp_path)
@@ -793,6 +824,7 @@ def test_removal_leaves_a_directory_substituted_at_the_staging_roots_path(tmp_pa
 @pytest.mark.parametrize(
     "where", ["tree/src", "tree/README", "tree/src/c.py", "read-context/files", "seed"]
 )
+@_needs_mount_ids
 def test_removal_removes_nothing_when_a_mount_is_below_the_staging_root(
     tmp_path, monkeypatch, where
 ):
@@ -809,6 +841,7 @@ def test_removal_removes_nothing_when_a_mount_is_below_the_staging_root(
 
 
 @pytest.mark.parametrize("where", ["/stage", "/stage/L-1"])
+@_needs_mount_ids
 def test_removal_leaves_a_staging_root_that_is_or_lies_below_a_mount_point(
     tmp_path, monkeypatch, where
 ):
@@ -822,6 +855,7 @@ def test_removal_leaves_a_staging_root_that_is_or_lies_below_a_mount_point(
     assert snapshot(Path(staged.root.path)) == before
 
 
+@_needs_mount_ids
 def test_a_mount_met_while_removing_stops_the_removal_before_it_descends(tmp_path, monkeypatch):
     """A directory mounted after the check is never descended into; what is left is still the
     launch's (its owner record goes last), and a later removal finishes it."""
@@ -866,6 +900,7 @@ def _reconciled(tmp_path: Path, staging: SourceStaging, repo: Path, roots):
     return {obj.owner.launch for obj in still_open}
 
 
+@_needs_mount_ids
 def test_reconciliation_removes_a_launchs_leftovers_and_leaves_what_is_not_its_own(tmp_path):
     review = review_repo(tmp_path)
     staging, staged, _ = stage(tmp_path, review, "L-1")  # a crash after the root was written
@@ -892,6 +927,7 @@ def test_reconciliation_removes_a_launchs_leftovers_and_leaves_what_is_not_its_o
     assert path["L-5"].read_text() == "keep\n"
 
 
+@_needs_mount_ids
 def test_reconciliation_descends_into_no_mount_below_a_leftover(tmp_path, monkeypatch):
     review = review_repo(tmp_path)
     staging, staged, _ = stage(tmp_path, review, "L-1")
@@ -1012,6 +1048,7 @@ def interrupted_staging(tmp: Path, head: str, merge_base: str, launch: str, poin
 
 
 @pytest.mark.parametrize("point", list(INTERRUPTIONS))
+@_needs_mount_ids
 def test_an_owner_record_publication_cut_short_leaves_what_reconciliation_removes(tmp_path, point):
     """Killed anywhere in its owner record's publication, a staging root is never left with a
     partial record, and lifecycle reconciliation removes what is left and closes its entry."""
@@ -1369,6 +1406,7 @@ HOSTILE_ATTRIBUTES = (
 POINTER = b"version https://git-lfs.github.com/spec/v1\noid sha256:" + b"a" * 64 + b"\nsize 12\n"
 
 
+@_needs_mount_ids
 def test_hostile_attributes_lfs_and_a_gitlink_stage_as_the_committed_bytes(tmp_path, monkeypatch):
     repo = init_repo(tmp_path / "repo")
     files = {
@@ -1432,6 +1470,7 @@ def test_hostile_attributes_lfs_and_a_gitlink_stage_as_the_committed_bytes(tmp_p
     assert {SUBMODULE, LFS, CONVERSIONS} <= cases
 
 
+@_needs_mount_ids
 def test_a_sparse_checkout_is_diagnosed_and_the_whole_tree_is_staged(tmp_path):
     review = review_repo(tmp_path)
     run_git(review.repo, "sparse-checkout", "set", "--no-cone", "/README")
@@ -1543,6 +1582,7 @@ def test_a_git_that_ignores_no_lazy_fetch_still_fetches_nothing_for_the_seed(tmp
     assert snapshot(common) == before
 
 
+@_needs_mount_ids
 def test_a_git_that_ignores_no_lazy_fetch_still_fetches_nothing_for_the_staging_root(tmp_path):
     """The bind form's tree reads the store the same way: a blob it lacks refuses the tree."""
     store = partial_clone(tmp_path, checkout=True)  # HEAD's blobs are fetched
@@ -1580,6 +1620,7 @@ def _git_dir_of(request) -> str:
     return (request.env or {}).get("GIT_DIR", "")
 
 
+@_needs_mount_ids
 def test_every_git_that_reads_the_stores_objects_runs_in_a_directory_of_the_controllers(
     tmp_path,
 ):
@@ -1879,6 +1920,7 @@ def _at(events: list[tuple], predicate) -> int:
     return next(i for i, event in enumerate(events) if predicate(event))
 
 
+@_needs_mount_ids
 def test_the_bind_form_stages_after_its_entry_and_presents_source_read_only(tmp_path):
     review, staging, backend, journal, events, saved, root, error = _lifecycle_run(
         tmp_path, StagingMethod.BIND
@@ -1941,6 +1983,7 @@ def test_a_seed_that_fails_its_checks_leaves_no_journal_entry_and_no_create(tmp_
     assert list(temporary.iterdir()) == []
 
 
+@_needs_mount_ids
 def test_a_tree_changed_between_its_proof_and_the_hand_off_is_refused_and_removed(tmp_path):
     def tamper(staged: StagedSource) -> None:
         target = Path(staged.root.path) / STAGED_TREE / "README"
@@ -1969,6 +2012,7 @@ def test_the_seed_carries_d2s_diagnostics_to_the_launch(tmp_path):
     assert any(line.startswith(f"{LFS}: unsupported for content") for line in seed.diagnostics)
 
 
+@_needs_mount_ids
 def test_the_staged_tree_is_the_carried_commits_for_a_relaunch(tmp_path):
     review = review_repo(tmp_path)
     run_git(review.repo, "checkout", "-q", "--detach", review.head)
@@ -1982,3 +2026,22 @@ def test_the_staged_tree_is_the_carried_commits_for_a_relaunch(tmp_path):
     assert staged.commit == carried
     assert (Path(root.path) / STAGED_TREE / "fix.txt").read_bytes() == b"fixed\n"
     staging.reprove(staged)
+
+
+def test_a_host_that_reports_no_mount_id_refuses_the_staging_root(tmp_path, monkeypatch):
+    """PR #509 R1-F1: a host without /proc/self/fdinfo or without O_PATH
+    (macOS, #501) cannot tell a nested mount from an ordinary entry, and each
+    lack is a refusal, never a staging root taken as free of mounts. Played
+    on every host: a descriptor fdinfo cannot list, and no O_PATH."""
+    unlisted = 1 << 30  # past any descriptor limit, so never open
+    with pytest.raises(SandboxLaunchRefusedError, match="cannot be read from /proc/self/fdinfo"):
+        source_staging._mount_id(unlisted, "the staging root")
+    (tmp_path / "entry").mkdir()
+    seen = os.stat(tmp_path / "entry")
+    monkeypatch.setattr(source_staging, "_O_PATH", 0)
+    parent = os.open(tmp_path, os.O_RDONLY)
+    try:
+        with pytest.raises(SandboxLaunchRefusedError, match=r"without reading it \(no O_PATH\)"):
+            source_staging._mount_id_at(parent, "entry", seen, "the entry")
+    finally:
+        os.close(parent)

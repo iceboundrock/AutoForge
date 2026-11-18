@@ -22,6 +22,7 @@ from tests.conftest import (
     is_shell_probe,
     no_credential_looking_names,
 )
+from tests.test_sdk_profiles import needs_elf_python
 
 RULES_ENDPOINT = "repos/owner/repo/rules/branches/main"
 RULESET_ENDPOINT = "repos/owner/repo/rulesets/22792049"
@@ -3111,6 +3112,7 @@ def test_an_invalid_sdk_profile_reached_only_after_a_merge_fails_one_row(tmp_pat
     assert requests == []
 
 
+@needs_elf_python
 def test_the_claude_probe_runs_none_of_the_helper_environments_startup_hooks(tmp_path):
     """R1-F2 of #150's review. ``-I`` alone still imports ``site``, which runs
     an ``import`` line of a ``.pth`` file in the helper environment with the
@@ -3140,6 +3142,7 @@ def test_the_claude_probe_runs_none_of_the_helper_environments_startup_hooks(tmp
     assert list(markers.iterdir()) == []
 
 
+@needs_elf_python
 @pytest.mark.parametrize("name", ["PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__"])
 @pytest.mark.parametrize("listed", ["exactly", "by-prefix"])
 def test_a_forwarded_launcher_variable_never_reaches_the_claude_probe(
@@ -3221,6 +3224,7 @@ def test_an_interpreter_with_a_pth_file_is_never_probed(tmp_path, beside):
     assert not any(req.command[0] == str(python) for req in requests)
 
 
+@needs_elf_python
 def test_a_copied_environment_whose_base_has_a_pth_file_is_never_run(tmp_path):
     """R2-F1 of #150's review. In an environment made with ``venv --copies``
     the interpreter is no link, so CPython takes its base from the ``home``

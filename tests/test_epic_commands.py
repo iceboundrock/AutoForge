@@ -49,6 +49,7 @@ from .conftest import (
     UNLOADABLE_STATES,
     deep_dir,
     git_out,
+    needs_long_paths,
     state_tree,
     unloadable_state,
 )
@@ -691,7 +692,9 @@ def test_status_while_a_scheduler_runs_shows_the_hung_worker_and_a_spawn_failure
     running = rows[2]
     assert running["category"] == "running" and running["live"]
     worker = running["claim"]["worker"]
-    assert worker["pid"] == child.pid and worker["process_start_time"] is not None
+    assert worker["pid"] == child.pid
+    # Read from /proc/<pid>/stat, so None on a host without procfs (macOS, #501).
+    assert (worker["process_start_time"] is not None) is os.path.isdir("/proc/self")
     assert worker["log"].endswith("/workers/1.log")
     assert "worker diagnostics (never signalled; a PID may be reused): pid" in seen["text"]
     assert rows[3]["category"] == "held" and rows[3]["hold_reason"] == "spawn-failed"
@@ -1681,7 +1684,7 @@ def _an_odd_standalone_dir(tmp_path: Path, odd: str) -> Path:
     return path
 
 
-@pytest.mark.parametrize("odd", ["control", "long"])
+@pytest.mark.parametrize("odd", ["control", pytest.param("long", marks=needs_long_paths)])
 @pytest.mark.parametrize("content", ["protocol-14", "invalid-json", "held"])
 def test_every_report_names_the_standalone_state_on_one_printable_bounded_line(
     epic, tmp_path, odd, content
@@ -1917,7 +1920,9 @@ def test_a_namespace_state_of_a_label_no_protocol_has_offers_no_repair_or_archiv
     assert (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes()) == before
 
 
-@pytest.mark.parametrize("length", [900, 1169], ids=["whole", "cut"])
+@pytest.mark.parametrize(
+    "length", [900, pytest.param(1169, marks=needs_long_paths)], ids=["whole", "cut"]
+)
 def test_every_report_of_a_refused_namespace_state_keeps_the_controller_however_long_its_path(
     epic, tmp_path, length
 ):

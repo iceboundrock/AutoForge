@@ -496,18 +496,64 @@ def test_ctrl_c_tears_down_a_running_agent_and_leaves_the_state_in_progress(
     assert signals == [signal.SIGINT]  # one Ctrl-C, forwarded once
 
 
-def _processes_naming(text: str) -> list[int]:
+def _processes_naming(text: str, *, procfs: bool | None = None) -> list[int]:
+    """The pids of the live processes whose command line holds ``text``.
+
+    Read from ``/proc`` where there is a procfs, and from ``ps`` where there
+    is none (macOS, #501), or as ``procfs`` says: a host without ``/proc``
+    never reads as one on which no process names ``text`` (PR #509 R1-F2).
+    A ``ps`` that cannot be run or fails raises. A zombie names nothing in
+    either listing: its command line is empty in ``/proc``, and ``ps`` shows
+    only its command name.
+    """
+    if procfs is None:
+        procfs = os.path.isdir("/proc/self")
     found = []
-    for entry in os.listdir("/proc") if os.path.isdir("/proc") else []:
-        if not entry.isdigit():
-            continue
-        try:
-            cmdline = Path(f"/proc/{entry}/cmdline").read_bytes()
-        except OSError:
-            continue
-        if text.encode() in cmdline:
-            found.append(int(entry))
+    if procfs:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                cmdline = Path(f"/proc/{entry}/cmdline").read_bytes()
+            except OSError:
+                continue
+            if text.encode() in cmdline:
+                found.append(int(entry))
+        return found
+    # Every process, its whole command line (-ww: never cut to a width), no header.
+    listing = subprocess.run(
+        ["ps", "-A", "-ww", "-o", "pid=", "-o", "args="],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        check=True,
+    )
+    for row in listing.stdout.splitlines():
+        pid, _, args = row.strip().partition(" ")
+        if text in args:
+            found.append(int(pid))
     return found
+
+
+@pytest.mark.parametrize("procfs", [True, False], ids=["procfs", "ps"])
+def test_the_process_scan_names_a_live_process_and_not_once_it_is_gone(tmp_path, procfs):
+    """PR #509 R1-F2: the scan that checks the Ctrl-C teardown above finds a
+    process that names a path, through ``/proc`` and through ``ps`` (the
+    listing used where there is no procfs, which this exercises on every
+    host), and finds none once that process has exited."""
+    if procfs and not os.path.isdir("/proc/self"):
+        pytest.skip("this host has no procfs")
+    marker = str(tmp_path / "scanned-agent-home")
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys, time; time.sleep(120)", marker],
+        stdin=subprocess.DEVNULL,
+    )
+    try:
+        assert _processes_naming(marker, procfs=procfs) == [child.pid]
+    finally:
+        child.kill()
+        child.wait()
+    assert _processes_naming(marker, procfs=procfs) == []
 
 
 def _blocked_standalone_run(b: Bench, monkeypatch, capsys) -> str:

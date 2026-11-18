@@ -1122,17 +1122,20 @@ def test_a_launchs_zsh_reads_no_startup_file_of_the_operators(probes, tmp_path):
     assert home.is_relative_to(tmp_path)  # the fixture's, never the developer's
     for name in (".zshenv", ".zprofile", ".zshrc", ".zlogin"):
         (home / name).write_text(f"export GH_TOKEN={FAKE_TOKEN}\n")
+    # The probe by its path: macOS's /etc/zprofile, which a login zsh reads,
+    # puts the system's directories ahead of the launch's PATH (#501).
+    merge = f"{probes.bin / 'gh'} pr merge 1 --squash"
     script = tmp_path / "check"
-    script.write_text(f"#!{_ZSH}\ngh pr merge 1 --squash\n")
+    script.write_text(f"#!{_ZSH}\n{merge}\n")
     script.chmod(0o755)
     with isolated_overrides(LaunchIdentity()) as overrides:
         for mode in (["-c"], ["-l", "-c"], ["-i", "-c"]):
-            command = [_ZSH, *mode, "gh pr merge 1 --squash"]
+            command = [_ZSH, *mode, merge]
             assert _run(command, tmp_path, DEFAULT_ENV_ALLOWLIST, overrides).exit_code != 0, mode
         assert _run([str(script)], tmp_path, DEFAULT_ENV_ALLOWLIST, overrides).exit_code != 0
         assert _merges(probes) == [False] * 4
         without = {k: v for k, v in overrides.items() if k != "ZDOTDIR"}
-        command = [_ZSH, "-c", "gh pr merge 1 --squash"]
+        command = [_ZSH, "-c", merge]
         assert _run(command, tmp_path, DEFAULT_ENV_ALLOWLIST, without).exit_code == 0
     assert _merges(probes)[-1] is True
 
@@ -1361,6 +1364,10 @@ def test_the_shell_probe_starts_its_python_as_named_whatever_names_another(
     hook runs."""
     from tests.test_sdk_profiles import launcher_override
 
+    if name == "__PYVENV_LAUNCHER__" and not sys.platform.startswith("linux"):
+        # A macOS framework build reads no ._pth file beside the path it
+        # names: the control run starts no hook there (#501).
+        pytest.skip("the control run needs CPython built as an ELF executable")
     markers = tmp_path / "markers"
     markers.mkdir()
     launcher = launcher_override(tmp_path, markers)

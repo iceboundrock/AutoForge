@@ -114,6 +114,39 @@ jobs:
           path: ${{ runner.temp }}/durations/history
           key: ci-durations-v1-py${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+  test-macos:
+    # The suite on macOS, Apple Silicon (#501): `macos-latest` is an arm64
+    # runner. It runs what `test` runs, `make test`'s command after the
+    # locked install, on the same interpreters, so a regression only macOS
+    # shows (no child subreaper, no /proc, no O_TMPFILE, the darwin statfs
+    # branch, no outer-sandbox backend) fails the commit that makes it
+    # instead of the next run on a Mac. Required through `ci` like every
+    # job here, which is what lets docs/compatibility.md cite it for every
+    # commit of `main`. No duration report: main's history is keyed by
+    # interpreter alone, so a second platform would mix into the Linux
+    # baseline. Intel Macs stay untested. On a private fork these minutes
+    # are billed at a higher rate than Linux minutes.
+    name: test-macos (py${{ matrix.python-version }})
+    runs-on: macos-latest
+    # The slowest serial run measured took about 25 minutes, on a
+    # workstation (docs/development.md); this leaves room for a slower
+    # runner, while a test that hangs on macOS fails within two hours
+    # instead of GitHub's default six.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # The same list as `test`; tests/test_ci_workflow.py keeps them equal.
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - run: uv sync --locked --group dev
+      - run: uv run pytest
+
   static:
     # Lint, format and type checks are interpreter-independent (mypy is
     # pinned to python_version = "3.11" in pyproject.toml), so they run once
@@ -207,12 +240,12 @@ jobs:
     # a SKIPPED check run as passing, so this job must never skip its way to
     # green.
     name: ci
-    needs: [test, static, sandbox, dist]
+    needs: [test, test-macos, static, sandbox, dist]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Require every job to have succeeded
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
         run: |
-          echo "test=${{ needs.test.result }} static=${{ needs.static.result }} sandbox=${{ needs.sandbox.result }} dist=${{ needs.dist.result }}"
+          echo "test=${{ needs.test.result }} test-macos=${{ needs.test-macos.result }} static=${{ needs.static.result }} sandbox=${{ needs.sandbox.result }} dist=${{ needs.dist.result }}"
           exit 1
