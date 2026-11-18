@@ -29,7 +29,8 @@
     (`test_every_test_adr_0015_names_exists`); it claims no protocol
     number and its links resolve
     (`test_adr_0015_claims_no_state_protocol_number_and_its_links_resolve`);
-    D3's transition table uses only its own states and leaves none out
+    D3's transition table uses only its own states, leaves none out, and
+    cancels each state that is not terminal when its step ends
     (`test_adr_0015_task_table_is_closed_over_its_states`); D14's table
     has a row for every provider the registry knows, and the argv facts
     it states hold (`test_adr_0015_fresh_context_table_takes_every_provider`,
@@ -58,7 +59,10 @@
     one:
     - a result whose own `status` stops the step is accepted in the stop
       save today's code makes, with no plan, and its Memory proposals with
-      it (D4.6).
+      it (D4.6);
+    - every task still open when its step concludes, is routed elsewhere
+      or is unblocked is canceled in that save, its process stopped after
+      it, and a reply it delivers later discarded (D3.1).
   - *Recorded here:* the task identities (D2), lifecycle and transition
     table (D3), the `TaskResult` / `PhaseResult` split (D4), the
     launch-intent protocol (D5), the reducer's input and output types for
@@ -359,16 +363,21 @@ A task is in one of seven states. `ACCEPTED` and `CANCELED` are terminal.
 |---|---|---|
 | `PROPOSED` | the controller's admission checks pass (D7.2) | `ADMITTED` |
 | `PROPOSED` | an admission check refuses it (`not-admitted`) | `CANCELED` |
+| `PROPOSED` | its step ended while it was open (D3.1: `step-concluded` or `unblocked`) | `CANCELED` |
 | `ADMITTED` | its launch-intent save (D5.1), which allocates its attempt's `AttemptID` | `RUNNING` |
-| `ADMITTED` | an input its role's rule names moved (D7.3), or the step ended without it | `CANCELED` |
+| `ADMITTED` | an input its role's rule names moved (`stale-input`, D7.3) | `CANCELED` |
+| `ADMITTED` | its step ended while it was open (D3.1: `step-concluded` or `unblocked`) | `CANCELED` |
 | `RUNNING` | the launch ended with a reply the controller holds: the receipt (D4.1, stage 1) | `VERIFYING` |
 | `RUNNING` | the launch ended with no reply, or a crash left its outcome unknown | `RETRYABLE` |
-| `RUNNING` | an input its role's rule names moved, and the controller stopped the launch (a read-only task, D7.3) | `CANCELED` |
+| `RUNNING` | an input its role's rule names moved, and the controller stopped the launch (`stale-input`, a read-only task, D7.3) | `CANCELED` |
+| `RUNNING` | its step ended while it was open (D3.1: `step-concluded` or `unblocked`); its process is stopped after the save | `CANCELED` |
 | `VERIFYING` | the parse and every check passed, and the acceptance save holds it (D4.1, stages 4 and 5): for the producing task, the save that concludes the step from its result, its phase plan's or, for a result that stops the step with nothing planned, its stop save (D4.6) | `ACCEPTED` |
 | `VERIFYING` | the parse or a check refuses the result (D4.1, stages 2 and 3) | `RETRYABLE` |
-| `VERIFYING` | an input its role's rule names moved before the acceptance save | `CANCELED` |
+| `VERIFYING` | an input its role's rule names moved before the acceptance save (`stale-input`) | `CANCELED` |
+| `VERIFYING` | its step ended while it was open, before its acceptance save (D3.1: `step-concluded` or `unblocked`) | `CANCELED` |
 | `RETRYABLE` | a bounded relaunch: a correction, a transient retry, D11's automatic relaunch, or the operator's `resume` | `RUNNING` |
-| `RETRYABLE` | an input its role's rule names moved, the step ended without it, or `unblock` re-entered its step (`unblocked`) | `CANCELED` |
+| `RETRYABLE` | an input its role's rule names moved (`stale-input`) | `CANCELED` |
+| `RETRYABLE` | its step ended while it was open (D3.1: `step-concluded` or `unblocked`) | `CANCELED` |
 
 `RETRYABLE` means a relaunch would be legal by the existing rules, not that
 one will happen: with no bound left, the step stops through its existing
@@ -378,10 +387,80 @@ have been. What a canceled mutating task left in the worktree is the next
 launch's starting state, read (#187) and imported strictly like any
 leftover (D5.4), never its result.
 
+**D3.1. A step that ends cancels every task still open in it.** A step
+ends in one of three saves. Each save cancels every task of the step that
+is not yet terminal, in whatever state it is and whatever its inputs:
+
+1. **The step concludes** from its producing task's accepted result. The
+   save that accepts the result, its plan's or its stop's (D4.1, stage 5;
+   D4.6), cancels every other open task (`step-concluded`). That includes
+   a read-only task pinned to the unchanged current candidate. None of its
+   D7.3 inputs moved, but its step has its result, and nothing left in the
+   step would read another.
+2. **The entry's reconciliation routes the phase elsewhere** (a push by
+   someone else turns `FIX` into `REVIEW`). The save that records the new
+   phase cancels every open task of the step, the producing one included
+   (`step-concluded`). No result was accepted.
+3. **`unblock` re-enters a phase** from the step's `BLOCKED`. The save that
+   records the re-entry cancels every open task of the blocked step
+   (`unblocked`).
+
+A stop the controller makes on its own, not one a result asked for, ends no
+step by itself. Its open tasks keep their last state. No receipt is saved
+after the stop, and their processes end with the invocation, as every
+process an agent starts does. A task left `RUNNING` on disk then reads as
+`RETRYABLE` (D5.4). `unblock` cancels these tasks (item 3), and a `FAILED`
+run launches nothing again.
+
+Whether a step waits for outstanding read-only work before it concludes is
+#332's policy: the reducer proposes `Conclude` or `Wait` (D6). Once the
+conclusion is saved, nothing waits for that work.
+
+- **The save is the boundary.** A task is `CANCELED` from the save that
+  ends its step, and nothing it delivers after that save is decided on. A
+  reply that arrives later binds to a canceled task and is discarded and
+  logged (D4.3). It is never saved as a receipt, parsed for Memory
+  proposals, or read by the reducer or the plan. A receipt saved before
+  that save but not yet accepted (`VERIFYING`) is canceled with its task,
+  and its result is never accepted or used. A read-only task already
+  `ACCEPTED` stays `ACCEPTED`, and the reducer's input says which
+  candidate its result was about (D7.3).
+- **Processes are stopped after the save.** The engine stops the process
+  of every task the save canceled while it was `RUNNING`, as it stops a
+  stale read-only launch (D7.3). It does so before the step goes on: before
+  a plan's effects, the next phase's entry or the re-entered phase's first
+  launch. Stopping a process decides nothing, because the save already
+  did. A crash between the save and the stop leaves no read-only process
+  behind: such a task runs only enforced (D7.4), and an enforced launch
+  dies with the controller (bwrap's `--die-with-parent`, or ADR 0013's
+  death-watch for a container). D5.5's survivor check still runs before
+  any later launch.
+
+*Scenarios.* #332 and #319 owe these as tests with fakes (§4.2).
+
+1. **A conclusion with read-only work outstanding.** The worker's task is
+   accepted with its plan. Ideator I1 is `RUNNING` and verifier V1 is
+   `VERIFYING`, both pinned to C2, which is still the step's current
+   candidate, so none of their D7.3 inputs moved. The plan save cancels
+   both (`step-concluded`), and the engine then stops I1's process. A
+   reply from I1 that arrives later binds to a canceled task and is
+   discarded. V1's parsed result is never accepted. Neither reaches the
+   reducer, Memory or the plan. The same holds when the producing task's
+   result stops the step (D4.6).
+2. **A crash between that save and the stop.** The next command finds I1
+   and V1 `CANCELED`. I1's process did not outlive the controller, D5.5's
+   survivor check runs before any launch, and a reply that turns up is
+   discarded.
+3. **Reconciliation and `unblock` with tasks open.** A save that routes
+   the phase elsewhere cancels every open task, the producing one included
+   (`step-concluded`). An `unblock` cancels every open task of the blocked
+   step (`unblocked`), in each state that is not terminal.
+
 **A terminal task is never launched again.** A step that launches again
 after its producing task is terminal admits a new producing task, with the
-next ordinal. That happens after an `unblock` into the same step, which
-cancels the task still open there, and after a plan that a later read
+next ordinal. That happens after an `unblock` into the same step, where
+the producing task is either `ACCEPTED` (its result asked for the stop) or
+canceled by the `unblock` (D3.1), and after a plan that a later read
 voided, so that the step asks again (ADR 0004 D4.7's `UPDATE_EPIC`
 rejection). Every attempt has its own `AttemptID` either way (D2.1).
 Corrections, transient retries and D11's relaunch are further attempts of
@@ -410,9 +489,9 @@ Under #319 a step holds tasks the existing fields cannot describe, so
 | Workflow | Task | How the two relate |
 |---|---|---|
 | an agent phase is entered | its producing task is `ADMITTED` | the entry admits it; under #319, the other tasks are admitted one by one |
-| the phase moves on from its result, to its next phase or to the stop the result asks for | the producing task is `ACCEPTED`; every other open task is `CANCELED` (`step-concluded`) | a transition is still `decide_next_phase`'s; a stop the result asks for is the engine's stop save, as today (D4.6) |
-| the entry's reconciliation routes the phase elsewhere | every open task is `CANCELED` (`step-concluded`) | no result was accepted; the next phase's entry admits its own task |
-| `BLOCKED` | none | not a task state. Open tasks keep their last state, and a crash's `RUNNING` reads as `RETRYABLE`. `unblock` re-enters a phase through `UNBLOCK_TARGETS`, which cancels every open task of the blocked step (`unblocked`). The phase re-entered then admits a new producing task, in the same step (the same `StepKey`, new `AttemptID`s, D2.1) or in another |
+| the phase moves on from its result, to its next phase or to the stop the result asks for | the producing task is `ACCEPTED`; every other open task is `CANCELED` (`step-concluded`, D3.1) | a transition is still `decide_next_phase`'s; a stop the result asks for is the engine's stop save, as today (D4.6) |
+| the entry's reconciliation routes the phase elsewhere | every open task is `CANCELED` (`step-concluded`, D3.1) | no result was accepted; the next phase's entry admits its own task |
+| `BLOCKED` | none | not a task state. A stop the result asked for concluded the step (D3.1). After a stop the controller made on its own, open tasks keep their last state, and a `RUNNING` one reads as `RETRYABLE`. `unblock` re-enters a phase through `UNBLOCK_TARGETS`, which cancels every open task of the blocked step (`unblocked`). The phase re-entered then admits a new producing task, in the same step (the same `StepKey`, new `AttemptID`s, D2.1) or in another |
 | `FAILED` | none | terminal; no open task is resumed |
 | `AWAITING_INPUT` | none | reserved for #126 (D15) |
 
@@ -487,7 +566,8 @@ The parser refuses a wrong `phase` from the producer. The phase's checks
 refuse a wrong `previous_head_sha` in a `FIX` result. A receipt whose task
 is `CANCELED`, or whose `AttemptID` is not its task's last attempt, is
 discarded and logged. That covers a reply that arrives after its task was
-canceled, and a reply of a launch from before an `unblock`.
+canceled, a read-only task's reply that arrives after its step ended
+(D3.1), and a reply of a launch from before an `unblock`.
 
 **D4.4. What a `TaskResult` holds is closed per role.**
 
@@ -1177,6 +1257,7 @@ The crash windows of one attempt, and what the next command does:
 | W8. the effects observed, before the transition | all of the above | the transition | none | unchanged |
 | W9. an operator's Memory command (seed, retract) | before or after its one save | nothing more to do | none | all or nothing |
 | W10. under #319, a save moved the step's current candidate | the new candidate; the read-only tasks pinned to the old one `CANCELED` in the same save | a reply or receipt of a canceled task discarded (D4.3); D5.5's survivor check before any launch | none | unchanged |
+| W11. under #319, a save ended the step with tasks open (D3.1), before their processes were stopped | every task that was open `CANCELED` in that save | a reply or receipt of a canceled task discarded (D4.3); D5.5's survivor check before any launch | none | unchanged: a canceled task's proposals are never admitted |
 
 Under #319 every task attempt has these windows, each read-only attempt
 charged in an intent save of its own. Once #332 lands, W4 is closed for
@@ -1402,7 +1483,8 @@ review round 1 of PR #512, in
 That comment assigns nothing. The acceptance added no item to the list and
 moved none to another owner. It settled item 5's condition, and its bump
 is announced on #23 by #332 when it is ready (§5, answer 6). Item 4 gained
-detail from the answers: the kept candidate's ref. #332 and #319 bring
+detail from the answers and the corrections that followed them: the kept
+candidate's ref and a canceled task's reason. #332 and #319 bring
 item 4's full schema to #23 with their bump.
 
 1. **Issue Working Memory** (#317, #333): one field of the state. A file of
@@ -1419,7 +1501,9 @@ item 4's full schema to #23 with their bump.
    run's arm without `--accept-config-change`. The evaluation needs this
    to show a run's settings.
 4. **The task table** (#332, #319). It holds:
-   - the tasks, with each step's ordinal counter (D2);
+   - the tasks, with each step's ordinal counter (D2) and each canceled
+     task's reason (`not-admitted`, `stale-input`, `step-concluded` or
+     `unblocked`, D3);
    - the attempts, by `AttemptID`;
    - the input fingerprints (D7.3);
    - the receipts: the binding, the reply's digest, and the parsed result
@@ -1558,7 +1642,11 @@ Each is a deterministic test with fakes, offline, in `make check`.
     - a non-producing task is never handed to the phase's plan;
   - the producer's `CONTROL_RESULT` keeps its schema, and a `phase` other
     than the launched one is refused at parse;
-  - each D11 window for a persisted task, W10 included;
+  - each D11 window for a persisted task, W10 and W11 included;
+  - D3.1's three scenarios: a conclusion with read-only work outstanding,
+    a crash between that save and the stop, and reconciliation and
+    `unblock` with a task open in each state that is not terminal; a
+    late reply of a canceled task discarded in each;
   - D2.1's regression scenario for a persisted task: the canceled task's
     receipt is discarded, and the new task has the next ordinal;
   - D5.3's receipt for the single-agent producer:
@@ -1577,6 +1665,10 @@ Each is a deterministic test with fakes, offline, in `make check`.
   - D7.3's three scenarios: a successful producer, its verification-derived
     Memory write, and stale read-only work, canceled in the save that moves
     the current candidate;
+  - a conclusion with an ideator `RUNNING` and a verifier `VERIFYING` on
+    the unchanged current candidate: both canceled in the conclusion
+    save, the ideator's process stopped after it, its late reply
+    discarded, and the verifier's result never accepted (D3.1);
   - a `CONTROL_RESULT` block in a role's reply refused;
   - a counterexample unverified until reproduced, and still unverified
     when its reproduction is `inconclusive` or `not-run`;

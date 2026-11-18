@@ -126,23 +126,31 @@ def test_adr_0015_task_table_is_closed_over_its_states():
     """D3's transition table uses only the seven task states, every state
     but the initial one is entered and every state but the terminal ones is
     left, nothing leaves a terminal state, and the workflow's stops are no
-    task state. The table of how each state is read in the single-agent path
-    has a row for every state that path can be in: all but PROPOSED."""
+    task state. Every state that is not terminal can be canceled when its
+    step ends, by a conclusion or a reconciliation (``step-concluded``) and
+    by an ``unblock`` (``unblocked``), as D3.1 and the workflow mirror say.
+    The table of how each state is read in the single-agent path has a row
+    for every state that path can be in: all but PROPOSED."""
     section = _decision("3")
     assert "one of seven states" in section and len(TASK_STATES) == 7
     tables = _tables(section)
     transitions = tables["From | Event | To"]
     assert transitions
     edges = []
+    step_ended: set[str] = set()
     for cells in transitions:
         assert len(cells) == 3, cells
         (source,), (target,) = _code_spans(cells[0]), _code_spans(cells[2])
         edges.append((source, target))
+        reasons = set(_code_spans(cells[1]))
+        if target == "CANCELED" and {"step-concluded", "unblocked"} <= reasons:
+            step_ended.add(source)
     sources, targets = {s for s, _ in edges}, {t for _, t in edges}
     assert sources | targets <= TASK_STATES
     assert targets == TASK_STATES - INITIAL
     assert sources == TASK_STATES - TERMINAL
     assert not (sources | targets) & NOT_TASK_STATES
+    assert step_ended == TASK_STATES - TERMINAL
     derived = tables["State | How it is read in the single-agent path"]
     assert {_code_spans(cells[0])[0] for cells in derived} == TASK_STATES - INITIAL
     mirrored = tables["Workflow | Task | How the two relate"]
