@@ -39,6 +39,8 @@
     attempt counter D2.1 refuses as an identity repeats after an `unblock`
     into the same step, as its regression scenario says
     (`test_adr_0015_attempt_repeats_after_an_unblock_into_the_same_step`);
+    an agent's stop is applied in one save with no plan, as D4.6 says
+    (`test_adr_0015_a_stop_result_is_applied_in_one_save_with_no_plan`);
     and what D10 says of SQLite holds
     (`test_the_package_opens_sqlite_only_for_the_opencode_probe`).
   - *Revised* on 2026-11-18, after review round 1 of PR #512: an
@@ -51,6 +53,12 @@
     input from the base, reads a pass from a report checked against the
     base's, and has outcomes that are not a pass (D7.5). D3, D5, D11, D19,
     D20 and §4.2 follow.
+  - *Corrected after the acceptance,* at review round 2 of PR #512. Each
+    correction makes an accepted decision implementable, and none reopens
+    one:
+    - a result whose own `status` stops the step is accepted in the stop
+      save today's code makes, with no plan, and its Memory proposals with
+      it (D4.6).
   - *Recorded here:* the task identities (D2), lifecycle and transition
     table (D3), the `TaskResult` / `PhaseResult` split (D4), the
     launch-intent protocol (D5), the reducer's input and output types for
@@ -356,7 +364,7 @@ A task is in one of seven states. `ACCEPTED` and `CANCELED` are terminal.
 | `RUNNING` | the launch ended with a reply the controller holds: the receipt (D4.1, stage 1) | `VERIFYING` |
 | `RUNNING` | the launch ended with no reply, or a crash left its outcome unknown | `RETRYABLE` |
 | `RUNNING` | an input its role's rule names moved, and the controller stopped the launch (a read-only task, D7.3) | `CANCELED` |
-| `VERIFYING` | the parse and every check passed, and the acceptance save holds it (D4.1, stages 4 and 5): for the producing task, the save of its phase plan | `ACCEPTED` |
+| `VERIFYING` | the parse and every check passed, and the acceptance save holds it (D4.1, stages 4 and 5): for the producing task, the save that concludes the step from its result, its phase plan's or, for a result that stops the step with nothing planned, its stop save (D4.6) | `ACCEPTED` |
 | `VERIFYING` | the parse or a check refuses the result (D4.1, stages 2 and 3) | `RETRYABLE` |
 | `VERIFYING` | an input its role's rule names moved before the acceptance save | `CANCELED` |
 | `RETRYABLE` | a bounded relaunch: a correction, a transient retry, D11's automatic relaunch, or the operator's `resume` | `RUNNING` |
@@ -390,7 +398,7 @@ because nothing in that path names a task (D2):
 | `ADMITTED` | an agent phase with `attempt == 0`: the entry admitted its producing task, the first one or, after an `unblock` into the same step, a new one |
 | `RUNNING` | in the process that launched it: `attempt >= 1` and the launch under way |
 | `VERIFYING` | in that process: the reply from its receipt to the plan save (`_check_reply` parses and checks it, then the validation gates run); on disk: a `delivered_reply` not yet applied and, once #332 keeps every receipt (D5.3), a receipt not yet accepted |
-| `ACCEPTED` | its result taken as the phase's: the phase's plan saved (`completion_context`), or the phase moved on from it through `decide_next_phase`, including to `BLOCKED` or `FAILED` when the result's own `status` asks for that |
+| `ACCEPTED` | its result taken as the phase's: the phase's plan saved (`completion_context`), or the phase moved on from it through `decide_next_phase`; or its stop saved, when the result's own `status` is `blocked` or `failure` and nothing is planned: the phase `BLOCKED` or `FAILED` with the stop code `agent-blocked` or `agent-failure`, which the engine saves itself (D4.6; `decide_next_phase` never enters either) |
 | `RETRYABLE` | on disk: `attempt >= 1`, no plan and no kept reply. A crash during `RUNNING` reads the same, and both resolve the same way: the entry's reconciliation, then a charged launch |
 | `CANCELED` | the phase moved on without an accepted result: the entry's reconciliation routed it elsewhere (a push by someone else turns `FIX` into `REVIEW`), or `unblock` re-entered the phase, which restarts `attempt` at 0 for the new task |
 
@@ -402,7 +410,7 @@ Under #319 a step holds tasks the existing fields cannot describe, so
 | Workflow | Task | How the two relate |
 |---|---|---|
 | an agent phase is entered | its producing task is `ADMITTED` | the entry admits it; under #319, the other tasks are admitted one by one |
-| the phase transitions from its result | the producing task is `ACCEPTED`; every other open task is `CANCELED` (`step-concluded`) | the transition is still `decide_next_phase`'s |
+| the phase moves on from its result, to its next phase or to the stop the result asks for | the producing task is `ACCEPTED`; every other open task is `CANCELED` (`step-concluded`) | a transition is still `decide_next_phase`'s; a stop the result asks for is the engine's stop save, as today (D4.6) |
 | the entry's reconciliation routes the phase elsewhere | every open task is `CANCELED` (`step-concluded`) | no result was accepted; the next phase's entry admits its own task |
 | `BLOCKED` | none | not a task state. Open tasks keep their last state, and a crash's `RUNNING` reads as `RETRYABLE`. `unblock` re-enters a phase through `UNBLOCK_TARGETS`, which cancels every open task of the blocked step (`unblocked`). The phase re-entered then admits a new producing task, in the same step (the same `StepKey`, new `AttemptID`s, D2.1) or in another |
 | `FAILED` | none | terminal; no open task is resumed |
@@ -445,16 +453,22 @@ until stage 4 accepts it or stage 2 or 3 refuses it (D3).
    comparison. A task other than the producing one is accepted in a save
    of its own (#332). Its result then becomes an input of later tasks and
    of the reducer, never a phase result.
-5. **Phase-plan acceptance.** The producing task's accepted `TaskResult`
-   is the `PhaseResult`. Its stage 4 is this stage's save: the phase plan
-   (completion context and `intended` effects), the task `ACCEPTED` and
-   the result's Memory proposals (D9.8), in one save. So no crash leaves
-   a producing task accepted without its plan, or a plan without its task.
-   The effects and the transition follow, as today.
+5. **Phase acceptance.** The producing task's accepted `TaskResult` is
+   the `PhaseResult`. Its stage 4 is this stage's save, the one that
+   concludes the step from the result:
+   - for a result that plans effects, the phase plan (completion context
+     and `intended` effects);
+   - for a result whose own `status` stops the step with nothing planned,
+     the stop save (D4.6).
+
+   That one save also holds the task `ACCEPTED` and the result's Memory
+   proposals (D9.8). So no crash leaves a producing task accepted without
+   its plan or its stop, or either without its task. The effects and the
+   transition follow a plan, as today. A stop has neither.
 
 In the single-agent path, `_check_reply` spans stages 1 to 3: the strict
-import, then the parse, then the phase's checks. The plan save is stages 4
-and 5. A reply delivered before a failed launch end
+import, then the parse, then the phase's checks. The plan save, or a stop
+result's stop save, is stages 4 and 5. A reply delivered before a failed launch end
 is kept after its checks (ADR 0012 D12). That kept reply is a saved
 receipt still at stage 3, re-checked after a restart. No launch path
 changes.
@@ -504,6 +518,48 @@ canceled, and a reply of a launch from before an `unblock`.
 **D4.5. Bounded and redacted at parse,** as `CONTROL_RESULT` is today: a
 block bound and per-field bounds, enforced by refusal, never by a silent
 cut.
+
+**D4.6. A result that stops the step is accepted in its stop save, with no
+plan.** A producing task's result whose own `status` is `blocked` or
+`failure` asks the controller to stop the step. Today the engine applies
+it in one save (`engine.py:6587`). The save sets the phase to `BLOCKED` or
+`FAILED`. It takes the agent's message, redacted and bounded, as the block
+reason, and the stop code `agent-blocked` or `agent-failure` (ADR 0011).
+It writes no completion context and no `intended` effect, and this record
+adds none. The stop publishes nothing, so recovery has nothing to complete
+and a plan would order no effect. `decide_next_phase` never enters
+`BLOCKED` or `FAILED`; the engine does, as today, so no route changes.
+
+- **The stop save is the acceptance save.** For such a result it is stage
+  5. It holds the stop, the task `ACCEPTED`, every other open task
+  `CANCELED` (`step-concluded`, D3) and the result's Memory proposals
+  (D9.8), all in one save. Stage 3 for such a result is what the phase
+  checks of a stop today: the parse, the PR owner check (ADR 0004 D9.4a)
+  and the checkout check. No candidate check runs, because nothing is
+  published.
+- **Its Memory proposals are admitted,** as any accepted result's are
+  (D9.8). An agent that stops has often learned what the next launch
+  needs: why it could not go on. The launch after an `unblock` is in the
+  same run (D9.1), and its projection shows them as proposals. A `failure`
+  ends the run. Its proposals stay in the state, where only a later export
+  reads them (D17).
+- **A blocked `FIX` that offers a partial fix (#433)** is accepted in its
+  plan save when the controller plans its publication, as a success is. It
+  is accepted in its stop save when the controller stops it with nothing
+  planned. Either way it is one save.
+- **Crash windows.** Before the stop save, the reply is where any reply
+  is. After a clean exit it is held in process and lost to a crash (W4,
+  until #332's receipt closes it, D5.3). After a failed end it is kept
+  after its checks, re-checked after a restart, and then makes the stop
+  save (W5, ADR 0012 D12). After the stop save, the stop stands, with
+  nothing to complete and no relaunch, and the proposals are in the
+  state (W7). `unblock` admits a new producing task (D3), and the
+  accepted one stays `ACCEPTED`.
+
+`test_adr_0015_a_stop_result_is_applied_in_one_save_with_no_plan` holds
+today's half of this. For an ordinary `blocked` and a `failure` result, the
+first save after the launch is the stop with the agent's code, and no save
+of the step holds a plan or an effect.
 
 ### D5. Launch intent and the attempt protocol
 
@@ -993,8 +1049,10 @@ A write past a bound is refused and counted; nothing is evicted silently.
 **D9.7. Writes from evidence are idempotent.** An observed record is keyed
 by its citation, so deriving it again adds nothing.
 
-**D9.8. Agent proposals come only from an accepted result:** the phase's
-plan save, or an accepted `TaskResult` (D4.1, stages 4 and 5). A refused,
+**D9.8. Agent proposals come only from an accepted result,** in the save
+that accepts it: the phase's plan save, a stop result's stop save (D4.6),
+or the save of another accepted `TaskResult` (D4.1, stages 4 and 5). A
+stop result's proposals are admitted like a success's. A refused,
 corrected or lost reply leaves no agent proposal in Memory. What the
 controller observed while checking it, a failed validation for example, is
 its own observed record, saved with its citation (D11). The MVP may ship without agent proposals, and
@@ -1078,10 +1136,13 @@ One attempt, each stage durable before the next begins:
    record derived from a record is saved in the same save as the record it
    cites, and it makes no task stale (D7.3).
 5. **Acceptance** (stages 4 and 5). For the producing task this is one
-   save: the phase plan (completion context and `intended` effects), the
-   task `ACCEPTED`, and the accepted result's Memory proposals. Another
-   task is accepted in a save of its own, after D7.3's last comparison.
+   save: the phase plan (completion context and `intended` effects), or,
+   for a result that stops the step with nothing planned, the stop save
+   (D4.6); with either, the task `ACCEPTED` and the accepted result's
+   Memory proposals. Another task is accepted in a save of its own, after
+   D7.3's last comparison.
 6. **The effects,** through ADR 0004's journal, then the transition save.
+   A stop result has no effects, and its stop save was its transition.
 
 **The checkpoint wins.** What is not in the last saved `state.json` did not
 happen, as far as any decision goes. What lies outside it (the worktree,
@@ -1112,7 +1173,7 @@ The crash windows of one attempt, and what the next command does:
 | W4. the reply received, not kept (a clean exit: stages 1 to 3 run in process), until #332 closes it (D5.3) | as in W3 | as in W3 | one more | unchanged |
 | W5. the reply kept before acceptance: a failed end's reply after its checks (ADR 0012 D12); under #319, a receipt after its parse | the kept reply or receipt; a validator's marker, perhaps | the kept reply re-checked, the receipt re-verified (a parse refusal's receipt: its correction); an interrupted validator recorded (ADR 0006) | none, or the correction's | the records saved with each verification record |
 | W6. verified, before the acceptance save | the records | the kept reply or receipt re-checked, or W4's relaunch, reusing the same candidate's records | none, or W4's | the records derived from them, already saved; none makes a task stale (D7.3) |
-| W7. the acceptance saved (for the producing task, its plan) | the task `ACCEPTED`; the plan and its `intended` effects | the journal completes the effects | none | the accepted result's proposals, already saved |
+| W7. the acceptance saved: for the producing task, its plan, or a stop result's stop save (D4.6) | the task `ACCEPTED`; the plan and its `intended` effects, or the stop with no plan | the journal completes the effects; a stop stands, with nothing to complete | none | the accepted result's proposals, already saved |
 | W8. the effects observed, before the transition | all of the above | the transition | none | unchanged |
 | W9. an operator's Memory command (seed, retract) | before or after its one save | nothing more to do | none | all or nothing |
 | W10. under #319, a save moved the step's current candidate | the new candidate; the read-only tasks pinned to the old one `CANCELED` in the same save | a reply or receipt of a canceled task discarded (D4.3); D5.5's survivor check before any launch | none | unchanged |
@@ -1458,6 +1519,14 @@ Each is a deterministic test with fakes, offline, in `make check`.
     refused;
   - a refused or lost reply leaves no agent proposal, while the
     controller's own observation of it is kept with its citation;
+  - an ordinary `blocked` result and a `failure` result (D4.6):
+    - each is accepted in one stop save that holds its proposals and no
+      plan, and its route is today's;
+    - a crash before that save leaves no proposal (W4), or re-checks the
+      kept reply and then makes the save (W5);
+    - after it, the stop stands with its proposals;
+    - after an `unblock` of the blocked one, the next launch's projection
+      shows them as proposals;
   - no module that decides a phase, write, budget or merge imports Memory;
   - a profile without D14's proof is refused before any save;
   - D2.1's regression scenario: an `unblock` back into the same step
@@ -1480,7 +1549,12 @@ Each is a deterministic test with fakes, offline, in `make check`.
   - D4.1's stages kept apart:
     - a parse refusal, a check refusal and a binding mismatch each leave
       the task `RETRYABLE` with no plan;
-    - a producing task is never `ACCEPTED` outside its plan's save;
+    - a producing task is never `ACCEPTED` outside the save that
+      concludes its step: its plan's save or, for a result that stops
+      the step with nothing planned, its stop save;
+    - an ordinary `blocked` result and a `failure` result are each
+      `ACCEPTED` in their stop save, which holds no completion context
+      and no `intended` effect and cancels every other open task;
     - a non-producing task is never handed to the phase's plan;
   - the producer's `CONTROL_RESULT` keeps its schema, and a `phase` other
     than the launched one is refused at parse;

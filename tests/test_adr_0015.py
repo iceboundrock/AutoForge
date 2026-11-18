@@ -271,6 +271,50 @@ def test_adr_0015_attempt_repeats_after_an_unblock_into_the_same_step(tmp_state_
     assert "launch_seq" not in {field.name for field in dataclasses.fields(AutoForgeState)}
 
 
+@pytest.mark.parametrize(
+    ("status", "phase", "code"),
+    [("blocked", "BLOCKED", "agent-blocked"), ("failure", "FAILED", "agent-failure")],
+)
+def test_adr_0015_a_stop_result_is_applied_in_one_save_with_no_plan(
+    tmp_state_dir, fake_github, monkeypatch, status, phase, code
+):
+    """D4.6, as today's code runs it. An ordinary ``blocked`` or ``failure``
+    result is applied in the first save after its launch: the stop, with the
+    agent's code and message. No save of the step holds a completion context
+    or an effect record, and nothing reaches GitHub. That stop save is where
+    D4.6 accepts the producing task and admits its Memory proposals, so the
+    child that changes it updates the record with this test."""
+    payload = {"phase": "ANALYZE_EXECUTE", "status": status, "message": "need decision"}
+    eng = make_engine(tmp_state_dir, [block(payload)], github=fake_github, origin=True)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    saves: list[tuple] = []
+    save = eng._save
+
+    def recording() -> None:
+        state = eng.state
+        saves.append(
+            (
+                len(eng.provider.calls),
+                state.phase.value,
+                state.stop_code,
+                state.block_reason,
+                dict(state.completion_context),
+                list(state.effect_records),
+            )
+        )
+        save()
+
+    monkeypatch.setattr(eng, "_save", recording)
+    assert eng.step().next_phase == phase
+
+    after = [s for s in saves if s[0] == 1]
+    assert after and after[0][1:4] == (phase, code, "need decision")
+    assert all(s[1:4] == after[0][1:4] for s in after)
+    assert all(s[4] == {} and s[5] == [] for s in saves)
+    assert fake_github.effect_writes == []
+    assert "**D4.6. A result that stops the step is accepted in its stop save" in _text()
+
+
 def test_the_package_opens_sqlite_only_for_the_opencode_probe():
     """D10 refuses SQLite as authoritative storage and says the package
     opens it in one place, read-only: the probe of OpenCode's organization
