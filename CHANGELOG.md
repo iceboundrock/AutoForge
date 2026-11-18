@@ -26,6 +26,28 @@ common dir did not exist. The lock file is now walked to again, up to five
 times, while the coordination root exists. A missing root is still refused
 at once.
 
+### Claude Code 2.1.326's background agents no longer fail a run (#507)
+
+Claude Code 2.1.326 sends a turn's result while a background agent the
+agent started is still running, and the agent's records keep arriving
+after it. AutoForge read the first of them as the start of another turn,
+so a run that then exited cleanly failed with `claude: exited inside a turn
+that has no result event` and automatic recovery refused it. Those records
+now open no turn. A reply followed by them no longer stops the CLI early:
+the run waits for the turn the agent's end gives it, as it did on earlier
+versions, and a CLI that exits before that turn fails the run (`claude:
+exited after a background agent's records followed the last result event`)
+instead of returning the reply the agent's work overtook. That wait needs
+the first of those records within 10 seconds of the reply. A background
+agent that writes nothing in that time (one waiting on its model, say) leaves the reply deciding the run, which stops
+the CLI then and does not wait for the agent's work, as with any reply
+(#439). 2.1.326 also stops every background task ten minutes after the
+last turn and exits without another. Every `claude` launch now sets
+`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`, whatever your shell sets, so
+the profile's `idle_timeout_seconds` and `max_runtime_seconds` bound that
+wait instead. A value in your Claude Code settings' `env` still brings the
+ceiling back ([configuration](docs/configuration.md)).
+
 ### `sandbox.container` takes the container backend's seed settings (#292)
 
 The configuration now accepts `sandbox.container.history_depth` (0 or more,

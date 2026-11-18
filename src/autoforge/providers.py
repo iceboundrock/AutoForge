@@ -20,7 +20,11 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
     record that ends the turn, whose ``result`` field is its final
     assistant text; a background task or a scheduled wakeup still pending
     then keeps the CLI alive for another turn with its own ``result``
-    (held back to the end, in turn order, while a background agent runs).
+    (held back to the end, in turn order, while a background agent runs, on
+    2.1.293; sent at once on 2.1.326, whose background agent then goes on
+    writing records of its own, #507). 2.1.326 also stops background tasks
+    ten minutes after the last turn unless the launch turns that off, which
+    every launch does (:data:`CLAUDE_LIFECYCLE_ENV`).
     The CLI refuses ``stream-json`` under ``--print`` without ``--verbose``.
     The child runs under the duplex handle and the stream is reduced in
     claude_stream.py: ``stdout`` of the result is the last ``result``
@@ -1362,6 +1366,18 @@ def claude_isolation_env(env_file: str, shell: str) -> dict[str, str]:
     }
 
 
+# What every ``claude`` launch sets for the CLI's own lifecycle (#507). 2.1.326
+# stops every background task (a background agent, a shell, a monitor) ten
+# minutes after the last turn and exits 0 without another turn, so an agent
+# that ended its turn to wait for its background agents loses their work and
+# never gets the turn it waited for. ``0`` turns that ceiling off (read from
+# the build: ``CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS``, default 600000): the
+# controller's idle limit and maximum runtime bound the wait instead, as they
+# bound everything else a launch does. Not for ``claude-sdk``, whose pinned
+# Claude Code predates the ceiling.
+CLAUDE_LIFECYCLE_ENV = {"CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"}
+
+
 @contextmanager
 def claude_shell_isolation() -> Iterator[dict[str, str]]:
     """A :data:`CLAUDE_SHELL_CLEANER` file for one Claude Code launch's
@@ -1462,7 +1478,7 @@ def _claude_config_env_problems(path: Path) -> list[str]:
     env = document.get("env") if isinstance(document, dict) else None
     if not isinstance(env, dict):
         return []
-    isolation = {name.upper() for name in ClaudeCodeProvider.isolation_names}
+    isolation = {name.upper() for name in claude_isolation_env("", "")}
     hits = sorted(
         name
         for name in env
@@ -1536,7 +1552,7 @@ class ClaudeCodeProvider(AgentProvider):
     environment_names = ("ANTHROPIC_*", "CLAUDE_*")
     sign_in_names = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
     option_keys = ("permission_mode", "output_format", "session_persistence")
-    isolation_names = tuple(sorted(claude_isolation_env("", "")))
+    isolation_names = tuple(sorted({**claude_isolation_env("", ""), **CLAUDE_LIFECYCLE_ENV}))
     path_names = ("CLAUDE_ENV_FILE", "CLAUDE_CODE_SHELL", "CLAUDE_CONFIG_DIR")
     # The end of a turn does not end this CLI while a background task is
     # pending, which is true of no other adapter's (#440).
@@ -1617,9 +1633,10 @@ class ClaudeCodeProvider(AgentProvider):
     def integration_isolation(self) -> Iterator[dict[str, str]]:
         """A :data:`CLAUDE_SHELL_CLEANER` file for this launch's
         ``CLAUDE_ENV_FILE``, a bash or zsh to run Bash tool commands in and no
-        shell prefix (:func:`claude_shell_isolation`, #165)."""
+        shell prefix (:func:`claude_shell_isolation`, #165), and the CLI's
+        background-wait ceiling off (:data:`CLAUDE_LIFECYCLE_ENV`, #507)."""
         with claude_shell_isolation() as isolation:
-            yield isolation
+            yield {**isolation, **CLAUDE_LIFECYCLE_ENV}
 
     def complete_isolation(
         self, isolation: Mapping[str, str], environment: Mapping[str, str]
@@ -3692,7 +3709,7 @@ class ClaudeSdkProvider(_SdkProvider):
     option_keys = CLAUDE_SDK_OPTION_KEYS
     # The SDK's bundled Claude Code is the CLI #165 isolates: its Bash tool
     # gets the same shell isolation (docs/sdk-policy.md §2, "startup scripts").
-    isolation_names = ClaudeCodeProvider.isolation_names
+    isolation_names = tuple(sorted(claude_isolation_env("", "")))
     path_names = ("CLAUDE_CONFIG_DIR", "CLAUDE_ENV_FILE", "CLAUDE_CODE_SHELL")
     passthrough = CLAUDE_SDK_PASSTHROUGH
     transport_issue = "151"

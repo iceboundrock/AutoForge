@@ -728,12 +728,16 @@ def test_a_pinned_deadline_is_not_moved_by_later_output(monkeypatch):
 def test_output_after_a_pin_is_not_the_last_activity(monkeypatch):
     """What Pi writes in answer to the abort after a limit is its shutdown:
     the record keeps the last output from before the pin, so the timeout
-    names when the silence began, not when the abort was answered (#343)."""
+    names when the silence began, not when the abort was answered (#343).
+
+    The pinned window is two seconds, not half of one, so that "it went on
+    writing" does not hang on how promptly a loaded runner wakes the reader
+    and the ticker (a macOS runner fit only two records in 0.5s)."""
     monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
     with start_duplex(
         DuplexRequest(
             command=[PY, "-c", _TICKER, "stdout", "1000", "0.05"],
-            idle_timeout_seconds=0.5,
+            idle_timeout_seconds=2.0,
             max_runtime_seconds=30,
         )
     ) as child:
