@@ -603,6 +603,13 @@ status --live (#374)                  read back by a fresh CLI engine: K10, K9 a
                                       cut; a verified PR description edited since; the whole
                                       human status naming only the package's commands, in
                                       every scenario and with the saved reason, PR #470 R4-F1)
+the recovery MVP evaluation (#375)    test_recovery_evaluation.py (the matrix of
+                                      docs/recovery-mvp-evaluation.md: each case a real stop
+                                      read in both arms, the package's displayed steps run as
+                                      typed, its gold resolution performed and read back; no
+                                      status writes, sends or launches, and no displayed step
+                                      ADR 0012 denies; the summary counted from the matrix, the
+                                      strata covered, every test the record names exists)
 the evaluation protocol (#318)        test_evaluation.py (the pins, what arms hold equal, the
                                       statistics and decision on synthetic records, what never
                                       runs in CI; the protocol held to its files),

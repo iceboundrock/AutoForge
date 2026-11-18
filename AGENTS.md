@@ -265,6 +265,11 @@ docs/evaluation-protocol.md            the pre-registered evaluation of Issue Me
 docs/test-suite-performance-audit.md   EPIC #338's exit audit: the suite at the EPIC's baseline and on
                                        main, measured on one host; each exit criterion and invariant
                                        with its verdict and tests; what only GitHub holds
+docs/recovery-mvp-evaluation.md        EPIC #354's deterministic recovery MVP evaluated (#375): the
+                                       before/after matrix of 17 real-engine stops, each gold
+                                       resolution held by the controller's read-back, the safety
+                                       regressions and their tests, gates D and A, a proposed go
+                                       awaiting the maintainer's sign-off
 docs/releasing.md                      distribution name, version and tag scheme, changelog, the
                                        maintainer's release procedure, PyPI Trusted Publishing
                                        (`pypi-publish.yml`) and its one-time setup
