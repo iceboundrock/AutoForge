@@ -238,8 +238,9 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        identities, states and transitions, the
                                        TaskResult / PhaseResult split, launch intent,
                                        the reducer's types, roles and one mutating
-                                       worker, four memory layers and their trust
-                                       boundary, Memory inside state.json, the
+                                       worker, staleness per role, independent
+                                       verification, four memory layers and their
+                                       trust boundary, Memory inside state.json, the
                                        commit order and crash windows, fresh-context
                                        proofs, the first scope)
 docs/README.md                         human-oriented documentation index, by intent

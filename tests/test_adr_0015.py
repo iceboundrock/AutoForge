@@ -32,7 +32,9 @@ from autoforge.providers import (
     OpenCodeProvider,
     PiProvider,
 )
-from autoforge.transitions import WorkflowMode
+from autoforge.state import AutoForgeState
+from autoforge.transitions import Phase, WorkflowMode
+from tests.conftest import block, make_engine
 from tests.test_container_backend_record import FENCE, LINK, PROTOCOL, _broken
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -224,6 +226,49 @@ def test_adr_0015_identities_are_the_codes():
         "execution_attempt",
     ]
     assert [mode.value for mode in WorkflowMode] == ["REMOTE"]
+
+
+def _step_key(state: AutoForgeState) -> StepKey:
+    return StepKey(
+        phase=state.phase,
+        issue_url=state.current_issue_url,
+        pr_url=state.current_pr_url,
+        review_round=state.review_round,
+        execution_attempt=state.execution_attempt,
+    )
+
+
+def test_adr_0015_attempt_repeats_after_an_unblock_into_the_same_step(tmp_state_dir, fake_github):
+    """D2.1's regression scenario, as today's code runs it. An ``unblock``
+    back into the same phase keeps the step's key and restarts the attempt
+    counter, so two launches of the step share ``(StepKey, attempt)``: the
+    counter names no launch. The run's step count does not restart. D2's
+    table takes the attempt's identity from ``launch_seq``, which D19.2
+    adds: it is no field yet, so the child that adds it updates the record
+    with this test."""
+    stop = block({"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": "need decision"})
+    eng = make_engine(tmp_state_dir, [stop, stop], github=fake_github, origin=True)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    key = _step_key(eng.state)
+
+    assert eng.step().next_phase == "BLOCKED"
+    first = (eng.state.attempt, eng.state.step_count)
+    assert eng.unblock("the operator decided").unblocked
+    assert eng.state.phase is Phase.ANALYZE_EXECUTE and _step_key(eng.state) == key
+    assert eng.state.attempt == 0 and eng.state.step_count == first[1]
+
+    assert eng.step().next_phase == "BLOCKED"
+    second = (eng.state.attempt, eng.state.step_count)
+    assert [call.attempt for call in eng.provider.calls] == [1, 1]
+    assert first[0] == second[0] == 1 and second[1] > first[1]
+
+    identity = next(
+        cells
+        for cells in _tables(_decision("2"))["Identity | What it is | Persisted"]
+        if _code_spans(cells[0]) == ["AttemptID"]
+    )
+    assert "`(RunID, launch_seq)`" in identity[1] and "state.attempt" not in identity[1]
+    assert "launch_seq" not in {field.name for field in dataclasses.fields(AutoForgeState)}
 
 
 def test_the_package_opens_sqlite_only_for_the_opencode_probe():

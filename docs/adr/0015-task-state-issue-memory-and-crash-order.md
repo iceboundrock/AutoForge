@@ -18,9 +18,22 @@
     it states hold (`test_adr_0015_fresh_context_table_takes_every_provider`,
     `test_adr_0015_fresh_context_proofs_hold_in_the_adapters`,
     `test_adr_0015_resume_flags_pass_validation_today`); D2's identities
-    are the code's (`test_adr_0015_identities_are_the_codes`); and what
-    D10 says of SQLite holds
+    are the code's (`test_adr_0015_identities_are_the_codes`), and the
+    attempt counter D2.1 refuses as an identity repeats after an `unblock`
+    into the same step, as its regression scenario says
+    (`test_adr_0015_attempt_repeats_after_an_unblock_into_the_same_step`);
+    and what D10 says of SQLite holds
     (`test_the_package_opens_sqlite_only_for_the_opencode_probe`).
+  - *Revised* on 2026-11-18, after review round 1 of PR #512: an
+    attempt's identity is a run-wide launch ordinal, not `state.attempt`
+    (D2.1); a result passes through receipt, parse, verification and
+    acceptance as separate stages, and the producer's result keeps the
+    phase's `CONTROL_RESULT` schema (D4); a fingerprint records what an
+    attempt was launched with, and each role has its own rule for what
+    makes it stale (D7.3); independent verification takes every checker
+    input from the base, reads a pass from a report checked against the
+    base's, and has outcomes that are not a pass (D7.5). D3, D5, D11, D19,
+    D20 and §4.2 follow.
   - *Recorded here:* the task identities (D2), lifecycle and transition
     table (D3), the `TaskResult` / `PhaseResult` split (D4), the
     launch-intent protocol (D5), the reducer's input and output types for
@@ -173,11 +186,18 @@ they extend the single-agent path rather than replace it.
 
 - **Task:** one unit of agent work inside a step: a role, its inputs, and
   the contract its result is held to.
-- **Attempt:** one physical launch for a task.
+- **Attempt:** one physical launch for a task, named by its `AttemptID`
+  (D2.1).
 - **Producing task:** the task whose accepted result is the phase's
-  result. A step has exactly one.
+  result. A step has one open producing task at a time.
+- **Receipt:** the controller's binding of what an attempt delivered to
+  the attempt it launched (D4.1).
 - **`PhaseResult`:** today's `CONTROL_RESULT`, the one input to a phase
-  transition. **`TaskResult`:** what any task's attempt returns, a claim.
+  transition. **`TaskResult`:** the typed object a role's parser makes of
+  an attempt's reply, a claim.
+- **The step's current candidate:** the candidate the controller last
+  recorded for the step from a producer's checked output (D7.3), never
+  the live worktree.
 - **Controller-observed fact:** a record the controller wrote from a typed
   source it holds as evidence, citing that source. **Model-proposed
   claim:** anything an agent wrote.
@@ -212,8 +232,8 @@ None stands in for another:
 |---|---|---|
 | `RunID` | `AutoForgeState.run_id`, `af-<UTC stamp>-<6 hex>` (`generate_run_id`) | yes, today |
 | `StepKey` | phase, issue URL, PR URL, review round, execution attempt (`auto_recovery.StepKey`) | today in the recovery journal; derived for every step |
-| `TaskID` | `(RunID, StepKey, ordinal)`, the ordinal of the task in its step, from 1 | derived in the single-agent path (always 1); persisted by #332 |
-| `AttemptID` | `(TaskID, n)`, where n is `state.attempt` as the launch-intent save leaves it | yes, today (`attempt`) |
+| `TaskID` | `(RunID, StepKey, ordinal)`: the task's ordinal in its step, from 1, allocated when the task is proposed and never reused in the step; a producing task admitted after an `unblock` into the same step takes the next (D3) | no: nothing names a task in the single-agent path; persisted by #332, with the step's ordinal counter |
+| `AttemptID` | `(RunID, launch_seq)`: the run-wide launch ordinal the attempt's launch-intent save allocates (D2.1). The receipt names the task the attempt belongs to | no: `launch_seq` is new (D19.2); `state.attempt` is a counter, not an identity |
 | role | a closed enum (D7.1) | derived in the single-agent path; persisted by #332 |
 | candidate | base: the revision the entry observation required (ADR 0004 D4.4); candidate: a `RemoteCandidate` (ADR 0006 D2.1), the commit the phase's candidate check accepted (D2.4) | yes, today, where ADR 0006 records it |
 | phase | `Phase` | yes |
@@ -223,10 +243,88 @@ None stands in for another:
 - **`RunID` is not ADR 0008's `RunKey`.** A `RunKey` outlives runs. Tasks
   and Issue Working Memory belong to one run (D9.1).
 - **Every identity comes from values the controller holds,** never from an
-  agent's report. A result that names a task or attempt other than the one
-  launched is refused (D4.3).
+  agent's report. The controller binds a reply to the attempt it launched
+  (D4.1). Where a role's schema asks the agent to echo a value (the
+  producer's `phase`), the echo is a cross-check, and a mismatch is
+  refused (D4.3).
 - **None is a GitHub object.** No task is a GitHub sub-issue, and the
   EPIC's graph is unchanged.
+
+**D2.1. An attempt's identity survives every re-entry of its step.** An
+`AttemptID` names one launch of the run, and no other.
+
+- **Why not `state.attempt`.** It counts the launches of one phase entry,
+  for the correction and transient bounds, and every phase entry resets
+  it to 0, `unblock` included (`engine.py:9495`). ADR 0012's `StepKey` is
+  deliberately the same when `unblock` re-enters the same phase, so that
+  D11's allowance is not refilled. `(StepKey, state.attempt)` therefore
+  names two launches after such an `unblock`, and a receipt, a Memory
+  record or a late reply of the first would bind to the second.
+- **Why not `step_count`.** It is unique per launch today, because #434
+  charges every physical launch a step. But it is a budget. It also counts
+  steps that launch nothing, and its rules belong to ADR 0012 and #434. An
+  identity read from it would break silently the day a budget rule
+  changes, a launch class charged otherwise for example. The run log's
+  step directory is unique too, but it is audit output that no decision
+  reads.
+- **Allocation.** `launch_seq` is a run-wide integer in `state.json`, 0
+  when the run starts. Each launch-intent save (D5.1) sets it to one more
+  than its last value, and the launch that follows is
+  `AttemptID = (RunID, launch_seq)`. Nothing else changes it: not
+  `unblock`, `resume`, a phase change, an issue switch
+  (`reset_for_new_issue`) or a crash. A new run (`run --force`) has a new
+  `RunID`, so its counter starting again collides with nothing. Under
+  #319, every attempt of every task, read-only ones included, allocates
+  from the same counter in its own intent save. AttemptIDs are therefore
+  unique across a step's tasks too, and ordered by their intent saves.
+- **The save spends it.** The value is computed in memory before the
+  intent save, so the read context and the prompt can name it, and only
+  that save spends it. A crash before the save launched nothing (W1, D11),
+  so the next intent save allocates the same value. A file rendered with it
+  before the crash names no launch, and nothing reads a read-context file
+  back. After the save, the value names exactly one launch, even if its
+  process never started (W2). Such a launch has a spent `AttemptID` and no
+  receipt.
+- **`state.attempt` keeps its meaning.** It is the launches of this phase
+  entry, which the correction and transient bounds count and D3's derived
+  states read. It names nothing.
+- **Migration.** `launch_seq` is a new field (D19.2), added by the first
+  child that persists an attempt's identity: #317, whose records name the
+  attempt that created them (D9.2), or #332 if it lands first. A file of
+  the previous protocol loads with `launch_seq` equal to its `step_count`.
+  Every launch it made was charged a step before it started (#434), so the
+  run made at most that many launches, and every `AttemptID` allocated
+  after the load is greater than that number. Nothing persisted before the bump
+  names an `AttemptID`, so nothing else is rewritten. A reply kept under
+  ADR 0012 D12 keeps its existing binding, and the first launch after the
+  load clears it, as today. A file labelled older that carries the field
+  is refused, and a file of the new protocol must carry it.
+
+*Regression scenario.* This is the sequence that makes
+`(StepKey, state.attempt)` name two launches.
+`test_adr_0015_attempt_repeats_after_an_unblock_into_the_same_step` checks
+the facts it rests on against today's code. It runs an `ANALYZE_EXECUTE`
+step that its agent's result blocks, and an `unblock` back into the same
+step. The step keeps its `StepKey`, both launches have `attempt` 1, and
+`step_count` grows:
+
+1. `FIX` in review round 2, with step key K. The intent save leaves
+   `attempt` 1 and allocates `launch_seq` 7, so the launch is `(R, 7)`.
+   The agent commits, then the launch ends without a usable reply. No
+   relaunch is left, and the step enters `BLOCKED`.
+2. `unblock` re-enters `FIX` through `UNBLOCK_TARGETS`. `attempt` is 0
+   again and the step key is still K. D3 cancels the open task
+   (`unblocked`), and the re-entry admits a new producing task, ordinal 2.
+3. The next intent save leaves `attempt` 1 again and allocates
+   `launch_seq` 8, so the launch is `(R, 8)`. The worktree the first
+   launch left is read (#187) and imported strictly before it starts, as
+   any leftover is (D5.4).
+4. Any receipt, Memory record or late reply naming `(R, 7)` is not
+   `(R, 8)`'s. A receipt is refused by the binding check (D4.3), and the
+   projection of the second launch names `(R, 8)` (D12). Under
+   `(TaskID, state.attempt)`, both launches would have been `(R, K, 1, 1)`.
+
+#317 and #332 each owe this sequence as a test with fakes (§4.2).
 
 ### D3. The task lifecycle
 
@@ -236,35 +334,48 @@ A task is in one of seven states. `ACCEPTED` and `CANCELED` are terminal.
 |---|---|---|
 | `PROPOSED` | the controller's admission checks pass (D7.2) | `ADMITTED` |
 | `PROPOSED` | an admission check refuses it (`not-admitted`) | `CANCELED` |
-| `ADMITTED` | the launch-intent save (D5.1) | `RUNNING` |
-| `ADMITTED` | an input moved, or the step ended without it | `CANCELED` |
-| `RUNNING` | the launch ended with a reply the controller holds | `VERIFYING` |
-| `RUNNING` | the launch ended with no usable reply, or a crash left its outcome unknown | `RETRYABLE` |
-| `RUNNING` | an input moved and the controller stopped the launch (a read-only task, D7.4) | `CANCELED` |
-| `VERIFYING` | the controller's checks accept the result | `ACCEPTED` |
-| `VERIFYING` | the checks refuse it | `RETRYABLE` |
-| `VERIFYING` | an input moved while it was checked | `CANCELED` |
+| `ADMITTED` | its launch-intent save (D5.1), which allocates its attempt's `AttemptID` | `RUNNING` |
+| `ADMITTED` | an input its role's rule names moved (D7.3), or the step ended without it | `CANCELED` |
+| `RUNNING` | the launch ended with a reply the controller holds: the receipt (D4.1, stage 1) | `VERIFYING` |
+| `RUNNING` | the launch ended with no reply, or a crash left its outcome unknown | `RETRYABLE` |
+| `RUNNING` | an input its role's rule names moved, and the controller stopped the launch (a read-only task, D7.3) | `CANCELED` |
+| `VERIFYING` | the parse and every check passed, and the acceptance save holds it (D4.1, stages 4 and 5): for the producing task, the save of its phase plan | `ACCEPTED` |
+| `VERIFYING` | the parse or a check refuses the result (D4.1, stages 2 and 3) | `RETRYABLE` |
+| `VERIFYING` | an input its role's rule names moved before the acceptance save | `CANCELED` |
 | `RETRYABLE` | a bounded relaunch: a correction, a transient retry, D11's automatic relaunch, or the operator's `resume` | `RUNNING` |
-| `RETRYABLE` | an input moved, or the step ended without it | `CANCELED` |
+| `RETRYABLE` | an input its role's rule names moved, the step ended without it, or `unblock` re-entered its step (`unblocked`) | `CANCELED` |
 
 `RETRYABLE` means a relaunch would be legal by the existing rules, not that
 one will happen: with no bound left, the step stops through its existing
 sink and the task waits in `RETRYABLE` for the operator. A `CANCELED`
-task's output is never used, whatever it later turns out to have been.
+task's result is never accepted or used, whatever it later turns out to
+have been. What a canceled mutating task left in the worktree is the next
+launch's starting state, read (#187) and imported strictly like any
+leftover (D5.4), never its result.
+
+**A terminal task is never launched again.** A step that launches again
+after its producing task is terminal admits a new producing task, with the
+next ordinal. That happens after an `unblock` into the same step, which
+cancels the task still open there, and after a plan that a later read
+voided, so that the step asks again (ADR 0004 D4.7's `UPDATE_EPIC`
+rejection). Every attempt has its own `AttemptID` either way (D2.1).
+Corrections, transient retries and D11's relaunch are further attempts of
+the same task.
 
 **Persisted and derived.** The single-agent path persists nothing new.
-Every state of its one task is read from fields the state already holds,
-and `PROPOSED` never occurs, because the phase's entry admits its task by
-construction:
+Every state of its producing task is read from fields the state already
+holds. `PROPOSED` never occurs, because the phase's entry admits its task
+by construction. No `TaskID` is needed, because nothing in that path names
+a task (D2):
 
 | State | How it is read in the single-agent path |
 |---|---|
-| `ADMITTED` | an agent phase with `attempt == 0` |
+| `ADMITTED` | an agent phase with `attempt == 0`: the entry admitted its producing task, the first one or, after an `unblock` into the same step, a new one |
 | `RUNNING` | in the process that launched it: `attempt >= 1` and the launch under way |
-| `VERIFYING` | in that process: the reply under `_check_reply`; on disk: a `delivered_reply` not yet applied |
-| `ACCEPTED` | the phase's plan saved (`completion_context`), or the phase moved on through `decide_next_phase` |
+| `VERIFYING` | in that process: the reply from its receipt to the plan save (`_check_reply` parses and checks it, then the validation gates run); on disk: a `delivered_reply` not yet applied |
+| `ACCEPTED` | its result taken as the phase's: the phase's plan saved (`completion_context`), or the phase moved on from it through `decide_next_phase`, including to `BLOCKED` or `FAILED` when the result's own `status` asks for that |
 | `RETRYABLE` | on disk: `attempt >= 1`, no plan and no kept reply. A crash during `RUNNING` reads the same, and both resolve the same way: the entry's reconciliation, then a charged launch |
-| `CANCELED` | the phase moved on without an accepted result: the entry's reconciliation routed it elsewhere (a push by someone else turns `FIX` into `REVIEW`) |
+| `CANCELED` | the phase moved on without an accepted result: the entry's reconciliation routed it elsewhere (a push by someone else turns `FIX` into `REVIEW`), or `unblock` re-entered the phase, which restarts `attempt` at 0 for the new task |
 
 Under #319 a step holds tasks the existing fields cannot describe, so
 #332 persists each task's state, attempts and receipts (D19).
@@ -274,8 +385,9 @@ Under #319 a step holds tasks the existing fields cannot describe, so
 | Workflow | Task | How the two relate |
 |---|---|---|
 | an agent phase is entered | its producing task is `ADMITTED` | the entry admits it; under #319, the other tasks are admitted one by one |
-| the phase transitions | the producing task is `ACCEPTED`; every other open task is `CANCELED` (`step-concluded`) | the transition is still `decide_next_phase`'s |
-| `BLOCKED` | none | not a task state. Open tasks keep their last state; `unblock` re-enters a phase through `UNBLOCK_TARGETS`, and that entry reconciles them: a `RUNNING` task's outcome is unknown, so it is `RETRYABLE`, or `CANCELED` when the phase re-entered is another step |
+| the phase transitions from its result | the producing task is `ACCEPTED`; every other open task is `CANCELED` (`step-concluded`) | the transition is still `decide_next_phase`'s |
+| the entry's reconciliation routes the phase elsewhere | every open task is `CANCELED` (`step-concluded`) | no result was accepted; the next phase's entry admits its own task |
+| `BLOCKED` | none | not a task state. Open tasks keep their last state, and a crash's `RUNNING` reads as `RETRYABLE`. `unblock` re-enters a phase through `UNBLOCK_TARGETS`, which cancels every open task of the blocked step (`unblocked`). The phase re-entered then admits a new producing task, in the same step (the same `StepKey`, new `AttemptID`s, D2.1) or in another |
 | `FAILED` | none | terminal; no open task is resumed |
 | `AWAITING_INPUT` | none | reserved for #126 (D15) |
 
@@ -286,41 +398,120 @@ because its step cannot, and the step's stop is the workflow's.
 
 ### D4. `TaskResult` and `PhaseResult`
 
-1. **One producing task per step.** Only its accepted `TaskResult` is
-   handed to the phase's existing acceptance path (`_check_reply`, the
-   plan, the effects) as the `PhaseResult`. In the single-agent path the
-   two are one object, and `parse_control_result` stays its parser.
-2. **Another role's reply is never parsed as a phase result.** It is
-   framed with markers of its own, and each parser refuses the other's
-   markers in its input. A `CONTROL_RESULT` block in an ideator's reply is
-   therefore refused, not read. #332 defines the framing.
-3. **A `TaskResult` is bound to its attempt.** It carries the task and
-   attempt it answers and the input fingerprint it was launched with
-   (D7.3). One whose binding differs, or that arrives after its task was
-   `CANCELED`, is discarded and logged.
-4. **What a `TaskResult` may carry is closed per role:** a task proposal
-   (a Manager's, D7), a finding or counterexample claim (D7.6), the
-   worker's candidate, which the controller reads from the worktree as
-   today and never takes from the text, and Memory proposals (D9.8). It
-   never carries a phase, an effect, a GitHub write, a merge, a
-   permission, a budget change or a stop code.
-5. **It is bounded and redacted at parse,** as `CONTROL_RESULT` is today:
-   a block bound and per-field bounds, enforced by refusal, never by a
-   silent cut.
+**D4.1. Five stages, in order.** Each stage is separate. None is skipped,
+and none is inferred from a later one. A task is `VERIFYING` from stage 1
+until stage 4 accepts it or stage 2 or 3 refuses it (D3).
+
+1. **Receipt.** When a launch ends, the controller binds what it holds
+   to the attempt it launched: the reply, how the launch ended, and the
+   objects the launch left. The binding is the `AttemptID`, the task, the
+   role and the input fingerprint, all from the launch-intent save, none
+   from the reply's text. The strict import of those objects (ADR 0005
+   D6.5) belongs here. It reads what the launch delivered, not what the
+   reply says, and `_check_reply` runs it before the parse; tampering it
+   finds blocks the run, as today. Nothing else is decided yet. A launch
+   that ended with no reply has no receipt and is `RETRYABLE`.
+2. **Parse.** The role's parser makes a typed `TaskResult` of the reply,
+   strictly, bounded and redacted (D4.5), or refuses it. A refusal is a
+   parse outcome, not a verification: the task is `RETRYABLE`, and the
+   correction quotes the refused reply as today (#393). For the producing
+   task the parser is `parse_control_result`, unchanged.
+3. **Verification.** The controller runs its checks of the parsed result,
+   and each check is its own. For the producing task they are the phase's
+   checks of the candidate, comment or plan, which `_check_reply` runs
+   after its parse. The validation gates follow (ADR 0006 D5). For another role they are its role's checks: the
+   binding (D4.3), D7.3's invalidation rule, and D7.6's reproduction.
+   Records are saved as they are made (ADR 0006), and so is the Memory
+   derived from them (D11). A refusal makes the task `RETRYABLE`.
+4. **Task acceptance.** Once every check has passed, the task is
+   `ACCEPTED` in the next save that records it, after D7.3's last
+   comparison. A task other than the producing one is accepted in a save
+   of its own (#332). Its result then becomes an input of later tasks and
+   of the reducer, never a phase result.
+5. **Phase-plan acceptance.** The producing task's accepted `TaskResult`
+   is the `PhaseResult`. Its stage 4 is this stage's save: the phase plan
+   (completion context and `intended` effects), the task `ACCEPTED` and
+   the result's Memory proposals (D9.8), in one save. So no crash leaves
+   a producing task accepted without its plan, or a plan without its task.
+   The effects and the transition follow, as today.
+
+In the single-agent path, `_check_reply` spans stages 1 to 3: the strict
+import, then the parse, then the phase's checks. The plan save is stages 4
+and 5. A reply delivered before a failed launch end
+is kept after its checks (ADR 0012 D12). That kept reply is a saved
+receipt still at stage 3, re-checked after a restart. No launch path
+changes.
+
+**D4.2. Another role's reply is never parsed as a phase result.** It is
+framed with markers of its own, and each parser refuses the other's
+markers in its input. A `CONTROL_RESULT` block in an ideator's reply is
+therefore refused, not read. #332 defines the framing.
+
+**D4.3. A result is bound by the controller, not by its text.** The
+receipt's binding comes from the launch-intent save. An agent has no value
+of its own that the controller could trust to name a task or an attempt,
+and the reply is asked for none. Where a role's schema asks for an echo, it
+is checked against what the controller holds, and a mismatch is refused.
+The parser refuses a wrong `phase` from the producer. The phase's checks
+refuse a wrong `previous_head_sha` in a `FIX` result. A receipt whose task
+is `CANCELED`, or whose `AttemptID` is not its task's last attempt, is
+discarded and logged. That covers a reply that arrives after its task was
+canceled, and a reply of a launch from before an `unblock`.
+
+**D4.4. What a `TaskResult` holds is closed per role.**
+
+- **The producing task's result is the phase's `CONTROL_RESULT`,** in the
+  schema the phase holds today, `phase` and `status` included.
+  - Its `phase` is the binding echo of D4.3: `parse_control_result`
+    refuses any value but the launched phase ("phase mismatch"), so the
+    field names the phase the controller launched and never requests
+    one.
+  - Its `status` and its other fields are claims the phase's existing
+    routing and checks read, as today. That includes a result asking for
+    `BLOCKED` or `FAILED`, and what `FIX` asks the controller to publish
+    (follow-ups, acceptance and operator actions, a PR description).
+  - The candidate is read from the worktree, and its SHA field is checked
+    against it.
+  - What the controller writes is still decided by the phase's plan, and
+    the transition by `decide_next_phase`.
+  - Agent Memory proposals, if the MVP takes them, are one bounded
+    optional field more, a prompt and schema change (D9.8, D19).
+- **Every other role's result** carries what its role may claim and
+  nothing else: a task proposal (a Manager's, D7), a finding or
+  counterexample claim (D7.6), an approach (an ideator's), and Memory
+  proposals (D9.8). It has no `phase` and no `status` that routes the
+  workflow. It names no candidate, effect, GitHub write, merge,
+  permission, budget change or stop code. A field outside its schema is
+  refused at parse.
+
+**D4.5. Bounded and redacted at parse,** as `CONTROL_RESULT` is today: a
+block bound and per-field bounds, enforced by refusal, never by a silent
+cut.
 
 ### D5. Launch intent and the attempt protocol
 
 **D5.1. Before a launch, one save.** It holds the attempt number, the step
-charge, the launch label and the entry observation, as today; under #319
-also the task, its role, its profile and its input fingerprint. Nothing
-is launched before that save is durable.
+charge, the launch label and the entry observation, as today. From D19.2
+on it also allocates the attempt's `launch_seq` (D2.1). Under #319 it also
+holds the task, its role, its profile and its input fingerprint (D7.3).
+Nothing is launched before that save is durable.
 
 **D5.2. After a launch, a reply is kept before anything follows from it,
-in two cases.** A reply delivered before a failed end is kept today (ADR
-0012 D12). Every attempt of a #319 task keeps its `TaskResult` receipt
-(the validated, bounded result object, its digest and its binding) in the
-save that ends `RUNNING`, so a restart re-checks the receipt and launches
-nothing.
+in two cases.** A reply delivered before a failed end is kept today, after
+its checks (ADR 0012 D12). Under #319, every task attempt keeps its
+receipt, after its parse (D4.1, stage 2), in the save that first records
+it on disk as past `RUNNING`.
+The receipt holds:
+
+- its binding;
+- the reply's digest;
+- either the parsed, bounded and redacted `TaskResult`, or the code of
+  its parse refusal.
+
+It never holds the raw reply. A restart re-verifies a parsed receipt and
+launches nothing for it. A refusal's receipt leads to the correction the
+refusal earned. The correction carries no quote of the reply, because the
+quote is never persisted (#393).
 
 **D5.3. Single-agent parity.** A clean exit's reply to a phase task is
 checked in process, and not saved before its checks. A crash in that
@@ -360,13 +551,16 @@ This record ratifies the types at this level; #332 owns the encodings.
 ReducerInput                 frozen and typed; no agent text beyond bounded typed fields
   run_id, step               RunID and StepKey (D2)
   tasks                      per task: id, role, state, prerequisites, input fingerprint,
-                             attempts, how its last attempt ended (typed), receipt digest
+                             its AttemptIDs, how its last attempt ended (typed), the
+                             D4.1 stage its last receipt reached, receipt digest
   policy                     PolicySnapshot (D2), the role table, D7.2's bounds
   capabilities               per routed profile: D14's proof, the interaction
                              capabilities (ADR 0007 D5.3), whether its launch is
                              enforced (ADR 0005), whether D7.4's read-only class exists
-  verification               candidate checks, import outcomes, and the ValidationRecords
-                             of the candidates in play under the frozen plan (D7.5)
+  verification               the step's current candidate (D7.3), candidate checks,
+                             import outcomes, the ValidationRecords of the candidates
+                             in play, and each one's independent outcome under the
+                             frozen plan: verified, failed, inconclusive or not-run (D7.5)
   budgets                    step_count and workflow.max_total_steps, the step's
                              attempts and D11 allowance, launches per role
 
@@ -420,17 +614,101 @@ transition, every candidate identity and the merge stay the controller's.
 A Manager's proposal stays `PROPOSED` until then. A Manager cannot admit,
 cancel, accept or order a task.
 
-**D7.3. Input fingerprints are immutable.** A task's fingerprint covers the
-base, the pinned candidate it reads (commit and tree), the read context's
-digest, the Memory revision and digest it was shown, the prompt template's
-digest, and the receipts of its prerequisites. If any of these moves before
-the task is accepted, the task is `CANCELED` (`stale-input`).
+**D7.3. A fingerprint records what an attempt was launched with.
+Staleness is a rule per role.**
+
+- **The fingerprint is immutable.** It is saved in the attempt's
+  launch-intent save and never rewritten. It holds:
+  - the step's base and the entry observation;
+  - the candidate the attempt starts from (commit and tree): for the
+    worker, the step's current candidate, or the base when there is
+    none; for a read-only task, the candidate it is pinned to;
+  - the frozen plan's digest (D7.5);
+  - the read context's digest;
+  - the Memory revision and digest of its projection;
+  - the prompt template's digest;
+  - the receipts of its prerequisites, each `ACCEPTED` before it was
+    admitted.
+
+  A relaunch is a new attempt with a fingerprint of its own. The
+  fingerprint answers what the attempt was shown, and receipts and the
+  reducer cite it. It is not by itself a staleness test: a value that
+  moves after the launch matters only where the role's rule below names
+  it.
+- **The step's current candidate is controller state.** It is the
+  candidate the controller last recorded for the step from a producer
+  attempt's output: imported strictly and accepted by the phase's
+  candidate check (ADR 0006 D2.4). It is set in a save, never by a commit
+  landing in the worktree. While the worker's attempt runs, its commits
+  change the worktree, not the current candidate.
+- **What makes a task stale, by role:**
+
+  | Role | Stale when, against the current values | Never stale because of |
+  |---|---|---|
+  | producer (the mutating worker) | the step's base or its entry observation moved (the entry's reconciliation finds it, as today: a push by someone else turns `FIX` into `REVIEW`), or the frozen plan's digest differs | its own commits; the current candidate moving to its own output; the records of its candidate's verification; any Memory revision, including records derived from its own verification; a read-only task's result |
+  | read-only (manager, ideator, verifier) | the step's current candidate is no longer the one it is pinned to; the base or the entry observation moved; the frozen plan's digest differs | any Memory revision; the records of its pinned candidate's verification; the worker's commits to the live worktree before the controller records them |
+
+- **Memory never makes a task stale.** Memory is advisory (D1), and no
+  task's state is decided on it. The revision in a fingerprint is
+  provenance. A record retracted after a launch disappears from the next
+  launch's projection (D12), and the claim an attempt returns is verified
+  on its own terms (D7.6), not on what the attempt was shown.
+- **Comparison points.** The engine holds the issue lock (D5.5) and
+  compares a task's stale-making inputs with the checkpoint's current
+  values at three points:
+  1. at admission;
+  2. in the launch-intent save;
+  3. in the acceptance save (D4.1, stage 4).
+
+  A move found at point 1 or 2 cancels the task (`stale-input`), and
+  nothing is launched. A move found at point 3 cancels it instead of
+  accepting it. Between the points, a running read-only launch whose
+  pinned candidate stops being current is stopped (`RUNNING` to
+  `CANCELED`). That saves a launch's cost and is not what makes the rule
+  hold: point 3 holds whenever the launch ends.
+- **Concurrency rules.** Only a save moves the step's base, its current
+  candidate or its frozen plan. The current candidate moves only to a
+  producer attempt's checked output. The save that moves it also cancels
+  every open read-only task pinned to the previous candidate, so the
+  cancellation is never apart from the move on disk. A read-only result
+  moves nothing but its own task's state. Read-only tasks read an
+  immutable export of their pinned candidate's objects, never the live
+  worktree (D7.4).
+
+*Scenarios.* #319 and #332 owe these as tests with fakes (§4.2). B is the
+step's base.
+
+1. **A successful producer.** The worker's attempt is launched from B,
+   shown Memory revision r3. While it runs it commits C1, then C2, and
+   nothing it is compared on moves. It replies, and its reply is parsed
+   (stage 2). The candidate check imports C2, and a save records C2 as
+   the step's current candidate (stage 3). The current candidate moved
+   from none to C2, but that is the producer's own output. The acceptance
+   save compares B, the entry observation and the plan's digest, finds
+   them unchanged, and accepts the task with its plan (stages 4 and 5).
+2. **Its verification-derived Memory write.** The frozen plan's
+   `ValidationRecord` for C2 is saved together with the layer 2 record
+   derived from it, which makes Memory revision r4 (D11). The producer was
+   shown r3, and r3 to r4 makes no task stale. Had C2 failed, the task
+   would be `RETRYABLE`. Its relaunch would then be a new attempt whose
+   fingerprint records r4 and starts from C2, while the first attempt's
+   fingerprint still records r3.
+3. **Genuinely stale read-only work.** Take scenario 2's other branch:
+   C2 failed, and the worker's task is `RETRYABLE`. Ideator I1 is pinned
+   to C2 and runs while the worker's relaunch runs. The relaunch's output C3
+   passes the candidate check, and the save that records C3 as current
+   also cancels I1 (`stale-input`). The engine stops I1's process. A reply
+   from I1, if one arrives, binds to a canceled task and is discarded
+   (D4.3). Ideator I2, also pinned to C2, replied and was verified before
+   C3 was recorded. It was accepted in a save in which C2 was current, so
+   it stays `ACCEPTED`, and the reducer's input says its result is about
+   C2, not C3.
 
 **D7.4. One mutating worker.** At most one task of a step writes the
 worktree, and it is the producing task. Read-only tasks read an immutable
 export of a pinned candidate, never the live worktree, and may run while
 the worker does. A read-only result is accepted only while its pinned
-candidate is still the step's current candidate.
+candidate is still the step's current candidate (D7.3, point 3).
 
 Read-only is enforced, not asked for. Read-only roles run in a launch class
 of their own (an ADR 0005 amendment by #319, shaped like ADR 0012 D7's
@@ -442,28 +720,119 @@ unisolated launch: a prompt that says "do not write" is logical isolation.
 So multi-agent execution needs a Linux host that can enforce the sandbox,
 and has no macOS support.
 
-**D7.5. The verification plan is frozen at the step's entry.** It is the
-trusted definitions from configuration (ADR 0006 D3), bound by their
-digests, and no role can change it. A definition runs the candidate's own
-tests, which the worker can edit, so a pass alone does not show the
-candidate left its checkers alone. A candidate counts as independently
-verified (D7.7) only when the same definitions also pass with the step
-base's existing test files laid over it, its added test files kept, as the
-evaluation's pristine run does (evaluation protocol §3.4). The
-single-agent path's validation is unchanged.
+**D7.5. Independent verification: a frozen plan, checker inputs from the
+base, and outcomes that are not a pass.** Ordinary validation (ADR 0006)
+is unchanged, and so is the single-agent path's. It runs the trusted
+definitions in a byte-exact export of the candidate. That export holds
+the candidate's own tests, configuration and runner hooks, all of which
+the worker can edit. Independent verification is a second, stricter
+question that #319 asks of a candidate: does it pass checkers the agent
+could not touch? It has four outcomes, and only one of them counts.
+
+1. **The plan is frozen at the step's entry.** It is the definitions of
+   the trusted configuration (ADR 0006 D3) that declare themselves
+   independent, a declaration #319 adds to ADR 0006's definitions. Each
+   such definition binds three things in its `definition_digest`:
+   - its argv;
+   - its checker inputs;
+   - its report contract.
+
+   The plan's digest binds the set. The plan is read from configuration
+   only (ADR 0006 D3.4), and no role can change it.
+2. **Every checker input comes from the base.** A definition declares, as
+   path patterns, every file its checkers read besides the code under
+   test:
+   - the tests and their fixtures;
+   - every file the runner loads before or around them. For pytest that
+     is every `conftest.py` at any depth, `pytest.ini`, `pyproject.toml`,
+     `setup.cfg`, `tox.ini` and plugin modules;
+   - the interpreter's start-up hooks (`sitecustomize.py`,
+     `usercustomize.py`, `*.pth`);
+   - every path its argv names.
+
+   An independent definition that declares none is refused at load
+   (D18).
+
+   The base here is a revision no agent wrote. For `ANALYZE_EXECUTE` it
+   is the default branch revision the entry observation required. For
+   `FIX`, when it follows (D13), it is the PR's merge base, never the PR
+   head, which an earlier agent wrote.
+
+   The run's tree is the candidate's tree with every path that matches a
+   pattern replaced from the base. A path the base holds keeps the base's bytes,
+   and a path the base lacks is removed. So the candidate's edits,
+   deletions and additions to its checkers never reach the run: a changed
+   `pyproject.toml`, an edited test, or a new `conftest.py` that skips the
+   base's tests. The candidate contributes only what matches no pattern,
+   the code under test. The evaluation's protected paths (evaluation
+   protocol §3.4) are the model. The controller records every
+   checker-input path the candidate changed (`checker-altered`), whatever
+   the outcome.
+3. **A pass is read from a report, never from the exit code alone.**
+   - **The report.** Each independent definition names a report format
+     the controller parses (#319 names the formats, JUnit XML first). The
+     run writes it to a path the controller supplies outside the run's
+     tree, and the controller reads it back.
+   - **The baseline.** Before the step's first independent run, the plan
+     runs once on the base itself, and the tests the base's report lists
+     as passed are saved as the baseline.
+   - **What passes.** A candidate's run passes when four things hold.
+     Every definition exits 0. Every report parses. The reports hold at
+     least one test. And every test in the baseline is reported as passed:
+     none is missing, skipped, deselected, expected to fail or in error.
+     A test that failed or was skipped on the base is reported, and not
+     required.
+4. **Outcomes.**
+   - `verified`: every definition of a non-empty plan passed by item 3.
+   - `failed`: a definition or a baseline test failed, on a candidate
+     that changed no checker input.
+   - `inconclusive`: anything else. That covers a report that is missing
+     or does not parse, an empty report, and a baseline test that is
+     missing, skipped, deselected, expected to fail or in error. It covers
+     a timeout and an interrupted run (ADR 0006's marker), and a baseline
+     that could not be recorded or lists no passed test. It also covers a
+     failure on a candidate whose checker inputs were replaced, since that
+     failure may be the replacement's.
+   - `not-run`: the plan is empty. `validation.commands` is empty by
+     default, and an empty set, which is complete evidence for ordinary
+     validation (ADR 0006 D3.6), is never independent verification.
+
+   Only `verified` counts, for D7.6 and D7.7. The step's conclusion and
+   the reducer's input name the outcome. `not-run` and `inconclusive` are
+   never rendered, logged or reported as a pass.
+5. **An empty plan with roles is refused.** A configuration that enables
+   #319's roles while its plan holds no independent definition is refused
+   at load (D18). Without one, no counterexample could ever be reproduced
+   (D7.6) and no candidate ever kept (D7.7).
+6. **The residual.** Code under test runs inside the process that tests
+   it, and it can subvert that process at run time. It can patch the
+   runner, rewrite its report, or exit 0 early. Taking the checker inputs
+   from the base keeps the candidate's *files* out of the checkers. It
+   cannot keep the candidate's *code* out of the process. The baseline
+   catches the plain forms: a missing or skipped test, and an empty or
+   absent report. It does not catch a forged report that lists the right
+   tests as passed. `verified` therefore means that the candidate passed
+   the base's checkers under the base's configuration, and that every
+   test that passed on the base was reported passing. It does not prove
+   the candidate honest. The review (D7.9) stays the independent
+   judgment, and the merge gate is unchanged.
 
 **D7.6. A counterexample is a claim.** One an ideator or verifier reports
 is unverified until the controller reproduces it, by running a definition
-of the frozen plan on the pinned candidate and recording the failure. A
-test the agent wrote that agrees with its own output proves nothing (the
-evaluation's `invented_expected_answer` fixture).
+of the frozen plan on the pinned candidate in D7.5's tree and recording
+the failure (`failed`). A test the agent wrote that agrees with its own
+output proves nothing (the evaluation's `invented_expected_answer`
+fixture), and D7.5's tree never runs it. An `inconclusive` or `not-run`
+reproduction leaves the counterexample unverified.
 
 **D7.7. The last independently verified candidate is kept.** The controller
-records the step's last candidate that D7.5 counts as independently
-verified, with its records. A later candidate never erases it. Whether the step concludes with
-it after a regression is #332's policy, and never silent: the conclusion
-names its candidate. How its objects stay reachable when AutoForge creates
-no local branch is open (§5).
+records the step's last candidate whose outcome is `verified` (D7.5), with
+its records. A later candidate never erases it, and no other outcome ever
+makes one. With no `verified` candidate, the step has none to keep, and its
+conclusion says so. Whether the step concludes with the kept candidate
+after a regression is #332's policy, and never silent: the conclusion names
+its candidate and that candidate's outcome. How its objects stay reachable
+when AutoForge creates no local branch is open (§5).
 
 **D7.8. No second scheduler.** Tasks run inside the per-issue engine, under
 its locks (ADR 0008's L0, L2 and L1). No daemon, queue or cross-issue
@@ -517,8 +886,8 @@ refused candidate, a typed launch end, an agent's note and an operator's
 seed); its provenance (`controller`, `agent` or `operator`) and trust
 (`observed`, `proposed` or `operator`); bounded, redacted text; a citation,
 required when observed; its applicability (the phases, and the candidates:
-exactly one commit, descendants of a base, or any); the step and attempt
-that created it; a status (`current`, `superseded` or `retracted`); and
+exactly one commit, descendants of a base, or any); the `StepKey` and the
+`AttemptID` that created it (D2.1), never `state.attempt`; a status (`current`, `superseded` or `retracted`); and
 its lineage.
 
 **D9.3. Live GitHub and CI state is not memory.** Whether a PR is open, a
@@ -558,8 +927,10 @@ A write past a bound is refused and counted; nothing is evicted silently.
 by its citation, so deriving it again adds nothing.
 
 **D9.8. Agent proposals come only from an accepted result:** the phase's
-plan save, or an accepted `TaskResult`. A refused, corrected or lost reply
-leaves nothing in Memory. The MVP may ship without agent proposals, and
+plan save, or an accepted `TaskResult` (D4.1, stages 4 and 5). A refused,
+corrected or lost reply leaves no agent proposal in Memory. What the
+controller observed while checking it, a failed validation for example, is
+its own observed record, saved with its citation (D11). The MVP may ship without agent proposals, and
 then the `CONTROL_RESULT` schema does not change; the contract above holds
 either way.
 
@@ -618,18 +989,25 @@ rather than failing a launch, and the MVP has none.
 
 One attempt, each stage durable before the next begins:
 
-1. **Budget and intent:** one save (D5.1).
+1. **Budget and intent:** one save (D5.1). It charges the step, allocates
+   the `AttemptID` and, under #319, records the fingerprint.
 2. **The launch.** The agent's commits land in the worktree, or in a
    container launch's exported artifact.
-3. **The reply,** held in process; kept in the checkpoint for a failed end
-   (ADR 0012 D12) and, under #319, for every task attempt (D5.2).
-4. **Verification:** the strict import, the candidate checks and each
-   `ValidationRecord` (each its own save, under ADR 0006's markers). A
-   layer 2 record derived from a record is saved in the same save as the
-   record it cites.
-5. **Acceptance:** the phase plan (completion context and `intended`
-   effects), the task `ACCEPTED`, and the accepted result's Memory
-   proposals: one save.
+3. **Receipt and parse** (D4.1, stages 1 and 2). A clean exit's reply is
+   held in process. A failed end's reply is kept in the checkpoint after
+   its checks (ADR 0012 D12). Under #319, every attempt's receipt is saved
+   after its parse (D5.2).
+4. **Verification** (stage 3). This is the strict import, then the
+   candidate checks, then each `ValidationRecord`, each in its own save
+   under ADR 0006's markers. Under #319 the save that records the step's
+   current candidate (D7.3) comes between the checks and the records,
+   and the independent run (D7.5) comes after the records. A layer 2
+   record derived from a record is saved in the same save as the record it
+   cites, and it makes no task stale (D7.3).
+5. **Acceptance** (stages 4 and 5). For the producing task this is one
+   save: the phase plan (completion context and `intended` effects), the
+   task `ACCEPTED`, and the accepted result's Memory proposals. Another
+   task is accepted in a save of its own, after D7.3's last comparison.
 6. **The effects,** through ADR 0004's journal, then the transition save.
 
 **The checkpoint wins.** What is not in the last saved `state.json` did not
@@ -644,7 +1022,7 @@ reads with today's checks, and never adopts because it is there.
 | checkpoint and attempt result | the reply is outside the checkpoint until kept | the checkpoint. A reply not kept is lost and its attempt stays charged. Nothing reads `stdout.log` or `events.jsonl` to recover one |
 | checkpoint and budget | the budget is in the checkpoint, charged before the launch | no window. The count can be one launch too high (a crash between the save and the start), never too low |
 | Memory and candidate | a record bound to a candidate cites its commit and tree | the candidate: a record whose candidate is not the step's current one is not applicable (D12) |
-| Memory and attempt result | Memory from a result is saved with its acceptance | neither without the other: a lost or refused reply leaves no Memory |
+| Memory and attempt result | a result's Memory proposals are saved with its acceptance; what the controller observed while checking it is saved with the record it cites (stage 4) | neither without the other: a lost or refused reply leaves no agent proposal. A failed validation or a refused candidate is the controller's own observed record, saved with its citation |
 | Memory and budget | a Memory write launches nothing | neither: Memory's byte bound refuses a write, and it never charges or refunds a launch |
 | candidate and attempt result | both outside the checkpoint until saved | neither: the next launch is told of the worktree's state, and the reply is lost |
 | candidate and budget | the budget first | the budget: the launch that made the candidate was charged |
@@ -654,31 +1032,34 @@ The crash windows of one attempt, and what the next command does:
 
 | Window | On disk | The next command | Launches | Memory |
 |---|---|---|---|---|
-| W1. before the intent save | as before the step | the step as if new | the step's first, charged then | unchanged |
-| W2. after the intent save, before the process starts | the attempt charged | the entry's reconciliation, then a charged launch | one more | unchanged |
-| W3. while the agent runs | the attempt charged; the worktree may hold commits | the lock, the worktree's state, the strict import, the entry's reconciliation, a charged launch told what the worktree holds | one more | unchanged: nothing was observed |
-| W4. the reply received, not kept (a clean exit) | as in W3 | as in W3 (D5.3) | one more | unchanged |
-| W5. the reply kept, under verification | the kept reply or receipt; a validator's marker, perhaps | the reply re-checked; an interrupted validator recorded (ADR 0006) | none | the records saved with each verification record |
-| W6. verified, before the plan save | the records | the kept reply re-checked, or W4's relaunch, reusing the same candidate's records | none, or W4's | the records derived from them, already saved |
-| W7. the plan saved | the plan and its `intended` effects | the journal completes the effects | none | the accepted result's proposals, already saved |
+| W1. before the intent save | as before the step; no `AttemptID` spent | the step as if new | the step's first, charged then | unchanged |
+| W2. after the intent save, before the process starts | the attempt charged, its `AttemptID` spent with no receipt | the entry's reconciliation, then a charged launch with the next `AttemptID` | one more | unchanged |
+| W3. while the agent runs | as in W2; the worktree may hold commits | the lock, the worktree's state, the strict import, the entry's reconciliation, a charged launch with the next `AttemptID`, told what the worktree holds | one more | unchanged: nothing was observed |
+| W4. the reply received, not kept (a clean exit: stages 1 to 3 run in process) | as in W3 | as in W3 (D5.3) | one more | unchanged |
+| W5. the reply kept before acceptance: a failed end's reply after its checks (ADR 0012 D12); under #319, a receipt after its parse | the kept reply or receipt; a validator's marker, perhaps | the kept reply re-checked, the receipt re-verified (a parse refusal's receipt: its correction); an interrupted validator recorded (ADR 0006) | none, or the correction's | the records saved with each verification record |
+| W6. verified, before the acceptance save | the records | the kept reply or receipt re-checked, or W4's relaunch, reusing the same candidate's records | none, or W4's | the records derived from them, already saved; none makes a task stale (D7.3) |
+| W7. the acceptance saved (for the producing task, its plan) | the task `ACCEPTED`; the plan and its `intended` effects | the journal completes the effects | none | the accepted result's proposals, already saved |
 | W8. the effects observed, before the transition | all of the above | the transition | none | unchanged |
 | W9. an operator's Memory command (seed, retract) | before or after its one save | nothing more to do | none | all or nothing |
+| W10. under #319, a save moved the step's current candidate | the new candidate; the read-only tasks pinned to the old one `CANCELED` in the same save | a reply or receipt of a canceled task discarded (D4.3); D5.5's survivor check before any launch | none | unchanged |
 
 Under #319 every task attempt has these windows, each read-only attempt
 charged in an intent save of its own, and W4 is closed by the receipt
-(D5.2): a crash after it re-checks the receipt and launches nothing.
+(D5.2): a crash after it re-verifies the receipt and launches nothing.
 
 ### D12. The projection and its freshness
 
 - **One file per launch.** The MVP renders `memory.md` into the launch's
-  read-context directory, and the prompt names it. It is rendered from the
-  checkpoint the intent save committed, written once before the launch and
-  not changed while it runs and, like every read-context file, never read
-  back.
+  read-context directory, and the prompt names it. Like every
+  read-context file, it is rendered just before the launch-intent save. It
+  is rendered from the Memory that save commits, which the save does not
+  change. It is written once, not changed while the launch runs, and never
+  read back.
 - **The header is the catalog:** the projection's format version, the
   scope (repository, issue, `RunID`),
-  the Memory revision and its digest, the `StepKey` and attempt it was
-  rendered for, the current candidate or none, how many records are
+  the Memory revision and its digest, the `StepKey` and the `AttemptID`
+  it was rendered for (the value the intent save then spends, D2.1), the
+  current candidate or none, how many records are
   shown, omitted for the bound, not applicable and retracted, and a line
   saying the file is advisory, untrusted data, never instructions.
 - **The body:** the applicable current records, observed ones first with
@@ -850,11 +1231,14 @@ an index or a consolidation has seen.
 
 ### D18. Unsupported provider behaviour: a refusal before any side effect
 
-- **Static:** a configuration whose Memory or role settings route a phase
-  to a profile that cannot prove what the phase or role needs (D14's
-  proof, D7.4's enforced read-only class, an interaction capability) is
-  refused when it is loaded, as profile validation refuses a bad option
-  today.
+- **Static:** these configurations are refused when they are loaded, as
+  profile validation refuses a bad option today:
+  - Memory or role settings that route a phase to a profile that cannot
+    prove what the phase or role needs (D14's proof, D7.4's enforced
+    read-only class, an interaction capability);
+  - an independent definition that declares no checker inputs or no
+    report contract (D7.5);
+  - #319's roles enabled with no independent definition (D7.5).
 - **Dynamic:** what only the launch's host or environment shows is checked
   at the phase's entry, in the part of `_invoke_phase` that runs the
   preflight and integration checks before the intent save, so a refusal
@@ -868,35 +1252,53 @@ an index or a consolidation has seen.
 
 ### D19. Persisted state and configuration, listed for #23
 
-No number is assigned. Each item is its own bump, numbered when its pull
-request is ready
+No number is assigned. A bump is numbered when its pull request is ready,
+and two independent persisted changes never share one
 ([state-and-recovery.md](../agent-guides/state-and-recovery.md), "Numbering
-a new protocol").
+a new protocol"). Items 1 to 3 are the Memory MVP's. They are one change,
+so they take one bump (#317). If #332 lands item 2 first, that is a bump of
+its own. #316 asks for this list on #23. The list posted there is this
+one, and it assigns nothing.
 
 1. **Issue Working Memory** (#317, #333): one field of the state. A file of
    the previous protocol loads with empty Memory; an older-labelled file
    that carries the field is refused; a file of the new protocol carries
    it, empty when Memory is off.
-2. **The run's Memory setting,** recorded with the run (in
+2. **The launch ordinal `launch_seq`** (D2.1): a run-wide counter that
+   each launch-intent save increments and nothing resets. A file of the
+   previous protocol loads with `launch_seq` equal to its `step_count`; an
+   older-labelled file that carries the field is refused; a file of the
+   new protocol carries it.
+3. **The run's Memory setting,** recorded with the run (in
    `config_fingerprint` or beside it), so that no later command switches a
    run's arm without `--accept-config-change`. The evaluation needs this
    to show a run's settings.
-3. **The task table** (#332, #319): tasks, attempts, input fingerprints,
-   receipts, and the last verified candidate.
-4. **Every reply kept,** if #332 closes D5.3's window: an extension of
+4. **The task table** (#332, #319). It holds:
+   - the tasks, with each step's ordinal counter (D2);
+   - the attempts, by `AttemptID`;
+   - the input fingerprints (D7.3);
+   - the receipts: the binding, the reply's digest, and the parsed result
+     or the code of its parse refusal (D5.2);
+   - the step's current candidate;
+   - the frozen plan's baseline and each candidate's independent outcome
+     (D7.5);
+   - the last verified candidate (D7.7).
+5. **Every reply kept,** if #332 closes D5.3's window: an extension of
    `delivered_reply`'s contract.
 
 Coordinated, though not state: a `memory:` configuration section is
 classified in `tests/evaluation.py` as a Memory arm's treatment (evaluation
 protocol §4.1); the prompt change that names `memory.md` moves
 `prompt_version`, which is an evaluation amendment (§11); #319's read-only
-launch class amends ADR 0005; and a new stop code amends ADR 0011.
+launch class amends ADR 0005; D7.5's declarations on a validation
+definition (independent, its checker inputs, its report contract) amend
+ADR 0006 and enter its digests; and a new stop code amends ADR 0011.
 
 ### D20. What the Memory MVP needs
 
 | Needs | Does not need |
 |---|---|
-| one state field and one bump (D19.1, D19.2) | #332's reducer or task table |
+| two state fields and a recorded setting, in one bump (D19.1 to D19.3) | #332's reducer or task table |
 | the existing atomic save and strict loader (D10) | #319's roles, or D7.4's launch class |
 | a deterministic render into the read context (D12) | #324, #325 or #326; SQLite, FTS5 or LTSearch; an embedding service |
 | D14's proof from `claude`, `opencode` or `pi`, refused otherwise (D18) | an SDK-only provider |
@@ -955,31 +1357,72 @@ this record relies on.
 
 Each is a deterministic test with fakes, offline, in `make check`.
 
-- **#317 and #333 (Memory):** with Memory off, prompts and effects are
-  byte-identical to today's; a seed's digest survives the round trip; each
-  crash window of D11 leaves Memory as its table says; a retraction or
-  correction shows at the next launch and never comes back; a tombstoned
-  digest is refused; a record for another candidate or phase is omitted
-  and counted; the projection's and the store's bounds hold, and a write
-  past one is refused; a refused or lost reply leaves no proposal; no
-  module that decides a phase, write, budget or merge imports Memory; a
-  profile without D14's proof is refused before any save; and the
-  evaluation's owed fixtures: obsolete, current, conflicting and corrected
-  memory, volatile GitHub state, scope boundary, a negative debugging
-  lesson, a hallucinated lesson, a prompt-injection string, and an
-  incomplete index watermark.
-- **#332 (the reducer):** purity (the same input, the same proposals);
-  totality; every proposal refused by the engine's checks changes nothing;
-  every row of D3's table and no other transition; each D11 window for a
-  persisted task; parity of the single-agent path through the reducer.
-- **#319 (roles):** timeout, crash, canceled work, tampering and candidate
-  drift for each role; a cycle and every bound refused at admission; a
-  read-only role refused under `disabled` and enforced under `required`;
-  a stale read-only result canceled; a `CONTROL_RESULT` block in a role's
-  reply refused; a counterexample unverified until reproduced; a candidate
-  that passes only with its own edited copy of an existing test not
-  counted as verified; the last verified candidate kept through a
-  regression; a Manager unable to admit, accept or cancel.
+- **#317 and #333 (Memory):**
+  - with Memory off, prompts and effects are byte-identical to today's;
+  - a seed's digest survives the round trip;
+  - each crash window of D11 leaves Memory as its table says;
+  - a retraction or correction shows at the next launch and never comes
+    back, and a tombstoned digest is refused;
+  - a record for another candidate or phase is omitted and counted;
+  - the projection's and the store's bounds hold, and a write past one is
+    refused;
+  - a refused or lost reply leaves no agent proposal, while the
+    controller's own observation of it is kept with its citation;
+  - no module that decides a phase, write, budget or merge imports Memory;
+  - a profile without D14's proof is refused before any save;
+  - D2.1's regression scenario: an `unblock` back into the same step
+    gives the next launch a new `AttemptID`, and a record of the first
+    launch names the first launch's `AttemptID`, not the second's;
+    `launch_seq` survives a crash, `resume`, `unblock` and an issue switch;
+    a file of the previous protocol loads with `launch_seq` equal to its
+    `step_count`;
+  - the evaluation's owed fixtures: obsolete, current, conflicting and
+    corrected memory, volatile GitHub state, scope boundary, a negative
+    debugging lesson, a hallucinated lesson, a prompt-injection string,
+    and an incomplete index watermark.
+- **#332 (the reducer and the task table):**
+  - purity (the same input, the same proposals) and totality;
+  - every proposal refused by the engine's checks changes nothing;
+  - every row of D3's table and no other transition;
+  - D4.1's stages kept apart:
+    - a parse refusal, a check refusal and a binding mismatch each leave
+      the task `RETRYABLE` with no plan;
+    - a producing task is never `ACCEPTED` outside its plan's save;
+    - a non-producing task is never handed to the phase's plan;
+  - the producer's `CONTROL_RESULT` keeps its schema, and a `phase` other
+    than the launched one is refused at parse;
+  - each D11 window for a persisted task, W10 included;
+  - D2.1's regression scenario for a persisted task: the canceled task's
+    receipt is discarded, and the new task has the next ordinal;
+  - parity of the single-agent path through the reducer.
+- **#319 (roles):**
+  - timeout, crash, canceled work, tampering and candidate drift for each
+    role;
+  - a cycle and every bound refused at admission;
+  - a read-only role refused under `disabled` and enforced under
+    `required`;
+  - D7.3's three scenarios: a successful producer, its verification-derived
+    Memory write, and stale read-only work, canceled in the save that moves
+    the current candidate;
+  - a `CONTROL_RESULT` block in a role's reply refused;
+  - a counterexample unverified until reproduced, and still unverified
+    when its reproduction is `inconclusive` or `not-run`;
+  - D7.5's outcomes, none of them `verified`:
+    - a candidate that edits `pyproject.toml`'s pytest options;
+    - one that adds a `conftest.py` that skips the base's tests, at the
+      root or in a subdirectory;
+    - one that edits an existing test;
+    - one that adds a `sitecustomize.py` or a `.pth` file;
+    - a run that exits 0 with no report, with an empty report, or with a
+      baseline test missing, skipped, deselected or expected to fail;
+    - a timeout or an interrupted run;
+    - a failure after checker inputs were replaced (`inconclusive`);
+    - an empty plan (`not-run`);
+  - a configuration with roles and no independent definition refused at
+    load;
+  - the last `verified` candidate kept through a regression, and none
+    kept when no candidate was `verified`;
+  - a Manager unable to admit, accept or cancel.
 
 ## 5. Open questions for the maintainer
 
@@ -1000,18 +1443,36 @@ Each is a deterministic test with fakes, offline, in `make check`.
 6. **D5.3 keeps today's window** in which a clean exit's reply is lost to a
    crash before its checks. Should #332 close it for the single-agent
    path too?
+7. **D7.5 accepts a residual and a cost.** Code under test can still
+   subvert the runner that tests it, so `verified` is not proof of
+   honesty. Taking every checker input from the base also makes a
+   candidate that needs a change to one of them `inconclusive`, never
+   `verified`: a new dependency in `pyproject.toml` is one example.
+   Accept both for #319, or ask for a runner-independent check first?
 
 ## 6. Consequences
 
 - The Memory MVP can be built from the existing save, loader, read context
-  and adapters, plus one state field, one recorded setting and an operator
-  command. Nothing of #332, #319 or EPIC #331 is on its path.
-- #332 and #319 inherit a contract instead of a blank page: the task
-  states and their table, the result split, the receipts, the reducer's
-  types, the admission rules and the one mutating worker.
-- Two gaps the code has today are named and assigned: a session-resuming
-  flag passes a Claude Code or OpenCode profile's validation (D14, for
-  #317), and a clean exit's reply is lost to a crash before its checks
-  (D5.3, for #332).
+  and adapters. It adds two state fields (Memory and `launch_seq`), one
+  recorded setting and an operator command. Nothing of #332, #319 or EPIC
+  #331 is on its path.
+- #332 and #319 inherit a contract instead of a blank page:
+  - the task states and their table;
+  - an attempt identity that no re-entry repeats;
+  - the result's five stages;
+  - the receipts;
+  - the reducer's types;
+  - the admission rules;
+  - each role's staleness rule;
+  - the one mutating worker;
+  - an independent verification whose absence is never a pass.
+- Three gaps the code has today are named and assigned:
+  - a session-resuming flag passes a Claude Code or OpenCode profile's
+    validation (D14, for #317);
+  - a clean exit's reply is lost to a crash before its checks (D5.3, for
+    #332);
+  - `state.attempt` repeats after an `unblock` into the same step, so it
+    can name no attempt (D2.1, for whichever of #317 and #332 first
+    persists an attempt's identity).
 - Multi-agent execution is Linux-only behind an enforcing sandbox, a cost
   of refusing logical isolation for read-only roles (D7.4).
