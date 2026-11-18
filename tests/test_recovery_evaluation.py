@@ -20,10 +20,15 @@ stopping command (ADR 0011) and the recovery package of a later
 
 Each case's gold resolution is written here by hand, from ADR 0012 D2 and
 D3, never from the package: what the operator does outside AutoForge, the
-command that leaves the stop, and the phase the controller must read back
-after it. It is then performed. The package's displayed steps run as an
-operator would type them, placeholders filled, and the state the controller
-saved is read back. No agent's or model's claim is evidence of anything here.
+command that leaves the stop, the phase the controller must read back after
+it, and the phase the next workflow step must save. It is then performed.
+The package's displayed steps run as an operator would type them,
+placeholders filled, each command's exit status checked and the state the
+controller saved read back. A step with no command is performed as its text
+reads, literally (:data:`READINGS`), never as the gold's act, and what it
+did is checked against what the gold keeps. A saved plan is checked against
+the journal and against what GitHub and the origin hold. No agent's or
+model's claim is evidence of anything here.
 
 Nothing launches a model, and nothing is written outside ``tmp_path``. Every
 ``status`` the harness runs is held to launching no agent, sending nothing
@@ -34,6 +39,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import dataclasses
 import json
 import re
 import shlex
@@ -46,7 +52,8 @@ from pathlib import Path
 import pytest
 
 from autoforge import cli
-from autoforge.effects import EffectKind, EffectRecord, Stage
+from autoforge.claims import IMPLEMENTATION, scan
+from autoforge.effects import AnalyzeContext, EffectKind, EffectRecord, FixContext, Stage
 from autoforge.engine import ControllerEngine
 from autoforge.errors import ExecutionTimeoutError, GitHubUnavailableError, StateError
 from autoforge.providers import ProviderRegistry, ScriptedProvider
@@ -90,10 +97,10 @@ MATRIX = "## 4. The matrix"
 SUMMARY = "## 5. What the matrix shows"
 SAFETY = "## 6. The safety regressions"
 
-#: A value the operator supplies: an unblock's reason, a comment's URL.
+#: A value the operator supplies: an unblock's reason, a comment's URL, the PR they keep.
 VALUE = "<value>"
 #: How the package and the saved reasons spell such a value.
-_PLACEHOLDERS = ("...", "<why>", "<comment URL>")
+_PLACEHOLDERS = ("...", "<why>", "<comment URL>", "<PR URL>")
 #: What the harness types for one: a reason is text for a human, never evidence.
 _FILLED = "recovery evaluation (#375)"
 #: Not a measure for this case: nothing stopped, or nothing applies.
@@ -113,14 +120,27 @@ class Gold:
     command's words with ``{action}`` for the stop's saved action id and
     ``<value>`` for what the operator supplies, ``""`` when the controller
     resolves the case itself. ``target`` is the phase the controller must
-    read back right after that command, and ``act`` what the operator does
+    read back right after that command. ``then``, for an ``unblock``, is
+    what the next workflow step (``resume --max-steps 1``) must save, the
+    phase and any stop code; a ``resume`` or ``run`` is that step itself,
+    and ``target`` is what it must save. ``act`` is what the operator does
     first, outside AutoForge.
     """
 
     stop: str
     command: str
     target: str
+    then: str = ""
     act: str = ""
+
+    @property
+    def unblocks(self) -> bool:
+        return self.command.startswith("unblock")
+
+    @property
+    def next_saves(self) -> str:
+        """What the workflow step after the stop must save: after an unblock, or itself."""
+        return self.then if self.unblocks else self.target
 
 
 @dataclass
@@ -130,9 +150,13 @@ class Stopped:
     ``line`` is what the stopping command's ``stop:`` line prints (``None``
     for no line: a process that died, or a run that did not stop); ``said``
     the text that command printed or the state saved for a human; ``act``
-    performs the gold's act; ``then`` is the agent that works once the run
-    goes on; ``steps`` holds the outcomes of the steps the controller ran
-    with no operator command, for a case that recovers by itself.
+    performs the gold's act, and only the gold's; ``then`` is the agent that
+    works once the run goes on; ``steps`` holds the outcomes of the steps the
+    controller ran with no operator command, for a case that recovers by
+    itself. ``raised`` is the value the operator gives a bound a text tells
+    them to raise, and ``chosen`` the PR the operator decides is the issue's
+    where a text leaves that to them: what a :data:`READINGS` act needs to
+    perform a text, never a choice the harness makes for the package.
     """
 
     eng: ControllerEngine
@@ -141,6 +165,8 @@ class Stopped:
     act: Callable[[], None] | None = None
     then: Callable | list | None = None
     steps: list = field(default_factory=list)
+    raised: dict[str, int] = field(default_factory=dict)
+    chosen: str = ""
 
 
 def _blocked(build: Callable[[Path], ControllerEngine], tmp: Path) -> Stopped:
@@ -210,13 +236,15 @@ STALE = "https://github.com/owner/repo/pull/43"
 def _ambiguous_prs(tmp: Path) -> Stopped:
     """Two open PRs carry the issue's implementation marker and the run recorded neither:
     which one is the issue's, and that this run takes it over, is the operator's decision
-    (ADR 0012 D3's adoption row, K11). The controller never chooses."""
+    (ADR 0012 D3's adoption row, K11). The controller never chooses. Here the operator
+    decides ``PR`` is the issue's: the PR the gold keeps open, marked and taken over."""
     stopped = _blocked(_ambiguous, tmp)
+    stopped.chosen = PR
 
-    def close_the_stale_one() -> None:
+    def keep_the_issues_close_the_stale_one() -> None:
         stopped.eng.github.prs[STALE].state = "CLOSED"
 
-    stopped.act = close_the_stale_one
+    stopped.act = keep_the_issues_close_the_stale_one
     return stopped
 
 
@@ -228,7 +256,13 @@ def _bound(tmp: Path, key: str, value: int, raised: int) -> Stopped:
     eng._save()
     outcomes = eng.run(max_steps=50)
     assert outcomes[-1].next_phase == "BLOCKED", outcomes[-1].message
-    stopped = Stopped(eng, outcomes[-1].stop, eng.state.block_reason, then=eng.provider._handler)
+    stopped = Stopped(
+        eng,
+        outcomes[-1].stop,
+        eng.state.block_reason,
+        then=eng.provider._handler,
+        raised={key: raised},
+    )
 
     def raise_the_bound() -> None:  # the configuration every later command loads
         setattr(eng.config.workflow, key, raised)
@@ -347,7 +381,7 @@ CASES = (
     Case(
         "k10-operator-actions",
         _k10,
-        Gold("blocked/operator-actions", _PLAIN, "FIX", "post each payload on its issue"),
+        Gold("blocked/operator-actions", _PLAIN, "FIX", "REVIEW", "post each payload on its issue"),
     ),
     Case(
         "k9-acceptance-action",
@@ -356,6 +390,7 @@ CASES = (
             "blocked/acceptance-action",
             f"unblock --approve-action {{action}} --reason {VALUE}",
             "FIX",
+            "REVIEW",
         ),
     ),
     Case(
@@ -365,6 +400,7 @@ CASES = (
             "blocked/acceptance-action",
             f"unblock --approve-action {{action}} --reason {VALUE}",
             "FIX",
+            "REVIEW",
         ),
     ),
     Case(
@@ -373,6 +409,7 @@ CASES = (
         Gold(
             "blocked/github-checks-refused",
             _PLAIN,
+            "READY_FOR_MERGE",
             "READY_FOR_MERGE",
             "a credential that may read check runs",
         ),
@@ -385,37 +422,48 @@ CASES = (
     Case(
         "false-conflict-314",
         _conflict_314,
-        Gold("blocked/effect-conflict", _PLAIN, "ANALYZE_EXECUTE"),
+        Gold("blocked/effect-conflict", _PLAIN, "ANALYZE_EXECUTE", "REVIEW"),
     ),
     Case(
         "ambiguous-prs",
         _ambiguous_prs,
         Gold(
             "blocked/claim-ambiguous",
-            f"unblock --take-over {PR} --reason {VALUE}",
+            f"unblock --take-over {VALUE} --reason {VALUE}",
             "ANALYZE_EXECUTE",
-            "close the stale PR",
+            "REVIEW",
+            "keep the issue's PR, close the other",
         ),
     ),
     Case(
         "review-round-cap",
         _review_cap,
-        Gold("blocked/review-round-cap", _PLAIN, "FIX", "raise workflow.max_review_rounds"),
+        Gold(
+            "blocked/review-round-cap", _PLAIN, "FIX", "REVIEW", "raise workflow.max_review_rounds"
+        ),
     ),
     Case(
         "step-budget",
         _step_budget,
-        Gold("blocked/step-budget", _PLAIN, "REVIEW", "raise workflow.max_total_steps"),
+        Gold("blocked/step-budget", _PLAIN, "REVIEW", "FIX", "raise workflow.max_total_steps"),
     ),
     Case(
         "no-saved-code",
         _no_code,
-        Gold("blocked/review-round-cap", _PLAIN, "FIX", "raise workflow.max_review_rounds"),
+        Gold(
+            "blocked/review-round-cap", _PLAIN, "FIX", "REVIEW", "raise workflow.max_review_rounds"
+        ),
     ),
     Case(
         "agent-blocked",
         _agent_stop("blocked"),
-        Gold("blocked/agent-blocked", _PLAIN, "ANALYZE_EXECUTE", "answer the agent's question"),
+        Gold(
+            "blocked/agent-blocked",
+            _PLAIN,
+            "ANALYZE_EXECUTE",
+            "REVIEW",
+            "answer the agent's question",
+        ),
     ),
     Case(
         "agent-failure",
@@ -505,6 +553,8 @@ def _words(command: str) -> list[str]:
     each value the operator supplies as ``<value>``; ``[]`` for a step with no command."""
     if not command:
         return []
+    for placeholder in ("<PR URL>", "<comment URL>"):  # one word each, as the operator types it
+        command = command.replace(placeholder, shlex.quote(placeholder))
     words = shlex.split(command)
     assert words[0] == "autoforge", command
     out: list[str] = []
@@ -528,6 +578,18 @@ def _spelled(text: str, command: list[str]) -> bool:
     text = re.sub(r"\bautoforge\s+((--state-dir|--config)\s+\S+\s+)*", "", text)
     text = " ".join(text.split())
     return re.search(rf"(?<![\w-]){re.escape(' '.join(command))}(?![\w-])", text) is not None
+
+
+def _fill(words: list[str], stopped: Stopped) -> list[str]:
+    """A command as the operator types it: the PR they keep after ``--take-over``, and
+    a reason, which is text for a human, for every other value."""
+    out = []
+    for i, word in enumerate(words):
+        if word == VALUE and i and words[i - 1] == "--take-over":
+            assert stopped.chosen, "a take-over of a PR the case has the operator choose none of"
+            word = stopped.chosen
+        out.append(_FILLED if word == VALUE else word)
+    return out
 
 
 def _records(eng: ControllerEngine) -> list[EffectRecord]:
@@ -555,6 +617,163 @@ def _github_writes(gh: FakeGitHub) -> tuple:
     )
 
 
+def _status(operator, eng: ControllerEngine, *argv: str) -> tuple[int, str, str]:
+    """A ``status`` the harness runs: it launches nothing (the provider fails if it is
+    called), sends nothing to GitHub and leaves the state directory as it was."""
+    tree, writes = state_tree(eng.paths.state_dir), _github_writes(eng.github)
+    rc, out, err = operator(eng, "status", *argv)
+    assert state_tree(eng.paths.state_dir) == tree, "status wrote to the state directory"
+    assert _github_writes(eng.github) == writes, "status sent something to GitHub"
+    return rc, out, err
+
+
+# -- what a step with no command tells the operator to do, read literally ------------------
+
+
+def _marked(eng: ControllerEngine) -> dict[str, str | None]:
+    """The open PRs carrying the issue's implementation marker, each with the run its
+    marker names (``None`` for no owner), as GitHub holds them now."""
+    found = {}
+    for url, pr in eng.github.prs.items():
+        claims = scan(IMPLEMENTATION, pr.body or "").claims if pr.is_open else ()
+        if claims:
+            found[url] = claims[0].owner_run_id
+    return found
+
+
+def _close(eng: ControllerEngine, url: str) -> None:
+    """The operator closes a PR on GitHub, outside AutoForge."""
+    eng.github.prs[url].state = "CLOSED"
+
+
+def _nothing(stopped: Stopped) -> None:
+    """A text that has the operator read or inspect: nothing the case holds changes."""
+
+
+def _answer(stopped: Stopped) -> None:
+    """'resolve what it asks for': the operator answers on the issue, which the case's
+    agent, launched again, does not read; nothing the case holds changes."""
+
+
+def _grant(stopped: Stopped) -> None:
+    """'run AutoForge with a credential that may read check runs'."""
+    stopped.eng.github.checks_error = None
+
+
+def _raise(key: str) -> Callable[[Stopped], None]:
+    """'raise workflow.<key>': the configuration every later command loads, to the value
+    the case's operator gives it."""
+
+    def act(stopped: Stopped) -> None:
+        assert key in stopped.raised, f"a text says to raise {key}, which the case does not hold"
+        setattr(stopped.eng.config.workflow, key, stopped.raised[key])
+
+    return act
+
+
+def _keep_the_chosen(stopped: Stopped) -> None:
+    """'decide which one PR is the issue's ... Keep that PR open with its marker ..., and
+    close each other PR or remove its marker, never the one kept'."""
+    assert stopped.chosen, "a text leaves the choice of a PR to the operator, and the case has none"
+    for url in _marked(stopped.eng):
+        if url != stopped.chosen:
+            _close(stopped.eng, url)
+
+
+def _close_every_unowned(stopped: Stopped) -> None:
+    """'close, delete or unmark every one that is not the run's own': each marked PR but
+    the one the run is bound to. With none bound, that is every one of them."""
+    own = load_state(stopped.eng.paths.state_file).current_pr_url
+    for url in _marked(stopped.eng):
+        if url != own:
+            _close(stopped.eng, url)
+
+
+def _repair_unowned(stopped: Stopped) -> None:
+    """'repair or remove it if it is not the run's own; the run's own object ... needs no
+    change': a marked PR whose marker names another run, or none, is closed."""
+    run_id = load_state(stopped.eng.paths.state_file).run_id
+    for url, owner in _marked(stopped.eng).items():
+        if owner != run_id:
+            _close(stopped.eng, url)
+
+
+@dataclass(frozen=True)
+class Reading:
+    """What a displayed text tells the operator to do outside AutoForge, read literally.
+
+    ``phrase`` is matched in the text, case and spacing aside. A step with no
+    command is performed by every reading whose phrase it holds, and a step
+    no reading matches fails its case: the harness never stands the gold's
+    act in for a text it has no reading of.
+    """
+
+    phrase: str
+    act: Callable[[Stopped], None]
+
+
+READINGS = (
+    Reading("read the agent's message and its run log, and resolve what it asks for", _answer),
+    Reading("read the agent's message and its run log; a new run starts over", _nothing),
+    Reading("the reason is text for a human, never evidence", _nothing),
+    Reading("run autoforge with a credential that may read check runs", _grant),
+    Reading("raise workflow.max_review_rounds in the configuration", _raise("max_review_rounds")),
+    Reading("raise workflow.max_total_steps in the configuration", _raise("max_total_steps")),
+    # The live preview's detail, which the operator reads at 'status --live'.
+    Reading("raise 'workflow.max_review_rounds' in the config", _raise("max_review_rounds")),
+    Reading("raise 'workflow.max_total_steps' in the config", _raise("max_total_steps")),
+    Reading("repair or remove it if it is not the run's own", _repair_unowned),
+    Reading("decide which one pr is the issue's", _keep_the_chosen),
+    # The text #374 first gave two marked PRs (PR #511 R1-F1): read so that a package
+    # that gives it again is measured, and found unsafe, rather than left unread.
+    Reading("close, delete or unmark every one that is not the run's own", _close_every_unowned),
+)
+
+
+def _readings(text: str) -> list[Reading]:
+    plain = " ".join(text.lower().split())
+    return [r for r in READINGS if r.phrase in plain]
+
+
+def _keeps(eng: ControllerEngine, stopped: Stopped) -> dict[str, tuple[bool, bool]]:
+    """The PRs the gold resolution keeps, each as it was at the stop (open, marked): the
+    one the operator chose, the one the run is bound to, and each whose marker names
+    the run."""
+    state = load_state(eng.paths.state_file)
+    marked = _marked(eng)
+    keep = {url for url, owner in marked.items() if owner == state.run_id}
+    keep |= {u for u in (stopped.chosen, state.current_pr_url) if u}
+    return {url: (eng.github.prs[url].is_open, url in marked) for url in keep}
+
+
+def _act_on(
+    stopped: Stopped, text: str, done: set[int], keep: dict[str, tuple[bool, bool]]
+) -> list[str]:
+    """Perform what ``text`` tells the operator to do, each reading once; what it broke.
+
+    The act happens outside AutoForge, so the state directory must not change,
+    and a PR the gold keeps must stay as open, and as marked, as it was before
+    the act: ``keep`` holds that, and is updated to what the act left.
+    """
+    eng = stopped.eng
+    tree = state_tree(eng.paths.state_dir)
+    for reading in _readings(text):
+        if id(reading) not in done:
+            done.add(id(reading))
+            reading.act(stopped)
+    assert state_tree(eng.paths.state_dir) == tree, "an operator's act wrote the state"
+    marked = _marked(eng)
+    broke = []
+    for url, (was_open, was_marked) in sorted(keep.items()):
+        now = (eng.github.prs[url].is_open, url in marked)
+        if was_open and not now[0]:
+            broke.append(f"{url} closed")
+        elif was_marked and not now[1]:
+            broke.append(f"{url} unmarked")
+        keep[url] = now  # the next act is judged by what it changes
+    return broke
+
+
 # -- the after arm's steps: what is unsafe, and what following them does -----------------------
 
 #: The flags of ``unblock`` that name a saved action, and every flag it may be shown with.
@@ -563,7 +782,7 @@ _UNBLOCK_FLAGS = (*_ACTION_FLAGS, "--reason", "--take-over", "--rereview")
 
 
 def _unsafe(package: dict, records: list[EffectRecord]) -> list[str]:
-    """The displayed steps ADR 0012 D2 denies for the stop, or D3 grants nobody.
+    """The displayed commands ADR 0012 D2 denies for the stop, or D3 grants nobody.
 
     A ``resume`` or ``step`` before the run has left BLOCKED, any ``unblock``
     of a run that is not BLOCKED (an alternative step stands in place of the
@@ -571,7 +790,8 @@ def _unsafe(package: dict, records: list[EffectRecord]) -> list[str]:
     awaiting the operator's approval, a decline or a bind of an action the
     plan does not hold, an open merge gate, an accepted configuration change,
     and any command that is not the controller's or the documented ``gh``
-    pipe of an operator action.
+    pipe of an operator action. A step with no command is judged by what
+    performing it does (:func:`_act_on`), when the steps are followed.
     """
     at_stop = package["outcome"] == "blocked"
     blocked = at_stop  # as the steps in sequence leave it; an alternative replaces them
@@ -623,23 +843,52 @@ def _unsafe(package: dict, records: list[EffectRecord]) -> list[str]:
     return bad
 
 
+@dataclass(frozen=True)
+class Ran:
+    """One command the harness typed: its words, its exit status and what it saved."""
+
+    words: tuple[str, ...]
+    rc: int
+    reached: str  # the phase, and "/code" when a stop code is saved
+
+
 @dataclass
 class Followed:
     """What following the displayed steps did, as the controller saved it."""
 
-    gold: str = ""  # the phase read back right after the gold command, "" if never run
-    after: str = ""  # the phase and saved code after the first step that followed it
+    ran: list[Ran] = field(default_factory=list)  # every controller command, in order
+    gold: Ran | None = None  # the gold command, when the steps ran it
+    next: Ran | None = None  # the workflow step after the gold (the gold itself for resume/run)
     preview: bool | None = None  # a plain unblock's live preview matched its decision
+    unsafe: list[str] = field(default_factory=list)  # steps whose literal act broke a kept PR
 
 
 def _phase(eng: ControllerEngine) -> str:
     return load_state(eng.paths.state_file).phase.value
 
 
+def _reached(eng: ControllerEngine) -> str:
+    state = load_state(eng.paths.state_file)
+    return f"{state.phase.value}/{state.stop_code}" if state.stop_code else state.phase.value
+
+
+def _resolved(done: Followed, gold: Gold) -> bool:
+    """The steps resolve the stop: every command they ran exited 0, the gold command
+    among them saved the gold phase, and the workflow step after it ran, exited 0 and
+    saved what the gold says it must (PR #511 R1-F2)."""
+    return (
+        done.gold is not None
+        and done.next is not None
+        and all(r.rc == 0 for r in done.ran)
+        and done.gold.reached.split("/")[0] == gold.target
+        and done.next.reached == gold.next_saves
+    )
+
+
 def _post_payload(operator, eng: ControllerEngine, words: list[str]) -> None:
     """``status --action ID | gh issue comment TARGET --body-file -``: the operator's post."""
     pipe = words.index("|")
-    rc, out, err = operator(eng, *words[:pipe])
+    rc, out, err = _status(operator, eng, *words[1:pipe])
     assert rc == 0, err
     target = words[pipe + 4]
     posted = sum(len(comments) for comments in eng.github.comments.values())
@@ -649,77 +898,222 @@ def _post_payload(operator, eng: ControllerEngine, words: list[str]) -> None:
 def _follow(operator, stopped: Stopped, package: dict, gold: list[str]) -> Followed:
     """Run the package's displayed steps in order, as the operator would type them.
 
-    A step with no command is the operator's own act, performed once. A
-    ``doctor`` is not run: it checks this host's environment, which a case
-    does not stand in for. The steps end with the first command that runs
-    the workflow (``resume`` or ``run``), given ``--max-steps 1`` so that the
+    A step with no command is performed as its text reads (:func:`_act_on`),
+    and so is the detail of a ``status --live`` preview, which the operator
+    reads there. A ``doctor`` is not run: it checks this host's environment,
+    which a case does not stand in for. Every other command runs and its exit
+    status is kept. The steps end with the first command that runs the
+    workflow (``resume`` or ``run``), given ``--max-steps 1`` so that the
     step right after the stop is the one read back.
     """
     eng = stopped.eng
-    done = Followed()
-    acted = False
+    done, keep = Followed(), _keeps(eng, stopped)
+    acted: set[int] = set()
     for step in package["next"]:
         if step["alternative"]:
+            assert step["command"], f"an alternative with no command: {step['text']!r}"
             continue
         words = _words(step["command"])
         if not words:
-            if stopped.act is not None and not acted:
-                stopped.act()
-                acted = True
+            assert _readings(step["text"]), (
+                f"no reading of the step {step['text']!r}: add one to READINGS, as it reads"
+            )
+            if _act_on(stopped, step["text"], acted, keep):
+                done.unsafe.append(step["text"])
             continue
         if "|" in words:
             _post_payload(operator, eng, words)
+        elif words[0] == "status" and "--live" in words:
+            rc, out, err = _status(operator, eng, *words[1:], "--json")
+            assert rc == 0, err
+            live = json.loads(out)["recovery"]["live"]
+            if _act_on(stopped, live.get("detail") or "", acted, keep):
+                done.unsafe.append(step["command"])
         elif words[0] == "status":
-            rc, _, err = operator(eng, *words)
+            rc, _, err = _status(operator, eng, *words[1:])
             assert rc == 0, err
         elif words[0] == "unblock":
-            live = None
+            preview = None
             if words == ["unblock", "--reason", VALUE]:
-                rc, out, err = operator(eng, "status", "--json", "--live")
+                rc, out, err = _status(operator, eng, "--json", "--live")
                 assert rc == 0, err
-                live = json.loads(out)["recovery"]["live"]
-            filled = [_FILLED if w == VALUE else w for w in words]
-            operator(eng, *filled)
-            phase = _phase(eng)
-            if live is not None:
-                done.preview = (live["target_phase"] or "BLOCKED") == phase
+                preview = json.loads(out)["recovery"]["live"]
+            rc, _, _ = operator(eng, *_fill(words, stopped))
+            ran = Ran(tuple(words), rc, _reached(eng))
+            done.ran.append(ran)
+            if preview is not None:
+                done.preview = (preview["target_phase"] or "BLOCKED") == _phase(eng)
             if words == gold:
-                done.gold = phase
+                done.gold = ran
         elif words[0] in ("resume", "run"):
-            operator(eng, *words, "--max-steps", "1", agent=stopped.then)
-            state = load_state(eng.paths.state_file)
-            reached = (
-                f"{state.phase.value}/{state.stop_code}" if state.stop_code else state.phase.value
-            )
+            rc, _, _ = operator(eng, *_fill(words, stopped), "--max-steps", "1", agent=stopped.then)
+            ran = Ran(tuple(words), rc, _reached(eng))
+            done.ran.append(ran)
             if words == gold:
-                done.gold = state.phase.value
-            else:
-                done.after = reached
+                done.gold = ran
+            if done.gold is not None:
+                done.next = ran
             break
     return done
 
 
-def _kept(eng: ControllerEngine, package: dict, records: list[EffectRecord], end: str) -> str:
-    """Whether the candidate and the saved plan survived: named as not to be touched at
-    the stop, the candidate still a commit of the repository once the steps were
-    followed, and the run's PR at it when the run went on."""
+# -- the saved plan: named, the relevant candidate, and kept (PR #511 R1-F3) -----------------
+
+_STAGES = (Stage.INTENDED, Stage.ATTEMPTED, Stage.OBSERVED)
+
+
+def _identity(record: EffectRecord) -> tuple:
+    """A record's identity: what it writes, where, and with what, never how far it got."""
+    return (
+        record.position,
+        record.kind,
+        json.dumps(record.identity, sort_keys=True),
+        json.dumps(record.target, sort_keys=True),
+        json.dumps(record.payload, sort_keys=True),
+    )
+
+
+def _git(eng: ControllerEngine, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", "-C", str(eng.workdir), *args], capture_output=True, text=True)
+
+
+@dataclass(frozen=True)
+class Plan:
+    """The saved plan at the stop, and what the repository and GitHub held of it then."""
+
+    phase: Phase
+    records: tuple[EffectRecord, ...]
+    candidate: str  # the push's commit, "" for a plan with no push
+    ref: str  # the ref the push targets
+    problems: tuple[str, ...]  # what the package or the plan got wrong at the stop
+
+
+def _plan_at_stop(stopped: Stopped, package: dict, records: list[EffectRecord]) -> Plan | None:
+    """The plan the stop saved, checked as the stop left it; ``None`` when none is saved.
+
+    The package names the journal and, for a push, its commit, as data not to
+    touch. The push is the plan's only one, and its commit is the candidate:
+    the commit the agent worktree holds, a descendant of what the push's
+    precondition read (the reviewed head a FIX builds on, the default branch
+    head an ANALYZE_EXECUTE builds on), and every fixed finding's commit is
+    in it. A push not observed has not reached GitHub's PR, which is still at
+    the precondition's head; an observed one is on the ref.
+    """
     if not records:
-        return NONE
+        return None
+    eng = stopped.eng
+    state = load_state(eng.paths.state_file)
+    effects = state.phase_effects()
+    problems = []
     preserve = package["preserve"]
-    texts = " ".join(c["text"] for c in preserve)
+    if "journal" not in {c["key"] for c in preserve}:
+        problems.append("the package does not name the journal")
     pushes = [r for r in records if r.kind is EffectKind.PUSH]
-    candidate = pushes[0].payload["sha"] if pushes else ""
-    named = "journal" in {c["key"] for c in preserve} and (not candidate or candidate in texts)
-    if candidate:
-        exists = subprocess.run(
-            ["git", "-C", str(eng.workdir), "cat-file", "-e", f"{candidate}^{{commit}}"],
-            capture_output=True,
-        )
-        named = named and exists.returncode == 0
-        state = load_state(eng.paths.state_file)
-        if end not in ("", "BLOCKED", "FAILED") and not end.startswith(("BLOCKED/", "FAILED/")):
-            named = named and state.current_head_sha == candidate
-    return "yes" if named else "no"
+    if len(pushes) > 1:
+        problems.append(f"{len(pushes)} pushes in one plan")
+    push = pushes[0] if pushes else None
+    candidate = push.payload["sha"] if push else ""
+    ref = push.target["ref"] if push else ""
+    if push is not None:
+        texts = " ".join(c["text"] for c in preserve)
+        if candidate not in texts:
+            problems.append(f"the package does not name the candidate {candidate}")
+        if push.identity.get("candidate_sha") != candidate:
+            problems.append("the push's identity names another candidate")
+        worktree = eng.agent_worktree_path()
+        head = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "HEAD"], capture_output=True, text=True
+        ).stdout.strip()
+        if head != candidate:
+            problems.append(f"the push is {candidate}, the worktree holds {head or 'nothing'}")
+        base = push.precondition.get("expected_old") or push.precondition["base_sha"]
+        if _git(eng, "merge-base", "--is-ancestor", base, candidate).returncode != 0:
+            problems.append(f"the candidate {candidate} does not descend from {base}")
+        if isinstance(effects.context, FixContext):
+            for resolution in effects.context.resolutions:
+                sha = resolution.get("commit_sha") or ""
+                if sha and _git(eng, "merge-base", "--is-ancestor", sha, candidate).returncode:
+                    problems.append(f"the fixed commit {sha} is not in the candidate")
+        on_ref = eng.origin.head(ref.removeprefix("refs/heads/"))
+        if push.stage is Stage.OBSERVED and on_ref != candidate:
+            problems.append(f"an observed push, and {ref} is at {on_ref}")
+        if push.stage is Stage.INTENDED and on_ref == candidate:
+            problems.append(f"a push never sent, and {ref} is at it")
+        if state.current_pr_url and push.stage is not Stage.OBSERVED:
+            at = eng.github.get_pr(state.current_pr_url).head_sha
+            if at == candidate:
+                problems.append(f"an unpushed candidate, and the PR is already at {at}")
+    elif not isinstance(effects.context, (AnalyzeContext, FixContext)):
+        problems.append("a plan with no push and no context")
+    return Plan(effects.phase, tuple(records), candidate, ref, tuple(problems))
+
+
+def _read_back(eng: ControllerEngine, record: EffectRecord, plan: Plan) -> str:
+    """Whether GitHub and the origin hold ``record``'s effect, exactly once; "" if they do.
+
+    Only for a phase that went on: the save that commits it drops its
+    records (ADR 0004 D2.4), so what they wrote is read where it was written.
+    """
+    state = load_state(eng.paths.state_file)
+    body = record.payload.get("body")
+    if record.kind is EffectKind.PUSH:
+        on_ref = eng.origin.head(plan.ref.removeprefix("refs/heads/"))
+        pr = eng.github.get_pr(state.current_pr_url).head_sha if state.current_pr_url else ""
+        if not (on_ref == pr == state.current_head_sha == plan.candidate):
+            return f"the candidate {plan.candidate}: {plan.ref} at {on_ref}, the PR at {pr}"
+        return ""
+    if record.kind is EffectKind.IMPLEMENTATION_PR:
+        prs = [
+            url
+            for url, pr in eng.github.prs.items()
+            if pr.is_open and pr.head_ref == record.target["head"] and pr.body == body
+        ]
+        if prs != [state.current_pr_url]:
+            return f"the implementation PR: {prs} open, the run bound to {state.current_pr_url}"
+        return ""
+    if record.kind in (EffectKind.ACCEPTANCE_COMMENT, EffectKind.OPERATOR_COMMENT):
+        target = record.target["issue_url"]
+        posted = [c for c in eng.github.comments.get(target, []) if c.body.rstrip("\n") == body]
+        return "" if len(posted) == 1 else f"{len(posted)} comments of {record.describe()}"
+    if record.kind is EffectKind.PR_BODY_UPDATE:
+        held = eng.github.get_pr(record.target["pr_url"]).body
+        return "" if held == body else f"the PR description is not {record.describe()}'s"
+    return f"no read-back for {record.kind.value}"
+
+
+def _plan_problems(stopped: Stopped, plan: Plan) -> list[str]:
+    """What of ``plan`` was lost once the steps were followed: ``[]`` when it was kept.
+
+    The candidate is still a commit of the repository. While the run is still
+    in the plan's entry (or BLOCKED or FAILED on it), every record of the
+    stop is in the journal with its identity, at a stage no earlier than it
+    was. Once the phase went on, every record's effect is read back from
+    GitHub and the origin (:func:`_read_back`), and the run's PR is at the
+    candidate.
+    """
+    eng = stopped.eng
+    problems = list(plan.problems)
+    if plan.candidate:
+        if _git(eng, "cat-file", "-e", f"{plan.candidate}^{{commit}}").returncode != 0:
+            problems.append(f"the candidate {plan.candidate} is gone")
+    state = load_state(eng.paths.state_file)
+    after = {_identity(r): r for r in _records(eng)}
+    if after or state.phase in (plan.phase, Phase.BLOCKED, Phase.FAILED):
+        for record in plan.records:
+            kept = after.get(_identity(record))
+            if kept is None:
+                problems.append(f"{record.describe()} is no longer in the journal")
+            elif record.stage in _STAGES and kept.stage in _STAGES:
+                if _STAGES.index(kept.stage) < _STAGES.index(record.stage):
+                    problems.append(f"{record.describe()} went back to {kept.stage.value}")
+            elif record.stage is Stage.OBSERVED and kept.stage is not Stage.OBSERVED:
+                problems.append(f"{record.describe()} went back to {kept.stage.value}")
+        return problems
+    for record in plan.records:
+        lost = _read_back(eng, record, plan)
+        if lost:
+            problems.append(lost)
+    return problems
 
 
 # -- one row of the matrix ---------------------------------------------------------------------
@@ -728,6 +1122,7 @@ def _kept(eng: ControllerEngine, package: dict, records: list[EffectRecord], end
 MEASURED = (
     "Gold stop",
     "Gold resolution",
+    "Gold read-back",
     "Before: a stop",
     "Before: command",
     "After: stop line",
@@ -752,28 +1147,46 @@ def _gold_text(gold: Gold) -> str:
     if not gold.command:
         return "none: the controller recovers"
     words = gold.command.format(action="<id>").split()
-    command = " ".join(_SHOWN.get(word, word) for word in words)
+    shown = [
+        "<PR kept>" if w == VALUE and i and words[i - 1] == "--take-over" else _SHOWN.get(w, w)
+        for i, w in enumerate(words)
+    ]
+    command = " ".join(shown)
     return f"{gold.act}, then `{command}`" if gold.act else f"`{command}`"
 
 
-def _perform(operator, stopped: Stopped, gold: Gold, words: list[str]) -> tuple[str, str]:
-    """The gold resolution itself: the act, the command, and the step after an unblock.
-    The phase after the command, and the phase (and saved code) after that step."""
+def _gold_read_back(gold: Gold) -> str:
+    """The phases the gold resolution must leave saved: after its command, and after the
+    workflow step that follows an unblock."""
+    if gold.unblocks:
+        return f"{gold.target}, then `resume`: {gold.then}"
+    return gold.target
+
+
+def _perform(operator, stopped: Stopped, gold: Gold, words: list[str]) -> tuple[Ran, Ran]:
+    """The gold resolution itself: the act, the command, and the workflow step after an
+    unblock. What the command saved, and what that step saved."""
     eng = stopped.eng
     if stopped.act is not None:
         stopped.act()
-    filled = [_FILLED if w == VALUE else w for w in words]
+    filled = _fill(words, stopped)
     if words[0] == "unblock":
-        operator(eng, *filled)
-        phase = _phase(eng)
-        if phase in ("BLOCKED", "FAILED"):
-            return phase, ""
-        operator(eng, "resume", "--max-steps", "1", agent=stopped.then)
-    else:
-        operator(eng, *filled, "--max-steps", "1", agent=stopped.then)
-        phase = _phase(eng)
-    state = load_state(eng.paths.state_file)
-    return phase, f"{state.phase.value}/{state.stop_code}" if state.stop_code else state.phase.value
+        rc, _, err = operator(eng, *filled)
+        command = Ran(tuple(words), rc, _reached(eng))
+        if rc != 0:
+            return command, command
+        rc, _, err = operator(eng, "resume", "--max-steps", "1", agent=stopped.then)
+        return command, Ran(("resume",), rc, _reached(eng))
+    rc, _, err = operator(eng, *filled, "--max-steps", "1", agent=stopped.then)
+    command = Ran(tuple(words), rc, _reached(eng))
+    return command, command
+
+
+def _holds(gold: Gold, command: Ran, step: Ran) -> None:
+    """The gold resolution, performed, saved what it says: every gold label is held by
+    the controller's own read-back, with each command's exit status."""
+    assert (command.rc, command.reached.split("/")[0]) == (0, gold.target), command
+    assert (step.rc, step.reached) == (0, gold.next_saves), step
 
 
 @dataclass
@@ -791,6 +1204,7 @@ def _measure(case: Case, operator, fresh: Callable[[], Path]) -> Measured:
     row = dict.fromkeys(MEASURED, NONE)
     row["Gold stop"] = gold.stop
     row["Gold resolution"] = _gold_text(gold)
+    row["Gold read-back"] = _gold_read_back(gold)
     if gold.stop == "none":
         # The controller resolved it itself: no operator command, and the run went on.
         assert _phase(eng) == gold.target, [o.message for o in stopped.steps]
@@ -819,28 +1233,26 @@ def _measure(case: Case, operator, fresh: Callable[[], Path]) -> Measured:
     if rc != 0:
         row["After: later status"] = f"refused (exit {rc})"
         row["After: command"] = _yes(_spelled(err, words))
-        reached, _ = _perform(operator, stopped, gold, words)
-        assert reached == gold.target, f"the gold resolution does not hold: {reached}"
+        _holds(gold, *_perform(operator, stopped, gold, words))
         return measured
 
     package = json.loads(out)["recovery"]
     row["After: later status"] = f"{package['outcome']}/{package['code']}"
     row["After: command"] = _yes(any(_words(s["command"]) == words for s in package["next"]))
-    measured.unsafe = _unsafe(package, records)
-    row["After: unsafe"] = str(len(measured.unsafe))
+    plan = _plan_at_stop(stopped, package, records)
     done = _follow(operator, stopped, package, words)
-    resolved = done.gold == gold.target and not done.after.startswith(("BLOCKED", "FAILED"))
+    measured.unsafe = _unsafe(package, records) + done.unsafe
+    row["After: unsafe"] = str(len(measured.unsafe))
+    resolved = _resolved(done, gold)
     row["After: steps resolve"] = _yes(resolved)
     if done.preview is not None:
         row["After: preview"] = _yes(done.preview)
-    row["Plan kept"] = _kept(eng, package, records, done.after or done.gold)
-    if not done.gold:
-        # The displayed steps never ran the gold command: perform it on a fresh copy,
-        # so that every gold label is held by the controller's own read-back.
-        again = case.build(fresh())
-        reached, after = _perform(operator, again, gold, words)
-        assert reached == gold.target, f"the gold resolution does not hold: {reached}"
-        assert not after.startswith(("BLOCKED", "FAILED")), after
+    if plan is not None:
+        row["Plan kept"] = _yes(not _plan_problems(stopped, plan))
+    if not resolved:
+        # The displayed steps did not resolve it: perform the gold on a fresh copy, so
+        # that every gold label is held by the controller's own read-back.
+        _holds(gold, *_perform(operator, case.build(fresh()), gold, words))
     return measured
 
 
@@ -890,8 +1302,8 @@ def test_the_documented_row_is_the_row_the_case_measures(
     """Each case's row, computed: what the document's matrix says of it.
 
     The CPU time of the later ``status --json`` is recorded as the test's
-    ``status_cpu_seconds`` property (``--junitxml`` reports it); it is a
-    measurement of this host, never a bound.
+    ``status_cpu_seconds`` property, which ``--junitxml`` reports with
+    ``-o junit_family=xunit1``; it is a measurement of this host, never a bound.
     """
     measured = _measure(case, operator, lambda: tmp_path_factory.mktemp("case") / ".autoforge")
     if measured.status_cpu_seconds is not None:
@@ -945,8 +1357,11 @@ def _summary(rows: dict[str, dict[str, str]]) -> dict[str, tuple[str, str]]:
             of(_count(stops, "Before: command"), stops),
             of(_count(stops, "After: command"), stops),
         ),
-        "Unsafe displayed steps": ("not measured", f"{unsafe} in {len(packages)} packages"),
-        "The displayed steps, followed as typed, resolve the stop": (
+        "Unsafe displayed steps, those without a command performed as they read": (
+            "not measured",
+            f"{unsafe} in {len(packages)} packages",
+        ),
+        "The displayed steps, followed as typed, resolve the stop, and the next step succeeds": (
             NONE,
             of(_count(packages, "After: steps resolve"), packages),
         ),
@@ -954,7 +1369,7 @@ def _summary(rows: dict[str, dict[str, str]]) -> dict[str, tuple[str, str]]:
             NONE,
             of(_count(previews, "After: preview"), previews),
         ),
-        "The saved plan and its candidate were named and kept": (
+        "The saved plan was named, its push was the candidate, and every record held": (
             NONE,
             of(_count(plans, "Plan kept"), plans),
         ),
@@ -1002,3 +1417,156 @@ def test_every_stratum_issue_375_names_is_a_case_or_says_why_not():
     for stratum in ("#291", "#327", "K9", "K10", "crash", "LOCAL", "FAILED", "timeouts"):
         assert stratum in strata, stratum
     assert "outside AutoForge" in strata and "review report" in strata
+
+
+# -- the measure, against what it must not count (PR #511 R1-F1 to R1-F3) --------------------
+
+
+def _case(name: str) -> Case:
+    [case] = [c for c in CASES if c.name == name]
+    return case
+
+
+def _stopped_with_package(name: str, operator, tmp: Path) -> tuple[Stopped, dict, list]:
+    stopped = _case(name).build(tmp)
+    records = _records(stopped.eng)
+    rc, out, err = _status(operator, stopped.eng, "--json")
+    assert rc == 0, err
+    return stopped, json.loads(out)["recovery"], records
+
+
+#: The step #374 first gave two marked PRs that the run recorded neither of.
+_CLOSE_EVERY_UNOWNED = "close, delete or unmark every one that is not the run's own, then 'unblock'"
+
+
+def test_a_manual_step_that_closes_the_pr_the_gold_keeps_is_unsafe(operator, tmp_path):
+    """R1-F1: the text first measured for two marked PRs, performed as it reads. Neither
+    PR is the run's own, so it closes both, the PR the operator chose among them: an
+    unsafe step, counted as one, and the steps no longer resolve the stop. The act is
+    the text's, never the gold's, which closes only the other PR."""
+    stopped, package, records = _stopped_with_package("ambiguous-prs", operator, tmp_path)
+    first = package["next"][0]
+    assert first["command"] == "" and "never the one kept" in first["text"]
+    first["text"] = _CLOSE_EVERY_UNOWNED
+    gold = _gold_words(_case("ambiguous-prs").gold, records)
+    done = _follow(operator, stopped, package, gold)
+    assert done.unsafe == [_CLOSE_EVERY_UNOWNED]
+    assert not stopped.eng.github.prs[PR].is_open and not stopped.eng.github.prs[STALE].is_open
+    assert not _resolved(done, _case("ambiguous-prs").gold)
+
+
+def test_a_manual_step_with_no_reading_fails_the_case(operator, tmp_path):
+    """R1-F1: a step with no command that no reading covers is never performed as the
+    gold's act: the case fails, naming the text, and nothing on GitHub changed."""
+    stopped, package, records = _stopped_with_package("ambiguous-prs", operator, tmp_path)
+    package["next"][0]["text"] = "put things right"
+    before = _github_writes(stopped.eng.github)
+    gold = _gold_words(_case("ambiguous-prs").gold, records)
+    with pytest.raises(AssertionError, match="no reading of the step 'put things right'"):
+        _follow(operator, stopped, package, gold)
+    assert _github_writes(stopped.eng.github) == before
+
+
+def test_a_package_that_omits_the_next_step_does_not_resolve(operator, tmp_path):
+    """R1-F2: the unblock runs and saves the gold phase, but the package shows no
+    'resume', so no workflow step runs after it: not a resolution."""
+    stopped, package, records = _stopped_with_package("agent-blocked", operator, tmp_path)
+    gold = _case("agent-blocked").gold
+    package["next"] = [s for s in package["next"] if _words(s["command"])[:1] != ["resume"]]
+    done = _follow(operator, stopped, package, _gold_words(gold, records))
+    assert done.gold is not None and (done.gold.rc, done.gold.reached) == (0, gold.target)
+    assert done.next is None and not _resolved(done, gold)
+
+
+def test_a_resume_that_fails_with_the_phase_unchanged_does_not_resolve(operator, tmp_path):
+    """R1-F2: GitHub answers 502 to the PR the resumed step opens: 'resume' exits 1 and
+    leaves ANALYZE_EXECUTE, which is neither BLOCKED nor FAILED. Its exit status and the
+    phase it saved, not REVIEW, make it no resolution; so does any failed command."""
+    stopped, package, records = _stopped_with_package("agent-blocked", operator, tmp_path)
+    gold = _case("agent-blocked").gold
+    stopped.eng.github.write_failures.append(
+        ("create_pull_request", GitHubUnavailableError("gh: HTTP 502"), False)
+    )
+    done = _follow(operator, stopped, package, _gold_words(gold, records))
+    assert done.next is not None and done.next.rc == 1
+    assert done.next.reached == gold.target == "ANALYZE_EXECUTE"
+    assert not _resolved(done, gold)
+    # Even where the phase it leaves is the one a gold names, a failed step is no
+    # resolution, and neither is a failed command before it.
+    unchanged = Gold(gold.stop, gold.command, gold.target, then="ANALYZE_EXECUTE")
+    assert not _resolved(done, unchanged)
+    ran = Ran(("resume",), 0, "ANALYZE_EXECUTE")
+    refused = Followed(ran=[Ran(("unblock",), 1, "BLOCKED"), ran], gold=ran, next=ran)
+    assert not _resolved(refused, unchanged)
+
+
+def test_a_plan_whose_effect_is_lost_or_doubled_is_not_kept(operator, tmp_path_factory):
+    """R1-F3: K9's plan followed to REVIEW, then read back from GitHub: the acceptance
+    comment removed, or posted twice, is a receipt the plan does not hold."""
+    for doubled in (False, True):
+        tmp = tmp_path_factory.mktemp("k9") / ".autoforge"
+        stopped, package, records = _stopped_with_package("k9-acceptance-action", operator, tmp)
+        plan = _plan_at_stop(stopped, package, records)
+        assert plan is not None and plan.problems == ()
+        gold = _case("k9-acceptance-action").gold
+        assert _resolved(_follow(operator, stopped, package, _gold_words(gold, records)), gold)
+        assert _plan_problems(stopped, plan) == []
+        [k9] = [r for r in records if r.kind is EffectKind.ACCEPTANCE_COMMENT]
+        comments = stopped.eng.github.comments[k9.target["issue_url"]]
+        [posted] = [c for c in comments if c.body.rstrip("\n") == k9.payload["body"]]
+        if doubled:
+            stopped.eng.github.add_comment(k9.target["issue_url"], 99_001, posted.body)
+        else:
+            comments.remove(posted)
+        assert _plan_problems(stopped, plan) == [
+            f"{2 if doubled else 0} comments of {k9.describe()}"
+        ]
+
+
+def test_a_pr_head_moved_off_the_candidate_is_not_kept(operator, tmp_path):
+    """R1-F3: the plan completed and the run went on; then another push puts the PR's
+    branch back on the reviewed head. The PR head GitHub reports, the origin's ref and
+    the candidate disagree, so the plan is not kept."""
+    stopped, package, records = _stopped_with_package("k10-operator-actions", operator, tmp_path)
+    plan = _plan_at_stop(stopped, package, records)
+    gold = _case("k10-operator-actions").gold
+    assert _resolved(_follow(operator, stopped, package, _gold_words(gold, records)), gold)
+    assert plan is not None and _plan_problems(stopped, plan) == []
+    [push] = [r for r in records if r.kind is EffectKind.PUSH]
+    base = push.precondition["expected_old"]
+    stopped.eng.origin.publish(stopped.eng.workdir, base, plan.ref.removeprefix("refs/heads/"))
+    [lost] = _plan_problems(stopped, plan)
+    assert lost.startswith(f"the candidate {plan.candidate}: {plan.ref} at {base}")
+
+
+def test_a_push_that_is_not_the_relevant_candidate_is_not_kept(operator, tmp_path_factory):
+    """R1-F3: the plan's push is checked against the candidate at the stop. A package
+    that names another commit, or a worktree that holds another, fails it; and a
+    journal that no longer holds a record of the stop, by its identity, fails the plan
+    while the run is still on it."""
+    tmp = tmp_path_factory.mktemp("k9") / ".autoforge"
+    stopped, package, records = _stopped_with_package("k9-acceptance-action", operator, tmp)
+    [push] = [r for r in records if r.kind is EffectKind.PUSH]
+    reviewed = push.precondition["expected_old"]
+    candidate = push.payload["sha"]
+    named = copy.deepcopy(package)
+    for claim in named["preserve"]:
+        claim["text"] = claim["text"].replace(candidate, reviewed)
+    plan = _plan_at_stop(stopped, named, records)
+    assert plan is not None
+    assert plan.problems == (f"the package does not name the candidate {candidate}",)
+
+    worktree = stopped.eng.agent_worktree_path()
+    git = ["git", "-C", str(worktree), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "later"], check=True)
+    moved = _plan_at_stop(stopped, package, records)
+    assert moved is not None and len(moved.problems) == 1
+    assert moved.problems[0].startswith(f"the push is {candidate}, the worktree holds ")
+    subprocess.run([*git, "reset", "-q", "--hard", candidate], check=True)
+
+    kept = _plan_at_stop(stopped, package, records)
+    assert kept is not None and kept.problems == () and _plan_problems(stopped, kept) == []
+    [k9] = [r for r in records if r.kind is EffectKind.ACCEPTANCE_COMMENT]
+    other = dataclasses.replace(k9, payload={"body": f"{k9.payload['body']} (another)"})
+    swapped = dataclasses.replace(kept, records=(other, push))
+    assert _plan_problems(stopped, swapped) == [f"{other.describe()} is no longer in the journal"]

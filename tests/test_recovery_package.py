@@ -32,6 +32,7 @@ from autoforge.errors import ExecutionTimeoutError, GitHubError, GitHubUnavailab
 from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
 from autoforge.providers import AgentExecutionResult, ProviderRegistry, ScriptedProvider
 from autoforge.recovery_package import (
+    CLAIM_AMBIGUOUS_UNBOUND,
     DIAGNOSES,
     GUIDE_BLOCKED,
     GUIDE_PAUSE,
@@ -49,6 +50,7 @@ from autoforge.recovery_package import (
     Policy,
     _command_line,
     build_package,
+    diagnosis_in,
     fix_follow_up_terms,
 )
 from autoforge.redaction import redact
@@ -195,6 +197,10 @@ def _commands(package: dict) -> list[str]:
 
 def _keys(items: list[dict]) -> list[str]:
     return [item["key"] for item in items]
+
+
+#: The remedy of two marked PRs the run recorded neither of (PR #511 R1-F1).
+REMEDY_UNBOUND = CLAIM_AMBIGUOUS_UNBOUND.remedy
 
 
 # -- the scenarios ------------------------------------------------------------------------
@@ -629,16 +635,67 @@ def test_a_conflict_is_named_and_its_own_object_never_advised_away(
 
 
 def test_true_ambiguous_prs_are_never_chosen_between(tmp_state_dir, status_cli, capsys):
-    """Two PRs carry the issue's marker: nothing is pending, no command takes either
-    over or approves anything, and the live preview stays BLOCKED naming both."""
+    """Two PRs carry the issue's marker: nothing is pending, no command names either PR
+    or approves anything, and the live preview stays BLOCKED naming both. Neither is the
+    run's own, so the operator keeps the one they choose, never closing it, and takes it
+    over: the take-over names no PR, only where its URL goes (PR #511 R1-F1)."""
     eng = _ambiguous(tmp_state_dir)
     package = _recovery(status_cli, eng, capsys, "--live")
     assert package["pending"] == [] and package["guide"] == GUIDE_BLOCKED
     commands = _commands(package)
-    assert not [c for c in commands if "--take-over" in c or "--approve-action" in c]
+    other = "https://github.com/owner/repo/pull/43"
+    assert not [c for c in commands if PR in c or other in c or "--approve-action" in c]
+    prefix = _prefix(eng)
+    take_over = f'{prefix} unblock --take-over <PR URL> --reason "..."'
+    assert _sequence(package)[:5] == [
+        ("", False),
+        (f"{prefix} status --live", False),
+        (take_over, False),
+        (f"{prefix} resume", False),
+        (f"{prefix} run --force --epic {EPIC} --issue {ISSUE}", True),
+    ]
+    keep = package["next"][0]["text"]
+    assert keep == REMEDY_UNBOUND and "never the one kept" in keep
+    assert "not the run's own" not in keep  # the reading that closes every one of them
     live = package["live"]
     assert (live["decision"], live["target_phase"]) == ("would_stay_blocked", None)
-    assert PR in live["detail"] and "https://github.com/owner/repo/pull/43" in live["detail"]
+    assert PR in live["detail"] and other in live["detail"]
+
+
+def test_the_pr_kept_of_an_ambiguity_is_taken_over_as_the_package_says(
+    tmp_state_dir, status_cli, capsys
+):
+    """The package's steps for two marked PRs the run recorded neither of, followed as
+    typed: the operator closes the other PR and keeps the one they chose; the preview
+    refuses a plain 'unblock' and names the take-over; the take-over of the kept PR
+    re-enters ANALYZE_EXECUTE, and the PR kept is still open with its marker."""
+    eng = _ambiguous(tmp_state_dir)
+    other = "https://github.com/owner/repo/pull/43"
+    eng.github.prs[other].state = "CLOSED"  # the operator's act: PR is the one kept
+    live = _recovery(status_cli, eng, capsys, "--live")["live"]
+    assert live["decision"] == "would_stay_blocked"
+    assert f"unblock --take-over {PR}" in live["detail"]
+    rc, _, err = status_cli(
+        eng, "unblock", "--take-over", PR, "--reason", "the issue's PR", capsys=capsys
+    )
+    assert rc == 0, err
+    assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
+    kept = eng.github.prs[PR]
+    assert kept.is_open and "ai-implementation" in kept.body
+
+
+def test_an_ambiguity_with_a_pr_bound_keeps_the_runs_own_and_unblocks_plainly(tmp_state_dir):
+    """With a PR bound, the run's own object is the one kept, and the plain 'unblock'
+    re-reads GitHub: the unbound diagnosis, and its take-over, are only for a run that
+    recorded no PR (PR #511 R1-F1)."""
+    eng = _ambiguous(tmp_state_dir)
+    state = load_state(eng.paths.state_file)
+    assert diagnosis_in(StopReasonCode.CLAIM_AMBIGUOUS, state).remedy == REMEDY_UNBOUND
+    state.current_pr_url = PR
+    bound = diagnosis_in(StopReasonCode.CLAIM_AMBIGUOUS, state)
+    assert bound == DIAGNOSES[StopReasonCode.CLAIM_AMBIGUOUS]
+    assert "the run's own where the run recorded one" in bound.remedy
+    assert "never the one kept" in bound.remedy and "--take-over" not in bound.remedy
 
 
 def test_refused_checks_291_are_previewed_and_never_claimed_passing(

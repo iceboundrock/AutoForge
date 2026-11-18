@@ -3,13 +3,15 @@
 - **Status:** proposed with #375's pull request, at `main` `d6283cc`
   (2026-11-18), where every reference below was read. It recommends a go
   (§8) and decides nothing. The go/no-go and the operator sign-off are the
-  maintainer's, recorded on #375. Until they are, §8 is a recommendation.
-- **Evaluates:** EPIC #354's deterministic MVP as `main` holds it. That is
-  ADR 0011's typed stop classification and `stop:` lines (#369, `84df820`),
-  the saved stop code, the recovery package and `status --live` (#374,
-  `4a95c6d`), the bounded automatic relaunch of ADR 0012 D11 (#434,
-  `143ac17`) and the acceptance of a delivered result of ADR 0012 D12
-  (#479, `32f5317`).
+  maintainer's, recorded on #375; neither is recorded yet, so §8 is a
+  recommendation and #375's last acceptance criterion is open.
+- **Evaluates:** EPIC #354's deterministic MVP as `main` holds it, with one
+  correction this pull request makes to the package's advice (§4,
+  `ambiguous-prs`). That is ADR 0011's typed stop classification and `stop:`
+  lines (#369, `84df820`), the saved stop code, the recovery package and
+  `status --live` (#374, `4a95c6d`), the bounded automatic relaunch of ADR
+  0012 D11 (#434, `143ac17`) and the acceptance of a delivered result of
+  ADR 0012 D12 (#479, `32f5317`).
 - **Inputs:** #375's body and its one comment, which the controller handed
   to the agent that wrote this record, and the repository at `d6283cc`.
   That agent held no GitHub credential and read nothing else of GitHub. It
@@ -93,12 +95,16 @@ of stop, not how often each kind occurs.
 Each case's gold resolution is written by hand in the harness, from ADR
 0012 D2 (who leaves each outcome, and how) and D3 (which authority each
 action needs), never from the package. It is the operator's act outside
-AutoForge, the command that leaves the stop, and the phase the controller
-must read back after that command. The harness performs it, on a fresh copy
-of the case when the package's steps did not, and fails if the saved state
-shows another phase or if the next step stops the run again. Every gold
-label in §4 passed that check, so each is held by the controller's own
-read-back. Nothing an agent or a model said counts as an outcome.
+AutoForge, the command that leaves the stop, the phase the controller must
+read back after that command, and what the next workflow step must save:
+after an `unblock`, the `resume --max-steps 1` that follows it; a `resume`
+or a `run` is that step itself. The harness performs it, on a fresh copy of
+the case when the package's steps did not resolve the stop, and fails if a
+command exits with anything but 0, if the saved state shows another phase
+after the command, or if the step after it saves anything but what the
+gold names (the **Gold read-back** column). Every gold label in §4 passed
+that check, so each is held by the controller's own read-back. Nothing an
+agent or a model said counts as an outcome.
 
 Two cases are resolved by the controller with no operator command; their
 gold resolution reads "none: the controller recovers". The other fifteen
@@ -123,28 +129,68 @@ those fifteen counts as an automated recovery.
   `status --json`, or the refusal it exits with.
 - **After: command:** a step of the package spells the gold command whole.
   For a refusal, which gets no package, its error text is read instead.
+- **Gold read-back:** what the controller must save after the gold
+  command, and, after an `unblock`, after the `resume` that follows it. For
+  a case the controller resolves itself, the phase its own steps saved.
 - **After: unsafe:** displayed steps that ADR 0012 D2 denies for the stop,
-  or that D3 grants nobody. These are: a `resume` or `step` before the run
-  has left `BLOCKED`; an `unblock` of a run that is not `BLOCKED`; an
-  approval of an action that awaits none; a decline or bind of an action the
-  plan does not hold; an open merge gate; an accepted configuration change;
-  and any command that is neither the controller's nor the documented `gh`
-  pipe of an operator action. An alternative step stands in place of the
-  steps before it, so it is checked against the run as it stopped.
+  or that D3 grants nobody, and steps without a command whose act, as the
+  text reads, breaks what the gold keeps. The commands counted are: a
+  `resume` or `step` before the run has left `BLOCKED`; an `unblock` of a
+  run that is not `BLOCKED`; an approval of an action that awaits none; a
+  decline or bind of an action the plan does not hold; an open merge gate;
+  an accepted configuration change; and any command that is neither the
+  controller's nor the documented `gh` pipe of an operator action. An
+  alternative step stands in place of the steps before it, so it is checked
+  against the run as it stopped. A step without a command is performed as
+  it reads (below), and it is unsafe when it closes or unmarks a PR the gold
+  keeps open and marked: the PR the operator chose, the PR the run is bound
+  to, or one whose marker names the run.
 - **After: steps resolve:** the package's steps are run in order as an
   operator would type them, without the alternatives. Placeholders are
-  filled, the operator's act is performed at the first step that has no
-  command, and `doctor` is skipped, since it checks the host and a case
-  does not stand in for one. The column is `yes` when those steps run the
-  gold command, the controller reads back the gold phase, and the step
-  after it (`resume --max-steps 1`) does not stop the run in `BLOCKED` or
-  `FAILED`.
+  filled (a reason with text, `<PR URL>` with the PR the operator chose),
+  and `doctor` is skipped, since it checks the host and a case does not
+  stand in for one. The column is `yes` when every command the steps ran
+  exited 0, the gold command was among them and saved the gold phase, and
+  the step after it, the first `resume` or `run` the steps show, ran with
+  `--max-steps 1`, exited 0 and saved what the **Gold read-back** names. A
+  package that shows no such step, or a step that fails with the phase
+  unchanged, is `no`
+  (`tests/test_recovery_evaluation.py::test_a_package_that_omits_the_next_step_does_not_resolve`,
+  `tests/test_recovery_evaluation.py::test_a_resume_that_fails_with_the_phase_unchanged_does_not_resolve`).
 - **After: preview:** before the steps run a plain `unblock`, the decision
   `status --live` reports is the one that `unblock` then takes.
-- **Plan kept:** for a stop with a saved plan. The package names the
-  journal and the candidate commit as data not to touch, the commit is
-  still in the repository after the steps, and, when the run went on, the
-  run's PR is at that commit.
+- **Plan kept:** for a stop with a saved plan, three checks. At the stop,
+  the package names the journal and the push's commit as data not to touch,
+  and that commit is the relevant candidate: the plan's only push, the
+  commit the agent worktree holds, a descendant of the head the push's
+  precondition read (the reviewed head for FIX, the default branch head for
+  ANALYZE_EXECUTE) and of every fixed finding's commit, not yet on the
+  PR's branch when the push was never sent, and on it when the push was
+  observed. After the steps, while the run is still on the plan, every
+  record of the stop is in the journal with the same identity, target and
+  payload, at a stage no earlier than before. Once the phase went on, which
+  drops its records (ADR 0004 D2.4), every record's effect is read where it
+  was written: the origin's branch, the PR head GitHub reports and the
+  state's head are all the candidate; exactly one open PR is the one the
+  plan created and the run is bound to; exactly one comment carries each
+  comment's payload; the PR description is the update's payload
+  (`tests/test_recovery_evaluation.py::test_a_plan_whose_effect_is_lost_or_doubled_is_not_kept`,
+  `tests/test_recovery_evaluation.py::test_a_pr_head_moved_off_the_candidate_is_not_kept`,
+  `tests/test_recovery_evaluation.py::test_a_push_that_is_not_the_relevant_candidate_is_not_kept`).
+
+A step without a command is the operator's own act, so the harness performs
+it as its text reads, literally. Each text the package shows in the sample
+has a reading written by hand in the harness (`READINGS`): reading or
+inspecting changes nothing; "raise workflow.max_review_rounds" raises it, to
+the value the case gives; "a credential that may read check runs" grants
+that read; "repair or remove it if it is not the run's own" closes a marked
+PR whose marker names another run or none; "decide which one PR is the
+issue's ... never the one kept" closes every marked PR but the one the case
+has the operator choose. The detail of a `status --live` preview is read the
+same way, since the operator reads it there. A step that no reading covers
+fails its case: the gold's act never stands in for a text
+(`tests/test_recovery_evaluation.py::test_a_manual_step_with_no_reading_fails_the_case`).
+An operator's act must leave the state directory unchanged.
 
 `—` means the column does not apply to the case.
 
@@ -156,44 +202,58 @@ time and bytes of every entry.
 
 ## 4. The matrix
 
-| Case | Stratum | Gold stop | Gold resolution | Before: a stop | Before: command | After: stop line | After: later status | After: command | After: unsafe | After: steps resolve | After: preview | Plan kept |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `k10-operator-actions` | K10 | blocked/operator-actions | post each payload on its issue, then `unblock --reason …` | yes | yes | blocked/operator-actions | blocked/operator-actions | yes | 0 | yes | yes | yes |
-| `k9-acceptance-action` | K9 | blocked/acceptance-action | `unblock --approve-action <id> --reason …` | yes | yes | blocked/acceptance-action | blocked/acceptance-action | yes | 0 | yes | — | yes |
-| `k12-pr-body-update` | K12 | blocked/acceptance-action | `unblock --approve-action <id> --reason …` | yes | yes | blocked/acceptance-action | blocked/acceptance-action | yes | 0 | yes | — | yes |
-| `checks-refused-291` | #291 | blocked/github-checks-refused | a credential that may read check runs, then `unblock --reason …` | yes | no | blocked/github-checks-refused | blocked/github-checks-refused | yes | 0 | yes | yes | — |
-| `no-stop-327` | #327 | none | none: the controller recovers | — | — | — | — | — | — | yes | — | — |
-| `false-conflict-314` | #327 | blocked/effect-conflict | `unblock --reason …` | yes | no | blocked/effect-conflict | blocked/effect-conflict | yes | 0 | yes | yes | yes |
-| `ambiguous-prs` | coordination | blocked/claim-ambiguous | close the stale PR, then `unblock --take-over <PR> --reason …` | yes | no | blocked/claim-ambiguous | blocked/claim-ambiguous | no | 0 | no | yes | — |
-| `review-round-cap` | bounds | blocked/review-round-cap | raise workflow.max_review_rounds, then `unblock --reason …` | yes | no | blocked/review-round-cap | blocked/review-round-cap | yes | 0 | yes | yes | — |
-| `step-budget` | bounds | blocked/step-budget | raise workflow.max_total_steps, then `unblock --reason …` | yes | no | blocked/step-budget | blocked/step-budget | yes | 0 | yes | yes | — |
-| `no-saved-code` | no code | blocked/review-round-cap | raise workflow.max_review_rounds, then `unblock --reason …` | yes | no | blocked/review-round-cap | blocked/unknown | yes | 0 | yes | yes | — |
-| `agent-blocked` | agent | blocked/agent-blocked | answer the agent's question, then `unblock --reason …` | yes | no | blocked/agent-blocked | blocked/agent-blocked | yes | 0 | yes | yes | — |
-| `agent-failure` | FAILED | failed/agent-failure | `run --force --epic <EPIC> --issue <issue>` | yes | no | failed/agent-failure | failed/agent-failure | yes | 0 | yes | — | — |
-| `idle-timeout-relaunched` | timeouts | none | none: the controller recovers | — | — | — | — | — | — | yes | — | — |
-| `idle-timeout-twice` | timeouts | resumable_error/execution-timeout | `resume` | no | yes | resumable_error/execution-timeout | in_progress/in-progress | yes | 0 | yes | — | — |
-| `github-unavailable` | unknown effect | resumable_error/github-unavailable | `resume` | no | yes | resumable_error/github-unavailable | in_progress/in-progress | yes | 0 | yes | — | yes |
-| `power-loss-after-push` | crash | — | `resume` | no | no | — | in_progress/in-progress | yes | 0 | yes | — | yes |
-| `local-blocked` | LOCAL | refused/state-invalid | `run --force --epic <EPIC> --issue <issue>` | yes | no | refused/state-invalid | refused (exit 2) | no | — | — | — | — |
+| Case | Stratum | Gold stop | Gold resolution | Gold read-back | Before: a stop | Before: command | After: stop line | After: later status | After: command | After: unsafe | After: steps resolve | After: preview | Plan kept |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `k10-operator-actions` | K10 | blocked/operator-actions | post each payload on its issue, then `unblock --reason …` | FIX, then `resume`: REVIEW | yes | yes | blocked/operator-actions | blocked/operator-actions | yes | 0 | yes | yes | yes |
+| `k9-acceptance-action` | K9 | blocked/acceptance-action | `unblock --approve-action <id> --reason …` | FIX, then `resume`: REVIEW | yes | yes | blocked/acceptance-action | blocked/acceptance-action | yes | 0 | yes | — | yes |
+| `k12-pr-body-update` | K12 | blocked/acceptance-action | `unblock --approve-action <id> --reason …` | FIX, then `resume`: REVIEW | yes | yes | blocked/acceptance-action | blocked/acceptance-action | yes | 0 | yes | — | yes |
+| `checks-refused-291` | #291 | blocked/github-checks-refused | a credential that may read check runs, then `unblock --reason …` | READY_FOR_MERGE, then `resume`: READY_FOR_MERGE | yes | no | blocked/github-checks-refused | blocked/github-checks-refused | yes | 0 | yes | yes | — |
+| `no-stop-327` | #327 | none | none: the controller recovers | REVIEW | — | — | — | — | — | — | yes | — | — |
+| `false-conflict-314` | #327 | blocked/effect-conflict | `unblock --reason …` | ANALYZE_EXECUTE, then `resume`: REVIEW | yes | no | blocked/effect-conflict | blocked/effect-conflict | yes | 0 | yes | yes | yes |
+| `ambiguous-prs` | coordination | blocked/claim-ambiguous | keep the issue's PR, close the other, then `unblock --take-over <PR kept> --reason …` | ANALYZE_EXECUTE, then `resume`: REVIEW | yes | no | blocked/claim-ambiguous | blocked/claim-ambiguous | yes | 0 | yes | — | — |
+| `review-round-cap` | bounds | blocked/review-round-cap | raise workflow.max_review_rounds, then `unblock --reason …` | FIX, then `resume`: REVIEW | yes | no | blocked/review-round-cap | blocked/review-round-cap | yes | 0 | yes | yes | — |
+| `step-budget` | bounds | blocked/step-budget | raise workflow.max_total_steps, then `unblock --reason …` | REVIEW, then `resume`: FIX | yes | no | blocked/step-budget | blocked/step-budget | yes | 0 | yes | yes | — |
+| `no-saved-code` | no code | blocked/review-round-cap | raise workflow.max_review_rounds, then `unblock --reason …` | FIX, then `resume`: REVIEW | yes | no | blocked/review-round-cap | blocked/unknown | yes | 0 | yes | yes | — |
+| `agent-blocked` | agent | blocked/agent-blocked | answer the agent's question, then `unblock --reason …` | ANALYZE_EXECUTE, then `resume`: REVIEW | yes | no | blocked/agent-blocked | blocked/agent-blocked | yes | 0 | yes | yes | — |
+| `agent-failure` | FAILED | failed/agent-failure | `run --force --epic <EPIC> --issue <issue>` | ANALYZE_EXECUTE | yes | no | failed/agent-failure | failed/agent-failure | yes | 0 | yes | — | — |
+| `idle-timeout-relaunched` | timeouts | none | none: the controller recovers | REVIEW | — | — | — | — | — | — | yes | — | — |
+| `idle-timeout-twice` | timeouts | resumable_error/execution-timeout | `resume` | REVIEW | no | yes | resumable_error/execution-timeout | in_progress/in-progress | yes | 0 | yes | — | — |
+| `github-unavailable` | unknown effect | resumable_error/github-unavailable | `resume` | REVIEW | no | yes | resumable_error/github-unavailable | in_progress/in-progress | yes | 0 | yes | — | yes |
+| `power-loss-after-push` | crash | — | `resume` | REVIEW | no | no | — | in_progress/in-progress | yes | 0 | yes | — | yes |
+| `local-blocked` | LOCAL | refused/state-invalid | `run --force --epic <EPIC> --issue <issue>` | ANALYZE_EXECUTE | yes | no | refused/state-invalid | refused (exit 2) | no | — | — | — | — |
 
 What the rows that differ show:
 
-- **`ambiguous-prs`** is the one case whose displayed steps do not resolve
-  it. Two open PRs carry the issue's marker and the run recorded neither.
-  The package's first step says to close every PR that is not the run's
-  own, then `unblock`. But neither PR is the run's own, so after the stale
-  one is closed the plain `unblock` refuses: a marked PR this run has no
-  record of is never bound by finding it (ADR 0004 D9.4a). The refusal, and
-  the `status --live` preview before it, spell the command that resolves it
-  (`unblock --take-over <PR>`, K11 under #414). The package's static steps
-  do not. Nothing unsafe happened: the refusal is ADR 0012 D3's fail-closed
-  `DENY`, and the preview predicted it. It costs the operator one refused
-  command. It is a deterministic gap, a follow-up for the package (§8).
+- **`ambiguous-prs`** is the row this pull request changed, and the one
+  where the first version of this record was wrong. Two open PRs carry the
+  issue's marker and the run recorded neither. #374's package said, as its
+  first step, to "close, delete or unmark every one that is not the run's
+  own, then 'unblock'". Neither PR is the run's own, so that text, read as
+  it stands, closes both, the PR the issue needs among them. The first
+  harness did not read it: it performed the gold's act (close the stale PR)
+  at the first step without a command, and so counted no unsafe step. Read
+  as it stands, that step is unsafe
+  (`tests/test_recovery_evaluation.py::test_a_manual_step_that_closes_the_pr_the_gold_keeps_is_unsafe`),
+  and even with only the stale PR closed, the plain `unblock` it named
+  refused the one left: a marked PR this run has no record of is never
+  bound by finding it (ADR 0004 D9.4a). So the package now tells a run that recorded no PR to
+  decide which PR is the issue's, keep that one open with its marker, close
+  or unmark each other one and never the one kept, then
+  `unblock --take-over <PR URL>`, which names no PR: the choice stays the
+  operator's (K11 under #414), and `unblock` refuses the take-over while a
+  second PR still carries the marker. A run bound to a PR keeps its own and
+  unblocks plainly, as before. Followed as typed, the steps now keep the PR
+  the operator chose, take it over, and the `resume` after it reaches
+  `REVIEW` on it. The take-over has no live preview, which covers a plain
+  `unblock` only, so the row's preview is `—`.
 - **`no-saved-code`** is the review cap saved with no code, as every stop
   saved before protocol 16 loads. The later `status` says `unknown`
-  explicitly and never derives a code from the reason's text. It still
-  offers the plain `unblock` and the live preview, and the preview names the
-  bound to raise, so the steps resolve it.
+  explicitly and never derives a code from the reason's text. Its own step
+  only says to read the reason and the run log. It still offers the live
+  preview and the plain `unblock`, and the preview's detail tells the
+  operator to raise `workflow.max_review_rounds`; performed as it reads, the
+  steps resolve it. The first harness raised the bound at the step that
+  says to read the reason, which no text there asked for.
 - **`idle-timeout-twice`**, **`github-unavailable`** and
   **`power-loss-after-push`** never entered `BLOCKED` or `FAILED`, so no code
   is saved for them (ADR 0011 D5, as #374 amended it, saves one only with
@@ -224,11 +284,11 @@ What the rows that differ show:
 | The stopping command names the gold outcome and code | 0 of 14 | 14 of 14 |
 | A later `status` names the gold code | 0 of 15 | 10 of 15 |
 | A later `status` says the code is unknown | 0 of 15 | 1 of 15 |
-| The text, or the package, spells the gold command | 5 of 15 | 13 of 15 |
-| Unsafe displayed steps | not measured | 0 in 14 packages |
-| The displayed steps, followed as typed, resolve the stop | — | 13 of 14 |
-| A plain `unblock`'s live preview was its decision | — | 8 of 8 |
-| The saved plan and its candidate were named and kept | — | 6 of 6 |
+| The text, or the package, spells the gold command | 5 of 15 | 14 of 15 |
+| Unsafe displayed steps, those without a command performed as they read | not measured | 0 in 14 packages |
+| The displayed steps, followed as typed, resolve the stop, and the next step succeeds | — | 14 of 14 |
+| A plain `unblock`'s live preview was its decision | — | 7 of 7 |
+| The saved plan was named, its push was the candidate, and every record held | — | 6 of 6 |
 | Resolved by the controller with no operator command | 2 of 17 | 2 of 17 |
 
 **Classification.** Every stop line names the gold outcome and code (14
@@ -239,37 +299,46 @@ four it says what the state can prove: `in_progress` with the `resume`
 route for the three that never stopped, and the loader's refusal for
 LOCAL. No case was classified wrongly.
 
-**Handoff.** The package spells the command that resolves the stop in 13
+**Handoff.** The package spells the command that resolves the stop in 14
 of 15 cases. The text an operator had before spells it in 5. The gains are
 where the before arm had little or nothing: an agent's own stop, whose
 reason is the agent's text; the bounds, identity and GitHub stops, whose
 reasons say what to fix but not the command (several end in "then
-'unblock'"); a FAILED run, whose route is a new run; and a crash, which
-prints nothing.
-In 13 of the 14 cases with a package, following its steps as typed
-resolves the stop. The one exception is `ambiguous-prs`, above. Its steps
-cost one refused `unblock`, the only repeated `BLOCKED` the sample showed,
-and the refusal named the remedy.
+'unblock'"); two marked PRs, whose reason says to close the stale one and
+`unblock`, which then refuses; a FAILED run, whose route is a new run; and
+a crash, which prints nothing. The one it misses is `local-blocked`, which
+gets no package.
+In all 14 cases with a package, following its steps as typed resolves the
+stop: every command exits 0, the gold phase is saved, and the step after it
+exits 0 and saves what the gold names. Before this pull request's
+correction, `ambiguous-prs` did not: its steps closed the PR the operator
+wanted, and its `unblock` was refused.
 
-**Safety and cost.** No package displayed an unsafe step. No `status`
-launched an agent, sent anything to GitHub or changed the state directory,
-in any of the 15 stops. The live preview matched the decision of every
-plain `unblock` that followed it (8 of 8). Every saved plan and its
-candidate were named as data not to touch, and survived (6 of 6). The
+**Safety and cost.** No package displayed an unsafe step, counting the
+steps without a command as performed. No `status` launched an agent, sent
+anything to GitHub or changed the state directory, in any of the 15 stops.
+The live preview matched the decision of every plain `unblock` that
+followed it (7 of 7). Every saved plan was named as data not to touch, its
+push was the candidate the worktree held, and every record held: in all six
+the run went on, and each record's effect was read back exactly once from
+GitHub and the origin, with the candidate, where the plan had one, at the
+PR's head (6 of 6). The
 package costs no model launch and no GitHub write. `status --live` reads
 GitHub as `unblock --dry-run` does, and reports the decision it prints
 (`tests/test_recovery_package.py::test_the_live_preview_is_the_decision_unblock_dry_run_prints`).
 The CPU time of one `status --json`
-over a case's state was 4 ms to 29 ms, median 14 ms, over the 15 stops, in
-one run on an Intel Core i7-8700K under CPython 3.14.10 (recorded as each
-case's `status_cpu_seconds` in `--junitxml`). That is a measurement of one
-host, and no test bounds it.
+over a case's state was 4 ms to 30 ms, median 16 ms, over the 15 stops, in
+one serial run on an Intel Core i7-8700K under CPython 3.14.10 (recorded as
+each case's `status_cpu_seconds` in `--junitxml`, with
+`-o junit_family=xunit1`, since pytest's default family drops a test's
+properties). That is a measurement of one host, and no test bounds it.
 
 ## 6. The safety regressions
 
 #375 requires each of these to hold. Each one names the tests that hold it
-on `main`, and every case of §4 adds its own checks: no `status` writes,
-sends or launches anything, and no displayed step is unsafe.
+on `main` or in this pull request, and every case of §4 adds its own checks:
+no `status` writes, sends or launches anything, no displayed step is unsafe,
+no operator's act writes the state, and no saved plan loses a record.
 `tests/test_recovery_evaluation.py` fails if a test named here no longer
 exists. Whether each one passes is the suite's business, since they all run
 in it.
@@ -334,12 +403,16 @@ in it.
   `tests/test_runlog.py::test_runlog_recovers_sequence_from_step_names_never_from_the_journal`).
 - **Unknown and ambiguous stay explicit.** No code is ever read from a
   reason's text, and a saved code classifies only as itself. Two candidate
-  PRs are never chosen between. An inconclusive read refuses `unblock`, and
-  a transient one writes nothing. An unknown view gets only the routes both
-  views share. A result delivered before a kill is never discarded
+  PRs are never chosen between: the package names neither, tells the
+  operator to keep the one they choose, and its take-over names no PR. An
+  inconclusive read refuses `unblock`, and a transient one writes nothing.
+  An unknown view gets only the routes both views share. A result delivered
+  before a kill is never discarded
   (`tests/test_stop_classification.py::test_a_persisted_reason_is_never_read_for_a_code`,
   `tests/test_stop_classification.py::test_a_saved_code_classifies_only_as_the_code_it_is`,
   `tests/test_recovery_package.py::test_true_ambiguous_prs_are_never_chosen_between`,
+  `tests/test_recovery_package.py::test_the_pr_kept_of_an_ambiguity_is_taken_over_as_the_package_says`,
+  `tests/test_recovery_package.py::test_an_ambiguity_with_a_pr_bound_keeps_the_runs_own_and_unblocks_plainly`,
   `tests/test_unblock.py::test_unblock_refuses_a_pr_that_cannot_be_read_conclusively`,
   `tests/test_unblock.py::test_unblock_propagates_a_transient_github_failure_and_writes_nothing`,
   `tests/test_stop_classification.py::test_an_unknown_view_gives_only_the_routes_both_views_share`,
@@ -358,8 +431,14 @@ in it.
   `tests/test_recovery_package.py::test_the_json_keys_are_stable`,
   `tests/test_recovery_package.py::test_two_status_runs_over_one_state_print_the_same`).
 
-This change adds no behaviour. It runs no real model, changes no CI
-threshold, runs no `autoforge epic run`, and changes no default.
+This change makes no controller decision differently. Its one change
+outside the evaluation is the advice of the package for `claim-ambiguous`
+with no PR bound: one diagnosis, and a take-over step in place of the plain
+`unblock`. Nothing that decides reads the package
+(`tests/test_recovery_package.py::test_the_package_module_reads_nothing_and_decides_nothing`),
+and `unblock --take-over` re-checks everything itself. The change runs no
+real model, changes no CI threshold, runs no `autoforge epic run`, and
+changes no default.
 
 ## 7. What this cannot say
 
@@ -396,6 +475,14 @@ threshold, runs no `autoforge epic run`, and changes no default.
 
   Such a corpus can show coverage and gaps on real stops. It cannot show
   diagnosis time either.
+- **A step without a command is read by the evaluator.** What a text tells
+  an operator to do is a reading written by hand, one per text
+  (`READINGS`), not something the harness can derive. It is checked by
+  performing it and by what it breaks, but a reading that is kinder than
+  the text would hide an unsafe step, so the readings deserve a reviewer's
+  eye. The first version of this record shows the cost: it performed the
+  gold's act in place of the text and missed that `ambiguous-prs` closed
+  both PRs.
 - **No stops from outside AutoForge were available.**
 - **The before arm is an upper bound** (§2): it reads today's reasons,
   which #369 and later changes corrected.
@@ -408,8 +495,9 @@ evaluation does not reopen it. D4 item 4 measures an advisor against the
 deterministic package. This record measures that package, and finds two
 gaps (`ambiguous-prs` and `local-blocked`). In both the controller already
 decides the route without a model: the take-over is spelled in the refusal
-it prints, and a LOCAL state's route is a new run. Neither is a diagnosis a
-model would add.
+it prints, and now in the package, and a LOCAL state's route is a new run.
+Which PR is the issue's is the operator's decision, never a model's (ADR
+0012 D3). Neither gap is a diagnosis a model would add.
 
 **Gate A, autonomous recovery actions: no-go,** as ADR 0012 D5 decided,
 except for the one class #434 approved (D11): one relaunch per step of an
@@ -420,39 +508,57 @@ This evaluation does not reopen A, and names no new class.
 them.
 
 **Recommendation: go for the deterministic MVP as `main` holds it, with
-no change.** It classified no case wrongly: it named the gold code, said
-`unknown`, or said only what the state proves. It displayed no unsafe
-step. It spelled the resolving command in 13 of 15
-stops against 5 for the text alone. Following its steps resolved 13 of the
-14 stops that have a package. And it changed no decision: §6's tests and
-the harness's checks hold that.
+this pull request's correction of the `claim-ambiguous` advice.** Without
+that correction the recommendation would be no-go: #375 requires zero
+unsafe suggested actions, and #374's text for two marked PRs, read as it
+stands, closes the PR the operator needs (§4). With it, the package
+classified no case wrongly: it named the gold code, said `unknown`, or said
+only what the state proves. It displayed no unsafe step, counting the steps
+without a command as performed. It spelled the resolving command in 14 of
+15 stops against 5 for the text alone. Following its steps resolved all 14
+stops that have a package, each command exiting 0 and the next step
+saving the gold's phase. Every saved plan kept its records, and every
+candidate reached the PR's head. And it changed no decision: §6's tests
+and the harness's checks hold that.
 
-- **Roll-forward** is no change. Every part is already on `main`. Every
-  part is either read-only advice (the stop line, the package, the
-  preview) or the one saved field (`stop_code`), and none of them decides
-  anything. No default changes.
-- **Rollback** would mean reverting #374's commit. A controller refuses a
-  state saved under a newer protocol than its own
+- **Roll-forward** is this pull request: the corrected advice, and the
+  evaluation. Everything else is already on `main`. Every part is either
+  read-only advice (the stop line, the package, the preview) or the one
+  saved field (`stop_code`), and none of them decides anything. No default
+  changes, and no state or protocol changes.
+- **Rollback** of the correction alone is a revert of this pull request,
+  and brings the unsafe text back; it changes no state, so any run can be on
+  either side of it. A rollback of the MVP would mean reverting #374's
+  commit too. A controller refuses a state saved under a newer protocol
+  than its own
   (`tests/test_protocol_compat.py::test_a_newer_label_is_refused_before_its_phase_and_fields_are_read`),
   so one from before #374 refuses every state saved under protocol 16 or
   later. A rollback across that protocol needs every run to have finished,
   or to be started afresh. Nothing in §5 calls for one.
-- **Follow-ups**, deterministic and not blocking. First, the package
-  should name `unblock --take-over` when the run owns none of the PRs
-  carrying the issue's marker (`ambiguous-prs`). Second, a refused LOCAL
+- **Follow-ups**, deterministic and not blocking. First, a refused LOCAL
   state's refusal could spell `run --force` with placeholders for the issue
   and the EPIC, which the controller does not read from a file it refuses
-  (`local-blocked`).
-  Third, the corpus protocol of §7 is still to be run. Each would be its own
-  issue, and none is opened by this change.
+  (`local-blocked`). Second, the corpus protocol of §7 is still to be run.
+  Each would be its own issue, and none is opened by this change. The
+  missing take-over this record first listed as a follow-up is the
+  correction above.
 - **Remaining risks.** A later `status` cannot say why a resumable error
   stopped (by design: §4). The cause is in the failing command's `stop:`
-  line and in the run log. And the evidence is offline, so a kind of stop
-  the suite does not model is not covered.
-- **For operators**, nothing changes. Read `status`'s Recovery block. Run
+  line and in the run log. The readings of the steps without a command are
+  hand-written (§7). The `claim-ambiguous` advice for a run bound to a PR
+  (two review comments of one round, two follow-up issues of one finding)
+  is reworded to keep the run's own and was not sampled. And the evidence
+  is offline, so a kind of stop the suite does not model is not covered.
+- **For operators**, one thing changes: with two PRs carrying the issue's
+  marker and none recorded by the run, `status` says to keep the PR you
+  choose and take it over. Otherwise, read `status`'s Recovery block. Run
   `status --live` before an `unblock`. Use the troubleshooting guide,
   indexed by symptom (`docs/troubleshooting.md`). Treat every displayed
   command as advice that the command itself re-checks.
 
-**Sign-off.** The deterministic MVP's go/no-go and the operator's sign-off
-are the maintainer's to record on #375. This record holds neither.
+**Sign-off: not recorded.** The deterministic MVP's go/no-go, its
+roll-forward and rollback above, and the operator's sign-off are the
+maintainer's to record on #375, as #375's last acceptance criterion
+requires. This record holds none of them, and does not satisfy that
+criterion. A maintainer who records them there may also record a no-go, or
+a go with other terms; this record is then amended to cite the decision.

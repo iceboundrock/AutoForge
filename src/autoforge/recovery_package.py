@@ -627,10 +627,14 @@ DIAGNOSES: dict[StopReasonCode, Diagnosis] = {
         "inspect the object the conflict names; the conflict's own steps below say what "
         "puts it right",
     ),
+    # With a PR bound; with none, :data:`CLAIM_AMBIGUOUS_UNBOUND`.
     StopReasonCode.CLAIM_AMBIGUOUS: Diagnosis(
         "more than one object claims the identity the controller looks for (two PRs with the "
         "issue's marker, two comments of one round), and it never chooses between them",
-        "close, delete or unmark every one that is not the run's own, then 'unblock'",
+        "decide which one of them to keep: the run's own where the run recorded one, "
+        "otherwise the one you choose (the controller never chooses). Leave that one as it "
+        "is, and close, delete or unmark each of the others, never the one kept; then "
+        "'unblock'",
     ),
     StopReasonCode.PR_OWNER: Diagnosis(
         "the PR's implementation marker does not name this run (another run, no run, or a "
@@ -792,6 +796,21 @@ REPLAN_POLICY_REFUSED = Diagnosis(
     "the PR to a human",
 )
 
+#: ``claim-ambiguous`` with no PR bound (PR #511 R1-F1). Only ANALYZE_EXECUTE's
+#: probe of the issue's PRs names it so: none of the PRs is the run's own, so
+#: the operator keeps the one they choose, and a plain 'unblock' refuses that
+#: one too (ADR 0004 D9.4a), so the take-over is the way on
+#: (:meth:`_Builder.takes_over`).
+CLAIM_AMBIGUOUS_UNBOUND = Diagnosis(
+    "more than one open PR carries the issue's implementation marker, or one carries a "
+    "marker that cannot be read, and this run recorded none of them: none is the run's own, "
+    "and the controller never chooses between them",
+    "decide which one PR is the issue's: your decision, never the controller's. Keep that "
+    "PR open with its marker (repair the marker if it cannot be read), and close each other "
+    "PR or remove its marker, never the one kept. Then take the kept PR over, below: a plain "
+    "'unblock' refuses a marked PR this run has no record of (ADR 0004 D9.4a)",
+)
+
 
 def diagnosis_in(code: StopReasonCode, state: AutoForgeState) -> Diagnosis:
     """:func:`diagnosis_of` ``code``, where the state tells one code's two stops apart.
@@ -807,9 +826,15 @@ def diagnosis_in(code: StopReasonCode, state: AutoForgeState) -> Diagnosis:
     the journal without launching an agent, or stops on the same cause again:
     so a saved plan's diagnosis gives its repair, says what of it is already
     on GitHub, and promises no fresh entry or launch.
+
+    ``claim-ambiguous`` with no PR bound is the issue's PRs, none of them the
+    run's own: the operator keeps the one they choose and takes it over
+    (:data:`CLAIM_AMBIGUOUS_UNBOUND`, PR #511 R1-F1).
     """
     if code is StopReasonCode.REPLAN_REFUSED and not state.replan_transaction:
         return REPLAN_POLICY_REFUSED
+    if code is StopReasonCode.CLAIM_AMBIGUOUS and not state.current_pr_url:
+        return CLAIM_AMBIGUOUS_UNBOUND
     if code is StopReasonCode.DEFAULT_BRANCH:
         effects = state.phase_effects()
         if _saved_analyze_plan(effects):
@@ -1941,18 +1966,45 @@ class _Builder:
                 "preview the decision 'unblock' would take from GitHub now; writes nothing",
             )
         )
-        self.steps.append(
-            Step(
-                self.plain_unblock(),
-                self.unblock_text(
-                    "the controller re-reads GitHub and re-enters a phase, or refuses and "
-                    "the run stays BLOCKED"
-                ),
+        if self.takes_over():
+            self.steps.append(
+                Step(
+                    f"{self.cli('unblock', '--take-over')} <PR URL> --reason {_WHY}",
+                    self.unblock_text(
+                        "take over the PR you kept, its URL in place of <PR URL>: the "
+                        "controller refuses while another PR still carries the issue's "
+                        "marker, and otherwise writes this run into the kept PR's marker and "
+                        "reads it back first. If another run is driving that PR, leave the "
+                        "issue to that run instead"
+                    ),
+                )
             )
-        )
+        else:
+            self.steps.append(
+                Step(
+                    self.plain_unblock(),
+                    self.unblock_text(
+                        "the controller re-reads GitHub and re-enters a phase, or refuses and "
+                        "the run stays BLOCKED"
+                    ),
+                )
+            )
         self.steps.append(self.resume_step())
         self.code_alternatives(code)
         self.new_run_steps()
+
+    def takes_over(self) -> bool:
+        """Whether the way on is the operator's take-over of the PR they keep (PR #511 R1-F1).
+
+        ``claim-ambiguous`` with no PR bound: open PRs carry the issue's
+        implementation marker, more than one or one unreadably, and the run
+        recorded none of them. None is the run's own, so whichever one the
+        operator keeps, a plain ``unblock`` refuses it as a marked PR this run
+        has no record of (ADR 0004 D9.4a), and only ``unblock --take-over``
+        binds it. The command names no PR: which one is the issue's is the
+        operator's decision (:data:`CLAIM_AMBIGUOUS_UNBOUND`).
+        """
+        return self.stop.code is StopReasonCode.CLAIM_AMBIGUOUS and not self.state.current_pr_url
 
     def saved_plan_repair(self) -> bool:
         """Whether the stop is a saved plan's, whose repair ``unblock`` replays (R6-F1).

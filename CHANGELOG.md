@@ -5,6 +5,21 @@ so.
 
 ## Unreleased
 
+### Two marked PRs: `status` says to keep the one you choose and take it over (#375)
+
+When more than one open PR carries the issue's implementation marker and
+the run recorded none of them (`claim-ambiguous` with no PR bound), the
+recovery package of `status` used to say "close, delete or unmark every one
+that is not the run's own, then 'unblock'". None of them is the run's own,
+so read as it stands that closed every PR, the one the issue needs among
+them, and the plain `unblock` it named refuses a marked PR the run has no
+record of. It now says to decide which PR is the issue's, keep that one
+open with its marker, close or unmark the others, and run
+`unblock --take-over <PR URL>`, naming no PR itself. A run bound to a PR is
+told to keep its own object and unblock as before. Only the advice
+changed: `unblock` decides exactly as it did. The deterministic recovery
+MVP's evaluation (`docs/recovery-mvp-evaluation.md`) found it.
+
 ### macOS on Apple Silicon is tested in CI on every commit (#501)
 
 The test suite now also runs on GitHub's `macos-latest` runner (arm64),
