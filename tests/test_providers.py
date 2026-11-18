@@ -2491,10 +2491,10 @@ def test_a_claude_launch_turns_the_clis_background_wait_ceiling_off(tmp_path, mo
     assert "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS" not in ClaudeSdkProvider.isolation_names
 
 
-def test_a_reply_followed_by_a_background_agents_records_stands_at_a_clean_exit(tmp_path):
-    """#507, through the driver: the run of #501 had its turn's result, then a
-    background agent's records, then exit 0. It failed as a turn without its
-    result; it is a clean exit with the reply as its output."""
+def _background_agent_run(*after: str) -> list[str]:
+    """The run of #501 through the fake ``claude``: a turn that starts a
+    background agent and gets its result at once, the agent's own records,
+    then ``after``."""
     from tests import claude_fake
 
     agent = [
@@ -2504,20 +2504,49 @@ def test_a_reply_followed_by_a_background_agents_records_stands_at_a_clean_exit(
             claude_fake.tool_result("s1"),
         )
     ]
-    _home, profile = claude_fake.fake_claude(
-        tmp_path,
-        [
-            claude_fake.init(),
-            claude_fake.tool_use("a1", "Agent", description="Audit"),
-            claude_fake.tool_result("a1"),
-            claude_fake.result("done"),
-            *agent,
-        ],
+    return [
+        claude_fake.init(),
+        claude_fake.tool_use("a1", "Agent", description="Audit"),
+        claude_fake.tool_result("a1"),
+        claude_fake.result("done"),
+        *agent,
+        *after,
+    ]
+
+
+def test_a_reply_a_background_agent_overtook_fails_a_clean_exit(tmp_path):
+    """#507, through the driver: the run of #501 had its turn's result, then a
+    background agent's records, then exit 0 with no later turn. Its reply was
+    written before that work ended, so the clean exit does not return it."""
+    from tests import claude_fake
+
+    _home, profile = claude_fake.fake_claude(tmp_path, _background_agent_run())
+    req = AgentRequest("FIX", "p", str(tmp_path), profile, 900, 30, env_allowlist=("PATH", "HOME"))
+    res = ClaudeCodeProvider().execute(req)
+    assert res.stdout == "" and res.exit_code == 0
+    assert res.provider_failure == (
+        "claude: exited after a background agent's records followed the last result "
+        "event, with no later result (exit 0)"
     )
+    assert not res.reply_delivered and not res.timed_out
+    assert res.provider_summary["subagent_records_after_result"] == 2
+
+
+def test_the_turn_a_background_agents_end_gives_decides_the_run(tmp_path):
+    """#507, through the driver: the later turn's own result replaces the
+    reply the agent's records made stale, and the run succeeds on it."""
+    from tests import claude_fake
+
+    later = [
+        claude_fake.line({"type": "system", "subtype": "task_notification"}),
+        claude_fake.init(),
+        claude_fake.result("final"),
+    ]
+    _home, profile = claude_fake.fake_claude(tmp_path, _background_agent_run(*later))
     req = AgentRequest("FIX", "p", str(tmp_path), profile, 900, 30, env_allowlist=("PATH", "HOME"))
     res = ClaudeCodeProvider().execute(req)
     assert res.ok, res.error
-    assert res.stdout == "done"
+    assert res.stdout == "final"
     assert res.provider_summary["subagent_records_after_result"] == 2
 
 

@@ -709,17 +709,52 @@ _AGENT_WORK = (
 
 def test_a_background_agents_records_after_a_result_open_no_turn():
     """#507: on 2.1.326 a background agent goes on writing records after the
-    result of the turn that started it. They are the agent's, so the stream
-    that ends then has every turn closed, not a turn without its result."""
-    stream, events = _run(*_early_result_run(*_AGENT_WORK))
+    result of the turn that started it. They are the agent's, so every turn
+    stays closed, not a turn without its result."""
+    stream, events = _run(*_early_result_run(*_AGENT_WORK), ended=False)
     assert stream.failure is None and not stream.exited_early
-    assert stream.text == TEXT
     summary = stream.summary()
     assert (summary["turns"], summary["results"], summary["open_tool_calls"]) == (1, 1, 0)
     assert summary["subagent_records_after_result"] == 3
     assert summary["records_after_result"] == 0 and summary["tool_calls"] == 2
     # Observed like any other record: the agent's call is progress.
     assert any(e.kind is ProgressKind.TOOL_STARTED and e.detail == "Read the tests" for e in events)
+
+
+_OVERTAKEN = (
+    "claude: exited after a background agent's records followed the last result event, "
+    "with no later result"
+)
+
+
+def test_a_stream_that_ends_on_a_result_a_background_agent_overtook_fails():
+    """#507: the CLI exited with no turn after the agent's records (a settings
+    ``env`` that restores the 2.1.326 ceiling does that at exit 0). The last
+    result's text was written before that work ended, so it is no outcome."""
+    stream, _ = _run(*_early_result_run(*_AGENT_WORK))
+    assert stream.failure == _OVERTAKEN and stream.text is None
+    assert stream.failure_kind == (
+        "claude: stdout ended after a background agent overtook the last result"
+    )
+    assert stream.exited_early and not stream.result_less and not stream.replied
+    # It is the same with a reply test given, and a notice of the agent's end
+    # with no turn after it changes nothing.
+    notice = {"type": "system", "subtype": "task_notification"}
+    stream = ClaudeStream(cwd=CWD, is_reply=lambda text: True)
+    for record in _early_result_run(*_AGENT_WORK, notice):
+        stream.feed(_line(record))
+    stream.stream_ended()
+    assert stream.failure == _OVERTAKEN
+
+
+def test_a_later_result_decides_again_after_a_background_agents_records():
+    """#507: the turn the agent's end gives the parent replaces the stale
+    result; a background agent's record after that one makes it stale again."""
+    stream, _ = _run(*_early_result_run(*_AGENT_WORK, *_later_turn("final")))
+    assert stream.failure is None and stream.text == "final"
+    assert not stream.exited_early
+    stream, _ = _run(*_early_result_run(*_AGENT_WORK, *_later_turn("final"), _AGENT_WORK[0]))
+    assert stream.failure == _OVERTAKEN
 
 
 @pytest.mark.parametrize("parent", [None, "", 7], ids=["null", "empty", "not-a-string"])

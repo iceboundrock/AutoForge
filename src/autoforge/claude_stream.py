@@ -53,8 +53,12 @@ every turn closed (it carries a non-empty ``parent_tool_use_id``) therefore
 opens no turn: it is the agent's, not the main conversation's, and is
 observed like any other record. It does make the reply in hand stale, as a
 held-back result kept it unread on 2.1.293: :attr:`ClaudeStream.replied`
-stays false until a later turn's own ``result`` decides again. That holds
-only from the first such record on: until it arrives the reply decides the
+stays false until a later turn's own ``result`` decides again, and a
+stream that ends before one fails the run: the CLI exited on a text the
+agent's own background work had already overtaken (a settings ``env`` that
+brings back the ceiling below stops that work and exits 0 so), and a text
+written before that work ended is no outcome of it. That holds only from
+the first such record on: until it arrives the reply decides the
 run, so a background agent that writes nothing within the driver's reply
 grace after the ``result`` (one waiting on its model) is not waited for, as
 no pending work is past that grace (#439,
@@ -87,6 +91,9 @@ The outcome:
   ``result`` line has no such allowance; if it was the line skipped, the
   stream ends without one and fails, the way Pi's final text must arrive
   whole in one record (ADR 0003).
+* A stream that ends with every turn closed but a background agent's record
+  after the last ``result`` (#507) fails the run: that result's text is
+  stale, and no later ``result`` decided again.
 * Records that arrive with every turn closed and open no turn (notices
   between turns, the operator's ``SessionEnd`` hooks after the last one)
   are counted and otherwise ignored.
@@ -249,9 +256,10 @@ TRANSIENT_API_STATUSES = frozenset({408, *range(500, 600)})
 LIMIT_API_STATUS = 429
 # A run that cost more than this is not a reading to believe.
 _MAX_COST_USD = Decimal(1_000_000)
-# Two of the fixed reasons :attr:`ClaudeStream.failure_kind` takes (#434).
+# Three of the fixed reasons :attr:`ClaudeStream.failure_kind` takes (#434).
 _PROTOCOL_VIOLATION = "claude: stream-json protocol violation"
 _ENDED_EARLY = "claude: stdout ended before a result event"
+_ENDED_STALE = "claude: stdout ended after a background agent overtook the last result"
 
 
 def _is_subagent(kind: str, record: dict) -> bool:
@@ -320,9 +328,11 @@ class ClaudeStream:
         # for a turn ended on a model API error with a status (401 and 403 an
         # authentication or permission refusal), ``claude: API error`` for one
         # without, ``claude: the run ended in an error``, ``claude: the run did
-        # not succeed``, ``claude: stream-json protocol violation`` or
+        # not succeed``, ``claude: stream-json protocol violation``,
         # ``claude: stdout ended before a result event`` (:attr:`api_error`
-        # instead when the CLI had reported one, R3-F1). The adapter keeps it
+        # instead when the CLI had reported one, R3-F1) or ``claude: stdout
+        # ended after a background agent overtook the last result`` (#507,
+        # module docstring). The adapter keeps it
         # when a limit then killed the CLI, which drops ``failure`` itself, so
         # the failure is not mistaken for the limit's (R2-F1 of PR #480).
         self.failure_kind: str | None = None
@@ -338,7 +348,8 @@ class ClaudeStream:
         # limit the CLI reported, with or without the ``result`` that would
         # set :attr:`limit`. A fixed reason, never text from the stream.
         self.api_limit: str | None = None
-        # stdout ended inside a turn; the driver names the exit code.
+        # stdout ended inside a turn, or after a background agent overtook the
+        # last result (#507); the driver names the exit code.
         self.exited_early = False
         # Turns opened so far: the first with the stream, each later one by
         # its ``system/init`` or, with every turn so far closed, by a record
@@ -372,6 +383,9 @@ class ClaudeStream:
         self._after_result = 0
         # Background agents' records that arrived with every turn closed (#507).
         self._subagent_after_result = 0
+        # Such a record arrived after the newest ``result``, whose text it made
+        # stale; only a later ``result`` clears it (#507).
+        self._overtaken = False
         self._tool_calls = 0
         # ``system/init`` records seen: the CLI started a session (#434).
         self._inits = 0
@@ -466,6 +480,7 @@ class ClaudeStream:
             # (:attr:`replied`) until a later turn's own ``result`` does.
             self._subagent_after_result += 1
             self._text_is_reply = False
+            self._overtaken = True
             self._observe(kind, record)
             return
         if self._results == self._turns:
@@ -490,7 +505,19 @@ class ClaudeStream:
 
     def stream_ended(self) -> None:
         """stdout reached EOF."""
-        if self._results == self._turns or self.failure is not None:
+        if self.failure is not None:
+            return
+        if self._results == self._turns:
+            if self._overtaken:
+                # #507: the last result's text was written before the
+                # background agent's work it was followed by, and no later
+                # result decided again; the driver names the exit code.
+                self.exited_early = True
+                self._fail(
+                    "claude: exited after a background agent's records followed "
+                    "the last result event, with no later result",
+                    _ENDED_STALE,
+                )
             return
         self.exited_early = True
         # A model API error the CLI reported before its stdout ended is what
@@ -593,6 +620,7 @@ class ClaudeStream:
 
     def _take_result(self, record: dict) -> None:
         self._results += 1
+        self._overtaken = False
         subtype = record.get("subtype")
         is_error = record.get("is_error")
         summary: dict[str, str | int | bool] = {

@@ -1011,7 +1011,9 @@ repository's runs in a launch:
   `max_runtime_seconds` bound that wait. The variable is not on the refusal
   list below, because it carries no credential and no shell code. A value in
   your Claude Code settings' `env` still takes effect and brings the ceiling
-  back.
+  back; a run whose agent was waiting on a background agent then fails when
+  the CLI exits at the ceiling, since the reply it holds was written before
+  that agent's work ended.
 - A Bash tool command runs with the `PATH` the launch gives Claude Code,
   login shell or not. A login shell reads `/etc/profile`, and some
   distributions' (Debian's) set `PATH` outright, so the same file sets the
