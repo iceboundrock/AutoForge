@@ -37,18 +37,21 @@ from autoforge.config import (
     load_config_file,
     validate_memory_routing,
 )
+from autoforge.engine import StateDirHome
 from autoforge.errors import ConfigurationDriftError, ConfigurationError, StateError
 from autoforge.locking import ControllerLock, repository_lock_path
 from autoforge.memory import (
     APPLICABLE_PHASES,
     MAX_CORRECTIONS,
     MAX_PROJECTION_CHARS,
+    MAX_PROJECTION_TOKENS,
     MAX_REASON_BYTES,
     MAX_RECORDS,
     MAX_SEED_BYTES,
     MAX_STORE_BYTES,
     MAX_TEXT_BYTES,
     MIN_PROJECTION_CHARS,
+    MIN_PROJECTION_TOKENS,
     Actor,
     Applicability,
     AttemptRef,
@@ -1390,8 +1393,12 @@ def test_a_launch_citation_is_observed_only_with_the_receipt_the_run_keeps():
     assert not downgraded((_launch(2), receipt))  # retained
     projection = _render(store, _evidence(launches=[(_launch(2), receipt)]))
     assert (
-        "observed by the controller, which holds the evidence it cites, established for this "
-        "launch" in projection.text
+        "observed by the controller, which holds the evidence it cites: what its "
+        "'established' line says is established for this launch" in projection.text
+    )
+    assert (
+        f"- established: the run keeps the receipt of launch {RUN}/2 with the digest cited"
+        in projection.text
     )
 
 
@@ -1697,6 +1704,157 @@ def test_a_replacement_evidenced_for_another_commit_or_withdrawn_hides_nothing_s
     assert projection.shown == (first, weaker) and _observed(projection, first)
     assert "at import" in _block_of(projection, first)
     assert "test_a fails on C1\n" not in projection.text  # the withdrawn revision
+
+
+def test_retracting_a_link_of_a_chain_keeps_its_surviving_end_in_its_place():
+    """R4-F4 of PR #513: M1 -> M2 -> M3, each evidenced for C1. Retracting M2 alone still
+    shows M3 alone, after a reload too, and never M2's text; retracting M3, the end,
+    leaves nothing in M2's place, so M2 is kept for its own evidence and hides M1."""
+    controller = {"actor": Actor.CONTROLLER, "issue_url": ISSUE, "attempt": _launch(4)}
+    store, m1 = _applied(observe(_store(), "test_a fails on C1", seq=1))
+    store, m2 = _applied(observe(store, "test_a fails on C1: ImportError", seq=2))
+    store, m3 = _applied(observe(store, "test_a fails on C1: ImportError of yaml", seq=3))
+    store, _ = _applied(store.supersede(m1, m2, **controller))
+    store, _ = _applied(store.supersede(m2, m3, **controller))
+    held = _evidence(1, 2, 3)
+    assert _render(store, held, candidate=C1).shown == (m3,)
+    middle, _ = _applied(store.retract(m2, actor=Actor.OPERATOR, issue_url=None))
+    for current in (middle, _reloaded(middle)):
+        projection = _render(current, held, candidate=C1)
+        assert projection.shown == (m3,) and projection.kept_over_replacement == 0
+        assert (projection.retracted, projection.superseded) == (1, 1)
+        assert "ImportError\n" not in projection.text  # the retracted link's text
+    end, _ = _applied(store.retract(m3, actor=Actor.OPERATOR, issue_url=None))
+    projection = _render(_reloaded(end), held, candidate=C1)
+    assert projection.shown == (m2,) and projection.kept_over_replacement == 1
+    assert (projection.retracted, projection.superseded) == (1, 1)
+
+
+# -- what is established is the receipt's, never the text (R4-F3 of PR #513) -----------------
+
+
+def test_a_receipt_establishes_what_it_records_and_never_a_text_that_contradicts_it():
+    """A failing receipt reused for the text "validation passed on C1" certifies none of
+    it, at the add and at a correction alike, after a save and a load: the established
+    line is read from the receipt, and the text is shown as the controller's unverified
+    account. Such a text weighs nothing in a supersession either: a replacement saying
+    so on a passing receipt, or on another commit's failure, hides no predecessor its
+    own receipt establishes."""
+    controller = {"actor": Actor.CONTROLLER, "issue_url": ISSUE, "attempt": _launch(4)}
+    on_c1 = Applicability(candidate=CandidateScope.EXACT, commit=C1)
+    claim = "validation passed on C1"
+    established = (
+        f"- established: validation record 1 of owner/repo recorded FAIL for commit {C1}, "
+        "this launch's candidate"
+    )
+    added, m1 = _applied(observe(_store(), claim, seq=1, applies=on_c1))
+    corrected, m2 = _applied(observe(_store(), "test_a fails on C1", seq=1, applies=on_c1))
+    corrected, _ = _applied(corrected.correct(m2, claim, **controller, citation=_vr(1)))
+    for store, record in ((added, m1), (corrected, m2)):
+        for current in (store, _reloaded(store)):
+            block = _block_of(_render(current, _evidence(1), candidate=C1), record)
+            assert established in block
+            assert "- text: the controller's account of its evidence; only an 'established' " in (
+                block
+            )
+            metadata, fenced = block.split("```untrusted", 1)
+            assert claim in fenced and "passed" not in metadata
+    for cite in (_vr(2, exit_code=0), _vr(2, commit=C2)):
+        store, before = _applied(observe(_store(), "test_a fails on C1", seq=1, applies=on_c1))
+        store, after = _applied(observe(store, claim, seq=2, cite=cite, applies=on_c1))
+        store, _ = _applied(store.supersede(before, after, **controller))
+        receipt = (
+            _receipt(2, exit_code=0) if cite == _vr(2, exit_code=0) else _receipt(2, commit=C2)
+        )
+        projection = _render(_reloaded(store), _evidence(1, receipt), candidate=C1)
+        assert projection.shown == (before, after) and _observed(projection, before)
+        assert projection.kept_over_replacement == 1 and projection.downgraded == 1
+        assert "- established:" not in _block_of(projection, after)
+
+
+def test_a_correction_that_only_swaps_the_citation_is_refused_and_changes_nothing():
+    """R4-F3 of PR #513: the same text with other evidence is no correction. It is
+    refused, the record keeps its citation, and the same text with the same evidence
+    is the record kept, as before."""
+    controller = {"actor": Actor.CONTROLLER, "issue_url": ISSUE, "attempt": _launch(3)}
+    store, m1 = _applied(observe(_store(), "test_a fails on C1", seq=1))
+    refused = store.correct(m1, "test_a fails on C1", **controller, citation=_vr(2))
+    assert refused.refusal is RefusalCode.INVALID and "text is unchanged" in refused.detail
+    assert refused.store.records == store.records and refused.store.record(m1).citation == _vr(1)
+    assert refused.store.refused == {RefusalCode.INVALID.value: 1}
+    again = store.correct(m1, "test_a fails on C1", **controller, citation=_vr(1))
+    assert again.applied and again.store == store
+
+
+# -- a launch with no candidate gets nothing bound to one (R4-F5 of PR #513) ------------------
+
+
+def test_a_launch_with_no_candidate_is_shown_no_record_bound_to_a_candidate():
+    """With no candidate, a request naming bases is refused, and one naming none is
+    shown no exact or descendants record, whose withdrawals then bind nothing either;
+    a known descendant and an unrelated candidate are judged as before."""
+    descendants = Applicability(candidate=CandidateScope.DESCENDANTS, commit=BASE)
+    exact = Applicability(candidate=CandidateScope.EXACT, commit=C1)
+    store, anywhere = _applied(propose(_store(), "applies anywhere", seq=1))
+    store, below = _applied(propose(store, "descends from BASE", seq=2, applies=descendants))
+    store, on_c1 = _applied(propose(store, "only on C1", seq=3, applies=exact))
+    with pytest.raises(ValueError, match="names bases its candidate descends from, but no"):
+        _render(store, candidate="", descends_from=frozenset({BASE}))
+    none = _render(store, candidate="")
+    assert none.shown == (anywhere,) and none.not_applicable == 2
+    assert "- current candidate: none" in none.text
+    assert set(_render(store, candidate=C2, descends_from=frozenset({BASE})).shown) == {
+        anywhere,
+        below,
+    }
+    assert _render(store, candidate=C2).shown == (anywhere,)  # an unrelated candidate
+    assert _render(store, candidate=C1).shown == (on_c1, anywhere)
+    for scope in (descendants, exact):
+        assert not scope.applies(Phase.ANALYZE_EXECUTE, "", frozenset({BASE, C1}))
+    # A text an agent withdrew from BASE's descendants is withheld from its duplicate
+    # there, and from nothing at a launch with no candidate, where neither applies.
+    store, dup = _applied(
+        propose(store, "descends from BASE", seq=4, applies=descendants, origin=_origin(9))
+    )
+    store, _ = _applied(store.correct(below, "descends from BASE: revised", **as_agent()))
+    assert _render(store, candidate=C2, descends_from=frozenset({BASE})).withdrawn == 1
+    none = _render(store, candidate="")
+    assert dup not in none.shown and none.withdrawn == 0 and none.not_applicable == 3
+
+
+# -- the token bound, held as UTF-8 bytes (R4-F6 of PR #513) ----------------------------------
+
+
+def test_the_projection_holds_its_token_bound_as_utf8_bytes_for_multibyte_text():
+    """The token bound is held as UTF-8 bytes, header, fences and omission marker
+    included, so four-byte text shows fewer records than one-byte text of as many
+    characters, the same ones every time; a bound outside its range is refused."""
+    wide = "\U0001f600"  # four UTF-8 bytes, one character
+    narrow, multibyte = _store(), _store()
+    for n in range(1, 17):
+        narrow, _ = _applied(propose(narrow, f"{n:03d} " + "z" * 500, seq=n))
+        multibyte, _ = _applied(propose(multibyte, f"{n:03d} " + wide * 500, seq=n))
+    for store in (narrow, multibyte):
+        projection = _render(store)
+        assert len(projection.text) <= MAX_PROJECTION_CHARS
+        assert len(projection.text.encode("utf-8")) <= MAX_PROJECTION_TOKENS
+        assert projection == _render(_reloaded(store))
+        assert (
+            f"- bound: {MAX_PROJECTION_CHARS} characters and {MAX_PROJECTION_TOKENS} tokens"
+        ) in projection.text
+    one, four = _render(narrow), _render(multibyte)
+    assert len(four.shown) < len(one.shown) and four.omitted_for_bound > one.omitted_for_bound
+    assert (
+        f"[AutoForge omitted {four.omitted_for_bound} records for the projection's bound]\n"
+    ) == four.text[
+        -len(f"[AutoForge omitted {four.omitted_for_bound} records for the projection's bound]\n") :
+    ]
+    small = _render(multibyte, max_tokens=4096)
+    assert len(small.text.encode("utf-8")) <= 4096 and len(small.shown) < len(four.shown)
+    assert "- bound: 16384 characters and 4096 tokens" in small.text
+    for bound in (MAX_PROJECTION_TOKENS + 1, MIN_PROJECTION_TOKENS - 1, True, 4096.0):
+        with pytest.raises(ValueError, match="a projection bound is 2048 to 16384 tokens"):
+            _render(multibyte, max_tokens=bound)
 
 
 # -- a record's metadata is redacted or refused, never rewritten (R3-F4) -----------------------
@@ -2611,18 +2769,107 @@ def test_a_memory_checkpoint_is_written_only_under_its_own_repositorys_lock(
     assert (clone / ".git" / "autoforge").is_dir()
 
 
-def test_a_run_without_memory_is_held_to_no_repository_binding():
-    """Memory off in the state and in the invocation: the binding is not asked for,
-    so such a run's commands behave exactly as before Memory existed."""
+def test_a_checkpoint_is_bound_to_its_repository_whatever_a_snapshot_says_of_memory():
+    """R4-F2 of PR #513: the binding no longer rests on the Memory setting of a
+    snapshot. With Memory off in the state and the invocation, a state directory of
+    another repository, or one git cannot place, is refused; one in no repository is
+    written as before Memory existed; this checkout's own always. With Memory on, in
+    the invocation or the state, one in no repository is refused too."""
 
     class Engine:
-        config = dataclasses.replace(default_config(), memory=MemoryConfig(enabled=False))
+        def __init__(self, home: StateDirHome, memory: bool = False) -> None:
+            self.home = home
+            self.config = dataclasses.replace(default_config(), memory=MemoryConfig(enabled=memory))
 
-        def state_dir_repository_problem(self) -> str:
-            raise AssertionError("asked for a run without Memory")
+        def state_dir_repository(self) -> tuple[StateDirHome, str]:
+            return self.home, "it lies elsewhere"
 
+    guard = cli._refuse_state_of_another_repository
+    seeded, _ = _applied(seed(_store(), "a lesson"))
+    with_memory = make_state(run_id=RUN)
+    with_memory.issue_memory = seeded.to_dict()
     for state in (None, make_state(run_id=RUN)):
-        cli._refuse_memory_state_of_another_repository(Engine(), "step", state)  # type: ignore[arg-type]
+        guard(Engine(StateDirHome.OWN), "step", state)  # type: ignore[arg-type]
+        guard(Engine(StateDirHome.NONE), "step", state)  # type: ignore[arg-type]
+        for home in (StateDirHome.OTHER, StateDirHome.UNKNOWN):
+            with pytest.raises(ConfigurationError, match="whatever its Issue Memory setting"):
+                guard(Engine(home), "step", state)  # type: ignore[arg-type]
+    guard(Engine(StateDirHome.OWN, memory=True), "step", with_memory)  # type: ignore[arg-type]
+    for engine, state in (
+        (Engine(StateDirHome.NONE, memory=True), None),
+        (Engine(StateDirHome.NONE), with_memory),
+    ):
+        with pytest.raises(ConfigurationError, match="A run's Issue Memory is written only"):
+            guard(engine, "step", state)  # type: ignore[arg-type]
+
+
+def test_a_writer_under_another_lock_never_saves_over_a_newer_memory_checkpoint(
+    tmp_path,
+    capsys,
+    monkeypatch,
+    tmp_path_factory,
+    fakes,  # noqa: F811
+):
+    """R4-F2 of PR #513, the reviewer's interleaving, made deterministic. Clone B
+    holds a run without Memory. A command from clone A, Memory off, loads that
+    snapshot; B then saves a Memory checkpoint under B's lock; A would next write
+    under A's lock. Each of A's commands refuses before taking any lock, whatever its
+    snapshot said, so B's newer checkpoint stays byte for byte. From B, the same
+    state is written under B's lock."""
+    from autoforge.engine import ControllerEngine
+    from tests.conftest import git_repo, github_origin
+
+    monkeypatch.chdir(tmp_path)
+    head_a, sd_a = _seeded_run(tmp_path, capsys)
+    clone = github_origin(git_repo(tmp_path_factory.mktemp("clone-b")))
+    theirs = os.path.realpath(clone / ".git")
+    sd_b = clone / ".autoforge"
+    sd_b.mkdir()
+    with_memory = load_state(sd_a / "state.json")
+    without = load_state(sd_a / "state.json")
+    without.issue_memory = {}
+    assert with_memory.memory_store() is not None and without.memory_store() is None
+    no_memory = tmp_path / "no-memory.yaml"
+    no_memory.write_text("memory:\n  enabled: false\n", encoding="utf-8")
+    head = ["--config", str(no_memory), "--state-dir", str(sd_b)]
+    run = ["run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    real = ControllerEngine.state_dir_repository
+    for argv, command in (
+        ([*head, "step"], "step"),
+        ([*head, "resume"], "resume"),
+        ([*head, "unblock", "--reason", "x"], "unblock"),
+        ([*head, *run, "--force"], "run"),
+    ):
+        save_state(without, sd_b / "state.json")  # B's run, Memory off
+        newer: list[bytes] = []
+
+        def b_saves_after_a_loaded(engine, newer=newer):
+            if not newer:
+                # A has read B's snapshot (its pre-lock load); now B's own writer
+                # saves a Memory checkpoint under B's lock.
+                assert load_state(sd_b / "state.json").memory_store() is None
+                with ControllerLock(repository_lock_path(clone)):
+                    save_state(with_memory, sd_b / "state.json")
+                newer.append((sd_b / "state.json").read_bytes())
+            return real(engine)
+
+        monkeypatch.setattr(ControllerEngine, "state_dir_repository", b_saves_after_a_loaded)
+        assert cli.main(argv) == 2, command
+        monkeypatch.setattr(ControllerEngine, "state_dir_repository", real)
+        err = capsys.readouterr().err
+        assert f"'{command}' refused" in err and theirs in err, err
+        assert "whatever its Issue Memory setting" in err and "no state write" in err
+        assert newer and (sd_b / "state.json").read_bytes() == newer[0], command
+        assert load_state(sd_b / "state.json").memory_store() is not None
+    # From B, the checkpoint's own repository, the same run is written under B's lock.
+    monkeypatch.chdir(clone)
+    assert (
+        cli.main(
+            [*head_a[:2], "--state-dir", str(sd_b), "memory", "retract", "M1", "--reason", "wrong"]
+        )
+        == 0
+    )
+    assert load_state(sd_b / "state.json").memory_store().record(1).status is Status.RETRACTED
 
 
 def test_memory_retract_refuses_a_scheduler_namespace_here_or_in_another_clone(

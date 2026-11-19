@@ -14,9 +14,11 @@ inside the run's `state.json`, which starts empty with the run (ADR 0015).
 for byte or not at all, and records its SHA-256; `memory show` prints the
 store and `memory retract` withdraws a record in one save, under the lock of
 the repository its state belongs to. Every command that writes a run's
-Memory takes that lock: with Memory on, `run` refuses a `--state-dir` in
-another clone or in no repository, and `step`, `resume`, `unblock` and
-`run --force` refuse another clone's Memory state. A retracted or corrected text is refused
+state takes that lock: `run`, `step`, `resume`, `unblock` and `run --force`
+now refuse a `--state-dir` in another repository (another clone of the same
+GitHub repository included) whatever the Memory setting, and, with Memory
+on, one in no repository. A `--state-dir` in no repository still works with
+Memory off. A retracted or corrected text is refused
 if a record its withdrawal binds (the same issue, a trust its writer could
 have withdrawn, where the withdrawn record applied) writes it again, and is
 not shown through another such record carrying the same text; an agent's

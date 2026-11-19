@@ -148,6 +148,7 @@ from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Seq
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from functools import partial
 from pathlib import Path
 from typing import NoReturn, TypeVar
@@ -457,6 +458,7 @@ from .locking import (
     ControllerLock,
     SharedGitLock,
     assert_shared_git_lock_free,
+    repository_common_dir,
     repository_lock_path,
 )
 from .loop_detect import LIMIT_LOOP
@@ -1689,6 +1691,24 @@ def _operator_home() -> str:
 # How every surface names a launch the outer sandbox did not enforce
 # (ADR 0005 D1.2): never "sandboxed".
 LOGICAL_ISOLATION_ONLY = "logical isolation only"
+
+
+class StateDirHome(StrEnum):
+    """Which repository a run's state directory lies in, as git answers (R4-F2 of PR #513).
+
+    What decides which controller lock guards a write of it
+    (:meth:`ControllerEngine.state_dir_repository`).
+    """
+
+    #: The working directory's repository: its controller lock guards every writer.
+    OWN = "own"
+    #: Another repository, another clone of the same GitHub repository included:
+    #: its own controller lock guards it, never this checkout's.
+    OTHER = "other"
+    #: No repository: git answers that the directory is in none.
+    NONE = "none"
+    #: Git could not answer, for it or for the working directory.
+    UNKNOWN = "unknown"
 
 
 def launch_backend() -> SandboxBackend:
@@ -3751,7 +3771,14 @@ class ControllerEngine:
         check_standalone_state_dir(self.paths.state_dir, self.coordination_root(), command)
 
     def state_dir_repository_problem(self) -> str:
-        """Why the state directory is not guarded by this engine's L0 ("" when it is).
+        """Why the state directory is not guarded by this engine's L0 ("" when it is):
+        :meth:`state_dir_repository`'s answer, for a caller that refuses every
+        state directory but this checkout's."""
+        return self.state_dir_repository()[1]
+
+    def state_dir_repository(self) -> tuple[StateDirHome, str]:
+        """Which repository the state directory lies in, and why that is not this
+        engine's L0 ("" when it is: :attr:`StateDirHome.OWN`).
 
         :meth:`lock_path` and :meth:`coordination_root` are derived from
         ``workdir``, while ``--state-dir`` may name the state of another
@@ -3763,16 +3790,20 @@ class ControllerEngine:
         contains the state directory (``git rev-parse --git-common-dir`` from
         it, as :func:`~autoforge.locking.repository_lock_path` asks from
         ``workdir``) and requires the same git common dir, symlinks
-        resolved. A linked worktree of the same repository shares it; a
-        state directory in no repository, or whose repository cannot be
-        read, has no identity to establish and is a problem too. A state
+        resolved. A linked worktree of the same repository shares it
+        (:attr:`StateDirHome.OWN`). Any other answer is a problem: another
+        repository (:attr:`~StateDirHome.OTHER`), none
+        (:attr:`~StateDirHome.NONE`: no lock of any checkout guards it), or
+        no answer from git (:attr:`~StateDirHome.UNKNOWN`). A state
         directory not created yet is judged by its nearest existing
         ancestor, the directory its first save creates it in, so ``run``
         binds a new run's state to the lock that will guard it (R3-F1 of PR
-        #513). Two git reads, no write. ``rebind-epic`` (#435) refuses on
-        it, and so does every command that writes a run's Issue Memory
-        (#317): ``run``, ``step``, ``resume``, ``unblock`` and ``memory
-        retract`` (R2-F1, R3-F1 of PR #513); no other command calls this.
+        #513). Two git reads, no write. ``rebind-epic`` (#435) refuses every
+        problem, and so does every command that writes a run's Issue Memory
+        (#317); every command that writes a run's state refuses
+        :attr:`~StateDirHome.OTHER` and :attr:`~StateDirHome.UNKNOWN`
+        whatever its Memory setting (R2-F1, R3-F1, R4-F2 of PR #513); no
+        other command calls this.
         """
         state_dir = self.paths.state_dir
         probe = Path(os.path.abspath(state_dir))
@@ -3786,24 +3817,33 @@ class ControllerEngine:
         try:
             own = Path(os.path.realpath(self.coordination_root()))
         except LockError as exc:
-            return f"the working directory's repository cannot be established: {exc}"
-        try:
-            theirs = Path(os.path.realpath(repository_lock_path(probe).parent.parent))
-        except LockError as exc:
             return (
-                f"the repository of the state directory {where} cannot be established "
-                f"({exc}), so the controller lock that guards its run is unknown; run the "
-                "command from the checkout the run belongs to, on a state directory inside it"
+                StateDirHome.UNKNOWN,
+                f"the working directory's repository cannot be established: {exc}",
             )
+        unknown = (
+            f"the repository of the state directory {where} cannot be established "
+            "({}), so the controller lock that guards its run is unknown; run the "
+            "command from the checkout the run belongs to, on a state directory inside it"
+        )
+        try:
+            common = repository_common_dir(probe)
+        except LockError as exc:
+            return StateDirHome.UNKNOWN, unknown.format(exc)
+        if common is None:
+            return StateDirHome.NONE, unknown.format(
+                f"{probe} is not inside a git repository, so no checkout's lock guards it"
+            )
+        theirs = Path(os.path.realpath(common))
         if own != theirs:
-            return (
+            return StateDirHome.OTHER, (
                 f"the state directory {where} belongs to the repository whose git common "
                 f"dir is {theirs}, and this command runs in the one whose git common dir is "
                 f"{own}: its controller lock and scheduler root are not this checkout's (two "
                 "clones of one GitHub repository are two repositories to the lock); run the "
                 f"command from a checkout of {theirs.parent if theirs.name == '.git' else theirs}"
             )
-        return ""
+        return StateDirHome.OWN, ""
 
     def state_dir_in_scheduler_root(self) -> bool:
         """Whether this engine's state dir lies in the scheduler root (ADR 0008 D17.3).

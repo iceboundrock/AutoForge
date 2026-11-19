@@ -42,6 +42,10 @@ id, monotonic in the run; a :class:`Kind` from a closed set; who wrote it
   ordinal is not a receipt) is shown downgraded, never as observed. Its
   add and each of its corrections name the evidence of the text they
   wrote, so a revised observation never keeps an old citation by default.
+  What a render calls established is what the receipt itself says, read
+  from its typed fields; the record's text is the controller's account,
+  shown as unverified, so a text that contradicts its receipt is never
+  certified by it.
 - ``operator``: the operator's text, kept byte for byte: trusted as their
   statement, not as evidence. The evaluation's seed is one (D9.5).
 - ``proposed``: an agent's claim. No agent, score or later write upgrades
@@ -157,15 +161,19 @@ records of the request's issue that apply to its phase and candidate,
 observations evidenced for that candidate first with their citations, then
 the operator's, then observations evidenced for another commit, then those
 no kept receipt establishes, then proposals, newest first in each, within
-the request's bound, which is at most :data:`MAX_PROJECTION_CHARS` (a
-larger one is refused), and reports in its header the scope, the revision
-and digest it read, the digest of the evidence it was given, what it was
-rendered for and how many records it showed, omitted for the bound, found
-not applicable, retracted, superseded, withheld as withdrawn text and kept
-over a replacement with weaker evidence. The same store, evidence and
-request render the same bytes: the receipts the run keeps are an input as
-much as the revision is, since an evicted receipt changes how an
-observation shows.
+the request's bound, which is at most :data:`MAX_PROJECTION_CHARS`
+characters and :data:`MAX_PROJECTION_TOKENS` tokens, held as UTF-8 bytes
+(a larger one is refused), and reports in its header the scope, the
+revision and digest it read, the digest of the evidence it was given, what
+it was rendered for, its bound and how many records it showed, omitted for
+the bound, found not applicable, retracted, superseded, withheld as
+withdrawn text and kept over a replacement with weaker evidence. The same
+store, evidence and request render the same bytes: the receipts the run
+keeps are an input as much as the revision is, since an evicted receipt
+changes how an observation shows. The header names the digests of the
+store and of the evidence, and no digest of the request: it shows what the
+request is for (its scope, step, launch, candidate and bound), not the
+bases it names.
 """
 
 from __future__ import annotations
@@ -213,6 +221,16 @@ MAX_TOMBSTONES = MAX_RECORDS * (MAX_CORRECTIONS + 1)
 MAX_PROJECTION_CHARS = 16_384
 #: The smallest projection bound a render accepts: its header always fits.
 MIN_PROJECTION_CHARS = 2_048
+#: One launch's projection, in tokens (#317: "explicit size and token
+#: limits"), header, fences and omission marker included. No tokenizer is
+#: run, so the bound is the same on every host and for every provider: it is
+#: held as at most this many UTF-8 bytes of the projection, a conservative
+#: bound for a byte-level tokenizer, whose every token encodes at least one
+#: byte (R4-F6 of PR #513). Text of one-byte characters is held to the same
+#: count as :data:`MAX_PROJECTION_CHARS`; multibyte text to fewer characters.
+MAX_PROJECTION_TOKENS = 16_384
+#: The smallest token bound a render accepts: its header always fits.
+MIN_PROJECTION_TOKENS = MIN_PROJECTION_CHARS
 #: A seed file, in bytes: one record's text.
 MAX_SEED_BYTES = MAX_TEXT_BYTES
 #: A refusal counter saturates here instead of growing without bound.
@@ -797,14 +815,21 @@ class Applicability:
         return cls(phases=tuple(phases), candidate=candidate, commit=commit)
 
     def applies(self, phase: Phase, candidate: str, descends_from: frozenset[str]) -> bool:
-        """Fails closed: an unknown candidate or ancestry does not apply (D12)."""
+        """Fails closed: an unknown candidate or ancestry does not apply (D12).
+
+        A record bound to a candidate never applies to a launch with none:
+        ``descends_from`` is the ancestry of the launch's candidate, so with
+        no candidate it names nothing's and is ignored (R4-F5 of PR #513).
+        """
         if phase.value not in self.phases:
             return False
         if self.candidate is CandidateScope.ANY:
             return True
+        if not candidate:
+            return False
         if self.candidate is CandidateScope.EXACT:
-            return bool(candidate) and candidate == self.commit
-        return (bool(candidate) and candidate == self.commit) or self.commit in descends_from
+            return candidate == self.commit
+        return candidate == self.commit or self.commit in descends_from
 
     def covers(self, other: Applicability) -> bool:
         """Whether this applies wherever ``other`` does, by what the two say alone.
@@ -1879,7 +1904,12 @@ class MemoryStore:
         observation never keeps its old citation by default, and a render
         judges the new text by the new evidence (R3-F2 of PR #513). The same
         evidence again is the controller re-deriving the text from it. No
-        other record's correction names any.
+        other record's correction names any. The same text again is the
+        record kept, with the same citation; with another one it is refused
+        (``invalid``): a correction writes text, and never swaps the evidence
+        of an unchanged one (R4-F3). Whatever the text says, a render calls
+        established only what the receipt itself says
+        (:attr:`Resolution.established`), never the text.
         """
         if not self.enabled:
             return self._refuse(RefusalCode.DISABLED, "the run's Issue Memory is off")
@@ -1915,6 +1945,17 @@ class MemoryStore:
             return refusal
         digest = sha256_text(kept)
         if digest == record.text_sha256:
+            if citation != record.citation:
+                # R4-F3 of PR #513: a correction writes new text. Naming other
+                # evidence for the same text is no correction, and reporting it
+                # applied while the record kept its old citation would mislead.
+                return self._refuse(
+                    RefusalCode.INVALID,
+                    f"record M{record_id}'s text is unchanged, and a correction writes new "
+                    "text: its evidence is never swapped under the same text; observe the "
+                    "other evidence as a record of its own, and supersede this one with it",
+                    record_id,
+                )
             return WriteOutcome(store=self, record_id=record_id)
         event = MemoryEvent(
             seq=self.revision + 1,
@@ -2185,11 +2226,16 @@ _STRENGTH: Mapping[Verdict, int] = {
 
 @dataclass(frozen=True)
 class Resolution:
-    """An observation's verdict for one launch, and the commit its evidence is of."""
+    """An observation's verdict for one launch, the commit its evidence is of, and
+    what that evidence establishes, in the controller's words from the receipt."""
 
     verdict: Verdict
     #: The commit a validation receipt validated; ``""`` for a launch's receipt or none.
     commit: str = ""
+    #: What the receipt establishes, derived from its typed fields alone and
+    #: never from the record's text (R4-F3 of PR #513): the only part of an
+    #: observation a render calls established. ``""`` when nothing is.
+    established: str = ""
 
 
 _UNRESOLVED = Resolution(Verdict.UNRESOLVED)
@@ -2331,7 +2377,14 @@ class EvidenceIndex:
                 and citation.ref == cited_at.label()
                 and (citation.ref, citation.sha256) in self.launch_receipts
             )
-            return Resolution(Verdict.CURRENT) if resolved else _UNRESOLVED
+            if not resolved:
+                return _UNRESOLVED
+            return Resolution(
+                Verdict.CURRENT,
+                established=(
+                    f"the run keeps the receipt of launch {citation.ref} with the digest cited"
+                ),
+            )
         receipt = self._receipt(citation)
         if receipt is None or receipt.outcome not in FAILED_OUTCOMES:
             return _UNRESOLVED
@@ -2345,8 +2398,17 @@ class EvidenceIndex:
         applies = record.applies_to
         if applies.candidate is not CandidateScope.ANY and applies.commit != receipt.commit:
             return _UNRESOLVED
-        verdict = Verdict.CURRENT if candidate == receipt.commit else Verdict.HISTORICAL
-        return Resolution(verdict, receipt.commit)
+        current = bool(candidate) and candidate == receipt.commit
+        verdict = Verdict.CURRENT if current else Verdict.HISTORICAL
+        whose = "this launch's candidate" if current else "not this launch's candidate"
+        return Resolution(
+            verdict,
+            receipt.commit,
+            established=(
+                f"validation record {receipt.seq} of {receipt.repository} recorded "
+                f"{receipt.outcome} for commit {receipt.commit}, {whose}"
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -2361,13 +2423,18 @@ class ProjectionRequest:
     attempt: AttemptRef
     #: The step's current candidate, ``""`` when there is none yet.
     candidate: str = ""
-    #: The bases the launch's starting point is known to descend from (the
-    #: caller reads them from git); a ``descendants`` record of any other
-    #: base does not apply.
+    #: The bases the candidate is known to descend from (the caller reads
+    #: them from git); a ``descendants`` record of any other base does not
+    #: apply. Empty without a candidate: a request naming bases but no
+    #: candidate is refused (R4-F5 of PR #513).
     descends_from: frozenset[str] = frozenset()
-    #: The projection's bound, from :data:`MIN_PROJECTION_CHARS` to
-    #: :data:`MAX_PROJECTION_CHARS`; a render refuses any other.
+    #: The projection's bound in characters, from :data:`MIN_PROJECTION_CHARS`
+    #: to :data:`MAX_PROJECTION_CHARS`; a render refuses any other.
     max_chars: int = MAX_PROJECTION_CHARS
+    #: Its bound in tokens, from :data:`MIN_PROJECTION_TOKENS` to
+    #: :data:`MAX_PROJECTION_TOKENS`, held as that many UTF-8 bytes
+    #: (:data:`MAX_PROJECTION_TOKENS` says why); a render refuses any other.
+    max_tokens: int = MAX_PROJECTION_TOKENS
 
     def binding_problem(self) -> str:
         """Why the request is not one launch's binding, ``""`` when it is (R2-F4 of PR #513).
@@ -2408,6 +2475,10 @@ class ProjectionRequest:
             isinstance(base, str) and _SHA40_RE.fullmatch(base) for base in self.descends_from
         ):
             return "its bases are not full commit SHAs"
+        if self.descends_from and not self.candidate:
+            # R4-F5 of PR #513: the bases are its candidate's ancestry, and a
+            # launch with no candidate has none to name.
+            return "it names bases its candidate descends from, but no candidate"
         return ""
 
 
@@ -2456,12 +2527,14 @@ class ContextProjection:
 _GROUPS = ("observed", "operator", "historical", "downgraded", "proposed")
 _LABELS = {
     "observed": (
-        "observed by the controller, which holds the evidence it cites, established for this launch"
+        "observed by the controller, which holds the evidence it cites: what its "
+        "'established' line says is established for this launch"
     ),
     "operator": "the operator's statement: their word, not evidence",
     "historical": (
         "observed by the controller on another commit than this launch's candidate, which "
-        "holds the evidence it cites: evidence of that commit, not of this candidate"
+        "holds the evidence it cites: what its 'established' line says is evidence of that "
+        "commit, not of this candidate"
     ),
     "downgraded": (
         "observed by the controller, but no evidence the run keeps now establishes it, so it "
@@ -2504,6 +2577,9 @@ def _header(
             f"execution attempt {step.execution_attempt}; launch "
             f"{escape_inline(request.attempt.label())}",
             f"- current candidate: {escape_inline(candidate)}",
+            f"- bound: {request.max_chars} characters and {request.max_tokens} tokens, this "
+            "header included; tokens are counted as UTF-8 bytes, which no byte-level "
+            "tokenizer exceeds",
             f"- records: {counts['shown']} shown, {counts['omitted']} omitted for the bound, "
             f"{counts['not_applicable']} not applicable, {counts['retracted']} retracted, "
             f"{counts['superseded']} superseded, {counts['withdrawn']} withheld as withdrawn "
@@ -2530,6 +2606,10 @@ def _block(record: MemoryRecord, group: str, resolution: Resolution | None, kept
         )
     if resolution is not None and resolution.verdict is Verdict.HISTORICAL:
         lines.append(f"- evidence of: commit {resolution.commit}, not this launch's candidate")
+    if resolution is not None and resolution.established:
+        # R4-F3 of PR #513: what is established is read from the typed receipt,
+        # never from the text, which stays the controller's unverified account.
+        lines.append(f"- established: {resolution.established}")
     if kept:
         lines.append(
             f"- superseded by M{record.superseded_by}, whose evidence establishes it less "
@@ -2544,6 +2624,11 @@ def _block(record: MemoryRecord, group: str, resolution: Resolution | None, kept
         lines.append(f"- proposed by: {record.origin.describe()}")
     if record.revision > 1:
         lines.append(f"- revision: {record.revision} (corrected; earlier text withdrawn)")
+    if record.trust is Trust.OBSERVED:
+        lines.append(
+            "- text: the controller's account of its evidence; only an 'established' line "
+            "is verified, never the text"
+        )
     lines += ["", fenced_untrusted_block(record.text, "untrusted"), "", ""]
     return "\n".join(lines)
 
@@ -2551,8 +2636,8 @@ def _block(record: MemoryRecord, group: str, resolution: Resolution | None, kept
 _NOTHING_SHOWN = "(no record applies to this launch)\n"
 
 
-def _omitted_line(count: int, bound: int) -> str:
-    return f"[AutoForge omitted {count} records for the {bound}-character bound]\n"
+def _omitted_line(count: int) -> str:
+    return f"[AutoForge omitted {count} records for the projection's bound]\n"
 
 
 def render_projection(
@@ -2580,7 +2665,17 @@ def render_projection(
     An observation shows as evidence of this launch's candidate only when a
     kept receipt establishes it for that candidate; as another commit's when
     the receipt is of another commit; and downgraded when none establishes
-    it (:meth:`EvidenceIndex.resolve`).
+    it (:meth:`EvidenceIndex.resolve`). What it calls established is the
+    receipt's own statement, derived from the receipt's typed fields
+    (:attr:`Resolution.established`); the record's text stays the
+    controller's account, shown as unverified, so a text that contradicts
+    its receipt is never certified by it, and weighs nothing in a
+    supersession (R4-F3 of PR #513).
+
+    The bound is both the request's characters and its tokens, the header,
+    the fences and the omission marker included; tokens are held as UTF-8
+    bytes (:data:`MAX_PROJECTION_TOKENS`), so multibyte text shows fewer
+    records than one-byte text, the same ones every time (R4-F6).
 
     A superseded record is hidden behind what replaced it, unless it is an
     observation its evidence establishes more strongly for this launch than
@@ -2590,7 +2685,13 @@ def render_projection(
     save and a load or a later eviction alike, since the render judges both
     against the evidence it is given. A kept record says what superseded
     it. A correction and a retraction act as they always do: a corrected
-    record shows its last revision, and a retracted one never shows.
+    record shows its last revision, and a retracted one never shows. A
+    record retracted after it was superseded passes its place on to its
+    replacement, so retracting a link of a chain brings back nothing the
+    chain's surviving end hides (R4-F4 of PR #513).
+
+    A request with no candidate is shown no record bound to one, whatever
+    bases it names; it may name none (R4-F5 of PR #513).
 
     A text withdrawn by a record that applies to this launch is withheld
     from every other current record carrying it, when the withdrawal's
@@ -2613,15 +2714,13 @@ def render_projection(
         raise ValueError("the evidence given is another issue's than the request's")
     if request.phase not in PROJECTED_PHASES:
         raise ValueError(f"phase {request.phase.value} gets no Issue Memory projection")
-    bound = request.max_chars
-    if (
-        not isinstance(bound, int)
-        or isinstance(bound, bool)
-        or not MIN_PROJECTION_CHARS <= bound <= MAX_PROJECTION_CHARS
+    bound, tokens = request.max_chars, request.max_tokens
+    for value, low, high, unit in (
+        (bound, MIN_PROJECTION_CHARS, MAX_PROJECTION_CHARS, "characters"),
+        (tokens, MIN_PROJECTION_TOKENS, MAX_PROJECTION_TOKENS, "tokens"),
     ):
-        raise ValueError(
-            f"a projection bound is {MIN_PROJECTION_CHARS} to {MAX_PROJECTION_CHARS} characters"
-        )
+        if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+            raise ValueError(f"a projection bound is {low} to {high} {unit}")
 
     def applies(record: MemoryRecord) -> bool:
         return _same_issue(record.issue_url, request.issue_url) and record.applies_to.applies(
@@ -2658,7 +2757,13 @@ def render_projection(
     kept: set[int] = set()
     for record in sorted(store.records, key=lambda r: r.id, reverse=True):
         if record.status is Status.RETRACTED:
-            stands[record.id] = None
+            # It shows nothing and stands for nothing of its own. One retracted
+            # after it was superseded hands its place on to its replacement, so
+            # a chain stays judged by its surviving end and retracting a link of
+            # it brings no record it hid back (R4-F4 of PR #513).
+            stands[record.id] = (
+                None if record.superseded_by is None else stands.get(record.superseded_by)
+            )
         elif record.status is Status.CURRENT:
             stands[record.id] = strength(record) if showable(record) else None
         else:
@@ -2699,16 +2804,20 @@ def render_projection(
             grouped[_GROUP_OF_VERDICT[resolutions[record.id].verdict]].append(record)
         else:
             grouped["operator" if record.trust is Trust.OPERATOR else "proposed"].append(record)
-    # Reserve the header at its widest: no count exceeds MAX_RECORDS.
+    # Reserve the header at its widest (no count exceeds MAX_RECORDS) and both
+    # trailers, in characters and in UTF-8 bytes, which bound the tokens (R4-F6
+    # of PR #513): every record shown fits both bounds with them.
     widest = dict.fromkeys(counts, MAX_RECORDS)
-    reserve = (
-        len(_header(store, request, evidence, widest))
-        + len(_NOTHING_SHOWN)
-        + len(_omitted_line(MAX_RECORDS, bound))
+    reserved = (
+        _header(store, request, evidence, widest) + _NOTHING_SHOWN + _omitted_line(MAX_RECORDS)
     )
-    budget = bound - reserve
-    if budget < 0:
-        raise ValueError(f"a projection bound is at least {reserve} characters")
+    budget = bound - len(reserved)
+    byte_budget = tokens - len(reserved.encode("utf-8"))
+    if budget < 0 or byte_budget < 0:
+        raise ValueError(
+            f"a projection bound is at least {len(reserved)} characters and "
+            f"{len(reserved.encode('utf-8'))} tokens"
+        )
     body: list[str] = []
     shown: list[int] = []
     by_group = dict.fromkeys(_GROUPS, 0)
@@ -2720,10 +2829,12 @@ def render_projection(
                     f"record M{record.id} renders text the run-log redactor would change: "
                     "nothing is rendered"
                 )
-            if len(block) > budget:
+            size = len(block.encode("utf-8"))
+            if len(block) > budget or size > byte_budget:
                 counts["omitted"] += 1
                 continue
             budget -= len(block)
+            byte_budget -= size
             body.append(block)
             shown.append(record.id)
             by_group[group] += 1
@@ -2735,8 +2846,8 @@ def render_projection(
     if not shown:
         text += _NOTHING_SHOWN
     if counts["omitted"]:
-        text += _omitted_line(counts["omitted"], bound)
-    assert len(text) <= bound, (len(text), bound)
+        text += _omitted_line(counts["omitted"])
+    assert len(text) <= bound and len(text.encode("utf-8")) <= tokens, (len(text), bound)
     return ContextProjection(
         text=text,
         freshness=Freshness(

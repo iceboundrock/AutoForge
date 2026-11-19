@@ -2436,17 +2436,20 @@ on launches, transitions and writes to GitHub exactly as one with it off.
   same GitHub repository included, whose lock this checkout cannot take),
   and under the lock for an issue a scheduler namespace owns.
 
-A run's Issue Memory is written only under the controller lock of the
-repository its state directory belongs to, by every command. With Memory
-on, `run` refuses a `--state-dir` in another repository (another clone
-included) or in none, judging a directory it would create by the one that
-would hold it; and `step`, `resume`, `unblock`, `run --force` and `memory
-retract` refuse a state directory of another repository whenever its run
-holds Issue Memory or this command's configuration turns Memory on. Each
-asks before it takes the lock and again under it, exits 2 and writes
-nothing. Run the command from a checkout of the repository the state
-directory is in. A run without Memory, continued with it off, is not
-affected.
+A run's checkpoint is written only under the controller lock of the
+repository its state directory belongs to, so every writer of it contends
+on one lock. `run`, `step`, `resume`, `unblock`, `run --force` and `memory
+retract` refuse a `--state-dir` in another repository (another clone of the
+same GitHub repository included), or one git cannot place, whatever the
+Memory setting: a command from another clone that loaded a run without
+Memory could otherwise save over the Memory that clone's own command added
+meanwhile. A `--state-dir` in no repository is refused when the run holds
+Issue Memory or this command's configuration turns Memory on; with Memory
+off in both it is written as before, and since no command writes Memory
+there, no Memory can be lost there. `run` judges a directory it would
+create by the one that would hold it. Each command asks before it takes the
+lock and again under it, exits 2 and writes nothing. Run the command from a
+checkout of the repository the state directory is in.
 
 A run's Memory setting is recorded when it is created, beside its recorded
 configuration: `step`, `resume` and `unblock` refuse a configuration with
@@ -2466,10 +2469,20 @@ What a launch will be shown (#333 renders it) rests on the evidence the
 run keeps when it is rendered: a validation failure shows as observed for
 a launch on the commit its `ValidationRecord` validated, as that commit's
 evidence for a launch on another one, and downgraded once no kept record of
-this run establishes it. A projection is reproducible from the store's
-revision, the request and the evidence together, and names the digest of
-each: a record evicted from the 64 the state keeps changes what the same
-revision renders.
+this run establishes it. What it calls established is a line read from the
+record's typed fields (its number, outcome and commit), never the
+observation's text, which is shown as the controller's unverified account:
+a text that contradicts its receipt is never certified by it. A launch
+with no candidate yet is shown no record bound to one. A projection is
+reproducible from the store's revision, the request and the evidence
+together. Its header names the digests of the store and of the evidence,
+and shows what the request is for (the scope, the step, the launch, the
+candidate and the bound) without a digest of it: a record evicted from the
+64 the state keeps changes what the same revision renders. A projection
+holds at most 16,384 characters and 16,384 tokens, its header, fences and
+omission marker included. Tokens are counted as UTF-8 bytes, which no
+byte-level tokenizer exceeds, so no tokenizer runs and the bound is the same
+everywhere; multibyte text fits fewer records.
 
 ### Candidate validation evidence
 

@@ -184,6 +184,34 @@ def repository_lock_path(workdir: str | Path, runner: Runner = execute) -> Path:
     or ``git`` cannot be run: without a repository identity there is nothing
     to lock, and the controller must not fall back to a weaker lock.
     """
+    common, refusal, _ = _git_common_dir(workdir, runner)
+    if common is None:
+        raise LockError(refusal)
+    return common / LOCK_DIRNAME / LOCK_FILENAME
+
+
+def repository_common_dir(workdir: str | Path, runner: Runner = execute) -> Path | None:
+    """The git common dir of the repository containing ``workdir``, ``None`` in none.
+
+    ``None`` only when git answers that ``workdir`` is in no repository it
+    reads (``git rev-parse`` exits with a failure); LockError, as for
+    :func:`repository_lock_path`, when git cannot answer at all (it cannot
+    be run, times out, or its output is cut or empty), since then the
+    directory may still be inside one. Asked as that function asks, so the
+    two agree on every repository.
+    """
+    common, refusal, in_none = _git_common_dir(workdir, runner)
+    if in_none:
+        return None
+    if common is None:
+        raise LockError(refusal)
+    return common
+
+
+def _git_common_dir(workdir: str | Path, runner: Runner) -> tuple[Path | None, str, bool]:
+    """``(git common dir, "", False)``, or ``(None, why, in_none)``: ``in_none``
+    exactly when git answered that ``workdir`` is in no repository it reads.
+    Never raises ExecutionError."""
     base = Path(workdir)
     shown = base.resolve()  # messages only: "." tells the operator nothing
     try:
@@ -197,28 +225,26 @@ def repository_lock_path(workdir: str | Path, runner: Runner = execute) -> Path:
             )
         )
     except ExecutionError as exc:
-        raise LockError(
-            f"cannot derive the controller lock for {shown}: git could not be run ({exc})"
-        ) from exc
+        why = f"cannot derive the controller lock for {shown}: git could not be run ({exc})"
+        return None, why, False
     if res.timed_out:
-        raise LockError(f"cannot derive the controller lock for {shown}: git rev-parse timed out")
+        why = f"cannot derive the controller lock for {shown}: git rev-parse timed out"
+        return None, why, False
     if res.truncated:
-        raise LockError(
-            f"cannot derive the controller lock for {shown}: git rev-parse output was truncated"
-        )
+        why = f"cannot derive the controller lock for {shown}: git rev-parse output was truncated"
+        return None, why, False
     if res.exit_code != 0:
         detail = (res.stderr or res.stdout).strip().splitlines()
-        raise LockError(
+        why = (
             f"cannot derive the controller lock: {shown} is not inside a git repository "
             f"({detail[0] if detail else f'git rev-parse exited {res.exit_code}'})"
         )
+        return None, why, True
     common = res.stdout.strip()
     if not common:
-        raise LockError(
-            f"cannot derive the controller lock for {shown}: git rev-parse returned no git dir"
-        )
-    git_dir = (base / common).resolve()
-    return git_dir / LOCK_DIRNAME / LOCK_FILENAME
+        why = f"cannot derive the controller lock for {shown}: git rev-parse returned no git dir"
+        return None, why, False
+    return (base / common).resolve(), "", False
 
 
 class ControllerLock:

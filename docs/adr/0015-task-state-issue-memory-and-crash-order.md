@@ -41,8 +41,11 @@
     it in event order. A proposal's key is its launch and its origin (task,
     role, input revision and its slot in the result), never its payload. A
     citation resolves only to a typed receipt that establishes its record (a
-    failing `ValidationRecord` of the record's issue and candidate). Wiring
-    the store into the running workflow is #333's.
+    failing `ValidationRecord` of the record's issue and candidate), and
+    what a render calls established is read from that receipt, never from
+    the record's text. D12's bound is 16,384 characters and 16,384 tokens,
+    the tokens held as UTF-8 bytes. Wiring the store into the running
+    workflow is #333's.
   - *Implemented with it:* nothing in the package. No phase, edge, state
     field, protocol number, configuration key, prompt, effect kind, launch
     class, stop code or default changes. `tests/test_adr_0015.py` keeps
