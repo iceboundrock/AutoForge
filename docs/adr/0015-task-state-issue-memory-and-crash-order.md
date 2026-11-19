@@ -16,12 +16,12 @@
     one run is kept (2), and so is D13's `REVIEW` without a projection, for
     the MVP (3). D7.4's refusal of read-only roles under `disabled` is
     accepted (4). D7.7's last verified candidate stays reachable by a ref
-    under `refs/autoforge/`, the one exception to AutoForge creating no
-    local refs (5). #332 closes D5.3's window, for the single-agent path
-    too (6). D7.5's residual and cost are accepted, and an `inconclusive`
-    caused by replaced checker inputs is named `checker-altered`, with the
-    changed paths, wherever the outcome is reported (7). D3, D11, D19, §4.2
-    and §6 follow.
+    of its own under `refs/autoforge/`, the one exception to AutoForge
+    creating no local refs (5). #332 closes D5.3's window, for the
+    single-agent path too (6). D7.5's residual and cost are accepted, and
+    an `inconclusive` caused by replaced checker inputs is named
+    `checker-altered`, with the changed paths, wherever the outcome is
+    reported (7). D3, D11, D19, §4.2 and §6 follow.
   - *Implemented with it:* nothing in the package. No phase, edge, state
     field, protocol number, configuration key, prompt, effect kind, launch
     class, stop code or default changes. `tests/test_adr_0015.py` keeps
@@ -42,6 +42,9 @@
     (`test_adr_0015_attempt_repeats_after_an_unblock_into_the_same_step`);
     an agent's stop is applied in one save with no plan, as D4.6 says
     (`test_adr_0015_a_stop_result_is_applied_in_one_save_with_no_plan`);
+    git's create-only write leaves a taken ref where it was, and two
+    candidates' refs coexist, as D7.7 relies on
+    (`test_adr_0015_a_candidates_ref_is_created_and_never_moved`);
     and what D10 says of SQLite holds
     (`test_the_package_opens_sqlite_only_for_the_opencode_probe`).
   - *Revised* on 2026-11-18, after review round 1 of PR #512: an
@@ -70,6 +73,12 @@
       maintainer accepted with the rest. It widens the cost answer 7
       accepted, from a candidate that needs a checker change to any
       candidate that makes one, a new test included (D7.5).
+  - *Corrected* at review round 3 of PR #512: each `verified` candidate
+    has a ref of its own, created before the save that keeps it and never
+    moved. One ref per step, moved to the new candidate before that save,
+    left a crash between the two with the kept candidate unreachable, so
+    the controller's own update defeated D7.7. A new crash window, W12,
+    says what the next command does (D7.7, D11, §4.2, §5, §6).
   - *Recorded here:* the task identities (D2), lifecycle and transition
     table (D3), the `TaskResult` / `PhaseResult` split (D4), the
     launch-intent protocol (D5), the reducer's input and output types for
@@ -1065,25 +1074,60 @@ has none to keep, and its conclusion says so. Whether the step concludes
 with the kept candidate after a regression is #332's policy, and never
 silent: the conclusion names its candidate and that candidate's outcome.
 
-Its objects stay reachable by a ref under `refs/autoforge/` (for example
-`refs/autoforge/<run>/verified/<step>`), as the maintainer decided (§5,
-answer 5). It is the one exception to AutoForge creating no local refs, and
-it is bounded:
+Its objects stay reachable by a ref under `refs/autoforge/`, as the
+maintainer decided (§5, answer 5). Each `verified` candidate gets a ref of
+its own, named for its commit: `refs/autoforge/<run>/verified/<commit>`,
+with the `RunID` and the candidate's full commit id. These refs are the one
+exception to AutoForge creating no local refs, and they are bounded:
 
-- the ref is never under `refs/heads/` and is never pushed;
-- the state records it, and `status` lists it;
-- AutoForge creates and updates it, and never deletes it. Cleanup is the
+- a ref is never under `refs/heads/` and is never pushed;
+- the state records the kept candidate's ref, and `status` lists it, with
+  the run's prefix `refs/autoforge/<run>/`, under which lies every ref
+  AutoForge made for the run;
+- AutoForge creates a ref, and never moves or deletes one. Cleanup is the
   operator's, as it is for the per-issue worktree;
 - a candidate whose ref is missing or no longer resolves to it is reported
   as unreachable, and is never treated as kept.
 
-The ref keeps objects reachable and is trusted for nothing else. ADR 0004
+**Keeping a new candidate never touches the kept one's ref.** The
+controller creates the new candidate's ref, then makes the save that
+records that candidate as kept (D11). The creation is create-only. A name
+that is absent is created. A ref of that name that already resolves to the
+candidate is reused: a crash's leftover, or the same commit verified again.
+A ref of that name that resolves to anything else is left as it is, the
+candidate is not kept, and the step reports it; the candidate kept before
+stays kept. Neither step writes the kept candidate's ref. So a crash
+between them leaves the state naming the candidate it kept before, whose
+ref still resolves to it, and that candidate stays kept. The new ref is a
+leftover the state does not name, and its target is never adopted (D11,
+W12). Only something outside AutoForge, an operator or an agent writing
+the shared refs, can make a kept candidate's ref missing or wrong.
+
+Review round 3 of PR #512 found the earlier text unsafe. It moved one ref
+per step to the new candidate before the save, so a crash between the two
+left the state naming a candidate whose ref now resolved elsewhere. The
+controller's own update then made its kept candidate unreachable. Answer 5
+gave `refs/autoforge/<run>/verified/<step>` as an example and allowed the
+ref to be updated. A ref per candidate keeps the answer's bounds and drops
+the update. The name carries no `StepKey`, which holds URLs a ref name
+cannot hold; the commit id alone is unique, and the state records the
+step. The cost is one ref per `verified` candidate. Every candidate comes
+from a charged launch, so the run's step budget bounds their number, and
+the operator removes them by the run's prefix. Deleting a superseded ref
+after the save that supersedes it would also be crash-safe, but AutoForge
+would then delete refs, which answer 5 excludes.
+`test_adr_0015_a_candidates_ref_is_created_and_never_moved` checks the git
+behaviour this rests on: a create-only write refuses an existing name and
+leaves it where it was, and two candidates' refs coexist under the run's
+prefix.
+
+Each ref keeps objects reachable and is trusted for nothing else. ADR 0004
 §2.6 rejected a `refs/autoforge/` namespace because shared refs are
-agent-writable, so such a ref could never be trusted. This one is not
+agent-writable, so such a ref could never be trusted. These are not
 trusted either: which candidate is kept is the state's record of its commit
-and tree, never the ref's target. The ref is updated before the save that
-records the candidate it keeps (D11). #319 amends `AGENTS.md` and the
-relevant guide to name the exception.
+and tree, never a ref's target, and a ref's existence never makes a
+candidate kept. #319 amends `AGENTS.md` and the relevant guide to name the
+exception.
 
 **D7.8. No second scheduler.** Tasks run inside the per-issue engine, under
 its locks (ADR 0008's L0, L2 and L1). No daemon, queue or cross-issue
@@ -1265,7 +1309,9 @@ One attempt, each stage durable before the next begins:
    candidate checks, then each `ValidationRecord`, each in its own save
    under ADR 0006's markers. Under #319 the save that records the step's
    current candidate (D7.3) comes between the checks and the records,
-   and the independent run (D7.5) comes after the records. A layer 2
+   and the independent run (D7.5) comes after the records. A `verified`
+   candidate's own ref is created before the save that records it as
+   kept, and no existing ref is moved (D7.7). A layer 2
    record derived from a record is saved in the same save as the record it
    cites, and it makes no task stale (D7.3).
 5. **Acceptance** (stages 4 and 5). For the producing task this is one
@@ -1294,7 +1340,7 @@ reads with today's checks, and never adopts because it is there.
 | candidate and attempt result | both outside the checkpoint until saved | neither: the next launch is told of the worktree's state, and the reply is lost |
 | candidate and budget | the budget first | the budget: the launch that made the candidate was charged |
 | attempt result and budget | the budget first | the budget |
-| checkpoint and the kept candidate's ref (#319, D7.7) | the ref is updated first, then the save that records the candidate it keeps | the checkpoint. The ref's target is never adopted as the kept candidate. After a crash between the two, the kept candidate the state names no longer has its ref, so it is reported unreachable and never treated as kept; the next `verified` candidate replaces it |
+| checkpoint and the kept candidate's ref (#319, D7.7) | the new candidate's own ref is created first, then the save that records it as kept. The ref of the candidate kept before is never moved or deleted | the checkpoint. After a crash between the two, the state still names the candidate it kept before, whose ref still resolves to it, so that candidate stays kept. The new ref is a leftover: its target is never adopted, and only a later save that records the new candidate keeps it. A kept candidate whose ref is missing or resolves elsewhere, which only something outside AutoForge can cause, is reported unreachable and never treated as kept |
 
 The crash windows of one attempt, and what the next command does:
 
@@ -1311,6 +1357,7 @@ The crash windows of one attempt, and what the next command does:
 | W9. an operator's Memory command (seed, retract) | before or after its one save | nothing more to do | none | all or nothing |
 | W10. under #319, a save moved the step's current candidate | the new candidate; the read-only tasks pinned to the old one `CANCELED` in the same save | a reply or receipt of a canceled task discarded (D4.3); D5.5's survivor check before any launch | none | unchanged |
 | W11. under #319, a save ended the step with tasks open (D3.1), before their processes were stopped | every task that was open `CANCELED` in that save | a reply or receipt of a canceled task discarded (D4.3); D5.5's survivor check before any launch | none | unchanged: a canceled task's proposals are never admitted |
+| W12. under #319, a `verified` candidate's ref created, before the save that records it as kept (D7.7) | the new candidate's ref; the state naming the candidate kept before, or none, with that candidate's ref untouched | the candidate kept before checked against its ref, and still kept; the new ref left where it is, its target not adopted; the new candidate kept only by a later save that records it, which reuses its ref | none | unchanged |
 
 Under #319 every task attempt has these windows, each read-only attempt
 charged in an intent save of its own. Once #332 lands, W4 is closed for
@@ -1753,15 +1800,27 @@ Each is a deterministic test with fakes, offline, in `make check`.
     load;
   - the last `verified` candidate kept through a regression, and none
     kept when no candidate was `verified`;
-  - D7.7's ref:
-    - it is under `refs/autoforge/`, never under `refs/heads/`, never
-      pushed, recorded in the state and listed by `status`;
-    - nothing of AutoForge deletes it;
+  - D7.7's refs:
+    - each `verified` candidate has its own, named for its commit under
+      `refs/autoforge/<run>/`, never under `refs/heads/` and never
+      pushed; the kept candidate's is recorded in the state and listed by
+      `status`;
+    - nothing of AutoForge moves or deletes one: keeping a new candidate
+      creates its ref and leaves the ref of the candidate kept before
+      resolving where it did;
+    - a name that already resolves to another commit is left as it is,
+      that candidate is not kept and the step reports it, and the
+      candidate kept before stays kept;
     - a kept candidate whose ref is missing or resolves elsewhere is
       reported unreachable, never treated as kept;
-    - after a crash between the ref's update and the save that records
-      its candidate, the ref's target is not adopted, and the state's
-      kept candidate is reported unreachable;
+    - W12, with the crash injected deterministically: C1 kept and its
+      ref saved, then C2 `verified`, and the crash after C2's ref is
+      created and before the save that records C2 as kept. The next
+      command finds C1 still kept and reachable through its unchanged
+      ref, and C2 not kept, its ref's target not adopted and the ref
+      left in place. A later save that records C2 keeps it and reuses
+      that ref. With no candidate kept before, the same crash leaves
+      none kept;
   - a Manager unable to admit, accept or cancel.
 
 ## 5. The maintainer's answers
@@ -1802,7 +1861,11 @@ implementing child an answer names owns its follow-up.
    under `refs/autoforge/` (for example
    `refs/autoforge/<run>/verified/<step>`). It is the one exception to
    AutoForge creating no local refs, bounded as D7.7 says, and #319
-   amends `AGENTS.md` and the relevant guide to name it.
+   amends `AGENTS.md` and the relevant guide to name it. *After review
+   round 3 of PR #512,* each `verified` candidate has a ref of its own,
+   which AutoForge creates and never moves: one ref per step, moved
+   before the save, made a crash lose the kept candidate. That stays
+   within the answer's bounds (D7.7).
 6. **D5.3, the lost clean-exit reply: closed by #332, for the single-agent
    path too.** A crash in that window costs a full charged relaunch, and a
    closed laptop or `Ctrl-C` during a long validation is an expected
@@ -1849,6 +1912,7 @@ implementing child an answer names owns its follow-up.
   of refusing logical isolation for read-only roles that the maintainer
   accepted (D7.4).
 - AutoForge gains one kind of local ref, under `refs/autoforge/`, to keep
-  the last verified candidate reachable (D7.7). It is never pushed or
-  trusted, and the operator cleans it up, as they clean up the per-issue
-  worktree.
+  the last verified candidate reachable (D7.7). There is one per `verified`
+  candidate, so that keeping a new candidate never moves the kept one's.
+  None is ever moved, pushed or trusted, and the operator cleans them up
+  by the run's prefix, as they clean up the per-issue worktree.

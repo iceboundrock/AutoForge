@@ -34,7 +34,7 @@ from autoforge.providers import (
 )
 from autoforge.state import AutoForgeState
 from autoforge.transitions import Phase, WorkflowMode
-from tests.conftest import block, make_engine
+from tests.conftest import block, git_repo, isolated_git, isolated_git_run, make_engine
 from tests.test_container_backend_record import FENCE, LINK, PROTOCOL, _broken
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -321,6 +321,57 @@ def test_adr_0015_a_stop_result_is_applied_in_one_save_with_no_plan(
     assert all(s[4] == {} and s[5] == [] for s in saves)
     assert fake_github.effect_writes == []
     assert "**D4.6. A result that stops the step is accepted in its stop save" in _text()
+
+
+def test_adr_0015_a_candidates_ref_is_created_and_never_moved(tmp_path):
+    """D7.7 names one ref per ``verified`` candidate, created with a
+    create-only write before the save that keeps it, so that keeping C2
+    never moves the ref of C1, the candidate the state kept before (W12).
+    This holds the git behaviour it rests on: the name D7.7 gives is a
+    valid ref outside ``refs/heads/`` for a real ``RunID``; two candidates'
+    refs coexist under the run's prefix; and a create-only write of a name
+    that exists, at another commit or the same one, is refused and leaves
+    the ref where it was. Which candidate is kept is the state's record,
+    which no ref decides, and #319 owes that scenario with fakes (§4.2)."""
+    pattern = "refs/autoforge/<run>/verified/<commit>"
+    assert f"`{pattern}`" in _decision("7")
+    run, repo = generate_run_id(), str(git_repo(tmp_path / "repo"))
+    tree = isolated_git("-C", repo, "mktree", input=b"").decode().strip()
+    identity = ("-c", "user.name=AutoForge tests", "-c", "user.email=tests@example.invalid")
+
+    def commit(message: str) -> str:
+        return (
+            isolated_git("-C", repo, *identity, "commit-tree", tree, "-m", message).decode().strip()
+        )
+
+    def ref(sha: str) -> str:
+        return pattern.replace("<run>", run).replace("<commit>", sha)
+
+    def resolves(name: str) -> str:
+        return isolated_git("-C", repo, "rev-parse", "--verify", name).decode().strip()
+
+    def create_only(name: str, sha: str) -> int:
+        return isolated_git_run("-C", repo, "update-ref", name, sha, "").returncode
+
+    c1, c2 = commit("c1"), commit("c2")
+    kept, new = ref(c1), ref(c2)
+    for name in (kept, new):
+        assert isolated_git_run("check-ref-format", name).returncode == 0, name
+        assert not name.startswith("refs/heads/")
+    assert create_only(kept, c1) == 0
+    # The crash window W12: C2's ref is created, and the save that would
+    # record C2 never happens. C1's ref still resolves to C1.
+    assert create_only(new, c2) == 0
+    assert (resolves(kept), resolves(new)) == (c1, c2)
+    listed = isolated_git(
+        "-C", repo, "for-each-ref", "--format=%(refname)", f"refs/autoforge/{run}/"
+    )
+    assert sorted(listed.decode().split()) == sorted([kept, new])
+    # A taken name is never moved: not to another commit, and a reuse reads
+    # the ref rather than writing it.
+    assert create_only(kept, c2) != 0
+    assert create_only(new, c2) != 0
+    assert (resolves(kept), resolves(new)) == (c1, c2)
 
 
 def test_the_package_opens_sqlite_only_for_the_opencode_probe():
