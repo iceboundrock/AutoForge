@@ -176,6 +176,9 @@ class _BackendInfo:
     has_size: bool
     has_perms: bool
     has_overlay: bool
+    # ``--ro-bind-fd``: a launch's program shown from the descriptor the
+    # controller checked (R5-F1 of PR #513).
+    has_bind_fd: bool = False
 
 
 _INFO_LOCK = threading.Lock()
@@ -219,6 +222,7 @@ def _backend_info(path: str) -> _BackendInfo:
         has_size="--size" in help_text,
         has_perms="--perms" in help_text,
         has_overlay="--overlay" in help_text,
+        has_bind_fd="--ro-bind-fd" in help_text,
     )
     with _INFO_LOCK:
         _INFO[key] = info
@@ -394,8 +398,17 @@ def _options(
     status_fd: int,
     cwd: str | None,
     env: Mapping[str, str],
+    program: tuple[int, str] | None = None,
 ) -> list[str]:
-    """The ``bwrap`` options for ``description``, in order."""
+    """The ``bwrap`` options for ``description``, in order.
+
+    ``program`` is ``(descriptor, path)``: the descriptor's file is mounted
+    read-only at ``path`` over whatever the description's mounts show there,
+    so the command started by that path inside is that file. ``bwrap``
+    closes the descriptor once mounted, so the command never holds it, and
+    no file put at ``path`` on the host since changes what runs (R5-F1 of PR
+    #513).
+    """
     opts = ["--unshare-user", "--unshare-pid", "--unshare-ipc"]
     if description.network is NetworkPosition.ISOLATED:
         opts.append("--unshare-net")
@@ -426,6 +439,8 @@ def _options(
             opts += ["--dir", mount.target]
         elif isinstance(mount, Link):
             opts += ["--symlink", mount.points_to, mount.target]
+    if program is not None:
+        opts += ["--ro-bind-fd", str(program[0]), program[1]]
     for target in masks:
         opts += ["--remount-ro", target]
     if cwd is not None:
@@ -485,6 +500,7 @@ class BwrapLaunch:
         *,
         cwd: str | None,
         env: Mapping[str, str],
+        executable_fd: int | None = None,
     ) -> None:
         self.description = description
         self._info = info
@@ -498,6 +514,7 @@ class BwrapLaunch:
                 status_fd=self._status_w,
                 cwd=cwd,
                 env=_environment(description, env),
+                program=None if executable_fd is None else (executable_fd, command[0]),
             )
             data = b"".join(os.fsencode(option) + b"\0" for option in options)
             self._args_fd = _options_file()
@@ -511,7 +528,10 @@ class BwrapLaunch:
         self.argv = [executable, "--args", str(self._args_fd), "--", *command]
         # ``bwrap``'s own environment: nothing; the command's is in the options.
         self.spawn_env: dict[str, str] = {}
-        self.pass_fds = (self._args_fd, self._status_w)
+        # The program's descriptor is the caller's: bwrap mounts it and closes
+        # its own copy before the command starts.
+        program_fd = () if executable_fd is None else (executable_fd,)
+        self.pass_fds = (self._args_fd, self._status_w, *program_fd)
         self.preexec_fn: Callable[[], None] = self._scope.apply
         self._status = b""
         self._collected = False
@@ -638,12 +658,16 @@ def prepare(
     *,
     cwd: str | None,
     env: Mapping[str, str],
+    executable_fd: int | None = None,
 ) -> BwrapLaunch:
     """Prepare ``command`` to run inside ``description``, or refuse (D14.2).
 
     ``env`` is the environment the executor selected for the command; the
     description's overrides are applied over it and ``bwrap`` hands exactly
-    that to the command. Nothing is spawned except ``bwrap --version`` and
+    that to the command. With ``executable_fd`` the file it holds is what
+    ``command[0]``, an absolute path, names inside (``--ro-bind-fd``; R5-F1
+    of PR #513); a ``bwrap`` without that option, or a relative
+    ``command[0]``, is refused. Nothing is spawned except ``bwrap --version`` and
     ``bwrap --help``, once per binary per controller process, and not even
     those on a Python that cannot hand ``bwrap`` its options (:func:`_no_memfd`).
     """
@@ -658,7 +682,17 @@ def prepare(
     info = _backend_info(executable)
     if any(isinstance(mount, Overlay) for mount in description.mounts) and not info.has_overlay:
         raise _refused(f"{executable} {info.version} cannot mount an overlay")
-    return BwrapLaunch(description, info, executable, command, cwd=cwd, env=env)
+    if executable_fd is not None:
+        if not info.has_bind_fd:
+            raise _refused(
+                f"{executable} {info.version} cannot mount a launch's program from the "
+                "descriptor it was checked through (--ro-bind-fd)"
+            )
+        if not command or not command[0].startswith("/"):
+            raise _refused("a launch bound to its program names it by an absolute path")
+    return BwrapLaunch(
+        description, info, executable, command, cwd=cwd, env=env, executable_fd=executable_fd
+    )
 
 
 # ---------------------------------------------------------------- the probe

@@ -376,7 +376,7 @@ class FakeBackend:
         if self.staging == "copy":
             self.runtime.cp(container.name, "read context")
 
-    def prepare(self, launch, handle, command, *, cwd, env):
+    def prepare(self, launch, handle, command, *, cwd, env, executable_fd=None):
         self.prepared.append((handle, list(command)))
         container = handle.find(ObjectKind.LAUNCH_CONTAINER) if handle is not None else None
         if container is None:

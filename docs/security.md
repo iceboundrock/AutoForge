@@ -316,6 +316,14 @@ the state directory not at all. The Memory MVP gives no launch a projection
 yet (#333 renders one into the read context, never into the worktree), so
 no agent is shown Memory by this release.
 
+A Memory phase's Claude launch starts the CLI file whose `--version` the
+controller checked, through a descriptor held from before the check
+([Configuration](configuration.md#issue-working-memory)). That binds the
+launch against an update of Claude Code between the check and the launch,
+not against a process of your own user that writes into that very file or
+times a rename to the instant bwrap or Node resolves its name: such a
+process can already change what any launch of yours runs.
+
 Memory holds nothing secret by design: an agent's or the operator's text the
 run-log redactor would change is refused, never redacted and kept, and text
 the controller derives from evidence is redacted, then bounded. A state file

@@ -159,7 +159,7 @@ class FakeBackend:
         self.refuse = False
         self.fail: BaseException | None = None
 
-    def prepare(self, launch, handle, command, *, cwd, env):
+    def prepare(self, launch, handle, command, *, cwd, env, executable_fd=None):
         self.prepared.append((type(launch), list(command), cwd, dict(env)))
         self.handles.append(handle)
         if self.refuse:
@@ -244,7 +244,7 @@ def test_bwraps_run_step_and_probe_are_the_backends_own(monkeypatch, tmp_path):
     calls: list[tuple] = []
     sentinel = object()
 
-    def prepare(description, command, *, cwd, env):
+    def prepare(description, command, *, cwd, env, executable_fd=None):
         calls.append(("prepare", description, command, cwd, env))
         return sentinel
 

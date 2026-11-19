@@ -317,6 +317,7 @@ import re
 import shlex
 import shutil
 import sqlite3
+import stat
 import tempfile
 import threading
 import time
@@ -895,29 +896,85 @@ class RuntimeProbe:
     max_output_bytes: int
 
 
+#: A file's identity: its device, inode, size, and modification and change
+#: times in nanoseconds. The change time moves with every write to the file and
+#: every change of its metadata, and no process sets it back.
+ExecutableIdentity = tuple[int, int, int, int, int]
+
+
+def _identity(st: os.stat_result) -> ExecutableIdentity:
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+class PinnedExecutable:
+    """An executable held open from its check to its start (R5-F1 of PR #513).
+
+    Opened read-only, without following a link at its name, from a resolved
+    path (:func:`~autoforge.sandbox_policy.resolve_command`), and identified
+    by :func:`_identity` of what was opened. A program started through
+    :attr:`fd` (:attr:`~autoforge.executor.ExecutionRequest.executable_fd`)
+    is this very file, whatever its name leads to by then: so the version a
+    probe reads is the opened file's, and so is the program a launch starts.
+    OSError when it cannot be opened, or is no regular file.
+    """
+
+    def __init__(self, path: str) -> None:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError(f"{path} is not a regular file")
+        except BaseException:
+            os.close(fd)
+            raise
+        self.path = path
+        self.fd = fd
+        self.identity = _identity(st)
+
+    def unchanged(self) -> bool:
+        """Whether the file held is still as it was opened: nothing wrote to it since."""
+        return _identity(os.fstat(self.fd)) == self.identity
+
+    def named_by(self, path: str) -> bool:
+        """Whether ``path`` (resolved) names the file held, unchanged."""
+        return path == self.path and FreshContextRuntime.identity_of(path) == self.identity
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def __enter__(self) -> PinnedExecutable:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
 @dataclass(frozen=True)
 class FreshContextRuntime:
     """The executable a fresh-context launch was established on, and what it said.
 
-    ``executable`` is its resolved host path, and ``identity`` its device,
-    inode, size and modification time when it answered: a launch starts
-    exactly that file, unchanged since, or is refused
-    (:meth:`AgentProvider.fresh_context_command`), so an update or another
-    ``PATH`` between the check and the launch voids nothing silently.
+    ``executable`` is its resolved host path, and ``identity`` the identity of
+    the file the probe started (:class:`PinnedExecutable`), the same before it
+    answered and after: a launch starts that very file, through a descriptor
+    opened and checked against ``identity`` before its spawn, or is refused
+    (:meth:`AgentProvider.fresh_context_launch`), so an update or another
+    ``PATH`` between the check and the launch voids nothing silently, and no
+    file put at the name after that last check is the one started.
     """
 
     executable: str
-    identity: tuple[int, int, int, int]
+    identity: ExecutableIdentity
     version: str
 
     @staticmethod
-    def identity_of(executable: str) -> tuple[int, int, int, int] | None:
-        """``executable``'s identity now, ``None`` when it cannot be read."""
+    def identity_of(executable: str) -> ExecutableIdentity | None:
+        """What ``executable`` names now, by its identity; ``None`` when it cannot be read."""
         try:
-            st = os.stat(executable)
+            return _identity(os.stat(executable))
         except OSError:
             return None
-        return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
 def no_fresh_context(profile: ProfileConfig, why: str, remedy: str) -> ConfigurationError:
@@ -1083,6 +1140,14 @@ class AgentProvider:
         launch would be enforced, never without it then. ``None`` when the
         adapter asks nothing; the refusal (:func:`no_fresh_context`) when the
         answer establishes nothing, before anything is charged.
+
+        The answer is bound to the file that gave it (R5-F1 of PR #513): the
+        executable is opened before the probe (:class:`PinnedExecutable`)
+        and the probe starts that open file, by its descriptor on the host
+        and as a read-only mount of it inside the sandbox, never by its name.
+        A file written to while it answered, or one the launch's ``PATH`` no
+        longer leads to once it has, is refused here, before the save; the
+        runtime carries the identity the probe's file had throughout.
         """
         probe = self.fresh_context_probe(profile)
         if probe is None:
@@ -1096,24 +1161,42 @@ class AgentProvider:
         if not needs.executable:
             return self.fresh_context_runtime(profile, "", None)
         try:
-            description = None if sandbox is None else sandbox.describe(needs, launch_env)
-            result = self._runner(
-                ExecutionRequest(
-                    command=[needs.executable, *command[1:]],
-                    cwd=workspace,
-                    timeout_seconds=probe.timeout_seconds,
-                    max_output_bytes=probe.max_output_bytes,
-                    env_allowlist=(
-                        None if env_allowlist is None else self.launch_allowlist(env_allowlist)
-                    ),
-                    env=dict(env),
-                    contain_orphans=True,
-                    sandbox=description,
+            pinned = PinnedExecutable(needs.executable)
+        except OSError as exc:
+            why = f"it cannot be opened ({exc.strerror or exc})"
+            return self.fresh_context_runtime(profile, needs.executable, None, why)
+        with pinned:
+            try:
+                description = None if sandbox is None else sandbox.describe(needs, launch_env)
+                result = self._runner(
+                    ExecutionRequest(
+                        command=[needs.executable, *command[1:]],
+                        cwd=workspace,
+                        timeout_seconds=probe.timeout_seconds,
+                        max_output_bytes=probe.max_output_bytes,
+                        env_allowlist=(
+                            None if env_allowlist is None else self.launch_allowlist(env_allowlist)
+                        ),
+                        env=dict(env),
+                        contain_orphans=True,
+                        sandbox=description,
+                        executable_fd=pinned.fd,
+                    )
                 )
+            except ExecutionError as exc:
+                return self.fresh_context_runtime(profile, needs.executable, None, str(exc))
+            if not pinned.unchanged() or not pinned.named_by(
+                resolve_command(command[0], launch_env.get("PATH"))
+            ):
+                raise no_fresh_context(
+                    profile,
+                    f"{needs.executable} changed while its runtime was being established, so "
+                    "its answer is no proof of the executable a launch would start",
+                    "Repeat the command once the CLI is no longer being updated",
+                )
+            return self.fresh_context_runtime(
+                profile, needs.executable, result, identity=pinned.identity
             )
-        except ExecutionError as exc:
-            return self.fresh_context_runtime(profile, needs.executable, None, str(exc))
-        return self.fresh_context_runtime(profile, needs.executable, result)
 
     def fresh_context_runtime(
         self,
@@ -1121,36 +1204,46 @@ class AgentProvider:
         executable: str,
         result: ExecutionResult | None,
         failure: str = "",
+        *,
+        identity: ExecutableIdentity | None = None,
     ) -> FreshContextRuntime:
         """The runtime :meth:`fresh_context_probe`'s answer establishes, or the
         refusal (:func:`no_fresh_context`, a ConfigurationError).
 
         ``executable`` is the resolved path the probe ran (``""``: none was
-        found on the launch's ``PATH``), ``result`` its answer, and
-        ``failure`` why it could not be run (``result`` is then ``None``).
-        An adapter that asks nothing establishes nothing.
+        found on the launch's ``PATH``), ``result`` its answer, ``identity``
+        the identity of the file that gave it (:class:`PinnedExecutable`),
+        and ``failure`` why it could not be run (``result`` is then
+        ``None``). An adapter that asks nothing establishes nothing.
         """
         raise no_fresh_context(
             profile, "its provider establishes no runtime", "Route the phase elsewhere"
         )
 
-    def fresh_context_command(
+    @contextmanager
+    def fresh_context_launch(
         self, req: AgentRequest, command: list[str], env: Mapping[str, str]
-    ) -> list[str]:
-        """``command`` as a launch of :attr:`AgentRequest.fresh_context` starts it.
+    ) -> Iterator[tuple[list[str], int | None]]:
+        """``command`` as a launch of :attr:`AgentRequest.fresh_context` starts it,
+        and the descriptor of the program it starts (``None``: by its name).
 
-        Unchanged for any other launch, and for an adapter whose
+        Unchanged, and ``None``, for any other launch and for an adapter whose
         :meth:`fresh_context_probe` asks nothing. Otherwise the launch starts
-        the very executable :attr:`AgentRequest.fresh_context_runtime` was
-        established on (R4-F1 of PR #513): ``command[0]`` resolved on
+        the very file :attr:`AgentRequest.fresh_context_runtime` was
+        established on (R4-F1, R5-F1 of PR #513): ``command[0]`` resolved on
         ``env``'s ``PATH`` (the launch's, :meth:`started_environment`) as the
-        spawn would resolve it must be that file, unchanged since it
-        answered, and is then named by its resolved path. A launch with no
-        established runtime, or another executable, is refused
-        (:func:`no_fresh_context`) before anything is spawned. Nothing is run.
+        spawn would resolve it must be that executable's path; it is opened
+        (:class:`PinnedExecutable`) and must have the identity the probe's
+        file had, and the launch then starts that open file through the
+        descriptor yielded, named by its resolved path, so no file put at that
+        name after this check is the one started. Held open until the block
+        ends. A launch with no established runtime, another executable, or
+        one changed since it answered is refused (:func:`no_fresh_context`)
+        before anything is spawned. Nothing is run.
         """
         if not req.fresh_context or self.fresh_context_probe(req.profile) is None:
-            return command
+            yield command, None
+            return
         runtime = req.fresh_context_runtime
         remedy = "Run it from the engine, which establishes its runtime before the launch"
         if runtime is None:
@@ -1167,13 +1260,23 @@ class AgentProvider:
                 f"{runtime.executable}, whose runtime was established",
                 remedy,
             )
-        if FreshContextRuntime.identity_of(found) != runtime.identity:
+        try:
+            pinned = PinnedExecutable(found)
+        except OSError as exc:
             raise no_fresh_context(
                 req.profile,
-                f"{found} changed after its runtime was established",
+                f"{found} cannot be opened since its runtime was established "
+                f"({exc.strerror or exc})",
                 "Repeat the command once the CLI is no longer being updated",
-            )
-        return [runtime.executable, *command[1:]]
+            ) from None
+        with pinned:
+            if pinned.identity != runtime.identity:
+                raise no_fresh_context(
+                    req.profile,
+                    f"{found} changed after its runtime was established",
+                    "Repeat the command once the CLI is no longer being updated",
+                )
+            yield [runtime.executable, *command[1:]], pinned.fd
 
     def own_names(self, profile: ProfileConfig | None) -> tuple[str, ...]:
         """The variables this provider adds to the allow-list of ``profile``'s agents."""
@@ -1410,26 +1513,27 @@ class AgentProvider:
             env = {**(req.env or {}), **isolation} if isolation else req.env
             command, description = self.sandboxed(req, command, env)
             started = self.started_environment(req, env, description)
-            command = self.fresh_context_command(req, command, started)
-            self.complete_isolation(isolation, started)
-            res = self._runner(
-                ExecutionRequest(
-                    command=command,
-                    cwd=req.cwd,
-                    timeout_seconds=req.max_runtime_seconds or MAX_DEADLINE_SECONDS,
-                    idle_timeout_seconds=req.idle_timeout_seconds,
-                    env_allowlist=self.environment_allowlist(req),
-                    env=env,
-                    # Nothing an agent starts outlives its invocation (ADR
-                    # 0002), including what it detached from its process group.
-                    contain_orphans=True,
-                    stdin_data=self.stdin_payload(req),
-                    on_output=_activity_hook(req.progress),
-                    on_chunk=on_chunk,
-                    stop=stop,
-                    sandbox=description,
+            with self.fresh_context_launch(req, command, started) as (command, program):
+                self.complete_isolation(isolation, started)
+                res = self._runner(
+                    ExecutionRequest(
+                        command=command,
+                        cwd=req.cwd,
+                        timeout_seconds=req.max_runtime_seconds or MAX_DEADLINE_SECONDS,
+                        idle_timeout_seconds=req.idle_timeout_seconds,
+                        env_allowlist=self.environment_allowlist(req),
+                        env=env,
+                        # Nothing an agent starts outlives its invocation (ADR
+                        # 0002), including what it detached from its process group.
+                        contain_orphans=True,
+                        stdin_data=self.stdin_payload(req),
+                        on_output=_activity_hook(req.progress),
+                        on_chunk=on_chunk,
+                        stop=stop,
+                        sandbox=description,
+                        executable_fd=program,
+                    )
                 )
-            )
         result = AgentExecutionResult.from_execution(res, req.profile)
         if res.stdin_unread and res.exit_code == 0 and not res.timed_out and not res.stopped:
             # A clean exit would otherwise be read as an answer to the whole
@@ -2049,7 +2153,7 @@ class ClaudeCodeProvider(AgentProvider):
         only on :data:`CLAUDE_FRESH_CONTEXT_VERSIONS`, so the proof holds only
         for an executable that reports one of them. The engine runs it as the
         launch runs (:class:`RuntimeProbe`), and the launch starts the
-        executable that answered (:meth:`fresh_context_command`)."""
+        file that answered (:meth:`fresh_context_launch`)."""
         return RuntimeProbe(
             command=(profile.command or "claude", "--version"),
             timeout_seconds=CLAUDE_VERSION_PROBE_SECONDS,
@@ -2062,6 +2166,8 @@ class ClaudeCodeProvider(AgentProvider):
         executable: str,
         result: ExecutionResult | None,
         failure: str = "",
+        *,
+        identity: ExecutableIdentity | None = None,
     ) -> FreshContextRuntime:
         """The executable that answered, when it reports one of
         :data:`CLAUDE_FRESH_CONTEXT_VERSIONS`; the refusal otherwise.
@@ -2098,7 +2204,6 @@ class ClaudeCodeProvider(AgentProvider):
                 why = f"{probe} printed no version this controller reads (output not shown)"
             else:
                 shown = ".".join(str(part) for part in found)
-                identity = FreshContextRuntime.identity_of(executable)
                 if pre:
                     why = f"{probe} reports a pre-release of {shown}"
                 elif found not in CLAUDE_FRESH_CONTEXT_VERSIONS:
@@ -2108,7 +2213,7 @@ class ClaudeCodeProvider(AgentProvider):
                         "nobody checked proves nothing"
                     )
                 elif identity is None:
-                    why = f"{executable} cannot be read after it answered"
+                    why = f"{executable} was not held open while it answered"
                 else:
                     return FreshContextRuntime(executable, identity, shown)
         raise no_fresh_context(profile, why, remedy)
@@ -2220,27 +2325,28 @@ class ClaudeCodeProvider(AgentProvider):
             }
             command, description = self.sandboxed(req, self.build_command(req), env)
             started = self.started_environment(req, env, description)
-            command = self.fresh_context_command(req, command, started)
-            self.complete_isolation(isolation, started)
-            duplex = DuplexRequest(
-                command=command,
-                cwd=req.cwd,
-                env_allowlist=self.environment_allowlist(req),
-                env=env,
-                idle_timeout_seconds=req.idle_timeout_seconds,
-                max_runtime_seconds=req.max_runtime_seconds,
-                max_record_bytes=CLAUDE_MAX_RECORD_BYTES,
-                max_pending_bytes=CLAUDE_MAX_PENDING_BYTES,
-                # The prompt travels in argv; stdin stays /dev/null so the CLI
-                # never waits on it.
-                stdin_pipe=False,
-                # Nothing an agent starts outlives its invocation (ADR 0002).
-                contain_orphans=True,
-                sandbox=description,
-            )
-            with start_duplex(duplex) as child:
-                cut = _read_claude_stream(child, stream, monitor)
-                res = child.finish()
+            with self.fresh_context_launch(req, command, started) as (command, program):
+                self.complete_isolation(isolation, started)
+                duplex = DuplexRequest(
+                    command=command,
+                    cwd=req.cwd,
+                    env_allowlist=self.environment_allowlist(req),
+                    env=env,
+                    idle_timeout_seconds=req.idle_timeout_seconds,
+                    max_runtime_seconds=req.max_runtime_seconds,
+                    max_record_bytes=CLAUDE_MAX_RECORD_BYTES,
+                    max_pending_bytes=CLAUDE_MAX_PENDING_BYTES,
+                    # The prompt travels in argv; stdin stays /dev/null so the CLI
+                    # never waits on it.
+                    stdin_pipe=False,
+                    # Nothing an agent starts outlives its invocation (ADR 0002).
+                    contain_orphans=True,
+                    sandbox=description,
+                    executable_fd=program,
+                )
+                with start_duplex(duplex) as child:
+                    cut = _read_claude_stream(child, stream, monitor)
+                    res = child.finish()
         replied = cut is _Cut.REPLIED
         timed_out = not replied and (cut in (_Cut.DEADLINE, _Cut.LOOP) or res.timed_out)
         failure = stream.failure

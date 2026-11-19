@@ -2657,7 +2657,7 @@ def test_a_runtime_that_cannot_honour_a_fresh_context_refuses_before_the_launch_
 
     asked: list[tuple] = []
     refusing = [True]
-    runtime = FreshContextRuntime("/bin/true", (1, 2, 3, 4), "test")
+    runtime = FreshContextRuntime("/bin/true", (1, 2, 3, 4, 5), "test")
 
     def establish(self, profile, env_allowlist, env, *, workspace, home, sandbox):
         asked.append((profile.name, workspace, os.path.isdir(workspace), sandbox, dict(env)))
@@ -2791,6 +2791,76 @@ def test_a_claude_launch_of_a_memory_phase_starts_the_build_established_before_i
         else:
             assert len(calls) == 1 and launch.command[0] == str(command)
             assert "CLAUDE_CODE_DISABLE_AUTO_MEMORY" not in (launch.env or {})
+
+
+@pytest.mark.parametrize("output_format", ["stream-json", "text"])
+def test_a_claude_executable_replaced_while_it_answers_is_refused_before_the_intent_save(
+    tmp_path, monkeypatch, output_format
+):
+    """R5-F1 of PR #513, through the engine and the real Claude adapter in both output
+    formats: the probe answers 2.1.328 and another file is renamed over the
+    executable's name before it returns. Refused before the launch-intent save, the
+    state as it was, no launch ordinal spent and nothing launched. Once it holds still,
+    the launch is started from a descriptor of the very file that answered."""
+    from autoforge import providers
+    from autoforge.executor import ExecutionResult
+    from autoforge.providers import ClaudeCodeProvider
+    from tests.conftest import FakeGitHub
+
+    class Launched(Exception):
+        pass
+
+    command = tmp_path / "bin" / "claude"
+    command.parent.mkdir()
+    command.write_text("#!/bin/sh\nexit 0\n")
+    command.chmod(0o755)
+    calls: list[tuple] = []
+    replace = [True]
+
+    def runner(req):
+        held = os.fstat(req.executable_fd)
+        if req.command[1:] == ["--version"]:
+            calls.append(("probe", (held.st_dev, held.st_ino)))
+            if replace[0]:
+                new = command.with_name("claude.new")
+                new.write_text("#!/bin/sh\necho 2.1.329\n")
+                new.chmod(0o755)
+                os.replace(new, command)
+            return ExecutionResult(req.command, req.cwd, 0, "2.1.328 (Claude Code)\n", "", "", "")
+        calls.append(("launch", (held.st_dev, held.st_ino), list(req.command)))
+        raise Launched
+
+    monkeypatch.setattr(providers, "start_duplex", runner)
+    sd = tmp_path / ".autoforge"
+    eng = make_engine(sd, "never", github=FakeGitHub(), origin=True)
+    eng.providers._overrides["claude"] = ClaudeCodeProvider(runner=runner)
+    profile = dataclasses.replace(eng.config.profile("analyze_execute"), command=str(command))
+    if output_format == "text":
+        profile = dataclasses.replace(
+            profile,
+            options={**profile.options, "output_format": "text"},
+            max_runtime_seconds=600,
+        )
+    eng.config.profiles["analyze_execute"] = profile
+    eng.config.memory.enabled = True
+    eng.record_run_configuration()
+    eng._save()
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    before = eng.paths.state_file.read_bytes()
+    with pytest.raises(ConfigurationError, match="changed while its runtime was being established"):
+        eng.step()
+    assert eng.paths.state_file.read_bytes() == before
+    assert load_state(eng.paths.state_file).launch_seq == 0
+    assert [call[0] for call in calls] == ["probe"]
+    replace[0] = False
+    calls.clear()
+    with pytest.raises(Launched):
+        eng.step()
+    assert load_state(eng.paths.state_file).launch_seq == 1
+    (_, answered), (kind, started, argv) = calls
+    now = os.stat(command)
+    assert kind == "launch" and started == answered == (now.st_dev, now.st_ino)
+    assert argv[0] == os.path.realpath(command)
 
 
 # -- the operator's commands (D9.5, W9) ----------------------------------------------------------

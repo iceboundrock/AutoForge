@@ -453,12 +453,16 @@ class SandboxBackend(Protocol):
         *,
         cwd: str | None,
         env: Mapping[str, str],
+        executable_fd: int | None = None,
     ) -> PreparedLaunch:
         """The run step: ``command`` prepared to run inside ``launch``, or a refusal.
 
         In the launch container ``handle`` names, created and staged for
         this launch; ``None`` when no lifecycle made one, which a backend
-        that needs an environment refuses.
+        that needs an environment refuses. With ``executable_fd``, what
+        ``command[0]`` names inside is that descriptor's file, shown
+        read-only and never the descriptor itself (R5-F1 of PR #513); a
+        backend that cannot show it so refuses the launch.
         """
         ...
 
@@ -549,11 +553,12 @@ class BwrapBackend:
         *,
         cwd: str | None,
         env: Mapping[str, str],
+        executable_fd: int | None = None,
     ) -> PreparedLaunch:
         # bwrap makes its namespace at the spawn: a handle names nothing it made.
         if handle is not None and handle.objects:
             raise _no_object(handle.objects[0])
-        return sandbox_bwrap.prepare(launch, command, cwd=cwd, env=env)
+        return sandbox_bwrap.prepare(launch, command, cwd=cwd, env=env, executable_fd=executable_fd)
 
     def exporter(self, handle: LaunchHandle) -> tuple[LifecycleObject, ...]:
         return ()
@@ -611,19 +616,25 @@ def prepare(
     *,
     cwd: str | None,
     env: Mapping[str, str],
+    executable_fd: int | None = None,
 ) -> PreparedLaunch:
     """The run step's prepare seam: ``command`` inside ``launch``.
 
     By the backend that planned the launch, in the environment its handle
     names (:class:`LaunchBinding`); a launch no plan step bound, by its
-    type (:func:`backend_for`).
+    type (:func:`backend_for`). ``executable_fd``: the program ``command``
+    starts (:attr:`autoforge.executor.ExecutionRequest.executable_fd`).
     """
     binding = launch.binding
     if binding is None:
-        return backend_for(launch).prepare(launch, None, command, cwd=cwd, env=env)
+        return backend_for(launch).prepare(
+            launch, None, command, cwd=cwd, env=env, executable_fd=executable_fd
+        )
     if not isinstance(binding, LaunchBinding):
         raise SandboxLaunchRefusedError(
             f"the launch is bound to a {type(binding).__name__}, which names no sandbox backend, "
             "so it is refused; it never runs without the sandbox"
         )
-    return binding.backend.prepare(launch, binding.handle, command, cwd=cwd, env=env)
+    return binding.backend.prepare(
+        launch, binding.handle, command, cwd=cwd, env=env, executable_fd=executable_fd
+    )

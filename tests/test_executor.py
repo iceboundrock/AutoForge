@@ -2010,3 +2010,78 @@ def test_without_a_subreaper_the_limit_is_reported(monkeypatch):
         assert not _gone(pid, within=0.1)
     finally:
         _kill_quietly(pid)
+
+
+def _replaced(path, held: str, replacement: str) -> int:
+    """``path`` written with ``held``, opened, then replaced by a file holding ``replacement``."""
+    path.write_text(held)
+    path.chmod(0o755)
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    new = path.with_name(path.name + ".new")
+    new.write_text(replacement)
+    new.chmod(0o755)
+    os.replace(new, path)
+    return fd
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="no /proc/self/fd on this host")
+def test_a_program_held_by_its_descriptor_is_the_one_started_whatever_its_name_holds(tmp_path):
+    """R5-F1 of PR #513: ``executable_fd`` is the program the child execs, and
+    ``command[0]`` only its ``argv[0]``: a file put at that name after the caller
+    checked the descriptor's is not the one that runs, a script or a binary, in the
+    one-shot executor and the duplex alike. By its name, the new file runs."""
+    import shutil
+
+    from autoforge.executor_duplex import DuplexRequest, Record, start_duplex
+
+    script = tmp_path / "prog"
+    fd = _replaced(script, '#!/bin/sh\necho held "$@"\n', "#!/bin/sh\necho replacement\n")
+    binary = tmp_path / "prog-bin"
+    shutil.copy2(shutil.which("echo") or "/bin/echo", binary)
+    binary_fd = os.open(binary, os.O_RDONLY | os.O_CLOEXEC)
+    swapped = tmp_path / "prog-bin.new"
+    swapped.write_text("#!/bin/sh\necho replacement\n")
+    swapped.chmod(0o755)
+    os.replace(swapped, binary)
+    try:
+        for path, held in ((script, fd), (binary, binary_fd)):
+            res = execute(
+                ExecutionRequest(command=[str(path), "x"], executable_fd=held, timeout_seconds=30)
+            )
+            assert res.exit_code == 0 and res.stdout.split()[-1] == "x", res.stdout
+            assert "replacement" not in res.stdout
+            named = execute(ExecutionRequest(command=[str(path)], timeout_seconds=30))
+            assert named.stdout.strip() == "replacement"
+            request = DuplexRequest(
+                command=[str(path), "y"],
+                executable_fd=held,
+                stdin_pipe=False,
+                max_runtime_seconds=30,
+            )
+            with start_duplex(request) as child:
+                line = child.read_line(30)
+                child.finish()
+            assert isinstance(line, Record) and line.data.split()[-1] == b"y", line
+        os.fstat(fd)  # still the caller's: the executor closes no descriptor it was handed
+    finally:
+        os.close(fd)
+        os.close(binary_fd)
+
+
+def test_a_host_that_cannot_start_a_held_program_starts_nothing(tmp_path, monkeypatch):
+    """R5-F1 of PR #513: where no directory gives a process its descriptors as files
+    (macOS), a launch bound to its program is refused, never started by its name."""
+    from autoforge import executor
+
+    marker = tmp_path / "ran"
+    script = tmp_path / "prog"
+    script.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
+    script.chmod(0o755)
+    fd = os.open(script, os.O_RDONLY | os.O_CLOEXEC)
+    monkeypatch.setattr(executor, "_DESCRIPTOR_DIR", str(tmp_path / "missing"))
+    try:
+        with pytest.raises(ExecutionError, match="cannot start a program from an open descriptor"):
+            execute(ExecutionRequest(command=[str(script)], executable_fd=fd, timeout_seconds=30))
+    finally:
+        os.close(fd)
+    assert not marker.exists()

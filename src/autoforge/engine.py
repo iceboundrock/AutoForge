@@ -3415,7 +3415,7 @@ class ControllerEngine:
         (:meth:`AgentProvider.fresh_context_runtime`): a refusal is a
         ConfigurationError before anything is charged or saved, and the
         runtime it establishes is the executable the launch must start
-        (:meth:`AgentProvider.fresh_context_command`).
+        (:meth:`AgentProvider.fresh_context_launch`).
         """
         if provider.fresh_context_probe(profile) is None:
             return None

@@ -4,6 +4,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -2588,7 +2589,7 @@ def test_a_fresh_context_launch_starts_only_the_executable_its_runtime_was_estab
     if output_format == "text":
         profile = _text(profile)
     changed = _runtime_of(command)
-    changed = dataclasses.replace(changed, identity=(*changed.identity[:3], 0))
+    changed = dataclasses.replace(changed, identity=(*changed.identity[:4], 0))  # its ctime
     for runtime, needle in (
         (None, "no runtime was established for this launch before it was charged"),
         (_runtime_of(other), f"not {os.path.realpath(other)}, whose runtime was established"),
@@ -2742,6 +2743,10 @@ def test_the_runtime_probe_runs_as_the_launch_does_and_refuses_what_it_cannot_as
         assert probe.cwd == str(tmp_path / "scratch") and probe.timeout_seconds == 30
         assert probe.env_allowlist == provider.launch_allowlist(("PATH",))
         assert probe.env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+        # R5-F1: started from the file held open, never by its name; closed after.
+        assert probe.executable_fd is not None
+        with pytest.raises(OSError):
+            os.fstat(probe.executable_fd)
     assert unenforced.sandbox is None and enforced.sandbox is not None
     missing = dataclasses.replace(profile, command=str(tmp_path / "missing"))
     with pytest.raises(ConfigurationError, match="is not on the launch's PATH"):
@@ -2761,6 +2766,131 @@ def test_the_runtime_probe_runs_as_the_launch_does_and_refuses_what_it_cannot_as
     for name in ("pi", "opencode", "scripted"):
         other = provider_for(dataclasses.replace(profile, provider=name))
         assert _establish(other, profile, tmp_path) is None
+
+
+def _put_at(path: Path, text: str, how: str) -> None:
+    """Another file at ``path``, as an update or a writer would put it there."""
+    if how == "write":  # into the very file: the same inode, changed
+        with open(path, "a") as fh:
+            fh.write(text)
+        return
+    if how == "aside":  # the old file kept under another name
+        os.rename(path, path.with_name(path.name + ".old"))
+    new = path.with_name(path.name + ".new")
+    new.write_text(text)
+    new.chmod(0o755)
+    os.replace(new, path)
+
+
+@pytest.mark.parametrize("how", ["rename", "aside", "write"])
+def test_an_executable_changed_while_it_answers_establishes_no_runtime(tmp_path, how):
+    """R5-F1 of PR #513, the reviewer's case: the stand-in runner answers 2.1.328 and,
+    before it returns, another file is put at the executable's name (renamed over it,
+    or with the old one moved aside), or the file itself is written. Its answer is no
+    proof of what a launch would start: refused before the intent save, never
+    recorded as verified. The probe was handed the file held from before it ran."""
+    profile = _versioned_claude(tmp_path, "2.1.328 (Claude Code)")
+    path = Path(profile.command)
+    before = os.stat(path)
+    held: list = []
+
+    def answers_then_changes(req):
+        held.append(os.fstat(req.executable_fd))
+        _put_at(path, "#!/bin/sh\nprintf '2.1.329 (Claude Code)\\n'\n", how)
+        return ExecutionResult(req.command, req.cwd, 0, "2.1.328 (Claude Code)\n", "", "", "")
+
+    with pytest.raises(ConfigurationError) as caught:
+        _establish(ClaudeCodeProvider(runner=answers_then_changes), profile, tmp_path)
+    assert "changed while its runtime was being established" in str(caught.value)
+    ((st,),) = [held]
+    assert (st.st_dev, st.st_ino) == (before.st_dev, before.st_ino)
+
+
+def test_the_answer_a_probe_reads_is_the_file_it_held(tmp_path):
+    """R5-F1 of PR #513, through the real executor: a build nobody checked put at the
+    executable's name after the probe opened it is not what answers. The held file
+    answers 2.1.328, and the runtime is refused all the same, since the launch's
+    ``PATH`` now leads to another file than the one that answered."""
+    from autoforge.executor import execute
+
+    profile = _versioned_claude(tmp_path, "2.1.328 (Claude Code)")
+    answered: list[str] = []
+
+    def replaced_then_run(req):
+        _put_at(Path(profile.command), "#!/bin/sh\necho '2.1.329 (Claude Code)'\n", "rename")
+        result = execute(req)
+        answered.append(result.stdout.strip())
+        return result
+
+    with pytest.raises(ConfigurationError, match="changed while its runtime was being"):
+        _establish(ClaudeCodeProvider(runner=replaced_then_run), profile, tmp_path)
+    assert answered == ["2.1.328 (Claude Code)"]
+
+
+def _claude_script(text: str) -> str:
+    """A ``claude`` that prints ``text`` as its final answer, in either output format."""
+    from tests import claude_fake
+
+    lines = " ".join(shlex.quote(line) for line in (claude_fake.init(), claude_fake.result(text)))
+    return (
+        "#!/bin/sh\n"
+        'case " $* " in\n'
+        f"  *' stream-json '*) printf '%s\\n' {lines} ;;\n"
+        f"  *) printf '%s\\n' {shlex.quote(text)} ;;\n"
+        "esac\n"
+    )
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="no /proc/self/fd on this host")
+@pytest.mark.parametrize("how", ["rename", "aside"])
+@pytest.mark.parametrize("output_format", ["stream-json", "text"])
+def test_a_fresh_context_launch_starts_the_file_it_checked_whatever_its_name_holds_after(
+    monkeypatch, tmp_path, output_format, how
+):
+    """R5-F1 of PR #513, both output formats, on the host: after the launch's last
+    check, another build is put at the executable's name (renamed over it, or with the
+    checked one moved aside). The launch still starts the file it checked, through the
+    descriptor it holds, named by its resolved path: the answer that established the
+    runtime is the answer of the file that runs."""
+    from autoforge import providers
+    from autoforge.executor import execute
+
+    command = tmp_path / "bin" / "claude"
+    command.parent.mkdir()
+    command.write_text(_claude_script("checked"))
+    command.chmod(0o755)
+    runtime = _runtime_of(command)
+    profile = dataclasses.replace(default_config().profile("analyze_execute"), command=str(command))
+    if output_format == "text":
+        profile = _text(profile)
+    started: list = []
+
+    def replace_then(real):
+        def spawn(req):
+            started.append((list(req.command), os.fstat(req.executable_fd)))
+            _put_at(command, _claude_script("unchecked"), how)
+            return real(req)
+
+        return spawn
+
+    monkeypatch.setattr(providers, "start_duplex", replace_then(providers.start_duplex))
+    req = AgentRequest(
+        "ANALYZE_EXECUTE",
+        "p",
+        str(tmp_path),
+        profile,
+        None if output_format == "text" else 60,
+        None,
+        env_allowlist=("PATH",),
+        fresh_context=True,
+        fresh_context_runtime=runtime,
+    )
+    result = ClaudeCodeProvider(runner=replace_then(execute)).execute(req)
+    assert result.exit_code == 0, (result.stdout, result.stderr)
+    assert result.stdout.strip() == "checked" and "unchecked" in command.read_text()
+    ((argv, st),) = started
+    assert argv[0] == runtime.executable
+    assert (st.st_dev, st.st_ino) == runtime.identity[:2]
 
 
 def _background_agent_run(*after: str) -> list[str]:

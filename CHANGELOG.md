@@ -54,8 +54,13 @@ your Claude settings sets that variable, or unless the profile's own
 `claude --version`, asked before the launch is charged as the launch runs
 (inside the outer sandbox when the launch would be), reports a build that
 variable was checked against: 2.1.328 only, a later build included until it
-is checked. The launch then starts that very executable. With Memory off,
-nothing of this is checked and no launch changes.
+is checked. The probe and the launch each start the file the controller
+opened before its check, through its descriptor, never by its name: a file
+written to or put at the name while the probe answered is refused before
+the launch is charged, and a build put there after the launch's last check
+is not the one that runs (bwrap refuses a launch whose file another was
+renamed over). On a host without `/proc/self/fd` (macOS) such a launch is
+refused. With Memory off, nothing of this is checked and no launch changes.
 
 ### `claim-ambiguous`: `status` goes by what the reason names (#375)
 

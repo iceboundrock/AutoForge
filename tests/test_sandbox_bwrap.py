@@ -865,3 +865,216 @@ def test_the_probe_finds_this_host_capable_and_leaves_nothing(
     assert result.supported and result.capability is None and result.reason == ""
     assert result.describe() == f"supported (bubblewrap {backend})"
     assert list(scratch.iterdir()) == []
+
+
+# ------------------------------------------- a program held by its descriptor (R5-F1)
+
+
+_HELD = """#!{py}
+import errno, json, os, sys
+try:
+    open(sys.argv[0], "a").close()
+    wrote = "ok"
+except OSError as exc:
+    wrote = errno.errorcode.get(exc.errno, str(exc.errno))
+print(json.dumps({{
+    "marker": {marker!r},
+    "fds": sorted(int(fd) for fd in os.listdir("/proc/self/fd")),
+    "write": wrote,
+}}), flush=True)
+"""
+
+
+def _held(path: Path, text: str) -> int:
+    """``path`` written with ``text``, and opened as a launch holds its program."""
+    path.write_text(text)
+    path.chmod(0o755)
+    return os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+
+
+def _put(path: Path, text: str, *, keep_aside: bool) -> None:
+    """Another file at ``path``: renamed over it, or after the held one was moved aside."""
+    if keep_aside:
+        os.rename(path, path.with_name(path.name + ".old"))
+    new = path.with_name(path.name + ".new")
+    new.write_text(text)
+    new.chmod(0o755)
+    os.replace(new, path)
+
+
+def test_a_program_held_by_its_descriptor_is_the_one_started_inside(
+    tmp_path: Path, backend: str
+) -> None:
+    """R5-F1 of PR #513: inside the sandbox the program a launch holds open is mounted
+    read-only at its name from the descriptor, one-shot and duplex alike: moved aside
+    on the host with another file put at its name, the file held is the one started.
+    The command never holds the descriptor and cannot write the file; by its name,
+    without the descriptor, the new file runs."""
+    b = _base(tmp_path)
+    bin_dir = _dir(b / "bin")
+    path = Path(bin_dir) / "prog"
+    fd = _held(path, _HELD.format(py=PY, marker="held"))
+    _put(path, _HELD.format(py=PY, marker="replacement"), keep_aside=True)
+    description = _describe(b, projections=(P(bin_dir),))
+    try:
+        result = execute(
+            ExecutionRequest(
+                command=[str(path)],
+                env_allowlist=("PATH",),
+                sandbox=description,
+                executable_fd=fd,
+                timeout_seconds=60,
+            )
+        )
+        assert result.exit_code == 0, (result.stdout, result.stderr)
+        assert result.sandbox is not None and result.sandbox.enforced
+        seen = json.loads(result.stdout)
+        assert seen["marker"] == "held" and seen["write"] == "EROFS"
+        assert seen["fds"][:3] == [0, 1, 2] and len(seen["fds"]) == 4  # the listing's own
+        named = execute(
+            ExecutionRequest(
+                command=[str(path)],
+                env_allowlist=("PATH",),
+                sandbox=description,
+                timeout_seconds=60,
+            )
+        )
+        assert json.loads(named.stdout)["marker"] == "replacement"
+        request = DuplexRequest(
+            command=[str(path)],
+            env_allowlist=("PATH",),
+            max_runtime_seconds=60,
+            stdin_pipe=False,
+            contain_orphans=True,
+            sandbox=description,
+            executable_fd=fd,
+        )
+        with start_duplex(request) as child:
+            line = child.read_line(30)
+            child.finish()
+        assert isinstance(line, Record) and json.loads(line.data)["marker"] == "held"
+        os.fstat(fd)  # the controller's copy stays open: bwrap closed its own
+    finally:
+        os.close(fd)
+
+
+def test_a_program_held_by_its_descriptor_and_renamed_over_starts_nothing_inside(
+    tmp_path: Path, backend: str
+) -> None:
+    """R5-F1 of PR #513: bwrap finds the held file through the descriptor's name, so
+    one another file was renamed over, which no name leads to any more, is refused as
+    the sandbox's setup failure: nothing is started, the new file least of all."""
+    b = _base(tmp_path)
+    bin_dir = _dir(b / "bin")
+    path = Path(bin_dir) / "prog"
+    ran = Path(_dir(b / "out")) / "ran"
+    fd = _held(path, _HELD.format(py=PY, marker="held"))
+    _put(path, f"#!/bin/sh\ntouch '{ran}'\n", keep_aside=False)
+    description = _describe(b, projections=(P(bin_dir), P(str(ran.parent), RW)))
+    try:
+        with pytest.raises(SandboxLaunchRefusedError, match="failed to set the sandbox up"):
+            execute(
+                ExecutionRequest(
+                    command=[str(path)],
+                    env_allowlist=("PATH",),
+                    sandbox=description,
+                    executable_fd=fd,
+                    timeout_seconds=60,
+                )
+            )
+    finally:
+        os.close(fd)
+    assert not ran.exists()
+
+
+_CLAUDE = """#!{py}
+import json, sys
+if sys.argv[1:] == ["--version"]:
+    print({version!r})
+elif "stream-json" in sys.argv:
+    print(json.dumps({{"type": "system", "subtype": "init", "model": "m", "tools": []}}))
+    print(json.dumps({{
+        "type": "result", "subtype": "success", "is_error": False, "result": {marker!r},
+        "session_id": "s", "num_turns": 1, "duration_ms": 1, "total_cost_usd": 0,
+    }}))
+else:
+    print({marker!r})
+"""
+
+
+@pytest.mark.parametrize("output_format", ["stream-json", "text"])
+def test_a_claude_launch_inside_the_sandbox_starts_the_file_its_probe_ran(
+    tmp_path: Path, backend: str, monkeypatch: pytest.MonkeyPatch, output_format: str
+) -> None:
+    """R5-F1 of PR #513, the enforced path through the real Claude adapter, in both
+    output formats: the probe runs inside the sandbox from the file it holds and
+    establishes 2.1.328, and the launch, inside the sandbox too, starts that very file
+    although a build nobody checked was put at its name after the launch's last check,
+    so the answer that authorized the launch is the answer of what runs."""
+    import dataclasses
+    import types
+
+    from autoforge import providers
+    from autoforge.config import default_config
+    from autoforge.providers import AgentRequest, ClaudeCodeProvider
+    from autoforge.sandbox_backend import default_backend
+    from autoforge.sandbox_policy import ProbeSandbox
+
+    b = _base(tmp_path)
+    claude = Path(_dir(b / "cli")) / "claude"
+    claude.write_text(_CLAUDE.format(py=PY, version="2.1.328 (Claude Code)", marker="held"))
+    claude.chmod(0o755)
+    later = _CLAUDE.format(py=PY, version="2.1.329 (Claude Code)", marker="replacement")
+    profile = dataclasses.replace(default_config().profile("analyze_execute"), command=str(claude))
+    if output_format == "text":
+        profile = dataclasses.replace(
+            profile, options={**profile.options, "output_format": "text"}, max_runtime_seconds=60
+        )
+    home, scratch = _dir(b / "home"), _dir(b / "scratch")
+    probe = ProbeSandbox(
+        home=home,
+        controller_env={"PATH": os.environ["PATH"]},
+        workspace=scratch,
+        backend=default_backend(),
+    )
+    provider = ClaudeCodeProvider()
+    runtime = provider.establish_fresh_context(
+        profile,
+        ("PATH",),
+        provider.fresh_context_environment(True),
+        workspace=scratch,
+        home=home,
+        sandbox=probe,
+    )
+    assert runtime is not None and runtime.version == "2.1.328"
+    assert runtime.executable == os.path.realpath(claude)
+
+    def replace_then(real):
+        def spawn(req):
+            if "--version" not in req.command:
+                # After the launch's last check: the build is moved aside and a build
+                # nobody checked put at its name.
+                _put(claude, later, keep_aside=True)
+            return real(req)
+
+        return spawn
+
+    monkeypatch.setattr(providers, "start_duplex", replace_then(providers.start_duplex))
+    plan = types.SimpleNamespace(
+        facts=types.SimpleNamespace(home=home, provider_state=()), describe=probe.describe
+    )
+    req = AgentRequest(
+        "ANALYZE_EXECUTE",
+        "p",
+        scratch,
+        profile,
+        None if output_format == "text" else 60,
+        None,
+        env_allowlist=("PATH",),
+        fresh_context=True,
+        fresh_context_runtime=runtime,
+        sandbox=plan,  # type: ignore[arg-type]
+    )
+    result = ClaudeCodeProvider(runner=replace_then(execute)).execute(req)
+    assert result.exit_code == 0, (result.stdout, result.stderr)
+    assert result.stdout.strip() == "held" and "replacement" in claude.read_text()

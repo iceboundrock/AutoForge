@@ -230,6 +230,9 @@ class DuplexRequest:
     # watches: it must outlive the handle (ADR 0005 D10.6), whichever
     # threads then send, read and finish.
     sandbox: LaunchDescription | None = None
+    # As :attr:`autoforge.executor.ExecutionRequest.executable_fd`: the program
+    # the child starts, whatever ``command[0]`` names by then (R5-F1 of PR #513).
+    executable_fd: int | None = None
 
 
 @dataclass
@@ -520,6 +523,7 @@ def start_duplex(req: DuplexRequest) -> DuplexChild:
             cwd=req.cwd,
             env_allowlist=req.env_allowlist,
             env=req.env,
+            executable_fd=req.executable_fd,
         )
     try:
         return _start(req, launch)
@@ -541,6 +545,7 @@ def _start(req: DuplexRequest, launch: PreparedLaunch | None) -> DuplexChild:
             env={} if launch is not None else _child_environment(req.env_allowlist, req.env),
             stdin=subprocess.PIPE if req.stdin_pipe else subprocess.DEVNULL,
             launch=launch,
+            executable_fd=req.executable_fd,
         )
     except BaseException:
         if contained is not None:

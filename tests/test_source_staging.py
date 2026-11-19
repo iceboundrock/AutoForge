@@ -1830,7 +1830,9 @@ class StagingBackend:
     def start(self, container: LifecycleObject) -> None:
         self.events.append(("runtime", "start"))
 
-    def prepare(self, launch, handle, command, *, cwd, env):  # pragma: no cover - not run
+    def prepare(
+        self, launch, handle, command, *, cwd, env, executable_fd=None
+    ):  # pragma: no cover - not run
         raise AssertionError("the tests stop before the run step")
 
     def exporter(self, handle: LaunchHandle) -> tuple[LifecycleObject, ...]:

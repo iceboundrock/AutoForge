@@ -237,6 +237,37 @@ class ExecutionRequest:
     # establish the sandbox raises :class:`SandboxLaunchRefusedError`; it never
     # runs the command without it.
     sandbox: LaunchDescription | None = None
+    # Start the program from this open descriptor, never by the name
+    # ``command[0]``, which stays its ``argv[0]`` (R5-F1 of PR #513): a file
+    # put at that name after the caller checked the descriptor's file is not
+    # the one that runs. On the host the child execs the descriptor
+    # (:func:`descriptor_program`), handed to it alone; inside the sandbox the
+    # backend mounts the descriptor's file read-only at ``command[0]``, an
+    # absolute path, and keeps the descriptor out of the command. The caller
+    # owns and closes it. A host that cannot start a program from a
+    # descriptor fails the spawn (:class:`ExecutionError`), never runs it by
+    # name instead.
+    executable_fd: int | None = None
+
+
+#: Where a process finds its own open descriptors as files it can exec.
+_DESCRIPTOR_DIR = "/proc/self/fd"
+
+
+def descriptor_program(fd: int) -> str:
+    """The path through which a child execs the file its descriptor ``fd`` holds.
+
+    ``/proc/self/fd/<fd>``: the kernel starts the open file itself, whatever
+    its name holds now, and a script's interpreter is handed that path (R5-F1
+    of PR #513). :class:`ExecutionError` on a host with no such directory
+    (macOS), which then starts nothing.
+    """
+    if not os.path.isdir(_DESCRIPTOR_DIR):
+        raise ExecutionError(
+            f"this host cannot start a program from an open descriptor ({_DESCRIPTOR_DIR} is "
+            "missing), so a launch bound to the file it checked is not started"
+        )
+    return f"{_DESCRIPTOR_DIR}/{fd}"
 
 
 @dataclass
@@ -1382,6 +1413,7 @@ def _spawn(
     env: dict[str, str],
     stdin: int,
     launch: PreparedLaunch | None = None,
+    executable_fd: int | None = None,
 ) -> subprocess.Popen[bytes]:
     """Start ``command`` in a session of its own with stdout and stderr piped.
 
@@ -1390,19 +1422,25 @@ def _spawn(
     inherited. A spawn failure is an :class:`ExecutionError`. With
     ``launch`` the sandbox backend is started in the command's place
     (:func:`_spawn_sandboxed`) and ``env`` is not used: the launch carries
-    the command's environment.
+    the command's environment, and the program it starts (``executable_fd``
+    was given to its preparation). Without it, ``executable_fd`` is the
+    program the child execs (:attr:`ExecutionRequest.executable_fd`), and
+    ``command[0]`` only its ``argv[0]``.
     """
     if launch is not None:
         return _spawn_sandboxed(launch, cwd=cwd, stdin=stdin)
+    program = None if executable_fd is None else descriptor_program(executable_fd)
     try:
         return subprocess.Popen(  # noqa: S603 - argv list, no shell
             command,
+            executable=program,
             cwd=cwd,
             env=env,
             stdin=stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
+            pass_fds=() if executable_fd is None else (executable_fd,),
         )
     except FileNotFoundError as exc:
         raise ExecutionError(f"executable not found: {command[0]} ({exc})") from exc
@@ -1454,6 +1492,7 @@ def _prepare_sandbox(
     cwd: str | None,
     env_allowlist: tuple[str, ...] | None,
     env: Mapping[str, str] | None,
+    executable_fd: int | None = None,
 ) -> PreparedLaunch:
     """The backend's launch for ``command`` inside ``description``, or a refusal.
 
@@ -1463,9 +1502,16 @@ def _prepare_sandbox(
     begins, since the backend may read its own version first. The backend is
     the one that prepares ``description`` (ADR 0013 D13's run step); a
     description no backend prepares is refused, never run without one.
+    ``executable_fd`` is the program the command starts
+    (:attr:`ExecutionRequest.executable_fd`), which the backend shows at
+    ``command[0]``.
     """
     return sandbox_backend.prepare(
-        description, command, cwd=cwd, env=_child_environment(env_allowlist, env)
+        description,
+        command,
+        cwd=cwd,
+        env=_child_environment(env_allowlist, env),
+        executable_fd=executable_fd,
     )
 
 
@@ -1528,6 +1574,7 @@ def execute(req: ExecutionRequest) -> ExecutionResult:
             cwd=req.cwd,
             env_allowlist=req.env_allowlist,
             env=req.env,
+            executable_fd=req.executable_fd,
         )
     try:
         contained = (
@@ -1596,6 +1643,7 @@ def _execute(
             env={} if launch is not None else _child_environment(req.env_allowlist, req.env),
             stdin=stdin,
             launch=launch,
+            executable_fd=req.executable_fd,
         )
     except BaseException:
         if feeder is not None:
