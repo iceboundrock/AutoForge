@@ -512,8 +512,9 @@ def _add_memory_parser(sub) -> None:
         description=(
             "Issue Working Memory is the advisory store of lessons a run keeps for its issue "
             "(ADR 0015, #317), on when the run was created with memory.enabled: true. It "
-            "informs a launch's prompt and decides nothing. These commands show it and "
-            "retract a record; the seed is imported by 'run --memory-seed'."
+            "decides nothing, and this release puts it in no launch's prompt or projection "
+            "yet: #333 wires that. These commands show it and retract a record; the seed is "
+            "imported by 'run --memory-seed'."
         ),
     )
     msub = mp.add_subparsers(dest="memory_command", required=True)
@@ -526,9 +527,12 @@ def _add_memory_parser(sub) -> None:
         help="withdraw one record under the controller lock, in one save",
         description=(
             "Withdraw one record of the run's Issue Memory: its text is dropped, its digest "
-            "kept, and the same text is refused if it is written again. Any record, whoever "
-            "wrote it; the next launch's projection no longer shows it. Runs under the "
-            "controller lock and makes one save; no agent runs and nothing reaches GitHub."
+            "kept, and the same text is refused if it is written again for that issue where "
+            "the record applied. Any record, whoever wrote it; no projection shows it again "
+            "(this release renders none into a launch: #333 does). Runs under the controller "
+            "lock of the repository the state directory belongs to and makes one save; it "
+            "refuses a scheduler namespace's state, an issue a scheduler namespace owns and a "
+            "state directory of another repository. No agent runs and nothing reaches GitHub."
         ),
     )
     retract.add_argument(
@@ -2666,6 +2670,7 @@ def cmd_epic_recheck(args) -> int:
 
 
 _RECORD_ID_RE = re.compile(r"M?([1-9][0-9]{0,5})")
+_MEMORY_RETRACT = "memory retract"
 
 
 def cmd_memory(args) -> int:
@@ -2677,11 +2682,25 @@ def cmd_memory(args) -> int:
     if match is None:
         raise ConfigurationError(f"memory retract: {args.record!r} is not a record id (M3, or 3)")
     record_id = int(match.group(1))
-    # A scheduler namespace's state is its worker's (ADR 0008 D17.3).
-    engine.refuse_scheduler_state_dir("memory retract")
+    # As `rebind-epic` (R2-F1 of PR #513): a scheduler namespace's state is its
+    # worker's (ADR 0008 D17.3), and an unloadable state is refused, before the
+    # lock. So is a state directory of another repository, another clone of the
+    # same GitHub repository included: this checkout's lock and scheduler root
+    # do not guard it, and its own controller may hold its own lock.
+    engine.refuse_scheduler_state_dir(_MEMORY_RETRACT)
     _refuse_unloadable_state_before_the_lock(engine)
+    foreign = engine.state_dir_repository_problem()
+    if foreign:
+        raise ConfigurationError(
+            f"{_MEMORY_RETRACT} refused: {foreign}. Nothing was changed: no lock taken and no "
+            "state write."
+        )
+    # Load, decide and write under one lock: a state loaded before the lock
+    # could already have been replaced by another controller.
     with engine.locked():
         state = engine.load()
+        # ADR 0008 D17.2's forward guard: an issue a namespace owns is its worker's.
+        _guard_scheduler_ownership(engine, state.current_issue_url, _MEMORY_RETRACT)
         store = state.memory_store()
         if store is None:
             raise ConfigurationError(
@@ -2697,9 +2716,10 @@ def cmd_memory(args) -> int:
         engine.save()
     print(
         redact(
-            f"[{state.run_id}] retracted M{record_id}: the next launch's projection no longer "
-            f"shows it, and its text is refused if written again (Issue Memory revision "
-            f"{outcome.store.revision})"
+            f"[{state.run_id}] retracted M{record_id}: its text is dropped and refused if "
+            "written again for its issue where it applied, and no projection shows it (Issue "
+            f"Memory revision {outcome.store.revision}). This release puts Memory in no "
+            "launch's prompt or projection yet (#333)."
         )
     )
     return 0

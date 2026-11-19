@@ -2425,11 +2425,16 @@ on launches, transitions and writes to GitHub exactly as one with it off.
   no lock and writes nothing; `status --json` carries the raw field
   (`issue_memory`) too.
 - `memory retract RECORD --reason TEXT` withdraws any record (`M3` or `3`),
-  under the controller lock, in one save: its text is dropped, its digest
-  is kept, and the same text is refused if anything writes it again. A
-  refusal (no such record, already retracted, a run without Memory) exits 2
-  and writes nothing. It is refused for a scheduler namespace's state
-  directory.
+  under the controller lock of the repository the state directory belongs
+  to, in one save: its text is dropped, its digest is kept, and the same
+  text is refused if anything writes it again for that issue where the
+  record applied. This release puts Memory in no launch's prompt or
+  projection yet (#333 does). A refusal (no such record, already retracted,
+  a run without Memory) exits 2 and writes nothing. Like `rebind-epic`, it
+  is refused before the lock for a scheduler namespace's state directory
+  and for a state directory of another repository (another clone of the
+  same GitHub repository included, whose lock this checkout cannot take),
+  and under the lock for an issue a scheduler namespace owns.
 
 A run's Memory setting is recorded when it is created, beside its recorded
 configuration: `step`, `resume` and `unblock` refuse a configuration with

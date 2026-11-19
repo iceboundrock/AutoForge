@@ -3766,8 +3766,8 @@ class ControllerEngine:
         state directory in no repository, or whose repository cannot be
         read, has no identity to establish and is a problem too. Two git
         reads, no write; a missing state directory is left to the state
-        load, which refuses it. ``rebind-epic`` refuses on it (#435); no
-        other command calls this.
+        load, which refuses it. ``rebind-epic`` (#435) and ``memory retract``
+        (#317, R2-F1 of PR #513) refuse on it; no other command calls this.
         """
         state_dir = self.paths.state_dir
         if not os.path.lexists(state_dir):

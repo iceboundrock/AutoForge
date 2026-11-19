@@ -3156,23 +3156,35 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   0 among them) is refused for add, correct, supersede and retract, so every
   store a write returns loads;
 - a correction or a retraction leaves its old text's digest as a tombstone,
-  a later write of it is refused, and a retraction survives a save and a
-  load (the snapshot is what loads; nothing replays an older write); the
-  withdrawn text is withheld from a duplicate record wherever the withdrawn
-  record applied, after a save and a load too, but not from a record of
-  another candidate or issue, and an agent's withdrawal hides no observation
-  or operator's record;
-- an observation derived again adds nothing; the proposal ledger: a replay
-  of the same task, launch, role and input revision adds nothing, even after
-  a correction or a retraction, another key with the same text is a record
-  of its own, and an agent's write from an earlier launch than the last that
-  changed a record is refused as stale;
+  and a retraction survives a save and a load (the snapshot is what loads;
+  nothing replays an older write); a later write of the text is refused only
+  into a record the withdrawal binds (same issue, a trust its writer could
+  have withdrawn, a scope the withdrawn record covered), so an agent's
+  withdrawal keeps out no observation, operator's record, other issue's or
+  other candidate's proposal, or broader proposal, and the loader refuses a
+  history that wrote a bound text back, in event order; the withdrawn text
+  is withheld from a duplicate record wherever the withdrawn record applied,
+  after a save and a load too, but not from a record of another candidate or
+  issue, and an agent's withdrawal hides no observation or operator's record;
+- an observation derived again adds nothing; the proposal ledger: the key is
+  the launch and the origin (task, role, input revision, slot), never the
+  payload; a replay with the same payload adds nothing, even after a
+  correction or a retraction, the same key with another text, kind,
+  applicability or issue is refused as a conflict, and on load too; another
+  key with the same text is a record of its own; a result's several
+  proposals keep a slot each; and an agent's write from an earlier launch
+  than the last that changed a record is refused as stale;
+- a supersession only by a record that covers the superseded one's phases
+  and candidates (a proposal on C2 never hides C1's), refused otherwise on
+  write and on load;
 - the bounds: records, corrections and text refused and counted, never by
   eviction; the largest store the bounds allow fits 1,048,576 bytes as the
   state file holds it, and a state at that ceiling saves and loads;
 - nothing raw: an agent's or the operator's text with a control character
   or a credential's shape refused, the controller's escaped, redacted and
-  cut; a seed kept byte for byte with its digest, or refused;
+  cut; a seed kept byte for byte with its digest, or refused; a loaded record
+  text or event reason the redactor would change refused unquoted, whatever
+  its digests say, and a render of a store holding one refused whole;
 - a store a controller did not write refused on load: each shape, a history
   that does not explain the record, a correction, supersession or
   retraction its actor may not make, a supersession the write would have
@@ -3182,11 +3194,18 @@ path's own tests (ADR 0015 §4.2). Keep covered:
 - the projection: observed, operator's, evidence-gone and proposed records
   in that order, newest first; a launch citation observed only with the
   receipt the run keeps and its digest (missing, mismatched and retained
-  receipts); another issue, phase or candidate omitted and counted;
-  retracted and superseded records counted, never shown; the bound kept with
-  every cut counted, and a bound above 16,384 characters refused; the same
-  revision and request render the same bytes; `REVIEW` and another run's
-  store refused;
+  receipts); a validation citation observed only with a real, failing
+  `ValidationRecord` of the record's issue and, for a candidate-bound
+  record, of its commit (a passing one, another candidate's, another
+  issue's, an edited one and a missing one downgrade it), and each observed
+  kind citing only the evidence it takes; another issue, phase or candidate
+  omitted and counted; retracted and superseded records counted, never
+  shown; the bound kept with every cut counted, and a bound above 16,384
+  characters refused; the same revision and request render the same bytes;
+  `REVIEW`, another run's store, a store whose Memory is off and a request
+  whose step, phase, launch, repository, candidate or bases disagree
+  refused; an issue spelt in another case selects the same records; every
+  rendered line what the redactor leaves unchanged;
 - the evaluation's owed Memory fixtures (evaluation protocol, section 8);
 - protocol 19 -> 20: a protocol-19 file loads with Memory off and
   `launch_seq` at its step count, an older label carrying either field and a
@@ -3202,4 +3221,8 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   goes through the same phases, launches and writes as one with it off;
 - `run --memory-seed`, `memory show` and `memory retract` end to end, a
   refusal writing nothing and a failed save leaving the checkpoint as it
-  was.
+  was; `memory retract` refused with no checkpoint changed and no lock taken
+  for another clone's state directory (its own lock held or free) and for a
+  scheduler namespace's, here or in another clone, and under the lock for an
+  issue a namespace owns; its help and confirmation say no launch is shown
+  Memory yet.

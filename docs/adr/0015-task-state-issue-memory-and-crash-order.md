@@ -33,8 +33,16 @@
     `finding`, `constraint` and `handoff` (an agent's); the bounds are 64
     records, 2,048 UTF-8 bytes of text, three corrections of a record and
     so 256 tombstones; the command is `run --memory-seed`, with
-    `memory show` and `memory retract`. Wiring the store into the running
-    workflow is #333's.
+    `memory show` and `memory retract`. D9.4's tombstone refuses its text
+    again where its withdrawal binds: a record of the same issue, of a trust
+    the withdrawer could have withdrawn, in a scope the withdrawn record
+    covered, so an agent's withdrawal keeps out no observation and nothing
+    withdrawn for one issue or candidate touches another; the loader checks
+    it in event order. A proposal's key is its launch and its origin (task,
+    role, input revision and its slot in the result), never its payload. A
+    citation resolves only to a typed receipt that establishes its record (a
+    failing `ValidationRecord` of the record's issue and candidate). Wiring
+    the store into the running workflow is #333's.
   - *Implemented with it:* nothing in the package. No phase, edge, state
     field, protocol number, configuration key, prompt, effect kind, launch
     class, stop code or default changes. `tests/test_adr_0015.py` keeps

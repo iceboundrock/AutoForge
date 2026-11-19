@@ -12,9 +12,16 @@ true` (off by default): a bounded store of advisory lessons for its issue,
 inside the run's `state.json`, which starts empty with the run (ADR 0015).
 `run --memory-seed FILE` imports one lesson before the first launch, byte
 for byte or not at all, and records its SHA-256; `memory show` prints the
-store and `memory retract` withdraws a record in one save. A retracted or
-corrected text is refused if anything writes it again, and is not shown
-through another record carrying the same text. Memory decides
+store and `memory retract` withdraws a record in one save, under the lock of
+the repository its state belongs to. A retracted or corrected text is refused
+if a record its withdrawal binds (the same issue, a trust its writer could
+have withdrawn, where the withdrawn record applied) writes it again, and is
+not shown through another such record carrying the same text; an agent's
+withdrawal never keeps out an observation, and nothing withdrawn for one
+issue or candidate touches another. An agent's proposal is keyed by its
+launch and origin (task, role, input revision and its slot in the result),
+never by what it says: its replay adds nothing, and the same key saying
+something else is refused. Memory decides
 nothing: no code that decides a phase, a write, a permission, a budget or a
 merge reads it.
 

@@ -38,6 +38,7 @@ from autoforge.config import (
     validate_memory_routing,
 )
 from autoforge.errors import ConfigurationDriftError, ConfigurationError, StateError
+from autoforge.locking import ControllerLock, repository_lock_path
 from autoforge.memory import (
     APPLICABLE_PHASES,
     MAX_CORRECTIONS,
@@ -75,10 +76,13 @@ from autoforge.providers import (
     outside_allow_list,
     provider_for,
 )
+from autoforge.redaction import redact
 from autoforge.state import AutoForgeState, load_state, save_state
 from autoforge.transitions import Phase
 from tests.conftest import EPIC, ISSUE, block, make_engine
 from tests.test_cli import _tmp_path_is_a_repository, fakes  # noqa: F401 - fixtures
+from tests.test_evidence import record as validation_record
+from tests.test_evidence import remote
 from tests.test_state import make_state
 
 RUN = "af-20261119T000000Z-abcdef"
@@ -97,8 +101,18 @@ def _launch(seq: int = 1, run: str = RUN) -> AttemptRef:
     return AttemptRef(run, seq)
 
 
-def _vr(seq: int, digest: str = "d" * 64) -> Citation:
-    return Citation(CitationKind.VALIDATION_RECORD, str(seq), digest)
+@functools.cache
+def _receipt(seq: int, exit_code: int = 1, commit: str = C1) -> dict:
+    """A real ValidationRecord of owner/repo (the issue's repository): by default a
+    failure (exit 1) of candidate C1. Shared: copy it before changing it."""
+    return validation_record(seq, candidate=remote(commit=commit), exit_code=exit_code)
+
+
+def _vr(seq: int, exit_code: int = 1, commit: str = C1) -> Citation:
+    """A citation of :func:`_receipt`'s record, by its seq and its own digest."""
+    return Citation(
+        CitationKind.VALIDATION_RECORD, str(seq), _receipt(seq, exit_code, commit)["digest"]
+    )
 
 
 def _store(run: str = RUN) -> MemoryStore:
@@ -123,8 +137,10 @@ def observe(store, text, *, seq=1, cite=None, issue=ISSUE, applies=None, kind=No
     )
 
 
-def _origin(task: int = 1, role: Role = Role.PRODUCER, input_sha: str = BASE) -> ProposalOrigin:
-    return ProposalOrigin(task, role, input_sha)
+def _origin(
+    task: int = 1, role: Role = Role.PRODUCER, input_sha: str = BASE, slot: int = 1
+) -> ProposalOrigin:
+    return ProposalOrigin(task, role, input_sha, slot)
 
 
 def propose(
@@ -173,12 +189,12 @@ def _request(**overrides) -> ProjectionRequest:
     return ProjectionRequest(**values)  # type: ignore[arg-type]
 
 
-def _evidence(*records: tuple[int, str], launches=()) -> EvidenceIndex:
-    """The receipts a run holds: validation records by (seq, digest), launch receipts by
-    (AttemptRef, digest). The state keeps no launch receipt before #332."""
-    return EvidenceIndex.from_state(
-        RUN, [{"seq": seq, "digest": digest} for seq, digest in records], launches
-    )
+def _evidence(*records: int | dict, launches=(), issue: str = ISSUE) -> EvidenceIndex:
+    """The receipts a run holds for ``issue``: real ValidationRecords (a seq stands for
+    :func:`_receipt`'s failure of C1), and launch receipts by (AttemptRef, digest). The
+    state keeps no launch receipt before #332."""
+    raws = [_receipt(r) if isinstance(r, int) else r for r in records]
+    return EvidenceIndex.from_state(RUN, raws, launches, issue_url=issue)
 
 
 def _render(store, evidence=None, **overrides):
@@ -275,7 +291,12 @@ def test_an_agent_changes_no_record_of_another_issue_or_another_run():
         other, "x", actor=Actor.AGENT, issue_url=ISSUE_B, attempt=_launch(2, OTHER_RUN)
     )
     assert stranger.refusal is RefusalCode.SCOPE
-    launch = observe(store, "x", cite=Citation(CitationKind.LAUNCH, f"{OTHER_RUN}/1", "e" * 64))
+    launch = observe(
+        store,
+        "x",
+        kind=Kind.LAUNCH_END,
+        cite=Citation(CitationKind.LAUNCH, f"{OTHER_RUN}/1", "e" * 64),
+    )
     assert launch.refusal is RefusalCode.SCOPE
 
 
@@ -302,11 +323,11 @@ def test_an_agent_or_controller_write_names_the_records_own_issue(actor, issue, 
 
 def test_the_operator_administers_every_issue_and_an_agent_only_the_one_it_acts_for():
     store, other = _applied(propose(_store(), "issue 3's lesson", issue=ISSUE_B))
-    store, own = _applied(propose(store, "issue 2's lesson"))
+    store, own = _applied(propose(store, "issue 2's lesson", seq=2))
     assert store.retract(other, **as_agent()).refusal is RefusalCode.SCOPE
     store, _ = _applied(store.correct(own, "issue 2's lesson, corrected", **as_agent()))
     store, _ = _applied(store.retract(other, **as_agent(issue=ISSUE_B)))
-    store, third = _applied(propose(store, "another of issue 3's", seq=2, issue=ISSUE_B))
+    store, third = _applied(propose(store, "another of issue 3's", seq=3, issue=ISSUE_B))
     store, _ = _applied(store.retract(third, actor=Actor.OPERATOR, issue_url=None))
     store, _ = _applied(store.retract(own, actor=Actor.OPERATOR, issue_url=ISSUE))
     assert [r.status for r in store.records] == [Status.RETRACTED] * 3
@@ -473,9 +494,55 @@ def test_a_replay_never_resurrects_or_duplicates_a_corrected_or_retracted_propos
     again = propose(store, "the API is async", seq=1)
     assert again.applied and not again.changed and again.store is store
     assert len(store.records) == 1 and store.record(record).status is Status.RETRACTED
+    # The same key saying something else is no replay (R2-F3 of PR #513), retracted or not.
+    conflict = propose(store, "the API is sync", seq=1)
+    assert conflict.refusal is RefusalCode.CONFLICT and conflict.store.records == store.records
     # Under any other key a withdrawn text stays refused: a rejection persists.
-    for text, seq in (("the API is sync", 1), ("the API is async", 3), ("the API is sync", 3)):
-        assert propose(store, text, seq=seq).refusal is RefusalCode.TOMBSTONED
+    for text in ("the API is async", "the API is sync"):
+        assert propose(store, text, seq=3).refusal is RefusalCode.TOMBSTONED
+
+
+@pytest.mark.parametrize("stage", ["current", "corrected", "retracted"])
+@pytest.mark.parametrize("change", ["text", "kind", "applicability", "issue"])
+def test_a_proposal_key_is_one_proposal_whatever_its_payload_says(change, stage):
+    """R2-F3 of PR #513: the key is the launch and its origin (task, role, input
+    revision and slot), never what the proposal says. Under a kept key, the same
+    payload is the record kept and another payload is refused, after a correction
+    or a retraction too, and nothing changes."""
+    store, record = _applied(propose(_store(), "the cache leaks", seq=1))
+    if stage == "corrected":
+        store, _ = _applied(store.correct(record, "the cache leaks twice", **as_agent(2)))
+    elif stage == "retracted":
+        store, _ = _applied(store.retract(record, **as_agent(2)))
+    replay = propose(store, "the cache leaks", seq=1)
+    assert replay.applied and not replay.changed and replay.record_id == record
+    payload = {
+        "text": dict(text="the cache is stale"),
+        "kind": dict(kind=Kind.FINDING),
+        "applicability": dict(applies=Applicability(candidate=CandidateScope.EXACT, commit=C1)),
+        "issue": dict(issue=ISSUE_B),
+    }[change]
+    text = payload.pop("text", "the cache leaks")
+    conflict = propose(store, text, seq=1, **payload)
+    assert conflict.refusal is RefusalCode.CONFLICT, conflict.detail
+    assert conflict.record_id == record and conflict.store.records == store.records
+    assert conflict.store.refused == {"conflict": 1} and len(store.records) == 1
+
+
+def test_a_results_proposals_each_keep_the_slot_the_controller_gave_them():
+    """Several proposals in one accepted result: each its own slot, each replayed alone."""
+    store = _store()
+    texts = ["try the cache", "the lock leaks", "retry once"]
+    for slot, text in enumerate(texts, start=1):
+        store, record = _applied(propose(store, text, seq=4, origin=_origin(slot=slot)))
+        assert record == slot
+    for slot, text in reversed(list(enumerate(texts, start=1))):
+        replay = propose(store, text, seq=4, origin=_origin(slot=slot))
+        assert replay.applied and not replay.changed and replay.record_id == slot
+    swapped = propose(store, texts[0], seq=4, origin=_origin(slot=2))
+    assert swapped.refusal is RefusalCode.CONFLICT
+    assert [r.origin.slot for r in _reloaded(store).records] == [1, 2, 3]
+    assert propose(store, "x", seq=4, origin=_origin(slot=0)).refusal is RefusalCode.INVALID
 
 
 def test_an_out_of_order_or_stale_proposal_overwrites_nothing_and_stays_a_claim():
@@ -566,7 +633,7 @@ def test_a_disabled_store_takes_no_write_but_a_retraction():
 
 # -- a withdrawn text is withheld from its duplicates (R1-F2 of PR #513) --------------------
 
-_HELD = _evidence((1, "d" * 64), (2, "d" * 64))
+_HELD = _evidence(1, 2)
 
 
 @pytest.mark.parametrize("withdrawal", ["retract", "correct", "operator"])
@@ -618,7 +685,7 @@ def test_a_withdrawal_hides_its_text_only_where_the_withdrawn_record_applied():
     assert broad in on_c2.shown and on_c2.withdrawn == 0
     on_c1_render = _render(store, candidate=C1)
     assert broad not in on_c1_render.shown and on_c1_render.withdrawn == 1
-    issue_3 = _render(store, issue_url=ISSUE_B, step=_step(ISSUE_B))
+    issue_3 = _render(store, _evidence(issue=ISSUE_B), issue_url=ISSUE_B, step=_step(ISSUE_B))
     assert issue_3.shown == (elsewhere,) and issue_3.withdrawn == 0
 
 
@@ -626,7 +693,7 @@ def test_an_agent_withdrawing_its_own_proposal_hides_no_observation_or_operator_
     """A withdrawal binds only what its writer could have withdrawn (D9.4): an agent
     retracting a duplicate proposal cannot hide evidence; the operator's binds all."""
     text = "use --format json"
-    held = _evidence((1, "d" * 64))
+    held = _evidence(1)
     store, observed = _applied(observe(_store(), text, seq=1))
     store, seeded = _applied(seed(store, text))
     store, proposal = _applied(propose(store, text, seq=2))
@@ -636,6 +703,171 @@ def test_an_agent_withdrawing_its_own_proposal_hides_no_observation_or_operator_
     store, _ = _applied(store.retract(seeded, actor=Actor.OPERATOR, issue_url=None))
     projection = _render(store, held)
     assert projection.shown == () and projection.withdrawn == 1 and text not in projection.text
+
+
+# -- a withdrawal binds only what its writer could withdraw, where it applied (R2-F2) --------
+
+_ON_C1 = Applicability(candidate=CandidateScope.EXACT, commit=C1)
+_ON_C2 = Applicability(candidate=CandidateScope.EXACT, commit=C2)
+
+
+def _reloaded(store: MemoryStore) -> MemoryStore:
+    """The store as a later load of the state reads it back, checked in event order."""
+    return MemoryStore.from_dict(json.loads(json.dumps(store.to_dict())))
+
+
+def test_an_agents_withdrawal_keeps_no_stronger_record_or_other_scope_out():
+    """R2-F2 of PR #513: an agent retracting its proposal refuses that text again only
+    to a proposal of the same issue the retracted one covered. An observation of the
+    same text, the operator's, another issue's proposal, another candidate's and a
+    broader one are written, and the checkpoint loads after each."""
+    text = "the fetch needs a retry"
+    store, first = _applied(propose(_store(), text, seq=1, applies=_ON_C1))
+    store, _ = _applied(store.retract(first, **as_agent(2), reason="wrong"))
+    replay_scope = propose(store, text, seq=3, applies=_ON_C1)
+    assert replay_scope.refusal is RefusalCode.TOMBSTONED
+    assert replay_scope.store.records == store.records
+    for write in (
+        lambda s: observe(s, text, seq=4, applies=_ON_C1),  # evidenced, stronger
+        lambda s: seed(s, text),  # the operator's
+        lambda s: propose(s, text, seq=5, issue=ISSUE_B),  # another issue
+        lambda s: propose(s, text, seq=6, applies=_ON_C2),  # another candidate
+        lambda s: propose(s, text, seq=7),  # any candidate: broader than C1
+    ):
+        store, _ = _applied(write(store))
+        assert _reloaded(store) == store
+    assert [r.status for r in store.records].count(Status.CURRENT) == 5
+    # Where the withdrawal applies, the broader proposal is withheld; the evidenced
+    # record and the operator's are not, and elsewhere the proposal is shown.
+    # M2 observed, M3 the operator's, M4 issue 3's, M5 on C2 and M6 on any candidate.
+    on_c1 = _render(store, _evidence(4), candidate=C1)
+    assert on_c1.shown == (2, 3) and on_c1.withdrawn == 1
+    on_c2 = _render(store, _evidence(4), candidate=C2)
+    assert on_c2.shown == (3, 6, 5) and on_c2.withdrawn == 0
+
+
+def test_the_controllers_withdrawal_binds_observations_and_proposals_of_its_scope():
+    text = "lint fails on C1"
+    store, first = _applied(observe(_store(), text, seq=1, applies=_ON_C1))
+    controller = {"actor": Actor.CONTROLLER, "issue_url": ISSUE, "attempt": _launch(2)}
+    store, _ = _applied(store.correct(first, "lint passes on C1", **controller))
+    for write in (
+        observe(store, text, seq=3, applies=_ON_C1),
+        propose(store, text, seq=3, applies=_ON_C1),
+        store.correct(first, text, **controller),  # back to the withdrawn text
+    ):
+        assert write.refusal is RefusalCode.TOMBSTONED, write.detail
+        assert write.store.records == store.records
+    store, _ = _applied(seed(store, text))  # the controller never withdraws the operator's
+    store, _ = _applied(observe(store, text, seq=4, issue=ISSUE_B))
+    assert _reloaded(store) == store
+
+
+def _with_text(record: dict, text: str) -> None:
+    """A record's text replaced, with every digest made consistent with it."""
+    digest = sha256_text(text)
+    record["text"], record["text_sha256"] = text, digest
+    record["events"][0]["text_sha256"] = digest
+
+
+def test_the_loader_refuses_a_withdrawn_text_written_back_in_event_order():
+    """R2-F2: digests consistent with an edited history do not make it one the writes
+    would have made. A text a withdrawal binds, added after it, is refused on load; one
+    the withdrawal does not bind loads."""
+    store, first = _applied(propose(_store(), "wrong idea", seq=1))
+    store, _ = _applied(store.retract(first, **as_agent(2)))
+    store, _ = _applied(propose(store, "placeholder", seq=3))  # M2, after the withdrawal
+    store, _ = _applied(observe(store, "an observation", seq=4))  # M3
+    data = store.to_dict()
+    _with_text(data["records"][1], "wrong idea")
+    with pytest.raises(StateError, match="withdrew from record 1 at seq 2"):
+        MemoryStore.from_dict(data)
+    data = store.to_dict()
+    _with_text(data["records"][2], "wrong idea")  # an observation: the agent's binds none
+    assert MemoryStore.from_dict(data).record(3).text == "wrong idea"
+    # A correction back to its own withdrawn text, made consistent, is refused too.
+    store, own = _applied(propose(_store(), "v1", seq=1))
+    store, _ = _applied(store.correct(own, "v2", **as_agent(2)))
+    store, _ = _applied(store.correct(own, "v3", **as_agent(3)))
+    data = store.to_dict()
+    record = data["records"][0]
+    record["text"], record["text_sha256"] = "v1", sha256_text("v1")
+    record["events"][2]["text_sha256"] = sha256_text("v1")
+    data["tombstones"] = sorted({sha256_text("v1"), sha256_text("v2")})
+    with pytest.raises(StateError, match="writes at seq 3 a text the agent withdrew"):
+        MemoryStore.from_dict(data)
+
+
+# -- what supersedes a record applies wherever it did (R2-F8 of PR #513) ----------------------
+
+
+@pytest.mark.parametrize(
+    ("older", "newer", "covered"),
+    [
+        (Applicability(), Applicability(), True),
+        (_ON_C1, Applicability(), True),
+        (_ON_C1, _ON_C1, True),
+        (_ON_C1, _ON_C2, False),
+        (Applicability(), _ON_C1, False),
+        (Applicability(phases=APPLICABLE_PHASES), Applicability(), False),
+        (Applicability(), Applicability(phases=APPLICABLE_PHASES), True),
+        (
+            Applicability(candidate=CandidateScope.EXACT, commit=BASE),
+            Applicability(candidate=CandidateScope.DESCENDANTS, commit=BASE),
+            True,
+        ),
+        (
+            Applicability(candidate=CandidateScope.DESCENDANTS, commit=BASE),
+            Applicability(candidate=CandidateScope.EXACT, commit=BASE),
+            False,
+        ),
+        (
+            Applicability(candidate=CandidateScope.DESCENDANTS, commit=C1),
+            Applicability(candidate=CandidateScope.DESCENDANTS, commit=BASE),
+            False,  # no ancestry is known: another base is never covered
+        ),
+    ],
+)
+def test_a_record_is_superseded_only_by_one_that_covers_it(older, newer, covered):
+    store, old = _applied(propose(_store(), "old", seq=1, applies=older))
+    store, new = _applied(propose(store, "new", seq=2, applies=newer))
+    write = store.supersede(old, new, **as_agent(3))
+    assert write.applied is covered, write.detail
+    if not covered:
+        assert write.refusal is RefusalCode.SCOPE and write.store.records == store.records
+
+
+def test_a_record_on_another_candidate_never_hides_a_still_applicable_fact(tmp_path):
+    """R2-F8: a proposal exactly on C2 cannot supersede one exactly on C1, so rendering
+    C1 keeps C1's fact, before and after a save and a load; an observation likewise."""
+    store, on_c1 = _applied(propose(_store(), "C1: retry the fetch", seq=1, applies=_ON_C1))
+    store, on_c2 = _applied(propose(store, "C2: retry the push", seq=2, applies=_ON_C2))
+    refused = store.supersede(on_c1, on_c2, **as_agent(3))
+    assert refused.refusal is RefusalCode.SCOPE
+    store, o1 = _applied(observe(store, "test_a fails on C1", seq=3, applies=_ON_C1))
+    store, o2 = _applied(
+        observe(store, "test_a fails on C2", seq=4, applies=_ON_C2, cite=_vr(4, commit=C2))
+    )
+    controller = {"actor": Actor.CONTROLLER, "issue_url": ISSUE}
+    assert store.supersede(o1, o2, **controller).refusal is RefusalCode.SCOPE
+    state = make_state(phase=Phase.ANALYZE_EXECUTE, run_id=RUN, launch_seq=4)
+    state.issue_memory = refused.store.to_dict()
+    save_state(state, tmp_path / "state.json")
+    loaded = load_state(tmp_path / "state.json").memory_store()
+    assert loaded is not None
+    for current in (refused.store, loaded):
+        assert on_c1 in _render(current, candidate=C1).shown
+        assert on_c2 in _render(current, candidate=C2).shown
+    # A broader replacement covers it, and C1's fact gives way to it.
+    store, broad = _applied(propose(store, "any: retry", seq=5))
+    store, _ = _applied(store.supersede(on_c1, broad, **as_agent(5)))
+    shown = _render(store, candidate=C1).shown
+    assert broad in shown and on_c1 not in shown
+    # The loader refuses a history that superseded C1's fact with C2's.
+    data = store.to_dict()
+    data["records"][broad - 1]["applies_to"] = _ON_C2.to_dict()
+    with pytest.raises(StateError, match="does not apply everywhere it did"):
+        MemoryStore.from_dict(data)
 
 
 # -- nothing raw, nothing secret (D9.9) ----------------------------------------------------
@@ -733,7 +965,8 @@ def _largest_store() -> MemoryStore:
     for i in range(MAX_RECORDS):
         store, _ = _applied(
             store.add(
-                kind=Kind.VALIDATION_FAILURE,
+                # A launch citation is the widest one, and a refused candidate cites one.
+                kind=Kind.REFUSED_CANDIDATE,
                 actor=Actor.CONTROLLER,
                 text=text(i, 0),
                 issue_url=issue,
@@ -917,7 +1150,12 @@ def _older_launchs_proposal(d: dict) -> None:
         (_tamper("records.3.origin", None), "required of an agent's proposal"),
         (_tamper("records.3.origin.role", "boss"), "role"),
         (_tamper("records.3.origin.input_sha", "abc"), "input_sha"),
-        (_tamper("records.0.origin", {"task": 1, "role": "producer", "input_sha": BASE}), "only"),
+        (
+            _tamper(
+                "records.0.origin", {"task": 1, "role": "producer", "input_sha": BASE, "slot": 1}
+            ),
+            "only",
+        ),
     ],
 )
 def test_a_history_its_writes_would_have_refused_is_refused_on_load(change, needle):
@@ -928,16 +1166,23 @@ def test_a_history_its_writes_would_have_refused_is_refused_on_load(change, need
         MemoryStore.from_dict(data)
 
 
-def test_two_records_of_one_proposal_key_are_refused_on_load():
+@pytest.mark.parametrize("payload", ["same", "another text"])
+def test_two_records_of_one_proposal_key_are_refused_on_load(payload):
+    """The loader holds the key as the writes do: one record per launch and origin,
+    whatever the second says (R2-F3 of PR #513)."""
     store, _ = _applied(propose(_store(), "one idea", seq=1))
     data = store.to_dict()
     twin = json.loads(json.dumps(data["records"][0]))
     twin["id"] = 2
     twin["events"][0]["seq"] = 2
+    if payload != "same":
+        _with_text(twin, "another idea")
     data["records"].append(twin)
     data["revision"] = 2
     with pytest.raises(StateError, match="the same proposal"):
         MemoryStore.from_dict(data)
+    twin["origin"]["slot"] = 2  # its own slot: a proposal of its own
+    assert len(MemoryStore.from_dict(data).records) == 2
 
 
 def test_the_state_refuses_another_runs_store_a_future_launch_and_another_repository(tmp_path):
@@ -969,7 +1214,7 @@ def _mixed_store() -> MemoryStore:
     store, _ = _applied(observe(store, "validation failed: test_a", seq=1))  # M2, evidence held
     store, _ = _applied(observe(store, "validation failed: test_b", seq=2))  # M3, evidence gone
     store, _ = _applied(propose(store, "hypothesis: the lock leaks", seq=3))  # M4
-    store, _ = _applied(propose(store, "about another issue", seq=3, issue=ISSUE_B))  # M5
+    store, _ = _applied(propose(store, "about another issue", seq=7, issue=ISSUE_B))  # M5
     store, _ = _applied(
         propose(
             store,
@@ -979,7 +1224,13 @@ def _mixed_store() -> MemoryStore:
         )
     )  # M6
     store, _ = _applied(
-        propose(store, "FIX only", seq=4, applies=Applicability(phases=("FIX",)))
+        propose(
+            store,
+            "FIX only",
+            seq=4,
+            applies=Applicability(phases=("FIX",)),
+            origin=_origin(slot=2),  # launch 4's second proposal
+        )
     )  # M7
     store, _ = _applied(
         propose(
@@ -989,17 +1240,17 @@ def _mixed_store() -> MemoryStore:
             applies=Applicability(candidate=CandidateScope.DESCENDANTS, commit=BASE),
         )
     )  # M8
-    store, _ = _applied(propose(store, "retract me", seq=5))  # M9
+    store, _ = _applied(propose(store, "retract me", seq=5, origin=_origin(slot=2)))  # M9
     store, _ = _applied(store.retract(9, actor=Actor.OPERATOR, issue_url=None))
     store, _ = _applied(propose(store, "old idea", seq=6))  # M10
-    store, _ = _applied(propose(store, "new idea", seq=6))  # M11
+    store, _ = _applied(propose(store, "new idea", seq=6, origin=_origin(slot=2)))  # M11
     store, _ = _applied(store.supersede(10, 11, **as_agent()))
     return store
 
 
 def test_the_projection_selects_and_orders_by_trust_and_says_what_it_left_out():
     store = _mixed_store()
-    projection = _render(store, _evidence((1, "d" * 64)))
+    projection = _render(store, _evidence(1))
     # Observed with evidence, the operator's, observed without, then proposals, newest first.
     assert projection.shown == (2, 1, 3, 11, 4)
     assert (projection.not_applicable, projection.retracted, projection.superseded) == (4, 1, 1)
@@ -1062,7 +1313,9 @@ def test_a_launch_citation_is_observed_only_with_the_receipt_the_run_keeps():
     observed only when the run keeps that launch's receipt with the digest cited."""
     receipt = "e" * 64
     cite = Citation(CitationKind.LAUNCH, f"{RUN}/2", receipt)
-    store, _ = _applied(observe(_store(), "launch 2 ended: idle timeout", seq=2, cite=cite))
+    store, _ = _applied(
+        observe(_store(), "launch 2 ended: idle timeout", seq=2, cite=cite, kind=Kind.LAUNCH_END)
+    )
 
     def downgraded(*launches) -> bool:
         projection = _render(store, _evidence(launches=launches))
@@ -1080,10 +1333,79 @@ def test_a_launch_citation_is_observed_only_with_the_receipt_the_run_keeps():
 
 
 def test_a_validation_record_citation_needs_the_records_own_digest():
-    store, _ = _applied(observe(_store(), "lint fails", seq=1))  # cites (1, d...)
-    assert _render(store, _evidence((1, "c" * 64))).downgraded == 1
-    assert _render(store, _evidence((2, "d" * 64))).downgraded == 1
-    assert _render(store, _evidence((1, "d" * 64))).downgraded == 0
+    store, _ = _applied(observe(_store(), "lint fails", seq=1))  # cites receipt 1's digest
+    assert _render(store, _evidence(_receipt(1, commit=C2))).downgraded == 1  # another digest
+    assert _render(store, _evidence(2)).downgraded == 1  # another seq
+    assert _render(store, _evidence()).downgraded == 1  # missing: evicted or cleared
+    assert _render(store, _evidence(1)).downgraded == 0
+
+
+def _observed(projection, record_id: int) -> bool:
+    """Whether the projection shows ``record_id`` as observed, not downgraded."""
+    assert record_id in projection.shown
+    block = projection.text.split(f"## M{record_id}:", 1)[1].split("\n## M", 1)[0]
+    return "which holds the evidence it cites" in block
+
+
+def test_a_citation_resolves_only_to_a_receipt_that_establishes_the_record():
+    """R2-F6 of PR #513: a receipt's identity and digest are not enough. A failure
+    observed on C1 is observed only with a failing ValidationRecord of C1, of the
+    record's issue; a passing record, one of another candidate or issue, and a
+    missing one each downgrade it, with real ValidationRecords throughout."""
+    on_c1 = Applicability(candidate=CandidateScope.EXACT, commit=C1)
+    passing = _vr(2, exit_code=0)  # a genuine PASS of C1
+    other_commit = _vr(3, commit=C2)  # a genuine FAIL of C2
+    store, failure = _applied(observe(_store(), "test_a fails on C1", seq=1, applies=on_c1))
+    store, on_pass = _applied(
+        observe(store, "test_b fails on C1", seq=2, cite=passing, applies=on_c1)
+    )
+    store, elsewhere = _applied(
+        observe(store, "test_c fails on C1", seq=3, cite=other_commit, applies=on_c1)
+    )
+    store, missing = _applied(observe(store, "test_d fails on C1", seq=4, applies=on_c1))
+    held = _evidence(1, _receipt(2, exit_code=0), _receipt(3, commit=C2))
+    projection = _render(store, held, candidate=C1)
+    assert _observed(projection, failure)
+    for record in (on_pass, elsewhere, missing):
+        assert not _observed(projection, record), record
+    assert projection.downgraded == 3
+    # The same failing receipt held for another issue establishes nothing of this one.
+    other_issue = _render(
+        store, _evidence(1, issue=ISSUE_B), issue_url=ISSUE_B, step=_step(ISSUE_B)
+    )
+    assert other_issue.shown == () and other_issue.not_applicable == 4
+    with pytest.raises(ValueError, match="another issue's"):
+        _render(store, _evidence(1, issue=ISSUE_B))
+    # A receipt that does not parse (edited, so its digest no longer matches) is none.
+    edited = json.loads(json.dumps(_receipt(1)))
+    edited["exit_code"] = 2
+    assert not _observed(_render(store, _evidence(edited), candidate=C1), failure)
+    # A failure bound to the descendants of C1 rests on C1's record too.
+    store, base = _applied(
+        observe(
+            _store(),
+            "test_a fails from C1 on",
+            seq=1,
+            applies=Applicability(candidate=CandidateScope.DESCENDANTS, commit=C1),
+        )
+    )
+    assert _observed(_render(store, _evidence(1), candidate=C1), base)
+    assert not _observed(_render(store, _evidence(_receipt(1, commit=C2)), candidate=C1), base)
+
+
+def test_an_observed_kind_cites_only_the_evidence_it_takes():
+    """A validation failure cites a ValidationRecord, how a launch ended cites the
+    launch: anything else is refused when written and when loaded."""
+    launch = Citation(CitationKind.LAUNCH, f"{RUN}/1", "e" * 64)
+    for kind, cite in ((Kind.VALIDATION_FAILURE, launch), (Kind.LAUNCH_END, _vr(1))):
+        refused = observe(_store(), "x", kind=kind, cite=cite)
+        assert refused.refusal is RefusalCode.NOT_PERMITTED and refused.store.records == ()
+    store, _ = _applied(observe(_store(), "launch 1 ended", kind=Kind.LAUNCH_END, cite=launch))
+    store, _ = _applied(observe(store, "refused at C1", kind=Kind.REFUSED_CANDIDATE, seq=2))
+    data = store.to_dict()
+    data["records"][0]["citation"] = _vr(1).to_dict()
+    with pytest.raises(StateError, match="not evidence a launch-end record may cite"):
+        MemoryStore.from_dict(data)
 
 
 @pytest.mark.parametrize(
@@ -1102,9 +1424,99 @@ def test_a_projection_bound_outside_the_registered_range_is_refused(bound):
 
 def test_review_gets_no_projection_and_another_run_none_at_all():
     with pytest.raises(ValueError, match="REVIEW gets no Issue Memory"):
-        _render(_store(), phase=Phase.REVIEW)
+        _render(_store(), phase=Phase.REVIEW, step=_step(phase=Phase.REVIEW))
     with pytest.raises(ValueError, match="run it belongs to"):
         render_projection(_store(OTHER_RUN), _request(), _evidence())
+
+
+_MISMATCHES = {
+    "a step of another issue": dict(step=_step(ISSUE_B)),
+    "a step of another phase": dict(step=_step(phase=Phase.REVIEW)),
+    "a launch of another run": dict(attempt=_launch(9, OTHER_RUN)),
+    "another repository": dict(repository="owner/other"),
+    "a repository with a credential's shape": dict(repository="gh" + "p_" + "x" * 36),
+    "a candidate that is no commit": dict(candidate="abc"),
+    "a base that is no commit": dict(descends_from=frozenset({"main"})),
+    "a step that is no step": dict(step=(Phase.ANALYZE_EXECUTE, ISSUE, "", 0, 1)),
+}
+
+
+@pytest.mark.parametrize("fields", list(_MISMATCHES.values()), ids=list(_MISMATCHES))
+def test_a_request_whose_fields_disagree_is_refused_and_shows_nothing(fields):
+    """R2-F4 of PR #513: one launch's binding. A step of issue 3 cannot fetch issue 3's
+    records under issue 2's request, nor a REVIEW step a projection under another phase
+    field; every disagreement is refused, never quoting the value."""
+    store, _ = _applied(propose(_store(), "issue 2's lesson", seq=1))
+    store, _ = _applied(propose(store, "issue 3's lesson", seq=2, issue=ISSUE_B))
+    with pytest.raises(ValueError, match="not one launch's binding") as refused:
+        _render(store, **fields)
+    assert "x" * 36 not in str(refused.value)
+
+
+def test_a_store_whose_memory_is_off_renders_nothing():
+    store, _ = _applied(propose(_store(), "kept from when it was on"))
+    with pytest.raises(ValueError, match="Issue Memory is off"):
+        _render(store.with_enabled(False))
+
+
+def test_an_issue_spelt_in_another_case_selects_the_same_records():
+    """Owner and repository fold case, as GitHub's own identity does (validation.py): an
+    equivalent spelling neither hides records nor loses the evidence, and a write
+    naming it acts on the same issue."""
+    upper = "https://github.com/Owner/Repo/issues/2"
+    store, observed = _applied(observe(_store(), "test_a fails", seq=1))
+    store, proposal = _applied(propose(store, "the lock leaks", seq=2))
+    lower = _render(store, _evidence(1))
+    spelt = _render(
+        store,
+        _evidence(1, issue=upper),
+        repository="Owner/Repo",
+        issue_url=upper,
+        step=_step(upper),
+    )
+    assert spelt.shown == lower.shown == (observed, proposal) and spelt.downgraded == 0
+    store, _ = _applied(store.correct(proposal, "the lock leaks twice", **as_agent(3, upper)))
+    assert store.record(proposal).text == "the lock leaks twice"
+
+
+def _secret() -> str:
+    # Built at runtime: a literal would itself be credential-shaped text.
+    return "gh" + "p_" + "R2F5" + "s" * 32
+
+
+def test_a_loaded_record_or_reason_the_redactor_would_change_is_refused_unquoted():
+    """R2-F5 of PR #513: consistent digests do not make a text safe to show. A record
+    text or an event reason the run-log redactor recognizes is refused on load, and
+    the refusal never quotes it."""
+    store, record = _applied(propose(_store(), "harmless", seq=1))
+    store, _ = _applied(store.correct(record, "still harmless", **as_agent(2), reason="why"))
+    data = store.to_dict()
+    secret_text = f"token {_secret()}"
+    rec = data["records"][0]
+    rec["text"], rec["text_sha256"] = secret_text, sha256_text(secret_text)
+    rec["events"][1]["text_sha256"] = sha256_text(secret_text)
+    with pytest.raises(StateError, match="redactor would change") as refused:
+        MemoryStore.from_dict(data)
+    assert _secret() not in str(refused.value)
+    data = store.to_dict()
+    data["records"][0]["events"][1]["reason"] = f"because {_secret()}"
+    with pytest.raises(StateError, match="reason: holds what the run-log redactor") as refused:
+        MemoryStore.from_dict(data)
+    assert _secret() not in str(refused.value)
+
+
+def test_every_rendered_line_is_redacted_or_nothing_is_rendered():
+    """R2-F5: the header and every block are what the redactor leaves unchanged. A store
+    no write or load could have made (a record changed in memory) is refused whole, the
+    secret unquoted, rather than rendered."""
+    store = _mixed_store()
+    projection = _render(store, _evidence(1), candidate=C1, descends_from=frozenset({BASE}))
+    assert redact(projection.text) == projection.text
+    forged = dataclasses.replace(store.records[3], text=f"token {_secret()}")
+    tampered = dataclasses.replace(store, records=(*store.records[:3], forged, *store.records[4:]))
+    with pytest.raises(ValueError, match="M4 renders text the run-log redactor") as refused:
+        _render(tampered)
+    assert _secret() not in str(refused.value)
 
 
 # -- the evaluation's owed Memory fixtures (evaluation protocol, section 8) ---------------------
@@ -1114,14 +1526,14 @@ def test_fixture_obsolete_and_current_memory():
     store, old = _applied(observe(_store(), "use --format json", seq=1))
     store, new = _applied(observe(store, "use --format default", seq=2))
     store, _ = _applied(store.supersede(old, new, actor=Actor.CONTROLLER, issue_url=ISSUE))
-    text = _render(store, _evidence((1, "d" * 64), (2, "d" * 64))).text
+    text = _render(store, _evidence(1, 2)).text
     assert "use --format default" in text and "use --format json" not in text
 
 
 def test_fixture_conflicting_memories_are_both_shown_by_trust_never_newest_wins():
     store, _ = _applied(observe(_store(), "test_lock fails on C1", seq=1))
     store, _ = _applied(propose(store, "test_lock passes on C1", seq=2))
-    text = _render(store, _evidence((1, "d" * 64))).text
+    text = _render(store, _evidence(1)).text
     assert text.index("test_lock fails") < text.index("test_lock passes")
     assert text.count("## M") == 2
 
@@ -1148,7 +1560,7 @@ def test_fixture_scope_boundary_and_a_negative_debugging_lesson():
     store, _ = _applied(
         propose(_store(), "bisecting with git stash lost work", kind=Kind.FAILED_APPROACH)
     )
-    store, _ = _applied(propose(store, "issue 3's lesson", issue=ISSUE_B))
+    store, _ = _applied(propose(store, "issue 3's lesson", seq=2, issue=ISSUE_B))
     projection = _render(store)
     assert "bisecting with git stash lost work" in projection.text
     assert "issue 3's lesson" not in projection.text and projection.not_applicable == 1
@@ -1589,13 +2001,102 @@ def test_memory_retract_withdraws_a_record_in_one_save_and_refuses_what_it_canno
     assert (sd / "state.json").read_bytes() == before
 
     assert cli.main([*head, "memory", "retract", "M1", "--reason", "it was wrong"]) == 0
-    assert "retracted M1" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    # R2-F9 of PR #513: this release shows Memory to no launch, and says so.
+    assert "retracted M1" in out and "no launch's prompt or projection yet (#333)" in out
+    assert "next launch" not in out
+    for words in (["memory", "--help"], ["memory", "retract", "--help"]):
+        with pytest.raises(SystemExit):
+            cli.main(words)
+        text = " ".join(capsys.readouterr().out.split())
+        assert "#333" in text and "informs a launch" not in text and "next launch" not in text
     store = load_state(sd / "state.json").memory_store()
     record = store.record(1)
     assert (record.status, record.text) == (Status.RETRACTED, "")
     assert record.events[-1].reason == "it was wrong" and record.events[-1].actor is Actor.OPERATOR
     assert cli.main([*head, "memory", "retract", "1", "--reason", "again"]) == 2
     assert "is retracted" in capsys.readouterr().err
+
+
+def _seeded_run(tmp_path: Path, capsys) -> tuple[list[str], Path]:
+    """A run of this checkout created with a seed, its flags and its state directory."""
+    sd = tmp_path / ".autoforge"
+    head = ["--config", str(_memory_config(tmp_path)), "--state-dir", str(sd)]
+    lesson = _seed_file(tmp_path, b"wrong lesson\n")
+    run = [*head, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    assert cli.main([*run, "--memory-seed", str(lesson)]) == 0
+    capsys.readouterr()
+    return head, sd
+
+
+def test_memory_retract_refuses_a_state_directory_of_another_clone(
+    tmp_path,
+    capsys,
+    monkeypatch,
+    tmp_path_factory,
+    fakes,  # noqa: F811
+):
+    """R2-F1 of PR #513: from clone B, ``--state-dir`` naming clone A's run would take
+    B's lock, which does not guard A's checkpoint, while A's controller may hold A's.
+    Refused before any lock, with A's lock held or free, and the checkpoint unchanged."""
+    from tests.conftest import git_repo, github_origin, state_tree
+
+    monkeypatch.chdir(tmp_path)
+    head, sd = _seeded_run(tmp_path, capsys)
+    clone = github_origin(git_repo(tmp_path_factory.mktemp("clone-b")))
+    monkeypatch.chdir(clone)
+    own = os.path.realpath(tmp_path / ".git")
+    for held in (True, False):
+        before = state_tree(sd)
+        lock = ControllerLock(repository_lock_path(tmp_path)) if held else None
+        try:
+            if lock is not None:
+                lock.acquire()
+            assert cli.main([*head, "memory", "retract", "M1", "--reason", "wrong"]) == 2
+        finally:
+            if lock is not None:
+                lock.release()
+        err = capsys.readouterr().err
+        assert f"belongs to the repository whose git common dir is {own}" in err
+        assert "no lock taken" in err
+        assert state_tree(sd) == before
+        assert not (clone / ".git" / "autoforge").exists()  # B's lock was never taken
+    assert load_state(sd / "state.json").memory_store().record(1).status is Status.CURRENT
+
+
+def test_memory_retract_refuses_a_scheduler_namespace_here_or_in_another_clone(
+    tmp_path,
+    capsys,
+    monkeypatch,
+    tmp_path_factory,
+    fakes,  # noqa: F811
+):
+    """R2-F1: a namespace's state is its worker's. Named from this checkout, the
+    scheduler-root check refuses it; named from another clone, which that check
+    cannot see, the repository binding does; and a standalone run of an issue a
+    namespace owns is refused under the lock. No checkpoint changes."""
+    from autoforge.run_namespace import issue_namespace
+    from tests.conftest import git_repo, github_origin, state_tree
+
+    monkeypatch.chdir(tmp_path)
+    head, sd = _seeded_run(tmp_path, capsys)
+    namespace = issue_namespace(Path(os.path.realpath(tmp_path / ".git")), 2)
+    namespace.state_dir.mkdir(parents=True)
+    save_state(load_state(sd / "state.json"), namespace.state_file)
+    ns_head = [head[0], head[1], "--state-dir", str(namespace.state_dir)]
+    retract = ["memory", "retract", "M1", "--reason", "wrong"]
+    before, ns_before = state_tree(sd), state_tree(namespace.directory)
+    assert cli.main([*ns_head, *retract]) == 2
+    assert "'memory retract' refuses state directory" in capsys.readouterr().err
+    assert cli.main([*head, *retract]) == 2  # the standalone run: its issue is owned
+    err = capsys.readouterr().err
+    assert f"'memory retract' refuses issue {ISSUE}" in err and "Nothing was written" in err
+    clone = github_origin(git_repo(tmp_path_factory.mktemp("clone-b")))
+    monkeypatch.chdir(clone)
+    assert cli.main([*ns_head, *retract]) == 2
+    assert "belongs to the repository whose git common dir" in capsys.readouterr().err
+    assert state_tree(sd) == before and state_tree(namespace.directory) == ns_before
+    assert not (clone / ".git" / "autoforge").exists()
 
 
 def test_memory_commands_on_a_run_with_memory_off(tmp_path, capsys, monkeypatch, fakes):  # noqa: F811

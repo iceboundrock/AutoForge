@@ -181,10 +181,15 @@ and only `state.py`, the CLI and the engine's run-configuration record and
 check touch it (`tests/test_memory.py`). The loader checks it whole: exactly
 its shape, every record's history closed over the store's revision, every
 lifecycle event one its actor may make, every supersession one the write
-would have made, no two records of one proposal key, the tombstones exactly
-those the histories left, the run's own run id, no launch past
-`launch_seq`, no issue of another repository, and at most 1,048,576 bytes
-as the file holds it. A
+would have made (by a record that applies wherever the superseded one did),
+no two records of one proposal key (a launch and its origin, never what the
+proposal says), no text written after a withdrawal that binds it (checked in
+event order: the same issue, a trust the withdrawer could have withdrawn, a
+scope the withdrawn record covered), every citation of a kind its record
+takes, no record text or event reason the run-log redactor would change, the
+tombstones exactly those the histories left, the run's own run id, no launch
+past `launch_seq`, no issue of another repository, and at most 1,048,576
+bytes as the file holds it. A
 REMOTE `last_fix_resolutions` entry carries `acceptance_comment_url`: the
 comment the controller verified for an `acceptance_action` resolution
 (required, on the run's issue), and `""` for any other (#211).
