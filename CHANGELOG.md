@@ -13,7 +13,8 @@ inside the run's `state.json`, which starts empty with the run (ADR 0015).
 `run --memory-seed FILE` imports one lesson before the first launch, byte
 for byte or not at all, and records its SHA-256; `memory show` prints the
 store and `memory retract` withdraws a record in one save. A retracted or
-corrected text is refused if anything writes it again. Memory decides
+corrected text is refused if anything writes it again, and is not shown
+through another record carrying the same text. Memory decides
 nothing: no code that decides a phase, a write, a permission, a budget or a
 merge reads it.
 

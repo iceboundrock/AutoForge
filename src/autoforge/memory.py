@@ -28,10 +28,12 @@ id, monotonic in the run; a :class:`Kind` from a closed set; who wrote it
 
 - ``observed``: the controller wrote it from evidence it holds, and cites
   that evidence (:class:`Citation`). Its trust is its citation's: a render
-  resolves the citation against the run's current evidence, and a record
-  whose citation no longer resolves (a validation record evicted from the 64
-  the state keeps, or cleared with its issue) is shown downgraded, never as
-  observed.
+  resolves the citation against the receipts the run holds now, by identity
+  and digest, and a record whose citation does not resolve (a validation
+  record evicted from the 64 the state keeps, or cleared with its issue; a
+  launch whose receipt the run does not keep, which before #332 is every
+  launch, since a spent launch ordinal is not a receipt) is shown
+  downgraded, never as observed.
 - ``operator``: the operator's text, kept byte for byte: trusted as their
   statement, not as evidence. The evaluation's seed is one (D9.5).
 - ``proposed``: an agent's claim. No agent, score or later write upgrades
@@ -43,7 +45,9 @@ which issue it belongs to, the step (``StepKey``) and the launch
 (:class:`AttemptRef`, ``(RunID, launch_seq)``, ADR 0015 D2.1) that created
 it, its status (``current``, ``superseded`` or ``retracted``), its revision
 and its history (:class:`MemoryEvent`: every lifecycle transition, with its
-actor and reason).
+actor and reason). An agent's proposal also names its origin
+(:class:`ProposalOrigin`: the task, the role and the input revision of the
+launch that proposed it), which with its step and launch is its key.
 
 The issue's planning names a lifecycle of ``candidate``, ``active``,
 ``superseded``, ``retracted``, ``rejected`` and ``needs_revalidation``; the
@@ -67,14 +71,32 @@ whether the write was applied or refused and why. Who may do what:
   observed record;
 - an agent adds proposals, and corrects, supersedes or retracts proposals
   only, never an observed record or the operator's: newer, unsupported text
-  never replaces stronger evidence;
-- the operator adds the seed and may retract any record.
+  never replaces stronger evidence. Each of its writes names the launch it
+  comes from, and one from an earlier launch than the last that changed the
+  record is stale and refused, so an out-of-order proposal never overwrites
+  a newer one;
+- the operator adds the seed and may retract any record, of any issue.
+
+Every write but the operator's names the issue it acts for, and a record of
+another issue is refused to it.
 
 A corrected or retracted text leaves its digest as a tombstone, and a later
-write of that text is refused, so a rejection persists. A retracted record
-keeps its digest and loses its text. An observed record is keyed by its
-citation and a text by its digest, so deriving a record again, or a
-duplicate or replayed proposal, adds nothing (D9.7).
+write of that text is refused, so a rejection persists. A render also
+withholds a current record carrying a withdrawn text wherever the record
+that withdrew it applies, when its writer could have withdrawn that record
+too: a duplicate never shows a withdrawn claim, and an agent withdrawing its
+own proposal hides no observation. A retracted record keeps its digest and
+loses its text. An observed record is keyed by its citation, an agent's
+proposal by its key (its issue, step, launch, origin, kind, applicability
+and first text) and the operator's seed by its text, so deriving a record
+again, or replaying a proposal, adds nothing (D9.7), whatever happened to
+the record since. A proposal with another key is a record of its own, its
+provenance kept, even when its text is the same.
+
+Every applied write returns a store its own loader accepts: the write is
+checked as :meth:`MemoryStore.from_dict` would check it before it is
+committed, and refused (``invalid``) otherwise. The loader checks every
+event against the same permissions as the writes.
 
 A write past a bound is refused and counted in the store it returns, never
 evicting anything. The bounds hold the 1,048,576-byte ceiling of the
@@ -104,10 +126,12 @@ read-only, from the store, the evidence the run holds
 records of the request's issue that apply to its phase and candidate,
 observed ones first with their citations, then the operator's, then
 observations whose evidence is gone, then proposals, newest first in each,
-within :data:`MAX_PROJECTION_CHARS`, and reports in its header the scope,
-the revision and digest it read, what it was rendered for and how many
-records it showed, omitted for the bound, found not applicable, retracted
-and superseded. The same store and request render the same bytes.
+within the request's bound, which is at most :data:`MAX_PROJECTION_CHARS`
+(a larger one is refused), and reports in its header the scope, the
+revision and digest it read, what it was rendered for and how many records
+it showed, omitted for the bound, found not applicable, retracted,
+superseded and withheld as withdrawn text. The same store and request
+render the same bytes.
 """
 
 from __future__ import annotations
@@ -222,6 +246,21 @@ class Operation(StrEnum):
     RETRACT = "retract"
 
 
+class Role(StrEnum):
+    """The role of the launch that proposed a record (ADR 0015 D7.1): a closed set.
+
+    A role names where a proposal came from, never what it may do: every
+    proposal is ``proposed`` whatever its role.
+    """
+
+    PRODUCER = "producer"
+    REVIEWER = "reviewer"
+    SELECTOR = "selector"
+    MANAGER = "manager"
+    IDEATOR = "ideator"
+    VERIFIER = "verifier"
+
+
 class CitationKind(StrEnum):
     """The evidence an observed record may cite."""
 
@@ -249,8 +288,13 @@ class RefusalCode(StrEnum):
     UNKNOWN_RECORD = "unknown-record"
     #: The record is superseded or retracted.
     NOT_CURRENT = "not-current"
-    #: Another issue's or another run's record or launch.
+    #: Another issue's or another run's record or launch, or a write of the
+    #: controller or an agent that names no issue it acts for.
     SCOPE = "scope"
+    #: An agent's write from an earlier launch than the last that changed the
+    #: record, or superseding it with an older launch's proposal: an
+    #: out-of-order or stale proposal never overwrites a newer one.
+    STALE = "stale"
     #: The text was corrected or retracted before (D9.4).
     TOMBSTONED = "tombstoned"
     #: A text, citation, applicability, step or launch of the wrong shape.
@@ -279,6 +323,29 @@ TRUST_BY_ACTOR: Mapping[Actor, Trust] = {
     Actor.CONTROLLER: Trust.OBSERVED,
     Actor.OPERATOR: Trust.OPERATOR,
     Actor.AGENT: Trust.PROPOSED,
+}
+#: Whose records each actor may correct or supersede (D9.4).
+_CHANGES: Mapping[Actor, frozenset[Trust]] = {
+    Actor.CONTROLLER: frozenset({Trust.OBSERVED, Trust.PROPOSED}),
+    Actor.AGENT: frozenset({Trust.PROPOSED}),
+}
+#: Whose records each actor may retract: the operator any. The same table
+#: decides whose duplicate a withdrawn text hides in a render.
+_RETRACTS: Mapping[Actor, frozenset[Trust]] = {
+    **_CHANGES,
+    Actor.OPERATOR: frozenset(Trust),
+}
+#: What each lifecycle operation after the add needs of its actor.
+_ALLOWED: Mapping[Operation, Mapping[Actor, frozenset[Trust]]] = {
+    Operation.CORRECT: _CHANGES,
+    Operation.SUPERSEDE: _CHANGES,
+    Operation.RETRACT: _RETRACTS,
+}
+_NOUNS: Mapping[Operation, str] = {
+    Operation.ADD: "add",
+    Operation.CORRECT: "correction",
+    Operation.SUPERSEDE: "supersession",
+    Operation.RETRACT: "retraction",
 }
 #: The phases a record may apply to: ADR 0015 D13 projects into
 #: ``ANALYZE_EXECUTE`` first, and ``FIX`` follows under the same contract.
@@ -465,6 +532,60 @@ class AttemptRef:
 
 
 @dataclass(frozen=True)
+class ProposalOrigin:
+    """Where an agent's proposal came from, beyond its step and launch (#317's Memdoor addendum).
+
+    ``task`` is the task's ordinal in its step (ADR 0015 D2's ``TaskID``
+    with the record's run and step; the single-agent path's producing task
+    until #332 persists tasks), ``role`` the launch's role (D7.1) and
+    ``input_sha`` the input revision the launch was given: the commit it
+    started from. With the record's step, launch, kind, applicability and
+    first text it is the proposal's key: a replay of the same key is the
+    record already kept, and another key is a record of its own.
+    """
+
+    task: int
+    role: Role
+    input_sha: str
+
+    _KEYS = ("task", "role", "input_sha")
+
+    def to_dict(self) -> dict:
+        return {"task": self.task, "role": self.role.value, "input_sha": self.input_sha}
+
+    def describe(self) -> str:
+        return f"the {self.role.value} of task {self.task}, given commit {self.input_sha}"
+
+    @classmethod
+    def from_dict(cls, raw: object, where: str) -> ProposalOrigin:
+        data = _exact(raw, cls._KEYS, where)
+        input_sha = data["input_sha"]
+        if not isinstance(input_sha, str) or not _SHA40_RE.fullmatch(input_sha):
+            raise _bad(f"{where}.input_sha", "must be a full lower-case commit SHA")
+        return cls(
+            task=_int(data["task"], f"{where}.task", 1),
+            role=_enum(Role, data["role"], f"{where}.role"),
+            input_sha=input_sha,
+        )
+
+
+def _canonical_part(value: object, kind: type, where: str) -> tuple[object, str]:
+    """A typed value given to a write, as the loader would read it back, or why it cannot be.
+
+    The write keeps the loader's reading, so what it commits is exactly what
+    a later load of the state builds.
+    """
+    if not isinstance(value, kind):
+        return None, f"{_FIELD}{where}: must be a {kind.__name__}"
+    try:
+        return kind.from_dict(value.to_dict(), where), ""  # type: ignore[attr-defined]
+    except StateError as exc:
+        return None, str(exc)
+    except (AttributeError, TypeError, ValueError):
+        return None, f"{_FIELD}{where}: is not a well-formed {kind.__name__}"
+
+
+@dataclass(frozen=True)
 class Citation:
     """What an observed record cites: a kind, an identity and a digest (D8)."""
 
@@ -541,14 +662,6 @@ class Applicability:
             raise _bad(f"{where}.commit", "must be a full lower-case commit SHA")
         return cls(phases=tuple(phases), candidate=candidate, commit=commit)
 
-    def check(self) -> str:
-        """Why this applicability could not be stored, ``""`` when it can."""
-        try:
-            Applicability.from_dict(self.to_dict(), "")
-        except StateError as exc:
-            return str(exc)
-        return ""
-
     def applies(self, phase: Phase, candidate: str, descends_from: frozenset[str]) -> bool:
         """Fails closed: an unknown candidate or ancestry does not apply (D12)."""
         if phase.value not in self.phases:
@@ -566,6 +679,20 @@ class Applicability:
         if self.candidate is CandidateScope.EXACT:
             return f"{phases}; exactly candidate {self.commit}"
         return f"{phases}; candidates descending from {self.commit}"
+
+
+def _event_launch_problem(actor: Actor, attempt: AttemptRef | None) -> str:
+    """Why a lifecycle write's launch does not fit its actor, ``""`` when it does.
+
+    An agent's write comes from the accepted result of one launch (D9.8),
+    so it names it; the operator's comes from no launch, so it names none;
+    the controller's names the launch it observed, when there is one.
+    """
+    if actor is Actor.AGENT and attempt is None:
+        return "names no launch, and an agent's write comes from one"
+    if actor is Actor.OPERATOR and attempt is not None:
+        return "names a launch, and the operator's write comes from none"
+    return ""
 
 
 @dataclass(frozen=True)
@@ -642,6 +769,8 @@ class MemoryRecord:
     attempt: AttemptRef | None
     superseded_by: int | None
     events: tuple[MemoryEvent, ...]
+    #: An agent's proposal's origin; ``None`` for every other record.
+    origin: ProposalOrigin | None = None
 
     _KEYS = (
         "id",
@@ -657,6 +786,7 @@ class MemoryRecord:
         "issue_url",
         "step",
         "attempt",
+        "origin",
         "superseded_by",
         "events",
     )
@@ -676,6 +806,7 @@ class MemoryRecord:
             "issue_url": self.issue_url,
             "step": None if self.step is None else self.step.to_dict(),
             "attempt": None if self.attempt is None else self.attempt.to_dict(),
+            "origin": None if self.origin is None else self.origin.to_dict(),
             "superseded_by": self.superseded_by,
             "events": [event.to_dict() for event in self.events],
         }
@@ -683,6 +814,47 @@ class MemoryRecord:
     @property
     def corrections(self) -> int:
         return sum(1 for event in self.events if event.op is Operation.CORRECT)
+
+    def proposal_key(self) -> tuple | None:
+        """An agent's proposal's identity (the Memdoor addendum), ``None`` for any other record.
+
+        Its issue, step, launch and origin (task, role, input revision), and
+        its kind, applicability and first text: fixed when it is added, so a
+        later correction does not make a replay of the add a new proposal.
+        """
+        if self.origin is None:
+            return None
+        return (
+            self.issue_url,
+            self.step,
+            self.attempt,
+            self.origin,
+            self.kind,
+            self.applies_to,
+            self.events[0].text_sha256,
+        )
+
+    def last_launch(self, before: int | None = None) -> int:
+        """The latest launch any of its events names, before seq ``before`` if given; 0 if none."""
+        return max(
+            (
+                event.attempt.launch_seq
+                for event in self.events
+                if event.attempt is not None and (before is None or event.seq < before)
+            ),
+            default=0,
+        )
+
+    def withdrawals(self) -> list[tuple[str, Actor]]:
+        """Each text digest its corrections and retraction withdrew, with who withdrew it."""
+        out: list[tuple[str, Actor]] = []
+        digest = ""
+        for event in self.events:
+            if event.op in (Operation.CORRECT, Operation.RETRACT):
+                out.append((digest, event.actor))
+            if event.op in (Operation.ADD, Operation.CORRECT):
+                digest = event.text_sha256
+        return out
 
     @classmethod
     def from_dict(cls, raw: object, where: str) -> MemoryRecord:
@@ -727,6 +899,13 @@ class MemoryRecord:
             raise _bad(where, "names its step and launch unless the operator wrote it")
         if step is not None and step.issue_url != issue_url:
             raise _bad(f"{where}.step", "belongs to another issue than the record")
+        origin = (
+            None
+            if data["origin"] is None
+            else ProposalOrigin.from_dict(data["origin"], f"{where}.origin")
+        )
+        if (origin is not None) != (provenance is Actor.AGENT):
+            raise _bad(f"{where}.origin", "is required of an agent's proposal, and only of one")
         superseded_by = data["superseded_by"]
         if superseded_by is not None:
             superseded_by = _int(
@@ -755,6 +934,7 @@ class MemoryRecord:
             attempt=attempt,
             superseded_by=superseded_by,
             events=events,
+            origin=origin,
         )
         why = record._history_problem()
         if why:
@@ -778,6 +958,23 @@ class MemoryRecord:
                 return "holds an event after the retraction"
             if event.op is Operation.ADD:
                 return "holds a second add"
+            # The write methods' permissions, event by event (D9.4).
+            noun = _NOUNS[event.op]
+            if self.trust not in _ALLOWED[event.op].get(event.actor, frozenset()):
+                return (
+                    f"holds a {noun} by the {event.actor.value}, which may not "
+                    f"{event.op.value} {self.trust.value} records"
+                )
+            why = _event_launch_problem(event.actor, event.attempt)
+            if why:
+                return f"holds a {noun} that {why}"
+            if event.actor is Actor.AGENT:
+                assert event.attempt is not None
+                if event.attempt.launch_seq < self.last_launch(before=event.seq):
+                    return (
+                        f"holds a stale {noun} by the agent, from an earlier launch than one "
+                        "that changed the record before it"
+                    )
             if event.op is Operation.CORRECT:
                 if superseded:
                     return "holds a correction after the record was superseded"
@@ -807,16 +1004,7 @@ class MemoryRecord:
 
     def tombstones(self) -> set[str]:
         """The digests this record's corrections and retraction left (D9.4)."""
-        out: set[str] = set()
-        digest = ""
-        for event in self.events:
-            if event.op is Operation.CORRECT:
-                out.add(digest)
-            if event.op is Operation.RETRACT:
-                out.add(digest)
-            if event.op in (Operation.ADD, Operation.CORRECT):
-                digest = event.text_sha256
-        return out
+        return {digest for digest, _ in self.withdrawals()}
 
     @property
     def last_seq(self) -> int:
@@ -946,15 +1134,51 @@ class MemoryStore:
             if record.superseded_by is not None:
                 if record.superseded_by > len(self.records):
                     return f"record {index} is superseded by a record that does not exist"
-                newer = self.records[record.superseded_by - 1]
-                if newer.issue_url != record.issue_url:
-                    return f"record {index} is superseded by another issue's record"
+                why = self._supersession_problem(record, self.records[record.superseded_by - 1])
+                if why:
+                    return f"record {index} {why}"
         seqs = sorted(event.seq for record in self.records for event in record.events)
         if seqs != list(range(1, self.revision + 1)):
             return "its records' events are not exactly the writes 1 to its revision"
         citations = [r.citation.key() for r in self.records if r.citation is not None]
         if len(citations) != len(set(citations)):
             return "two records cite the same evidence"
+        proposals = [r.proposal_key() for r in self.records if r.origin is not None]
+        if len(proposals) != len(set(proposals)):
+            return "two records are the same proposal: a replay adds nothing"
+        return ""
+
+    @staticmethod
+    def _supersession_problem(record: MemoryRecord, newer: MemoryRecord) -> str:
+        """Why ``newer`` cannot have superseded ``record`` as its history says, ``""`` if it can.
+
+        What :meth:`supersede` checks, at the seq of the supersession: a
+        newer record of the same issue, as strong as its writer, current
+        then, and for an agent no older a launch than the record's last.
+        """
+        event = next(e for e in record.events if e.op is Operation.SUPERSEDE)
+        if newer.id <= record.id:
+            return "is superseded by a record that is not newer"
+        if newer.issue_url != record.issue_url:
+            return "is superseded by another issue's record"
+        if newer.trust is not TRUST_BY_ACTOR[event.actor]:
+            return (
+                f"is superseded by the {event.actor.value} with a {newer.trust.value} record; "
+                f"the {event.actor.value} supersedes with {TRUST_BY_ACTOR[event.actor].value} "
+                "records only"
+            )
+        if newer.events[0].seq > event.seq or any(
+            e.seq < event.seq and e.op in (Operation.SUPERSEDE, Operation.RETRACT)
+            for e in newer.events
+        ):
+            return "is superseded by a record that was not current then"
+        if event.actor is Actor.AGENT:
+            assert newer.attempt is not None
+            if newer.attempt.launch_seq < record.last_launch(before=event.seq):
+                return (
+                    "is superseded by the agent with an older launch's proposal than one that "
+                    "changed it"
+                )
         return ""
 
     def digest(self) -> str:
@@ -987,12 +1211,26 @@ class MemoryStore:
         )
 
     def _commit(self, records: tuple[MemoryRecord, ...], record_id: int, what: str) -> WriteOutcome:
+        """The write applied, once the store it makes is one :meth:`from_dict` accepts.
+
+        The checks before it refuse what they name with their own code; this
+        one holds whatever they did not name, so an applied write never
+        returns a store that would make the checkpoint unloadable.
+        """
         store = replace(self, revision=self.revision + 1, records=records)
         size = stored_bytes(store)
         if size > MAX_STORE_BYTES:
             return self._refuse(
                 RefusalCode.STORE_FULL,
                 f"{what} would make Issue Memory {size} bytes, more than {MAX_STORE_BYTES}",
+                record_id,
+            )
+        try:
+            MemoryStore.from_dict(store.to_dict())
+        except StateError as exc:
+            return self._refuse(
+                RefusalCode.INVALID,
+                f"{what} would leave a store its loader refuses: {exc}",
                 record_id,
             )
         return WriteOutcome(store=store, record_id=record_id, changed=True)
@@ -1024,6 +1262,28 @@ class MemoryStore:
             )
         return text, None
 
+    def _launch_refusal(
+        self, actor: Actor, attempt: object, record_id: int | None = None
+    ) -> WriteOutcome | None:
+        """The refusal of a write's launch: of the wrong shape, another run's, or not its actor's.
+
+        Checked with the loader's own shape and bounds (``launch_seq`` from 1),
+        so no applied write names a launch a load would refuse (R1-F5 of PR #513).
+        """
+        if attempt is not None:
+            _, problem = _canonical_part(attempt, AttemptRef, ".attempt")
+            if problem:
+                return self._refuse(RefusalCode.INVALID, problem, record_id)
+            assert isinstance(attempt, AttemptRef)
+            if attempt.run_id != self.run_id:
+                return self._refuse(
+                    RefusalCode.SCOPE, "the launch belongs to another run", record_id
+                )
+        problem = _event_launch_problem(actor, attempt if isinstance(attempt, AttemptRef) else None)
+        if problem:
+            return self._refuse(RefusalCode.INVALID, f"the write {problem}", record_id)
+        return None
+
     def add(
         self,
         *,
@@ -1035,11 +1295,13 @@ class MemoryStore:
         citation: Citation | None = None,
         step: StepKey | None = None,
         attempt: AttemptRef | None = None,
+        origin: ProposalOrigin | None = None,
         reason: str = "",
     ) -> WriteOutcome:
         """Add a record (D9.4): the controller's observation, an agent's proposal or the seed.
 
-        ``applies_to`` defaults to ``ANALYZE_EXECUTE`` and any candidate.
+        ``applies_to`` defaults to ``ANALYZE_EXECUTE`` and any candidate. An
+        agent's proposal names its ``origin``; no other record does.
         """
         applies_to = Applicability() if applies_to is None else applies_to
         if not self.enabled:
@@ -1059,45 +1321,80 @@ class MemoryStore:
                 RefusalCode.INVALID,
                 "a record names its step and launch unless the operator wrote it",
             )
+        if (origin is not None) != (actor is Actor.AGENT):
+            return self._refuse(
+                RefusalCode.INVALID,
+                "an agent's proposal names its origin (task, role and input revision), and no "
+                "other record does",
+            )
+        if not isinstance(reason, str):
+            return self._refuse(RefusalCode.INVALID, "the reason is not text")
         try:
             _issue_url(issue_url, ".issue_url")
-            if step is not None:
-                _step(step.to_dict(), ".step")
-                if step.issue_url != issue_url:
-                    raise _bad(".step", "belongs to another issue than the record")
-            if citation is not None:
-                Citation.from_dict(citation.to_dict(), ".citation")
         except StateError as exc:
             return self._refuse(RefusalCode.INVALID, str(exc))
-        problem = applies_to.check()
-        if problem:
-            return self._refuse(RefusalCode.INVALID, problem)
-        scope = self._scope_refusal(attempt, citation)
-        if scope is not None:
-            return scope
+        parts: dict[str, object] = {}
+        for name, value, kind_of in (
+            ("step", step, StepKey),
+            ("citation", citation, Citation),
+            ("origin", origin, ProposalOrigin),
+            ("applies_to", applies_to, Applicability),
+        ):
+            parts[name], problem = (
+                (None, "") if value is None else _canonical_part(value, kind_of, f".{name}")
+            )
+            if problem:
+                return self._refuse(RefusalCode.INVALID, problem)
+        step = parts["step"]  # type: ignore[assignment]
+        citation = parts["citation"]  # type: ignore[assignment]
+        origin = parts["origin"]  # type: ignore[assignment]
+        applies_to = parts["applies_to"]  # type: ignore[assignment]
+        if step is not None and step.issue_url != issue_url:
+            return self._refuse(
+                RefusalCode.INVALID, f"{_FIELD}.step: belongs to another issue than the record"
+            )
+        refusal = self._launch_refusal(actor, attempt)
+        if refusal is not None:
+            return refusal
+        if (
+            citation is not None
+            and citation.kind is CitationKind.LAUNCH
+            and not citation.ref.startswith(f"{self.run_id}/")
+        ):
+            return self._refuse(RefusalCode.SCOPE, "the cited launch belongs to another run")
         if citation is not None:
             for record in self.records:
                 if record.citation is not None and record.citation.key() == citation.key():
                     # D9.7: deriving the same observation again adds nothing.
                     return WriteOutcome(store=self, record_id=record.id)
+        if (
+            origin is not None
+            and isinstance(text, str)
+            and not text_problem(text, max_bytes=1 << 30)
+        ):
+            key = (issue_url, step, attempt, origin, kind, applies_to, sha256_text(text))
+            for record in self.records:
+                if record.proposal_key() == key:
+                    # The Memdoor addendum: a replay of the same key is the
+                    # proposal already kept, whatever happened to it since, so
+                    # a replay never adds a second record or resurrects one.
+                    return WriteOutcome(store=self, record_id=record.id)
         kept, refusal = self._text_refusal(text, actor)
         if refusal is not None:
             return refusal
         digest = sha256_text(kept)
-        for record in self.records:
-            if (
-                citation is None
-                and record.status is not Status.RETRACTED
-                and record.text_sha256 == digest
-                and record.kind is kind
-                and record.issue_url == issue_url
-                and record.applies_to == applies_to
-            ):
-                # A duplicate, replayed or out-of-order proposal or seed of the
-                # same text is the record already kept, never a second one. An
-                # observation is keyed by its citation alone (D9.7), so the
-                # same text citing other evidence is a record of its own.
-                return WriteOutcome(store=self, record_id=record.id)
+        if operator:
+            for record in self.records:
+                if (
+                    record.provenance is Actor.OPERATOR
+                    and record.status is not Status.RETRACTED
+                    and record.text_sha256 == digest
+                    and record.kind is kind
+                    and record.issue_url == issue_url
+                    and record.applies_to == applies_to
+                ):
+                    # The operator's same seed again is the record already kept.
+                    return WriteOutcome(store=self, record_id=record.id)
         if len(self.records) >= MAX_RECORDS:
             return self._refuse(
                 RefusalCode.RECORDS_FULL, f"Issue Memory holds {MAX_RECORDS} records already"
@@ -1128,49 +1425,79 @@ class MemoryStore:
                     text_sha256=digest,
                 ),
             ),
+            origin=origin,
         )
         return self._commit((*self.records, record), record_id, f"record {record_id}")
-
-    def _scope_refusal(
-        self, attempt: AttemptRef | None, citation: Citation | None = None
-    ) -> WriteOutcome | None:
-        if attempt is not None and attempt.run_id != self.run_id:
-            return self._refuse(RefusalCode.SCOPE, "the launch belongs to another run")
-        if (
-            citation is not None
-            and citation.kind is CitationKind.LAUNCH
-            and not citation.ref.startswith(f"{self.run_id}/")
-        ):
-            return self._refuse(RefusalCode.SCOPE, "the cited launch belongs to another run")
-        return None
 
     def _target(
         self,
         record_id: int,
-        actor: Actor,
-        allowed: Mapping[Actor, frozenset[Trust]],
-        issue_url: str | None,
         *,
-        current: bool = True,
+        op: Operation,
+        actor: Actor,
+        issue_url: str | None,
+        attempt: AttemptRef | None,
+        reason: object,
     ) -> tuple[MemoryRecord | None, WriteOutcome | None]:
-        record = self.record(record_id) if isinstance(record_id, int) else None
+        """The record a lifecycle write changes, or the refusal that leaves every record as it is.
+
+        In order: the record exists; the actor may make this write to it
+        (D9.4); the reason and the launch are of the loader's shape; the write
+        names the record's issue, which only the operator may leave out, to
+        administer every issue (R1-F3 of PR #513); the record is current (or
+        not yet retracted, for a retraction); and an agent's write comes from
+        no earlier a launch than the last that changed the record.
+        """
+        record = (
+            self.record(record_id)
+            if isinstance(record_id, int) and not isinstance(record_id, bool)
+            else None
+        )
         if record is None:
             return None, self._refuse(RefusalCode.UNKNOWN_RECORD, f"no record M{record_id}")
-        if record.trust not in allowed.get(actor, frozenset()):
+        if record.trust not in _ALLOWED[op].get(actor, frozenset()):
             return None, self._refuse(
                 RefusalCode.NOT_PERMITTED,
-                f"the {actor.value} may not change record M{record_id}, which is "
+                f"the {actor.value} may not {op.value} record M{record_id}, which is "
                 f"{record.trust.value}",
                 record_id,
             )
-        if issue_url is not None and record.issue_url != issue_url:
-            return None, self._refuse(
-                RefusalCode.SCOPE, f"record M{record_id} belongs to another issue", record_id
-            )
+        if not isinstance(reason, str):
+            return None, self._refuse(RefusalCode.INVALID, "the reason is not text", record_id)
+        refusal = self._launch_refusal(actor, attempt, record_id)
+        if refusal is not None:
+            return None, refusal
+        if issue_url is None:
+            if actor is not Actor.OPERATOR:
+                return None, self._refuse(
+                    RefusalCode.SCOPE,
+                    f"the {actor.value}'s write names the issue it acts for; only the "
+                    "operator's may name none",
+                    record_id,
+                )
+        else:
+            try:
+                _issue_url(issue_url, ".issue_url")
+            except StateError as exc:
+                return None, self._refuse(RefusalCode.INVALID, str(exc), record_id)
+            if record.issue_url != issue_url:
+                return None, self._refuse(
+                    RefusalCode.SCOPE, f"record M{record_id} belongs to another issue", record_id
+                )
+        current = op is not Operation.RETRACT
         if record.status is Status.RETRACTED or (current and record.status is not Status.CURRENT):
             return None, self._refuse(
                 RefusalCode.NOT_CURRENT, f"record M{record_id} is {record.status.value}", record_id
             )
+        if actor is Actor.AGENT:
+            assert attempt is not None
+            if attempt.launch_seq < record.last_launch():
+                return None, self._refuse(
+                    RefusalCode.STALE,
+                    f"launch {attempt.launch_seq} is older than launch {record.last_launch()}, "
+                    f"the last that changed record M{record_id}",
+                    record_id,
+                )
         return record, None
 
     def _replaced(self, record: MemoryRecord) -> tuple[MemoryRecord, ...]:
@@ -1191,10 +1518,14 @@ class MemoryStore:
         """A new revision of a current record; its old text is never shown again (D9.4)."""
         if not self.enabled:
             return self._refuse(RefusalCode.DISABLED, "the run's Issue Memory is off")
-        scope = self._scope_refusal(attempt)
-        if scope is not None:
-            return scope
-        record, refusal = self._target(record_id, actor, _CHANGES, issue_url)
+        record, refusal = self._target(
+            record_id,
+            op=Operation.CORRECT,
+            actor=actor,
+            issue_url=issue_url,
+            attempt=attempt,
+            reason=reason,
+        )
         if refusal is not None:
             return refusal
         assert record is not None
@@ -1241,18 +1572,24 @@ class MemoryStore:
 
         What supersedes must be at least as strong as the writer may change:
         an observed record for the controller, a proposal for an agent. So
-        newer, unsupported text never supersedes an observation.
+        newer, unsupported text never supersedes an observation. An agent's
+        proposal from an older launch than the last that changed the record
+        never supersedes it: an out-of-order proposal overwrites nothing.
         """
         if not self.enabled:
             return self._refuse(RefusalCode.DISABLED, "the run's Issue Memory is off")
-        scope = self._scope_refusal(attempt)
-        if scope is not None:
-            return scope
-        record, refusal = self._target(record_id, actor, _CHANGES, issue_url)
+        record, refusal = self._target(
+            record_id,
+            op=Operation.SUPERSEDE,
+            actor=actor,
+            issue_url=issue_url,
+            attempt=attempt,
+            reason=reason,
+        )
         if refusal is not None:
             return refusal
         assert record is not None
-        newer = self.record(by) if isinstance(by, int) else None
+        newer = self.record(by) if isinstance(by, int) and not isinstance(by, bool) else None
         if newer is None:
             return self._refuse(RefusalCode.UNKNOWN_RECORD, f"no record M{by}", record_id)
         if newer.trust is not TRUST_BY_ACTOR[actor]:
@@ -1272,6 +1609,15 @@ class MemoryStore:
             return self._refuse(
                 RefusalCode.SCOPE, f"record M{by} belongs to another issue", record_id
             )
+        if actor is Actor.AGENT:
+            assert newer.attempt is not None
+            if newer.attempt.launch_seq < record.last_launch():
+                return self._refuse(
+                    RefusalCode.STALE,
+                    f"record M{by} comes from launch {newer.attempt.launch_seq}, older than "
+                    f"launch {record.last_launch()}, the last that changed M{record_id}",
+                    record_id,
+                )
         event = MemoryEvent(
             seq=self.revision + 1,
             op=Operation.SUPERSEDE,
@@ -1300,12 +1646,17 @@ class MemoryStore:
         """Withdraw a record: its text is dropped and its digest kept as a tombstone.
 
         Allowed whatever the run's setting: a retraction only ever removes
-        something from what a launch is shown.
+        something from what a launch is shown. The operator's names no issue
+        when it administers every issue, and no launch.
         """
-        scope = self._scope_refusal(attempt)
-        if scope is not None:
-            return scope
-        record, refusal = self._target(record_id, actor, _RETRACTS, issue_url, current=False)
+        record, refusal = self._target(
+            record_id,
+            op=Operation.RETRACT,
+            actor=actor,
+            issue_url=issue_url,
+            attempt=attempt,
+            reason=reason,
+        )
         if refusal is not None:
             return refusal
         assert record is not None
@@ -1330,18 +1681,6 @@ class MemoryStore:
         return out
 
 
-#: Whose records each actor may correct or supersede (D9.4).
-_CHANGES: Mapping[Actor, frozenset[Trust]] = {
-    Actor.CONTROLLER: frozenset({Trust.OBSERVED, Trust.PROPOSED}),
-    Actor.AGENT: frozenset({Trust.PROPOSED}),
-}
-#: Whose records each actor may retract: the operator any.
-_RETRACTS: Mapping[Actor, frozenset[Trust]] = {
-    **_CHANGES,
-    Actor.OPERATOR: frozenset(Trust),
-}
-
-
 def stored_bytes(store: MemoryStore) -> int:
     """The store's size as the state file holds it: ``save_state``'s encoding, under its key."""
     return len(
@@ -1354,36 +1693,68 @@ def stored_bytes(store: MemoryStore) -> int:
 
 @dataclass(frozen=True)
 class EvidenceIndex:
-    """The evidence the run holds now, which an observed record's citation must resolve to.
+    """The receipts the run holds now, which an observed record's citation must resolve to.
 
-    ``validation_records`` are the ``(seq, digest)`` of the state's
-    ``ValidationRecord``s; a launch resolves when it is a launch of
-    ``run_id`` the state has spent (``1 <= launch_seq <= launch_seq``). The
-    state holds no copy of a launch's typed end, so a launch citation's
-    digest is the controller's own and is not checked again.
+    A citation resolves only to a controller-owned receipt the run still
+    keeps, by its identity and its digest; anything else renders the record
+    downgraded, never as observed (D8, #317's rule for a missing receipt).
+
+    - ``validation_records``: the ``(seq, digest)`` of the state's
+      ``ValidationRecord``s, at most the 64 it keeps.
+    - ``launch_receipts``: the ``(<run_id>/<launch_seq>, digest)`` of the
+      launch receipts the run keeps (ADR 0015 D5.3). A spent launch ordinal
+      is not one: an intent saved before a crash names a launch that may
+      never have started (W2). The state keeps no launch receipt before #332,
+      so the caller passes none, and every launch citation renders
+      downgraded until then.
     """
 
     run_id: str
-    launch_seq: int = 0
     validation_records: frozenset[tuple[str, str]] = frozenset()
+    launch_receipts: frozenset[tuple[str, str]] = frozenset()
 
     @classmethod
     def from_state(
-        cls, run_id: str, launch_seq: int, validation_records: Iterable[object]
+        cls,
+        run_id: str,
+        validation_records: Iterable[object],
+        launch_receipts: Iterable[tuple[AttemptRef, str]] = (),
     ) -> EvidenceIndex:
+        """The index of the receipts given; one of another run or of no digest is left out."""
         pairs: set[tuple[str, str]] = set()
         for record in validation_records:
             if isinstance(record, Mapping):
                 seq, digest = record.get("seq"), record.get("digest")
-                if isinstance(seq, int) and not isinstance(seq, bool) and isinstance(digest, str):
+                if (
+                    isinstance(seq, int)
+                    and not isinstance(seq, bool)
+                    and isinstance(digest, str)
+                    and _HEX64_RE.fullmatch(digest)
+                ):
                     pairs.add((str(seq), digest))
-        return cls(run_id=run_id, launch_seq=launch_seq, validation_records=frozenset(pairs))
+        launches: set[tuple[str, str]] = set()
+        for launch, digest in launch_receipts:
+            if (
+                isinstance(launch, AttemptRef)
+                and launch.run_id == run_id
+                and isinstance(digest, str)
+                and _HEX64_RE.fullmatch(digest)
+            ):
+                launches.add((launch.label(), digest))
+        return cls(
+            run_id=run_id,
+            validation_records=frozenset(pairs),
+            launch_receipts=frozenset(launches),
+        )
 
     def resolves(self, citation: Citation) -> bool:
+        """Whether the run keeps the cited receipt, with the digest cited."""
         if citation.kind is CitationKind.VALIDATION_RECORD:
             return (citation.ref, citation.sha256) in self.validation_records
-        run, _, seq = citation.ref.partition("/")
-        return run == self.run_id and seq.isdigit() and 1 <= int(seq) <= self.launch_seq
+        return (
+            citation.ref.startswith(f"{self.run_id}/")
+            and (citation.ref, citation.sha256) in self.launch_receipts
+        )
 
 
 @dataclass(frozen=True)
@@ -1402,6 +1773,8 @@ class ProjectionRequest:
     #: caller reads them from git); a ``descendants`` record of any other
     #: base does not apply.
     descends_from: frozenset[str] = frozenset()
+    #: The projection's bound, from :data:`MIN_PROJECTION_CHARS` to
+    #: :data:`MAX_PROJECTION_CHARS`; a render refuses any other.
     max_chars: int = MAX_PROJECTION_CHARS
 
 
@@ -1432,6 +1805,9 @@ class ContextProjection:
     retracted: int
     superseded: int
     downgraded: int
+    #: Current records withheld because their text was withdrawn (corrected
+    #: away or retracted) by another record that applies to this launch.
+    withdrawn: int = 0
 
 
 _GROUPS = ("observed", "operator", "downgraded", "proposed")
@@ -1469,7 +1845,8 @@ def _header(store: MemoryStore, request: ProjectionRequest, counts: Mapping[str,
             f"- current candidate: {escape_inline(candidate)}",
             f"- records: {counts['shown']} shown, {counts['omitted']} omitted for the bound, "
             f"{counts['not_applicable']} not applicable, {counts['retracted']} retracted, "
-            f"{counts['superseded']} superseded",
+            f"{counts['superseded']} superseded, {counts['withdrawn']} withheld as withdrawn "
+            "text",
             f"- freshness: rendered from the committed snapshot at revision {store.revision}; "
             "no index, nothing pending",
             "",
@@ -1494,6 +1871,8 @@ def _block(record: MemoryRecord, group: str) -> str:
         if record.attempt is None
         else f"- written at: launch {escape_inline(record.attempt.label())}"
     )
+    if record.origin is not None:
+        lines.append(f"- proposed by: {record.origin.describe()}")
     if record.revision > 1:
         lines.append(f"- revision: {record.revision} (corrected; earlier text withdrawn)")
     lines += ["", fenced_untrusted_block(record.text, "untrusted"), "", ""]
@@ -1514,26 +1893,60 @@ def render_projection(
 
     Reads nothing but its arguments. Raises ValueError for a request it must
     never serve: another run's store (Memory is one run's, D9.1), a phase
-    ADR 0015 D13 gives no projection (``REVIEW`` above all), or a bound too
-    small for the header.
+    ADR 0015 D13 gives no projection (``REVIEW`` above all), or a bound
+    outside :data:`MIN_PROJECTION_CHARS` to :data:`MAX_PROJECTION_CHARS`.
+
+    A text withdrawn by a record that applies to this launch is withheld
+    from every other current record carrying it, when the withdrawal's
+    author could have withdrawn that record too (D9.4): a duplicate never
+    shows a withdrawn claim, a record whose scope the withdrawal does not
+    cover (another issue, phase or candidate) keeps it, and an agent
+    withdrawing its own proposal hides no observation and no operator's
+    record.
     """
     if store.run_id != request.run_id or evidence.run_id != request.run_id:
         raise ValueError("Issue Memory is rendered only for the run it belongs to")
     if request.phase not in PROJECTED_PHASES:
         raise ValueError(f"phase {request.phase.value} gets no Issue Memory projection")
-    if request.max_chars < MIN_PROJECTION_CHARS:
-        raise ValueError(f"a projection bound is at least {MIN_PROJECTION_CHARS} characters")
-    counts = {"shown": 0, "omitted": 0, "not_applicable": 0, "retracted": 0, "superseded": 0}
+    bound = request.max_chars
+    if (
+        not isinstance(bound, int)
+        or isinstance(bound, bool)
+        or not MIN_PROJECTION_CHARS <= bound <= MAX_PROJECTION_CHARS
+    ):
+        raise ValueError(
+            f"a projection bound is {MIN_PROJECTION_CHARS} to {MAX_PROJECTION_CHARS} characters"
+        )
+
+    def applies(record: MemoryRecord) -> bool:
+        return record.issue_url == request.issue_url and record.applies_to.applies(
+            request.phase, request.candidate, request.descends_from
+        )
+
+    # Each text withdrawn where this launch is, and whose records its withdrawal binds.
+    withdrawn: dict[str, set[Trust]] = {}
+    for record in store.records:
+        if applies(record):
+            for digest, actor in record.withdrawals():
+                withdrawn.setdefault(digest, set()).update(_RETRACTS.get(actor, frozenset()))
+    counts = {
+        "shown": 0,
+        "omitted": 0,
+        "not_applicable": 0,
+        "retracted": 0,
+        "superseded": 0,
+        "withdrawn": 0,
+    }
     grouped: dict[str, list[MemoryRecord]] = {group: [] for group in _GROUPS}
     for record in store.records:
         if record.status is Status.RETRACTED:
             counts["retracted"] += 1
         elif record.status is Status.SUPERSEDED:
             counts["superseded"] += 1
-        elif record.issue_url != request.issue_url or not record.applies_to.applies(
-            request.phase, request.candidate, request.descends_from
-        ):
+        elif not applies(record):
             counts["not_applicable"] += 1
+        elif record.trust in withdrawn.get(record.text_sha256, ()):
+            counts["withdrawn"] += 1
         elif record.trust is Trust.OBSERVED:
             assert record.citation is not None
             resolved = evidence.resolves(record.citation)
@@ -1545,9 +1958,9 @@ def render_projection(
     reserve = (
         len(_header(store, request, widest))
         + len(_NOTHING_SHOWN)
-        + len(_omitted_line(MAX_RECORDS, request.max_chars))
+        + len(_omitted_line(MAX_RECORDS, bound))
     )
-    budget = request.max_chars - reserve
+    budget = bound - reserve
     if budget < 0:
         raise ValueError(f"a projection bound is at least {reserve} characters")
     body: list[str] = []
@@ -1568,8 +1981,8 @@ def render_projection(
     if not shown:
         text += _NOTHING_SHOWN
     if counts["omitted"]:
-        text += _omitted_line(counts["omitted"], request.max_chars)
-    assert len(text) <= request.max_chars, (len(text), request.max_chars)
+        text += _omitted_line(counts["omitted"], bound)
+    assert len(text) <= bound, (len(text), bound)
     return ContextProjection(
         text=text,
         freshness=Freshness(revision=store.revision, digest=store.digest()),
@@ -1578,5 +1991,6 @@ def render_projection(
         not_applicable=counts["not_applicable"],
         retracted=counts["retracted"],
         superseded=counts["superseded"],
+        withdrawn=counts["withdrawn"],
         downgraded=downgraded,
     )

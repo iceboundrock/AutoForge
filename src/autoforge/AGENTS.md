@@ -302,10 +302,11 @@ delivered_result.py a reply delivered before its launch failed (#479, ADR 0012 D
                     persists nothing itself
 memory.py           Issue Working Memory (#317, ADR 0015 D8-D12): the store the state's
                     issue_memory holds (MemoryStore: records typed by kind, trust,
-                    applicability, issue, step and launch, status and history; the
-                    tombstones; the refusal counters), its writes (add, correct,
-                    supersede, retract, each who-may-do-what checked, bounded,
-                    redacted and returning the store to save), the operator's seed
+                    applicability, issue, step and launch, an agent's proposal key,
+                    status and history; the tombstones; the refusal counters), its
+                    writes (add, correct, supersede, retract, each who-may-do-what
+                    checked, bounded, redacted and returning the store to save,
+                    which its loader accepts), the operator's seed
                     check, and the deterministic, bounded projection (render_projection)
                     #333 renders into a launch's read context; advisory: imported only
                     by state.py and cli.py, never by a module that decides; pure,

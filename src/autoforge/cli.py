@@ -2761,6 +2761,8 @@ def _memory_lines(state: AutoForgeState, store: MemoryStore | None) -> list[str]
             )
         if record.attempt is not None:
             lines.append(f"  written at: launch {record.attempt.label()}")
+        if record.origin is not None:
+            lines.append(f"  proposed by: {record.origin.describe()}")
         for event in record.events:
             why = f": {event.reason}" if event.reason else ""
             lines.append(

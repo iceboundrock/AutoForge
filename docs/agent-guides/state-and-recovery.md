@@ -173,15 +173,18 @@ Working Memory is `issue_memory` (ADR 0015 D8 to D12, #317,
 `autoforge.memory.MemoryStore`): `{}` for a run created with Memory off,
 otherwise one bounded store with the run's Memory setting (`enabled`), its
 revision, its records (each typed, with its trust, applicability, issue,
-step and launch, status and history), the tombstones of corrected and
-retracted texts and the count of refused writes. It is advisory: no code
+step and launch, an agent's proposal's origin, status and history), the
+tombstones of corrected and retracted texts and the count of refused
+writes. It is advisory: no code
 that decides a phase, a write, a permission, a budget or a merge reads it,
 and only `state.py`, the CLI and the engine's run-configuration record and
 check touch it (`tests/test_memory.py`). The loader checks it whole: exactly
-its shape, every record's history closed over the store's revision, the
-tombstones exactly those the histories left, the run's own run id, no launch
-past `launch_seq`, no issue of another repository, and at most 1,048,576
-bytes as the file holds it. A
+its shape, every record's history closed over the store's revision, every
+lifecycle event one its actor may make, every supersession one the write
+would have made, no two records of one proposal key, the tombstones exactly
+those the histories left, the run's own run id, no launch past
+`launch_seq`, no issue of another repository, and at most 1,048,576 bytes
+as the file holds it. A
 REMOTE `last_fix_resolutions` entry carries `acceptance_comment_url`: the
 comment the controller verified for an `acceptance_action` resolution
 (required, on the run's issue), and `""` for any other (#211).

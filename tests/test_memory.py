@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import functools
 import hashlib
 import json
 import os
@@ -46,6 +47,7 @@ from autoforge.memory import (
     MAX_SEED_BYTES,
     MAX_STORE_BYTES,
     MAX_TEXT_BYTES,
+    MIN_PROJECTION_CHARS,
     Actor,
     Applicability,
     AttemptRef,
@@ -56,7 +58,9 @@ from autoforge.memory import (
     Kind,
     MemoryStore,
     ProjectionRequest,
+    ProposalOrigin,
     RefusalCode,
+    Role,
     Status,
     Trust,
     render_projection,
@@ -119,7 +123,13 @@ def observe(store, text, *, seq=1, cite=None, issue=ISSUE, applies=None, kind=No
     )
 
 
-def propose(store, text, *, seq=1, issue=ISSUE, applies=None, kind=Kind.HYPOTHESIS, **extra):
+def _origin(task: int = 1, role: Role = Role.PRODUCER, input_sha: str = BASE) -> ProposalOrigin:
+    return ProposalOrigin(task, role, input_sha)
+
+
+def propose(
+    store, text, *, seq=1, issue=ISSUE, applies=None, kind=Kind.HYPOTHESIS, origin=None, **extra
+):
     return store.add(
         kind=kind,
         actor=Actor.AGENT,
@@ -128,8 +138,14 @@ def propose(store, text, *, seq=1, issue=ISSUE, applies=None, kind=Kind.HYPOTHES
         applies_to=applies,
         step=_step(issue),
         attempt=_launch(seq),
+        origin=origin or _origin(),
         **extra,
     )
+
+
+def as_agent(seq: int = 9, issue: str = ISSUE) -> dict:
+    """An agent's lifecycle write: the issue it acts for and the launch it comes from."""
+    return {"actor": Actor.AGENT, "issue_url": issue, "attempt": _launch(seq)}
 
 
 def seed(store, text, *, issue=ISSUE):
@@ -157,9 +173,11 @@ def _request(**overrides) -> ProjectionRequest:
     return ProjectionRequest(**values)  # type: ignore[arg-type]
 
 
-def _evidence(*records: tuple[int, str], launch_seq: int = 9) -> EvidenceIndex:
+def _evidence(*records: tuple[int, str], launches=()) -> EvidenceIndex:
+    """The receipts a run holds: validation records by (seq, digest), launch receipts by
+    (AttemptRef, digest). The state keeps no launch receipt before #332."""
     return EvidenceIndex.from_state(
-        RUN, launch_seq, [{"seq": seq, "digest": digest} for seq, digest in records]
+        RUN, [{"seq": seq, "digest": digest} for seq, digest in records], launches
     )
 
 
@@ -242,7 +260,7 @@ def test_the_operator_retracts_any_record_and_an_agent_only_proposals():
     assert store.correct(seeded, "x", actor=Actor.OPERATOR, issue_url=None).refusal is (
         RefusalCode.NOT_PERMITTED
     )
-    store, _ = _applied(store.retract(proposal, actor=Actor.AGENT, issue_url=ISSUE, reason="no"))
+    store, _ = _applied(store.retract(proposal, **as_agent(), reason="no"))
     for record in (observed, seeded):
         store, _ = _applied(store.retract(record, actor=Actor.OPERATOR, issue_url=None, reason="x"))
     assert [r.status for r in store.records] == [Status.RETRACTED] * 3
@@ -252,7 +270,7 @@ def test_the_operator_retracts_any_record_and_an_agent_only_proposals():
 
 def test_an_agent_changes_no_record_of_another_issue_or_another_run():
     store, other = _applied(propose(_store(), "about issue 3", issue=ISSUE_B))
-    assert store.retract(other, actor=Actor.AGENT, issue_url=ISSUE).refusal is RefusalCode.SCOPE
+    assert store.retract(other, **as_agent()).refusal is RefusalCode.SCOPE
     stranger = store.correct(
         other, "x", actor=Actor.AGENT, issue_url=ISSUE_B, attempt=_launch(2, OTHER_RUN)
     )
@@ -261,17 +279,121 @@ def test_an_agent_changes_no_record_of_another_issue_or_another_run():
     assert launch.refusal is RefusalCode.SCOPE
 
 
+# -- issue scope and launches of a lifecycle write (R1-F3, R1-F5 of PR #513) ---------------
+
+
+@pytest.mark.parametrize("operation", ["correct", "supersede", "retract"])
+@pytest.mark.parametrize("issue", [None, ISSUE_B], ids=["absent", "another-issue"])
+@pytest.mark.parametrize("actor", [Actor.AGENT, Actor.CONTROLLER])
+def test_an_agent_or_controller_write_names_the_records_own_issue(actor, issue, operation):
+    """Only the operator administers every issue; any other write names the issue it
+    acts for, and a record of another issue is refused to it, changing nothing."""
+    store, record = _applied(propose(_store(), "issue 2's lesson", seq=1))
+    store, newer = _applied(propose(store, "issue 2's newer lesson", seq=2))
+    scope = {"actor": actor, "issue_url": issue, "attempt": _launch(3)}
+    write = {
+        "correct": lambda: store.correct(record, "changed", **scope),
+        "supersede": lambda: store.supersede(record, newer, **scope),
+        "retract": lambda: store.retract(record, **scope),
+    }[operation]()
+    assert write.refusal is RefusalCode.SCOPE, write.detail
+    assert write.store.records == store.records and write.store.refused == {"scope": 1}
+
+
+def test_the_operator_administers_every_issue_and_an_agent_only_the_one_it_acts_for():
+    store, other = _applied(propose(_store(), "issue 3's lesson", issue=ISSUE_B))
+    store, own = _applied(propose(store, "issue 2's lesson"))
+    assert store.retract(other, **as_agent()).refusal is RefusalCode.SCOPE
+    store, _ = _applied(store.correct(own, "issue 2's lesson, corrected", **as_agent()))
+    store, _ = _applied(store.retract(other, **as_agent(issue=ISSUE_B)))
+    store, third = _applied(propose(store, "another of issue 3's", seq=2, issue=ISSUE_B))
+    store, _ = _applied(store.retract(third, actor=Actor.OPERATOR, issue_url=None))
+    store, _ = _applied(store.retract(own, actor=Actor.OPERATOR, issue_url=ISSUE))
+    assert [r.status for r in store.records] == [Status.RETRACTED] * 3
+    pr_url = store.add(
+        kind=Kind.HYPOTHESIS,
+        actor=Actor.AGENT,
+        text="x",
+        issue_url=PR_URL,
+        step=_step(),
+        attempt=_launch(),
+        origin=_origin(),
+    )
+    assert pr_url.refusal is RefusalCode.INVALID
+
+
+_BAD_LAUNCHES = {
+    "launch-0": AttemptRef(RUN, 0),
+    "negative": AttemptRef(RUN, -1),
+    "past-the-bound": AttemptRef(RUN, 2**31),
+    "a-bool": AttemptRef(RUN, True),
+    "not-a-run-id": AttemptRef("../x", 1),
+    "not-an-attempt": (RUN, 1),
+}
+
+
+@pytest.mark.parametrize("operation", ["add", "correct", "supersede", "retract"])
+@pytest.mark.parametrize("attempt", list(_BAD_LAUNCHES.values()), ids=list(_BAD_LAUNCHES))
+def test_a_launch_the_loader_would_refuse_is_refused_and_every_store_returned_loads(
+    attempt, operation
+):
+    """The write checks a launch with the loader's own shape and bounds, so it never
+    returns a store its loader refuses (``launch_seq`` 0 was the reviewer's example)."""
+    store, record = _applied(propose(_store(), "kept", seq=1))
+    store, newer = _applied(propose(store, "newer", seq=2))
+    agent = {"actor": Actor.AGENT, "issue_url": ISSUE, "attempt": attempt}
+    write = {
+        "add": lambda: store.add(
+            kind=Kind.HYPOTHESIS, text="new", step=_step(), origin=_origin(), **agent
+        ),
+        "correct": lambda: store.correct(record, "changed", **agent),
+        "supersede": lambda: store.supersede(record, newer, **agent),
+        "retract": lambda: store.retract(record, **agent),
+    }[operation]()
+    assert write.refusal is RefusalCode.INVALID, write.detail
+    assert write.store.records == store.records
+    assert MemoryStore.from_dict(write.store.to_dict()).records == store.records
+
+
+def test_each_actor_names_the_launch_its_write_comes_from():
+    """An agent's write names the launch whose result carried it (D9.8), the
+    operator's names none, and the controller's names the one it observed, if any."""
+    store, record = _applied(propose(_store(), "kept"))
+    zero = store.add(
+        kind=Kind.VALIDATION_FAILURE,
+        actor=Actor.CONTROLLER,
+        text="x",
+        issue_url=ISSUE,
+        citation=_vr(1),
+        step=_step(),
+        attempt=AttemptRef(RUN, 0),
+    )
+    assert zero.refusal is RefusalCode.INVALID and zero.store.records == store.records
+    unnamed = store.correct(record, "x", actor=Actor.AGENT, issue_url=ISSUE)
+    assert unnamed.refusal is RefusalCode.INVALID and "names no launch" in unnamed.detail
+    named = store.retract(record, actor=Actor.OPERATOR, issue_url=None, attempt=_launch())
+    assert named.refusal is RefusalCode.INVALID and "names a launch" in named.detail
+    store, _ = _applied(store.correct(record, "x", actor=Actor.CONTROLLER, issue_url=ISSUE))
+    store, _ = _applied(store.retract(record, actor=Actor.CONTROLLER, issue_url=ISSUE))
+    assert [e.attempt for e in store.record(record).events] == [_launch(), None, None]
+
+
+def test_a_write_its_loader_would_refuse_is_refused_even_past_the_named_checks(monkeypatch):
+    """The last check of every write is the loader itself: with the launch check
+    switched off, a launch 0 still never reaches a store."""
+    monkeypatch.setattr(MemoryStore, "_launch_refusal", lambda self, *args: None)
+    outcome = propose(_store(), "x", seq=0)
+    assert outcome.refusal is RefusalCode.INVALID and "its loader refuses" in outcome.detail
+    assert outcome.store.records == () and outcome.store.refused == {"invalid": 1}
+
+
 # -- corrections, retractions and tombstones (D9.4) ---------------------------------------
 
 
 def test_a_correction_is_a_new_revision_and_its_old_text_is_refused_ever_after():
     store, record = _applied(propose(_store(), "the bug is in parse()"))
     old = sha256_text("the bug is in parse()")
-    store, _ = _applied(
-        store.correct(
-            record, "the bug is in render()", actor=Actor.AGENT, issue_url=ISSUE, reason="r"
-        )
-    )
+    store, _ = _applied(store.correct(record, "the bug is in render()", **as_agent(), reason="r"))
     kept = store.record(record)
     assert (kept.text, kept.revision, kept.status) == ("the bug is in render()", 2, Status.CURRENT)
     assert old in store.tombstones and "parse()" not in json.dumps(store.to_dict())
@@ -299,27 +421,129 @@ def test_a_retraction_drops_the_text_keeps_the_digest_and_survives_a_reload(tmp_
     assert "the API is async" not in _render(loaded).text
 
 
-def test_an_observation_derived_again_adds_nothing_and_a_duplicate_proposal_neither():
-    """D9.7 and the Memdoor addendum: a write keyed by its citation or its text is
-    the record already kept, never a second one, whatever order it arrives in."""
+def test_an_observation_derived_again_adds_nothing():
+    """D9.7: an observation is keyed by its citation, so deriving it again is the
+    record already kept; the same text citing other evidence is a record of its own."""
     store, first = _applied(observe(_store(), "lint fails", seq=1))
     again = observe(store, "lint fails, said differently", seq=1)
     assert again.applied and not again.changed and again.record_id == first
     assert again.store is store
-    store, proposal = _applied(propose(store, "try the cache", seq=2))
-    duplicate = propose(store, "try the cache", seq=3)
-    assert duplicate.applied and not duplicate.changed and duplicate.record_id == proposal
-    assert store.revision == 2
-    # The same text citing other evidence is another observation, its citation kept.
     store, second = _applied(observe(store, "lint fails", seq=4))
     assert second != first and store.record(second).citation == _vr(4)
+
+
+# -- the proposal ledger's identity (#317's Memdoor addendum; R1-F4 of PR #513) -------------
+
+
+def test_a_replayed_proposal_is_the_record_kept_and_another_key_a_record_of_its_own():
+    """A replay of the same task, launch, role and input revision adds nothing; a
+    proposal under any other key keeps its own immutable record and provenance, even
+    with the same text, and every one of them stays a proposal."""
+    store, first = _applied(propose(_store(), "try the cache", seq=2))
+    replay = propose(store, "try the cache", seq=2)
+    assert replay.applied and not replay.changed and replay.record_id == first
+    assert replay.store is store
+    keys = [
+        dict(seq=3),  # another attempt
+        dict(seq=2, origin=_origin(task=2)),  # another task
+        dict(seq=2, origin=_origin(role=Role.IDEATOR)),  # another role
+        dict(seq=2, origin=_origin(input_sha=C1)),  # another input revision
+    ]
+    for key in keys:
+        store, record = _applied(propose(store, "try the cache", **key))
+        assert record != first
+    assert len(store.records) == 5 and store.revision == 5
+    origins = {(r.attempt, r.origin) for r in store.records}
+    assert len(origins) == 5
+    assert {r.trust for r in store.records} == {Trust.PROPOSED}
+    # Each replayed again, in any order, adds nothing.
+    for key in reversed([dict(seq=2), *keys]):
+        assert not propose(store, "try the cache", **key).changed
+    reloaded = MemoryStore.from_dict(json.loads(json.dumps(store.to_dict())))
+    assert reloaded == store and reloaded.record(3).origin == _origin(task=2)
+
+
+def test_a_replay_never_resurrects_or_duplicates_a_corrected_or_retracted_proposal():
+    store, record = _applied(propose(_store(), "the API is async", seq=1))
+    store, _ = _applied(store.correct(record, "the API is sync", **as_agent(2)))
+    replay = propose(store, "the API is async", seq=1)
+    assert replay.applied and not replay.changed and replay.record_id == record
+    assert store.record(record).text == "the API is sync"
+    store, _ = _applied(store.retract(record, actor=Actor.OPERATOR, issue_url=None))
+    again = propose(store, "the API is async", seq=1)
+    assert again.applied and not again.changed and again.store is store
+    assert len(store.records) == 1 and store.record(record).status is Status.RETRACTED
+    # Under any other key a withdrawn text stays refused: a rejection persists.
+    for text, seq in (("the API is sync", 1), ("the API is async", 3), ("the API is sync", 3)):
+        assert propose(store, text, seq=seq).refusal is RefusalCode.TOMBSTONED
+
+
+def test_an_out_of_order_or_stale_proposal_overwrites_nothing_and_stays_a_claim():
+    """A proposal from launch 3 arriving after one from launch 5 is kept as its own
+    claim, and no write of an earlier launch than the last that changed a record
+    corrects, supersedes or retracts it."""
+    store, newer = _applied(propose(_store(), "launch 5's idea", seq=5))
+    store, late = _applied(propose(store, "launch 3's idea", seq=3))  # out of order
+    assert late > newer and store.record(late).attempt == _launch(3)
+    for write in (
+        store.supersede(newer, late, **as_agent(5)),  # an older launch's proposal
+        store.correct(newer, "launch 3 says otherwise", **as_agent(3)),
+        store.retract(newer, **as_agent(3)),
+    ):
+        assert write.refusal is RefusalCode.STALE, write.detail
+        assert write.store.records == store.records
+    store, _ = _applied(store.correct(newer, "launch 6's idea", **as_agent(6)))
+    stale = store.correct(newer, "launch 5's second thought", **as_agent(5))
+    assert stale.refusal is RefusalCode.STALE and stale.store.refused == {"stale": 1}
+    assert store.supersede(newer, late, **as_agent(7)).refusal is RefusalCode.STALE
+    store, _ = _applied(store.correct(late, "launch 3's idea, refined", **as_agent(7)))
+    # A newer launch's proposal supersedes an older one, and nothing becomes evidence.
+    store, latest = _applied(propose(store, "launch 7's idea", seq=7))
+    store, _ = _applied(store.supersede(late, latest, **as_agent(7)))
+    assert {r.trust for r in store.records} == {Trust.PROPOSED}
+    text = _render(store).text
+    assert "launch 6's idea" in text and "proposed by an agent: a claim, never evidence" in text
+    assert "observed by the controller" not in text
+
+
+def test_only_an_agents_proposal_names_an_origin_and_of_the_loaders_shape():
+    store = _store()
+    no_origin = store.add(
+        kind=Kind.HYPOTHESIS,
+        actor=Actor.AGENT,
+        text="x",
+        issue_url=ISSUE,
+        step=_step(),
+        attempt=_launch(),
+    )
+    assert no_origin.refusal is RefusalCode.INVALID and "origin" in no_origin.detail
+    assert observe(store, "x").store.records != ()
+    with_origin = store.add(
+        kind=Kind.VALIDATION_FAILURE,
+        actor=Actor.CONTROLLER,
+        text="x",
+        issue_url=ISSUE,
+        citation=_vr(1),
+        step=_step(),
+        attempt=_launch(),
+        origin=_origin(),
+    )
+    assert with_origin.refusal is RefusalCode.INVALID
+    for origin in (
+        ProposalOrigin(0, Role.PRODUCER, BASE),
+        ProposalOrigin(1, Role.PRODUCER, "abc"),
+        ProposalOrigin(1, "boss", BASE),  # type: ignore[arg-type]
+        (1, "producer", BASE),
+    ):
+        bad = propose(store, "x", origin=origin)
+        assert bad.refusal is RefusalCode.INVALID and bad.store.records == ()
 
 
 def test_a_correction_bound_and_the_record_bound_refuse_and_count_never_evict():
     store, record = _applied(propose(_store(), "v0"))
     for n in range(1, MAX_CORRECTIONS + 1):
-        store, _ = _applied(store.correct(record, f"v{n}", actor=Actor.AGENT, issue_url=ISSUE))
-    over = store.correct(record, "one more", actor=Actor.AGENT, issue_url=ISSUE)
+        store, _ = _applied(store.correct(record, f"v{n}", **as_agent()))
+    over = store.correct(record, "one more", **as_agent())
     assert over.refusal is RefusalCode.CORRECTIONS_FULL and over.store.records == store.records
     for n in range(2, MAX_RECORDS + 1):
         store, _ = _applied(propose(store, f"proposal {n}", seq=n))
@@ -338,6 +562,80 @@ def test_a_disabled_store_takes_no_write_but_a_retraction():
     )
     off, _ = _applied(off.retract(record, actor=Actor.OPERATOR, issue_url=None))
     assert off.record(record).status is Status.RETRACTED
+
+
+# -- a withdrawn text is withheld from its duplicates (R1-F2 of PR #513) --------------------
+
+_HELD = _evidence((1, "d" * 64), (2, "d" * 64))
+
+
+@pytest.mark.parametrize("withdrawal", ["retract", "correct", "operator"])
+def test_a_withdrawn_text_is_withheld_from_its_duplicate_after_a_save_and_a_load(
+    tmp_path, withdrawal
+):
+    """Two observations of one text citing different evidence: withdrawing one, by a
+    correction or a retraction, withholds the text from the other too, and the
+    checkpoint keeps it so."""
+    store, first = _applied(observe(_store(), "test_a fails: KeyError 'a'", seq=1))
+    store, second = _applied(observe(store, "test_a fails: KeyError 'a'", seq=2))
+    assert _render(store, _HELD).shown == (second, first)
+    controller = {"actor": Actor.CONTROLLER, "issue_url": ISSUE, "attempt": _launch(3)}
+    store, _ = _applied(
+        {
+            "retract": lambda: store.retract(first, **controller),
+            "correct": lambda: store.correct(first, "test_a passes at C2", **controller),
+            "operator": lambda: store.retract(first, actor=Actor.OPERATOR, issue_url=None),
+        }[withdrawal]()
+    )
+    projection = _render(store, _HELD)
+    assert "KeyError" not in projection.text and second not in projection.shown
+    assert projection.withdrawn == 1 and "1 withheld as withdrawn text" in projection.text
+    state = make_state(phase=Phase.ANALYZE_EXECUTE, run_id=RUN, launch_seq=3)
+    state.issue_memory = store.to_dict()
+    save_state(state, tmp_path / "state.json")
+    loaded = load_state(tmp_path / "state.json").memory_store()
+    assert _render(loaded, _HELD) == projection
+
+
+def test_an_agents_correction_withholds_its_text_from_another_attempts_duplicate():
+    store, first = _applied(propose(_store(), "the lock leaks", seq=1))
+    store, second = _applied(propose(store, "the lock leaks", seq=2))
+    assert _render(store).shown == (second, first)
+    store, _ = _applied(store.correct(first, "the cache leaks, not the lock", **as_agent(3)))
+    projection = _render(store)
+    assert projection.shown == (first,) and projection.withdrawn == 1
+    assert "the lock leaks" not in projection.text
+
+
+def test_a_withdrawal_hides_its_text_only_where_the_withdrawn_record_applied():
+    """The issue's evidence acceptance: the same claim in another valid scope stays."""
+    on_c1 = Applicability(candidate=CandidateScope.EXACT, commit=C1)
+    store, narrow = _applied(propose(_store(), "retry the fetch", seq=1, applies=on_c1))
+    store, broad = _applied(propose(store, "retry the fetch", seq=2))
+    store, elsewhere = _applied(propose(store, "retry the fetch", seq=3, issue=ISSUE_B))
+    store, _ = _applied(store.retract(narrow, **as_agent(4), reason="wrong on C1"))
+    on_c2 = _render(store, candidate=C2)
+    assert broad in on_c2.shown and on_c2.withdrawn == 0
+    on_c1_render = _render(store, candidate=C1)
+    assert broad not in on_c1_render.shown and on_c1_render.withdrawn == 1
+    issue_3 = _render(store, issue_url=ISSUE_B, step=_step(ISSUE_B))
+    assert issue_3.shown == (elsewhere,) and issue_3.withdrawn == 0
+
+
+def test_an_agent_withdrawing_its_own_proposal_hides_no_observation_or_operator_record():
+    """A withdrawal binds only what its writer could have withdrawn (D9.4): an agent
+    retracting a duplicate proposal cannot hide evidence; the operator's binds all."""
+    text = "use --format json"
+    held = _evidence((1, "d" * 64))
+    store, observed = _applied(observe(_store(), text, seq=1))
+    store, seeded = _applied(seed(store, text))
+    store, proposal = _applied(propose(store, text, seq=2))
+    store, _ = _applied(store.retract(proposal, **as_agent(3)))
+    projection = _render(store, held)
+    assert projection.shown == (observed, seeded) and projection.withdrawn == 0
+    store, _ = _applied(store.retract(seeded, actor=Actor.OPERATOR, issue_url=None))
+    projection = _render(store, held)
+    assert projection.shown == () and projection.withdrawn == 1 and text not in projection.text
 
 
 # -- nothing raw, nothing secret (D9.9) ----------------------------------------------------
@@ -410,6 +708,7 @@ def test_a_seeds_digest_is_the_files_and_survives_the_round_trip(tmp_path):
 # -- bounds (D9.6, D10) ----------------------------------------------------------------------
 
 
+@functools.cache
 def _largest_store() -> MemoryStore:
     """Every bound at its limit, in the characters that escape widest in the state file."""
     owner, repo = "o" * 39, "r" * 100
@@ -505,7 +804,7 @@ def test_a_state_at_the_ceiling_saves_and_loads(tmp_path):
 def _saved_store() -> dict:
     store, _ = _applied(observe(_store(), "observed", seq=1))
     store, record = _applied(propose(store, "proposed", seq=2))
-    store, _ = _applied(store.correct(record, "corrected", actor=Actor.AGENT, issue_url=ISSUE))
+    store, _ = _applied(store.correct(record, "corrected", **as_agent(2)))
     store, _ = _applied(seed(store, "seed"))
     store, _ = _applied(store.retract(1, actor=Actor.OPERATOR, issue_url=None))
     return store.to_dict()
@@ -569,6 +868,78 @@ def test_a_store_that_is_not_one_a_controller_wrote_is_refused_on_load(change, n
         MemoryStore.from_dict(data)
 
 
+def _lifecycle_store() -> dict:
+    """Every lifecycle write as a controller makes it: an observation corrected and
+    superseded, a seed retracted, a proposal corrected and superseded by an agent."""
+    controller = {"actor": Actor.CONTROLLER, "issue_url": ISSUE}
+    store, m1 = _applied(observe(_store(), "observed v1", seq=1))  # seq 1
+    store, _ = _applied(store.correct(m1, "observed v2", **controller, attempt=_launch(2)))  # 2
+    store, m2 = _applied(observe(store, "observed newer", seq=2))  # 3
+    store, _ = _applied(store.supersede(m1, m2, **controller))  # 4
+    store, m3 = _applied(seed(store, "the operator's lesson"))  # 5
+    store, _ = _applied(store.retract(m3, actor=Actor.OPERATOR, issue_url=None))  # 6
+    store, m4 = _applied(propose(store, "proposal", seq=3))  # 7
+    store, m5 = _applied(propose(store, "proposal newer", seq=4))  # 8
+    store, _ = _applied(store.correct(m4, "proposal v2", **as_agent(4)))  # 9
+    store, _ = _applied(store.supersede(m4, m5, **as_agent(6)))  # 10
+    store, _ = _applied(propose(store, "proposal newest", seq=7))  # M6, seq 11
+    return store.to_dict()
+
+
+def _older_launchs_proposal(d: dict) -> None:
+    """M5, which an agent's launch-6 write superseded M4 with, moved to launch 3."""
+    m5 = d["records"][4]
+    m5["attempt"]["launch_seq"] = 3
+    m5["events"][0]["attempt"]["launch_seq"] = 3
+
+
+@pytest.mark.parametrize(
+    ("change", "needle"),
+    [
+        # Unauthorized corrections, supersessions and retractions (D9.4).
+        (_tamper("records.0.events.1.actor", "agent"), "agent, which may not correct observed"),
+        (_tamper("records.0.events.1.actor", "operator"), "operator, which may not correct"),
+        (_tamper("records.0.events.2.actor", "agent"), "agent, which may not supersede observed"),
+        (_tamper("records.2.events.1.actor", "agent"), "agent, which may not retract operator"),
+        (_tamper("records.2.events.1.actor", "controller"), "may not retract operator records"),
+        # The launches each actor's write names.
+        (_tamper("records.3.events.1.attempt", None), "names no launch"),
+        (
+            _tamper("records.2.events.1.attempt", {"run_id": RUN, "launch_seq": 1}),
+            "names a launch",
+        ),
+        (_tamper("records.3.events.1.attempt.launch_seq", 2), "stale correction"),
+        # Supersessions the write would have refused.
+        (_tamper("records.0.superseded_by", 4), "with a proposed record"),
+        (_tamper("records.3.superseded_by", 6), "not current then"),
+        (_older_launchs_proposal, "older launch's proposal"),
+        # A proposal's origin, and its key.
+        (_tamper("records.3.origin", None), "required of an agent's proposal"),
+        (_tamper("records.3.origin.role", "boss"), "role"),
+        (_tamper("records.3.origin.input_sha", "abc"), "input_sha"),
+        (_tamper("records.0.origin", {"task": 1, "role": "producer", "input_sha": BASE}), "only"),
+    ],
+)
+def test_a_history_its_writes_would_have_refused_is_refused_on_load(change, needle):
+    data = _lifecycle_store()
+    MemoryStore.from_dict(data)
+    change(data)
+    with pytest.raises(StateError, match=needle):
+        MemoryStore.from_dict(data)
+
+
+def test_two_records_of_one_proposal_key_are_refused_on_load():
+    store, _ = _applied(propose(_store(), "one idea", seq=1))
+    data = store.to_dict()
+    twin = json.loads(json.dumps(data["records"][0]))
+    twin["id"] = 2
+    twin["events"][0]["seq"] = 2
+    data["records"].append(twin)
+    data["revision"] = 2
+    with pytest.raises(StateError, match="the same proposal"):
+        MemoryStore.from_dict(data)
+
+
 def test_the_state_refuses_another_runs_store_a_future_launch_and_another_repository(tmp_path):
     path = tmp_path / "state.json"
     good = make_state(run_id=RUN, launch_seq=2)
@@ -622,7 +993,7 @@ def _mixed_store() -> MemoryStore:
     store, _ = _applied(store.retract(9, actor=Actor.OPERATOR, issue_url=None))
     store, _ = _applied(propose(store, "old idea", seq=6))  # M10
     store, _ = _applied(propose(store, "new idea", seq=6))  # M11
-    store, _ = _applied(store.supersede(10, 11, actor=Actor.AGENT, issue_url=ISSUE))
+    store, _ = _applied(store.supersede(10, 11, **as_agent()))
     return store
 
 
@@ -686,6 +1057,49 @@ def test_the_projection_bound_holds_and_every_cut_is_counted():
     assert len(small.text) <= 4096 and small.omitted_for_bound > projection.omitted_for_bound
 
 
+def test_a_launch_citation_is_observed_only_with_the_receipt_the_run_keeps():
+    """R1-F1 of PR #513: a spent launch ordinal is not a receipt. A launch citation is
+    observed only when the run keeps that launch's receipt with the digest cited."""
+    receipt = "e" * 64
+    cite = Citation(CitationKind.LAUNCH, f"{RUN}/2", receipt)
+    store, _ = _applied(observe(_store(), "launch 2 ended: idle timeout", seq=2, cite=cite))
+
+    def downgraded(*launches) -> bool:
+        projection = _render(store, _evidence(launches=launches))
+        shown_unverified = "no longer held, so it is not verified" in projection.text
+        assert shown_unverified == bool(projection.downgraded)
+        return shown_unverified
+
+    assert downgraded()  # missing: launch 2 was spent, and no receipt is kept
+    assert downgraded((_launch(2), "f" * 64))  # mismatched digest
+    assert downgraded((_launch(3), receipt))  # another launch's receipt
+    assert downgraded((_launch(2, OTHER_RUN), receipt))  # another run's
+    assert not downgraded((_launch(2), receipt))  # retained
+    projection = _render(store, _evidence(launches=[(_launch(2), receipt)]))
+    assert "observed by the controller, which holds the evidence it cites" in projection.text
+
+
+def test_a_validation_record_citation_needs_the_records_own_digest():
+    store, _ = _applied(observe(_store(), "lint fails", seq=1))  # cites (1, d...)
+    assert _render(store, _evidence((1, "c" * 64))).downgraded == 1
+    assert _render(store, _evidence((2, "d" * 64))).downgraded == 1
+    assert _render(store, _evidence((1, "d" * 64))).downgraded == 0
+
+
+@pytest.mark.parametrize(
+    "bound", [MAX_PROJECTION_CHARS + 1, 100_000, MIN_PROJECTION_CHARS - 1, True, 4096.0]
+)
+def test_a_projection_bound_outside_the_registered_range_is_refused(bound):
+    """R1-F7 of PR #513: no request renders more than MAX_PROJECTION_CHARS."""
+    store = _store()
+    for n in range(1, 16):
+        store, _ = _applied(propose(store, f"{n:03d} " + "z" * (MAX_TEXT_BYTES - 8), seq=n))
+    with pytest.raises(ValueError, match="a projection bound is 2048 to 16384 characters"):
+        _render(store, max_chars=bound)
+    widest = _render(store, max_chars=MAX_PROJECTION_CHARS)
+    assert len(widest.text) <= MAX_PROJECTION_CHARS and widest.omitted_for_bound > 0
+
+
 def test_review_gets_no_projection_and_another_run_none_at_all():
     with pytest.raises(ValueError, match="REVIEW gets no Issue Memory"):
         _render(_store(), phase=Phase.REVIEW)
@@ -714,7 +1128,7 @@ def test_fixture_conflicting_memories_are_both_shown_by_trust_never_newest_wins(
 
 def test_fixture_corrected_memory_shows_only_its_last_revision():
     store, record = _applied(propose(_store(), "retry three times"))
-    store, _ = _applied(store.correct(record, "retry once", actor=Actor.AGENT, issue_url=ISSUE))
+    store, _ = _applied(store.correct(record, "retry once", **as_agent()))
     text = _render(store).text
     assert "retry once" in text and "retry three times" not in text
     assert "revision: 2 (corrected; earlier text withdrawn)" in text

@@ -3149,11 +3149,24 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   the operator's; the operator retracts any record; what supersedes is at
   least as strong as what the writer may change, so newer, unsupported text
   never replaces an observation;
+- scope and launches of a write: the controller's and an agent's writes
+  name the record's issue (absent or another issue refused, for each
+  operation), only the operator's may name none; an agent's names its
+  launch, the operator's none, and a launch of the wrong shape (`launch_seq`
+  0 among them) is refused for add, correct, supersede and retract, so every
+  store a write returns loads;
 - a correction or a retraction leaves its old text's digest as a tombstone,
   a later write of it is refused, and a retraction survives a save and a
-  load (the snapshot is what loads; nothing replays an older write);
-- an observation derived again, and a duplicate or replayed proposal, add
-  nothing;
+  load (the snapshot is what loads; nothing replays an older write); the
+  withdrawn text is withheld from a duplicate record wherever the withdrawn
+  record applied, after a save and a load too, but not from a record of
+  another candidate or issue, and an agent's withdrawal hides no observation
+  or operator's record;
+- an observation derived again adds nothing; the proposal ledger: a replay
+  of the same task, launch, role and input revision adds nothing, even after
+  a correction or a retraction, another key with the same text is a record
+  of its own, and an agent's write from an earlier launch than the last that
+  changed a record is refused as stale;
 - the bounds: records, corrections and text refused and counted, never by
   eviction; the largest store the bounds allow fits 1,048,576 bytes as the
   state file holds it, and a state at that ceiling saves and loads;
@@ -3161,13 +3174,19 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   or a credential's shape refused, the controller's escaped, redacted and
   cut; a seed kept byte for byte with its digest, or refused;
 - a store a controller did not write refused on load: each shape, a history
-  that does not explain the record, foreign tombstones, another run's
-  launch, a launch past `launch_seq`, an issue of another repository;
+  that does not explain the record, a correction, supersession or
+  retraction its actor may not make, a supersession the write would have
+  refused, a proposal's origin or two records of one proposal key, foreign
+  tombstones, another run's launch, a launch past `launch_seq`, an issue of
+  another repository;
 - the projection: observed, operator's, evidence-gone and proposed records
-  in that order, newest first; another issue, phase or candidate omitted
-  and counted; retracted and superseded records counted, never shown; the
-  bound kept with every cut counted; the same revision and request render
-  the same bytes; `REVIEW` and another run's store refused;
+  in that order, newest first; a launch citation observed only with the
+  receipt the run keeps and its digest (missing, mismatched and retained
+  receipts); another issue, phase or candidate omitted and counted;
+  retracted and superseded records counted, never shown; the bound kept with
+  every cut counted, and a bound above 16,384 characters refused; the same
+  revision and request render the same bytes; `REVIEW` and another run's
+  store refused;
 - the evaluation's owed Memory fixtures (evaluation protocol, section 8);
 - protocol 19 -> 20: a protocol-19 file loads with Memory off and
   `launch_seq` at its step count, an older label carrying either field and a
