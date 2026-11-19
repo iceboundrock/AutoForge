@@ -653,6 +653,7 @@ def provider_request(
     workspace: str,
     operator_paths: tuple[str, ...] = (),
     denied_roots: tuple[str, ...] = (),
+    controller_config: str = "",
 ) -> SandboxRequest:
     """A provider's declaration alone, around a scratch ``workspace`` (ADR 0005 D14.1).
 
@@ -661,15 +662,30 @@ def provider_request(
     rows every agent launch gets from its provider and the operator, the
     workspace writable, and none of a workflow's (no repository, no cache,
     no read context). The same rules as :func:`sandbox_request`'s.
+    ``controller_config`` is the directory #165's overrides point into,
+    read-only as an agent launch has it (empty: none, as for ``doctor``).
     """
     declared = _declared(needs, operator_paths, home)
     workspace_projection = ProjectionRequest(
         workspace, Access.WRITABLE, Origin.ENGINE, label="the scratch workspace"
     )
+    config = (
+        (
+            ProjectionRequest(
+                controller_config,
+                Access.READ_ONLY,
+                Origin.ENGINE,
+                carve_out=False,
+                label="the launch's gh, git and shell configuration",
+            ),
+        )
+        if controller_config
+        else ()
+    )
     return SandboxRequest(
         home=home,
         controller_env=controller_env,
-        projections=(workspace_projection, *declared.projections),
+        projections=(workspace_projection, *config, *declared.projections),
         denied_roots=tuple(dict.fromkeys(denied_roots)),
         operator_config_roots=declared.operator_roots,
         keyring_items=declared.keyring,
@@ -889,6 +905,62 @@ def describe_launch(
     except SandboxPolicyError as exc:
         raise policy_refusal(exc, facts) from exc
     return bind(rewrite_environment(description, env, needs), planner)
+
+
+@dataclass(frozen=True)
+class ProbeSandbox:
+    """Where a provider's runtime probe runs when its launch would be enforced.
+
+    The engine's facts for one probe a launch that needs a fresh context
+    asks before it is charged (ADR 0015 D18; R4-F1 of PR #513): the scratch
+    ``workspace`` it runs in, the operator's home and the controller's
+    environment (D4.3), the operator's read-only paths, the denied roots (every
+    worktree, the state directory and the lock among them) and the directory
+    #165's overrides point into, and the backend whose plan step compiles it.
+    """
+
+    home: str
+    controller_env: Mapping[str, str]
+    workspace: str
+    operator_paths: tuple[str, ...] = ()
+    denied_roots: tuple[str, ...] = ()
+    controller_config: str = ""
+    backend: SandboxBackend = field(default_factory=default_backend)
+
+    def describe(self, needs: ProviderRequirements, env: Mapping[str, str]) -> LaunchDescription:
+        """The probe's description, compiled as ``doctor`` compiles its ``--version``.
+
+        :func:`provider_request` around the scratch workspace, so the probe
+        sees the provider's declaration, the operator's read-only paths and
+        the launch's configuration, and no repository, read context or state
+        directory; compiled by the backend's plan step and its environment
+        rewritten (D8.2) as :func:`describe_launch` does for a launch. A
+        request the compiler refuses is a :class:`SandboxLaunchRefusedError`,
+        before anything is spawned.
+        """
+        request = provider_request(
+            needs,
+            home=self.home,
+            controller_env=self.controller_env,
+            workspace=self.workspace,
+            operator_paths=self.operator_paths,
+            denied_roots=self.denied_roots,
+            controller_config=self.controller_config,
+        )
+        try:
+            description = self.backend.plan(request)
+        except SandboxPolicyError as exc:
+            reason = redact(str(exc))
+            raise SandboxLaunchRefusedError(
+                f"the sandbox cannot be established for the provider's runtime probe: {reason}",
+                SandboxFacts(
+                    enforced=False,
+                    backend="",
+                    network=NetworkPosition.HOST.value,
+                    setup_failure=reason,
+                ),
+            ) from exc
+        return bind(rewrite_environment(description, env, needs), self.backend)
 
 
 def policy_refusal(exc: SandboxPolicyError, facts: LaunchFacts) -> SandboxLaunchRefusedError:

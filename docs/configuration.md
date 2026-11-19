@@ -1540,14 +1540,24 @@ a value:
   auto memory, which an earlier launch would have written under your Claude
   configuration, is neither read nor written (the 2.1.328 build reads the
   variable before any setting; a launch with Memory off sets nothing new).
-  The proof holds only for a Claude Code that honours the variable, so
-  before such a launch is charged the controller runs the profile's own
-  `claude --version` (its `command`, found through the launch's
-  environment) and refuses the launch unless it reports 2.1.328 or later:
-  an older build, a pre-release of 2.1.328, a version it cannot read, a
-  failing or silent probe and a missing executable are refused alike,
-  naming what was read and never the output. Upgrade Claude Code, or route
-  the phase to another provider. A launch with Memory off is never probed.
+  The proof holds only for a Claude Code build known to honour the
+  variable, so before such a launch is charged the controller runs the
+  profile's own `claude --version` as the launch would run: its `command`
+  resolved on the launch's `PATH`, in the launch's environment (the
+  allow-list, the controller's overrides, the adapter's isolation and the
+  variable), in a scratch directory and never in the worktree, and, when
+  the launch would be enforced, inside the outer sandbox, compiled as
+  `doctor`'s sandboxed `--version` is. It refuses the launch unless the
+  answer is a build that variable was checked against: 2.1.328 today. A
+  later build is refused too, until someone checks how it treats the
+  variable and adds it, since a build nobody checked proves nothing; so
+  are an older build, a pre-release, a version it cannot read, a failing or
+  silent probe, one the sandbox refuses and a missing executable, naming
+  what was read and never the output. The launch then starts that very
+  executable, unchanged since it answered, or is refused: an update between
+  the check and the launch, or a `PATH` that now leads elsewhere, launches
+  nothing. Run a checked build, or route the phase to another provider. A
+  launch with Memory off is never probed.
   Such a launch is also refused before anything starts while the `env` of
   your Claude settings or global configuration sets that variable, which
   Claude Code would apply over the launch's. It is refused with

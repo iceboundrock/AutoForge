@@ -143,6 +143,7 @@ import os
 import re
 import secrets
 import shlex
+import tempfile
 import time
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
@@ -202,6 +203,7 @@ from .certificate import (
     remote_certificate,
 )
 from .child_env import (
+    LaunchIdentity,
     describe_overrides,
     isolated_overrides,
     override_names,
@@ -496,6 +498,7 @@ from .providers import (
     AgentExecutionResult,
     AgentProvider,
     AgentRequest,
+    FreshContextRuntime,
     ProviderRegistry,
     provider_for,
 )
@@ -624,6 +627,7 @@ from .sandbox_policy import (
     SANDBOX_DIR,
     LaunchClass,
     LaunchFacts,
+    ProbeSandbox,
     SandboxPlan,
     absolute_spelling,
     class_summary,
@@ -3384,6 +3388,61 @@ class ControllerEngine:
         change = phase in WORKTREE_STATE_PHASES
         facts = self._remote_facts(cwd, overrides, read_context, cache=change)
         return replace(facts, provider_state=provider_state)
+
+    def _fresh_context_runtime(
+        self,
+        provider: AgentProvider,
+        profile: ProfileConfig,
+        env_allowlist: tuple[str, ...],
+        identity: LaunchIdentity,
+    ) -> FreshContextRuntime | None:
+        """ADR 0015 D18's dynamic check of a launch that needs a fresh context (R4-F1 of PR #513).
+
+        The adapter's probe (:meth:`AgentProvider.fresh_context_probe`; ``None``
+        when it asks nothing), run before the launch-intent save as the launch
+        will run: its executable resolved on the launch's ``PATH`` as the launch
+        resolves it, in the launch's environment (the allow-listed variables,
+        #165's overrides, the adapter's isolation and what a fresh context
+        sets), and whenever the launch would be enforced, inside the outer
+        sandbox, compiled as ``doctor``'s sandboxed ``--version`` is (ADR 0005
+        D14.1): around a scratch directory, with every worktree, the state
+        directory and the lock denied. Never in the worktree, and never
+        unenforced in place of enforced. The adapter judges the answer
+        (:meth:`AgentProvider.fresh_context_runtime`): a refusal is a
+        ConfigurationError before anything is charged or saved, and the
+        runtime it establishes is the executable the launch must start
+        (:meth:`AgentProvider.fresh_context_command`).
+        """
+        if provider.fresh_context_probe(profile) is None:
+            return None
+        enforced = self._sandbox_enforced()
+        home = _operator_home()
+        with ExitStack() as stack:
+            overrides = stack.enter_context(isolated_overrides(identity))
+            isolation = stack.enter_context(provider.integration_isolation())
+            workspace = os.path.realpath(
+                stack.enter_context(tempfile.TemporaryDirectory(prefix="autoforge-probe-"))
+            )
+            return provider.establish_fresh_context(
+                profile,
+                env_allowlist,
+                {**overrides, **isolation, **provider.fresh_context_environment(True)},
+                workspace=workspace,
+                home=home,
+                sandbox=(
+                    ProbeSandbox(
+                        home=home,
+                        controller_env=dict(os.environ),
+                        workspace=workspace,
+                        operator_paths=tuple(self.config.sandbox.read_only_paths),
+                        denied_roots=self.gate_denied_roots(),
+                        controller_config=overrides_directory(overrides),
+                        backend=launch_backend(),
+                    )
+                    if enforced
+                    else None
+                ),
+            )
 
     def _provider_state(self, provider: AgentProvider, profile: ProfileConfig) -> tuple[str, ...]:
         """The issue's sandbox directory and the provider's state directories in it.
@@ -17001,10 +17060,14 @@ class ControllerEngine:
             # to this invocation's (ADR 0015 D14, D18; R2-F7 of PR #513).
             fresh_context = self.config.memory.enabled and phase.value in MEMORY_PHASES
             provider.integration_preflight(env_allowlist, fresh_context=fresh_context)
-            if fresh_context:
-                # The runtime the launch would start honours what the profile's
-                # proof rests on, or nothing is charged or saved (R3-F5 of PR #513).
-                provider.fresh_context_preflight(profile, cwd, env_allowlist)
+            # The runtime the launch will start honours what the profile's proof
+            # rests on, established under the launch's own isolation, or nothing
+            # is charged or saved (R3-F5, R4-F1 of PR #513).
+            runtime = (
+                self._fresh_context_runtime(provider, profile, env_allowlist, identity)
+                if fresh_context
+                else None
+            )
             # What the agent reads from GitHub, read by the controller (it
             # holds no credential to read it itself) and written before the
             # prompt that names it is rendered; nothing is saved yet.
@@ -17090,6 +17153,7 @@ class ControllerEngine:
                 loop_detection=self.config.execution.loop_detection,
                 interaction=broker,
                 fresh_context=fresh_context,
+                fresh_context_runtime=runtime,
             )
             record = ExecutionRecord(
                 run_id=state.run_id,
@@ -17118,7 +17182,7 @@ class ControllerEngine:
                     "env_set": [
                         *override_names(),
                         *provider.isolation_names,
-                        *provider.fresh_context_environment(req),
+                        *provider.fresh_context_environment(req.fresh_context),
                     ],
                     "sandbox_mode": self.config.sandbox.mode,
                 },

@@ -2517,38 +2517,158 @@ def test_only_a_memory_phases_launch_with_memory_on_needs_a_fresh_context(tmp_pa
 def test_a_runtime_that_cannot_honour_a_fresh_context_refuses_before_the_launch_intent_save(
     tmp_path, monkeypatch
 ):
-    """R3-F5 of PR #513: the engine asks the adapter to establish that the runtime it
-    would start honours the profile's fresh-context proof before the launch-intent
-    save, so a refusal charges nothing, spends no launch ordinal and writes nothing. A
-    launch with Memory off never asks."""
-    from autoforge.providers import ScriptedProvider, no_fresh_context
+    """R3-F5, R4-F1 of PR #513: the engine has the adapter establish the runtime its
+    launch will start before the launch-intent save, in a scratch directory with the
+    launch's environment (#165's overrides included), inside the probe's sandbox when
+    the launch would be enforced; a refusal charges nothing, spends no launch ordinal
+    and writes nothing, and an established runtime reaches the launch. A launch with
+    Memory off never asks."""
+    from autoforge.child_env import override_names
+    from autoforge.providers import (
+        FreshContextRuntime,
+        RuntimeProbe,
+        ScriptedProvider,
+        no_fresh_context,
+    )
+    from autoforge.sandbox_policy import ProbeSandbox
     from tests.conftest import FakeGitHub, implement
 
-    asked: list[str] = []
+    asked: list[tuple] = []
+    refusing = [True]
+    runtime = FreshContextRuntime("/bin/true", (1, 2, 3, 4), "test")
 
-    def refuse(self, profile, cwd, env_allowlist):
-        asked.append(profile.name)
-        raise no_fresh_context(profile, "its CLI is older than the proof's build", "Upgrade it")
+    def establish(self, profile, env_allowlist, env, *, workspace, home, sandbox):
+        asked.append((profile.name, workspace, os.path.isdir(workspace), sandbox, dict(env)))
+        if refusing[0]:
+            raise no_fresh_context(profile, "its CLI is not a checked build", "Upgrade it")
+        return runtime
 
-    monkeypatch.setattr(ScriptedProvider, "fresh_context_preflight", refuse)
+    monkeypatch.setattr(
+        ScriptedProvider,
+        "fresh_context_probe",
+        lambda self, profile: RuntimeProbe(("scripted-agent", "--version"), 30, 4096),
+    )
+    monkeypatch.setattr(ScriptedProvider, "establish_fresh_context", establish)
+    for mode, memory in (("disabled", True), ("required", True), ("disabled", False)):
+        sd = tmp_path / f"{mode}-{memory}" / ".autoforge"
+        cfg = default_config()
+        cfg.sandbox = dataclasses.replace(cfg.sandbox, mode=mode)
+        eng = make_engine(sd, implement, github=FakeGitHub(), cfg=cfg, origin=True)
+        eng.config.memory.enabled = memory
+        eng.record_run_configuration()
+        eng._save()
+        assert eng.step().next_phase == "ANALYZE_EXECUTE"
+        before = eng.paths.state_file.read_bytes()
+        refusing[0] = True
+        if memory:
+            with pytest.raises(ConfigurationError, match="not a checked build"):
+                eng.step()
+            assert eng.paths.state_file.read_bytes() == before
+            assert load_state(eng.paths.state_file).launch_seq == 0
+            assert eng.provider.calls == []
+            name, workspace, existed, sandbox, env = asked[-1]
+            assert name == "analyze_execute" and existed and not os.path.exists(workspace)
+            assert os.path.basename(workspace).startswith("autoforge-probe-")
+            assert set(override_names()) <= set(env)
+            if mode == "required":
+                assert isinstance(sandbox, ProbeSandbox) and sandbox.workspace == workspace
+                assert str(eng.paths.state_dir.resolve()) in sandbox.denied_roots or any(
+                    os.path.realpath(root) == os.path.realpath(eng.paths.state_dir)
+                    for root in sandbox.denied_roots
+                )
+            else:
+                assert sandbox is None
+            if mode == "disabled":
+                refusing[0] = False
+                eng.step()
+                assert load_state(eng.paths.state_file).launch_seq == 1
+                assert eng.provider.calls[-1].fresh_context_runtime == runtime
+        else:
+            count = len(asked)
+            eng.step()
+            assert len(asked) == count  # Memory off: nothing asked
+            assert load_state(eng.paths.state_file).launch_seq == 1
+            assert eng.provider.calls[-1].fresh_context_runtime is None
+    assert len(asked) == 3
+
+
+@pytest.mark.parametrize("output_format", ["stream-json", "text"])
+def test_a_claude_launch_of_a_memory_phase_starts_the_build_established_before_its_save(
+    tmp_path, monkeypatch, output_format
+):
+    """R4-F1 of PR #513, end to end through the engine and the real Claude adapter in
+    both output formats: with Memory on, ``--version`` is asked of the profile's own
+    executable before the launch-intent save, in a scratch directory with the launch's
+    auto memory variable; an unchecked build is refused with the state as it was, and
+    a checked one is saved as the launch's intent and then started, that very
+    executable with its auto memory off. With Memory off nothing is asked and the
+    launch starts its command as before."""
+    from autoforge import providers
+    from autoforge.executor import ExecutionResult
+    from autoforge.providers import ClaudeCodeProvider
+    from tests.conftest import FakeGitHub
+
+    class Launched(Exception):
+        pass
+
+    command = tmp_path / "bin" / "claude"
+    command.parent.mkdir()
+    command.write_text("#!/bin/sh\nexit 0\n")
+    command.chmod(0o755)
     for memory in (True, False):
+        calls: list[tuple] = []
+        version = ["2.1.329 (Claude Code)"]
         sd = tmp_path / str(memory) / ".autoforge"
-        eng = make_engine(sd, implement, github=FakeGitHub(), origin=True)
+
+        def runner(req, calls=calls, version=version, sd=sd):
+            if req.command[1:] == ["--version"]:
+                calls.append(("probe", req, (sd / "state.json").read_bytes()))
+                return ExecutionResult(req.command, req.cwd, 0, version[0] + "\n", "", "", "")
+            calls.append(("launch", req, None))
+            raise Launched
+
+        monkeypatch.setattr(providers, "start_duplex", lambda req, runner=runner: runner(req))
+        eng = make_engine(sd, "never", github=FakeGitHub(), origin=True)
+        eng.providers._overrides["claude"] = ClaudeCodeProvider(runner=runner)
+        profile = dataclasses.replace(eng.config.profile("analyze_execute"), command=str(command))
+        if output_format == "text":
+            # Silent until it exits, so it runs under a wall-clock limit only.
+            profile = dataclasses.replace(
+                profile,
+                options={**profile.options, "output_format": "text"},
+                max_runtime_seconds=600,
+            )
+        eng.config.profiles["analyze_execute"] = profile
         eng.config.memory.enabled = memory
         eng.record_run_configuration()
         eng._save()
         assert eng.step().next_phase == "ANALYZE_EXECUTE"
         before = eng.paths.state_file.read_bytes()
         if memory:
-            with pytest.raises(ConfigurationError, match="older than the proof's build"):
+            with pytest.raises(ConfigurationError, match="reports 2.1.329, and only 2.1.328"):
                 eng.step()
             assert eng.paths.state_file.read_bytes() == before
             assert load_state(eng.paths.state_file).launch_seq == 0
-            assert eng.provider.calls == []
-        else:
+            ((kind, probe, at),) = calls
+            assert kind == "probe" and at == before
+            assert probe.command == [os.path.realpath(command), "--version"]
+            assert os.path.basename(probe.cwd).startswith("autoforge-probe-")
+            assert probe.env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+            version[0] = "2.1.328 (Claude Code)"
+            calls.clear()
+        with pytest.raises(Launched):
             eng.step()
-            assert load_state(eng.paths.state_file).launch_seq == 1
-    assert asked == ["analyze_execute"]
+        assert load_state(eng.paths.state_file).launch_seq == 1
+        launch = calls[-1][1]
+        assert calls[-1][0] == "launch" and "--version" not in launch.command
+        if memory:
+            (kind, probe, at), _ = calls
+            assert kind == "probe" and at == before  # asked before the intent save
+            assert launch.command[0] == os.path.realpath(command) and launch.cwd != probe.cwd
+            assert launch.env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+        else:
+            assert len(calls) == 1 and launch.command[0] == str(command)
+            assert "CLAUDE_CODE_DISABLE_AUTO_MEMORY" not in (launch.env or {})
 
 
 # -- the operator's commands (D9.5, W9) ----------------------------------------------------------

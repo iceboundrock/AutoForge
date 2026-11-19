@@ -49,9 +49,11 @@ profile likewise, and an `opencode-sdk` profile. A Claude launch of that
 phase also has Claude Code's auto memory turned off
 (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`), and is refused while the `env` of
 your Claude settings sets that variable, or unless the profile's own
-`claude --version` reports 2.1.328 or later, the build that variable was
-read from. With Memory off, nothing of this is checked and no launch
-changes.
+`claude --version`, asked before the launch is charged as the launch runs
+(inside the outer sandbox when the launch would be), reports a build that
+variable was checked against: 2.1.328 only, a later build included until it
+is checked. The launch then starts that very executable. With Memory off,
+nothing of this is checked and no launch changes.
 
 ### `claim-ambiguous`: `status` goes by what the reason names (#375)
 

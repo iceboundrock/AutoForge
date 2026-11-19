@@ -3239,11 +3239,16 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   both output formats) and is refused while the user's or global
   configuration's `env` sets that variable, and every other launch's
   environment is as before (`tests/test_providers.py`); the profile's own
-  `claude --version` passes from 2.1.328 and refuses an older build, a
-  pre-release, an unreadable, failing or silent probe and a missing
-  executable, unquoted, and only a launch that needs a fresh context is
-  probed; the engine asks before the launch-intent save, so a refusal
-  spends no launch ordinal and writes nothing;
+  `claude --version` passes for the checked build 2.1.328 only and refuses
+  an older or later build, a pre-release, an unreadable, failing, silent or
+  sandbox-refused probe and a missing executable, unquoted; it runs through
+  the adapter's runner with the launch's allow-list and environment, in a
+  scratch directory, inside the probe's sandbox when the launch would be
+  enforced; a launch starts only the executable it established, unchanged,
+  in both output formats, and runs no probe itself; only a launch that
+  needs a fresh context is probed, and the engine asks before the
+  launch-intent save, in both output formats, so a refusal spends no
+  launch ordinal and writes nothing (`tests/test_memory.py`);
 - no module that decides imports Memory, and the engine touches it only in
   the run-configuration record and check; a run with Memory on and a seed
   goes through the same phases, launches and writes as one with it off;

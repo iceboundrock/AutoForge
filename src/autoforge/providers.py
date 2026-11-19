@@ -352,6 +352,7 @@ from .container_auth import (
     private_path,
 )
 from .errors import (
+    AutoForgeError,
     ChildStdinClosedError,
     ConfigurationError,
     ExecutionError,
@@ -402,10 +403,12 @@ from .sandbox import LaunchDescription, SandboxFacts
 from .sandbox_policy import (
     AuthItem,
     AuthMode,
+    ProbeSandbox,
     ProviderRequirements,
     SandboxPlan,
     declared_writable,
     executable_requirements,
+    resolve_command,
 )
 from .sdk_assets import (
     CLAUDE_ENVIRONMENT_PROBE,
@@ -505,6 +508,11 @@ class AgentRequest:
     # rests on (:meth:`AgentProvider.fresh_context_environment`). ``False``
     # launches exactly as before Memory existed.
     fresh_context: bool = False
+    # The runtime the engine established, before the launch-intent save,
+    # that such a launch may start (:meth:`AgentProvider.fresh_context_probe`;
+    # R4-F1 of PR #513): the adapter starts exactly that executable, or
+    # refuses. ``None`` for an adapter whose proof rests on its argv alone.
+    fresh_context_runtime: FreshContextRuntime | None = None
 
     def __post_init__(self) -> None:
         self.loop_detection = self.loop_detection.for_invocation(self.profile.provider, self.phase)
@@ -869,6 +877,49 @@ def _truthy(value: str | None, default: bool) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+@dataclass(frozen=True)
+class RuntimeProbe:
+    """What an adapter asks of the runtime a fresh-context launch would start
+    (ADR 0015 D18's dynamic check; R3-F5, R4-F1 of PR #513).
+
+    The engine runs ``command`` before the launch-intent save as a launch of
+    the profile runs: its executable resolved on the launch's ``PATH`` as
+    the launch resolves it, in the launch's environment, and inside the
+    outer sandbox whenever the launch would be, around a scratch directory
+    as ``doctor``'s sandboxed ``--version`` is (ADR 0005 D14.1). The adapter
+    judges the result (:meth:`AgentProvider.fresh_context_runtime`).
+    """
+
+    command: tuple[str, ...]
+    timeout_seconds: int
+    max_output_bytes: int
+
+
+@dataclass(frozen=True)
+class FreshContextRuntime:
+    """The executable a fresh-context launch was established on, and what it said.
+
+    ``executable`` is its resolved host path, and ``identity`` its device,
+    inode, size and modification time when it answered: a launch starts
+    exactly that file, unchanged since, or is refused
+    (:meth:`AgentProvider.fresh_context_command`), so an update or another
+    ``PATH`` between the check and the launch voids nothing silently.
+    """
+
+    executable: str
+    identity: tuple[int, int, int, int]
+    version: str
+
+    @staticmethod
+    def identity_of(executable: str) -> tuple[int, int, int, int] | None:
+        """``executable``'s identity now, ``None`` when it cannot be read."""
+        try:
+            st = os.stat(executable)
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
 def no_fresh_context(profile: ProfileConfig, why: str, remedy: str) -> ConfigurationError:
     """The refusal of a profile a Memory phase routes to that cannot prove a fresh context.
 
@@ -988,7 +1039,7 @@ class AgentProvider:
         again before it launches. The base adapter has nothing to refuse.
         """
 
-    def fresh_context_environment(self, req: AgentRequest) -> dict[str, str]:
+    def fresh_context_environment(self, fresh_context: bool) -> dict[str, str]:
         """What this adapter sets over a launch's environment so that a launch
         of :attr:`AgentRequest.fresh_context` starts with one (ADR 0015 D14),
         ``{}`` for any other launch. Part of the proof
@@ -997,18 +1048,132 @@ class AgentProvider:
         """
         return {}
 
-    def fresh_context_preflight(
-        self, profile: ProfileConfig, cwd: str, env_allowlist: tuple[str, ...] | None
-    ) -> None:
-        """Establish that the runtime a launch of ``profile`` would start honours
-        what :meth:`fresh_context_proof` rests on (ADR 0015 D18's dynamic check;
-        R3-F5 of PR #513), for a launch of :attr:`AgentRequest.fresh_context`
-        only. :class:`ConfigurationError` (:func:`no_fresh_context`) before
-        anything starts when it cannot: the engine calls this before the
-        launch-intent save, and :meth:`execute` again before it launches. The
-        base adapters' proofs rest on the argv they build, which no runtime
-        changes, so there is nothing to establish.
+    def fresh_context_probe(self, profile: ProfileConfig) -> RuntimeProbe | None:
+        """What establishes that the runtime a launch of ``profile`` would start
+        honours what :meth:`fresh_context_proof` rests on (ADR 0015 D18's
+        dynamic check; R3-F5, R4-F1 of PR #513), for a launch of
+        :attr:`AgentRequest.fresh_context` only; ``None`` when nothing needs
+        establishing. The engine runs it before the launch-intent save, as the
+        launch would run (:class:`RuntimeProbe`), and hands the adapter's
+        verdict (:meth:`fresh_context_runtime`) to the launch. The base
+        adapters' proofs rest on the argv they build, which no runtime
+        changes.
         """
+        return None
+
+    def establish_fresh_context(
+        self,
+        profile: ProfileConfig,
+        env_allowlist: tuple[str, ...] | None,
+        env: Mapping[str, str],
+        *,
+        workspace: str,
+        home: str,
+        sandbox: ProbeSandbox | None,
+    ) -> FreshContextRuntime | None:
+        """Run :meth:`fresh_context_probe` as a launch of ``profile`` would run, and judge it.
+
+        ADR 0015 D18's dynamic check (R4-F1 of PR #513), before the
+        launch-intent save. ``env`` is what the launch sets over its
+        allow-listed environment (#165's overrides, :meth:`integration_isolation`
+        and :meth:`fresh_context_environment`); the probe's executable is
+        resolved on that environment's ``PATH`` as :meth:`sandboxed` resolves
+        the launch's, and run with this adapter's runner, in the scratch
+        ``workspace`` (never the worktree), inside ``sandbox`` whenever the
+        launch would be enforced, never without it then. ``None`` when the
+        adapter asks nothing; the refusal (:func:`no_fresh_context`) when the
+        answer establishes nothing, before anything is charged.
+        """
+        probe = self.fresh_context_probe(profile)
+        if probe is None:
+            return None
+        command = list(probe.command)
+        launch_env = {**self.launch_environment(env_allowlist), **env}
+        try:
+            needs = self.sandbox_requirements(profile, command, launch_env, home)
+        except (AutoForgeError, OSError) as exc:
+            return self.fresh_context_runtime(profile, command[0], None, str(exc))
+        if not needs.executable:
+            return self.fresh_context_runtime(profile, "", None)
+        try:
+            description = None if sandbox is None else sandbox.describe(needs, launch_env)
+            result = self._runner(
+                ExecutionRequest(
+                    command=[needs.executable, *command[1:]],
+                    cwd=workspace,
+                    timeout_seconds=probe.timeout_seconds,
+                    max_output_bytes=probe.max_output_bytes,
+                    env_allowlist=(
+                        None if env_allowlist is None else self.launch_allowlist(env_allowlist)
+                    ),
+                    env=dict(env),
+                    contain_orphans=True,
+                    sandbox=description,
+                )
+            )
+        except ExecutionError as exc:
+            return self.fresh_context_runtime(profile, needs.executable, None, str(exc))
+        return self.fresh_context_runtime(profile, needs.executable, result)
+
+    def fresh_context_runtime(
+        self,
+        profile: ProfileConfig,
+        executable: str,
+        result: ExecutionResult | None,
+        failure: str = "",
+    ) -> FreshContextRuntime:
+        """The runtime :meth:`fresh_context_probe`'s answer establishes, or the
+        refusal (:func:`no_fresh_context`, a ConfigurationError).
+
+        ``executable`` is the resolved path the probe ran (``""``: none was
+        found on the launch's ``PATH``), ``result`` its answer, and
+        ``failure`` why it could not be run (``result`` is then ``None``).
+        An adapter that asks nothing establishes nothing.
+        """
+        raise no_fresh_context(
+            profile, "its provider establishes no runtime", "Route the phase elsewhere"
+        )
+
+    def fresh_context_command(
+        self, req: AgentRequest, command: list[str], env: Mapping[str, str]
+    ) -> list[str]:
+        """``command`` as a launch of :attr:`AgentRequest.fresh_context` starts it.
+
+        Unchanged for any other launch, and for an adapter whose
+        :meth:`fresh_context_probe` asks nothing. Otherwise the launch starts
+        the very executable :attr:`AgentRequest.fresh_context_runtime` was
+        established on (R4-F1 of PR #513): ``command[0]`` resolved on
+        ``env``'s ``PATH`` (the launch's, :meth:`started_environment`) as the
+        spawn would resolve it must be that file, unchanged since it
+        answered, and is then named by its resolved path. A launch with no
+        established runtime, or another executable, is refused
+        (:func:`no_fresh_context`) before anything is spawned. Nothing is run.
+        """
+        if not req.fresh_context or self.fresh_context_probe(req.profile) is None:
+            return command
+        runtime = req.fresh_context_runtime
+        remedy = "Run it from the engine, which establishes its runtime before the launch"
+        if runtime is None:
+            raise no_fresh_context(
+                req.profile,
+                "no runtime was established for this launch before it was charged",
+                remedy,
+            )
+        found = resolve_command(command[0], env.get("PATH"))
+        if not found or found != runtime.executable:
+            raise no_fresh_context(
+                req.profile,
+                f"the launch would start {found or 'no executable'}, not "
+                f"{runtime.executable}, whose runtime was established",
+                remedy,
+            )
+        if FreshContextRuntime.identity_of(found) != runtime.identity:
+            raise no_fresh_context(
+                req.profile,
+                f"{found} changed after its runtime was established",
+                "Repeat the command once the CLI is no longer being updated",
+            )
+        return [runtime.executable, *command[1:]]
 
     def own_names(self, profile: ProfileConfig | None) -> tuple[str, ...]:
         """The variables this provider adds to the allow-list of ``profile``'s agents."""
@@ -1240,13 +1405,13 @@ class AgentProvider:
                 stop.set()
 
         self.integration_preflight(req.env_allowlist, fresh_context=req.fresh_context)
-        if req.fresh_context:
-            self.fresh_context_preflight(req.profile, req.cwd, req.env_allowlist)
         with self.integration_isolation() as isolation:
-            isolation = {**isolation, **self.fresh_context_environment(req)}
+            isolation = {**isolation, **self.fresh_context_environment(req.fresh_context)}
             env = {**(req.env or {}), **isolation} if isolation else req.env
             command, description = self.sandboxed(req, command, env)
-            self.complete_isolation(isolation, self.started_environment(req, env, description))
+            started = self.started_environment(req, env, description)
+            command = self.fresh_context_command(req, command, started)
+            self.complete_isolation(isolation, started)
             res = self._runner(
                 ExecutionRequest(
                     command=command,
@@ -1504,13 +1669,16 @@ CLAUDE_LIFECYCLE_ENV = {"CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"}
 # launch is unchanged. Not for ``claude-sdk``, whose policy turns auto memory
 # off in its settings and checks ``init`` for it (docs/sdk-policy.md).
 CLAUDE_FRESH_CONTEXT_ENV = {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
-# The first Claude Code build the variable above was read from (R3-F5 of PR
-# #513): 2.1.328 decides auto memory from it before any setting. An earlier
-# build is not known to honour it, so a launch that needs a fresh context runs
-# only a CLI whose `claude --version` reports this build or a later one, asked
-# of the very executable the launch would start, in its environment, before
-# the launch is charged (:meth:`ClaudeCodeProvider.fresh_context_preflight`).
-CLAUDE_FRESH_CONTEXT_MIN_VERSION = (2, 1, 328)
+# The Claude Code builds the variable above was read from (R3-F5, R4-F1 of PR
+# #513): 2.1.328 decides auto memory from it before any setting. A launch that
+# needs a fresh context runs only a CLI whose `claude --version` reports one of
+# these builds, a release and not a pre-release, asked of the very executable
+# the launch then starts, in its environment and under the launch's isolation,
+# before the launch is charged (:meth:`ClaudeCodeProvider.fresh_context_probe`).
+# An exact list, not a floor: a later build is refused until someone reads how
+# it treats the variable and adds it here, as for a flag of CLAUDE_MEMORY_ARGS,
+# since a build nobody checked proves nothing.
+CLAUDE_FRESH_CONTEXT_VERSIONS: frozenset[tuple[int, int, int]] = frozenset({(2, 1, 328)})
 # The probe's bounds: `--version` answers at once and prints one line.
 CLAUDE_VERSION_PROBE_SECONDS = 30
 CLAUDE_VERSION_PROBE_MAX_OUTPUT_BYTES = 4096
@@ -1518,10 +1686,17 @@ CLAUDE_VERSION_PROBE_MAX_OUTPUT_BYTES = 4096
 _CLAUDE_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(?: \(Claude Code\))?")
 
 
-def parse_claude_version(text: str) -> tuple[int, int, int] | None:
-    """``(major, minor, patch)`` from ``claude --version`` output, or None when
-    unreadable; a pre-release sorts below its release, as for Pi and OpenCode."""
-    return _parse_version(text, _CLAUDE_VERSION_RE)
+def claude_release(text: str) -> tuple[tuple[int, int, int] | None, bool]:
+    """The release ``claude --version`` output names, and whether it is a pre-release.
+
+    ``(None, False)`` when the output is not one line of the version's shape.
+    """
+    lines = text.strip().splitlines()
+    match = _CLAUDE_VERSION_RE.fullmatch(lines[0].strip()) if len(lines) == 1 else None
+    if match is None:
+        return None, False
+    major, minor, patch = (int(part) for part in match.group(1, 2, 3))
+    return (major, minor, patch), bool(match.group(4))
 
 
 @contextmanager
@@ -1864,70 +2039,78 @@ class ClaudeCodeProvider(AgentProvider):
         # `text` prints the final text once, at exit, and nothing before it.
         return self.output_format(profile) == "stream-json"
 
-    def fresh_context_environment(self, req: AgentRequest) -> dict[str, str]:
+    def fresh_context_environment(self, fresh_context: bool) -> dict[str, str]:
         """:data:`CLAUDE_FRESH_CONTEXT_ENV` for a launch that needs a fresh context."""
-        return dict(CLAUDE_FRESH_CONTEXT_ENV) if req.fresh_context else {}
+        return dict(CLAUDE_FRESH_CONTEXT_ENV) if fresh_context else {}
 
-    def fresh_context_preflight(
-        self, profile: ProfileConfig, cwd: str, env_allowlist: tuple[str, ...] | None
-    ) -> None:
-        """Refuse a launch that needs a fresh context unless the ``claude`` it
-        would start is :data:`CLAUDE_FRESH_CONTEXT_MIN_VERSION` or later (R3-F5
-        of PR #513): :data:`CLAUDE_FRESH_CONTEXT_ENV` turns auto memory off from
-        that build on, and an earlier one is not known to honour it, so the
-        proof holds only for the executable that is launched.
+    def fresh_context_probe(self, profile: ProfileConfig) -> RuntimeProbe | None:
+        """``<command> --version``, of the profile's own command (R3-F5, R4-F1 of PR
+        #513): :data:`CLAUDE_FRESH_CONTEXT_ENV` is known to turn auto memory off
+        only on :data:`CLAUDE_FRESH_CONTEXT_VERSIONS`, so the proof holds only
+        for an executable that reports one of them. The engine runs it as the
+        launch runs (:class:`RuntimeProbe`), and the launch starts the
+        executable that answered (:meth:`fresh_context_command`)."""
+        return RuntimeProbe(
+            command=(profile.command or "claude", "--version"),
+            timeout_seconds=CLAUDE_VERSION_PROBE_SECONDS,
+            max_output_bytes=CLAUDE_VERSION_PROBE_MAX_OUTPUT_BYTES,
+        )
 
-        Asks ``<command> --version`` of the profile's own command, resolved in
-        the environment the launch inherits (its allow-list), in its working
-        directory, within :data:`CLAUDE_VERSION_PROBE_SECONDS`. A CLI that
-        cannot be run, times out, exits with a failure, or prints no version
-        this controller reads is refused like an older one. Names the version
-        it read and the command, never the CLI's output. A launch that needs
-        no fresh context is never asked about (:meth:`execute`, the engine).
+    def fresh_context_runtime(
+        self,
+        profile: ProfileConfig,
+        executable: str,
+        result: ExecutionResult | None,
+        failure: str = "",
+    ) -> FreshContextRuntime:
+        """The executable that answered, when it reports one of
+        :data:`CLAUDE_FRESH_CONTEXT_VERSIONS`; the refusal otherwise.
+
+        Refused, too: no executable on the launch's ``PATH``, a probe that
+        could not be run (inside the sandbox included), timed out, exited with
+        a failure or printed no version this controller reads, a pre-release,
+        and a build not in the list, older or later. Names the version it read
+        and the command, never the CLI's output.
         """
         command = profile.command or "claude"
         probe = f"`{command} --version`"
-        minimum = ".".join(str(part) for part in CLAUDE_FRESH_CONTEXT_MIN_VERSION)
-        remedy = (
-            f"Run Claude Code {minimum} or later for this profile, or route the phase to "
-            "another provider"
+        checked = ", ".join(
+            ".".join(str(part) for part in version)
+            for version in sorted(CLAUDE_FRESH_CONTEXT_VERSIONS)
         )
-        try:
-            res = self._runner(
-                ExecutionRequest(
-                    command=[command, "--version"],
-                    cwd=cwd or None,
-                    timeout_seconds=CLAUDE_VERSION_PROBE_SECONDS,
-                    max_output_bytes=CLAUDE_VERSION_PROBE_MAX_OUTPUT_BYTES,
-                    env_allowlist=(
-                        None if env_allowlist is None else self.launch_allowlist(env_allowlist)
-                    ),
-                    contain_orphans=True,
-                )
-            )
-        except ExecutionError as exc:
-            raise no_fresh_context(
-                profile, f"{probe} could not be run ({redact(str(exc))})", remedy
-            ) from None
-        if res.timed_out:
+        remedy = (
+            f"Run a Claude Code build checked to honour {', '.join(CLAUDE_FRESH_CONTEXT_ENV)} "
+            f"({checked}) for this profile, or route the phase to another provider"
+        )
+        if not executable:
+            why = f"{command!r} is not on the launch's PATH"
+        elif result is None:
+            why = f"{probe} could not be run ({redact(failure)})"
+        elif result.timed_out:
             why = f"{probe} did not answer within {CLAUDE_VERSION_PROBE_SECONDS}s"
-        elif res.exit_code != 0:
-            why = f"{probe} exited {res.exit_code} (output not shown)"
+        elif result.exit_code != 0:
+            why = f"{probe} exited {result.exit_code} (output not shown)"
         else:
-            found = None if res.stdout_truncated else parse_claude_version(res.stdout or "")
+            found, pre = (
+                (None, False) if result.stdout_truncated else claude_release(result.stdout or "")
+            )
             if found is None:
                 why = f"{probe} printed no version this controller reads (output not shown)"
-            elif found < CLAUDE_FRESH_CONTEXT_MIN_VERSION:
-                # The output matched the version pattern whole: its release is
-                # digits and dots, and a pre-release's suffix is not shown.
-                release, _, suffix = res.stdout.strip().split(" ", 1)[0].partition("-")
-                shown = f"{release} (a pre-release)" if suffix else release
-                why = (
-                    f"{probe} reports {shown}, and Claude Code turns its auto memory off by "
-                    f"{', '.join(CLAUDE_FRESH_CONTEXT_ENV)} from {minimum} on"
-                )
             else:
-                return
+                shown = ".".join(str(part) for part in found)
+                identity = FreshContextRuntime.identity_of(executable)
+                if pre:
+                    why = f"{probe} reports a pre-release of {shown}"
+                elif found not in CLAUDE_FRESH_CONTEXT_VERSIONS:
+                    why = (
+                        f"{probe} reports {shown}, and only {checked} is known to turn its "
+                        f"auto memory off by {', '.join(CLAUDE_FRESH_CONTEXT_ENV)}: a build "
+                        "nobody checked proves nothing"
+                    )
+                elif identity is None:
+                    why = f"{executable} cannot be read after it answered"
+                else:
+                    return FreshContextRuntime(executable, identity, shown)
         raise no_fresh_context(profile, why, remedy)
 
     def fresh_context_proof(self, profile: ProfileConfig) -> str:
@@ -1937,8 +2120,8 @@ class ClaudeCodeProvider(AgentProvider):
         needs a fresh context also has its auto memory off
         (:data:`CLAUDE_FRESH_CONTEXT_ENV`), refused while the user's
         configuration would set that variable over it (R2-F7 of PR #513) or
-        while the CLI it would start is older than the build that variable
-        was read from (:meth:`fresh_context_preflight`, R3-F5)."""
+        unless the CLI it starts reports a build that variable was read from
+        (:meth:`fresh_context_probe`; R3-F5, R4-F1)."""
         if _truthy(profile.options.get("session_persistence"), default=False) is not False:
             raise no_fresh_context(
                 profile,
@@ -1956,8 +2139,9 @@ class ClaudeCodeProvider(AgentProvider):
             )
         return (
             "claude -p --no-session-persistence, with CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 on a "
-            "Claude Code each launch checks is 2.1.328 or later: a new session per launch, "
-            "never saved, and no auto memory read or written"
+            "Claude Code build checked to honour it, which each launch establishes of the "
+            "executable it starts: a new session per launch, never saved, and no auto memory "
+            "read or written"
         )
 
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
@@ -2028,12 +2212,16 @@ class ClaudeCodeProvider(AgentProvider):
             cwd=req.cwd, emit=emit, loop=_ClockedLoop(monitor), is_reply=holds_control_result
         )
         self.integration_preflight(req.env_allowlist, fresh_context=req.fresh_context)
-        if req.fresh_context:
-            self.fresh_context_preflight(req.profile, req.cwd, req.env_allowlist)
         with self.integration_isolation() as isolation:
-            env = {**(req.env or {}), **isolation, **self.fresh_context_environment(req)}
+            env = {
+                **(req.env or {}),
+                **isolation,
+                **self.fresh_context_environment(req.fresh_context),
+            }
             command, description = self.sandboxed(req, self.build_command(req), env)
-            self.complete_isolation(isolation, self.started_environment(req, env, description))
+            started = self.started_environment(req, env, description)
+            command = self.fresh_context_command(req, command, started)
+            self.complete_isolation(isolation, started)
             duplex = DuplexRequest(
                 command=command,
                 cwd=req.cwd,
