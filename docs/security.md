@@ -318,7 +318,10 @@ no agent is shown Memory by this release.
 
 Memory holds nothing secret by design: an agent's or the operator's text the
 run-log redactor would change is refused, never redacted and kept, and text
-the controller derives from evidence is redacted, then bounded. No
+the controller derives from evidence is redacted, then bounded. A state file
+edited to hold such a text, or such a lifecycle reason, is refused when it
+loads even with consistent digests, and a projection that would render one
+is refused whole. No
 transcript, reasoning, prompt, diff or environment is stored. Like the rest
 of the state directory it is stored in the clear.
 

@@ -1926,7 +1926,7 @@ def test_only_a_memory_phases_launch_with_memory_on_needs_a_fresh_context(tmp_pa
         eng.config.memory.enabled = memory
         eng.record_run_configuration()
         eng._save()
-        for _ in range(2):
+        for _ in range(3):  # INITIALIZING, then the two launches
             eng.step()
         return seen
 

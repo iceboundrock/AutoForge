@@ -1288,22 +1288,17 @@ class MemoryStore:
         record's history it is in. A history whose digests are consistent but
         that brought a withdrawn text back is refused, as the write was.
         """
-        withdrawn = [
-            (record, digest, actor, seq)
-            for record in self.records
-            for digest, actor, seq in record.withdrawals()
-        ]
+        withdrawn: dict[str, list[tuple[MemoryRecord, Actor, int]]] = {}
+        for source in self.records:
+            for digest, actor, seq in source.withdrawals():
+                withdrawn.setdefault(digest, []).append((source, actor, seq))
         for record in self.records:
             for event in record.events:
                 if event.op not in (Operation.ADD, Operation.CORRECT):
                     continue
-                for source, digest, actor, seq in withdrawn:
-                    if (
-                        seq < event.seq
-                        and digest == event.text_sha256
-                        and source.withdrawal_binds(
-                            actor, record.trust, record.issue_url, record.applies_to
-                        )
+                for source, actor, seq in withdrawn.get(event.text_sha256, ()):
+                    if seq < event.seq and source.withdrawal_binds(
+                        actor, record.trust, record.issue_url, record.applies_to
                     ):
                         return (
                             f"record {record.id} writes at seq {event.seq} a text the "
