@@ -159,6 +159,13 @@ _CONTENTION = (
 
 _GIT_COMMON_DIR_ARGS = ["rev-parse", "--git-common-dir"]
 _GIT_TIMEOUT_SECONDS = 30
+# Git's messages in its own words, whatever the operator's locale, so that
+# its answer that a directory is in no repository can be told from any other
+# failure (R5-F2 of PR #513).
+_GIT_MESSAGES_ENV = {"LC_ALL": "C", "LANGUAGE": ""}
+# How git 2.x begins that answer from discovery: "(or any of the parent
+# directories): .git" or "(or any parent up to mount point ...)".
+_NOT_A_REPOSITORY = "fatal: not a git repository ("
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 
@@ -193,12 +200,17 @@ def repository_lock_path(workdir: str | Path, runner: Runner = execute) -> Path:
 def repository_common_dir(workdir: str | Path, runner: Runner = execute) -> Path | None:
     """The git common dir of the repository containing ``workdir``, ``None`` in none.
 
-    ``None`` only when git answers that ``workdir`` is in no repository it
-    reads (``git rev-parse`` exits with a failure); LockError, as for
-    :func:`repository_lock_path`, when git cannot answer at all (it cannot
-    be run, times out, or its output is cut or empty), since then the
-    directory may still be inside one. Asked as that function asks, so the
-    two agree on every repository.
+    ``None`` only once it is confirmed that ``workdir`` is in no repository:
+    git answers so (``fatal: not a git repository (...``, read in git's own
+    words whatever the operator's locale), and no ``.git`` entry and no
+    directory shaped like a git directory lies on the way from ``workdir``
+    to the root (:func:`_repository_doubt`). LockError, as for
+    :func:`repository_lock_path`, for every other answer: git cannot be run,
+    times out, its output is cut or empty, or it fails otherwise (a
+    malformed configuration, a repository of dubious ownership, a ``.git``
+    that names nothing), since then the directory may still be inside one
+    and its lock is unknown (R5-F2 of PR #513). Asked as that function
+    asks, so the two agree on every repository.
     """
     common, refusal, in_none = _git_common_dir(workdir, runner)
     if in_none:
@@ -210,8 +222,8 @@ def repository_common_dir(workdir: str | Path, runner: Runner = execute) -> Path
 
 def _git_common_dir(workdir: str | Path, runner: Runner) -> tuple[Path | None, str, bool]:
     """``(git common dir, "", False)``, or ``(None, why, in_none)``: ``in_none``
-    exactly when git answered that ``workdir`` is in no repository it reads.
-    Never raises ExecutionError."""
+    exactly when it is confirmed that ``workdir`` is in no repository
+    (:func:`repository_common_dir`). Never raises ExecutionError."""
     base = Path(workdir)
     shown = base.resolve()  # messages only: "." tells the operator nothing
     try:
@@ -221,7 +233,10 @@ def _git_common_dir(workdir: str | Path, runner: Runner) -> tuple[Path | None, s
         # another.
         res = runner(
             local_git_request(
-                _GIT_COMMON_DIR_ARGS, cwd=str(base), timeout_seconds=_GIT_TIMEOUT_SECONDS
+                _GIT_COMMON_DIR_ARGS,
+                cwd=str(base),
+                env=_GIT_MESSAGES_ENV,
+                timeout_seconds=_GIT_TIMEOUT_SECONDS,
             )
         )
     except ExecutionError as exc:
@@ -235,16 +250,59 @@ def _git_common_dir(workdir: str | Path, runner: Runner) -> tuple[Path | None, s
         return None, why, False
     if res.exit_code != 0:
         detail = (res.stderr or res.stdout).strip().splitlines()
-        why = (
-            f"cannot derive the controller lock: {shown} is not inside a git repository "
-            f"({detail[0] if detail else f'git rev-parse exited {res.exit_code}'})"
-        )
+        first = detail[0] if detail else f"git rev-parse exited {res.exit_code}"
+        doubt = _repository_doubt(base, first)
+        if doubt:
+            # A failure that is not a confirmed absence: the directory may be
+            # in a repository git cannot read now, whose lock is then unknown
+            # (R5-F2 of PR #513).
+            why = (
+                f"cannot derive the controller lock for {shown}: git rev-parse failed "
+                f"({first}), and {doubt}, so it is not established that {shown} is in no "
+                "repository"
+            )
+            return None, why, False
+        why = f"cannot derive the controller lock: {shown} is not inside a git repository ({first})"
         return None, why, True
     common = res.stdout.strip()
     if not common:
         why = f"cannot derive the controller lock for {shown}: git rev-parse returned no git dir"
         return None, why, False
     return (base / common).resolve(), "", False
+
+
+def _repository_doubt(base: Path, first: str) -> str:
+    """Why a failed ``git rev-parse`` from ``base`` does not confirm it is in no repository.
+
+    ``""`` when it does: git's first line is its answer that discovery found
+    no repository, and on the way from ``base`` (symlinks resolved) to the
+    root no directory holds a ``.git`` entry of any kind, and none looks like
+    a git directory itself (a ``HEAD`` beside ``objects`` or ``commondir``,
+    as a bare repository or a worktree's git directory has). Anything else
+    is a doubt: git failed another way, a ``.git`` that git could not read
+    or follow is there, or a directory on the way cannot be read. Reads
+    names only, never a file's content, and writes nothing (R5-F2 of PR
+    #513).
+    """
+    if not first.startswith(_NOT_A_REPOSITORY):
+        return "git did not answer that it is in no repository"
+    try:
+        start = base.resolve()
+    except OSError as exc:
+        return f"{base} cannot be resolved ({exc.strerror})"
+    for directory in (start, *start.parents):
+        for name in (".git", "HEAD"):
+            try:
+                os.lstat(directory / name)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError as exc:
+                return f"{directory} cannot be read ({exc.strerror})"
+            if name == ".git":
+                return f"{directory / name} exists"
+            if any(os.path.lexists(directory / part) for part in ("objects", "commondir")):
+                return f"{directory} looks like a git directory"
+    return ""
 
 
 class ControllerLock:

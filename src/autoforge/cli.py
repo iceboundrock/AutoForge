@@ -926,14 +926,16 @@ def _refuse_state_of_another_repository(
     contend on that repository's lock:
 
     - a state directory of another repository, or one git cannot place, is
-      refused whatever the Memory setting. Whether a checkpoint holds Issue
-      Memory is no guard against a writer under another lock: one that
-      loaded it without Memory could otherwise save over the Memory its own
-      repository's writer added since, and atomic replacement does not
-      prevent that lost update (R4-F2);
-    - a state directory in no repository is refused when the checkpoint
-      holds Issue Memory (``state``, the one there now) or would (this
-      invocation's ``memory.enabled``). With both off it is written as
+      refused whatever the Memory setting. A failure of git that does not
+      confirm the directory is in no repository (a malformed configuration
+      of the repository it is in, say) places it nowhere (R5-F2). Whether a
+      checkpoint holds Issue Memory is no guard against a writer under
+      another lock: one that loaded it without Memory could otherwise save
+      over the Memory its own repository's writer added since, and atomic
+      replacement does not prevent that lost update (R4-F2);
+    - a state directory confirmed to be in no repository is refused when the
+      checkpoint holds Issue Memory (``state``, the one there now) or would
+      (this invocation's ``memory.enabled``). With both off it is written as
       before: no checkout's lock guards it, as before Memory existed, and
       since every writer that would put Memory in it refuses it, no Memory
       checkpoint can be there to lose.

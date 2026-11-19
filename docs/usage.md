@@ -2443,7 +2443,14 @@ retract` refuse a `--state-dir` in another repository (another clone of the
 same GitHub repository included), or one git cannot place, whatever the
 Memory setting: a command from another clone that loaded a run without
 Memory could otherwise save over the Memory that clone's own command added
-meanwhile. A `--state-dir` in no repository is refused when the run holds
+meanwhile. A directory git fails in is one it cannot place: a malformed
+`.git/config` of the repository it is in, a repository of dubious
+ownership, or a `.git` that names nothing makes `git rev-parse` fail there
+just as no repository does, so a directory counts as in no repository only
+when git answers exactly that (its "not a git repository" message, read in
+the C locale) and no `.git` entry, and no directory that looks like a git
+directory, lies on the way from it to `/`. A `--state-dir` confirmed in no
+repository is refused when the run holds
 Issue Memory or this command's configuration turns Memory on; with Memory
 off in both it is written as before, and since no command writes Memory
 there, no Memory can be lost there. `run` judges a directory it would
@@ -2458,8 +2465,11 @@ change in the run log. Turning Memory off keeps the records, which then take
 no write but a retraction.
 
 Bounds: at most 64 records, a text of at most 2,048 UTF-8 bytes, three
-corrections of a record, and so at most 256 tombstones; together they keep
-the store under 1,048,576 bytes in the state file. A write past a bound is
+corrections of a record, and so at most 256 tombstones, and no number above
+2,147,483,647 (a step's review round and execution attempt included);
+together they keep the store under 1,048,576 bytes in the state file, with
+room left for every refusal counter at its largest, so the store a refused
+write returns always loads again. A write past a bound is
 refused and counted, never by evicting another record. A record whose
 issue URL, or whose step's issue or PR URL, the run-log redactor would
 change (a credential's shape in an owner or repository name) is refused
@@ -2472,7 +2482,13 @@ evidence for a launch on another one, and downgraded once no kept record of
 this run establishes it. What it calls established is a line read from the
 record's typed fields (its number, outcome and commit), never the
 observation's text, which is shown as the controller's unverified account:
-a text that contradicts its receipt is never certified by it. A launch
+a text that contradicts its receipt is never certified by it. An
+observation citing a launch is always shown downgraded: a launch's receipt
+records no outcome, issue or candidate, so even one the run keeps
+establishes nothing the record says. A superseded failure stays shown
+unless what replaced it has a validation receipt of the launch's candidate,
+or of the commit the failure was evidence of: a record citing a launch, or
+another commit's failure, never hides it. A launch
 with no candidate yet is shown no record bound to one. A projection is
 reproducible from the store's revision, the request and the evidence
 together. Its header names the digests of the store and of the evidence,

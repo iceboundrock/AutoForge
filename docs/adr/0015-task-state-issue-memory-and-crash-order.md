@@ -43,7 +43,11 @@
     citation resolves only to a typed receipt that establishes its record (a
     failing `ValidationRecord` of the record's issue and candidate), and
     what a render calls established is read from that receipt, never from
-    the record's text. D12's bound is 16,384 characters and 16,384 tokens,
+    the record's text. A launch's receipt records no outcome, issue or
+    candidate, so a launch citation renders downgraded until #332's typed
+    receipt exists, and a superseded failure is hidden only behind a
+    validation receipt of the launch's candidate or of the commit the
+    failure was evidence of. D12's bound is 16,384 characters and 16,384 tokens,
     the tokens held as UTF-8 bytes. Wiring the store into the running
     workflow is #333's.
   - *Implemented with it:* nothing in the package. No phase, edge, state

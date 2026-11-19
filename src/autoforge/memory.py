@@ -83,8 +83,9 @@ whether the write was applied or refused and why. Who may do what:
   retracts observed and proposed ones; an observation's correction names
   the evidence of its new text; what supersedes is always an observed
   record, and whatever supersedes applies everywhere the record it
-  replaces did, and a render still shows an observation its evidence
-  establishes more strongly than its replacement's does there;
+  replaces did, and a render still shows an observation whose evidence
+  establishes there what its replacement's does not (a launch's receipt
+  establishes no outcome, so it never hides a verified failure);
 - an agent adds proposals, and corrects, supersedes or retracts proposals
   only, never an observed record or the operator's: newer, unsupported text
   never replaces stronger evidence. Each of its writes names the launch it
@@ -130,9 +131,13 @@ evicting anything. The bounds hold the 1,048,576-byte ceiling of the
 evaluation protocol by construction: at most :data:`MAX_RECORDS` records, a
 text of at most :data:`MAX_TEXT_BYTES` UTF-8 bytes, at most
 :data:`MAX_CORRECTIONS` corrections of a record, a reason of at most
-:data:`MAX_REASON_BYTES`, and so at most :data:`MAX_TOMBSTONES` tombstones
-(``tests/test_memory.py`` builds the largest store these allow and measures
-it). Every write also measures the store as the state file would hold it.
+:data:`MAX_REASON_BYTES`, and so at most :data:`MAX_TOMBSTONES` tombstones,
+and no number above ``2**31 - 1``, a step's review round and execution
+attempt included (``tests/test_memory.py`` builds the largest store these
+allow and measures it). Every applied write and the loader also measure the
+store as the state file would hold it with every refusal counter at its
+largest (:func:`ceiling_bytes`), so the store a refused write returns, whose
+counters alone changed, always loads again (R5-F4 of PR #513).
 
 Text
 ----
@@ -367,7 +372,8 @@ class RefusalCode(StrEnum):
     RECORDS_FULL = "records-full"
     #: The record was corrected :data:`MAX_CORRECTIONS` times already.
     CORRECTIONS_FULL = "corrections-full"
-    #: The store would exceed :data:`MAX_STORE_BYTES` in the state file.
+    #: The store would exceed :data:`MAX_STORE_BYTES` in the state file, every refusal
+    #: counter at its largest (:func:`ceiling_bytes`).
     STORE_FULL = "store-full"
 
 
@@ -561,9 +567,30 @@ def _step(raw: object, where: str) -> StepKey:
             "must be a step: its phase, canonical issue URL, PR URL or none, review round and "
             "execution attempt",
         ) from None
-    if _step_unredacted(step):
-        raise _bad(where, _URL_UNREDACTED)
+    problem = _step_problem(step)
+    if problem:
+        raise _bad(where, problem)
     return step
+
+
+#: Why a step's counters are refused: Issue Memory bounds every number it keeps,
+#: so that its largest store is one the bounds fix (R5-F4 of PR #513).
+_STEP_COUNTERS = f"has a review round or execution attempt above {_MAX_SEQ}"
+
+
+def _step_problem(step: StepKey) -> str:
+    """Why Issue Memory keeps no record of ``step`` ("" when it may).
+
+    A URL the run-log redactor would change (R3-F4 of PR #513), or a review
+    round or execution attempt beyond :data:`_MAX_SEQ`: a step's own loader
+    bounds neither counter, and a number of any length would let a store's
+    metadata grow it past what its bounds allow (R5-F4).
+    """
+    if _step_unredacted(step):
+        return _URL_UNREDACTED
+    if not (0 <= step.review_round <= _MAX_SEQ and 0 <= step.execution_attempt <= _MAX_SEQ):
+        return _STEP_COUNTERS
+    return ""
 
 
 #: Why a URL of a record is refused, never quoting it (R3-F4 of PR #513).
@@ -1352,7 +1379,9 @@ class MemoryStore:
         repairs it. The revision is the number of writes applied, so the
         events of every record together are exactly the seqs 1 to the
         revision; the tombstones are exactly what the histories left; and
-        the store fits :data:`MAX_STORE_BYTES` as the state file holds it.
+        the store fits :data:`MAX_STORE_BYTES` as the state file holds it,
+        with room for every refusal counter at its largest
+        (:func:`ceiling_bytes`).
         """
         if isinstance(raw, dict) and (
             # The integer label the writer writes: JSON's true and 1.0 compare
@@ -1391,8 +1420,14 @@ class MemoryStore:
         tombstones = data["tombstones"]
         if not isinstance(tombstones, list) or tombstones != list(store.tombstones):
             raise _bad(".tombstones", "must be exactly the sorted digests its records left")
-        if stored_bytes(store) > MAX_STORE_BYTES:
-            raise _bad("", f"is larger than {MAX_STORE_BYTES} bytes")
+        if ceiling_bytes(store) > MAX_STORE_BYTES:
+            # Room for every refusal counter at its largest is reserved, so the
+            # store a refused write returns always loads again (R5-F4 of PR #513).
+            raise _bad(
+                "",
+                f"is larger than {MAX_STORE_BYTES} bytes once every refusal counter is "
+                "given its room",
+            )
         return store
 
     def _closure_problem(self) -> str:
@@ -1534,11 +1569,12 @@ class MemoryStore:
         returns a store that would make the checkpoint unloadable.
         """
         store = replace(self, revision=self.revision + 1, records=records)
-        size = stored_bytes(store)
+        size = ceiling_bytes(store)
         if size > MAX_STORE_BYTES:
             return self._refuse(
                 RefusalCode.STORE_FULL,
-                f"{what} would make Issue Memory {size} bytes, more than {MAX_STORE_BYTES}",
+                f"{what} would make Issue Memory {size} bytes with every refusal counter at "
+                f"its largest, more than {MAX_STORE_BYTES}",
                 record_id,
             )
         try:
@@ -1703,6 +1739,8 @@ class MemoryStore:
         applies_to = parts["applies_to"]  # type: ignore[assignment]
         if step is not None and _step_unredacted(step):
             return self._refuse(RefusalCode.CREDENTIAL, f"{_FIELD}.step: {_URL_UNREDACTED}")
+        if step is not None and _step_problem(step):
+            return self._refuse(RefusalCode.INVALID, f"{_FIELD}.step: {_STEP_COUNTERS}")
         if step is not None and not _same_issue(step.issue_url, issue_url):
             # As GitHub identifies an issue: another spelling of the owner or
             # repository is the same one (R3-F6 of PR #513).
@@ -2170,6 +2208,22 @@ def stored_bytes(store: MemoryStore) -> int:
     )
 
 
+#: Every refusal code counted at its largest: the most room the counters take.
+_FULL_COUNTERS: Mapping[str, int] = {code.value: MAX_REFUSAL_COUNT for code in RefusalCode}
+
+
+def ceiling_bytes(store: MemoryStore) -> int:
+    """The store's :func:`stored_bytes` once every refusal counter is at its largest.
+
+    What a refused write can grow the store to, since a refusal changes the
+    counters alone, and each saturates at :data:`MAX_REFUSAL_COUNT`. The
+    loader and every applied write hold this to :data:`MAX_STORE_BYTES`, so
+    the store a refusal returns is never one the loader rejects (R5-F4 of PR
+    #513). Counters only grow, so it is never below :func:`stored_bytes`.
+    """
+    return stored_bytes(replace(store, refused=dict(_FULL_COUNTERS)))
+
+
 # -- the read interface (D12) --------------------------------------------------------------
 
 
@@ -2208,20 +2262,15 @@ class Verdict(StrEnum):
     another commit than the launch's candidate (an ancestor it descends
     from, or an earlier candidate), so it is shown as that commit's and
     never as this candidate's (R3-F2 of PR #513); an ``unresolved`` one has
-    no receipt the run keeps that establishes it, and is shown downgraded.
+    no receipt the run keeps that establishes it, a launch citation always
+    (a launch's receipt records no outcome, issue or candidate; R5-F3), and
+    is shown downgraded. A supersession compares what each establishes, not
+    the rank alone (:func:`_replaces`).
     """
 
     CURRENT = "current"
     HISTORICAL = "historical"
     UNRESOLVED = "unresolved"
-
-
-#: How strongly each verdict stands; what is not observed stands at 0.
-_STRENGTH: Mapping[Verdict, int] = {
-    Verdict.CURRENT: 3,
-    Verdict.HISTORICAL: 2,
-    Verdict.UNRESOLVED: 1,
-}
 
 
 @dataclass(frozen=True)
@@ -2241,6 +2290,30 @@ class Resolution:
 _UNRESOLVED = Resolution(Verdict.UNRESOLVED)
 
 
+def _replaces(standing: Resolution | None, own: Resolution) -> bool:
+    """Whether what stands in a superseded observation's place, for one launch,
+    establishes what the observation's own evidence establishes there.
+
+    Compared by what each typed receipt establishes, never by rank alone
+    (R5-F3 of PR #513). An observation no receipt establishes
+    (``unresolved``, a launch citation's always) has nothing a replacement
+    must match. Otherwise the replacement must be a validation receipt's
+    too: one of this launch's candidate (``current``), or, for evidence of
+    another commit (``historical``), of that very commit. A record that is
+    no observation, one only a launch's receipt or nothing establishes, and
+    a validation of another commit establish none of it, so the observation
+    is kept: a newer record never hides a verified failure on the strength
+    of a receipt that records no outcome, issue or candidate.
+    """
+    if own.verdict is Verdict.UNRESOLVED:
+        return True
+    if standing is None or standing.verdict is Verdict.UNRESOLVED:
+        return False
+    if standing.verdict is Verdict.CURRENT:
+        return True
+    return own.verdict is Verdict.HISTORICAL and standing.commit == own.commit
+
+
 @dataclass(frozen=True)
 class EvidenceIndex:
     """The receipts the run holds now, which an observed record's citation must resolve to.
@@ -2251,7 +2324,9 @@ class EvidenceIndex:
     #513), and only as far as it establishes it: a validation record is
     evidence of the commit it validated, never of another one (R3-F2). See
     :meth:`resolve`. Anything else renders the record downgraded, never as
-    observed (D8, #317's rule for a missing receipt).
+    observed (D8, #317's rule for a missing receipt), and so does a launch
+    citation, even of a receipt the run keeps, since a launch's receipt
+    records no outcome, issue or candidate (R5-F3 of PR #513).
 
     It is an input of a projection as much as the store is: the same store
     and request render other bytes once a receipt is evicted, so a
@@ -2265,9 +2340,11 @@ class EvidenceIndex:
     - ``launch_receipts``: the ``(<run_id>/<launch_seq>, digest)`` of the
       launch receipts the run keeps (ADR 0015 D5.3). A spent launch ordinal
       is not one: an intent saved before a crash names a launch that may
-      never have started (W2). The state keeps no launch receipt before #332,
-      so the caller passes none, and every launch citation renders
-      downgraded until then.
+      never have started (W2). A receipt kept with the digest cited is named
+      in the record's ``established`` line, and the record still renders
+      downgraded: it establishes the launch's receipt and nothing of its
+      outcome, issue or candidate (R5-F3 of PR #513). The state keeps no
+      launch receipt before #332, so the caller passes none.
     """
 
     run_id: str
@@ -2360,11 +2437,17 @@ class EvidenceIndex:
         ancestor the candidate descends from, an earlier candidate, or no
         candidate yet), named with that commit so a render never shows an
         earlier commit's failure as this one's (R3-F2 of PR #513). A launch
-        must be kept with the digest cited, be of this run, and be the
+        citation is never more than ``unresolved``: a launch's receipt, its
+        id and digest, records no outcome, issue or candidate, so even one
+        the run keeps establishes none of what the record says, and the
+        record shows downgraded and weighs nothing in a supersession until a
+        typed receipt that records them exists (#332; R5-F3 of PR #513).
+        When the run keeps it with the digest cited, for this run and the
         launch of the write that named the citation (the record's add, or
-        the correction that cited it), and is then ``current``. A citation
-        of a kind the record's kind does not take (:data:`CITATIONS_BY_KIND`)
-        resolves to nothing, and so does anything else: ``unresolved``.
+        the correction that cited it), the render says that much and no
+        more. A citation of a kind the record's kind does not take
+        (:data:`CITATIONS_BY_KIND`) resolves to nothing, and so does
+        anything else: ``unresolved``.
         """
         citation = record.citation
         if citation is None or citation.kind not in CITATIONS_BY_KIND.get(record.kind, ()):
@@ -2380,9 +2463,11 @@ class EvidenceIndex:
             if not resolved:
                 return _UNRESOLVED
             return Resolution(
-                Verdict.CURRENT,
+                Verdict.UNRESOLVED,
                 established=(
-                    f"the run keeps the receipt of launch {citation.ref} with the digest cited"
+                    f"the run keeps the receipt of launch {citation.ref} with the digest "
+                    "cited, and nothing more: a launch's receipt records no outcome, issue or "
+                    "candidate, so it establishes none of them"
                 ),
             )
         receipt = self._receipt(citation)
@@ -2519,8 +2604,8 @@ class ContextProjection:
     #: candidate (R3-F2 of PR #513).
     historical: int = 0
     #: Superseded observations shown all the same, because their evidence
-    #: establishes them more strongly for this launch than what replaced them
-    #: does (R3-F3 of PR #513).
+    #: establishes for this launch what the evidence of what replaced them
+    #: does not (R3-F3, R5-F3 of PR #513).
     kept_over_replacement: int = 0
 
 
@@ -2537,8 +2622,8 @@ _LABELS = {
         "commit, not of this candidate"
     ),
     "downgraded": (
-        "observed by the controller, but no evidence the run keeps now establishes it, so it "
-        "is not verified"
+        "observed by the controller, but no evidence the run keeps now establishes what it "
+        "says, so it is not verified"
     ),
     "proposed": "proposed by an agent: a claim, never evidence",
 }
@@ -2612,8 +2697,8 @@ def _block(record: MemoryRecord, group: str, resolution: Resolution | None, kept
         lines.append(f"- established: {resolution.established}")
     if kept:
         lines.append(
-            f"- superseded by M{record.superseded_by}, whose evidence establishes it less "
-            "strongly for this launch: kept for its own"
+            f"- superseded by M{record.superseded_by}, whose evidence does not establish what "
+            "this record's does for this launch: kept for its own"
         )
     lines.append(
         "- written by: the operator"
@@ -2678,13 +2763,18 @@ def render_projection(
     records than one-byte text, the same ones every time (R4-F6).
 
     A superseded record is hidden behind what replaced it, unless it is an
-    observation its evidence establishes more strongly for this launch than
-    what stands in its place does (R3-F3 of PR #513): a replacement whose
-    receipt is missing, of another commit, retracted since or withheld here
-    never hides an observation a kept receipt still establishes, after a
-    save and a load or a later eviction alike, since the render judges both
-    against the evidence it is given. A kept record says what superseded
-    it. A correction and a retraction act as they always do: a corrected
+    observation whose evidence establishes for this launch what the
+    evidence of what stands in its place does not (R3-F3, R5-F3 of PR #513;
+    :func:`_replaces`): only a validation receipt of this launch's
+    candidate, or of the very commit the observation's receipt validated,
+    replaces it. A replacement whose receipt is missing, of another commit,
+    retracted since or withheld here, one that is no observation, and one
+    citing a launch, whose receipt records no outcome, issue or candidate
+    even when the run keeps it, never hides an observation a kept receipt
+    still establishes, after a save and a load or a later eviction alike,
+    since the render judges both against the evidence it is given. A kept
+    record says what superseded it. A correction and a retraction act as
+    they always do: a corrected
     record shows its last revision, and a retracted one never shows. A
     record retracted after it was superseded passes its place on to its
     replacement, so retracting a link of a chain brings back nothing the
@@ -2741,19 +2831,17 @@ def render_projection(
         if record.trust is Trust.OBSERVED and record.status is not Status.RETRACTED
     }
 
-    def strength(record: MemoryRecord) -> int:
-        resolution = resolutions.get(record.id)
-        return 0 if resolution is None else _STRENGTH[resolution.verdict]
-
     def showable(record: MemoryRecord) -> bool:
         return applies(record) and record.trust not in withdrawn.get(record.text_sha256, ())
 
     # What stands in each record's place here, newest first (a replacement is
-    # always newer): a shown current record stands at its own strength; a
-    # superseded one at what stands in its replacement's place, unless it is
-    # an observation its evidence establishes more strongly, which is kept
-    # (R3-F3 of PR #513); a retracted one, or one not shown, stands for nothing.
-    stands: dict[int, int | None] = {}
+    # always newer): a shown current record stands for what its own evidence
+    # establishes (a record that is no observation, for nothing: _UNRESOLVED);
+    # a superseded one for what stands in its replacement's place, unless it is
+    # an observation whose evidence establishes what that does not, which is
+    # kept (R3-F3, R5-F3 of PR #513); a retracted one, or one not shown, stands
+    # for nothing at all.
+    stands: dict[int, Resolution | None] = {}
     kept: set[int] = set()
     for record in sorted(store.records, key=lambda r: r.id, reverse=True):
         if record.status is Status.RETRACTED:
@@ -2765,16 +2853,14 @@ def render_projection(
                 None if record.superseded_by is None else stands.get(record.superseded_by)
             )
         elif record.status is Status.CURRENT:
-            stands[record.id] = strength(record) if showable(record) else None
+            stands[record.id] = (
+                resolutions.get(record.id, _UNRESOLVED) if showable(record) else None
+            )
         else:
             assert record.superseded_by is not None
             replacement = stands.get(record.superseded_by)
-            own = strength(record)
-            if (
-                own > _STRENGTH[Verdict.UNRESOLVED]
-                and showable(record)
-                and (replacement is None or replacement < own)
-            ):
+            own = resolutions.get(record.id)
+            if own is not None and showable(record) and not _replaces(replacement, own):
                 kept.add(record.id)
                 stands[record.id] = own
             else:

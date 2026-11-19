@@ -1709,9 +1709,13 @@ class StateDirHome(StrEnum):
     #: Another repository, another clone of the same GitHub repository included:
     #: its own controller lock guards it, never this checkout's.
     OTHER = "other"
-    #: No repository: git answers that the directory is in none.
+    #: No repository, confirmed: git answers that the directory is in none,
+    #: and nothing on its way to the root is a ``.git`` or looks like a git
+    #: directory (:func:`~autoforge.locking.repository_common_dir`).
     NONE = "none"
-    #: Git could not answer, for it or for the working directory.
+    #: Git could not answer, for it or for the working directory, or failed in
+    #: a way that leaves it possible that the directory is in a repository (a
+    #: malformed configuration, a ``.git`` it cannot follow; R5-F2 of PR #513).
     UNKNOWN = "unknown"
 
 
@@ -3851,9 +3855,11 @@ class ControllerEngine:
         ``workdir``) and requires the same git common dir, symlinks
         resolved. A linked worktree of the same repository shares it
         (:attr:`StateDirHome.OWN`). Any other answer is a problem: another
-        repository (:attr:`~StateDirHome.OTHER`), none
+        repository (:attr:`~StateDirHome.OTHER`), none, confirmed
         (:attr:`~StateDirHome.NONE`: no lock of any checkout guards it), or
-        no answer from git (:attr:`~StateDirHome.UNKNOWN`). A state
+        no answer from git that establishes either, a failure of git in the
+        state directory's repository included (:attr:`~StateDirHome.UNKNOWN`;
+        R5-F2 of PR #513). A state
         directory not created yet is judged by its nearest existing
         ancestor, the directory its first save creates it in, so ``run``
         binds a new run's state to the lock that will guard it (R3-F1 of PR

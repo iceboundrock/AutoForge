@@ -379,7 +379,80 @@ def test_repository_lock_path_runs_git_in_the_workdir_and_joins_relative_output(
     # ADR 0004 D7.3: no hook, no fsmonitor, no credential and no GIT_* of the
     # operator's shell, the same as the workspace reader the run keys on.
     assert seen[0].env_allowlist == LOCAL_GIT_ENV_ALLOWLIST
-    assert seen[0].env == {"GIT_NO_REPLACE_OBJECTS": "1"}
+    # Git's own words, whatever the operator's locale, so that its answer that a
+    # directory is in no repository can be told from another failure (R5-F2).
+    assert seen[0].env == {"GIT_NO_REPLACE_OBJECTS": "1", "LC_ALL": "C", "LANGUAGE": ""}
+
+
+def _answer(exit_code: int, stderr: str):
+    """A git that answers every request with ``exit_code`` and ``stderr``."""
+    from autoforge.executor import ExecutionResult
+
+    def runner(req):
+        return ExecutionResult(
+            command=req.command,
+            cwd=req.cwd,
+            exit_code=exit_code,
+            stdout="",
+            stderr=stderr,
+            started_at="",
+            finished_at="",
+        )
+
+    return runner
+
+
+NOT_A_REPOSITORY = "fatal: not a git repository (or any of the parent directories): .git\n"
+
+
+def test_a_directory_is_in_no_repository_only_once_that_is_confirmed(tmp_path):
+    """R5-F2 of PR #513: ``None`` only when git answers that discovery found no
+    repository and no ``.git`` entry, and no directory shaped like a git directory,
+    lies on the way to the root. Any other failure of git is a LockError, real git's
+    exit 128 for a malformed configuration above all, so a state directory is never
+    taken to be in no repository while it may be in one."""
+    from autoforge.locking import repository_common_dir
+
+    plain = tmp_path / "plain" / "state"
+    plain.mkdir(parents=True)
+    assert repository_common_dir(plain) is None
+    assert repository_common_dir(plain, runner=_answer(128, NOT_A_REPOSITORY)) is None
+    # Real git, a malformed configuration in the repository: exit 128, not "none".
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    (repo / "state").mkdir()
+    config = repo / ".git" / "config"
+    good = config.read_bytes()
+    config.write_bytes(good + b"[core\n\tbroken = \n")
+    with pytest.raises(LockError, match=r"bad config.*not established .* is in no repository"):
+        repository_common_dir(repo / "state")
+    config.write_bytes(good)
+    assert repository_common_dir(repo / "state") == (repo / ".git").resolve()
+    # Git's answer alone confirms nothing while a .git it could not follow is there.
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    (linked / ".git").write_text("gitdir: /nonexistent/.git\n", encoding="utf-8")
+    with pytest.raises(LockError, match=r"not a git repository: /nonexistent.*not established"):
+        repository_common_dir(linked)  # real git names the .git: no answer from discovery
+    with pytest.raises(LockError, match=r"\.git exists"):
+        repository_common_dir(linked, runner=_answer(128, NOT_A_REPOSITORY))
+    # Nor while a directory on the way looks like a git directory (a bare repository).
+    bare = tmp_path / "bare.git"
+    for name in ("objects", "refs"):
+        (bare / name).mkdir(parents=True)
+    (bare / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (bare / "state").mkdir()
+    with pytest.raises(LockError, match="looks like a git directory"):
+        repository_common_dir(bare / "state", runner=_answer(128, NOT_A_REPOSITORY))
+    # Any other failure of git, whatever it printed: not an answer that it is in none.
+    for stderr in (
+        "fatal: detected dubious ownership in repository at '/x'\n",
+        "fatal: not a git repository: /nonexistent/.git\n",
+        "",
+    ):
+        with pytest.raises(LockError, match="did not answer that it is in no repository"):
+            repository_common_dir(plain, runner=_answer(128, stderr))
 
 
 def test_repository_lock_path_ignores_a_git_dir_in_the_operators_environment(tmp_path, monkeypatch):

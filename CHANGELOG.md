@@ -16,9 +16,11 @@ store and `memory retract` withdraws a record in one save, under the lock of
 the repository its state belongs to. Every command that writes a run's
 state takes that lock: `run`, `step`, `resume`, `unblock` and `run --force`
 now refuse a `--state-dir` in another repository (another clone of the same
-GitHub repository included) whatever the Memory setting, and, with Memory
-on, one in no repository. A `--state-dir` in no repository still works with
-Memory off. A retracted or corrected text is refused
+GitHub repository included) or one git fails in (a malformed configuration
+of its repository, say) whatever the Memory setting, and, with Memory on,
+one in no repository. A `--state-dir` confirmed in no repository (git
+answers so, and no `.git` lies above it) still works with Memory off. A
+retracted or corrected text is refused
 if a record its withdrawal binds (the same issue, a trust its writer could
 have withdrawn, where the withdrawn record applied) writes it again, and is
 not shown through another such record carrying the same text; an agent's

@@ -3179,7 +3179,12 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   write and on load;
 - the bounds: records, corrections and text refused and counted, never by
   eviction; the largest store the bounds allow fits 1,048,576 bytes as the
-  state file holds it, and a state at that ceiling saves and loads;
+  state file holds it, every refusal counter at its largest, and a state at
+  that ceiling saves and loads; a step counter beyond 2**31 - 1 refused at
+  the write and the load; a refused write at the ceiling, its counter
+  saturated or not, returns a store that saves and loads, while a store
+  without room for every counter is refused at the load and an applied
+  write that would leave none is `store-full` (R5-F4);
 - nothing raw: an agent's or the operator's text with a control character
   or a credential's shape refused, the controller's escaped, redacted and
   cut; a seed kept byte for byte with its digest, or refused; a loaded record
@@ -3205,12 +3210,15 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   evidence, never as a descendant's or as no candidate's; an observation's
   correction refused without the evidence of its new text and judged by
   that evidence after it; a superseded observation kept while its evidence
-  establishes it more strongly for the launch than its replacement's
-  (a missing launch receipt, another commit's, a retracted replacement),
-  hidden behind a replacement as strong or a chain's stronger end, after a
-  save and a load and once its own receipt is lost; a launch citation observed only with the
-  receipt the run keeps and its digest (missing, mismatched and retained
-  receipts); a validation citation observed only with a real, failing
+  establishes for the launch what its replacement's does not (a launch
+  citation, with its receipt missing or kept, another commit's failure, on
+  a launch of a third commit or of none too, a retracted replacement),
+  hidden behind a validation receipt of the launch's candidate or of the
+  same commit, or a chain's end that has one, after a save and a load and
+  once its own receipt is lost; a launch citation never observed, whatever
+  the run keeps (missing, mismatched and retained receipts), its
+  'established' line naming a retained receipt and no outcome (R5-F3); a
+  validation citation observed only with a real, failing
   `ValidationRecord` of the record's issue and, for a candidate-bound
   record, of its commit (a passing one, another candidate's, another
   issue's, an edited one and a missing one downgrade it), and each observed
@@ -3262,4 +3270,12 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   clone or in no repository, nothing created, and `step`, `resume`,
   `unblock` and `run --force` refused on another clone's Memory checkpoint
   with nothing changed, while that clone's own `memory retract` writes it;
-  a run without Memory is not asked.
+  a run without Memory is not asked. A real git failure in the other
+  clone (a malformed `.git/config`, exit 128) places its state directory
+  nowhere: each of those commands and `memory retract`, Memory off, refuse
+  it with the checkpoint unchanged, even when that clone repairs its
+  configuration right after the check and saves a Memory checkpoint, which
+  stays byte for byte; a directory confirmed in no repository still takes
+  a Memory-off run (R5-F2). `tests/test_lock.py` holds the classification:
+  no repository only on git's own answer with no `.git` and no git-shaped
+  directory on the way to the root.

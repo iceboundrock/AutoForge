@@ -29,6 +29,7 @@ import pytest
 
 import autoforge
 from autoforge import cli
+from autoforge import memory as memory_module
 from autoforge.auto_recovery import StepKey
 from autoforge.config import (
     MemoryConfig,
@@ -47,6 +48,7 @@ from autoforge.memory import (
     MAX_PROJECTION_TOKENS,
     MAX_REASON_BYTES,
     MAX_RECORDS,
+    MAX_REFUSAL_COUNT,
     MAX_SEED_BYTES,
     MAX_STORE_BYTES,
     MAX_TEXT_BYTES,
@@ -68,6 +70,7 @@ from autoforge.memory import (
     Status,
     Trust,
     Verdict,
+    ceiling_bytes,
     render_projection,
     seed_text,
     sha256_text,
@@ -1063,21 +1066,101 @@ def test_the_storage_ceiling_holds_by_construction():
     assert MemoryStore.from_dict(store.to_dict()).to_dict() == store.to_dict()
 
 
-def test_a_state_at_the_ceiling_saves_and_loads(tmp_path):
+def _ceiling_state() -> AutoForgeState:
+    """A state :func:`_largest_store` belongs in: its repository, issue and launches."""
     repository = f"{'o' * 39}/{'r' * 100}"
-    state = make_state(
+    return make_state(
         run_id=RUN,
         launch_seq=2**31 - 1,
         repository=repository,
         epic_url=f"https://github.com/{repository}/issues/1",
         current_issue_url=f"https://github.com/{repository}/issues/9999999999",
     )
+
+
+def test_a_state_at_the_ceiling_saves_and_loads(tmp_path):
+    state = _ceiling_state()
     state.issue_memory = _largest_store().to_dict()
     path = tmp_path / "state.json"
     started = time.perf_counter()
     save_state(state, path)
     assert time.perf_counter() - started < 30  # a sanity bound, not a measurement
     assert load_state(path).issue_memory == state.issue_memory
+
+
+def test_a_step_counter_beyond_the_bound_is_refused_and_the_store_is_unchanged():
+    """R5-F4: a step's own loader bounds neither counter, Issue Memory bounds both, so
+    no number of any length pads a store past what its bounds allow."""
+    store, _ = _applied(observe(_store(), "test_a fails on C1", seq=1))
+    for huge in (
+        dataclasses.replace(_step(), review_round=2**31),
+        dataclasses.replace(_step(), execution_attempt=10**80),
+    ):
+        outcome = store.add(
+            kind=Kind.HYPOTHESIS,
+            actor=Actor.AGENT,
+            text="a hypothesis",
+            issue_url=ISSUE,
+            step=huge,
+            attempt=_launch(2),
+            origin=_origin(),
+        )
+        assert outcome.refusal is RefusalCode.INVALID and not outcome.applied
+        assert "review round or execution attempt above" in outcome.detail
+        assert outcome.store.records == store.records
+        assert outcome.store.revision == store.revision
+
+
+def _at_the_ceiling(store: MemoryStore, monkeypatch) -> None:
+    """The ceiling moved to exactly what ``store`` takes with every counter at its largest."""
+    monkeypatch.setattr(memory_module, "MAX_STORE_BYTES", ceiling_bytes(store))
+
+
+def test_a_refused_write_at_the_ceiling_returns_a_store_that_saves_and_loads(tmp_path, monkeypatch):
+    """R5-F4: a refusal changes only its counter, and the loader and every applied write
+    keep room for every counter at its largest, so the store a refusal returns at the
+    ceiling saves and loads, as it does after the counter saturates. A store without
+    that room is refused at the load, its counters empty or not, and an applied write
+    that would leave none is refused (``store-full``)."""
+    store = _largest_store()
+    assert ceiling_bytes(store) <= MAX_STORE_BYTES  # the real ceiling, by construction
+    assert ceiling_bytes(store) - stored_bytes(store) > 0
+    _at_the_ceiling(store, monkeypatch)
+    assert MemoryStore.from_dict(store.to_dict()).to_dict() == store.to_dict()
+    nearly = dataclasses.replace(
+        store, refused={code.value: MAX_REFUSAL_COUNT - 1 for code in RefusalCode}
+    )
+    for current in (store, nearly):
+        refused = current.retract(MAX_RECORDS + 1, actor=Actor.OPERATOR, issue_url=None)
+        assert refused.refusal is RefusalCode.UNKNOWN_RECORD and not refused.applied
+        assert stored_bytes(refused.store) <= memory_module.MAX_STORE_BYTES
+        state = _ceiling_state()
+        state.issue_memory = refused.store.to_dict()
+        save_state(state, tmp_path / "state.json")
+        loaded = load_state(tmp_path / "state.json").memory_store()
+        assert loaded.to_dict() == refused.store.to_dict()
+        again = loaded.retract(MAX_RECORDS + 1, actor=Actor.OPERATOR, issue_url=None).store
+        assert MemoryStore.from_dict(again.to_dict()).refused == again.refused
+    saturated = nearly.retract(MAX_RECORDS + 1, actor=Actor.OPERATOR, issue_url=None).store
+    assert saturated.refused[RefusalCode.UNKNOWN_RECORD.value] == MAX_REFUSAL_COUNT
+    # One byte less: the same store, counters empty, leaves no room for them.
+    monkeypatch.setattr(memory_module, "MAX_STORE_BYTES", ceiling_bytes(store) - 1)
+    with pytest.raises(StateError, match="once every refusal counter is given its room"):
+        MemoryStore.from_dict(dataclasses.replace(store, refused={}).to_dict())
+    # An applied write that would leave no room is refused, and counted in room kept.
+    small, record = _applied(observe(_store(), "test_a fails on C1", seq=1))
+    _at_the_ceiling(small, monkeypatch)
+    outcome = small.correct(
+        record,
+        "test_a fails on C1 at import, a longer account",
+        actor=Actor.CONTROLLER,
+        issue_url=ISSUE,
+        attempt=_launch(2),
+        citation=_vr(1),
+    )
+    assert outcome.refusal is RefusalCode.STORE_FULL and not outcome.applied
+    assert "with every refusal counter at its largest" in outcome.detail
+    assert MemoryStore.from_dict(outcome.store.to_dict()).records == small.records
 
 
 # -- the persisted store (D10) ----------------------------------------------------------------
@@ -1140,6 +1223,9 @@ def _another_runs_launch(d: dict) -> None:
         (_tamper("records.1.events", []), "1 to 6 events"),
         (_tamper("records.1.id", 7), "has id 7"),
         (_tamper("records.1.text", "tab\x1b"), "control character"),
+        # A number of any length would grow the store past what its bounds allow (R5-F4).
+        (_tamper("records.1.step.review_round", 2**31), "review round or execution attempt"),
+        (_tamper("records.1.step.execution_attempt", 10**80), "review round or execution"),
     ],
 )
 def test_a_store_that_is_not_one_a_controller_wrote_is_refused_on_load(change, needle):
@@ -1333,7 +1419,7 @@ def test_the_projection_selects_and_orders_by_trust_and_says_what_it_left_out():
         assert hidden not in text
     assert text.index("M1:") < text.index("M2:") < text.index("M3:") < text.index("M11:")
     assert _historical(projection, 2) and f"- evidence of: commit {C1}" in _block_of(projection, 2)
-    assert "no evidence the run keeps now establishes it" in _block_of(projection, 3)
+    assert "no evidence the run keeps now establishes what it says" in _block_of(projection, 3)
     assert "a claim, never evidence" in text and "their word, not evidence" in text
     # On C1, its own failure is this launch's evidence, shown before everything else.
     on_c1 = _render(store, held, candidate=C1)
@@ -1371,34 +1457,35 @@ def test_the_projection_bound_holds_and_every_cut_is_counted():
     assert len(small.text) <= 4096 and small.omitted_for_bound > projection.omitted_for_bound
 
 
-def test_a_launch_citation_is_observed_only_with_the_receipt_the_run_keeps():
-    """R1-F1 of PR #513: a spent launch ordinal is not a receipt. A launch citation is
-    observed only when the run keeps that launch's receipt with the digest cited."""
+def test_a_launch_citation_is_never_observed_and_names_only_the_receipt_the_run_keeps():
+    """R1-F1 of PR #513: a spent launch ordinal is not a receipt. R5-F3: nor does a
+    launch's receipt establish what a record says of it: its id and digest record no
+    outcome, issue or candidate. A launch citation is shown downgraded whatever the run
+    keeps; with the receipt kept under the digest cited, its 'established' line says
+    that much and nothing more, and without it there is none."""
     receipt = "e" * 64
     cite = Citation(CitationKind.LAUNCH, f"{RUN}/2", receipt)
     store, _ = _applied(
         observe(_store(), "launch 2 ended: idle timeout", seq=2, cite=cite, kind=Kind.LAUNCH_END)
     )
-
-    def downgraded(*launches) -> bool:
-        projection = _render(store, _evidence(launches=launches))
-        shown_unverified = "no evidence the run keeps now establishes it" in projection.text
-        assert shown_unverified == bool(projection.downgraded)
-        return shown_unverified
-
-    assert downgraded()  # missing: launch 2 was spent, and no receipt is kept
-    assert downgraded((_launch(2), "f" * 64))  # mismatched digest
-    assert downgraded((_launch(3), receipt))  # another launch's receipt
-    assert downgraded((_launch(2, OTHER_RUN), receipt))  # another run's
-    assert not downgraded((_launch(2), receipt))  # retained
+    kept = f"- established: the run keeps the receipt of launch {RUN}/2 with the digest cited"
+    for launches, named in (
+        ((), False),  # missing: launch 2 was spent, and no receipt is kept
+        (((_launch(2), "f" * 64),), False),  # mismatched digest
+        (((_launch(3), receipt),), False),  # another launch's receipt
+        (((_launch(2, OTHER_RUN), receipt),), False),  # another run's
+        (((_launch(2), receipt),), True),  # retained, and still no outcome established
+    ):
+        for current in (store, _reloaded(store)):
+            projection = _render(current, _evidence(launches=launches))
+            assert projection.downgraded == 1 and not _observed(projection, 1)
+            assert "no evidence the run keeps now establishes what it says" in projection.text
+            assert (kept in projection.text) is named
+            assert "established for this launch" not in _block_of(projection, 1)
     projection = _render(store, _evidence(launches=[(_launch(2), receipt)]))
     assert (
-        "observed by the controller, which holds the evidence it cites: what its "
-        "'established' line says is established for this launch" in projection.text
-    )
-    assert (
-        f"- established: the run keeps the receipt of launch {RUN}/2 with the digest cited"
-        in projection.text
+        "a launch's receipt records no outcome, issue or candidate, so it establishes none "
+        "of them" in _block_of(projection, 1)
     )
 
 
@@ -1620,7 +1707,7 @@ def test_the_same_revision_and_request_render_other_bytes_once_a_receipt_is_evic
     assert _observed(first, record) and not _observed(later, record)
 
 
-# -- a superseded observation stays while its evidence is the stronger (R3-F3) -----------------
+# -- a superseded observation stays while its evidence establishes more (R3-F3, R5-F3) -------
 
 
 def _launch_end(store, text, seq, receipt="e" * 64, applies=None):
@@ -1639,30 +1726,65 @@ def _launch_end(store, text, seq, receipt="e" * 64, applies=None):
 
 def test_a_replacement_without_adequate_evidence_never_hides_a_verified_observation():
     """A validation failure with a kept, matching receipt, superseded by the controller's
-    record citing a launch whose receipt the run does not keep: both are shown, the
-    superseded one marked as kept for its own evidence, after a save and a load too.
-    Once the replacement's receipt is kept it hides the failure; once the failure's
-    receipt is lost, the failure is hidden and the replacement shown downgraded."""
+    record citing a launch: both are shown, the superseded one marked as kept for its
+    own evidence, after a save and a load too. R5-F3 of PR #513: so it stays once the
+    replacement's launch receipt is kept, since that receipt records no outcome, issue
+    or candidate and so establishes nothing a failure is replaced by, and the
+    replacement's text says the tests did not run at all. Once the failure's receipt is
+    lost, the failure is hidden and the replacement shown downgraded."""
     controller = {"actor": Actor.CONTROLLER, "issue_url": ISSUE, "attempt": _launch(3)}
     store, failure = _applied(observe(_store(), "test_a fails on C1", seq=1))
     store, replacement = _applied(_launch_end(store, "launch 2 ended: tests unrun", seq=2))
     store, _ = _applied(store.supersede(failure, replacement, **controller))
-    held = _evidence(1)
+    launch_kept = [(_launch(2), "e" * 64)]
     for current in (store, _reloaded(store)):
-        projection = _render(current, held, candidate=C1)
-        assert projection.shown == (failure, replacement)
-        assert _observed(projection, failure) and projection.downgraded == 1
-        assert projection.kept_over_replacement == 1 and projection.superseded == 0
-        assert f"- superseded by M{replacement}, whose evidence establishes it less" in (
-            _block_of(projection, failure)
-        )
-        assert "1 superseded but kept over a replacement with weaker evidence" in projection.text
-    with_receipt = _evidence(1, launches=[(_launch(2), "e" * 64)])
-    projection = _render(store, with_receipt, candidate=C1)
-    assert projection.shown == (replacement,) and projection.superseded == 1
-    assert _observed(projection, replacement) and projection.kept_over_replacement == 0
-    lost = _render(store, _evidence(), candidate=C1)  # the failure's receipt evicted since
+        for held in (_evidence(1), _evidence(1, launches=launch_kept)):
+            for candidate in (C1, ""):  # the failure's commit, and a launch with none
+                projection = _render(current, held, candidate=candidate)
+                assert projection.shown == (failure, replacement)
+                assert projection.downgraded == 1 and not _observed(projection, replacement)
+                assert projection.kept_over_replacement == 1 and projection.superseded == 0
+                if candidate:
+                    assert _observed(projection, failure)
+                else:
+                    assert _historical(projection, failure)
+                assert (
+                    f"- superseded by M{replacement}, whose evidence does not establish what "
+                    "this record's does for this launch: kept for its own"
+                ) in _block_of(projection, failure)
+                assert "1 superseded but kept over a replacement with weaker evidence" in (
+                    projection.text
+                )
+    lost = _render(store, _evidence(launches=launch_kept), candidate=C1)  # failure evicted
     assert lost.shown == (replacement,) and lost.superseded == 1 and lost.downgraded == 1
+
+
+def test_a_failure_is_hidden_only_by_evidence_of_what_it_establishes():
+    """R5-F3 of PR #513: supersession compares what each receipt establishes for the
+    launch, not its rank. A failure of C1 shown as C1's evidence on a launch of another
+    commit, or of none, is kept over a replacement of C2's evidence, which is just as
+    historical there but says nothing of C1; a replacement of C1's own evidence hides it
+    there, and C2's own failure hides it on a launch of C2."""
+    controller = {"actor": Actor.CONTROLLER, "issue_url": ISSUE, "attempt": _launch(4)}
+    other = "c" * 40
+    store, failure = _applied(observe(_store(), "test_a fails on C1", seq=1))
+    store, of_c2 = _applied(observe(store, "test_a fails on C2", seq=2, cite=_vr(2, commit=C2)))
+    store, _ = _applied(store.supersede(failure, of_c2, **controller))
+    held = _evidence(1, _receipt(2, commit=C2))
+    for current in (store, _reloaded(store)):
+        for candidate in (other, ""):
+            projection = _render(current, held, candidate=candidate)
+            assert projection.shown == (of_c2, failure) and projection.kept_over_replacement == 1
+            assert _historical(projection, failure) and _historical(projection, of_c2)
+        on_c2 = _render(current, held, candidate=C2)
+        assert on_c2.shown == (of_c2,) and _observed(on_c2, of_c2) and on_c2.superseded == 1
+    # The same commit's newer failure replaces it everywhere its evidence stands.
+    same, first = _applied(observe(_store(), "test_a fails on C1", seq=1))
+    same, newer = _applied(observe(same, "test_a fails on C1: KeyError", seq=3))
+    same, _ = _applied(same.supersede(first, newer, **controller))
+    for candidate in (other, "", C1):
+        projection = _render(same, _evidence(1, 3), candidate=candidate)
+        assert projection.shown == (newer,) and projection.kept_over_replacement == 0
 
 
 def test_a_replacement_evidenced_for_another_commit_or_withdrawn_hides_nothing_stronger():
@@ -2990,6 +3112,90 @@ def test_a_writer_under_another_lock_never_saves_over_a_newer_memory_checkpoint(
         == 0
     )
     assert load_state(sd_b / "state.json").memory_store().record(1).status is Status.RETRACTED
+
+
+def test_a_git_failure_in_the_state_directorys_repository_places_it_in_none(
+    tmp_path,
+    capsys,
+    monkeypatch,
+    tmp_path_factory,
+    fakes,  # noqa: F811
+):
+    """R5-F2 of PR #513: a failure of git that does not confirm the state directory is in
+    no repository places it nowhere. Clone B holds a run, Memory off, and B's git
+    configuration is malformed, so ``git rev-parse`` there exits 128. Each of A's
+    commands, Memory off too, refuses before any lock, even when B's owner repairs its
+    configuration right after A's check and saves a Memory checkpoint under B's lock:
+    that checkpoint stays byte for byte. A directory confirmed in no repository is not
+    one of these: there, with Memory off, a run is written as before."""
+    from autoforge.engine import ControllerEngine
+    from tests.conftest import git_repo, github_origin, state_tree
+
+    monkeypatch.chdir(tmp_path)
+    head_a, sd_a = _seeded_run(tmp_path, capsys)
+    clone = github_origin(git_repo(tmp_path_factory.mktemp("clone-b")))
+    sd_b = clone / ".autoforge"
+    sd_b.mkdir()
+    with_memory = load_state(sd_a / "state.json")
+    without = load_state(sd_a / "state.json")
+    without.issue_memory = {}
+    config = clone / ".git" / "config"
+    good = config.read_bytes()
+    broken = good + b"[core\n\tbroken = \n"
+    no_memory = tmp_path / "no-memory.yaml"
+    no_memory.write_text("memory:\n  enabled: false\n", encoding="utf-8")
+    head = ["--config", str(no_memory), "--state-dir", str(sd_b)]
+    run = ["run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    commands = (
+        ([*head, "step"], "step"),
+        ([*head, "resume"], "resume"),
+        ([*head, "unblock", "--reason", "x"], "unblock"),
+        ([*head, *run, "--force"], "run"),
+        ([*head, "memory", "retract", "M1", "--reason", "wrong"], "memory retract"),
+    )
+    # The failure itself: git exits 128 in B, and nothing confirms B's directory is in none.
+    config.write_bytes(broken)
+    engine = make_engine(sd_b, ["never"], workdir=tmp_path)
+    home, why = engine.state_dir_repository()
+    assert home is StateDirHome.UNKNOWN and "bad config" in why, why
+    for argv, command in commands:
+        save_state(without, sd_b / "state.json")
+        config.write_bytes(broken)
+        before = state_tree(sd_b)
+        assert cli.main(argv) == 2, command
+        err = capsys.readouterr().err
+        assert f"{command} refused" in err.replace("'", "") and "cannot be established" in err
+        assert "bad config" in err and "nothing was changed" in err.lower(), err
+        assert state_tree(sd_b) == before, command
+        assert not (clone / ".git" / "autoforge").exists()
+    real = ControllerEngine.state_dir_repository
+    for argv, command in commands[:4]:
+        save_state(without, sd_b / "state.json")
+        config.write_bytes(broken)
+        newer: list[bytes] = []
+
+        def b_repairs_and_saves(engine, newer=newer):
+            answer = real(engine)
+            if not newer:
+                # A's check has read git's failure; B's owner repairs B's
+                # configuration and saves a Memory checkpoint under B's lock.
+                config.write_bytes(good)
+                with ControllerLock(repository_lock_path(clone)):
+                    save_state(with_memory, sd_b / "state.json")
+                newer.append((sd_b / "state.json").read_bytes())
+            return answer
+
+        monkeypatch.setattr(ControllerEngine, "state_dir_repository", b_repairs_and_saves)
+        assert cli.main(argv) == 2, command
+        monkeypatch.setattr(ControllerEngine, "state_dir_repository", real)
+        err = capsys.readouterr().err
+        assert f"'{command}' refused" in err and "whatever its Issue Memory setting" in err
+        assert newer and (sd_b / "state.json").read_bytes() == newer[0], command
+    # Confirmed in no repository: with Memory off, a run is written there as before.
+    outside = tmp_path_factory.mktemp("no-repository") / "state"
+    argv = ["--config", str(no_memory), "--state-dir", str(outside), *run]
+    assert cli.main(argv) == 0, capsys.readouterr().err
+    assert load_state(outside / "state.json").memory_store() is None
 
 
 def test_memory_retract_refuses_a_scheduler_namespace_here_or_in_another_clone(

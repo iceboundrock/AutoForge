@@ -722,8 +722,15 @@ As implemented (`flock(2)`, `src/autoforge/locking.py`):
   of another repository or that git cannot place, whatever the Memory
   setting (`ControllerEngine.state_dir_repository`): a writer that loaded a
   snapshot without Memory under another lock could otherwise save over the
-  Memory checkpoint the directory's own repository wrote since. A state
-  directory in no repository is refused when the run holds Issue Memory or
+  Memory checkpoint the directory's own repository wrote since. A failure
+  of git that does not confirm the directory is in no repository (a
+  malformed configuration of the repository it is in, dubious ownership, a
+  `.git` that names nothing) places it nowhere: `locking.repository_common_dir`
+  returns no repository only when git, in the C locale, answers that
+  discovery found none and no `.git` entry or directory shaped like a git
+  directory lies on the way to the root, and raises `LockError` otherwise
+  (R5-F2). A state directory confirmed in no repository is refused when the
+  run holds Issue Memory or
   the invocation turns Memory on, and otherwise written as before: no
   command writes Memory there, so none can be lost there. Each asks before
   the lock and again under it. `rebind-epic`'s dry run also asks whether L0 is held now
