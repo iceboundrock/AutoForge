@@ -498,6 +498,13 @@ class AgentRequest:
     # (#151); a sandboxed launch has each projected writable as an engine
     # carve-out. "" for a provider that names none.
     state_dir: str = ""
+    # The launch must start with a fresh context (ADR 0015 D14): no
+    # conversation of an earlier launch and no provider-side memory written by
+    # one. The engine sets it for a phase Issue Memory projects into while the
+    # run's Memory setting is on (#317); each adapter keeps what its proof
+    # rests on (:meth:`AgentProvider.fresh_context_environment`). ``False``
+    # launches exactly as before Memory existed.
+    fresh_context: bool = False
 
     def __post_init__(self) -> None:
         self.loop_detection = self.loop_detection.for_invocation(self.profile.provider, self.phase)
@@ -965,16 +972,30 @@ class AgentProvider:
         nothing to finish.
         """
 
-    def integration_preflight(self, env_allowlist: tuple[str, ...] | None) -> None:
+    def integration_preflight(
+        self, env_allowlist: tuple[str, ...] | None, *, fresh_context: bool = False
+    ) -> None:
         """Refuse a launch whose CLI would still load an integration that
         neither its flags nor :meth:`integration_isolation` keep off (#165).
 
         ``env_allowlist`` is the configured allow-list (this provider adds
-        its own names, as for the launch). Raises :class:`ConfigurationError`
+        its own names, as for the launch). ``fresh_context`` is the launch's
+        :attr:`AgentRequest.fresh_context`: an adapter refuses, too, a
+        configuration that would undo what its fresh-context proof rests on
+        (ADR 0015 D18's dynamic check). Raises :class:`ConfigurationError`
         before anything starts: the engine calls this with the credential
         preflight, before a launch is charged, and :meth:`execute` calls it
         again before it launches. The base adapter has nothing to refuse.
         """
+
+    def fresh_context_environment(self, req: AgentRequest) -> dict[str, str]:
+        """What this adapter sets over a launch's environment so that a launch
+        of :attr:`AgentRequest.fresh_context` starts with one (ADR 0015 D14),
+        ``{}`` for any other launch. Part of the proof
+        :meth:`fresh_context_proof` names; the base adapter's proofs rest on
+        their argv alone, so it sets nothing.
+        """
+        return {}
 
     def own_names(self, profile: ProfileConfig | None) -> tuple[str, ...]:
         """The variables this provider adds to the allow-list of ``profile``'s agents."""
@@ -1205,8 +1226,9 @@ class AgentProvider:
             if monitor.output(stream, chunk, time.monotonic()) is not None:
                 stop.set()
 
-        self.integration_preflight(req.env_allowlist)
+        self.integration_preflight(req.env_allowlist, fresh_context=req.fresh_context)
         with self.integration_isolation() as isolation:
+            isolation = {**isolation, **self.fresh_context_environment(req)}
             env = {**(req.env or {}), **isolation} if isolation else req.env
             command, description = self.sandboxed(req, command, env)
             self.complete_isolation(isolation, self.started_environment(req, env, description))
@@ -1454,6 +1476,19 @@ def claude_isolation_env(env_file: str, shell: str) -> dict[str, str]:
 # bound everything else a launch does. Not for ``claude-sdk``, whose pinned
 # Claude Code predates the ceiling.
 CLAUDE_LIFECYCLE_ENV = {"CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"}
+# What a launch that needs a fresh context sets (ADR 0015 D14; R2-F7 of PR
+# #513): no auto memory, which an earlier launch of the same worktree path
+# would otherwise have written under the user's Claude configuration and this
+# one would read. Read from the 2.1.328 build: the CLI decides auto memory
+# from this variable before any setting, and a true value turns it off
+# whatever ``autoMemoryEnabled`` the user, the project or ``--settings`` says
+# (``0`` forces it on instead, so a configuration whose ``env`` sets it is
+# refused, :meth:`ClaudeCodeProvider.integration_preflight`). ``--safe-mode``
+# alone was not shown to turn it off, and ``--bare``, whose help names it,
+# also changes how the CLI authenticates. Only for such a launch: every other
+# launch is unchanged. Not for ``claude-sdk``, whose policy turns auto memory
+# off in its settings and checks ``init`` for it (docs/sdk-policy.md).
+CLAUDE_FRESH_CONTEXT_ENV = {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
 
 
 @contextmanager
@@ -1532,9 +1567,10 @@ def claude_config_files(env: Mapping[str, str]) -> list[Path]:
     return [config_dir / "settings.json", global_config]
 
 
-def _claude_config_env_problems(path: Path) -> list[str]:
+def _claude_config_env_problems(path: Path, also: tuple[str, ...] = ()) -> list[str]:
     """The names in the ``env`` of ``path`` that would undo a launch's
-    isolation, or that it could not be read; names only, never a value."""
+    isolation, or one of ``also``, or that it could not be read; names only,
+    never a value."""
     if not path.exists():
         return []
     refused = _not_a_regular_file(path)
@@ -1556,7 +1592,7 @@ def _claude_config_env_problems(path: Path) -> list[str]:
     env = document.get("env") if isinstance(document, dict) else None
     if not isinstance(env, dict):
         return []
-    isolation = {name.upper() for name in claude_isolation_env("", "")}
+    isolation = {name.upper() for name in (*claude_isolation_env("", ""), *also)}
     hits = sorted(
         name
         for name in env
@@ -1567,9 +1603,10 @@ def _claude_config_env_problems(path: Path) -> list[str]:
     return [f"{', '.join(redact(name) for name in hits)} in the env of {path}"]
 
 
-def claude_configuration_problems(env: Mapping[str, str]) -> list[str]:
+def claude_configuration_problems(env: Mapping[str, str], also: tuple[str, ...] = ()) -> list[str]:
     """What, in the configuration a Claude Code launch with ``env`` reads,
-    would set a variable over the launch's isolation (empty: nothing would).
+    would set a variable over the launch's isolation, or one of ``also``
+    (empty: nothing would).
 
     ``env`` is the environment the launch inherits (``HOME``,
     ``CLAUDE_CONFIG_DIR`` and ``CLAUDE_CODE_CUSTOM_OAUTH_URL`` decide where
@@ -1580,7 +1617,7 @@ def claude_configuration_problems(env: Mapping[str, str]) -> list[str]:
     """
     problems: list[str] = []
     for path in claude_config_files(env):
-        problems += _claude_config_env_problems(path)
+        problems += _claude_config_env_problems(path, also)
     return problems
 
 
@@ -1723,15 +1760,24 @@ class ClaudeCodeProvider(AgentProvider):
         (:func:`complete_claude_isolation`, #347)."""
         complete_claude_isolation(isolation, environment)
 
-    def integration_preflight(self, env_allowlist: tuple[str, ...] | None) -> None:
+    def integration_preflight(
+        self, env_allowlist: tuple[str, ...] | None, *, fresh_context: bool = False
+    ) -> None:
         """Refuse a launch while Claude Code's own configuration would set a
         variable over its isolation (:func:`claude_configuration_problems`):
         2.1.296 applies the ``env`` of the user settings and of the global
         configuration over the environment it is started with, under
         ``--safe-mode`` too, so a ``GH_TOKEN`` there would replace the
-        placeholder and a ``CLAUDE_ENV_FILE`` there the cleaner.
+        placeholder and a ``CLAUDE_ENV_FILE`` there the cleaner. For a launch
+        that needs a fresh context, a ``CLAUDE_CODE_DISABLE_AUTO_MEMORY``
+        there too: ``0`` would force the auto memory on that
+        :data:`CLAUDE_FRESH_CONTEXT_ENV` turns off (ADR 0015 D14, D18;
+        R2-F7 of PR #513).
         """
-        problems = claude_configuration_problems(self.launch_environment(env_allowlist))
+        problems = claude_configuration_problems(
+            self.launch_environment(env_allowlist),
+            also=tuple(CLAUDE_FRESH_CONTEXT_ENV) if fresh_context else (),
+        )
         if problems:
             raise ConfigurationError(
                 "refusing to launch claude: its own configuration sets variables over the "
@@ -1785,10 +1831,17 @@ class ClaudeCodeProvider(AgentProvider):
         # `text` prints the final text once, at exit, and nothing before it.
         return self.output_format(profile) == "stream-json"
 
+    def fresh_context_environment(self, req: AgentRequest) -> dict[str, str]:
+        """:data:`CLAUDE_FRESH_CONTEXT_ENV` for a launch that needs a fresh context."""
+        return dict(CLAUDE_FRESH_CONTEXT_ENV) if req.fresh_context else {}
+
     def fresh_context_proof(self, profile: ProfileConfig) -> str:
         """``-p`` with ``--no-session-persistence``, and no flag outside
         :data:`CLAUDE_MEMORY_ARGS` (ADR 0015 D14): an allow-list, since a deny
-        list would miss a resuming flag a later CLI adds."""
+        list would miss a resuming flag a later CLI adds. Each launch that
+        needs a fresh context also has its auto memory off
+        (:data:`CLAUDE_FRESH_CONTEXT_ENV`), refused while the user's
+        configuration would set that variable over it (R2-F7 of PR #513)."""
         if _truthy(profile.options.get("session_persistence"), default=False) is not False:
             raise no_fresh_context(
                 profile,
@@ -1804,7 +1857,10 @@ class ClaudeCodeProvider(AgentProvider):
                 f"{', '.join(sorted(CLAUDE_MEMORY_ARGS))} there",
                 "Remove it from extra_args",
             )
-        return "claude -p --no-session-persistence: a new session per launch, never saved"
+        return (
+            "claude -p --no-session-persistence, with CLAUDE_CODE_DISABLE_AUTO_MEMORY=1: a new "
+            "session per launch, never saved, and no auto memory read or written"
+        )
 
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
         argv = [profile.command or "claude", "-p"]
@@ -1873,9 +1929,9 @@ class ClaudeCodeProvider(AgentProvider):
         stream = ClaudeStream(
             cwd=req.cwd, emit=emit, loop=_ClockedLoop(monitor), is_reply=holds_control_result
         )
-        self.integration_preflight(req.env_allowlist)
+        self.integration_preflight(req.env_allowlist, fresh_context=req.fresh_context)
         with self.integration_isolation() as isolation:
-            env = {**(req.env or {}), **isolation}
+            env = {**(req.env or {}), **isolation, **self.fresh_context_environment(req)}
             command, description = self.sandboxed(req, self.build_command(req), env)
             self.complete_isolation(isolation, self.started_environment(req, env, description))
             duplex = DuplexRequest(
@@ -2434,7 +2490,9 @@ class OpenCodeProvider(AgentProvider):
         """The data directory a launch with ``env_allowlist`` uses (:func:`opencode_data_dir`)."""
         return opencode_data_dir(self.launch_environment(env_allowlist))
 
-    def integration_preflight(self, env_allowlist: tuple[str, ...] | None) -> None:
+    def integration_preflight(
+        self, env_allowlist: tuple[str, ...] | None, *, fresh_context: bool = False
+    ) -> None:
         """Refuse a launch while OpenCode would load an organization's
         configuration (:func:`opencode_organization_problems`): 2.0.26 loads
         it ahead of every configuration file, and no variable of
@@ -3610,7 +3668,9 @@ class _SdkProvider(AgentProvider):
         """
         return [profile.command, *self.interpreter_flags, self.helper().staged_path()]
 
-    def integration_preflight(self, env_allowlist: tuple[str, ...] | None) -> None:
+    def integration_preflight(
+        self, env_allowlist: tuple[str, ...] | None, *, fresh_context: bool = False
+    ) -> None:
         """Refused while :meth:`launch_problem` names a reason, so the engine
         stops here, before a launch is charged."""
         if self.launch_problem():
@@ -3902,12 +3962,14 @@ class ClaudeSdkProvider(_SdkProvider):
         """:data:`CLAUDE_SDK_CAPABILITIES`, the gates that passed on the pinned pair."""
         return self.capabilities
 
-    def integration_preflight(self, env_allowlist: tuple[str, ...] | None) -> None:
+    def integration_preflight(
+        self, env_allowlist: tuple[str, ...] | None, *, fresh_context: bool = False
+    ) -> None:
         """Refuse a launch whose helper is not usable (missing, or not the
         manifest's sha256) or whose environment would not authenticate with
         ``ANTHROPIC_API_KEY`` alone (:func:`~autoforge.sdk_policy.claude_sdk_auth_problems`,
         D10.2), before a launch is charged. Names only, never a value."""
-        super().integration_preflight(env_allowlist)
+        super().integration_preflight(env_allowlist, fresh_context=fresh_context)
         problems = claude_sdk_auth_problems(self.launch_environment(env_allowlist))
         if problems:
             raise ConfigurationError(f"refusing to launch {self.name}: {'; '.join(problems)}")

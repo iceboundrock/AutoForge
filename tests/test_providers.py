@@ -2491,6 +2491,93 @@ def test_a_claude_launch_turns_the_clis_background_wait_ceiling_off(tmp_path, mo
     assert "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS" not in ClaudeSdkProvider.isolation_names
 
 
+@pytest.mark.parametrize("output_format", ["stream-json", "text"])
+def test_a_launch_that_needs_a_fresh_context_turns_claudes_auto_memory_off(
+    monkeypatch, output_format
+):
+    """ADR 0015 D14 (R2-F7 of PR #513): a launch of a Memory phase while Memory is on
+    starts with Claude Code's auto memory off, over the operator's own ``0`` (which
+    forces it on); any other launch sets nothing new, whatever its output format."""
+    from autoforge import providers
+    from autoforge.providers import CLAUDE_FRESH_CONTEXT_ENV
+
+    class Launched(Exception):
+        pass
+
+    seen: list[dict] = []
+
+    def launch(req):
+        seen.append(dict(req.env))
+        raise Launched
+
+    monkeypatch.setattr(providers, "start_duplex", launch)
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "0")
+    profile = default_config().profile("analyze_execute")
+    if output_format == "text":
+        profile = _text(profile)
+    for fresh in (True, False):
+        req = AgentRequest(
+            "ANALYZE_EXECUTE",
+            "p",
+            "/tmp",
+            profile,
+            None,
+            7,
+            env_allowlist=("PATH", "CLAUDE_*"),
+            env={"GH_TOKEN": "placeholder"},
+            fresh_context=fresh,
+        )
+        with pytest.raises(Launched):
+            ClaudeCodeProvider(runner=launch).execute(req)
+    on, off = seen
+    assert on["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+    assert CLAUDE_FRESH_CONTEXT_ENV == {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+    # Memory off, or another phase: exactly what a launch set before Memory existed.
+    assert "CLAUDE_CODE_DISABLE_AUTO_MEMORY" not in off
+    assert sorted(set(off) - {"GH_TOKEN"}) == sorted(ClaudeCodeProvider.isolation_names)
+    assert {k: v for k, v in on.items() if k != "CLAUDE_CODE_DISABLE_AUTO_MEMORY"}.keys() == (
+        off.keys()
+    )
+    other = AgentRequest("ANALYZE_EXECUTE", "p", "/tmp", profile, None, 7, fresh_context=True)
+    for name in ("pi", "opencode", "scripted"):
+        assert (
+            provider_for(dataclasses.replace(profile, provider=name)).fresh_context_environment(
+                other
+            )
+            == {}
+        )
+
+
+@pytest.mark.parametrize("where", ["settings", "global"])
+def test_a_claude_configuration_that_would_force_auto_memory_on_refuses_a_fresh_context(
+    tmp_path, operator_claude_config, where
+):
+    """R2-F7: 2.1.296 applies the env of the user settings and of the global
+    configuration over the launch's, so a ``CLAUDE_CODE_DISABLE_AUTO_MEMORY`` there
+    would undo the fresh context: a launch that needs one is refused before anything
+    starts, naming the file and the variable, never the value. A launch that needs
+    none launches as before."""
+    from tests import claude_fake
+
+    home = operator_claude_config
+    path = home / ".claude" / "settings.json" if where == "settings" else home / ".claude.json"
+    path.write_text(json.dumps({"env": {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "0"}}))
+    fake_home, profile = claude_fake.fake_claude(tmp_path, [claude_fake.result("done")])
+    allow = default_config().execution.environment_names()
+    provider = ClaudeCodeProvider()
+    with pytest.raises(ConfigurationError) as caught:
+        provider.integration_preflight(allow, fresh_context=True)
+    assert f"CLAUDE_CODE_DISABLE_AUTO_MEMORY in the env of {path}" in str(caught.value)
+    fresh = AgentRequest(
+        "ANALYZE_EXECUTE", "p", str(tmp_path), profile, 900, 30, env_allowlist=allow
+    )
+    with pytest.raises(ConfigurationError):
+        provider.execute(dataclasses.replace(fresh, fresh_context=True))
+    assert not (fake_home / "log.json").exists()
+    provider.integration_preflight(allow)
+    assert provider.execute(fresh).ok
+
+
 def _background_agent_run(*after: str) -> list[str]:
     """The run of #501 through the fake ``claude``: a turn that starts a
     background agent and gets its result at once, the agent's own records,

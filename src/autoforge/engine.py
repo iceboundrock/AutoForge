@@ -234,6 +234,7 @@ from .config import (
     ACCEPTANCE_ACTIONS_AUTO,
     ACCEPTANCE_ACTIONS_OFF,
     KNOWN_PROVIDERS,
+    MEMORY_PHASES,
     MEMORY_SETTING_KEY,
     PR_BODY_UPDATES_AUTO,
     PR_BODY_UPDATES_OFF,
@@ -16945,7 +16946,11 @@ class ControllerEngine:
             identity = preflight(
                 cwd, self._runner, env_allowlist=provider.launch_allowlist(env_allowlist)
             )
-            provider.integration_preflight(env_allowlist)
+            # A Memory phase's launch needs a fresh context while the run's
+            # Memory setting is on, which check_run_configuration keeps equal
+            # to this invocation's (ADR 0015 D14, D18; R2-F7 of PR #513).
+            fresh_context = self.config.memory.enabled and phase.value in MEMORY_PHASES
+            provider.integration_preflight(env_allowlist, fresh_context=fresh_context)
             # What the agent reads from GitHub, read by the controller (it
             # holds no credential to read it itself) and written before the
             # prompt that names it is rendered; nothing is saved yet.
@@ -17030,6 +17035,7 @@ class ControllerEngine:
                 env_allowlist=env_allowlist,
                 loop_detection=self.config.execution.loop_detection,
                 interaction=broker,
+                fresh_context=fresh_context,
             )
             record = ExecutionRecord(
                 run_id=state.run_id,
@@ -17053,8 +17059,13 @@ class ControllerEngine:
                 metadata={
                     **self._log_metadata(phase),
                     "env_allowlist": list(provider.environment_allowlist(req) or ()),
-                    # The controller's names, then the adapter's own (#165).
-                    "env_set": [*override_names(), *provider.isolation_names],
+                    # The controller's names, then the adapter's own (#165),
+                    # and what a fresh context adds (ADR 0015 D14).
+                    "env_set": [
+                        *override_names(),
+                        *provider.isolation_names,
+                        *provider.fresh_context_environment(req),
+                    ],
                     "sandbox_mode": self.config.sandbox.mode,
                 },
             )

@@ -1534,7 +1534,15 @@ refuses, when it loads and before anything is saved, an `analyze_execute`
 profile that cannot prove it, naming the profile, why and the remedy, never
 a value:
 
-- `claude` proves it with `-p --no-session-persistence`. It is refused with
+- `claude` proves it with `-p --no-session-persistence`, and each launch of
+  a Memory phase while Memory is on also sets
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` over its environment, so Claude Code's
+  auto memory, which an earlier launch would have written under your Claude
+  configuration, is neither read nor written (the 2.1.328 build reads the
+  variable before any setting; a launch with Memory off sets nothing new).
+  Such a launch is refused before anything starts while the `env` of your
+  Claude settings or global configuration sets that variable, which Claude
+  Code would apply over the launch's. It is refused with
   the option `session_persistence` on, and with any `extra_args` outside an
   allow-list read from Claude Code 2.1.328's help: `--allowed-tools`
   (`--allowedTools`), `--disallowed-tools` (`--disallowedTools`),
@@ -1547,7 +1555,8 @@ a value:
   their values, `--archived` and `--print-logs`. `-c`, `--continue`, `-s`,
   `--session`, `--fork` and `--server` are outside it.
 - `pi` (`--no-session`, no `extra_args`) and `claude-sdk` (a new session id
-  per launch, no `extra_args`) prove it by construction.
+  per launch, no `extra_args`, and its policy's `autoMemoryEnabled: false`,
+  checked in the launch's `init`) prove it by construction.
 - `opencode-sdk` proves nothing: every launch of it is refused until #152.
 
 A value in an allow-listed flag's place must not look like a flag, and a

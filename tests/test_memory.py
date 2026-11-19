@@ -1906,6 +1906,36 @@ def test_memory_on_with_a_seed_changes_no_launch_effect_or_transition(tmp_path):
     assert store is not None and store.revision == 1 and store.records[0].status is Status.CURRENT
 
 
+def test_only_a_memory_phases_launch_with_memory_on_needs_a_fresh_context(tmp_path):
+    """ADR 0015 D14, D18 (R2-F7 of PR #513): the engine asks for a fresh context for a
+    launch of a phase Memory projects into while the run's Memory is on, and for no
+    other: REVIEW's launch, and every launch of a run with Memory off, are as before."""
+    from tests.conftest import PR, FakeGitHub, implement, review_result
+
+    def loop(sd: Path, memory: bool) -> list[tuple[str, bool]]:
+        gh = FakeGitHub()
+        seen: list[tuple[str, bool]] = []
+
+        def agent(req):
+            seen.append((req.phase, req.fresh_context))
+            if req.phase == "ANALYZE_EXECUTE":
+                return implement(req)
+            return block(review_result(1, gh.prs[PR].head_sha))
+
+        eng = make_engine(sd, agent, github=gh, origin=True)
+        eng.config.memory.enabled = memory
+        eng.record_run_configuration()
+        eng._save()
+        for _ in range(2):
+            eng.step()
+        return seen
+
+    on = loop(tmp_path / "on" / ".autoforge", True)
+    off = loop(tmp_path / "off" / ".autoforge", False)
+    assert on == [("ANALYZE_EXECUTE", True), ("REVIEW", False)]
+    assert off == [("ANALYZE_EXECUTE", False), ("REVIEW", False)]
+
+
 # -- the operator's commands (D9.5, W9) ----------------------------------------------------------
 
 

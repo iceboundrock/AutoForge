@@ -655,6 +655,8 @@ MEMORY_SETTING_KEY = "memory.enabled"
 #: (ADR 0015 D13: ``ANALYZE_EXECUTE`` first; ``FIX`` follows once it has an
 #: evaluation result, and ``REVIEW`` never gets the implementer's lessons).
 MEMORY_PHASE_PROFILES: tuple[tuple[str, str], ...] = (("ANALYZE_EXECUTE", "analyze_execute"),)
+#: The phases whose launches need a fresh context while Memory is on (D14).
+MEMORY_PHASES: frozenset[str] = frozenset(phase for phase, _ in MEMORY_PHASE_PROFILES)
 
 
 @dataclass

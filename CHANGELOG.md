@@ -40,8 +40,11 @@ on, the configuration refuses an `analyze_execute` profile that cannot prove
 each launch starts with a fresh context: a Claude profile with
 `session_persistence` or with `extra_args` outside a short allow-list (a
 resuming flag such as `--resume` or `--continue` among them), an OpenCode
-profile likewise, and an `opencode-sdk` profile. With Memory off, nothing of
-this is checked.
+profile likewise, and an `opencode-sdk` profile. A Claude launch of that
+phase also has Claude Code's auto memory turned off
+(`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`), and is refused while the `env` of
+your Claude settings sets that variable. With Memory off, nothing of this
+is checked and no launch changes.
 
 ### `claim-ambiguous`: `status` goes by what the reason names (#375)
 

@@ -3215,7 +3215,12 @@ path's own tests (ADR 0015 §4.2). Keep covered:
 - the run's Memory setting recorded at creation and a later change refused
   without `--accept-config-change`; with Memory on, a profile without a
   fresh-context proof refused when the configuration loads, for every flag
-  ADR 0015 D14 lists;
+  ADR 0015 D14 lists; only a Memory phase's launch with Memory on asks for a
+  fresh context, a Claude launch that does has its auto memory off
+  (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, over the operator's own value, in
+  both output formats) and is refused while the user's or global
+  configuration's `env` sets that variable, and every other launch's
+  environment is as before (`tests/test_providers.py`);
 - no module that decides imports Memory, and the engine touches it only in
   the run-configuration record and check; a run with Memory on and a seed
   goes through the same phases, launches and writes as one with it off;
