@@ -98,6 +98,14 @@ uv run autoforge rebind-epic --issue https://github.com/owner/repo/issues/257 \
 # rewritten by hand): give up the round's FIX and have a fresh REVIEW round
 # judge the PR as it now stands; then `resume`
 uv run autoforge unblock --rereview --reason "rewrote the PR description"
+
+# Issue Working Memory (memory.enabled: true in the config; off by default):
+# seed a new run with one lesson, byte for byte, before its first launch;
+# show the run's Memory; withdraw a record (one save, under the lock)
+uv run autoforge --config autoforge.yaml run --issue https://github.com/owner/repo/issues/2 \
+               --memory-seed lesson.txt
+uv run autoforge memory show            # or --json; read-only
+uv run autoforge memory retract M1 --reason "the lesson was wrong"
 ```
 
 Pass a config file with the global option, before the subcommand:
@@ -2388,6 +2396,51 @@ compares the routing only and says so.
 A state file written before this check (protocol 8) has no recorded
 configuration. It loads and resumes unchecked, and the first `step`,
 `resume` or `unblock` records the configuration it runs on (`upgraded`).
+
+### Issue Working Memory
+
+A run created with `memory.enabled: true` keeps an Issue Working Memory: a
+bounded store of advisory lessons for its issue, inside its `state.json`,
+that lives and dies with the run (ADR 0015, #317). It decides nothing: no
+phase, write, permission, budget or merge reads it. Each record says who
+wrote it and how far it may be trusted: `observed` by the controller and
+citing evidence it holds, the `operator`'s own statement, or `proposed` by
+an agent and never more than a claim. `run --force` and `epic archive` start
+a new run with empty Memory; a lesson carried forward is seeded again.
+
+This release adds the store, its record of the run's setting and the
+operator's commands. It does not yet put Memory in front of an agent:
+that, and the controller's own observations, are #333's. A run with Memory
+on launches, transitions and writes to GitHub exactly as one with it off.
+
+- `run --memory-seed FILE` imports `FILE` as one `operator` record in the
+  run's first save, before any launch: UTF-8 text of at most 2,048 bytes,
+  no control character but a tab or a newline, and nothing the run-log
+  redactor would change. It is kept byte for byte, with its SHA-256, or
+  refused with exit 2 and nothing written. The configuration must turn
+  Memory on. The dry run checks the file and prints its size and digest.
+- `memory show [--json]` prints the store: each record's kind, status,
+  trust, applicability, citation, history and text, the revision and the
+  digest of the content, and how many writes were refused and why. It takes
+  no lock and writes nothing; `status --json` carries the raw field
+  (`issue_memory`) too.
+- `memory retract RECORD --reason TEXT` withdraws any record (`M3` or `3`),
+  under the controller lock, in one save: its text is dropped, its digest
+  is kept, and the same text is refused if anything writes it again. A
+  refusal (no such record, already retracted, a run without Memory) exits 2
+  and writes nothing. It is refused for a scheduler namespace's state
+  directory.
+
+A run's Memory setting is recorded when it is created, beside its recorded
+configuration: `step`, `resume` and `unblock` refuse a configuration with
+another `memory.enabled` unless `--accept-config-change`, which records the
+change in the run log. Turning Memory off keeps the records, which then take
+no write but a retraction.
+
+Bounds: at most 64 records, a text of at most 2,048 UTF-8 bytes, three
+corrections of a record, and so at most 256 tombstones; together they keep
+the store under 1,048,576 bytes in the state file. A write past a bound is
+refused and counted, never by evicting another record.
 
 ### Candidate validation evidence
 

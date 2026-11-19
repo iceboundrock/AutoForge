@@ -510,6 +510,17 @@ scheduler:
   poll_interval_seconds: 60 # least time between two EPIC snapshots, 15-3600
   stop_grace_seconds: 30    # a stop or first Ctrl-C waits this long, 10-600
 
+memory:
+  # Issue Working Memory (#317, ADR 0015): a bounded store of advisory lessons
+  # a new run keeps for its issue in its state.json, empty when the run starts
+  # (`run --memory-seed FILE` imports one lesson before the first launch).
+  # It decides nothing, and this release shows it to no agent yet (#333 does).
+  # Recorded with the run: a later command with another value is refused
+  # unless --accept-config-change. With it on, the analyze_execute profile must
+  # prove a fresh context for each launch: no session persistence, and only the
+  # allow-listed extra_args (docs/configuration.md, "Issue Working Memory").
+  enabled: false
+
 sandbox:
   # The outer sandbox (ADR 0005, #168, #169): an OS-enforced filesystem,
   # process and IPC boundary around what AutoForge launches, on top of the

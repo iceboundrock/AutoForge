@@ -163,7 +163,25 @@ that step. Every save drops it in another phase or
 after another launch (`BLOCKED` and `FAILED` included), and the step drops it
 when its own checks refuse it before its plan is saved (a verification failure, the producer gate);
 the loader refuses one bound to another phase, attempt or launch label than
-the state's. A
+the state's. Each launch is named by `launch_seq`, the run-wide launch
+ordinal (ADR 0015 D2.1, #317): the launch-intent save sets it to one more,
+and that launch is `(run_id, launch_seq)`; nothing else changes it, not
+`unblock`, `resume`, a phase change, an issue switch or a crash, so no two
+launches of a run share it the way two launches of one step share `attempt`
+after an `unblock`. It is an identity, never a budget. The run's Issue
+Working Memory is `issue_memory` (ADR 0015 D8 to D12, #317,
+`autoforge.memory.MemoryStore`): `{}` for a run created with Memory off,
+otherwise one bounded store with the run's Memory setting (`enabled`), its
+revision, its records (each typed, with its trust, applicability, issue,
+step and launch, status and history), the tombstones of corrected and
+retracted texts and the count of refused writes. It is advisory: no code
+that decides a phase, a write, a permission, a budget or a merge reads it,
+and only `state.py`, the CLI and the engine's run-configuration record and
+check touch it (`tests/test_memory.py`). The loader checks it whole: exactly
+its shape, every record's history closed over the store's revision, the
+tombstones exactly those the histories left, the run's own run id, no launch
+past `launch_seq`, no issue of another repository, and at most 1,048,576
+bytes as the file holds it. A
 REMOTE `last_fix_resolutions` entry carries `acceptance_comment_url`: the
 comment the controller verified for an `acceptance_action` resolution
 (required, on the run's issue), and `""` for any other (#211).
@@ -611,6 +629,8 @@ Protocol 16 → 17 (#433) added the partial fix: the field `partial_fix` above, 
 Protocol 17 → 18 (#434) added the automatic-recovery journal: the field `auto_recovery` above, and the effect kind K13 (ADR 0004 D13.13), whose records live in that journal and never in `effect_records`, which refuses one under any label. Every protocol-18 save writes `auto_recovery`, `{}` included, so a protocol-18 file missing it is refused: read as the empty default, it would refill an allowance a decision already spent. A protocol-17 file, and every older file its own rules load, loads in every phase with `auto_recovery: {}` (no decision was taken, so every step's allowance is unspent) and is relabelled 18 on its next save. A file labelled 17 or older that carries the field, even `{}`, is a hand edit or a foreign file and is refused, unchanged. The journal is validated whole on load: its step, every decision's step, category and refusal, a relaunch only for an allowlisted category, the step's relaunches at most one and no fewer than its decisions made, decisions in increasing order up to the journal's number, each audit record a K13 of this run and of its decision's step and number, and no settled decision of an earlier step. The number is the implementation's (`main` was at 17 when it was written); it is settled on #23 before the change merges.
 
 Protocol 18 → 19 (#479, R1-F1 of PR #481) added the kept reply: the field `delivered_reply` above. Every protocol-19 save writes it, `{}` included, so a protocol-19 file missing it is refused: read as the empty default, it would drop a reply the step goes on from and launch the agent again. A protocol-18 file, and every older file its own rules load, loads in every phase with `delivered_reply: {}` (an older controller held such a reply in memory only, so none survived it) and is relabelled 19 on its next save. A file labelled 18 or older that carries the field, even `{}`, is a hand edit or a foreign file and is refused, unchanged. A kept reply is validated whole on load: exactly its keys, an agent phase, an attempt of at least 1, a launch label, a full lower-case candidate SHA or none, the bound revision (a full lower-case HEAD SHA or none, a base branch name of at most 512 characters, a full lower-case merge base SHA or none), a kill at the idle limit or the maximum runtime or a failing exit with no limit (each end checked on its own, so a failing exit naming any limit is refused: R5-F2 of PR #481), a step directory's name, a payload of its own phase within the parser's bound and the digest of that payload, and a boolean `applied` (R3-F2 of PR #481); and it must be bound to the state's own phase, attempt and launch label. The number is the implementation's (`main` was at 18 when it was written); it is settled on #23 before the change merges.
+
+Protocol 19 → 20 (#317, ADR 0015 D19.1 to D19.3) added Issue Working Memory and the launch ordinal: the fields `issue_memory` and `launch_seq` above, and with `issue_memory` the run's recorded Memory setting, which `step`, `resume` and `unblock` hold `memory.enabled` against (a change needs `--accept-config-change`). Every protocol-20 save writes both, `{}` and 0 included, so a protocol-20 file missing either is refused: read as the empty default, Memory would lose its records and retractions, and the ordinal would start again and name two launches alike. A protocol-19 file, and every older file its own rules load, loads in every phase with `issue_memory: {}` (Memory off, which is all an older controller had) and `launch_seq` equal to its `step_count`: every launch it made was charged a step before it started (#434), so every ordinal allocated after the load is greater than any launch the run made, and nothing persisted before the bump names an ordinal. It is relabelled 20 on its next save. A file labelled 19 or older that carries either field, even empty, is a hand edit or a foreign file and is refused, unchanged. The number is the implementation's (`main` was at 19 when it was written); it is settled on #23 before the change merges.
 
 Protocol 5 → 7 (#160) added the effect state above (`effect_records`, `entry_observation`, `completion_context`, `launch_label`). Protocol 6 is skipped, and stays skipped for good: #23 once reserved it for #126, which now takes the next number like every other bump (see "Numbering a new protocol" below). The number this bump took was settled on #23 before it merged. State persisted under protocol 5, or under any older protocol that its own rules load, carries no effect state and loads as none; a legacy file that does carry one of these fields is a hand edit or a foreign file and is refused. A legacy REMOTE file with `attempt >= 1` gets the launch label `agent_publishes` for a phase whose agent published under the previous contract, so that the first entry of this version knows an agent may already have published (D13.3). `UPDATE_EPIC` is the one such phase whose publication this version performs itself: its one-shot legacy re-entry adopts the progress comment that agent posted, with no record, and asks for the selection only (D13.7; [github-safety.md](github-safety.md), "Before UPDATE_EPIC"). LOCAL state, whatever its protocol, carries no effect state.
 

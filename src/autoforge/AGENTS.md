@@ -300,6 +300,16 @@ delivered_result.py a reply delivered before its launch failed (#479, ADR 0012 D
                     to, and marked applied by the save of the plan made from it);
                     accepts nothing itself; pure,
                     persists nothing itself
+memory.py           Issue Working Memory (#317, ADR 0015 D8-D12): the store the state's
+                    issue_memory holds (MemoryStore: records typed by kind, trust,
+                    applicability, issue, step and launch, status and history; the
+                    tombstones; the refusal counters), its writes (add, correct,
+                    supersede, retract, each who-may-do-what checked, bounded,
+                    redacted and returning the store to save), the operator's seed
+                    check, and the deterministic, bounded projection (render_projection)
+                    #333 renders into a launch's read context; advisory: imported only
+                    by state.py and cli.py, never by a module that decides; pure,
+                    persists nothing itself
 recovery_package.py status's recovery action package (#374): from a loaded state, its
                     classification, the configuration and, for 'status --live',
                     unblock's dry-run decision: the diagnosis of the saved stop code,
@@ -447,6 +457,11 @@ delivered_result.py, engine.py (_invoke_phase's
 failed launch end, _failed_launch)              -> docs/adr/0012-recovery-and-escalation-stop-
                                                      authority-and-advisor-gates.md (D12) + docs/
                                                      agent-guides/control-result-protocol.md
+memory.py, state.py (issue_memory, launch_seq),
+cli.py (run --memory-seed, memory), config.py
+(memory:), providers.py (fresh_context_proof)     -> docs/adr/0015-task-state-issue-memory-and-
+                                                     crash-order.md + docs/evaluation-
+                                                     protocol.md
 stop_classification.py, engine.py (_block and
 _blocked codes, the agent-status sink),
 cli.py (stop lines), errors.py (a new class),

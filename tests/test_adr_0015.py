@@ -247,28 +247,31 @@ def _step_key(state: AutoForgeState) -> StepKey:
 
 
 def test_adr_0015_attempt_repeats_after_an_unblock_into_the_same_step(tmp_state_dir, fake_github):
-    """D2.1's regression scenario, as today's code runs it. An ``unblock``
-    back into the same phase keeps the step's key and restarts the attempt
-    counter, so two launches of the step share ``(StepKey, attempt)``: the
-    counter names no launch. The run's step count does not restart. D2's
-    table takes the attempt's identity from ``launch_seq``, which D19.2
-    adds: it is no field yet, so the child that adds it updates the record
-    with this test."""
+    """D2.1's regression scenario. An ``unblock`` back into the same phase keeps
+    the step's key and restarts the attempt counter, so two launches of the step
+    share ``(StepKey, attempt)``: the counter names no launch. The run's step
+    count does not restart. D2's table takes the attempt's identity from
+    ``launch_seq``, which #317 added (D19.2): each launch-intent save spends the
+    next one, and the ``unblock`` between the two launches changes nothing of it,
+    so the two launches are ``(RunID, 1)`` and ``(RunID, 2)``."""
     stop = block({"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": "need decision"})
     eng = make_engine(tmp_state_dir, [stop, stop], github=fake_github, origin=True)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     key = _step_key(eng.state)
+    assert eng.state.launch_seq == 0
 
     assert eng.step().next_phase == "BLOCKED"
-    first = (eng.state.attempt, eng.state.step_count)
+    first = (eng.state.attempt, eng.state.step_count, eng.state.launch_seq)
     assert eng.unblock("the operator decided").unblocked
     assert eng.state.phase is Phase.ANALYZE_EXECUTE and _step_key(eng.state) == key
     assert eng.state.attempt == 0 and eng.state.step_count == first[1]
+    assert eng.state.launch_seq == first[2] == 1
 
     assert eng.step().next_phase == "BLOCKED"
-    second = (eng.state.attempt, eng.state.step_count)
+    second = (eng.state.attempt, eng.state.step_count, eng.state.launch_seq)
     assert [call.attempt for call in eng.provider.calls] == [1, 1]
     assert first[0] == second[0] == 1 and second[1] > first[1]
+    assert (first[2], second[2]) == (1, 2)
 
     identity = next(
         cells
@@ -276,7 +279,8 @@ def test_adr_0015_attempt_repeats_after_an_unblock_into_the_same_step(tmp_state_
         if _code_spans(cells[0]) == ["AttemptID"]
     )
     assert "`(RunID, launch_seq)`" in identity[1] and "state.attempt" not in identity[1]
-    assert "launch_seq" not in {field.name for field in dataclasses.fields(AutoForgeState)}
+    assert identity[2].startswith("yes")
+    assert "launch_seq" in {field.name for field in dataclasses.fields(AutoForgeState)}
 
 
 @pytest.mark.parametrize(

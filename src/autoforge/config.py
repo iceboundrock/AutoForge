@@ -648,6 +648,33 @@ class ValidationConfig:
     scope: str = SCOPE
 
 
+MEMORY_KEYS = ("enabled",)
+#: What a configuration change and its refusal call the run's Memory setting.
+MEMORY_SETTING_KEY = "memory.enabled"
+#: The phases Issue Memory projects into, and the profile each routes to
+#: (ADR 0015 D13: ``ANALYZE_EXECUTE`` first; ``FIX`` follows once it has an
+#: evaluation result, and ``REVIEW`` never gets the implementer's lessons).
+MEMORY_PHASE_PROFILES: tuple[tuple[str, str], ...] = (("ANALYZE_EXECUTE", "analyze_execute"),)
+
+
+@dataclass
+class MemoryConfig:
+    """Issue Working Memory (``memory:`` in the config file; #317, ADR 0015).
+
+    ``enabled`` (default ``false``) gives a new run a store of advisory
+    lessons that lives and dies with the run: the operator's seed
+    (``run --memory-seed``), and, once #333 lands, what the controller
+    observes and what agents propose, rendered into each launch of the
+    phases of :data:`MEMORY_PHASE_PROFILES`. The setting is recorded with the
+    run, and a later command that differs from it is refused unless it is
+    repeated with ``--accept-config-change`` (D19.3). A configuration that
+    turns it on refuses at load a profile those phases route to that cannot
+    prove a fresh context for each launch (D14, D18).
+    """
+
+    enabled: bool = False
+
+
 REPLAN_KEYS = (
     "enabled",
     "soft_threshold",
@@ -869,6 +896,7 @@ TOP_LEVEL_KEYS = (
     "sandbox",
     "validation",
     "scheduler",
+    "memory",
     "profiles",
 )
 
@@ -912,6 +940,7 @@ class AutoForgeConfig:
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     scheduler: EpicSchedulerConfig = field(default_factory=EpicSchedulerConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
     profiles: dict[str, ProfileConfig] = field(default_factory=dict)
 
     def profile(self, name: str) -> ProfileConfig:
@@ -1068,6 +1097,28 @@ def validate_profile(profile: ProfileConfig) -> None:
     provider_for(profile).validate_profile(profile)
 
 
+def validate_memory_routing(cfg: AutoForgeConfig) -> None:
+    """ADR 0015 D18's static refusal: with ``memory.enabled``, every profile a
+    Memory phase routes to proves a fresh context for each launch (D14).
+
+    ConfigurationError naming the profile, the capability and the remedy,
+    never a value, before anything is saved or launched. Nothing to check
+    with Memory off.
+    """
+    if not cfg.memory.enabled:
+        return
+    from .providers import provider_for  # local import: providers depends on config
+
+    for _phase, name in MEMORY_PHASE_PROFILES:
+        profile = cfg.profiles.get(name)
+        if profile is None:
+            raise ConfigurationError(
+                f"memory.enabled needs profile {name!r}, which is not configured"
+            )
+        validate_profile(profile)
+        provider_for(profile).fresh_context_proof(profile)
+
+
 def validate_required_profiles(cfg: AutoForgeConfig, names: list[str]) -> None:
     """Fail early (ConfigurationError) if any required profile is missing/invalid."""
     missing = [n for n in names if n not in cfg.profiles]
@@ -1129,6 +1180,10 @@ def load_config_file(path: str | Path | None) -> AutoForgeConfig:
     problem = merged.environment_overlap()
     if problem:
         raise ConfigurationError(f"{p}: {problem}")
+    try:
+        validate_memory_routing(merged)
+    except ConfigurationError as exc:
+        raise ConfigurationError(f"{p}: {exc}") from None
     return merged
 
 
@@ -1704,6 +1759,9 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                     f"{source}: 'sandbox.container.{key}' must be a positive number, got {value}"
                 )
             setattr(base.sandbox.container, key, value)
+    memory = _section(data, "memory", source, MEMORY_KEYS)
+    if "enabled" in memory:
+        base.memory.enabled = _as_bool(memory["enabled"], source, "memory.enabled")
     validation = _section(data, "validation", source, VALIDATION_KEYS)
     if "commands" in validation:
         base.validation.commands = _as_definitions(

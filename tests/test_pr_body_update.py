@@ -2193,6 +2193,7 @@ def test_a_protocol_14_fix_entry_loads_and_offers_nothing(tmp_state_dir):
     del data["entry_observation"]["pr_body_sha256"]
     del data["pr_body_outcomes"], data["stop_code"], data["partial_fix"]
     del data["auto_recovery"], data["delivered_reply"]
+    del data["issue_memory"], data["launch_seq"]
     data["protocol_version"] = "14"
     eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
 
@@ -2205,7 +2206,7 @@ def test_a_protocol_14_fix_entry_loads_and_offers_nothing(tmp_state_dir):
             fixer(no_change("R1-F1"), commit=False),
         ),
     )
-    assert eng2.state.protocol_version == "19" and eng2.state.pr_body_outcomes == []
+    assert eng2.state.protocol_version == "20" and eng2.state.pr_body_outcomes == []
     out = eng2.step()
     assert out.next_phase == "REVIEW", out.message
     assert _body_writes(gh) == []

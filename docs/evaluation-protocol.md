@@ -160,7 +160,10 @@ A record of a seeded arm carries the digest of the lesson its Memory collector r
 arm's carries none. Anything else leaves the contrast `NOT_EVALUATED`: another Memory is another
 intervention. **That collector is owed by #317 and #333**, whose design this was written without, so how
 a lesson is entered into Memory cannot be stated here; if the design has no way to hold it unchanged, that
-is an amendment before the first comparison.
+is an amendment before the first comparison. #317's design holds it unchanged, so no amendment is needed on
+that point: `run --memory-seed FILE` imports the lesson before the first launch as one operator record,
+byte for byte or not at all, with its SHA-256, which `memory show --json` reads back (ADR 0015 D9.5). The
+collector itself, and the projection that puts the lesson in front of an agent, are #333's.
 
 A lesson is the author's summary of its evidence, not a transcript of a real attempt: these commits are
 the closest thing this repository holds to earlier verified experience on the same code. Whether a lesson
@@ -175,7 +178,9 @@ Within a pair: repository task, base commit, models and providers, sandbox polic
 commands, review and resource limits. `tests/evaluation.py` digests the whole configuration except
 where this host keeps things. A key added under any existing section, such as `validation.fast_commands`
 if ADR 0010's stage 2 (D11 to D13) lands, is therefore held equal the day it exists, and a new
-top-level section is refused until someone classifies it. That digest is of the file `collect` is given
+top-level section is refused until someone classifies it. The one section classified as a treatment is
+`memory:` (#317): it is what arm 2 adds to arm 1, so the arms of `memory_benefit` differ in it by design,
+and it is left out of the digest, which its arrival therefore did not move. That digest is of the file `collect` is given
 when it scores a run; section 4.2 says how little of it a run's own records can back. Both arms of a pair
 run on one host, one controller commit and the same provider CLI versions, within 24 hours of each other.
 

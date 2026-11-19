@@ -862,6 +862,46 @@ def _truthy(value: str | None, default: bool) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def no_fresh_context(profile: ProfileConfig, why: str, remedy: str) -> ConfigurationError:
+    """The refusal of a profile a Memory phase routes to that cannot prove a fresh context.
+
+    ADR 0015 D14 and D18: it names the profile, the capability and the remedy,
+    never a value of the profile.
+    """
+    return ConfigurationError(
+        f"profile {profile.name!r} ({profile.provider}) cannot prove that each launch starts "
+        "with a fresh context, with no conversation of an earlier launch and no provider-side "
+        "memory written by one, which Issue Memory needs (memory.enabled; ADR 0015 D14): "
+        f"{why}. {remedy}, or turn memory.enabled off"
+    )
+
+
+def outside_allow_list(args: Iterable[str], allowed: Mapping[str, bool]) -> str:
+    """The first of ``args`` an allow-list of flags does not take, as a refusal names it.
+
+    ``allowed`` maps each flag to whether it takes a value, given as
+    ``--flag=value`` or as the next argument, which must not look like a
+    flag. ``""`` when every argument is taken. What is named is a flag's
+    name, never a value: an argument that is no flag is "an argument that is
+    not a flag".
+    """
+    items = list(args)
+    i = 0
+    while i < len(items):
+        arg = items[i]
+        name, eq, _ = arg.partition("=")
+        if not arg.startswith("--") or name not in allowed:
+            return repr(name) if arg.startswith("-") else "an argument that is not a flag"
+        if eq and not allowed[name]:
+            return f"{name!r} with a value"
+        if allowed[name] and not eq:
+            if i + 1 >= len(items) or items[i + 1].startswith("-"):
+                return f"{name!r} without its value"
+            i += 1
+        i += 1
+    return ""
+
+
 class AgentProvider:
     """Base adapter. Subclasses implement ``build_command_for``, and
     ``stdin_payload`` when the prompt does not travel in argv."""
@@ -997,6 +1037,21 @@ class AgentProvider:
         ask fails the invocation under every policy.
         """
         return NO_CAPABILITIES
+
+    def fresh_context_proof(self, profile: ProfileConfig) -> str:
+        """How every launch of ``profile`` starts with a fresh context (ADR 0015 D14).
+
+        A fresh context is no conversation of an earlier launch and no
+        provider-side memory written by one, so that all a launch knows of
+        earlier ones comes from its prompt and its read context. The proof is
+        a property of the argv or the helper policy this adapter builds from
+        ``profile``, never the provider's claim. Returns what it rests on;
+        :class:`ConfigurationError` (:func:`no_fresh_context`) when the
+        profile voids it or the adapter has none. The base adapter has none.
+        """
+        raise no_fresh_context(
+            profile, "its provider declares no way to prove one", "Route the phase elsewhere"
+        )
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         """Raise ConfigurationError for values this CLI cannot accept.
@@ -1231,6 +1286,29 @@ CLAUDE_REPLIED_EXIT_GRACE_SECONDS = 10.0
 # (seen with a loopback API). The user's settings stay, checked instead
 # (:func:`claude_configuration_problems`).
 CLAUDE_ISOLATION_FLAGS = ("--safe-mode", "--strict-mcp-config", "--setting-sources=user")
+# The extra_args a Claude Code profile may carry when a Memory phase routes
+# to it (#317, ADR 0015 D14), each mapped to whether it takes a value: none
+# resumes, forks or names a session, loads settings or reaches memory an
+# earlier launch wrote. Read from `claude --help` of Claude Code 2.1.328; a
+# flag a later CLI adds is refused until someone checks it and adds it here.
+CLAUDE_MEMORY_ARGS: Mapping[str, bool] = {
+    "--allowed-tools": True,
+    "--allowedTools": True,
+    "--disallowed-tools": True,
+    "--disallowedTools": True,
+    "--fallback-model": True,
+    "--max-budget-usd": True,
+    "--verbose": False,
+}
+# The same for an OpenCode profile, read from `opencode run --help` of
+# OpenCode 2.3.0: none continues, forks or names a session or reaches a
+# server whose sessions persist.
+OPENCODE_MEMORY_ARGS: Mapping[str, bool] = {
+    "--archived": False,
+    "--log-level": True,
+    "--print-logs": False,
+    "--title": True,
+}
 # The flags that would bring an integration or the repository's settings
 # back, refused in ``extra_args``: MCP servers, plugins, settings (hooks
 # among them), setting sources and agent definitions, and the browser and
@@ -1706,6 +1784,27 @@ class ClaudeCodeProvider(AgentProvider):
     def reports_activity(self, profile: ProfileConfig) -> bool:
         # `text` prints the final text once, at exit, and nothing before it.
         return self.output_format(profile) == "stream-json"
+
+    def fresh_context_proof(self, profile: ProfileConfig) -> str:
+        """``-p`` with ``--no-session-persistence``, and no flag outside
+        :data:`CLAUDE_MEMORY_ARGS` (ADR 0015 D14): an allow-list, since a deny
+        list would miss a resuming flag a later CLI adds."""
+        if _truthy(profile.options.get("session_persistence"), default=False) is not False:
+            raise no_fresh_context(
+                profile,
+                "its option session_persistence saves each launch's session for a later one "
+                "to resume",
+                "Remove the option",
+            )
+        outside = outside_allow_list(profile.extra_args, CLAUDE_MEMORY_ARGS)
+        if outside:
+            raise no_fresh_context(
+                profile,
+                f"its extra_args carry {outside}, and a Memory phase takes only "
+                f"{', '.join(sorted(CLAUDE_MEMORY_ARGS))} there",
+                "Remove it from extra_args",
+            )
+        return "claude -p --no-session-persistence: a new session per launch, never saved"
 
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
         argv = [profile.command or "claude", "-p"]
@@ -2387,6 +2486,19 @@ class OpenCodeProvider(AgentProvider):
         argv += list(profile.extra_args)
         return argv
 
+    def fresh_context_proof(self, profile: ProfileConfig) -> str:
+        """``run --standalone`` with no session flag, and no flag outside
+        :data:`OPENCODE_MEMORY_ARGS` (ADR 0015 D14)."""
+        outside = outside_allow_list(profile.extra_args, OPENCODE_MEMORY_ARGS)
+        if outside:
+            raise no_fresh_context(
+                profile,
+                f"its extra_args carry {outside}, and a Memory phase takes only "
+                f"{', '.join(sorted(OPENCODE_MEMORY_ARGS))} there",
+                "Remove it from extra_args",
+            )
+        return "opencode run --standalone: a new session per launch on a private server"
+
     def stdin_payload(self, req: AgentRequest) -> bytes:
         # A lone surrogate (legal in the JSON GitHub returns, not in UTF-8)
         # becomes U+FFFD rather than failing the launch.
@@ -2834,6 +2946,12 @@ class PiProvider(AgentProvider):
                     f"built-in tools ({', '.join(PI_TOOLS)}): {problem}, "
                     f"got {profile.options['tools']!r}"
                 )
+
+    def fresh_context_proof(self, profile: ProfileConfig) -> str:
+        """``--no-session`` in an argv the adapter owns whole (ADR 0015 D14)."""
+        if profile.extra_args:
+            raise no_fresh_context(profile, "pi takes no extra_args", "Remove extra_args")
+        return "pi --no-session: no session is kept, and no profile setting adds one"
 
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
         # The prompt is deliberately absent: it reaches Pi as a JSON `prompt`
@@ -3715,6 +3833,12 @@ class ClaudeSdkProvider(_SdkProvider):
     transport_issue = "151"
     transport_landed = True
 
+    def fresh_context_proof(self, profile: ProfileConfig) -> str:
+        """A new session id per launch, with no resume in the helper's policy (ADR 0015 D14)."""
+        if profile.extra_args:
+            raise no_fresh_context(profile, f"{self.name} takes no extra_args", "Remove extra_args")
+        return f"{self.name}: a new session id per launch, and no resume in its policy"
+
     @contextmanager
     def integration_isolation(self) -> Iterator[dict[str, str]]:
         """The ``claude`` CLI's shell isolation, for the Claude Code the helper
@@ -4323,6 +4447,14 @@ class OpenCodeSdkProvider(_SdkProvider):
     interpreter = "Node executable"
     runtime_decision = "D2.5"
 
+    def fresh_context_proof(self, profile: ProfileConfig) -> str:
+        """None: every launch is refused until #152 (ADR 0015 D14)."""
+        raise no_fresh_context(
+            profile,
+            f"every {self.name} launch is refused until #152, so none is proven",
+            "Route the phase to another provider",
+        )
+
     def validate_profile(self, profile: ProfileConfig) -> None:
         super().validate_profile(profile)
         where = f"profile {profile.name!r}"
@@ -4420,6 +4552,10 @@ class ScriptedProvider(AgentProvider):
 
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
         return ["scripted-agent", f"--profile={profile.name}", "--", prompt]
+
+    def fresh_context_proof(self, profile: ProfileConfig) -> str:
+        """The tests' provider runs no process and keeps no session (ADR 0015 D14)."""
+        return "scripted: no process, so no session"
 
     def execute(self, req: AgentRequest) -> AgentExecutionResult:
         self.calls.append(req)

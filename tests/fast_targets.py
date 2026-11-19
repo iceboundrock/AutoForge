@@ -122,6 +122,9 @@ COVERAGE: Mapping[str, Entry] = {
         "test_state",
     ),
     "src/autoforge/evidence.py": (*LOOP, "test_unblock"),
+    # #317: Issue Memory, which every state load checks and the operator's
+    # commands write; nothing that decides imports it.
+    "src/autoforge/memory.py": ("test_memory", "test_state", "test_cli", "test_adr_0015"),
     "src/autoforge/git_input.py": ("test_sandbox_lifecycle", "test_candidate_source"),
     "src/autoforge/git_transport.py": (*LOOP, "test_replan", "test_validation_gates"),
     "src/autoforge/git_workspace.py": LOOP,

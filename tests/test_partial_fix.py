@@ -1473,7 +1473,7 @@ def test_a_plain_block_pushed_by_hand_keeps_the_worktree_check(tmp_state_dir, le
     _refuses_until_moved_out(eng, leave, needle, "the PR's HEAD", candidate)
 
 
-# -- the persisted state (protocol 19) ----------------------------------------------------
+# -- the persisted state (protocol 20) ----------------------------------------------------
 
 
 def test_the_stored_message_bound_is_the_block_reason_bound():
@@ -1558,6 +1558,7 @@ def _protocol_16(data: dict) -> dict:
     data.pop("partial_fix", None)
     data.pop("auto_recovery", None)  # protocol 18's own field (#434)
     data.pop("delivered_reply", None)  # protocol 19's own field (#479)
+    data.pop("issue_memory", None), data.pop("launch_seq", None)  # protocol 20's (#317)
     context = data.get("completion_context")
     if isinstance(context, dict):
         context.pop("unresolved", None)
@@ -1570,10 +1571,10 @@ def test_a_protocol_16_file_loads_with_no_partial_fix_and_is_relabelled(tmp_path
     data = _protocol_16(make_state(phase=Phase.REVIEW, current_pr_url=PR).to_dict())
     p.write_text(json.dumps(data), encoding="utf-8")
     loaded = load_state(p)
-    assert loaded.protocol_version == "19" and loaded.partial_fix == {}
+    assert loaded.protocol_version == "20" and loaded.partial_fix == {}
     save_state(loaded, p)
     raw = json.loads(p.read_text())
-    assert raw["protocol_version"] == "19" and raw["partial_fix"] == {}
+    assert raw["protocol_version"] == "20" and raw["partial_fix"] == {}
 
 
 def test_a_protocol_16_fix_plan_loads_as_a_plan_that_resolves_every_finding(tmp_state_dir):

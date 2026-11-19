@@ -5,6 +5,36 @@ so.
 
 ## Unreleased
 
+### Issue Working Memory: the store, the seed and the operator's commands (#317)
+
+A run can now keep an Issue Working Memory, opt-in with `memory.enabled:
+true` (off by default): a bounded store of advisory lessons for its issue,
+inside the run's `state.json`, which starts empty with the run (ADR 0015).
+`run --memory-seed FILE` imports one lesson before the first launch, byte
+for byte or not at all, and records its SHA-256; `memory show` prints the
+store and `memory retract` withdraws a record in one save. A retracted or
+corrected text is refused if anything writes it again. Memory decides
+nothing: no code that decides a phase, a write, a permission, a budget or a
+merge reads it.
+
+This release is the store and its read interface only. No launch is shown
+Memory yet, and the controller records nothing in it by itself: #333 wires
+both into the run. A run with Memory on launches, transitions and publishes
+exactly as one with it off.
+
+What changes for every run: the state protocol is 20. A protocol-19 file
+loads with Memory off and with the new launch ordinal (`launch_seq`, which
+names each launch of a run) set to its step count, and is written as 20 on
+its next save; an older AutoForge refuses a protocol-20 file. A run records
+its Memory setting when it is created, and `step`, `resume` and `unblock`
+refuse another `memory.enabled` unless `--accept-config-change`. With Memory
+on, the configuration refuses an `analyze_execute` profile that cannot prove
+each launch starts with a fresh context: a Claude profile with
+`session_persistence` or with `extra_args` outside a short allow-list (a
+resuming flag such as `--resume` or `--continue` among them), an OpenCode
+profile likewise, and an `opencode-sdk` profile. With Memory off, nothing of
+this is checked.
+
 ### `claim-ambiguous`: `status` goes by what the reason names (#375)
 
 When more than one open PR carries the issue's implementation marker and

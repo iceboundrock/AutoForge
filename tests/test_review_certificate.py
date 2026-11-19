@@ -477,18 +477,27 @@ def _relabelled(data: dict, label: str) -> dict:
     """``data`` under ``label``: a protocol-12 file carries LOCAL's twelve fields empty."""
     if label == __protocol_version__:
         return {**data, "protocol_version": label}
-    # An older label never wrote protocol 19's field (#479), one before 18 never
-    # wrote protocol 18's (#434), one before 17 never wrote protocol 17's (#433),
-    # one before 16 never wrote protocol 16's (#374), and one before 15 never
-    # wrote protocol 15's (#423).
+    # An older label never wrote protocol 20's fields (#317), one before 19 never
+    # wrote protocol 19's (#479), one before 18 never wrote protocol 18's (#434),
+    # one before 17 never wrote protocol 17's (#433), one before 16 never wrote
+    # protocol 16's (#374), and one before 15 never wrote protocol 15's (#423).
+    memory = ("issue_memory", "launch_seq")
     newer = {
-        "18": ("delivered_reply",),
-        "17": ("auto_recovery", "delivered_reply"),
-        "16": ("partial_fix", "auto_recovery", "delivered_reply"),
-        "15": ("stop_code", "partial_fix", "auto_recovery", "delivered_reply"),
+        "19": memory,
+        "18": ("delivered_reply", *memory),
+        "17": ("auto_recovery", "delivered_reply", *memory),
+        "16": ("partial_fix", "auto_recovery", "delivered_reply", *memory),
+        "15": ("stop_code", "partial_fix", "auto_recovery", "delivered_reply", *memory),
     }.get(
         label,
-        ("pr_body_outcomes", "stop_code", "partial_fix", "auto_recovery", "delivered_reply"),
+        (
+            "pr_body_outcomes",
+            "stop_code",
+            "partial_fix",
+            "auto_recovery",
+            "delivered_reply",
+            *memory,
+        ),
     )
     data = {k: v for k, v in data.items() if k not in newer}
     if label == "12":
@@ -496,7 +505,7 @@ def _relabelled(data: dict, label: str) -> dict:
     return {**data, "protocol_version": label}
 
 
-@pytest.mark.parametrize("label", ["19", "18", "17", "16", "15", "12"])
+@pytest.mark.parametrize("label", ["20", "19", "18", "17", "16", "15", "12"])
 @pytest.mark.parametrize(
     ("plant", "needle"),
     [(_with_record, "end_fingerprint"), (_with_certificate, "review_certificate'.kind")],

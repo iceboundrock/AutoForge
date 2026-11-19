@@ -22,6 +22,19 @@
     an `inconclusive` caused by replaced checker inputs is named
     `checker-altered`, with the changed paths, wherever the outcome is
     reported (7). D3, D11, D19, §4.2 and §6 follow.
+  - *Implemented since,* by #317 (state protocol 20): D19.1 to D19.3,
+    the record contract of D9 with the kinds, bounds and command it leaves
+    to #317, D12's render as a function no launch calls yet, D14's proofs
+    with the allow-lists it asks for, D18's static refusal and D1's import
+    rule (`tests/test_memory.py`,
+    `test_no_module_that_decides_imports_memory`). The kinds are
+    `validation-failure`, `refused-candidate` and `launch-end` (the
+    controller's), `operator-seed`, and `hypothesis`, `failed-approach`,
+    `finding`, `constraint` and `handoff` (an agent's); the bounds are 64
+    records, 2,048 UTF-8 bytes of text, three corrections of a record and
+    so 256 tombstones; the command is `run --memory-seed`, with
+    `memory show` and `memory retract`. Wiring the store into the running
+    workflow is #333's.
   - *Implemented with it:* nothing in the package. No phase, edge, state
     field, protocol number, configuration key, prompt, effect kind, launch
     class, stop code or default changes. `tests/test_adr_0015.py` keeps
@@ -278,7 +291,7 @@ None stands in for another:
 | `RunID` | `AutoForgeState.run_id`, `af-<UTC stamp>-<6 hex>` (`generate_run_id`) | yes, today |
 | `StepKey` | phase, issue URL, PR URL, review round, execution attempt (`auto_recovery.StepKey`) | today in the recovery journal; derived for every step |
 | `TaskID` | `(RunID, StepKey, ordinal)`: the task's ordinal in its step, from 1, allocated when the task is proposed and never reused in the step; a producing task admitted after an `unblock` into the same step takes the next (D3) | no: nothing names a task in the single-agent path; persisted by #332, with the step's ordinal counter |
-| `AttemptID` | `(RunID, launch_seq)`: the run-wide launch ordinal the attempt's launch-intent save allocates (D2.1). The receipt names the task the attempt belongs to | no: `launch_seq` is new (D19.2); `state.attempt` is a counter, not an identity |
+| `AttemptID` | `(RunID, launch_seq)`: the run-wide launch ordinal the attempt's launch-intent save allocates (D2.1). The receipt names the task the attempt belongs to | yes, since protocol 20 (#317): `launch_seq` in `state.json` (D19.2); `state.attempt` is a counter, not an identity |
 | role | a closed enum (D7.1) | derived in the single-agent path; persisted by #332 |
 | candidate | base: the revision the entry observation required (ADR 0004 D4.4); candidate: a `RemoteCandidate` (ADR 0006 D2.1), the commit the phase's candidate check accepted (D2.4) | yes, today, where ADR 0006 records it |
 | phase | `Phase` | yes |
@@ -1454,8 +1467,8 @@ adapter builds, never the provider's claim.
 
 | Provider | The proof today | What voids it | Status at `9baed0a` |
 |---|---|---|---|
-| `claude` | `-p` with `--no-session-persistence` (`providers.py:1724`); `--safe-mode` keeps `CLAUDE.md` auto-discovery off | `options.session_persistence: true`; in `extra_args`, any of `-c`, `--continue`, `-r`, `--resume`, `--session-id`, `--fork-session`, `--from-pr`, `--teleport` (2.1.327's help) | the option and these flags pass validation |
-| `opencode` | `run --standalone` (`providers.py:2380`) with no session flag: `run` starts a new session | in `extra_args`, any of `-c`, `--continue`, `-s`, `--session`, `--fork`, `--server` (2.3.0's help) | these flags pass validation |
+| `claude` | `-p` with `--no-session-persistence` (`providers.py:1724`); `--safe-mode` keeps `CLAUDE.md` auto-discovery off | `options.session_persistence: true`; in `extra_args`, any of `-c`, `--continue`, `-r`, `--resume`, `--session-id`, `--fork-session`, `--from-pr`, `--teleport` (2.1.327's help) | the option and these flags pass validation; since #317, a configuration with `memory.enabled` refuses them, and any flag outside its allow-list |
+| `opencode` | `run --standalone` (`providers.py:2380`) with no session flag: `run` starts a new session | in `extra_args`, any of `-c`, `--continue`, `-s`, `--session`, `--fork`, `--server` (2.3.0's help) | these flags pass validation; since #317, a configuration with `memory.enabled` refuses them, and any flag outside its allow-list |
 | `pi` | `--no-session` (`providers.py:2847`); `extra_args` refused (`providers.py:2818`) | nothing a profile sets | holds by construction |
 | `claude-sdk` | a new session id per launch (`providers.py:3947`); `extra_args` refused (`providers.py:3421`); no resume option in the policy | nothing a profile sets | holds by construction |
 | `opencode-sdk` | none: every launch is refused until #152 | not applicable | unsupported |

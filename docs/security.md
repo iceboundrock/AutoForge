@@ -297,6 +297,31 @@ several workers behave, and which variables redaction recognises are in
 The full threat model, its capability matrix and the residuals are in
 [GitHub safety](agent-guides/github-safety.md#container-launch-threat-model-adr-0013-d18-270).
 
+### Issue Working Memory
+
+Issue Working Memory (`memory.enabled`, off by default; #317) is advisory
+data in the run's `state.json`, and it is no stronger than that file. Under
+`sandbox.mode: disabled` an agent runs as you and can rewrite the state
+directory by absolute path, Memory included, and no keyed integrity check
+would notice: an agent of the same user could read any key the controller
+used. What such a rewrite achieves is bounded by what Memory is: it grants
+nothing, and no code that decides a phase, a write, a permission, a budget
+or a merge reads it. A rewritten record can mislead a later launch, as
+injected issue text already can; it cannot move the run, publish anything
+or merge. A rewritten seed changes what an evaluation compared, which is
+one reason the evaluation's `collect` requires `sandbox.mode: required`.
+
+Under `required`, a launch sees its read context read-only and the rest of
+the state directory not at all. The Memory MVP gives no launch a projection
+yet (#333 renders one into the read context, never into the worktree), so
+no agent is shown Memory by this release.
+
+Memory holds nothing secret by design: an agent's or the operator's text the
+run-log redactor would change is refused, never redacted and kept, and text
+the controller derives from evidence is redacted, then bounded. No
+transcript, reasoning, prompt, diff or environment is stored. Like the rest
+of the state directory it is stored in the clear.
+
 ### Redaction is a baseline
 
 Redaction recognises well-known shapes and variable names and makes no

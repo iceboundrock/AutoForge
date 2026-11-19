@@ -60,6 +60,7 @@ import os
 import re
 import select
 import shlex
+import stat
 import sys
 import time
 import unicodedata
@@ -158,6 +159,16 @@ from .interaction import (
     UnavailableReason,
 )
 from .locking import ControllerLock, controller_lock_live, repository_lock_path
+from .memory import (
+    APPLICABLE_PHASES,
+    MAX_SEED_BYTES,
+    Actor,
+    Applicability,
+    Kind,
+    MemoryStore,
+    seed_text,
+    stored_bytes,
+)
 from .ownership import (
     refuse_scheduler_owned_issue,
     scheduler_ownership,
@@ -299,6 +310,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     r.add_argument(
         "--full-prompt", action="store_true", help="print full rendered prompt in dry-run"
+    )
+    r.add_argument(
+        "--memory-seed",
+        default=None,
+        metavar="FILE",
+        help=(
+            "import FILE, byte for byte, into the new run's Issue Memory as one operator "
+            f"record before the first launch (#317): UTF-8 text of at most {MAX_SEED_BYTES} "
+            "bytes, no control character but a tab or a newline, and nothing the run-log "
+            "redactor would change; refused otherwise, and unless the configuration sets "
+            "memory.enabled: true"
+        ),
     )
 
     s = sub.add_parser("step", help="execute exactly one step from persisted state")
@@ -476,8 +499,44 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    _add_memory_parser(sub)
     _add_epic_parser(sub)
     return p
+
+
+def _add_memory_parser(sub) -> None:
+    """`autoforge memory ...`: the operator's view of a run's Issue Memory (#317)."""
+    mp = sub.add_parser(
+        "memory",
+        help="show a run's Issue Memory, or retract one of its records",
+        description=(
+            "Issue Working Memory is the advisory store of lessons a run keeps for its issue "
+            "(ADR 0015, #317), on when the run was created with memory.enabled: true. It "
+            "informs a launch's prompt and decides nothing. These commands show it and "
+            "retract a record; the seed is imported by 'run --memory-seed'."
+        ),
+    )
+    msub = mp.add_subparsers(dest="memory_command", required=True)
+    show = msub.add_parser(
+        "show", help="print the run's Issue Memory (read-only: no lock, nothing written)"
+    )
+    show.add_argument("--json", action="store_true", dest="as_json")
+    retract = msub.add_parser(
+        "retract",
+        help="withdraw one record under the controller lock, in one save",
+        description=(
+            "Withdraw one record of the run's Issue Memory: its text is dropped, its digest "
+            "kept, and the same text is refused if it is written again. Any record, whoever "
+            "wrote it; the next launch's projection no longer shows it. Runs under the "
+            "controller lock and makes one save; no agent runs and nothing reaches GitHub."
+        ),
+    )
+    retract.add_argument(
+        "record", metavar="RECORD", help="the record's id, as 'memory show' prints it (M3 or 3)"
+    )
+    retract.add_argument(
+        "--reason", required=True, help="why (kept with the record, redacted and bounded)"
+    )
 
 
 def _add_accept_config_change(parser: argparse.ArgumentParser) -> None:
@@ -488,8 +547,8 @@ def _add_accept_config_change(parser: argparse.ArgumentParser) -> None:
             "continue a REMOTE run although this invocation's profile routing or agent "
             "worktree root differs from the configuration the run was recorded under, or any "
             "run although this invocation's sandbox.mode is weaker than the one it is pinned "
-            "to: the change is written to the run log and becomes the run's configuration "
-            "(#219, #280)"
+            "to or its memory.enabled is not the run's: the change is written to the run log "
+            "and becomes the run's configuration (#219, #280, #317)"
         ),
     )
 
@@ -694,6 +753,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_rebind_epic(args)
         if args.command == "status":
             return cmd_status(args)
+        if args.command == "memory":
+            return cmd_memory(args)
         if args.command == "epic":
             return cmd_epic(args)
         parser.error(f"unknown command {args.command}")
@@ -1861,6 +1922,8 @@ def cmd_run(args) -> int:
     cfg = _load_cfg(args)
     engine = _engine_for(args, cfg)
     engine.validate_config()
+    # Read and checked before anything else is read or written (#317).
+    seed = _memory_seed(args, cfg)
 
     if args.dry_run:
         # Side-effect-free: the checks and reads the run makes before its
@@ -1869,6 +1932,8 @@ def cmd_run(args) -> int:
         binding = engine.bind_new_run(args.epic, args.issue)
         _print_binding(binding)
         engine.new_run(binding.epic_url, binding.issue_url)
+        if seed is not None:
+            print(redact(f"[dry-run] would seed the run's Issue Memory with {seed.line()}"))
         outcomes = engine.run(max_steps=args.max_steps, dry_run=True, allow_merge=args.allow_merge)
         for o in outcomes:
             assert o.plan is not None
@@ -1912,6 +1977,9 @@ def cmd_run(args) -> int:
         assert engine.state is not None
         # What later commands of the run are checked against (#219).
         engine.record_run_configuration()
+        if seed is not None:
+            # In the run's first save, so before its first launch (ADR 0015 D9.5).
+            _import_seed(engine.state, seed)
         if corrupt:
             moved = engine.quarantine_state()
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
@@ -1929,6 +1997,11 @@ def cmd_run(args) -> int:
                     file=sys.stderr,
                 )
         engine.save()
+        if seed is not None:
+            print(
+                redact(f"autoforge: seeded the run's Issue Memory with {seed.line()}"),
+                file=sys.stderr,
+            )
         engine.log_epic_binding(binding)
         _attach_terminal(engine)
         outcomes = engine.run(
@@ -1954,6 +2027,77 @@ def _refuse_an_unusable_state_directory(engine: ControllerEngine) -> None:
         engine.state_root(create=False)
     except FileNotFoundError:
         pass
+
+
+@dataclass(frozen=True)
+class _Seed:
+    """The operator's seed file, read and checked: kept byte for byte (#317, D9.5)."""
+
+    path: str
+    text: str
+
+    def line(self) -> str:
+        size = len(self.text.encode("utf-8"))
+        return f"{self.path} ({size} bytes, sha256 {sha256_text(self.text)})"
+
+
+def _memory_seed(args, cfg: AutoForgeConfig) -> _Seed | None:
+    """``run --memory-seed``'s file, read with a bound and checked, or None.
+
+    ConfigurationError, with nothing read from GitHub or written, when the
+    configuration does not turn Memory on, or when the file is not a regular
+    file whose bytes Issue Memory keeps unchanged (:func:`autoforge.memory.seed_text`).
+    """
+    path = getattr(args, "memory_seed", None)
+    if path is None:
+        return None
+    if not cfg.memory.enabled:
+        raise ConfigurationError(
+            "run --memory-seed needs memory.enabled: true in the configuration: a run created "
+            "with Memory off keeps no Issue Memory to seed"
+        )
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        raise ConfigurationError(
+            f"cannot read the memory seed {path}: {exc.strerror or exc}"
+        ) from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ConfigurationError(f"the memory seed {path} is not a regular file")
+        chunks: list[bytes] = []
+        size = 0
+        while size <= MAX_SEED_BYTES:
+            chunk = os.read(fd, MAX_SEED_BYTES + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    except OSError as exc:
+        raise ConfigurationError(
+            f"cannot read the memory seed {path}: {exc.strerror or exc}"
+        ) from None
+    finally:
+        os.close(fd)
+    return _Seed(path=path, text=seed_text(b"".join(chunks)))
+
+
+def _import_seed(state: AutoForgeState | None, seed: _Seed) -> None:
+    """The seed as the new run's one operator record, in memory; the run's first save keeps it."""
+    assert state is not None
+    store = state.memory_store()
+    assert store is not None and store.enabled  # record_run_configuration turned it on
+    outcome = store.add(
+        kind=Kind.OPERATOR_SEED,
+        actor=Actor.OPERATOR,
+        text=seed.text,
+        issue_url=state.current_issue_url,
+        applies_to=Applicability(phases=APPLICABLE_PHASES),
+        reason="run --memory-seed",
+    )
+    if not outcome.applied:
+        raise ConfigurationError(f"the memory seed is refused: {outcome.detail}")
+    state.issue_memory = outcome.store.to_dict()
 
 
 def _print_binding(binding: EpicBinding) -> None:
@@ -2519,6 +2663,112 @@ def cmd_epic_recheck(args) -> int:
         _print_stopped_run(engine, stop)
         return 1
     return 0
+
+
+_RECORD_ID_RE = re.compile(r"M?([1-9][0-9]{0,5})")
+
+
+def cmd_memory(args) -> int:
+    """``autoforge memory show|retract``: the operator's view and retraction (#317)."""
+    engine = _engine_for(args)
+    if args.memory_command == "show":
+        return _memory_show(engine.load(), args.as_json)
+    match = _RECORD_ID_RE.fullmatch(args.record.strip())
+    if match is None:
+        raise ConfigurationError(f"memory retract: {args.record!r} is not a record id (M3, or 3)")
+    record_id = int(match.group(1))
+    # A scheduler namespace's state is its worker's (ADR 0008 D17.3).
+    engine.refuse_scheduler_state_dir("memory retract")
+    _refuse_unloadable_state_before_the_lock(engine)
+    with engine.locked():
+        state = engine.load()
+        store = state.memory_store()
+        if store is None:
+            raise ConfigurationError(
+                f"run {state.run_id} has no Issue Memory: it was created with memory.enabled off"
+            )
+        outcome = store.retract(record_id, actor=Actor.OPERATOR, issue_url=None, reason=args.reason)
+        if not outcome.applied:
+            raise ConfigurationError(
+                f"memory retract refused ({outcome.refusal}): {outcome.detail}; nothing was written"
+            )
+        # ADR 0015 W9: one save, all or nothing.
+        state.issue_memory = outcome.store.to_dict()
+        engine.save()
+    print(
+        redact(
+            f"[{state.run_id}] retracted M{record_id}: the next launch's projection no longer "
+            f"shows it, and its text is refused if written again (Issue Memory revision "
+            f"{outcome.store.revision})"
+        )
+    )
+    return 0
+
+
+def _memory_show(state: AutoForgeState, as_json: bool) -> int:
+    store = state.memory_store()
+    if as_json:
+        memory = (
+            None
+            if store is None
+            else {
+                **store.to_dict(),
+                "digest": store.digest(),
+                "stored_bytes": stored_bytes(store),
+            }
+        )
+        document = {
+            "run_id": state.run_id,
+            "issue_url": state.current_issue_url,
+            "launch_seq": state.launch_seq,
+            "memory": memory,
+        }
+        print(json.dumps(redact_dict(document), indent=2, sort_keys=True))
+        return 0
+    print(redact("\n".join(_memory_lines(state, store))))
+    return 0
+
+
+def _memory_lines(state: AutoForgeState, store: MemoryStore | None) -> list[str]:
+    head = f"run {state.run_id}, issue {state.current_issue_url}, launch_seq {state.launch_seq}"
+    if store is None:
+        return [head, "Issue Memory: off (the run was created with memory.enabled off)"]
+    counts = store.counts()
+    setting = "on" if store.enabled else "off (records kept; no write but a retraction)"
+    refused = ", ".join(f"{code} {count}" for code, count in sorted(store.refused.items()))
+    lines = [
+        head,
+        f"Issue Memory: {setting}; revision {store.revision}, sha256 {store.digest()}, "
+        f"{stored_bytes(store)} bytes",
+        f"records: {len(store.records)} ({counts['current']} current, "
+        f"{counts['superseded']} superseded, {counts['retracted']} retracted); "
+        f"tombstones: {len(store.tombstones)}; refused writes: {refused or 'none'}",
+    ]
+    for record in store.records:
+        superseded = f" by M{record.superseded_by}" if record.superseded_by else ""
+        lines += [
+            "",
+            f"M{record.id} {record.kind.value}: {record.status.value}{superseded}, "
+            f"{record.trust.value} ({record.provenance.value}), revision {record.revision}, "
+            f"sha256 {record.text_sha256}",
+            f"  issue: {record.issue_url}",
+            f"  applies to: {record.applies_to.describe()}",
+        ]
+        if record.citation is not None:
+            lines.append(
+                f"  cites: {record.citation.kind.value} {record.citation.ref}, "
+                f"sha256 {record.citation.sha256}"
+            )
+        if record.attempt is not None:
+            lines.append(f"  written at: launch {record.attempt.label()}")
+        for event in record.events:
+            why = f": {event.reason}" if event.reason else ""
+            lines.append(
+                f"  {event.seq}. {event.op.value} by the {event.actor.value}"
+                + why.replace("\n", " ")
+            )
+        lines += [f"    | {line}" for line in record.text.splitlines()]
+    return lines
 
 
 def cmd_status(args) -> int:

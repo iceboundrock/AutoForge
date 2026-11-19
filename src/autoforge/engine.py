@@ -234,6 +234,7 @@ from .config import (
     ACCEPTANCE_ACTIONS_AUTO,
     ACCEPTANCE_ACTIONS_OFF,
     KNOWN_PROVIDERS,
+    MEMORY_SETTING_KEY,
     PR_BODY_UPDATES_AUTO,
     PR_BODY_UPDATES_OFF,
     SANDBOX_REQUIRED,
@@ -242,6 +243,7 @@ from .config import (
     LoopDetectionConfig,
     ProfileConfig,
     SandboxConfig,
+    validate_memory_routing,
     validate_required_profiles,
 )
 from .config_fingerprint import (
@@ -2243,6 +2245,8 @@ class ControllerEngine:
             self.invocation_config_fingerprint(), source
         )
         state.sandbox_pin = pin
+        # The run's Memory setting (#317, ADR 0015 D19.3): its evaluation arm.
+        state.record_memory_setting(self.config.memory.enabled)
 
     def _fingerprint_record(self, fingerprint: ConfigFingerprint, source: str) -> dict:
         """The persisted form of ``fingerprint`` as this invocation's; ConfigurationError
@@ -2329,7 +2333,19 @@ class ControllerEngine:
             if pin is not None and direction < 0
             else None
         )
-        accepted = [*changes, *([downgrade] if downgrade else [])]
+        # The run's Memory setting (#317, ADR 0015 D19.3): recorded with the
+        # run and switched only by the operator's decision, like the pin.
+        memory_was, memory_now = state.memory_setting(), self.config.memory.enabled
+        memory_change = (
+            ConfigChange(MEMORY_SETTING_KEY, json.dumps(memory_was), json.dumps(memory_now))
+            if memory_was != memory_now
+            else None
+        )
+        accepted = [
+            *changes,
+            *([downgrade] if downgrade else []),
+            *([memory_change] if memory_change else []),
+        ]
         if accepted and not accept_change:
             refusals = []
             if changes:
@@ -2337,6 +2353,8 @@ class ControllerEngine:
                 refusals.append(self._config_drift_refusal(recorded, changes, words))
             if pin is not None and downgrade is not None:
                 refusals.append(self._sandbox_downgrade_refusal(pin, words))
+            if memory_change is not None:
+                refusals.append(self._memory_setting_refusal(memory_was, words))
             refusal = "\n".join(refusals)
             raise ConfigurationDriftError(f"{refusal}\n{unresolved}" if unresolved else refusal)
         # Built first: a record that could not be read back is refused, in a
@@ -2375,6 +2393,8 @@ class ControllerEngine:
             state.config_fingerprint = fingerprint
         if new_pin is not None:
             state.sandbox_pin = new_pin
+        if memory_change is not None:
+            state.record_memory_setting(memory_now)
         if accepted:
             self.save()
         return "\n".join(notices)
@@ -2411,23 +2431,37 @@ class ControllerEngine:
                     f"[dry-run] would accept the configuration change of run {run} and record "
                     f"it in the run log:{listed}"
                 )
-            elif fingerprint_changed:
-                pinned = (
-                    f", and the run is pinned to sandbox.mode {mode}"
-                    if any(change.key == MODE_KEY for change in accepted)
+            else:
+                memory = next(
+                    (change.current for change in accepted if change.key == MEMORY_SETTING_KEY),
+                    "",
+                )
+                memory_note = (
+                    f", and its Issue Memory is {'on' if memory == 'true' else 'off'}"
+                    if memory
                     else ""
                 )
-                out.append(
-                    f"accepted the configuration change of run {run} (--accept-config-change); "
-                    f"it is in the run log, and {self._config_origin()} is the run's "
-                    f"configuration from now on{pinned}:{listed}"
-                )
-            else:
-                out.append(
-                    f"accepted the configuration change of run {run} (--accept-config-change); "
-                    f"it is in the run log, and the run is pinned to sandbox.mode {mode} from "
-                    f"now on:{listed}"
-                )
+                pinned_now = any(change.key == MODE_KEY for change in accepted)
+                if fingerprint_changed:
+                    pinned = f", and the run is pinned to sandbox.mode {mode}" if pinned_now else ""
+                    out.append(
+                        f"accepted the configuration change of run {run} "
+                        "(--accept-config-change); it is in the run log, and "
+                        f"{self._config_origin()} is the run's configuration from now on"
+                        f"{pinned}{memory_note}:{listed}"
+                    )
+                elif pinned_now:
+                    out.append(
+                        f"accepted the configuration change of run {run} "
+                        "(--accept-config-change); it is in the run log, and the run is pinned "
+                        f"to sandbox.mode {mode} from now on{memory_note}:{listed}"
+                    )
+                else:
+                    out.append(
+                        f"accepted the configuration change of run {run} "
+                        "(--accept-config-change); it is in the run log, and the run's Issue "
+                        f"Memory is {'on' if memory == 'true' else 'off'} from now on:{listed}"
+                    )
         weaker = (
             "a later command under a weaker sandbox.mode is refused unless it is repeated "
             "with --accept-config-change"
@@ -2471,6 +2505,25 @@ class ControllerEngine:
             "To continue under this command's mode instead, repeat it with "
             "--accept-config-change: the change is written to the run log, and the run is "
             f"pinned to sandbox.mode {mode}."
+        )
+
+    def _memory_setting_refusal(self, recorded: bool, words: Sequence[str]) -> str:
+        """Why ``words`` refuses another Memory setting than the run's (#317, ADR 0015 D19.3)."""
+        state = self._require_state()
+        now = self.config.memory.enabled
+        command = words[0] if words else "this command"
+        return (
+            f"run {state.run_id} was created with {MEMORY_SETTING_KEY} {json.dumps(recorded)}, "
+            f"and this command's configuration sets it {json.dumps(now)}, so '{command}' "
+            "refuses before any phase executes; nothing was written. A run's Issue Memory "
+            "setting is part of what the run is (an evaluation arm, ADR 0015 D19.3), and "
+            "changes only by the operator's decision. Changed (recorded -> this command):\n"
+            f"  {MEMORY_SETTING_KEY}: {json.dumps(recorded)} -> {json.dumps(now)}\n"
+            "To continue under the recorded setting, run it with a configuration that sets "
+            f"{MEMORY_SETTING_KEY}: {json.dumps(recorded)}.\n"
+            "To continue under this command's setting instead, repeat it with "
+            "--accept-config-change: the change is written to the run log and becomes the "
+            "run's setting."
         )
 
     def _config_origin(self) -> str:
@@ -4094,6 +4147,8 @@ class ControllerEngine:
         """
         validate_required_profiles(self.config, REQUIRED_PROFILES)
         fingerprint_routing(self.config)
+        # ADR 0015 D18 (#317): a Memory phase's profile proves a fresh context.
+        validate_memory_routing(self.config)
 
     # -- prompt context ---------------------------------------------------
     @staticmethod
@@ -16916,6 +16971,10 @@ class ControllerEngine:
                 state.step_count += 1
             attempt += 1
             state.attempt += 1
+            # ADR 0015 D2.1 (#317): this launch's ordinal in the run, spent by
+            # the save below and by nothing else, so the launch is named
+            # (run_id, launch_seq) whatever re-entered its step.
+            state.launch_seq += 1
             # D13.3: which publication contract this launch runs under, so a
             # later version can tell a launch of its own from one whose agent
             # published under the previous contract.
@@ -16933,8 +16992,8 @@ class ControllerEngine:
             state.delivered_reply = {}
             # The one write before the agent starts: the attempt counter, the
             # step it is charged as (the first launch's by the step itself, a
-            # relaunch's above), the entry observation (D4.4) and the launch
-            # label. A crash while the agent runs, or a refused run-log write
+            # relaunch's above), the launch ordinal, the entry observation
+            # (D4.4) and the launch label. A crash while the agent runs, or a refused run-log write
             # after it returned, therefore never leaves controller state
             # claiming the phase was not yet attempted (#55, PR #89), or the
             # launch uncharged (#434).

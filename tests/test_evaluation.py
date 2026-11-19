@@ -435,17 +435,32 @@ def test_every_section_of_the_configuration_is_classified():
     """A new top-level section fails here until someone says whether arms hold it equal."""
     names = {field.name for field in dataclasses.fields(AutoForgeConfig)}
     exempt = {path.partition(".")[0] for path in ev.EXEMPT_SETTINGS if "." not in path}
-    assert names == set(ev.EQUALIZED_SECTIONS) | exempt
+    assert names == set(ev.EQUALIZED_SECTIONS) | set(ev.TREATMENT_SECTIONS) | exempt
+    assert not set(ev.TREATMENT_SECTIONS) & (set(ev.EQUALIZED_SECTIONS) | exempt)
 
 
 def test_a_new_section_is_refused_until_it_is_classified():
     extended = dataclasses.make_dataclass(
         "Extended",
-        [("memory", dict, dataclasses.field(default_factory=dict))],
+        [("ideation", dict, dataclasses.field(default_factory=dict))],
         bases=(AutoForgeConfig,),
     )
-    with pytest.raises(ev.EvaluationError, match=r"\['memory'\] are neither held equal nor exempt"):
+    with pytest.raises(
+        ev.EvaluationError, match=r"\['ideation'\] are neither held equal nor exempt"
+    ):
         ev.equalized_settings(extended())
+
+
+def test_the_memory_section_is_an_arms_treatment_and_moves_no_digest():
+    """#317: `memory:` is what arm 2 adds to arm 1, so two arms differ in it by design, and
+    adding it moved neither the settings digest nor the pinned real-run configuration."""
+    plain, treated = default_config(), default_config()
+    treated.memory.enabled = True
+    assert "memory" not in ev.equalized_settings(treated)
+    assert ev.settings_digest(plain) == ev.settings_digest(treated)
+    cfg = load_config_file(str(ev.REAL_RUN_CONFIG))
+    assert cfg.memory.enabled is False
+    assert ev.settings_digest(cfg) == ev.load_manifest()["equalized_settings"]["digest"]
 
 
 def test_a_new_key_under_validation_is_held_equal_the_day_it_lands():

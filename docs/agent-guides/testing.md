@@ -3137,3 +3137,50 @@ on synthetic stderr and stream lines (`tests/test_providers.py`,
   ends usable keeps its outcome; a timeout stays a timeout;
 - an exit 1 that names no request keeps today's message, and a CLI silent
   after a refusal is ended by the idle limit.
+
+### Issue Working Memory (#317, ADR 0015)
+
+`tests/test_memory.py` holds the store, the projection and the operator's
+commands on fakes; no launch reads Memory yet, and #333 owes the launch
+path's own tests (ADR 0015 §4.2). Keep covered:
+
+- who writes what: each actor's kinds and trust; an agent never observes,
+  cites evidence, or corrects, supersedes or retracts an observed record or
+  the operator's; the operator retracts any record; what supersedes is at
+  least as strong as what the writer may change, so newer, unsupported text
+  never replaces an observation;
+- a correction or a retraction leaves its old text's digest as a tombstone,
+  a later write of it is refused, and a retraction survives a save and a
+  load (the snapshot is what loads; nothing replays an older write);
+- an observation derived again, and a duplicate or replayed proposal, add
+  nothing;
+- the bounds: records, corrections and text refused and counted, never by
+  eviction; the largest store the bounds allow fits 1,048,576 bytes as the
+  state file holds it, and a state at that ceiling saves and loads;
+- nothing raw: an agent's or the operator's text with a control character
+  or a credential's shape refused, the controller's escaped, redacted and
+  cut; a seed kept byte for byte with its digest, or refused;
+- a store a controller did not write refused on load: each shape, a history
+  that does not explain the record, foreign tombstones, another run's
+  launch, a launch past `launch_seq`, an issue of another repository;
+- the projection: observed, operator's, evidence-gone and proposed records
+  in that order, newest first; another issue, phase or candidate omitted
+  and counted; retracted and superseded records counted, never shown; the
+  bound kept with every cut counted; the same revision and request render
+  the same bytes; `REVIEW` and another run's store refused;
+- the evaluation's owed Memory fixtures (evaluation protocol, section 8);
+- protocol 19 -> 20: a protocol-19 file loads with Memory off and
+  `launch_seq` at its step count, an older label carrying either field and a
+  protocol-20 file missing one refused; `launch_seq` spent by the intent
+  save, kept across a crash mid-launch, a `resume`, an `unblock` (in
+  `tests/test_adr_0015.py`) and an issue switch;
+- the run's Memory setting recorded at creation and a later change refused
+  without `--accept-config-change`; with Memory on, a profile without a
+  fresh-context proof refused when the configuration loads, for every flag
+  ADR 0015 D14 lists;
+- no module that decides imports Memory, and the engine touches it only in
+  the run-configuration record and check; a run with Memory on and a seed
+  goes through the same phases, launches and writes as one with it off;
+- `run --memory-seed`, `memory show` and `memory retract` end to end, a
+  refusal writing nothing and a failed save leaving the checkpoint as it
+  was.

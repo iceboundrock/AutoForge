@@ -488,6 +488,10 @@ EQUALIZED_SECTIONS = (
     "scheduler",
     "profiles",
 )
+# What an arm is: the sections whose settings are the treatment a contrast
+# compares, so the arms of a pair differ in them by design. `memory:` turns
+# Issue Working Memory on (#317, ADR 0015 D19), arm 2's treatment over arm 1.
+TREATMENT_SECTIONS = ("memory",)
 # Where this host and this run keep things, and how the value was set: equal
 # across a pair by the protocol's one-host rule, and no part of a real run's
 # behaviour the arms could differ in.
@@ -503,13 +507,19 @@ EXEMPT_SETTINGS = (
 def equalized_settings(cfg: AutoForgeConfig) -> dict:
     """What of ``cfg`` the arms of a pair must hold equal; an unclassified section raises."""
     data = dataclasses.asdict(cfg)
-    known = {*EQUALIZED_SECTIONS, *(path.partition(".")[0] for path in EXEMPT_SETTINGS)}
+    known = {
+        *EQUALIZED_SECTIONS,
+        *TREATMENT_SECTIONS,
+        *(path.partition(".")[0] for path in EXEMPT_SETTINGS),
+    }
     unknown = sorted(set(data) - known)
     if unknown:
         raise EvaluationError(
             f"configuration section(s) {unknown} are neither held equal nor exempt: "
             "classify them in tests/evaluation.py"
         )
+    for section in TREATMENT_SECTIONS:
+        del data[section]
     for path in EXEMPT_SETTINGS:
         section, _, key = path.partition(".")
         if key:

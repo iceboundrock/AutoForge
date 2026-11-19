@@ -633,6 +633,7 @@ SECTION_SCHEMAS = [
     ("review.replan", ("review", "replan"), ("enabled", "false"), config.REPLAN_KEYS),
     ("workflow", ("workflow",), ("max_review_rounds", "3"), config.WORKFLOW_KEYS),
     ("scheduler", ("scheduler",), ("max_parallel", "2"), config.SCHEDULER_KEYS),
+    ("memory", ("memory",), ("enabled", "false"), config.MEMORY_KEYS),
     ("profiles.fix", ("profiles", "fix"), ("effort", '"high"'), config.PROFILE_KEYS),
 ]
 
@@ -916,6 +917,7 @@ def test_removed_execution_allow_merge_keeps_its_own_message(tmp_path):
         (config.REPLAN_KEYS, config.ReplanConfig),
         (config.WORKFLOW_KEYS, config.WorkflowConfig),
         (config.SCHEDULER_KEYS, config.EpicSchedulerConfig),
+        (config.MEMORY_KEYS, config.MemoryConfig),
         (config.PROFILE_KEYS, config.ProfileConfig),
         (config.TOP_LEVEL_KEYS, config.AutoForgeConfig),
     ],
