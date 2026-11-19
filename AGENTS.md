@@ -234,7 +234,7 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        what reopens it and the SSH-first direction
                                        for a reopening, which is not a go);
                                        task state below a phase and Issue Memory
-                                       (proposed, nothing implemented): task
+                                       (accepted, nothing implemented): task
                                        identities, states and transitions, the
                                        TaskResult / PhaseResult split, launch intent,
                                        the reducer's types, roles and one mutating

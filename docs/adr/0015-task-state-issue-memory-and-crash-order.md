@@ -1,10 +1,27 @@
 # ADR 0015. Task state below a phase, Issue Memory, and what wins after a crash
 
-- **Status:** proposed, for the maintainer's decision on #316. Planning
-  only. Written at `main` `9baed0a` (2026-11-18), where every reference
-  below was read. #316's "Current scope" was reconciled on 2026-10-25 at
-  `f04db5f` (state protocol 12); §1.2 says what has moved since and how
-  this record reads the issue where the code moved under it.
+- **Status:** accepted. The maintainer accepted this record on 2026-11-18
+  in the
+  [maintainer decision on #316](https://github.com/iceboundrock/AutoForge/issues/316#issuecomment-6994876085),
+  as revised at `821735e` after review round 1 of PR #512. That comment is
+  the decision #316 asks for; this line only records it. D1 to D20 stand.
+  The comment answers the seven questions §5 held, and §5 now records each
+  answer in place of its question. Planning only. Written at `main`
+  `9baed0a` (2026-11-18), where every reference below was read. #316's
+  "Current scope" was reconciled on 2026-10-25 at `f04db5f` (state
+  protocol 12); §1.2 says what has moved since and how this record reads
+  the issue where the code moved under it.
+  - *The answers, written into the decisions they settle:* D10's cost is
+    accepted with no gate, and #317 measures it (answer 1). D9.1's scope of
+    one run is kept (2), and so is D13's `REVIEW` without a projection, for
+    the MVP (3). D7.4's refusal of read-only roles under `disabled` is
+    accepted (4). D7.7's last verified candidate stays reachable by a ref
+    under `refs/autoforge/`, the one exception to AutoForge creating no
+    local refs (5). #332 closes D5.3's window, for the single-agent path
+    too (6). D7.5's residual and cost are accepted, and an `inconclusive`
+    caused by replaced checker inputs is named `checker-altered`, with the
+    changed paths, wherever the outcome is reported (7). D3, D11, D19, §4.2
+    and §6 follow.
   - *Implemented with it:* nothing in the package. No phase, edge, state
     field, protocol number, configuration key, prompt, effect kind, launch
     class, stop code or default changes. `tests/test_adr_0015.py` keeps
@@ -362,17 +379,17 @@ rejection). Every attempt has its own `AttemptID` either way (D2.1).
 Corrections, transient retries and D11's relaunch are further attempts of
 the same task.
 
-**Persisted and derived.** The single-agent path persists nothing new.
-Every state of its producing task is read from fields the state already
-holds. `PROPOSED` never occurs, because the phase's entry admits its task
-by construction. No `TaskID` is needed, because nothing in that path names
-a task (D2):
+**Persisted and derived.** The single-agent path persists nothing new
+until #332 keeps its receipts (D5.3). Every state of its producing task is
+read from fields the state already holds. `PROPOSED` never occurs, because
+the phase's entry admits its task by construction. No `TaskID` is needed,
+because nothing in that path names a task (D2):
 
 | State | How it is read in the single-agent path |
 |---|---|
 | `ADMITTED` | an agent phase with `attempt == 0`: the entry admitted its producing task, the first one or, after an `unblock` into the same step, a new one |
 | `RUNNING` | in the process that launched it: `attempt >= 1` and the launch under way |
-| `VERIFYING` | in that process: the reply from its receipt to the plan save (`_check_reply` parses and checks it, then the validation gates run); on disk: a `delivered_reply` not yet applied |
+| `VERIFYING` | in that process: the reply from its receipt to the plan save (`_check_reply` parses and checks it, then the validation gates run); on disk: a `delivered_reply` not yet applied and, once #332 keeps every receipt (D5.3), a receipt not yet accepted |
 | `ACCEPTED` | its result taken as the phase's: the phase's plan saved (`completion_context`), or the phase moved on from it through `decide_next_phase`, including to `BLOCKED` or `FAILED` when the result's own `status` asks for that |
 | `RETRYABLE` | on disk: `attempt >= 1`, no plan and no kept reply. A crash during `RUNNING` reads the same, and both resolve the same way: the entry's reconciliation, then a charged launch |
 | `CANCELED` | the phase moved on without an accepted result: the entry's reconciliation routed it elsewhere (a push by someone else turns `FIX` into `REVIEW`), or `unblock` re-entered the phase, which restarts `attempt` at 0 for the new task |
@@ -513,11 +530,30 @@ launches nothing for it. A refusal's receipt leads to the correction the
 refusal earned. The correction carries no quote of the reply, because the
 quote is never persisted (#393).
 
-**D5.3. Single-agent parity.** A clean exit's reply to a phase task is
-checked in process, and not saved before its checks. A crash in that
-window costs one charged relaunch (W4, D11). Closing the window by keeping
-every reply is #332's decision, with its own bump. The Memory MVP does not
-need it.
+**D5.3. The clean-exit window: closed by #332, for both paths.** Today a
+clean exit's reply to a phase task is checked in process, and not saved
+before its checks. A crash in that window costs one charged relaunch (W4,
+D11). The maintainer decided that #332 closes it for the single-agent path
+too (§5, answer 6). A crash there is an expected failure: a closed laptop,
+or `Ctrl-C` during a long validation. #319 needs receipts anyway, and one
+crash semantics then serves both paths.
+
+- **What #332 keeps.** Every attempt keeps its receipt as D5.2 says, the
+  single-agent producer's included. It is saved after the parse, before
+  the phase's checks, the validation gates and the save that accepts the
+  result (D4.1).
+- **A restart.** It re-verifies a parsed receipt and launches nothing: it
+  runs the phase's checks again, reusing the same candidate's
+  `ValidationRecord`s (ADR 0006). A refusal's receipt leads to its
+  correction, without the quote (#393).
+- **What it extends.** The receipt extends `delivered_reply`'s contract
+  (ADR 0012 D12) from a failed end's reply to every reply. #332 decides
+  how the two share a field. Its binding is the `AttemptID` (D2.1), so it
+  needs `launch_seq` (D19.2).
+- **Its bump.** It takes a protocol bump of its own, which #332 announces
+  on #23 (D19.5).
+
+The Memory MVP does not wait for it. Until #332 lands, W4 stays as it is.
 
 **D5.4. An unknown outcome is never guessed.** A task found `RUNNING` after
 a crash has its attempt charged and its result lost. No recovery reads
@@ -718,7 +754,11 @@ Under `required` the launch must be enforced (`enforced: true`). Under
 `disabled` it is refused before it starts, with no fallback to an
 unisolated launch: a prompt that says "do not write" is logical isolation.
 So multi-agent execution needs a Linux host that can enforce the sandbox,
-and has no macOS support.
+and has no macOS support. The maintainer accepted this (§5, answer 4):
+D7.3's staleness rules depend on read-only being enforced. macOS in CI
+(#501) runs the suite and enforces nothing. A macOS-capable enforcing
+backend, ADR 0013's container backend for example, lifts this without a
+new decision.
 
 **D7.5. Independent verification: a frozen plan, checker inputs from the
 base, and outcomes that are not a pass.** Ordinary validation (ADR 0006)
@@ -815,7 +855,11 @@ could not touch? It has four outcomes, and only one of them counts.
    the base's checkers under the base's configuration, and that every
    test that passed on the base was reported passing. It does not prove
    the candidate honest. The review (D7.9) stays the independent
-   judgment, and the merge gate is unchanged.
+   judgment, and the merge gate is unchanged. The maintainer accepted
+   this residual for #319 (§5, answer 7): `verified` qualifies a candidate
+   to be kept (D7.7) or to reproduce a counterexample (D7.6), nothing
+   more. A runner-independent check would be a separate project and does
+   not block #319.
 
 **D7.6. A counterexample is a claim.** One an ideator or verifier reports
 is unverified until the controller reproduces it, by running a definition
@@ -825,14 +869,33 @@ output proves nothing (the evaluation's `invented_expected_answer`
 fixture), and D7.5's tree never runs it. An `inconclusive` or `not-run`
 reproduction leaves the counterexample unverified.
 
-**D7.7. The last independently verified candidate is kept.** The controller
-records the step's last candidate whose outcome is `verified` (D7.5), with
-its records. A later candidate never erases it, and no other outcome ever
-makes one. With no `verified` candidate, the step has none to keep, and its
-conclusion says so. Whether the step concludes with the kept candidate
-after a regression is #332's policy, and never silent: the conclusion names
-its candidate and that candidate's outcome. How its objects stay reachable
-when AutoForge creates no local branch is open (§5).
+**D7.7. The last independently verified candidate is kept, and stays
+reachable.** The controller records the step's last candidate whose outcome
+is `verified` (D7.5), with its records. A later candidate never erases it,
+and no other outcome ever makes one. With no `verified` candidate, the step
+has none to keep, and its conclusion says so. Whether the step concludes
+with the kept candidate after a regression is #332's policy, and never
+silent: the conclusion names its candidate and that candidate's outcome.
+
+Its objects stay reachable by a ref under `refs/autoforge/` (for example
+`refs/autoforge/<run>/verified/<step>`), as the maintainer decided (§5,
+answer 5). It is the one exception to AutoForge creating no local refs, and
+it is bounded:
+
+- the ref is never under `refs/heads/` and is never pushed;
+- the state records it, and `status` lists it;
+- AutoForge creates and updates it, and never deletes it. Cleanup is the
+  operator's, as it is for the per-issue worktree;
+- a candidate whose ref is missing or no longer resolves to it is reported
+  as unreachable, and is never treated as kept.
+
+The ref keeps objects reachable and is trusted for nothing else. ADR 0004
+§2.6 rejected a `refs/autoforge/` namespace because shared refs are
+agent-writable, so such a ref could never be trusted. This one is not
+trusted either: which candidate is kept is the state's record of its commit
+and tree, never the ref's target. The ref is updated before the save that
+records the candidate it keeps (D11). #319 amends `AGENTS.md` and the
+relevant guide to name the exception.
 
 **D7.8. No second scheduler.** Tasks run inside the per-issue engine, under
 its locks (ADR 0008's L0, L2 and L1). No daemon, queue or cross-issue
@@ -878,7 +941,11 @@ state is the one store whose integrity and lifetime the controller already
 manages; an earlier run's state may have been quarantined, archived or
 written by another controller version. Memory is retained as long as its
 state file: an archived or quarantined state keeps its Memory, and nothing
-reads it again.
+reads it again. The maintainer kept this scope (§5, answer 2): `run
+--force` usually means the earlier run's state is not to be trusted, and
+the evaluation needs each run's Memory to start from a known point, empty
+or the operator's seed. An operator who wants a lesson carried forward
+seeds it (D9.5).
 
 **D9.2. A record** has a controller-assigned id, monotonic in the run; a
 kind from a closed set (#317 names it; at least a validation failure, a
@@ -954,8 +1021,14 @@ written by the ordinary atomic save.**
 - There is no second loader, schema label or file to reconcile.
 
 The cost: every save rewrites Memory too, up to 1 MiB more per save of a
-file that is a few tens of kilobytes today. Nobody has measured it. And
-every change to Memory's schema is a state protocol bump.
+file that is a few tens of kilobytes today. And every change to Memory's
+schema is a state protocol bump. The maintainer accepted the cost for the
+MVP with no gate (§5, answer 1). One save is a local fsync of the file and
+its directory, small next to an agent launch measured in minutes even at
+the ceiling, and Memory is off by default, so only an evaluation arm comes
+near the ceiling. #317 still measures one save at the ceiling and reports
+the number in its PR. A number that matters is a reason to reopen D10, not
+a precondition for building it.
 
 *Rejected: SQLite as authoritative storage.* SQLite opens the database and
 its rollback journal, WAL and shared-memory files by pathname, through
@@ -1027,6 +1100,7 @@ reads with today's checks, and never adopts because it is there.
 | candidate and attempt result | both outside the checkpoint until saved | neither: the next launch is told of the worktree's state, and the reply is lost |
 | candidate and budget | the budget first | the budget: the launch that made the candidate was charged |
 | attempt result and budget | the budget first | the budget |
+| checkpoint and the kept candidate's ref (#319, D7.7) | the ref is updated first, then the save that records the candidate it keeps | the checkpoint. The ref's target is never adopted as the kept candidate. After a crash between the two, the kept candidate the state names no longer has its ref, so it is reported unreachable and never treated as kept; the next `verified` candidate replaces it |
 
 The crash windows of one attempt, and what the next command does:
 
@@ -1035,7 +1109,7 @@ The crash windows of one attempt, and what the next command does:
 | W1. before the intent save | as before the step; no `AttemptID` spent | the step as if new | the step's first, charged then | unchanged |
 | W2. after the intent save, before the process starts | the attempt charged, its `AttemptID` spent with no receipt | the entry's reconciliation, then a charged launch with the next `AttemptID` | one more | unchanged |
 | W3. while the agent runs | as in W2; the worktree may hold commits | the lock, the worktree's state, the strict import, the entry's reconciliation, a charged launch with the next `AttemptID`, told what the worktree holds | one more | unchanged: nothing was observed |
-| W4. the reply received, not kept (a clean exit: stages 1 to 3 run in process) | as in W3 | as in W3 (D5.3) | one more | unchanged |
+| W4. the reply received, not kept (a clean exit: stages 1 to 3 run in process), until #332 closes it (D5.3) | as in W3 | as in W3 | one more | unchanged |
 | W5. the reply kept before acceptance: a failed end's reply after its checks (ADR 0012 D12); under #319, a receipt after its parse | the kept reply or receipt; a validator's marker, perhaps | the kept reply re-checked, the receipt re-verified (a parse refusal's receipt: its correction); an interrupted validator recorded (ADR 0006) | none, or the correction's | the records saved with each verification record |
 | W6. verified, before the acceptance save | the records | the kept reply or receipt re-checked, or W4's relaunch, reusing the same candidate's records | none, or W4's | the records derived from them, already saved; none makes a task stale (D7.3) |
 | W7. the acceptance saved (for the producing task, its plan) | the task `ACCEPTED`; the plan and its `intended` effects | the journal completes the effects | none | the accepted result's proposals, already saved |
@@ -1044,8 +1118,9 @@ The crash windows of one attempt, and what the next command does:
 | W10. under #319, a save moved the step's current candidate | the new candidate; the read-only tasks pinned to the old one `CANCELED` in the same save | a reply or receipt of a canceled task discarded (D4.3); D5.5's survivor check before any launch | none | unchanged |
 
 Under #319 every task attempt has these windows, each read-only attempt
-charged in an intent save of its own, and W4 is closed by the receipt
-(D5.2): a crash after it re-verifies the receipt and launches nothing.
+charged in an intent save of its own. Once #332 lands, W4 is closed for
+every attempt, the single-agent producer's included, by the receipt (D5.2,
+D5.3): a crash after it re-verifies the receipt and launches nothing.
 
 ### D12. The projection and its freshness
 
@@ -1113,8 +1188,11 @@ charged in an intent save of its own, and W4 is closed by the receipt
   bound to a reviewed head.
 - **`REVIEW` gets no projection in the MVP.** The reviewer is the
   independent check, and the implementer's lessons would anchor it on the
-  implementer's view. A later record may add a projection of observed
-  records only.
+  implementer's view. The maintainer kept this (§5, answer 3). A later
+  record may propose a projection of observed records only. It needs its
+  own ADR and an evaluation result showing that the reviewer gains
+  something it cannot already read on the PR. Proposals and operator
+  records never reach the reviewer.
 - **`REPLAN_REEXECUTE` keeps `verification_failures` as it is;**
   `UPDATE_EPIC` gets nothing.
 - **Multi-agent execution starts with `ANALYZE_EXECUTE` too,** under
@@ -1257,8 +1335,14 @@ and two independent persisted changes never share one
 ([state-and-recovery.md](../agent-guides/state-and-recovery.md), "Numbering
 a new protocol"). Items 1 to 3 are the Memory MVP's. They are one change,
 so they take one bump (#317). If #332 lands item 2 first, that is a bump of
-its own. #316 asks for this list on #23. The list posted there is this
-one, and it assigns nothing.
+its own. #316 asks for this list on #23, and it was posted there during
+review round 1 of PR #512, in
+[the coordination comment on #23](https://github.com/iceboundrock/AutoForge/issues/23#issuecomment-6994507351).
+That comment assigns nothing. The acceptance added no item to the list and
+moved none to another owner. It settled item 5's condition, and its bump
+is announced on #23 by #332 when it is ready (§5, answer 6). Item 4 gained
+detail from the answers: the kept candidate's ref. #332 and #319 bring
+item 4's full schema to #23 with their bump.
 
 1. **Issue Working Memory** (#317, #333): one field of the state. A file of
    the previous protocol loads with empty Memory; an older-labelled file
@@ -1282,9 +1366,13 @@ one, and it assigns nothing.
    - the step's current candidate;
    - the frozen plan's baseline and each candidate's independent outcome
      (D7.5);
-   - the last verified candidate (D7.7).
-5. **Every reply kept,** if #332 closes D5.3's window: an extension of
-   `delivered_reply`'s contract.
+   - the last verified candidate, and the name of the ref that keeps it
+     reachable (D7.7).
+5. **Every reply kept** (D5.3): #332 closes the clean-exit window for both
+   paths, as the maintainer decided (§5, answer 6). It extends
+   `delivered_reply`'s contract to every reply, as a receipt. It is a bump
+   of its own, which #332 announces on #23, and the Memory MVP does not
+   wait for it.
 
 Coordinated, though not state: a `memory:` configuration section is
 classified in `tests/evaluation.py` as a Memory arm's treatment (evaluation
@@ -1292,7 +1380,9 @@ protocol §4.1); the prompt change that names `memory.md` moves
 `prompt_version`, which is an evaluation amendment (§11); #319's read-only
 launch class amends ADR 0005; D7.5's declarations on a validation
 definition (independent, its checker inputs, its report contract) amend
-ADR 0006 and enter its digests; and a new stop code amends ADR 0011.
+ADR 0006 and enter its digests; the kept candidate's ref, the one
+exception to AutoForge creating no local refs, amends `AGENTS.md` and the
+relevant guide (#319, D7.7); and a new stop code amends ADR 0011.
 
 ### D20. What the Memory MVP needs
 
@@ -1380,6 +1470,9 @@ Each is a deterministic test with fakes, offline, in `make check`.
     corrected memory, volatile GitHub state, scope boundary, a negative
     debugging lesson, a hallucinated lesson, a prompt-injection string,
     and an incomplete index watermark.
+
+  #317 also measures one save at the 1 MiB ceiling and reports the number
+  in its PR (D10). That is a measurement, not one of these tests.
 - **#332 (the reducer and the task table):**
   - purity (the same input, the same proposals) and totality;
   - every proposal refused by the engine's checks changes nothing;
@@ -1394,6 +1487,12 @@ Each is a deterministic test with fakes, offline, in `make check`.
   - each D11 window for a persisted task, W10 included;
   - D2.1's regression scenario for a persisted task: the canceled task's
     receipt is discarded, and the new task has the next ordinal;
+  - D5.3's receipt for the single-agent producer:
+    - a crash after the receipt's save and before the save that accepts
+      the result re-verifies the receipt and launches nothing, reusing
+      the candidate's `ValidationRecord`s;
+    - a parse refusal's receipt leads to its correction, with no quote of
+      the reply;
   - parity of the single-agent path through the reducer.
 - **#319 (roles):**
   - timeout, crash, canceled work, tampering and candidate drift for each
@@ -1422,33 +1521,73 @@ Each is a deterministic test with fakes, offline, in `make check`.
     load;
   - the last `verified` candidate kept through a regression, and none
     kept when no candidate was `verified`;
+  - D7.7's ref:
+    - it is under `refs/autoforge/`, never under `refs/heads/`, never
+      pushed, recorded in the state and listed by `status`;
+    - nothing of AutoForge deletes it;
+    - a kept candidate whose ref is missing or resolves elsewhere is
+      reported unreachable, never treated as kept;
+    - after a crash between the ref's update and the save that records
+      its candidate, the ref's target is not adopted, and the state's
+      kept candidate is reported unreachable;
   - a Manager unable to admit, accept or cancel.
 
-## 5. Open questions for the maintainer
+## 5. The maintainer's answers
 
-1. **D10's storage cost is unmeasured.** Memory inside the checkpoint
-   rewrites up to 1 MiB per save. Accept it for the MVP, or have #317
-   measure the save's cost at the ceiling first?
-2. **D9.1 scopes Memory to one run.** A rerun of the same issue after
-   `run --force` starts empty. Is carrying a lesson across runs layer 3's,
-   as decided, or wanted in layer 2?
-3. **D13 gives `REVIEW` no projection.** Should a later record consider a
-   projection of observed records only?
-4. **D7.4 refuses read-only roles under `disabled`.** Multi-agent
-   execution then needs an enforcing Linux host and has no macOS support.
-5. **D7.7's last verified candidate** must stay reachable in the object
-   store while AutoForge creates no local branch. #319 needs a way to
-   keep it reachable that is neither a branch nor a garbage-collection
-   setting the operator owns.
-6. **D5.3 keeps today's window** in which a clean exit's reply is lost to a
-   crash before its checks. Should #332 close it for the single-agent
-   path too?
-7. **D7.5 accepts a residual and a cost.** Code under test can still
-   subvert the runner that tests it, so `verified` is not proof of
-   honesty. Taking every checker input from the base also makes a
-   candidate that needs a change to one of them `inconclusive`, never
-   `verified`: a new dependency in `pyproject.toml` is one example.
-   Accept both for #319, or ask for a runner-independent check first?
+This section held seven open questions when the maintainer accepted the
+record. The
+[maintainer decision on #316](https://github.com/iceboundrock/AutoForge/issues/316#issuecomment-6994876085)
+answers each one, and each answer is now part of the record. The
+implementing child an answer names owns its follow-up.
+
+1. **D10, Memory inside `state.json`: accepted for the MVP, with no gate.**
+   One save is a local fsync of the file and its directory. Even at the
+   1 MiB ceiling it is small next to an agent launch measured in minutes,
+   and Memory is off by default, so only an evaluation arm comes near the
+   ceiling. #317 still measures one save at the ceiling and reports the
+   number in its PR. A number that matters is a reason to reopen D10, not
+   a precondition for building it.
+2. **D9.1, Memory scoped to one run: kept.** A lesson that outlives its run
+   belongs to layer 3, under approval (#325). `run --force` usually means
+   the earlier run's state is not to be trusted, and inheriting its Memory
+   automatically would undo that. The evaluation also needs each run's
+   Memory to start from a known point: empty, or the operator's seed. An
+   operator who wants a lesson carried forward can seed it (D9.5).
+3. **D13, no projection for `REVIEW`: kept for the MVP.** A later record
+   may propose a projection of observed records only. It needs its own ADR
+   and an evaluation result showing that the reviewer gains something it
+   cannot already read on the PR. Proposals and operator records never
+   reach the reviewer.
+4. **D7.4, read-only roles refused under `disabled`: accepted.**
+   Multi-agent execution needs an enforcing Linux host and has no macOS
+   support. A read-only role that is only asked not to write is logical
+   isolation, and D7.3's staleness rules depend on read-only being
+   enforced. macOS in CI (#501) runs the suite and enforces nothing. A
+   macOS-capable enforcing backend, ADR 0013's container backend for
+   example, lifts this without a new decision.
+5. **D7.7, keeping the last verified candidate reachable: a hidden ref, as
+   an explicit exception.** #319 keeps that candidate reachable with a ref
+   under `refs/autoforge/` (for example
+   `refs/autoforge/<run>/verified/<step>`). It is the one exception to
+   AutoForge creating no local refs, bounded as D7.7 says, and #319
+   amends `AGENTS.md` and the relevant guide to name it.
+6. **D5.3, the lost clean-exit reply: closed by #332, for the single-agent
+   path too.** A crash in that window costs a full charged relaunch, and a
+   closed laptop or `Ctrl-C` during a long validation is an expected
+   failure, not an edge case. #319 needs receipts anyway, and reusing them
+   keeps one crash semantics for both paths. It takes its own protocol
+   bump, announced on #23, and the Memory MVP does not wait for it.
+7. **D7.5, the residual and the cost: both accepted for #319, with one
+   requirement.** The residual is accepted. `verified` qualifies a
+   candidate to be kept or to reproduce a counterexample, nothing more.
+   The review stays the independent judgment, and the merge gate is
+   unchanged. A runner-independent check would be a separate project and
+   does not block #319. The cost is accepted too, but an `inconclusive`
+   caused by replaced checker inputs must be distinguishable from every
+   other `inconclusive`: the step's conclusion, the reducer's input and
+   `status` name `checker-altered` and the changed paths. Otherwise a
+   legitimate change to `pyproject.toml` or a test reads the same as a
+   broken run.
 
 ## 6. Consequences
 
@@ -1469,10 +1608,15 @@ Each is a deterministic test with fakes, offline, in `make check`.
 - Three gaps the code has today are named and assigned:
   - a session-resuming flag passes a Claude Code or OpenCode profile's
     validation (D14, for #317);
-  - a clean exit's reply is lost to a crash before its checks (D5.3, for
-    #332);
+  - a clean exit's reply is lost to a crash before its checks, which #332
+    closes for both paths (D5.3);
   - `state.attempt` repeats after an `unblock` into the same step, so it
     can name no attempt (D2.1, for whichever of #317 and #332 first
     persists an attempt's identity).
 - Multi-agent execution is Linux-only behind an enforcing sandbox, a cost
-  of refusing logical isolation for read-only roles (D7.4).
+  of refusing logical isolation for read-only roles that the maintainer
+  accepted (D7.4).
+- AutoForge gains one kind of local ref, under `refs/autoforge/`, to keep
+  the last verified candidate reachable (D7.7). It is never pushed or
+  trusted, and the operator cleans it up, as they clean up the per-issue
+  worktree.
