@@ -321,7 +321,9 @@ run-log redactor would change is refused, never redacted and kept, and text
 the controller derives from evidence is redacted, then bounded. A state file
 edited to hold such a text, or such a lifecycle reason, is refused when it
 loads even with consistent digests, and a projection that would render one
-is refused whole. No
+is refused whole. So is a record's issue URL, or its step's issue or PR URL,
+whose owner or repository has a credential's shape: refused when written
+and when loaded, never rewritten. No
 transcript, reasoning, prompt, diff or environment is stored. Like the rest
 of the state directory it is stored in the clear.
 

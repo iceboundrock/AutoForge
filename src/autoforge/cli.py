@@ -895,7 +895,7 @@ def _refuse_scheduler_state_dir(engine: ControllerEngine, args, command: str) ->
         engine.refuse_scheduler_state_dir(command)
 
 
-def _refuse_unloadable_state_before_the_lock(engine: ControllerEngine) -> None:
+def _refuse_unloadable_state_before_the_lock(engine: ControllerEngine) -> AutoForgeState:
     """Load the state once before the lock, only to refuse one that does not load.
 
     Taking the controller lock creates ``controller.lock`` or rewrites its
@@ -904,10 +904,45 @@ def _refuse_unloadable_state_before_the_lock(engine: ControllerEngine) -> None:
     A refusal needs no lock and writes nothing, so a missing state and one
     that does not load, a LOCAL one among them (ADR 0009 D4, D8), are
     refused before the lock is taken and leave the directory as it was. The
-    snapshot decides nothing else: ``step``, ``resume`` and ``unblock`` read
+    snapshot decides only refusals: ``step``, ``resume`` and ``unblock`` read
     the state again under the lock and act on that one alone.
     """
-    engine.load()
+    return engine.load()
+
+
+def _refuse_memory_state_of_another_repository(
+    engine: ControllerEngine, command: str, state: AutoForgeState | None
+) -> None:
+    """Every writer of a checkpoint holding Issue Memory takes one lock: its repository's.
+
+    R3-F1 of PR #513. A command takes the controller lock of the checkout it
+    runs in, while ``--state-dir`` may name a state directory of another
+    repository, another clone of the same GitHub repository included, or of
+    none: a run created from clone A in clone B's directory would be written
+    under A's lock while ``memory retract`` from B writes it under B's. So a
+    checkpoint that holds Issue Memory (``state``, the one there now) or
+    would (this invocation's ``memory.enabled``) is written only when its
+    state directory lies in this checkout's repository
+    (:meth:`ControllerEngine.state_dir_repository_problem`, which judges a
+    directory not created yet by the one that would hold it): ``run`` binds
+    a new run to that lock when it creates it, and ``step``, ``resume``,
+    ``unblock`` and ``memory retract`` hold every later write to it. Each
+    asks before it takes the lock and again under it; a refusal is a
+    ConfigurationError (exit 2) and writes nothing. A run without Memory,
+    continued with it off, is left exactly as before.
+    """
+    memory = engine.config.memory.enabled or (
+        state is not None and state.memory_store() is not None
+    )
+    if not memory:
+        return
+    foreign = engine.state_dir_repository_problem()
+    if foreign:
+        raise ConfigurationError(
+            f"'{command}' refused: {foreign}. A run's Issue Memory is written only under the "
+            "controller lock of the repository its state directory belongs to, so nothing "
+            "was changed: no state write"
+        )
 
 
 def _doctor_runner():
@@ -1950,9 +1985,12 @@ def cmd_run(args) -> int:
     # A run the state already there refuses is refused before the lock too:
     # the refusal writes nothing, and taking the lock would write its PID
     # record in the state directory when that is the lock's own (#387).
-    rc, _, _ = _existing_run_guard(engine, args.force)
+    rc, _, existing = _existing_run_guard(engine, args.force)
     if rc is not None:
         return rc
+    # A checkpoint holding Issue Memory, the new one or the one it replaces, is
+    # bound to its own repository's lock (R3-F1 of PR #513).
+    _refuse_memory_state_of_another_repository(engine, "run", existing)
     # Inspect, decide, quarantine, write the first state AND execute under
     # one continuous lock: a verdict taken before the lock could go stale
     # (another controller may have repaired, replaced or created state.json
@@ -1964,6 +2002,7 @@ def cmd_run(args) -> int:
         rc, corrupt, replaced = _existing_run_guard(engine, args.force)
         if rc is not None:
             return rc
+        _refuse_memory_state_of_another_repository(engine, "run", replaced)
         # A scheduler-owned issue is refused before anything is read from
         # GitHub or written (ADR 0008 D17.2): no quarantine, no state, no
         # run log.
@@ -2123,11 +2162,14 @@ def cmd_step(args) -> int:
         if outcome.plan is not None:
             print_plan(outcome.plan, full_prompt=args.full_prompt)
         return 0
-    _refuse_unloadable_state_before_the_lock(engine)
+    _refuse_memory_state_of_another_repository(
+        engine, "step", _refuse_unloadable_state_before_the_lock(engine)
+    )
     # Load and execute under one lock: a snapshot loaded before the lock
     # could already have been replaced by another controller.
     with engine.locked():
         state = engine.load()
+        _refuse_memory_state_of_another_repository(engine, "step", state)
         _guard_scheduler_ownership(engine, state.current_issue_url, "step")
         if state.phase not in TERMINAL_PHASES:
             _check_configuration(engine, args, "step", dry_run=False)
@@ -2151,11 +2193,14 @@ def cmd_resume(args) -> int:
             assert o.plan is not None
             print_plan(o.plan, full_prompt=args.full_prompt)
         return 0
-    _refuse_unloadable_state_before_the_lock(engine)
+    _refuse_memory_state_of_another_repository(
+        engine, "resume", _refuse_unloadable_state_before_the_lock(engine)
+    )
     # Load, decide and execute under one lock: a snapshot loaded before the
     # lock could already have been replaced by another controller.
     with engine.locked():
         state = engine.load()
+        _refuse_memory_state_of_another_repository(engine, "resume", state)
         _guard_scheduler_ownership(engine, state.current_issue_url, "resume")
         rc = _resume_holding_state(engine, state, args.allow_merge)
         if rc is not None:
@@ -2207,12 +2252,15 @@ def cmd_unblock(args) -> int:
         )
         print_unblock_outcome(outcome)
         return 0
-    _refuse_unloadable_state_before_the_lock(engine)
+    _refuse_memory_state_of_another_repository(
+        engine, "unblock", _refuse_unloadable_state_before_the_lock(engine)
+    )
     # Load, decide and write under one lock, like `step`. An accepted
     # configuration change is its own recorded write, made before the
     # decision: a refused unblock leaves it in place.
     with engine.locked():
         state = engine.load()
+        _refuse_memory_state_of_another_repository(engine, "unblock", state)
         _guard_scheduler_ownership(engine, state.current_issue_url, "unblock")
         if state.phase == Phase.BLOCKED:
             _check_configuration(engine, args, *words, dry_run=False)
@@ -2686,7 +2734,9 @@ def cmd_memory(args) -> int:
     # worker's (ADR 0008 D17.3), and an unloadable state is refused, before the
     # lock. So is a state directory of another repository, another clone of the
     # same GitHub repository included: this checkout's lock and scheduler root
-    # do not guard it, and its own controller may hold its own lock.
+    # do not guard it, and its own controller may hold its own lock. `run`,
+    # `step`, `resume` and `unblock` hold a Memory checkpoint to the same
+    # lock, so every writer of one takes this one (R3-F1).
     engine.refuse_scheduler_state_dir(_MEMORY_RETRACT)
     _refuse_unloadable_state_before_the_lock(engine)
     foreign = engine.state_dir_repository_problem()
@@ -2699,6 +2749,7 @@ def cmd_memory(args) -> int:
     # could already have been replaced by another controller.
     with engine.locked():
         state = engine.load()
+        _refuse_memory_state_of_another_repository(engine, _MEMORY_RETRACT, state)
         # ADR 0008 D17.2's forward guard: an issue a namespace owns is its worker's.
         _guard_scheduler_ownership(engine, state.current_issue_url, _MEMORY_RETRACT)
         store = state.memory_store()
@@ -2785,8 +2836,14 @@ def _memory_lines(state: AutoForgeState, store: MemoryStore | None) -> list[str]
             lines.append(f"  proposed by: {record.origin.describe()}")
         for event in record.events:
             why = f": {event.reason}" if event.reason else ""
+            # The evidence an observation's add or correction named (R3-F2 of PR #513).
+            cited = (
+                ""
+                if event.citation is None
+                else f", citing {event.citation.kind.value} {event.citation.ref}"
+            )
             lines.append(
-                f"  {event.seq}. {event.op.value} by the {event.actor.value}"
+                f"  {event.seq}. {event.op.value} by the {event.actor.value}{cited}"
                 + why.replace("\n", " ")
             )
         lines += [f"    | {line}" for line in record.text.splitlines()]

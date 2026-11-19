@@ -1540,9 +1540,17 @@ a value:
   auto memory, which an earlier launch would have written under your Claude
   configuration, is neither read nor written (the 2.1.328 build reads the
   variable before any setting; a launch with Memory off sets nothing new).
-  Such a launch is refused before anything starts while the `env` of your
-  Claude settings or global configuration sets that variable, which Claude
-  Code would apply over the launch's. It is refused with
+  The proof holds only for a Claude Code that honours the variable, so
+  before such a launch is charged the controller runs the profile's own
+  `claude --version` (its `command`, found through the launch's
+  environment) and refuses the launch unless it reports 2.1.328 or later:
+  an older build, a pre-release of 2.1.328, a version it cannot read, a
+  failing or silent probe and a missing executable are refused alike,
+  naming what was read and never the output. Upgrade Claude Code, or route
+  the phase to another provider. A launch with Memory off is never probed.
+  Such a launch is also refused before anything starts while the `env` of
+  your Claude settings or global configuration sets that variable, which
+  Claude Code would apply over the launch's. It is refused with
   the option `session_persistence` on, and with any `extra_args` outside an
   allow-list read from Claude Code 2.1.328's help: `--allowed-tools`
   (`--allowedTools`), `--disallowed-tools` (`--disallowedTools`),

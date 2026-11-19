@@ -13,7 +13,10 @@ inside the run's `state.json`, which starts empty with the run (ADR 0015).
 `run --memory-seed FILE` imports one lesson before the first launch, byte
 for byte or not at all, and records its SHA-256; `memory show` prints the
 store and `memory retract` withdraws a record in one save, under the lock of
-the repository its state belongs to. A retracted or corrected text is refused
+the repository its state belongs to. Every command that writes a run's
+Memory takes that lock: with Memory on, `run` refuses a `--state-dir` in
+another clone or in no repository, and `step`, `resume`, `unblock` and
+`run --force` refuse another clone's Memory state. A retracted or corrected text is refused
 if a record its withdrawal binds (the same issue, a trust its writer could
 have withdrawn, where the withdrawn record applied) writes it again, and is
 not shown through another such record carrying the same text; an agent's
@@ -43,8 +46,10 @@ resuming flag such as `--resume` or `--continue` among them), an OpenCode
 profile likewise, and an `opencode-sdk` profile. A Claude launch of that
 phase also has Claude Code's auto memory turned off
 (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`), and is refused while the `env` of
-your Claude settings sets that variable. With Memory off, nothing of this
-is checked and no launch changes.
+your Claude settings sets that variable, or unless the profile's own
+`claude --version` reports 2.1.328 or later, the build that variable was
+read from. With Memory off, nothing of this is checked and no launch
+changes.
 
 ### `claim-ambiguous`: `status` goes by what the reason names (#375)
 

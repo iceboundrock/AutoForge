@@ -3765,29 +3765,39 @@ class ControllerEngine:
         ``workdir``) and requires the same git common dir, symlinks
         resolved. A linked worktree of the same repository shares it; a
         state directory in no repository, or whose repository cannot be
-        read, has no identity to establish and is a problem too. Two git
-        reads, no write; a missing state directory is left to the state
-        load, which refuses it. ``rebind-epic`` (#435) and ``memory retract``
-        (#317, R2-F1 of PR #513) refuse on it; no other command calls this.
+        read, has no identity to establish and is a problem too. A state
+        directory not created yet is judged by its nearest existing
+        ancestor, the directory its first save creates it in, so ``run``
+        binds a new run's state to the lock that will guard it (R3-F1 of PR
+        #513). Two git reads, no write. ``rebind-epic`` (#435) refuses on
+        it, and so does every command that writes a run's Issue Memory
+        (#317): ``run``, ``step``, ``resume``, ``unblock`` and ``memory
+        retract`` (R2-F1, R3-F1 of PR #513); no other command calls this.
         """
         state_dir = self.paths.state_dir
-        if not os.path.lexists(state_dir):
-            return ""
+        probe = Path(os.path.abspath(state_dir))
+        while not os.path.lexists(probe) and probe != probe.parent:
+            probe = probe.parent
+        where = (
+            f"{state_dir}"
+            if os.path.lexists(state_dir)
+            else f"{state_dir} (not created yet: judged by {probe}, which would hold it)"
+        )
         try:
             own = Path(os.path.realpath(self.coordination_root()))
         except LockError as exc:
             return f"the working directory's repository cannot be established: {exc}"
         try:
-            theirs = Path(os.path.realpath(repository_lock_path(state_dir).parent.parent))
+            theirs = Path(os.path.realpath(repository_lock_path(probe).parent.parent))
         except LockError as exc:
             return (
-                f"the repository of the state directory {state_dir} cannot be established "
+                f"the repository of the state directory {where} cannot be established "
                 f"({exc}), so the controller lock that guards its run is unknown; run the "
                 "command from the checkout the run belongs to, on a state directory inside it"
             )
         if own != theirs:
             return (
-                f"the state directory {state_dir} belongs to the repository whose git common "
+                f"the state directory {where} belongs to the repository whose git common "
                 f"dir is {theirs}, and this command runs in the one whose git common dir is "
                 f"{own}: its controller lock and scheduler root are not this checkout's (two "
                 "clones of one GitHub repository are two repositories to the lock); run the "
@@ -16951,6 +16961,10 @@ class ControllerEngine:
             # to this invocation's (ADR 0015 D14, D18; R2-F7 of PR #513).
             fresh_context = self.config.memory.enabled and phase.value in MEMORY_PHASES
             provider.integration_preflight(env_allowlist, fresh_context=fresh_context)
+            if fresh_context:
+                # The runtime the launch would start honours what the profile's
+                # proof rests on, or nothing is charged or saved (R3-F5 of PR #513).
+                provider.fresh_context_preflight(profile, cwd, env_allowlist)
             # What the agent reads from GitHub, read by the controller (it
             # holds no credential to read it itself) and written before the
             # prompt that names it is rendered; nothing is saved yet.

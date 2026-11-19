@@ -3190,9 +3190,25 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   retraction its actor may not make, a supersession the write would have
   refused, a proposal's origin or two records of one proposal key, foreign
   tombstones, another run's launch, a launch past `launch_seq`, an issue of
-  another repository;
-- the projection: observed, operator's, evidence-gone and proposed records
-  in that order, newest first; a launch citation observed only with the
+  another repository, a schema label that is not the integer 1 (`true`,
+  `1.0`), records added out of id order, an issue or step URL the redactor
+  would change (refused unquoted, at the write too), an observation's
+  correction that names no evidence or a record citing other evidence than
+  its last write named, and two records sharing evidence;
+- a proposal's replay in another spelling of the issue's and step's owner
+  and repository is the record kept, and another issue, PR or round under
+  its key a conflict; a record and its step may spell one issue
+  differently;
+- the projection: observed for this launch, operator's, another commit's,
+  evidence-gone and proposed records in that order, newest first; a
+  receipt of another run's log none; a failure of C1 shown as C1's
+  evidence, never as a descendant's or as no candidate's; an observation's
+  correction refused without the evidence of its new text and judged by
+  that evidence after it; a superseded observation kept while its evidence
+  establishes it more strongly for the launch than its replacement's
+  (a missing launch receipt, another commit's, a retracted replacement),
+  hidden behind a replacement as strong or a chain's stronger end, after a
+  save and a load and once its own receipt is lost; a launch citation observed only with the
   receipt the run keeps and its digest (missing, mismatched and retained
   receipts); a validation citation observed only with a real, failing
   `ValidationRecord` of the record's issue and, for a candidate-bound
@@ -3201,7 +3217,9 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   kind citing only the evidence it takes; another issue, phase or candidate
   omitted and counted; retracted and superseded records counted, never
   shown; the bound kept with every cut counted, and a bound above 16,384
-  characters refused; the same revision and request render the same bytes;
+  characters refused; the same revision, request and evidence render the
+  same bytes, an evicted receipt other bytes, and the header names the
+  evidence's digest;
   `REVIEW`, another run's store, a store whose Memory is off and a request
   whose step, phase, launch, repository, candidate or bases disagree
   refused; an issue spelt in another case selects the same records; every
@@ -3220,7 +3238,12 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, over the operator's own value, in
   both output formats) and is refused while the user's or global
   configuration's `env` sets that variable, and every other launch's
-  environment is as before (`tests/test_providers.py`);
+  environment is as before (`tests/test_providers.py`); the profile's own
+  `claude --version` passes from 2.1.328 and refuses an older build, a
+  pre-release, an unreadable, failing or silent probe and a missing
+  executable, unquoted, and only a launch that needs a fresh context is
+  probed; the engine asks before the launch-intent save, so a refusal
+  spends no launch ordinal and writes nothing;
 - no module that decides imports Memory, and the engine touches it only in
   the run-configuration record and check; a run with Memory on and a seed
   goes through the same phases, launches and writes as one with it off;
@@ -3230,4 +3253,8 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   for another clone's state directory (its own lock held or free) and for a
   scheduler namespace's, here or in another clone, and under the lock for an
   issue a namespace owns; its help and confirmation say no launch is shown
-  Memory yet.
+  Memory yet; `run` with Memory on refused for a state directory in another
+  clone or in no repository, nothing created, and `step`, `resume`,
+  `unblock` and `run --force` refused on another clone's Memory checkpoint
+  with nothing changed, while that clone's own `memory retract` writes it;
+  a run without Memory is not asked.

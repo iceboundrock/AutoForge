@@ -997,6 +997,19 @@ class AgentProvider:
         """
         return {}
 
+    def fresh_context_preflight(
+        self, profile: ProfileConfig, cwd: str, env_allowlist: tuple[str, ...] | None
+    ) -> None:
+        """Establish that the runtime a launch of ``profile`` would start honours
+        what :meth:`fresh_context_proof` rests on (ADR 0015 D18's dynamic check;
+        R3-F5 of PR #513), for a launch of :attr:`AgentRequest.fresh_context`
+        only. :class:`ConfigurationError` (:func:`no_fresh_context`) before
+        anything starts when it cannot: the engine calls this before the
+        launch-intent save, and :meth:`execute` again before it launches. The
+        base adapters' proofs rest on the argv they build, which no runtime
+        changes, so there is nothing to establish.
+        """
+
     def own_names(self, profile: ProfileConfig | None) -> tuple[str, ...]:
         """The variables this provider adds to the allow-list of ``profile``'s agents."""
         return self.environment_names
@@ -1227,6 +1240,8 @@ class AgentProvider:
                 stop.set()
 
         self.integration_preflight(req.env_allowlist, fresh_context=req.fresh_context)
+        if req.fresh_context:
+            self.fresh_context_preflight(req.profile, req.cwd, req.env_allowlist)
         with self.integration_isolation() as isolation:
             isolation = {**isolation, **self.fresh_context_environment(req)}
             env = {**(req.env or {}), **isolation} if isolation else req.env
@@ -1489,6 +1504,24 @@ CLAUDE_LIFECYCLE_ENV = {"CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"}
 # launch is unchanged. Not for ``claude-sdk``, whose policy turns auto memory
 # off in its settings and checks ``init`` for it (docs/sdk-policy.md).
 CLAUDE_FRESH_CONTEXT_ENV = {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+# The first Claude Code build the variable above was read from (R3-F5 of PR
+# #513): 2.1.328 decides auto memory from it before any setting. An earlier
+# build is not known to honour it, so a launch that needs a fresh context runs
+# only a CLI whose `claude --version` reports this build or a later one, asked
+# of the very executable the launch would start, in its environment, before
+# the launch is charged (:meth:`ClaudeCodeProvider.fresh_context_preflight`).
+CLAUDE_FRESH_CONTEXT_MIN_VERSION = (2, 1, 328)
+# The probe's bounds: `--version` answers at once and prints one line.
+CLAUDE_VERSION_PROBE_SECONDS = 30
+CLAUDE_VERSION_PROBE_MAX_OUTPUT_BYTES = 4096
+# What `claude --version` prints: `2.1.328 (Claude Code)`.
+_CLAUDE_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(?: \(Claude Code\))?")
+
+
+def parse_claude_version(text: str) -> tuple[int, int, int] | None:
+    """``(major, minor, patch)`` from ``claude --version`` output, or None when
+    unreadable; a pre-release sorts below its release, as for Pi and OpenCode."""
+    return _parse_version(text, _CLAUDE_VERSION_RE)
 
 
 @contextmanager
@@ -1835,13 +1868,77 @@ class ClaudeCodeProvider(AgentProvider):
         """:data:`CLAUDE_FRESH_CONTEXT_ENV` for a launch that needs a fresh context."""
         return dict(CLAUDE_FRESH_CONTEXT_ENV) if req.fresh_context else {}
 
+    def fresh_context_preflight(
+        self, profile: ProfileConfig, cwd: str, env_allowlist: tuple[str, ...] | None
+    ) -> None:
+        """Refuse a launch that needs a fresh context unless the ``claude`` it
+        would start is :data:`CLAUDE_FRESH_CONTEXT_MIN_VERSION` or later (R3-F5
+        of PR #513): :data:`CLAUDE_FRESH_CONTEXT_ENV` turns auto memory off from
+        that build on, and an earlier one is not known to honour it, so the
+        proof holds only for the executable that is launched.
+
+        Asks ``<command> --version`` of the profile's own command, resolved in
+        the environment the launch inherits (its allow-list), in its working
+        directory, within :data:`CLAUDE_VERSION_PROBE_SECONDS`. A CLI that
+        cannot be run, times out, exits with a failure, or prints no version
+        this controller reads is refused like an older one. Names the version
+        it read and the command, never the CLI's output. A launch that needs
+        no fresh context is never asked about (:meth:`execute`, the engine).
+        """
+        command = profile.command or "claude"
+        probe = f"`{command} --version`"
+        minimum = ".".join(str(part) for part in CLAUDE_FRESH_CONTEXT_MIN_VERSION)
+        remedy = (
+            f"Run Claude Code {minimum} or later for this profile, or route the phase to "
+            "another provider"
+        )
+        try:
+            res = self._runner(
+                ExecutionRequest(
+                    command=[command, "--version"],
+                    cwd=cwd or None,
+                    timeout_seconds=CLAUDE_VERSION_PROBE_SECONDS,
+                    max_output_bytes=CLAUDE_VERSION_PROBE_MAX_OUTPUT_BYTES,
+                    env_allowlist=(
+                        None if env_allowlist is None else self.launch_allowlist(env_allowlist)
+                    ),
+                    contain_orphans=True,
+                )
+            )
+        except ExecutionError as exc:
+            raise no_fresh_context(
+                profile, f"{probe} could not be run ({redact(str(exc))})", remedy
+            ) from None
+        if res.timed_out:
+            why = f"{probe} did not answer within {CLAUDE_VERSION_PROBE_SECONDS}s"
+        elif res.exit_code != 0:
+            why = f"{probe} exited {res.exit_code} (output not shown)"
+        else:
+            found = None if res.stdout_truncated else parse_claude_version(res.stdout or "")
+            if found is None:
+                why = f"{probe} printed no version this controller reads (output not shown)"
+            elif found < CLAUDE_FRESH_CONTEXT_MIN_VERSION:
+                # The output matched the version pattern whole: its release is
+                # digits and dots, and a pre-release's suffix is not shown.
+                release, _, suffix = res.stdout.strip().split(" ", 1)[0].partition("-")
+                shown = f"{release} (a pre-release)" if suffix else release
+                why = (
+                    f"{probe} reports {shown}, and Claude Code turns its auto memory off by "
+                    f"{', '.join(CLAUDE_FRESH_CONTEXT_ENV)} from {minimum} on"
+                )
+            else:
+                return
+        raise no_fresh_context(profile, why, remedy)
+
     def fresh_context_proof(self, profile: ProfileConfig) -> str:
         """``-p`` with ``--no-session-persistence``, and no flag outside
         :data:`CLAUDE_MEMORY_ARGS` (ADR 0015 D14): an allow-list, since a deny
         list would miss a resuming flag a later CLI adds. Each launch that
         needs a fresh context also has its auto memory off
         (:data:`CLAUDE_FRESH_CONTEXT_ENV`), refused while the user's
-        configuration would set that variable over it (R2-F7 of PR #513)."""
+        configuration would set that variable over it (R2-F7 of PR #513) or
+        while the CLI it would start is older than the build that variable
+        was read from (:meth:`fresh_context_preflight`, R3-F5)."""
         if _truthy(profile.options.get("session_persistence"), default=False) is not False:
             raise no_fresh_context(
                 profile,
@@ -1858,8 +1955,9 @@ class ClaudeCodeProvider(AgentProvider):
                 "Remove it from extra_args",
             )
         return (
-            "claude -p --no-session-persistence, with CLAUDE_CODE_DISABLE_AUTO_MEMORY=1: a new "
-            "session per launch, never saved, and no auto memory read or written"
+            "claude -p --no-session-persistence, with CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 on a "
+            "Claude Code each launch checks is 2.1.328 or later: a new session per launch, "
+            "never saved, and no auto memory read or written"
         )
 
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
@@ -1930,6 +2028,8 @@ class ClaudeCodeProvider(AgentProvider):
             cwd=req.cwd, emit=emit, loop=_ClockedLoop(monitor), is_reply=holds_control_result
         )
         self.integration_preflight(req.env_allowlist, fresh_context=req.fresh_context)
+        if req.fresh_context:
+            self.fresh_context_preflight(req.profile, req.cwd, req.env_allowlist)
         with self.integration_isolation() as isolation:
             env = {**(req.env or {}), **isolation, **self.fresh_context_environment(req)}
             command, description = self.sandboxed(req, self.build_command(req), env)

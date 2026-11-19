@@ -2510,6 +2510,16 @@ def test_a_launch_that_needs_a_fresh_context_turns_claudes_auto_memory_off(
         seen.append(dict(req.env))
         raise Launched
 
+    probes: list[list[str]] = []
+
+    def runner(req):
+        # The CLI's version, asked before a launch that needs a fresh context only
+        # (R3-F5 of PR #513); every other request is the launch.
+        if req.command[1:] == ["--version"]:
+            probes.append(req.command)
+            return ExecutionResult(req.command, req.cwd, 0, "2.1.328 (Claude Code)\n", "", "", "")
+        return launch(req)
+
     monkeypatch.setattr(providers, "start_duplex", launch)
     monkeypatch.setenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "0")
     profile = default_config().profile("analyze_execute")
@@ -2528,8 +2538,9 @@ def test_a_launch_that_needs_a_fresh_context_turns_claudes_auto_memory_off(
             fresh_context=fresh,
         )
         with pytest.raises(Launched):
-            ClaudeCodeProvider(runner=launch).execute(req)
+            ClaudeCodeProvider(runner=runner).execute(req)
     on, off = seen
+    assert probes == [[profile.command or "claude", "--version"]]  # the fresh launch's only
     assert on["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
     assert CLAUDE_FRESH_CONTEXT_ENV == {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
     # Memory off, or another phase: exactly what a launch set before Memory existed.
@@ -2576,6 +2587,79 @@ def test_a_claude_configuration_that_would_force_auto_memory_on_refuses_a_fresh_
     assert not (fake_home / "log.json").exists()
     provider.integration_preflight(allow)
     assert provider.execute(fresh).ok
+
+
+def _versioned_claude(tmp_path: Path, output: str, exit_code: int = 0) -> ProfileConfig:
+    """A profile whose ``claude`` answers ``--version`` with ``output`` and ``exit_code``."""
+    command = tmp_path / "claude"
+    command.write_text(f"#!/bin/sh\nprintf '%s\\n' '{output}'\nexit {exit_code}\n")
+    command.chmod(0o755)
+    return dataclasses.replace(default_config().profile("analyze_execute"), command=str(command))
+
+
+@pytest.mark.parametrize(
+    "output", ["2.1.328 (Claude Code)", "2.1.329 (Claude Code)", "3.0.0 (Claude Code)", "2.1.400"]
+)
+def test_a_claude_from_the_build_its_auto_memory_variable_was_read_from_proves_it(tmp_path, output):
+    """R3-F5 of PR #513: the version is asked of the very executable the profile
+    launches, in the launch's allow-listed environment; 2.1.328 or later passes."""
+    profile = _versioned_claude(tmp_path, output)
+    ClaudeCodeProvider().fresh_context_preflight(profile, str(tmp_path), ("PATH",))
+
+
+@pytest.mark.parametrize(
+    ("output", "exit_code", "needle"),
+    [
+        ("2.1.327 (Claude Code)", 0, "reports 2.1.327, and Claude Code turns its auto memory"),
+        ("2.1.328-rc.1 (Claude Code)", 0, "reports 2.1.328 (a pre-release)"),
+        ("build-xyzzy", 0, "printed no version this controller reads (output not shown)"),
+        ("2.1.400 (Claude Code)", 3, "exited 3 (output not shown)"),
+    ],
+)
+def test_a_claude_that_may_not_honour_its_auto_memory_variable_refuses_a_fresh_context(
+    tmp_path, output, exit_code, needle
+):
+    """Older than 2.1.328, a pre-release of it, unreadable, or failing: the profile is
+    refused for a launch that needs a fresh context, before anything is launched,
+    naming what it read, never the output."""
+    profile = _versioned_claude(tmp_path, output, exit_code)
+    with pytest.raises(ConfigurationError) as caught:
+        ClaudeCodeProvider().fresh_context_preflight(profile, str(tmp_path), ("PATH",))
+    message = str(caught.value)
+    assert needle in message and "cannot prove that each launch starts with a fresh context" in (
+        message
+    )
+    assert "Run Claude Code 2.1.328 or later" in message and "xyzzy" not in message
+    req = AgentRequest(
+        "ANALYZE_EXECUTE", "p", str(tmp_path), profile, 60, 30, env_allowlist=("PATH",)
+    )
+    with pytest.raises(ConfigurationError, match="cannot prove that each launch") as launched:
+        ClaudeCodeProvider().execute(dataclasses.replace(req, fresh_context=True))
+    assert needle in str(launched.value)
+
+
+def test_a_claude_that_cannot_be_run_or_does_not_answer_refuses_a_fresh_context(tmp_path):
+    profile = dataclasses.replace(
+        default_config().profile("analyze_execute"), command=str(tmp_path / "missing")
+    )
+    with pytest.raises(ConfigurationError, match="could not be run"):
+        ClaudeCodeProvider().fresh_context_preflight(profile, str(tmp_path), ("PATH",))
+    asked: list = []
+
+    def slow(req):
+        asked.append(req)
+        return ExecutionResult(req.command, req.cwd, -1, "", "", "", "", timed_out=True)
+
+    with pytest.raises(ConfigurationError, match="did not answer within 30s"):
+        ClaudeCodeProvider(runner=slow).fresh_context_preflight(profile, str(tmp_path), ("PATH",))
+    (probe,) = asked
+    assert probe.env_allowlist == ClaudeCodeProvider().launch_allowlist(("PATH",))
+    assert probe.timeout_seconds == 30 and probe.cwd == str(tmp_path)
+    # Every other adapter's proof rests on its argv: nothing to ask.
+    for name in ("pi", "opencode", "scripted"):
+        provider_for(dataclasses.replace(profile, provider=name)).fresh_context_preflight(
+            profile, str(tmp_path), ("PATH",)
+        )
 
 
 def _background_agent_run(*after: str) -> list[str]:

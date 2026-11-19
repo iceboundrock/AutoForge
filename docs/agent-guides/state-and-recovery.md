@@ -714,7 +714,14 @@ As implemented (`flock(2)`, `src/autoforge/locking.py`):
   directory of another repository (another clone of the same GitHub
   repository, or a scheduler namespace in another one's git directory) or
   of none is refused before the lock is taken, and in its dry run, with
-  nothing written there. Its dry run also asks whether L0 is held now
+  nothing written there. A run's Issue Memory (#317) is held to the same
+  binding by every command that writes it (R3-F1 of PR #513): `run` with
+  Memory on refuses a state directory, existing or about to be created
+  (judged by the nearest existing directory above it), outside the working
+  directory's repository; `step`, `resume`, `unblock`, `run --force` and
+  `memory retract` refuse one whenever its run holds Memory or the
+  invocation turns Memory on, before the lock and again under it. A run
+  without Memory, continued with Memory off, is not asked. Its dry run also asks whether L0 is held now
   (`locking.controller_lock_live`: `LOCK_SH | LOCK_NB` on a descriptor of
   the common dir opened read-only and never created, closed at once; it
   writes no lock file or PID, and a collision fails only the simultaneous

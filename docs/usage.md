@@ -2436,6 +2436,18 @@ on launches, transitions and writes to GitHub exactly as one with it off.
   same GitHub repository included, whose lock this checkout cannot take),
   and under the lock for an issue a scheduler namespace owns.
 
+A run's Issue Memory is written only under the controller lock of the
+repository its state directory belongs to, by every command. With Memory
+on, `run` refuses a `--state-dir` in another repository (another clone
+included) or in none, judging a directory it would create by the one that
+would hold it; and `step`, `resume`, `unblock`, `run --force` and `memory
+retract` refuse a state directory of another repository whenever its run
+holds Issue Memory or this command's configuration turns Memory on. Each
+asks before it takes the lock and again under it, exits 2 and writes
+nothing. Run the command from a checkout of the repository the state
+directory is in. A run without Memory, continued with it off, is not
+affected.
+
 A run's Memory setting is recorded when it is created, beside its recorded
 configuration: `step`, `resume` and `unblock` refuse a configuration with
 another `memory.enabled` unless `--accept-config-change`, which records the
@@ -2445,7 +2457,19 @@ no write but a retraction.
 Bounds: at most 64 records, a text of at most 2,048 UTF-8 bytes, three
 corrections of a record, and so at most 256 tombstones; together they keep
 the store under 1,048,576 bytes in the state file. A write past a bound is
-refused and counted, never by evicting another record.
+refused and counted, never by evicting another record. A record whose
+issue URL, or whose step's issue or PR URL, the run-log redactor would
+change (a credential's shape in an owner or repository name) is refused
+when written and when loaded, and never rewritten.
+
+What a launch will be shown (#333 renders it) rests on the evidence the
+run keeps when it is rendered: a validation failure shows as observed for
+a launch on the commit its `ValidationRecord` validated, as that commit's
+evidence for a launch on another one, and downgraded once no kept record of
+this run establishes it. A projection is reproducible from the store's
+revision, the request and the evidence together, and names the digest of
+each: a record evicted from the 64 the state keeps changes what the same
+revision renders.
 
 ### Candidate validation evidence
 

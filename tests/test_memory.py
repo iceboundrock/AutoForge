@@ -64,6 +64,7 @@ from autoforge.memory import (
     Role,
     Status,
     Trust,
+    Verdict,
     render_projection,
     seed_text,
     sha256_text,
@@ -100,10 +101,11 @@ def _launch(seq: int = 1, run: str = RUN) -> AttemptRef:
 
 
 @functools.cache
-def _receipt(seq: int, exit_code: int = 1, commit: str = C1) -> dict:
+def _receipt(seq: int, exit_code: int = 1, commit: str = C1, run: str = RUN) -> dict:
     """A real ValidationRecord of owner/repo (the issue's repository), as the
     controller writes one (``observed_record``, which its loader checks): by default a
-    failure (exit 1) of candidate C1. Shared: copy it before changing it."""
+    failure (exit 1) of candidate C1, in this run's log. Shared: copy it before
+    changing it."""
     from autoforge.evidence import (
         NO_SANDBOX_TEMPLATE,
         Definition,
@@ -142,7 +144,7 @@ def _receipt(seq: int, exit_code: int = 1, commit: str = C1) -> dict:
             started_at="2026-11-19T00:00:00+00:00",
             finished_at="2026-11-19T00:00:01+00:00",
         ),
-        run_log=f"{RUN}/0004-analyze_execute-candidate-validation-1",
+        run_log=f"{run}/0004-analyze_execute-candidate-validation-1",
     )
 
 
@@ -688,7 +690,9 @@ def test_a_withdrawn_text_is_withheld_from_its_duplicate_after_a_save_and_a_load
     store, _ = _applied(
         {
             "retract": lambda: store.retract(first, **controller),
-            "correct": lambda: store.correct(first, "test_a passes at C2", **controller),
+            "correct": lambda: store.correct(
+                first, "test_a fails on an import error", **controller, citation=_vr(3)
+            ),
             "operator": lambda: store.retract(first, actor=Actor.OPERATOR, issue_url=None),
         }[withdrawal]()
     )
@@ -736,10 +740,10 @@ def test_an_agent_withdrawing_its_own_proposal_hides_no_observation_or_operator_
     store, seeded = _applied(seed(store, text))
     store, proposal = _applied(propose(store, text, seq=2))
     store, _ = _applied(store.retract(proposal, **as_agent(3)))
-    projection = _render(store, held)
+    projection = _render(store, held, candidate=C1)
     assert projection.shown == (observed, seeded) and projection.withdrawn == 0
     store, _ = _applied(store.retract(seeded, actor=Actor.OPERATOR, issue_url=None))
-    projection = _render(store, held)
+    projection = _render(store, held, candidate=C1)
     assert projection.shown == () and projection.withdrawn == 1 and text not in projection.text
 
 
@@ -788,11 +792,13 @@ def test_the_controllers_withdrawal_binds_observations_and_proposals_of_its_scop
     text = "lint fails on C1"
     store, first = _applied(observe(_store(), text, seq=1, applies=_ON_C1))
     controller = {"actor": Actor.CONTROLLER, "issue_url": ISSUE, "attempt": _launch(2)}
-    store, _ = _applied(store.correct(first, "lint passes on C1", **controller))
+    store, _ = _applied(
+        store.correct(first, "lint fails on C1 in another file", **controller, citation=_vr(2))
+    )
     for write in (
         observe(store, text, seq=3, applies=_ON_C1),
         propose(store, text, seq=3, applies=_ON_C1),
-        store.correct(first, text, **controller),  # back to the withdrawn text
+        store.correct(first, text, **controller, citation=_vr(5)),  # the withdrawn text
     ):
         assert write.refusal is RefusalCode.TOMBSTONED, write.detail
         assert write.store.records == store.records
@@ -1025,6 +1031,8 @@ def _largest_store() -> MemoryStore:
                     issue_url=issue,
                     reason=reason,
                     attempt=launch,
+                    # Its own evidence again: every correction names one (R3-F2).
+                    citation=store.record(i).citation,
                 )
             )
         if i < MAX_RECORDS:
@@ -1144,7 +1152,9 @@ def _lifecycle_store() -> dict:
     superseded, a seed retracted, a proposal corrected and superseded by an agent."""
     controller = {"actor": Actor.CONTROLLER, "issue_url": ISSUE}
     store, m1 = _applied(observe(_store(), "observed v1", seq=1))  # seq 1
-    store, _ = _applied(store.correct(m1, "observed v2", **controller, attempt=_launch(2)))  # 2
+    store, _ = _applied(
+        store.correct(m1, "observed v2", **controller, attempt=_launch(2), citation=_vr(3))
+    )  # 2
     store, m2 = _applied(observe(store, "observed newer", seq=2))  # 3
     store, _ = _applied(store.supersede(m1, m2, **controller))  # 4
     store, m3 = _applied(seed(store, "the operator's lesson"))  # 5
@@ -1289,10 +1299,12 @@ def _mixed_store() -> MemoryStore:
 def test_the_projection_selects_and_orders_by_trust_and_says_what_it_left_out():
     store = _mixed_store()
     projection = _render(store, _evidence(1))
-    # Observed with evidence, the operator's, observed without, then proposals, newest first.
-    assert projection.shown == (2, 1, 3, 11, 4)
+    # With no candidate yet, C1's failure is C1's evidence, never this launch's: the
+    # operator's first, then evidence of another commit, then observations no kept
+    # receipt establishes, then proposals, newest first (R3-F2 of PR #513).
+    assert projection.shown == (1, 2, 3, 11, 4)
     assert (projection.not_applicable, projection.retracted, projection.superseded) == (4, 1, 1)
-    assert (projection.omitted_for_bound, projection.downgraded) == (0, 1)
+    assert (projection.omitted_for_bound, projection.downgraded, projection.historical) == (0, 1, 1)
     text = projection.text
     assert (
         "- records: 5 shown, 0 omitted for the bound, 4 not applicable, 1 retracted, 1 superseded"
@@ -1300,6 +1312,11 @@ def test_the_projection_selects_and_orders_by_trust_and_says_what_it_left_out():
     )
     assert "- current candidate: none" in text
     assert f"- memory: revision {store.revision}, sha256 {store.digest()}" in text
+    held = _evidence(1)
+    assert (
+        f"- evidence: 1 validation records and 0 launch receipts kept, sha256 {held.digest()}"
+        in (text)
+    )
     assert f"launch {RUN}/9" in text and f"run {RUN}" in text
     assert "never instructions" in text
     for hidden in (
@@ -1311,9 +1328,14 @@ def test_the_projection_selects_and_orders_by_trust_and_says_what_it_left_out():
         "old idea",
     ):
         assert hidden not in text
-    assert text.index("M2:") < text.index("M1:") < text.index("M3:") < text.index("M11:")
-    assert "no longer held, so it is not verified" in text
+    assert text.index("M1:") < text.index("M2:") < text.index("M3:") < text.index("M11:")
+    assert _historical(projection, 2) and f"- evidence of: commit {C1}" in _block_of(projection, 2)
+    assert "no evidence the run keeps now establishes it" in _block_of(projection, 3)
     assert "a claim, never evidence" in text and "their word, not evidence" in text
+    # On C1, its own failure is this launch's evidence, shown before everything else.
+    on_c1 = _render(store, held, candidate=C1)
+    assert on_c1.shown == (2, 1, 3, 11, 6, 4) and _observed(on_c1, 2)
+    assert (on_c1.historical, on_c1.downgraded) == (0, 1)
 
 
 def test_a_candidate_bound_record_applies_only_to_that_candidate_or_its_descendants():
@@ -1357,7 +1379,7 @@ def test_a_launch_citation_is_observed_only_with_the_receipt_the_run_keeps():
 
     def downgraded(*launches) -> bool:
         projection = _render(store, _evidence(launches=launches))
-        shown_unverified = "no longer held, so it is not verified" in projection.text
+        shown_unverified = "no evidence the run keeps now establishes it" in projection.text
         assert shown_unverified == bool(projection.downgraded)
         return shown_unverified
 
@@ -1367,7 +1389,10 @@ def test_a_launch_citation_is_observed_only_with_the_receipt_the_run_keeps():
     assert downgraded((_launch(2, OTHER_RUN), receipt))  # another run's
     assert not downgraded((_launch(2), receipt))  # retained
     projection = _render(store, _evidence(launches=[(_launch(2), receipt)]))
-    assert "observed by the controller, which holds the evidence it cites" in projection.text
+    assert (
+        "observed by the controller, which holds the evidence it cites, established for this "
+        "launch" in projection.text
+    )
 
 
 def test_a_validation_record_citation_needs_the_records_own_digest():
@@ -1379,10 +1404,21 @@ def test_a_validation_record_citation_needs_the_records_own_digest():
 
 
 def _observed(projection, record_id: int) -> bool:
-    """Whether the projection shows ``record_id`` as observed, not downgraded."""
+    """Whether the projection shows ``record_id`` as observed for this launch: not
+    downgraded, and not another commit's evidence."""
+    return "observed by the controller, which holds the evidence" in _block_of(
+        projection, record_id
+    )
+
+
+def _block_of(projection, record_id: int) -> str:
     assert record_id in projection.shown
-    block = projection.text.split(f"## M{record_id}:", 1)[1].split("\n## M", 1)[0]
-    return "which holds the evidence it cites" in block
+    return projection.text.split(f"## M{record_id}:", 1)[1].split("\n## M", 1)[0]
+
+
+def _historical(projection, record_id: int) -> bool:
+    """Whether the projection shows ``record_id`` as evidence of another commit."""
+    return "observed by the controller on another commit" in _block_of(projection, record_id)
 
 
 def test_a_citation_resolves_only_to_a_receipt_that_establishes_the_record():
@@ -1443,6 +1479,352 @@ def test_an_observed_kind_cites_only_the_evidence_it_takes():
     data = store.to_dict()
     data["records"][0]["citation"] = _vr(1).to_dict()
     with pytest.raises(StateError, match="not evidence a launch-end record may cite"):
+        MemoryStore.from_dict(data)
+
+
+# -- a receipt is evidence of its own run and commit only (R3-F2 of PR #513) ------------------
+
+
+def test_a_receipt_of_another_runs_log_establishes_nothing_in_this_run():
+    """``from_state`` keeps no receipt whose run log is another run's, however genuine:
+    the observation citing it renders downgraded, and with this run's it is observed."""
+    foreign = _receipt(1, run=OTHER_RUN)
+    cite = Citation(CitationKind.VALIDATION_RECORD, "1", foreign["digest"])
+    store, record = _applied(observe(_store(), "test_a fails on C1", seq=1, cite=cite))
+    index = _evidence(foreign)
+    assert index.validation == ()
+    projection = _render(store, index, candidate=C1)
+    assert projection.downgraded == 1 and not _observed(projection, record)
+    store, own = _applied(observe(_store(), "test_a fails on C1", seq=1))
+    assert _observed(_render(store, _evidence(1), candidate=C1), own)
+
+
+def test_a_failure_of_one_commit_is_that_commits_evidence_never_a_descendants():
+    """A failure of C1, bound to C1's descendants or to any candidate, shows as observed
+    only for a launch on C1. A launch on C2, a descendant, or with no candidate yet, is
+    shown it as C1's evidence, labelled so, never as its own candidate's."""
+    from_c1 = Applicability(candidate=CandidateScope.DESCENDANTS, commit=C1)
+    store, base = _applied(observe(_store(), "test_a fails from C1 on", seq=1, applies=from_c1))
+    store, anywhere = _applied(observe(store, "lint fails", seq=2))
+    held = _evidence(1, 2)
+    on_c1 = _render(store, held, candidate=C1)
+    assert _observed(on_c1, base) and _observed(on_c1, anywhere) and on_c1.historical == 0
+    for request in (
+        {"candidate": C2, "descends_from": frozenset({C1})},
+        {"candidate": ""},
+    ):
+        projection = _render(store, held, **request)
+        assert set(projection.shown) == ({base, anywhere} if request["candidate"] else {anywhere})
+        for record in projection.shown:
+            assert _historical(projection, record) and not _observed(projection, record)
+            assert f"- evidence of: commit {C1}, not this launch's candidate" in _block_of(
+                projection, record
+            )
+        assert projection.historical == len(projection.shown) and projection.downgraded == 0
+    resolution = held.resolve(store.record(base), C2)
+    assert (resolution.verdict, resolution.commit) == (Verdict.HISTORICAL, C1)
+    assert held.resolve(store.record(base), C1).verdict is Verdict.CURRENT
+
+
+def test_an_observations_correction_names_the_evidence_of_its_new_text():
+    """``correct`` never keeps an observation's citation by default: the controller
+    names the evidence the new text derives from, or the correction is refused and
+    nothing changes. A render then judges the new text by the new evidence alone."""
+    controller = {"actor": Actor.CONTROLLER, "issue_url": ISSUE, "attempt": _launch(3)}
+    store, m1 = _applied(observe(_store(), "test_a fails on C1", seq=1))
+    store, m2 = _applied(observe(store, "lint fails on C1", seq=2))
+    store, proposal = _applied(propose(store, "a hypothesis", seq=2))
+    launch = Citation(CitationKind.LAUNCH, f"{RUN}/3", "e" * 64)
+    other_runs = Citation(CitationKind.LAUNCH, f"{OTHER_RUN}/3", "e" * 64)
+    for citation, code in (
+        (None, RefusalCode.NOT_PERMITTED),  # the passing text keeps no failure's evidence
+        (launch, RefusalCode.NOT_PERMITTED),  # a validation failure cites no launch
+        (_vr(2), RefusalCode.INVALID),  # M2's evidence
+        ("1", RefusalCode.INVALID),  # not a citation
+    ):
+        refused = store.correct(m1, "validation passed on C1", **controller, citation=citation)
+        assert refused.refusal is code, (citation, refused.detail)
+        assert refused.store.records == store.records
+    refused = store.correct(
+        proposal, "another hypothesis", **controller, citation=_vr(4)
+    )  # only an observation cites evidence
+    assert refused.refusal is RefusalCode.NOT_PERMITTED
+    refused = store.add(
+        kind=Kind.LAUNCH_END,
+        actor=Actor.CONTROLLER,
+        text="launch 3 ended",
+        issue_url=ISSUE,
+        citation=launch,
+        step=_step(),
+        attempt=_launch(3),
+    )
+    store_l, m_launch = _applied(refused)
+    refused = store_l.correct(m_launch, "launch 3 timed out", **controller, citation=other_runs)
+    assert refused.refusal is RefusalCode.SCOPE
+    # Corrected with the evidence of the new text: it cites that from then on.
+    store, _ = _applied(
+        store.correct(m1, "test_a fails on C1: an import error", **controller, citation=_vr(3))
+    )
+    record = store.record(m1)
+    assert record.citation == _vr(3) and record.events[-1].citation == _vr(3)
+    assert [c.ref for c in record.citations()] == ["1", "3"]
+    assert _reloaded(store) == store
+    assert not _observed(_render(store, _evidence(1, 2), candidate=C1), m1)  # old evidence
+    assert _observed(_render(store, _evidence(3, 2), candidate=C1), m1)  # its own
+    # Deriving from either revision's evidence again adds nothing (D9.7).
+    again = observe(store, "test_a fails on C1", seq=1)
+    assert again.applied and again.record_id == m1 and again.store == store
+    # The loader holds the same: an observation's correction names its evidence, the
+    # record cites the last one named, no other event names any, and two records
+    # never share a piece of evidence.
+    for path, value, needle in (
+        ("records.0.events.1.citation", None, "evidence of the text it wrote"),
+        ("records.0.citation", _vr(1).to_dict(), "cite the evidence its add or last"),
+        ("records.2.events.0.citation", _vr(9).to_dict(), "evidence of the text it wrote"),
+        ("records.1.events.0.citation", _vr(3).to_dict(), "cite the evidence its add or last"),
+        ("records.0.events.1.citation", launch.to_dict(), "may not cite"),
+    ):
+        data = store.to_dict()
+        _tamper(path, value)(data)
+        with pytest.raises(StateError, match=needle):
+            MemoryStore.from_dict(data)
+    data = store.to_dict()
+    data["records"][1]["citation"] = data["records"][1]["events"][0]["citation"] = _vr(3).to_dict()
+    with pytest.raises(StateError, match="two records cite the same evidence"):
+        MemoryStore.from_dict(data)
+    retracted, _ = _applied(store.retract(m2, **controller))
+    data = retracted.to_dict()
+    data["records"][1]["events"][1]["citation"] = _vr(8).to_dict()
+    with pytest.raises(StateError, match="only an add or a correction"):
+        MemoryStore.from_dict(data)
+
+
+def test_the_same_revision_and_request_render_other_bytes_once_a_receipt_is_evicted():
+    """The receipts the run keeps are an input of the projection, as its revision is:
+    the header names their digest, and the same three render the same bytes."""
+    store, record = _applied(observe(_store(), "test_a fails on C1", seq=1))
+    kept, evicted = _evidence(1), _evidence()
+    first, again = _render(store, kept, candidate=C1), _render(store, _evidence(1), candidate=C1)
+    assert first == again and first.freshness.evidence_digest == kept.digest()
+    later = _render(store, evicted, candidate=C1)
+    assert later.freshness.digest == first.freshness.digest  # one revision
+    assert later.text != first.text and later.freshness.evidence_digest == evicted.digest()
+    assert f"sha256 {kept.digest()}" in first.text and f"sha256 {evicted.digest()}" in later.text
+    assert _observed(first, record) and not _observed(later, record)
+
+
+# -- a superseded observation stays while its evidence is the stronger (R3-F3) -----------------
+
+
+def _launch_end(store, text, seq, receipt="e" * 64, applies=None):
+    """The controller's typed launch end, citing launch ``seq``'s receipt."""
+    return store.add(
+        kind=Kind.LAUNCH_END,
+        actor=Actor.CONTROLLER,
+        text=text,
+        issue_url=ISSUE,
+        applies_to=applies,
+        citation=Citation(CitationKind.LAUNCH, f"{RUN}/{seq}", receipt),
+        step=_step(),
+        attempt=_launch(seq),
+    )
+
+
+def test_a_replacement_without_adequate_evidence_never_hides_a_verified_observation():
+    """A validation failure with a kept, matching receipt, superseded by the controller's
+    record citing a launch whose receipt the run does not keep: both are shown, the
+    superseded one marked as kept for its own evidence, after a save and a load too.
+    Once the replacement's receipt is kept it hides the failure; once the failure's
+    receipt is lost, the failure is hidden and the replacement shown downgraded."""
+    controller = {"actor": Actor.CONTROLLER, "issue_url": ISSUE, "attempt": _launch(3)}
+    store, failure = _applied(observe(_store(), "test_a fails on C1", seq=1))
+    store, replacement = _applied(_launch_end(store, "launch 2 ended: tests unrun", seq=2))
+    store, _ = _applied(store.supersede(failure, replacement, **controller))
+    held = _evidence(1)
+    for current in (store, _reloaded(store)):
+        projection = _render(current, held, candidate=C1)
+        assert projection.shown == (failure, replacement)
+        assert _observed(projection, failure) and projection.downgraded == 1
+        assert projection.kept_over_replacement == 1 and projection.superseded == 0
+        assert f"- superseded by M{replacement}, whose evidence establishes it less" in (
+            _block_of(projection, failure)
+        )
+        assert "1 superseded but kept over a replacement with weaker evidence" in projection.text
+    with_receipt = _evidence(1, launches=[(_launch(2), "e" * 64)])
+    projection = _render(store, with_receipt, candidate=C1)
+    assert projection.shown == (replacement,) and projection.superseded == 1
+    assert _observed(projection, replacement) and projection.kept_over_replacement == 0
+    lost = _render(store, _evidence(), candidate=C1)  # the failure's receipt evicted since
+    assert lost.shown == (replacement,) and lost.superseded == 1 and lost.downgraded == 1
+
+
+def test_a_replacement_evidenced_for_another_commit_or_withdrawn_hides_nothing_stronger():
+    """Strength is judged per launch: C2's failure replacing C1's is shown as C2's
+    evidence on C1, below C1's own, which stays. A chain is judged by what stands at
+    its end; a replacement retracted since stands for nothing. A correction shows the
+    last revision and a retraction nothing, as always."""
+    controller = {"actor": Actor.CONTROLLER, "issue_url": ISSUE, "attempt": _launch(4)}
+    on_c1 = Applicability(candidate=CandidateScope.EXACT, commit=C1)
+    store, own = _applied(observe(_store(), "test_a fails on C1", seq=1, applies=on_c1))
+    store, of_c2 = _applied(observe(store, "test_a fails", seq=2, cite=_vr(2, commit=C2)))
+    store, _ = _applied(store.supersede(own, of_c2, **controller))
+    held = _evidence(1, _receipt(2, commit=C2))
+    projection = _render(store, held, candidate=C1)
+    assert projection.shown == (own, of_c2) and _historical(projection, of_c2)
+    assert _observed(projection, own) and projection.kept_over_replacement == 1
+    on_c2 = _render(store, held, candidate=C2)  # C1's record does not apply to C2
+    assert on_c2.shown == (of_c2,) and _observed(on_c2, of_c2)
+    # A chain: the end of it stands. M2 superseded by M3, evidenced for C1 too.
+    store, newest = _applied(observe(store, "test_a fails: KeyError", seq=3))
+    store, _ = _applied(store.supersede(of_c2, newest, **controller))
+    projection = _render(store, _evidence(1, _receipt(2, commit=C2), 3), candidate=C1)
+    assert projection.shown == (newest,) and projection.superseded == 2
+    # Retracted since: nothing stands in M1's place but M1, kept for its evidence.
+    retracted, _ = _applied(store.retract(newest, actor=Actor.OPERATOR, issue_url=None))
+    projection = _render(retracted, _evidence(1, _receipt(2, commit=C2), 3), candidate=C1)
+    assert own in projection.shown and newest not in projection.shown
+    assert "test_a fails: KeyError" not in projection.text
+    # Retracting the kept record itself hides it; correcting it shows its last text.
+    gone, _ = _applied(retracted.retract(own, actor=Actor.OPERATOR, issue_url=None))
+    assert own not in _render(gone, _evidence(1, 3), candidate=C1).shown
+    fixed, first = _applied(observe(_store(), "test_a fails on C1", seq=1, applies=on_c1))
+    fixed, _ = _applied(
+        fixed.correct(first, "test_a fails on C1 at import", **controller, citation=_vr(5))
+    )
+    fixed, weaker = _applied(_launch_end(fixed, "launch 2 ended", seq=2, applies=on_c1))
+    fixed, _ = _applied(fixed.supersede(first, weaker, **controller))
+    projection = _render(_reloaded(fixed), _evidence(1, 5), candidate=C1)
+    assert projection.shown == (first, weaker) and _observed(projection, first)
+    assert "at import" in _block_of(projection, first)
+    assert "test_a fails on C1\n" not in projection.text  # the withdrawn revision
+
+
+# -- a record's metadata is redacted or refused, never rewritten (R3-F4) -----------------------
+
+_CREDENTIAL_REPO = "owner/" + "gh" + "p_" + "R3F4" + "m" * 32
+
+
+def test_an_issue_or_step_url_the_redactor_would_change_is_refused_unquoted():
+    """A validly shaped issue or PR URL whose repository is a credential's shape is
+    refused at the write, the issue's and the step's alike, and at the load, and the
+    refusal quotes none of it."""
+    secret = _CREDENTIAL_REPO.split("/")[1]
+    issue = f"https://github.com/{_CREDENTIAL_REPO}/issues/2"
+    pr = f"https://github.com/{_CREDENTIAL_REPO}/pull/3"
+    assert redact(issue) != issue and redact(pr) != pr
+    for write in (
+        lambda: propose(_store(), "an idea", seq=1, issue=issue),
+        lambda: observe(_store(), "a failure", seq=1, issue=issue),
+        lambda: store_with_step(StepKey(Phase.ANALYZE_EXECUTE, ISSUE, pr, 0, 1)),
+        lambda: store_with_step(StepKey(Phase.ANALYZE_EXECUTE, issue, "", 0, 1)),
+    ):
+        refused = write()
+        assert refused.refusal is RefusalCode.CREDENTIAL, refused.detail
+        assert refused.store.records == () and secret not in refused.detail
+    store, _ = _applied(propose(_store(), "an idea", seq=1))
+    for path, value in (
+        ("records.0.issue_url", issue),
+        ("records.0.step.issue_url", issue),
+        ("records.0.step.pr_url", pr),
+    ):
+        data = store.to_dict()
+        _tamper(path, value)(data)
+        with pytest.raises(StateError, match="redactor would change") as refused:
+            MemoryStore.from_dict(data)
+        assert secret not in str(refused.value)
+
+
+def store_with_step(step: StepKey):
+    return _store().add(
+        kind=Kind.HYPOTHESIS,
+        actor=Actor.AGENT,
+        text="an idea",
+        issue_url=ISSUE,
+        step=step,
+        attempt=_launch(1),
+        origin=_origin(),
+    )
+
+
+# -- GitHub identity, not spelling, in a proposal's payload and its step (R3-F6) ---------------
+
+_SPELT = "https://github.com/Owner/Repo/issues/2"
+
+
+def test_a_replay_in_another_spelling_is_the_proposal_kept_and_another_target_a_conflict():
+    """The same key and text, the issue and the step's issue and PR spelt ``Owner/Repo``,
+    is the record kept; another issue, PR or round under that key is a conflict."""
+    pr, spelt_pr = PR_URL, "https://github.com/OWNER/REPO/pull/42"
+    step = StepKey(Phase.ANALYZE_EXECUTE, ISSUE, pr, 1, 1)
+    store, kept = _applied(
+        _store().add(
+            kind=Kind.FINDING,
+            actor=Actor.AGENT,
+            text="the fetch needs a retry",
+            issue_url=ISSUE,
+            step=step,
+            attempt=_launch(1),
+            origin=_origin(),
+        )
+    )
+
+    def replay(issue: str, step: StepKey):
+        return store.add(
+            kind=Kind.FINDING,
+            actor=Actor.AGENT,
+            text="the fetch needs a retry",
+            issue_url=issue,
+            step=step,
+            attempt=_launch(1),
+            origin=_origin(),
+        )
+
+    same = replay(_SPELT, StepKey(Phase.ANALYZE_EXECUTE, _SPELT, spelt_pr, 1, 1))
+    assert same.applied and not same.changed and same.record_id == kept
+    assert same.store == store
+    for issue, other in (
+        (ISSUE_B, StepKey(Phase.ANALYZE_EXECUTE, ISSUE_B, pr, 1, 1)),
+        (_SPELT, StepKey(Phase.ANALYZE_EXECUTE, _SPELT, PR_URL.replace("42", "43"), 1, 1)),
+        (_SPELT, StepKey(Phase.ANALYZE_EXECUTE, _SPELT, spelt_pr, 2, 1)),
+        (_SPELT, StepKey(Phase.ANALYZE_EXECUTE, _SPELT, "", 1, 1)),
+    ):
+        conflict = replay(issue, other)
+        assert conflict.refusal is RefusalCode.CONFLICT, other
+        assert conflict.store.records == store.records
+
+
+def test_a_record_and_its_step_may_spell_one_issue_differently_and_round_trip():
+    """The record names ``owner/repo`` and its step ``Owner/Repo``: one issue, written and
+    loaded; a step of another issue is refused at both."""
+    store, record = _applied(store_with_step(StepKey(Phase.ANALYZE_EXECUTE, _SPELT, "", 0, 1)))
+    assert store.record(record).step.issue_url == _SPELT and _reloaded(store) == store
+    refused = store_with_step(StepKey(Phase.ANALYZE_EXECUTE, ISSUE_B, "", 0, 1))
+    assert refused.refusal is RefusalCode.INVALID and "another issue" in refused.detail
+    data = store.to_dict()
+    data["records"][0]["step"]["issue_url"] = ISSUE_B
+    with pytest.raises(StateError, match="belongs to another issue than the record"):
+        MemoryStore.from_dict(data)
+
+
+# -- what the writer cannot produce, the loader refuses (R3-F7) --------------------------------
+
+
+@pytest.mark.parametrize("label", [True, 1.0, "1", None])
+def test_a_schema_label_that_is_not_the_integer_one_is_refused(label):
+    data = _saved_store()
+    data["schema"] = label
+    with pytest.raises(StateError, match="must be the integer 1"):
+        MemoryStore.from_dict(data)
+
+
+def test_records_added_out_of_id_order_are_refused():
+    """Ids are allocated as records are added: add seqs ``[2, 1]`` in id order is a
+    history no writer made, whose newest-first render would disagree with it."""
+    store, _ = _applied(propose(_store(), "first", seq=1))
+    store, _ = _applied(propose(store, "second", seq=2))
+    data = store.to_dict()
+    data["records"][0]["events"][0]["seq"], data["records"][1]["events"][0]["seq"] = 2, 1
+    with pytest.raises(StateError, match="record 2 was added before record 1"):
         MemoryStore.from_dict(data)
 
 
@@ -1974,6 +2356,43 @@ def test_only_a_memory_phases_launch_with_memory_on_needs_a_fresh_context(tmp_pa
     assert off == [("ANALYZE_EXECUTE", False), ("REVIEW", False)]
 
 
+def test_a_runtime_that_cannot_honour_a_fresh_context_refuses_before_the_launch_intent_save(
+    tmp_path, monkeypatch
+):
+    """R3-F5 of PR #513: the engine asks the adapter to establish that the runtime it
+    would start honours the profile's fresh-context proof before the launch-intent
+    save, so a refusal charges nothing, spends no launch ordinal and writes nothing. A
+    launch with Memory off never asks."""
+    from autoforge.providers import ScriptedProvider, no_fresh_context
+    from tests.conftest import FakeGitHub, implement
+
+    asked: list[str] = []
+
+    def refuse(self, profile, cwd, env_allowlist):
+        asked.append(profile.name)
+        raise no_fresh_context(profile, "its CLI is older than the proof's build", "Upgrade it")
+
+    monkeypatch.setattr(ScriptedProvider, "fresh_context_preflight", refuse)
+    for memory in (True, False):
+        sd = tmp_path / str(memory) / ".autoforge"
+        eng = make_engine(sd, implement, github=FakeGitHub(), origin=True)
+        eng.config.memory.enabled = memory
+        eng.record_run_configuration()
+        eng._save()
+        assert eng.step().next_phase == "ANALYZE_EXECUTE"
+        before = eng.paths.state_file.read_bytes()
+        if memory:
+            with pytest.raises(ConfigurationError, match="older than the proof's build"):
+                eng.step()
+            assert eng.paths.state_file.read_bytes() == before
+            assert load_state(eng.paths.state_file).launch_seq == 0
+            assert eng.provider.calls == []
+        else:
+            eng.step()
+            assert load_state(eng.paths.state_file).launch_seq == 1
+    assert asked == ["analyze_execute"]
+
+
 # -- the operator's commands (D9.5, W9) ----------------------------------------------------------
 
 
@@ -2130,6 +2549,80 @@ def test_memory_retract_refuses_a_state_directory_of_another_clone(
         assert state_tree(sd) == before
         assert not (clone / ".git" / "autoforge").exists()  # B's lock was never taken
     assert load_state(sd / "state.json").memory_store().record(1).status is Status.CURRENT
+
+
+def test_a_memory_checkpoint_is_written_only_under_its_own_repositorys_lock(
+    tmp_path,
+    capsys,
+    monkeypatch,
+    tmp_path_factory,
+    fakes,  # noqa: F811
+):
+    """R3-F1 of PR #513, the inverse of the case above. From clone A, ``run`` with a
+    state directory in clone B, or in no repository, would create a Memory checkpoint
+    under A's lock that ``memory retract`` from B writes under B's: refused before any
+    lock, nothing created. A Memory checkpoint in B (B's own run) is refused, with
+    nothing changed, to A's ``step``, ``resume``, ``unblock`` and ``run --force``
+    (whose new run has Memory off), while B's own ``memory retract`` takes B's lock."""
+    from tests.conftest import git_repo, github_origin, state_tree
+
+    monkeypatch.chdir(tmp_path)
+    head_a, sd_a = _seeded_run(tmp_path, capsys)
+    clone = github_origin(git_repo(tmp_path_factory.mktemp("clone-b")))
+    theirs = os.path.realpath(clone / ".git")
+    cfg = head_a[1]
+    lesson = _seed_file(tmp_path, b"a lesson\n")
+    run = ["run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    sd_b = clone / ".autoforge"
+    outside = tmp_path_factory.mktemp("no-repository") / "state"
+    # Creation: a new Memory checkpoint in B's directory, or in none, from A.
+    for target, needle in (
+        (sd_b, f"belongs to the repository whose git common dir is {theirs}"),
+        (outside, "cannot be established"),
+    ):
+        argv = ["--config", cfg, "--state-dir", str(target), *run, "--memory-seed", str(lesson)]
+        assert cli.main(argv) == 2
+        err = capsys.readouterr().err
+        assert "'run' refused" in err and needle in err and "nothing was changed" in err
+        assert "not created yet" in err and not target.exists()
+    assert not (clone / ".git" / "autoforge").exists()
+    # Continuation: B's own Memory checkpoint, written from A.
+    sd_b.mkdir()
+    save_state(load_state(sd_a / "state.json"), sd_b / "state.json")
+    head_b = ["--config", cfg, "--state-dir", str(sd_b)]
+    no_memory = tmp_path / "no-memory.yaml"
+    no_memory.write_text("memory:\n  enabled: false\n", encoding="utf-8")
+    before = state_tree(sd_b)
+    for argv, command in (
+        ([*head_b, "step"], "step"),
+        ([*head_b, "resume"], "resume"),
+        ([*head_b, "unblock", "--reason", "x"], "unblock"),
+        (["--config", str(no_memory), "--state-dir", str(sd_b), *run, "--force"], "run"),
+    ):
+        assert cli.main(argv) == 2, command
+        err = capsys.readouterr().err
+        assert f"'{command}' refused" in err and theirs in err
+        assert state_tree(sd_b) == before
+    assert not (clone / ".git" / "autoforge").exists()
+    # From B, the checkpoint's own repository: B's lock, and the write is made.
+    monkeypatch.chdir(clone)
+    assert cli.main([*head_b, "memory", "retract", "M1", "--reason", "wrong"]) == 0
+    assert load_state(sd_b / "state.json").memory_store().record(1).status is Status.RETRACTED
+    assert (clone / ".git" / "autoforge").is_dir()
+
+
+def test_a_run_without_memory_is_held_to_no_repository_binding():
+    """Memory off in the state and in the invocation: the binding is not asked for,
+    so such a run's commands behave exactly as before Memory existed."""
+
+    class Engine:
+        config = dataclasses.replace(default_config(), memory=MemoryConfig(enabled=False))
+
+        def state_dir_repository_problem(self) -> str:
+            raise AssertionError("asked for a run without Memory")
+
+    for state in (None, make_state(run_id=RUN)):
+        cli._refuse_memory_state_of_another_repository(Engine(), "step", state)  # type: ignore[arg-type]
 
 
 def test_memory_retract_refuses_a_scheduler_namespace_here_or_in_another_clone(

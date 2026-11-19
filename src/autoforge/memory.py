@@ -32,12 +32,16 @@ id, monotonic in the run; a :class:`Kind` from a closed set; who wrote it
   resolves the citation against the typed receipts the run holds now
   (:class:`EvidenceIndex`), by identity and digest and by what the receipt
   establishes: a validation failure needs a failing ``ValidationRecord`` of
-  the record's issue and, for a record bound to a candidate, of that
-  commit. A record whose citation does not resolve (a validation record
-  evicted from the 64 the state keeps, cleared with its issue, passing, or
-  of another commit; a launch whose receipt the run does not keep, which
-  before #332 is every launch, since a spent launch ordinal is not a
-  receipt) is shown downgraded, never as observed.
+  this run and the record's issue and, for a record bound to a candidate,
+  of that commit, and it is evidence of that commit alone: a launch on
+  another candidate is shown it as that commit's, never as its own. A
+  record whose citation does not resolve (a validation record evicted from
+  the 64 the state keeps, cleared with its issue, passing, of another run
+  or of another commit than the record's; a launch whose receipt the run
+  does not keep, which before #332 is every launch, since a spent launch
+  ordinal is not a receipt) is shown downgraded, never as observed. Its
+  add and each of its corrections name the evidence of the text they
+  wrote, so a revised observation never keeps an old citation by default.
 - ``operator``: the operator's text, kept byte for byte: trusted as their
   statement, not as evidence. The evaluation's seed is one (D9.5).
 - ``proposed``: an agent's claim. No agent, score or later write upgrades
@@ -72,9 +76,11 @@ a pure function returning a :class:`WriteOutcome`: the store to save, and
 whether the write was applied or refused and why. Who may do what:
 
 - the controller adds observed records, and corrects, supersedes or
-  retracts observed and proposed ones; what supersedes is always an
-  observed record, and whatever supersedes applies everywhere the record
-  it replaces did;
+  retracts observed and proposed ones; an observation's correction names
+  the evidence of its new text; what supersedes is always an observed
+  record, and whatever supersedes applies everywhere the record it
+  replaces did, and a render still shows an observation its evidence
+  establishes more strongly than its replacement's does there;
 - an agent adds proposals, and corrects, supersedes or retracts proposals
   only, never an observed record or the operator's: newer, unsupported text
   never replaces stronger evidence. Each of its writes names the launch it
@@ -84,8 +90,8 @@ whether the write was applied or refused and why. Who may do what:
 - the operator adds the seed and may retract any record, of any issue.
 
 Every write but the operator's names the issue it acts for, and a record of
-another issue is refused to it. Issues are compared as GitHub identifies
-them: owner and repository fold case.
+another issue is refused to it. Issues, and a step's issue and PR, are
+compared as GitHub identifies them: owner and repository fold case.
 
 A corrected or retracted text leaves its digest as a tombstone. A
 withdrawal binds a record of the same issue, of a trust its writer could
@@ -132,8 +138,10 @@ environment or credential. An agent's or the operator's text is refused
 when the run-log redactor would change it, and when it holds a control
 character other than a tab or a newline; it is kept as given or not at all.
 Text the controller derives from evidence has such characters escaped, is
-redacted, then cut to the bound with an omission marker. The loader refuses
-a record text or an event reason the redactor would change, whatever its
+redacted, then cut to the bound with an omission marker. A record's issue
+URL, or its step's issue or PR URL, the redactor would change is refused
+at the write and the load alike, never rewritten. The loader refuses a
+record text or an event reason the redactor would change, whatever its
 digests say, and a render refuses a header or record it would change.
 
 Reading
@@ -146,14 +154,18 @@ binding whose fields must agree (its step's issue and phase are the
 request's, its launch is of the request's run, its repository is the
 issue's), of a store whose run's setting is on. It selects the
 records of the request's issue that apply to its phase and candidate,
-observed ones first with their citations, then the operator's, then
-observations whose evidence is gone, then proposals, newest first in each,
-within the request's bound, which is at most :data:`MAX_PROJECTION_CHARS`
-(a larger one is refused), and reports in its header the scope, the
-revision and digest it read, what it was rendered for and how many records
-it showed, omitted for the bound, found not applicable, retracted,
-superseded and withheld as withdrawn text. The same store and request
-render the same bytes.
+observations evidenced for that candidate first with their citations, then
+the operator's, then observations evidenced for another commit, then those
+no kept receipt establishes, then proposals, newest first in each, within
+the request's bound, which is at most :data:`MAX_PROJECTION_CHARS` (a
+larger one is refused), and reports in its header the scope, the revision
+and digest it read, the digest of the evidence it was given, what it was
+rendered for and how many records it showed, omitted for the bound, found
+not applicable, retracted, superseded, withheld as withdrawn text and kept
+over a replacement with weaker evidence. The same store, evidence and
+request render the same bytes: the receipts the run keeps are an input as
+much as the revision is, since an evicted receipt changes how an
+observation shows.
 """
 
 from __future__ import annotations
@@ -173,7 +185,7 @@ from .prompts import escape_inline, fenced_untrusted_block
 from .redaction import redact
 from .runlog import RUN_ID_RE
 from .transitions import Phase
-from .validation import parse_issue_url, same_issue_url
+from .validation import parse_issue_url, parse_pr_url, same_issue_url
 
 #: The persisted shape's version. Changing it is a state protocol bump (D10).
 MEMORY_SCHEMA = 1
@@ -328,7 +340,8 @@ class RefusalCode(StrEnum):
     CONFLICT = "conflict"
     #: A text, citation, applicability, step or launch of the wrong shape.
     INVALID = "invalid"
-    #: An agent's or the operator's text the run-log redactor would change.
+    #: An agent's or the operator's text, or a record's issue or step URL, the
+    #: run-log redactor would change (R3-F4 of PR #513): refused, never rewritten.
     CREDENTIAL = "credential"
     #: An agent's or the operator's text beyond :data:`MAX_TEXT_BYTES`.
     TOO_LONG = "too-long"
@@ -523,23 +536,42 @@ def _enum(enum: type[_E], raw: object, where: str) -> _E:
 
 def _step(raw: object, where: str) -> StepKey:
     try:
-        return StepKey.from_dict(raw, where)
+        step = StepKey.from_dict(raw, where)
     except StateError:
         raise _bad(
             where,
             "must be a step: its phase, canonical issue URL, PR URL or none, review round and "
             "execution attempt",
         ) from None
+    if _step_unredacted(step):
+        raise _bad(where, _URL_UNREDACTED)
+    return step
+
+
+#: Why a URL of a record is refused, never quoting it (R3-F4 of PR #513).
+_URL_UNREDACTED = (
+    "holds a URL the run-log redactor would change (a credential's shape in its owner or "
+    "repository): Issue Memory keeps no such identity, and never rewrites one"
+)
 
 
 def _issue_url(raw: object, where: str) -> str:
     if isinstance(raw, str) and len(raw) <= _MAX_URL_CHARS:
         try:
             if parse_issue_url(raw).canonical == raw:
+                if _unredacted(raw):
+                    # A canonical URL may still carry a credential's shape in its
+                    # owner or repository: refused, not rewritten (R3-F4 of PR #513).
+                    raise _bad(where, _URL_UNREDACTED)
                 return raw
         except ConfigurationError:
             pass
     raise _bad(where, "must be a canonical issue URL")
+
+
+def _step_unredacted(step: StepKey) -> bool:
+    """Whether the run-log redactor would change a step's issue or PR URL (R3-F4 of PR #513)."""
+    return _unredacted(step.issue_url) or _unredacted(step.pr_url)
 
 
 def _run_id(raw: object, where: str) -> str:
@@ -559,6 +591,36 @@ def _issue_identity(url: str) -> tuple:
         return parse_issue_url(url).identity
     except ConfigurationError:
         return ()
+
+
+def _pr_identity(url: str) -> tuple:
+    """A PR URL's typed identity, owner and repository folded; ``()`` for none."""
+    try:
+        return parse_pr_url(url).identity if url else ()
+    except ConfigurationError:
+        return ()
+
+
+def _step_identity(step: StepKey | None) -> tuple | None:
+    """A step as GitHub identifies what it names (R3-F6 of PR #513): its phase, its issue's
+    and PR's typed identities, its review round and execution attempt. Two spellings of
+    one owner or repository are one step; another issue or PR is another."""
+    if step is None:
+        return None
+    return (
+        step.phase,
+        _issue_identity(step.issue_url),
+        _pr_identity(step.pr_url),
+        step.review_round,
+        step.execution_attempt,
+    )
+
+
+def _payload(
+    issue_url: str, step: StepKey | None, kind: Kind, applies_to: Applicability, digest: str
+) -> tuple:
+    """A proposal's payload, every GitHub reference as GitHub identifies it (R3-F6 of PR #513)."""
+    return (_issue_identity(issue_url), _step_identity(step), kind, applies_to, digest)
 
 
 def _unredacted(text: str) -> bool:
@@ -794,7 +856,11 @@ class MemoryEvent:
     """One lifecycle transition of a record: what, when, by whom and why (D9.4).
 
     ``seq`` is the store revision the write made. ``text_sha256`` is the
-    record's text digest after it, ``""`` once retracted.
+    record's text digest after it, ``""`` once retracted. ``citation`` is the
+    evidence the text it wrote derives from: on an observed record's add and
+    on each of its corrections, and on nothing else, so a revised observation
+    names the evidence of its new text and never keeps an old citation by
+    default (R3-F2 of PR #513).
     """
 
     seq: int
@@ -803,8 +869,9 @@ class MemoryEvent:
     reason: str = ""
     attempt: AttemptRef | None = None
     text_sha256: str = ""
+    citation: Citation | None = None
 
-    _KEYS = ("seq", "op", "actor", "reason", "attempt", "text_sha256")
+    _KEYS = ("seq", "op", "actor", "reason", "attempt", "text_sha256", "citation")
 
     def to_dict(self) -> dict:
         return {
@@ -814,7 +881,13 @@ class MemoryEvent:
             "reason": self.reason,
             "attempt": None if self.attempt is None else self.attempt.to_dict(),
             "text_sha256": self.text_sha256,
+            "citation": None if self.citation is None else self.citation.to_dict(),
         }
+
+    @property
+    def writes_text(self) -> bool:
+        """Whether this event wrote the record's text: an add or a correction."""
+        return self.op in (Operation.ADD, Operation.CORRECT)
 
     @classmethod
     def from_dict(cls, raw: object, where: str) -> MemoryEvent:
@@ -833,6 +906,15 @@ class MemoryEvent:
                 raise _bad(f"{where}.text_sha256", "must be empty for a retraction")
         else:
             _hex64(digest, f"{where}.text_sha256")
+        citation = (
+            None
+            if data["citation"] is None
+            else Citation.from_dict(data["citation"], f"{where}.citation")
+        )
+        if citation is not None and op not in (Operation.ADD, Operation.CORRECT):
+            raise _bad(
+                f"{where}.citation", "names evidence, which only an add or a correction does"
+            )
         return cls(
             seq=_int(data["seq"], f"{where}.seq", 1),
             op=op,
@@ -844,6 +926,7 @@ class MemoryEvent:
                 else AttemptRef.from_dict(data["attempt"], f"{where}.attempt")
             ),
             text_sha256=digest,
+            citation=citation,
         )
 
 
@@ -927,17 +1010,31 @@ class MemoryRecord:
     def proposal_payload(self) -> tuple:
         """What a replay of the proposal must say again to be one: fixed when it is added.
 
-        Its issue (as GitHub identifies it), step, kind, applicability and
-        first text, so a later correction or retraction does not make a
-        replay of the add a conflict.
+        Its issue and step as GitHub identifies what they name (the step's
+        issue and PR too: owner and repository fold case, R3-F6 of PR #513),
+        kind, applicability and first text, so a later correction or
+        retraction does not make a replay of the add a conflict, and neither
+        does another spelling of the same owner or repository.
         """
-        return (
-            _issue_identity(self.issue_url),
-            self.step,
-            self.kind,
-            self.applies_to,
-            self.events[0].text_sha256,
+        return _payload(
+            self.issue_url, self.step, self.kind, self.applies_to, self.events[0].text_sha256
         )
+
+    def citations(self) -> tuple[Citation, ...]:
+        """Every piece of evidence its add and corrections named, each once, in order."""
+        seen: dict[tuple[str, str, str], Citation] = {}
+        for event in self.events:
+            if event.citation is not None:
+                seen.setdefault(event.citation.key(), event.citation)
+        return tuple(seen.values())
+
+    def _last_write(self) -> MemoryEvent:
+        """Its add or its last correction: the event that wrote its text."""
+        return [event for event in self.events if event.writes_text][-1]
+
+    def cited_at(self) -> AttemptRef | None:
+        """The launch of the write that named its current citation: its add or last correction."""
+        return self._last_write().attempt
 
     def last_launch(self, before: int | None = None) -> int:
         """The latest launch any of its events names, before seq ``before`` if given; 0 if none."""
@@ -1028,7 +1125,8 @@ class MemoryRecord:
         operator = provenance is Actor.OPERATOR
         if (step is None) != operator or (attempt is None) != operator:
             raise _bad(where, "names its step and launch unless the operator wrote it")
-        if step is not None and step.issue_url != issue_url:
+        if step is not None and not _same_issue(step.issue_url, issue_url):
+            # As GitHub identifies an issue (R3-F6 of PR #513).
             raise _bad(f"{where}.step", "belongs to another issue than the record")
         origin = (
             None
@@ -1082,6 +1180,22 @@ class MemoryRecord:
         seqs = [event.seq for event in self.events]
         if seqs != sorted(set(seqs)):
             return "must be in strictly increasing seq"
+        # R3-F2 of PR #513: an observation's add and each of its corrections
+        # name the evidence of the text they wrote, of a kind its kind takes,
+        # and the record cites the last of them; no other event names any.
+        observed = self.trust is Trust.OBSERVED
+        for event in self.events:
+            if (event.citation is not None) != (observed and event.writes_text):
+                return (
+                    "must name, in an observation's add and in each of its corrections, the "
+                    "evidence of the text it wrote, and evidence in no other event"
+                )
+            if event.citation is not None and event.citation.kind not in CITATIONS_BY_KIND.get(
+                self.kind, ()
+            ):
+                return f"names evidence a {self.kind.value} record may not cite"
+        if observed and self._last_write().citation != self.citation:
+            return "must cite the evidence its add or last correction named"
         digest = first.text_sha256
         superseded = retracted = False
         for event in rest:
@@ -1215,8 +1329,14 @@ class MemoryStore:
         revision; the tombstones are exactly what the histories left; and
         the store fits :data:`MAX_STORE_BYTES` as the state file holds it.
         """
-        if isinstance(raw, dict) and raw.get("schema") != MEMORY_SCHEMA:
-            raise _bad(".schema", f"must be {MEMORY_SCHEMA}, the one this controller writes")
+        if isinstance(raw, dict) and (
+            # The integer label the writer writes: JSON's true and 1.0 compare
+            # equal to 1 in Python, and are no label it writes (R3-F7 of PR #513).
+            type(raw.get("schema")) is not int or raw.get("schema") != MEMORY_SCHEMA
+        ):
+            raise _bad(
+                ".schema", f"must be the integer {MEMORY_SCHEMA}, the one this controller writes"
+            )
         data = _exact(raw, cls._KEYS, "")
         if not isinstance(data["enabled"], bool):
             raise _bad(".enabled", "must be a boolean")
@@ -1254,13 +1374,20 @@ class MemoryStore:
         for index, record in enumerate(self.records, start=1):
             if record.id != index:
                 return f"record {index} has id {record.id}: ids are 1, 2, ... in order"
+            if index > 1 and record.events[0].seq <= self.records[index - 2].events[0].seq:
+                # Ids are allocated as records are added, so the adds are in id
+                # order: a history that says otherwise is no writer's, and would
+                # make the render's newest-first order disagree with it (R3-F7).
+                return f"record {index} was added before record {index - 1}: ids follow the adds"
             for event in record.events:
                 if event.attempt is not None and event.attempt.run_id != self.run_id:
                     return f"record {index} names a launch of another run"
             if record.attempt is not None and record.attempt.run_id != self.run_id:
                 return f"record {index} names a launch of another run"
-            if record.citation is not None and record.citation.kind is CitationKind.LAUNCH:
-                if not record.citation.ref.startswith(f"{self.run_id}/"):
+            for citation in record.citations():
+                if citation.kind is CitationKind.LAUNCH and not citation.ref.startswith(
+                    f"{self.run_id}/"
+                ):
                     return f"record {index} cites a launch of another run"
             if record.superseded_by is not None:
                 if record.superseded_by > len(self.records):
@@ -1271,7 +1398,9 @@ class MemoryStore:
         seqs = sorted(event.seq for record in self.records for event in record.events)
         if seqs != list(range(1, self.revision + 1)):
             return "its records' events are not exactly the writes 1 to its revision"
-        citations = [r.citation.key() for r in self.records if r.citation is not None]
+        # D9.7: an observation is keyed by its evidence, whichever revision of
+        # it named that evidence, so no two records ever cite the same.
+        citations = [c.key() for r in self.records for c in r.citations()]
         if len(citations) != len(set(citations)):
             return "two records cite the same evidence"
         proposals = [r.proposal_key() for r in self.records if r.origin is not None]
@@ -1524,6 +1653,9 @@ class MemoryStore:
             )
         if not isinstance(reason, str):
             return self._refuse(RefusalCode.INVALID, "the reason is not text")
+        if isinstance(issue_url, str) and _unredacted(issue_url):
+            # R3-F4 of PR #513: an identity is refused, never rewritten to pass.
+            return self._refuse(RefusalCode.CREDENTIAL, f"{_FIELD}.issue_url: {_URL_UNREDACTED}")
         try:
             _issue_url(issue_url, ".issue_url")
         except StateError as exc:
@@ -1544,7 +1676,11 @@ class MemoryStore:
         citation = parts["citation"]  # type: ignore[assignment]
         origin = parts["origin"]  # type: ignore[assignment]
         applies_to = parts["applies_to"]  # type: ignore[assignment]
-        if step is not None and step.issue_url != issue_url:
+        if step is not None and _step_unredacted(step):
+            return self._refuse(RefusalCode.CREDENTIAL, f"{_FIELD}.step: {_URL_UNREDACTED}")
+        if step is not None and not _same_issue(step.issue_url, issue_url):
+            # As GitHub identifies an issue: another spelling of the owner or
+            # repository is the same one (R3-F6 of PR #513).
             return self._refuse(
                 RefusalCode.INVALID, f"{_FIELD}.step: belongs to another issue than the record"
             )
@@ -1564,8 +1700,9 @@ class MemoryStore:
             return self._refuse(RefusalCode.SCOPE, "the cited launch belongs to another run")
         if citation is not None:
             for record in self.records:
-                if record.citation is not None and record.citation.key() == citation.key():
-                    # D9.7: deriving the same observation again adds nothing.
+                if any(c.key() == citation.key() for c in record.citations()):
+                    # D9.7: deriving the same observation again adds nothing,
+                    # whichever revision of the record named that evidence.
                     return WriteOutcome(store=self, record_id=record.id)
         if origin is not None:
             kept_proposal = next(
@@ -1583,7 +1720,7 @@ class MemoryStore:
                     if isinstance(text, str) and not text_problem(text, max_bytes=1 << 30)
                     else ""
                 )
-                payload = (_issue_identity(issue_url), step, kind, applies_to, digest)
+                payload = _payload(issue_url, step, kind, applies_to, digest)
                 if kept_proposal.proposal_payload() == payload:
                     return WriteOutcome(store=self, record_id=kept_proposal.id)
                 return self._refuse(
@@ -1640,6 +1777,7 @@ class MemoryStore:
                     reason=_reason(reason),
                     attempt=attempt,
                     text_sha256=digest,
+                    citation=citation,
                 ),
             ),
             origin=origin,
@@ -1731,8 +1869,18 @@ class MemoryStore:
         issue_url: str | None,
         reason: str = "",
         attempt: AttemptRef | None = None,
+        citation: Citation | None = None,
     ) -> WriteOutcome:
-        """A new revision of a current record; its old text is never shown again (D9.4)."""
+        """A new revision of a current record; its old text is never shown again (D9.4).
+
+        An observation's correction names ``citation``, the evidence its new
+        text derives from, of a kind the record's kind takes, and the record
+        cites that from then on: observed trust is a receipt's, so a revised
+        observation never keeps its old citation by default, and a render
+        judges the new text by the new evidence (R3-F2 of PR #513). The same
+        evidence again is the controller re-deriving the text from it. No
+        other record's correction names any.
+        """
         if not self.enabled:
             return self._refuse(RefusalCode.DISABLED, "the run's Issue Memory is off")
         record, refusal = self._target(
@@ -1746,6 +1894,9 @@ class MemoryStore:
         if refusal is not None:
             return refusal
         assert record is not None
+        citation, refusal = self._correction_citation(record, citation)
+        if refusal is not None:
+            return refusal
         if record.corrections >= MAX_CORRECTIONS:
             return self._refuse(
                 RefusalCode.CORRECTIONS_FULL,
@@ -1772,15 +1923,68 @@ class MemoryStore:
             reason=_reason(reason),
             attempt=attempt,
             text_sha256=digest,
+            citation=citation,
         )
         corrected = replace(
             record,
             text=kept,
             text_sha256=digest,
             revision=record.revision + 1,
+            citation=citation,
             events=(*record.events, event),
         )
         return self._commit(self._replaced(corrected), record_id, f"correcting M{record_id}")
+
+    def _correction_citation(
+        self, record: MemoryRecord, citation: object
+    ) -> tuple[Citation | None, WriteOutcome | None]:
+        """The evidence a correction of ``record`` names, as the loader reads it, or the refusal.
+
+        An observation's correction names one (R3-F2 of PR #513): of a kind
+        its kind takes, of this run when it is a launch, and no other
+        record's evidence (D9.7). Nothing else's correction names any.
+        """
+        if record.trust is not Trust.OBSERVED:
+            if citation is not None:
+                return None, self._refuse(
+                    RefusalCode.NOT_PERMITTED,
+                    f"record M{record.id} is {record.trust.value}, and only an observation "
+                    "cites evidence",
+                    record.id,
+                )
+            return None, None
+        if citation is None:
+            return None, self._refuse(
+                RefusalCode.NOT_PERMITTED,
+                f"record M{record.id} is observed: its correction names the evidence its new "
+                "text derives from, and an observation never keeps its trust for text no "
+                "evidence backs",
+                record.id,
+            )
+        canonical, problem = _canonical_part(citation, Citation, ".citation")
+        if problem or not isinstance(canonical, Citation):
+            return None, self._refuse(RefusalCode.INVALID, problem, record.id)
+        if canonical.kind not in CITATIONS_BY_KIND[record.kind]:
+            return None, self._refuse(
+                RefusalCode.NOT_PERMITTED,
+                f"a {record.kind.value} record does not cite a {canonical.kind.value}",
+                record.id,
+            )
+        if canonical.kind is CitationKind.LAUNCH and not canonical.ref.startswith(
+            f"{self.run_id}/"
+        ):
+            return None, self._refuse(
+                RefusalCode.SCOPE, "the cited launch belongs to another run", record.id
+            )
+        for other in self.records:
+            if other.id != record.id and any(c.key() == canonical.key() for c in other.citations()):
+                return None, self._refuse(
+                    RefusalCode.INVALID,
+                    f"record M{other.id} cites that evidence already: an observation is keyed "
+                    "by its evidence (D9.7)",
+                    record.id,
+                )
+        return canonical, None
 
     def supersede(
         self,
@@ -1799,6 +2003,10 @@ class MemoryStore:
         newer, unsupported text never supersedes an observation. An agent's
         proposal from an older launch than the last that changed the record
         never supersedes it: an out-of-order proposal overwrites nothing.
+        Whether a replacement's evidence holds is the render's to judge, with
+        the receipts of each launch: one it does not establish as strongly
+        as the record it replaced hides nothing there (R3-F3 of PR #513,
+        :func:`render_projection`).
         """
         if not self.enabled:
             return self._refuse(RefusalCode.DISABLED, "the run's Issue Memory is off")
@@ -1929,7 +2137,8 @@ class ValidationReceipt:
     """What a ``ValidationRecord`` of the state says, as a citation is checked against it.
 
     Read from the record by :func:`autoforge.evidence.parse_record`, which
-    checks its shape and its digest; one that does not parse is no receipt.
+    checks its shape and its digest; one that does not parse, or whose run
+    log is another run's, is no receipt of this run.
     """
 
     seq: int
@@ -1940,22 +2149,73 @@ class ValidationReceipt:
     repository: str
     commit: str
 
+    def to_dict(self) -> dict:
+        return {
+            "seq": self.seq,
+            "digest": self.digest,
+            "outcome": self.outcome,
+            "repository": self.repository,
+            "commit": self.commit,
+        }
+
+
+class Verdict(StrEnum):
+    """What the receipts a run keeps establish of an observation, for one launch (D8, D12).
+
+    Ranked: a ``current`` observation is evidence for the launch's own
+    candidate; a ``historical`` one is evidence the run keeps, but of
+    another commit than the launch's candidate (an ancestor it descends
+    from, or an earlier candidate), so it is shown as that commit's and
+    never as this candidate's (R3-F2 of PR #513); an ``unresolved`` one has
+    no receipt the run keeps that establishes it, and is shown downgraded.
+    """
+
+    CURRENT = "current"
+    HISTORICAL = "historical"
+    UNRESOLVED = "unresolved"
+
+
+#: How strongly each verdict stands; what is not observed stands at 0.
+_STRENGTH: Mapping[Verdict, int] = {
+    Verdict.CURRENT: 3,
+    Verdict.HISTORICAL: 2,
+    Verdict.UNRESOLVED: 1,
+}
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """An observation's verdict for one launch, and the commit its evidence is of."""
+
+    verdict: Verdict
+    #: The commit a validation receipt validated; ``""`` for a launch's receipt or none.
+    commit: str = ""
+
+
+_UNRESOLVED = Resolution(Verdict.UNRESOLVED)
+
 
 @dataclass(frozen=True)
 class EvidenceIndex:
     """The receipts the run holds now, which an observed record's citation must resolve to.
 
-    A citation resolves only to a controller-owned receipt the run still
-    keeps, by its identity and its digest, and only when that receipt
-    establishes what the record says, where it says it (R2-F6 of PR #513);
-    anything else renders the record downgraded, never as observed (D8,
-    #317's rule for a missing receipt). See :meth:`resolves`.
+    A citation resolves only to a controller-owned receipt of this run the
+    run still keeps, by its identity and its digest, and only when that
+    receipt establishes what the record says, where it says it (R2-F6 of PR
+    #513), and only as far as it establishes it: a validation record is
+    evidence of the commit it validated, never of another one (R3-F2). See
+    :meth:`resolve`. Anything else renders the record downgraded, never as
+    observed (D8, #317's rule for a missing receipt).
+
+    It is an input of a projection as much as the store is: the same store
+    and request render other bytes once a receipt is evicted, so a
+    projection names :meth:`digest` with the store's.
 
     - ``issue_url``: the issue whose evidence the state holds now. The state
       keeps the validation records of its current issue only, and clears
       them with it (``clear_validation_evidence``).
-    - ``validation``: the state's ``ValidationRecord`` s, at most the 64 it
-      keeps, as :class:`ValidationReceipt` s.
+    - ``validation``: the state's ``ValidationRecord`` s of this run, at most
+      the 64 it keeps, as :class:`ValidationReceipt` s.
     - ``launch_receipts``: the ``(<run_id>/<launch_seq>, digest)`` of the
       launch receipts the run keeps (ADR 0015 D5.3). A spent launch ordinal
       is not one: an intent saved before a crash names a launch that may
@@ -1980,14 +2240,19 @@ class EvidenceIndex:
     ) -> EvidenceIndex:
         """The index of the receipts given, for the issue the state holds them for.
 
-        A validation record that does not parse (its shape or its digest) is
-        left out, as is a launch receipt of another run or of no digest.
+        A validation record that does not parse (its shape or its digest),
+        or whose run log is another run's (R3-F2 of PR #513: the state's
+        loader refuses one, and this index holds no other run's receipt
+        whoever built its arguments), is left out, as is a launch receipt of
+        another run or of no digest.
         """
         receipts: dict[int, ValidationReceipt] = {}
         for raw in validation_records:
             try:
                 view = parse_record(raw)
             except StateError:
+                continue
+            if view.run_log.partition("/")[0] != run_id:
                 continue
             receipts[view.seq] = ValidationReceipt(
                 seq=view.seq,
@@ -2012,6 +2277,19 @@ class EvidenceIndex:
             launch_receipts=frozenset(launches),
         )
 
+    def digest(self) -> str:
+        """The SHA-256 of what this index holds: a projection's input with the store's revision."""
+        return hashlib.sha256(
+            _canonical(
+                {
+                    "run_id": self.run_id,
+                    "issue_url": self.issue_url,
+                    "validation": [receipt.to_dict() for receipt in self.validation],
+                    "launch_receipts": sorted(list(pair) for pair in self.launch_receipts),
+                }
+            ).encode("ascii")
+        ).hexdigest()
+
     def _receipt(self, citation: Citation) -> ValidationReceipt | None:
         return next(
             (
@@ -2022,42 +2300,53 @@ class EvidenceIndex:
             None,
         )
 
-    def resolves(self, record: MemoryRecord) -> bool:
-        """Whether the run keeps the receipt ``record`` cites, and it establishes the record.
+    def resolve(self, record: MemoryRecord, candidate: str) -> Resolution:
+        """What the receipt ``record`` cites establishes of it, for a launch on ``candidate``.
 
-        A validation record must be kept with the digest cited, and be a
-        failure (``FAIL`` or ``TIMEOUT``: a passing record, or one recovery
-        built from a marker, proves no failure) of the record's issue's
-        repository, held for the record's issue; and when the record is
-        bound to a candidate (exactly one commit, or a base's descendants),
-        the commit validated is that commit. A launch must be kept with the
-        digest cited, be of this run, and be the launch the record was
-        written at, whose step is the record's. A citation of a kind the
-        record's kind does not take (:data:`CITATIONS_BY_KIND`) resolves to
-        nothing.
+        A validation record must be kept with the digest cited, be of this
+        run, and be a failure (``FAIL`` or ``TIMEOUT``: a passing record, or
+        one recovery built from a marker, proves no failure) of the record's
+        issue's repository, held for the record's issue; and when the record
+        is bound to a candidate (exactly one commit, or a base's
+        descendants), the commit validated is that commit. Even then it is
+        evidence of the commit it validated alone: ``current`` when that is
+        ``candidate``, the launch's own, and ``historical`` otherwise (an
+        ancestor the candidate descends from, an earlier candidate, or no
+        candidate yet), named with that commit so a render never shows an
+        earlier commit's failure as this one's (R3-F2 of PR #513). A launch
+        must be kept with the digest cited, be of this run, and be the
+        launch of the write that named the citation (the record's add, or
+        the correction that cited it), and is then ``current``. A citation
+        of a kind the record's kind does not take (:data:`CITATIONS_BY_KIND`)
+        resolves to nothing, and so does anything else: ``unresolved``.
         """
         citation = record.citation
         if citation is None or citation.kind not in CITATIONS_BY_KIND.get(record.kind, ()):
-            return False
+            return _UNRESOLVED
         if citation.kind is CitationKind.LAUNCH:
-            return (
+            cited_at = record.cited_at()
+            resolved = (
                 citation.ref.startswith(f"{self.run_id}/")
-                and record.attempt is not None
-                and citation.ref == record.attempt.label()
+                and cited_at is not None
+                and citation.ref == cited_at.label()
                 and (citation.ref, citation.sha256) in self.launch_receipts
             )
+            return Resolution(Verdict.CURRENT) if resolved else _UNRESOLVED
         receipt = self._receipt(citation)
         if receipt is None or receipt.outcome not in FAILED_OUTCOMES:
-            return False
+            return _UNRESOLVED
         if not _same_issue(self.issue_url, record.issue_url):
-            return False
+            return _UNRESOLVED
         try:
             if not parse_issue_url(record.issue_url).same_repository(receipt.repository):
-                return False
+                return _UNRESOLVED
         except ConfigurationError:
-            return False
+            return _UNRESOLVED
         applies = record.applies_to
-        return applies.candidate is CandidateScope.ANY or applies.commit == receipt.commit
+        if applies.candidate is not CandidateScope.ANY and applies.commit != receipt.commit:
+            return _UNRESOLVED
+        verdict = Verdict.CURRENT if candidate == receipt.commit else Verdict.HISTORICAL
+        return Resolution(verdict, receipt.commit)
 
 
 @dataclass(frozen=True)
@@ -2128,13 +2417,16 @@ class Freshness:
 
     The MVP renders from the committed snapshot itself: no index lags behind
     it, nothing is pending, and a correction or retraction saved before the
-    render is in it.
+    render is in it. ``evidence_digest`` is :meth:`EvidenceIndex.digest` of
+    the receipts it resolved citations against: with the revision and the
+    request, what decides the bytes (R3-F2 of PR #513).
     """
 
     revision: int
     digest: str
     source: str = "snapshot"
     pending: int = 0
+    evidence_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -2152,21 +2444,44 @@ class ContextProjection:
     #: Current records withheld because their text was withdrawn (corrected
     #: away or retracted) by another record that applies to this launch.
     withdrawn: int = 0
+    #: Observations shown as evidence of another commit than the launch's
+    #: candidate (R3-F2 of PR #513).
+    historical: int = 0
+    #: Superseded observations shown all the same, because their evidence
+    #: establishes them more strongly for this launch than what replaced them
+    #: does (R3-F3 of PR #513).
+    kept_over_replacement: int = 0
 
 
-_GROUPS = ("observed", "operator", "downgraded", "proposed")
+_GROUPS = ("observed", "operator", "historical", "downgraded", "proposed")
 _LABELS = {
-    "observed": "observed by the controller, which holds the evidence it cites",
+    "observed": (
+        "observed by the controller, which holds the evidence it cites, established for this launch"
+    ),
     "operator": "the operator's statement: their word, not evidence",
+    "historical": (
+        "observed by the controller on another commit than this launch's candidate, which "
+        "holds the evidence it cites: evidence of that commit, not of this candidate"
+    ),
     "downgraded": (
-        "observed by the controller, but the evidence it cites is no longer held, so it is "
-        "not verified"
+        "observed by the controller, but no evidence the run keeps now establishes it, so it "
+        "is not verified"
     ),
     "proposed": "proposed by an agent: a claim, never evidence",
 }
+_GROUP_OF_VERDICT: Mapping[Verdict, str] = {
+    Verdict.CURRENT: "observed",
+    Verdict.HISTORICAL: "historical",
+    Verdict.UNRESOLVED: "downgraded",
+}
 
 
-def _header(store: MemoryStore, request: ProjectionRequest, counts: Mapping[str, int]) -> str:
+def _header(
+    store: MemoryStore,
+    request: ProjectionRequest,
+    evidence: EvidenceIndex,
+    counts: Mapping[str, int],
+) -> str:
     step = request.step
     candidate = request.candidate or "none"
     return "\n".join(
@@ -2182,6 +2497,8 @@ def _header(store: MemoryStore, request: ProjectionRequest, counts: Mapping[str,
             f"- scope: repository {escape_inline(request.repository)}, issue "
             f"{escape_inline(request.issue_url)}, run {escape_inline(request.run_id)}",
             f"- memory: revision {store.revision}, sha256 {store.digest()}",
+            f"- evidence: {len(evidence.validation)} validation records and "
+            f"{len(evidence.launch_receipts)} launch receipts kept, sha256 {evidence.digest()}",
             f"- rendered for: {step.phase.value} of {escape_inline(step.issue_url)}, PR "
             f"{escape_inline(step.pr_url) or 'none'}, review round {step.review_round}, "
             f"execution attempt {step.execution_attempt}; launch "
@@ -2190,15 +2507,16 @@ def _header(store: MemoryStore, request: ProjectionRequest, counts: Mapping[str,
             f"- records: {counts['shown']} shown, {counts['omitted']} omitted for the bound, "
             f"{counts['not_applicable']} not applicable, {counts['retracted']} retracted, "
             f"{counts['superseded']} superseded, {counts['withdrawn']} withheld as withdrawn "
-            "text",
-            f"- freshness: rendered from the committed snapshot at revision {store.revision}; "
-            "no index, nothing pending",
+            f"text, {counts['kept']} superseded but kept over a replacement with weaker "
+            "evidence here",
+            f"- freshness: rendered from the committed snapshot at revision {store.revision} "
+            "and the evidence above; no index, nothing pending",
             "",
         ]
     )
 
 
-def _block(record: MemoryRecord, group: str) -> str:
+def _block(record: MemoryRecord, group: str, resolution: Resolution | None, kept: bool) -> str:
     lines = [
         f"## M{record.id}: {record.kind.value}",
         "",
@@ -2209,6 +2527,13 @@ def _block(record: MemoryRecord, group: str) -> str:
         lines.append(
             f"- cites: {record.citation.kind.value} {escape_inline(record.citation.ref)}, "
             f"sha256 {record.citation.sha256}"
+        )
+    if resolution is not None and resolution.verdict is Verdict.HISTORICAL:
+        lines.append(f"- evidence of: commit {resolution.commit}, not this launch's candidate")
+    if kept:
+        lines.append(
+            f"- superseded by M{record.superseded_by}, whose evidence establishes it less "
+            "strongly for this launch: kept for its own"
         )
     lines.append(
         "- written by: the operator"
@@ -2235,7 +2560,11 @@ def render_projection(
 ) -> ContextProjection:
     """The launch's projection: deterministic, bounded, redacted, read-only (D12).
 
-    Reads nothing but its arguments. Raises ValueError, never quoting a
+    Reads nothing but its arguments, so the same store, request and
+    evidence render the same bytes; the header names the store's revision
+    and digest and the evidence's digest, since a receipt evicted between
+    two renders of one revision changes what an observation shows as
+    (R3-F2 of PR #513). Raises ValueError, never quoting a
     value, for a request it must never serve: a store whose run's Memory
     setting is off; another run's store or evidence (Memory is one run's,
     D9.1); a request whose fields disagree among themselves
@@ -2247,6 +2576,21 @@ def render_projection(
     which only a store no loader or write made can hold (D9.9, R2-F5 of PR
     #513). Issues are compared as GitHub identifies them, so a spelling of
     the owner or repository in another case selects the same records.
+
+    An observation shows as evidence of this launch's candidate only when a
+    kept receipt establishes it for that candidate; as another commit's when
+    the receipt is of another commit; and downgraded when none establishes
+    it (:meth:`EvidenceIndex.resolve`).
+
+    A superseded record is hidden behind what replaced it, unless it is an
+    observation its evidence establishes more strongly for this launch than
+    what stands in its place does (R3-F3 of PR #513): a replacement whose
+    receipt is missing, of another commit, retracted since or withheld here
+    never hides an observation a kept receipt still establishes, after a
+    save and a load or a later eviction alike, since the render judges both
+    against the evidence it is given. A kept record says what superseded
+    it. A correction and a retraction act as they always do: a corrected
+    record shows its last revision, and a retracted one never shows.
 
     A text withdrawn by a record that applies to this launch is withheld
     from every other current record carrying it, when the withdrawal's
@@ -2291,6 +2635,46 @@ def render_projection(
         if applies(record):
             for digest, actor, _ in record.withdrawals():
                 withdrawn.setdefault(digest, set()).update(_RETRACTS.get(actor, frozenset()))
+
+    resolutions = {
+        record.id: evidence.resolve(record, request.candidate)
+        for record in store.records
+        if record.trust is Trust.OBSERVED and record.status is not Status.RETRACTED
+    }
+
+    def strength(record: MemoryRecord) -> int:
+        resolution = resolutions.get(record.id)
+        return 0 if resolution is None else _STRENGTH[resolution.verdict]
+
+    def showable(record: MemoryRecord) -> bool:
+        return applies(record) and record.trust not in withdrawn.get(record.text_sha256, ())
+
+    # What stands in each record's place here, newest first (a replacement is
+    # always newer): a shown current record stands at its own strength; a
+    # superseded one at what stands in its replacement's place, unless it is
+    # an observation its evidence establishes more strongly, which is kept
+    # (R3-F3 of PR #513); a retracted one, or one not shown, stands for nothing.
+    stands: dict[int, int | None] = {}
+    kept: set[int] = set()
+    for record in sorted(store.records, key=lambda r: r.id, reverse=True):
+        if record.status is Status.RETRACTED:
+            stands[record.id] = None
+        elif record.status is Status.CURRENT:
+            stands[record.id] = strength(record) if showable(record) else None
+        else:
+            assert record.superseded_by is not None
+            replacement = stands.get(record.superseded_by)
+            own = strength(record)
+            if (
+                own > _STRENGTH[Verdict.UNRESOLVED]
+                and showable(record)
+                and (replacement is None or replacement < own)
+            ):
+                kept.add(record.id)
+                stands[record.id] = own
+            else:
+                stands[record.id] = replacement
+
     counts = {
         "shown": 0,
         "omitted": 0,
@@ -2298,26 +2682,27 @@ def render_projection(
         "retracted": 0,
         "superseded": 0,
         "withdrawn": 0,
+        "kept": 0,
     }
     grouped: dict[str, list[MemoryRecord]] = {group: [] for group in _GROUPS}
     for record in store.records:
         if record.status is Status.RETRACTED:
             counts["retracted"] += 1
-        elif record.status is Status.SUPERSEDED:
+        elif record.status is Status.SUPERSEDED and record.id not in kept:
             counts["superseded"] += 1
         elif not applies(record):
             counts["not_applicable"] += 1
         elif record.trust in withdrawn.get(record.text_sha256, ()):
             counts["withdrawn"] += 1
         elif record.trust is Trust.OBSERVED:
-            resolved = evidence.resolves(record)
-            grouped["observed" if resolved else "downgraded"].append(record)
+            counts["kept"] += record.id in kept
+            grouped[_GROUP_OF_VERDICT[resolutions[record.id].verdict]].append(record)
         else:
             grouped["operator" if record.trust is Trust.OPERATOR else "proposed"].append(record)
     # Reserve the header at its widest: no count exceeds MAX_RECORDS.
     widest = dict.fromkeys(counts, MAX_RECORDS)
     reserve = (
-        len(_header(store, request, widest))
+        len(_header(store, request, evidence, widest))
         + len(_NOTHING_SHOWN)
         + len(_omitted_line(MAX_RECORDS, bound))
     )
@@ -2326,10 +2711,10 @@ def render_projection(
         raise ValueError(f"a projection bound is at least {reserve} characters")
     body: list[str] = []
     shown: list[int] = []
-    downgraded = 0
+    by_group = dict.fromkeys(_GROUPS, 0)
     for group in _GROUPS:
         for record in sorted(grouped[group], key=lambda r: r.id, reverse=True):
-            block = _block(record, group)
+            block = _block(record, group, resolutions.get(record.id), record.id in kept)
             if _unredacted(block):
                 raise ValueError(
                     f"record M{record.id} renders text the run-log redactor would change: "
@@ -2341,9 +2726,9 @@ def render_projection(
             budget -= len(block)
             body.append(block)
             shown.append(record.id)
-            downgraded += group == "downgraded"
+            by_group[group] += 1
     counts["shown"] = len(shown)
-    header = _header(store, request, counts)
+    header = _header(store, request, evidence, counts)
     if _unredacted(header):
         raise ValueError("the projection's header renders text the run-log redactor would change")
     text = header + "".join(body)
@@ -2354,12 +2739,16 @@ def render_projection(
     assert len(text) <= bound, (len(text), bound)
     return ContextProjection(
         text=text,
-        freshness=Freshness(revision=store.revision, digest=store.digest()),
+        freshness=Freshness(
+            revision=store.revision, digest=store.digest(), evidence_digest=evidence.digest()
+        ),
         shown=tuple(shown),
         omitted_for_bound=counts["omitted"],
         not_applicable=counts["not_applicable"],
         retracted=counts["retracted"],
         superseded=counts["superseded"],
         withdrawn=counts["withdrawn"],
-        downgraded=downgraded,
+        downgraded=by_group["downgraded"],
+        historical=by_group["historical"],
+        kept_over_replacement=counts["kept"],
     )
