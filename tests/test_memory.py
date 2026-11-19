@@ -81,8 +81,6 @@ from autoforge.state import AutoForgeState, load_state, save_state
 from autoforge.transitions import Phase
 from tests.conftest import EPIC, ISSUE, block, make_engine
 from tests.test_cli import _tmp_path_is_a_repository, fakes  # noqa: F401 - fixtures
-from tests.test_evidence import record as validation_record
-from tests.test_evidence import remote
 from tests.test_state import make_state
 
 RUN = "af-20261119T000000Z-abcdef"
@@ -103,9 +101,49 @@ def _launch(seq: int = 1, run: str = RUN) -> AttemptRef:
 
 @functools.cache
 def _receipt(seq: int, exit_code: int = 1, commit: str = C1) -> dict:
-    """A real ValidationRecord of owner/repo (the issue's repository): by default a
+    """A real ValidationRecord of owner/repo (the issue's repository), as the
+    controller writes one (``observed_record``, which its loader checks): by default a
     failure (exit 1) of candidate C1. Shared: copy it before changing it."""
-    return validation_record(seq, candidate=remote(commit=commit), exit_code=exit_code)
+    from autoforge.evidence import (
+        NO_SANDBOX_TEMPLATE,
+        Definition,
+        Policy,
+        RemoteCandidate,
+        WorktreeProvenance,
+        observed_record,
+    )
+    from autoforge.executor import ExecutionResult
+    from autoforge.materialize import METHOD
+
+    return observed_record(
+        seq=seq,
+        candidate=RemoteCandidate(
+            repository="owner/repo",
+            object_format="sha1",
+            commit=commit,
+            tree="b" * 40,
+            provenance=WorktreeProvenance(2, "2", True),
+        ),
+        definition=Definition(0, ("make", "test")),
+        policy=Policy(
+            mode="disabled",
+            template=NO_SANDBOX_TEMPLATE,
+            env_names=("HOME", "PATH"),
+            timeout_seconds=600,
+            contain_orphans=True,
+            method=METHOD,
+        ),
+        result=ExecutionResult(
+            command=["make", "test"],
+            cwd="/tmp/x",
+            exit_code=exit_code,
+            stdout="",
+            stderr="",
+            started_at="2026-11-19T00:00:00+00:00",
+            finished_at="2026-11-19T00:00:01+00:00",
+        ),
+        run_log=f"{RUN}/0004-analyze_execute-candidate-validation-1",
+    )
 
 
 def _vr(seq: int, exit_code: int = 1, commit: str = C1) -> Citation:

@@ -16098,15 +16098,16 @@ def test_an_integration_the_provider_cannot_keep_off_refuses_the_launch_and_leav
     assert eng.step().next_phase == "ANALYZE_EXECUTE"
     asked: list = []
 
-    def refuse(env_allowlist):
-        asked.append(env_allowlist)
+    def refuse(env_allowlist, *, fresh_context=False):
+        asked.append((env_allowlist, fresh_context))
         raise ConfigurationError("refusing to launch opencode: an organization")
 
     monkeypatch.setattr(eng.provider, "integration_preflight", refuse)
     before = eng.paths.state_file.read_bytes()
     with pytest.raises(ConfigurationError, match="refusing to launch opencode"):
         eng.step()
-    assert asked == [eng.config.execution.environment_names()]
+    # Memory is off: the launch needs no fresh context (ADR 0015 D14).
+    assert asked == [(eng.config.execution.environment_names(), False)]
     assert eng.provider.calls == []
     assert eng.paths.state_file.read_bytes() == before
     assert not (eng.paths.state_dir / "read-context").exists()
