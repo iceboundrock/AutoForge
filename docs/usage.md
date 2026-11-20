@@ -2549,14 +2549,24 @@ launch: a supersession cannot hide it unless a record the projection
 actually shows carries matching check, policy, outcome and candidate
 evidence. A record the budget leaves out does not count. Until then the
 failure is shown, marked as superseded. The distinct established claims
-are chosen first, each by the shortest whole block of a record that
-establishes it, in rank order and as if no record were superseded, so a
-supersession never removes a claim the projection showed. A superseded
-failure then holds its claim alone, labeled as superseded with its text
-omitted, a block no longer than the one it was chosen on; a current record
-with the same claim takes its place where that fits. Its whole block is
-shown only if the budget left after that holds it. Neither prose nor a
-second proof of one claim displaces another claim.
+are chosen first, on the records that establish one alone. Each claim is
+held by one record: of those establishing it, the one with the shortest
+whole block as if it were not superseded. In rank order, each claim is
+held where that block fits beside the claims held before it; then, with
+the budget left, the claims not yet held, in rank order, each by that
+record's block as it is now, until the first that does not fit. A record
+establishing a claim that is not held is not shown. The header gives every
+count at one width, and a render that shows a record has no closing
+notice, so nothing a supersession or another record changes alters the
+first choice, and a supersession only shrinks the blocks the second one
+sizes. A supersession therefore never removes a claim the projection
+showed, and the prose of a record that establishes no claim never changes
+which claims are shown. A superseded failure holds its claim alone, labeled as superseded
+with its text omitted, a block no longer than the one it was chosen on; a
+current record with the same claim takes its place where that fits. Its
+whole block is shown only if the budget left after that holds it. Neither
+prose nor a second proof of one claim displaces another claim. The choice
+is greedy: it does not show the most claims possible at every budget.
 
 Each citation resolves to a typed retention result. `established` means a
 retained validation record establishes the claim on this launch.
@@ -2569,8 +2579,11 @@ launch. Validation receipts are resolved from their whole records, and
 candidate and launch receipts from the references the controller supplies.
 No record of this release cites a review, an effect record or a Git
 object, and a checkpoint that does is refused. The full projection,
-including headings and omission notices, is at most 16,384 characters
-and 16,384 UTF-8 bytes (a conservative byte-level token bound).
+including headings and its notice, is at most 16,384 characters and
+16,384 UTF-8 bytes (a conservative byte-level token bound). A render that
+shows no record ends with a notice saying why (a budget cut, a withdrawal
+or nothing applicable), and a budget that cannot hold the header and the
+longest notice is refused whatever the records.
 
 No launch is shown Memory and no observations are captured automatically
 yet; that is #333. A Memory `ANALYZE_EXECUTE` launch runs only under

@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import random
 import re
 from dataclasses import replace
 
@@ -55,7 +56,7 @@ from autoforge.sandbox_policy import ProviderRequirements
 from autoforge.state import AutoForgeState, load_state, save_state
 from autoforge.transitions import Phase
 from tests.conftest import connect_origin, make_engine
-from tests.test_evidence import RUN, RUN_LOG, policy, record, remote
+from tests.test_evidence import DEF0, DEF1, RUN, RUN_LOG, policy, record, remote
 
 ISSUE = "https://github.com/owner/repo/issues/2"
 OTHER = "https://github.com/owner/repo/issues/3"
@@ -492,17 +493,33 @@ def test_projection_has_one_scope_and_no_ancestry_without_candidate():
 
 
 def test_projection_budgets_exact_final_counts_and_distinguishes_empty_reasons():
-    st = apply(proposal(empty(), text="short"))
+    st = apply(proposal(empty(), text="a short note, longer than any notice"))
     for i in range(2, 11):
         st = apply(proposal(st, n=i, text=chr(0x1F680 + i) * (MAX_TEXT_BYTES // 4)))
     st = reload(st)
     partial = render_projection(st, replace(REQ, max_bytes=1800))
     assert partial.ids == (1,) and partial.freshness.omitted == 9
+    # R6-F1 of PR #526: the header's counts say what was left out, at one
+    # width, and a render that shows a block has no notice after it.
+    assert "Shown 01; omitted 09; inapplicable 00; withdrawn 00; needs revalidation 00." in (
+        partial.text
+    )
+    assert partial.text.endswith("```\n") and "omitted for the budget" not in partial.text
     exact = replace(REQ, max_chars=len(partial.text), max_bytes=len(partial.text.encode()))
     assert render_projection(st, exact) == partial
     nothing = render_projection(st, replace(exact, max_bytes=exact.max_bytes - 1))
-    assert not nothing.ids and "omitted for the budget" in nothing.text
+    assert not nothing.ids and "[10 applicable record(s) omitted for the budget]" in nothing.text
     assert "No current record applies" not in nothing.text
+    # A budget that cannot hold the header and its longest notice is refused
+    # whatever the records, even where one short block would fit.
+    head = len(nothing.text) - len("\n[10 applicable record(s) omitted for the budget]\n")
+    floor = head + len("\n[64 applicable record(s) omitted for the budget]\n")
+    assert render_projection(st, replace(REQ, max_bytes=floor)).ids == ()
+    tiny = apply(proposal(empty(), text="x"))
+    assert len(render_projection(tiny, REQ).text.encode()) < floor
+    for store in (st, tiny):
+        with pytest.raises(StateError):
+            render_projection(store, replace(REQ, max_bytes=floor - 1))
     full = render_projection(st, REQ)
     assert len(full.text.encode()) <= MAX_PROJECTION_BYTES
     assert len(full.text) < len(full.text.encode())
@@ -1036,6 +1053,161 @@ def test_a_second_proof_of_one_claim_never_displaces_a_distinct_claim(prose):
         pair, replace(REQ, max_bytes=len(every.text.encode()) - 1), validation_records=[d, e, f]
     )
     assert sorted(_claims(one).values()) == ["FAIL", "TIMEOUT"] and len(one.ids) == 2
+
+
+def _claim_set(projection):
+    """The distinct validation claims a projection shows, whichever records
+    carry them: outcome, check, definition and policy (one candidate here)."""
+    return set(
+        re.findall(
+            r"^Observed validation \d+ \([0-9a-f]{64}\): (\w+) on [0-9a-f]{40} "
+            r"\(tree [0-9a-f]{40}\), check (\d+) definition ([0-9a-f]{64}), "
+            r"policy ([0-9a-f]{64})\.$",
+            projection.text,
+            re.M,
+        )
+    )
+
+
+def _caps(top):
+    """Budgets from below the smallest render to above ``top``, in each measure."""
+    for budget in range(500, top + 2, 7):
+        yield replace(REQ, max_bytes=budget)
+        yield replace(REQ, max_chars=budget)
+
+
+def _within(projection, cap):
+    return len(projection.text) <= cap.max_chars and len(projection.text.encode()) <= cap.max_bytes
+
+
+def _render_or_none(store, cap, receipts):
+    try:
+        return render_projection(store, cap, validation_records=receipts)
+    except StateError:
+        return None
+
+
+def test_a_claim_shown_before_successive_supersessions_stays_shown_at_their_exact_budget():
+    """R6-F1 of PR #526: M1 an unverified proposal, M2 a retained FAIL and M3 a
+    retained TIMEOUT. M1 is superseded by M3, and the render at its exact
+    size shows both claims and leaves nothing out. Superseding M2 with M3
+    then dropped FAIL at that budget, although M2 by its claim alone and M3
+    whole fit: the claims were sized as if the hidden M1 were still to show,
+    and with an omission notice the render did not print. Both claims stay
+    shown after each supersession, within both limits, at that budget and
+    at every other one."""
+    a = failure(1, exit_code=1)
+    b = failure(2, exit_code=1, timed_out=True)
+    receipts = [a, b]
+    st = apply(proposal(empty(), text="the suite needs a longer timeout"))
+    st = apply(observation(st, a, text="the suite failed"))
+    st = reload(apply(observation(st, b, text="the suite timed out")))
+    first = reload(apply(revise(st, Action.SUPERSEDE, 1, replacement=3)))
+    second = reload(apply(revise(first, Action.SUPERSEDE, 2, replacement=3)))
+    both = {2: "TIMEOUT", 1: "FAIL"}
+    loose = render_projection(first, REQ, validation_records=receipts)
+    assert loose.ids == (3, 2) and loose.freshness.omitted == 0 and _claims(loose) == both
+    for exact in (
+        replace(REQ, max_bytes=len(loose.text.encode())),
+        replace(REQ, max_chars=len(loose.text), max_bytes=len(loose.text.encode())),
+    ):
+        assert render_projection(first, exact, validation_records=receipts).text == loose.text
+        after = render_projection(second, exact, validation_records=receipts)
+        assert _claims(after) == both and after.ids == (3, 2)
+        assert after.freshness.omitted == 0 and _within(after, exact)
+        assert dict(after.retention) == {2: Retention.ESTABLISHED, 3: Retention.ESTABLISHED}
+        assert (
+            "\nM2 validation-failure — superseded by M3; claim only, text omitted\n"
+            f"Observed validation 1 ({a['digest']}): FAIL on {SHA}"
+        ) in after.text
+        assert "the suite failed" not in after.text and "longer timeout" not in after.text
+    # At every budget, across both supersessions, every claim shown before
+    # one is shown after it, and a budget too small for the header and its
+    # notice is too small for all three.
+    roomy = len(render_projection(second, REQ, validation_records=receipts).text.encode())
+    for cap in _caps(roomy):
+        renders = [_render_or_none(s, cap, receipts) for s in (st, first, second)]
+        if renders[0] is None:
+            assert renders == [None] * 3, cap
+            continue
+        for before, after in zip(renders, renders[1:], strict=False):
+            assert _claim_set(before) <= _claim_set(after), cap
+            assert _within(after, cap), cap
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_no_supersession_removes_a_shown_claim_and_no_prose_changes_the_claims(seed):
+    """R6-F1 of PR #526, over seeded random stores: observations of FAIL and
+    TIMEOUT on two checks (so some establish the same claim), proposals,
+    texts of very different lengths, then a chain of supersessions. At
+    budgets across the whole range in both measures, and at the exact size
+    of each render before a supersession, the supersession keeps every claim
+    shown before it, and a proposal added, corrected or retracted changes no
+    claim shown."""
+    rng = random.Random(seed)
+    receipts = []
+    st = empty()
+    for n in range(1, rng.randint(4, 6) + 1):
+        text = f"account {n} " + "x" * rng.choice((1, 40, 300, 700))
+        if rng.random() < 0.65:
+            rec = failure(
+                len(receipts) + 1,
+                exit_code=1,
+                timed_out=rng.random() < 0.5,
+                definition=rng.choice((DEF0, DEF1)),
+            )
+            receipts.append(rec)
+            st = apply(observation(st, rec, text=text))
+        else:
+            st = apply(proposal(st, text=text, n=n))
+    chain = [reload(st)]
+    for _ in range(rng.randint(2, 3)):
+        current = chain[-1]
+        pairs = [(t, r) for t in current._facts for r in current._facts if t < r]
+        rng.shuffle(pairs)
+        for target, replacement in pairs:
+            out = revise(current, Action.SUPERSEDE, target, replacement=replacement)
+            if out.status == "applied":
+                chain.append(reload(out.store))
+                break
+    assert len(chain) > 1
+    last = chain[-1]
+    texts = [f.id for f in last._facts.values() if f.author is Actor.AGENT and not f.replacement]
+    prose = [reload(apply(proposal(last, text="y" * rng.choice((1, 600)), n=100)))]
+    if texts:
+        prose.append(reload(apply(revise(last, Action.CORRECT, texts[0], text="z" * 700))))
+        prose.append(reload(apply(revise(last, Action.RETRACT, texts[0]))))
+    roomy = max(
+        len(render_projection(s, REQ, validation_records=receipts).text.encode())
+        for s in (*chain, *prose)
+    )
+    step = max(7, (roomy - 500) // 40)
+    for budget in range(500, roomy + step, step):
+        for cap in (replace(REQ, max_bytes=budget), replace(REQ, max_chars=budget)):
+            renders = [_render_or_none(s, cap, receipts) for s in chain]
+            if renders[0] is None:
+                assert renders == [None] * len(chain), cap
+                continue
+            for k, before in enumerate(renders[:-1]):
+                text = before.text
+                exact = replace(REQ, max_chars=len(text), max_bytes=len(text.encode()))
+                pairs = [(cap, before, renders[k + 1])]
+                # The exact size of a render that shows nothing, or one short
+                # block, can be below the header and its longest notice:
+                # every state is refused there alike.
+                again = _render_or_none(chain[k], exact, receipts)
+                if again is None:
+                    assert _render_or_none(chain[k + 1], exact, receipts) is None
+                else:
+                    later = render_projection(chain[k + 1], exact, validation_records=receipts)
+                    pairs.append((exact, again, later))
+                for limit, earlier, after in pairs:
+                    assert _claim_set(earlier) <= _claim_set(after), (seed, k, limit)
+                    assert _within(after, limit), (seed, k, limit)
+            for other in prose:
+                changed = render_projection(other, cap, validation_records=receipts)
+                assert _claim_set(changed) == _claim_set(renders[-1]), (seed, cap)
+                assert _within(changed, cap), (seed, cap)
 
 
 def test_freshness_names_the_candidate_and_launch_receipts_the_render_resolved():

@@ -1676,14 +1676,27 @@ stays superseded when its replacement is retracted. Only a validation
 failure its retained receipt establishes on the launch stays shown, unless
 a record the projection actually shows carries the same claim; a record
 the budget leaves out does not. The distinct established claims are chosen
-before anything else is spent, each by the shortest whole block of a
-record that establishes it, in rank order, and as if no record were
-superseded, so a supersession removes no claim the projection showed. A
-superseded record then holds its claim alone, labeled as superseded with
-its text omitted, a block no longer than the one it was chosen on; a
-current record with the same claim takes its place where that fits, and
-its whole block is shown only with the budget left after that. Neither
-prose nor a second proof of one claim displaces another. A projection is bound to the next launch
+before anything else is spent, on the records that establish one alone.
+Each is held by one record, the one establishing it whose whole block is
+shortest as if it were not superseded: in rank order, each claim where
+that block fits beside the claims held before it, then, with the budget
+left, the claims not held, each by that record's block as it is now, up to
+the first that does not fit. A record establishing a claim not held is not
+shown. The header gives every count at one width and a render that shows a
+record has no notice, so a supersession changes nothing the first choice
+reads and only shrinks what the second sizes: a supersession removes no
+claim the projection showed, and the prose of a record that establishes
+no claim never changes which claims are shown. A budget that cannot hold the header and
+its longest notice is refused whatever the records. A superseded record
+then holds its claim alone, labeled as superseded with its text omitted, a
+block no longer than the one it was chosen on; a current record with the
+same claim takes its place where that fits, and its whole block is shown
+only with the budget left after that. Neither prose nor a second proof of
+one claim displaces another. A launch ordinal is bounded by 2^63 − 1, the
+loader's bound: Memory's writes, its launch citations and a projection
+take every ordinal the loader reads, and a run that has spent the last one
+can still settle a reply it kept, which spends none, but launches nothing
+more. A projection is bound to the next launch
 ordinal of its snapshot, and its freshness digests every receipt it
 resolved citations against, validation, candidate and launch, unique and
 in any order. A
