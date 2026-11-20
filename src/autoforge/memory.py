@@ -710,12 +710,20 @@ class MemoryStore:
         an acceptance save (``accepted``); the operator and the controller
         act on the snapshot they hold under the lock, which is the default.
         A revision against any other revision is stale and refused.
+
+        The row is built from canonical, validated input (the step as
+        :func:`_step` saves it, the reason as it is redacted), so a retry
+        of an applied revision is compared with the saved row as it was
+        saved: a replay, never a stale revision (R3-F5 of PR #526).
         """
         if not self.enabled:
             return WriteOutcome(self, "disabled")
         try:
             action = Action(action)
             actor = Actor(actor)
+            if step is not None:
+                _require(isinstance(step, StepKey))
+                step = _step(step.to_dict(), self.repository)
             _require(action is not Action.ADD)
             _require(issue is not None or actor is not Actor.OPERATOR)
             fact = self._facts.get(target) if type(target) is int else None
@@ -731,6 +739,9 @@ class MemoryStore:
             _require(isinstance(reason, str) and bool(reason.strip()))
             _require((text is not None) == (action is Action.CORRECT))
             _require((replacement is not None) == (action is Action.SUPERSEDE))
+            _require(type(target) is int and type(expected) is int)
+            _require(replacement is None or type(replacement) is int)
+            _integer(attempt)
             content = _digest(_string(text, MAX_TEXT_BYTES)) if text is not None else replacement
             return self._write(
                 dict(
@@ -749,8 +760,13 @@ class MemoryStore:
             return WriteOutcome(self._refusal(), "refused")
 
     def catalog(self, issue_url: str) -> dict:
-        """Operator view, restricted to the current issue. No verified prose."""
-        issue = _issue(issue_url)
+        """Operator view, restricted to the current issue. No verified prose.
+
+        The issue is validated only to filter records: a store with none
+        (Memory off, a migrated checkpoint whose run names no issue) is
+        listed without it (R3-F6 of PR #526).
+        """
+        issue = _issue(issue_url) if self._facts else ""
         facts = []
         for f in self._facts.values():
             if f.scope.step.issue_url != issue:
@@ -807,6 +823,22 @@ class MemoryStore:
         )
 
 
+def summarize(repository: str, run_id: str, launch_seq: int, raw: object, issue_url: str) -> dict:
+    """``status``'s Memory summary of a checkpoint's ``issue_memory`` value.
+
+    The empty value, which every Memory-off run and every migrated
+    checkpoint holds, is summarized as it is: disabled, no record, no
+    refusal, the digest of the empty value. Nothing of the run's identity
+    or of its issue is validated for it, since the state loader accepts
+    checkpoints, older ones with no issue URL included, that Memory's own
+    scope rules would refuse (R3-F6 of PR #526). Any other value is the
+    store's, read under its strict rules (:meth:`MemoryStore.summary`).
+    """
+    if isinstance(raw, dict) and not raw:
+        return dict(enabled=False, revision=0, digest=_digest(_json({})), refusals=0, records={})
+    return MemoryStore(repository, run_id, launch_seq, raw).summary(issue_url)
+
+
 @dataclass(frozen=True)
 class WriteOutcome:
     store: MemoryStore
@@ -834,6 +866,15 @@ class ProjectionRequest:
 
 @dataclass(frozen=True)
 class MemoryFreshness:
+    """What a projection was rendered from, and what it left out.
+
+    ``memory_digest`` is the store's value; ``evidence_digest`` every
+    receipt input the render resolved citations against (the retained
+    validation records and the candidate and launch receipts), sorted: two
+    renders for one request with equal freshness resolved every citation
+    against the same receipts, in whatever order they were supplied.
+    """
+
     revision: int
     memory_digest: str
     evidence_digest: str
@@ -850,6 +891,27 @@ class ContextProjection:
     freshness: MemoryFreshness
     # The typed retention result of each shown record that cites a receipt.
     retention: tuple[tuple[int, Retention], ...] = ()
+
+
+def _compact_label(replacement: int) -> str:
+    """The label of a superseded record shown by its receipt's claim alone."""
+    return f"superseded by M{replacement}; claim only, text omitted"
+
+
+# How much shorter a superseded record's compact block is than the shortest
+# full block it had before (R3-F2 of PR #526). Both open with the same
+# ``\nM<id> <kind> — `` and carry the same established-claim line; the full
+# block then has the observed record's label, its fenced text (one
+# character at least) and a newline, the compact one its label for the
+# largest record ID. A supersession adds at most one digit to the Memory
+# revision, and ranking the record first at most one to the omitted count,
+# which the header and the omission notice each show: this must exceed 3.
+COMPACT_SLACK_BYTES = (
+    len("unverified controller account\n")
+    + len(fenced_untrusted_block("x", "untrusted"))
+    + len("\n")
+    - len(_compact_label(MAX_EVENTS) + "\n")
+)
 
 
 def _validation_facts(
@@ -1022,7 +1084,18 @@ def render_projection(
     exempt = [facts[i] for i in resolved if facts[i].replacement and claim_of(i) is not None]
     revision = len(store._events)
     memory_digest = _digest(_json(store.encode()))
-    evidence_digest = _digest(_json([[v.seq, v.digest] for v in receipts.values()]))
+    # Every receipt input the render resolves a citation against: the run's
+    # validation records and the candidate and launch receipts it holds, each
+    # sorted, so the same inputs in another order give the same digest
+    # (R3-F4 of PR #526).
+    evidence_digest = _digest(
+        _json(
+            {
+                "validation": sorted([v.seq, v.digest] for v in receipts.values()),
+                "retained": sorted([ref.kind.value, ref.sequence, ref.digest] for ref in held),
+            }
+        )
+    )
 
     def fits(text: str) -> bool:
         return len(text) <= request.max_chars and len(text.encode()) <= request.max_bytes
@@ -1037,7 +1110,7 @@ def render_projection(
             f"round {step.review_round}, PR {step.pr_url or 'none'}\n"
             f"Candidate: {request.candidate or 'none'}\n"
             f"Memory revision: {revision}; digest: {memory_digest}\n"
-            f"Retained validation evidence digest: {evidence_digest}\n"
+            f"Retained evidence digest: {evidence_digest}\n"
             f"Shown {shown}; omitted {omitted}; inapplicable {inapplicable}; "
             f"withdrawn {withheld}; needs revalidation {downgraded}.\n"
         )
@@ -1053,7 +1126,7 @@ def render_projection(
             tail = ""
         return header + "".join(blocks) + tail
 
-    def block(fact: MemoryFact) -> str:
+    def block(fact: MemoryFact, *, compact: bool = False) -> str:
         retention, claim = resolved[fact.id]
         label = (
             "unverified controller account"
@@ -1069,6 +1142,17 @@ def render_projection(
                 f"{outcome.value} on {commit} (tree {tree}), check {index} "
                 f"definition {definition}, policy {policy}.\n"
             )
+            if compact:
+                # The evidence alone, for a superseded record whose full block
+                # no longer fits (R3-F2 of PR #526): its receipt's claim and
+                # what it is, never its prose. It is shorter than the record's
+                # whole block before the supersession by more than the header
+                # and the omission notice can grow (COMPACT_SLACK_BYTES), and
+                # the supersession ranks it first among established claims.
+                assert fact.replacement
+                return (
+                    f"\nM{fact.id} {fact.kind.value} — {_compact_label(fact.replacement)}\n" + proof
+                )
             if fact.replacement:
                 proof += (
                     f"Superseded by M{fact.replacement}; shown because no record shown "
@@ -1102,10 +1186,15 @@ def render_projection(
         blocks: list[str] = []
         ids: list[int] = []
         for fact in visible:
-            text = block(fact)
-            if fits(assemble([*blocks, text], len(visible), downgraded)):
-                blocks.append(text)
-                ids.append(fact.id)
+            # A superseded record is visible only for the claim its receipt
+            # establishes: when its whole block does not fit, its evidence
+            # alone is shown, never nothing (R3-F2 of PR #526).
+            forms = [block(fact), *([block(fact, compact=True)] if fact.replacement else [])]
+            for text in forms:
+                if fits(assemble([*blocks, text], len(visible), downgraded)):
+                    blocks.append(text)
+                    ids.append(fact.id)
+                    break
         return blocks, ids, downgraded
 
     # Start from every exempt record a later record of its chain could carry,

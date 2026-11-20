@@ -1636,14 +1636,25 @@ relevant guide (#319, D7.7); and a new stop code amends ADR 0011.
 **Implementation note (#317).** Protocol 20 ships the atomic store, seed
 and retraction commands, and the pure projection. Automatic writers and
 launch delivery remain #333's. For this first slice, only the Pi adapter
-with context files disabled supplies D14's proof, and only in two halves.
-The profile's half is checked at config load. The host's half is D18's
-dynamic check before each Memory launch's intent save. It requires that Pi's
-agent directory holds no `SYSTEM.md` or `APPEND_SYSTEM.md`, which no flag
-turns off and an earlier launch can write. It also requires a host that
-kills a launch's leftover processes. D14's table above, written before
-this, lists Pi's proof as holding by construction. That is true of its
-argv, not of its agent directory. Claude's no-session option does not
+supplies D14's proof, in three parts. The profile's part is checked at
+config load: context files off and `require_oauth: false`. Pi's agent
+directory holds `SYSTEM.md` and `APPEND_SYSTEM.md`, which no flag turns off.
+No check of a directory that outlives the launch keeps them out: a process
+an earlier launch started can outlive a controller killed with `SIGKILL`
+(D5.5, ADR 0002 §4e), and launches of other checkouts share the directory.
+So the proof is the launch's own: its agent directory must be the one in
+the private home the outer sandbox makes empty for that launch alone (ADR
+0005 D8.1). The host's part is D18's dynamic check before each Memory
+launch's intent save. The launch must be enforced, `PI_CODING_AGENT_DIR`
+unset (it would project a host directory read-write), and no operator path
+may show a host directory at, above or inside `~/.pi/agent` in that home.
+The launch's part is checked on its compiled sandbox description: Pi's home
+is the private tmpfs, and nothing is mounted over its agent directory there.
+Otherwise the launch is refused before anything is spawned. A same-UID
+process outside the sandbox that enters the launch's namespace through
+`/proc` is not excluded (docs/pi-policy.md §5). D14's table
+above, written before this, lists Pi's proof as holding by construction.
+That is true of its argv, not of its agent directory. Claude's no-session option does not
 prove auto-memory is off; it is refused when Memory is on, as are the
 other adapters without a proof. AutoForge does not start a version probe
 or change how any Memory-off launch runs. For D9.6, every record not yet
@@ -1651,15 +1662,21 @@ retracted reserves one event slot and the bytes of one operator retraction,
 so the operator's retraction (D9.4) is never refused for a bound. Every
 revision names the record revision it acts on. An agent's revision comes
 from an acceptance save, from a launch no earlier than the record's latest
-change. A stale one is refused, on write and on load. A superseded record
+change. A stale one is refused, on write and on load. A revision is
+compared with the saved rows in its canonical form, so the same input
+again is a replay, whatever the case of its URLs. A superseded record
 stays superseded when its replacement is retracted. Only a validation
 failure its retained receipt establishes on the launch stays shown, until
 a record of its chain that the projection actually shows carries the same
-claim; a replacement the budget leaves out does not. A projection is bound
-to the next launch ordinal of its snapshot. A citation resolves to a typed
-retention result: established (a validation record only), retained or
-unavailable. This slice admits validation, candidate and launch receipts,
-not review, effect or Git references.
+claim; a replacement the budget leaves out does not. When its whole block
+no longer fits, its receipt's claim is shown alone, labeled as superseded
+with its text omitted; that block is shorter than the record's block
+before the supersession. A projection is bound to the next launch ordinal
+of its snapshot, and its freshness digests every receipt it resolved
+citations against, validation, candidate and launch, in any order. A
+citation resolves to a typed retention result: established (a validation
+record only), retained or unavailable. This slice admits validation,
+candidate and launch receipts, not review, effect or Git references.
 
 | Needs | Does not need |
 |---|---|
@@ -1667,7 +1684,7 @@ not review, effect or Git references.
 | the existing atomic save and strict loader (D10) | #319's roles, or D7.4's launch class |
 | a deterministic render into the read context (D12) | #324, #325 or #326; SQLite, FTS5 or LTSearch; an embedding service |
 | D14's proof from `claude`, `opencode` or `pi`, refused otherwise (D18) | an SDK-only provider |
-| `sandbox.mode` `disabled` or `required` with bwrap | Docker or Podman |
+| `sandbox.mode` `required` with bwrap for a Memory launch (`disabled` for every other) | Docker or Podman |
 | an operator command for the seed and retractions (D9.5) | #126's pause; a new effect kind or stop code |
 
 ## 3. What does not change

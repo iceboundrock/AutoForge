@@ -2499,7 +2499,9 @@ the run, before the first launch. A new run does not inherit previous notes.
 `autoforge memory show --json` reads the current issue's catalog without a
 lock or write. `autoforge status --json` prints no ledger. Its `memory`
 key holds the current issue's record count by status, the revision, the
-store's digest and the refusal count. `autoforge memory retract RECORD
+store's digest and the refusal count. A run with Memory off and an empty
+store reads as disabled with no record, an older checkpoint whose run names
+no issue included. `autoforge memory retract RECORD
 --reason WHY` takes the repository lock and withdraws a saved record of
 the current issue by its numeric ID. A record of an issue the run worked on
 earlier is not in either view, and retracting it is refused with nothing
@@ -2512,8 +2514,9 @@ Every correction, supersession or retraction names the record revision
 it acts on, and one made against an older revision is refused. An agent's
 revision must also come from an accepted result of a launch no earlier
 than the record's latest change. A late result from an earlier launch
-therefore cannot overwrite a newer correction. The same row submitted again
-is a replay and changes nothing. A
+therefore cannot overwrite a newer correction. The same revision submitted
+again is a replay and changes nothing: it is compared with the saved row in
+its canonical form, so a URL spelled in another case is the same revision. A
 correction or retraction leaves a content digest that prevents reappearance
 within its scope and authority. Refusals are counted, not tombstoned. The
 store keeps at most 64 facts and 256 lifecycle events per run, and at most
@@ -2524,7 +2527,10 @@ reason, in reserve. Other writes are refused before they would spend it,
 so `memory retract` is never refused for the bounds.
 
 The provider-neutral projection uses the committed revision, one bound
-launch and retained typed receipts. The launch is the snapshot's next one
+launch and retained typed receipts. Its freshness names the revision, the
+store's digest and one digest of every receipt it resolved citations
+against (validation, candidate and launch), which is the same in whatever
+order they are supplied. The launch is the snapshot's next one
 (its `launch_seq` plus one): a projection is never labeled as what an
 earlier launch was shown. A validation receipt can establish
 only what it records for that issue and exact candidate, not adjacent
@@ -2534,7 +2540,10 @@ a validation failure that its own retained receipt establishes on the
 launch: a supersession cannot hide it without matching check, policy,
 outcome and candidate evidence in a record of the chain that the
 projection actually shows. A replacement the budget leaves out does not
-count. Until then the failure is shown, marked as superseded.
+count. Until then the failure is shown, marked as superseded. When its
+whole block no longer fits the budget, its receipt's claim is shown alone,
+labeled as superseded with its text omitted. That block is shorter than
+the record's block was before the supersession.
 
 Each citation resolves to a typed retention result. `established` means a
 retained validation record establishes the claim on this launch.
@@ -2551,9 +2560,13 @@ including headings and omission notices, is at most 16,384 characters
 and 16,384 UTF-8 bytes (a conservative byte-level token bound).
 
 No launch is shown Memory and no observations are captured automatically
-yet; that is #333. With `sandbox.mode: disabled`, an agent of the same UID
-can reach the state directory by absolute path. The ledger remains advisory
-and grants no workflow or GitHub authority.
+yet; that is #333. A Memory `ANALYZE_EXECUTE` launch runs only under
+`sandbox.mode: required`, with Pi's agent directory in its private home
+([Configuration](configuration.md#issue-working-memory)); under `disabled`
+it is refused before its intent save. With `sandbox.mode: disabled`, an
+agent of the same UID can reach the state directory, the ledger included,
+by absolute path. The ledger remains advisory and grants no workflow or
+GitHub authority.
 
 ## Logging and redaction
 

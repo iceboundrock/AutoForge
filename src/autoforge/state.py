@@ -64,6 +64,7 @@ from .errors import ConfigurationError, StateError, StateProtocolError
 from .evidence import EvidenceFields, RecordView, check_evidence
 from .loop_guard import validate_review_history
 from .memory import MemoryStore
+from .memory import summarize as summarize_memory
 from .provenance import ControllerIdentity, protocol_ranges, shown, shown_path
 from .replan_txn import LEGACY_JOURNAL_PROTOCOLS, legacy_journal_refusal
 from .result_parser import (
@@ -954,6 +955,20 @@ class AutoForgeState:
 
     def memory(self) -> MemoryStore:
         return MemoryStore(self.repository, self.run_id, self.launch_seq, self.issue_memory)
+
+    def memory_summary(self) -> dict:
+        """``status``'s Memory summary: the current issue's records by status.
+
+        An empty store (Memory off, a migrated checkpoint) is summarized
+        without Memory's scope validation (:func:`autoforge.memory.summarize`).
+        """
+        return summarize_memory(
+            self.repository,
+            self.run_id,
+            self.launch_seq,
+            self.issue_memory,
+            self.current_issue_url,
+        )
 
     def memory_setting(self, enabled: bool) -> dict:
         """The validated checkpoint value with a new opt-in setting, without a write."""

@@ -26,9 +26,10 @@ version: 1
 state_dir: .autoforge
 
 # Issue Working Memory stays off unless explicitly enabled. Enabling it
-# requires a Pi analyze_execute profile with options.context_files: false,
-# and each Memory launch is refused while Pi's agent directory holds
-# SYSTEM.md or APPEND_SYSTEM.md (docs/configuration.md).
+# requires a Pi analyze_execute profile with options.context_files: false
+# and options.require_oauth: false, sandbox.mode: required, and no
+# PI_CODING_AGENT_DIR, so that each Memory launch's agent directory is the
+# one its private home makes empty for it (docs/configuration.md).
 # memory:
 #   enabled: false
 

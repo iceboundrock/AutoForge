@@ -1102,27 +1102,41 @@ provider integrations above stay off. The guarantees and what they do not cover 
 ## Issue Working Memory
 
 `memory.enabled: true` opts a run into the advisory checkpoint store. The
-`analyze_execute` profile must be Pi with `options.context_files: false`,
-and every Memory launch must also pass a check of the host. Other providers
-are refused when Memory is on. In particular, a Claude
-session-persistence setting alone establishes nothing about auto-memory.
-No runtime version probe is made.
+`analyze_execute` profile must be Pi with `options.context_files: false`
+and `options.require_oauth: false` (a provider API key; see below), and
+every Memory launch must also pass a check of the host and of the sandbox it
+runs in. Other providers are refused when Memory is on. In particular, a
+Claude session-persistence setting alone establishes nothing about
+auto-memory. No runtime version probe is made.
 
 Pi's flags do not disable everything an earlier launch could leave behind.
 `--no-session`, `--no-approve`, the executable-resource flags and
 `--no-context-files` cover sessions, project trust, extensions, skills,
 prompt templates, themes and context files. No flag turns off the agent
 directory's `SYSTEM.md` and `APPEND_SYSTEM.md`, which Pi loads at every
-launch ([Pi policy](pi-policy.md) §5). That directory stays writable by
-every launch that uses it, even under `sandbox.mode: required`. Before each
-Memory launch's intent save, the controller therefore checks the directory
-`doctor` names (`$PI_CODING_AGENT_DIR`, else `~/.pi/agent`). It refuses the
-launch while either file is there, or when the check cannot be made: the
-variable is not absolute, a file cannot be examined, or the host cannot kill
-a launch's leftover processes (no Linux child subreaper, so a process an
-earlier launch left could write after the check). The refusal leaves the
-state as it was. Remove the file, or turn Memory off. Memory-off launches
-are neither checked nor changed.
+launch ([Pi policy](pi-policy.md) §5). No check of a directory that
+outlives the launch keeps them out either. A process an earlier launch
+started can outlive a controller killed with `SIGKILL`, and launches of
+other checkouts share the directory, so either can write after the check
+and before Pi reads it. A Memory launch therefore uses an agent directory
+that exists for it alone: `~/.pi/agent` in the private home that
+`sandbox.mode: required` gives every launch, an empty tmpfs no other launch
+or host directory shares. Before each Memory launch's intent save, the
+controller refuses the launch unless it will run inside the outer sandbox,
+`PI_CODING_AGENT_DIR` is unset (when set, it names a host directory every launch given it
+shares), and no `sandbox.read_only_paths` entry shows a host directory at,
+above or inside `~/.pi/agent`. That home holds no ChatGPT sign-in, hence
+`require_oauth: false`, with the model provider's API key forwarded as a
+variable (`execution.agent_env_allowlist_extra`, as the
+[Pi operator guide](pi.md#deepseek-on-an-api-key) describes). Once the
+launch's sandbox is compiled, the same is checked on what it actually mounts, and the launch is
+refused before anything is spawned if Pi's agent directory is not its own.
+A refusal before the intent save leaves the state as it was. Memory-off
+launches are neither checked nor changed. A process of your user outside
+the sandbox can still reach that home through `/proc`, as it can reach
+anything else you own ([Pi policy](pi-policy.md) §5): the proof excludes
+every other launch and host directory, not a same-UID process that
+targets the launch.
 
 Changing the recorded `memory.enabled` on `step`, `resume` or `unblock`
 requires `--accept-config-change`. Turning it off disables the projection

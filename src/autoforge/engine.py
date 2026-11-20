@@ -493,6 +493,7 @@ from .providers import (
     AgentExecutionResult,
     AgentProvider,
     AgentRequest,
+    FreshContextHost,
     ProviderRegistry,
     provider_for,
 )
@@ -1947,9 +1948,10 @@ class ControllerEngine:
         # re-resolved into a new binding.
         self._state_root: SafeRoot | None = None
         # What :meth:`require_checkpoint_owner` bound: the identity of the
-        # directory git was asked from, and how far below it the state
-        # directory lies; checked whenever the state root is opened.
-        self._checkpoint_probe: tuple[tuple[int, int], int] | None = None
+        # directory git was asked from, how far below it the state directory
+        # lies, and the standalone command whose scheduler-root refusal it
+        # decided (``""``: none); checked whenever the state root is opened.
+        self._checkpoint_probe: tuple[tuple[int, int], int, str] | None = None
         self.workdir = str(workdir)
         self.providers = providers or ProviderRegistry(runner=runner)
         # The GitHub client is built on first *use*, never on construction:
@@ -3726,8 +3728,27 @@ class ControllerEngine:
         dry run is not checked: it takes no lock and derives no coordination
         root (``run --dry-run``'s one git read is the checkout's ``origin``,
         #293), and it writes nothing.
+
+        Decided on :meth:`checkpoint_target`, the directory the state root
+        opens, never on the caller's spelling (R3-F3 of PR #526): ``link/..``
+        names what it normalizes to, not where the link leads. The writers
+        decide it again under the lock, bound to the directory their owner
+        check asked git about (:meth:`require_checkpoint_owner`).
         """
-        check_standalone_state_dir(self.paths.state_dir, self.coordination_root(), command)
+        check_standalone_state_dir(self.checkpoint_target(), self.coordination_root(), command)
+
+    def checkpoint_target(self) -> Path:
+        """The directory :meth:`state_root` opens, as :class:`StatePaths` spells it.
+
+        Its anchor and the components below it, ``..`` already normalized
+        (``os.path.abspath``), so ``link/..`` is the link's parent whatever the
+        link names. The anchor is resolved by the kernel when the root is
+        opened, every component below it ``O_NOFOLLOW``. Every guard that
+        says which run, repository or scheduler namespace a command acts on
+        decides on this path (R2-F2, R3-F3 of PR #526), and the writers bind
+        it to the directory they open (:meth:`require_checkpoint_owner`).
+        """
+        return self.paths.anchor.joinpath(*self.paths.relative)
 
     def state_dir_repository_problem(self) -> str:
         """Why the state directory is not guarded by this engine's L0 ("" when it is).
@@ -3747,9 +3768,14 @@ class ControllerEngine:
         read, has no identity to establish and is a problem too. Two git
         reads, no write; a missing state directory is left to the state
         load, which refuses it. ``rebind-epic`` refuses on it (#435); no
-        other command calls this.
+        other command calls this, and ``rebind-epic`` also binds the answer
+        to the directory it opens (:meth:`require_checkpoint_owner`).
+
+        The state directory is :meth:`checkpoint_target`, the directory the
+        state root opens, never the caller's spelling, which may name
+        another directory or none (R3-F3 of PR #526).
         """
-        state_dir = self.paths.state_dir
+        state_dir = self.checkpoint_target()
         if not os.path.lexists(state_dir):
             return ""
         try:
@@ -3774,7 +3800,9 @@ class ControllerEngine:
             )
         return ""
 
-    def require_checkpoint_owner(self, *, allow_external: bool = True) -> bool:
+    def require_checkpoint_owner(
+        self, *, allow_external: bool = True, standalone: str = ""
+    ) -> bool:
         """Match the write target to L0 before reading a writable snapshot.
 
         Return False only for the legacy Memory-off use of a directory
@@ -3792,8 +3820,19 @@ class ControllerEngine:
         directory git was asked from; a missing one is asked again once
         :meth:`state_root` has created and opened it. Each call replaces the
         binding, so the call made under the lock is the one that holds.
+
+        ``standalone`` names a standalone command (``run``, ``step``,
+        ``resume``, ``memory retract``, ``rebind-epic``): its target must not
+        lie in the scheduler root (ADR 0008 D17.3), decided on the same
+        directory, symbolic links resolved, whose identity git was asked
+        about and the state root is bound to, here and again when a missing
+        target is created (R3-F3 of PR #526). So a spelling that resolves
+        outside the scheduler root while the state root would open a
+        namespace's checkpoint is refused, under the lock too, and
+        ``run --force`` cannot replace a namespace's checkpoint whatever
+        issue it names.
         """
-        target = self.paths.anchor.joinpath(*self.paths.relative)
+        target = self.checkpoint_target()
         self._checkpoint_probe = None
         probe, depth = target, 0
         try:
@@ -3810,6 +3849,10 @@ class ControllerEngine:
                 raise StateError("checkpoint directory is a symbolic link")
             identity, theirs = self._checkpoint_repository(probe)
         except NoRepository:
+            if standalone:
+                # Outside every repository, so outside the scheduler root too;
+                # decided on the path all the same, as before the lock.
+                check_standalone_state_dir(target, self.coordination_root(), standalone)
             if allow_external and not self.config.memory.enabled:
                 return False
             raise LockError(
@@ -3819,10 +3862,34 @@ class ControllerEngine:
             raise LockError("cannot establish the checkpoint directory's repository") from None
         if theirs != self.coordination_root():
             raise LockError("checkpoint directory is not owned by this checkout's repository lock")
-        self._checkpoint_probe = (identity, depth)
+        if standalone:
+            self._refuse_scheduler_directory(
+                probe, identity, target.parts[len(target.parts) - depth :], standalone
+            )
+        self._checkpoint_probe = (identity, depth, standalone)
         if depth == 0:
             self._bind_checkpoint_root(self.state_root(create=False))
         return True
+
+    def _refuse_scheduler_directory(
+        self, probe: Path, identity: tuple[int, int], missing: tuple[str, ...], command: str
+    ) -> None:
+        """ADR 0008 D17.3 for the directory the owner check bound (R3-F3 of PR #526).
+
+        ``probe`` is the directory git was asked from, of ``identity``, and
+        ``missing`` the components of the target below it that do not exist
+        yet. Where the target lies is decided on ``probe`` with its symbolic
+        links resolved, which must still be the same directory, and those
+        components, which the state root creates without following a link.
+        """
+        try:
+            real = Path(os.path.realpath(probe))
+            found = os.stat(real)
+        except OSError:
+            raise LockError("cannot establish the checkpoint directory's repository") from None
+        if (found.st_dev, found.st_ino) != identity:
+            raise LockError("checkpoint directory changed while its repository was established")
+        check_standalone_state_dir(real.joinpath(*missing), self.coordination_root(), command)
 
     @staticmethod
     def _checkpoint_repository(path: Path) -> tuple[tuple[int, int], Path]:
@@ -3847,9 +3914,9 @@ class ControllerEngine:
         """
         if self._checkpoint_probe is None:
             return
-        identity, depth = self._checkpoint_probe
+        identity, depth, standalone = self._checkpoint_probe
         if depth:
-            target = self.paths.anchor.joinpath(*self.paths.relative)
+            target = self.checkpoint_target()
             try:
                 identity, theirs = self._checkpoint_repository(target)
             except (LockError, OSError):
@@ -3858,7 +3925,9 @@ class ControllerEngine:
                 raise LockError(
                     "checkpoint directory is not owned by this checkout's repository lock"
                 )
-            self._checkpoint_probe = (identity, 0)
+            if standalone:
+                self._refuse_scheduler_directory(target, identity, (), standalone)
+            self._checkpoint_probe = (identity, 0, standalone)
         if root.identity != identity:
             raise LockError(
                 "checkpoint directory is not the directory its repository lock was checked for"
@@ -3869,9 +3938,10 @@ class ControllerEngine:
 
         ``unblock`` may act on such a state directory, and then names the
         scheduler's command to continue it, since a standalone ``resume``
-        refuses it (:meth:`refuse_scheduler_state_dir`).
+        refuses it (:meth:`refuse_scheduler_state_dir`). Decided on
+        :meth:`checkpoint_target`, the directory the state root opens.
         """
-        return inside_scheduler_root(self.paths.state_dir, self.coordination_root())
+        return inside_scheduler_root(self.checkpoint_target(), self.coordination_root())
 
     # -- state handling --------------------------------------------------
     def new_run(self, epic_url: str, issue_url: str) -> AutoForgeState:
@@ -16917,7 +16987,7 @@ class ControllerEngine:
         if memory_launch and not provider.proves_fresh_context(profile):
             raise ConfigurationError(
                 "analyze_execute cannot prove fresh context with Memory; "
-                "use Pi with context files disabled, or turn Memory off"
+                "use Pi with context_files and require_oauth false, or turn Memory off"
             )
         # What config load refuses, for this launch's provider: a name listed
         # for repository commands alone would reach this agent (#286).
@@ -17028,8 +17098,15 @@ class ControllerEngine:
             provider.integration_preflight(env_allowlist)
             if memory_launch:
                 # D18's dynamic check, for every launch: an earlier one, this
-                # invocation's included, may have left context behind.
-                refusal = provider.fresh_context_refusal(profile, os.environ)
+                # invocation's included, may have left context behind, and
+                # the launch's own sandbox decides whether any can reach it
+                # (R3-F1 of PR #526).
+                host = FreshContextHost(
+                    enforced=self._sandbox_enforced(),
+                    home=_operator_home(),
+                    operator_paths=tuple(self.config.sandbox.read_only_paths),
+                )
+                refusal = provider.fresh_context_refusal(profile, os.environ, host)
                 if refusal:
                     raise ConfigurationError(
                         f"refusing to launch {phase.value} with Memory: profile "
@@ -17116,6 +17193,8 @@ class ControllerEngine:
                 env_allowlist=env_allowlist,
                 loop_detection=self.config.execution.loop_detection,
                 interaction=broker,
+                # The adapter checks the launch it compiles too (D14).
+                fresh_context=memory_launch,
             )
             record = ExecutionRecord(
                 run_id=state.run_id,

@@ -692,26 +692,39 @@ As implemented (`flock(2)`, `src/autoforge/locking.py`):
 - A working directory outside a git repository has no lock to take and is
   refused (exit 2, nothing written), so `run`, `step` and `resume` require
   one (a REMOTE dry-run does not).
-- Mutating standalone commands refuse a checkpoint in another checkout's
-  repository, including another clone of the same remote. They check the
-  path before taking L0 and again under it, without assuming that an older
-  snapshot of the checkpoint still holds. The path checked is the one the
-  state root opens: `StatePaths`' normalized spelling, never the caller's,
-  so `..` after a symbolic link or a missing directory cannot send git to
-  another repository (R2-F2 of PR #526). Git is asked from that directory,
-  or from its nearest existing ancestor while it does not exist, and the
-  directory must be the same before and after. The answer is bound to the
-  held state root: an existing directory is opened as the root and must
-  be the directory git was asked from; a directory created afterwards is
-  asked about again once it is opened (`ControllerEngine.require_checkpoint_owner`,
-  `_bind_checkpoint_root`). A standalone state directory
-  positively identified as outside Git keeps working for Memory-off runs;
-  ambiguous Git discovery errors are refused. `memory retract` also
-  refuses scheduler-owned state and always requires the owning repository.
+- Mutating standalone commands (`run`, `step`, `resume`, `unblock`,
+  `memory retract` and `rebind-epic`) refuse a checkpoint in another
+  checkout's repository, including another clone of the same remote. They
+  check before taking L0 and again under it, without assuming that an
+  older snapshot of the checkpoint still holds. The directory checked is
+  the one the state root opens (`ControllerEngine.checkpoint_target`):
+  `StatePaths`' normalized spelling, never the caller's, so `..` after a
+  symbolic link or a missing directory cannot send git to another
+  repository (R2-F2 of PR #526). Git is asked from that directory, or from
+  its nearest existing ancestor while it does not exist, and the directory
+  must be the same before and after. The answer is bound to the held state
+  root: an existing directory is opened as the root and must be the
+  directory git was asked from; a directory created afterwards is asked
+  about again once it is opened (`ControllerEngine.require_checkpoint_owner`,
+  `_bind_checkpoint_root`). `run`, `step`, `resume`, `memory retract` and
+  `rebind-epic` also refuse, in the same call and so under the lock too, a
+  directory inside the scheduler root, decided on that same bound
+  directory with its links resolved (R3-F3 of PR #526): `run --force`
+  therefore cannot replace a namespace's checkpoint, whatever issue it
+  names. Every other guard that says which run a command acts on (the
+  pre-lock scheduler-root refusal, `unblock`'s namespace exemption,
+  `rebind-epic`'s repository check and its dry run's report) decides on
+  the same normalized directory, never on the caller's spelling. A
+  standalone state directory positively identified as outside Git keeps
+  working for Memory-off runs; ambiguous Git discovery errors are refused.
+  `memory retract` and `rebind-epic` always require the owning repository.
 - The lock is the working directory's, whatever `--state-dir` names, so
   `rebind-epic` (#435) also binds its state directory to it: `git rev-parse
-  --git-common-dir` run from the state directory must name the same git
-  common dir (`ControllerEngine.state_dir_repository_problem`). A state
+  --git-common-dir` run from the directory the state root opens (its
+  normalized spelling, as above) must name the same git common dir
+  (`ControllerEngine.state_dir_repository_problem`), and the applied command
+  then binds that answer to the directory it opens, before the lock and
+  under it (`require_checkpoint_owner`). A state
   directory of another repository (another clone of the same GitHub
   repository, or a scheduler namespace in another one's git directory) or
   of none is refused before the lock is taken, and in its dry run, with
@@ -1160,7 +1173,11 @@ workers (`src/autoforge/scheduler.py`, `src/autoforge/worker.py`, below);
   2) a `--state-dir` or `config.state_dir` that resolves inside
   `<git common dir>/autoforge/scheduler/` (decided on the resolved path, so
   a relative path or a link is judged by where it leads), before the lock
-  is taken and before any state is read or written; the error names
+  is taken and before any state is read or written, and again under the
+  lock; so do `memory retract` and `rebind-epic`. The path resolved is the
+  directory the state root opens, `..` normalized first, so `link/..` is
+  judged as the link's parent, never as where the link leads (R3-F3 of
+  PR #526); the error names
   `autoforge epic resume`, `epic status` and `epic archive` instead.
   The configured directory is the only one `step` and `resume` read, so
   one in the scheduler root is refused before any state in it is read,

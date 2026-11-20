@@ -935,7 +935,7 @@ class AutoForgeConfig:
             if not provider_for(profile).proves_fresh_context(profile):
                 raise ConfigurationError(
                     "Memory needs a fresh-context analyze_execute profile; "
-                    "use Pi with context files disabled, or turn Memory off"
+                    "use Pi with context_files and require_oauth false, or turn Memory off"
                 )
 
     def environment_overlap(self) -> str:

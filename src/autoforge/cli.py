@@ -828,7 +828,9 @@ def _guard_scheduler_ownership(engine: ControllerEngine, issue_url: str, command
     """
     root = engine.coordination_root()
     exempt = (
-        namespace_issue_of_state_dir(engine.paths.state_dir, root) if command == "unblock" else None
+        namespace_issue_of_state_dir(engine.checkpoint_target(), root)
+        if command == "unblock"
+        else None
     )
     refuse_scheduler_owned_issue(root, issue_url, command, exempt_issue=exempt)
     engine.issue_ownership = standalone_ownership_predicate(root, exempt_issue=exempt)
@@ -1902,7 +1904,7 @@ def cmd_run(args) -> int:
     # A state directory inside the scheduler root is a namespace's, never a
     # standalone run's (ADR 0008 D17.3); refused before the lock is taken.
     engine.refuse_scheduler_state_dir("run")
-    engine.require_checkpoint_owner()
+    engine.require_checkpoint_owner(standalone="run")
     # A run the state already there refuses is refused before the lock too:
     # the refusal writes nothing, and taking the lock would write its PID
     # record in the state directory when that is the lock's own (#387).
@@ -1917,7 +1919,10 @@ def cmd_run(args) -> int:
     # would let a second controller take over the repository and both would
     # then run agents and persist state over each other.
     with engine.locked():
-        local_checkpoint = engine.require_checkpoint_owner()
+        # Again under the lock, the scheduler root included, bound to the
+        # directory opened (R3-F3 of PR #526): `--force` replaces whatever
+        # run this directory holds, not only the issue it names.
+        local_checkpoint = engine.require_checkpoint_owner(standalone="run")
         rc, corrupt, replaced = _existing_run_guard(engine, args.force)
         if rc is not None:
             return rc
@@ -2001,11 +2006,11 @@ def cmd_memory(args) -> int:
             for row in payload["records"]:
                 print(f"M{row['id']}: {row['kind']} ({row['status']})")
         return 0
-    engine.require_checkpoint_owner(allow_external=False)
     engine.refuse_scheduler_state_dir("memory retract")
+    engine.require_checkpoint_owner(allow_external=False, standalone="memory retract")
     _refuse_unloadable_state_before_the_lock(engine)
     with engine.locked():
-        engine.require_checkpoint_owner(allow_external=False)
+        engine.require_checkpoint_owner(allow_external=False, standalone="memory retract")
         state = engine.load()
         _guard_scheduler_ownership(engine, state.current_issue_url, "memory retract")
         result = state.memory().revise(
@@ -2067,12 +2072,12 @@ def cmd_step(args) -> int:
         if outcome.plan is not None:
             print_plan(outcome.plan, full_prompt=args.full_prompt)
         return 0
-    engine.require_checkpoint_owner()
+    engine.require_checkpoint_owner(standalone="step")
     _refuse_unloadable_state_before_the_lock(engine)
     # Load and execute under one lock: a snapshot loaded before the lock
     # could already have been replaced by another controller.
     with engine.locked():
-        owned = engine.require_checkpoint_owner()
+        owned = engine.require_checkpoint_owner(standalone="step")
         state = engine.load()
         if not owned and state.issue_memory:
             raise ConfigurationError("Memory checkpoint requires its repository's lock")
@@ -2099,12 +2104,12 @@ def cmd_resume(args) -> int:
             assert o.plan is not None
             print_plan(o.plan, full_prompt=args.full_prompt)
         return 0
-    engine.require_checkpoint_owner()
+    engine.require_checkpoint_owner(standalone="resume")
     _refuse_unloadable_state_before_the_lock(engine)
     # Load, decide and execute under one lock: a snapshot loaded before the
     # lock could already have been replaced by another controller.
     with engine.locked():
-        owned = engine.require_checkpoint_owner()
+        owned = engine.require_checkpoint_owner(standalone="resume")
         state = engine.load()
         if not owned and state.issue_memory:
             raise ConfigurationError("Memory checkpoint requires its repository's lock")
@@ -2246,9 +2251,14 @@ def cmd_rebind_epic(args) -> int:
             f"{REBIND_COMMAND} refused: {foreign}. Nothing was changed: no lock taken, no "
             "state write, and nothing written to GitHub."
         )
+    # The same answer bound to the directory the state root opens, and the
+    # scheduler root refused on it, before the lock and again under it, as
+    # every other standalone writer does (R3-F3 of PR #526).
+    engine.require_checkpoint_owner(allow_external=False, standalone=REBIND_COMMAND)
     # Load, decide and write under one lock, like `unblock`: a state loaded
     # before the lock could already have been replaced by another controller.
     with engine.locked():
+        engine.require_checkpoint_owner(allow_external=False, standalone=REBIND_COMMAND)
         state = engine.load()
         _guard_scheduler_ownership(engine, state.current_issue_url, REBIND_COMMAND)
         report = engine.rebind_epic(request)
@@ -2279,7 +2289,7 @@ def _rebind_preflight_problems(engine: ControllerEngine, state: AutoForgeState) 
     if engine.state_dir_repository_problem():
         return []  # reported by the engine
     problems: list[str] = []
-    if inside_scheduler_root(engine.paths.state_dir, root):
+    if inside_scheduler_root(engine.checkpoint_target(), root):
         problems.append(
             f"the state directory {engine.paths.state_dir} is inside the parallel EPIC "
             "scheduler's root: a scheduler's issue keeps the EPIC whose graph admitted it, and "
@@ -2671,7 +2681,7 @@ def cmd_status(args) -> int:
         # them.
         document = {
             **persisted,
-            "memory": state.memory().summary(state.current_issue_url),
+            "memory": state.memory_summary(),
             "replan_journal": _replan_journal_summary(txn),
             "acceptance_actions": _acceptance_actions(state),
             "operator_actions": _operator_actions(state),

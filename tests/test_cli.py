@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from autoforge import cli
+from autoforge.auto_recovery import StepKey
 from autoforge.engine import ControllerEngine, StepOutcome
 from autoforge.errors import (
     ExecutionError,
@@ -19,15 +20,23 @@ from autoforge.errors import (
     GitHubNotFoundError,
     GitHubUnavailableError,
     LockError,
+    SchedulerStateDirError,
 )
 from autoforge.executor import ExecutionResult, execute
 from autoforge.github import GitHubClient
 from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
-from autoforge.memory import Action, Actor
+from autoforge.memory import Action, Actor, Kind, MemoryScope
 from autoforge.provenance import MAX_PATH_CHARS
 from autoforge.providers import ProviderRegistry, ScriptedProvider
 from autoforge.redaction import redact, redact_obj
-from autoforge.run_namespace import EpicRef, RunBinding, RunKey, issue_namespace, write_binding
+from autoforge.run_namespace import (
+    EpicRef,
+    RunBinding,
+    RunKey,
+    inside_scheduler_root,
+    issue_namespace,
+    write_binding,
+)
 from autoforge.scheduler_state import Admission, ClaimKind, StateRef, open_claim
 from autoforge.state import AutoForgeState, load_state, quarantine_state_file, save_state
 from autoforge.transitions import Phase
@@ -143,7 +152,7 @@ def test_memory_seed_and_retraction_are_checkpoint_only(tmp_path, monkeypatch, c
                 "provider": "pi",
                 "model": "openai/fixture-model",
                 "effort": "high",
-                "options": {"context_files": False},
+                "options": {"context_files": False, "require_oauth": False},
             }
         },
     )
@@ -180,7 +189,7 @@ def test_memory_retract_refuses_an_earlier_issues_record(tmp_path, monkeypatch, 
                 "provider": "pi",
                 "model": "openai/fixture-model",
                 "effort": "high",
-                "options": {"context_files": False},
+                "options": {"context_files": False, "require_oauth": False},
             }
         },
     )
@@ -216,7 +225,7 @@ def _memory_config(tmp_path) -> list[str]:
                 "provider": "pi",
                 "model": "openai/fixture-model",
                 "effort": "high",
-                "options": {"context_files": False},
+                "options": {"context_files": False, "require_oauth": False},
             }
         },
     )
@@ -504,6 +513,173 @@ def test_checkpoint_writers_ask_git_about_the_directory_they_open(
     assert state_tree(state_dir) == before
     assert not (tmp_path / ".af").exists()
     assert fakes["provider"].calls == []
+
+
+_ALIASED_WRITERS = [
+    ["step"],
+    ["resume"],
+    ["unblock", "--reason", "test"],
+    ["memory", "retract", "1", "--reason", "test"],
+    ["run", "--epic", EPIC, "--issue", ISSUE, "--force", "--max-steps", "1"],
+    ["rebind-epic", "--issue", ISSUE, "--from", EPIC, "--to", ISSUE3, "--reason", "test"],
+]
+_ALIASED_IDS = ("step", "resume", "unblock", "retract", "force", "rebind")
+
+
+def _memory_checkpoint(state_dir: Path, run_id: str) -> None:
+    """A run with Memory on and one seeded record, saved in ``state_dir``."""
+    saved = AutoForgeState(
+        run_id=run_id,
+        repository="owner/repo",
+        epic_url=EPIC,
+        current_issue_url=ISSUE,
+        phase=Phase.ANALYZE_EXECUTE,
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    saved.issue_memory = saved.memory_setting(True)
+    scope = MemoryScope(StepKey(Phase.INITIALIZING, ISSUE, "", 0, 1))
+    seeded = saved.memory().add(
+        actor=Actor.OPERATOR, kind=Kind.SEED, scope=scope, text="A lesson of this run.\n"
+    )
+    assert seeded.status == "applied"
+    saved.issue_memory = seeded.store.encode()
+    save_state(saved, state_dir / "state.json")
+
+
+@pytest.mark.parametrize("words", _ALIASED_WRITERS, ids=_ALIASED_IDS)
+def test_a_foreign_memory_checkpoint_under_a_dotdot_alias_is_refused_by_every_writer(
+    tmp_path, monkeypatch, capsys, fakes, words
+):
+    """R3-F3 of PR #526: as spelled, ``link/..`` is this checkout, whose
+    ``.af`` is absent; normalized, as the state root opens it, it is another
+    clone's Memory checkpoint. Every writer, ``rebind-epic`` included, asks
+    git about the directory it opens and leaves the checkpoint unchanged."""
+    monkeypatch.chdir(tmp_path)
+    foreign = git_repo(tmp_path / "other-clone")
+    state_dir = foreign / ".af"
+    _memory_checkpoint(state_dir, "foreign-run")
+    (tmp_path / "sub").mkdir()
+    (foreign / "link").symlink_to(tmp_path / "sub")
+    spelled = foreign / "link" / ".." / ".af"
+    assert os.path.abspath(spelled) == str(state_dir)
+    assert not os.path.lexists(os.path.realpath(spelled))
+    before = state_tree(state_dir)
+    assert cli.main(["--state-dir", str(spelled), *words]) == 2
+    err = capsys.readouterr().err
+    assert (
+        "not owned by this checkout's repository lock" in err or "belongs to the repository" in err
+    )
+    assert state_tree(state_dir) == before
+    assert not (tmp_path / ".af").exists()
+    assert fakes["provider"].calls == []
+
+
+@pytest.mark.parametrize("words", _ALIASED_WRITERS, ids=_ALIASED_IDS)
+def test_a_scheduler_checkpoint_under_a_dotdot_alias_is_refused_by_every_standalone_writer(
+    tmp_path, monkeypatch, capsys, fakes, words
+):
+    """R3-F3 of PR #526: as spelled, ``<namespace>/link/..`` resolves outside
+    the scheduler root; normalized, as the state root opens it, it is the
+    namespace's own state directory. ``run --force`` names an issue no
+    namespace owns, and still cannot replace the namespace's checkpoint;
+    ``unblock`` acts on it as on any namespace state directory, and no
+    standalone writer is exempted by the spelling."""
+    monkeypatch.chdir(tmp_path)
+    namespace = _namespace_state_dir(tmp_path, 7).parent
+    namespace.mkdir(parents=True)
+    _memory_checkpoint(namespace / "state", "af-namespace")
+    (tmp_path / "outside" / "sub").mkdir(parents=True)
+    (namespace / "link").symlink_to(tmp_path / "outside" / "sub")
+    spelled = namespace / "link" / ".." / "state"
+    assert os.path.abspath(spelled) == str(namespace / "state")
+    assert not inside_scheduler_root(spelled, tmp_path / ".git")
+    before = state_tree(namespace / "state")
+    rc = cli.main(["--state-dir", str(spelled), *words])
+    err = capsys.readouterr().err
+    if words[0] == "unblock":
+        # Allowed on a namespace's state directory; this run is not blocked.
+        assert rc == 2 and "refuses state directory" not in err
+    else:
+        assert rc == 2 and "inside the parallel EPIC scheduler's root" in err
+        assert state_tree(namespace / "state") == before
+    assert not (tmp_path / "outside" / "state").exists()
+    assert fakes["provider"].calls == []
+
+
+def test_the_scheduler_root_is_refused_again_on_the_directory_the_state_root_opens(
+    tmp_path, monkeypatch, fakes
+):
+    """R3-F3 of PR #526: the owner check made while the state directory was
+    missing found it outside the scheduler root; the directory then opened
+    is a namespace's, reached through a link made after the check, so it is
+    refused there and the namespace's checkpoint is left as it was."""
+    monkeypatch.chdir(tmp_path)
+    namespace = _namespace_state_dir(tmp_path, 7).parent
+    namespace.mkdir(parents=True)
+    _memory_checkpoint(namespace / "state", "af-namespace")
+    from autoforge.config import AutoForgeConfig
+
+    engine = ControllerEngine(
+        config=AutoForgeConfig(), state_dir=str(tmp_path / "a" / "state"), workdir=tmp_path
+    )
+    assert engine.require_checkpoint_owner(standalone="step") is True
+    (tmp_path / "a").symlink_to(namespace)
+    before = state_tree(namespace / "state")
+    with pytest.raises(SchedulerStateDirError, match="inside the parallel EPIC scheduler's root"):
+        engine.load()
+    assert state_tree(namespace / "state") == before
+    engine.close()
+    # The same directory, existing when it is checked, is refused at once.
+    engine = ControllerEngine(
+        config=AutoForgeConfig(), state_dir=str(tmp_path / "a" / "state"), workdir=tmp_path
+    )
+    with pytest.raises(SchedulerStateDirError):
+        engine.require_checkpoint_owner(standalone="step")
+    assert engine.require_checkpoint_owner() is True  # unblock's check: no refusal
+    engine.close()
+
+
+def test_status_json_reads_a_legacy_memory_off_checkpoint_with_no_issue_url(
+    tmp_path, monkeypatch, capsys, fakes
+):
+    """R3-F6 of PR #526: the state loader accepts a protocol-19 checkpoint
+    whose run names no issue, and loads it with Memory off. ``status --json``
+    and ``memory show --json`` read it, the empty store summarized without
+    Memory's scope rules, and write nothing."""
+    monkeypatch.chdir(tmp_path)
+    state_dir = tmp_path / ".autoforge"
+    state_dir.mkdir()
+    data = AutoForgeState(
+        run_id="af-legacy",
+        repository="owner/repo",
+        epic_url=EPIC,
+        current_issue_url="",
+        phase=Phase.INITIALIZING,
+        step_count=3,
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    ).to_dict()
+    data["protocol_version"] = "19"
+    del data["launch_seq"], data["issue_memory"]
+    (state_dir / "state.json").write_text(json.dumps(data))
+    loaded = load_state(state_dir / "state.json")
+    assert loaded.current_issue_url == "" and loaded.issue_memory == {}
+    before = state_tree(state_dir)
+    assert cli.main(["--state-dir", str(state_dir), "status", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["memory"] == {
+        "enabled": False,
+        "revision": 0,
+        "digest": hashlib.sha256(b"{}").hexdigest(),
+        "refusals": 0,
+        "records": {},
+    }
+    assert "issue_memory" not in printed and printed["launch_seq"] == 3
+    assert cli.main(["--state-dir", str(state_dir), "memory", "show", "--json"]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert (shown["enabled"], shown["records"], shown["revision"]) == (False, [], 0)
+    assert state_tree(state_dir) == before
 
 
 @pytest.mark.parametrize("spelling", ["missing/../.autoforge", "a/b/.autoforge"])
