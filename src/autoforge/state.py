@@ -63,6 +63,7 @@ from .effects import (
 from .errors import ConfigurationError, StateError, StateProtocolError
 from .evidence import EvidenceFields, RecordView, check_evidence
 from .loop_guard import validate_review_history
+from .memory import MemoryStore
 from .provenance import ControllerIdentity, protocol_ranges, shown, shown_path
 from .replan_txn import LEGACY_JOURNAL_PROTOCOLS, legacy_journal_refusal
 from .result_parser import (
@@ -259,7 +260,8 @@ _PRE_AUTO_RECOVERY_PROTOCOL = "17"
 # ``delivered_reply: {}`` (no reply kept, which is all an older controller
 # could leave: it held such a reply in memory only), and relabelled. An older
 # file that carries the field is refused (:func:`_refuse_delivered_reply`).
-_PREVIOUS_PROTOCOL = "18"
+_PRE_DELIVERED_REPLY_PROTOCOL = "18"
+_PREVIOUS_PROTOCOL = "19"
 # Every label :meth:`AutoForgeState.from_dict` has a rule for: the current
 # one and each older one it migrates or refuses by its own rule. Any other
 # label is refused by :func:`protocol_support`'s classification before the
@@ -278,6 +280,7 @@ SUPPORTED_PROTOCOLS: frozenset[str] = frozenset(
         _PRE_STOP_CODE_PROTOCOL,
         _PRE_PARTIAL_FIX_PROTOCOL,
         _PRE_AUTO_RECOVERY_PROTOCOL,
+        _PRE_DELIVERED_REPLY_PROTOCOL,
         _PREVIOUS_PROTOCOL,
         __protocol_version__,
     }
@@ -939,11 +942,26 @@ class AutoForgeState:
     updated_at: str = ""
 
     # -- serialization -------------------------------------------------
+    # ADR 0015 D19: advisory store and monotonic launch-intent identity.
+    issue_memory: dict = field(default_factory=dict)
+    launch_seq: int = 0
+
     def to_dict(self) -> dict:
         d = asdict(self)
         d["phase"] = self.phase.value
         d["mode"] = self.mode.value
         return d
+
+    def memory(self) -> MemoryStore:
+        return MemoryStore(self.repository, self.run_id, self.launch_seq, self.issue_memory)
+
+    def memory_setting(self, enabled: bool) -> dict:
+        """The validated checkpoint value with a new opt-in setting, without a write."""
+        if not enabled and not self.issue_memory:
+            return {}
+        raw = self.issue_memory or {"run_id": self.run_id, "events": [], "texts": {}, "refusals": 0}
+        raw = {**raw, "enabled": enabled}
+        return MemoryStore(self.repository, self.run_id, self.launch_seq, raw).encode()
 
     @classmethod
     def from_dict(cls, data: dict) -> AutoForgeState:
@@ -1244,6 +1262,7 @@ class AutoForgeState:
             _PRE_STOP_CODE_PROTOCOL,
             _PRE_PARTIAL_FIX_PROTOCOL,
             _PRE_AUTO_RECOVERY_PROTOCOL,
+            _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1318,6 +1337,7 @@ class AutoForgeState:
             _PRE_STOP_CODE_PROTOCOL,
             _PRE_PARTIAL_FIX_PROTOCOL,
             _PRE_AUTO_RECOVERY_PROTOCOL,
+            _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1335,6 +1355,7 @@ class AutoForgeState:
             _PRE_STOP_CODE_PROTOCOL,
             _PRE_PARTIAL_FIX_PROTOCOL,
             _PRE_AUTO_RECOVERY_PROTOCOL,
+            _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1343,6 +1364,7 @@ class AutoForgeState:
         if raw_protocol in (
             _PRE_PARTIAL_FIX_PROTOCOL,
             _PRE_AUTO_RECOVERY_PROTOCOL,
+            _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1354,7 +1376,12 @@ class AutoForgeState:
         else:
             # 15 -> 16 (#374): the stop code is written from protocol 16 on.
             _refuse_stop_code(data, str(raw_protocol))
-        if raw_protocol in (_PRE_AUTO_RECOVERY_PROTOCOL, _PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol in (
+            _PRE_AUTO_RECOVERY_PROTOCOL,
+            _PRE_DELIVERED_REPLY_PROTOCOL,
+            _PREVIOUS_PROTOCOL,
+            __protocol_version__,
+        ):
             # Every protocol-17 save writes it, ``{}`` included, so an absent
             # one is a truncation or a hand edit, never "no partial fix".
             _require_fields(
@@ -1368,7 +1395,11 @@ class AutoForgeState:
             # 16 -> 17 (#433): the partial fix state is written from protocol
             # 17 on.
             _refuse_partial_fix_state(data, str(raw_protocol))
-        if raw_protocol in (_PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol in (
+            _PRE_DELIVERED_REPLY_PROTOCOL,
+            _PREVIOUS_PROTOCOL,
+            __protocol_version__,
+        ):
             # Every protocol-18 save writes it, ``{}`` included, so an absent
             # one is a truncation or a hand edit: read as the empty default it
             # would refill an allowance a decision already spent.
@@ -1383,7 +1414,7 @@ class AutoForgeState:
             # 17 -> 18 (#434): the recovery journal is written from protocol
             # 18 on.
             _refuse_auto_recovery_state(data, str(raw_protocol))
-        if raw_protocol == __protocol_version__:
+        if raw_protocol in (_PREVIOUS_PROTOCOL, __protocol_version__):
             # Every protocol-19 save writes it, ``{}`` included, so an absent
             # one is a truncation or a hand edit: read as the empty default it
             # would drop a reply the step goes on from and launch the agent
@@ -1399,10 +1430,26 @@ class AutoForgeState:
             # 18 -> 19 (#479): the delivered reply is written by this protocol
             # only.
             _refuse_delivered_reply(data, str(raw_protocol))
+        memory_fields = ("issue_memory", "launch_seq")
+        if raw_protocol == __protocol_version__:
+            _require_fields(
+                data,
+                raw_protocol,
+                memory_fields,
+                "Issue Working Memory",
+                "not a run with Memory off",
+            )
+        elif any(name in data for name in memory_fields):
+            raise StateError(
+                "older state protocol never wrote 'issue_memory' or 'launch_seq'; refusing to load"
+            )
         kwargs = dict(data)
         kwargs["phase"] = phase
         kwargs["mode"] = mode
         kwargs["protocol_version"] = __protocol_version__
+        if raw_protocol != __protocol_version__:
+            kwargs["launch_seq"] = data.get("step_count", 0)
+            kwargs["issue_memory"] = {}
         if raw_protocol not in (
             _PRE_CONFIG_PROTOCOL,
             _PRE_VALIDATION_PROTOCOL,
@@ -1414,6 +1461,7 @@ class AutoForgeState:
             _PRE_STOP_CODE_PROTOCOL,
             _PRE_PARTIAL_FIX_PROTOCOL,
             _PRE_AUTO_RECOVERY_PROTOCOL,
+            _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1428,6 +1476,7 @@ class AutoForgeState:
             _PRE_STOP_CODE_PROTOCOL,
             _PRE_PARTIAL_FIX_PROTOCOL,
             _PRE_AUTO_RECOVERY_PROTOCOL,
+            _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1438,6 +1487,7 @@ class AutoForgeState:
             _PRE_STOP_CODE_PROTOCOL,
             _PRE_PARTIAL_FIX_PROTOCOL,
             _PRE_AUTO_RECOVERY_PROTOCOL,
+            _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1447,6 +1497,7 @@ class AutoForgeState:
         if raw_protocol not in (
             _PRE_PARTIAL_FIX_PROTOCOL,
             _PRE_AUTO_RECOVERY_PROTOCOL,
+            _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1455,17 +1506,22 @@ class AutoForgeState:
             kwargs["stop_code"] = ""
         if raw_protocol not in (
             _PRE_AUTO_RECOVERY_PROTOCOL,
+            _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
             # Before protocol 17 (#433): over the migrations above, so a FIX
             # context of any older label gains both keys.
             kwargs.update(_partial_fix_migration(kwargs))
-        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol not in (
+            _PRE_DELIVERED_REPLY_PROTOCOL,
+            _PREVIOUS_PROTOCOL,
+            __protocol_version__,
+        ):
             # Before protocol 18 (#434): no recovery decision was taken, so
             # every step's allowance is unspent.
             kwargs["auto_recovery"] = {}
-        if raw_protocol != __protocol_version__:
+        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
             # Before protocol 19 (#479): no reply was kept; an older controller
             # held one in memory only.
             kwargs["delivered_reply"] = {}
@@ -1485,6 +1541,7 @@ class AutoForgeState:
             _PRE_STOP_CODE_PROTOCOL,
             _PRE_PARTIAL_FIX_PROTOCOL,
             _PRE_AUTO_RECOVERY_PROTOCOL,
+            _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
@@ -1583,6 +1640,10 @@ class AutoForgeState:
         _validate_partial_fix(state)
         _validate_auto_recovery(state)
         _validate_delivered_reply(state)
+        if not 0 <= state.launch_seq <= 2**63 - 1:
+            raise StateError("state field 'launch_seq' is out of range")
+        if not isinstance(state.issue_memory, dict) or state.issue_memory:
+            state.memory()
         _validate_operator_state(state)
         _validate_config_fingerprint(state)
         _validate_sandbox_pin(state)

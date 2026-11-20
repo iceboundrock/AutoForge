@@ -614,6 +614,15 @@ Protocol 18 → 19 (#479, R1-F1 of PR #481) added the kept reply: the field `del
 
 Protocol 5 → 7 (#160) added the effect state above (`effect_records`, `entry_observation`, `completion_context`, `launch_label`). Protocol 6 is skipped, and stays skipped for good: #23 once reserved it for #126, which now takes the next number like every other bump (see "Numbering a new protocol" below). The number this bump took was settled on #23 before it merged. State persisted under protocol 5, or under any older protocol that its own rules load, carries no effect state and loads as none; a legacy file that does carry one of these fields is a hand edit or a foreign file and is refused. A legacy REMOTE file with `attempt >= 1` gets the launch label `agent_publishes` for a phase whose agent published under the previous contract, so that the first entry of this version knows an agent may already have published (D13.3). `UPDATE_EPIC` is the one such phase whose publication this version performs itself: its one-shot legacy re-entry adopts the progress comment that agent posted, with no record, and asks for the selection only (D13.7; [github-safety.md](github-safety.md), "Before UPDATE_EPIC"). LOCAL state, whatever its protocol, carries no effect state.
 
+Protocol 19 → 20 (#317, ADR 0015) adds `issue_memory` and `launch_seq`.
+Every protocol-20 save writes both, including when Memory is off. A
+protocol-19 file, or any older file its own rules load, loads with Memory
+off (`{}`) and `launch_seq` initialized to `step_count`, then is relabelled
+on the next save. An older label carrying either new field is refused.
+The launch-intent save increments the ordinal; retry, resume, unblock
+and issue changes never reset it. An ordinal is not a launch receipt.
+The new fields and migration were [announced on issue #23](https://github.com/iceboundrock/AutoForge/issues/23#issuecomment-7017724690).
+
 **Numbering a new protocol.** A change that adds or changes persisted state takes N + 1, where N is `__protocol_version__` on `main` when its PR is ready to merge, and it makes that bump alone: two independent persisted changes never share one. Before the PR merges, its issue announces N → N + 1, the new fields and the migration rule on #23, the home of protocol numbering. If `main` moves past N first, the PR rebases, takes the new N + 1 and says so there; after the merge, #23 records the squash commit. No number is reserved ahead of time. Label 6 stays skipped: never written, and refused as unknown like a future label (`tests/test_state.py`, `test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged`). Each bump states its migration rule in this section, in the form above: what a file of the previous protocol loads as, what an older-labelled file carrying the new state is refused as, and which new field a file of the new protocol must carry.
 
 ---
@@ -679,6 +688,13 @@ As implemented (`flock(2)`, `src/autoforge/locking.py`):
 - A working directory outside a git repository has no lock to take and is
   refused (exit 2, nothing written), so `run`, `step` and `resume` require
   one (a REMOTE dry-run does not).
+- Mutating standalone commands refuse a checkpoint in another checkout's
+  repository, including another clone of the same remote. They check the
+  path before taking L0 and again under it, without assuming that an older
+  snapshot of the checkpoint still holds. A standalone state directory
+  positively identified as outside Git keeps working for Memory-off runs;
+  ambiguous Git discovery errors are refused. `memory retract` also
+  refuses scheduler-owned state and always requires the owning repository.
 - The lock is the working directory's, whatever `--state-dir` names, so
   `rebind-epic` (#435) also binds its state directory to it: `git rev-parse
   --git-common-dir` run from the state directory must name the same git

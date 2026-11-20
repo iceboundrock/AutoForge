@@ -867,6 +867,11 @@ class AgentProvider:
     ``stdin_payload`` when the prompt does not travel in argv."""
 
     name = "base"
+
+    def proves_fresh_context(self, profile: ProfileConfig) -> bool:
+        """Default deny: neither a version string nor session flags alone are proof."""
+        return False
+
     # The environment variables this provider's CLI reads for its own
     # authentication and configuration, added to the request's allow-list.
     # Names, never values: the executor selects them from the environment.
@@ -2834,6 +2839,11 @@ class PiProvider(AgentProvider):
                     f"built-in tools ({', '.join(PI_TOOLS)}): {problem}, "
                     f"got {profile.options['tools']!r}"
                 )
+
+    def proves_fresh_context(self, profile: ProfileConfig) -> bool:
+        # Pi's fixed no-session argv and disabled resource loading, including
+        # context-file discovery. No passthrough args may override these.
+        return not profile.extra_args and not self.context_files(profile)
 
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
         # The prompt is deliberately absent: it reaches Pi as a JSON `prompt`

@@ -212,6 +212,7 @@ probe file it creates and removes there.
 | `profiles` | provider, model, effort, command, idle timeout, maximum runtime and provider options per logical profile | [Profiles](#profiles) below |
 | `github` | the `gh` binary (a relative path, and a relative `PATH` entry a bare name is found through, is resolved against the directory AutoForge starts in: every `gh` runs in an empty directory of its own) and its timeout | [GitHub safety](agent-guides/github-safety.md#controller-owned-effects) |
 | `validation` | REMOTE candidate validation (#172): `commands` (argv lists, empty by default), `scope` (`candidate-tree`, the only value) | [Candidate validation](#candidate-validation) below, [State and recovery](agent-guides/state-and-recovery.md#validation-evidence) |
+| `memory` | Issue Working Memory: `enabled` (default `false`) | [Issue Working Memory](usage.md#issue-working-memory) |
 | `scheduler` | the parallel EPIC scheduler (#182, `autoforge epic`): `max_parallel` (1-4, default 2; `epic run --max-parallel` overrides it), `poll_interval_seconds` (15-3600, default 60), `stop_grace_seconds` (10-600, default 30) | [Parallel EPIC scheduler](#parallel-epic-scheduler) below, [Workflow](agent-guides/workflow.md#scheduler-execution-policy) |
 | `sandbox` | the outer sandbox (#168, #169): `mode` (`disabled`, the default, `preferred` or `required`), `validation_network` and `premerge_network` (`host`, the default, or `isolated`), `read_only_paths`; the container backend's seed settings under `sandbox.container` (`history_depth` 0, `history_tags` false, `seed_max_bytes` 2 GiB, `seed_max_objects` 1,000,000; read by nothing before that backend is selectable) | [Outer sandbox](#outer-sandbox) below, [The container backend's seed](#the-container-backends-seed-sandboxcontainer), [Architecture](agent-guides/architecture.md#launch-routing-adr-0005-168) |
 
@@ -1097,6 +1098,20 @@ socket) do not get it; curl and wget get none of their configured defaults
 zsh startup files, and a fish `SHELL` is replaced with `bash`; and the
 provider integrations above stay off. The guarantees and what they do not cover are in
 [GitHub safety](agent-guides/github-safety.md#agents-hold-no-github-credential).
+
+## Issue Working Memory
+
+`memory.enabled: true` opts a run into the advisory checkpoint store. The
+`analyze_execute` profile must be Pi with `options.context_files: false`.
+The adapter uses a fresh session and disables resource loading; it adds no
+flags to Memory-off launches. Other providers are refused when Memory is
+on. In particular, a Claude session-persistence setting alone establishes
+nothing about auto-memory. No runtime version probe is made.
+
+Changing the recorded `memory.enabled` on `step`, `resume` or `unblock`
+requires `--accept-config-change`. Turning it off disables the projection
+and writes to the ledger, but does not erase the ledger. Automatic
+collection and delivery are not part of this release.
 
 ## Candidate validation
 

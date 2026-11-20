@@ -25,6 +25,11 @@ version: 1
 
 state_dir: .autoforge
 
+# Issue Working Memory stays off unless explicitly enabled. Enabling it
+# requires a Pi analyze_execute profile with options.context_files: false.
+# memory:
+#   enabled: false
+
 # `prompt_version` is left unset. The prompt version a new run records (in
 # the state file, the run logs and every prompt) is the controller's own
 # label for the templates it renders, and the key does not select templates:

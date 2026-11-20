@@ -11009,6 +11009,7 @@ def _as_protocol_5(eng, *, attempt: int) -> None:
     """Rewrite the state file as the previous protocol left it: no effect state."""
     data = json.loads(eng.paths.state_file.read_text())
     data["protocol_version"] = "5"
+    del data["issue_memory"], data["launch_seq"]
     data["attempt"] = attempt
     for key in (
         "effect_records",
@@ -11058,7 +11059,7 @@ def test_update_epic_legacy_reentry_adopts_the_agents_comment_and_asks_for_the_s
     assert "posted by an agent under the previous contract" in call.prompt
     assert _progress_posts(fake_github) == [] and len(fake_github.comments[EPIC]) == 1
     s = load_state(eng.paths.state_file)
-    assert s.current_issue_url == ISSUE3 and s.protocol_version == "19"
+    assert s.current_issue_url == ISSUE3 and s.protocol_version == "20"
     assert s.effect_records == []  # adopted with no record (D13.7)
 
 
@@ -11610,6 +11611,7 @@ def test_oversized_resolution_never_reaches_state_or_a_prompt(tmp_state_dir, fak
     expected = json.loads(before) | {
         "attempt": 1,
         "step_count": 1,
+        "launch_seq": 1,
         "launch_label": "controller_publishes",
         "review_evidence": persisted["review_evidence"],
     }

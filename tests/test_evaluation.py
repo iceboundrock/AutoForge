@@ -441,10 +441,12 @@ def test_every_section_of_the_configuration_is_classified():
 def test_a_new_section_is_refused_until_it_is_classified():
     extended = dataclasses.make_dataclass(
         "Extended",
-        [("memory", dict, dataclasses.field(default_factory=dict))],
+        [("another_treatment", dict, dataclasses.field(default_factory=dict))],
         bases=(AutoForgeConfig,),
     )
-    with pytest.raises(ev.EvaluationError, match=r"\['memory'\] are neither held equal nor exempt"):
+    with pytest.raises(
+        ev.EvaluationError, match=r"\['another_treatment'\] are neither held equal nor exempt"
+    ):
         ev.equalized_settings(extended())
 
 

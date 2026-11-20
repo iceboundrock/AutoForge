@@ -128,6 +128,7 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/interaction.py": LOOP,
     "src/autoforge/locking.py": LOOP,
     "src/autoforge/loop_guard.py": (*LOOP, "test_routing"),
+    "src/autoforge/memory.py": ("test_memory", "test_cli", "test_adr_0015"),
     "src/autoforge/profiles.py": LOOP,
     "src/autoforge/progress.py": LOOP,
     "src/autoforge/read_context.py": LOOP,

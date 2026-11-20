@@ -870,6 +870,7 @@ TOP_LEVEL_KEYS = (
     "validation",
     "scheduler",
     "profiles",
+    "memory",
 )
 
 
@@ -898,6 +899,11 @@ class AgentLimits:
         return f"idle timeout {idle}, max runtime {ceiling}"
 
 
+@dataclass(frozen=True)
+class MemoryConfig:
+    enabled: bool = False
+
+
 @dataclass
 class AutoForgeConfig:
     version: int = CONFIG_VERSION
@@ -912,6 +918,7 @@ class AutoForgeConfig:
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     scheduler: EpicSchedulerConfig = field(default_factory=EpicSchedulerConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
     profiles: dict[str, ProfileConfig] = field(default_factory=dict)
 
     def profile(self, name: str) -> ProfileConfig:
@@ -919,6 +926,17 @@ class AutoForgeConfig:
             return self.profiles[name]
         except KeyError:
             raise ConfigurationError(f"unknown execution profile {name!r}") from None
+
+    def validate_memory(self) -> None:
+        if self.memory.enabled:
+            from .providers import provider_for
+
+            profile = self.profile("analyze_execute")
+            if not provider_for(profile).proves_fresh_context(profile):
+                raise ConfigurationError(
+                    "Memory needs a fresh-context analyze_execute profile; "
+                    "use Pi with context files disabled, or turn Memory off"
+                )
 
     def environment_overlap(self) -> str:
         """:meth:`ExecutionConfig.environment_overlap` for the providers of every
@@ -1126,6 +1144,7 @@ def load_config_file(path: str | Path | None) -> AutoForgeConfig:
     if not isinstance(data, dict):
         raise ConfigurationError(f"config {p} must contain a mapping at top level")
     merged = _merge_config(cfg, data, source=str(p))
+    merged.validate_memory()
     problem = merged.environment_overlap()
     if problem:
         raise ConfigurationError(f"{p}: {problem}")
@@ -1141,7 +1160,10 @@ def config_digest(cfg: AutoForgeConfig) -> str:
     It covers every field of the effective configuration, the defaults a
     file left in force included; it is a comparison, never shown.
     """
-    document = json.dumps(asdict(cfg), sort_keys=True, separators=(",", ":"), default=str)
+    data = asdict(cfg)
+    if not cfg.memory.enabled:
+        del data["memory"]  # Preserve the pre-Memory scheduler digest for existing runs.
+    document = json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(document.encode("utf-8")).hexdigest()
 
 
@@ -1488,6 +1510,11 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         base.state_dir = str(data["state_dir"])
     if "prompt_version" in data:
         base.prompt_version = _prompt_version(data["prompt_version"], source)
+    memory = _section(data, "memory", source, ("enabled",))
+    if "enabled" in memory:
+        if type(memory["enabled"]) is not bool:
+            raise ConfigurationError("memory.enabled must be a boolean")
+        base.memory = MemoryConfig(memory["enabled"])
     exe = _section(data, "execution", source, EXECUTION_KEYS, removed=REMOVED_EXECUTION_KEYS)
     # The executor treats a non-positive wall-clock timeout as "no timeout at
     # all", and an unbounded subprocess would hold the repository lock

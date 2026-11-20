@@ -2487,6 +2487,38 @@ A push to the PR, a retarget or a rewritten base still goes back to
 the new revision; a base that only advanced keeps it. A PR already merged
 on GitHub is counted once without one, as before.
 
+## Issue Working Memory
+
+Memory is off by default. To try the checkpoint and operator commands,
+configure [`memory.enabled`](configuration.md#issue-working-memory) and
+start the run with `autoforge run --issue ISSUE_URL --memory-seed FILE`.
+The optional seed must be nonempty UTF-8, at most 2,048 bytes, and unchanged
+by the run-log redactor. Its bytes and their SHA-256 digest are saved with
+the run, before the first launch. A new run does not inherit previous notes.
+
+`autoforge memory show --json` reads the current issue's catalog without a
+lock or write. `autoforge memory retract RECORD --reason WHY` takes the
+repository lock and withdraws a saved record by its numeric ID. A
+correction or retraction leaves a content digest that prevents reappearance
+within its scope and authority. Refusals are counted, not tombstoned. The
+store keeps at most 64 facts and 256 lifecycle events per run, and at most
+1 MiB of serialized state. It refuses writes beyond the bounds rather
+than evicting audit history.
+
+The provider-neutral projection uses the committed revision, one bound
+launch and retained typed receipts. A validation receipt can establish
+only what it records for that issue and exact candidate, not adjacent
+commentary. A supersession cannot hide a verified statement without
+matching check, policy, outcome and candidate evidence. Missing or
+unmatched evidence downgrades rather than verifies. The full projection,
+including headings and omission notices, is at most 16,384 characters
+and 16,384 UTF-8 bytes (a conservative byte-level token bound).
+
+No launch is shown Memory and no observations are captured automatically
+yet; that is #333. With `sandbox.mode: disabled`, an agent of the same UID
+can reach the state directory by absolute path. The ledger remains advisory
+and grants no workflow or GitHub authority.
+
 ## Logging and redaction
 
 Every agent invocation is logged under `<state dir>/logs/<run-id>/`. Logs

@@ -452,6 +452,7 @@ from .github import (
 from .interaction import InteractionBroker, Lifecycle, Resolver, Unattended
 from .locking import (
     ControllerLock,
+    NoRepository,
     SharedGitLock,
     assert_shared_git_lock_free,
     repository_lock_path,
@@ -2239,10 +2240,12 @@ class ControllerEngine:
         """
         state = self._require_state()
         pin = self._sandbox_pin_record(source)
+        memory = state.memory_setting(self.config.memory.enabled)
         state.config_fingerprint = self._fingerprint_record(
             self.invocation_config_fingerprint(), source
         )
         state.sandbox_pin = pin
+        state.issue_memory = memory
 
     def _fingerprint_record(self, fingerprint: ConfigFingerprint, source: str) -> dict:
         """The persisted form of ``fingerprint`` as this invocation's; ConfigurationError
@@ -2296,6 +2299,12 @@ class ControllerEngine:
         dry run too, before anything is recorded or logged.
         """
         state = self._require_state()
+        memory_change = bool(state.issue_memory.get("enabled")) != self.config.memory.enabled
+        if memory_change and not accept_change:
+            raise ConfigurationDriftError(
+                "memory.enabled differs from the recorded run; restore it or use "
+                "--accept-config-change"
+            )
         recorded: RecordedConfiguration | None = None
         current: ConfigFingerprint | None = None
         changes: list[ConfigChange] = []
@@ -2330,6 +2339,14 @@ class ControllerEngine:
             else None
         )
         accepted = [*changes, *([downgrade] if downgrade else [])]
+        if memory_change:
+            accepted.append(
+                ConfigChange(
+                    "memory.enabled",
+                    json.dumps(not self.config.memory.enabled),
+                    json.dumps(self.config.memory.enabled),
+                )
+            )
         if accepted and not accept_change:
             refusals = []
             if changes:
@@ -2359,6 +2376,7 @@ class ControllerEngine:
             else ""
         )
         new_pin = self._sandbox_pin_record(pin_source) if pin_source else None
+        new_memory = state.memory_setting(self.config.memory.enabled) if memory_change else None
         notices = self._configuration_notices(
             upgrade, accepted, pin, dry_run=dry_run, fingerprint_changed=bool(changes)
         )
@@ -2375,6 +2393,8 @@ class ControllerEngine:
             state.config_fingerprint = fingerprint
         if new_pin is not None:
             state.sandbox_pin = new_pin
+        if new_memory is not None:
+            state.issue_memory = new_memory
         if accepted:
             self.save()
         return "\n".join(notices)
@@ -3741,6 +3761,36 @@ class ControllerEngine:
             )
         return ""
 
+    def require_checkpoint_owner(self, *, allow_external: bool = True) -> bool:
+        """Match the write target to L0 before reading a writable snapshot.
+
+        Return False only for the legacy Memory-off use of a directory
+        positively identified as outside Git. Every path to enabling or
+        writing Memory requires a repository match, irrespective of what a
+        previously loaded snapshot said.
+        """
+        path = self.paths.state_dir
+        try:
+            while True:
+                try:
+                    path.lstat()
+                except FileNotFoundError:
+                    path = path.parent
+                else:
+                    break
+            if self.paths.state_dir.is_symlink():
+                raise StateError("checkpoint directory is a symbolic link")
+            theirs = repository_lock_path(path, cross_filesystems=True).parent.parent
+        except NoRepository:
+            if allow_external and not self.config.memory.enabled:
+                return False
+            theirs = None
+        except (LockError, OSError):
+            raise LockError("cannot establish the checkpoint directory's repository") from None
+        if theirs != self.coordination_root():
+            raise LockError("checkpoint directory is not owned by this checkout's repository lock")
+        return True
+
     def state_dir_in_scheduler_root(self) -> bool:
         """Whether this engine's state dir lies in the scheduler root (ADR 0008 D17.3).
 
@@ -4094,6 +4144,7 @@ class ControllerEngine:
         """
         validate_required_profiles(self.config, REQUIRED_PROFILES)
         fingerprint_routing(self.config)
+        self.config.validate_memory()
 
     # -- prompt context ---------------------------------------------------
     @staticmethod
@@ -16784,6 +16835,15 @@ class ControllerEngine:
         profile = profile_for_phase(self.config, phase, state.review_round)
         provider = self.providers.get(profile)
         provider.validate_profile(profile)
+        if (
+            phase is Phase.ANALYZE_EXECUTE
+            and (self.config.memory.enabled or bool(state.issue_memory.get("enabled")))
+            and not provider.proves_fresh_context(profile)
+        ):
+            raise ConfigurationError(
+                "analyze_execute cannot prove fresh context with Memory; "
+                "use Pi with context files disabled, or turn Memory off"
+            )
         # What config load refuses, for this launch's provider: a name listed
         # for repository commands alone would reach this agent (#286).
         overlap = self.config.execution.environment_overlap(
@@ -16916,6 +16976,7 @@ class ControllerEngine:
                 state.step_count += 1
             attempt += 1
             state.attempt += 1
+            state.launch_seq += 1
             # D13.3: which publication contract this launch runs under, so a
             # later version can tell a launch of its own from one whose agent
             # published under the previous contract.

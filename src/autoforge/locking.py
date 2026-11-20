@@ -171,7 +171,27 @@ _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _BASE_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
 
 
-def repository_lock_path(workdir: str | Path, runner: Runner = execute) -> Path:
+class NoRepository(LockError):
+    """Git and the ancestor layout both rule out a containing repository."""
+
+
+def _no_git_ancestor(base: Path) -> bool:
+    try:
+        for path in (base, *base.parents):
+            for name in (".git", "HEAD", "commondir"):
+                try:
+                    (path / name).lstat()
+                except FileNotFoundError:
+                    continue
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def repository_lock_path(
+    workdir: str | Path, runner: Runner = execute, *, cross_filesystems: bool = False
+) -> Path:
     """Canonical lock path of the repository that contains ``workdir``.
 
     ``git rev-parse --git-common-dir`` names the git directory shared by all
@@ -186,6 +206,9 @@ def repository_lock_path(workdir: str | Path, runner: Runner = execute) -> Path:
     """
     base = Path(workdir)
     shown = base.resolve()  # messages only: "." tells the operator nothing
+    env = {"LC_ALL": "C"}
+    if cross_filesystems:
+        env["GIT_DISCOVERY_ACROSS_FILESYSTEM"] = "1"
     try:
         # Hardened like every controller git process (ADR 0004 D7.3), and
         # from the same environment as the workspace reader, so an operator's
@@ -193,7 +216,10 @@ def repository_lock_path(workdir: str | Path, runner: Runner = execute) -> Path:
         # another.
         res = runner(
             local_git_request(
-                _GIT_COMMON_DIR_ARGS, cwd=str(base), timeout_seconds=_GIT_TIMEOUT_SECONDS
+                _GIT_COMMON_DIR_ARGS,
+                cwd=str(base),
+                timeout_seconds=_GIT_TIMEOUT_SECONDS,
+                env=env,
             )
         )
     except ExecutionError as exc:
@@ -207,6 +233,15 @@ def repository_lock_path(workdir: str | Path, runner: Runner = execute) -> Path:
             f"cannot derive the controller lock for {shown}: git rev-parse output was truncated"
         )
     if res.exit_code != 0:
+        if (
+            res.exit_code == 128
+            and res.stderr.strip()
+            == "fatal: not a git repository (or any of the parent directories): .git"
+            and _no_git_ancestor(shown)
+        ):
+            raise NoRepository(
+                f"cannot derive the controller lock: {shown} is not inside a git repository"
+            )
         detail = (res.stderr or res.stdout).strip().splitlines()
         raise LockError(
             f"cannot derive the controller lock: {shown} is not inside a git repository "

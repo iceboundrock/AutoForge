@@ -278,7 +278,7 @@ None stands in for another:
 | `RunID` | `AutoForgeState.run_id`, `af-<UTC stamp>-<6 hex>` (`generate_run_id`) | yes, today |
 | `StepKey` | phase, issue URL, PR URL, review round, execution attempt (`auto_recovery.StepKey`) | today in the recovery journal; derived for every step |
 | `TaskID` | `(RunID, StepKey, ordinal)`: the task's ordinal in its step, from 1, allocated when the task is proposed and never reused in the step; a producing task admitted after an `unblock` into the same step takes the next (D3) | no: nothing names a task in the single-agent path; persisted by #332, with the step's ordinal counter |
-| `AttemptID` | `(RunID, launch_seq)`: the run-wide launch ordinal the attempt's launch-intent save allocates (D2.1). The receipt names the task the attempt belongs to | no: `launch_seq` is new (D19.2); `state.attempt` is a counter, not an identity |
+| `AttemptID` | `(RunID, launch_seq)`: the run-wide launch ordinal the attempt's launch-intent save allocates (D2.1). The receipt names the task the attempt belongs to | `launch_seq` is saved from protocol 20 (#317); `state.attempt` is a counter, not an identity |
 | role | a closed enum (D7.1) | derived in the single-agent path; persisted by #332 |
 | candidate | base: the revision the entry observation required (ADR 0004 D4.4); candidate: a `RemoteCandidate` (ADR 0006 D2.1), the commit the phase's candidate check accepted (D2.4) | yes, today, where ADR 0006 records it |
 | phase | `Phase` | yes |
@@ -1632,6 +1632,14 @@ exception to AutoForge creating no local refs, amends `AGENTS.md` and the
 relevant guide (#319, D7.7); and a new stop code amends ADR 0011.
 
 ### D20. What the Memory MVP needs
+
+**Implementation note (#317).** Protocol 20 ships the atomic store, seed
+and retraction commands, and the pure projection. Automatic writers and
+launch delivery remain #333's. For this first slice, only the Pi adapter
+with context files disabled supplies D14's proof. Claude's no-session
+option does not prove auto-memory is off; it is refused when Memory is on,
+as are the other adapters without a proof. AutoForge does not start a
+version probe or change how any Memory-off launch runs.
 
 | Needs | Does not need |
 |---|---|
