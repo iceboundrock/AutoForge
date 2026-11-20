@@ -1663,7 +1663,11 @@ retracted reserves one event slot and the bytes of one operator retraction,
 so the operator's retraction (D9.4) is never refused for a bound. Every
 revision names the record revision it acts on. An agent's revision comes
 from an acceptance save, from a launch no earlier than the record's latest
-change. A stale one is refused, on write and on load. A revision is
+change. Every revision row also records the launch ordinal it was written
+at; the operator's and the controller's are known only to the launches
+after it, so a result of a launch up to that watermark cannot revise what
+they changed, whatever revision it names. A stale one is refused, on write
+and on load. A revision is
 compared with the saved rows in its canonical form, so the same input
 again is a replay, whatever the case of its URLs. A superseded record
 stays superseded when its replacement is retracted. Only a validation

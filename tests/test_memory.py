@@ -658,8 +658,9 @@ def test_a_late_or_stale_agent_revision_is_refused_and_the_newer_one_stays():
     # Replay of the applied correction changes nothing and counts nothing.
     again = correct(newer, 1, "attempt three", attempt=3, expected=1)
     assert again.status == "replay" and again.store is newer
-    # The same rules hold on load: the stale row, written by hand, is refused.
-    for attempt, expected in ((2, 1), (2, 5), (4, 1)):
+    # The same rules hold on load: the stale row, written by hand, is refused,
+    # and the same row from a current launch loads.
+    for attempt, expected in ((2, 1), (2, 5), (4, 1), (4, 5)):
         raw = newer.encode()
         digest = hashlib.sha256(b"attempt two").hexdigest()
         raw["events"].append(
@@ -672,11 +673,15 @@ def test_a_late_or_stale_agent_revision_is_refused_and_the_newer_one_stays():
                 expected=expected,
                 reason="late",
                 value=digest,
+                watermark=newer.launch_seq,
             )
         )
         raw["texts"] = {k: v for k, v in raw["texts"].items() if v != "attempt three"} | {
             digest: "attempt two"
         }
+        if (attempt, expected) == (4, 5):
+            MemoryStore(REPO, RUN, newer.launch_seq, raw)
+            continue
         with pytest.raises(StateError):
             MemoryStore(REPO, RUN, newer.launch_seq, raw)
     # A current revision applies, and the operator's retraction acts on it.
@@ -685,6 +690,106 @@ def test_a_late_or_stale_agent_revision_is_refused_and_the_newer_one_stays():
     assert revise(latest, Action.RETRACT, 1, expected=5).status == "refused"
     done = reload(apply(revise(latest, Action.RETRACT, 1)))
     assert done.catalog(ISSUE)["records"][0]["status"] == "retracted"
+
+
+@pytest.mark.parametrize("action", [Action.CORRECT, Action.SUPERSEDE])
+def test_an_earlier_launch_cannot_revise_what_the_operator_changed_after_it(action):
+    """R5-F2 of PR #526: the operator changes M1 at launch watermark 128. An
+    accepted result of launch 2, or of launch 128 itself, both started before
+    that change, names the revision it made and is refused, after reload,
+    with the operator's change unchanged. Launch 129 is the first that saw
+    it, and may revise it. The watermark is saved with the row and checked
+    again on load."""
+    st = apply(proposal(empty(), text="the agent's idea", n=1))
+    st = apply(proposal(st, text="the agent's other idea", n=2))
+    if action is Action.CORRECT:
+        st = reload(apply(revise(st, Action.CORRECT, 1, text="the operator's correction")))
+    else:
+        st = reload(apply(revise(st, Action.SUPERSEDE, 1, replacement=2)))
+    row = st.encode()["events"][-1]
+    assert row["actor"] == "operator" and row["attempt"] == 0 and row["watermark"] == 128
+    revision = st.catalog(ISSUE)["records"][0]["revision"]
+    assert revision == 3
+    for attempt in (2, 128):
+        late = [
+            correct(st, 1, "an earlier launch's text", attempt=attempt, expected=revision),
+            revise(
+                st,
+                Action.RETRACT,
+                1,
+                actor=Actor.AGENT,
+                step=STEP,
+                attempt=attempt,
+                expected=revision,
+            ),
+        ]
+        for out in late:
+            assert out.status == "refused"
+            assert out.store.encode() == dict(st.encode(), refusals=1)
+            again = reload(out.store)
+            if action is Action.CORRECT:
+                assert "the operator's correction\n" in render_projection(again, REQ).text
+            assert again.catalog(ISSUE)["records"][0]["revision"] == revision
+        # Written by hand, the same row is refused on load.
+        with pytest.raises(StateError):
+            MemoryStore(REPO, RUN, 128, _late_retraction(st, attempt, revision, 128))
+    # ... and loads from the next launch, at its watermark.
+    MemoryStore(REPO, RUN, 129, _late_retraction(st, 129, revision, 129))
+    # The next launch saw the operator's change: its accepted result revises it.
+    later = MemoryStore(REPO, RUN, 129, st.encode())
+    out = revise(later, Action.RETRACT, 1, actor=Actor.AGENT, step=STEP, attempt=129)
+    assert out.status == "applied"
+    done = MemoryStore(REPO, RUN, 129, json.loads(json.dumps(out.store.encode())))
+    assert done.catalog(ISSUE)["records"][0]["status"] == "retracted"
+    assert done.encode()["events"][-1]["watermark"] == 129
+    if action is Action.CORRECT:
+        fixed = MemoryStore(REPO, RUN, 129, st.encode())
+        fixed = apply(correct(fixed, 1, "launch 129's text", attempt=129, expected=revision))
+        assert (
+            "launch 129's text\n"
+            in render_projection(reload(fixed), replace(REQ, attempt=130)).text
+        )
+    # A watermark is the launch ordinal of its write: never past the store's,
+    # never below an earlier row's or its own launch's.
+    for edit in (
+        {"watermark": 129},
+        {"watermark": 1},
+        {"watermark": -1},
+        {"watermark": "128"},
+    ):
+        raw = st.encode()
+        raw["events"][-1] = dict(raw["events"][-1], **edit)
+        with pytest.raises(StateError):
+            MemoryStore(REPO, RUN, 128, raw)
+    del raw["events"][-1]["watermark"]
+    with pytest.raises(StateError):
+        MemoryStore(REPO, RUN, 128, raw)
+    # An agent's row is written at its launch's watermark or after it.
+    fresh = apply(proposal(empty(), text="the agent's idea", n=1))
+    with pytest.raises(StateError):
+        MemoryStore(REPO, RUN, 128, _late_retraction(fresh, 5, 1, 3))
+    MemoryStore(REPO, RUN, 128, _late_retraction(fresh, 3, 1, 5))
+
+
+def _late_retraction(store, attempt, expected, watermark):
+    """``store``'s value with an agent's retraction of M1 written by hand."""
+    raw = store.encode()
+    raw["events"].append(
+        dict(
+            action="retract",
+            actor="agent",
+            step=STEP.to_dict(),
+            attempt=attempt,
+            target=1,
+            expected=expected,
+            reason="late",
+            value=None,
+            watermark=watermark,
+        )
+    )
+    live = {store._facts[1].content}
+    raw["texts"] = {k: v for k, v in raw["texts"].items() if k not in live}
+    return raw
 
 
 def test_a_replacement_the_budget_cuts_does_not_hide_the_claim_it_carries():

@@ -31,6 +31,9 @@ MAX_FACTS = 64
 MAX_TEXT_BYTES = 2048
 MAX_REASON_BYTES = 256
 MAX_COUNTER = 2**31 - 1
+# The highest launch ordinal a checkpoint holds (``launch_seq``): the loader's
+# bound, the launch-intent save's and a projection's (R5-F5 of PR #526).
+MAX_LAUNCH_SEQ = 2**63 - 1
 MAX_PROJECTION_CHARS = 16_384
 MAX_PROJECTION_BYTES = 16_384  # Conservative token bound for byte-level tokenizers.
 _SHA = re.compile(r"(?:[a-f0-9]{40}|[a-f0-9]{64})")
@@ -327,8 +330,10 @@ class MemoryFact:
     revision: int
     replacement: int = 0
     withdrawn: bool = False
-    # The latest launch ordinal that created or changed the record. A launch
-    # earlier than it never saw the revision it would act on.
+    # The first launch ordinal that knows the record as it is: the launch of
+    # an agent's add or revision, the one after the watermark of the
+    # operator's or the controller's. An agent's revision from an earlier
+    # launch never saw the revision it would act on (R5-F2 of PR #526).
     changed: int = 0
 
 
@@ -354,6 +359,10 @@ _OBSERVATIONS = {
     Kind.REFUSED_CANDIDATE: Receipt.CANDIDATE,
     Kind.LAUNCH_END: Receipt.LAUNCH,
 }
+
+
+def _sans_watermark(row: dict) -> dict:
+    return {k: v for k, v in row.items() if k != "watermark"}
 
 
 def _authorized(actor: Actor, author: Actor) -> bool:
@@ -383,6 +392,7 @@ RETRACTION_RESERVE_BYTES = _serialized_size(
                 "step": None,
                 "target": MAX_EVENTS,
                 "value": None,
+                "watermark": MAX_LAUNCH_SEQ,
             }
         ]
     }
@@ -400,13 +410,16 @@ class MemoryStore:
     def __init__(self, repository: str, run_id: str, launch_seq: int, raw: object):
         self.repository = _string(_string(repository, 141).lower(), 141)
         self.run_id = _match(run_id, RUN_ID_RE, 128)
-        self.launch_seq = _integer(launch_seq, high=2**63 - 1)
+        self.launch_seq = _integer(launch_seq, high=MAX_LAUNCH_SEQ)
         self._facts: dict[int, MemoryFact] = {}
         self._withdrawals: list[Withdrawal] = []
         self._proposals: dict[ProposalKey, MemoryFact] = {}
         self._citations: set[EvidenceRef] = set()
         self._events: list[dict] = []
         self._texts: dict[str, str] = {}
+        # The latest launch ordinal any row so far was written at or after:
+        # rows are appended in time, and the ordinal never decreases.
+        self._floor = 0
         self.enabled = False
         self.refusals = 0
         if isinstance(raw, dict) and not raw:
@@ -532,10 +545,20 @@ class MemoryStore:
             self._facts[revision] = fact
             if key is not None:
                 self._proposals[key] = fact
+            self._floor = max(self._floor, attempt)
             canonical = dict(row, scope=scope.encode())
         else:
             row = _dict(
-                raw, "action", "actor", "step", "attempt", "target", "expected", "reason", "value"
+                raw,
+                "action",
+                "actor",
+                "step",
+                "attempt",
+                "target",
+                "expected",
+                "reason",
+                "value",
+                "watermark",
             )
             actor = Actor(row["actor"])
             target = _integer(row["target"], 1, revision - 1)
@@ -551,19 +574,29 @@ class MemoryStore:
             _string(row["reason"], MAX_REASON_BYTES)
             attempt = _integer(row["attempt"], 0, self.launch_seq)
             step = None if row["step"] is None else _step(row["step"], self.repository)
+            # The store's launch ordinal when the row was written: never
+            # below an earlier row's, and never below its own launch's.
+            watermark = _integer(row["watermark"], self._floor, self.launch_seq)
             if actor is Actor.OPERATOR:
                 _require(not attempt and step is None)
             else:
-                # A launch earlier than the record's latest change never saw
-                # the revision it would change (concurrent or late results).
                 _require(
-                    attempt >= fact.changed
-                    and attempt > 0
+                    0 < attempt <= watermark
                     and step is not None
                     and step.phase in AGENT_PHASES
                     and step.issue_url == fact.scope.step.issue_url
                 )
-            changed = max(fact.changed, attempt)
+            if actor is Actor.AGENT:
+                # A launch earlier than the record's latest change never saw
+                # the revision it would change (concurrent or late results).
+                _require(attempt >= fact.changed)
+            # An agent's revision is its launch's: that launch and later ones
+            # know it. The operator's or the controller's is made on the
+            # snapshot held under the lock, after every row before it: no
+            # launch up to the watermark it was made at saw it, whatever
+            # revision number a result from one names (R5-F2 of PR #526).
+            changed = max(fact.changed, attempt if actor is Actor.AGENT else watermark + 1)
+            self._floor = watermark
             value = row["value"]
             if action is Action.SUPERSEDE:
                 other = self._facts.get(_integer(value, target + 1, revision - 1))
@@ -574,7 +607,7 @@ class MemoryStore:
                     and other.scope.covers(fact.scope)
                     and _RANK[other.author] >= _RANK[fact.author]
                     and _authorized(actor, other.author)
-                    and (actor is Actor.OPERATOR or attempt >= other.changed)
+                    and (actor is not Actor.AGENT or attempt >= other.changed)
                 )
                 self._facts[target] = replace(
                     fact, replacement=value, revision=revision, changed=changed
@@ -613,9 +646,12 @@ class MemoryStore:
                 if same:
                     return WriteOutcome(self, "replay", existing.id)
                 return WriteOutcome(self._refusal(), "conflict")
-            if "target" in event and event in candidate._events:
-                # A revision row already applied, byte for byte: it named the
-                # revision it changed, so it can only be the same revision.
+            if "target" in event and any(
+                _sans_watermark(row) == _sans_watermark(event) for row in candidate._events
+            ):
+                # A revision row already applied, byte for byte but for the
+                # launch ordinal it was written at: it named the revision it
+                # changed, so it can only be the same revision.
                 return WriteOutcome(self, "replay", event["target"])
             candidate._apply(event)
             if text is not None:
@@ -711,6 +747,12 @@ class MemoryStore:
         act on the snapshot they hold under the lock, which is the default.
         A revision against any other revision is stale and refused.
 
+        The row records the store's launch ordinal as its ``watermark``,
+        never a caller's value. An operator's or the controller's revision
+        is known only to launches after it, so an agent's revision from a
+        launch up to that watermark is refused, whatever revision it names
+        (R5-F2 of PR #526).
+
         The row is built from canonical, validated input (the step as
         :func:`_step` saves it, the reason as it is redacted), so a retry
         of an applied revision is compared with the saved row as it was
@@ -753,6 +795,7 @@ class MemoryStore:
                     step=None if step is None else step.to_dict(),
                     reason=_bounded_redaction(reason, MAX_REASON_BYTES),
                     value=content,
+                    watermark=self.launch_seq,
                 ),
                 text,
             )

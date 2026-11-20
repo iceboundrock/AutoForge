@@ -2513,10 +2513,14 @@ Neither launches, transitions or writes to GitHub.
 Every correction, supersession or retraction names the record revision
 it acts on, and one made against an older revision is refused. An agent's
 revision must also come from an accepted result of a launch no earlier
-than the record's latest change. A late result from an earlier launch
-therefore cannot overwrite a newer correction. The same revision submitted
-again is a replay and changes nothing: it is compared with the saved row in
-its canonical form, so a URL spelled in another case is the same revision. A
+than the record's latest change. Each revision row records the launch
+ordinal it was written at. An operator's change, `memory retract`'s
+included, is known only to launches after that ordinal, so a result of an
+earlier launch is refused even when it names the new revision. A late
+result from an earlier launch therefore cannot overwrite a newer correction.
+The same revision submitted again is a replay and changes nothing: it is
+compared with the saved row in its canonical form, so a URL spelled in
+another case is the same revision. A
 correction or retraction leaves a content digest that prevents reappearance
 within its scope and authority. Refusals are counted, not tombstoned. The
 store keeps at most 64 facts and 256 lifecycle events per run, and at most
