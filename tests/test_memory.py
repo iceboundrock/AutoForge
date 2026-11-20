@@ -1697,6 +1697,25 @@ def test_after_a_restart_a_memory_launch_is_fresh_only_in_its_private_home(
     previous.close()
 
 
+def test_a_memory_launch_runs_enforced_under_preferred_on_a_capable_host(
+    tmp_state_dir, fake_github, tmp_path_factory, monkeypatch
+):
+    """R7-F1 of PR #526: what a Memory launch needs is enforcement, not the
+    name ``required``. ``preferred``, its alias, launches it inside the outer
+    sandbox on a host that can enforce, in the private home made empty for
+    it, as the operator documentation says."""
+    home, _ = _host_agent_dir(tmp_path_factory, monkeypatch)
+    eng, pi = pi_engine(tmp_state_dir, fake_github, memory=True, sandbox="preferred")
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    with pytest.raises(ControlResultValidationError):
+        eng.step()
+    assert pi.calls and all(r.fresh_context for r in pi.calls)
+    assert pi.compiled
+    for _, description in pi.compiled:
+        assert PrivateTmpfs(os.path.realpath(home), 0o700, None) in description.mounts
+    eng.close()
+
+
 def test_a_configured_pi_agent_directory_refuses_a_memory_launch_before_its_intent_save(
     tmp_state_dir, fake_github, tmp_path_factory, monkeypatch
 ):

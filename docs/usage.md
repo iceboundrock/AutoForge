@@ -2586,10 +2586,20 @@ or nothing applicable), and a budget that cannot hold the header and the
 longest notice is refused whatever the records.
 
 No launch is shown Memory and no observations are captured automatically
-yet; that is #333. A Memory `ANALYZE_EXECUTE` launch runs only under
-`sandbox.mode: required`, with Pi's agent directory in its private home
-([Configuration](configuration.md#issue-working-memory)); under `disabled`
-it is refused before its intent save. With `sandbox.mode: disabled`, an
+yet; that is #333. With Memory on, enforcement is mandatory: a Memory
+`ANALYZE_EXECUTE` launch runs only inside the outer sandbox, with Pi's
+agent directory in its private home
+([Configuration](configuration.md#issue-working-memory)). It runs under
+`sandbox.mode: required` on a host that can enforce, or under `preferred`,
+which is accepted there as an alias of `required`. Under `disabled` it is
+refused before its intent save. On a host that cannot enforce, `required`
+and `preferred` refuse the step before anything of it is saved, so
+switching to `disabled` gets past nothing while Memory stays on. Make the
+host capable to keep Memory on, or turn Memory off
+(`memory.enabled: false`) and then set `sandbox.mode: disabled` for
+logical isolation only. An existing run accepts either change only with
+`--accept-config-change`. `doctor`'s `outer sandbox: mode` row and the
+step's refusal say the same. With `sandbox.mode: disabled`, an
 agent of the same UID can reach the state directory, the ledger included,
 by absolute path. The ledger remains advisory and grants no workflow or
 GitHub authority.

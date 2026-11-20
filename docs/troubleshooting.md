@@ -780,7 +780,11 @@ The messages below are AutoForge's own refusals, grouped by subject.
   reason says which of the two a kernel lacks, see
   [Compatibility](compatibility.md#outer-sandbox)), or set
   `sandbox.mode: disabled` (logical isolation only), and run the same
-  command again.
+  command again. With Memory on (`memory.enabled: true`), `disabled` alone
+  is no way out, since every Memory `ANALYZE_EXECUTE` launch is refused
+  without the outer sandbox: make the host capable to keep Memory on, or
+  turn Memory off and then set `sandbox.mode: disabled`
+  ([Usage](usage.md#issue-working-memory)).
 - **"the configuration file ... lies in ..., a tree that launches inside
   the outer sandbox write"** (exit 2; also "is reached through ...", "has
   N hard links" or "opens another file than its lookup walk was followed

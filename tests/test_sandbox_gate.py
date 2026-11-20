@@ -16,10 +16,10 @@ import pytest
 
 import autoforge.engine as engine_module
 from autoforge.cli import _render_outer_sandbox
-from autoforge.config import default_config
+from autoforge.config import MemoryConfig, ProfileConfig, default_config
 from autoforge.errors import ConfigurationError, SandboxCapabilityError, SandboxLaunchRefusedError
 from autoforge.sandbox_bwrap import Capability
-from autoforge.state import load_state
+from autoforge.state import load_state, save_state
 from autoforge.transitions import Phase
 from tests.conftest import implement, make_engine
 
@@ -82,6 +82,78 @@ def test_a_remote_step_on_an_incapable_host_is_refused_with_state_unchanged(
     assert eng.provider.calls == []
     assert fake_github.effect_writes == []
     assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
+
+
+@pytest.mark.parametrize("mode", ["required", "preferred"])
+def test_with_memory_on_the_refusal_never_offers_disabled_alone(
+    tmp_state_dir, fake_github, sandbox_probe, mode
+):
+    """R7-F1 of PR #526: with Memory on, ``sandbox.mode: disabled`` is no way
+    out of the refusal, since every Memory ANALYZE_EXECUTE launch is refused
+    without the outer sandbox. The message says what doctor's mode row says:
+    a capable host keeps Memory on, or Memory goes off before the run goes on
+    unenforced. The state stays byte-identical, as without Memory."""
+    cfg = _cfg(mode)
+    cfg.memory = MemoryConfig(enabled=True)
+    # The profile's half of Memory's proof, which the run's start checks.
+    cfg.profiles["analyze_execute"] = ProfileConfig(
+        "analyze_execute",
+        "pi",
+        "openai/fixture-model",
+        "high",
+        options={"context_files": "false", "require_oauth": "false"},
+    )
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, cfg=cfg, origin=True)
+    sandbox_probe.unsupported(Capability.PROCFS, "bwrap: Can't mount proc on /newroot/proc")
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    before = _snapshot(eng)
+    with pytest.raises(SandboxCapabilityError) as caught:
+        eng.step()
+    assert caught.value.capability == "procfs"
+    message = str(caught.value)
+    assert "cannot provide a new procfs" in message and "autoforge doctor" in message
+    assert "memory.enabled is true" in message and "refused without the outer sandbox" in message
+    assert "make the host capable to keep Memory on" in message
+    assert "turn Memory off and set sandbox.mode: disabled" in message
+    assert "logical isolation only" in message
+    # `disabled` is never offered on its own.
+    assert "or set sandbox.mode: disabled" not in message
+    if mode == "preferred":
+        assert "REMOTE run treats as required" in message
+    assert _snapshot(eng) == before
+    assert eng.provider.calls == []
+    assert fake_github.effect_writes == []
+    # Memory recorded for the run, the configuration since turned off: the
+    # launch would still be a Memory launch, as the launch decides it, so
+    # the refusal says the same.
+    run = load_state(eng.paths.state_file)
+    run.issue_memory = run.memory_setting(True)
+    save_state(run, eng.paths.state_file)
+    eng.load()
+    eng.config.memory = MemoryConfig(enabled=False)
+    before = _snapshot(eng)
+    with pytest.raises(SandboxCapabilityError) as caught:
+        eng.step()
+    assert "turn Memory off and set sandbox.mode: disabled" in str(caught.value)
+    assert _snapshot(eng) == before
+
+
+@pytest.mark.parametrize("mode", ["required", "preferred"])
+def test_with_memory_off_the_refusal_still_offers_disabled(
+    tmp_state_dir, fake_github, sandbox_probe, mode
+):
+    """R7-F1 of PR #526: the Memory-off guidance is unchanged: make the host
+    capable, or set ``sandbox.mode: disabled`` for logical isolation only;
+    nothing of Memory is mentioned."""
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, cfg=_cfg(mode), origin=True)
+    sandbox_probe.unsupported(Capability.PROCFS, "bwrap: Can't mount proc on /newroot/proc")
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    with pytest.raises(SandboxCapabilityError) as caught:
+        eng.step()
+    message = str(caught.value)
+    assert "make the host capable, or set sandbox.mode: disabled to run with" in message
+    assert "logical isolation only" in message
+    assert "Memory" not in message and "memory" not in message
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the backend is Linux-only")

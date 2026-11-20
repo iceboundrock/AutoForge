@@ -3320,12 +3320,28 @@ class ControllerEngine:
             else "sandbox.mode is preferred, which a REMOTE run treats as required"
         )
         capability = probe.capability or Capability.UNKNOWN
-        alternatives = f"set sandbox.mode: disabled to run with {LOGICAL_ISOLATION_ONLY}"
+        # With Memory on, `disabled` alone is no way out: every Memory
+        # ANALYZE_EXECUTE launch is refused without the outer sandbox (ADR
+        # 0015 D18), so continuing unenforced means turning Memory off too, as
+        # doctor's mode row says (R7-F1 of PR #526). Memory is on as the
+        # launch decides it: configured, or recorded for the run.
+        state = self.state
+        if self.config.memory.enabled or bool(state and state.issue_memory.get("enabled")):
+            remedy = (
+                "memory.enabled is true, and a Memory ANALYZE_EXECUTE launch is refused without "
+                "the outer sandbox, so make the host capable to keep Memory on, or turn Memory "
+                f"off and set sandbox.mode: disabled to run with {LOGICAL_ISOLATION_ONLY}"
+            )
+        else:
+            remedy = (
+                "make the host capable, or set sandbox.mode: disabled to run with "
+                f"{LOGICAL_ISOLATION_ONLY}"
+            )
         return SandboxCapabilityError(
             f"{why}, and this host cannot enforce the outer sandbox: it cannot provide "
             f"{capability.value} ({probe.reason}). Nothing was launched, saved or charged; the "
-            "run is as it was. `autoforge doctor` shows the capability check; make the host "
-            f'capable, or {alternatives} (ADR 0005 D12.2; docs/usage.md, "Outer sandbox")',
+            f"run is as it was. `autoforge doctor` shows the capability check; {remedy} "
+            '(ADR 0005 D12.2; docs/usage.md, "Outer sandbox")',
             capability.key,
         )
 

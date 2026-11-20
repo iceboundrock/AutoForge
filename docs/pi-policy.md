@@ -163,8 +163,9 @@ own. A Memory launch's agent directory must be `~/.pi/agent` in the private
 home the outer sandbox makes empty for that launch alone, which no other
 launch or host directory shares (ADR 0005 D8.1). Before each Memory
 launch's intent save, `PiProvider.fresh_context_refusal` refuses the launch
-unless it will be enforced (`sandbox.mode: required`), `PI_CODING_AGENT_DIR`
-is unset (when set, it is projected read-write from the host, §8) and no
+unless it will be enforced (`sandbox.mode: required`, or its alias
+`preferred`, on a host that can enforce), `PI_CODING_AGENT_DIR` is unset
+(when set, it is projected read-write from the host, §8) and no
 `sandbox.read_only_paths` entry is, contains or lies inside that directory
 in the home, decided on where the launch shows the entry, by the
 compiler's own rule (`sandbox_policy.operator_path_destination`): one
