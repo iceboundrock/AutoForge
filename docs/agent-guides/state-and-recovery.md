@@ -622,9 +622,13 @@ on the next save. An older label carrying either new field is refused.
 The launch-intent save increments the ordinal; retry, resume, unblock
 and issue changes never reset it. An ordinal is not a launch receipt. The
 loader, the launch-intent save and a projection share one bound,
-2^63 − 1 (`autoforge.memory.MAX_LAUNCH_SEQ`): a run at it has spent its
-last ordinal, and its next launch, a relaunch included, is refused before
-anything of the launch is changed or saved.
+2^63 − 1 (`autoforge.memory.MAX_LAUNCH_SEQ`), and so do Memory's
+revisions and its launch citations, which name an ordinal. A run at it
+has spent its last ordinal, and its next launch, a relaunch included, is
+refused before anything of the launch is written or saved, its read
+context included. Going on from a reply the state keeps (`delivered_reply`)
+spends no ordinal and launches nothing, so a run at the bound still
+settles it.
 `issue_memory` is validated whole on load, by the rules every write
 applies, and a value that would leave an open record without its
 retraction reserve (one event slot and its bytes) is refused. The number

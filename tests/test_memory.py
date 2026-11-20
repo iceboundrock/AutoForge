@@ -1619,8 +1619,9 @@ def test_the_last_launch_ordinal_is_never_spent_past_the_loaders_bound(
     loads, and its next launch is refused before anything of its intent is
     changed or saved: no agent, the checkpoint byte for byte as it was and
     still loadable. One ordinal short, the step's launch spends the last
-    ordinal and its correction relaunch is refused the same way, leaving a
-    checkpoint that loads. A projection has the same bound."""
+    ordinal and its correction relaunch is refused the same way, before its
+    read context is written, leaving a checkpoint that loads. A projection
+    has the same bound."""
     monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
     eng, pi = pi_engine(
         tmp_state_dir, fake_github, memory=memory, sandbox="required" if memory else "disabled"
@@ -1647,8 +1648,12 @@ def test_the_last_launch_ordinal_is_never_spent_past_the_loaders_bound(
         eng.step()
     assert len(pi.calls) == 1
     spent = load_state(eng.paths.state_file)
-    # The first launch's intent is saved; nothing of the refused relaunch is.
+    # The first launch's intent is saved; nothing of the refused relaunch is,
+    # not even its read context, which is written before the launch's intent
+    # save and is checked after the exhaustion (R6-F2 of PR #526).
     assert spent.launch_seq == MAX_LAUNCH_SEQ and spent.attempt == 1
+    contexts = eng.paths.state_dir / "read-context" / spent.run_id
+    assert [p.name.rsplit("-", 1)[0] for p in contexts.iterdir()] == ["analyze_execute-1"]
     eng.close()
     # The loader's bound and a projection's are the one bound.
     over = load_state(eng.paths.state_file).to_dict()

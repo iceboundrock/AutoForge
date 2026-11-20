@@ -1699,7 +1699,10 @@ def _refuse_a_launch_past_the_last_ordinal(state: AutoForgeState, phase: Phase) 
     one bound the loader, the launch-intent save and a projection share. A
     run at that bound has spent its last ordinal, and saving one more would
     leave a checkpoint the loader refuses: nothing is changed, saved or
-    launched (R5-F5 of PR #526).
+    launched (R5-F5 of PR #526). Called only once a launch is needed and
+    before anything of it is written: a kept reply, which spends no ordinal,
+    is gone on from first, and a relaunch is checked once its reconciliation
+    found it needed, before its read context (R6-F2 of PR #526).
     """
     if state.launch_seq >= MAX_LAUNCH_SEQ:
         raise StateError(
@@ -17006,10 +17009,6 @@ class ControllerEngine:
         """
         assert_shared_git_lock_free(f"launch the {phase.value} agent")
         state = self._require_state()
-        # R5-F5 of PR #526: the ordinal this launch's intent save would spend
-        # must be one the loader reads again, checked before anything of the
-        # launch is written; each relaunch checks again, below.
-        _refuse_a_launch_past_the_last_ordinal(state, phase)
         profile = profile_for_phase(self.config, phase, state.review_round)
         provider = self.providers.get(profile)
         provider.validate_profile(profile)
@@ -17039,9 +17038,17 @@ class ControllerEngine:
         # Read once per invocation, before the loop: the agent and the record
         # of it are launched from the same directory (see :meth:`_execution_cwd`).
         self._launch_cwd, self._launch_log = "", None
+        kept = self._kept_reply(phase)
+        if kept is None:
+            # R5-F5, R6-F2 of PR #526: a launch is needed, and the ordinal its
+            # intent save would spend must be one the loader reads again.
+            # Going on from a kept reply (below) spends none and launches
+            # nothing, so only a launch is checked, here, before the
+            # worktree, the logger, the read context or anything else of it
+            # is written; each relaunch checks again, below.
+            _refuse_a_launch_past_the_last_ordinal(state, phase)
         cwd = self._execution_cwd()
         self._launch_cwd = cwd
-        kept = self._kept_reply(phase)
         if kept is not None:
             # #479 (R1-F1 of PR #481): the last launch of this entry delivered
             # a reply the state kept before the step went on from it, and the
@@ -17108,6 +17115,11 @@ class ControllerEngine:
                         ),
                         code=StopReasonCode.STEP_BUDGET,
                     )
+                # A relaunch spends one more ordinal than the launch before
+                # it: refused here, once the reconciliation above found the
+                # relaunch needed, before its import, its read context or
+                # anything of its intent is written (R6-F2 of PR #526).
+                _refuse_a_launch_past_the_last_ordinal(state, phase)
             # Which UPDATE_EPIC result this launch asks for (ADR 0004 D4.7):
             # decided by the entry above, and the schema its result is held to.
             request = (
@@ -17167,9 +17179,6 @@ class ControllerEngine:
             finally:
                 self._read_context_dir = None
                 self._worktree_state = None
-            # Before anything of the launch's intent is changed or saved: a
-            # relaunch spends one more ordinal than the step's first launch.
-            _refuse_a_launch_past_the_last_ordinal(state, phase)
             if attempt:
                 # The relaunch's step (above), in the save before it starts.
                 state.step_count += 1

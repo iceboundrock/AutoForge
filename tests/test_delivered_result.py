@@ -42,6 +42,7 @@ from autoforge.errors import (
     ProviderUsageLimitError,
     StateError,
 )
+from autoforge.memory import MAX_LAUNCH_SEQ
 from autoforge.providers import AgentExecutionResult, ScriptedProvider
 from autoforge.result_parser import BlockShape, reply_block_shape
 from autoforge.state import load_state
@@ -638,6 +639,50 @@ def test_a_provisional_reply_is_kept_in_the_state_before_the_step_goes_on_from_i
     assert _settled(eng2)["kept_across_restart"] is True
     assert _settled(eng2)["outcome"] == "accepted"
     assert load_state(eng2.paths.state_file).delivered_reply == {}
+
+
+def test_a_reply_kept_at_the_last_launch_ordinal_is_settled_after_a_restart(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """R6-F2 of PR #526: the step's launch spends the run's last launch ordinal
+    (``MAX_LAUNCH_SEQ``), delivers a reply the checks let through, and the
+    controller dies after keeping it. Going on from a kept reply spends no
+    ordinal and starts no process, so the restart checks it again and
+    settles it, launching nothing, instead of refusing for the exhausted
+    ordinal. The next launch the run needs, the review's, is refused, with
+    nothing of the launch written: no read context and no launch intent."""
+    from .test_engine import _resumed
+
+    eng, provider = _analyzing(tmp_state_dir, fake_github, (implement, IDLE))
+    eng.state.launch_seq = MAX_LAUNCH_SEQ - 1
+    _crash_before_the_plan(eng, monkeypatch)
+    with pytest.raises(_Crash):
+        eng.step()
+    on_disk = load_state(eng.paths.state_file)
+    assert on_disk.launch_seq == MAX_LAUNCH_SEQ and len(provider.calls) == 1
+    kept = KeptReply.from_dict(on_disk.delivered_reply)
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github)
+    later = _no_agent(eng2)
+    outcome = eng2.step()
+    assert outcome.next_phase == "REVIEW", outcome.message
+    assert later.calls == [], "the kept reply was not run again"
+    assert "kept in the run's state across an interruption" in outcome.message
+    assert eng2.state.current_head_sha == kept.candidate
+    assert _settled(eng2)["outcome"] == "accepted"
+    settled = load_state(eng2.paths.state_file)
+    assert settled.delivered_reply == {} and settled.launch_seq == MAX_LAUNCH_SEQ
+    contexts = eng2.paths.state_dir / "read-context" / settled.run_id
+    written = sorted(p.name for p in contexts.iterdir())
+    with pytest.raises(StateError, match="spent its last launch ordinal"):
+        eng2.step()
+    # The review's entry ran (it binds the round's revision); its launch
+    # wrote nothing: no read context and no launch intent.
+    refused = load_state(eng2.paths.state_file)
+    intent = ("launch_seq", "attempt", "launch_label", "delivered_reply")
+    assert [getattr(refused, f) for f in intent] == [getattr(settled, f) for f in intent]
+    assert later.calls == [] and sorted(p.name for p in contexts.iterdir()) == written
+    assert not any(name.startswith("review-") for name in written)
 
 
 def test_a_kept_review_is_posted_once_after_a_restart_and_the_reviewer_not_run_again(
