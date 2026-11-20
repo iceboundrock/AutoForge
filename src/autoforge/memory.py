@@ -2712,8 +2712,12 @@ def _header(
     store: MemoryStore,
     request: ProjectionRequest,
     evidence: EvidenceIndex,
+    digests: tuple[str, str],
     counts: Mapping[str, int],
 ) -> str:
+    """The projection's header naming ``counts``; ``digests`` are the store's and
+    the evidence's, read once by the render, which measures a header per count."""
+    memory_digest, evidence_digest = digests
     step = request.step
     candidate = request.candidate or "none"
     return "\n".join(
@@ -2728,9 +2732,9 @@ def _header(
             f"- format: {PROJECTION_FORMAT}",
             f"- scope: repository {escape_inline(request.repository)}, issue "
             f"{escape_inline(request.issue_url)}, run {escape_inline(request.run_id)}",
-            f"- memory: revision {store.revision}, sha256 {store.digest()}",
+            f"- memory: revision {store.revision}, sha256 {memory_digest}",
             f"- evidence: {len(evidence.validation)} validation records and "
-            f"{len(evidence.launch_receipts)} launch receipts kept, sha256 {evidence.digest()}",
+            f"{len(evidence.launch_receipts)} launch receipts kept, sha256 {evidence_digest}",
             f"- rendered for: {step.phase.value} of {escape_inline(step.issue_url)}, PR "
             f"{escape_inline(step.pr_url) or 'none'}, review round {step.review_round}, "
             f"execution attempt {step.execution_attempt}; launch "
@@ -2853,7 +2857,11 @@ def render_projection(
     records than one-byte text, the same ones every time (R4-F6). A record
     gives up room only to what is emitted beside it (R9-F1 of PR #513):
     when every record fits beside the header, all are shown and nothing
-    follows them; otherwise room is kept for the omission line too. A
+    follows them; otherwise room is kept for the omission line too, and
+    both only as wide as the counts of shown and omitted records they name
+    (R10-F1): the records shown are those that fit, in order, beside the
+    header and omission line of that very selection, never beside the
+    wider ones of every record shown and omitted at once. A
     projection that shows no record says why, and never that none applies
     when one does: when the bound cut a record, that the bound left room
     for none, then the omission line (R8-F1); when a record that applies
@@ -3003,37 +3011,60 @@ def render_projection(
                 )
             blocks.append((group, record, block))
     # Room is kept, in characters and in UTF-8 bytes, which bound the tokens
-    # (R4-F6 of PR #513), only for what follows a record shown, and only where
-    # it is emitted (R9-F1). When every record fits beside its header, each is
-    # shown and nothing follows them. Otherwise one is cut whatever else is
-    # shown, so the omission line follows: room is kept for it and for the
-    # header at its widest, no count of shown or omitted records exceeding
-    # the records counted. The sentence saying why no record is shown follows
-    # only when none is, so no record gives up its room for it: the finished
-    # text is measured instead, below.
-    every = {**counts, "shown": len(blocks)}
-    reserved = _header(store, request, evidence, every)
-    whole = reserved + "".join(block for _, _, block in blocks)
-    if len(whole) > bound or len(whole.encode("utf-8")) > tokens:
-        widest = {**every, "omitted": len(blocks)}
-        reserved = _header(store, request, evidence, widest) + _omitted_line(len(blocks))
-    budget = bound - len(reserved)
-    byte_budget = tokens - len(reserved.encode("utf-8"))
+    # (R4-F6 of PR #513), only for what the render emits beside the records it
+    # shows (R9-F1), and only as wide as it emits it (R10-F1): the header names
+    # how many records are shown and how many omitted, and the omission line,
+    # naming the latter, follows only when one is, so its width depends on the
+    # selection it bounds. Each count the render could emit is tried, the
+    # narrowest room first, and the first selection that holds both bounds
+    # beside the header and the omission line naming its own counts is shown:
+    # the records that fit in order, as ever. The widest room always ends the
+    # search when a record is shown: what its selection emits is one of the
+    # rooms tried, so no wider, as every count is ASCII digits and no room is
+    # wider in bytes yet narrower in characters. The sentence saying why no
+    # record is shown follows only when none is, so no record gives up its room
+    # for it: the finished text is measured instead, below.
+    digests = (store.digest(), evidence.digest())
+    sizes = [(len(block), len(block.encode("utf-8"))) for _, _, block in blocks]
+
+    def beside(shown: int) -> tuple[int, int]:
+        """The characters and bytes emitted beside ``shown`` records: the header
+        naming that count, and the omission line when a record is cut."""
+        omitted = len(blocks) - shown
+        text = _header(
+            store, request, evidence, digests, {**counts, "shown": shown, "omitted": omitted}
+        )
+        text += _omitted_line(omitted) if omitted else ""
+        return len(text), len(text.encode("utf-8"))
+
+    def select(room: tuple[int, int]) -> tuple[list[int], int, int]:
+        """The indexes of the records shown beside ``room``, each in order that
+        fits what the earlier ones left, and the characters and bytes they take."""
+        chars, octets = bound - room[0], tokens - room[1]
+        chosen: list[int] = []
+        for index, (width, weight) in enumerate(sizes):
+            if width <= chars and weight <= octets:
+                chars, octets = chars - width, octets - weight
+                chosen.append(index)
+        return chosen, bound - room[0] - chars, tokens - room[1] - octets
+
+    chosen: list[int] = []
+    for room in sorted({beside(n) for n in range(len(blocks) + 1)}):
+        chosen, chars, octets = select(room)
+        emitted = beside(len(chosen))
+        if emitted[0] + chars <= bound and emitted[1] + octets <= tokens:
+            break
     body: list[str] = []
     shown: list[int] = []
     by_group = dict.fromkeys(_GROUPS, 0)
-    for group, record, block in blocks:
-        size = len(block.encode("utf-8"))
-        if len(block) > budget or size > byte_budget:
-            counts["omitted"] += 1
-            continue
-        budget -= len(block)
-        byte_budget -= size
+    for index in chosen:
+        group, record, block = blocks[index]
         body.append(block)
         shown.append(record.id)
         by_group[group] += 1
     counts["shown"] = len(shown)
-    header = _header(store, request, evidence, counts)
+    counts["omitted"] = len(blocks) - len(shown)
+    header = _header(store, request, evidence, digests, counts)
     if _unredacted(header):
         raise ValueError("the projection's header renders text the run-log redactor would change")
     text = header + "".join(body)
@@ -3050,11 +3081,12 @@ def render_projection(
     if counts["omitted"]:
         text += _omitted_line(counts["omitted"])
     if len(text) > bound or len(text.encode("utf-8")) > tokens:
-        # Each record shown left room for the header and the omission line, so
+        # A selection showing a record is kept only when it holds both bounds
+        # beside the header and the omission line naming its own counts, so
         # only a projection showing none gets here: its header and what it must
         # say of the records exceed a bound. Any bound this text fits renders:
         # a record that fits it is shown, and if none does, this same text is
-        # (R9-F1 of PR #513).
+        # (R9-F1, R10-F1 of PR #513).
         assert not shown, (len(text), bound)
         raise ValueError(
             f"a projection bound is at least {len(text)} characters and "
@@ -3062,9 +3094,7 @@ def render_projection(
         )
     return ContextProjection(
         text=text,
-        freshness=Freshness(
-            revision=store.revision, digest=store.digest(), evidence_digest=evidence.digest()
-        ),
+        freshness=Freshness(revision=store.revision, digest=digests[0], evidence_digest=digests[1]),
         shown=tuple(shown),
         omitted_for_bound=counts["omitted"],
         not_applicable=counts["not_applicable"],

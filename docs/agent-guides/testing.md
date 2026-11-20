@@ -3232,7 +3232,11 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   kind citing only the evidence it takes; another issue, phase or candidate
   omitted and counted; retracted and superseded records counted, never
   shown; the bound kept with every cut counted, and a bound above 16,384
-  characters refused; the same revision, request and evidence render the
+  characters refused; a partial projection whose counts cross a digit
+  boundary (one shown and nine omitted, ten shown and one omitted) showing
+  at a bound it fills exactly what it shows with room to spare, and one
+  record fewer at one less in either bound (R10-F1 of PR #513); the same
+  revision, request and evidence render the
   same bytes, an evicted receipt other bytes, and the header names the
   evidence's digest;
   `REVIEW`, another run's store, a store whose Memory is off and a request

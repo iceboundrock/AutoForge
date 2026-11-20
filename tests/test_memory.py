@@ -1694,6 +1694,74 @@ def test_a_projection_keeps_room_only_for_what_it_emits():
         assert _needed(again) == (chars, tokens)
 
 
+def _maximal(n: int) -> str:
+    """A proposal's text of :data:`MAX_TEXT_BYTES` bytes, distinct for each ``n``."""
+    return f"{n:02d} " + "z" * (MAX_TEXT_BYTES - 3)
+
+
+@pytest.mark.parametrize(
+    ("texts", "probe", "shown", "cut"),
+    [
+        # The reviewer's: nine maximal proposals over one short one; one shown and
+        # nine omitted, where the widest counts are ten and ten.
+        (["00 short lesson " + "s" * 700] + [_maximal(n) for n in range(1, 10)], 3000, (1,), ()),
+        # Ten short proposals over a maximal one: ten shown and one omitted, where
+        # the widest counts are eleven and eleven; one fewer shown names nine.
+        (
+            [_maximal(0)] + [f"{n:02d} short lesson" for n in range(1, 11)],
+            5000,
+            tuple(range(11, 1, -1)),
+            tuple(range(11, 2, -1)),
+        ),
+    ],
+    ids=["one-shown-nine-omitted", "ten-shown-one-omitted"],
+)
+def test_a_partial_projection_keeps_room_only_as_wide_as_the_counts_it_names(
+    texts, probe, shown, cut
+):
+    """R10-F1 of PR #513: a projection that cuts a record keeps room for its header and
+    omission line only as wide as the counts it names, never as wide as the counts of
+    every record. After a reload, a store whose selection crosses a digit boundary
+    (one shown and nine omitted, ten shown and one omitted) renders at a bound its
+    output fills exactly the same records, newest first, as it does with room to
+    spare; one less in either bound shows one record fewer, the rest in the same
+    order. The same store before its reload renders the same bytes, and every output
+    holds both bounds."""
+    store = _store()
+    for seq, text in enumerate(texts, 1):
+        store, _ = _applied(propose(store, text, seq=seq))
+    reloaded = _reloaded(store)
+    omitted = len(texts) - len(shown)
+    trailer = f"[AutoForge omitted {omitted} records for the projection's bound]\n"
+    spare = _render(reloaded, max_chars=probe, max_tokens=probe)
+    assert (spare.shown, spare.omitted_for_bound) == (shown, omitted)
+    assert f"- records: {len(shown)} shown, {omitted} omitted for the bound" in spare.text
+    assert spare.text.endswith(trailer)
+
+    exact = len(spare.text)
+    # Four digits, as the probe: the header's bound line keeps its length.
+    assert len(str(exact)) == len(str(probe)) and MIN_PROJECTION_CHARS <= exact < probe
+    full = _render(reloaded, max_chars=exact, max_tokens=exact)
+    assert full == _render(store, max_chars=exact, max_tokens=exact)
+    assert (full.shown, full.omitted_for_bound) == (shown, omitted)
+    assert len(full.text) == len(full.text.encode()) == exact
+    bound_line = "- bound: {0} characters and {0} tokens"
+    assert full.text == spare.text.replace(bound_line.format(probe), bound_line.format(exact))
+
+    for bounds in ((exact - 1, exact), (exact, exact - 1)):
+        short = _render(reloaded, max_chars=bounds[0], max_tokens=bounds[1])
+        assert (short.shown, short.omitted_for_bound) == (cut, len(texts) - len(cut))
+        assert (
+            f"- records: {len(cut)} shown, {len(texts) - len(cut)} omitted for the bound"
+            in short.text
+        )
+        assert short.text.endswith(
+            ("" if cut else _NOTHING_FITS)
+            + f"[AutoForge omitted {len(texts) - len(cut)} records for the projection's bound]\n"
+        )
+        assert _within_both_bounds(short, *bounds)
+
+
 def test_a_launch_citation_is_never_observed_and_names_only_the_receipt_the_run_keeps():
     """R1-F1 of PR #513: a spent launch ordinal is not a receipt. R5-F3: nor does a
     launch's receipt establish what a record says of it: its id and digest record no
