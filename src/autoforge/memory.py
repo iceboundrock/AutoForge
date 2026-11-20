@@ -173,7 +173,9 @@ the operator's, then observations evidenced for another commit, then those
 no kept receipt establishes, then proposals, newest first in each, within
 the request's bound, which is at most :data:`MAX_PROJECTION_CHARS`
 characters and :data:`MAX_PROJECTION_TOKENS` tokens, held as UTF-8 bytes
-(a larger one is refused), and reports in its header the scope, the
+(a larger one is refused, and so is one too small for its header and what
+it must say when it shows no record, naming the bound it needs; R9-F1 of
+PR #513), and reports in its header the scope, the
 revision and digest it read, the digest of the evidence it was given, what
 it was rendered for, its bound and how many records it showed, omitted for
 the bound, found not applicable, retracted, superseded, withheld as
@@ -230,7 +232,11 @@ MAX_EVENTS = 1 + MAX_CORRECTIONS + 2
 MAX_TOMBSTONES = MAX_RECORDS * (MAX_CORRECTIONS + 1)
 #: One launch's projection, in characters (evaluation protocol, section 5).
 MAX_PROJECTION_CHARS = 16_384
-#: The smallest projection bound a render accepts: its header always fits.
+#: The smallest projection bound a render accepts. A header grows with its
+#: request's run ID, repository and URLs, so this bound does not hold every
+#: one: a render refuses a request whose header, with what it must say when
+#: it shows no record, exceeds its bound, and names the bound it needs; a
+#: record shown never takes the room that sentence would (R9-F1 of PR #513).
 MIN_PROJECTION_CHARS = 2_048
 #: One launch's projection, in tokens (#317: "explicit size and token
 #: limits"), header, fences and omission marker included. No tokenizer is
@@ -240,7 +246,8 @@ MIN_PROJECTION_CHARS = 2_048
 #: byte (R4-F6 of PR #513). Text of one-byte characters is held to the same
 #: count as :data:`MAX_PROJECTION_CHARS`; multibyte text to fewer characters.
 MAX_PROJECTION_TOKENS = 16_384
-#: The smallest token bound a render accepts: its header always fits.
+#: The smallest token bound a render accepts, held like
+#: :data:`MIN_PROJECTION_CHARS`.
 MIN_PROJECTION_TOKENS = MIN_PROJECTION_CHARS
 #: A seed file, in bytes: one record's text.
 MAX_SEED_BYTES = MAX_TEXT_BYTES
@@ -2579,11 +2586,13 @@ class ProjectionRequest:
     #: candidate is refused (R4-F5 of PR #513).
     descends_from: frozenset[str] = frozenset()
     #: The projection's bound in characters, from :data:`MIN_PROJECTION_CHARS`
-    #: to :data:`MAX_PROJECTION_CHARS`; a render refuses any other.
+    #: to :data:`MAX_PROJECTION_CHARS`; a render refuses any other, and one
+    #: its header does not fit (:data:`MIN_PROJECTION_CHARS` says when).
     max_chars: int = MAX_PROJECTION_CHARS
     #: Its bound in tokens, from :data:`MIN_PROJECTION_TOKENS` to
     #: :data:`MAX_PROJECTION_TOKENS`, held as that many UTF-8 bytes
-    #: (:data:`MAX_PROJECTION_TOKENS` says why); a render refuses any other.
+    #: (:data:`MAX_PROJECTION_TOKENS` says why); a render refuses any other,
+    #: and one its header does not fit.
     max_tokens: int = MAX_PROJECTION_TOKENS
 
     def binding_problem(self) -> str:
@@ -2783,17 +2792,21 @@ def _block(record: MemoryRecord, group: str, resolution: Resolution | None, kept
     return "\n".join(lines)
 
 
-#: What a projection that shows no record says when nothing was cut for its
-#: bound: no record applies to the launch.
-_NOTHING_APPLIES = "(no record applies to this launch)\n"
+#: What a projection that shows no record says when its bound cut nothing and
+#: no record was withheld as withdrawn text: every current record is another
+#: issue's, phase's or candidate's, or there is none.
+_NOTHING_APPLIES = "(no current record applies to this launch)\n"
+#: What it says when its bound cut nothing but a current record that applies
+#: was withheld, its text withdrawn by another record: such a record does
+#: apply, and saying none does would misreport a withdrawal as inapplicability
+#: (R9-F2 of PR #513). It names no text, so none withdrawn is shown.
+_NOTHING_UNWITHDRAWN = (
+    "(no record is shown: each current record that applies to this launch is withheld "
+    "as withdrawn text)\n"
+)
 #: What it says when the bound cut every record the launch would be shown,
 #: which do apply to it (R8-F1 of PR #513): the omission line follows.
-_NOTHING_FITS = (
-    "(no record is shown: each record this launch would be shown was omitted for the "
-    "projection's bound)\n"
-)
-#: The wider of the two, reserved by every render.
-_NOTHING_SHOWN_WIDEST = max(_NOTHING_APPLIES, _NOTHING_FITS, key=lambda s: len(s.encode("utf-8")))
+_NOTHING_FITS = "(no record is shown: the projection's bound left room for none)\n"
 
 
 def _omitted_line(count: int) -> str:
@@ -2816,11 +2829,13 @@ def render_projection(
     (:meth:`ProjectionRequest.binding_problem`: a step of another issue or
     phase, a launch of another run, a repository that is not the issue's);
     a phase ADR 0015 D13 gives no projection (``REVIEW`` above all); a bound
-    outside :data:`MIN_PROJECTION_CHARS` to :data:`MAX_PROJECTION_CHARS`; or
-    a header or record whose rendering the run-log redactor would change,
-    which only a store no loader or write made can hold (D9.9, R2-F5 of PR
-    #513). Issues are compared as GitHub identifies them, so a spelling of
-    the owner or repository in another case selects the same records.
+    outside :data:`MIN_PROJECTION_CHARS` to :data:`MAX_PROJECTION_CHARS`; a
+    bound its header and what it must say when it shows no record exceed
+    (R9-F1 of PR #513), named in the error; or a header or record whose
+    rendering the run-log redactor would change, which only a store no
+    loader or write made can hold (D9.9, R2-F5 of PR #513). Issues are
+    compared as GitHub identifies them, so a spelling of the owner or
+    repository in another case selects the same records.
 
     An observation shows as evidence of this launch's candidate only when a
     kept receipt establishes it for that candidate; as another commit's when
@@ -2835,7 +2850,15 @@ def render_projection(
     The bound is both the request's characters and its tokens, the header,
     the fences and the omission marker included; tokens are held as UTF-8
     bytes (:data:`MAX_PROJECTION_TOKENS`), so multibyte text shows fewer
-    records than one-byte text, the same ones every time (R4-F6).
+    records than one-byte text, the same ones every time (R4-F6). A record
+    gives up room only to what is emitted beside it (R9-F1 of PR #513):
+    when every record fits beside the header, all are shown and nothing
+    follows them; otherwise room is kept for the omission line too. A
+    projection that shows no record says why, and never that none applies
+    when one does: when the bound cut a record, that the bound left room
+    for none, then the omission line (R8-F1); when a record that applies
+    was withheld as withdrawn text, that each such record is, naming no
+    text (R9-F2); otherwise that no current record applies.
 
     A superseded record is hidden behind what replaced it, unless it is an
     observation whose evidence establishes for this launch what the
@@ -2968,25 +2991,8 @@ def render_projection(
             grouped[_GROUP_OF_VERDICT[resolutions[record.id].verdict]].append(record)
         else:
             grouped["operator" if record.trust is Trust.OPERATOR else "proposed"].append(record)
-    # Reserve the header at its widest (no count exceeds MAX_RECORDS) and both
-    # trailers, in characters and in UTF-8 bytes, which bound the tokens (R4-F6
-    # of PR #513): every record shown fits both bounds with them.
-    widest = dict.fromkeys(counts, MAX_RECORDS)
-    reserved = (
-        _header(store, request, evidence, widest)
-        + _NOTHING_SHOWN_WIDEST
-        + _omitted_line(MAX_RECORDS)
-    )
-    budget = bound - len(reserved)
-    byte_budget = tokens - len(reserved.encode("utf-8"))
-    if budget < 0 or byte_budget < 0:
-        raise ValueError(
-            f"a projection bound is at least {len(reserved)} characters and "
-            f"{len(reserved.encode('utf-8'))} tokens"
-        )
-    body: list[str] = []
-    shown: list[int] = []
-    by_group = dict.fromkeys(_GROUPS, 0)
+    # Every record the launch would be shown, in the order it would be.
+    blocks: list[tuple[str, MemoryRecord, str]] = []
     for group in _GROUPS:
         for record in sorted(grouped[group], key=lambda r: r.id, reverse=True):
             block = _block(record, group, resolutions.get(record.id), record.id in kept)
@@ -2995,27 +3001,65 @@ def render_projection(
                     f"record M{record.id} renders text the run-log redactor would change: "
                     "nothing is rendered"
                 )
-            size = len(block.encode("utf-8"))
-            if len(block) > budget or size > byte_budget:
-                counts["omitted"] += 1
-                continue
-            budget -= len(block)
-            byte_budget -= size
-            body.append(block)
-            shown.append(record.id)
-            by_group[group] += 1
+            blocks.append((group, record, block))
+    # Room is kept, in characters and in UTF-8 bytes, which bound the tokens
+    # (R4-F6 of PR #513), only for what follows a record shown, and only where
+    # it is emitted (R9-F1). When every record fits beside its header, each is
+    # shown and nothing follows them. Otherwise one is cut whatever else is
+    # shown, so the omission line follows: room is kept for it and for the
+    # header at its widest, no count of shown or omitted records exceeding
+    # the records counted. The sentence saying why no record is shown follows
+    # only when none is, so no record gives up its room for it: the finished
+    # text is measured instead, below.
+    every = {**counts, "shown": len(blocks)}
+    reserved = _header(store, request, evidence, every)
+    whole = reserved + "".join(block for _, _, block in blocks)
+    if len(whole) > bound or len(whole.encode("utf-8")) > tokens:
+        widest = {**every, "omitted": len(blocks)}
+        reserved = _header(store, request, evidence, widest) + _omitted_line(len(blocks))
+    budget = bound - len(reserved)
+    byte_budget = tokens - len(reserved.encode("utf-8"))
+    body: list[str] = []
+    shown: list[int] = []
+    by_group = dict.fromkeys(_GROUPS, 0)
+    for group, record, block in blocks:
+        size = len(block.encode("utf-8"))
+        if len(block) > budget or size > byte_budget:
+            counts["omitted"] += 1
+            continue
+        budget -= len(block)
+        byte_budget -= size
+        body.append(block)
+        shown.append(record.id)
+        by_group[group] += 1
     counts["shown"] = len(shown)
     header = _header(store, request, evidence, counts)
     if _unredacted(header):
         raise ValueError("the projection's header renders text the run-log redactor would change")
     text = header + "".join(body)
     if not shown:
-        # Records the bound cut do apply to this launch: saying none does would
-        # misreport an omission as inapplicability (R8-F1 of PR #513).
-        text += _NOTHING_FITS if counts["omitted"] else _NOTHING_APPLIES
+        # Records the bound cut do apply to this launch, and so does one withheld
+        # as withdrawn text: saying none does would misreport an omission or a
+        # withdrawal as inapplicability (R8-F1, R9-F2 of PR #513).
+        if counts["omitted"]:
+            text += _NOTHING_FITS
+        elif counts["withdrawn"]:
+            text += _NOTHING_UNWITHDRAWN
+        else:
+            text += _NOTHING_APPLIES
     if counts["omitted"]:
         text += _omitted_line(counts["omitted"])
-    assert len(text) <= bound and len(text.encode("utf-8")) <= tokens, (len(text), bound)
+    if len(text) > bound or len(text.encode("utf-8")) > tokens:
+        # Each record shown left room for the header and the omission line, so
+        # only a projection showing none gets here: its header and what it must
+        # say of the records exceed a bound. Any bound this text fits renders:
+        # a record that fits it is shown, and if none does, this same text is
+        # (R9-F1 of PR #513).
+        assert not shown, (len(text), bound)
+        raise ValueError(
+            f"a projection bound is at least {len(text)} characters and "
+            f"{len(text.encode('utf-8'))} tokens for this request"
+        )
     return ContextProjection(
         text=text,
         freshness=Freshness(

@@ -727,6 +727,13 @@ def test_a_withdrawn_text_is_withheld_from_its_duplicate_after_a_save_and_a_load
     projection = _render(store, _HELD)
     assert "KeyError" not in projection.text and second not in projection.shown
     assert projection.withdrawn == 1 and "1 withheld as withdrawn text" in projection.text
+    if withdrawal == "correct":
+        assert projection.shown == (first,)  # its own corrected text
+    else:
+        # R9-F2 of PR #513: what shows nothing here was withheld, not inapplicable.
+        assert (projection.shown, projection.not_applicable) == ((), 0)
+        assert projection.text.endswith("nothing pending\n" + _NOTHING_UNWITHDRAWN)
+        assert _NOTHING_APPLIES not in projection.text
     state = make_state(phase=Phase.ANALYZE_EXECUTE, run_id=RUN, launch_seq=3)
     state.issue_memory = store.to_dict()
     save_state(state, tmp_path / "state.json")
@@ -734,14 +741,36 @@ def test_a_withdrawn_text_is_withheld_from_its_duplicate_after_a_save_and_a_load
     assert _render(loaded, _HELD) == projection
 
 
-def test_an_agents_correction_withholds_its_text_from_another_attempts_duplicate():
+@pytest.mark.parametrize("withdrawal", ["correct", "retract"])
+def test_an_agents_withdrawal_withholds_its_text_from_another_attempts_duplicate(withdrawal):
+    """Two proposals of one text under different launch keys: an agent's correction or
+    retraction of one withholds the text from the other, after a reload too. R9-F2 of
+    PR #513: a projection that shows nothing for it says each record that applies is
+    withheld as withdrawn text, never that none applies and never the text; beside a
+    record that does not apply too."""
     store, first = _applied(propose(_store(), "the lock leaks", seq=1))
     store, second = _applied(propose(store, "the lock leaks", seq=2))
     assert _render(store).shown == (second, first)
-    store, _ = _applied(store.correct(first, "the cache leaks, not the lock", **as_agent(3)))
-    projection = _render(store)
-    assert projection.shown == (first,) and projection.withdrawn == 1
-    assert "the lock leaks" not in projection.text
+    store, _ = _applied(
+        store.correct(first, "the cache leaks, not the lock", **as_agent(3))
+        if withdrawal == "correct"
+        else store.retract(first, **as_agent(3), reason="wrong")
+    )
+    projection = _render(_reloaded(store))
+    assert projection == _render(store)
+    assert projection.withdrawn == 1 and "the lock leaks" not in projection.text
+    if withdrawal == "correct":
+        assert projection.shown == (first,)
+        return
+    assert (projection.shown, projection.retracted, projection.not_applicable) == ((), 1, 0)
+    assert "- records: 0 shown, 0 omitted for the bound, 0 not applicable" in projection.text
+    assert projection.text.endswith("nothing pending\n" + _NOTHING_UNWITHDRAWN)
+    assert _NOTHING_APPLIES not in projection.text and "[AutoForge omitted" not in projection.text
+    store, _ = _applied(propose(store, "FIX only", seq=4, applies=Applicability(phases=("FIX",))))
+    beside = _render(_reloaded(store))
+    assert (beside.shown, beside.withdrawn, beside.not_applicable) == ((), 1, 1)
+    assert beside.text.endswith("nothing pending\n" + _NOTHING_UNWITHDRAWN)
+    assert "the lock leaks" not in beside.text and "FIX only" not in beside.text
 
 
 def test_a_withdrawal_hides_its_text_only_where_the_withdrawn_record_applied():
@@ -773,6 +802,7 @@ def test_an_agent_withdrawing_its_own_proposal_hides_no_observation_or_operator_
     store, _ = _applied(store.retract(seeded, actor=Actor.OPERATOR, issue_url=None))
     projection = _render(store, held, candidate=C1)
     assert projection.shown == () and projection.withdrawn == 1 and text not in projection.text
+    assert projection.text.endswith("nothing pending\n" + _NOTHING_UNWITHDRAWN)
 
 
 # -- a withdrawal binds only what its writer could withdraw, where it applied (R2-F2) --------
@@ -1487,11 +1517,13 @@ def test_the_projection_bound_holds_and_every_cut_is_counted():
     assert len(small.text) <= 4096 and small.omitted_for_bound > projection.omitted_for_bound
 
 
-_NOTHING_APPLIES = "(no record applies to this launch)\n"
-_NOTHING_FITS = (
-    "(no record is shown: each record this launch would be shown was omitted for the "
-    "projection's bound)\n"
+#: What a projection showing no record says of why (R8-F1, R9-F2 of PR #513).
+_NOTHING_APPLIES = "(no current record applies to this launch)\n"
+_NOTHING_UNWITHDRAWN = (
+    "(no record is shown: each current record that applies to this launch is withheld "
+    "as withdrawn text)\n"
 )
+_NOTHING_FITS = "(no record is shown: the projection's bound left room for none)\n"
 
 
 def _within_both_bounds(projection, max_chars: int, max_tokens: int) -> bool:
@@ -1500,12 +1532,13 @@ def _within_both_bounds(projection, max_chars: int, max_tokens: int) -> bool:
 
 def test_a_projection_whose_bound_cut_every_record_never_says_none_applies():
     """R8-F1 of PR #513: a projection that shows nothing because its bound cut every
-    record the launch would be shown says so, and never that no record applies: one
-    valid 2,048-byte proposal at the smallest bounds, after a reload, and one of
-    four-byte characters cut by the token bound alone, its character bound the
-    largest, beside a record that does not apply. Only a projection that cut nothing
-    says no record applies: an empty store, and one whose records all apply
-    elsewhere. Every output holds both bounds."""
+    record the launch would be shown says the bound left room for none, and never
+    that no record applies: one valid 2,048-byte proposal at the smallest bounds,
+    after a reload, and one of four-byte characters cut by the token bound alone, its
+    character bound the largest, beside a record that does not apply. Only a
+    projection that cut and withheld nothing says no current record applies: an empty
+    store, and one whose records all apply elsewhere. Every output holds both
+    bounds."""
     lowest = {"max_chars": MIN_PROJECTION_CHARS, "max_tokens": MIN_PROJECTION_TOKENS}
     store, _ = _applied(propose(_store(), "z" * MAX_TEXT_BYTES, seq=1))
     cut = _render(_reloaded(store), **lowest)
@@ -1547,6 +1580,118 @@ def test_a_projection_whose_bound_cut_every_record_never_says_none_applies():
                 bounds.get("max_chars", MAX_PROJECTION_CHARS),
                 bounds.get("max_tokens", MAX_PROJECTION_TOKENS),
             )
+
+
+# -- a projection keeps room only for what it emits (R9-F1 of PR #513) ---------------------
+
+#: GitHub's longest owner (39 characters) and repository name (100).
+_LONG_REPOSITORY = "o" * 39 + "/" + "r" * 100
+_LONG_ISSUE = f"https://github.com/{_LONG_REPOSITORY}/issues/317"
+_LONG_STEP = StepKey(
+    Phase.ANALYZE_EXECUTE, _LONG_ISSUE, f"https://github.com/{_LONG_REPOSITORY}/pull/513", 1, 1
+)
+
+
+def _long_render(store: MemoryStore, max_chars: int, max_tokens: int):
+    """``store`` rendered for a launch whose header is long: the store's run ID,
+    :data:`_LONG_REPOSITORY`'s issue, a PR and a candidate."""
+    run = store.run_id
+    request = ProjectionRequest(
+        repository=_LONG_REPOSITORY,
+        issue_url=_LONG_ISSUE,
+        run_id=run,
+        phase=Phase.ANALYZE_EXECUTE,
+        step=_LONG_STEP,
+        attempt=AttemptRef(run, 9),
+        candidate=C1,
+        descends_from=frozenset(),
+        max_chars=max_chars,
+        max_tokens=max_tokens,
+    )
+    return render_projection(
+        store, request, EvidenceIndex.from_state(run, [], (), issue_url=_LONG_ISSUE)
+    )
+
+
+def _long_proposal(store: MemoryStore, text: str, seq: int) -> MemoryStore:
+    store, _ = _applied(
+        store.add(
+            kind=Kind.HYPOTHESIS,
+            actor=Actor.AGENT,
+            text=text,
+            issue_url=_LONG_ISSUE,
+            step=_LONG_STEP,
+            attempt=AttemptRef(store.run_id, seq),
+            origin=_origin(),
+        )
+    )
+    return _reloaded(store)
+
+
+def _needed(error: pytest.ExceptionInfo) -> tuple[int, int]:
+    """The characters and tokens a refused render names as the bound it needs."""
+    words = str(error.value).split()
+    return int(words[words.index("characters") - 1]), int(words[words.index("tokens") - 1])
+
+
+def test_a_projection_keeps_room_only_for_what_it_emits():
+    """R9-F1 of PR #513: a render refuses a bound only when what it would emit exceeds
+    it, never for room kept for a sentence or an omission line it does not emit. The
+    reviewer's request (a 50-character run ID, GitHub's longest owner and repository
+    names, a PR and a candidate) at both smallest bounds renders an empty store, after
+    a reload; with a record the bound cuts, it still says so with the omission line.
+    A record that fills its bound to the last byte beside the header is shown, and
+    one byte less cuts it with the omission line. A header the smallest bound cannot
+    hold (a 128-character run ID) is refused naming the exact bound it needs, at which
+    it renders. Every output holds both bounds."""
+    lowest = {"max_chars": MIN_PROJECTION_CHARS, "max_tokens": MIN_PROJECTION_TOKENS}
+    run = "af-20261119T000000Z-" + "a" * 30
+    assert len(run) == 50
+    empty = _long_render(_reloaded(_store(run)), **lowest)
+    assert (empty.shown, empty.omitted_for_bound, empty.not_applicable) == ((), 0, 0)
+    assert empty.text.endswith("nothing pending\n" + _NOTHING_APPLIES)
+    assert "[AutoForge omitted" not in empty.text and _NOTHING_FITS not in empty.text
+    assert f"run {run}" in empty.text and f"launch {run}/9" in empty.text
+    assert _within_both_bounds(empty, **lowest)
+
+    # The same request with a record the smallest bound cuts says so, and how many.
+    cut = _long_render(_long_proposal(_store(run), "z" * MAX_TEXT_BYTES, 1), **lowest)
+    assert (cut.shown, cut.omitted_for_bound) == ((), 1)
+    assert cut.text.endswith(
+        _NOTHING_FITS + "[AutoForge omitted 1 records for the projection's bound]\n"
+    )
+    assert _NOTHING_APPLIES not in cut.text and "z" * 64 not in cut.text
+    assert _within_both_bounds(cut, **lowest)
+
+    # A record whose block, beside the header, fills a bound exactly is shown: no room
+    # is kept for a sentence or an omission line that would not be emitted.
+    probe = _long_render(_long_proposal(_store(run), "x", 1), 4096, 4096)
+    exact = len(probe.text) + 600  # four digits, as 4096: the header keeps its length
+    store = _long_proposal(_store(run), "x" * 601, 1)
+    full = _long_render(store, exact, exact)
+    assert full.shown == (1,) and full.omitted_for_bound == 0
+    assert len(full.text) == len(full.text.encode()) == exact
+    assert full.text.endswith("x" * 601 + "\n```\n\n")
+    for bounds in ((exact - 1, exact), (exact, exact - 1)):
+        short = _long_render(store, *bounds)
+        assert (short.shown, short.omitted_for_bound) == ((), 1)
+        assert short.text.endswith(
+            _NOTHING_FITS + "[AutoForge omitted 1 records for the projection's bound]\n"
+        )
+        assert _within_both_bounds(short, *bounds)
+
+    # A header the smallest bound cannot hold is refused, naming what it needs.
+    longest = "a" * 128
+    with pytest.raises(ValueError, match="a projection bound is at least") as refused:
+        _long_render(_store(longest), **lowest)
+    chars, tokens = _needed(refused)
+    assert chars == tokens > MIN_PROJECTION_CHARS
+    at_need = _long_render(_store(longest), chars, tokens)
+    assert len(at_need.text) == chars and at_need.text.endswith(_NOTHING_APPLIES)
+    for bounds in ((chars - 1, tokens), (chars, tokens - 1)):
+        with pytest.raises(ValueError, match="a projection bound is at least") as again:
+            _long_render(_store(longest), *bounds)
+        assert _needed(again) == (chars, tokens)
 
 
 def test_a_launch_citation_is_never_observed_and_names_only_the_receipt_the_run_keeps():
