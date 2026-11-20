@@ -166,9 +166,12 @@ launch's intent save, `PiProvider.fresh_context_refusal` refuses the launch
 unless it will be enforced (`sandbox.mode: required`), `PI_CODING_AGENT_DIR`
 is unset (when set, it is projected read-write from the host, §8) and no
 `sandbox.read_only_paths` entry is, contains or lies inside that directory
-in the home. The profile must also set `require_oauth: false`: the private
-home holds no sign-in, so the model's key comes from a variable. When the
-launch's sandbox is compiled, `fresh_context_launch_problem` checks the
+in the home, decided on where the launch shows the entry, by the
+compiler's own rule (`sandbox_policy.operator_path_destination`): one
+spelled inside the home appears at that spelling, wherever a link there
+leads, and any other at its resolved path. The profile must also set
+`require_oauth: false`: the private home holds no sign-in, so the model's
+key comes from a variable. When the launch's sandbox is compiled, `fresh_context_launch_problem` checks the
 description it actually runs in: Pi starts without `PI_CODING_AGENT_DIR`,
 its home is the launch's private tmpfs, and nothing is mounted at, above or
 inside `~/.pi/agent` there. Otherwise it is refused before anything is

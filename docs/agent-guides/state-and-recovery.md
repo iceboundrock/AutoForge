@@ -716,7 +716,12 @@ As implemented (`flock(2)`, `src/autoforge/locking.py`):
   `rebind-epic`'s repository check and its dry run's report) decides on
   the same normalized directory, never on the caller's spelling. A
   standalone state directory positively identified as outside Git keeps
-  working for Memory-off runs; ambiguous Git discovery errors are refused.
+  working for Memory-off runs, its answer bound to the directory opened in
+  the same way (R4-F1 of PR #526): an existing one must be the directory
+  found outside Git, and one created afterwards is asked about again once
+  opened, so a directory that then lies in another checkout, or in the
+  scheduler root for a standalone command, is refused and `run --force`
+  replaces nothing there. Ambiguous Git discovery errors are refused.
   `memory retract` and `rebind-epic` always require the owning repository.
 - The lock is the working directory's, whatever `--state-dir` names, so
   `rebind-epic` (#435) also binds its state directory to it: `git rev-parse

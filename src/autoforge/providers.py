@@ -407,6 +407,7 @@ from .sandbox_policy import (
     SandboxPlan,
     declared_writable,
     executable_requirements,
+    operator_path_destination,
 )
 from .sdk_assets import (
     CLAUDE_ENVIRONMENT_PROBE,
@@ -520,8 +521,9 @@ class FreshContextHost:
     sandbox (``enforced``), whose home is then a private tmpfs made empty for
     that launch alone (ADR 0005 D8.1); the operator's ``home``, at whose path
     that tmpfs is mounted; and ``operator_paths``
-    (``sandbox.read_only_paths``), which every enforced launch shows at their
-    host paths, inside that home too.
+    (``sandbox.read_only_paths``), which every enforced launch shows: one
+    spelled inside that home at its spelling there, any other at its
+    resolved path (:func:`~autoforge.sandbox_policy.operator_path_destination`).
     """
 
     enforced: bool
@@ -2955,8 +2957,10 @@ class PiProvider(AgentProvider):
         launch must be enforced, ``$PI_CODING_AGENT_DIR`` (projected
         read-write from the host when set) must be unset, and no operator
         path may show a host directory at, above or inside
-        ``~/.pi/agent`` in that home. :meth:`fresh_context_launch_problem`
-        checks the same on the description the launch actually runs in.
+        ``~/.pi/agent`` in that home, decided on where the launch shows it,
+        by the compiler's own rule, never on where it leads (R4-F3 of PR
+        #526). :meth:`fresh_context_launch_problem` checks the same on the
+        description the launch actually runs in, a backstop.
         The reason names variables and settings, never a path.
         """
         if not self.proves_fresh_context(profile):
@@ -2983,7 +2987,12 @@ class PiProvider(AgentProvider):
         home = os.path.realpath(host.home)
         agent = os.path.join(home, PI_DEFAULT_AGENT_DIR.removeprefix("~/"))
         for path in host.operator_paths:
-            shown = os.path.realpath(os.path.expanduser(path))
+            # Where the launch shows the path, by the compiler's own rule: one
+            # spelled in the home at that spelling, wherever a link there
+            # leads, so a `~/.pi` linked outside the home is refused here,
+            # before the intent save, as the compiled check would refuse it
+            # after (R4-F3 of PR #526).
+            shown = operator_path_destination(path, host.home)
             if _covers_agent_dir(shown, home, agent):
                 return (
                     "cannot prove a fresh context: sandbox.read_only_paths shows a host "

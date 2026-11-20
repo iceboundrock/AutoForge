@@ -247,6 +247,27 @@ def _inside(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
+def _shown_at_spelling(path: str, home: str) -> bool:
+    """An operator path spelled strictly inside ``home``: projected at that spelling."""
+    return _inside(path, home) and path != home
+
+
+def operator_path_destination(path: str, home: str) -> str:
+    """Where an enforced launch shows a ``sandbox.read_only_paths`` entry (D15.4).
+
+    The rule :func:`_declared` and the compiler apply: an entry spelled
+    strictly inside ``home`` appears at that spelling in the private home,
+    rebased onto the home's resolved path (C7), wherever its links lead; any
+    other entry appears at its resolved path (C1). A check of what a launch
+    shows at a path in its home decides on this destination, never on the
+    entry's resolved source (R4-F3 of PR #526). Reads nothing but the
+    paths' resolution.
+    """
+    if _shown_at_spelling(path, home):
+        return posixpath.join(os.path.realpath(home), path[len(home.rstrip("/")) + 1 :])
+    return os.path.realpath(path)
+
+
 def sandbox_request(
     facts: LaunchFacts, needs: ProviderRequirements | None = None
 ) -> SandboxRequest:
@@ -579,7 +600,7 @@ def _declared(
     projections: list[ProjectionRequest] = []
     env: list[tuple[str, str]] = []
     keyring: list[str] = []
-    in_home = [p for p in operator_paths if _inside(p, home) and p != home]
+    in_home = [p for p in operator_paths if _shown_at_spelling(p, home)]
     elsewhere = [p for p in operator_paths if p not in in_home]
     roots = _outermost([*needs.install_roots, *needs.config]) if needs is not None else []
     if roots:

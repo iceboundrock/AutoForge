@@ -21,6 +21,7 @@ from autoforge.errors import (
     GitHubUnavailableError,
     LockError,
     SchedulerStateDirError,
+    StateError,
 )
 from autoforge.executor import ExecutionResult, execute
 from autoforge.github import GitHubClient
@@ -715,6 +716,97 @@ def test_a_state_directory_created_in_a_foreign_clone_after_the_check_is_refused
         engine.load()
     assert state_tree(state_dir) == before
     engine.close()
+
+
+def _memory_off_checkpoint(state_dir: Path, run_id: str) -> None:
+    """A Memory-off run saved in ``state_dir``."""
+    saved = AutoForgeState(
+        run_id=run_id,
+        repository="owner/repo",
+        epic_url=EPIC,
+        current_issue_url=ISSUE,
+        phase=Phase.ANALYZE_EXECUTE,
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    save_state(saved, state_dir / "state.json")
+
+
+@pytest.mark.parametrize("other", ["foreign-clone", "scheduler-namespace"])
+def test_run_force_on_an_external_state_directory_cannot_replace_a_checkpoint_linked_in_later(
+    tmp_path, tmp_path_factory, monkeypatch, capsys, fakes, other
+):
+    """R4-F1 of PR #526: with Memory off, ``--state-dir`` names a missing
+    directory outside every repository, which both owner checks, the one
+    under the lock included, admit as the legacy external use. Its parent is
+    then made a link to another checkout's run, or to a scheduler
+    namespace's. The state root opens that directory, is asked about again,
+    and refuses it: ``run --force`` replaces nothing, and nothing runs."""
+    monkeypatch.chdir(tmp_path)
+    if other == "foreign-clone":
+        state_dir = git_repo(tmp_path / "other-clone") / "state"
+        refusal = "not owned by this checkout's repository lock"
+    else:
+        state_dir = _namespace_state_dir(tmp_path, 7)
+        refusal = "inside the parallel EPIC scheduler's root"
+    state_dir.mkdir(parents=True)
+    _memory_off_checkpoint(state_dir, "af-other")
+    external = Path(os.path.realpath(tmp_path_factory.mktemp("external")))
+    spelled = external / "a" / "state"
+    answers: list[bool] = []
+    checked = ControllerEngine.require_checkpoint_owner
+
+    def checked_then_linked(self, **kwargs):
+        answers.append(checked(self, **kwargs))
+        if len(answers) == 2:  # the check made under the lock
+            (external / "a").symlink_to(state_dir.parent)
+        return answers[-1]
+
+    monkeypatch.setattr(ControllerEngine, "require_checkpoint_owner", checked_then_linked)
+    before = state_tree(state_dir)
+    argv = ["--state-dir", str(spelled), "run", "--epic", EPIC, "--issue", ISSUE, "--force"]
+    assert cli.main([*argv, "--max-steps", "1"]) == 2
+    assert answers == [False, False]
+    assert refusal in capsys.readouterr().err
+    assert state_tree(state_dir) == before
+    assert load_state(state_dir / "state.json").run_id == "af-other"
+    assert fakes["provider"].calls == [] and fakes["gh"].effect_writes == []
+
+
+def test_an_external_memory_off_state_directory_still_runs_and_is_bound_to_it(
+    tmp_path, tmp_path_factory, monkeypatch, capsys, fakes
+):
+    """R4-F1 of PR #526: a state directory outside every repository stays
+    usable with Memory off: created by ``run``, replaced by ``run --force``
+    and continued by ``step``. The owner check binds it to the directory it
+    found, so one put in its place after the check is refused, not read."""
+    monkeypatch.chdir(tmp_path)
+    external = Path(os.path.realpath(tmp_path_factory.mktemp("external")))
+    state_dir = external / "runs" / "state"
+    argv = ["--state-dir", str(state_dir)]
+    assert cli.main([*argv, *_run_argv_of(1)]) == 0
+    first = load_state(state_dir / "state.json").run_id
+    assert cli.main([*argv, *_run_argv_of(1), "--force"]) == 0
+    second = load_state(state_dir / "state.json")
+    assert second.run_id != first and second.issue_memory == {}
+    capsys.readouterr()
+    # Admitted, the step launches; the scripted agent returns no result.
+    cli.main([*argv, "step"])
+    assert "repository lock" not in capsys.readouterr().err
+    assert fakes["provider"].calls
+    from autoforge.config import AutoForgeConfig
+
+    engine = ControllerEngine(config=AutoForgeConfig(), state_dir=str(state_dir), workdir=tmp_path)
+    assert engine.require_checkpoint_owner(standalone="step") is False
+    found = state_tree(state_dir)
+    moved = external / "runs" / "moved"
+    state_dir.rename(moved)
+    state_dir.mkdir()
+    shutil.copy2(moved / "state.json", state_dir / "state.json")
+    with pytest.raises(StateError, match="was replaced while the controller was running"):
+        engine.load()
+    engine.close()
+    assert state_tree(moved) == found
 
 
 def test_run_dry_run_writes_nothing(tmp_path, capsys, monkeypatch, fakes):

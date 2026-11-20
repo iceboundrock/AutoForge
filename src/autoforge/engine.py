@@ -1949,9 +1949,11 @@ class ControllerEngine:
         self._state_root: SafeRoot | None = None
         # What :meth:`require_checkpoint_owner` bound: the identity of the
         # directory git was asked from, how far below it the state directory
-        # lies, and the standalone command whose scheduler-root refusal it
-        # decided (``""``: none); checked whenever the state root is opened.
-        self._checkpoint_probe: tuple[tuple[int, int], int, str] | None = None
+        # lies, the standalone command whose scheduler-root refusal it
+        # decided (``""``: none) and whether it found that directory outside
+        # every repository (the legacy Memory-off use, its answer False);
+        # checked whenever the state root is opened.
+        self._checkpoint_probe: tuple[tuple[int, int], int, str, bool] | None = None
         self.workdir = str(workdir)
         self.providers = providers or ProviderRegistry(runner=runner)
         # The GitHub client is built on first *use*, never on construction:
@@ -3808,7 +3810,11 @@ class ControllerEngine:
         Return False only for the legacy Memory-off use of a directory
         positively identified as outside Git. Every path to enabling or
         writing Memory requires a repository match, irrespective of what a
-        previously loaded snapshot said.
+        previously loaded snapshot said. That answer is bound to the
+        directory opened like any other (R4-F1 of PR #526): an existing
+        target must be the directory found outside Git, and a missing one,
+        once created and opened, is asked about again, so a directory that
+        then lies in another checkout or in the scheduler root is refused.
 
         The target is the one directory :meth:`state_root` opens, spelled as
         :class:`StatePaths` spells it (its anchor and components, no ``..``),
@@ -3848,28 +3854,23 @@ class ControllerEngine:
             if depth == 0 and stat.S_ISLNK(found.st_mode):
                 raise StateError("checkpoint directory is a symbolic link")
             identity, theirs = self._checkpoint_repository(probe)
-        except NoRepository:
-            if standalone:
-                # Outside every repository, so outside the scheduler root too;
-                # decided on the path all the same, as before the lock.
-                check_standalone_state_dir(target, self.coordination_root(), standalone)
-            if allow_external and not self.config.memory.enabled:
-                return False
-            raise LockError(
-                "checkpoint directory is not owned by this checkout's repository lock"
-            ) from None
         except (LockError, OSError):
             raise LockError("cannot establish the checkpoint directory's repository") from None
-        if theirs != self.coordination_root():
+        if theirs is not None and theirs != self.coordination_root():
             raise LockError("checkpoint directory is not owned by this checkout's repository lock")
         if standalone:
+            # Outside every repository is outside the scheduler root too;
+            # decided on the directory git was asked from all the same.
             self._refuse_scheduler_directory(
                 probe, identity, target.parts[len(target.parts) - depth :], standalone
             )
-        self._checkpoint_probe = (identity, depth, standalone)
+        external = theirs is None
+        if external and not (allow_external and not self.config.memory.enabled):
+            raise LockError("checkpoint directory is not owned by this checkout's repository lock")
+        self._checkpoint_probe = (identity, depth, standalone, external)
         if depth == 0:
             self._bind_checkpoint_root(self.state_root(create=False))
-        return True
+        return theirs is not None
 
     def _refuse_scheduler_directory(
         self, probe: Path, identity: tuple[int, int], missing: tuple[str, ...], command: str
@@ -3892,11 +3893,17 @@ class ControllerEngine:
         check_standalone_state_dir(real.joinpath(*missing), self.coordination_root(), command)
 
     @staticmethod
-    def _checkpoint_repository(path: Path) -> tuple[tuple[int, int], Path]:
+    def _checkpoint_repository(path: Path) -> tuple[tuple[int, int], Path | None]:
         """The identity of the directory ``path`` names and its repository's git
-        common dir, asked from it; the directory must not change meanwhile."""
+        common dir, asked from it; the directory must not change meanwhile.
+        ``None`` for a directory positively outside every repository
+        (:class:`~autoforge.locking.NoRepository`)."""
         before = os.stat(path)
-        theirs = repository_lock_path(path, cross_filesystems=True).parent.parent
+        theirs: Path | None
+        try:
+            theirs = repository_lock_path(path, cross_filesystems=True).parent.parent
+        except NoRepository:
+            theirs = None
         after = os.stat(path)
         identity = (before.st_dev, before.st_ino)
         if (after.st_dev, after.st_ino) != identity:
@@ -3908,26 +3915,33 @@ class ControllerEngine:
 
         A target that existed when it was checked must be the directory git
         was asked from. One that did not is asked about again now that it is
-        opened: the root's directory itself, under the same rule. Nothing is
-        bound before :meth:`require_checkpoint_owner` runs, or after the
-        engine's paths change.
+        opened: the root's directory itself, under the same rule. A directory
+        found outside every repository (the legacy Memory-off use) is bound
+        the same way (R4-F1 of PR #526): one opened after the check must lie
+        in this checkout's repository or still in none, and never in the
+        scheduler root when a standalone command asked; one found in this
+        checkout's repository must still lie there. Nothing is bound
+        before :meth:`require_checkpoint_owner` runs, or after the engine's
+        paths change.
         """
         if self._checkpoint_probe is None:
             return
-        identity, depth, standalone = self._checkpoint_probe
+        identity, depth, standalone, external = self._checkpoint_probe
         if depth:
             target = self.checkpoint_target()
             try:
                 identity, theirs = self._checkpoint_repository(target)
             except (LockError, OSError):
                 raise LockError("cannot establish the checkpoint directory's repository") from None
-            if theirs != self.coordination_root():
+            if theirs is None and not external:
+                raise LockError("cannot establish the checkpoint directory's repository")
+            if theirs is not None and theirs != self.coordination_root():
                 raise LockError(
                     "checkpoint directory is not owned by this checkout's repository lock"
                 )
             if standalone:
                 self._refuse_scheduler_directory(target, identity, (), standalone)
-            self._checkpoint_probe = (identity, 0, standalone)
+            self._checkpoint_probe = (identity, 0, standalone, external)
         if root.identity != identity:
             raise LockError(
                 "checkpoint directory is not the directory its repository lock was checked for"

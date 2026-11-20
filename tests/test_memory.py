@@ -762,6 +762,48 @@ def test_a_claim_that_fit_before_its_supersession_stays_shown_at_that_exact_budg
     assert COMPACT_SLACK_BYTES > 3
 
 
+def test_supersession_prose_never_displaces_another_established_claim():
+    """R4-F2 of PR #526: two retained, non-equivalent observations (FAIL and
+    TIMEOUT) both fit a budget of the exact size of their render. M1 is then
+    superseded by M2, which does not carry M1's claim, so both stay shown:
+    M1's whole block, now with its supersession note, and M2's no longer fit
+    together, and the claims are chosen before the prose, so M1 is shown by
+    its claim alone and M2 whole, within both limits."""
+    a = failure(1, exit_code=1)
+    b = failure(2, exit_code=1, timed_out=True)
+    st = apply(observation(empty(), a, text="the suite failed"))
+    st = apply(observation(st, b, text="the suite timed out"))
+    loose = render_projection(reload(st), REQ, validation_records=[a, b])
+    assert sorted(loose.ids) == [1, 2] and loose.freshness.omitted == 0
+    size = len(loose.text.encode())
+    superseded = reload(apply(revise(st, Action.SUPERSEDE, 1, replacement=2)))
+    # With room, both whole blocks: more than the exact budget holds.
+    roomy = render_projection(superseded, REQ, validation_records=[a, b])
+    assert roomy.ids == (1, 2) and "Superseded by M2; shown because" in roomy.text
+    assert len(roomy.text.encode()) > size
+    for exact in (
+        replace(REQ, max_bytes=size),
+        replace(REQ, max_chars=len(loose.text), max_bytes=size),
+    ):
+        before = render_projection(reload(st), exact, validation_records=[a, b])
+        assert before.text == loose.text
+        after = render_projection(superseded, exact, validation_records=[a, b])
+        assert after.ids == (1, 2) and after.freshness.omitted == 0
+        assert dict(after.retention) == {1: Retention.ESTABLISHED, 2: Retention.ESTABLISHED}
+        assert (
+            "\nM1 validation-failure — superseded by M2; claim only, text omitted\n"
+            f"Observed validation 1 ({a['digest']}): FAIL on {SHA}"
+        ) in after.text
+        assert f"Observed validation 2 ({b['digest']}): TIMEOUT on {SHA}" in after.text
+        assert "the suite failed" not in after.text and "the suite timed out" in after.text
+        assert len(after.text) <= exact.max_chars and len(after.text.encode()) <= exact.max_bytes
+    # A budget with room for M1's whole block beside M2's restores its prose.
+    whole = render_projection(
+        superseded, replace(REQ, max_bytes=len(roomy.text.encode())), validation_records=[a, b]
+    )
+    assert whole.text == roomy.text
+
+
 def test_freshness_names_the_candidate_and_launch_receipts_the_render_resolved():
     """R3-F4 of PR #526: holding only the candidate receipt, or only the launch
     receipt, downgrades a different record, and the freshness says so; the
@@ -808,6 +850,29 @@ def test_freshness_names_the_candidate_and_launch_receipts_the_render_resolved()
         again = render_projection(st, REQ, retained=order)
         assert again.freshness == both.freshness and again.text == both.text
     assert f"Retained evidence digest: {both.freshness.evidence_digest}" in both.text
+
+
+def test_validation_receipts_in_any_order_give_the_same_projection():
+    """R4-F4 of PR #526: the same two valid validation records, supplied in
+    checkpoint order or reversed, resolve every citation alike: equal
+    freshness, text, IDs and retention. Two records sharing one sequence
+    number are refused, in either order."""
+    a = failure(1, exit_code=1)
+    b = failure(2, exit_code=1, timed_out=True)
+    st = apply(observation(empty(), a, text="the suite failed"))
+    st = reload(apply(observation(st, b, text="the suite timed out")))
+    forward = render_projection(st, REQ, validation_records=[a, b])
+    assert sorted(forward.ids) == [1, 2]
+    assert dict(forward.retention) == {1: Retention.ESTABLISHED, 2: Retention.ESTABLISHED}
+    for order in ([b, a], (b, a)):
+        again = render_projection(st, REQ, validation_records=order)
+        assert again == forward
+    # One receipt only is a different input, and a different freshness.
+    assert render_projection(st, REQ, validation_records=[b]).freshness != forward.freshness
+    twin = failure(1, exit_code=1, timed_out=True)
+    for order in ([a, twin], [twin, a], [b, a, a]):
+        with pytest.raises(StateError, match="invalid Issue Working Memory data"):
+            render_projection(st, REQ, validation_records=order)
 
 
 def test_an_identical_agent_revision_spelled_with_mixed_case_urls_is_a_replay():
@@ -943,7 +1008,9 @@ def pi_profile(**options):
 
 
 def _host(home, *, enforced=True, paths=()):
-    return FreshContextHost(enforced=enforced, home=str(home), operator_paths=tuple(paths))
+    return FreshContextHost(
+        enforced=enforced, home=str(home), operator_paths=tuple(str(path) for path in paths)
+    )
 
 
 def test_pi_fresh_context_is_proved_only_by_the_launchs_private_agent_directory(
@@ -1071,10 +1138,11 @@ class PiShaped(ScriptedProvider):
         return super().execute(req)
 
 
-def pi_engine(state_dir, github, *, memory, sandbox="disabled", workdir=None):
+def pi_engine(state_dir, github, *, memory, sandbox="disabled", workdir=None, read_only=()):
     cfg = default_config()
     cfg.memory = MemoryConfig(memory)
     cfg.sandbox.mode = sandbox
+    cfg.sandbox.read_only_paths = [str(path) for path in read_only]
     cfg.profiles["analyze_execute"] = pi_profile()
     eng = make_engine(
         state_dir, "never", github=github, cfg=cfg, origin=workdir is None, workdir=workdir
@@ -1184,6 +1252,45 @@ def test_a_configured_pi_agent_directory_refuses_a_memory_launch_before_its_inte
     with pytest.raises(ControlResultValidationError):
         eng.step()
     assert pi.calls and load_state(eng.paths.state_file).launch_seq == 2
+
+
+def test_a_pi_directory_linked_out_of_the_home_is_refused_before_the_intent_save(
+    tmp_state_dir, fake_github, tmp_path_factory, monkeypatch
+):
+    """R4-F3 of PR #526: ``~/.pi`` is a link to a directory outside the home,
+    and ``sandbox.read_only_paths`` names it. Resolved, it lies outside the
+    home; the launch shows it at its spelling, over Pi's agent directory in
+    the private home. The adapter decides on that destination, so the launch
+    is refused before its intent save: no ordinal spent, nothing launched,
+    the checkpoint as it was. The compiled check stays the backstop."""
+    home = tmp_path_factory.mktemp("home")
+    store = tmp_path_factory.mktemp("pi-store")
+    (store / "agent").mkdir()
+    (home / ".pi").symlink_to(store)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    linked = home / ".pi"
+    host = _host(home, paths=[linked])
+    assert PiProvider().fresh_context_refusal(pi_profile(), {}, host) != ""
+    eng, pi = pi_engine(
+        tmp_state_dir, fake_github, memory=True, sandbox="required", read_only=[linked]
+    )
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    before = eng.paths.state_file.read_bytes()
+    spent = load_state(eng.paths.state_file).launch_seq
+    with pytest.raises(ConfigurationError, match="sandbox.read_only_paths shows a host") as caught:
+        eng.step()
+    assert str(home) not in str(caught.value) and str(store) not in str(caught.value)
+    assert pi.calls == [] and eng.paths.state_file.read_bytes() == before
+    assert not (eng.paths.state_dir / "read-context").exists()
+    # Without the adapter's check, the compiled description refuses the
+    # launch before anything is spawned, but only after its intent save.
+    monkeypatch.setattr(PiShaped, "fresh_context_refusal", lambda *args: "")
+    with pytest.raises(SandboxLaunchRefusedError, match="at, above or inside"):
+        eng.step()
+    assert pi.compiled == []
+    assert load_state(eng.paths.state_file).launch_seq == spent + 1
+    eng.close()
 
 
 @pytest.mark.parametrize("sandbox", ["disabled", "required"])

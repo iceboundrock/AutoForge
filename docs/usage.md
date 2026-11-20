@@ -2530,7 +2530,8 @@ The provider-neutral projection uses the committed revision, one bound
 launch and retained typed receipts. Its freshness names the revision, the
 store's digest and one digest of every receipt it resolved citations
 against (validation, candidate and launch), which is the same in whatever
-order they are supplied. The launch is the snapshot's next one
+order they are supplied; two validation records with one sequence number
+are refused. The launch is the snapshot's next one
 (its `launch_seq` plus one): a projection is never labeled as what an
 earlier launch was shown. A validation receipt can establish
 only what it records for that issue and exact candidate, not adjacent
@@ -2540,10 +2541,12 @@ a validation failure that its own retained receipt establishes on the
 launch: a supersession cannot hide it without matching check, policy,
 outcome and candidate evidence in a record of the chain that the
 projection actually shows. A replacement the budget leaves out does not
-count. Until then the failure is shown, marked as superseded. When its
-whole block no longer fits the budget, its receipt's claim is shown alone,
-labeled as superseded with its text omitted. That block is shorter than
-the record's block was before the supersession.
+count. Until then the failure is shown, marked as superseded. Which
+records are shown is decided with that failure as its receipt's claim
+alone, labeled as superseded with its text omitted, a block shorter than
+the record's block was before the supersession. Its whole block is shown
+only if the budget left after that holds it, so its prose never displaces
+another record's established claim.
 
 Each citation resolves to a typed retention result. `established` means a
 retained validation record establishes the claim on this launch.

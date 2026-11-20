@@ -917,15 +917,22 @@ COMPACT_SLACK_BYTES = (
 def _validation_facts(
     store: MemoryStore, receipts: Sequence[dict]
 ) -> dict[EvidenceRef, RecordView]:
+    """The run's retained validation records, by the reference that cites each.
+
+    Unique by sequence number and in any order (R4-F4 of PR #526): the
+    result is a mapping, and the freshness digests it sorted, so the same
+    records in another order resolve every citation alike and give the
+    same projection. Two records with one sequence number are refused.
+    """
     _require(len(receipts) <= MAX_RECORDS)
     result = {}
-    previous = 0
+    seen: set[int] = set()
     for raw in receipts:
         # Never quote errors from an evidence snapshot supplied to a render.
         try:
             record = parse_record(raw)
-            _require(record.seq > previous)
-            previous = record.seq
+            _require(record.seq not in seen)
+            seen.add(record.seq)
         except StateError:
             _invalid()
         if (
@@ -1143,8 +1150,8 @@ def render_projection(
                 f"definition {definition}, policy {policy}.\n"
             )
             if compact:
-                # The evidence alone, for a superseded record whose full block
-                # no longer fits (R3-F2 of PR #526): its receipt's claim and
+                # The evidence alone, the form in which a superseded record is
+                # selected (R3-F2, R4-F2 of PR #526): its receipt's claim and
                 # what it is, never its prose. It is shorter than the record's
                 # whole block before the supersession by more than the header
                 # and the omission notice can grow (COMPACT_SLACK_BYTES), and
@@ -1183,19 +1190,30 @@ def render_projection(
 
     def fit(visible: list[MemoryFact]) -> tuple[list[str], list[int], int]:
         downgraded = sum(_downgraded(f, resolved[f.id][0]) for f in visible)
+
+        def fitting(blocks: list[str]) -> bool:
+            return fits(assemble(blocks, len(visible), downgraded))
+
+        # A superseded record is visible only for the claim its receipt
+        # establishes. Which records are shown is decided first, in rank
+        # order, with each superseded record in that compact form, so its
+        # optional prose never displaces another record's established claim
+        # (R3-F2, R4-F2 of PR #526).
         blocks: list[str] = []
-        ids: list[int] = []
+        shown: list[MemoryFact] = []
         for fact in visible:
-            # A superseded record is visible only for the claim its receipt
-            # establishes: when its whole block does not fit, its evidence
-            # alone is shown, never nothing (R3-F2 of PR #526).
-            forms = [block(fact), *([block(fact, compact=True)] if fact.replacement else [])]
-            for text in forms:
-                if fits(assemble([*blocks, text], len(visible), downgraded)):
-                    blocks.append(text)
-                    ids.append(fact.id)
-                    break
-        return blocks, ids, downgraded
+            text = block(fact, compact=bool(fact.replacement))
+            if fitting([*blocks, text]):
+                blocks.append(text)
+                shown.append(fact)
+        # Then, with the budget left, each shown superseded record's whole
+        # block, in rank order. The shown set and its counts do not change.
+        for index, fact in enumerate(shown):
+            if fact.replacement:
+                whole = [*blocks[:index], block(fact), *blocks[index + 1 :]]
+                if fitting(whole):
+                    blocks = whole
+        return blocks, [f.id for f in shown], downgraded
 
     # Start from every exempt record a later record of its chain could carry,
     # and release each whose carrier the budget left out, until none is left:

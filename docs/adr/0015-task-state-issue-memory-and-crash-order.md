@@ -1647,8 +1647,9 @@ the private home the outer sandbox makes empty for that launch alone (ADR
 0005 D8.1). The host's part is D18's dynamic check before each Memory
 launch's intent save. The launch must be enforced, `PI_CODING_AGENT_DIR`
 unset (it would project a host directory read-write), and no operator path
-may show a host directory at, above or inside `~/.pi/agent` in that home.
-The launch's part is checked on its compiled sandbox description: Pi's home
+may show a host directory at, above or inside `~/.pi/agent` in that home,
+decided on where the sandbox mounts it: one spelled in the home at that
+spelling, wherever a link there leads. The launch's part is checked on its compiled sandbox description: Pi's home
 is the private tmpfs, and nothing is mounted over its agent directory there.
 Otherwise the launch is refused before anything is spawned. A same-UID
 process outside the sandbox that enters the launch's namespace through
@@ -1668,12 +1669,15 @@ again is a replay, whatever the case of its URLs. A superseded record
 stays superseded when its replacement is retracted. Only a validation
 failure its retained receipt establishes on the launch stays shown, until
 a record of its chain that the projection actually shows carries the same
-claim; a replacement the budget leaves out does not. When its whole block
-no longer fits, its receipt's claim is shown alone, labeled as superseded
-with its text omitted; that block is shorter than the record's block
-before the supersession. A projection is bound to the next launch ordinal
-of its snapshot, and its freshness digests every receipt it resolved
-citations against, validation, candidate and launch, in any order. A
+claim; a replacement the budget leaves out does not. Which records are
+shown is decided with each such record as its receipt's claim alone,
+labeled as superseded with its text omitted, a block shorter than the
+record's block before the supersession; its whole block is shown only
+with the budget left after that, so its prose never displaces another
+record's established claim. A projection is bound to the next launch
+ordinal of its snapshot, and its freshness digests every receipt it
+resolved citations against, validation, candidate and launch, unique and
+in any order. A
 citation resolves to a typed retention result: established (a validation
 record only), retained or unavailable. This slice admits validation,
 candidate and launch receipts, not review, effect or Git references.
@@ -1684,7 +1688,7 @@ candidate and launch receipts, not review, effect or Git references.
 | the existing atomic save and strict loader (D10) | #319's roles, or D7.4's launch class |
 | a deterministic render into the read context (D12) | #324, #325 or #326; SQLite, FTS5 or LTSearch; an embedding service |
 | D14's proof from `claude`, `opencode` or `pi`, refused otherwise (D18) | an SDK-only provider |
-| `sandbox.mode` `required` with bwrap for a Memory launch (`disabled` for every other) | Docker or Podman |
+| `sandbox.mode` `required` with bwrap for a Memory launch (every other launch keeps its configured mode) | Docker or Podman |
 | an operator command for the seed and retractions (D9.5) | #126's pause; a new effect kind or stop code |
 
 ## 3. What does not change

@@ -1125,7 +1125,10 @@ or host directory shares. Before each Memory launch's intent save, the
 controller refuses the launch unless it will run inside the outer sandbox,
 `PI_CODING_AGENT_DIR` is unset (when set, it names a host directory every launch given it
 shares), and no `sandbox.read_only_paths` entry shows a host directory at,
-above or inside `~/.pi/agent`. That home holds no ChatGPT sign-in, hence
+above or inside `~/.pi/agent`. Where an entry shows is decided as the
+sandbox mounts it: one spelled inside the home appears at that spelling,
+wherever a link there leads, so a `~/.pi` linked outside the home is refused
+too. That home holds no ChatGPT sign-in, hence
 `require_oauth: false`, with the model provider's API key forwarded as a
 variable (`execution.agent_env_allowlist_extra`, as the
 [Pi operator guide](pi.md#deepseek-on-an-api-key) describes). Once the
