@@ -1667,14 +1667,17 @@ change. A stale one is refused, on write and on load. A revision is
 compared with the saved rows in its canonical form, so the same input
 again is a replay, whatever the case of its URLs. A superseded record
 stays superseded when its replacement is retracted. Only a validation
-failure its retained receipt establishes on the launch stays shown, until
-a record of its chain that the projection actually shows carries the same
-claim; a replacement the budget leaves out does not. Which records are
-shown is decided with each such record as its receipt's claim alone,
-labeled as superseded with its text omitted, a block shorter than the
-record's block before the supersession; its whole block is shown only
-with the budget left after that, so its prose never displaces another
-record's established claim. A projection is bound to the next launch
+failure its retained receipt establishes on the launch stays shown, unless
+a record the projection actually shows carries the same claim; a record
+the budget leaves out does not. The distinct established claims are chosen
+before anything else is spent, each by the shortest whole block of a
+record that establishes it, in rank order, and as if no record were
+superseded, so a supersession removes no claim the projection showed. A
+superseded record then holds its claim alone, labeled as superseded with
+its text omitted, a block no longer than the one it was chosen on; a
+current record with the same claim takes its place where that fits, and
+its whole block is shown only with the budget left after that. Neither
+prose nor a second proof of one claim displaces another. A projection is bound to the next launch
 ordinal of its snapshot, and its freshness digests every receipt it
 resolved citations against, validation, candidate and launch, unique and
 in any order. A

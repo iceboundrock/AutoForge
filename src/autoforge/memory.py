@@ -899,13 +899,17 @@ def _compact_label(replacement: int) -> str:
 
 
 # How much shorter a superseded record's compact block is than the shortest
-# full block it had before (R3-F2 of PR #526). Both open with the same
-# ``\nM<id> <kind> — `` and carry the same established-claim line; the full
+# whole block it had before (R3-F2 of PR #526). Both open with the same
+# ``\nM<id> <kind> — `` and carry the same established-claim line; the whole
 # block then has the observed record's label, its fenced text (one
 # character at least) and a newline, the compact one its label for the
-# largest record ID. A supersession adds at most one digit to the Memory
-# revision, and ranking the record first at most one to the omitted count,
-# which the header and the omission notice each show: this must exceed 3.
+# largest record ID. A claim is chosen on the whole block (R5-F1 of PR
+# #526), and the header shows the Memory revision at a fixed width, so a
+# compact block that is not longer always fits where it was chosen: this
+# must not be negative.
+# The Memory revision's width in a projection's header: a supersession,
+# one revision more, never makes the header longer.
+_REVISION_WIDTH = len(str(MAX_EVENTS))
 COMPACT_SLACK_BYTES = (
     len("unverified controller account\n")
     + len(fenced_untrusted_block("x", "untrusted"))
@@ -1065,18 +1069,14 @@ def render_projection(
     def claim_of(i: int) -> tuple | None:
         return resolved[i][1] if i in resolved else None
 
-    def chain(fact: MemoryFact) -> list[MemoryFact]:
-        # The records that replaced ``fact``, in order.
-        links = []
-        while fact.replacement:
-            fact = facts[fact.replacement]
-            links.append(fact)
-        return links
-
     def rank(fact: MemoryFact) -> tuple[int, int]:
         retention, claim = resolved[fact.id]
         if claim is not None:
-            return (3, fact.revision)
+            # An established observation keeps the place its add gave it: an
+            # observed record is never corrected, so only a supersession
+            # changes its revision, and a supersession promotes the claim
+            # it leaves behind above no other claim (R5-F1 of PR #526).
+            return (3, fact.id)
         if _downgraded(fact, retention):
             return (0, fact.revision)
         return (_RANK[fact.author], fact.revision)
@@ -1085,10 +1085,18 @@ def render_projection(
     # without its receipt or cut by the budget does not make the record it
     # replaced current again. One record outlives its supersession: an
     # observation its retained receipt establishes on this launch, unless a
-    # record of its chain that this projection actually shows establishes the
-    # same claim, so neither unsupported text nor the budget hides it.
+    # record this projection actually shows establishes the same claim, so
+    # neither unsupported text nor the budget hides it, and a second proof
+    # of a claim already shown is never spent on it (R5-F1 of PR #526).
     current = [facts[i] for i in resolved if not facts[i].replacement]
     exempt = [facts[i] for i in resolved if facts[i].replacement and claim_of(i) is not None]
+    downgraded = sum(_downgraded(f, resolved[f.id][0]) for f in current)
+    order = sorted([*current, *exempt], key=rank, reverse=True)
+    # The same records as they would be with no supersession: every one this
+    # launch can be shown counted as current, each by its whole block. Which
+    # established claims are shown is decided on this view (R5-F1 of PR #526).
+    unsuperseded = len(resolved)
+    unsuperseded_downgraded = sum(_downgraded(facts[i], resolved[i][0]) for i in resolved)
     revision = len(store._events)
     memory_digest = _digest(_json(store.encode()))
     # Every receipt input the render resolves a citation against: the run's
@@ -1116,7 +1124,7 @@ def render_projection(
             f"Step: {step.phase.value}, execution {step.execution_attempt}, "
             f"round {step.review_round}, PR {step.pr_url or 'none'}\n"
             f"Candidate: {request.candidate or 'none'}\n"
-            f"Memory revision: {revision}; digest: {memory_digest}\n"
+            f"Memory revision: {revision:0{_REVISION_WIDTH}d}; digest: {memory_digest}\n"
             f"Retained evidence digest: {evidence_digest}\n"
             f"Shown {shown}; omitted {omitted}; inapplicable {inapplicable}; "
             f"withdrawn {withheld}; needs revalidation {downgraded}.\n"
@@ -1133,7 +1141,7 @@ def render_projection(
             tail = ""
         return header + "".join(blocks) + tail
 
-    def block(fact: MemoryFact, *, compact: bool = False) -> str:
+    def block(fact: MemoryFact, *, compact: bool = False, unsuperseded: bool = False) -> str:
         retention, claim = resolved[fact.id]
         label = (
             "unverified controller account"
@@ -1150,17 +1158,16 @@ def render_projection(
                 f"definition {definition}, policy {policy}.\n"
             )
             if compact:
-                # The evidence alone, the form in which a superseded record is
-                # selected (R3-F2, R4-F2 of PR #526): its receipt's claim and
-                # what it is, never its prose. It is shorter than the record's
-                # whole block before the supersession by more than the header
-                # and the omission notice can grow (COMPACT_SLACK_BYTES), and
-                # the supersession ranks it first among established claims.
+                # The evidence alone, the form in which a superseded record
+                # holds its claim (R3-F2, R4-F2, R5-F1 of PR #526): its
+                # receipt's claim and what it is, never its prose, shorter
+                # than the whole block the claim was chosen on
+                # (COMPACT_SLACK_BYTES).
                 assert fact.replacement
                 return (
                     f"\nM{fact.id} {fact.kind.value} — {_compact_label(fact.replacement)}\n" + proof
                 )
-            if fact.replacement:
+            if fact.replacement and not unsuperseded:
                 proof += (
                     f"Superseded by M{fact.replacement}; shown because no record shown "
                     "here establishes the same observed claim.\n"
@@ -1188,52 +1195,69 @@ def render_projection(
             + "\n"
         )
 
-    def fit(visible: list[MemoryFact]) -> tuple[list[str], list[int], int]:
-        downgraded = sum(_downgraded(f, resolved[f.id][0]) for f in visible)
+    def visible(chosen: Collection[int]) -> int:
+        # Every current record counts; a superseded one only while no record
+        # shown carries its claim, so one left out for a carrier is no
+        # omission, and one left out for the budget is.
+        carried = {claim_of(i) for i in chosen}
+        return len(current) + sum(f.id in chosen or claim_of(f.id) not in carried for f in exempt)
 
-        def fitting(blocks: list[str]) -> bool:
-            return fits(assemble(blocks, len(visible), downgraded))
+    def compose(chosen: dict[int, str]) -> str:
+        blocks = [chosen[f.id] for f in order if f.id in chosen]
+        return assemble(blocks, visible(chosen), downgraded)
 
-        # A superseded record is visible only for the claim its receipt
-        # establishes. Which records are shown is decided first, in rank
-        # order, with each superseded record in that compact form, so its
-        # optional prose never displaces another record's established claim
-        # (R3-F2, R4-F2 of PR #526).
-        blocks: list[str] = []
-        shown: list[MemoryFact] = []
-        for fact in visible:
-            text = block(fact, compact=bool(fact.replacement))
-            if fitting([*blocks, text]):
-                blocks.append(text)
-                shown.append(fact)
-        # Then, with the budget left, each shown superseded record's whole
-        # block, in rank order. The shown set and its counts do not change.
-        for index, fact in enumerate(shown):
-            if fact.replacement:
-                whole = [*blocks[:index], block(fact), *blocks[index + 1 :]]
-                if fitting(whole):
-                    blocks = whole
-        return blocks, [f.id for f in shown], downgraded
+    def fitting(chosen: dict[int, str]) -> bool:
+        return fits(compose(chosen))
 
-    # Start from every exempt record a later record of its chain could carry,
-    # and release each whose carrier the budget left out, until none is left:
-    # the hidden set only shrinks, so this ends within len(exempt) + 1 passes.
-    hidden = {f.id for f in exempt if any(claim_of(r.id) == claim_of(f.id) for r in chain(f))}
-    while True:
-        visible = sorted(
-            [*current, *(f for f in exempt if f.id not in hidden)], key=rank, reverse=True
-        )
-        blocks, ids, downgraded = fit(visible)
-        shown = set(ids)
-        carried = {
-            i
-            for i in hidden
-            if any(r.id in shown and claim_of(r.id) == claim_of(i) for r in chain(facts[i]))
-        }
-        if carried == hidden:
-            break
-        hidden = carried
-    rendered = assemble(blocks, len(visible), downgraded)
+    # 1. The claims, decided before anything else is spent, so neither prose
+    # nor a second proof of one claim displaces another (R3-F2, R4-F2, R5-F1
+    # of PR #526). Each distinct established claim, in the rank of its
+    # highest-ranked record (a supersession leaves a record's place), is
+    # held by the shortest whole block of a record establishing it, where
+    # it fits beside the claims held before it. That is decided on the view
+    # with no supersession, its counts and blocks, so a supersession changes
+    # no claim shown. A superseded record holds its claim by the claim alone,
+    # never longer than the whole block it was chosen on
+    # (COMPACT_SLACK_BYTES), with counts no higher, so what is held fits.
+    carriers: dict[tuple, list[MemoryFact]] = {}
+    for fact in order:
+        if (claim := claim_of(fact.id)) is not None:
+            carriers.setdefault(claim, []).append(fact)
+    reserved: dict[tuple, tuple[int, str]] = {}
+    chosen_on: list[str] = []
+    for claim, group in carriers.items():
+        forms = [(f, block(f, unsuperseded=True)) for f in group]
+        fact, whole = min(forms, key=lambda form: (len(form[1].encode()), len(form[1])))
+        if fits(assemble([*chosen_on, whole], unsuperseded, unsuperseded_downgraded)):
+            chosen_on.append(whole)
+            reserved[claim] = (fact.id, block(fact, compact=bool(fact.replacement)))
+    # 2. The current records, whole, in rank order, each only if every claim
+    # still reserved fits beside it. One that carries a reserved claim takes
+    # its reservation's place, so a current record is preferred to a
+    # superseded one whenever both fit.
+    chosen: dict[int, str] = {}
+    for fact in order:
+        if fact.replacement:
+            continue
+        claim = claim_of(fact.id)
+        whole = block(fact)
+        rest = dict(form for c, form in reserved.items() if c != claim)
+        if fitting({**chosen, fact.id: whole, **rest}):
+            chosen[fact.id] = whole
+            if claim is not None:
+                reserved.pop(claim, None)
+    # 3. A claim no current record shown carries: its superseded record, by
+    # its claim alone; then, with the budget left, in rank order, each such
+    # record's whole block. The shown set does not change.
+    chosen.update(reserved.values())
+    for fact in order:
+        if fact.replacement and fact.id in chosen:
+            upgraded = {**chosen, fact.id: block(fact)}
+            if fitting(upgraded):
+                chosen = upgraded
+    ids = [f.id for f in order if f.id in chosen]
+    rendered = compose(chosen)
+    applicable = visible(chosen)
     _require(fits(rendered) and redact(rendered) == rendered)
     return ContextProjection(
         rendered,
@@ -1242,7 +1266,7 @@ def render_projection(
             revision,
             memory_digest,
             evidence_digest,
-            len(visible) - len(ids),
+            applicable - len(ids),
             inapplicable,
             withheld,
             downgraded,

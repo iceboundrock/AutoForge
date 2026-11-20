@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 from dataclasses import replace
 
 import pytest
@@ -757,9 +758,11 @@ def test_a_claim_that_fit_before_its_supersession_stays_shown_at_that_exact_budg
     roomy = render_projection(superseded, replace(REQ, max_bytes=1400), validation_records=[a, b])
     assert roomy.ids == (short,) and "the suite failed" in roomy.text
     assert f"Superseded by M{long}; shown because no record shown here" in roomy.text
-    # The compact block is shorter than any full block of an observed record
-    # by more than the supersession can add to the header and the notice.
+    # The compact block is shorter than any whole block of an observed record,
+    # the block its claim is chosen on (R5-F1 of PR #526), and the header
+    # shows the Memory revision at a fixed width.
     assert COMPACT_SLACK_BYTES > 3
+    assert f"Memory revision: {revisions[1]:03d};" in after.text
 
 
 def test_supersession_prose_never_displaces_another_established_claim():
@@ -777,9 +780,10 @@ def test_supersession_prose_never_displaces_another_established_claim():
     assert sorted(loose.ids) == [1, 2] and loose.freshness.omitted == 0
     size = len(loose.text.encode())
     superseded = reload(apply(revise(st, Action.SUPERSEDE, 1, replacement=2)))
-    # With room, both whole blocks: more than the exact budget holds.
+    # With room, both whole blocks: more than the exact budget holds. M1
+    # keeps its place in the claim order, after M2 (R5-F1 of PR #526).
     roomy = render_projection(superseded, REQ, validation_records=[a, b])
-    assert roomy.ids == (1, 2) and "Superseded by M2; shown because" in roomy.text
+    assert roomy.ids == (2, 1) and "Superseded by M2; shown because" in roomy.text
     assert len(roomy.text.encode()) > size
     for exact in (
         replace(REQ, max_bytes=size),
@@ -788,7 +792,7 @@ def test_supersession_prose_never_displaces_another_established_claim():
         before = render_projection(reload(st), exact, validation_records=[a, b])
         assert before.text == loose.text
         after = render_projection(superseded, exact, validation_records=[a, b])
-        assert after.ids == (1, 2) and after.freshness.omitted == 0
+        assert after.ids == (2, 1) and after.freshness.omitted == 0
         assert dict(after.retention) == {1: Retention.ESTABLISHED, 2: Retention.ESTABLISHED}
         assert (
             "\nM1 validation-failure — superseded by M2; claim only, text omitted\n"
@@ -802,6 +806,79 @@ def test_supersession_prose_never_displaces_another_established_claim():
         superseded, replace(REQ, max_bytes=len(roomy.text.encode())), validation_records=[a, b]
     )
     assert whole.text == roomy.text
+
+
+def _claims(projection):
+    """The validation claims a projection shows: receipt sequence to outcome."""
+    found = re.findall(
+        r"^Observed validation (\d+) \([0-9a-f]{64}\): (\w+) on ", projection.text, re.M
+    )
+    return {int(seq): outcome for seq, outcome in found}
+
+
+@pytest.mark.parametrize("prose", [16, 300], ids=["short-M3", "long-M3"])
+def test_a_second_proof_of_one_claim_never_displaces_a_distinct_claim(prose):
+    """R5-F1 of PR #526: M1 (FAIL, long prose), M2 (TIMEOUT) and M3 (FAIL, the
+    same check, policy, outcome and candidate as M1). At the exact size of
+    the render that shows M3 and M2 and leaves M1 out, superseding M1 with
+    M2 used to show M1 by its claim and M3, two proofs of FAIL, and drop
+    TIMEOUT. Each distinct claim is now held, in its cheapest form, before a
+    second proof of one is spent: both stay shown, within both limits, at
+    that budget and at every other one."""
+    a = failure(1, exit_code=1)
+    b = failure(2, exit_code=1, timed_out=True)
+    c = failure(3, exit_code=1)
+    receipts = [a, b, c]
+    st = apply(observation(empty(), a, text="x" * MAX_TEXT_BYTES))
+    st = apply(observation(st, b, text="the suite timed out"))
+    st = reload(apply(observation(st, c, text="the suite failed".ljust(prose, "!"))))
+    loose = render_projection(st, replace(REQ, max_bytes=2000), validation_records=receipts)
+    assert loose.ids == (3, 2) and loose.freshness.omitted == 1
+    size = len(loose.text.encode())
+    superseded = reload(apply(revise(st, Action.SUPERSEDE, 1, replacement=2)))
+    for exact in (
+        replace(REQ, max_bytes=size),
+        replace(REQ, max_chars=len(loose.text), max_bytes=size),
+    ):
+        assert render_projection(st, exact, validation_records=receipts).text == loose.text
+        after = render_projection(superseded, exact, validation_records=receipts)
+        assert _claims(after) == {3: "FAIL", 2: "TIMEOUT"}
+        # M3 shows M1's claim, so M1 is neither shown nor counted as omitted.
+        assert after.ids == (3, 2) and after.freshness.omitted == 0
+        assert "superseded by M2" not in after.text and "Superseded by M2" not in after.text
+        assert len(after.text) <= exact.max_chars and len(after.text.encode()) <= exact.max_bytes
+    # At every budget, every claim shown before the supersession is shown
+    # after it, and never two proofs of FAIL. The claims are chosen on the
+    # records' whole blocks as they were before it, which M1's claim alone
+    # never exceeds; M1 left out for M3 is no omission, so after it the
+    # budget may hold a claim more, never one less.
+    roomy = len(render_projection(superseded, REQ, validation_records=receipts).text.encode())
+    for budget in range(1, roomy + 2, 5):
+        for cap in (replace(REQ, max_bytes=budget), replace(REQ, max_chars=budget)):
+            try:
+                before = render_projection(st, cap, validation_records=receipts)
+            except StateError:
+                # Not even the header and its notice fit, before or after.
+                with pytest.raises(StateError):
+                    render_projection(superseded, cap, validation_records=receipts)
+                continue
+            after = render_projection(superseded, cap, validation_records=receipts)
+            assert set(_claims(before).values()) <= set(_claims(after).values()), cap
+            assert not {1, 3} <= set(after.ids), cap
+            assert len(after.text) <= cap.max_chars and len(after.text.encode()) <= cap.max_bytes
+    # Two current proofs of one claim do not displace a distinct claim either:
+    # M1 (TIMEOUT) ranks below M2 and M3 (both FAIL), and fits beside one.
+    d = failure(4, exit_code=1, timed_out=True)
+    e, f = failure(5, exit_code=1), failure(6, exit_code=1)
+    pair = apply(observation(empty(), d, text="the suite timed out"))
+    pair = apply(observation(pair, e, text="the suite failed once"))
+    pair = reload(apply(observation(pair, f, text="the suite failed again")))
+    every = render_projection(pair, REQ, validation_records=[d, e, f])
+    assert every.ids == (3, 2, 1)
+    one = render_projection(
+        pair, replace(REQ, max_bytes=len(every.text.encode()) - 1), validation_records=[d, e, f]
+    )
+    assert sorted(_claims(one).values()) == ["FAIL", "TIMEOUT"] and len(one.ids) == 2
 
 
 def test_freshness_names_the_candidate_and_launch_receipts_the_render_resolved():

@@ -2538,15 +2538,18 @@ only what it records for that issue and exact candidate, not adjacent
 commentary. A superseded record stays out of the projection, even when its
 replacement is later retracted or loses its receipt. The one exception is
 a validation failure that its own retained receipt establishes on the
-launch: a supersession cannot hide it without matching check, policy,
-outcome and candidate evidence in a record of the chain that the
-projection actually shows. A replacement the budget leaves out does not
-count. Until then the failure is shown, marked as superseded. Which
-records are shown is decided with that failure as its receipt's claim
-alone, labeled as superseded with its text omitted, a block shorter than
-the record's block was before the supersession. Its whole block is shown
-only if the budget left after that holds it, so its prose never displaces
-another record's established claim.
+launch: a supersession cannot hide it unless a record the projection
+actually shows carries matching check, policy, outcome and candidate
+evidence. A record the budget leaves out does not count. Until then the
+failure is shown, marked as superseded. The distinct established claims
+are chosen first, each by the shortest whole block of a record that
+establishes it, in rank order and as if no record were superseded, so a
+supersession never removes a claim the projection showed. A superseded
+failure then holds its claim alone, labeled as superseded with its text
+omitted, a block no longer than the one it was chosen on; a current record
+with the same claim takes its place where that fits. Its whole block is
+shown only if the budget left after that holds it. Neither prose nor a
+second proof of one claim displaces another claim.
 
 Each citation resolves to a typed retention result. `established` means a
 retained validation record establishes the claim on this launch.
