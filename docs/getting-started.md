@@ -340,6 +340,7 @@ On a first run, expect these rows:
 | | `SKIP` | the rules could not be read: the plan offers none (a private repository on GitHub Free), or the token cannot read them. The row names which, and the way out |
 | `pull request check runs readable` | `SKIP ... UNKNOWN: no recently updated open pull request ... has a check result` | nothing to try it on yet. It matters only with the merge gate open |
 | `outer sandbox: mode (disabled)` | `WARN` | agents run as you, without the outer sandbox. That is the default; [Security boundaries](security.md#the-outer-sandbox-is-opt-in-and-linux-only) explains the choice |
+| | `FAIL ... memory.enabled is true` | Memory is on, and a Memory launch is refused without the outer sandbox; set `sandbox.mode: required` on a capable host, or turn Memory off ([Configuration](configuration.md#issue-working-memory)) |
 | `config` | `FAIL` | the file is missing or wrong; the row and [section 7](#7-common-first-run-failures) say which |
 | `controller` | `OK autoforge <version> (protocol <n>) imported from <path>, python <path>; reads state protocols ...` | never fails: the AutoForge code this command line runs, by the file Python imported, and the run protocols it reads. With several installs or checkouts, check it is the one you meant ([A run a newer controller wrote](usage.md#a-run-a-newer-controller-wrote)) |
 

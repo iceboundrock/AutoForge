@@ -278,7 +278,7 @@ None stands in for another:
 | `RunID` | `AutoForgeState.run_id`, `af-<UTC stamp>-<6 hex>` (`generate_run_id`) | yes, today |
 | `StepKey` | phase, issue URL, PR URL, review round, execution attempt (`auto_recovery.StepKey`) | today in the recovery journal; derived for every step |
 | `TaskID` | `(RunID, StepKey, ordinal)`: the task's ordinal in its step, from 1, allocated when the task is proposed and never reused in the step; a producing task admitted after an `unblock` into the same step takes the next (D3) | no: nothing names a task in the single-agent path; persisted by #332, with the step's ordinal counter |
-| `AttemptID` | `(RunID, launch_seq)`: the run-wide launch ordinal the attempt's launch-intent save allocates (D2.1). The receipt names the task the attempt belongs to | no: `launch_seq` is new (D19.2); `state.attempt` is a counter, not an identity |
+| `AttemptID` | `(RunID, launch_seq)`: the run-wide launch ordinal the attempt's launch-intent save allocates (D2.1). The receipt names the task the attempt belongs to | `launch_seq` is saved from protocol 20 (#317); `state.attempt` is a counter, not an identity |
 | role | a closed enum (D7.1) | derived in the single-agent path; persisted by #332 |
 | candidate | base: the revision the entry observation required (ADR 0004 D4.4); candidate: a `RemoteCandidate` (ADR 0006 D2.1), the commit the phase's candidate check accepted (D2.4) | yes, today, where ADR 0006 records it |
 | phase | `Phase` | yes |
@@ -1633,13 +1633,84 @@ relevant guide (#319, D7.7); and a new stop code amends ADR 0011.
 
 ### D20. What the Memory MVP needs
 
+**Implementation note (#317).** Protocol 20 ships the atomic store, seed
+and retraction commands, and the pure projection. Automatic writers and
+launch delivery remain #333's. For this first slice, only the Pi adapter
+supplies D14's proof, in three parts. The profile's part is checked at
+config load: context files off and `require_oauth: false`. Pi's agent
+directory holds `SYSTEM.md` and `APPEND_SYSTEM.md`, which no flag turns off.
+No check of a directory that outlives the launch keeps them out: a process
+an earlier launch started can outlive a controller killed with `SIGKILL`
+(D5.5, ADR 0002 §4e), and launches of other checkouts share the directory.
+So the proof is the launch's own: its agent directory must be the one in
+the private home the outer sandbox makes empty for that launch alone (ADR
+0005 D8.1). The host's part is D18's dynamic check before each Memory
+launch's intent save. The launch must be enforced, `PI_CODING_AGENT_DIR`
+unset (it would project a host directory read-write), and no operator path
+may show a host directory at, above or inside `~/.pi/agent` in that home,
+decided on where the sandbox mounts it: one spelled in the home at that
+spelling, wherever a link there leads. The launch's part is checked on its compiled sandbox description: Pi's home
+is the private tmpfs, and nothing is mounted over its agent directory there.
+Otherwise the launch is refused before anything is spawned. A same-UID
+process outside the sandbox that enters the launch's namespace through
+`/proc` is not excluded (docs/pi-policy.md §5). D14's table
+above, written before this, lists Pi's proof as holding by construction.
+That is true of its argv, not of its agent directory. Claude's no-session option does not
+prove auto-memory is off; it is refused when Memory is on, as are the
+other adapters without a proof. AutoForge does not start a version probe
+or change how any Memory-off launch runs. For D9.6, every record not yet
+retracted reserves one event slot and the bytes of one operator retraction,
+so the operator's retraction (D9.4) is never refused for a bound, and it
+stays available with Memory turned off, the one write that leaves (no
+collection, no projection, the same issue and lock rules). Every
+revision names the record revision it acts on. An agent's revision comes
+from an acceptance save, from a launch no earlier than the record's latest
+change. Every revision row also records the launch ordinal it was written
+at; the operator's and the controller's are known only to the launches
+after it, so a result of a launch up to that watermark cannot revise what
+they changed, whatever revision it names. A stale one is refused, on write
+and on load. A revision is
+compared with the saved rows in its canonical form, so the same input
+again is a replay, whatever the case of its URLs. A superseded record
+stays superseded when its replacement is retracted. Only a validation
+failure its retained receipt establishes on the launch stays shown, unless
+a record the projection actually shows carries the same claim; a record
+the budget leaves out does not. The distinct established claims are chosen
+before anything else is spent, on the records that establish one alone.
+Each is held by one record, the one establishing it whose whole block is
+shortest as if it were not superseded: in rank order, each claim where
+that block fits beside the claims held before it, then, with the budget
+left, the claims not held, each by that record's block as it is now, up to
+the first that does not fit. A record establishing a claim not held is not
+shown. The header gives every count at one width and a render that shows a
+record has no notice, so a supersession changes nothing the first choice
+reads and only shrinks what the second sizes: a supersession removes no
+claim the projection showed, and the prose of a record that establishes
+no claim never changes which claims are shown. A budget that cannot hold the header and
+its longest notice is refused whatever the records. A superseded record
+then holds its claim alone, labeled as superseded with its text omitted, a
+block no longer than the one it was chosen on; a current record with the
+same claim takes its place where that fits, and its whole block is shown
+only with the budget left after that. Neither prose nor a second proof of
+one claim displaces another. A launch ordinal is bounded by 2^63 − 1, the
+loader's bound: Memory's writes, its launch citations and a projection
+take every ordinal the loader reads, and a run that has spent the last one
+can still settle a reply it kept, which spends none, but launches nothing
+more. A projection is bound to the next launch
+ordinal of its snapshot, and its freshness digests every receipt it
+resolved citations against, validation, candidate and launch, unique and
+in any order. A
+citation resolves to a typed retention result: established (a validation
+record only), retained or unavailable. This slice admits validation,
+candidate and launch receipts, not review, effect or Git references.
+
 | Needs | Does not need |
 |---|---|
 | two state fields and a recorded setting, in one bump (D19.1 to D19.3) | #332's reducer or task table |
 | the existing atomic save and strict loader (D10) | #319's roles, or D7.4's launch class |
 | a deterministic render into the read context (D12) | #324, #325 or #326; SQLite, FTS5 or LTSearch; an embedding service |
 | D14's proof from `claude`, `opencode` or `pi`, refused otherwise (D18) | an SDK-only provider |
-| `sandbox.mode` `disabled` or `required` with bwrap | Docker or Podman |
+| `sandbox.mode` `required` with bwrap for a Memory launch (every other launch keeps its configured mode) | Docker or Podman |
 | an operator command for the seed and retractions (D9.5) | #126's pause; a new effect kind or stop code |
 
 ## 3. What does not change

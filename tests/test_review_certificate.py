@@ -482,6 +482,7 @@ def _relabelled(data: dict, label: str) -> dict:
     # one before 16 never wrote protocol 16's (#374), and one before 15 never
     # wrote protocol 15's (#423).
     newer = {
+        "19": (),
         "18": ("delivered_reply",),
         "17": ("auto_recovery", "delivered_reply"),
         "16": ("partial_fix", "auto_recovery", "delivered_reply"),
@@ -490,13 +491,13 @@ def _relabelled(data: dict, label: str) -> dict:
         label,
         ("pr_body_outcomes", "stop_code", "partial_fix", "auto_recovery", "delivered_reply"),
     )
-    data = {k: v for k, v in data.items() if k not in newer}
+    data = {k: v for k, v in data.items() if k not in (*newer, "issue_memory", "launch_seq")}
     if label == "12":
         return {**data, **LOCAL_STATE_FIELDS, "protocol_version": "12"}
     return {**data, "protocol_version": label}
 
 
-@pytest.mark.parametrize("label", ["19", "18", "17", "16", "15", "12"])
+@pytest.mark.parametrize("label", ["20", "19", "18", "17", "16", "15", "12"])
 @pytest.mark.parametrize(
     ("plant", "needle"),
     [(_with_record, "end_fingerprint"), (_with_certificate, "review_certificate'.kind")],

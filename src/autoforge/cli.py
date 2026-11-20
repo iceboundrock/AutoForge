@@ -71,7 +71,7 @@ from typing import TextIO
 
 from . import __version__
 from .auto_recovery import ALLOWLIST as RECOVERY_ALLOWLIST
-from .auto_recovery import MAX_AUTOMATIC_RELAUNCHES_PER_STEP, RecoveryJournal, RunLogStage
+from .auto_recovery import MAX_AUTOMATIC_RELAUNCHES_PER_STEP, RecoveryJournal, RunLogStage, StepKey
 from .certificate import NOT_A_PERMISSION
 from .certificate import describe as describe_certificate
 from .config import (
@@ -158,6 +158,7 @@ from .interaction import (
     UnavailableReason,
 )
 from .locking import ControllerLock, controller_lock_live, repository_lock_path
+from .memory import MAX_TEXT_BYTES, Action, Actor, Kind, MemoryScope
 from .ownership import (
     refuse_scheduler_owned_issue,
     scheduler_ownership,
@@ -180,12 +181,13 @@ from .review_provenance import ProvenanceReport, unjournaled_review_report
 from .review_provenance import applies as unjournaled_review_applies
 from .run_binding import EpicBinding
 from .run_namespace import inside_scheduler_root, namespace_issue_of_state_dir
+from .safefs import SafeRoot
 from .sandbox_pin import SandboxPin
 from .sandbox_policy import absolute_spelling
 from .scheduler import EpicScheduler, SchedulerInputs
 from .scheduler_stop import StopMode
 from .sdk_policy import MAX_ANSWER_CHARS
-from .state import SUPPORTED_PROTOCOLS, AutoForgeState, utcnow_iso
+from .state import SUPPORTED_PROTOCOLS, AutoForgeState, save_state, utcnow_iso
 from .stop_classification import (
     StopClassification,
     StopOutcome,
@@ -242,6 +244,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="state directory (default: from config, else .autoforge)",
     )
     sub = p.add_subparsers(dest="command", required=True)
+    m = sub.add_parser("memory", help="inspect or retract advisory Issue Working Memory")
+    memory = m.add_subparsers(dest="memory_command", required=True)
+    show = memory.add_parser("show", help="read the issue's saved Memory without writing")
+    show.add_argument("--json", action="store_true", help="print the catalog as JSON")
+    retract = memory.add_parser("retract", help="withdraw a saved Memory record")
+    retract.add_argument("record", type=_positive_int)
+    retract.add_argument("--reason", required=True)
 
     d = sub.add_parser("doctor", help="check git/gh/claude/opencode/repo/config (read-only)")
     d.add_argument("--json", action="store_true", dest="as_json")
@@ -278,6 +287,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     r.add_argument("--issue", required=True, metavar="ISSUE_URL", help="the issue to work on")
+    r.add_argument(
+        "--memory-seed",
+        type=Path,
+        metavar="FILE",
+        help="save a UTF-8 seed with the new run; not shown to agents yet",
+    )
     r.add_argument("--dry-run", action="store_true", help="plan only; no side effects")
     r.add_argument(
         "--force",
@@ -692,6 +707,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_unblock(args)
         if args.command == "rebind-epic":
             return cmd_rebind_epic(args)
+        if args.command == "memory":
+            return cmd_memory(args)
         if args.command == "status":
             return cmd_status(args)
         if args.command == "epic":
@@ -811,7 +828,9 @@ def _guard_scheduler_ownership(engine: ControllerEngine, issue_url: str, command
     """
     root = engine.coordination_root()
     exempt = (
-        namespace_issue_of_state_dir(engine.paths.state_dir, root) if command == "unblock" else None
+        namespace_issue_of_state_dir(engine.checkpoint_target(), root)
+        if command == "unblock"
+        else None
     )
     refuse_scheduler_owned_issue(root, issue_url, command, exempt_issue=exempt)
     engine.issue_ownership = standalone_ownership_predicate(root, exempt_issue=exempt)
@@ -1861,6 +1880,9 @@ def cmd_run(args) -> int:
     cfg = _load_cfg(args)
     engine = _engine_for(args, cfg)
     engine.validate_config()
+    seed = getattr(args, "memory_seed", None)
+    if seed is not None and not cfg.memory.enabled:
+        raise ConfigurationError("--memory-seed requires memory.enabled")
 
     if args.dry_run:
         # Side-effect-free: the checks and reads the run makes before its
@@ -1869,6 +1891,10 @@ def cmd_run(args) -> int:
         binding = engine.bind_new_run(args.epic, args.issue)
         _print_binding(binding)
         engine.new_run(binding.epic_url, binding.issue_url)
+        if seed is not None:
+            assert engine.state is not None
+            engine.record_run_configuration()
+            _seed_memory(engine.state, seed)
         outcomes = engine.run(max_steps=args.max_steps, dry_run=True, allow_merge=args.allow_merge)
         for o in outcomes:
             assert o.plan is not None
@@ -1878,6 +1904,7 @@ def cmd_run(args) -> int:
     # A state directory inside the scheduler root is a namespace's, never a
     # standalone run's (ADR 0008 D17.3); refused before the lock is taken.
     engine.refuse_scheduler_state_dir("run")
+    engine.require_checkpoint_owner(standalone="run")
     # A run the state already there refuses is refused before the lock too:
     # the refusal writes nothing, and taking the lock would write its PID
     # record in the state directory when that is the lock's own (#387).
@@ -1892,9 +1919,15 @@ def cmd_run(args) -> int:
     # would let a second controller take over the repository and both would
     # then run agents and persist state over each other.
     with engine.locked():
+        # Again under the lock, the scheduler root included, bound to the
+        # directory opened (R3-F3 of PR #526): `--force` replaces whatever
+        # run this directory holds, not only the issue it names.
+        local_checkpoint = engine.require_checkpoint_owner(standalone="run")
         rc, corrupt, replaced = _existing_run_guard(engine, args.force)
         if rc is not None:
             return rc
+        if not local_checkpoint and replaced is not None and replaced.issue_memory:
+            raise ConfigurationError("Memory checkpoint requires its repository's lock")
         # A scheduler-owned issue is refused before anything is read from
         # GitHub or written (ADR 0008 D17.2): no quarantine, no state, no
         # run log.
@@ -1912,6 +1945,8 @@ def cmd_run(args) -> int:
         assert engine.state is not None
         # What later commands of the run are checked against (#219).
         engine.record_run_configuration()
+        if seed is not None:
+            _seed_memory(engine.state, seed)
         if corrupt:
             moved = engine.quarantine_state()
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
@@ -1938,6 +1973,68 @@ def cmd_run(args) -> int:
             on_outcome=_print_outcome_now,
         )
     return _finish(engine, outcomes, args.allow_merge, printed=True)
+
+
+def _seed_memory(state: AutoForgeState, path: Path) -> None:
+    try:
+        with SafeRoot.open(path.absolute().parent) as root:
+            raw = root.read_bytes(path.name, limit=MAX_TEXT_BYTES)
+            if raw is None:
+                raise FileNotFoundError
+            text = raw.decode("utf-8")
+    except (OSError, StateError, UnicodeError):
+        raise ConfigurationError("cannot read a bounded UTF-8 Memory seed") from None
+    scope = MemoryScope(StepKey(Phase.INITIALIZING, state.current_issue_url, "", 0, 1))
+    result = state.memory().add(actor=Actor.OPERATOR, kind=Kind.SEED, scope=scope, text=text)
+    if result.status != "applied":
+        raise ConfigurationError("Memory seed is empty, invalid or would require redaction")
+    state.issue_memory = result.store.encode()
+
+
+def cmd_memory(args) -> int:
+    engine = _engine_for(args)
+    if args.memory_command == "show":
+        state = engine.load()
+        payload = state.memory().catalog(state.current_issue_url)
+        if args.json:
+            print(json.dumps(redact_obj(payload), sort_keys=True))
+        else:
+            print(
+                f"Memory {'enabled' if payload['enabled'] else 'disabled'}, "
+                f"revision {payload['revision']}"
+            )
+            for row in payload["records"]:
+                print(f"M{row['id']}: {row['kind']} ({row['status']})")
+        return 0
+    engine.refuse_scheduler_state_dir("memory retract")
+    engine.require_checkpoint_owner(allow_external=False, standalone="memory retract")
+    _refuse_unloadable_state_before_the_lock(engine)
+    with engine.locked():
+        engine.require_checkpoint_owner(allow_external=False, standalone="memory retract")
+        state = engine.load()
+        _guard_scheduler_ownership(engine, state.current_issue_url, "memory retract")
+        result = state.memory().revise(
+            Action.RETRACT,
+            args.record,
+            actor=Actor.OPERATOR,
+            reason=args.reason,
+            issue=state.current_issue_url,
+        )
+        if result.status == "foreign":
+            # `memory show` lists the current issue's records only; an earlier
+            # issue's record of the run is left as it is, and nothing is saved.
+            raise ConfigurationError(
+                f"Memory record M{args.record} is not a record of the run's current issue; "
+                "nothing was written"
+            )
+        if result.store.encode() != state.issue_memory:
+            state.issue_memory = result.store.encode()
+            # An operator ledger write does not settle or reconcile workflow state.
+            save_state(state, engine.paths.state_file, root=engine.state_root())
+    if result.status != "applied":
+        raise ConfigurationError("Memory retraction refused")
+    print(f"Withdrew Memory record M{result.id}; Memory is not yet shown to agents.")
+    return 0
 
 
 def _refuse_an_unusable_state_directory(engine: ControllerEngine) -> None:
@@ -1975,11 +2072,15 @@ def cmd_step(args) -> int:
         if outcome.plan is not None:
             print_plan(outcome.plan, full_prompt=args.full_prompt)
         return 0
+    engine.require_checkpoint_owner(standalone="step")
     _refuse_unloadable_state_before_the_lock(engine)
     # Load and execute under one lock: a snapshot loaded before the lock
     # could already have been replaced by another controller.
     with engine.locked():
+        owned = engine.require_checkpoint_owner(standalone="step")
         state = engine.load()
+        if not owned and state.issue_memory:
+            raise ConfigurationError("Memory checkpoint requires its repository's lock")
         _guard_scheduler_ownership(engine, state.current_issue_url, "step")
         if state.phase not in TERMINAL_PHASES:
             _check_configuration(engine, args, "step", dry_run=False)
@@ -2003,11 +2104,15 @@ def cmd_resume(args) -> int:
             assert o.plan is not None
             print_plan(o.plan, full_prompt=args.full_prompt)
         return 0
+    engine.require_checkpoint_owner(standalone="resume")
     _refuse_unloadable_state_before_the_lock(engine)
     # Load, decide and execute under one lock: a snapshot loaded before the
     # lock could already have been replaced by another controller.
     with engine.locked():
+        owned = engine.require_checkpoint_owner(standalone="resume")
         state = engine.load()
+        if not owned and state.issue_memory:
+            raise ConfigurationError("Memory checkpoint requires its repository's lock")
         _guard_scheduler_ownership(engine, state.current_issue_url, "resume")
         rc = _resume_holding_state(engine, state, args.allow_merge)
         if rc is not None:
@@ -2059,12 +2164,16 @@ def cmd_unblock(args) -> int:
         )
         print_unblock_outcome(outcome)
         return 0
+    engine.require_checkpoint_owner()
     _refuse_unloadable_state_before_the_lock(engine)
     # Load, decide and write under one lock, like `step`. An accepted
     # configuration change is its own recorded write, made before the
     # decision: a refused unblock leaves it in place.
     with engine.locked():
+        owned = engine.require_checkpoint_owner()
         state = engine.load()
+        if not owned and state.issue_memory:
+            raise ConfigurationError("Memory checkpoint requires its repository's lock")
         _guard_scheduler_ownership(engine, state.current_issue_url, "unblock")
         if state.phase == Phase.BLOCKED:
             _check_configuration(engine, args, *words, dry_run=False)
@@ -2142,9 +2251,14 @@ def cmd_rebind_epic(args) -> int:
             f"{REBIND_COMMAND} refused: {foreign}. Nothing was changed: no lock taken, no "
             "state write, and nothing written to GitHub."
         )
+    # The same answer bound to the directory the state root opens, and the
+    # scheduler root refused on it, before the lock and again under it, as
+    # every other standalone writer does (R3-F3 of PR #526).
+    engine.require_checkpoint_owner(allow_external=False, standalone=REBIND_COMMAND)
     # Load, decide and write under one lock, like `unblock`: a state loaded
     # before the lock could already have been replaced by another controller.
     with engine.locked():
+        engine.require_checkpoint_owner(allow_external=False, standalone=REBIND_COMMAND)
         state = engine.load()
         _guard_scheduler_ownership(engine, state.current_issue_url, REBIND_COMMAND)
         report = engine.rebind_epic(request)
@@ -2175,7 +2289,7 @@ def _rebind_preflight_problems(engine: ControllerEngine, state: AutoForgeState) 
     if engine.state_dir_repository_problem():
         return []  # reported by the engine
     problems: list[str] = []
-    if inside_scheduler_root(engine.paths.state_dir, root):
+    if inside_scheduler_root(engine.checkpoint_target(), root):
         problems.append(
             f"the state directory {engine.paths.state_dir} is inside the parallel EPIC "
             "scheduler's root: a scheduler's issue keeps the EPIC whose graph admitted it, and "
@@ -2552,15 +2666,22 @@ def cmd_status(args) -> int:
         engine.continue_command = (*config, "epic", "resume", state.epic_url)
     # The snapshot is taken before the live read, which reads only (#374).
     persisted = state.to_dict()
+    # Memory is the one persisted field status does not print raw: its ledger
+    # holds every issue of the run, and status shows the current issue's
+    # record count by status only (R2-F6 of PR #526); `memory show` is the
+    # read of the current issue's records.
+    del persisted["issue_memory"]
     live = _live_inspection(engine, state) if live_requested else None
     package = _recovery_package(engine, args, state, stop, live)
     if args.as_json:
-        # to_dict() carries "mode" and every persisted field; protocol 13
-        # removed LOCAL's twelve fields from it (#388, ADR 0009 D8, D10).
-        # `replan_journal` and `acceptance_actions` are derived beside the
-        # raw fields, never merged into them.
+        # to_dict() carries "mode" and every persisted field but
+        # `issue_memory`; protocol 13 removed LOCAL's twelve fields from it
+        # (#388, ADR 0009 D8, D10). `replan_journal`, `acceptance_actions`
+        # and `memory` are derived beside the raw fields, never merged into
+        # them.
         document = {
             **persisted,
+            "memory": state.memory_summary(),
             "replan_journal": _replan_journal_summary(txn),
             "acceptance_actions": _acceptance_actions(state),
             "operator_actions": _operator_actions(state),

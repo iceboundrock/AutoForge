@@ -143,6 +143,7 @@ import os
 import re
 import secrets
 import shlex
+import stat
 import time
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
@@ -452,6 +453,7 @@ from .github import (
 from .interaction import InteractionBroker, Lifecycle, Resolver, Unattended
 from .locking import (
     ControllerLock,
+    NoRepository,
     SharedGitLock,
     assert_shared_git_lock_free,
     repository_lock_path,
@@ -470,6 +472,7 @@ from .loop_guard import (
 )
 from .materialize import METHOD as MATERIALIZATION_METHOD
 from .materialize import materialize, read_object_format
+from .memory import MAX_LAUNCH_SEQ
 from .premerge import (
     commit_is_local,
     describe_definition_difference,
@@ -491,6 +494,7 @@ from .providers import (
     AgentExecutionResult,
     AgentProvider,
     AgentRequest,
+    FreshContextHost,
     ProviderRegistry,
     provider_for,
 )
@@ -1688,6 +1692,25 @@ def _operator_home() -> str:
 LOGICAL_ISOLATION_ONLY = "logical isolation only"
 
 
+def _refuse_a_launch_past_the_last_ordinal(state: AutoForgeState, phase: Phase) -> None:
+    """Refuse a launch whose intent save would spend an ordinal past the last.
+
+    ``launch_seq`` is bounded by :data:`autoforge.memory.MAX_LAUNCH_SEQ`, the
+    one bound the loader, the launch-intent save and a projection share. A
+    run at that bound has spent its last ordinal, and saving one more would
+    leave a checkpoint the loader refuses: nothing is changed, saved or
+    launched (R5-F5 of PR #526). Called only once a launch is needed and
+    before anything of it is written: a kept reply, which spends no ordinal,
+    is gone on from first, and a relaunch is checked once its reconciliation
+    found it needed, before its read context (R6-F2 of PR #526).
+    """
+    if state.launch_seq >= MAX_LAUNCH_SEQ:
+        raise StateError(
+            f"refusing to launch {phase.value}: the run has spent its last launch ordinal "
+            f"({MAX_LAUNCH_SEQ}); nothing was saved or launched; start a new run"
+        )
+
+
 def launch_backend() -> SandboxBackend:
     """The backend this controller's enforced launches use (ADR 0013 D13, #268).
 
@@ -1944,6 +1967,13 @@ class ControllerEngine:
         # and the pathname is only ever *re-verified* against it, never
         # re-resolved into a new binding.
         self._state_root: SafeRoot | None = None
+        # What :meth:`require_checkpoint_owner` bound: the identity of the
+        # directory git was asked from, how far below it the state directory
+        # lies, the standalone command whose scheduler-root refusal it
+        # decided (``""``: none) and whether it found that directory outside
+        # every repository (the legacy Memory-off use, its answer False);
+        # checked whenever the state root is opened.
+        self._checkpoint_probe: tuple[tuple[int, int], int, str, bool] | None = None
         self.workdir = str(workdir)
         self.providers = providers or ProviderRegistry(runner=runner)
         # The GitHub client is built on first *use*, never on construction:
@@ -2157,6 +2187,7 @@ class ControllerEngine:
         if self._state_root is not None:
             self._state_root.close()
             self._state_root = None
+        self._checkpoint_probe = None
         self._paths = value
 
     def state_root(self, *, create: bool = True) -> SafeRoot:
@@ -2175,7 +2206,14 @@ class ControllerEngine:
         not exist (reads never create it).
         """
         if self._state_root is None:
-            self._state_root = self._paths.open_root(create=create)
+            root = self._paths.open_root(create=create)
+            try:
+                # The directory the owner check bound, when one ran (R2-F2 of PR #526).
+                self._bind_checkpoint_root(root)
+            except BaseException:
+                root.close()
+                raise
+            self._state_root = root
         else:
             self._state_root.verify_identity(role="state directory")
         return self._state_root
@@ -2239,10 +2277,12 @@ class ControllerEngine:
         """
         state = self._require_state()
         pin = self._sandbox_pin_record(source)
+        memory = state.memory_setting(self.config.memory.enabled)
         state.config_fingerprint = self._fingerprint_record(
             self.invocation_config_fingerprint(), source
         )
         state.sandbox_pin = pin
+        state.issue_memory = memory
 
     def _fingerprint_record(self, fingerprint: ConfigFingerprint, source: str) -> dict:
         """The persisted form of ``fingerprint`` as this invocation's; ConfigurationError
@@ -2296,6 +2336,12 @@ class ControllerEngine:
         dry run too, before anything is recorded or logged.
         """
         state = self._require_state()
+        memory_change = bool(state.issue_memory.get("enabled")) != self.config.memory.enabled
+        if memory_change and not accept_change:
+            raise ConfigurationDriftError(
+                "memory.enabled differs from the recorded run; restore it or use "
+                "--accept-config-change"
+            )
         recorded: RecordedConfiguration | None = None
         current: ConfigFingerprint | None = None
         changes: list[ConfigChange] = []
@@ -2330,6 +2376,14 @@ class ControllerEngine:
             else None
         )
         accepted = [*changes, *([downgrade] if downgrade else [])]
+        if memory_change:
+            accepted.append(
+                ConfigChange(
+                    "memory.enabled",
+                    json.dumps(not self.config.memory.enabled),
+                    json.dumps(self.config.memory.enabled),
+                )
+            )
         if accepted and not accept_change:
             refusals = []
             if changes:
@@ -2359,6 +2413,7 @@ class ControllerEngine:
             else ""
         )
         new_pin = self._sandbox_pin_record(pin_source) if pin_source else None
+        new_memory = state.memory_setting(self.config.memory.enabled) if memory_change else None
         notices = self._configuration_notices(
             upgrade, accepted, pin, dry_run=dry_run, fingerprint_changed=bool(changes)
         )
@@ -2375,6 +2430,8 @@ class ControllerEngine:
             state.config_fingerprint = fingerprint
         if new_pin is not None:
             state.sandbox_pin = new_pin
+        if new_memory is not None:
+            state.issue_memory = new_memory
         if accepted:
             self.save()
         return "\n".join(notices)
@@ -3263,12 +3320,28 @@ class ControllerEngine:
             else "sandbox.mode is preferred, which a REMOTE run treats as required"
         )
         capability = probe.capability or Capability.UNKNOWN
-        alternatives = f"set sandbox.mode: disabled to run with {LOGICAL_ISOLATION_ONLY}"
+        # With Memory on, `disabled` alone is no way out: every Memory
+        # ANALYZE_EXECUTE launch is refused without the outer sandbox (ADR
+        # 0015 D18), so continuing unenforced means turning Memory off too, as
+        # doctor's mode row says (R7-F1 of PR #526). Memory is on as the
+        # launch decides it: configured, or recorded for the run.
+        state = self.state
+        if self.config.memory.enabled or bool(state and state.issue_memory.get("enabled")):
+            remedy = (
+                "memory.enabled is true, and a Memory ANALYZE_EXECUTE launch is refused without "
+                "the outer sandbox, so make the host capable to keep Memory on, or turn Memory "
+                f"off and set sandbox.mode: disabled to run with {LOGICAL_ISOLATION_ONLY}"
+            )
+        else:
+            remedy = (
+                "make the host capable, or set sandbox.mode: disabled to run with "
+                f"{LOGICAL_ISOLATION_ONLY}"
+            )
         return SandboxCapabilityError(
             f"{why}, and this host cannot enforce the outer sandbox: it cannot provide "
             f"{capability.value} ({probe.reason}). Nothing was launched, saved or charged; the "
-            "run is as it was. `autoforge doctor` shows the capability check; make the host "
-            f'capable, or {alternatives} (ADR 0005 D12.2; docs/usage.md, "Outer sandbox")',
+            f"run is as it was. `autoforge doctor` shows the capability check; {remedy} "
+            '(ADR 0005 D12.2; docs/usage.md, "Outer sandbox")',
             capability.key,
         )
 
@@ -3693,8 +3766,27 @@ class ControllerEngine:
         dry run is not checked: it takes no lock and derives no coordination
         root (``run --dry-run``'s one git read is the checkout's ``origin``,
         #293), and it writes nothing.
+
+        Decided on :meth:`checkpoint_target`, the directory the state root
+        opens, never on the caller's spelling (R3-F3 of PR #526): ``link/..``
+        names what it normalizes to, not where the link leads. The writers
+        decide it again under the lock, bound to the directory their owner
+        check asked git about (:meth:`require_checkpoint_owner`).
         """
-        check_standalone_state_dir(self.paths.state_dir, self.coordination_root(), command)
+        check_standalone_state_dir(self.checkpoint_target(), self.coordination_root(), command)
+
+    def checkpoint_target(self) -> Path:
+        """The directory :meth:`state_root` opens, as :class:`StatePaths` spells it.
+
+        Its anchor and the components below it, ``..`` already normalized
+        (``os.path.abspath``), so ``link/..`` is the link's parent whatever the
+        link names. The anchor is resolved by the kernel when the root is
+        opened, every component below it ``O_NOFOLLOW``. Every guard that
+        says which run, repository or scheduler namespace a command acts on
+        decides on this path (R2-F2, R3-F3 of PR #526), and the writers bind
+        it to the directory they open (:meth:`require_checkpoint_owner`).
+        """
+        return self.paths.anchor.joinpath(*self.paths.relative)
 
     def state_dir_repository_problem(self) -> str:
         """Why the state directory is not guarded by this engine's L0 ("" when it is).
@@ -3714,9 +3806,14 @@ class ControllerEngine:
         read, has no identity to establish and is a problem too. Two git
         reads, no write; a missing state directory is left to the state
         load, which refuses it. ``rebind-epic`` refuses on it (#435); no
-        other command calls this.
+        other command calls this, and ``rebind-epic`` also binds the answer
+        to the directory it opens (:meth:`require_checkpoint_owner`).
+
+        The state directory is :meth:`checkpoint_target`, the directory the
+        state root opens, never the caller's spelling, which may name
+        another directory or none (R3-F3 of PR #526).
         """
-        state_dir = self.paths.state_dir
+        state_dir = self.checkpoint_target()
         if not os.path.lexists(state_dir):
             return ""
         try:
@@ -3741,14 +3838,160 @@ class ControllerEngine:
             )
         return ""
 
+    def require_checkpoint_owner(
+        self, *, allow_external: bool = True, standalone: str = ""
+    ) -> bool:
+        """Match the write target to L0 before reading a writable snapshot.
+
+        Return False only for the legacy Memory-off use of a directory
+        positively identified as outside Git. Every path to enabling or
+        writing Memory requires a repository match, irrespective of what a
+        previously loaded snapshot said. That answer is bound to the
+        directory opened like any other (R4-F1 of PR #526): an existing
+        target must be the directory found outside Git, and a missing one,
+        once created and opened, is asked about again, so a directory that
+        then lies in another checkout or in the scheduler root is refused.
+
+        The target is the one directory :meth:`state_root` opens, spelled as
+        :class:`StatePaths` spells it (its anchor and components, no ``..``),
+        never the caller's spelling (R2-F2 of PR #526). Git is asked from it,
+        or, while it does not exist, from its nearest existing ancestor, and
+        the directory git ran in must be the same before and after. The
+        answer is bound to the state root (:meth:`_bind_checkpoint_root`): an
+        existing target is opened as the held root here and must be the
+        directory git was asked from; a missing one is asked again once
+        :meth:`state_root` has created and opened it. Each call replaces the
+        binding, so the call made under the lock is the one that holds.
+
+        ``standalone`` names a standalone command (``run``, ``step``,
+        ``resume``, ``memory retract``, ``rebind-epic``): its target must not
+        lie in the scheduler root (ADR 0008 D17.3), decided on the same
+        directory, symbolic links resolved, whose identity git was asked
+        about and the state root is bound to, here and again when a missing
+        target is created (R3-F3 of PR #526). So a spelling that resolves
+        outside the scheduler root while the state root would open a
+        namespace's checkpoint is refused, under the lock too, and
+        ``run --force`` cannot replace a namespace's checkpoint whatever
+        issue it names.
+        """
+        target = self.checkpoint_target()
+        self._checkpoint_probe = None
+        probe, depth = target, 0
+        try:
+            while True:
+                try:
+                    found = probe.lstat()
+                except FileNotFoundError:
+                    if probe.parent == probe:
+                        raise
+                    probe, depth = probe.parent, depth + 1
+                else:
+                    break
+            if depth == 0 and stat.S_ISLNK(found.st_mode):
+                raise StateError("checkpoint directory is a symbolic link")
+            identity, theirs = self._checkpoint_repository(probe)
+        except (LockError, OSError):
+            raise LockError("cannot establish the checkpoint directory's repository") from None
+        if theirs is not None and theirs != self.coordination_root():
+            raise LockError("checkpoint directory is not owned by this checkout's repository lock")
+        if standalone:
+            # Outside every repository is outside the scheduler root too;
+            # decided on the directory git was asked from all the same.
+            self._refuse_scheduler_directory(
+                probe, identity, target.parts[len(target.parts) - depth :], standalone
+            )
+        external = theirs is None
+        if external and not (allow_external and not self.config.memory.enabled):
+            raise LockError("checkpoint directory is not owned by this checkout's repository lock")
+        self._checkpoint_probe = (identity, depth, standalone, external)
+        if depth == 0:
+            self._bind_checkpoint_root(self.state_root(create=False))
+        return theirs is not None
+
+    def _refuse_scheduler_directory(
+        self, probe: Path, identity: tuple[int, int], missing: tuple[str, ...], command: str
+    ) -> None:
+        """ADR 0008 D17.3 for the directory the owner check bound (R3-F3 of PR #526).
+
+        ``probe`` is the directory git was asked from, of ``identity``, and
+        ``missing`` the components of the target below it that do not exist
+        yet. Where the target lies is decided on ``probe`` with its symbolic
+        links resolved, which must still be the same directory, and those
+        components, which the state root creates without following a link.
+        """
+        try:
+            real = Path(os.path.realpath(probe))
+            found = os.stat(real)
+        except OSError:
+            raise LockError("cannot establish the checkpoint directory's repository") from None
+        if (found.st_dev, found.st_ino) != identity:
+            raise LockError("checkpoint directory changed while its repository was established")
+        check_standalone_state_dir(real.joinpath(*missing), self.coordination_root(), command)
+
+    @staticmethod
+    def _checkpoint_repository(path: Path) -> tuple[tuple[int, int], Path | None]:
+        """The identity of the directory ``path`` names and its repository's git
+        common dir, asked from it; the directory must not change meanwhile.
+        ``None`` for a directory positively outside every repository
+        (:class:`~autoforge.locking.NoRepository`)."""
+        before = os.stat(path)
+        theirs: Path | None
+        try:
+            theirs = repository_lock_path(path, cross_filesystems=True).parent.parent
+        except NoRepository:
+            theirs = None
+        after = os.stat(path)
+        identity = (before.st_dev, before.st_ino)
+        if (after.st_dev, after.st_ino) != identity:
+            raise LockError("checkpoint directory changed while its repository was established")
+        return identity, theirs
+
+    def _bind_checkpoint_root(self, root: SafeRoot) -> None:
+        """Refuse a state root that is not the directory the owner check bound.
+
+        A target that existed when it was checked must be the directory git
+        was asked from. One that did not is asked about again now that it is
+        opened: the root's directory itself, under the same rule. A directory
+        found outside every repository (the legacy Memory-off use) is bound
+        the same way (R4-F1 of PR #526): one opened after the check must lie
+        in this checkout's repository or still in none, and never in the
+        scheduler root when a standalone command asked; one found in this
+        checkout's repository must still lie there. Nothing is bound
+        before :meth:`require_checkpoint_owner` runs, or after the engine's
+        paths change.
+        """
+        if self._checkpoint_probe is None:
+            return
+        identity, depth, standalone, external = self._checkpoint_probe
+        if depth:
+            target = self.checkpoint_target()
+            try:
+                identity, theirs = self._checkpoint_repository(target)
+            except (LockError, OSError):
+                raise LockError("cannot establish the checkpoint directory's repository") from None
+            if theirs is None and not external:
+                raise LockError("cannot establish the checkpoint directory's repository")
+            if theirs is not None and theirs != self.coordination_root():
+                raise LockError(
+                    "checkpoint directory is not owned by this checkout's repository lock"
+                )
+            if standalone:
+                self._refuse_scheduler_directory(target, identity, (), standalone)
+            self._checkpoint_probe = (identity, 0, standalone, external)
+        if root.identity != identity:
+            raise LockError(
+                "checkpoint directory is not the directory its repository lock was checked for"
+            )
+
     def state_dir_in_scheduler_root(self) -> bool:
         """Whether this engine's state dir lies in the scheduler root (ADR 0008 D17.3).
 
         ``unblock`` may act on such a state directory, and then names the
         scheduler's command to continue it, since a standalone ``resume``
-        refuses it (:meth:`refuse_scheduler_state_dir`).
+        refuses it (:meth:`refuse_scheduler_state_dir`). Decided on
+        :meth:`checkpoint_target`, the directory the state root opens.
         """
-        return inside_scheduler_root(self.paths.state_dir, self.coordination_root())
+        return inside_scheduler_root(self.checkpoint_target(), self.coordination_root())
 
     # -- state handling --------------------------------------------------
     def new_run(self, epic_url: str, issue_url: str) -> AutoForgeState:
@@ -4094,6 +4337,7 @@ class ControllerEngine:
         """
         validate_required_profiles(self.config, REQUIRED_PROFILES)
         fingerprint_routing(self.config)
+        self.config.validate_memory()
 
     # -- prompt context ---------------------------------------------------
     @staticmethod
@@ -16784,6 +17028,17 @@ class ControllerEngine:
         profile = profile_for_phase(self.config, phase, state.review_round)
         provider = self.providers.get(profile)
         provider.validate_profile(profile)
+        # ADR 0015 D14, D18: a Memory launch needs a fresh context. The
+        # profile's half is checked here and at config load; the host's half
+        # before each launch's intent save, below.
+        memory_launch = phase is Phase.ANALYZE_EXECUTE and (
+            self.config.memory.enabled or bool(state.issue_memory.get("enabled"))
+        )
+        if memory_launch and not provider.proves_fresh_context(profile):
+            raise ConfigurationError(
+                "analyze_execute cannot prove fresh context with Memory; "
+                "use Pi with context_files and require_oauth false, or turn Memory off"
+            )
         # What config load refuses, for this launch's provider: a name listed
         # for repository commands alone would reach this agent (#286).
         overlap = self.config.execution.environment_overlap(
@@ -16799,9 +17054,17 @@ class ControllerEngine:
         # Read once per invocation, before the loop: the agent and the record
         # of it are launched from the same directory (see :meth:`_execution_cwd`).
         self._launch_cwd, self._launch_log = "", None
+        kept = self._kept_reply(phase)
+        if kept is None:
+            # R5-F5, R6-F2 of PR #526: a launch is needed, and the ordinal its
+            # intent save would spend must be one the loader reads again.
+            # Going on from a kept reply (below) spends none and launches
+            # nothing, so only a launch is checked, here, before the
+            # worktree, the logger, the read context or anything else of it
+            # is written; each relaunch checks again, below.
+            _refuse_a_launch_past_the_last_ordinal(state, phase)
         cwd = self._execution_cwd()
         self._launch_cwd = cwd
-        kept = self._kept_reply(phase)
         if kept is not None:
             # #479 (R1-F1 of PR #481): the last launch of this entry delivered
             # a reply the state kept before the step went on from it, and the
@@ -16868,6 +17131,11 @@ class ControllerEngine:
                         ),
                         code=StopReasonCode.STEP_BUDGET,
                     )
+                # A relaunch spends one more ordinal than the launch before
+                # it: refused here, once the reconciliation above found the
+                # relaunch needed, before its import, its read context or
+                # anything of its intent is written (R6-F2 of PR #526).
+                _refuse_a_launch_past_the_last_ordinal(state, phase)
             # Which UPDATE_EPIC result this launch asks for (ADR 0004 D4.7):
             # decided by the entry above, and the schema its result is held to.
             request = (
@@ -16891,6 +17159,22 @@ class ControllerEngine:
                 cwd, self._runner, env_allowlist=provider.launch_allowlist(env_allowlist)
             )
             provider.integration_preflight(env_allowlist)
+            if memory_launch:
+                # D18's dynamic check, for every launch: an earlier one, this
+                # invocation's included, may have left context behind, and
+                # the launch's own sandbox decides whether any can reach it
+                # (R3-F1 of PR #526).
+                host = FreshContextHost(
+                    enforced=self._sandbox_enforced(),
+                    home=_operator_home(),
+                    operator_paths=tuple(self.config.sandbox.read_only_paths),
+                )
+                refusal = provider.fresh_context_refusal(profile, os.environ, host)
+                if refusal:
+                    raise ConfigurationError(
+                        f"refusing to launch {phase.value} with Memory: profile "
+                        f"{profile.name!r} {refusal}; or turn Memory off"
+                    )
             # What the agent reads from GitHub, read by the controller (it
             # holds no credential to read it itself) and written before the
             # prompt that names it is rendered; nothing is saved yet.
@@ -16916,6 +17200,7 @@ class ControllerEngine:
                 state.step_count += 1
             attempt += 1
             state.attempt += 1
+            state.launch_seq += 1
             # D13.3: which publication contract this launch runs under, so a
             # later version can tell a launch of its own from one whose agent
             # published under the previous contract.
@@ -16971,6 +17256,8 @@ class ControllerEngine:
                 env_allowlist=env_allowlist,
                 loop_detection=self.config.execution.loop_detection,
                 interaction=broker,
+                # The adapter checks the launch it compiles too (D14).
+                fresh_context=memory_launch,
             )
             record = ExecutionRecord(
                 run_id=state.run_id,

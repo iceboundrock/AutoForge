@@ -212,6 +212,7 @@ probe file it creates and removes there.
 | `profiles` | provider, model, effort, command, idle timeout, maximum runtime and provider options per logical profile | [Profiles](#profiles) below |
 | `github` | the `gh` binary (a relative path, and a relative `PATH` entry a bare name is found through, is resolved against the directory AutoForge starts in: every `gh` runs in an empty directory of its own) and its timeout | [GitHub safety](agent-guides/github-safety.md#controller-owned-effects) |
 | `validation` | REMOTE candidate validation (#172): `commands` (argv lists, empty by default), `scope` (`candidate-tree`, the only value) | [Candidate validation](#candidate-validation) below, [State and recovery](agent-guides/state-and-recovery.md#validation-evidence) |
+| `memory` | Issue Working Memory: `enabled` (default `false`) | [Issue Working Memory](usage.md#issue-working-memory) |
 | `scheduler` | the parallel EPIC scheduler (#182, `autoforge epic`): `max_parallel` (1-4, default 2; `epic run --max-parallel` overrides it), `poll_interval_seconds` (15-3600, default 60), `stop_grace_seconds` (10-600, default 30) | [Parallel EPIC scheduler](#parallel-epic-scheduler) below, [Workflow](agent-guides/workflow.md#scheduler-execution-policy) |
 | `sandbox` | the outer sandbox (#168, #169): `mode` (`disabled`, the default, `preferred` or `required`), `validation_network` and `premerge_network` (`host`, the default, or `isolated`), `read_only_paths`; the container backend's seed settings under `sandbox.container` (`history_depth` 0, `history_tags` false, `seed_max_bytes` 2 GiB, `seed_max_objects` 1,000,000; read by nothing before that backend is selectable) | [Outer sandbox](#outer-sandbox) below, [The container backend's seed](#the-container-backends-seed-sandboxcontainer), [Architecture](agent-guides/architecture.md#launch-routing-adr-0005-168) |
 
@@ -1097,6 +1098,64 @@ socket) do not get it; curl and wget get none of their configured defaults
 zsh startup files, and a fish `SHELL` is replaced with `bash`; and the
 provider integrations above stay off. The guarantees and what they do not cover are in
 [GitHub safety](agent-guides/github-safety.md#agents-hold-no-github-credential).
+
+## Issue Working Memory
+
+`memory.enabled: true` opts a run into the advisory checkpoint store. The
+`analyze_execute` profile must be Pi with `options.context_files: false`
+and `options.require_oauth: false` (a provider API key; see below), and
+every Memory launch must also pass a check of the host and of the sandbox it
+runs in. Other providers are refused when Memory is on. In particular, a
+Claude session-persistence setting alone establishes nothing about
+auto-memory. No runtime version probe is made.
+
+Pi's flags do not disable everything an earlier launch could leave behind.
+`--no-session`, `--no-approve`, the executable-resource flags and
+`--no-context-files` cover sessions, project trust, extensions, skills,
+prompt templates, themes and context files. No flag turns off the agent
+directory's `SYSTEM.md` and `APPEND_SYSTEM.md`, which Pi loads at every
+launch ([Pi policy](pi-policy.md) §5). No check of a directory that
+outlives the launch keeps them out either. A process an earlier launch
+started can outlive a controller killed with `SIGKILL`, and launches of
+other checkouts share the directory, so either can write after the check
+and before Pi reads it. A Memory launch therefore uses an agent directory
+that exists for it alone: `~/.pi/agent` in the private home that
+`sandbox.mode: required` gives every launch, an empty tmpfs no other launch
+or host directory shares. Before each Memory launch's intent save, the
+controller refuses the launch unless it will run inside the outer sandbox,
+`PI_CODING_AGENT_DIR` is unset (when set, it names a host directory every launch given it
+shares), and no `sandbox.read_only_paths` entry shows a host directory at,
+above or inside `~/.pi/agent`. Where an entry shows is decided as the
+sandbox mounts it: one spelled inside the home appears at that spelling,
+wherever a link there leads, so a `~/.pi` linked outside the home is refused
+too. That home holds no ChatGPT sign-in, hence
+`require_oauth: false`, with the model provider's API key forwarded as a
+variable (`execution.agent_env_allowlist_extra`, as the
+[Pi operator guide](pi.md#deepseek-on-an-api-key) describes). Once the
+launch's sandbox is compiled, the same is checked on what it actually mounts, and the launch is
+refused before anything is spawned if Pi's agent directory is not its own.
+A refusal before the intent save leaves the state as it was. With Memory
+on, enforcement is mandatory: a Memory launch runs under `sandbox.mode:
+required` on a host that can enforce, or under `preferred`, accepted there
+as its alias. `doctor`
+fails its `outer sandbox: mode` row for Memory under `sandbox.mode:
+disabled`, since such a launch is always refused. On a host that cannot
+enforce, `disabled` is no way out with Memory on: make the host capable to
+keep Memory on, or turn Memory off and then set `sandbox.mode: disabled`,
+as `doctor` and the step's refusal say. Memory-off launches are
+neither checked nor changed. A process of your user outside
+the sandbox can still reach that home through `/proc`, as it can reach
+anything else you own ([Pi policy](pi-policy.md) §5): the proof excludes
+every other launch and host directory, not a same-UID process that
+targets the launch.
+
+Changing the recorded `memory.enabled` on `step`, `resume` or `unblock`
+requires `--accept-config-change`. Turning it off disables the projection
+and writes to the ledger, but does not erase the ledger. The one write left
+is the operator's `memory retract`, which still withdraws a record of the
+current issue, under the repository lock, without turning Memory on or
+advancing the run; the record stays withdrawn when Memory is turned on
+again. Automatic collection and delivery are not part of this release.
 
 ## Candidate validation
 

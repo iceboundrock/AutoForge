@@ -250,25 +250,26 @@ def test_adr_0015_attempt_repeats_after_an_unblock_into_the_same_step(tmp_state_
     """D2.1's regression scenario, as today's code runs it. An ``unblock``
     back into the same phase keeps the step's key and restarts the attempt
     counter, so two launches of the step share ``(StepKey, attempt)``: the
-    counter names no launch. The run's step count does not restart. D2's
-    table takes the attempt's identity from ``launch_seq``, which D19.2
-    adds: it is no field yet, so the child that adds it updates the record
-    with this test."""
+    counter names no launch. The persisted launch ordinal distinguishes them."""
     stop = block({"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": "need decision"})
     eng = make_engine(tmp_state_dir, [stop, stop], github=fake_github, origin=True)
     eng.state.phase = Phase.ANALYZE_EXECUTE
     key = _step_key(eng.state)
 
     assert eng.step().next_phase == "BLOCKED"
-    first = (eng.state.attempt, eng.state.step_count)
+    first = (eng.state.attempt, eng.state.step_count, eng.state.launch_seq)
+    assert first[2] == 1
+    eng.load()
+    assert eng.state.launch_seq == first[2]
     assert eng.unblock("the operator decided").unblocked
     assert eng.state.phase is Phase.ANALYZE_EXECUTE and _step_key(eng.state) == key
     assert eng.state.attempt == 0 and eng.state.step_count == first[1]
 
     assert eng.step().next_phase == "BLOCKED"
-    second = (eng.state.attempt, eng.state.step_count)
+    second = (eng.state.attempt, eng.state.step_count, eng.state.launch_seq)
     assert [call.attempt for call in eng.provider.calls] == [1, 1]
     assert first[0] == second[0] == 1 and second[1] > first[1]
+    assert second[2] == 2
 
     identity = next(
         cells
@@ -276,7 +277,7 @@ def test_adr_0015_attempt_repeats_after_an_unblock_into_the_same_step(tmp_state_
         if _code_spans(cells[0]) == ["AttemptID"]
     )
     assert "`(RunID, launch_seq)`" in identity[1] and "state.attempt" not in identity[1]
-    assert "launch_seq" not in {field.name for field in dataclasses.fields(AutoForgeState)}
+    assert "launch_seq" in {field.name for field in dataclasses.fields(AutoForgeState)}
 
 
 @pytest.mark.parametrize(

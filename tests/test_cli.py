@@ -1,5 +1,6 @@
 """CLI: --help, doctor, run/step/resume/status with injected fakes (no real gh/agents)."""
 
+import hashlib
 import json
 import os
 import shlex
@@ -11,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from autoforge import cli
+from autoforge.auto_recovery import StepKey
 from autoforge.engine import ControllerEngine, StepOutcome
 from autoforge.errors import (
     ExecutionError,
@@ -18,14 +20,24 @@ from autoforge.errors import (
     GitHubNotFoundError,
     GitHubUnavailableError,
     LockError,
+    SchedulerStateDirError,
+    StateError,
 )
 from autoforge.executor import ExecutionResult, execute
 from autoforge.github import GitHubClient
 from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
+from autoforge.memory import Action, Actor, Kind, MemoryScope
 from autoforge.provenance import MAX_PATH_CHARS
 from autoforge.providers import ProviderRegistry, ScriptedProvider
 from autoforge.redaction import redact, redact_obj
-from autoforge.run_namespace import EpicRef, RunBinding, RunKey, issue_namespace, write_binding
+from autoforge.run_namespace import (
+    EpicRef,
+    RunBinding,
+    RunKey,
+    inside_scheduler_root,
+    issue_namespace,
+    write_binding,
+)
 from autoforge.scheduler_state import Admission, ClaimKind, StateRef, open_claim
 from autoforge.state import AutoForgeState, load_state, quarantine_state_file, save_state
 from autoforge.transitions import Phase
@@ -129,6 +141,731 @@ def test_status_without_state_errors(tmp_path, capsys, monkeypatch):
     rc = cli.main(["--state-dir", str(tmp_path / ".autoforge"), "status"])
     assert rc == 2
     assert "no state" in capsys.readouterr().err.lower()
+
+
+def test_memory_seed_and_retraction_are_checkpoint_only(tmp_path, monkeypatch, capsys, fakes):
+    monkeypatch.chdir(tmp_path)
+    config = _config(
+        tmp_path / "af.json",
+        memory={"enabled": True},
+        profiles={
+            "analyze_execute": {
+                "provider": "pi",
+                "model": "openai/fixture-model",
+                "effort": "high",
+                "options": {"context_files": False, "require_oauth": False},
+            }
+        },
+    )
+    args = ["--config", config]
+    seed = tmp_path / "seed.txt"
+    text = "A note about the repository.\r\n"
+    seed.write_bytes(text.encode())
+    assert cli.main([*args, *_run_argv_of(1), "--memory-seed", str(seed)]) == 0
+    state_file = tmp_path / ".autoforge" / "state.json"
+    before = state_file.read_bytes()
+    capsys.readouterr()
+    assert cli.main([*args, "memory", "show", "--json"]) == 0
+    catalog = json.loads(capsys.readouterr().out)
+    assert catalog["records"][0]["text"] == text
+    assert state_file.read_bytes() == before
+    calls = list(fakes["gh"].calls)
+    assert cli.main([*args, "memory", "retract", "1", "--reason", "wrong lesson"]) == 0
+    checkpoint = load_state(state_file)
+    assert checkpoint.launch_seq == 0 and checkpoint.phase is Phase.ANALYZE_EXECUTE
+    assert checkpoint.memory().catalog(ISSUE)["records"][0]["status"] == "retracted"
+    assert text.strip() not in state_file.read_text()
+    assert fakes["provider"].calls == [] and fakes["gh"].calls == calls
+
+
+def test_memory_retract_withdraws_a_record_with_memory_off(tmp_path, monkeypatch, capsys, fakes):
+    """R5-F3 of PR #526: a run whose Memory was turned off keeps its records,
+    and `memory retract` withdraws one without turning Memory on, launching,
+    transitioning or reaching GitHub. The record stays withdrawn when Memory
+    is turned on again; another issue's record is still refused unchanged."""
+    monkeypatch.chdir(tmp_path)
+    pi = {
+        "analyze_execute": {
+            "provider": "pi",
+            "model": "openai/fixture-model",
+            "effort": "high",
+            "options": {"context_files": False, "require_oauth": False},
+        }
+    }
+    config = _config(tmp_path / "af.json", memory={"enabled": True}, profiles=pi)
+    seed = tmp_path / "seed.txt"
+    seed.write_text("A wrong lesson about issue 2.\n", encoding="utf-8")
+    assert cli.main(["--config", config, *_run_argv_of(1), "--memory-seed", str(seed)]) == 0
+    state_file = tmp_path / ".autoforge" / "state.json"
+    off = load_state(state_file)
+    off.issue_memory = off.memory_setting(False)
+    save_state(off, state_file)
+    off_config = _config(tmp_path / "off.json", memory={"enabled": False}, profiles=pi)
+    args = ["--config", off_config]
+    before = load_state(state_file)
+    calls = list(fakes["gh"].calls)
+    capsys.readouterr()
+    assert cli.main([*args, "memory", "retract", "1", "--reason", "wrong lesson"]) == 0
+    assert "Withdrew Memory record M1" in capsys.readouterr().out
+    after = load_state(state_file)
+    assert after.memory().enabled is False and after.issue_memory["enabled"] is False
+    (record,) = after.memory().catalog(ISSUE)["records"]
+    assert record["status"] == "retracted"
+    assert "A wrong lesson" not in state_file.read_text()
+    # Nothing of the run moved: no launch, no transition, no GitHub call.
+    assert (after.phase, after.launch_seq, after.step_count, after.attempt) == (
+        before.phase,
+        before.launch_seq,
+        before.step_count,
+        before.attempt,
+    )
+    assert fakes["provider"].calls == [] and fakes["gh"].calls == calls
+    # Memory on again: still withdrawn.
+    on = load_state(state_file)
+    on.issue_memory = on.memory_setting(True)
+    save_state(on, state_file)
+    (record,) = load_state(state_file).memory().catalog(ISSUE)["records"]
+    assert record["status"] == "retracted" and record["text"] == ""
+    # Off again, a record of an earlier issue is refused with nothing written.
+    moved = load_state(state_file)
+    moved.issue_memory = moved.memory_setting(False)
+    moved.reset_for_new_issue(ISSUE3)
+    save_state(moved, state_file)
+    unchanged = state_tree(tmp_path / ".autoforge")
+    assert cli.main([*args, "memory", "retract", "1", "--reason", "wrong lesson"]) == 2
+    assert "not a record of the run's current issue" in capsys.readouterr().err
+    assert state_tree(tmp_path / ".autoforge") == unchanged
+
+
+def test_memory_retract_refuses_an_earlier_issues_record(tmp_path, monkeypatch, capsys, fakes):
+    """R1-F3 of PR #526: `memory show` hides an earlier issue's records, and
+    `memory retract` leaves them as they are and writes nothing."""
+    monkeypatch.chdir(tmp_path)
+    config = _config(
+        tmp_path / "af.json",
+        memory={"enabled": True},
+        profiles={
+            "analyze_execute": {
+                "provider": "pi",
+                "model": "openai/fixture-model",
+                "effort": "high",
+                "options": {"context_files": False, "require_oauth": False},
+            }
+        },
+    )
+    args = ["--config", config]
+    seed = tmp_path / "seed.txt"
+    seed.write_text("A lesson about issue 2.\n", encoding="utf-8")
+    assert cli.main([*args, *_run_argv_of(1), "--memory-seed", str(seed)]) == 0
+    state_file = tmp_path / ".autoforge" / "state.json"
+    moved = load_state(state_file)
+    moved.reset_for_new_issue(ISSUE3)
+    save_state(moved, state_file)
+    before = state_tree(tmp_path / ".autoforge")
+    capsys.readouterr()
+    assert cli.main([*args, "memory", "show", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["records"] == []
+    assert cli.main([*args, "memory", "retract", "1", "--reason", "wrong lesson"]) == 2
+    assert "not a record of the run's current issue; nothing was written" in (
+        capsys.readouterr().err
+    )
+    assert state_tree(tmp_path / ".autoforge") == before
+    (record,) = load_state(state_file).memory().catalog(ISSUE)["records"]
+    assert record["status"] == "current" and record["text"] == "A lesson about issue 2.\n"
+    assert fakes["provider"].calls == []
+
+
+def _memory_config(tmp_path) -> list[str]:
+    """``--config`` for a Memory run on Pi with context files off."""
+    config = _config(
+        tmp_path / "af.json",
+        memory={"enabled": True},
+        profiles={
+            "analyze_execute": {
+                "provider": "pi",
+                "model": "openai/fixture-model",
+                "effort": "high",
+                "options": {"context_files": False, "require_oauth": False},
+            }
+        },
+    )
+    return ["--config", config]
+
+
+def test_status_and_memory_show_json_stay_issue_scoped_after_an_issue_switch(
+    tmp_path, monkeypatch, capsys, fakes
+):
+    """R2-F6 of PR #526: neither JSON view prints an earlier issue's Memory."""
+    monkeypatch.chdir(tmp_path)
+    args = _memory_config(tmp_path)
+    seed = tmp_path / "seed.txt"
+    text = "A lesson about issue 2, kept out of later views.\n"
+    seed.write_text(text, encoding="utf-8")
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    assert cli.main([*args, *_run_argv_of(1), "--memory-seed", str(seed)]) == 0
+    capsys.readouterr()
+    assert cli.main([*args, "status", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert "issue_memory" not in printed
+    assert printed["memory"]["records"] == {"current": 1} and printed["memory"]["enabled"]
+    state_file = tmp_path / ".autoforge" / "state.json"
+    moved = load_state(state_file)
+    moved.reset_for_new_issue(ISSUE3)
+    save_state(moved, state_file)
+    before = state_tree(tmp_path / ".autoforge")
+    for words in (["status", "--json"], ["memory", "show", "--json"]):
+        assert cli.main([*args, *words]) == 0
+        out = capsys.readouterr().out
+        assert text.strip() not in out and digest not in out and "issue_memory" not in out
+        printed = json.loads(out)
+        if words[0] == "status":
+            assert printed["memory"]["records"] == {} and printed["memory"]["enabled"]
+            assert printed["current_issue_url"] == ISSUE3
+        else:
+            assert printed["records"] == []
+    assert state_tree(tmp_path / ".autoforge") == before
+    # The earlier issue's record is still in the ledger, unchanged.
+    (record,) = load_state(state_file).memory().catalog(ISSUE)["records"]
+    assert record["status"] == "current" and record["text"] == text
+
+
+class Crash(BaseException):
+    """A kill at one point of an operator Memory command (ADR 0015 D11, W9)."""
+
+
+def _github_writes(gh) -> str:
+    """Everything a GitHub write of the fake would change."""
+    return repr(
+        (
+            gh.issues,
+            gh.prs,
+            gh.comments,
+            gh.merges,
+            gh.closed_prs,
+            gh.reopened_prs,
+            gh.deleted_branches,
+        )
+    )
+
+
+def _crash_at(patch, boundary: str) -> None:
+    """Interrupt the next ``state.json`` publication just before or just after it."""
+    if boundary == "before":
+        import autoforge.safefs as safefs
+
+        real_replace = os.replace
+
+        def crash_replace(src, dst, *a, **k):
+            # The rename that publishes the checkpoint, and nothing else.
+            if dst == "state.json":
+                raise Crash()
+            return real_replace(src, dst, *a, **k)
+
+        patch.setattr(safefs.os, "replace", crash_replace)
+    else:
+        import autoforge.state as state_module
+
+        real_save = state_module.save_state
+
+        def save_then_crash(*a, **k):
+            real_save(*a, **k)
+            raise Crash()
+
+        import autoforge.engine as engine_module
+
+        # Every name the checkpoint's save is called through: the engine's
+        # (the seed's save is the run's first) and the CLI's (a retraction).
+        for module in (state_module, engine_module, cli):
+            patch.setattr(module, "save_state", save_then_crash)
+
+
+@pytest.mark.parametrize("boundary", ["before", "after"])
+def test_an_interrupted_memory_seed_leaves_no_run_or_the_whole_new_one(
+    tmp_path, monkeypatch, capsys, fakes, boundary
+):
+    """R2-F8 of PR #526, ADR 0015 D11 W9: the seed is saved with the run's
+    first checkpoint. Interrupted before that save is published there is no
+    run; after it, the fresh load is the whole new run, seed included, with
+    no launch, no transition and no GitHub write."""
+    monkeypatch.chdir(tmp_path)
+    args = _memory_config(tmp_path)
+    seed = tmp_path / "seed.txt"
+    text = "A lesson saved with the run, whole or not at all.\n"
+    seed.write_text(text, encoding="utf-8")
+    state_file = tmp_path / ".autoforge" / "state.json"
+    writes = _github_writes(fakes["gh"])
+    with monkeypatch.context() as patch:
+        _crash_at(patch, boundary)
+        with pytest.raises(Crash):
+            cli.main([*args, *_run_argv_of(1), "--memory-seed", str(seed)])
+    capsys.readouterr()
+    assert fakes["provider"].calls == [] and _github_writes(fakes["gh"]) == writes
+    if boundary == "before":
+        assert not state_file.exists()
+        assert cli.main([*args, "status", "--json"]) == 2
+        # Nothing to reconcile: the run is started again and holds one seed.
+        assert cli.main([*args, *_run_argv_of(1), "--memory-seed", str(seed)]) == 0
+        (record,) = load_state(state_file).memory().catalog(ISSUE)["records"]
+        assert record["text"] == text
+        return
+    fresh = load_state(state_file)
+    assert fresh.phase is Phase.INITIALIZING
+    assert (fresh.launch_seq, fresh.step_count, fresh.attempt) == (0, 0, 0)
+    catalog = fresh.memory().catalog(ISSUE)
+    assert catalog["enabled"] and catalog["revision"] == 1
+    (record,) = catalog["records"]
+    assert (record["kind"], record["status"], record["text"]) == ("seed", "current", text)
+
+
+@pytest.mark.parametrize("boundary", ["before", "after"])
+def test_an_interrupted_memory_retraction_leaves_the_old_or_the_whole_new_checkpoint(
+    tmp_path, monkeypatch, capsys, fakes, boundary
+):
+    """R2-F8 of PR #526, ADR 0015 D11 W9: the retraction is one save.
+    Interrupted before it is published the old checkpoint stands, byte for
+    byte; after it, the fresh load is the whole new checkpoint, the record
+    retracted and nothing else changed, with no launch, no transition and no
+    GitHub write."""
+    monkeypatch.chdir(tmp_path)
+    args = _memory_config(tmp_path)
+    seed = tmp_path / "seed.txt"
+    text = "A wrong lesson.\n"
+    seed.write_text(text, encoding="utf-8")
+    assert cli.main([*args, *_run_argv_of(1), "--memory-seed", str(seed)]) == 0
+    state_file = tmp_path / ".autoforge" / "state.json"
+    before = state_file.read_bytes()
+    old = load_state(state_file)
+    expected = (
+        old.memory()
+        .revise(Action.RETRACT, 1, actor=Actor.OPERATOR, reason="wrong lesson", issue=ISSUE)
+        .store.encode()
+    )
+    writes = _github_writes(fakes["gh"])
+    capsys.readouterr()
+    with monkeypatch.context() as patch:
+        _crash_at(patch, boundary)
+        with pytest.raises(Crash):
+            cli.main([*args, "memory", "retract", "1", "--reason", "wrong lesson"])
+    capsys.readouterr()
+    assert fakes["provider"].calls == [] and _github_writes(fakes["gh"]) == writes
+    if boundary == "before":
+        assert state_file.read_bytes() == before
+        assert load_state(state_file).memory().catalog(ISSUE)["records"][0]["status"] == "current"
+        # Nothing to reconcile: the operator retracts again.
+        assert cli.main([*args, "memory", "retract", "1", "--reason", "wrong lesson"]) == 0
+    fresh = load_state(state_file)
+    assert fresh.issue_memory == expected
+    assert fresh.memory().catalog(ISSUE)["records"][0]["status"] == "retracted"
+    assert text.strip() not in state_file.read_text()
+    unchanged = {"issue_memory", "updated_at"}
+    assert {k: v for k, v in fresh.to_dict().items() if k not in unchanged} == {
+        k: v for k, v in old.to_dict().items() if k not in unchanged
+    }
+
+
+@pytest.mark.parametrize("output_format", ["text", "stream-json"])
+def test_memory_refuses_unproved_claude_before_any_checkpoint(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    fakes,
+    output_format,
+):
+    monkeypatch.chdir(tmp_path)
+    config = _config(
+        tmp_path / "af.json",
+        memory={"enabled": True},
+        profiles={"analyze_execute": {"options": {"output_format": output_format}}},
+    )
+    assert cli.main(["--config", config, *_run_argv_of(1)]) == 2
+    assert "fresh-context" in capsys.readouterr().err
+    assert not (tmp_path / ".autoforge").exists()
+    assert not repository_lock_path(tmp_path).exists()
+    assert fakes["provider"].calls == []
+
+
+@pytest.mark.parametrize("bad_git", [False, True])
+@pytest.mark.parametrize(
+    "words",
+    [
+        ["step"],
+        ["resume"],
+        ["unblock", "--reason", "test"],
+        ["memory", "retract", "1", "--reason", "test"],
+        ["run", "--epic", EPIC, "--issue", ISSUE, "--force", "--max-steps", "1"],
+    ],
+    ids=("step", "resume", "unblock", "retract", "force"),
+)
+def test_checkpoint_writers_refuse_foreign_clone_even_if_git_discovery_fails(
+    tmp_path, monkeypatch, fakes, bad_git, words
+):
+    monkeypatch.chdir(tmp_path)
+    foreign = git_repo(tmp_path / "other-clone")
+    state_dir = foreign / ".af"
+    path = state_dir / "state.json"
+    if bad_git:
+        (foreign / ".git" / "config").write_text("[\n")
+    saved = AutoForgeState(
+        run_id="foreign-run",
+        repository="owner/repo",
+        epic_url=EPIC,
+        current_issue_url=ISSUE,
+        phase=Phase.ANALYZE_EXECUTE,
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    save_state(saved, path)
+    before = state_tree(state_dir)
+    assert cli.main(["--state-dir", str(state_dir), *words]) == 2
+    assert state_tree(state_dir) == before
+    assert fakes["provider"].calls == []
+
+
+def _foreign_checkpoint(tmp_path) -> Path:
+    """Another clone's run, nested in this checkout: ``other-clone/.af``."""
+    foreign = git_repo(tmp_path / "other-clone")
+    state_dir = foreign / ".af"
+    saved = AutoForgeState(
+        run_id="foreign-run",
+        repository="owner/repo",
+        epic_url=EPIC,
+        current_issue_url=ISSUE,
+        phase=Phase.ANALYZE_EXECUTE,
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    save_state(saved, state_dir / "state.json")
+    return state_dir
+
+
+@pytest.mark.parametrize("spelling", ["missing-intermediate", "symlinked-parent"])
+@pytest.mark.parametrize(
+    "words",
+    [
+        ["step"],
+        ["resume"],
+        ["unblock", "--reason", "test"],
+        ["memory", "retract", "1", "--reason", "test"],
+        ["run", "--epic", EPIC, "--issue", ISSUE, "--force", "--max-steps", "1"],
+    ],
+    ids=("step", "resume", "unblock", "retract", "force"),
+)
+def test_checkpoint_writers_ask_git_about_the_directory_they_open(
+    tmp_path, monkeypatch, capsys, fakes, spelling, words
+):
+    """R2-F2 of PR #526: a ``..`` spelling that names the foreign clone's
+    checkpoint once normalized, as the state root opens it, but this
+    checkout when walked as spelled, is refused and leaves it unchanged."""
+    monkeypatch.chdir(tmp_path)
+    state_dir = _foreign_checkpoint(tmp_path)
+    if spelling == "missing-intermediate":
+        # As spelled, nothing exists below this checkout's ``missing``.
+        spelled = tmp_path / "missing" / ".." / "other-clone" / ".af"
+    else:
+        # As spelled, ``link/..`` is this checkout, whose ``.af`` is absent.
+        (tmp_path / "sub").mkdir()
+        (state_dir.parent / "link").symlink_to(tmp_path / "sub")
+        spelled = state_dir.parent / "link" / ".." / ".af"
+    assert os.path.abspath(spelled) == str(state_dir)
+    before = state_tree(state_dir)
+    assert cli.main(["--state-dir", str(spelled), *words]) == 2
+    assert "not owned by this checkout's repository lock" in capsys.readouterr().err
+    assert state_tree(state_dir) == before
+    assert not (tmp_path / ".af").exists()
+    assert fakes["provider"].calls == []
+
+
+_ALIASED_WRITERS = [
+    ["step"],
+    ["resume"],
+    ["unblock", "--reason", "test"],
+    ["memory", "retract", "1", "--reason", "test"],
+    ["run", "--epic", EPIC, "--issue", ISSUE, "--force", "--max-steps", "1"],
+    ["rebind-epic", "--issue", ISSUE, "--from", EPIC, "--to", ISSUE3, "--reason", "test"],
+]
+_ALIASED_IDS = ("step", "resume", "unblock", "retract", "force", "rebind")
+
+
+def _memory_checkpoint(state_dir: Path, run_id: str) -> None:
+    """A run with Memory on and one seeded record, saved in ``state_dir``."""
+    saved = AutoForgeState(
+        run_id=run_id,
+        repository="owner/repo",
+        epic_url=EPIC,
+        current_issue_url=ISSUE,
+        phase=Phase.ANALYZE_EXECUTE,
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    saved.issue_memory = saved.memory_setting(True)
+    scope = MemoryScope(StepKey(Phase.INITIALIZING, ISSUE, "", 0, 1))
+    seeded = saved.memory().add(
+        actor=Actor.OPERATOR, kind=Kind.SEED, scope=scope, text="A lesson of this run.\n"
+    )
+    assert seeded.status == "applied"
+    saved.issue_memory = seeded.store.encode()
+    save_state(saved, state_dir / "state.json")
+
+
+@pytest.mark.parametrize("words", _ALIASED_WRITERS, ids=_ALIASED_IDS)
+def test_a_foreign_memory_checkpoint_under_a_dotdot_alias_is_refused_by_every_writer(
+    tmp_path, monkeypatch, capsys, fakes, words
+):
+    """R3-F3 of PR #526: as spelled, ``link/..`` is this checkout, whose
+    ``.af`` is absent; normalized, as the state root opens it, it is another
+    clone's Memory checkpoint. Every writer, ``rebind-epic`` included, asks
+    git about the directory it opens and leaves the checkpoint unchanged."""
+    monkeypatch.chdir(tmp_path)
+    foreign = git_repo(tmp_path / "other-clone")
+    state_dir = foreign / ".af"
+    _memory_checkpoint(state_dir, "foreign-run")
+    (tmp_path / "sub").mkdir()
+    (foreign / "link").symlink_to(tmp_path / "sub")
+    spelled = foreign / "link" / ".." / ".af"
+    assert os.path.abspath(spelled) == str(state_dir)
+    assert not os.path.lexists(os.path.realpath(spelled))
+    before = state_tree(state_dir)
+    assert cli.main(["--state-dir", str(spelled), *words]) == 2
+    err = capsys.readouterr().err
+    assert (
+        "not owned by this checkout's repository lock" in err or "belongs to the repository" in err
+    )
+    assert state_tree(state_dir) == before
+    assert not (tmp_path / ".af").exists()
+    assert fakes["provider"].calls == []
+
+
+@pytest.mark.parametrize("words", _ALIASED_WRITERS, ids=_ALIASED_IDS)
+def test_a_scheduler_checkpoint_under_a_dotdot_alias_is_refused_by_every_standalone_writer(
+    tmp_path, monkeypatch, capsys, fakes, words
+):
+    """R3-F3 of PR #526: as spelled, ``<namespace>/link/..`` resolves outside
+    the scheduler root; normalized, as the state root opens it, it is the
+    namespace's own state directory. ``run --force`` names an issue no
+    namespace owns, and still cannot replace the namespace's checkpoint;
+    ``unblock`` acts on it as on any namespace state directory, and no
+    standalone writer is exempted by the spelling."""
+    monkeypatch.chdir(tmp_path)
+    namespace = _namespace_state_dir(tmp_path, 7).parent
+    namespace.mkdir(parents=True)
+    _memory_checkpoint(namespace / "state", "af-namespace")
+    (tmp_path / "outside" / "sub").mkdir(parents=True)
+    (namespace / "link").symlink_to(tmp_path / "outside" / "sub")
+    spelled = namespace / "link" / ".." / "state"
+    assert os.path.abspath(spelled) == str(namespace / "state")
+    assert not inside_scheduler_root(spelled, tmp_path / ".git")
+    before = state_tree(namespace / "state")
+    rc = cli.main(["--state-dir", str(spelled), *words])
+    err = capsys.readouterr().err
+    if words[0] == "unblock":
+        # Allowed on a namespace's state directory; this run is not blocked.
+        assert rc == 2 and "refuses state directory" not in err
+    else:
+        assert rc == 2 and "inside the parallel EPIC scheduler's root" in err
+        assert state_tree(namespace / "state") == before
+    assert not (tmp_path / "outside" / "state").exists()
+    assert fakes["provider"].calls == []
+
+
+def test_the_scheduler_root_is_refused_again_on_the_directory_the_state_root_opens(
+    tmp_path, monkeypatch, fakes
+):
+    """R3-F3 of PR #526: the owner check made while the state directory was
+    missing found it outside the scheduler root; the directory then opened
+    is a namespace's, reached through a link made after the check, so it is
+    refused there and the namespace's checkpoint is left as it was."""
+    monkeypatch.chdir(tmp_path)
+    namespace = _namespace_state_dir(tmp_path, 7).parent
+    namespace.mkdir(parents=True)
+    _memory_checkpoint(namespace / "state", "af-namespace")
+    from autoforge.config import AutoForgeConfig
+
+    engine = ControllerEngine(
+        config=AutoForgeConfig(), state_dir=str(tmp_path / "a" / "state"), workdir=tmp_path
+    )
+    assert engine.require_checkpoint_owner(standalone="step") is True
+    (tmp_path / "a").symlink_to(namespace)
+    before = state_tree(namespace / "state")
+    with pytest.raises(SchedulerStateDirError, match="inside the parallel EPIC scheduler's root"):
+        engine.load()
+    assert state_tree(namespace / "state") == before
+    engine.close()
+    # The same directory, existing when it is checked, is refused at once.
+    engine = ControllerEngine(
+        config=AutoForgeConfig(), state_dir=str(tmp_path / "a" / "state"), workdir=tmp_path
+    )
+    with pytest.raises(SchedulerStateDirError):
+        engine.require_checkpoint_owner(standalone="step")
+    assert engine.require_checkpoint_owner() is True  # unblock's check: no refusal
+    engine.close()
+
+
+def test_status_json_reads_a_legacy_memory_off_checkpoint_with_no_issue_url(
+    tmp_path, monkeypatch, capsys, fakes
+):
+    """R3-F6 of PR #526: the state loader accepts a protocol-19 checkpoint
+    whose run names no issue, and loads it with Memory off. ``status --json``
+    and ``memory show --json`` read it, the empty store summarized without
+    Memory's scope rules, and write nothing."""
+    monkeypatch.chdir(tmp_path)
+    state_dir = tmp_path / ".autoforge"
+    state_dir.mkdir()
+    data = AutoForgeState(
+        run_id="af-legacy",
+        repository="owner/repo",
+        epic_url=EPIC,
+        current_issue_url="",
+        phase=Phase.INITIALIZING,
+        step_count=3,
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    ).to_dict()
+    data["protocol_version"] = "19"
+    del data["launch_seq"], data["issue_memory"]
+    (state_dir / "state.json").write_text(json.dumps(data))
+    loaded = load_state(state_dir / "state.json")
+    assert loaded.current_issue_url == "" and loaded.issue_memory == {}
+    before = state_tree(state_dir)
+    assert cli.main(["--state-dir", str(state_dir), "status", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["memory"] == {
+        "enabled": False,
+        "revision": 0,
+        "digest": hashlib.sha256(b"{}").hexdigest(),
+        "refusals": 0,
+        "records": {},
+    }
+    assert "issue_memory" not in printed and printed["launch_seq"] == 3
+    assert cli.main(["--state-dir", str(state_dir), "memory", "show", "--json"]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert (shown["enabled"], shown["records"], shown["revision"]) == (False, [], 0)
+    assert state_tree(state_dir) == before
+
+
+@pytest.mark.parametrize("spelling", ["missing/../.autoforge", "a/b/.autoforge"])
+def test_a_new_run_binds_its_own_missing_state_directory(
+    tmp_path, monkeypatch, capsys, fakes, spelling
+):
+    """R2-F2 of PR #526: missing intermediates of this checkout's own state
+    directory are created and the run saved there, asked about once opened."""
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["--state-dir", str(tmp_path / spelling), *_run_argv_of(1)]) == 0
+    saved = Path(os.path.abspath(tmp_path / spelling)) / "state.json"
+    assert load_state(saved).current_issue_url == ISSUE
+    assert not (tmp_path / "missing").exists()
+
+
+def test_a_state_directory_created_in_a_foreign_clone_after_the_check_is_refused(
+    tmp_path, monkeypatch, fakes
+):
+    """R2-F2 of PR #526: the check made while the directory was missing asked
+    this checkout; the directory then opened lies in another clone, nested
+    at the same depth, so it is asked about again and refused unchanged."""
+    monkeypatch.chdir(tmp_path)
+    state_dir = _foreign_checkpoint(tmp_path)
+    from autoforge.config import AutoForgeConfig
+
+    engine = ControllerEngine(
+        config=AutoForgeConfig(), state_dir=str(tmp_path / "a" / ".af"), workdir=tmp_path
+    )
+    assert engine.require_checkpoint_owner() is True
+    (tmp_path / "a").symlink_to(state_dir.parent)
+    before = state_tree(state_dir)
+    with pytest.raises(LockError, match="not owned by this checkout's repository lock"):
+        engine.load()
+    assert state_tree(state_dir) == before
+    engine.close()
+
+
+def _memory_off_checkpoint(state_dir: Path, run_id: str) -> None:
+    """A Memory-off run saved in ``state_dir``."""
+    saved = AutoForgeState(
+        run_id=run_id,
+        repository="owner/repo",
+        epic_url=EPIC,
+        current_issue_url=ISSUE,
+        phase=Phase.ANALYZE_EXECUTE,
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    save_state(saved, state_dir / "state.json")
+
+
+@pytest.mark.parametrize("other", ["foreign-clone", "scheduler-namespace"])
+def test_run_force_on_an_external_state_directory_cannot_replace_a_checkpoint_linked_in_later(
+    tmp_path, tmp_path_factory, monkeypatch, capsys, fakes, other
+):
+    """R4-F1 of PR #526: with Memory off, ``--state-dir`` names a missing
+    directory outside every repository, which both owner checks, the one
+    under the lock included, admit as the legacy external use. Its parent is
+    then made a link to another checkout's run, or to a scheduler
+    namespace's. The state root opens that directory, is asked about again,
+    and refuses it: ``run --force`` replaces nothing, and nothing runs."""
+    monkeypatch.chdir(tmp_path)
+    if other == "foreign-clone":
+        state_dir = git_repo(tmp_path / "other-clone") / "state"
+        refusal = "not owned by this checkout's repository lock"
+    else:
+        state_dir = _namespace_state_dir(tmp_path, 7)
+        refusal = "inside the parallel EPIC scheduler's root"
+    state_dir.mkdir(parents=True)
+    _memory_off_checkpoint(state_dir, "af-other")
+    external = Path(os.path.realpath(tmp_path_factory.mktemp("external")))
+    spelled = external / "a" / "state"
+    answers: list[bool] = []
+    checked = ControllerEngine.require_checkpoint_owner
+
+    def checked_then_linked(self, **kwargs):
+        answers.append(checked(self, **kwargs))
+        if len(answers) == 2:  # the check made under the lock
+            (external / "a").symlink_to(state_dir.parent)
+        return answers[-1]
+
+    monkeypatch.setattr(ControllerEngine, "require_checkpoint_owner", checked_then_linked)
+    before = state_tree(state_dir)
+    argv = ["--state-dir", str(spelled), "run", "--epic", EPIC, "--issue", ISSUE, "--force"]
+    assert cli.main([*argv, "--max-steps", "1"]) == 2
+    assert answers == [False, False]
+    assert refusal in capsys.readouterr().err
+    assert state_tree(state_dir) == before
+    assert load_state(state_dir / "state.json").run_id == "af-other"
+    assert fakes["provider"].calls == [] and fakes["gh"].effect_writes == []
+
+
+def test_an_external_memory_off_state_directory_still_runs_and_is_bound_to_it(
+    tmp_path, tmp_path_factory, monkeypatch, capsys, fakes
+):
+    """R4-F1 of PR #526: a state directory outside every repository stays
+    usable with Memory off: created by ``run``, replaced by ``run --force``
+    and continued by ``step``. The owner check binds it to the directory it
+    found, so one put in its place after the check is refused, not read."""
+    monkeypatch.chdir(tmp_path)
+    external = Path(os.path.realpath(tmp_path_factory.mktemp("external")))
+    state_dir = external / "runs" / "state"
+    argv = ["--state-dir", str(state_dir)]
+    assert cli.main([*argv, *_run_argv_of(1)]) == 0
+    first = load_state(state_dir / "state.json").run_id
+    assert cli.main([*argv, *_run_argv_of(1), "--force"]) == 0
+    second = load_state(state_dir / "state.json")
+    assert second.run_id != first and second.issue_memory == {}
+    capsys.readouterr()
+    # Admitted, the step launches; the scripted agent returns no result.
+    cli.main([*argv, "step"])
+    assert "repository lock" not in capsys.readouterr().err
+    assert fakes["provider"].calls
+    from autoforge.config import AutoForgeConfig
+
+    engine = ControllerEngine(config=AutoForgeConfig(), state_dir=str(state_dir), workdir=tmp_path)
+    assert engine.require_checkpoint_owner(standalone="step") is False
+    found = state_tree(state_dir)
+    moved = external / "runs" / "moved"
+    state_dir.rename(moved)
+    state_dir.mkdir()
+    shutil.copy2(moved / "state.json", state_dir / "state.json")
+    with pytest.raises(StateError, match="was replaced while the controller was running"):
+        engine.load()
+    engine.close()
+    assert state_tree(moved) == found
 
 
 def test_run_dry_run_writes_nothing(tmp_path, capsys, monkeypatch, fakes):
@@ -771,7 +1508,7 @@ def test_status_json_carries_none_of_the_local_fields_since_protocol_13(
     capsys.readouterr()
     assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
     printed = json.loads(capsys.readouterr().out)
-    assert printed["protocol_version"] == "19" and printed["mode"] == "REMOTE"
+    assert printed["protocol_version"] == "20" and printed["mode"] == "REMOTE"
     assert not set(LOCAL_STATE_FIELDS) & set(printed)
     state_file = tmp_path / ".autoforge" / "state.json"
     data = json.loads(state_file.read_text())
@@ -782,13 +1519,14 @@ def test_status_json_carries_none_of_the_local_fields_since_protocol_13(
     del data["partial_fix"]  # protocol 17's own field (#433)
     del data["auto_recovery"]  # protocol 18's own field (#434)
     del data["delivered_reply"]  # protocol 19's own field (#479)
+    del data["issue_memory"], data["launch_seq"]
     data.update({name: type(empty)() for name, empty in LOCAL_STATE_FIELDS.items()})
     state_file.write_text(json.dumps(data))
     before = state_file.read_bytes()
     assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
     printed = json.loads(capsys.readouterr().out)
     assert not set(LOCAL_STATE_FIELDS) & set(printed)
-    assert printed["protocol_version"] == "19"
+    assert printed["protocol_version"] == "20"
     assert state_file.read_bytes() == before
 
 
@@ -2248,7 +2986,7 @@ def test_run_refuses_a_state_that_does_not_load_and_force_moves_it_aside_whole(
 
 
 def _newer_controllers_run(tmp_path, capsys) -> tuple[Path, bytes]:
-    """A run started in ``tmp_path/.autoforge``, then relabelled as protocol 20 wrote it.
+    """A run started in ``tmp_path/.autoforge``, then relabelled as protocol 21 wrote it.
 
     Its phase is one this controller does not have, so a refusal that read
     the phase before the label would misreport it. The run's logs stay.
@@ -2260,8 +2998,8 @@ def _newer_controllers_run(tmp_path, capsys) -> tuple[Path, bytes]:
     state_file = sd / "state.json"
     data = json.loads(state_file.read_text(encoding="utf-8"))
     data.update(
-        protocol_version="20",
-        phase="A_PHASE_OF_PROTOCOL_20",
+        protocol_version="21",
+        phase="A_PHASE_OF_PROTOCOL_21",
         controller_version="0.2.0",
         run_id="af-written-by-protocol-20",
         # The run's own recovery decisions name its run id (#434): none of this one's.
@@ -2275,16 +3013,16 @@ def _assert_the_newer_run_is_named(err: str, state_file: Path, flags: str) -> No
     import autoforge
 
     assert (
-        f"autoforge: error: state file {state_file}: unsupported protocol_version '20' "
-        "(controller speaks '19'): a newer AutoForge wrote it\n"
+        f"autoforge: error: state file {state_file}: unsupported protocol_version '21' "
+        "(controller speaks '20'): a newer AutoForge wrote it\n"
     ) in err
     assert "AutoForge controller/state protocol mismatch" in err
-    assert f"  state:      {state_file} (protocol_version '20')" in err
+    assert f"  state:      {state_file} (protocol_version '21')" in err
     assert "  recorded:   run af-written-by-protocol-20, written by autoforge 0.2.0" in err
     assert f"  import:     {os.path.abspath(autoforge.__file__)}\n" in err
     assert f"  python:     {sys.executable}\n" in err
     assert f"  cwd:        {os.getcwd()}\n" in err
-    assert f"<an autoforge that speaks protocol 20> {flags}status\n" in err
+    assert f"<an autoforge that speaks protocol 21> {flags}status\n" in err
     assert "unknown phase" not in err and "--force" not in err and "repair" not in err
     _assert_the_result_claims_only_what_holds(err)
 
@@ -2373,7 +3111,7 @@ def test_a_state_a_newer_controller_replaced_after_the_first_load_is_refused_und
     sd, newer = _newer_controllers_run(tmp_path, capsys)
     state_file = sd / "state.json"
     data = json.loads(newer)
-    data.update(protocol_version="19", phase="ANALYZE_EXECUTE")
+    data.update(protocol_version="20", phase="ANALYZE_EXECUTE")
     state_file.write_text(json.dumps(data), encoding="utf-8")
     assert load_state(state_file).phase is Phase.ANALYZE_EXECUTE
     real = ControllerEngine.locked
@@ -2407,7 +3145,7 @@ def test_the_refusal_under_the_lock_claims_no_more_than_it_established(
     sd, newer = _newer_controllers_run(tmp_path, capsys)
     state_file = sd / "state.json"
     data = json.loads(newer)
-    data.update(protocol_version="19", phase="ANALYZE_EXECUTE")
+    data.update(protocol_version="20", phase="ANALYZE_EXECUTE")
     state_file.write_text(json.dumps(data), encoding="utf-8")
     lock_file = repository_lock_path(tmp_path)
     real = ControllerEngine.locked
@@ -2453,7 +3191,7 @@ def test_run_over_a_label_no_protocol_has_suggests_no_force(
         err = captured.err
         assert captured.out == ""
         assert (
-            f"unsupported protocol_version {label!r} (controller speaks '19'): no AutoForge "
+            f"unsupported protocol_version {label!r} (controller speaks '20'): no AutoForge "
             "protocol has that label\n"
         ) in err
         assert "AutoForge controller/state protocol mismatch" in err
@@ -2483,7 +3221,7 @@ def _a_newer_state_at(sd: Path) -> None:
     )
     save_state(state, sd / "state.json")
     data = json.loads((sd / "state.json").read_text(encoding="utf-8"))
-    data.update(protocol_version="20")
+    data.update(protocol_version="21")
     (sd / "state.json").write_text(json.dumps(data), encoding="utf-8")
 
 
@@ -2534,9 +3272,9 @@ def test_an_odd_state_dir_or_config_never_reaches_the_diagnostic_raw(
         assert line.isprintable(), line
         assert len(line) <= 2 * MAX_PATH_CHARS + 300, len(line)
         assert not line.startswith("autoforge: error: forged")
-    (command,) = [line for line in lines if "<an autoforge that speaks protocol 20>" in line]
+    (command,) = [line for line in lines if "<an autoforge that speaks protocol 21>" in line]
     assert command.strip() == (
-        "<an autoforge that speaks protocol 20> --config <the --config value this command was "
+        "<an autoforge that speaks protocol 21> --config <the --config value this command was "
         "given> --state-dir <the --state-dir value this command was given> status"
     )
     assert "put back the value you typed" in err
@@ -2626,6 +3364,7 @@ def test_help_lists_no_local_command(capsys):
         "resume",
         "unblock",
         "rebind-epic",
+        "memory",
         "status",
         "epic",
     }
@@ -5570,6 +6309,7 @@ def test_an_old_state_file_without_a_recorded_configuration_loads_and_resumes(
     del data["partial_fix"]  # protocol 17's own field (#433)
     del data["auto_recovery"]  # protocol 18's own field (#434)
     del data["delivered_reply"]  # protocol 19's own field (#479)
+    del data["issue_memory"], data["launch_seq"]
     data["protocol_version"] = "8"
     with open(state_file, "w", encoding="utf-8") as handle:
         json.dump(data, handle)
@@ -5587,7 +6327,7 @@ def test_an_old_state_file_without_a_recorded_configuration_loads_and_resumes(
     assert f"--config {cfg} is recorded as the run's" in out.err
     assert "ANALYZE_EXECUTE -> REVIEW" in out.out
     saved = load_state(state_file)
-    assert saved.protocol_version == "19"
+    assert saved.protocol_version == "20"
     assert saved.config_fingerprint["source"] == "upgraded"
     assert saved.sandbox_pin["mode"] == "disabled" and saved.sandbox_pin["source"] == "upgraded"
     assert saved.config_fingerprint["profiles"]["analyze_execute"]["model"] == "opus"

@@ -128,6 +128,19 @@ def mode_row(cfg: AutoForgeConfig, probe: ProbeResult) -> CheckResult:
     """What ``sandbox.mode`` does on this host: OK, a risk (WARN), or a refusal (FAIL)."""
     sandbox = cfg.sandbox
     name = f"mode ({sandbox.mode})"
+    if not sandbox.enabled and cfg.memory.enabled:
+        # Not a risk but a certain refusal: a Memory launch proves its fresh
+        # context only inside the outer sandbox, so every Memory
+        # ANALYZE_EXECUTE launch is refused before its intent save (ADR 0015
+        # D18, R5-F4 of PR #526).
+        return _row(
+            name,
+            False,
+            f"{_engine.LOGICAL_ISOLATION_ONLY}, and memory.enabled is true: a Memory "
+            "ANALYZE_EXECUTE launch needs the outer sandbox to prove a fresh context, so "
+            "every one is refused before anything is saved; set sandbox.mode: required "
+            "where the capability row is supported, or turn Memory off",
+        )
     if not sandbox.enabled:
         return _row(
             name,
@@ -148,12 +161,18 @@ def mode_row(cfg: AutoForgeConfig, probe: ProbeResult) -> CheckResult:
         if sandbox.mode != SANDBOX_PREFERRED
         else "preferred, which a REMOTE run treats as required"
     )
+    # With Memory on, `disabled` refuses every Memory launch instead.
+    instead = (
+        f"or turn Memory off and set sandbox.mode: disabled ({_engine.LOGICAL_ISOLATION_ONLY})"
+        if cfg.memory.enabled
+        else f"or set sandbox.mode: disabled ({_engine.LOGICAL_ISOLATION_ONLY})"
+    )
     return _row(
         name,
         False,
         f"sandbox.mode is {how}, and this host cannot provide {missing}: every step that "
         f"launches is refused before anything is saved or charged; make the host capable, "
-        f"or set sandbox.mode: disabled ({_engine.LOGICAL_ISOLATION_ONLY})",
+        f"{instead}",
     )
 
 

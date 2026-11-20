@@ -158,9 +158,9 @@ evidence commit, as a hidden test runs; `pin_verification.json` records that all
 
 A record of a seeded arm carries the digest of the lesson its Memory collector read back, and an unseeded
 arm's carries none. Anything else leaves the contrast `NOT_EVALUATED`: another Memory is another
-intervention. **That collector is owed by #317 and #333**, whose design this was written without, so how
-a lesson is entered into Memory cannot be stated here; if the design has no way to hold it unchanged, that
-is an amendment before the first comparison.
+intervention. #317's `run --memory-seed` holds the lesson unchanged and
+records its digest. The collector and prompt handoff are still owed by
+#333; this protocol records no Memory-arm result.
 
 A lesson is the author's summary of its evidence, not a transcript of a real attempt: these commits are
 the closest thing this repository holds to earlier verified experience on the same code. Whether a lesson

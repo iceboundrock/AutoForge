@@ -151,6 +151,44 @@ The row checks whether each path exists. It never opens a file, and never
 `auth.json`. The agent directory is `$PI_CODING_AGENT_DIR` when the launch
 allow-list passes it, otherwise `~/.pi/agent`.
 
+**With Issue Working Memory on** (#317), a warning is not enough. A launch
+can leave `SYSTEM.md` or `APPEND_SYSTEM.md` in that directory, and the next
+one loads it, so Pi's flags alone do not prove a fresh context (ADR 0015
+D14). Nor does any check of a directory that outlives the launch: a process
+an earlier launch started can outlive a controller killed with `SIGKILL`
+(ADR 0002 §4e, ADR 0015 D5.5), and launches of other checkouts, under
+other repository locks, share the directory too, so either can write a file
+after the check and before Pi reads it. The proof is therefore the launch's
+own. A Memory launch's agent directory must be `~/.pi/agent` in the private
+home the outer sandbox makes empty for that launch alone, which no other
+launch or host directory shares (ADR 0005 D8.1). Before each Memory
+launch's intent save, `PiProvider.fresh_context_refusal` refuses the launch
+unless it will be enforced (`sandbox.mode: required`, or its alias
+`preferred`, on a host that can enforce), `PI_CODING_AGENT_DIR` is unset
+(when set, it is projected read-write from the host, §8) and no
+`sandbox.read_only_paths` entry is, contains or lies inside that directory
+in the home, decided on where the launch shows the entry, by the
+compiler's own rule (`sandbox_policy.operator_path_destination`): one
+spelled inside the home appears at that spelling, wherever a link there
+leads, and any other at its resolved path. The profile must also set
+`require_oauth: false`: the private home holds no sign-in, so the model's
+key comes from a variable. When the launch's sandbox is compiled, `fresh_context_launch_problem` checks the
+description it actually runs in: Pi starts without `PI_CODING_AGENT_DIR`,
+its home is the launch's private tmpfs, and nothing is mounted at, above or
+inside `~/.pi/agent` there. Otherwise it is refused before anything is
+spawned. The refusals name variables and settings, never a path. Memory-off
+launches are neither checked nor changed.
+
+What this does not exclude: a process of the operator's user outside the
+sandbox can still enter the launch's private home through
+`/proc/<pid>/root` of a process inside it, and write there (measured with
+bwrap 0.12.0 on Linux, Yama `ptrace_scope` 1), as it can reach anything
+else the user owns. No launch of a run under `sandbox.mode: required`
+leaves such a process behind, since an enforced launch dies with its
+controller (ADR 0002 §4e). A process left by an unsandboxed launch of
+another run or checkout, or one the operator started, that targets the
+launch this way is the same-UID residual of §8.
+
 **Evidence.** `core/resource-loader.js` (system-prompt discovery).
 Verified on installed Pi 1.0.1.
 
@@ -346,7 +384,8 @@ changes.
   Candidate follow-up: refuse a Pi launch in a tree that has
   `.pi/commands/`.
 - **Global system prompt files** cannot be disabled by any flag. `doctor`
-  only warns.
+  only warns. A Memory launch runs only with the agent directory of its
+  private home, so it never loads the host's (§5).
 - **Context files** from the main checkout and from directories above it
   load by default (§4).
 - **Same UID.** Everything in §8 under "Credential exposure that remains".
@@ -372,6 +411,17 @@ changes.
     then that nothing loads under the adapter's.
 - `tests/test_providers.py`, `tests/test_engine.py`: the argv, option keys
   and the preflight runner pinned.
+- `tests/test_memory.py`: the Memory launch's proof (§5), offline. An
+  unenforced launch is refused even with a clean directory and a child
+  subreaper, as are a set `PI_CODING_AGENT_DIR`, an operator path at, above
+  or inside `~/.pi/agent` (through a link too) and a profile with context
+  files or `require_oauth`. A compiled launch whose home is not its private
+  tmpfs, or that mounts anything over that directory, is refused before
+  spawning. After a restart, a file a leftover process writes into the
+  host's directory during the launch never reaches the enforced launch.
+  The same run without the sandbox, or with the variable set, is refused
+  before its intent save, its state unchanged. A Memory-off launch never
+  consults the proof.
 - `tests/test_doctor.py`: the outside-instruction WARN row, the auth
   row's API-key refusal, and the containment row (#135: OK with a child
   subreaper, WARN without one, and WARN where the setting can be read

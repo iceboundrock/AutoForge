@@ -2487,6 +2487,123 @@ A push to the PR, a retarget or a rewritten base still goes back to
 the new revision; a base that only advanced keeps it. A PR already merged
 on GitHub is counted once without one, as before.
 
+## Issue Working Memory
+
+Memory is off by default. To try the checkpoint and operator commands,
+configure [`memory.enabled`](configuration.md#issue-working-memory) and
+start the run with `autoforge run --issue ISSUE_URL --memory-seed FILE`.
+The optional seed must be nonempty UTF-8, at most 2,048 bytes, and unchanged
+by the run-log redactor. Its bytes and their SHA-256 digest are saved with
+the run, before the first launch. A new run does not inherit previous notes.
+
+`autoforge memory show --json` reads the current issue's catalog without a
+lock or write. `autoforge status --json` prints no ledger. Its `memory`
+key holds the current issue's record count by status, the revision, the
+store's digest and the refusal count. A run with Memory off and an empty
+store reads as disabled with no record, an older checkpoint whose run names
+no issue included. `autoforge memory retract RECORD
+--reason WHY` takes the repository lock and withdraws a saved record of
+the current issue by its numeric ID, with Memory on or off: turning Memory
+off keeps the records, and the retraction is the one write it still allows,
+without turning Memory on or advancing the run. A refused retraction with
+Memory off writes nothing, not even the refusal count. A record of an issue
+the run worked on earlier is not in either view, and retracting it is
+refused with nothing written. Each save is the checkpoint's one atomic write. A command
+interrupted before it is published leaves the old checkpoint, or no run
+for a seed. One interrupted after it leaves the whole new checkpoint.
+Neither launches, transitions or writes to GitHub.
+
+Every correction, supersession or retraction names the record revision
+it acts on, and one made against an older revision is refused. An agent's
+revision must also come from an accepted result of a launch no earlier
+than the record's latest change. Each revision row records the launch
+ordinal it was written at. An operator's change, `memory retract`'s
+included, is known only to launches after that ordinal, so a result of an
+earlier launch is refused even when it names the new revision. A late
+result from an earlier launch therefore cannot overwrite a newer correction.
+The same revision submitted again is a replay and changes nothing: it is
+compared with the saved row in its canonical form, so a URL spelled in
+another case is the same revision. A
+correction or retraction leaves a content digest that prevents reappearance
+within its scope and authority. Refusals are counted, not tombstoned. The
+store keeps at most 64 facts and 256 lifecycle events per run, and at most
+1 MiB of serialized state. It refuses writes beyond the bounds rather
+than evicting audit history. Every record not yet retracted keeps one
+event slot, and the bytes of an operator retraction with the longest
+reason, in reserve. Other writes are refused before they would spend it,
+so `memory retract` is never refused for the bounds.
+
+The provider-neutral projection uses the committed revision, one bound
+launch and retained typed receipts. Its freshness names the revision, the
+store's digest and one digest of every receipt it resolved citations
+against (validation, candidate and launch), which is the same in whatever
+order they are supplied; two validation records with one sequence number
+are refused. The launch is the snapshot's next one
+(its `launch_seq` plus one): a projection is never labeled as what an
+earlier launch was shown. A validation receipt can establish
+only what it records for that issue and exact candidate, not adjacent
+commentary. A superseded record stays out of the projection, even when its
+replacement is later retracted or loses its receipt. The one exception is
+a validation failure that its own retained receipt establishes on the
+launch: a supersession cannot hide it unless a record the projection
+actually shows carries matching check, policy, outcome and candidate
+evidence. A record the budget leaves out does not count. Until then the
+failure is shown, marked as superseded. The distinct established claims
+are chosen first, on the records that establish one alone. Each claim is
+held by one record: of those establishing it, the one with the shortest
+whole block as if it were not superseded. In rank order, each claim is
+held where that block fits beside the claims held before it; then, with
+the budget left, the claims not yet held, in rank order, each by that
+record's block as it is now, until the first that does not fit. A record
+establishing a claim that is not held is not shown. The header gives every
+count at one width, and a render that shows a record has no closing
+notice, so nothing a supersession or another record changes alters the
+first choice, and a supersession only shrinks the blocks the second one
+sizes. A supersession therefore never removes a claim the projection
+showed, and the prose of a record that establishes no claim never changes
+which claims are shown. A superseded failure holds its claim alone, labeled as superseded
+with its text omitted, a block no longer than the one it was chosen on; a
+current record with the same claim takes its place where that fits. Its
+whole block is shown only if the budget left after that holds it. Neither
+prose nor a second proof of one claim displaces another claim. The choice
+is greedy: it does not show the most claims possible at every budget.
+
+Each citation resolves to a typed retention result. `established` means a
+retained validation record establishes the claim on this launch.
+`retained` means the controller supplied the receipt but it establishes
+nothing here: a candidate or launch receipt, or a validation record for
+another candidate. `unavailable` means the receipt was evicted, missing or
+never supplied, and the record is downgraded rather than kept as verified;
+so is a retained validation record that establishes nothing on the
+launch. Validation receipts are resolved from their whole records, and
+candidate and launch receipts from the references the controller supplies.
+No record of this release cites a review, an effect record or a Git
+object, and a checkpoint that does is refused. The full projection,
+including headings and its notice, is at most 16,384 characters and
+16,384 UTF-8 bytes (a conservative byte-level token bound). A render that
+shows no record ends with a notice saying why (a budget cut, a withdrawal
+or nothing applicable), and a budget that cannot hold the header and the
+longest notice is refused whatever the records.
+
+No launch is shown Memory and no observations are captured automatically
+yet; that is #333. With Memory on, enforcement is mandatory: a Memory
+`ANALYZE_EXECUTE` launch runs only inside the outer sandbox, with Pi's
+agent directory in its private home
+([Configuration](configuration.md#issue-working-memory)). It runs under
+`sandbox.mode: required` on a host that can enforce, or under `preferred`,
+which is accepted there as an alias of `required`. Under `disabled` it is
+refused before its intent save. On a host that cannot enforce, `required`
+and `preferred` refuse the step before anything of it is saved, so
+switching to `disabled` gets past nothing while Memory stays on. Make the
+host capable to keep Memory on, or turn Memory off
+(`memory.enabled: false`) and then set `sandbox.mode: disabled` for
+logical isolation only. An existing run accepts either change only with
+`--accept-config-change`. `doctor`'s `outer sandbox: mode` row and the
+step's refusal say the same. With `sandbox.mode: disabled`, an
+agent of the same UID can reach the state directory, the ledger included,
+by absolute path. The ledger remains advisory and grants no workflow or
+GitHub authority.
+
 ## Logging and redaction
 
 Every agent invocation is logged under `<state dir>/logs/<run-id>/`. Logs

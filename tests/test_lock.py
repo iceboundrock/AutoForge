@@ -379,7 +379,7 @@ def test_repository_lock_path_runs_git_in_the_workdir_and_joins_relative_output(
     # ADR 0004 D7.3: no hook, no fsmonitor, no credential and no GIT_* of the
     # operator's shell, the same as the workspace reader the run keys on.
     assert seen[0].env_allowlist == LOCAL_GIT_ENV_ALLOWLIST
-    assert seen[0].env == {"GIT_NO_REPLACE_OBJECTS": "1"}
+    assert seen[0].env == {"GIT_NO_REPLACE_OBJECTS": "1", "LC_ALL": "C"}
 
 
 def test_repository_lock_path_ignores_a_git_dir_in_the_operators_environment(tmp_path, monkeypatch):

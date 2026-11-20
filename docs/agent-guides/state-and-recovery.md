@@ -614,6 +614,27 @@ Protocol 18 → 19 (#479, R1-F1 of PR #481) added the kept reply: the field `del
 
 Protocol 5 → 7 (#160) added the effect state above (`effect_records`, `entry_observation`, `completion_context`, `launch_label`). Protocol 6 is skipped, and stays skipped for good: #23 once reserved it for #126, which now takes the next number like every other bump (see "Numbering a new protocol" below). The number this bump took was settled on #23 before it merged. State persisted under protocol 5, or under any older protocol that its own rules load, carries no effect state and loads as none; a legacy file that does carry one of these fields is a hand edit or a foreign file and is refused. A legacy REMOTE file with `attempt >= 1` gets the launch label `agent_publishes` for a phase whose agent published under the previous contract, so that the first entry of this version knows an agent may already have published (D13.3). `UPDATE_EPIC` is the one such phase whose publication this version performs itself: its one-shot legacy re-entry adopts the progress comment that agent posted, with no record, and asks for the selection only (D13.7; [github-safety.md](github-safety.md), "Before UPDATE_EPIC"). LOCAL state, whatever its protocol, carries no effect state.
 
+Protocol 19 → 20 (#317, ADR 0015) adds `issue_memory` and `launch_seq`.
+Every protocol-20 save writes both, including when Memory is off. A
+protocol-19 file, or any older file its own rules load, loads with Memory
+off (`{}`) and `launch_seq` initialized to `step_count`, then is relabelled
+on the next save. An older label carrying either new field is refused.
+The launch-intent save increments the ordinal; retry, resume, unblock
+and issue changes never reset it. An ordinal is not a launch receipt. The
+loader, the launch-intent save and a projection share one bound,
+2^63 − 1 (`autoforge.memory.MAX_LAUNCH_SEQ`), and so do Memory's
+revisions and its launch citations, which name an ordinal. A run at it
+has spent its last ordinal, and its next launch, a relaunch included, is
+refused before anything of the launch is written or saved, its read
+context included. Going on from a reply the state keeps (`delivered_reply`)
+spends no ordinal and launches nothing, so a run at the bound still
+settles it.
+`issue_memory` is validated whole on load, by the rules every write
+applies, and a value that would leave an open record without its
+retraction reserve (one event slot and its bytes) is refused. The number
+is the implementation's (`main` was at 19 when it was written); it is
+settled on #23 before the change merges.
+
 **Numbering a new protocol.** A change that adds or changes persisted state takes N + 1, where N is `__protocol_version__` on `main` when its PR is ready to merge, and it makes that bump alone: two independent persisted changes never share one. Before the PR merges, its issue announces N → N + 1, the new fields and the migration rule on #23, the home of protocol numbering. If `main` moves past N first, the PR rebases, takes the new N + 1 and says so there; after the merge, #23 records the squash commit. No number is reserved ahead of time. Label 6 stays skipped: never written, and refused as unknown like a future label (`tests/test_state.py`, `test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged`). Each bump states its migration rule in this section, in the form above: what a file of the previous protocol loads as, what an older-labelled file carrying the new state is refused as, and which new field a file of the new protocol must carry.
 
 ---
@@ -679,10 +700,44 @@ As implemented (`flock(2)`, `src/autoforge/locking.py`):
 - A working directory outside a git repository has no lock to take and is
   refused (exit 2, nothing written), so `run`, `step` and `resume` require
   one (a REMOTE dry-run does not).
+- Mutating standalone commands (`run`, `step`, `resume`, `unblock`,
+  `memory retract` and `rebind-epic`) refuse a checkpoint in another
+  checkout's repository, including another clone of the same remote. They
+  check before taking L0 and again under it, without assuming that an
+  older snapshot of the checkpoint still holds. The directory checked is
+  the one the state root opens (`ControllerEngine.checkpoint_target`):
+  `StatePaths`' normalized spelling, never the caller's, so `..` after a
+  symbolic link or a missing directory cannot send git to another
+  repository (R2-F2 of PR #526). Git is asked from that directory, or from
+  its nearest existing ancestor while it does not exist, and the directory
+  must be the same before and after. The answer is bound to the held state
+  root: an existing directory is opened as the root and must be the
+  directory git was asked from; a directory created afterwards is asked
+  about again once it is opened (`ControllerEngine.require_checkpoint_owner`,
+  `_bind_checkpoint_root`). `run`, `step`, `resume`, `memory retract` and
+  `rebind-epic` also refuse, in the same call and so under the lock too, a
+  directory inside the scheduler root, decided on that same bound
+  directory with its links resolved (R3-F3 of PR #526): `run --force`
+  therefore cannot replace a namespace's checkpoint, whatever issue it
+  names. Every other guard that says which run a command acts on (the
+  pre-lock scheduler-root refusal, `unblock`'s namespace exemption,
+  `rebind-epic`'s repository check and its dry run's report) decides on
+  the same normalized directory, never on the caller's spelling. A
+  standalone state directory positively identified as outside Git keeps
+  working for Memory-off runs, its answer bound to the directory opened in
+  the same way (R4-F1 of PR #526): an existing one must be the directory
+  found outside Git, and one created afterwards is asked about again once
+  opened, so a directory that then lies in another checkout, or in the
+  scheduler root for a standalone command, is refused and `run --force`
+  replaces nothing there. Ambiguous Git discovery errors are refused.
+  `memory retract` and `rebind-epic` always require the owning repository.
 - The lock is the working directory's, whatever `--state-dir` names, so
   `rebind-epic` (#435) also binds its state directory to it: `git rev-parse
-  --git-common-dir` run from the state directory must name the same git
-  common dir (`ControllerEngine.state_dir_repository_problem`). A state
+  --git-common-dir` run from the directory the state root opens (its
+  normalized spelling, as above) must name the same git common dir
+  (`ControllerEngine.state_dir_repository_problem`), and the applied command
+  then binds that answer to the directory it opens, before the lock and
+  under it (`require_checkpoint_owner`). A state
   directory of another repository (another clone of the same GitHub
   repository, or a scheduler namespace in another one's git directory) or
   of none is refused before the lock is taken, and in its dry run, with
@@ -1131,7 +1186,11 @@ workers (`src/autoforge/scheduler.py`, `src/autoforge/worker.py`, below);
   2) a `--state-dir` or `config.state_dir` that resolves inside
   `<git common dir>/autoforge/scheduler/` (decided on the resolved path, so
   a relative path or a link is judged by where it leads), before the lock
-  is taken and before any state is read or written; the error names
+  is taken and before any state is read or written, and again under the
+  lock; so do `memory retract` and `rebind-epic`. The path resolved is the
+  directory the state root opens, `..` normalized first, so `link/..` is
+  judged as the link's parent, never as where the link leads (R3-F3 of
+  PR #526); the error names
   `autoforge epic resume`, `epic status` and `epic archive` instead.
   The configured directory is the only one `step` and `resume` read, so
   one in the scheduler root is refused before any state in it is read,

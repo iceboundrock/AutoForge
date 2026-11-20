@@ -25,6 +25,14 @@ version: 1
 
 state_dir: .autoforge
 
+# Issue Working Memory stays off unless explicitly enabled. Enabling it
+# requires a Pi analyze_execute profile with options.context_files: false
+# and options.require_oauth: false, sandbox.mode: required, and no
+# PI_CODING_AGENT_DIR, so that each Memory launch's agent directory is the
+# one its private home makes empty for it (docs/configuration.md).
+# memory:
+#   enabled: false
+
 # `prompt_version` is left unset. The prompt version a new run records (in
 # the state file, the run logs and every prompt) is the controller's own
 # label for the templates it renders, and the key does not select templates:

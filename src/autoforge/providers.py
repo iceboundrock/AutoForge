@@ -357,6 +357,7 @@ from .errors import (
     ExecutionError,
     ExecutionTimeoutError,
     InteractionDataError,
+    SandboxLaunchRefusedError,
 )
 from .executor import (
     DEFAULT_MAX_OUTPUT_BYTES,
@@ -398,7 +399,7 @@ from .pi_rpc import PiConversation, encodable
 from .progress import ProgressEvent, ProgressKind, ProgressSink, clean, guarded
 from .redaction import redact
 from .result_parser import holds_control_result
-from .sandbox import LaunchDescription, SandboxFacts
+from .sandbox import LaunchDescription, PrivateTmpfs, SandboxFacts
 from .sandbox_policy import (
     AuthItem,
     AuthMode,
@@ -406,6 +407,7 @@ from .sandbox_policy import (
     SandboxPlan,
     declared_writable,
     executable_requirements,
+    operator_path_destination,
 )
 from .sdk_assets import (
     CLAUDE_ENVIRONMENT_PROBE,
@@ -498,9 +500,35 @@ class AgentRequest:
     # (#151); a sandboxed launch has each projected writable as an engine
     # carve-out. "" for a provider that names none.
     state_dir: str = ""
+    # A Memory launch (ADR 0015 D14, #317): the adapter must show, on the
+    # launch it compiles, that nothing of an earlier launch can reach what
+    # its CLI loads (:meth:`AgentProvider.fresh_context_launch_problem`), or
+    # refuse it before anything is spawned. The engine sets it only once
+    # the adapter's pre-save check (:meth:`AgentProvider.fresh_context_refusal`)
+    # passed. False changes nothing.
+    fresh_context: bool = False
 
     def __post_init__(self) -> None:
         self.loop_detection = self.loop_detection.for_invocation(self.profile.provider, self.phase)
+
+
+@dataclass(frozen=True)
+class FreshContextHost:
+    """What the engine knows of a Memory launch's host before its intent save.
+
+    The facts :meth:`AgentProvider.fresh_context_refusal` decides on (ADR 0015
+    D18's dynamic check): whether the launch will run inside the outer
+    sandbox (``enforced``), whose home is then a private tmpfs made empty for
+    that launch alone (ADR 0005 D8.1); the operator's ``home``, at whose path
+    that tmpfs is mounted; and ``operator_paths``
+    (``sandbox.read_only_paths``), which every enforced launch shows: one
+    spelled inside that home at its spelling there, any other at its
+    resolved path (:func:`~autoforge.sandbox_policy.operator_path_destination`).
+    """
+
+    enforced: bool
+    home: str
+    operator_paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -867,6 +895,40 @@ class AgentProvider:
     ``stdin_payload`` when the prompt does not travel in argv."""
 
     name = "base"
+
+    def proves_fresh_context(self, profile: ProfileConfig) -> bool:
+        """Default deny: neither a version string nor session flags alone are proof."""
+        return False
+
+    def fresh_context_refusal(
+        self, profile: ProfileConfig, environ: Mapping[str, str], host: FreshContextHost
+    ) -> str:
+        """Why this host cannot complete ``profile``'s fresh-context proof, or ``""``.
+
+        The launch-time half of ADR 0015 D14 (D18's dynamic check): the
+        engine asks before every Memory launch's intent save, so a refusal
+        leaves state as it was. ``environ`` is the controller's environment,
+        which the launch inherits through its allow-list, and ``host`` what
+        the engine knows of the launch's sandbox. The base adapter adds
+        nothing to :meth:`proves_fresh_context`.
+        """
+        if self.proves_fresh_context(profile):
+            return ""
+        return "proves no fresh context"
+
+    def fresh_context_launch_problem(
+        self, req: AgentRequest, description: LaunchDescription | None, env: Mapping[str, str]
+    ) -> str:
+        """Why the launch as compiled could load what an earlier one left, or ``""``.
+
+        The last half of the proof, for a request with
+        :attr:`AgentRequest.fresh_context`: decided on ``description``, the
+        sandbox the launch actually runs in (``None``: none), and ``env``,
+        everything its CLI starts with. A problem refuses the launch before
+        anything is spawned. The base adapter proves nothing.
+        """
+        return "proves no fresh context"
+
     # The environment variables this provider's CLI reads for its own
     # authentication and configuration, added to the request's allow-list.
     # Names, never values: the executor selects them from the environment.
@@ -1091,16 +1153,28 @@ class AgentProvider:
         over the allow-listed environment for this process. A launch the
         policy refuses raises
         :class:`~autoforge.errors.SandboxLaunchRefusedError` before anything
-        is spawned.
+        is spawned, and so does a Memory launch
+        (:attr:`AgentRequest.fresh_context`) whose description does not keep
+        what the CLI loads to this launch alone (R3-F1 of PR #526).
         """
-        if req.sandbox is None:
-            return command, None
-        launch_env = {**self.launch_environment(req.env_allowlist), **(env or {})}
-        needs = self.sandbox_requirements(req.profile, command, launch_env, req.sandbox.facts.home)
-        needs = _without_engine_state(needs, req.sandbox.facts.provider_state)
-        description = req.sandbox.describe(needs, launch_env)
-        if needs.executable:
-            command = [needs.executable, *command[1:]]
+        description: LaunchDescription | None = None
+        if req.sandbox is not None:
+            launch_env = {**self.launch_environment(req.env_allowlist), **(env or {})}
+            needs = self.sandbox_requirements(
+                req.profile, command, launch_env, req.sandbox.facts.home
+            )
+            needs = _without_engine_state(needs, req.sandbox.facts.provider_state)
+            description = req.sandbox.describe(needs, launch_env)
+            if needs.executable:
+                command = [needs.executable, *command[1:]]
+        if req.fresh_context:
+            started = self.started_environment(req, env, description)
+            problem = self.fresh_context_launch_problem(req, description, started)
+            if problem:
+                raise SandboxLaunchRefusedError(
+                    f"refusing to launch {req.phase} with Memory: profile "
+                    f"{req.profile.name!r} {problem}"
+                )
         return command, description
 
     def started_environment(
@@ -2709,6 +2783,21 @@ def parse_pi_auth_check(stdout: str, exit_code: int) -> PiAuthCheck:
     return PiAuthCheck(status=status, provider=provider, reason=reason, auth_type=auth_type)
 
 
+def _covers_agent_dir(path: str, home: str, agent: str) -> bool:
+    """Whether a mount or projection at ``path`` could show anything at ``agent``.
+
+    ``agent`` lies in ``home``, where a private tmpfs is mounted over
+    everything above it: a path above the home is covered by that tmpfs,
+    and a path elsewhere is unrelated. One at the home itself, or inside it
+    at, above or below ``agent``, could show something there.
+    """
+
+    def inside(child: str, parent: str) -> bool:
+        return child == parent or child.startswith(parent.rstrip("/") + "/")
+
+    return inside(path, home) and (inside(path, agent) or inside(agent, path))
+
+
 class PiProvider(AgentProvider):
     """Pi (``@earendil-works/pi-coding-agent``) over its stdio RPC mode (ADR 0003).
 
@@ -2834,6 +2923,126 @@ class PiProvider(AgentProvider):
                     f"built-in tools ({', '.join(PI_TOOLS)}): {problem}, "
                     f"got {profile.options['tools']!r}"
                 )
+
+    def proves_fresh_context(self, profile: ProfileConfig) -> bool:
+        # The profile's half of the proof: Pi's fixed argv keeps sessions,
+        # project trust and executable resources off, and the profile turns
+        # context files off. No pass-through argument may override these.
+        # Nothing turns off the agent directory's system prompt files, so
+        # the directory must be the launch's own (:meth:`fresh_context_refusal`),
+        # and a ChatGPT sign-in, which lives in a shared one, cannot be used
+        # (``require_oauth: false``, with a provider API key).
+        return (
+            not profile.extra_args
+            and not self.context_files(profile)
+            and not self.require_oauth(profile)
+        )
+
+    def fresh_context_refusal(
+        self, profile: ProfileConfig, environ: Mapping[str, str], host: FreshContextHost
+    ) -> str:
+        """The host's half of Pi's fresh-context proof (R2-F1, R3-F1 of PR #526).
+
+        Pi loads its agent directory's ``SYSTEM.md`` and ``APPEND_SYSTEM.md``
+        at every launch, whatever its flags (docs/pi-policy.md §5). No check
+        of a directory that outlives the launch can keep them out: a process
+        an earlier launch started can outlive a controller killed with
+        ``SIGKILL`` (ADR 0002 §4e, ADR 0015 D5.5), and launches of other
+        checkouts, under other repository locks, share the directory too, so
+        either can write a file after any check and before Pi reads it. The
+        proof is therefore positive: the agent directory is the one in the
+        launch's private home, a tmpfs the outer sandbox makes empty for this
+        launch alone, which no other launch or host directory shares (ADR
+        0005 D8.1). So the
+        launch must be enforced, ``$PI_CODING_AGENT_DIR`` (projected
+        read-write from the host when set) must be unset, and no operator
+        path may show a host directory at, above or inside
+        ``~/.pi/agent`` in that home, decided on where the launch shows it,
+        by the compiler's own rule, never on where it leads (R4-F3 of PR
+        #526). :meth:`fresh_context_launch_problem` checks the same on the
+        description the launch actually runs in, a backstop.
+        The reason names variables and settings, never a path.
+        """
+        if not self.proves_fresh_context(profile):
+            return (
+                "proves no fresh context: Pi needs options.context_files: false and "
+                "options.require_oauth: false"
+            )
+        if not host.enforced:
+            return (
+                "cannot prove a fresh context without the outer sandbox: Pi's agent directory "
+                "($PI_CODING_AGENT_DIR, else ~/.pi/agent) is then a host directory, which a "
+                "process an earlier launch left running (one can outlive a controller killed "
+                "with SIGKILL) or a launch of another checkout can write after any check and "
+                "before Pi reads SYSTEM.md or APPEND_SYSTEM.md from it; set sandbox.mode: "
+                "required"
+            )
+        if environ.get("PI_CODING_AGENT_DIR"):
+            return (
+                "cannot prove a fresh context: $PI_CODING_AGENT_DIR names a host directory every "
+                "launch given it shares read-write, under any repository's lock; unset it, so "
+                "that Pi's agent directory is the one the launch's private home makes empty "
+                "for it alone"
+            )
+        home = os.path.realpath(host.home)
+        agent = os.path.join(home, PI_DEFAULT_AGENT_DIR.removeprefix("~/"))
+        for path in host.operator_paths:
+            # Where the launch shows the path, by the compiler's own rule: one
+            # spelled in the home at that spelling, wherever a link there
+            # leads, so a `~/.pi` linked outside the home is refused here,
+            # before the intent save, as the compiled check would refuse it
+            # after (R4-F3 of PR #526).
+            shown = operator_path_destination(path, host.home)
+            if _covers_agent_dir(shown, home, agent):
+                return (
+                    "cannot prove a fresh context: sandbox.read_only_paths shows a host "
+                    "directory at, above or inside Pi's agent directory (~/.pi/agent) in the "
+                    "launch's private home; remove it"
+                )
+        return ""
+
+    def fresh_context_launch_problem(
+        self, req: AgentRequest, description: LaunchDescription | None, env: Mapping[str, str]
+    ) -> str:
+        """Pi's proof on the launch as compiled (R3-F1 of PR #526).
+
+        The directory Pi actually uses is ``$PI_CODING_AGENT_DIR`` when the
+        CLI starts with it, else ``$HOME/.pi/agent``. It must lie in the
+        launch's private home (the :class:`~autoforge.sandbox.PrivateTmpfs`
+        at the home's resolved path), with no other mount at, above or
+        inside it there: then it starts empty, and no other launch and no
+        host directory shares it. A process of the same user outside the
+        sandbox can still enter it through ``/proc/<pid>/root``, the
+        same-UID residual docs/pi-policy.md §5 records.
+        """
+        if description is None:
+            return (
+                "cannot prove a fresh context: the launch is not enforced, so Pi's agent "
+                "directory is a host directory"
+            )
+        if env.get("PI_CODING_AGENT_DIR"):
+            return (
+                "cannot prove a fresh context: the launch starts Pi with $PI_CODING_AGENT_DIR, "
+                "a directory projected from the host"
+            )
+        home = env.get("HOME", "")
+        if not home.startswith("/"):
+            return "cannot prove a fresh context: the launch starts Pi with no absolute $HOME"
+        home = os.path.realpath(home)
+        if not any(isinstance(m, PrivateTmpfs) and m.target == home for m in description.mounts):
+            return (
+                "cannot prove a fresh context: Pi's home is not the launch's private home, "
+                "so its agent directory is not made empty for this launch"
+            )
+        agent = os.path.join(home, PI_DEFAULT_AGENT_DIR.removeprefix("~/"))
+        for mount in description.mounts:
+            private_home = isinstance(mount, PrivateTmpfs) and mount.target == home
+            if not private_home and _covers_agent_dir(mount.target, home, agent):
+                return (
+                    "cannot prove a fresh context: the launch mounts something at, above or "
+                    "inside Pi's agent directory (~/.pi/agent) in its private home"
+                )
+        return ""
 
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
         # The prompt is deliberately absent: it reaches Pi as a JSON `prompt`

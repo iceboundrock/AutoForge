@@ -96,7 +96,11 @@ as well: its auth row runs outside the sandbox, so without the variable it
 checks `~/.pi/agent` and can report `ready` for a credential a sandboxed
 launch cannot see. A forwarded `DEEPSEEK_API_KEY` is an ordinary
 allow-listed variable and passes into the sandbox too. Neither sandboxed
-route has been run against the real DeepSeek API yet.
+route has been run against the real DeepSeek API yet. With Issue Working
+Memory on, the `analyze_execute` launch refuses `PI_CODING_AGENT_DIR`: its
+agent directory must be the one its private home makes empty for it, so
+its key is the forwarded variable
+([Configuration](configuration.md#issue-working-memory)).
 
 **What is checked, and when.** `doctor`'s auth row passes on
 `status ready` with `authType api_key` for provider `deepseek`. With

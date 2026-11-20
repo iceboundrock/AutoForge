@@ -492,6 +492,7 @@ EQUALIZED_SECTIONS = (
 # across a pair by the protocol's one-host rule, and no part of a real run's
 # behaviour the arms could differ in.
 EXEMPT_SETTINGS = (
+    "memory",  # The Memory arm's treatment, not a held-equal setting.
     "state_dir",
     "execution.worktree_dir",
     "github.command",
