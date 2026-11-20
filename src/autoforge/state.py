@@ -63,7 +63,7 @@ from .effects import (
 from .errors import ConfigurationError, StateError, StateProtocolError
 from .evidence import EvidenceFields, RecordView, check_evidence
 from .loop_guard import validate_review_history
-from .memory import MemoryStore
+from .memory import MAX_LAUNCH_SEQ, MemoryStore
 from .memory import summarize as summarize_memory
 from .provenance import ControllerIdentity, protocol_ranges, shown, shown_path
 from .replan_txn import LEGACY_JOURNAL_PROTOCOLS, legacy_journal_refusal
@@ -1655,7 +1655,7 @@ class AutoForgeState:
         _validate_partial_fix(state)
         _validate_auto_recovery(state)
         _validate_delivered_reply(state)
-        if not 0 <= state.launch_seq <= 2**63 - 1:
+        if not 0 <= state.launch_seq <= MAX_LAUNCH_SEQ:
             raise StateError("state field 'launch_seq' is out of range")
         if not isinstance(state.issue_memory, dict) or state.issue_memory:
             state.memory()

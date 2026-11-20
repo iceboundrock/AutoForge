@@ -472,6 +472,7 @@ from .loop_guard import (
 )
 from .materialize import METHOD as MATERIALIZATION_METHOD
 from .materialize import materialize, read_object_format
+from .memory import MAX_LAUNCH_SEQ
 from .premerge import (
     commit_is_local,
     describe_definition_difference,
@@ -1689,6 +1690,22 @@ def _operator_home() -> str:
 # How every surface names a launch the outer sandbox did not enforce
 # (ADR 0005 D1.2): never "sandboxed".
 LOGICAL_ISOLATION_ONLY = "logical isolation only"
+
+
+def _refuse_a_launch_past_the_last_ordinal(state: AutoForgeState, phase: Phase) -> None:
+    """Refuse a launch whose intent save would spend an ordinal past the last.
+
+    ``launch_seq`` is bounded by :data:`autoforge.memory.MAX_LAUNCH_SEQ`, the
+    one bound the loader, the launch-intent save and a projection share. A
+    run at that bound has spent its last ordinal, and saving one more would
+    leave a checkpoint the loader refuses: nothing is changed, saved or
+    launched (R5-F5 of PR #526).
+    """
+    if state.launch_seq >= MAX_LAUNCH_SEQ:
+        raise StateError(
+            f"refusing to launch {phase.value}: the run has spent its last launch ordinal "
+            f"({MAX_LAUNCH_SEQ}); nothing was saved or launched; start a new run"
+        )
 
 
 def launch_backend() -> SandboxBackend:
@@ -16989,6 +17006,10 @@ class ControllerEngine:
         """
         assert_shared_git_lock_free(f"launch the {phase.value} agent")
         state = self._require_state()
+        # R5-F5 of PR #526: the ordinal this launch's intent save would spend
+        # must be one the loader reads again, checked before anything of the
+        # launch is written; each relaunch checks again, below.
+        _refuse_a_launch_past_the_last_ordinal(state, phase)
         profile = profile_for_phase(self.config, phase, state.review_round)
         provider = self.providers.get(profile)
         provider.validate_profile(profile)
@@ -17146,6 +17167,9 @@ class ControllerEngine:
             finally:
                 self._read_context_dir = None
                 self._worktree_state = None
+            # Before anything of the launch's intent is changed or saved: a
+            # relaunch spends one more ordinal than the step's first launch.
+            _refuse_a_launch_past_the_last_ordinal(state, phase)
             if attempt:
                 # The relaunch's step (above), in the save before it starts.
                 state.step_count += 1

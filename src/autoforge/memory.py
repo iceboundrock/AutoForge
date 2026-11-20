@@ -1103,7 +1103,7 @@ def render_projection(
     _require(step.phase is Phase.ANALYZE_EXECUTE)
     # The launch this snapshot is rendered for is the next one: an earlier
     # ordinal would label later records as what that launch was shown.
-    _require(_integer(request.attempt, 1, 2**63) == store.launch_seq + 1)
+    _require(_integer(request.attempt, 1, MAX_LAUNCH_SEQ) == store.launch_seq + 1)
     _integer(request.max_chars, 1, MAX_PROJECTION_CHARS)
     _integer(request.max_bytes, 1, MAX_PROJECTION_BYTES)
     _require(

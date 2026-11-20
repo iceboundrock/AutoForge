@@ -620,7 +620,11 @@ protocol-19 file, or any older file its own rules load, loads with Memory
 off (`{}`) and `launch_seq` initialized to `step_count`, then is relabelled
 on the next save. An older label carrying either new field is refused.
 The launch-intent save increments the ordinal; retry, resume, unblock
-and issue changes never reset it. An ordinal is not a launch receipt.
+and issue changes never reset it. An ordinal is not a launch receipt. The
+loader, the launch-intent save and a projection share one bound,
+2^63 − 1 (`autoforge.memory.MAX_LAUNCH_SEQ`): a run at it has spent its
+last ordinal, and its next launch, a relaunch included, is refused before
+anything of the launch is changed or saved.
 `issue_memory` is validated whole on load, by the rules every write
 applies, and a value that would leave an open record without its
 retraction reserve (one event slot and its bytes) is refused. The number

@@ -22,6 +22,7 @@ from autoforge.memory import (
     COMPACT_SLACK_BYTES,
     MAX_EVENTS,
     MAX_FACTS,
+    MAX_LAUNCH_SEQ,
     MAX_PROJECTION_BYTES,
     MAX_REASON_BYTES,
     MAX_STORE_BYTES,
@@ -1547,3 +1548,56 @@ def test_a_memory_off_pi_launch_does_not_consult_the_fresh_context_proof(
         eng.step()
     assert pi.calls and not any(r.fresh_context for r in pi.calls)
     assert load_state(eng.paths.state_file).issue_memory == {}
+
+
+@pytest.mark.parametrize("memory", [False, True], ids=["memory-off", "memory-on"])
+def test_the_last_launch_ordinal_is_never_spent_past_the_loaders_bound(
+    tmp_state_dir, fake_github, monkeypatch, memory
+):
+    """R5-F5 of PR #526: a checkpoint at the highest ordinal the loader reads
+    loads, and its next launch is refused before anything of its intent is
+    changed or saved: no agent, the checkpoint byte for byte as it was and
+    still loadable. One ordinal short, the step's launch spends the last
+    ordinal and its correction relaunch is refused the same way, leaving a
+    checkpoint that loads. A projection has the same bound."""
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    eng, pi = pi_engine(
+        tmp_state_dir, fake_github, memory=memory, sandbox="required" if memory else "disabled"
+    )
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    run = load_state(eng.paths.state_file)
+    run.launch_seq = MAX_LAUNCH_SEQ
+    save_state(run, eng.paths.state_file)
+    before = eng.paths.state_file.read_bytes()
+    assert load_state(eng.paths.state_file).launch_seq == MAX_LAUNCH_SEQ
+    eng.load()
+    with pytest.raises(StateError, match="spent its last launch ordinal"):
+        eng.step()
+    assert pi.calls == [] and eng.paths.state_file.read_bytes() == before
+    assert not (eng.paths.state_dir / "read-context").exists()
+    assert load_state(eng.paths.state_file).launch_seq == MAX_LAUNCH_SEQ
+    # One short: the first launch spends the last ordinal; the relaunch that
+    # corrects its reply would spend one past it, and is refused.
+    run = load_state(eng.paths.state_file)
+    run.launch_seq = MAX_LAUNCH_SEQ - 1
+    save_state(run, eng.paths.state_file)
+    eng.load()
+    with pytest.raises(StateError, match="spent its last launch ordinal"):
+        eng.step()
+    assert len(pi.calls) == 1
+    spent = load_state(eng.paths.state_file)
+    # The first launch's intent is saved; nothing of the refused relaunch is.
+    assert spent.launch_seq == MAX_LAUNCH_SEQ and spent.attempt == 1
+    eng.close()
+    # The loader's bound and a projection's are the one bound.
+    over = load_state(eng.paths.state_file).to_dict()
+    over["launch_seq"] = MAX_LAUNCH_SEQ + 1
+    eng.paths.state_file.write_text(json.dumps(over))
+    with pytest.raises(StateError, match="'launch_seq' is out of range"):
+        load_state(eng.paths.state_file)
+    with pytest.raises(StateError):
+        MemoryStore.empty(REPO, RUN, MAX_LAUNCH_SEQ + 1)
+    last = empty(MAX_LAUNCH_SEQ - 1)
+    assert render_projection(last, replace(REQ, attempt=MAX_LAUNCH_SEQ)).ids == ()
+    with pytest.raises(StateError):
+        render_projection(empty(MAX_LAUNCH_SEQ), replace(REQ, attempt=MAX_LAUNCH_SEQ + 1))
