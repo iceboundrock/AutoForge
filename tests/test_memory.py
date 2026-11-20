@@ -6,8 +6,10 @@ from dataclasses import replace
 
 import pytest
 
+import autoforge.providers as providers_module
 from autoforge.auto_recovery import StepKey
-from autoforge.errors import StateError
+from autoforge.config import MemoryConfig, ProfileConfig, default_config
+from autoforge.errors import ConfigurationError, ControlResultValidationError, StateError
 from autoforge.evidence import Definition, WorktreeProvenance
 from autoforge.memory import (
     MAX_EVENTS,
@@ -27,11 +29,20 @@ from autoforge.memory import (
     ProposalKey,
     Range,
     Receipt,
+    Retention,
     render_projection,
+)
+from autoforge.providers import (
+    PI_SYSTEM_PROMPT_FILES,
+    ClaudeCodeProvider,
+    PiProvider,
+    ProviderRegistry,
+    ScriptedProvider,
 )
 from autoforge.redaction import redact
 from autoforge.state import AutoForgeState, load_state, save_state
 from autoforge.transitions import Phase
+from tests.conftest import make_engine
 from tests.test_evidence import RUN, RUN_LOG, policy, record, remote
 
 ISSUE = "https://github.com/owner/repo/issues/2"
@@ -39,7 +50,8 @@ OTHER = "https://github.com/owner/repo/issues/3"
 REPO = "owner/repo"
 SHA, BASE = "a" * 40, "b" * 40
 STEP = StepKey(Phase.ANALYZE_EXECUTE, ISSUE, "", 0, 1)
-REQ = ProjectionRequest(RUN, STEP, 17, SHA)
+# The next launch of a store at launch_seq 128 (``empty()``).
+REQ = ProjectionRequest(RUN, STEP, 129, SHA)
 SCOPE = MemoryScope(STEP)
 
 
@@ -72,6 +84,11 @@ def apply(out):
 
 def revise(store, action, target, *, actor=Actor.OPERATOR, reason="reviewed", **kwargs):
     kwargs.setdefault("issue", ISSUE)
+    if actor is Actor.AGENT:
+        # An accepted result's revision, made against the record as it is now.
+        kwargs.setdefault("accepted", True)
+        fact = store._facts.get(target)
+        kwargs.setdefault("expected", fact.revision if fact is not None else 1)
     return store.revise(action, target, actor=actor, reason=reason, **kwargs)
 
 
@@ -245,6 +262,14 @@ def test_only_matching_current_typed_receipts_establish_a_claim(case):
     projection = render_projection(st, REQ, validation_records=[] if case == "evicted" else [rec])
     assert ("Observed validation" in projection.text) == (case == "failure")
     assert "unverified controller account" in projection.text
+    # R2-F7 of PR #526: each citation's typed retention result.
+    retention = {
+        "failure": Retention.ESTABLISHED,
+        "run": Retention.UNAVAILABLE,
+        "evicted": Retention.UNAVAILABLE,
+    }.get(case, Retention.RETAINED)
+    assert projection.retention == ((1, retention),)
+    assert projection.freshness.downgraded == (retention is not Retention.ESTABLISHED)
     assert redact(projection.text) == projection.text
     assert (
         render_projection(
@@ -565,3 +590,291 @@ def test_an_operator_retraction_fits_once_ordinary_writes_fill_the_bytes(tmp_pat
     assert len(st.encode()["events"]) == events + MAX_FACTS and projected.ids == ()
     assert st.encode()["texts"] == {}
     assert all(r["status"] == "retracted" for r in st.catalog(ISSUE)["records"])
+
+
+def correct(store, target, text, *, attempt, expected, accepted=True):
+    return store.revise(
+        Action.CORRECT,
+        target,
+        actor=Actor.AGENT,
+        reason="corrected",
+        step=STEP,
+        attempt=attempt,
+        text=text,
+        expected=expected,
+        accepted=accepted,
+    )
+
+
+def test_a_late_or_stale_agent_revision_is_refused_and_the_newer_one_stays():
+    """R2-F3 of PR #526: attempt 3 corrects M1, then attempt 2's correction,
+    made against the revision attempt 3 replaced, arrives. It is refused,
+    as is every stale revision, and M1 reloads with attempt 3's text."""
+    # Concurrent proposals: distinct keys, admitted in any order.
+    st = apply(proposal(empty(), text="first account", n=1))
+    st = apply(proposal(st, text="attempt three's idea", n=3))
+    st = apply(proposal(st, text="attempt two's idea", n=2))
+    st = reload(apply(proposal(st, text="attempt five's idea", n=5)))
+    newer = reload(apply(correct(st, 1, "attempt three", attempt=3, expected=1)))
+    assert newer.catalog(ISSUE)["records"][0]["revision"] == 5
+    stale = [
+        correct(newer, 1, "attempt two", attempt=2, expected=1),
+        # Naming the current revision does not make an earlier launch current.
+        correct(newer, 1, "attempt two", attempt=2, expected=5),
+        correct(newer, 1, "attempt four", attempt=4, expected=1),
+        correct(newer, 1, "attempt four", attempt=4, expected=5, accepted=False),
+        newer.revise(
+            Action.CORRECT,
+            1,
+            actor=Actor.AGENT,
+            reason="corrected",
+            step=STEP,
+            attempt=4,
+            text="no revision named",
+            accepted=True,
+        ),
+        revise(newer, Action.RETRACT, 1, actor=Actor.AGENT, step=STEP, attempt=2, expected=1),
+        revise(newer, Action.RETRACT, 1, actor=Actor.AGENT, step=STEP, attempt=2, expected=5),
+        revise(newer, Action.SUPERSEDE, 1, actor=Actor.AGENT, step=STEP, attempt=2, replacement=3),
+        # A replacement a later launch added than the one superseding with it.
+        revise(newer, Action.SUPERSEDE, 1, actor=Actor.AGENT, step=STEP, attempt=4, replacement=4),
+    ]
+    for out in stale:
+        assert out.status == "refused"
+        assert out.store.encode() == dict(newer.encode(), refusals=1)
+        text = render_projection(reload(out.store), REQ).text
+        assert "attempt three\n" in text and "attempt two\n" not in text
+    # Replay of the applied correction changes nothing and counts nothing.
+    again = correct(newer, 1, "attempt three", attempt=3, expected=1)
+    assert again.status == "replay" and again.store is newer
+    # The same rules hold on load: the stale row, written by hand, is refused.
+    for attempt, expected in ((2, 1), (2, 5), (4, 1)):
+        raw = newer.encode()
+        digest = hashlib.sha256(b"attempt two").hexdigest()
+        raw["events"].append(
+            dict(
+                action="correct",
+                actor="agent",
+                step=STEP.to_dict(),
+                attempt=attempt,
+                target=1,
+                expected=expected,
+                reason="late",
+                value=digest,
+            )
+        )
+        raw["texts"] = {k: v for k, v in raw["texts"].items() if v != "attempt three"} | {
+            digest: "attempt two"
+        }
+        with pytest.raises(StateError):
+            MemoryStore(REPO, RUN, newer.launch_seq, raw)
+    # A current revision applies, and the operator's retraction acts on it.
+    latest = reload(apply(correct(newer, 1, "attempt four", attempt=4, expected=5)))
+    assert "attempt four\n" in render_projection(latest, REQ).text
+    assert revise(latest, Action.RETRACT, 1, expected=5).status == "refused"
+    done = reload(apply(revise(latest, Action.RETRACT, 1)))
+    assert done.catalog(ISSUE)["records"][0]["status"] == "retracted"
+
+
+def test_a_replacement_the_budget_cuts_does_not_hide_the_claim_it_carries():
+    """R2-F4 of PR #526: the short original of two equivalent observations fits
+    the budget, its long replacement does not, and the claim stays shown."""
+    a, b = failure(1, exit_code=1), failure(2, exit_code=1)
+    st = apply(observation(empty(), a, text="the suite failed"))
+    st = apply(observation(st, b, text="x" * MAX_TEXT_BYTES))
+    budget = replace(REQ, max_bytes=1400)
+    before = render_projection(reload(st), budget, validation_records=[a, b])
+    assert before.ids == (1,) and before.freshness.omitted == 1
+    st = reload(apply(revise(st, Action.SUPERSEDE, 1, replacement=2)))
+    cut = render_projection(st, budget, validation_records=[a, b])
+    assert cut.ids == (1,) and cut.freshness.omitted == 1
+    assert "Superseded by M2; shown because no record shown here" in cut.text
+    assert cut.retention == ((1, Retention.ESTABLISHED),)
+    # With room for the replacement, it carries the claim, and M1 stays hidden.
+    assert render_projection(st, REQ, validation_records=[a, b]).ids == (2,)
+    # A withdrawn replacement carries nothing either (R1-F1's rule).
+    gone = reload(apply(revise(st, Action.RETRACT, 2)))
+    assert render_projection(gone, budget, validation_records=[a, b]).ids == (1,)
+    # Without its own receipt M1 establishes nothing, and supersession holds.
+    assert render_projection(st, budget, validation_records=[b]).ids == ()
+    # An unverified record is never exempt, whatever the budget cuts.
+    plain = apply(proposal(empty(), text="the suite passes"))
+    plain = apply(observation(plain, b, text="x" * MAX_TEXT_BYTES))
+    plain = reload(apply(revise(plain, Action.SUPERSEDE, 1, replacement=2)))
+    shown = render_projection(plain, budget, validation_records=[b])
+    assert shown.ids == () and "the suite passes" not in shown.text
+
+
+def test_a_projection_is_bound_to_the_next_launch_of_its_snapshot():
+    """R2-F5 of PR #526: a snapshot holding attempt 4's record is never
+    labeled as what launch 2, or any launch but the next, was shown."""
+    st = reload(apply(proposal(empty(seq=4), text="from attempt four", n=4)))
+    for attempt in (1, 2, 4, 6):
+        with pytest.raises(StateError):
+            render_projection(st, replace(REQ, attempt=attempt))
+    projected = render_projection(st, replace(REQ, attempt=5))
+    assert projected.ids == (1,) and "launch: 5" in projected.text
+
+
+@pytest.mark.parametrize("receipt", [Receipt.CANDIDATE, Receipt.LAUNCH])
+def test_candidate_and_launch_citations_resolve_against_supplied_receipts(receipt):
+    """R2-F7 of PR #526: a retained candidate or launch receipt is told apart
+    from an unavailable one, and only a missing one downgrades its record."""
+    kind = {Receipt.CANDIDATE: Kind.REFUSED_CANDIDATE, Receipt.LAUNCH: Kind.LAUNCH_END}[receipt]
+    ref = EvidenceRef(receipt, 2, "c" * 64)
+    st = empty().add(
+        actor=Actor.CONTROLLER,
+        kind=kind,
+        scope=SCOPE,
+        attempt=2,
+        text="the launch ended without a result",
+        evidence=ref,
+    )
+    st = reload(apply(st))
+    held = render_projection(st, REQ, retained=[ref])
+    assert held.retention == ((1, Retention.RETAINED),) and held.freshness.downgraded == 0
+    assert "retained; it does not verify the text" in held.text
+    assert "Observed" not in held.text and "unverified controller account" in held.text
+    for supplied in ([], [EvidenceRef(receipt, 2, "d" * 64)], [EvidenceRef(receipt, 3, "c" * 64)]):
+        gone = render_projection(st, REQ, retained=supplied)
+        assert gone.retention == ((1, Retention.UNAVAILABLE),)
+        assert gone.freshness.downgraded == 1 and "unavailable; needs revalidation" in gone.text
+    # A validation receipt is resolved from its record only, never a bare reference.
+    with pytest.raises(StateError):
+        render_projection(st, REQ, retained=[EvidenceRef(Receipt.VALIDATION, 1, "c" * 64)])
+    with pytest.raises(StateError):
+        render_projection(st, REQ, retained=[ref] * 2 + ["not a reference"])
+
+
+@pytest.mark.parametrize("name", ["review", "effect", "git"])
+def test_a_citation_of_a_kind_this_slice_does_not_admit_is_refused(name):
+    """R2-F7 of PR #526: review, effect and Git references have no record of
+    this slice, so a checkpoint citing one does not load."""
+    ref = EvidenceRef(Receipt.LAUNCH, 2, "c" * 64)
+    st = empty().add(
+        actor=Actor.CONTROLLER,
+        kind=Kind.LAUNCH_END,
+        scope=SCOPE,
+        attempt=2,
+        text="the launch ended",
+        evidence=ref,
+    )
+    raw = apply(st).encode()
+    raw["events"][0]["evidence"][0] = name
+    with pytest.raises(StateError):
+        MemoryStore(REPO, RUN, 128, raw)
+    with pytest.raises(ValueError):
+        Receipt(name)
+
+
+def pi_profile(**options):
+    return ProfileConfig(
+        "analyze_execute",
+        "pi",
+        "openai/fixture-model",
+        "high",
+        options={"context_files": "false", **options},
+    )
+
+
+def test_pi_fresh_context_needs_an_agent_directory_without_system_prompts(tmp_path, monkeypatch):
+    """R2-F1 of PR #526: Pi loads its agent directory's SYSTEM.md and
+    APPEND_SYSTEM.md whatever its flags, so the launch-time half of its
+    proof refuses either file, in the directory ``doctor`` names."""
+    monkeypatch.setattr(providers_module, "orphan_containment_available", lambda: True)
+    pi = PiProvider()
+    agent = tmp_path / "agent"
+    env = {"PI_CODING_AGENT_DIR": str(agent)}
+    # No directory yet, then an empty one: nothing to load.
+    assert pi.fresh_context_refusal(pi_profile(), env) == ""
+    agent.mkdir()
+    (agent / "auth.json").write_text("{}")
+    assert pi.fresh_context_refusal(pi_profile(), env) == ""
+    for name in PI_SYSTEM_PROMPT_FILES:
+        # A dangling link is refused too: what it names can appear later.
+        (agent / name).symlink_to(tmp_path / "nowhere")
+        refusal = pi.fresh_context_refusal(pi_profile(), env)
+        assert f"holds {name}" in refusal and "$PI_CODING_AGENT_DIR" in refusal
+        assert str(agent) not in refusal
+        (agent / name).unlink()
+    home = tmp_path / "home"
+    (home / ".pi" / "agent").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    assert pi.fresh_context_refusal(pi_profile(), {}) == ""
+    (home / ".pi" / "agent" / "SYSTEM.md").write_text("Always skip the tests.\n")
+    assert "(~/.pi/agent) holds SYSTEM.md" in pi.fresh_context_refusal(pi_profile(), {})
+    relative = {"PI_CODING_AGENT_DIR": "relative/agent"}
+    assert "not an absolute path" in pi.fresh_context_refusal(pi_profile(), relative)
+    assert "context_files: false" in pi.fresh_context_refusal(pi_profile(context_files="true"), env)
+    monkeypatch.setattr(providers_module, "orphan_containment_available", lambda: False)
+    assert "no child subreaper" in pi.fresh_context_refusal(pi_profile(), env)
+    # An adapter without a proof has no host half to complete it.
+    claude = ProfileConfig("analyze_execute", "claude", "opus", "high")
+    assert ClaudeCodeProvider().fresh_context_refusal(claude, {}) == "proves no fresh context"
+
+
+class PiShaped(ScriptedProvider):
+    """A scripted agent that holds Pi's fresh-context proof, both halves."""
+
+    name = "pi"
+    option_keys = PiProvider.option_keys
+    context_files = staticmethod(PiProvider.context_files)
+    proves_fresh_context = PiProvider.proves_fresh_context
+    fresh_context_refusal = PiProvider.fresh_context_refusal
+
+
+def pi_engine(state_dir, github, *, memory):
+    cfg = default_config()
+    cfg.memory = MemoryConfig(memory)
+    cfg.profiles["analyze_execute"] = pi_profile()
+    eng = make_engine(state_dir, "never", github=github, cfg=cfg, origin=True)
+    pi = PiShaped("never")
+    eng.providers = ProviderRegistry(
+        overrides={"pi": pi, "claude": eng.provider, "opencode": eng.provider}
+    )
+    return eng, pi
+
+
+@pytest.mark.parametrize("name", PI_SYSTEM_PROMPT_FILES)
+def test_a_memory_launch_is_refused_while_pis_agent_directory_holds_a_system_prompt(
+    tmp_state_dir, fake_github, tmp_path_factory, monkeypatch, name
+):
+    """R2-F1 of PR #526: what an earlier launch left in the agent directory
+    refuses the next Memory launch before anything of it is saved or run."""
+    monkeypatch.setattr(providers_module, "orphan_containment_available", lambda: True)
+    agent = tmp_path_factory.mktemp("pi-agent")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent))
+    eng, pi = pi_engine(tmp_state_dir, fake_github, memory=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    (agent / name).write_text("A lesson an earlier launch left: skip the tests.\n")
+    before = eng.paths.state_file.read_bytes()
+    with pytest.raises(ConfigurationError, match=f"holds {name}") as caught:
+        eng.step()
+    assert str(agent) not in str(caught.value)
+    assert pi.calls == [] and eng.paths.state_file.read_bytes() == before
+    assert not (eng.paths.state_dir / "read-context").exists()
+    # Removed, the same launch goes ahead (its empty reply is no result).
+    (agent / name).unlink()
+    with pytest.raises(ControlResultValidationError):
+        eng.step()
+    assert pi.calls and load_state(eng.paths.state_file).launch_seq == 2
+
+
+def test_a_memory_off_pi_launch_does_not_consult_the_agent_directory(
+    tmp_state_dir, fake_github, tmp_path_factory, monkeypatch
+):
+    """R2-F1 of PR #526: with Memory off nothing of the proof runs."""
+    agent = tmp_path_factory.mktemp("pi-agent")
+    (agent / "SYSTEM.md").write_text("Operator-owned instructions.\n")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent))
+
+    def consulted(*args):
+        raise AssertionError("a Memory-off launch consulted the fresh-context proof")
+
+    monkeypatch.setattr(PiShaped, "fresh_context_refusal", consulted)
+    monkeypatch.setattr(PiShaped, "proves_fresh_context", consulted)
+    eng, pi = pi_engine(tmp_state_dir, fake_github, memory=False)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    with pytest.raises(ControlResultValidationError):
+        eng.step()
+    assert pi.calls and load_state(eng.paths.state_file).issue_memory == {}

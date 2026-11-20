@@ -1636,15 +1636,30 @@ relevant guide (#319, D7.7); and a new stop code amends ADR 0011.
 **Implementation note (#317).** Protocol 20 ships the atomic store, seed
 and retraction commands, and the pure projection. Automatic writers and
 launch delivery remain #333's. For this first slice, only the Pi adapter
-with context files disabled supplies D14's proof. Claude's no-session
-option does not prove auto-memory is off; it is refused when Memory is on,
-as are the other adapters without a proof. AutoForge does not start a
-version probe or change how any Memory-off launch runs. For D9.6, every
-record not yet retracted reserves one event slot and the bytes of one
-operator retraction, so the operator's retraction (D9.4) is never refused
-for a bound. A superseded record stays superseded when its replacement
-is retracted; only a validation failure its retained receipt establishes
-on the launch stays shown until a shown record carries the same claim.
+with context files disabled supplies D14's proof, and only in two halves.
+The profile's half is checked at config load. The host's half is D18's
+dynamic check before each Memory launch's intent save. It requires that Pi's
+agent directory holds no `SYSTEM.md` or `APPEND_SYSTEM.md`, which no flag
+turns off and an earlier launch can write. It also requires a host that
+kills a launch's leftover processes. D14's table above, written before
+this, lists Pi's proof as holding by construction. That is true of its
+argv, not of its agent directory. Claude's no-session option does not
+prove auto-memory is off; it is refused when Memory is on, as are the
+other adapters without a proof. AutoForge does not start a version probe
+or change how any Memory-off launch runs. For D9.6, every record not yet
+retracted reserves one event slot and the bytes of one operator retraction,
+so the operator's retraction (D9.4) is never refused for a bound. Every
+revision names the record revision it acts on. An agent's revision comes
+from an acceptance save, from a launch no earlier than the record's latest
+change. A stale one is refused, on write and on load. A superseded record
+stays superseded when its replacement is retracted. Only a validation
+failure its retained receipt establishes on the launch stays shown, until
+a record of its chain that the projection actually shows carries the same
+claim; a replacement the budget leaves out does not. A projection is bound
+to the next launch ordinal of its snapshot. A citation resolves to a typed
+retention result: established (a validation record only), retained or
+unavailable. This slice admits validation, candidate and launch receipts,
+not review, effect or Git references.
 
 | Needs | Does not need |
 |---|---|

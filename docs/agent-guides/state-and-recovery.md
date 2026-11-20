@@ -695,7 +695,16 @@ As implemented (`flock(2)`, `src/autoforge/locking.py`):
 - Mutating standalone commands refuse a checkpoint in another checkout's
   repository, including another clone of the same remote. They check the
   path before taking L0 and again under it, without assuming that an older
-  snapshot of the checkpoint still holds. A standalone state directory
+  snapshot of the checkpoint still holds. The path checked is the one the
+  state root opens: `StatePaths`' normalized spelling, never the caller's,
+  so `..` after a symbolic link or a missing directory cannot send git to
+  another repository (R2-F2 of PR #526). Git is asked from that directory,
+  or from its nearest existing ancestor while it does not exist, and the
+  directory must be the same before and after. The answer is bound to the
+  held state root: an existing directory is opened as the root and must
+  be the directory git was asked from; a directory created afterwards is
+  asked about again once it is opened (`ControllerEngine.require_checkpoint_owner`,
+  `_bind_checkpoint_root`). A standalone state directory
   positively identified as outside Git keeps working for Memory-off runs;
   ambiguous Git discovery errors are refused. `memory retract` also
   refuses scheduler-owned state and always requires the owning repository.

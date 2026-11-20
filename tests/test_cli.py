@@ -1,5 +1,6 @@
 """CLI: --help, doctor, run/step/resume/status with injected fakes (no real gh/agents)."""
 
+import hashlib
 import json
 import os
 import shlex
@@ -22,6 +23,7 @@ from autoforge.errors import (
 from autoforge.executor import ExecutionResult, execute
 from autoforge.github import GitHubClient
 from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
+from autoforge.memory import Action, Actor
 from autoforge.provenance import MAX_PATH_CHARS
 from autoforge.providers import ProviderRegistry, ScriptedProvider
 from autoforge.redaction import redact, redact_obj
@@ -204,6 +206,194 @@ def test_memory_retract_refuses_an_earlier_issues_record(tmp_path, monkeypatch, 
     assert fakes["provider"].calls == []
 
 
+def _memory_config(tmp_path) -> list[str]:
+    """``--config`` for a Memory run on Pi with context files off."""
+    config = _config(
+        tmp_path / "af.json",
+        memory={"enabled": True},
+        profiles={
+            "analyze_execute": {
+                "provider": "pi",
+                "model": "openai/fixture-model",
+                "effort": "high",
+                "options": {"context_files": False},
+            }
+        },
+    )
+    return ["--config", config]
+
+
+def test_status_and_memory_show_json_stay_issue_scoped_after_an_issue_switch(
+    tmp_path, monkeypatch, capsys, fakes
+):
+    """R2-F6 of PR #526: neither JSON view prints an earlier issue's Memory."""
+    monkeypatch.chdir(tmp_path)
+    args = _memory_config(tmp_path)
+    seed = tmp_path / "seed.txt"
+    text = "A lesson about issue 2, kept out of later views.\n"
+    seed.write_text(text, encoding="utf-8")
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    assert cli.main([*args, *_run_argv_of(1), "--memory-seed", str(seed)]) == 0
+    capsys.readouterr()
+    assert cli.main([*args, "status", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert "issue_memory" not in printed
+    assert printed["memory"]["records"] == {"current": 1} and printed["memory"]["enabled"]
+    state_file = tmp_path / ".autoforge" / "state.json"
+    moved = load_state(state_file)
+    moved.reset_for_new_issue(ISSUE3)
+    save_state(moved, state_file)
+    before = state_tree(tmp_path / ".autoforge")
+    for words in (["status", "--json"], ["memory", "show", "--json"]):
+        assert cli.main([*args, *words]) == 0
+        out = capsys.readouterr().out
+        assert text.strip() not in out and digest not in out and "issue_memory" not in out
+        printed = json.loads(out)
+        if words[0] == "status":
+            assert printed["memory"]["records"] == {} and printed["memory"]["enabled"]
+            assert printed["current_issue_url"] == ISSUE3
+        else:
+            assert printed["records"] == []
+    assert state_tree(tmp_path / ".autoforge") == before
+    # The earlier issue's record is still in the ledger, unchanged.
+    (record,) = load_state(state_file).memory().catalog(ISSUE)["records"]
+    assert record["status"] == "current" and record["text"] == text
+
+
+class Crash(BaseException):
+    """A kill at one point of an operator Memory command (ADR 0015 D11, W9)."""
+
+
+def _github_writes(gh) -> str:
+    """Everything a GitHub write of the fake would change."""
+    return repr(
+        (
+            gh.issues,
+            gh.prs,
+            gh.comments,
+            gh.merges,
+            gh.closed_prs,
+            gh.reopened_prs,
+            gh.deleted_branches,
+        )
+    )
+
+
+def _crash_at(patch, boundary: str) -> None:
+    """Interrupt the next ``state.json`` publication just before or just after it."""
+    if boundary == "before":
+        import autoforge.safefs as safefs
+
+        real_replace = os.replace
+
+        def crash_replace(src, dst, *a, **k):
+            # The rename that publishes the checkpoint, and nothing else.
+            if dst == "state.json":
+                raise Crash()
+            return real_replace(src, dst, *a, **k)
+
+        patch.setattr(safefs.os, "replace", crash_replace)
+    else:
+        import autoforge.state as state_module
+
+        real_save = state_module.save_state
+
+        def save_then_crash(*a, **k):
+            real_save(*a, **k)
+            raise Crash()
+
+        import autoforge.engine as engine_module
+
+        # Every name the checkpoint's save is called through: the engine's
+        # (the seed's save is the run's first) and the CLI's (a retraction).
+        for module in (state_module, engine_module, cli):
+            patch.setattr(module, "save_state", save_then_crash)
+
+
+@pytest.mark.parametrize("boundary", ["before", "after"])
+def test_an_interrupted_memory_seed_leaves_no_run_or_the_whole_new_one(
+    tmp_path, monkeypatch, capsys, fakes, boundary
+):
+    """R2-F8 of PR #526, ADR 0015 D11 W9: the seed is saved with the run's
+    first checkpoint. Interrupted before that save is published there is no
+    run; after it, the fresh load is the whole new run, seed included, with
+    no launch, no transition and no GitHub write."""
+    monkeypatch.chdir(tmp_path)
+    args = _memory_config(tmp_path)
+    seed = tmp_path / "seed.txt"
+    text = "A lesson saved with the run, whole or not at all.\n"
+    seed.write_text(text, encoding="utf-8")
+    state_file = tmp_path / ".autoforge" / "state.json"
+    writes = _github_writes(fakes["gh"])
+    with monkeypatch.context() as patch:
+        _crash_at(patch, boundary)
+        with pytest.raises(Crash):
+            cli.main([*args, *_run_argv_of(1), "--memory-seed", str(seed)])
+    capsys.readouterr()
+    assert fakes["provider"].calls == [] and _github_writes(fakes["gh"]) == writes
+    if boundary == "before":
+        assert not state_file.exists()
+        assert cli.main([*args, "status", "--json"]) == 2
+        # Nothing to reconcile: the run is started again and holds one seed.
+        assert cli.main([*args, *_run_argv_of(1), "--memory-seed", str(seed)]) == 0
+        (record,) = load_state(state_file).memory().catalog(ISSUE)["records"]
+        assert record["text"] == text
+        return
+    fresh = load_state(state_file)
+    assert fresh.phase is Phase.INITIALIZING
+    assert (fresh.launch_seq, fresh.step_count, fresh.attempt) == (0, 0, 0)
+    catalog = fresh.memory().catalog(ISSUE)
+    assert catalog["enabled"] and catalog["revision"] == 1
+    (record,) = catalog["records"]
+    assert (record["kind"], record["status"], record["text"]) == ("seed", "current", text)
+
+
+@pytest.mark.parametrize("boundary", ["before", "after"])
+def test_an_interrupted_memory_retraction_leaves_the_old_or_the_whole_new_checkpoint(
+    tmp_path, monkeypatch, capsys, fakes, boundary
+):
+    """R2-F8 of PR #526, ADR 0015 D11 W9: the retraction is one save.
+    Interrupted before it is published the old checkpoint stands, byte for
+    byte; after it, the fresh load is the whole new checkpoint, the record
+    retracted and nothing else changed, with no launch, no transition and no
+    GitHub write."""
+    monkeypatch.chdir(tmp_path)
+    args = _memory_config(tmp_path)
+    seed = tmp_path / "seed.txt"
+    text = "A wrong lesson.\n"
+    seed.write_text(text, encoding="utf-8")
+    assert cli.main([*args, *_run_argv_of(1), "--memory-seed", str(seed)]) == 0
+    state_file = tmp_path / ".autoforge" / "state.json"
+    before = state_file.read_bytes()
+    old = load_state(state_file)
+    expected = (
+        old.memory()
+        .revise(Action.RETRACT, 1, actor=Actor.OPERATOR, reason="wrong lesson", issue=ISSUE)
+        .store.encode()
+    )
+    writes = _github_writes(fakes["gh"])
+    capsys.readouterr()
+    with monkeypatch.context() as patch:
+        _crash_at(patch, boundary)
+        with pytest.raises(Crash):
+            cli.main([*args, "memory", "retract", "1", "--reason", "wrong lesson"])
+    capsys.readouterr()
+    assert fakes["provider"].calls == [] and _github_writes(fakes["gh"]) == writes
+    if boundary == "before":
+        assert state_file.read_bytes() == before
+        assert load_state(state_file).memory().catalog(ISSUE)["records"][0]["status"] == "current"
+        # Nothing to reconcile: the operator retracts again.
+        assert cli.main([*args, "memory", "retract", "1", "--reason", "wrong lesson"]) == 0
+    fresh = load_state(state_file)
+    assert fresh.issue_memory == expected
+    assert fresh.memory().catalog(ISSUE)["records"][0]["status"] == "retracted"
+    assert text.strip() not in state_file.read_text()
+    unchanged = {"issue_memory", "updated_at"}
+    assert {k: v for k, v in fresh.to_dict().items() if k not in unchanged} == {
+        k: v for k, v in old.to_dict().items() if k not in unchanged
+    }
+
+
 @pytest.mark.parametrize("output_format", ["text", "stream-json"])
 def test_memory_refuses_unproved_claude_before_any_checkpoint(
     tmp_path,
@@ -260,6 +450,95 @@ def test_checkpoint_writers_refuse_foreign_clone_even_if_git_discovery_fails(
     assert cli.main(["--state-dir", str(state_dir), *words]) == 2
     assert state_tree(state_dir) == before
     assert fakes["provider"].calls == []
+
+
+def _foreign_checkpoint(tmp_path) -> Path:
+    """Another clone's run, nested in this checkout: ``other-clone/.af``."""
+    foreign = git_repo(tmp_path / "other-clone")
+    state_dir = foreign / ".af"
+    saved = AutoForgeState(
+        run_id="foreign-run",
+        repository="owner/repo",
+        epic_url=EPIC,
+        current_issue_url=ISSUE,
+        phase=Phase.ANALYZE_EXECUTE,
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    save_state(saved, state_dir / "state.json")
+    return state_dir
+
+
+@pytest.mark.parametrize("spelling", ["missing-intermediate", "symlinked-parent"])
+@pytest.mark.parametrize(
+    "words",
+    [
+        ["step"],
+        ["resume"],
+        ["unblock", "--reason", "test"],
+        ["memory", "retract", "1", "--reason", "test"],
+        ["run", "--epic", EPIC, "--issue", ISSUE, "--force", "--max-steps", "1"],
+    ],
+    ids=("step", "resume", "unblock", "retract", "force"),
+)
+def test_checkpoint_writers_ask_git_about_the_directory_they_open(
+    tmp_path, monkeypatch, capsys, fakes, spelling, words
+):
+    """R2-F2 of PR #526: a ``..`` spelling that names the foreign clone's
+    checkpoint once normalized, as the state root opens it, but this
+    checkout when walked as spelled, is refused and leaves it unchanged."""
+    monkeypatch.chdir(tmp_path)
+    state_dir = _foreign_checkpoint(tmp_path)
+    if spelling == "missing-intermediate":
+        # As spelled, nothing exists below this checkout's ``missing``.
+        spelled = tmp_path / "missing" / ".." / "other-clone" / ".af"
+    else:
+        # As spelled, ``link/..`` is this checkout, whose ``.af`` is absent.
+        (tmp_path / "sub").mkdir()
+        (state_dir.parent / "link").symlink_to(tmp_path / "sub")
+        spelled = state_dir.parent / "link" / ".." / ".af"
+    assert os.path.abspath(spelled) == str(state_dir)
+    before = state_tree(state_dir)
+    assert cli.main(["--state-dir", str(spelled), *words]) == 2
+    assert "not owned by this checkout's repository lock" in capsys.readouterr().err
+    assert state_tree(state_dir) == before
+    assert not (tmp_path / ".af").exists()
+    assert fakes["provider"].calls == []
+
+
+@pytest.mark.parametrize("spelling", ["missing/../.autoforge", "a/b/.autoforge"])
+def test_a_new_run_binds_its_own_missing_state_directory(
+    tmp_path, monkeypatch, capsys, fakes, spelling
+):
+    """R2-F2 of PR #526: missing intermediates of this checkout's own state
+    directory are created and the run saved there, asked about once opened."""
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["--state-dir", str(tmp_path / spelling), *_run_argv_of(1)]) == 0
+    saved = Path(os.path.abspath(tmp_path / spelling)) / "state.json"
+    assert load_state(saved).current_issue_url == ISSUE
+    assert not (tmp_path / "missing").exists()
+
+
+def test_a_state_directory_created_in_a_foreign_clone_after_the_check_is_refused(
+    tmp_path, monkeypatch, fakes
+):
+    """R2-F2 of PR #526: the check made while the directory was missing asked
+    this checkout; the directory then opened lies in another clone, nested
+    at the same depth, so it is asked about again and refused unchanged."""
+    monkeypatch.chdir(tmp_path)
+    state_dir = _foreign_checkpoint(tmp_path)
+    from autoforge.config import AutoForgeConfig
+
+    engine = ControllerEngine(
+        config=AutoForgeConfig(), state_dir=str(tmp_path / "a" / ".af"), workdir=tmp_path
+    )
+    assert engine.require_checkpoint_owner() is True
+    (tmp_path / "a").symlink_to(state_dir.parent)
+    before = state_tree(state_dir)
+    with pytest.raises(LockError, match="not owned by this checkout's repository lock"):
+        engine.load()
+    assert state_tree(state_dir) == before
+    engine.close()
 
 
 def test_run_dry_run_writes_nothing(tmp_path, capsys, monkeypatch, fakes):

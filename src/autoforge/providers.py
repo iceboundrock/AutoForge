@@ -365,6 +365,7 @@ from .executor import (
     ExecutionResult,
     describe_leftovers,
     execute,
+    orphan_containment_available,
     select_environment,
 )
 from .executor_duplex import (
@@ -871,6 +872,19 @@ class AgentProvider:
     def proves_fresh_context(self, profile: ProfileConfig) -> bool:
         """Default deny: neither a version string nor session flags alone are proof."""
         return False
+
+    def fresh_context_refusal(self, profile: ProfileConfig, environ: Mapping[str, str]) -> str:
+        """Why this host cannot complete ``profile``'s fresh-context proof, or ``""``.
+
+        The launch-time half of ADR 0015 D14 (D18's dynamic check): the
+        engine asks before every Memory launch's intent save, so a refusal
+        leaves state as it was. ``environ`` is the controller's environment,
+        which the launch inherits through its allow-list. The base adapter
+        adds nothing to :meth:`proves_fresh_context`.
+        """
+        if self.proves_fresh_context(profile):
+            return ""
+        return "proves no fresh context"
 
     # The environment variables this provider's CLI reads for its own
     # authentication and configuration, added to the request's allow-list.
@@ -2841,9 +2855,61 @@ class PiProvider(AgentProvider):
                 )
 
     def proves_fresh_context(self, profile: ProfileConfig) -> bool:
-        # Pi's fixed no-session argv and disabled resource loading, including
-        # context-file discovery. No passthrough args may override these.
+        # The profile's half of the proof: Pi's fixed argv keeps sessions,
+        # project trust and executable resources off, and the profile turns
+        # context files off. No pass-through argument may override these.
+        # Nothing turns off the agent directory's system prompt files, which
+        # :meth:`fresh_context_refusal` checks at every launch.
         return not profile.extra_args and not self.context_files(profile)
+
+    def fresh_context_refusal(self, profile: ProfileConfig, environ: Mapping[str, str]) -> str:
+        """The host's half of Pi's fresh-context proof (R2-F1 of PR #526).
+
+        Pi loads its agent directory's ``SYSTEM.md`` and ``APPEND_SYSTEM.md``
+        at every launch, whatever its flags, and that directory stays
+        writable by every launch that uses it, under ``sandbox.mode:
+        required`` too (docs/pi-policy.md §5, §8). The proof therefore needs,
+        at each launch: that no process an earlier launch started can still
+        write there (the executor kills a launch's leftovers through a child
+        subreaper, ADR 0002 §4b), and that neither file is there now. The
+        directory is the one ``doctor`` names: ``$PI_CODING_AGENT_DIR``, else
+        ``~/.pi/agent``. Under the outer sandbox without the variable Pi uses
+        a private home of its own, so checking ``~/.pi/agent`` there can only
+        refuse more, never less. The reason names the directory's variable
+        and the file, never a path.
+        """
+        if not self.proves_fresh_context(profile):
+            return "proves no fresh context: Pi needs options.context_files: false"
+        if not orphan_containment_available():
+            return (
+                "cannot prove a fresh context here: a process an earlier Pi launch left "
+                "running could still write the system prompt files Pi loads, and this host "
+                "cannot contain a launch's leftovers (no child subreaper, ADR 0002 §4b)"
+            )
+        configured = environ.get("PI_CODING_AGENT_DIR", "")
+        where = "$PI_CODING_AGENT_DIR" if configured else PI_DEFAULT_AGENT_DIR
+        agent_dir = Path(configured or PI_DEFAULT_AGENT_DIR).expanduser()
+        if not agent_dir.is_absolute():
+            return (
+                f"cannot prove a fresh context: Pi's agent directory ({where}) is not an "
+                "absolute path, so the files Pi loads from it cannot be checked"
+            )
+        for name in PI_SYSTEM_PROMPT_FILES:
+            try:
+                os.lstat(agent_dir / name)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return (
+                    f"cannot prove a fresh context: {name} in Pi's agent directory ({where}) "
+                    "cannot be checked"
+                )
+            return (
+                f"cannot prove a fresh context: Pi's agent directory ({where}) holds {name}, "
+                "which Pi loads at every launch whatever its flags and which an earlier "
+                "launch may have written; remove it"
+            )
+        return ""
 
     def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
         # The prompt is deliberately absent: it reaches Pi as a JSON `prompt`

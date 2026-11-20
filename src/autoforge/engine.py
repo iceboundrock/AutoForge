@@ -143,6 +143,7 @@ import os
 import re
 import secrets
 import shlex
+import stat
 import time
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
@@ -1945,6 +1946,10 @@ class ControllerEngine:
         # and the pathname is only ever *re-verified* against it, never
         # re-resolved into a new binding.
         self._state_root: SafeRoot | None = None
+        # What :meth:`require_checkpoint_owner` bound: the identity of the
+        # directory git was asked from, and how far below it the state
+        # directory lies; checked whenever the state root is opened.
+        self._checkpoint_probe: tuple[tuple[int, int], int] | None = None
         self.workdir = str(workdir)
         self.providers = providers or ProviderRegistry(runner=runner)
         # The GitHub client is built on first *use*, never on construction:
@@ -2158,6 +2163,7 @@ class ControllerEngine:
         if self._state_root is not None:
             self._state_root.close()
             self._state_root = None
+        self._checkpoint_probe = None
         self._paths = value
 
     def state_root(self, *, create: bool = True) -> SafeRoot:
@@ -2176,7 +2182,14 @@ class ControllerEngine:
         not exist (reads never create it).
         """
         if self._state_root is None:
-            self._state_root = self._paths.open_root(create=create)
+            root = self._paths.open_root(create=create)
+            try:
+                # The directory the owner check bound, when one ran (R2-F2 of PR #526).
+                self._bind_checkpoint_root(root)
+            except BaseException:
+                root.close()
+                raise
+            self._state_root = root
         else:
             self._state_root.verify_identity(role="state directory")
         return self._state_root
@@ -3768,28 +3781,88 @@ class ControllerEngine:
         positively identified as outside Git. Every path to enabling or
         writing Memory requires a repository match, irrespective of what a
         previously loaded snapshot said.
+
+        The target is the one directory :meth:`state_root` opens, spelled as
+        :class:`StatePaths` spells it (its anchor and components, no ``..``),
+        never the caller's spelling (R2-F2 of PR #526). Git is asked from it,
+        or, while it does not exist, from its nearest existing ancestor, and
+        the directory git ran in must be the same before and after. The
+        answer is bound to the state root (:meth:`_bind_checkpoint_root`): an
+        existing target is opened as the held root here and must be the
+        directory git was asked from; a missing one is asked again once
+        :meth:`state_root` has created and opened it. Each call replaces the
+        binding, so the call made under the lock is the one that holds.
         """
-        path = self.paths.state_dir
+        target = self.paths.anchor.joinpath(*self.paths.relative)
+        self._checkpoint_probe = None
+        probe, depth = target, 0
         try:
             while True:
                 try:
-                    path.lstat()
+                    found = probe.lstat()
                 except FileNotFoundError:
-                    path = path.parent
+                    if probe.parent == probe:
+                        raise
+                    probe, depth = probe.parent, depth + 1
                 else:
                     break
-            if self.paths.state_dir.is_symlink():
+            if depth == 0 and stat.S_ISLNK(found.st_mode):
                 raise StateError("checkpoint directory is a symbolic link")
-            theirs = repository_lock_path(path, cross_filesystems=True).parent.parent
+            identity, theirs = self._checkpoint_repository(probe)
         except NoRepository:
             if allow_external and not self.config.memory.enabled:
                 return False
-            theirs = None
+            raise LockError(
+                "checkpoint directory is not owned by this checkout's repository lock"
+            ) from None
         except (LockError, OSError):
             raise LockError("cannot establish the checkpoint directory's repository") from None
         if theirs != self.coordination_root():
             raise LockError("checkpoint directory is not owned by this checkout's repository lock")
+        self._checkpoint_probe = (identity, depth)
+        if depth == 0:
+            self._bind_checkpoint_root(self.state_root(create=False))
         return True
+
+    @staticmethod
+    def _checkpoint_repository(path: Path) -> tuple[tuple[int, int], Path]:
+        """The identity of the directory ``path`` names and its repository's git
+        common dir, asked from it; the directory must not change meanwhile."""
+        before = os.stat(path)
+        theirs = repository_lock_path(path, cross_filesystems=True).parent.parent
+        after = os.stat(path)
+        identity = (before.st_dev, before.st_ino)
+        if (after.st_dev, after.st_ino) != identity:
+            raise LockError("checkpoint directory changed while its repository was established")
+        return identity, theirs
+
+    def _bind_checkpoint_root(self, root: SafeRoot) -> None:
+        """Refuse a state root that is not the directory the owner check bound.
+
+        A target that existed when it was checked must be the directory git
+        was asked from. One that did not is asked about again now that it is
+        opened: the root's directory itself, under the same rule. Nothing is
+        bound before :meth:`require_checkpoint_owner` runs, or after the
+        engine's paths change.
+        """
+        if self._checkpoint_probe is None:
+            return
+        identity, depth = self._checkpoint_probe
+        if depth:
+            target = self.paths.anchor.joinpath(*self.paths.relative)
+            try:
+                identity, theirs = self._checkpoint_repository(target)
+            except (LockError, OSError):
+                raise LockError("cannot establish the checkpoint directory's repository") from None
+            if theirs != self.coordination_root():
+                raise LockError(
+                    "checkpoint directory is not owned by this checkout's repository lock"
+                )
+            self._checkpoint_probe = (identity, 0)
+        if root.identity != identity:
+            raise LockError(
+                "checkpoint directory is not the directory its repository lock was checked for"
+            )
 
     def state_dir_in_scheduler_root(self) -> bool:
         """Whether this engine's state dir lies in the scheduler root (ADR 0008 D17.3).
@@ -16835,11 +16908,13 @@ class ControllerEngine:
         profile = profile_for_phase(self.config, phase, state.review_round)
         provider = self.providers.get(profile)
         provider.validate_profile(profile)
-        if (
-            phase is Phase.ANALYZE_EXECUTE
-            and (self.config.memory.enabled or bool(state.issue_memory.get("enabled")))
-            and not provider.proves_fresh_context(profile)
-        ):
+        # ADR 0015 D14, D18: a Memory launch needs a fresh context. The
+        # profile's half is checked here and at config load; the host's half
+        # before each launch's intent save, below.
+        memory_launch = phase is Phase.ANALYZE_EXECUTE and (
+            self.config.memory.enabled or bool(state.issue_memory.get("enabled"))
+        )
+        if memory_launch and not provider.proves_fresh_context(profile):
             raise ConfigurationError(
                 "analyze_execute cannot prove fresh context with Memory; "
                 "use Pi with context files disabled, or turn Memory off"
@@ -16951,6 +17026,15 @@ class ControllerEngine:
                 cwd, self._runner, env_allowlist=provider.launch_allowlist(env_allowlist)
             )
             provider.integration_preflight(env_allowlist)
+            if memory_launch:
+                # D18's dynamic check, for every launch: an earlier one, this
+                # invocation's included, may have left context behind.
+                refusal = provider.fresh_context_refusal(profile, os.environ)
+                if refusal:
+                    raise ConfigurationError(
+                        f"refusing to launch {phase.value} with Memory: profile "
+                        f"{profile.name!r} {refusal}; or turn Memory off"
+                    )
             # What the agent reads from GitHub, read by the controller (it
             # holds no credential to read it itself) and written before the
             # prompt that names it is rendered; nothing is saved yet.

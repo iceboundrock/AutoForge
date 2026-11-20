@@ -2656,15 +2656,22 @@ def cmd_status(args) -> int:
         engine.continue_command = (*config, "epic", "resume", state.epic_url)
     # The snapshot is taken before the live read, which reads only (#374).
     persisted = state.to_dict()
+    # Memory is the one persisted field status does not print raw: its ledger
+    # holds every issue of the run, and status shows the current issue's
+    # record count by status only (R2-F6 of PR #526); `memory show` is the
+    # read of the current issue's records.
+    del persisted["issue_memory"]
     live = _live_inspection(engine, state) if live_requested else None
     package = _recovery_package(engine, args, state, stop, live)
     if args.as_json:
-        # to_dict() carries "mode" and every persisted field; protocol 13
-        # removed LOCAL's twelve fields from it (#388, ADR 0009 D8, D10).
-        # `replan_journal` and `acceptance_actions` are derived beside the
-        # raw fields, never merged into them.
+        # to_dict() carries "mode" and every persisted field but
+        # `issue_memory`; protocol 13 removed LOCAL's twelve fields from it
+        # (#388, ADR 0009 D8, D10). `replan_journal`, `acceptance_actions`
+        # and `memory` are derived beside the raw fields, never merged into
+        # them.
         document = {
             **persisted,
+            "memory": state.memory().summary(state.current_issue_url),
             "replan_journal": _replan_journal_summary(txn),
             "acceptance_actions": _acceptance_actions(state),
             "operator_actions": _operator_actions(state),

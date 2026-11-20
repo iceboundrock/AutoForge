@@ -2497,10 +2497,23 @@ by the run-log redactor. Its bytes and their SHA-256 digest are saved with
 the run, before the first launch. A new run does not inherit previous notes.
 
 `autoforge memory show --json` reads the current issue's catalog without a
-lock or write. `autoforge memory retract RECORD --reason WHY` takes the
-repository lock and withdraws a saved record of the current issue by its
-numeric ID. A record of an issue the run worked on earlier is not in the
-catalog, and retracting it is refused with nothing written. A
+lock or write. `autoforge status --json` prints no ledger. Its `memory`
+key holds the current issue's record count by status, the revision, the
+store's digest and the refusal count. `autoforge memory retract RECORD
+--reason WHY` takes the repository lock and withdraws a saved record of
+the current issue by its numeric ID. A record of an issue the run worked on
+earlier is not in either view, and retracting it is refused with nothing
+written. Each save is the checkpoint's one atomic write. A command
+interrupted before it is published leaves the old checkpoint, or no run
+for a seed. One interrupted after it leaves the whole new checkpoint.
+Neither launches, transitions or writes to GitHub.
+
+Every correction, supersession or retraction names the record revision
+it acts on, and one made against an older revision is refused. An agent's
+revision must also come from an accepted result of a launch no earlier
+than the record's latest change. A late result from an earlier launch
+therefore cannot overwrite a newer correction. The same row submitted again
+is a replay and changes nothing. A
 correction or retraction leaves a content digest that prevents reappearance
 within its scope and authority. Refusals are counted, not tombstoned. The
 store keeps at most 64 facts and 256 lifecycle events per run, and at most
@@ -2511,15 +2524,29 @@ reason, in reserve. Other writes are refused before they would spend it,
 so `memory retract` is never refused for the bounds.
 
 The provider-neutral projection uses the committed revision, one bound
-launch and retained typed receipts. A validation receipt can establish
+launch and retained typed receipts. The launch is the snapshot's next one
+(its `launch_seq` plus one): a projection is never labeled as what an
+earlier launch was shown. A validation receipt can establish
 only what it records for that issue and exact candidate, not adjacent
 commentary. A superseded record stays out of the projection, even when its
 replacement is later retracted or loses its receipt. The one exception is
 a validation failure that its own retained receipt establishes on the
 launch: a supersession cannot hide it without matching check, policy,
-outcome and candidate evidence in a shown record of the chain, and until
-then it is shown, marked as superseded. Missing or unmatched evidence
-downgrades rather than verifies. The full projection,
+outcome and candidate evidence in a record of the chain that the
+projection actually shows. A replacement the budget leaves out does not
+count. Until then the failure is shown, marked as superseded.
+
+Each citation resolves to a typed retention result. `established` means a
+retained validation record establishes the claim on this launch.
+`retained` means the controller supplied the receipt but it establishes
+nothing here: a candidate or launch receipt, or a validation record for
+another candidate. `unavailable` means the receipt was evicted, missing or
+never supplied, and the record is downgraded rather than kept as verified;
+so is a retained validation record that establishes nothing on the
+launch. Validation receipts are resolved from their whole records, and
+candidate and launch receipts from the references the controller supplies.
+No record of this release cites a review, an effect record or a Git
+object, and a checkpoint that does is refused. The full projection,
 including headings and omission notices, is at most 16,384 characters
 and 16,384 UTF-8 bytes (a conservative byte-level token bound).
 

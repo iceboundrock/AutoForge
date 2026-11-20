@@ -1102,11 +1102,27 @@ provider integrations above stay off. The guarantees and what they do not cover 
 ## Issue Working Memory
 
 `memory.enabled: true` opts a run into the advisory checkpoint store. The
-`analyze_execute` profile must be Pi with `options.context_files: false`.
-The adapter uses a fresh session and disables resource loading; it adds no
-flags to Memory-off launches. Other providers are refused when Memory is
-on. In particular, a Claude session-persistence setting alone establishes
-nothing about auto-memory. No runtime version probe is made.
+`analyze_execute` profile must be Pi with `options.context_files: false`,
+and every Memory launch must also pass a check of the host. Other providers
+are refused when Memory is on. In particular, a Claude
+session-persistence setting alone establishes nothing about auto-memory.
+No runtime version probe is made.
+
+Pi's flags do not disable everything an earlier launch could leave behind.
+`--no-session`, `--no-approve`, the executable-resource flags and
+`--no-context-files` cover sessions, project trust, extensions, skills,
+prompt templates, themes and context files. No flag turns off the agent
+directory's `SYSTEM.md` and `APPEND_SYSTEM.md`, which Pi loads at every
+launch ([Pi policy](pi-policy.md) §5). That directory stays writable by
+every launch that uses it, even under `sandbox.mode: required`. Before each
+Memory launch's intent save, the controller therefore checks the directory
+`doctor` names (`$PI_CODING_AGENT_DIR`, else `~/.pi/agent`). It refuses the
+launch while either file is there, or when the check cannot be made: the
+variable is not absolute, a file cannot be examined, or the host cannot kill
+a launch's leftover processes (no Linux child subreaper, so a process an
+earlier launch left could write after the check). The refusal leaves the
+state as it was. Remove the file, or turn Memory off. Memory-off launches
+are neither checked nor changed.
 
 Changing the recorded `memory.enabled` on `step`, `resume` or `unblock`
 requires `--accept-config-change`. Turning it off disables the projection

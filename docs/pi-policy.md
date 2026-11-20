@@ -151,6 +151,18 @@ The row checks whether each path exists. It never opens a file, and never
 `auth.json`. The agent directory is `$PI_CODING_AGENT_DIR` when the launch
 allow-list passes it, otherwise `~/.pi/agent`.
 
+**With Issue Working Memory on** (#317), a warning is not enough. A launch
+can leave `SYSTEM.md` or `APPEND_SYSTEM.md` in that directory, and the next
+one loads it, so Pi's flags alone do not prove a fresh context (ADR 0015
+D14). Before each Memory launch's intent save,
+`PiProvider.fresh_context_refusal` checks the same directory, without
+following a link, and refuses the launch while either name exists. It also
+refuses when the check cannot be made: the variable is not absolute, a
+file cannot be examined, or the host has no child subreaper to kill a
+launch's leftover processes, one of which could write after the check. The
+refusal names the variable, never the path. Memory-off launches are not
+checked.
+
 **Evidence.** `core/resource-loader.js` (system-prompt discovery).
 Verified on installed Pi 1.0.1.
 
@@ -346,7 +358,7 @@ changes.
   Candidate follow-up: refuse a Pi launch in a tree that has
   `.pi/commands/`.
 - **Global system prompt files** cannot be disabled by any flag. `doctor`
-  only warns.
+  only warns, and a Memory launch is refused while either file exists (§5).
 - **Context files** from the main checkout and from directories above it
   load by default (§4).
 - **Same UID.** Everything in §8 under "Credential exposure that remains".
@@ -372,6 +384,11 @@ changes.
     then that nothing loads under the adapter's.
 - `tests/test_providers.py`, `tests/test_engine.py`: the argv, option keys
   and the preflight runner pinned.
+- `tests/test_memory.py`: the Memory launch's agent-directory check (§5),
+  offline: either file, a dangling link, `~/.pi/agent`, a relative variable
+  and a host without a child subreaper are refused; an engine launch is
+  refused with its state unchanged and goes ahead once the file is removed;
+  a Memory-off launch never consults the check.
 - `tests/test_doctor.py`: the outside-instruction WARN row, the auth
   row's API-key refusal, and the containment row (#135: OK with a child
   subreaper, WARN without one, and WARN where the setting can be read
