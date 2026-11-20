@@ -238,15 +238,19 @@ class ExecutionRequest:
     # runs the command without it.
     sandbox: LaunchDescription | None = None
     # Start the program from this open descriptor, never by the name
-    # ``command[0]``, which stays its ``argv[0]`` (R5-F1 of PR #513): a file
-    # put at that name after the caller checked the descriptor's file is not
-    # the one that runs. On the host the child execs the descriptor
-    # (:func:`descriptor_program`), handed to it alone; inside the sandbox the
-    # backend mounts the descriptor's file read-only at ``command[0]``, an
-    # absolute path, and keeps the descriptor out of the command. The caller
-    # owns and closes it. A host that cannot start a program from a
-    # descriptor fails the spawn (:class:`ExecutionError`), never runs it by
-    # name instead.
+    # ``command[0]`` (R5-F1, R6-F3 of PR #513): a file put at that name after
+    # the caller checked the descriptor's file is not the one that runs. On the
+    # host the child execs the descriptor (:func:`descriptor_program`), handed
+    # to it alone, and ``command[0]`` stays its ``argv[0]``; inside the sandbox
+    # the backend mounts the descriptor's file read-only at a path of the
+    # sandbox's own, which no name on the host leads to, starts that path in
+    # ``command[0]``'s place, an absolute path, and keeps the descriptor out
+    # of the command. The caller owns and closes it. A host that cannot start
+    # a program from a descriptor fails the spawn (:class:`ExecutionError`),
+    # never runs it by name instead. What the kernel starts is the file
+    # itself only for a native program: a script's interpreter is handed a
+    # path and opens it itself, which is why a launch that relies on this
+    # (a fresh context's) refuses a script before it is charged.
     executable_fd: int | None = None
 
 
@@ -254,19 +258,33 @@ class ExecutionRequest:
 _DESCRIPTOR_DIR = "/proc/self/fd"
 
 
+def descriptor_start_problem() -> str:
+    """Why this host cannot start a program from an open descriptor; ``""`` when it can.
+
+    Linux can, through ``/proc/self/fd``. A host without it (macOS) cannot,
+    so a launch bound to the file it checked is refused there before it is
+    charged (R6-F3 of PR #513), and :func:`descriptor_program` starts nothing.
+    """
+    if not os.path.isdir(_DESCRIPTOR_DIR):
+        return (
+            f"this host cannot start a program from an open descriptor ({_DESCRIPTOR_DIR} is "
+            "missing)"
+        )
+    return ""
+
+
 def descriptor_program(fd: int) -> str:
     """The path through which a child execs the file its descriptor ``fd`` holds.
 
     ``/proc/self/fd/<fd>``: the kernel starts the open file itself, whatever
-    its name holds now, and a script's interpreter is handed that path (R5-F1
-    of PR #513). :class:`ExecutionError` on a host with no such directory
-    (macOS), which then starts nothing.
+    its name holds now (R5-F1 of PR #513); a script's interpreter is handed
+    that path, and what it opens then is its own affair.
+    :class:`ExecutionError` on a host with no such directory
+    (:func:`descriptor_start_problem`), which then starts nothing.
     """
-    if not os.path.isdir(_DESCRIPTOR_DIR):
-        raise ExecutionError(
-            f"this host cannot start a program from an open descriptor ({_DESCRIPTOR_DIR} is "
-            "missing), so a launch bound to the file it checked is not started"
-        )
+    problem = descriptor_start_problem()
+    if problem:
+        raise ExecutionError(f"{problem}, so a launch bound to the file it checked is not started")
     return f"{_DESCRIPTOR_DIR}/{fd}"
 
 

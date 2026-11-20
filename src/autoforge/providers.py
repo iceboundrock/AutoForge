@@ -366,6 +366,7 @@ from .executor import (
     ExecutionRequest,
     ExecutionResult,
     describe_leftovers,
+    descriptor_start_problem,
     execute,
     select_environment,
 )
@@ -915,7 +916,12 @@ class PinnedExecutable:
     :attr:`fd` (:attr:`~autoforge.executor.ExecutionRequest.executable_fd`)
     is this very file, whatever its name leads to by then: so the version a
     probe reads is the opened file's, and so is the program a launch starts.
-    OSError when it cannot be opened, or is no regular file.
+    That holds through the program's start only for a native program, which
+    the kernel loads from the file itself; :attr:`script` says whether it is
+    a script (``#!``), which the kernel hands to its interpreter by a path
+    the interpreter opens itself, and Node resolves back to the file's name
+    first (R6-F3 of PR #513). OSError when it cannot be opened, or is no
+    regular file.
     """
 
     def __init__(self, path: str) -> None:
@@ -924,12 +930,15 @@ class PinnedExecutable:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode):
                 raise OSError(f"{path} is not a regular file")
+            head = os.pread(fd, 2, 0)
         except BaseException:
             os.close(fd)
             raise
         self.path = path
         self.fd = fd
         self.identity = _identity(st)
+        #: Whether the file held is a script, read from the file held itself.
+        self.script = head == b"#!"
 
     def unchanged(self) -> bool:
         """Whether the file held is still as it was opened: nothing wrote to it since."""
@@ -957,11 +966,15 @@ class FreshContextRuntime:
 
     ``executable`` is its resolved host path, and ``identity`` the identity of
     the file the probe started (:class:`PinnedExecutable`), the same before it
-    answered and after: a launch starts that very file, through a descriptor
-    opened and checked against ``identity`` before its spawn, or is refused
+    answered and after, a native program and never a script (R6-F3 of PR
+    #513): a launch starts that very file, through a descriptor opened and
+    checked against ``identity`` before its spawn, or is refused
     (:meth:`AgentProvider.fresh_context_launch`), so an update or another
     ``PATH`` between the check and the launch voids nothing silently, and no
-    file put at the name after that last check is the one started.
+    file put at the name after that last check is the one started: on the
+    host the kernel loads the file from the descriptor, and inside the
+    sandbox ``bwrap`` mounts it at a path no name on the host leads to,
+    checks that it mounted the descriptor's file, and starts that path.
     """
 
     executable: str
@@ -1144,14 +1157,30 @@ class AgentProvider:
         The answer is bound to the file that gave it (R5-F1 of PR #513): the
         executable is opened before the probe (:class:`PinnedExecutable`)
         and the probe starts that open file, by its descriptor on the host
-        and as a read-only mount of it inside the sandbox, never by its name.
-        A file written to while it answered, or one the launch's ``PATH`` no
-        longer leads to once it has, is refused here, before the save; the
-        runtime carries the identity the probe's file had throughout.
+        and as a read-only mount of it inside the sandbox at a path of the
+        sandbox's own, never by its name. A file written to while it
+        answered, or one the launch's ``PATH`` no longer leads to once it
+        has, is refused here, before the save; the runtime carries the
+        identity the probe's file had throughout.
+
+        Refused before anything is run, too (R6-F3 of PR #513), what no
+        descriptor can bind through the program's start: a host that cannot
+        start a program from an open descriptor (no ``/proc/self/fd``:
+        macOS), and an executable that is a script (``#!``), whose
+        interpreter, not the kernel, opens it, by a path it may resolve back
+        to the file's name first (Node does), so a file put at that name in
+        between would run in its place.
         """
         probe = self.fresh_context_probe(profile)
         if probe is None:
             return None
+        unable = descriptor_start_problem()
+        if unable:
+            raise no_fresh_context(
+                profile,
+                f"{unable}, so no launch can be bound to the file whose runtime is checked",
+                "Run the phase on a host with /proc/self/fd (Linux)",
+            )
         command = list(probe.command)
         launch_env = {**self.launch_environment(env_allowlist), **env}
         try:
@@ -1166,6 +1195,16 @@ class AgentProvider:
             why = f"it cannot be opened ({exc.strerror or exc})"
             return self.fresh_context_runtime(profile, needs.executable, None, why)
         with pinned:
+            if pinned.script:
+                raise no_fresh_context(
+                    profile,
+                    f"{needs.executable} is a script (#!): the kernel hands it to its "
+                    "interpreter, which opens it itself, by a path it may resolve back to the "
+                    "file's name (Node does), so no descriptor binds what runs to the file "
+                    "whose answer is checked",
+                    "Install a Claude Code build whose executable is a native program (its "
+                    "native installer's), or route the phase to another provider",
+                )
             try:
                 description = None if sandbox is None else sandbox.describe(needs, launch_env)
                 result = self._runner(
@@ -1234,11 +1273,15 @@ class AgentProvider:
         ``env``'s ``PATH`` (the launch's, :meth:`started_environment`) as the
         spawn would resolve it must be that executable's path; it is opened
         (:class:`PinnedExecutable`) and must have the identity the probe's
-        file had, and the launch then starts that open file through the
-        descriptor yielded, named by its resolved path, so no file put at that
-        name after this check is the one started. Held open until the block
-        ends. A launch with no established runtime, another executable, or
-        one changed since it answered is refused (:func:`no_fresh_context`)
+        file had (so it is still the native program the probe ran, never a
+        script: R6-F3 of PR #513), and the launch then starts that open file
+        through the descriptor yielded, named by its resolved path, so no
+        file put at that name after this check is the one started: the
+        kernel loads it from the descriptor on the host, and inside the
+        sandbox ``bwrap`` starts it from a path of the sandbox's own
+        (:data:`~autoforge.sandbox_bwrap.PROGRAM_DIR`). Held open until the
+        block ends. A launch with no established runtime, another executable,
+        or one changed since it answered is refused (:func:`no_fresh_context`)
         before anything is spawned. Nothing is run.
         """
         if not req.fresh_context or self.fresh_context_probe(req.profile) is None:
@@ -1270,6 +1313,13 @@ class AgentProvider:
                 "Repeat the command once the CLI is no longer being updated",
             ) from None
         with pinned:
+            if pinned.script:
+                # A runtime the engine established never names one (R6-F3 of PR #513).
+                raise no_fresh_context(
+                    req.profile,
+                    f"{found} is a script (#!), which no descriptor binds through its start",
+                    remedy,
+                )
             if pinned.identity != runtime.identity:
                 raise no_fresh_context(
                     req.profile,

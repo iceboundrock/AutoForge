@@ -85,7 +85,9 @@ whether the write was applied or refused and why. Who may do what:
   record, and whatever supersedes applies everywhere the record it
   replaces did, and a render still shows an observation whose evidence
   establishes there what its replacement's does not (a launch's receipt
-  establishes no outcome, so it never hides a verified failure);
+  establishes no outcome, so it never hides a verified failure, and a
+  failure of another check, or of the same check under another policy,
+  never hides a failure of this one);
 - an agent adds proposals, and corrects, supersedes or retracts proposals
   only, never an observed record or the operator's: newer, unsupported text
   never replaces stronger evidence. Each of its writes names the launch it
@@ -172,7 +174,8 @@ characters and :data:`MAX_PROJECTION_TOKENS` tokens, held as UTF-8 bytes
 revision and digest it read, the digest of the evidence it was given, what
 it was rendered for, its bound and how many records it showed, omitted for
 the bound, found not applicable, retracted, superseded, withheld as
-withdrawn text and kept over a replacement with weaker evidence. The same
+withdrawn text and kept over a replacement whose evidence is weaker or of
+something else. The same
 store, evidence and request render the same bytes: the receipts the run
 keeps are an input as much as the revision is, since an evicted receipt
 changes how an observation shows. The header names the digests of the
@@ -2243,6 +2246,14 @@ class ValidationReceipt:
     #: The repository and the commit the record validated.
     repository: str
     commit: str
+    #: The check it ran, by its typed identity (R6-F2 of PR #513): its index in
+    #: ``validation.commands`` and the digest of its definition (argv and
+    #: scope), and the digest of the policy it ran under (ADR 0006 D8). A
+    #: failure of one check is no evidence of another, nor of the same check
+    #: under another policy.
+    index: int = 0
+    definition_digest: str = ""
+    policy_digest: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -2251,7 +2262,14 @@ class ValidationReceipt:
             "outcome": self.outcome,
             "repository": self.repository,
             "commit": self.commit,
+            "index": self.index,
+            "definition_digest": self.definition_digest,
+            "policy_digest": self.policy_digest,
         }
+
+    def check(self) -> Check:
+        """The check this receipt ran, under the policy it ran under."""
+        return Check(self.definition_digest, self.policy_digest)
 
 
 class Verdict(StrEnum):
@@ -2274,13 +2292,34 @@ class Verdict(StrEnum):
 
 
 @dataclass(frozen=True)
+class Check:
+    """A validation check by its typed identity, under the policy it ran under.
+
+    Two receipts are evidence of the same check only when both digests are
+    equal (R6-F2 of PR #513): the definition's (its argv and scope, ADR 0006
+    D8.1) and the policy's, which binds the execution's mode, template,
+    environment, timeout and materialization (D8.2), as
+    :func:`autoforge.evidence.applicable` compares them. A failure of
+    ``make lint`` says nothing of ``make test``, and one under another policy
+    nothing of the same command under this one.
+    """
+
+    definition_digest: str
+    policy_digest: str
+
+
+@dataclass(frozen=True)
 class Resolution:
-    """An observation's verdict for one launch, the commit its evidence is of, and
-    what that evidence establishes, in the controller's words from the receipt."""
+    """An observation's verdict for one launch, the commit its evidence is of, the
+    check it ran, and what that evidence establishes, in the controller's words
+    from the receipt."""
 
     verdict: Verdict
     #: The commit a validation receipt validated; ``""`` for a launch's receipt or none.
     commit: str = ""
+    #: The check a validation receipt ran (R6-F2 of PR #513); ``None`` for a
+    #: launch's receipt or none.
+    check: Check | None = None
     #: What the receipt establishes, derived from its typed fields alone and
     #: never from the record's text (R4-F3 of PR #513): the only part of an
     #: observation a render calls established. ``""`` when nothing is.
@@ -2298,16 +2337,22 @@ def _replaces(standing: Resolution | None, own: Resolution) -> bool:
     (R5-F3 of PR #513). An observation no receipt establishes
     (``unresolved``, a launch citation's always) has nothing a replacement
     must match. Otherwise the replacement must be a validation receipt's
-    too: one of this launch's candidate (``current``), or, for evidence of
-    another commit (``historical``), of that very commit. A record that is
-    no observation, one only a launch's receipt or nothing establishes, and
-    a validation of another commit establish none of it, so the observation
-    is kept: a newer record never hides a verified failure on the strength
-    of a receipt that records no outcome, issue or candidate.
+    too, of the same check under the same policy (:class:`Check`; R6-F2 of
+    PR #513), and of a commit that covers the observation's: this launch's
+    candidate (``current``), or, for evidence of another commit
+    (``historical``), that very commit. A record that is no observation,
+    one only a launch's receipt or nothing establishes, a validation of
+    another commit, and a validation of another check, or of the same check
+    under another policy, establish none of it, so the observation is kept:
+    a newer record never hides a verified failure on the strength of a
+    receipt that records no outcome, issue or candidate, nor on that of a
+    failure of something else.
     """
     if own.verdict is Verdict.UNRESOLVED:
         return True
     if standing is None or standing.verdict is Verdict.UNRESOLVED:
+        return False
+    if own.check is None or standing.check != own.check:
         return False
     if standing.verdict is Verdict.CURRENT:
         return True
@@ -2383,6 +2428,9 @@ class EvidenceIndex:
                 outcome=view.outcome.value,
                 repository=view.candidate.repository,
                 commit=view.candidate.commit,
+                index=view.index,
+                definition_digest=view.definition_digest,
+                policy_digest=view.policy_digest,
             )
         launches: set[tuple[str, str]] = set()
         for launch, digest in launch_receipts:
@@ -2489,9 +2537,12 @@ class EvidenceIndex:
         return Resolution(
             verdict,
             receipt.commit,
+            receipt.check(),
             established=(
                 f"validation record {receipt.seq} of {receipt.repository} recorded "
-                f"{receipt.outcome} for commit {receipt.commit}, {whose}"
+                f"{receipt.outcome} for commit {receipt.commit}, {whose}, running check "
+                f"[{receipt.index}] (definition {receipt.definition_digest[:16]}, policy "
+                f"{receipt.policy_digest[:16]})"
             ),
         )
 
@@ -2668,8 +2719,8 @@ def _header(
             f"- records: {counts['shown']} shown, {counts['omitted']} omitted for the bound, "
             f"{counts['not_applicable']} not applicable, {counts['retracted']} retracted, "
             f"{counts['superseded']} superseded, {counts['withdrawn']} withheld as withdrawn "
-            f"text, {counts['kept']} superseded but kept over a replacement with weaker "
-            "evidence here",
+            f"text, {counts['kept']} superseded but kept over a replacement whose evidence "
+            "does not establish theirs here",
             f"- freshness: rendered from the committed snapshot at revision {store.revision} "
             "and the evidence above; no index, nothing pending",
             "",
@@ -2764,10 +2815,11 @@ def render_projection(
 
     A superseded record is hidden behind what replaced it, unless it is an
     observation whose evidence establishes for this launch what the
-    evidence of what stands in its place does not (R3-F3, R5-F3 of PR #513;
-    :func:`_replaces`): only a validation receipt of this launch's
-    candidate, or of the very commit the observation's receipt validated,
-    replaces it. A replacement whose receipt is missing, of another commit,
+    evidence of what stands in its place does not (R3-F3, R5-F3, R6-F2 of PR
+    #513; :func:`_replaces`): only a validation receipt of the same check
+    under the same policy, of this launch's candidate or of the very commit
+    the observation's receipt validated, replaces it. A replacement whose
+    receipt is missing, of another commit, of another check or policy,
     retracted since or withheld here, one that is no observation, and one
     citing a launch, whose receipt records no outcome, issue or candidate
     even when the run keeps it, never hides an observation a kept receipt

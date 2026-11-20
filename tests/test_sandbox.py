@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import ctypes
+import dataclasses
 import errno
 import json
 import os
@@ -44,6 +45,7 @@ from autoforge.sandbox import (
     TEARDOWN_UNCOUNTED,
     Access,
     Bind,
+    Dir,
     LaunchDescription,
     Link,
     Mask,
@@ -1760,11 +1762,13 @@ def test_the_options_travel_in_a_descriptor(
 def test_a_program_held_by_its_descriptor_is_mounted_from_it_and_handed_to_bwrap_alone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """R5-F1 of PR #513: a launch whose program the controller holds open names it by
-    its absolute path, and bwrap mounts the descriptor's file read-only there, after
-    every mount of the description (so it shows over them) and before the masks turn
-    read-only. The descriptor goes to bwrap with its own two, stays the caller's, and
-    a launch without one has no such option."""
+    """R5-F1, R6-F3 of PR #513: a launch whose program the controller holds open names
+    it by its absolute path, and bwrap mounts the descriptor's file read-only under a
+    directory of the sandbox's own root (``PROGRAM_DIR``), which no name on the host
+    leads to, after every mount of the description and before the masks turn
+    read-only, and starts it from there in the program's place, its arguments
+    unchanged. The descriptor goes to bwrap with its own two, stays the caller's, and
+    a launch without one has no such option and starts its command as given."""
     _needs_memfd()
     monkeypatch.setattr(sandbox_bwrap, "_ProcessScope", _NoScope)
     b = _base(tmp_path)
@@ -1772,11 +1776,13 @@ def test_a_program_held_by_its_descriptor_is_mounted_from_it_and_handed_to_bwrap
         tmp_path, projections=(P(_dir(b / "ro")),), masks=(_dir(b / "ro" / "masked"),)
     )
     program = "/opt/claude/bin/claude"
+    inside = sandbox_bwrap.program_path(program)
+    assert inside == f"{sandbox_bwrap.PROGRAM_DIR}/claude" == "/.autoforge-program/claude"
     opts = sandbox_bwrap._options(
-        description, _FULL, status_fd=9, cwd=None, env={}, program=(7, program)
+        description, _FULL, status_fd=9, cwd=None, env={}, program=(7, inside)
     )
     at = opts.index("--ro-bind-fd")
-    assert opts[at : at + 3] == ["--ro-bind-fd", "7", program]
+    assert opts[at : at + 3] == ["--ro-bind-fd", "7", inside]
     mounts = {"--ro-bind", "--bind", "--tmpfs", "--dir", "--symlink", "--overlay"}
     assert max(i for i, opt in enumerate(opts) if opt in mounts) < at
     assert min(i for i, opt in enumerate(opts) if opt == "--remount-ro") > at
@@ -1784,42 +1790,64 @@ def test_a_program_held_by_its_descriptor_is_mounted_from_it_and_handed_to_bwrap
     held = os.open("/bin/true", os.O_RDONLY | os.O_CLOEXEC)
     try:
         launch = sandbox_bwrap.BwrapLaunch(
-            description, _FULL, "/usr/bin/bwrap", [program], cwd=None, env={}, executable_fd=held
+            description,
+            _FULL,
+            "/usr/bin/bwrap",
+            [program, "-p", "x"],
+            cwd=None,
+            env={},
+            executable_fd=held,
         )
         try:
             args_fd, status_fd, handed = launch.pass_fds
             assert handed == held
+            assert launch.argv[-4:] == ["--", inside, "-p", "x"]
             with open(f"/proc/self/fd/{args_fd}", "rb") as fh:
                 options = fh.read().split(b"\0")
             assert options[options.index(b"--ro-bind-fd") + 1 :][:2] == [
                 str(held).encode(),
-                program.encode(),
+                inside.encode(),
             ]
+            assert program.encode() not in options
             launch.spawned()
         finally:
             launch.close()
         os.fstat(held)  # the caller's still: bwrap's copy is the one it closes
     finally:
         os.close(held)
+    plain = sandbox_bwrap.BwrapLaunch(
+        description, _FULL, "/usr/bin/bwrap", [program, "-p"], cwd=None, env={}
+    )
+    try:
+        assert plain.argv[-3:] == ["--", program, "-p"]
+    finally:
+        plain.close()
 
 
 @_linux_only
 def test_a_bwrap_that_cannot_mount_a_held_program_refuses_the_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_spawn: None
 ) -> None:
-    """R5-F1 of PR #513: a launch bound to the program it checked is never started by
-    its name instead. A bwrap without ``--ro-bind-fd``, or a program not named by an
-    absolute path, refuses it before anything is spawned."""
+    """R5-F1, R6-F3 of PR #513: a launch bound to the program it checked is never
+    started by its name instead. A bwrap without ``--ro-bind-fd``, a program not named
+    by an absolute path, and a description that mounts anything at, inside or around
+    the directory the program would be shown in, refuse it before anything is
+    spawned."""
     _needs_memfd()
     description = _description(tmp_path)
     monkeypatch.setattr(sandbox_bwrap.shutil, "which", lambda name: "/usr/bin/bwrap")
     for info, command, needle in (
         (_BARE, ["/opt/claude"], "cannot mount a launch's program from the descriptor"),
         (_FULL, ["claude"], "names it by an absolute path"),
+        (_FULL, ["/"], "names it by an absolute path"),
     ):
         monkeypatch.setattr(sandbox_bwrap, "_backend_info", lambda path, info=info: info)
         with pytest.raises(SandboxLaunchRefusedError, match=needle):
             sandbox_bwrap.prepare(description, command, cwd=None, env={}, executable_fd=0)
+    for target in (sandbox_bwrap.PROGRAM_DIR, f"{sandbox_bwrap.PROGRAM_DIR}/claude"):
+        clashing = dataclasses.replace(description, mounts=(*description.mounts, Dir(target)))
+        with pytest.raises(SandboxLaunchRefusedError, match="where a launch bound to its"):
+            sandbox_bwrap.prepare(clashing, ["/opt/claude"], cwd=None, env={}, executable_fd=0)
 
 
 # ------------------------------------------- the capability probe, typed (#169)

@@ -2480,15 +2480,19 @@ run keeps when it is rendered: a validation failure shows as observed for
 a launch on the commit its `ValidationRecord` validated, as that commit's
 evidence for a launch on another one, and downgraded once no kept record of
 this run establishes it. What it calls established is a line read from the
-record's typed fields (its number, outcome and commit), never the
+record's typed fields (its number, outcome and commit, and the check it ran:
+its index, and the digests of its definition and policy), never the
 observation's text, which is shown as the controller's unverified account:
 a text that contradicts its receipt is never certified by it. An
 observation citing a launch is always shown downgraded: a launch's receipt
 records no outcome, issue or candidate, so even one the run keeps
 establishes nothing the record says. A superseded failure stays shown
-unless what replaced it has a validation receipt of the launch's candidate,
-or of the commit the failure was evidence of: a record citing a launch, or
-another commit's failure, never hides it. A launch
+unless what replaced it has a validation receipt of the same check, by the
+digest of its definition (its argv and scope), under the same policy (the
+same policy digest), and of the launch's candidate or of the commit the
+failure was evidence of: a record citing a launch, another commit's
+failure, and a failure of another check (`make lint` replacing a failure of
+`make test`) or of the same check under another policy never hide it. A launch
 with no candidate yet is shown no record bound to one. A projection is
 reproducible from the store's revision, the request and the evidence
 together. Its header names the digests of the store and of the evidence,

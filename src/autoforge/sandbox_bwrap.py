@@ -96,6 +96,13 @@ from .sandbox import (
 
 BACKEND = "bubblewrap"
 EXECUTABLE = "bwrap"
+#: Where a launch bound to its program finds that program inside (R6-F3 of PR
+#: #513): a directory bwrap makes on the sandbox's own root, which no description
+#: mounts and no name on the host leads to. The held file is mounted there, under
+#: its own name, and started from there, so no process outside can put another
+#: file at that path or take the mount away by renaming over the program's name on
+#: the host, as it could at the name a host directory's bind shows.
+PROGRAM_DIR = "/.autoforge-program"
 
 # Landlock (linux/landlock.h). The syscall numbers are the same on every
 # architecture that has the generic table, which is every one Linux added
@@ -403,11 +410,14 @@ def _options(
     """The ``bwrap`` options for ``description``, in order.
 
     ``program`` is ``(descriptor, path)``: the descriptor's file is mounted
-    read-only at ``path`` over whatever the description's mounts show there,
-    so the command started by that path inside is that file. ``bwrap``
-    closes the descriptor once mounted, so the command never holds it, and
-    no file put at ``path`` on the host since changes what runs (R5-F1 of PR
-    #513).
+    read-only at ``path``, under :data:`PROGRAM_DIR`, so the command started
+    by that path inside is that file. ``bwrap`` finds the file through the
+    descriptor's name, mounts it, checks that what it mounted is the
+    descriptor's file (its device and inode) and fails the setup otherwise,
+    then closes the descriptor, so the command never holds it. No name on
+    the host leads to ``path``, so no file put at the program's name on the
+    host since, before the mount or after it, changes what runs (R5-F1,
+    R6-F3 of PR #513).
     """
     opts = ["--unshare-user", "--unshare-pid", "--unshare-ipc"]
     if description.network is NetworkPosition.ISOLATED:
@@ -507,6 +517,12 @@ class BwrapLaunch:
         self._scope = _ProcessScope()
         self._status_r, self._status_w = os.pipe()
         self._args_fd = -1
+        # The program a launch bound to it starts: its descriptor's file, shown
+        # at a path of the sandbox's own (R6-F3 of PR #513).
+        program = None if executable_fd is None or not command else program_path(command[0])
+        if executable_fd is not None and not program:
+            self.close()
+            raise _refused("a launch bound to its program names it by an absolute path")
         try:
             options = _options(
                 description,
@@ -514,7 +530,7 @@ class BwrapLaunch:
                 status_fd=self._status_w,
                 cwd=cwd,
                 env=_environment(description, env),
-                program=None if executable_fd is None else (executable_fd, command[0]),
+                program=None if executable_fd is None or not program else (executable_fd, program),
             )
             data = b"".join(os.fsencode(option) + b"\0" for option in options)
             self._args_fd = _options_file()
@@ -525,7 +541,8 @@ class BwrapLaunch:
         except BaseException:
             self.close()
             raise
-        self.argv = [executable, "--args", str(self._args_fd), "--", *command]
+        started = command if program is None else [program, *command[1:]]
+        self.argv = [executable, "--args", str(self._args_fd), "--", *started]
         # ``bwrap``'s own environment: nothing; the command's is in the options.
         self.spawn_env: dict[str, str] = {}
         # The program's descriptor is the caller's: bwrap mounts it and closes
@@ -652,6 +669,13 @@ def _setup_reason(stderr: str, returncode: int) -> str:
     return text
 
 
+def program_path(executable: str) -> str:
+    """Where a launch bound to ``executable`` finds it inside: its name under
+    :data:`PROGRAM_DIR`; ``""`` for a path that names no file."""
+    name = executable.rstrip("/").rpartition("/")[2] if executable.startswith("/") else ""
+    return "" if name in ("", ".", "..") else f"{PROGRAM_DIR}/{name}"
+
+
 def prepare(
     description: LaunchDescription,
     command: list[str],
@@ -665,9 +689,12 @@ def prepare(
     ``env`` is the environment the executor selected for the command; the
     description's overrides are applied over it and ``bwrap`` hands exactly
     that to the command. With ``executable_fd`` the file it holds is what
-    ``command[0]``, an absolute path, names inside (``--ro-bind-fd``; R5-F1
-    of PR #513); a ``bwrap`` without that option, or a relative
-    ``command[0]``, is refused. Nothing is spawned except ``bwrap --version`` and
+    the command starts inside, in ``command[0]``'s place: mounted read-only
+    at :func:`program_path` of ``command[0]``, an absolute path, and checked
+    by ``bwrap`` to be the descriptor's file (``--ro-bind-fd``; R5-F1, R6-F3
+    of PR #513). A ``bwrap`` without that option, a relative ``command[0]``,
+    and a description that mounts anything at or around :data:`PROGRAM_DIR`
+    are refused. Nothing is spawned except ``bwrap --version`` and
     ``bwrap --help``, once per binary per controller process, and not even
     those on a Python that cannot hand ``bwrap`` its options (:func:`_no_memfd`).
     """
@@ -688,8 +715,19 @@ def prepare(
                 f"{executable} {info.version} cannot mount a launch's program from the "
                 "descriptor it was checked through (--ro-bind-fd)"
             )
-        if not command or not command[0].startswith("/"):
+        if not command or not command[0].startswith("/") or not program_path(command[0]):
             raise _refused("a launch bound to its program names it by an absolute path")
+        for mount in description.mounts:
+            target = mount.target.rstrip("/") or "/"
+            if (
+                target == PROGRAM_DIR
+                or target.startswith(PROGRAM_DIR + "/")
+                or PROGRAM_DIR.startswith(target.rstrip("/") + "/")
+            ):
+                raise _refused(
+                    f"the description mounts {target}, where a launch bound to its program "
+                    f"is shown it ({PROGRAM_DIR})"
+                )
     return BwrapLaunch(
         description, info, executable, command, cwd=cwd, env=env, executable_fd=executable_fd
     )

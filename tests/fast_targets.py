@@ -220,6 +220,7 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/fast_targets.py": (),
     "tests/stop_corpus.py": (),
     "tests/live_pi.py": (),
+    "tests/native_program.py": (),  # the native stand-in a fresh context needs (#317)
     "tests/operator_comment_fidelity.py": (),
     "tests/parallel_bench.py": ("test_suite_performance_audit",),  # via suite_comparison
     "tests/pi_fake.py": (),

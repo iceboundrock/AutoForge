@@ -3212,10 +3212,14 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   that evidence after it; a superseded observation kept while its evidence
   establishes for the launch what its replacement's does not (a launch
   citation, with its receipt missing or kept, another commit's failure, on
-  a launch of a third commit or of none too, a retracted replacement),
-  hidden behind a validation receipt of the launch's candidate or of the
-  same commit, or a chain's end that has one, after a save and a load and
-  once its own receipt is lost; a launch citation never observed, whatever
+  a launch of a third commit or of none too, a retracted replacement, a
+  failure of another check, `make lint` over `make test`, on C1, on no
+  candidate and on C2, and of the same check under another policy: R6-F2),
+  hidden behind a validation receipt of the same check and policy, of the
+  launch's candidate or of the same commit, or a chain's end that has one,
+  after a save and a load and once its own receipt is lost; the
+  'established' line naming the check (its index and the digests of its
+  definition and policy); a launch citation never observed, whatever
   the run keeps (missing, mismatched and retained receipts), its
   'established' line naming a retained receipt and no outcome (R5-F3); a
   validation citation observed only with a real, failing
@@ -3248,31 +3252,43 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   configuration's `env` sets that variable, and every other launch's
   environment is as before (`tests/test_providers.py`); the profile's own
   `claude --version` passes for the checked build 2.1.328 only and refuses
-  an older or later build, a pre-release, an unreadable, failing, silent or
-  sandbox-refused probe and a missing executable, unquoted; it runs through
-  the adapter's runner with the launch's allow-list and environment, in a
-  scratch directory, inside the probe's sandbox when the launch would be
-  enforced; a launch starts only the executable it established, unchanged,
-  in both output formats, and runs no probe itself; the probe is started
-  from the file held open and refused when another file is renamed over its
-  name, or put there with the old one moved aside, or the file is written,
-  before the stand-in runner returns (the reviewer's case of R5-F1), and
-  through the real executor the held file is what answers; a launch whose
+  an older or later build, a pre-release, an unreadable or failing answer,
+  decided from the answer on every host, and through the real executor
+  where a program can be started from its descriptor; a silent or
+  sandbox-refused probe and a missing executable are refused, unquoted; it
+  runs through the adapter's runner with the launch's allow-list and
+  environment, in a scratch directory, inside the probe's sandbox when the
+  launch would be enforced; a host without `/proc/self/fd` (simulated
+  away on Linux) and an executable that is a script (`#!/bin/sh`,
+  `#!/usr/bin/env node`), on the host or enforced, are refused before
+  anything is run or described (R6-F1, R6-F3); a launch starts only the
+  executable it established, unchanged and never a script, in both output
+  formats, and runs no probe itself; the probe is started from the file
+  held open and refused when another file is renamed over its name, or put
+  there with the old one moved aside, or the file is written, before the
+  stand-in runner returns (the reviewer's case of R5-F1), and through the
+  real executor the held file is what answers; a launch whose native
   executable is replaced after its last check starts the checked file, in
-  both output formats (`tests/test_providers.py`); the executor starts a
-  held program, a script or a binary, whatever its name holds, one-shot and
-  duplex, and a host without `/proc/self/fd` starts nothing
-  (`tests/test_executor.py`); bwrap mounts it read-only from its descriptor
-  after the description's mounts and refuses a launch where it cannot
-  (`tests/test_sandbox.py`), and with the real backend a held program moved
-  aside is the one started inside, the descriptor never reaching the
-  command, one renamed over is a setup refusal with nothing started, and
-  the Claude adapter's probe and launch, both enforced, start the file that
-  answered in both output formats (`tests/test_sandbox_bwrap.py`); only a launch that
-  needs a fresh context is probed, and the engine asks before the
-  launch-intent save, in both output formats, so a refusal spends no
-  launch ordinal and writes nothing, an executable replaced while it
-  answers included, and the launch is then started from a descriptor of
+  both output formats (`tests/test_providers.py`, with the native stand-in
+  of `tests/native_program.py`); the executor starts a held program, a
+  script or a binary, whatever its name holds, one-shot and duplex, and a
+  host without `/proc/self/fd` starts nothing (`tests/test_executor.py`);
+  bwrap mounts it read-only from its descriptor under `/.autoforge-program`
+  after the description's mounts, starts it from there with its arguments,
+  and refuses a launch where it cannot, a description mounting anything
+  there included (`tests/test_sandbox.py`); with the real backend a held
+  program moved aside is the one started inside, from a path of the
+  sandbox's own, the descriptor never reaching the command, one renamed
+  over is a setup refusal with nothing started, one whose name is renamed
+  over on the host while it runs still reads itself at its own path (the
+  name inside shows the new file), and the Claude adapter's probe and
+  launch, both enforced, start the native file that answered in both
+  output formats (`tests/test_sandbox_bwrap.py`); only a launch that needs
+  a fresh context is probed, and the engine asks before the launch-intent
+  save, in both output formats, so a refusal spends no launch ordinal and
+  writes nothing, an executable replaced while it answers, a script and a
+  host without `/proc/self/fd` included, and the launch is then started
+  from a descriptor of
   the file that answered (`tests/test_memory.py`);
 - no module that decides imports Memory, and the engine touches it only in
   the run-configuration record and check; a run with Memory on and a seed

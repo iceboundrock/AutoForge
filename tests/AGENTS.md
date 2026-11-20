@@ -175,6 +175,14 @@ read it before adding tests for a listed area.
   and permission host, sleeps, a detached process, an exception, a flood),
   and what it was given and what its callbacks answered is logged in the
   working directory (`log`).
+- `tests/native_program.py` writes a native stand-in (#317, R6-F3 of PR
+  #513): a small C program, compiled once per test process with the host's
+  C compiler, whose copy at a path `exec`s the script named when the copy
+  was written. A launch that needs a fresh context refuses a script, whose
+  interpreter opens it again by name, so its tests that run the real
+  executor start such a stand-in. Linux only; a host without a C compiler
+  skips them (`needs_native_program`), and a stand-in runner answering for
+  a native-shaped file covers the decisions everywhere.
 - `tests/credential_fake.py` holds a fake `claude`, `opencode` and `pi`
   for the container credential mapping (#290): standalone scripts, run by
   the `#!` line with no shell in between, that find their model credential

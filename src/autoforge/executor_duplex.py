@@ -231,7 +231,8 @@ class DuplexRequest:
     # threads then send, read and finish.
     sandbox: LaunchDescription | None = None
     # As :attr:`autoforge.executor.ExecutionRequest.executable_fd`: the program
-    # the child starts, whatever ``command[0]`` names by then (R5-F1 of PR #513).
+    # the child starts, whatever ``command[0]`` names by then (R5-F1, R6-F3 of
+    # PR #513).
     executable_fd: int | None = None
 
 

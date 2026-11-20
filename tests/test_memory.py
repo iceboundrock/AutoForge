@@ -106,12 +106,23 @@ def _launch(seq: int = 1, run: str = RUN) -> AttemptRef:
     return AttemptRef(run, seq)
 
 
+#: The checks of :func:`_receipt`: ``validation.commands``' index and argv.
+TEST, LINT = (0, ("make", "test")), (1, ("make", "lint"))
+
+
 @functools.cache
-def _receipt(seq: int, exit_code: int = 1, commit: str = C1, run: str = RUN) -> dict:
+def _receipt(
+    seq: int,
+    exit_code: int = 1,
+    commit: str = C1,
+    run: str = RUN,
+    check: tuple[int, tuple[str, ...]] = TEST,
+    timeout: int = 600,
+) -> dict:
     """A real ValidationRecord of owner/repo (the issue's repository), as the
     controller writes one (``observed_record``, which its loader checks): by default a
-    failure (exit 1) of candidate C1, in this run's log. Shared: copy it before
-    changing it."""
+    failure (exit 1) of candidate C1 running ``make test`` under a 600-second policy,
+    in this run's log. Shared: copy it before changing it."""
     from autoforge.evidence import (
         NO_SANDBOX_TEMPLATE,
         Definition,
@@ -132,17 +143,17 @@ def _receipt(seq: int, exit_code: int = 1, commit: str = C1, run: str = RUN) -> 
             tree="b" * 40,
             provenance=WorktreeProvenance(2, "2", True),
         ),
-        definition=Definition(0, ("make", "test")),
+        definition=Definition(check[0], check[1]),
         policy=Policy(
             mode="disabled",
             template=NO_SANDBOX_TEMPLATE,
             env_names=("HOME", "PATH"),
-            timeout_seconds=600,
+            timeout_seconds=timeout,
             contain_orphans=True,
             method=METHOD,
         ),
         result=ExecutionResult(
-            command=["make", "test"],
+            command=list(check[1]),
             cwd="/tmp/x",
             exit_code=exit_code,
             stdout="",
@@ -154,11 +165,19 @@ def _receipt(seq: int, exit_code: int = 1, commit: str = C1, run: str = RUN) -> 
     )
 
 
-def _vr(seq: int, exit_code: int = 1, commit: str = C1) -> Citation:
+def _vr(seq: int, exit_code: int = 1, commit: str = C1, **check) -> Citation:
     """A citation of :func:`_receipt`'s record, by its seq and its own digest."""
-    return Citation(
-        CitationKind.VALIDATION_RECORD, str(seq), _receipt(seq, exit_code, commit)["digest"]
-    )
+    receipt = _receipt(seq, exit_code, commit, **check)
+    return Citation(CitationKind.VALIDATION_RECORD, str(seq), receipt["digest"])
+
+
+def _check_line(seq: int, **check) -> str:
+    """How an established line names the check :func:`_receipt`'s record ran."""
+    receipt = _receipt(seq, **check)
+    definition = receipt["definition"]["definition_digest"][:16]
+    policy = receipt["policy"]["policy_digest"][:16]
+    index = receipt["definition"]["index"]
+    return f"running check [{index}] (definition {definition}, policy {policy})"
 
 
 def _store(run: str = RUN) -> MemoryStore:
@@ -1752,9 +1771,10 @@ def test_a_replacement_without_adequate_evidence_never_hides_a_verified_observat
                     f"- superseded by M{replacement}, whose evidence does not establish what "
                     "this record's does for this launch: kept for its own"
                 ) in _block_of(projection, failure)
-                assert "1 superseded but kept over a replacement with weaker evidence" in (
-                    projection.text
-                )
+                assert (
+                    "1 superseded but kept over a replacement whose evidence does not "
+                    "establish theirs here"
+                ) in projection.text
     lost = _render(store, _evidence(launches=launch_kept), candidate=C1)  # failure evicted
     assert lost.shown == (replacement,) and lost.superseded == 1 and lost.downgraded == 1
 
@@ -1852,6 +1872,68 @@ def test_retracting_a_link_of_a_chain_keeps_its_surviving_end_in_its_place():
     assert (projection.retracted, projection.superseded) == (1, 1)
 
 
+def test_a_failure_of_another_check_never_hides_a_failure_of_this_one():
+    """R6-F2 of PR #513, the reviewer's case: two valid failing receipts of C1, one of
+    ``make test`` and one of ``make lint``, both kept. The lint failure's observation
+    superseding the test failure's hides nothing: both show, each established line
+    naming its own check, after a save and a load, on C1 and on a launch with no
+    candidate, and on C2 beside a C2 failure of lint. A failure of the same check
+    under another policy (another timeout) hides nothing either. A genuine
+    replacement, a newer failure of the same check under the same policy, of C1 or of
+    the launch's own candidate, still hides it."""
+    controller = {"actor": Actor.CONTROLLER, "issue_url": ISSUE, "attempt": _launch(4)}
+    store, tests = _applied(observe(_store(), "make test fails on C1", seq=1))
+    store, lint = _applied(observe(store, "make lint fails", seq=2, cite=_vr(2, check=LINT)))
+    store, _ = _applied(store.supersede(tests, lint, **controller))
+    held = _evidence(1, _receipt(2, check=LINT))
+    assert {r.definition_digest for r in held.validation} == {
+        _receipt(1)["definition"]["definition_digest"],
+        _receipt(2, check=LINT)["definition"]["definition_digest"],
+    }
+    for current in (store, _reloaded(store)):
+        for candidate in (C1, ""):
+            projection = _render(current, held, candidate=candidate)
+            assert sorted(projection.shown) == [tests, lint], candidate
+            assert projection.kept_over_replacement == 1 and projection.superseded == 0
+            assert _check_line(1) in _block_of(projection, tests)
+            assert _check_line(2, check=LINT) in _block_of(projection, lint)
+            assert (
+                f"- superseded by M{lint}, whose evidence does not establish what this "
+                "record's does for this launch: kept for its own"
+            ) in _block_of(projection, tests)
+    # On C2, a C2 failure of lint establishes nothing of C1's failure of make test.
+    on_c2, of_c2 = _applied(observe(_store(), "make test fails on C1", seq=1))
+    on_c2, lint_c2 = _applied(
+        observe(on_c2, "make lint fails on C2", seq=3, cite=_vr(3, commit=C2, check=LINT))
+    )
+    on_c2, _ = _applied(on_c2.supersede(of_c2, lint_c2, **controller))
+    projection = _render(
+        _reloaded(on_c2), _evidence(1, _receipt(3, commit=C2, check=LINT)), candidate=C2
+    )
+    assert sorted(projection.shown) == [of_c2, lint_c2] and _historical(projection, of_c2)
+    # The same check under another policy: kept as well.
+    slower, first = _applied(observe(_store(), "make test fails on C1", seq=1))
+    slower, other = _applied(
+        observe(slower, "make test fails on C1, slowly", seq=2, cite=_vr(2, timeout=900))
+    )
+    slower, _ = _applied(slower.supersede(first, other, **controller))
+    projection = _render(_reloaded(slower), _evidence(1, _receipt(2, timeout=900)), candidate=C1)
+    assert sorted(projection.shown) == [first, other] and projection.kept_over_replacement == 1
+    # A genuine replacement: a newer failure of make test under the same policy, of
+    # C1 (on every launch) or of the launch's own candidate C2.
+    same, older = _applied(observe(_store(), "make test fails on C1", seq=1))
+    same, newer = _applied(observe(same, "make test fails on C1: KeyError", seq=2))
+    same, _ = _applied(same.supersede(older, newer, **controller))
+    for candidate in (C1, ""):
+        projection = _render(_reloaded(same), _evidence(1, 2), candidate=candidate)
+        assert projection.shown == (newer,) and projection.superseded == 1
+    moved, c1 = _applied(observe(_store(), "make test fails on C1", seq=1))
+    moved, c2 = _applied(observe(moved, "make test fails on C2", seq=2, cite=_vr(2, commit=C2)))
+    moved, _ = _applied(moved.supersede(c1, c2, **controller))
+    projection = _render(_reloaded(moved), _evidence(1, _receipt(2, commit=C2)), candidate=C2)
+    assert projection.shown == (c2,) and projection.superseded == 1
+
+
 # -- what is established is the receipt's, never the text (R4-F3 of PR #513) -----------------
 
 
@@ -1867,7 +1949,7 @@ def test_a_receipt_establishes_what_it_records_and_never_a_text_that_contradicts
     claim = "validation passed on C1"
     established = (
         f"- established: validation record 1 of owner/repo recorded FAIL for commit {C1}, "
-        "this launch's candidate"
+        f"this launch's candidate, {_check_line(1)}"
     )
     added, m1 = _applied(observe(_store(), claim, seq=1, applies=on_c1))
     corrected, m2 = _applied(observe(_store(), "test_a fails on C1", seq=1, applies=on_c1))
@@ -2714,6 +2796,20 @@ def test_a_runtime_that_cannot_honour_a_fresh_context_refuses_before_the_launch_
     assert len(asked) == 3
 
 
+#: Whether this host can start a program from its descriptor (Linux's /proc/self/fd),
+#: which a fresh context's launch needs (R6-F1, R6-F3 of PR #513).
+DESCRIPTORS = os.path.isdir("/proc/self/fd")
+
+
+def _native_shaped(path: Path, filler: bytes = b"\0") -> Path:
+    """A file a fresh context takes for a native program (no ``#!``), never run here: a
+    stand-in runner answers for it (R6-F3 of PR #513)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\x7fELF" + filler * 60)
+    path.chmod(0o755)
+    return path
+
+
 @pytest.mark.parametrize("output_format", ["stream-json", "text"])
 def test_a_claude_launch_of_a_memory_phase_starts_the_build_established_before_its_save(
     tmp_path, monkeypatch, output_format
@@ -2724,7 +2820,9 @@ def test_a_claude_launch_of_a_memory_phase_starts_the_build_established_before_i
     auto memory variable; an unchecked build is refused with the state as it was, and
     a checked one is saved as the launch's intent and then started, that very
     executable with its auto memory off. With Memory off nothing is asked and the
-    launch starts its command as before."""
+    launch starts its command as before. On a host that cannot start a program from
+    its descriptor (R6-F1 of PR #513), Memory on is refused before the save with
+    nothing asked, and Memory off launches as before."""
     from autoforge import providers
     from autoforge.executor import ExecutionResult
     from autoforge.providers import ClaudeCodeProvider
@@ -2733,10 +2831,7 @@ def test_a_claude_launch_of_a_memory_phase_starts_the_build_established_before_i
     class Launched(Exception):
         pass
 
-    command = tmp_path / "bin" / "claude"
-    command.parent.mkdir()
-    command.write_text("#!/bin/sh\nexit 0\n")
-    command.chmod(0o755)
+    command = _native_shaped(tmp_path / "bin" / "claude")
     for memory in (True, False):
         calls: list[tuple] = []
         version = ["2.1.329 (Claude Code)"]
@@ -2766,6 +2861,12 @@ def test_a_claude_launch_of_a_memory_phase_starts_the_build_established_before_i
         eng._save()
         assert eng.step().next_phase == "ANALYZE_EXECUTE"
         before = eng.paths.state_file.read_bytes()
+        if memory and not DESCRIPTORS:
+            with pytest.raises(ConfigurationError, match="cannot start a program from an open"):
+                eng.step()
+            assert eng.paths.state_file.read_bytes() == before
+            assert load_state(eng.paths.state_file).launch_seq == 0 and calls == []
+            continue
         if memory:
             with pytest.raises(ConfigurationError, match="reports 2.1.329, and only 2.1.328"):
                 eng.step()
@@ -2793,6 +2894,7 @@ def test_a_claude_launch_of_a_memory_phase_starts_the_build_established_before_i
             assert "CLAUDE_CODE_DISABLE_AUTO_MEMORY" not in (launch.env or {})
 
 
+@pytest.mark.skipif(not DESCRIPTORS, reason="no /proc/self/fd: no runtime is established here")
 @pytest.mark.parametrize("output_format", ["stream-json", "text"])
 def test_a_claude_executable_replaced_while_it_answers_is_refused_before_the_intent_save(
     tmp_path, monkeypatch, output_format
@@ -2810,10 +2912,7 @@ def test_a_claude_executable_replaced_while_it_answers_is_refused_before_the_int
     class Launched(Exception):
         pass
 
-    command = tmp_path / "bin" / "claude"
-    command.parent.mkdir()
-    command.write_text("#!/bin/sh\nexit 0\n")
-    command.chmod(0o755)
+    command = _native_shaped(tmp_path / "bin" / "claude")
     calls: list[tuple] = []
     replace = [True]
 
@@ -2822,10 +2921,7 @@ def test_a_claude_executable_replaced_while_it_answers_is_refused_before_the_int
         if req.command[1:] == ["--version"]:
             calls.append(("probe", (held.st_dev, held.st_ino)))
             if replace[0]:
-                new = command.with_name("claude.new")
-                new.write_text("#!/bin/sh\necho 2.1.329\n")
-                new.chmod(0o755)
-                os.replace(new, command)
+                os.replace(_native_shaped(command.with_name("claude.new"), b"\1"), command)
             return ExecutionResult(req.command, req.cwd, 0, "2.1.328 (Claude Code)\n", "", "", "")
         calls.append(("launch", (held.st_dev, held.st_ino), list(req.command)))
         raise Launched
@@ -2861,6 +2957,66 @@ def test_a_claude_executable_replaced_while_it_answers_is_refused_before_the_int
     now = os.stat(command)
     assert kind == "launch" and started == answered == (now.st_dev, now.st_ino)
     assert argv[0] == os.path.realpath(command)
+
+
+@pytest.mark.skipif(not DESCRIPTORS, reason="no /proc/self/fd: refused before any script check")
+@pytest.mark.parametrize("output_format", ["stream-json", "text"])
+def test_a_claude_executable_that_is_a_script_is_refused_before_the_intent_save(
+    tmp_path, monkeypatch, output_format
+):
+    """R6-F3 of PR #513, through the engine and the real Claude adapter in both output
+    formats: a script's interpreter, not the kernel, opens it, by a path it may resolve
+    back to the file's name (Node does), so no descriptor binds what would run. With
+    Memory on it is refused before the launch-intent save: the state as it was, no
+    launch ordinal spent, nothing asked of it and nothing launched. With Memory off it
+    launches as before, by its name."""
+    from autoforge import providers
+    from autoforge.executor import ExecutionResult
+    from autoforge.providers import ClaudeCodeProvider
+    from tests.conftest import FakeGitHub
+
+    class Launched(Exception):
+        pass
+
+    command = tmp_path / "bin" / "claude"
+    command.parent.mkdir()
+    command.write_text("#!/usr/bin/env node\nconsole.log('2.1.328 (Claude Code)')\n")
+    command.chmod(0o755)
+    for memory in (True, False):
+        calls: list = []
+
+        def runner(req, calls=calls):
+            calls.append(list(req.command))
+            if req.command[1:] == ["--version"]:
+                return ExecutionResult(req.command, req.cwd, 0, "2.1.328\n", "", "", "")
+            raise Launched
+
+        monkeypatch.setattr(providers, "start_duplex", lambda req, runner=runner: runner(req))
+        eng = make_engine(tmp_path / str(memory) / ".autoforge", "never", github=FakeGitHub())
+        eng.providers._overrides["claude"] = ClaudeCodeProvider(runner=runner)
+        profile = dataclasses.replace(eng.config.profile("analyze_execute"), command=str(command))
+        if output_format == "text":
+            profile = dataclasses.replace(
+                profile,
+                options={**profile.options, "output_format": "text"},
+                max_runtime_seconds=600,
+            )
+        eng.config.profiles["analyze_execute"] = profile
+        eng.config.memory.enabled = memory
+        eng.record_run_configuration()
+        eng._save()
+        assert eng.step().next_phase == "ANALYZE_EXECUTE"
+        before = eng.paths.state_file.read_bytes()
+        if memory:
+            with pytest.raises(ConfigurationError, match=r"is a script \(#!\)"):
+                eng.step()
+            assert eng.paths.state_file.read_bytes() == before
+            assert load_state(eng.paths.state_file).launch_seq == 0 and calls == []
+        else:
+            with pytest.raises(Launched):
+                eng.step()
+            assert calls == [calls[-1]] and calls[-1][0] == str(command)
+            assert load_state(eng.paths.state_file).launch_seq == 1
 
 
 # -- the operator's commands (D9.5, W9) ----------------------------------------------------------

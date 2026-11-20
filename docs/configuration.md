@@ -1554,29 +1554,36 @@ a value:
   are an older build, a pre-release, a version it cannot read, a failing or
   silent probe, one the sandbox refuses and a missing executable, naming
   what was read and never the output. The answer is bound to the file
-  that gave it: the controller opens the executable before it asks, the
-  probe starts that open file and not whatever its name leads to, and a
-  file written to, or put at its name, while it answered is refused there,
-  before anything is charged. The launch then opens the executable again,
-  refuses it unless it is that file unchanged (its device, inode, size and
-  modification and change times), and starts the file it opened, so a
-  build put at the name after that last check is not the one that runs.
-  On the host the launch execs its descriptor (`/proc/self/fd`); inside
-  the outer sandbox bwrap mounts the file read-only at its name from the
-  descriptor (`--ro-bind-fd`) and closes the descriptor before the CLI
-  starts. What that leaves: bwrap finds the file through the descriptor's
-  current name, so a file another one was renamed over (an update's
-  usual way) makes it refuse the launch, and nothing runs, while one moved
-  aside is still the one mounted; only a replacement put at that name in
-  the instant between bwrap's lookup and its mount would be mounted. On
-  the host, a `#!` script's interpreter is handed the descriptor's path,
-  and Node, which resolves it back to the file's name before it reads it,
-  has the same instant; a write into the very file after the last check is
-  not detected. A host without `/proc/self/fd` (macOS) cannot start a
-  program from a descriptor, so such a launch, and its probe, are refused
-  there. Run a checked build, or route the phase to another provider. A
-  launch with Memory off is never probed, and starts its command by name
-  as before.
+  that gave it, and the launch starts that file. The controller opens the
+  executable before it asks, and refuses, before anything is run or
+  charged, an executable that is a script (it starts with `#!`) and a host
+  that cannot start a program from an open descriptor (no
+  `/proc/self/fd`: macOS). The kernel hands a script to its interpreter,
+  which opens it again itself, by a path it may first resolve back to the
+  file's name (Node does), so no descriptor binds what runs: a Memory
+  phase runs Claude Code's native build, whose executable is a native
+  program, and an npm installation's `cli.js`, a Node script, is refused.
+  The probe starts the open file and not whatever its name leads to, and
+  a file written to, or put at its name, while it answered is refused
+  there, before anything is charged. The launch then opens the executable
+  again, refuses it unless it is that file unchanged (its device, inode,
+  size and modification and change times), and starts the file it opened.
+  On the host the kernel loads it from its descriptor (`/proc/self/fd`).
+  Inside the outer sandbox bwrap mounts it read-only from the descriptor
+  (`--ro-bind-fd`, which a bwrap must have) at a path of the sandbox's own,
+  `/.autoforge-program/<its name>`, which no name on the host leads to;
+  bwrap checks that what it mounted is the descriptor's file (its device
+  and inode) and fails the setup otherwise, closes the descriptor, and
+  starts that path. So a build put at the executable's name after the
+  launch's last check, renamed over it or with the checked one moved
+  aside, before the launch starts or while it runs, is never the program
+  started. What that leaves: the program started is the file checked, and
+  what that program opens by name once it runs (its libraries, a copy of
+  itself it starts again) is its own; a write into the very file between
+  the launch's last check and its start, which only a process of your own
+  user could make, is not detected. Run a checked native build, or route
+  the phase to another provider. A launch with Memory off is never probed,
+  and starts its command by name as before.
   Such a launch is also refused before anything starts while the `env` of
   your Claude settings or global configuration sets that variable, which
   Claude Code would apply over the launch's. It is refused with

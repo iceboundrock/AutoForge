@@ -318,10 +318,17 @@ no agent is shown Memory by this release.
 
 A Memory phase's Claude launch starts the CLI file whose `--version` the
 controller checked, through a descriptor held from before the check
-([Configuration](configuration.md#issue-working-memory)). That binds the
-launch against an update of Claude Code between the check and the launch,
-not against a process of your own user that writes into that very file or
-times a rename to the instant bwrap or Node resolves its name: such a
+([Configuration](configuration.md#issue-working-memory)): a native program,
+which the kernel loads from that descriptor on the host, and which bwrap
+mounts from it inside the outer sandbox at a path no name on the host
+leads to, after checking that it mounted that very file. A script is
+refused before the launch is charged, since its interpreter, not the
+kernel, opens it again, by a name (Node resolves the descriptor's path back
+to it), and so is a host without `/proc/self/fd`. That binds the launch
+against an update of Claude Code, and against any file put at the CLI's
+name, between the check and the launch or while it runs. It does not bind
+what the program opens by name once it runs, and does not detect a process
+of your own user that writes into that very file before it starts: such a
 process can already change what any launch of yours runs.
 
 Memory holds nothing secret by design: an agent's or the operator's text the

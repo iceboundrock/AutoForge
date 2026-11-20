@@ -51,6 +51,7 @@ from autoforge.sandbox import (
     compile_launch,
 )
 from tests.conftest import SYSTEM_PYTHON, bind_unix, real_sandbox_backend
+from tests.native_program import needs_native_program, write_native_program, write_script
 
 PY = SYSTEM_PYTHON
 RO = Access.READ_ONLY
@@ -879,6 +880,7 @@ except OSError as exc:
     wrote = errno.errorcode.get(exc.errno, str(exc.errno))
 print(json.dumps({{
     "marker": {marker!r},
+    "path": sys.argv[0],
     "fds": sorted(int(fd) for fd in os.listdir("/proc/self/fd")),
     "write": wrote,
 }}), flush=True)
@@ -905,11 +907,12 @@ def _put(path: Path, text: str, *, keep_aside: bool) -> None:
 def test_a_program_held_by_its_descriptor_is_the_one_started_inside(
     tmp_path: Path, backend: str
 ) -> None:
-    """R5-F1 of PR #513: inside the sandbox the program a launch holds open is mounted
-    read-only at its name from the descriptor, one-shot and duplex alike: moved aside
-    on the host with another file put at its name, the file held is the one started.
-    The command never holds the descriptor and cannot write the file; by its name,
-    without the descriptor, the new file runs."""
+    """R5-F1, R6-F3 of PR #513: inside the sandbox the program a launch holds open is
+    mounted read-only from the descriptor at a path of the sandbox's own, and started
+    from there, one-shot and duplex alike: moved aside on the host with another file
+    put at its name, the file held is the one started. The command never holds the
+    descriptor and cannot write the file; by its name, without the descriptor, the
+    new file runs."""
     b = _base(tmp_path)
     bin_dir = _dir(b / "bin")
     path = Path(bin_dir) / "prog"
@@ -930,6 +933,7 @@ def test_a_program_held_by_its_descriptor_is_the_one_started_inside(
         assert result.sandbox is not None and result.sandbox.enforced
         seen = json.loads(result.stdout)
         assert seen["marker"] == "held" and seen["write"] == "EROFS"
+        assert seen["path"] == sandbox_bwrap.program_path(str(path)) == "/.autoforge-program/prog"
         assert seen["fds"][:3] == [0, 1, 2] and len(seen["fds"]) == 4  # the listing's own
         named = execute(
             ExecutionRequest(
@@ -954,6 +958,59 @@ def test_a_program_held_by_its_descriptor_is_the_one_started_inside(
             child.finish()
         assert isinstance(line, Record) and json.loads(line.data)["marker"] == "held"
         os.fstat(fd)  # the controller's copy stays open: bwrap closed its own
+    finally:
+        os.close(fd)
+
+
+_WATCH = """#!{py}
+import json, os, sys, time
+print(json.dumps({{"path": sys.argv[0]}}), flush=True)
+deadline = time.monotonic() + 30
+while not os.path.exists({go!r}) and time.monotonic() < deadline:
+    time.sleep(0.01)
+with open(sys.argv[0]) as fh:
+    own = fh.read()
+with open({name!r}) as fh:
+    named = fh.read()
+print(json.dumps({{"own": {marker!r} in own, "named": "replacement" in named}}), flush=True)
+"""
+
+
+def test_a_held_program_keeps_its_path_inside_while_its_name_is_replaced_outside(
+    tmp_path: Path, backend: str
+) -> None:
+    """R6-F3 of PR #513: the held program is shown at a path no name on the host leads
+    to, so once it runs, another file renamed over its name on the host (which, at a
+    name a host directory's bind shows, would take a mount there away) changes nothing
+    at its own path: reading itself there it still reads the file held, while its
+    name inside shows the new file."""
+    b = _base(tmp_path)
+    bin_dir = _dir(b / "bin")
+    out = _dir(b / "out")
+    path = Path(bin_dir) / "prog"
+    go = Path(out) / "go"
+    fd = _held(path, _WATCH.format(py=PY, go=str(go), name=str(path), marker="held-file"))
+    description = _describe(b, projections=(P(bin_dir), P(out, RW)))
+    request = DuplexRequest(
+        command=[str(path)],
+        env_allowlist=("PATH",),
+        max_runtime_seconds=60,
+        stdin_pipe=False,
+        contain_orphans=True,
+        sandbox=description,
+        executable_fd=fd,
+    )
+    try:
+        with start_duplex(request) as child:
+            first = child.read_line(30)
+            assert isinstance(first, Record), first
+            assert json.loads(first.data)["path"] == sandbox_bwrap.program_path(str(path))
+            _put(path, "replacement\n", keep_aside=False)
+            go.touch()
+            second = child.read_line(30)
+            child.finish()
+        assert isinstance(second, Record), second
+        assert json.loads(second.data) == {"own": True, "named": True}
     finally:
         os.close(fd)
 
@@ -987,30 +1044,44 @@ def test_a_program_held_by_its_descriptor_and_renamed_over_starts_nothing_inside
     assert not ran.exists()
 
 
-_CLAUDE = """#!{py}
-import json, sys
-if sys.argv[1:] == ["--version"]:
-    print({version!r})
-elif "stream-json" in sys.argv:
-    print(json.dumps({{"type": "system", "subtype": "init", "model": "m", "tools": []}}))
-    print(json.dumps({{
-        "type": "result", "subtype": "success", "is_error": False, "result": {marker!r},
-        "session_id": "s", "num_turns": 1, "duration_ms": 1, "total_cost_usd": 0,
-    }}))
-else:
-    print({marker!r})
-"""
+def _claude(version: str, marker: str) -> str:
+    """A ``claude`` script answering ``--version`` with ``version`` and a launch with
+    ``marker``, in either output format; run by a native stand-in (R6-F3 of PR #513),
+    with nothing but ``/bin/sh``, which every sandbox shows."""
+    init = json.dumps({"type": "system", "subtype": "init", "model": "m", "tools": []})
+    result = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": marker,
+            "session_id": "s",
+            "num_turns": 1,
+            "duration_ms": 1,
+            "total_cost_usd": 0,
+        }
+    )
+    return (
+        "#!/bin/sh\n"
+        'case " $* " in\n'
+        f"  *' --version '*) printf '%s\\n' '{version}' ;;\n"
+        f"  *' stream-json '*) printf '%s\\n' '{init}' '{result}' ;;\n"
+        f"  *) printf '%s\\n' '{marker}' ;;\n"
+        "esac\n"
+    )
 
 
+@needs_native_program
 @pytest.mark.parametrize("output_format", ["stream-json", "text"])
 def test_a_claude_launch_inside_the_sandbox_starts_the_file_its_probe_ran(
     tmp_path: Path, backend: str, monkeypatch: pytest.MonkeyPatch, output_format: str
 ) -> None:
-    """R5-F1 of PR #513, the enforced path through the real Claude adapter, in both
-    output formats: the probe runs inside the sandbox from the file it holds and
-    establishes 2.1.328, and the launch, inside the sandbox too, starts that very file
-    although a build nobody checked was put at its name after the launch's last check,
-    so the answer that authorized the launch is the answer of what runs."""
+    """R5-F1, R6-F3 of PR #513, the enforced path through the real Claude adapter, in
+    both output formats: the probe runs inside the sandbox from the native program it
+    holds, shown at a path of the sandbox's own, and establishes 2.1.328, and the
+    launch, inside the sandbox too, starts that very file from there although a build
+    nobody checked was put at its name after the launch's last check, so the answer
+    that authorized the launch is the answer of what runs."""
     import dataclasses
     import types
 
@@ -1021,10 +1092,11 @@ def test_a_claude_launch_inside_the_sandbox_starts_the_file_its_probe_ran(
     from autoforge.sandbox_policy import ProbeSandbox
 
     b = _base(tmp_path)
-    claude = Path(_dir(b / "cli")) / "claude"
-    claude.write_text(_CLAUDE.format(py=PY, version="2.1.328 (Claude Code)", marker="held"))
-    claude.chmod(0o755)
-    later = _CLAUDE.format(py=PY, version="2.1.329 (Claude Code)", marker="replacement")
+    cli = Path(_dir(b / "cli"))
+    claude = write_native_program(
+        cli / "claude", write_script(cli / "held.sh", _claude("2.1.328 (Claude Code)", "held"))
+    )
+    later = write_script(cli / "later.sh", _claude("2.1.329 (Claude Code)", "replacement"))
     profile = dataclasses.replace(default_config().profile("analyze_execute"), command=str(claude))
     if output_format == "text":
         profile = dataclasses.replace(
@@ -1054,7 +1126,8 @@ def test_a_claude_launch_inside_the_sandbox_starts_the_file_its_probe_ran(
             if "--version" not in req.command:
                 # After the launch's last check: the build is moved aside and a build
                 # nobody checked put at its name.
-                _put(claude, later, keep_aside=True)
+                os.rename(claude, claude.with_name("claude.old"))
+                write_native_program(claude, later)
             return real(req)
 
         return spawn
@@ -1077,4 +1150,5 @@ def test_a_claude_launch_inside_the_sandbox_starts_the_file_its_probe_ran(
     )
     result = ClaudeCodeProvider(runner=replace_then(execute)).execute(req)
     assert result.exit_code == 0, (result.stdout, result.stderr)
-    assert result.stdout.strip() == "held" and "replacement" in claude.read_text()
+    assert result.stdout.strip() == "held"
+    assert os.stat(claude).st_ino != runtime.identity[1]  # another build at the name

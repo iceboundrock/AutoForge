@@ -46,8 +46,9 @@
     the record's text. A launch's receipt records no outcome, issue or
     candidate, so a launch citation renders downgraded until #332's typed
     receipt exists, and a superseded failure is hidden only behind a
-    validation receipt of the launch's candidate or of the commit the
-    failure was evidence of. D12's bound is 16,384 characters and 16,384 tokens,
+    validation receipt of the same check (its definition's digest) under
+    the same policy (its digest), of the launch's candidate or of the
+    commit the failure was evidence of. D12's bound is 16,384 characters and 16,384 tokens,
     the tokens held as UTF-8 bytes. Wiring the store into the running
     workflow is #333's.
   - *Implemented with it:* nothing in the package. No phase, edge, state
@@ -1482,7 +1483,7 @@ adapter builds, never the provider's claim.
 
 | Provider | The proof today | What voids it | Status at `9baed0a` |
 |---|---|---|---|
-| `claude` | `-p` with `--no-session-persistence` (`providers.py:1724`); `--safe-mode` keeps `CLAUDE.md` auto-discovery off | `options.session_persistence: true`; in `extra_args`, any of `-c`, `--continue`, `-r`, `--resume`, `--session-id`, `--fork-session`, `--from-pr`, `--teleport` (2.1.327's help) | the option and these flags pass validation; since #317, a configuration with `memory.enabled` refuses them, and any flag outside its allow-list; and a Memory phase's launch sets `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` (auto memory off, read from the 2.1.328 build), refused while the user's configuration `env` sets it or unless the profile's own `claude --version`, asked before the intent save as the launch runs (its resolved executable, its environment, a scratch directory, the outer sandbox when the launch is enforced), reports a build that variable was checked against (2.1.328), the probe and the launch each starting the file the controller holds open from before its check, by its descriptor on the host and as a read-only mount of it inside the sandbox, so a build put at the name meanwhile is refused or never runs (R5-F1 of PR #513) |
+| `claude` | `-p` with `--no-session-persistence` (`providers.py:1724`); `--safe-mode` keeps `CLAUDE.md` auto-discovery off | `options.session_persistence: true`; in `extra_args`, any of `-c`, `--continue`, `-r`, `--resume`, `--session-id`, `--fork-session`, `--from-pr`, `--teleport` (2.1.327's help) | the option and these flags pass validation; since #317, a configuration with `memory.enabled` refuses them, and any flag outside its allow-list; and a Memory phase's launch sets `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` (auto memory off, read from the 2.1.328 build), refused while the user's configuration `env` sets it or unless the profile's own `claude --version`, asked before the intent save as the launch runs (its resolved executable, its environment, a scratch directory, the outer sandbox when the launch is enforced), reports a build that variable was checked against (2.1.328), the probe and the launch each starting the file the controller holds open from before its check, a native program and never a script, whose interpreter opens it again by a name (R6-F3 of PR #513), by its descriptor on the host and inside the sandbox as a read-only mount of it at a path of the sandbox's own that bwrap checks is that file, so a build put at the name meanwhile is refused or never runs (R5-F1, R6-F3); a host without `/proc/self/fd` refuses it |
 | `opencode` | `run --standalone` (`providers.py:2380`) with no session flag: `run` starts a new session | in `extra_args`, any of `-c`, `--continue`, `-s`, `--session`, `--fork`, `--server` (2.3.0's help) | these flags pass validation; since #317, a configuration with `memory.enabled` refuses them, and any flag outside its allow-list |
 | `pi` | `--no-session` (`providers.py:2847`); `extra_args` refused (`providers.py:2818`) | nothing a profile sets | holds by construction |
 | `claude-sdk` | a new session id per launch (`providers.py:3947`); `extra_args` refused (`providers.py:3421`); no resume option in the policy | nothing a profile sets | holds by construction |

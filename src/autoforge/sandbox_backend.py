@@ -460,9 +460,10 @@ class SandboxBackend(Protocol):
         In the launch container ``handle`` names, created and staged for
         this launch; ``None`` when no lifecycle made one, which a backend
         that needs an environment refuses. With ``executable_fd``, what
-        ``command[0]`` names inside is that descriptor's file, shown
-        read-only and never the descriptor itself (R5-F1 of PR #513); a
-        backend that cannot show it so refuses the launch.
+        the command starts inside is that descriptor's file, shown read-only
+        where no name on the host leads, and never the descriptor itself
+        (R5-F1, R6-F3 of PR #513); a backend that cannot show it so, or
+        cannot tell that what it shows is that file, refuses the launch.
         """
         ...
 

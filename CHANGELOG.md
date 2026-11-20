@@ -55,12 +55,19 @@ your Claude settings sets that variable, or unless the profile's own
 (inside the outer sandbox when the launch would be), reports a build that
 variable was checked against: 2.1.328 only, a later build included until it
 is checked. The probe and the launch each start the file the controller
-opened before its check, through its descriptor, never by its name: a file
-written to or put at the name while the probe answered is refused before
-the launch is charged, and a build put there after the launch's last check
-is not the one that runs (bwrap refuses a launch whose file another was
-renamed over). On a host without `/proc/self/fd` (macOS) such a launch is
-refused. With Memory off, nothing of this is checked and no launch changes.
+opened before its check, through its descriptor, never by its name: the
+kernel loads it from the descriptor on the host, and inside the outer
+sandbox bwrap mounts it at a path of the sandbox's own, which no name on
+the host leads to, after checking that it mounted that very file. That
+file must be a native program: a `#!` script, an npm installation's Node
+`cli.js` among them, is refused before the launch is charged, since its
+interpreter opens it again by a name; Claude Code's native build is what
+such a launch runs. A file written to or put at the name while the probe
+answered is refused before the launch is charged, and a build put there
+after the launch's last check, before it starts or while it runs, is not
+the one that runs. On a host without `/proc/self/fd` (macOS) such a launch
+is refused. With Memory off, nothing of this is checked and no launch
+changes.
 
 ### `claim-ambiguous`: `status` goes by what the reason names (#375)
 

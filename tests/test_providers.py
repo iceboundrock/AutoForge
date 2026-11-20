@@ -38,6 +38,7 @@ from autoforge.providers import (
     provider_for,
 )
 from tests.conftest import DECODER_LIMIT_RECORDS, NOTHING_LEFT
+from tests.native_program import needs_native_program, write_native_program, write_script
 
 
 def _text(profile: ProfileConfig) -> ProfileConfig:
@@ -2494,11 +2495,7 @@ def test_a_claude_launch_turns_the_clis_background_wait_ceiling_off(tmp_path, mo
 
 def _fake_claude_executable(tmp_path: Path, name: str = "claude") -> Path:
     """An executable a launch names; launches that reach it are stopped before it runs."""
-    command = tmp_path / "bin" / name
-    command.parent.mkdir(exist_ok=True)
-    command.write_text("#!/bin/sh\nexit 0\n")
-    command.chmod(0o755)
-    return command
+    return _native_placeholder(tmp_path / "bin" / name)
 
 
 def _runtime_of(command: Path, version: str = "2.1.328"):
@@ -2642,17 +2639,65 @@ def test_a_claude_configuration_that_would_force_auto_memory_on_refuses_a_fresh_
     assert provider.execute(fresh).ok
 
 
-def _versioned_claude(tmp_path: Path, output: str, exit_code: int = 0) -> ProfileConfig:
-    """A profile whose ``claude`` answers ``--version`` with ``output`` and ``exit_code``,
-    and records its working directory and its auto memory variable."""
+#: Whether this host can start a program from its descriptor (Linux's /proc/self/fd).
+_DESCRIPTORS = os.path.isdir("/proc/self/fd")
+#: A test that runs a fresh context's probe or launch past its refusals: only a host
+#: that can start a program from its descriptor gets that far (R6-F1 of PR #513). A
+#: host that cannot refuses first (test_a_host_that_cannot_start_a_program_...).
+needs_descriptors = pytest.mark.skipif(
+    not _DESCRIPTORS,
+    reason="no /proc/self/fd on this host: it cannot start a program from its descriptor",
+)
+
+
+def _native_placeholder(path: Path) -> Path:
+    """A file a fresh context takes for a native program (no ``#!``), never run: a
+    stand-in runner answers for it, or the launch is stopped before it starts."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\x7fELF" + bytes(60))
+    path.chmod(0o755)
+    return path
+
+
+def _versioned_claude(
+    tmp_path: Path, output: str, exit_code: int = 0, *, native: bool = False
+) -> ProfileConfig:
+    """A profile whose ``claude`` answers ``--version`` with ``output`` and ``exit_code``.
+
+    ``native``: a native program (``tests/native_program.py``) running a script that
+    answers so and records its working directory and its auto memory variable, for
+    the real executor. Otherwise a native-shaped file nothing runs, for a stand-in
+    runner or a decision read from a stand-in answer.
+    """
     command = tmp_path / "claude"
-    command.write_text(
-        "#!/bin/sh\n"
-        f"printf '%s %s\\n' \"$PWD\" \"$CLAUDE_CODE_DISABLE_AUTO_MEMORY\" > '{tmp_path}/asked'\n"
-        f"printf '%s\\n' '{output}'\nexit {exit_code}\n"
-    )
-    command.chmod(0o755)
+    if native:
+        script = write_script(
+            tmp_path / "claude-version.sh",
+            "#!/bin/sh\n"
+            'printf \'%s %s\\n\' "$PWD" "$CLAUDE_CODE_DISABLE_AUTO_MEMORY"'
+            f" > '{tmp_path}/asked'\n"
+            f"printf '%s\\n' '{output}'\nexit {exit_code}\n",
+        )
+        write_native_program(command, script)
+    else:
+        _native_placeholder(command)
     return dataclasses.replace(default_config().profile("analyze_execute"), command=str(command))
+
+
+def _answered(executable: str, output: str, exit_code: int = 0) -> ExecutionResult:
+    """What a probe of ``executable`` that printed ``output`` returns."""
+    return ExecutionResult([executable, "--version"], "/", exit_code, output + "\n", "", "", "")
+
+
+def _answers(output: str, asked: list | None = None):
+    """A stand-in runner whose every probe prints ``output``, recording each request."""
+
+    def run(req):
+        if asked is not None:
+            asked.append(req)
+        return ExecutionResult(req.command, req.cwd, 0, output + "\n", "", "", "")
+
+    return run
 
 
 def _establish(provider, profile, tmp_path: Path, sandbox=None):
@@ -2669,42 +2714,38 @@ def _establish(provider, profile, tmp_path: Path, sandbox=None):
 
 
 def test_a_claude_build_checked_to_honour_its_auto_memory_variable_proves_it(tmp_path):
-    """R3-F5, R4-F1 of PR #513: the version is asked of the very executable the profile
-    launches, resolved and run in the launch's allow-listed environment with what a
-    fresh context sets, in a scratch directory, never the worktree; a checked build
-    passes, and the runtime names that executable as it is now."""
+    """R3-F5, R4-F1 of PR #513, decided on every host (R6-F1): the answer of a checked
+    build, read from the file held open while it answered, establishes the runtime of
+    that executable, by its path and identity. The same answer from a file nobody held
+    establishes nothing."""
     from autoforge.providers import CLAUDE_FRESH_CONTEXT_VERSIONS, FreshContextRuntime
 
     assert CLAUDE_FRESH_CONTEXT_VERSIONS == frozenset({(2, 1, 328)})
+    profile = _versioned_claude(tmp_path, "")
+    executable = os.path.realpath(profile.command)
+    identity = FreshContextRuntime.identity_of(executable)
+    assert identity is not None
+    provider = ClaudeCodeProvider()
     for output in ("2.1.328 (Claude Code)", "2.1.328"):
-        profile = _versioned_claude(tmp_path, output)
-        runtime = _establish(ClaudeCodeProvider(), profile, tmp_path)
-        assert runtime.executable == os.path.realpath(profile.command)
-        assert runtime.version == "2.1.328"
-        assert runtime.identity == FreshContextRuntime.identity_of(runtime.executable)
-        assert (tmp_path / "asked").read_text().split() == [str(tmp_path / "scratch"), "1"]
+        runtime = provider.fresh_context_runtime(
+            profile, executable, _answered(executable, output), identity=identity
+        )
+        assert runtime == FreshContextRuntime(executable, identity, "2.1.328")
+    with pytest.raises(ConfigurationError, match="was not held open while it answered"):
+        provider.fresh_context_runtime(profile, executable, _answered(executable, "2.1.328"))
 
 
-@pytest.mark.parametrize(
-    ("output", "exit_code", "needle"),
-    [
-        ("2.1.327 (Claude Code)", 0, "reports 2.1.327, and only 2.1.328 is known to turn"),
-        ("2.1.329 (Claude Code)", 0, "reports 2.1.329, and only 2.1.328 is known to turn"),
-        ("3.0.0 (Claude Code)", 0, "a build nobody checked proves nothing"),
-        ("2.1.328-rc.1 (Claude Code)", 0, "reports a pre-release of 2.1.328"),
-        ("build-xyzzy", 0, "printed no version this controller reads (output not shown)"),
-        ("2.1.328 (Claude Code)", 3, "exited 3 (output not shown)"),
-    ],
-)
-def test_a_claude_build_nobody_checked_refuses_a_fresh_context(tmp_path, output, exit_code, needle):
-    """An unchecked build, older or later, a pre-release, unreadable output or a
-    failing exit: the profile is refused for a launch that needs a fresh context
-    before anything is launched, naming what it read, never the output. A later
-    build is no proof that it still honours the variable."""
-    profile = _versioned_claude(tmp_path, output, exit_code)
-    with pytest.raises(ConfigurationError) as caught:
-        _establish(ClaudeCodeProvider(), profile, tmp_path)
-    message = str(caught.value)
+_UNCHECKED = [
+    ("2.1.327 (Claude Code)", 0, "reports 2.1.327, and only 2.1.328 is known to turn"),
+    ("2.1.329 (Claude Code)", 0, "reports 2.1.329, and only 2.1.328 is known to turn"),
+    ("3.0.0 (Claude Code)", 0, "a build nobody checked proves nothing"),
+    ("2.1.328-rc.1 (Claude Code)", 0, "reports a pre-release of 2.1.328"),
+    ("build-xyzzy", 0, "printed no version this controller reads (output not shown)"),
+    ("2.1.328 (Claude Code)", 3, "exited 3 (output not shown)"),
+]
+
+
+def _refused_as_unchecked(message: str, needle: str) -> None:
     assert needle in message and "cannot prove that each launch starts with a fresh context" in (
         message
     )
@@ -2712,6 +2753,128 @@ def test_a_claude_build_nobody_checked_refuses_a_fresh_context(tmp_path, output,
     assert "xyzzy" not in message
 
 
+@pytest.mark.parametrize(("output", "exit_code", "needle"), _UNCHECKED)
+def test_a_claude_build_nobody_checked_refuses_a_fresh_context(tmp_path, output, exit_code, needle):
+    """An unchecked build, older or later, a pre-release, unreadable output or a
+    failing exit, decided on every host from the probe's answer (R6-F1 of PR #513):
+    the profile is refused for a launch that needs a fresh context, naming what it
+    read, never the output. A later build is no proof that it still honours the
+    variable."""
+    from autoforge.providers import FreshContextRuntime
+
+    profile = _versioned_claude(tmp_path, output, exit_code)
+    executable = os.path.realpath(profile.command)
+    with pytest.raises(ConfigurationError) as caught:
+        ClaudeCodeProvider().fresh_context_runtime(
+            profile,
+            executable,
+            _answered(executable, output, exit_code),
+            identity=FreshContextRuntime.identity_of(executable),
+        )
+    _refused_as_unchecked(str(caught.value), needle)
+
+
+@needs_descriptors
+@needs_native_program
+@pytest.mark.parametrize(
+    ("output", "exit_code", "needle"),
+    [("2.1.328 (Claude Code)", 0, ""), ("2.1.328", 0, ""), *_UNCHECKED[1:2], *_UNCHECKED[-1:]],
+)
+def test_a_claude_build_is_judged_by_what_its_held_file_answers_through_the_real_executor(
+    tmp_path, output, exit_code, needle
+):
+    """R3-F5, R4-F1, R5-F1 of PR #513, where a program can be started from its
+    descriptor: the version is asked of the very executable the profile launches, a
+    native program held open and started from its descriptor, resolved and run in the
+    launch's allow-listed environment with what a fresh context sets, in a scratch
+    directory, never the worktree. A checked build passes, and the runtime names that
+    executable as it is now; an unchecked one is refused before any launch."""
+    from autoforge.providers import FreshContextRuntime
+
+    profile = _versioned_claude(tmp_path, output, exit_code, native=True)
+    if needle:
+        with pytest.raises(ConfigurationError) as caught:
+            _establish(ClaudeCodeProvider(), profile, tmp_path)
+        _refused_as_unchecked(str(caught.value), needle)
+    else:
+        runtime = _establish(ClaudeCodeProvider(), profile, tmp_path)
+        assert runtime.executable == os.path.realpath(profile.command)
+        assert runtime.version == "2.1.328"
+        assert runtime.identity == FreshContextRuntime.identity_of(runtime.executable)
+    assert (tmp_path / "asked").read_text().split() == [str(tmp_path / "scratch"), "1"]
+
+
+@pytest.mark.parametrize("host", ["simulated", "this host"])
+def test_a_host_that_cannot_start_a_program_from_its_descriptor_refuses_before_the_probe(
+    monkeypatch, tmp_path, host
+):
+    """R6-F1, R6-F3 of PR #513: where no program can be started from its descriptor (no
+    ``/proc/self/fd``: macOS, or Linux with that directory simulated away), a fresh
+    context is refused before anything is run, with the real executor and a stand-in
+    runner alike, whatever the build would answer: no launch could be bound to the
+    file whose answer is checked. Nothing is asked of the CLI."""
+    from autoforge import executor
+
+    if host == "simulated":
+        monkeypatch.setattr(executor, "_DESCRIPTOR_DIR", str(tmp_path / "no-such-directory"))
+    elif _DESCRIPTORS:
+        pytest.skip("this host has /proc/self/fd: the simulated case stands for one without")
+    profile = _versioned_claude(tmp_path, "2.1.328 (Claude Code)")
+    asked: list = []
+    for provider in (
+        ClaudeCodeProvider(),
+        ClaudeCodeProvider(runner=_answers("2.1.328 (Claude Code)", asked)),
+    ):
+        with pytest.raises(ConfigurationError) as caught:
+            _establish(provider, profile, tmp_path)
+        message = str(caught.value)
+        assert "this host cannot start a program from an open descriptor" in message
+        assert "cannot prove that each launch starts with a fresh context" in message
+    assert asked == []
+
+
+class _NoSandbox:
+    """A probe sandbox that records being asked, and is never asked."""
+
+    def __init__(self) -> None:
+        self.asked = 0
+
+    def describe(self, needs, env):
+        self.asked += 1
+        raise AssertionError("a script is refused before its sandbox is described")
+
+
+@needs_descriptors
+@pytest.mark.parametrize("interpreter", ["#!/bin/sh", "#!/usr/bin/env node", "#! /bin/sh -e"])
+@pytest.mark.parametrize("enforced", [False, True])
+def test_a_claude_executable_that_is_a_script_establishes_no_fresh_context(
+    tmp_path, interpreter, enforced
+):
+    """R6-F3 of PR #513: the kernel hands a script to its interpreter, which opens it
+    itself, by a path it may resolve back to the file's name first (Node does), so a
+    descriptor binds nothing through its start and a file put at that name in
+    between would run instead. Refused before anything is run, on the host and where
+    the launch would be enforced: no probe, and no sandbox described."""
+    command = tmp_path / "claude"
+    command.write_text(f"{interpreter}\necho '2.1.328 (Claude Code)'\n")
+    command.chmod(0o755)
+    profile = dataclasses.replace(default_config().profile("analyze_execute"), command=str(command))
+    asked: list = []
+    sandbox = _NoSandbox() if enforced else None
+    with pytest.raises(ConfigurationError) as caught:
+        _establish(
+            ClaudeCodeProvider(runner=_answers("2.1.328 (Claude Code)", asked)),
+            profile,
+            tmp_path,
+            sandbox,
+        )
+    message = str(caught.value)
+    assert f"{os.path.realpath(command)} is a script (#!)" in message
+    assert "whose executable is a native program" in message
+    assert asked == [] and (sandbox is None or sandbox.asked == 0)
+
+
+@needs_descriptors
 def test_the_runtime_probe_runs_as_the_launch_does_and_refuses_what_it_cannot_ask(tmp_path):
     """R4-F1 of PR #513: the probe goes through the adapter's own runner with the
     launch's allow-list and environment, its executable named by its resolved path,
@@ -2723,12 +2886,7 @@ def test_the_runtime_probe_runs_as_the_launch_does_and_refuses_what_it_cannot_as
 
     profile = _versioned_claude(tmp_path, "2.1.328 (Claude Code)")
     asked: list = []
-
-    def answers(req):
-        asked.append(req)
-        return ExecutionResult(req.command, req.cwd, 0, "2.1.328 (Claude Code)\n", "", "", "")
-
-    provider = ClaudeCodeProvider(runner=answers)
+    provider = ClaudeCodeProvider(runner=_answers("2.1.328 (Claude Code)", asked))
     assert _establish(provider, profile, tmp_path).executable == os.path.realpath(profile.command)
     sandbox = ProbeSandbox(
         home=str(tmp_path),
@@ -2782,6 +2940,15 @@ def _put_at(path: Path, text: str, how: str) -> None:
     os.replace(new, path)
 
 
+def _put_native_at(path: Path, script: Path, how: str) -> None:
+    """Another native build at ``path``, running ``script``: renamed over the one there,
+    or put there with the one there moved aside."""
+    if how == "aside":
+        os.rename(path, path.with_name(path.name + ".old"))
+    write_native_program(path, script)
+
+
+@needs_descriptors
 @pytest.mark.parametrize("how", ["rename", "aside", "write"])
 def test_an_executable_changed_while_it_answers_establishes_no_runtime(tmp_path, how):
     """R5-F1 of PR #513, the reviewer's case: the stand-in runner answers 2.1.328 and,
@@ -2806,18 +2973,21 @@ def test_an_executable_changed_while_it_answers_establishes_no_runtime(tmp_path,
     assert (st.st_dev, st.st_ino) == (before.st_dev, before.st_ino)
 
 
+@needs_descriptors
+@needs_native_program
 def test_the_answer_a_probe_reads_is_the_file_it_held(tmp_path):
-    """R5-F1 of PR #513, through the real executor: a build nobody checked put at the
-    executable's name after the probe opened it is not what answers. The held file
-    answers 2.1.328, and the runtime is refused all the same, since the launch's
+    """R5-F1 of PR #513, through the real executor: a native build nobody checked put
+    at the executable's name after the probe opened it is not what answers. The held
+    file answers 2.1.328, and the runtime is refused all the same, since the launch's
     ``PATH`` now leads to another file than the one that answered."""
     from autoforge.executor import execute
 
-    profile = _versioned_claude(tmp_path, "2.1.328 (Claude Code)")
+    profile = _versioned_claude(tmp_path, "2.1.328 (Claude Code)", native=True)
+    later = write_script(tmp_path / "later.sh", "#!/bin/sh\necho '2.1.329 (Claude Code)'\n")
     answered: list[str] = []
 
     def replaced_then_run(req):
-        _put_at(Path(profile.command), "#!/bin/sh\necho '2.1.329 (Claude Code)'\n", "rename")
+        _put_native_at(Path(profile.command), later, "rename")
         result = execute(req)
         answered.append(result.stdout.strip())
         return result
@@ -2841,24 +3011,26 @@ def _claude_script(text: str) -> str:
     )
 
 
-@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="no /proc/self/fd on this host")
+@needs_descriptors
+@needs_native_program
 @pytest.mark.parametrize("how", ["rename", "aside"])
 @pytest.mark.parametrize("output_format", ["stream-json", "text"])
 def test_a_fresh_context_launch_starts_the_file_it_checked_whatever_its_name_holds_after(
     monkeypatch, tmp_path, output_format, how
 ):
-    """R5-F1 of PR #513, both output formats, on the host: after the launch's last
-    check, another build is put at the executable's name (renamed over it, or with the
-    checked one moved aside). The launch still starts the file it checked, through the
-    descriptor it holds, named by its resolved path: the answer that established the
-    runtime is the answer of the file that runs."""
+    """R5-F1, R6-F3 of PR #513, both output formats, on the host: after the launch's
+    last check, another native build is put at the executable's name (renamed over
+    it, or with the checked one moved aside). The launch still starts the file it
+    checked, which the kernel loads from the descriptor it holds, named by its
+    resolved path: the answer that established the runtime is the answer of the file
+    that runs."""
     from autoforge import providers
     from autoforge.executor import execute
 
     command = tmp_path / "bin" / "claude"
     command.parent.mkdir()
-    command.write_text(_claude_script("checked"))
-    command.chmod(0o755)
+    write_native_program(command, write_script(tmp_path / "checked.sh", _claude_script("checked")))
+    unchecked = write_script(tmp_path / "unchecked.sh", _claude_script("unchecked"))
     runtime = _runtime_of(command)
     profile = dataclasses.replace(default_config().profile("analyze_execute"), command=str(command))
     if output_format == "text":
@@ -2868,7 +3040,7 @@ def test_a_fresh_context_launch_starts_the_file_it_checked_whatever_its_name_hol
     def replace_then(real):
         def spawn(req):
             started.append((list(req.command), os.fstat(req.executable_fd)))
-            _put_at(command, _claude_script("unchecked"), how)
+            _put_native_at(command, unchecked, how)
             return real(req)
 
         return spawn
@@ -2887,10 +3059,44 @@ def test_a_fresh_context_launch_starts_the_file_it_checked_whatever_its_name_hol
     )
     result = ClaudeCodeProvider(runner=replace_then(execute)).execute(req)
     assert result.exit_code == 0, (result.stdout, result.stderr)
-    assert result.stdout.strip() == "checked" and "unchecked" in command.read_text()
+    assert result.stdout.strip() == "checked"
+    assert _runtime_of(command).identity != runtime.identity  # another build at the name
     ((argv, st),) = started
     assert argv[0] == runtime.executable
     assert (st.st_dev, st.st_ino) == runtime.identity[:2]
+
+
+@pytest.mark.parametrize("output_format", ["stream-json", "text"])
+def test_a_fresh_context_launch_never_starts_a_script_whatever_runtime_it_is_handed(
+    monkeypatch, tmp_path, output_format
+):
+    """R6-F3 of PR #513, both output formats: a runtime names the native program its
+    probe ran, so a launch handed one whose executable is a script (a runtime nobody
+    established, with the script's identity) is refused before anything is spawned."""
+    from autoforge import providers
+
+    spawned: list = []
+    monkeypatch.setattr(providers, "start_duplex", spawned.append)
+    command = tmp_path / "bin" / "claude"
+    command.parent.mkdir()
+    write_script(command, _claude_script("script"))
+    profile = dataclasses.replace(default_config().profile("analyze_execute"), command=str(command))
+    if output_format == "text":
+        profile = _text(profile)
+    req = AgentRequest(
+        "ANALYZE_EXECUTE",
+        "p",
+        str(tmp_path),
+        profile,
+        None if output_format == "text" else 60,
+        None,
+        env_allowlist=("PATH",),
+        fresh_context=True,
+        fresh_context_runtime=_runtime_of(command),
+    )
+    with pytest.raises(ConfigurationError, match=r"is a script \(#!\)"):
+        ClaudeCodeProvider(runner=spawned.append).execute(req)
+    assert spawned == []
 
 
 def _background_agent_run(*after: str) -> list[str]:
