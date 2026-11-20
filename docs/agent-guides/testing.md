@@ -3187,7 +3187,14 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   write that would leave none is `store-full` (R5-F4);
 - nothing raw: an agent's or the operator's text with a control character
   or a credential's shape refused, the controller's escaped, redacted and
-  cut; a seed kept byte for byte with its digest, or refused; a loaded record
+  cut; a harmless reason or controller text whose cut leaves a shape the
+  redactor reads with the omission marker (a name and separator taking the
+  marker as a value, a cut redaction marker, a key's run cut to a key's
+  length) kept without its last words, so an operator's retraction applies
+  and survives a reload with its reason in its bound and unchanged by the
+  redactor, and the marker alone when no word before the cut passes, while
+  the loader still refuses the uncorrected cut (R11-F1 of PR #513); a seed
+  kept byte for byte with its digest, or refused; a loaded record
   text or event reason the redactor would change refused unquoted, whatever
   its digests say, and a render of a store holding one refused whole;
 - a store a controller did not write refused on load: each shape, a history

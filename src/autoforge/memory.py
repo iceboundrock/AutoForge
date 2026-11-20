@@ -152,7 +152,10 @@ environment or credential. An agent's or the operator's text is refused
 when the run-log redactor would change it, and when it holds a control
 character other than a tab or a newline; it is kept as given or not at all.
 Text the controller derives from evidence has such characters escaped, is
-redacted, then cut to the bound with an omission marker. A record's issue
+redacted, then cut to the bound with an omission marker, and so is a
+lifecycle reason; a cut drops the kept text's last words until the
+redactor leaves the result unchanged, so that bounding never makes text
+the loader refuses (R11-F1 of PR #513). A record's issue
 URL, or its step's issue or PR URL, the redactor would change is refused
 at the write and the load alike, never rewritten. The loader refuses a
 record text or an event reason the redactor would change, whatever its
@@ -487,15 +490,32 @@ def _escaped(text: str) -> str:
 
 
 def _cut(text: str, max_bytes: int, what: str) -> str:
-    """``text`` cut to ``max_bytes`` UTF-8 bytes, with an omission marker when cut."""
+    """``text`` cut to ``max_bytes`` UTF-8 bytes, with an omission marker when cut.
+
+    ``text`` is the redactor's output, which the redactor leaves unchanged,
+    and so is what this returns: the loader refuses a reason or a text the
+    redactor would change (D9.9). A cut can make one of a harmless text (R11-F1
+    of PR #513): a credential's name and separator at the cut take the marker
+    on the next line as their value (``refresh_token=``), a cut inside a
+    redaction marker leaves a value of no known shape (``GITHUB_TOKEN=***RE``),
+    and a cut that ends a run of key characters early can complete a key's
+    shape. So the kept text loses its last word, and then the one before,
+    until the redactor leaves the whole unchanged; the marker alone always
+    passes, so the loop ends, and each word lost only shortens what is kept.
+    """
     data = text.encode("utf-8")
     if len(data) <= max_bytes:
         return text
     total = len(data)
     widest = f"\n[AutoForge omitted {total} of {total} bytes of {what}]"
     kept = data[: max(0, max_bytes - len(widest.encode("utf-8")))].decode("utf-8", "ignore")
-    omitted = total - len(kept.encode("utf-8"))
-    return f"{kept}\n[AutoForge omitted {omitted} of {total} bytes of {what}]"
+    while True:
+        omitted = total - len(kept.encode("utf-8"))
+        cut = f"{kept}\n[AutoForge omitted {omitted} of {total} bytes of {what}]"
+        if not kept or not _unredacted(cut):
+            return cut
+        words = kept.rstrip()
+        kept = words[: len(words) - len(words.split()[-1])] if words else ""
 
 
 def controller_text(text: str) -> str:

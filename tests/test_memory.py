@@ -1020,6 +1020,111 @@ def test_a_reason_is_redacted_and_bounded_whoever_gives_it():
     assert TOKEN not in reason and len(reason.encode("utf-8")) <= MAX_REASON_BYTES
 
 
+def _cut_lands_after(head: str, tail: str, bound: int, what: str, *, filler: str = "lorem ") -> str:
+    """A harmless ASCII text, four times ``bound`` bytes, whose cut keeps exactly up to ``head``."""
+    total = 4 * bound
+    kept = bound - len(f"\n[AutoForge omitted {total} of {total} bytes of {what}]")
+    before = (filler * kept)[: kept - len(head)]
+    text = before + head + tail
+    return text + (filler * total)[: total - len(text)]
+
+
+def _naive_cut(text: str, bound: int, what: str) -> str:
+    """The cut before R11-F1: the longest prefix that fits beside the marker, unchecked."""
+    total = len(text)
+    kept = text[: bound - len(f"\n[AutoForge omitted {total} of {total} bytes of {what}]")]
+    return f"{kept}\n[AutoForge omitted {total - len(kept)} of {total} bytes of {what}]"
+
+
+#: A cut that ends in one of these turns a harmless text into one the redactor
+#: changes: a name and separator take the marker on the next line as a value, a
+#: cut redaction marker is a value of no known shape, and a run of key
+#: characters cut at 39 is a Google API key's shape.
+_CUTS_THE_REDACTOR_READS = {
+    "an OAuth assignment": (" refresh_token=", "; was empty"),
+    "an environment assignment": (" GITHUB_TOKEN=", "; was unset"),
+    "an authorization header": (" Authorization: Bearer", "; was sent"),
+    "a redaction marker": (" GITHUB_TOKEN=***RE", "DACTED*** in the log"),
+    "a key's run": (" AIza" + "a" * 35, "aaaaa is no key"),
+}
+
+
+@pytest.mark.parametrize(
+    ("head", "tail"), list(_CUTS_THE_REDACTOR_READS.values()), ids=list(_CUTS_THE_REDACTOR_READS)
+)
+def test_a_cut_reason_still_passes_the_redactor_and_the_retraction_survives_reload(
+    head, tail, tmp_path
+):
+    """R11-F1 of PR #513: a harmless reason the redactor leaves unchanged, cut where
+    the redactor would read the cut and its omission marker as a credential. The
+    retraction applies, survives a reload, and its stored reason is in its bound and
+    unchanged by the redactor; the loader still refuses the naive cut."""
+    reason = _cut_lands_after(head, tail, MAX_REASON_BYTES, "this reason")
+    naive = _naive_cut(reason, MAX_REASON_BYTES, "this reason")
+    assert redact(reason) == reason and redact(naive) != naive
+    store, record = _applied(propose(_store(), "an idea", seq=1))
+    store, _ = _applied(store.retract(record, actor=Actor.OPERATOR, issue_url=None, reason=reason))
+    state = make_state(run_id=RUN, launch_seq=1)
+    state.issue_memory = store.to_dict()
+    save_state(state, tmp_path / "state.json")
+    loaded = load_state(tmp_path / "state.json").memory_store()
+    assert loaded is not None
+    retracted = loaded.record(record)
+    assert retracted.status is Status.RETRACTED and retracted.text == ""
+    kept = retracted.events[-1].reason
+    assert len(kept.encode("utf-8")) <= MAX_REASON_BYTES and redact(kept) == kept
+    prefix, marker = kept.rsplit("\n", 1)
+    assert reason.startswith(prefix) and head.strip() not in prefix
+    assert (
+        marker
+        == f"[AutoForge omitted {len(reason) - len(prefix)} of {len(reason)} bytes of this reason]"
+    )
+    # The strict loader check stays: the naive cut is refused on load.
+    data = loaded.to_dict()
+    data["records"][0]["events"][-1]["reason"] = naive
+    with pytest.raises(StateError, match="reason: holds what the run-log redactor"):
+        MemoryStore.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    ("head", "tail"), list(_CUTS_THE_REDACTOR_READS.values()), ids=list(_CUTS_THE_REDACTOR_READS)
+)
+def test_the_controllers_cut_text_still_passes_the_redactor(head, tail, tmp_path):
+    """R11-F1 of PR #513: the same cut of evidence the controller observes is kept,
+    within its bound and unchanged by the redactor, rather than refused."""
+    text = _cut_lands_after(head, tail, MAX_TEXT_BYTES, "this text")
+    naive = _naive_cut(text, MAX_TEXT_BYTES, "this text")
+    assert redact(text) == text and redact(naive) != naive
+    store, record = _applied(observe(_store(), text))
+    state = make_state(run_id=RUN, launch_seq=1)
+    state.issue_memory = store.to_dict()
+    save_state(state, tmp_path / "state.json")
+    loaded = load_state(tmp_path / "state.json").memory_store()
+    assert loaded is not None
+    kept = loaded.record(record).text
+    assert len(kept.encode("utf-8")) <= MAX_TEXT_BYTES and redact(kept) == kept
+    prefix = kept.rsplit("\n", 1)[0]
+    assert text.startswith(prefix) and head.strip() not in prefix
+
+
+def test_a_cut_with_no_word_the_redactor_leaves_alone_keeps_the_marker_alone():
+    """R11-F1 of PR #513: a cut with no whitespace before the shape the redactor
+    reads drops every kept byte; the marker alone always passes, so the loop ends."""
+    reason = _cut_lands_after(
+        ";refresh_token=", ";was empty", MAX_REASON_BYTES, "this reason", filler=";"
+    )
+    assert redact(reason) == reason
+    store, record = _applied(propose(_store(), "an idea", seq=1))
+    store, _ = _applied(store.retract(record, actor=Actor.OPERATOR, issue_url=None, reason=reason))
+    total = len(reason)
+    assert store.record(record).events[-1].reason == (
+        f"\n[AutoForge omitted {total} of {total} bytes of this reason]"
+    )
+    for what in ("this reason", "this text"):
+        widest = f"\n[AutoForge omitted {10**9} of {10**9} bytes of {what}]"
+        assert redact(widest) == widest
+
+
 @pytest.mark.parametrize(
     ("data", "needle"),
     [
