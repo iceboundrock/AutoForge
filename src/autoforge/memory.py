@@ -2311,8 +2311,8 @@ class Check:
 @dataclass(frozen=True)
 class Resolution:
     """An observation's verdict for one launch, the commit its evidence is of, the
-    check it ran, and what that evidence establishes, in the controller's words
-    from the receipt."""
+    check it ran, the outcome it recorded, and what that evidence establishes, in
+    the controller's words from the receipt."""
 
     verdict: Verdict
     #: The commit a validation receipt validated; ``""`` for a launch's receipt or none.
@@ -2320,6 +2320,11 @@ class Resolution:
     #: The check a validation receipt ran (R6-F2 of PR #513); ``None`` for a
     #: launch's receipt or none.
     check: Check | None = None
+    #: The typed outcome a validation receipt recorded (``FAIL`` or
+    #: ``TIMEOUT``, :data:`FAILED_OUTCOMES`; R7-F1 of PR #513): a check that
+    #: exited nonzero and one that never finished are different results.
+    #: ``""`` for a launch's receipt or none.
+    outcome: str = ""
     #: What the receipt establishes, derived from its typed fields alone and
     #: never from the record's text (R4-F3 of PR #513): the only part of an
     #: observation a render calls established. ``""`` when nothing is.
@@ -2338,21 +2343,26 @@ def _replaces(standing: Resolution | None, own: Resolution) -> bool:
     (``unresolved``, a launch citation's always) has nothing a replacement
     must match. Otherwise the replacement must be a validation receipt's
     too, of the same check under the same policy (:class:`Check`; R6-F2 of
-    PR #513), and of a commit that covers the observation's: this launch's
-    candidate (``current``), or, for evidence of another commit
-    (``historical``), that very commit. A record that is no observation,
-    one only a launch's receipt or nothing establishes, a validation of
-    another commit, and a validation of another check, or of the same check
-    under another policy, establish none of it, so the observation is kept:
-    a newer record never hides a verified failure on the strength of a
-    receipt that records no outcome, issue or candidate, nor on that of a
-    failure of something else.
+    PR #513), with the same typed outcome (R7-F1 of PR #513), and of a
+    commit that covers the observation's: this launch's candidate
+    (``current``), or, for evidence of another commit (``historical``),
+    that very commit. A record that is no observation, one only a launch's
+    receipt or nothing establishes, a validation of another commit, a
+    validation of another check, or of the same check under another policy,
+    and a validation with another outcome (a ``TIMEOUT``, which establishes
+    that the check never finished, in place of a ``FAIL``, which establishes
+    that it exited nonzero, or the reverse) establish none of it, so the
+    observation is kept: a newer record never hides a verified failure on
+    the strength of a receipt that records no outcome, issue or candidate,
+    nor on that of a failure of something else or of another kind.
     """
     if own.verdict is Verdict.UNRESOLVED:
         return True
     if standing is None or standing.verdict is Verdict.UNRESOLVED:
         return False
     if own.check is None or standing.check != own.check:
+        return False
+    if not own.outcome or standing.outcome != own.outcome:
         return False
     if standing.verdict is Verdict.CURRENT:
         return True
@@ -2538,6 +2548,7 @@ class EvidenceIndex:
             verdict,
             receipt.commit,
             receipt.check(),
+            receipt.outcome,
             established=(
                 f"validation record {receipt.seq} of {receipt.repository} recorded "
                 f"{receipt.outcome} for commit {receipt.commit}, {whose}, running check "
@@ -2815,11 +2826,13 @@ def render_projection(
 
     A superseded record is hidden behind what replaced it, unless it is an
     observation whose evidence establishes for this launch what the
-    evidence of what stands in its place does not (R3-F3, R5-F3, R6-F2 of PR
-    #513; :func:`_replaces`): only a validation receipt of the same check
-    under the same policy, of this launch's candidate or of the very commit
-    the observation's receipt validated, replaces it. A replacement whose
-    receipt is missing, of another commit, of another check or policy,
+    evidence of what stands in its place does not (R3-F3, R5-F3, R6-F2,
+    R7-F1 of PR #513; :func:`_replaces`): only a validation receipt of the
+    same check under the same policy, recording the same outcome, of this
+    launch's candidate or of the very commit the observation's receipt
+    validated, replaces it. A replacement whose receipt is missing, of
+    another commit, of another check or policy, of another outcome (a
+    ``TIMEOUT`` for a ``FAIL``, or a ``FAIL`` for a ``TIMEOUT``),
     retracted since or withheld here, one that is no observation, and one
     citing a launch, whose receipt records no outcome, issue or candidate
     even when the run keeps it, never hides an observation a kept receipt

@@ -47,8 +47,9 @@
     candidate, so a launch citation renders downgraded until #332's typed
     receipt exists, and a superseded failure is hidden only behind a
     validation receipt of the same check (its definition's digest) under
-    the same policy (its digest), of the launch's candidate or of the
-    commit the failure was evidence of. D12's bound is 16,384 characters and 16,384 tokens,
+    the same policy (its digest), recording the same outcome (`FAIL` or
+    `TIMEOUT`), of the launch's candidate or of the commit the failure was
+    evidence of. D12's bound is 16,384 characters and 16,384 tokens,
     the tokens held as UTF-8 bytes. Wiring the store into the running
     workflow is #333's.
   - *Implemented with it:* nothing in the package. No phase, edge, state

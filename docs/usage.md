@@ -2489,10 +2489,15 @@ records no outcome, issue or candidate, so even one the run keeps
 establishes nothing the record says. A superseded failure stays shown
 unless what replaced it has a validation receipt of the same check, by the
 digest of its definition (its argv and scope), under the same policy (the
-same policy digest), and of the launch's candidate or of the commit the
-failure was evidence of: a record citing a launch, another commit's
-failure, and a failure of another check (`make lint` replacing a failure of
-`make test`) or of the same check under another policy never hide it. A launch
+same policy digest), recording the same outcome (`FAIL` or `TIMEOUT`), and
+of the launch's candidate or of the commit the failure was evidence of: a
+record citing a launch, another commit's failure, a failure of another
+check (`make lint` replacing a failure of `make test`) or of the same check
+under another policy, and a record of another outcome never hide it. A
+`TIMEOUT` establishes that the check never finished, a `FAIL` that it
+exited nonzero, so a `TIMEOUT` of `make test` superseding a `FAIL` of it on
+the same commit and policy, or a `FAIL` superseding a `TIMEOUT`, leaves
+both shown; a newer record of the same outcome replaces it. A launch
 with no candidate yet is shown no record bound to one. A projection is
 reproducible from the store's revision, the request and the evidence
 together. Its header names the digests of the store and of the evidence,

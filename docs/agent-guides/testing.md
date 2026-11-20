@@ -3214,9 +3214,12 @@ path's own tests (ADR 0015 §4.2). Keep covered:
   citation, with its receipt missing or kept, another commit's failure, on
   a launch of a third commit or of none too, a retracted replacement, a
   failure of another check, `make lint` over `make test`, on C1, on no
-  candidate and on C2, and of the same check under another policy: R6-F2),
-  hidden behind a validation receipt of the same check and policy, of the
-  launch's candidate or of the same commit, or a chain's end that has one,
+  candidate and on C2, and of the same check under another policy: R6-F2,
+  and a record of another outcome, a `TIMEOUT` of `make test` over its
+  `FAIL` and a `FAIL` over its `TIMEOUT`, on C1, on no candidate and on C2:
+  R7-F1), hidden behind a validation receipt of the same check, policy and
+  outcome, of the launch's candidate or of the same commit, or a chain's
+  end that has one,
   after a save and a load and once its own receipt is lost; the
   'established' line naming the check (its index and the digests of its
   definition and policy); a launch citation never observed, whatever

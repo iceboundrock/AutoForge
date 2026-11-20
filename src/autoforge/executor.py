@@ -1521,8 +1521,12 @@ def _prepare_sandbox(
     the one that prepares ``description`` (ADR 0013 D13's run step); a
     description no backend prepares is refused, never run without one.
     ``executable_fd`` is the program the command starts
-    (:attr:`ExecutionRequest.executable_fd`), which the backend shows at
-    ``command[0]``.
+    (:attr:`ExecutionRequest.executable_fd`): the backend shows that file
+    read-only at a private path of the sandbox's own, which no name on the
+    host leads to, and starts that path in place of ``command[0]``. It never
+    mounts anything at ``command[0]``, so no file put at that name on the
+    host, before the launch or while it runs, changes what runs (R6-F3 of
+    PR #513).
     """
     return sandbox_backend.prepare(
         description,

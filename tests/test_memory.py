@@ -118,11 +118,13 @@ def _receipt(
     run: str = RUN,
     check: tuple[int, tuple[str, ...]] = TEST,
     timeout: int = 600,
+    timed_out: bool = False,
 ) -> dict:
     """A real ValidationRecord of owner/repo (the issue's repository), as the
     controller writes one (``observed_record``, which its loader checks): by default a
     failure (exit 1) of candidate C1 running ``make test`` under a 600-second policy,
-    in this run's log. Shared: copy it before changing it."""
+    in this run's log; with ``timed_out``, that check's ``TIMEOUT`` instead. Shared:
+    copy it before changing it."""
     from autoforge.evidence import (
         NO_SANDBOX_TEMPLATE,
         Definition,
@@ -160,6 +162,7 @@ def _receipt(
             stderr="",
             started_at="2026-11-19T00:00:00+00:00",
             finished_at="2026-11-19T00:00:01+00:00",
+            timed_out=timed_out,
         ),
         run_log=f"{run}/0004-analyze_execute-candidate-validation-1",
     )
@@ -1932,6 +1935,72 @@ def test_a_failure_of_another_check_never_hides_a_failure_of_this_one():
     moved, _ = _applied(moved.supersede(c1, c2, **controller))
     projection = _render(_reloaded(moved), _evidence(1, _receipt(2, commit=C2)), candidate=C2)
     assert projection.shown == (c2,) and projection.superseded == 1
+
+
+def test_a_failure_of_another_outcome_never_hides_one_of_this_check():
+    """R7-F1 of PR #513, the reviewer's case: two valid receipts of ``make test`` on C1
+    under one policy, one a ``FAIL`` (it exited nonzero) and one a ``TIMEOUT`` (it never
+    finished). Either superseding the other hides nothing, in both orderings: both show,
+    each established line naming its own outcome, after a save and a load, on C1 and on
+    a launch with no candidate, and on C2 beside a C2 record of the other outcome. A
+    genuine replacement, a newer record of the same check, policy and outcome, of C1 or
+    of the launch's own candidate, still hides it, a ``TIMEOUT`` as a ``FAIL``."""
+    controller = {"actor": Actor.CONTROLLER, "issue_url": ISSUE, "attempt": _launch(4)}
+    fail, timeout = {}, {"timed_out": True}
+    assert _receipt(1)["outcome"] == "FAIL"
+    assert _receipt(2, **timeout)["outcome"] == "TIMEOUT"
+    assert _check_line(1) == _check_line(2, **timeout)  # one check, one policy
+    for first, second in ((fail, timeout), (timeout, fail)):
+        older_outcome = _receipt(1, **first)["outcome"]
+        newer_outcome = _receipt(2, **second)["outcome"]
+        store, older = _applied(
+            observe(_store(), f"make test: {older_outcome}", seq=1, cite=_vr(1, **first))
+        )
+        store, newer = _applied(
+            observe(store, f"make test: {newer_outcome}", seq=2, cite=_vr(2, **second))
+        )
+        store, _ = _applied(store.supersede(older, newer, **controller))
+        held = _evidence(_receipt(1, **first), _receipt(2, **second))
+        assert [r.outcome for r in held.validation] == [older_outcome, newer_outcome]
+        for current in (store, _reloaded(store)):
+            for candidate in (C1, ""):
+                projection = _render(current, held, candidate=candidate)
+                assert sorted(projection.shown) == [older, newer], (first, candidate)
+                assert projection.kept_over_replacement == 1 and projection.superseded == 0
+                assert f"recorded {older_outcome} for commit {C1}" in _block_of(projection, older)
+                assert f"recorded {newer_outcome} for commit {C1}" in _block_of(projection, newer)
+                assert (
+                    f"- superseded by M{newer}, whose evidence does not establish what this "
+                    "record's does for this launch: kept for its own"
+                ) in _block_of(projection, older)
+        # On C2, a C2 record of the other outcome establishes nothing of C1's.
+        on_c2, of_c1 = _applied(
+            observe(_store(), f"make test: {older_outcome}", seq=1, cite=_vr(1, **first))
+        )
+        on_c2, of_c2 = _applied(observe(on_c2, "on C2", seq=3, cite=_vr(3, commit=C2, **second)))
+        on_c2, _ = _applied(on_c2.supersede(of_c1, of_c2, **controller))
+        held = _evidence(_receipt(1, **first), _receipt(3, commit=C2, **second))
+        projection = _render(_reloaded(on_c2), held, candidate=C2)
+        assert sorted(projection.shown) == [of_c1, of_c2] and _historical(projection, of_c1)
+        # A genuine replacement: a newer record of the same check, policy and outcome,
+        # of C1 (on every launch) or of the launch's own candidate C2.
+        same, before = _applied(
+            observe(_store(), f"make test: {older_outcome}", seq=1, cite=_vr(1, **first))
+        )
+        same, after = _applied(observe(same, "again", seq=2, cite=_vr(2, **first)))
+        same, _ = _applied(same.supersede(before, after, **controller))
+        held = _evidence(_receipt(1, **first), _receipt(2, **first))
+        for candidate in (C1, ""):
+            projection = _render(_reloaded(same), held, candidate=candidate)
+            assert projection.shown == (after,) and projection.superseded == 1
+        moved, c1 = _applied(
+            observe(_store(), f"make test: {older_outcome}", seq=1, cite=_vr(1, **first))
+        )
+        moved, c2 = _applied(observe(moved, "on C2", seq=2, cite=_vr(2, commit=C2, **first)))
+        moved, _ = _applied(moved.supersede(c1, c2, **controller))
+        held = _evidence(_receipt(1, **first), _receipt(2, commit=C2, **first))
+        projection = _render(_reloaded(moved), held, candidate=C2)
+        assert projection.shown == (c2,) and projection.superseded == 1
 
 
 # -- what is established is the receipt's, never the text (R4-F3 of PR #513) -----------------
