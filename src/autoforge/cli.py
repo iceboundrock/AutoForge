@@ -2009,8 +2009,19 @@ def cmd_memory(args) -> int:
         state = engine.load()
         _guard_scheduler_ownership(engine, state.current_issue_url, "memory retract")
         result = state.memory().revise(
-            Action.RETRACT, args.record, actor=Actor.OPERATOR, reason=args.reason
+            Action.RETRACT,
+            args.record,
+            actor=Actor.OPERATOR,
+            reason=args.reason,
+            issue=state.current_issue_url,
         )
+        if result.status == "foreign":
+            # `memory show` lists the current issue's records only; an earlier
+            # issue's record of the run is left as it is, and nothing is saved.
+            raise ConfigurationError(
+                f"Memory record M{args.record} is not a record of the run's current issue; "
+                "nothing was written"
+            )
         if result.store.encode() != state.issue_memory:
             state.issue_memory = result.store.encode()
             # An operator ledger write does not settle or reconcile workflow state.

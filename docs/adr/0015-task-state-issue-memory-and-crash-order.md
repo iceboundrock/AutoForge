@@ -1639,7 +1639,12 @@ launch delivery remain #333's. For this first slice, only the Pi adapter
 with context files disabled supplies D14's proof. Claude's no-session
 option does not prove auto-memory is off; it is refused when Memory is on,
 as are the other adapters without a proof. AutoForge does not start a
-version probe or change how any Memory-off launch runs.
+version probe or change how any Memory-off launch runs. For D9.6, every
+record not yet retracted reserves one event slot and the bytes of one
+operator retraction, so the operator's retraction (D9.4) is never refused
+for a bound. A superseded record stays superseded when its replacement
+is retracted; only a validation failure its retained receipt establishes
+on the launch stays shown until a shown record carries the same claim.
 
 | Needs | Does not need |
 |---|---|

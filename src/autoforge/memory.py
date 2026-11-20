@@ -343,6 +343,28 @@ def _serialized_size(value: dict) -> int:
     return len(rendered) + 2 * rendered.count("\n")
 
 
+# The most an operator's retraction row can add to the serialized store: a
+# whole one-row events list, with a reason whose every byte escapes to six
+# characters. Every record not yet retracted keeps this many bytes and one
+# event slot in reserve (``MemoryStore._within_bounds``), so the operator's
+# retraction is never refused for the store's bounds.
+RETRACTION_RESERVE_BYTES = _serialized_size(
+    {
+        "events": [
+            {
+                "action": Action.RETRACT.value,
+                "actor": Actor.OPERATOR.value,
+                "attempt": 0,
+                "reason": "\x01" * MAX_REASON_BYTES,
+                "step": None,
+                "target": MAX_EVENTS,
+                "value": None,
+            }
+        ]
+    }
+)
+
+
 class MemoryStore:
     """A validated checkpoint value bound to its outer repository and run.
 
@@ -381,7 +403,7 @@ class MemoryStore:
             _require(texts.keys() == {f.content for f in self._facts.values() if not f.withdrawn})
             self._texts = dict(texts)
             _require(_serialized_size(state) <= MAX_STORE_BYTES)
-            _require(_serialized_size(self._encode(refusals=MAX_COUNTER)) <= MAX_STORE_BYTES)
+            _require(self._within_bounds())
         except (TypeError, ValueError, OverflowError):
             _invalid()
 
@@ -402,6 +424,21 @@ class MemoryStore:
         if not (self.enabled or self._events or self.refusals):
             return {}
         return json.loads(_json(self._encode(refusals=self.refusals)))
+
+    def _within_bounds(self) -> bool:
+        """Room for the operator to retract every record not yet retracted.
+
+        Each open record reserves one event slot and the bytes of one
+        operator retraction. That retraction spends at most its record's
+        reserve and never adds a text, so it always fits; every other write,
+        and every load, must leave the whole reserve in place.
+        """
+        open_records = sum(not f.withdrawn for f in self._facts.values())
+        size = _serialized_size(self._encode(refusals=MAX_COUNTER))
+        return (
+            len(self._events) + open_records <= MAX_EVENTS
+            and size + open_records * RETRACTION_RESERVE_BYTES <= MAX_STORE_BYTES
+        )
 
     def _check_content(self, fact: MemoryFact) -> None:
         _require(not any(w.binds(fact) and w.scope.covers(fact.scope) for w in self._withdrawals))
@@ -536,7 +573,7 @@ class MemoryStore:
                 candidate._texts[_digest(text)] = text
             active = {f.content for f in candidate._facts.values() if not f.withdrawn}
             candidate._texts = {k: candidate._texts[k] for k in active}
-            _require(_serialized_size(candidate._encode(refusals=MAX_COUNTER)) <= MAX_STORE_BYTES)
+            _require(candidate._within_bounds())
         except (StateError, ValueError, TypeError, KeyError, OverflowError):
             return WriteOutcome(self._refusal(), "refused")
         return WriteOutcome(candidate, "applied", event.get("target", len(candidate._events)))
@@ -609,13 +646,24 @@ class MemoryStore:
         attempt: int = 0,
         text: str | None = None,
         replacement: int | None = None,
+        issue: str | None = None,
     ) -> WriteOutcome:
-        """Correct advisory prose, supersede with a later fact, or retract."""
+        """Correct advisory prose, supersede with a later fact, or retract.
+
+        ``issue`` is the issue the caller acts for, required of the operator,
+        whose row names no step. A target that is another issue's record is
+        ``foreign``: nothing is written, not even the refusal count.
+        """
         if not self.enabled:
             return WriteOutcome(self, "disabled")
         try:
             action = Action(action)
             _require(action is not Action.ADD)
+            _require(issue is not None or Actor(actor) is not Actor.OPERATOR)
+            fact = self._facts.get(target) if type(target) is int else None
+            if issue is not None and fact is not None:
+                if fact.scope.step.issue_url != _issue(issue):
+                    return WriteOutcome(self, "foreign")
             _require(isinstance(reason, str) and bool(reason.strip()))
             _require((text is not None) == (action is Action.CORRECT))
             _require((replacement is not None) == (action is Action.SUPERSEDE))
@@ -802,22 +850,24 @@ def render_projection(
         else:
             matching[fact.id] = _established(fact, request, receipts)
 
-    def equivalent(old: MemoryFact, new: MemoryFact) -> bool:
-        if old.evidence is not None:
-            return matching[old.id] is not None and matching[old.id] == matching[new.id]
-        if new.evidence is not None:
-            return matching[new.id] is not None
-        return True
+    def carried(fact: MemoryFact, claim: tuple) -> bool:
+        # Whether a current record later in the chain establishes the same claim.
+        while fact.replacement:
+            fact = facts[fact.replacement]
+            if matching.get(fact.id) == claim:
+                return True
+        return False
 
-    visible = []
-    for i in matching:
-        predecessor = successor = facts[i]
-        while successor.replacement:
-            successor = facts[successor.replacement]
-            if successor.id in matching and equivalent(predecessor, successor):
-                break
-        else:
-            visible.append(predecessor)
+    # Supersession is final: a replacement later withdrawn, withheld or left
+    # without its receipt does not make the record it replaced current again.
+    # One record outlives its supersession: an observation its retained
+    # receipt establishes on this launch, until a current record of its chain
+    # establishes the same claim, so no unsupported text hides it.
+    visible = [
+        facts[i]
+        for i, claim in matching.items()
+        if not facts[i].replacement or (claim is not None and not carried(facts[i], claim))
+    ]
     visible.sort(
         key=lambda f: (3 if matching[f.id] else 0 if f.evidence else _RANK[f.author], f.revision),
         reverse=True,
@@ -884,6 +934,11 @@ def render_projection(
                 f"{outcome.value} on {commit} (tree {tree}), check {index} "
                 f"definition {definition}, policy {policy}.\n"
             )
+            if fact.replacement:
+                proof += (
+                    f"Superseded by M{fact.replacement}; shown because no current "
+                    "replacement establishes the same observed claim.\n"
+                )
         block = (
             f"\nM{fact.id} {fact.kind.value} — {label}\n{proof}"
             + (

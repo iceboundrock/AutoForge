@@ -621,7 +621,11 @@ off (`{}`) and `launch_seq` initialized to `step_count`, then is relabelled
 on the next save. An older label carrying either new field is refused.
 The launch-intent save increments the ordinal; retry, resume, unblock
 and issue changes never reset it. An ordinal is not a launch receipt.
-The new fields and migration were [announced on issue #23](https://github.com/iceboundrock/AutoForge/issues/23#issuecomment-7017724690).
+`issue_memory` is validated whole on load, by the rules every write
+applies, and a value that would leave an open record without its
+retraction reserve (one event slot and its bytes) is refused. The number
+is the implementation's (`main` was at 19 when it was written); it is
+settled on #23 before the change merges.
 
 **Numbering a new protocol.** A change that adds or changes persisted state takes N + 1, where N is `__protocol_version__` on `main` when its PR is ready to merge, and it makes that bump alone: two independent persisted changes never share one. Before the PR merges, its issue announces N → N + 1, the new fields and the migration rule on #23, the home of protocol numbering. If `main` moves past N first, the PR rebases, takes the new N + 1 and says so there; after the merge, #23 records the squash commit. No number is reserved ahead of time. Label 6 stays skipped: never written, and refused as unknown like a future label (`tests/test_state.py`, `test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged`). Each bump states its migration rule in this section, in the form above: what a file of the previous protocol loads as, what an older-labelled file carrying the new state is refused as, and which new field a file of the new protocol must carry.
 

@@ -2498,19 +2498,28 @@ the run, before the first launch. A new run does not inherit previous notes.
 
 `autoforge memory show --json` reads the current issue's catalog without a
 lock or write. `autoforge memory retract RECORD --reason WHY` takes the
-repository lock and withdraws a saved record by its numeric ID. A
+repository lock and withdraws a saved record of the current issue by its
+numeric ID. A record of an issue the run worked on earlier is not in the
+catalog, and retracting it is refused with nothing written. A
 correction or retraction leaves a content digest that prevents reappearance
 within its scope and authority. Refusals are counted, not tombstoned. The
 store keeps at most 64 facts and 256 lifecycle events per run, and at most
 1 MiB of serialized state. It refuses writes beyond the bounds rather
-than evicting audit history.
+than evicting audit history. Every record not yet retracted keeps one
+event slot, and the bytes of an operator retraction with the longest
+reason, in reserve. Other writes are refused before they would spend it,
+so `memory retract` is never refused for the bounds.
 
 The provider-neutral projection uses the committed revision, one bound
 launch and retained typed receipts. A validation receipt can establish
 only what it records for that issue and exact candidate, not adjacent
-commentary. A supersession cannot hide a verified statement without
-matching check, policy, outcome and candidate evidence. Missing or
-unmatched evidence downgrades rather than verifies. The full projection,
+commentary. A superseded record stays out of the projection, even when its
+replacement is later retracted or loses its receipt. The one exception is
+a validation failure that its own retained receipt establishes on the
+launch: a supersession cannot hide it without matching check, policy,
+outcome and candidate evidence in a shown record of the chain, and until
+then it is shown, marked as superseded. Missing or unmatched evidence
+downgrades rather than verifies. The full projection,
 including headings and omission notices, is at most 16,384 characters
 and 16,384 UTF-8 bytes (a conservative byte-level token bound).
 

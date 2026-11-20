@@ -1,6 +1,5 @@
 """Protocol-20's advisory snapshot and its independent projection."""
 
-import copy
 import hashlib
 import json
 from dataclasses import replace
@@ -17,6 +16,7 @@ from autoforge.memory import (
     MAX_REASON_BYTES,
     MAX_STORE_BYTES,
     MAX_TEXT_BYTES,
+    RETRACTION_RESERVE_BYTES,
     Action,
     Actor,
     EvidenceRef,
@@ -71,6 +71,7 @@ def apply(out):
 
 
 def revise(store, action, target, *, actor=Actor.OPERATOR, reason="reviewed", **kwargs):
+    kwargs.setdefault("issue", ISSUE)
     return store.revise(action, target, actor=actor, reason=reason, **kwargs)
 
 
@@ -291,7 +292,7 @@ def test_supersession_compares_claim_identity_after_reload(kind):
     )
 
 
-def test_supersession_chain_survives_intermediate_but_not_terminal_withdrawal():
+def test_an_established_chain_keeps_its_claim_shown_through_withdrawals():
     records = [failure(i, exit_code=1) for i in (1, 2, 3)]
     st = empty()
     for i, rec in enumerate(records):
@@ -301,10 +302,85 @@ def test_supersession_chain_survives_intermediate_but_not_terminal_withdrawal():
     mid = reload(apply(revise(st, Action.RETRACT, 2)))
     end = reload(apply(revise(st, Action.RETRACT, 3)))
     assert render_projection(mid, REQ, validation_records=records).ids == (3,)
-    assert render_projection(end, REQ, validation_records=records).ids == (2,)
+    # No shown record carries the claim M2's own receipt establishes, so M2
+    # stays shown, marked as superseded; M1's claim is M2's and stays hidden.
+    shown = render_projection(end, REQ, validation_records=records)
+    assert shown.ids == (2,) and "Superseded by M3; shown because" in shown.text
+    # Without its receipt M2 establishes nothing, and its supersession holds;
+    # M1's receipt then establishes a claim no shown record carries.
+    assert render_projection(end, REQ, validation_records=records[:1]).ids == (1,)
+    assert render_projection(end, REQ).ids == ()
     a = apply(proposal(empty(), scope=replace(SCOPE, range=Range.EXACT, candidate=SHA)))
     b = apply(proposal(a, n=2, scope=replace(SCOPE, range=Range.EXACT, candidate=BASE)))
     assert revise(b, Action.SUPERSEDE, 1, replacement=2).status == "refused"
+
+
+@pytest.mark.parametrize("withdrawn", [2, 3])
+def test_a_superseded_proposal_stays_superseded_when_its_replacement_goes(withdrawn):
+    st = empty()
+    for n in (1, 2, 3):
+        st = apply(proposal(st, text=f"proposal {n}", n=n))
+    pair = apply(revise(st, Action.SUPERSEDE, 1, replacement=2))
+    pair = reload(apply(revise(pair, Action.RETRACT, 2)))
+    projected = render_projection(pair, REQ)
+    assert 1 not in projected.ids and "proposal 1" not in projected.text
+    assert [r["status"] for r in pair.catalog(ISSUE)["records"][:2]] == ["superseded", "retracted"]
+    chain = apply(revise(st, Action.SUPERSEDE, 1, replacement=2))
+    chain = apply(revise(chain, Action.SUPERSEDE, 2, replacement=3))
+    chain = reload(apply(revise(chain, Action.RETRACT, withdrawn)))
+    projected = render_projection(chain, REQ)
+    assert projected.ids == (() if withdrawn == 3 else (3,))
+    assert "proposal 1" not in projected.text and "proposal 2" not in projected.text
+    assert [r["status"] for r in chain.catalog(ISSUE)["records"]] == [
+        "superseded",
+        "retracted" if withdrawn == 2 else "superseded",
+        "retracted" if withdrawn == 3 else "current",
+    ]
+
+
+def test_a_superseded_proposal_stays_superseded_when_its_receipt_is_evicted():
+    rec = failure(exit_code=1)
+    st = apply(proposal(empty(), text="the suite passes"))
+    st = apply(observation(st, rec, text="the suite failed"))
+    st = reload(apply(revise(st, Action.SUPERSEDE, 1, replacement=2)))
+    for receipts in ([rec], []):
+        projected = render_projection(st, REQ, validation_records=receipts)
+        assert projected.ids == (2,) and "the suite passes" not in projected.text
+    assert render_projection(st, REQ).freshness.downgraded == 1
+
+
+def test_an_established_observation_is_not_hidden_by_a_replacement_without_its_claim():
+    rec = failure(exit_code=1)
+    st = apply(observation(empty(), rec, text="the suite failed"))
+    st = st.add(
+        actor=Actor.CONTROLLER,
+        kind=Kind.LAUNCH_END,
+        scope=SCOPE,
+        attempt=2,
+        text="the suite did not run",
+        evidence=EvidenceRef(Receipt.LAUNCH, 2, "c" * 64),
+    )
+    st = apply(revise(apply(st), Action.SUPERSEDE, 1, replacement=2))
+    for current in (st, apply(revise(st, Action.RETRACT, 2))):
+        projected = render_projection(reload(current), REQ, validation_records=[rec])
+        assert 1 in projected.ids and "Superseded by M2" in projected.text
+        # The receipt gone, the observation establishes nothing and stays superseded.
+        assert 1 not in render_projection(reload(current), REQ).ids
+
+
+def test_an_operator_revision_acts_only_on_the_issue_it_names():
+    st = apply(proposal(empty()))
+    st = apply(proposal(st, n=2, scope=replace(SCOPE, step=replace(STEP, issue_url=OTHER))))
+    for action, kwargs in ((Action.RETRACT, {}), (Action.CORRECT, {"text": "new"})):
+        foreign = revise(st, action, 1, issue=OTHER, **kwargs)
+        assert foreign.status == "foreign" and foreign.store is st
+        assert revise(st, action, 2, issue=ISSUE, **kwargs).status == "foreign"
+    # The operator's row names no step, so its issue is not optional.
+    refused = revise(st, Action.RETRACT, 1, issue=None)
+    assert refused.status == "refused" and refused.store.refusals == 1
+    done = reload(apply(revise(st, Action.RETRACT, 2, issue=OTHER)))
+    assert [r["status"] for r in done.catalog(OTHER)["records"]] == ["retracted"]
+    assert [r["status"] for r in done.catalog(ISSUE)["records"]] == ["current"]
 
 
 def test_projection_has_one_scope_and_no_ancestry_without_candidate():
@@ -394,23 +470,98 @@ def test_redacting_then_formatting_still_yields_a_loadable_reason_and_observatio
     assert len(reason.encode()) <= MAX_REASON_BYTES and redact(reason) == reason
 
 
-def test_full_history_refuses_without_eviction_or_an_unloadable_counter(tmp_path):
+def test_a_record_past_the_count_is_refused_and_counted():
     st = empty()
-    for i in range(MAX_FACTS):
-        st = apply(proposal(st, n=i + 1, text=chr(0x1F680 + i) * (MAX_TEXT_BYTES // 4)))
-    refused = proposal(st, n=MAX_FACTS + 1, text="new")
+    for n in range(1, MAX_FACTS + 1):
+        st = apply(proposal(st, text=f"note {n}", n=n))
+    refused = proposal(st, n=MAX_FACTS + 1, text="one more")
     assert refused.status == "refused" and refused.store.refusals == 1
-    st = refused.store
-    for i in range(MAX_EVENTS - MAX_FACTS):
-        st = apply(revise(st, Action.CORRECT, 1, text=f"revision {i}", reason="long " * 100))
-    refused = revise(st, Action.RETRACT, 1)
-    assert refused.status == "refused" and refused.store.refusals == 2
-    assert len(refused.store.encode()["events"]) == MAX_EVENTS
+    assert len(reload(refused.store).encode()["events"]) == MAX_FACTS
+
+
+def fill(st, write):
+    """Apply ``write(st, i)`` until the store refuses one; the last store and that refusal."""
+    for i in range(MAX_EVENTS + 1):
+        out = write(st, i)
+        if out.status != "applied":
+            return st, out
+        st = out.store
+    raise AssertionError("the store never refused an ordinary write")
+
+
+def checkpoint_bytes(st):
+    # As the state file renders the field: two more spaces on each line.
+    rendered = json.dumps(st.encode(), indent=2, sort_keys=True)
+    return len(rendered) + 2 * rendered.count("\n")
+
+
+def withdrawn_everywhere(st, tmp_path, texts):
+    st = reload(st)
     path = tmp_path / "state.json"
-    save_state(state(issue_memory=refused.store.encode(), launch_seq=128), path)
-    assert load_state(path).memory().encode() == refused.store.encode()
-    assert len(json.dumps(refused.store.encode(), indent=2).encode()) <= MAX_STORE_BYTES
-    altered = copy.deepcopy(st.encode())
-    altered["schema"] = True  # No independent nested schema label is accepted.
+    save_state(state(issue_memory=st.encode(), launch_seq=st.launch_seq), path)
+    assert load_state(path).memory().encode() == st.encode()
+    assert checkpoint_bytes(st) <= MAX_STORE_BYTES
+    projected = render_projection(st, REQ)
+    for text in texts:
+        assert text not in projected.text and text not in path.read_text()
+    return st, projected
+
+
+def test_an_operator_retraction_fits_once_ordinary_writes_fill_the_events(tmp_path):
+    st = apply(proposal(empty(), text="a wrong lesson"))
+    st = apply(proposal(st, n=2, text="filler"))
+    st, refused = fill(st, lambda s, i: revise(s, Action.CORRECT, 2, text=f"filler {i}"))
+    assert refused.status == "refused" and refused.store.refusals == 1
+    # Each record not yet retracted keeps one event slot for its retraction.
+    assert len(st.encode()["events"]) == MAX_EVENTS - 2
+    for other in (
+        proposal(st, n=3, text="new"),
+        revise(st, Action.SUPERSEDE, 1, replacement=2),
+        revise(st, Action.CORRECT, 1, text="corrected"),
+    ):
+        assert other.status == "refused"
+    st = apply(revise(refused.store, Action.RETRACT, 1, reason="the lesson is wrong"))
+    st, projected = withdrawn_everywhere(st, tmp_path, ["a wrong lesson"])
+    assert projected.freshness.withdrawn == 1 and projected.ids == (2,)
+    assert [r["status"] for r in st.catalog(ISSUE)["records"]] == ["retracted", "current"]
+    st = apply(revise(st, Action.RETRACT, 2))
+    st, projected = withdrawn_everywhere(st, tmp_path, ["a wrong lesson", "filler"])
+    assert len(st.encode()["events"]) == MAX_EVENTS and projected.ids == ()
+    assert "Applicable text withheld by withdrawal" in projected.text
+    assert revise(st, Action.RETRACT, 2).status == "refused"
+    # A hand edit that spends a retraction's slot on another write is refused.
+    raw = reload(refused.store).encode()
+    event = dict(raw["events"][-1], value=hashlib.sha256(b"spent").hexdigest())
+    raw["texts"] = {k: v for k, v in raw["texts"].items() if k != raw["events"][-1]["value"]}
+    raw["texts"][event["value"]] = "spent"
+    raw["events"].append(event)
     with pytest.raises(StateError):
-        MemoryStore(REPO, RUN, 128, altered)
+        MemoryStore(REPO, RUN, 128, raw)
+    raw["events"].pop()
+    raw["schema"] = True  # No independent nested schema label is accepted.
+    with pytest.raises(StateError):
+        MemoryStore(REPO, RUN, 128, raw)
+
+
+def test_an_operator_retraction_fits_once_ordinary_writes_fill_the_bytes(tmp_path):
+    # Every byte of these texts and reasons escapes to six characters. The
+    # last records repeat earlier texts, so retracting them frees no text.
+    worst = "\x01" * MAX_REASON_BYTES
+    unique = [f"{i:02d}" + "\x01" * (MAX_TEXT_BYTES - 2) for i in range(MAX_FACTS - 8)]
+    st = empty()
+    for i, text in enumerate(unique + unique[:8]):
+        st = apply(proposal(st, n=i + 1, text=text))
+    st, refused = fill(st, lambda s, i: revise(s, Action.CORRECT, 1, text=f"{i}", reason=worst))
+    events = len(st.encode()["events"])
+    assert refused.status == "refused" and events + MAX_FACTS < MAX_EVENTS  # Bytes, not count.
+    st = refused.store
+    for target in range(MAX_FACTS, MAX_FACTS - 8, -1):
+        st = reload(apply(revise(st, Action.RETRACT, target, reason=worst)))
+    # These retractions took bytes that no ordinary write was allowed.
+    assert checkpoint_bytes(st) > MAX_STORE_BYTES - MAX_FACTS * RETRACTION_RESERVE_BYTES
+    for target in range(MAX_FACTS - 8, 0, -1):
+        st = reload(apply(revise(st, Action.RETRACT, target, reason=worst)))
+    st, projected = withdrawn_everywhere(st, tmp_path, [])
+    assert len(st.encode()["events"]) == events + MAX_FACTS and projected.ids == ()
+    assert st.encode()["texts"] == {}
+    assert all(r["status"] == "retracted" for r in st.catalog(ISSUE)["records"])

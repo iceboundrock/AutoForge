@@ -166,6 +166,44 @@ def test_memory_seed_and_retraction_are_checkpoint_only(tmp_path, monkeypatch, c
     assert fakes["provider"].calls == [] and fakes["gh"].calls == calls
 
 
+def test_memory_retract_refuses_an_earlier_issues_record(tmp_path, monkeypatch, capsys, fakes):
+    """R1-F3 of PR #526: `memory show` hides an earlier issue's records, and
+    `memory retract` leaves them as they are and writes nothing."""
+    monkeypatch.chdir(tmp_path)
+    config = _config(
+        tmp_path / "af.json",
+        memory={"enabled": True},
+        profiles={
+            "analyze_execute": {
+                "provider": "pi",
+                "model": "openai/fixture-model",
+                "effort": "high",
+                "options": {"context_files": False},
+            }
+        },
+    )
+    args = ["--config", config]
+    seed = tmp_path / "seed.txt"
+    seed.write_text("A lesson about issue 2.\n", encoding="utf-8")
+    assert cli.main([*args, *_run_argv_of(1), "--memory-seed", str(seed)]) == 0
+    state_file = tmp_path / ".autoforge" / "state.json"
+    moved = load_state(state_file)
+    moved.reset_for_new_issue(ISSUE3)
+    save_state(moved, state_file)
+    before = state_tree(tmp_path / ".autoforge")
+    capsys.readouterr()
+    assert cli.main([*args, "memory", "show", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["records"] == []
+    assert cli.main([*args, "memory", "retract", "1", "--reason", "wrong lesson"]) == 2
+    assert "not a record of the run's current issue; nothing was written" in (
+        capsys.readouterr().err
+    )
+    assert state_tree(tmp_path / ".autoforge") == before
+    (record,) = load_state(state_file).memory().catalog(ISSUE)["records"]
+    assert record["status"] == "current" and record["text"] == "A lesson about issue 2.\n"
+    assert fakes["provider"].calls == []
+
+
 @pytest.mark.parametrize("output_format", ["text", "stream-json"])
 def test_memory_refuses_unproved_claude_before_any_checkpoint(
     tmp_path,
