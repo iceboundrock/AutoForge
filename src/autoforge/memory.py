@@ -965,6 +965,11 @@ def _compact_label(replacement: int) -> str:
     return f"superseded by M{replacement}; claim only, text omitted"
 
 
+# The Memory revision's width in a projection's header: a supersession,
+# one revision more, never makes the header longer (R5-F1 of PR #526).
+_REVISION_WIDTH = len(str(MAX_EVENTS))
+
+
 # How much shorter a superseded record's compact block is than the shortest
 # whole block it had before (R3-F2 of PR #526). Both open with the same
 # ``\nM<id> <kind> — `` and carry the same established-claim line; the whole
@@ -974,9 +979,6 @@ def _compact_label(replacement: int) -> str:
 # #526), and the header shows the Memory revision at a fixed width, so a
 # compact block that is not longer always fits where it was chosen: this
 # must not be negative.
-# The Memory revision's width in a projection's header: a supersession,
-# one revision more, never makes the header longer.
-_REVISION_WIDTH = len(str(MAX_EVENTS))
 COMPACT_SLACK_BYTES = (
     len("unverified controller account\n")
     + len(fenced_untrusted_block("x", "untrusted"))

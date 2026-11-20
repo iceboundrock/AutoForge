@@ -445,7 +445,7 @@ def test_the_operator_retracts_with_memory_off_and_the_withdrawal_survives_re_en
     assert revise(off, Action.CORRECT, 1, text="fixed").status == "disabled"
     with pytest.raises(StateError):
         render_projection(off, REQ)
-    # Another issue's record, a missing one, and one retracted already: no write.
+    # Another issue's record and a missing one: nothing is written.
     assert revise(off, Action.RETRACT, 2, issue=ISSUE).status == "foreign"
     for target in (9, 0):
         out = revise(off, Action.RETRACT, target)
