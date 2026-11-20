@@ -7,6 +7,7 @@ temporary repository; nothing reaches GitHub.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -15,7 +16,7 @@ import pytest
 
 import autoforge.engine as engine_module
 from autoforge import cli, doctor_sandbox
-from autoforge.config import default_config
+from autoforge.config import MemoryConfig, default_config
 from autoforge.doctor import Doctor
 from autoforge.errors import SandboxPolicyError
 from autoforge.executor import ExecutionResult, execute
@@ -126,6 +127,81 @@ def test_the_mode_row_says_what_the_mode_does_on_this_host(mode, supported, labe
     # No mode falls back (ADR 0009 D7), and no row calls a launch sandboxed (D12.2).
     assert "falls back" not in row.detail and "or preferred" not in row.detail
     assert "is sandboxed" not in row.detail and "runs sandboxed" not in row.detail
+
+
+_PI_MEMORY_PROFILE = {
+    "provider": "pi",
+    "model": "openai/fixture-model",
+    "effort": "high",
+    "options": {"context_files": False, "require_oauth": False},
+}
+
+
+@pytest.mark.parametrize("supported", [True, False], ids=["capable", "incapable"])
+def test_memory_with_the_sandbox_disabled_is_a_required_failure(supported):
+    """R5-F4 of PR #526: every Memory ANALYZE_EXECUTE launch is refused before
+    its intent save under ``sandbox.mode: disabled``, so doctor's mode row is
+    a required failure with Memory on, whatever the host; with Memory off it
+    stays the warning it was."""
+    probe = (
+        ProbeResult(True, "", "0.12.0")
+        if supported
+        else ProbeResult(False, "bwrap: Can't mount proc", "", Capability.PROCFS)
+    )
+    cfg = default_config()
+    cfg.sandbox.mode = "disabled"
+    assert doctor_sandbox.mode_row(cfg, probe).label == "WARN"
+    cfg.memory = MemoryConfig(enabled=True)
+    row = doctor_sandbox.mode_row(cfg, probe)
+    assert row.label == "FAIL" and row.required and not row.ok
+    assert "memory.enabled is true" in row.detail and "refused" in row.detail
+    assert "sandbox.mode: required" in row.detail and "turn Memory off" in row.detail
+    assert "is sandboxed" not in row.detail and "runs sandboxed" not in row.detail
+    # Required on a host that cannot enforce: `disabled` is no way out with Memory.
+    cfg.sandbox.mode = "required"
+    row = doctor_sandbox.mode_row(cfg, probe)
+    if supported:
+        assert row.label == "OK  "
+    else:
+        assert row.label == "FAIL"
+        assert "turn Memory off and set sandbox.mode: disabled" in row.detail
+
+
+def test_doctor_fails_a_valid_memory_configuration_with_the_sandbox_disabled(tmp_path, host):
+    """R5-F4 of PR #526, offline: a Pi profile that passes the configuration
+    check, Memory on and ``sandbox.mode: disabled``. The config row passes, as
+    the profile's half of the proof holds, and the mode row fails as
+    required, since the launch's half never can."""
+    repo = git_repo(tmp_path / "repo")
+    config = tmp_path / "memory.json"
+    config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "memory": {"enabled": True},
+                "sandbox": {"mode": "disabled"},
+                "profiles": {"analyze_execute": _PI_MEMORY_PROFILE},
+            }
+        )
+    )
+    d = Doctor(config_path=str(config), cwd=str(repo), runner=Runner())
+    d.proc_net = str(host["proc_net"])
+    assert d.check_config().ok
+    rows = _rows(d.sandbox_checks())
+    row = rows["mode (disabled)"]
+    assert row.label == "FAIL" and row.required and "memory.enabled is true" in row.detail
+    # The same file with Memory off: the mode row is the warning it was.
+    config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "sandbox": {"mode": "disabled"},
+                "profiles": {"analyze_execute": _PI_MEMORY_PROFILE},
+            }
+        )
+    )
+    assert d.check_config().ok
+    assert _rows(d.sandbox_checks())["mode (disabled)"].label == "WARN"
 
 
 def test_a_keyring_login_is_refused_and_the_alternatives_named(tmp_path):

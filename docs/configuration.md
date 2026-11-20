@@ -1134,8 +1134,10 @@ variable (`execution.agent_env_allowlist_extra`, as the
 [Pi operator guide](pi.md#deepseek-on-an-api-key) describes). Once the
 launch's sandbox is compiled, the same is checked on what it actually mounts, and the launch is
 refused before anything is spawned if Pi's agent directory is not its own.
-A refusal before the intent save leaves the state as it was. Memory-off
-launches are neither checked nor changed. A process of your user outside
+A refusal before the intent save leaves the state as it was. `doctor`
+fails its `outer sandbox: mode` row for Memory under `sandbox.mode:
+disabled`, since such a launch is always refused. Memory-off launches are
+neither checked nor changed. A process of your user outside
 the sandbox can still reach that home through `/proc`, as it can reach
 anything else you own ([Pi policy](pi-policy.md) §5): the proof excludes
 every other launch and host directory, not a same-UID process that
