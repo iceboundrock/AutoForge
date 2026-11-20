@@ -66,10 +66,13 @@ The issue's planning names a lifecycle of ``candidate``, ``active``,
 ``superseded``, ``retracted``, ``rejected`` and ``needs_revalidation``; the
 equivalent ADR 0015 ratified is this one. A *candidate* is a ``proposed``
 record, *active* is ``current``, a *rejected* write is refused and counted
-and leaves nothing (a rejected text's digest stays a tombstone), and
-*needs revalidation* is what a render does with a record whose candidate or
-phase does not apply, or whose citation no longer resolves: it omits or
-downgrades it, every time, from the snapshot it reads.
+and leaves nothing, no record and no tombstone (R8-F3 of PR #513): only a
+correction or a retraction leaves one, the digest of the text it withdraws,
+and a later write a tombstone refuses is counted like any other refusal and
+adds no tombstone of its own. *Needs revalidation* is what a render does
+with a record whose candidate or phase does not apply, or whose citation no
+longer resolves: it omits or downgrades it, every time, from the snapshot
+it reads.
 
 Writes
 ------
@@ -2780,7 +2783,17 @@ def _block(record: MemoryRecord, group: str, resolution: Resolution | None, kept
     return "\n".join(lines)
 
 
-_NOTHING_SHOWN = "(no record applies to this launch)\n"
+#: What a projection that shows no record says when nothing was cut for its
+#: bound: no record applies to the launch.
+_NOTHING_APPLIES = "(no record applies to this launch)\n"
+#: What it says when the bound cut every record the launch would be shown,
+#: which do apply to it (R8-F1 of PR #513): the omission line follows.
+_NOTHING_FITS = (
+    "(no record is shown: each record this launch would be shown was omitted for the "
+    "projection's bound)\n"
+)
+#: The wider of the two, reserved by every render.
+_NOTHING_SHOWN_WIDEST = max(_NOTHING_APPLIES, _NOTHING_FITS, key=lambda s: len(s.encode("utf-8")))
 
 
 def _omitted_line(count: int) -> str:
@@ -2960,7 +2973,9 @@ def render_projection(
     # of PR #513): every record shown fits both bounds with them.
     widest = dict.fromkeys(counts, MAX_RECORDS)
     reserved = (
-        _header(store, request, evidence, widest) + _NOTHING_SHOWN + _omitted_line(MAX_RECORDS)
+        _header(store, request, evidence, widest)
+        + _NOTHING_SHOWN_WIDEST
+        + _omitted_line(MAX_RECORDS)
     )
     budget = bound - len(reserved)
     byte_budget = tokens - len(reserved.encode("utf-8"))
@@ -2995,7 +3010,9 @@ def render_projection(
         raise ValueError("the projection's header renders text the run-log redactor would change")
     text = header + "".join(body)
     if not shown:
-        text += _NOTHING_SHOWN
+        # Records the bound cut do apply to this launch: saying none does would
+        # misreport an omission as inapplicability (R8-F1 of PR #513).
+        text += _NOTHING_FITS if counts["omitted"] else _NOTHING_APPLIES
     if counts["omitted"]:
         text += _omitted_line(counts["omitted"])
     assert len(text) <= bound and len(text.encode("utf-8")) <= tokens, (len(text), bound)

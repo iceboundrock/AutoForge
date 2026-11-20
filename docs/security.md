@@ -317,19 +317,28 @@ yet (#333 renders one into the read context, never into the worktree), so
 no agent is shown Memory by this release.
 
 A Memory phase's Claude launch starts the CLI file whose `--version` the
-controller checked, through a descriptor held from before the check
-([Configuration](configuration.md#issue-working-memory)): a native program,
-which the kernel loads from that descriptor on the host, and which bwrap
-mounts from it inside the outer sandbox at a path no name on the host
-leads to, after checking that it mounted that very file. A script is
-refused before the launch is charged, since its interpreter, not the
-kernel, opens it again, by a name (Node resolves the descriptor's path back
-to it), and so is a host without `/proc/self/fd`. That binds the launch
-against an update of Claude Code, and against any file put at the CLI's
-name, between the check and the launch or while it runs. It does not bind
+controller checked ([Configuration](configuration.md#issue-working-memory)),
+and the controller opens that file twice. The version probe opens the
+executable before it asks, starts that open file and not whatever its name
+leads to, and closes its descriptor once the file has answered; a file
+written to, or put at the name, while it answered is refused there. The
+launch then opens the executable again, refuses it unless it is the file
+that answered, unchanged (its device, inode, size and modification and
+change times), and starts the program from that second descriptor: the
+kernel loads it from the descriptor on the host, and inside the outer
+sandbox bwrap mounts it from the descriptor at a path no name on the host
+leads to, after checking that it mounted that very file. The file must be a
+native program: a script is refused before the launch is charged, since its
+interpreter, not the kernel, opens it again, by a name (Node resolves the
+descriptor's path back to it), and so is a host without `/proc/self/fd`.
+So an update of Claude Code, or any file put at the CLI's name, is refused
+when it comes while the probe answers or before the launch opens the file
+again, and is never the program started when it comes after the launch's
+last check, before the start or while the program runs. That does not bind
 what the program opens by name once it runs, and does not detect a process
-of your own user that writes into that very file before it starts: such a
-process can already change what any launch of yours runs.
+of your own user that writes into that very file between the launch's last
+check and its start: such a process can already change what any launch of
+yours runs.
 
 Memory holds nothing secret by design: an agent's or the operator's text the
 run-log redactor would change is refused, never redacted and kept, and text

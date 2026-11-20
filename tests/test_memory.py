@@ -797,6 +797,14 @@ def test_an_agents_withdrawal_keeps_no_stronger_record_or_other_scope_out():
     replay_scope = propose(store, text, seq=3, applies=_ON_C1)
     assert replay_scope.refusal is RefusalCode.TOMBSTONED
     assert replay_scope.store.records == store.records
+    # R8-F3 of PR #513: the retraction left the one tombstone; the write it refuses
+    # is counted and leaves none of its own.
+    assert (
+        replay_scope.store.tombstones
+        == store.tombstones
+        == (hashlib.sha256(text.encode()).hexdigest(),)
+    )
+    assert replay_scope.store.refused[RefusalCode.TOMBSTONED.value] == 1
     for write in (
         lambda s: observe(s, text, seq=4, applies=_ON_C1),  # evidenced, stronger
         lambda s: seed(s, text),  # the operator's
@@ -1477,6 +1485,68 @@ def test_the_projection_bound_holds_and_every_cut_is_counted():
     assert f"[AutoForge omitted {projection.omitted_for_bound} records" in projection.text
     small = _render(store, max_chars=4096)
     assert len(small.text) <= 4096 and small.omitted_for_bound > projection.omitted_for_bound
+
+
+_NOTHING_APPLIES = "(no record applies to this launch)\n"
+_NOTHING_FITS = (
+    "(no record is shown: each record this launch would be shown was omitted for the "
+    "projection's bound)\n"
+)
+
+
+def _within_both_bounds(projection, max_chars: int, max_tokens: int) -> bool:
+    return len(projection.text) <= max_chars and len(projection.text.encode()) <= max_tokens
+
+
+def test_a_projection_whose_bound_cut_every_record_never_says_none_applies():
+    """R8-F1 of PR #513: a projection that shows nothing because its bound cut every
+    record the launch would be shown says so, and never that no record applies: one
+    valid 2,048-byte proposal at the smallest bounds, after a reload, and one of
+    four-byte characters cut by the token bound alone, its character bound the
+    largest, beside a record that does not apply. Only a projection that cut nothing
+    says no record applies: an empty store, and one whose records all apply
+    elsewhere. Every output holds both bounds."""
+    lowest = {"max_chars": MIN_PROJECTION_CHARS, "max_tokens": MIN_PROJECTION_TOKENS}
+    store, _ = _applied(propose(_store(), "z" * MAX_TEXT_BYTES, seq=1))
+    cut = _render(_reloaded(store), **lowest)
+    assert cut == _render(store, **lowest)
+    assert (cut.shown, cut.omitted_for_bound, cut.not_applicable) == ((), 1, 0)
+    assert "- records: 0 shown, 1 omitted for the bound, 0 not applicable" in cut.text
+    assert _NOTHING_APPLIES not in cut.text
+    assert cut.text.endswith(
+        _NOTHING_FITS + "[AutoForge omitted 1 records for the projection's bound]\n"
+    )
+    assert _within_both_bounds(cut, **lowest)
+
+    wide = "\U0001f600"  # four UTF-8 bytes, one character
+    tokens_only = {"max_chars": MAX_PROJECTION_CHARS, "max_tokens": MIN_PROJECTION_TOKENS}
+    store, _ = _applied(propose(_store(), wide * (MAX_TEXT_BYTES // 4), seq=1))
+    store, _ = _applied(propose(store, "FIX only", seq=2, applies=Applicability(phases=("FIX",))))
+    by_tokens = _render(_reloaded(store), **tokens_only)
+    assert (by_tokens.shown, by_tokens.omitted_for_bound, by_tokens.not_applicable) == ((), 1, 1)
+    assert len(_render(store).shown) == 1  # the character bound alone cuts nothing
+    assert _NOTHING_APPLIES not in by_tokens.text
+    assert by_tokens.text.endswith(
+        _NOTHING_FITS + "[AutoForge omitted 1 records for the projection's bound]\n"
+    )
+    assert _within_both_bounds(by_tokens, **tokens_only)
+
+    elsewhere, _ = _applied(
+        propose(_store(), "FIX only", seq=1, applies=Applicability(phases=("FIX",)))
+    )
+    elsewhere, _ = _applied(propose(elsewhere, "on C1 only", seq=2, applies=_ON_C1))
+    for store, not_applicable in ((_store(), 0), (_reloaded(elsewhere), 2)):
+        for bounds in (lowest, tokens_only, {}):
+            empty = _render(store, **bounds)
+            assert (empty.shown, empty.omitted_for_bound) == ((), 0)
+            assert empty.not_applicable == not_applicable
+            assert empty.text.endswith("nothing pending\n" + _NOTHING_APPLIES)
+            assert _NOTHING_FITS not in empty.text and "[AutoForge omitted" not in empty.text
+            assert _within_both_bounds(
+                empty,
+                bounds.get("max_chars", MAX_PROJECTION_CHARS),
+                bounds.get("max_tokens", MAX_PROJECTION_TOKENS),
+            )
 
 
 def test_a_launch_citation_is_never_observed_and_names_only_the_receipt_the_run_keeps():
