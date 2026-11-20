@@ -19,6 +19,7 @@ from typing import NoReturn
 from .auto_recovery import StepKey
 from .errors import ConfigurationError, StateError
 from .evidence import MAX_RECORDS, Outcome, RecordView, WorktreeProvenance, parse_record
+from .evidence import MAX_SEQ as MAX_VALIDATION_SEQ
 from .prompts import fenced_untrusted_block
 from .redaction import redact
 from .runlog import RUN_ID_RE
@@ -312,9 +313,25 @@ class EvidenceRef:
 
     @classmethod
     def decode(cls, raw: object) -> EvidenceRef:
+        """A citation, its sequence held to the bound of what it numbers.
+
+        A launch receipt's is a launch ordinal, up to the store's bound
+        (R6-F3 of PR #526); a validation receipt's is a validation record's
+        sequence number, up to the evidence ledger's; a candidate receipt's
+        to Memory's counter bound.
+        """
         if not isinstance(raw, list) or len(raw) != 3:
             _invalid()
-        return cls(Receipt(raw[0]), _integer(raw[1], 1), _match(raw[2], _DIGEST, 64))
+        kind = Receipt(raw[0])
+        return cls(kind, _integer(raw[1], 1, _SEQUENCE_BOUND[kind]), _match(raw[2], _DIGEST, 64))
+
+
+# The highest sequence a citation of each kind can name (EvidenceRef.decode).
+_SEQUENCE_BOUND = {
+    Receipt.VALIDATION: MAX_VALIDATION_SEQ,
+    Receipt.CANDIDATE: MAX_COUNTER,
+    Receipt.LAUNCH: MAX_LAUNCH_SEQ,
+}
 
 
 @dataclass(frozen=True)
@@ -806,7 +823,9 @@ class MemoryStore:
             _require((replacement is not None) == (action is Action.SUPERSEDE))
             _require(type(target) is int and type(expected) is int)
             _require(replacement is None or type(replacement) is int)
-            _integer(attempt)
+            # A launch ordinal, as an add's is: the store's, never a counter's
+            # bound (R6-F3 of PR #526).
+            _integer(attempt, 0, self.launch_seq)
             content = _digest(_string(text, MAX_TEXT_BYTES)) if text is not None else replacement
             return self._write(
                 dict(

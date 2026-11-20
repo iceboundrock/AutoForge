@@ -1169,6 +1169,67 @@ def test_an_identical_agent_revision_spelled_with_mixed_case_urls_is_a_replay():
         assert st.refusals == 0
 
 
+@pytest.mark.parametrize("seq", [2**31, MAX_LAUNCH_SEQ - 1], ids=["past-counter", "last"])
+def test_memory_writes_and_launch_citations_take_every_ordinal_the_loader_reads(seq):
+    """R6-F3 of PR #526: a launch ordinal past 2**31 - 1, Memory's counter bound,
+    is still one the checkpoint holds. A proposal from that launch, a
+    revision from the same accepted launch, the controller's revision and a
+    launch-end observation citing the ordinal are each written and reloaded,
+    and the citation resolves against the launch receipts supplied. Other
+    receipt kinds keep the bounds of what they number."""
+    st = reload(apply(proposal(empty(seq), text="an idea", n=seq)))
+    agent = revise(
+        st, Action.CORRECT, 1, actor=Actor.AGENT, step=STEP, attempt=seq, text="a better idea"
+    )
+    st = reload(apply(agent))
+    assert st._events[-1]["attempt"] == seq and st._events[-1]["watermark"] == seq
+    controller = revise(
+        st, Action.CORRECT, 1, actor=Actor.CONTROLLER, step=STEP, attempt=seq, text="checked"
+    )
+    st = reload(apply(controller))
+    launch = EvidenceRef(Receipt.LAUNCH, seq, "c" * 64)
+    ended = st.add(
+        actor=Actor.CONTROLLER,
+        kind=Kind.LAUNCH_END,
+        scope=SCOPE,
+        attempt=seq,
+        text="tests did not run",
+        evidence=launch,
+    )
+    st = reload(apply(ended))
+    assert st.catalog(ISSUE)["records"][1]["citation"] == ["launch", seq, "c" * 64]
+    # Deriving the same observation again adds nothing (D9.7).
+    again = st.add(
+        actor=Actor.CONTROLLER,
+        kind=Kind.LAUNCH_END,
+        scope=SCOPE,
+        attempt=seq,
+        text="tests did not run",
+        evidence=launch,
+    )
+    assert again.status == "replay" and again.store is st
+    request = replace(REQ, attempt=seq + 1)
+    held = render_projection(st, request, retained=[launch])
+    assert dict(held.retention) == {4: Retention.RETAINED} and held.freshness.downgraded == 0
+    gone = render_projection(st, request)
+    assert dict(gone.retention) == {4: Retention.UNAVAILABLE} and gone.freshness.downgraded == 1
+    # Still no ordinal the store has not spent, and no ordinal past the bound.
+    assert (
+        revise(st, Action.RETRACT, 1, actor=Actor.CONTROLLER, step=STEP, attempt=seq + 1).status
+        == "refused"
+    )
+    with pytest.raises(StateError):
+        EvidenceRef.decode(["launch", MAX_LAUNCH_SEQ + 1, "c" * 64])
+    # Each kind's own bound: a validation record's sequence number and a
+    # candidate receipt's stay below 2**31.
+    for kind in ("validation", "candidate"):
+        assert EvidenceRef.decode([kind, 2**31 - 1, "c" * 64]).sequence == 2**31 - 1
+        with pytest.raises(StateError):
+            EvidenceRef.decode([kind, 2**31, "c" * 64])
+    with pytest.raises(StateError):
+        render_projection(st, request, retained=[EvidenceRef(Receipt.CANDIDATE, 2**31, "c" * 64)])
+
+
 def test_a_projection_is_bound_to_the_next_launch_of_its_snapshot():
     """R2-F5 of PR #526: a snapshot holding attempt 4's record is never
     labeled as what launch 2, or any launch but the next, was shown."""
