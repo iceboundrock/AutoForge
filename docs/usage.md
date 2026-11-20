@@ -2503,9 +2503,12 @@ store's digest and the refusal count. A run with Memory off and an empty
 store reads as disabled with no record, an older checkpoint whose run names
 no issue included. `autoforge memory retract RECORD
 --reason WHY` takes the repository lock and withdraws a saved record of
-the current issue by its numeric ID. A record of an issue the run worked on
-earlier is not in either view, and retracting it is refused with nothing
-written. Each save is the checkpoint's one atomic write. A command
+the current issue by its numeric ID, with Memory on or off: turning Memory
+off keeps the records, and the retraction is the one write it still allows,
+without turning Memory on or advancing the run. A refused retraction with
+Memory off writes nothing, not even the refusal count. A record of an issue
+the run worked on earlier is not in either view, and retracting it is
+refused with nothing written. Each save is the checkpoint's one atomic write. A command
 interrupted before it is published leaves the old checkpoint, or no run
 for a seed. One interrupted after it leaves the whole new checkpoint.
 Neither launches, transitions or writes to GitHub.

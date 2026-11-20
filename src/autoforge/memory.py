@@ -631,9 +631,14 @@ class MemoryStore:
         self._events.append(canonical)
 
     def _write(
-        self, event: dict, text: str | None = None, *, existing: MemoryFact | None = None
+        self,
+        event: dict,
+        text: str | None = None,
+        *,
+        existing: MemoryFact | None = None,
+        withdrawal: bool = False,
     ) -> WriteOutcome:
-        if not self.enabled:
+        if not (self.enabled or withdrawal):
             return WriteOutcome(self, "disabled")
         try:
             candidate = MemoryStore(self.repository, self.run_id, self.launch_seq, self.encode())
@@ -645,7 +650,7 @@ class MemoryStore:
                 same = candidate._events[existing.id - 1] == event
                 if same:
                     return WriteOutcome(self, "replay", existing.id)
-                return WriteOutcome(self._refusal(), "conflict")
+                return WriteOutcome(self._refused(), "conflict")
             if "target" in event and any(
                 _sans_watermark(row) == _sans_watermark(event) for row in candidate._events
             ):
@@ -660,10 +665,18 @@ class MemoryStore:
             candidate._texts = {k: candidate._texts[k] for k in active}
             _require(candidate._within_bounds())
         except (StateError, ValueError, TypeError, KeyError, OverflowError):
-            return WriteOutcome(self._refusal(), "refused")
+            return WriteOutcome(self._refused(), "refused")
         return WriteOutcome(candidate, "applied", event.get("target", len(candidate._events)))
 
-    def _refusal(self) -> MemoryStore:
+    def _refused(self) -> MemoryStore:
+        """The store after a refused write: its count one more while Memory is on.
+
+        With Memory off nothing is written but the operator's retraction, so
+        a refused one leaves the value as it was, a run that never used
+        Memory included (R5-F3 of PR #526).
+        """
+        if not self.enabled:
+            return self
         raw = self.encode()
         raw["refusals"] = min(self.refusals + 1, MAX_COUNTER)
         return MemoryStore(self.repository, self.run_id, self.launch_seq, raw)
@@ -718,7 +731,7 @@ class MemoryStore:
                         break
             return self._write(row, text, existing=existing)
         except (StateError, ValueError, TypeError, OverflowError):
-            return WriteOutcome(self._refusal(), "refused")
+            return WriteOutcome(self._refused(), "refused")
 
     def revise(
         self,
@@ -757,8 +770,18 @@ class MemoryStore:
         :func:`_step` saves it, the reason as it is redacted), so a retry
         of an applied revision is compared with the saved row as it was
         saved: a replay, never a stale revision (R3-F5 of PR #526).
+
+        With Memory off, the operator's retraction is the one write there
+        is (ADR 0015 D9.4): turning Memory off keeps the records, and the
+        operator can still withdraw one, under the same issue and lock
+        rules, without turning Memory on (R5-F3 of PR #526). Every other
+        write, the projection and collection stay off.
         """
-        if not self.enabled:
+        try:
+            withdrawal = Action(action) is Action.RETRACT and Actor(actor) is Actor.OPERATOR
+        except (ValueError, TypeError):
+            withdrawal = False
+        if not (self.enabled or withdrawal):
             return WriteOutcome(self, "disabled")
         try:
             action = Action(action)
@@ -798,9 +821,10 @@ class MemoryStore:
                     watermark=self.launch_seq,
                 ),
                 text,
+                withdrawal=withdrawal,
             )
         except (StateError, ValueError, TypeError, OverflowError):
-            return WriteOutcome(self._refusal(), "refused")
+            return WriteOutcome(self._refused(), "refused")
 
     def catalog(self, issue_url: str) -> dict:
         """Operator view, restricted to the current issue. No verified prose.

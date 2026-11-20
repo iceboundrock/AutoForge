@@ -419,6 +419,57 @@ def test_an_operator_revision_acts_only_on_the_issue_it_names():
     assert [r["status"] for r in done.catalog(ISSUE)["records"]] == ["current"]
 
 
+def test_the_operator_retracts_with_memory_off_and_the_withdrawal_survives_re_enabling():
+    """R5-F3 of PR #526: turning Memory off keeps its records, and the
+    operator's retraction (ADR 0015 D9.4) is the one write left. It still
+    acts only on the issue it names, survives reload and stays in force once
+    Memory is on again; every other write and the projection stay off, and
+    a refused retraction writes nothing, not even the refusal count."""
+    st = apply(proposal(empty(), text="a wrong lesson"))
+    st = apply(
+        proposal(
+            st,
+            text="another issue's lesson",
+            n=2,
+            scope=replace(SCOPE, step=replace(STEP, issue_url=OTHER)),
+        )
+    )
+    st = apply(proposal(st, text="a right lesson", n=3))
+    off = MemoryStore(REPO, RUN, 128, dict(st.encode(), enabled=False))
+    assert off.catalog(ISSUE)["enabled"] is False
+    # Collection, agents' revisions and the projection stay off.
+    assert proposal(off, text="a new lesson", n=4).status == "disabled"
+    agent = revise(off, Action.RETRACT, 1, actor=Actor.AGENT, step=STEP, attempt=128)
+    assert agent.status == "disabled" and agent.store is off
+    assert revise(off, Action.CORRECT, 1, text="fixed").status == "disabled"
+    with pytest.raises(StateError):
+        render_projection(off, REQ)
+    # Another issue's record, a missing one, and one retracted already: no write.
+    assert revise(off, Action.RETRACT, 2, issue=ISSUE).status == "foreign"
+    for target in (9, 0):
+        out = revise(off, Action.RETRACT, target)
+        assert out.status == "refused" and out.store.encode() == off.encode()
+    out = revise(off, Action.RETRACT, 1, reason="wrong lesson")
+    assert out.status == "applied" and out.id == 1
+    withdrawn = reload(out.store)
+    assert withdrawn.enabled is False and "a wrong lesson" not in json.dumps(withdrawn.encode())
+    (row,) = [r for r in withdrawn.catalog(ISSUE)["records"] if r["id"] == 1]
+    assert row["status"] == "retracted" and row["text"] == ""
+    again = revise(withdrawn, Action.RETRACT, 1)
+    assert again.status == "refused" and again.store.encode() == withdrawn.encode()
+    # Memory on again: the record stays withdrawn, never shown.
+    on = MemoryStore(REPO, RUN, 128, dict(withdrawn.encode(), enabled=True))
+    statuses = {r["id"]: r["status"] for r in on.catalog(ISSUE)["records"]}
+    assert statuses == {1: "retracted", 3: "current"}
+    shown = render_projection(on, REQ)
+    assert shown.ids == (3,) and shown.freshness.withdrawn == 1
+    assert "a wrong lesson" not in shown.text and "a right lesson" in shown.text
+    # A store that never held Memory gains no value from a refused retraction.
+    never = MemoryStore.empty(REPO, RUN, 128)
+    out = revise(never, Action.RETRACT, 1)
+    assert out.status == "refused" and out.store.encode() == {}
+
+
 def test_projection_has_one_scope_and_no_ancestry_without_candidate():
     st = reload(apply(proposal(empty(), scope=replace(SCOPE, range=Range.DESCENDANTS, base=BASE))))
     for req in (

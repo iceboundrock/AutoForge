@@ -1143,8 +1143,11 @@ targets the launch.
 
 Changing the recorded `memory.enabled` on `step`, `resume` or `unblock`
 requires `--accept-config-change`. Turning it off disables the projection
-and writes to the ledger, but does not erase the ledger. Automatic
-collection and delivery are not part of this release.
+and writes to the ledger, but does not erase the ledger. The one write left
+is the operator's `memory retract`, which still withdraws a record of the
+current issue, under the repository lock, without turning Memory on or
+advancing the run; the record stays withdrawn when Memory is turned on
+again. Automatic collection and delivery are not part of this release.
 
 ## Candidate validation
 

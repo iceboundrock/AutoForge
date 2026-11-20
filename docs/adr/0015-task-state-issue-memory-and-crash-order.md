@@ -1660,7 +1660,9 @@ prove auto-memory is off; it is refused when Memory is on, as are the
 other adapters without a proof. AutoForge does not start a version probe
 or change how any Memory-off launch runs. For D9.6, every record not yet
 retracted reserves one event slot and the bytes of one operator retraction,
-so the operator's retraction (D9.4) is never refused for a bound. Every
+so the operator's retraction (D9.4) is never refused for a bound, and it
+stays available with Memory turned off, the one write that leaves (no
+collection, no projection, the same issue and lock rules). Every
 revision names the record revision it acts on. An agent's revision comes
 from an acceptance save, from a launch no earlier than the record's latest
 change. Every revision row also records the launch ordinal it was written

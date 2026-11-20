@@ -178,6 +178,65 @@ def test_memory_seed_and_retraction_are_checkpoint_only(tmp_path, monkeypatch, c
     assert fakes["provider"].calls == [] and fakes["gh"].calls == calls
 
 
+def test_memory_retract_withdraws_a_record_with_memory_off(tmp_path, monkeypatch, capsys, fakes):
+    """R5-F3 of PR #526: a run whose Memory was turned off keeps its records,
+    and `memory retract` withdraws one without turning Memory on, launching,
+    transitioning or reaching GitHub. The record stays withdrawn when Memory
+    is turned on again; another issue's record is still refused unchanged."""
+    monkeypatch.chdir(tmp_path)
+    pi = {
+        "analyze_execute": {
+            "provider": "pi",
+            "model": "openai/fixture-model",
+            "effort": "high",
+            "options": {"context_files": False, "require_oauth": False},
+        }
+    }
+    config = _config(tmp_path / "af.json", memory={"enabled": True}, profiles=pi)
+    seed = tmp_path / "seed.txt"
+    seed.write_text("A wrong lesson about issue 2.\n", encoding="utf-8")
+    assert cli.main(["--config", config, *_run_argv_of(1), "--memory-seed", str(seed)]) == 0
+    state_file = tmp_path / ".autoforge" / "state.json"
+    off = load_state(state_file)
+    off.issue_memory = off.memory_setting(False)
+    save_state(off, state_file)
+    off_config = _config(tmp_path / "off.json", memory={"enabled": False}, profiles=pi)
+    args = ["--config", off_config]
+    before = load_state(state_file)
+    calls = list(fakes["gh"].calls)
+    capsys.readouterr()
+    assert cli.main([*args, "memory", "retract", "1", "--reason", "wrong lesson"]) == 0
+    assert "Withdrew Memory record M1" in capsys.readouterr().out
+    after = load_state(state_file)
+    assert after.memory().enabled is False and after.issue_memory["enabled"] is False
+    (record,) = after.memory().catalog(ISSUE)["records"]
+    assert record["status"] == "retracted"
+    assert "A wrong lesson" not in state_file.read_text()
+    # Nothing of the run moved: no launch, no transition, no GitHub call.
+    assert (after.phase, after.launch_seq, after.step_count, after.attempt) == (
+        before.phase,
+        before.launch_seq,
+        before.step_count,
+        before.attempt,
+    )
+    assert fakes["provider"].calls == [] and fakes["gh"].calls == calls
+    # Memory on again: still withdrawn.
+    on = load_state(state_file)
+    on.issue_memory = on.memory_setting(True)
+    save_state(on, state_file)
+    (record,) = load_state(state_file).memory().catalog(ISSUE)["records"]
+    assert record["status"] == "retracted" and record["text"] == ""
+    # Off again, a record of an earlier issue is refused with nothing written.
+    moved = load_state(state_file)
+    moved.issue_memory = moved.memory_setting(False)
+    moved.reset_for_new_issue(ISSUE3)
+    save_state(moved, state_file)
+    unchanged = state_tree(tmp_path / ".autoforge")
+    assert cli.main([*args, "memory", "retract", "1", "--reason", "wrong lesson"]) == 2
+    assert "not a record of the run's current issue" in capsys.readouterr().err
+    assert state_tree(tmp_path / ".autoforge") == unchanged
+
+
 def test_memory_retract_refuses_an_earlier_issues_record(tmp_path, monkeypatch, capsys, fakes):
     """R1-F3 of PR #526: `memory show` hides an earlier issue's records, and
     `memory retract` leaves them as they are and writes nothing."""
