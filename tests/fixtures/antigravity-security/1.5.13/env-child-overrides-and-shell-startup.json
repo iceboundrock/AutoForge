@@ -1,0 +1,117 @@
+{
+ "agy_sha256": "c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65",
+ "agy_version": "1.5.13",
+ "argv": [
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--settings",
+  "{\"modelProvider\":\"gemini\",\"toolPermission\":\"always-proceed\",\"allowNonWorkspaceAccess\":false}",
+  "--model",
+  "gemini-4-argon",
+  "--effort",
+  "high",
+  "--print-timeout",
+  "60s",
+  "--disable-slash-commands"
+ ],
+ "capture": {
+  "stderr_eof": true,
+  "stderr_error": null,
+  "stderr_truncated": false,
+  "stdout_eof": true,
+  "stdout_error": null,
+  "stdout_truncated": false
+ },
+ "exit": 0,
+ "home_files": [
+  ".bash_profile",
+  ".bashrc",
+  ".gemini/antigravity-cli/bin/agentapi",
+  ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript/00000000.jsonl",
+  ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript_full/00000000.jsonl",
+  ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl",
+  ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript_full.jsonl",
+  ".gemini/antigravity-cli/brain/<id>/.system_generated/steps/2/output.txt",
+  ".gemini/antigravity-cli/cache/default_project_id.txt",
+  ".gemini/antigravity-cli/cache/last_conversations.json",
+  ".gemini/antigravity-cli/cache/onboarding.json",
+  ".gemini/antigravity-cli/cli.log",
+  ".gemini/antigravity-cli/conversation_summaries.db",
+  ".gemini/antigravity-cli/conversations/<id>.db",
+  ".gemini/antigravity-cli/installation_id",
+  ".gemini/antigravity-cli/jetbox_summaries_proto.pb",
+  ".gemini/antigravity-cli/jetski_state.pbtxt",
+  ".gemini/antigravity-cli/last_check.timestamp",
+  ".gemini/antigravity-cli/log/cli-<time>.log",
+  ".gemini/antigravity-cli/presence/<id>.lock",
+  ".gemini/antigravity-cli/updater/update.lock",
+  ".gemini/antigravity-cli/updater/update_status.json",
+  ".gemini/config/.migrated",
+  ".gemini/config/config.json",
+  ".gemini/config/mcp_config.json",
+  ".gemini/config/projects/default-cli-project.json",
+  ".profile",
+  ".zshenv"
+ ],
+ "isolation": "private-root",
+ "killed_by_probe": false,
+ "markers": {
+  "{work}/env-dump.json": "{\n \"keys\": [\n  \"ANTIGRAVITY_AGENT\",\n  \"ANTIGRAVITY_AGENTAPI_EXE\",\n  \"ANTIGRAVITY_APP_DATA_DIR\",\n  \"ANTIGRAVITY_CONVERSATION_ID\",\n  \"ANTIGRAVITY_CSRF_TOKEN\",\n  \"ANTIGRAVITY_LS_ADDRESS\",\n  \"ANTIGRAVITY_LS_VERSION\",\n  \"ANTIGRAVITY_PROJECT_ID\",\n  \"ANTIGRAVITY_SOURCE_METADATA\",\n  \"ANTIGRAVITY_TRAJECTORY_ID\",\n  \"CURL_HOME\",\n  \"GEMINI_API_KEY\",\n  \"GH_CONFIG_DIR\",\n  \"GH_ENTERPRISE_TOKEN\",\n  \"GH_TOKEN\",\n  \"GIT_CONFIG_COUNT\",\n  \"GIT_CONFIG_GLOBAL\",\n  \"GIT_CONFIG_KEY_0\",\n  \"GIT_CONFIG_KEY_1\",\n  \"GIT_CONFIG_KEY_2\",\n  \"GIT_CONFIG_KEY_3\",\n  \"GIT_CONFIG_VALUE_0\",\n  \"GIT_CONFIG_VALUE_1\",\n  \"GIT_CONFIG_VALUE_2\",\n  \"GIT_CONFIG_VALUE_3\",\n  \"GIT_EDITOR\",\n  \"GIT_PAGER\",\n  \"GIT_TERMINAL_PROMPT\",\n  \"GOOGLE_GEMINI_BASE_URL\",\n  \"HGEDITOR\",\n  \"HOME\",\n  \"JJ_EDITOR\",\n  \"JJ_PAGER\",\n  \"LANG\",\n  \"PAGER\",\n  \"PATH\",\n  \"PWD\",\n  \"SHELL\",\n  \"SHLVL\",\n  \"TERM\",\n  \"WGET2RC\",\n  \"WGETRC\",\n  \"XDG_CACHE_HOME\",\n  \"XDG_CONFIG_HOME\",\n  \"XDG_DATA_HOME\",\n  \"XDG_STATE_HOME\",\n  \"ZDOTDIR\",\n  \"_\"\n ],\n \"vals\": {\n  \"ANTIGRAVITY_AGENT\": \"1\",\n  \"ANTIGRAVITY_AGENTAPI_EXE\": \"agy\",\n  \"ANTIGRAVITY_APP_DATA_DIR\": \"<root>/env-child-overrides-and-shell-startup.56vmvg2h/home/.gemini/antigravity-cli\",\n  \"ANTIGRAVITY_CONVERSATION_ID\": \"<uuid>\",\n  \"ANTIGRAVITY_CSRF_TOKEN\": \"<uuid>\",\n  \"ANTIGRAVITY_LS_ADDRESS\": \"127.0.0.1:<port>\",\n  \"ANTIGRAVITY_LS_VERSION\": \"cli-1.5.13\",\n  \"ANTIGRAVITY_PROJECT_ID\": \"default-cli-project\",\n  \"ANTIGRAVITY_SOURCE_METADATA\": \"{\\\"tool\\\":{\\\"conversationId\\\":\\\"<uuid>\\\", \\\"stepIndex\\\":2, \\\"toolCall\\\":{\\\"id\\\":\\\"<uuid>\\\", \\\"name\\\":\\\"run_command\\\", \\\"argumentsJson\\\":\\\"{\\\\\\\"CommandLine\\\\\\\":\\\\\\\"python3 -c 'import json, os; d = dict(sorted(os.environ.items())); open(\\\\\\\\\\\\\\\"<root>/env-child-overrides-and-shell-startup.56vmvg2h/work/env-dump.json\\\\\\\\\\\\\\\",\\\\\\\\\\\\\\\"w\\\\\\\\\\\\\\\").write(json.dumps({\\\\\\\\\\\\\\\"keys\\\\\\\\\\\\\\\": list(d), \\\\\\\\\\\\\\\"vals\\\\\\\\\\\\\\\": d}, indent=1))' \\\\\\\\u0026\\\\\\\\u0026 echo \\\\\\\\\\\\\\\"FLAGS=$- ARG0=$0\\\\\\\\\\\\\\\" \\\\\\\\u003e <root>/env-child-overrides-and-shell-startup.56vmvg2h/work/shell-info.txt\\\\\\\",\\\\\\\"WaitMsBeforeAsync\\\\\\\":5000,\\\\\\\"toolSummary\\\\\\\":\\\\\\\"Inspect child env\\\\\\\"}\\\"}}}\",\n  \"ANTIGRAVITY_TRAJECTORY_ID\": \"<uuid>\",\n  \"CURL_HOME\": \"<root>/env-child-overrides-and-shell-startup.56vmvg2h/curl\",\n  \"GEMINI_API_KEY\": \"synthetic-agy-probe-key\",\n  \"GH_CONFIG_DIR\": \"<root>/env-child-overrides-and-shell-startup.56vmvg2h/empty-gh\",\n  \"GH_ENTERPRISE_TOKEN\": \"autoforge-no-github-credential\",\n  \"GH_TOKEN\": \"autoforge-no-github-credential\",\n  \"GIT_CONFIG_COUNT\": \"4\",\n  \"GIT_CONFIG_GLOBAL\": \"<root>/env-child-overrides-and-shell-startup.56vmvg2h/child-gitconfig\",\n  \"GIT_CONFIG_KEY_0\": \"credential.helper\",\n  \"GIT_CONFIG_KEY_1\": \"core.askPass\",\n  \"GIT_CONFIG_KEY_2\": \"core.sshCommand\",\n  \"GIT_CONFIG_KEY_3\": \"http.extraHeader\",\n  \"GIT_CONFIG_VALUE_0\": \"\",\n  \"GIT_CONFIG_VALUE_1\": \"\",\n  \"GIT_CONFIG_VALUE_2\": \"ssh -F /dev/null -o IdentityFile=none\",\n  \"GIT_CONFIG_VALUE_3\": \"\",\n  \"GIT_EDITOR\": \"false\",\n  \"GIT_PAGER\": \"cat\",\n  \"GIT_TERMINAL_PROMPT\": \"0\",\n  \"GOOGLE_GEMINI_BASE_URL\": \"http://127.0.0.1:<port>\",\n  \"HGEDITOR\": \"false\",\n  \"HOME\": \"<root>/env-child-overrides-and-shell-startup.56vmvg2h/home\",\n  \"JJ_EDITOR\": \"false\",\n  \"JJ_PAGER\": \"cat\",\n  \"LANG\": \"C.UTF-8\",\n  \"PAGER\": \"cat\",\n  \"PATH\": \"<root>/env-child-overrides-and-shell-startup.56vmvg2h/home/.gemini/antigravity-cli/bin:/usr/bin:/bin\",\n  \"PWD\": \"<root>/env-child-overrides-and-shell-startup.56vmvg2h/work\",\n  \"SHELL\": \"/bin/bash\",\n  \"SHLVL\": \"1\",\n  \"TERM\": \"dumb\",\n  \"WGET2RC\": \"<root>/env-child-overrides-and-shell-startup.56vmvg2h/wgetrc\",\n  \"WGETRC\": \"<root>/env-child-overrides-and-shell-startup.56vmvg2h/wgetrc\",\n  \"XDG_CACHE_HOME\": \"<root>/env-child-overrides-and-shell-startup.56vmvg2h/home/.cache\",\n  \"XDG_CONFIG_HOME\": \"<root>/env-child-overrides-and-shell-startup.56vmvg2h/home/.config\",\n  \"XDG_DATA_HOME\": \"<root>/env-child-overrides-and-shell-startup.56vmvg2h/home/.local/share\",\n  \"XDG_STATE_HOME\": \"<root>/env-child-overrides-and-shell-startup.56vmvg2h/home/.local/state\",\n  \"ZDOTDIR\": \"<root>/env-child-overrides-and-shell-startup.56vmvg2h/zsh\",\n  \"_\": \"/usr/bin/python3\"\n }\n}",
+  "{work}/shell-info.txt": "FLAGS=hBc ARG0=bash"
+ },
+ "other_requests": [],
+ "requests": [
+  {
+   "key": "synthetic",
+   "model_path": "/v1beta/models/gemini-4-argon:streamGenerateContent",
+   "system_markers": [],
+   "tool_results": [],
+   "user_text_excerpt": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: <timestamp>.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Argon (High). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>"
+  },
+  {
+   "key": "synthetic",
+   "model_path": "/v1beta/models/gemini-4-argon:streamGenerateContent",
+   "system_markers": [],
+   "tool_results": [
+    "{\"output\": \"Created At: <timestamp>\\nCompleted At: <timestamp>\\nCommand exited with code 0.\\n\\nNo output from the command.\"}"
+   ],
+   "user_text_excerpt": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: <timestamp>.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Argon (High). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>"
+  }
+ ],
+ "scenario": "env-child-overrides-and-shell-startup",
+ "seconds": 0.5,
+ "session_keyring": "own",
+ "stderr": [],
+ "stdout": [
+  [
+   0.34,
+   "{\"event\":\"init\",\"conversation_id\":\"<uuid>\",\"init\":{\"model\":\"gemini-4-argon\",\"cwd\":\"<root>/env-child-overrides-and-shell-startup.56vmvg2h/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"always-proceed\"}}\n"
+  ],
+  [
+   0.37,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"<uuid>\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
+  ],
+  [
+   0.4,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"<uuid>\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"duration_seconds\":0.007319613,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+  ],
+  [
+   0.4,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"<uuid>\",\"step_index\":2,\"state\":\"ACTIVE\",\"step_type\":\"tool\",\"tool_name\":\"run_command\",\"tool_info\":{\"name\":\"run_command\",\"parameters\":{\"CommandLine\":\"python3 -c 'import json, os; d = dict(sorted(os.environ.items())); open(\\\"<root>/env-child-overrides-and-shell-startup.56vmvg2h/work/env-dump.json\\\",\\\"w\\\").write(json.dumps({\\\"keys\\\": list(d), \\\"vals\\\": d}, indent=1))' \\u0026\\u0026 echo \\\"FLAGS=$- ARG0=$0\\\" \\u003e <root>/env-child-overrides-and-shell-startup.56vmvg2h/work/shell-info.txt\"}}}}\n"
+  ],
+  [
+   0.45,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"<uuid>\",\"step_index\":2,\"state\":\"DONE\",\"step_type\":\"tool\",\"tool_name\":\"run_command\",\"duration_seconds\":0.062182492,\"tool_info\":{\"name\":\"run_command\",\"parameters\":{\"CommandLine\":\"python3 -c 'import json, os; d = dict(sorted(os.environ.items())); open(\\\"<root>/env-child-overrides-and-shell-startup.56vmvg2h/work/env-dump.json\\\",\\\"w\\\").write(json.dumps({\\\"keys\\\": list(d), \\\"vals\\\": d}, indent=1))' \\u0026\\u0026 echo \\\"FLAGS=$- ARG0=$0\\\" \\u003e <root>/env-child-overrides-and-shell-startup.56vmvg2h/work/shell-info.txt\"},\"output\":\"Created At: <timestamp>\\nCompleted At: <timestamp>\\nCommand exited with code 0.\\n\\nNo output from the command.\"}}}\n"
+  ],
+  [
+   0.48,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"<uuid>\",\"step_index\":3,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"DONE\\n\",\"duration_seconds\":0.008472543,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+  ],
+  [
+   0.48,
+   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"<uuid>\",\"status\":\"SUCCESS\",\"response\":\"DONE\\n\",\"duration_seconds\":0.117006367,\"num_turns\":1,\"usage\":{\"input_tokens\":22,\"output_tokens\":14,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":36}}}\n"
+  ]
+ ]
+}

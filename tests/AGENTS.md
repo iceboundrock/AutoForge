@@ -634,6 +634,14 @@ the evaluation protocol (#318)        test_evaluation.py (the pins, what arms ho
 troubleshooting guide (#260)          test_troubleshooting_guide.py (every scenario row names
                                       a test that exists; the guide's links and the links
                                       into it resolve)
+Antigravity CLI spikes (#528, #529)   test_antigravity_probe.py (#528: 147 records in
+                                      tests/fixtures/antigravity/1.5.13/, dropped.txt,
+                                      prototype reducer, private-root bwrap boundary),
+                                      test_antigravity_security_probe.py (#529: 51 security
+                                      records in tests/fixtures/antigravity-security/1.5.13/,
+                                      report alignment, child_env, sandbox_policy, redaction
+                                      audit, and opt-in real bwrap/subreaper verification
+                                      when AUTOFORGE_AGY_PROBE_BIN is set)
 ```
 
 Add a new test next to the behaviour's existing file; create a new file only
