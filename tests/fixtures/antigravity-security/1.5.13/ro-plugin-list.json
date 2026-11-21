@@ -1,0 +1,33 @@
+{
+ "agy_sha256": "c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65",
+ "agy_version": "1.5.13",
+ "argv": [
+  "plugin",
+  "list"
+ ],
+ "capture": {
+  "stderr_eof": true,
+  "stderr_error": null,
+  "stderr_truncated": false,
+  "stdout_eof": true,
+  "stdout_error": null,
+  "stdout_truncated": false
+ },
+ "exit": 0,
+ "home_files": [],
+ "isolation": "private-root",
+ "killed_by_probe": false,
+ "markers": {},
+ "other_requests": [],
+ "requests": [],
+ "scenario": "ro-plugin-list",
+ "seconds": 0.2,
+ "session_keyring": "own",
+ "stderr": [],
+ "stdout": [
+  [
+   0.16,
+   "No plugins installed.\n"
+  ]
+ ]
+}
