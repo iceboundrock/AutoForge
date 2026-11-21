@@ -1,0 +1,102 @@
+{
+ "agy_sha256": "c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65",
+ "agy_version": "1.5.13",
+ "argv": [
+  "-p",
+  "do it",
+  "--output-format",
+  "json",
+  "--settings",
+  "{\"modelProvider\":\"gemini\"}"
+ ],
+ "capture": {
+  "stderr_eof": true,
+  "stderr_error": null,
+  "stderr_truncated": false,
+  "stdout_eof": true,
+  "stdout_error": null,
+  "stdout_truncated": false
+ },
+ "exit": 0,
+ "facts": {
+  "context_markers": [],
+  "names_app_data_dir": true,
+  "system_prompt_chars": 16851,
+  "system_prompt_sha256": "e626abefcd08c2f74f14f2610504657da87d2bbe443303379c96961f8630a698"
+ },
+ "home_files": [
+  ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript/00000000.jsonl",
+  ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript_full/00000000.jsonl",
+  ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl",
+  ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript_full.jsonl",
+  ".gemini/antigravity-cli/cache/default_project_id.txt",
+  ".gemini/antigravity-cli/cache/last_conversations.json",
+  ".gemini/antigravity-cli/cache/onboarding.json",
+  ".gemini/antigravity-cli/cli.log",
+  ".gemini/antigravity-cli/conversation_summaries.db",
+  ".gemini/antigravity-cli/conversations/<id>.db",
+  ".gemini/antigravity-cli/implicit/<id>.pb",
+  ".gemini/antigravity-cli/installation_id",
+  ".gemini/antigravity-cli/jetbox_summaries_proto.pb",
+  ".gemini/antigravity-cli/jetski_state.pbtxt",
+  ".gemini/antigravity-cli/last_check.timestamp",
+  ".gemini/antigravity-cli/log/cli-<time>.log",
+  ".gemini/antigravity-cli/presence/<id>.lock",
+  ".gemini/antigravity-cli/updater/update.lock",
+  ".gemini/antigravity-cli/updater/update_status.json",
+  ".gemini/config/.migrated",
+  ".gemini/config/config.json",
+  ".gemini/config/mcp_config.json",
+  ".gemini/config/projects/default-cli-project.json"
+ ],
+ "isolation": "private-root",
+ "killed_by_probe": false,
+ "markers": {},
+ "other_requests": [],
+ "outside_file_written": false,
+ "processes_during": [],
+ "processes_left": [],
+ "requests": [
+  {
+   "contents": 1,
+   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T04:53:09Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "key": "synthetic",
+   "last_role": "user",
+   "markers_present": [],
+   "model_path": "/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent",
+   "thinking": {
+    "includeThoughts": true,
+    "thinkingBudget": 1024
+   },
+   "tool_results": [],
+   "tools": [
+    "read_file",
+    "run_command",
+    "manage_task",
+    "send_message",
+    "schedule",
+    "invoke_subagent",
+    "define_subagent",
+    "manage_subagents",
+    "write_file",
+    "edit_file",
+    "search_web",
+    "run_workflow",
+    "swarm",
+    "ask_question"
+   ]
+  }
+ ],
+ "scenario": "model-default",
+ "seconds": 0.3,
+ "session_keyring": "own",
+ "signalled": null,
+ "stderr": [],
+ "stdout": [
+  [
+   0.28,
+   "{\"conversation_id\":\"e6c4be6e-5756-4fd4-85e1-dac0ca042cfe\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.029078504,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}\n"
+  ]
+ ],
+ "title_requests": 0
+}

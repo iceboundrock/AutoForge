@@ -1,0 +1,68 @@
+{
+ "agy_sha256": "c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65",
+ "agy_version": "1.5.13",
+ "argv": [
+  "-p",
+  "do it",
+  "--output-format",
+  "json",
+  "--settings",
+  "{\"modelProvider\":\"gemini\"}",
+  "--model",
+  "gemini-4-argon",
+  "--effort",
+  "max"
+ ],
+ "capture": {
+  "stderr_eof": true,
+  "stderr_error": null,
+  "stderr_truncated": false,
+  "stdout_eof": true,
+  "stdout_error": null,
+  "stdout_truncated": false
+ },
+ "exit": 1,
+ "facts": {},
+ "home_files": [
+  ".gemini/antigravity-cli/cache/default_project_id.txt",
+  ".gemini/antigravity-cli/cache/onboarding.json",
+  ".gemini/antigravity-cli/cli.log",
+  ".gemini/antigravity-cli/conversation_summaries.db",
+  ".gemini/antigravity-cli/implicit/<id>.pb",
+  ".gemini/antigravity-cli/installation_id",
+  ".gemini/antigravity-cli/jetski_state.pbtxt",
+  ".gemini/antigravity-cli/last_check.timestamp",
+  ".gemini/antigravity-cli/log/cli-<time>.log",
+  ".gemini/antigravity-cli/updater/update.lock",
+  ".gemini/antigravity-cli/updater/update_status.json",
+  ".gemini/config/.migrated",
+  ".gemini/config/config.json",
+  ".gemini/config/mcp_config.json",
+  ".gemini/config/projects/default-cli-project.json"
+ ],
+ "isolation": "private-root",
+ "killed_by_probe": false,
+ "markers": {},
+ "other_requests": [],
+ "outside_file_written": false,
+ "processes_during": [],
+ "processes_left": [],
+ "requests": [],
+ "scenario": "model-effort-unsupported",
+ "seconds": 0.3,
+ "session_keyring": "own",
+ "signalled": null,
+ "stderr": [
+  [
+   0.25,
+   "error: invalid model selection (--model \"gemini-4-argon\" --effort \"max\"): gemini-4-argon has no \"max\" effort (available: low, medium, high)\n"
+  ]
+ ],
+ "stdout": [
+  [
+   0.25,
+   "{\"conversation_id\":\"\",\"status\":\"ERROR\",\"response\":\"\",\"error\":\"invalid model selection (--model \\\"gemini-4-argon\\\" --effort \\\"max\\\"): gemini-4-argon has no \\\"max\\\" effort (available: low, medium, high)\",\"duration_seconds\":0,\"num_turns\":0,\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":0},\"finished_reason\":\"error\"}\n"
+  ]
+ ],
+ "title_requests": 0
+}

@@ -1,0 +1,163 @@
+{
+ "agy_sha256": "c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65",
+ "agy_version": "1.5.13",
+ "argv": [
+  "help",
+  "acp"
+ ],
+ "capture": {
+  "stderr_eof": true,
+  "stderr_error": null,
+  "stderr_truncated": false,
+  "stdout_eof": true,
+  "stdout_error": null,
+  "stdout_truncated": false
+ },
+ "exit": 0,
+ "facts": {},
+ "home_files": [],
+ "isolation": "private-root",
+ "killed_by_probe": false,
+ "markers": {},
+ "other_requests": [],
+ "outside_file_written": false,
+ "processes_during": [],
+ "processes_left": [],
+ "requests": [],
+ "scenario": "acp-help",
+ "seconds": 0.2,
+ "session_keyring": "own",
+ "signalled": null,
+ "stderr": [
+  [
+   0.15,
+   "Usage: agy acp [flags]\n"
+  ],
+  [
+   0.15,
+   "\n"
+  ],
+  [
+   0.15,
+   "Start the Agent Client Protocol (ACP) stdio server\n"
+  ],
+  [
+   0.15,
+   "\n"
+  ],
+  [
+   0.15,
+   "Flags:\n"
+  ],
+  [
+   0.15,
+   "  --add-dir                         Add a directory to the workspace (repeatable) (default [])\n"
+  ],
+  [
+   0.15,
+   "  --agent                           Agent for the ACP session\n"
+  ],
+  [
+   0.15,
+   "  --app-data-dir                    Path where application data is stored (default antigravity-cli)\n"
+  ],
+  [
+   0.15,
+   "  --app_data_dir                    Path where application data is stored (default antigravity-cli)\n"
+  ],
+  [
+   0.15,
+   "  --cli_dir_name                    Subdirectory under app_data_dir for CLI settings and logs\n"
+  ],
+  [
+   0.15,
+   "  --cli_log_file                    Override ACP log file path\n"
+  ],
+  [
+   0.15,
+   "  --cloud_code_endpoint             CCPA API URL (default https://daily-cloudcode-pa.googleapis.com)\n"
+  ],
+  [
+   0.15,
+   "  --dangerously-skip-permissions    Auto-approve all tool permission requests\n"
+  ],
+  [
+   0.15,
+   "  --disable-telemetry               If true, disable telemetry\n"
+  ],
+  [
+   0.15,
+   "  --disable_telemetry               If true, disable telemetry\n"
+  ],
+  [
+   0.15,
+   "  --gemini-dir                      Path where Gemini files are stored (default .gemini)\n"
+  ],
+  [
+   0.15,
+   "  --gemini_dir                      Path where Gemini files are stored (default .gemini)\n"
+  ],
+  [
+   0.15,
+   "  -h                                Show help\n"
+  ],
+  [
+   0.15,
+   "  --help                            Show help\n"
+  ],
+  [
+   0.15,
+   "  --ide-mcp-port                    Port for host IDE tools MCP server (requires 'nc' in $PATH) (default 0)\n"
+  ],
+  [
+   0.15,
+   "  --ide_mcp_port                    Port for host IDE tools MCP server (requires 'nc' in $PATH) (default 0)\n"
+  ],
+  [
+   0.15,
+   "  --include-default-customizations  Include default customizations (default true)\n"
+  ],
+  [
+   0.15,
+   "  --is_google3_workspace            Whether running in Google environment\n"
+  ],
+  [
+   0.15,
+   "  --is_google_internal              Deprecated: use is_google3_workspace\n"
+  ],
+  [
+   0.15,
+   "  --log-file                        Override ACP log file path\n"
+  ],
+  [
+   0.15,
+   "  --login                           Log in with Google interactively, then exit (ACP terminal auth)\n"
+  ],
+  [
+   0.15,
+   "  --override_user_agent_name        Override user agent name for HTTP requests\n"
+  ],
+  [
+   0.15,
+   "  --process-per-session             Serve each session from an isolated worker process\n"
+  ],
+  [
+   0.15,
+   "  --sandbox                         Run in a sandbox with terminal restrictions enabled\n"
+  ],
+  [
+   0.15,
+   "  --stdio                           Use stdio JSON-RPC transport (default)\n"
+  ],
+  [
+   0.15,
+   "  --use_stubby_auth                 Use LOAS auth\n"
+  ],
+  [
+   0.15,
+   "  --worker                          Serve a single session for an ACP front process (internal)\n"
+  ]
+ ],
+ "stdout": [],
+ "title_requests": 0
+}
