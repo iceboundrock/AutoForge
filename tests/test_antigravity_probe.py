@@ -480,7 +480,7 @@ for _sc in SCENARIOS:
             "identical_after_strip": True,
         }
 # Framed at the proposed prompt bound: a large mixed sample, the widest
-# framing of all, and one astral character alone: each whole and unchanged.
+# framing measured, and one astral character alone: each whole and unchanged.
 for _name in AT_THE_BOUND:
     EXPECTED[_name] = {
         **OK,
@@ -1995,15 +1995,10 @@ def test_a_build_of_another_version_is_assessed_by_its_behaviour(committed, tmp_
 # -- the probe itself, against a fake agy, in the sandbox ------------------------
 
 
-def _bwrap_works() -> bool:
-    """bwrap with unprivileged user namespaces, the sandbox's interpreter, and a
-    session keyring the launch can join (a container's seccomp may refuse it)."""
-    if sys.platform != "linux" or shutil.which("bwrap") is None:
-        return False
-    if not Path(SANDBOX_PYTHON).is_file():
-        return False
-    argv = ["bwrap", "--ro-bind", "/", "/", "--unshare-net", "--unshare-pid", "--", "true"]
-    if subprocess.run(argv, capture_output=True).returncode != 0:
+def _keyring_works() -> bool:
+    """Linux with a supported keyctl(2) number and permission to join a session
+    keyring (a container's seccomp may refuse it)."""
+    if sys.platform != "linux":
         return False
     try:
         launch = probe.keyring_launcher()
@@ -2013,9 +2008,24 @@ def _bwrap_works() -> bool:
     return subprocess.run([*launch, true], capture_output=True).returncode == 0
 
 
+def _bwrap_works() -> bool:
+    """bwrap with unprivileged user namespaces, the sandbox's interpreter, and a
+    session keyring the launch can join (a container's seccomp may refuse it)."""
+    if not _keyring_works() or shutil.which("bwrap") is None:
+        return False
+    if not Path(SANDBOX_PYTHON).is_file():
+        return False
+    argv = ["bwrap", "--ro-bind", "/", "/", "--unshare-net", "--unshare-pid", "--", "true"]
+    return subprocess.run(argv, capture_output=True).returncode == 0
+
+
 # The host's one file of /etc the sandbox shows, where the host has it.
 SHOWN_ETC = [f"/etc/{n}" for n in probe.HOST_ETC if Path("/etc", n).exists()]
 
+needs_keyring = pytest.mark.skipif(
+    not _keyring_works(),
+    reason="needs Linux with keyctl(2) permission to join a session keyring",
+)
 needs_bwrap = pytest.mark.skipif(
     not _bwrap_works(),
     reason=f"needs Linux, {SANDBOX_PYTHON}, bwrap with unprivileged user namespaces "
@@ -2473,12 +2483,10 @@ def test_a_host_where_no_session_keyring_can_be_joined_records_nothing(tmp_path,
 _SYS_GETPID = {"x86_64": 39, "aarch64": 172}
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="keyctl(2) is Linux's")
-def test_the_launcher_joins_a_session_keyring_of_its_own_or_starts_nothing(tmp_path):
+@needs_keyring
+def test_the_launcher_joins_a_session_keyring_of_its_own():
     """The launcher, on its own: the command it execs holds a session
-    keyring that is not this process's; and when the join cannot have
-    happened (here a call that joins nothing stands in for keyctl), it
-    refuses with its own status, and the command never starts."""
+    keyring that is not this process's (R5-F5: gated on keyring capability)."""
     number = probe.keyctl_number()
     show = f"""
 import ctypes, json
@@ -2489,11 +2497,21 @@ print(json.dumps({{"own": libc.syscall(*args)}}))
 """
     launched = run_sandboxed([*probe.keyring_launcher(), sys.executable, "-I", "-c", show], 30)
     assert launched["own"] > 0 and launched["own"] != probe.session_keyring(number)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="getpid(2) refusal stand-in is Linux's",
+)
+def test_the_launcher_starts_nothing_when_no_keyring_was_joined(tmp_path):
+    """When the join cannot have happened (here a call that joins nothing
+    stands in for keyctl), the launcher refuses with its own status and the
+    command never starts, even on hosts that deny keyctl(2) (R5-F5)."""
     machine = platform.machine().lower()
     if machine not in _SYS_GETPID:
         pytest.skip(f"no getpid(2) number for {machine}")
     marker = tmp_path / "started"
-    launch = [*probe.keyring_launcher()[:-1], str(_SYS_GETPID[machine])]
+    launch = [sys.executable, "-I", "-S", "-c", probe.KEYRING_LAUNCHER, str(_SYS_GETPID[machine])]
     started = f"open({str(marker)!r}, 'w').close(); print('{{}}')"
     with pytest.raises(ProbeError, match="could not join a session keyring of its own"):
         run_sandboxed([*launch, sys.executable, "-I", "-c", started], 30)

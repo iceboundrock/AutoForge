@@ -477,8 +477,8 @@ Each record must have its shape, checked before anything in it is read:
   every earlier step's. A step keeps its type. Nothing updates a step after
   it ended (`DONE` or `ERROR`). Every recorded stream kept to these rules.
 - The `result` carries the init's `conversation_id`, a `status` of
-  `SUCCESS` or `ERROR`, a string `response`, and one of the two shapes
-  every recorded result had, never a mix:
+  `SUCCESS` or `ERROR`, a string `response`, and one of the two accepted
+  shapes, never a mix:
   - **`SUCCESS`:** no `error` member and no `finished_reason`, and
     `denied_actions` either absent or a non-empty list of objects, each
     with a non-empty string `action`. A `null`, an empty list, or a

@@ -212,8 +212,8 @@ def near_limit_prompt(size: int = PROMPT_LIMIT) -> str:
     Numbered lines of astral characters (12 escaped bytes for 4 of UTF-8),
     with CJK, Latin, a quote, a backslash, a tab and a CR LF on each, every
     character one agy 1.5.13 keeps: it must arrive identical. Its framed
-    line is about 2.6 times its UTF-8, so it is not the widest framing a
-    prompt of that size can have (:func:`widest_prompt` is).
+    line is about 2.6 times its UTF-8, so it is not the widest framing
+    measured at that size (:func:`widest_prompt` is).
     """
     lines, n, used = [], 0, 0
     while True:
@@ -1734,7 +1734,7 @@ def _facts(
 #   ended (DONE or ERROR).
 # - result: ``{"event": "result", "result": {"conversation_id": C,
 #   "status": S, "response": R, ...}}``, the last record, R a string, and
-#   one of the two shapes every recorded result had:
+#   one of the two accepted shapes:
 #   - SUCCESS: no ``error``, no ``finished_reason``, and ``denied_actions``
 #     absent or a non-empty list of objects each with a non-empty string
 #     ``action``;
