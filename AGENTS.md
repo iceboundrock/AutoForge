@@ -285,7 +285,7 @@ docs/antigravity-cli-spike.md          #528's spike of the Antigravity CLI (`agy
                                        against a loopback stand-in of the Gemini API: the stream and
                                        its terminal proof, exit codes, soft refusals, prompt
                                        fidelity, lifetime, fresh context, repository hooks that no
-                                       setting turns off, the transport and adapter contract, a
+                                       setting tried turns off, the transport and adapter contract, a
                                        proposed conditional go; no adapter
 docs/releasing.md                      distribution name, version and tag scheme, changelog, the
                                        maintainer's release procedure, PyPI Trusted Publishing

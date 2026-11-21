@@ -13,18 +13,59 @@
   one JSON record per scenario named in backticks (`deny-command` is
   `deny-command.json`). `tests/test_antigravity_probe.py` holds the records
   to what this document says and fails when they differ.
-- **How:** each scenario runs `agy` once inside `bwrap` with a network
-  namespace of its own (loopback only) and a pid namespace of its own (every
-  process the run leaves is seen), an empty temporary `HOME` and a minimal
-  environment. The model API is a loopback stand-in of the Gemini API that
-  answers each request with a scripted step: a reply, a reply in chunks, a
-  tool call, an HTTP error, a stream cut mid-record, or nothing. `agy`
-  reaches it through its own API-key route: a synthetic `GEMINI_API_KEY`,
-  `--settings '{"modelProvider":"gemini"}'`, and the Gemini SDK's
-  `GOOGLE_GEMINI_BASE_URL`, which the 1.x changelog names for "a custom
-  endpoint". **No model was called and no credential was read.** The issue
-  allows live calls only with the operator's explicit approval and a budget,
-  and this run had neither.
+- **How:** each scenario runs `agy` once inside `bwrap`, against a loopback
+  stand-in of the Gemini API that answers each request with a scripted
+  step: a reply, a reply in chunks, a tool call, an HTTP error, a stream cut
+  mid-record, or nothing. `agy` reaches it through its own API-key route: a
+  synthetic `GEMINI_API_KEY`, `--settings '{"modelProvider":"gemini"}'`,
+  and the Gemini SDK's `GOOGLE_GEMINI_BASE_URL`, which the 1.x changelog
+  names for "a custom endpoint". **No model was called, and `agy` was given
+  no credential:** every model request the stand-in saw carried the
+  synthetic key (the tests check each one). The issue allows live calls
+  only with the operator's explicit approval and a budget, and this run had
+  neither.
+- **Two sandboxes, and which record was made in which.** Each record says
+  (`isolation`); the tests hold every record to the list below.
+  - **The private root** (`isolation: private-root`), the probe's sandbox
+    now. `bwrap`'s own empty root, never the host's, holding only `/usr`
+    read-only (with `/usr/local` hidden), the loader's cache, synthetic
+    `/etc/passwd`, `/etc/group` and `/etc/hosts`, the probe and the binary
+    read-only, and the run's own home, workspace and spec directory. The
+    helper that starts `agy` has an empty environment (`--clearenv`; `bwrap`
+    sets `PWD=/`), and `agy` gets only the variables the helper sets, ten
+    at most. It has namespaces of its own for users, pids, the network
+    (loopback only: no route out, and no socket of the host's, abstract ones
+    included), IPC, UTS and cgroups. A test measures this with a fake `agy`
+    and harmless canaries: a file of the test's, the checkout, the caller's
+    home, `/run`, `/var` and the rest of `/etc` are not there; the value of
+    a variable set in the caller's environment is in no process's
+    `/proc/<pid>/environ`; a socket by path, an abstract socket and a
+    loopback port of the host's refuse the connection. 34 records were made
+    this way: `fidelity-framed-nul`, `fidelity-framed-00` to
+    `fidelity-framed-29`, `fidelity-near-limit-stream-json`,
+    `repository-customizations-recommended` and `detached-child`. So was a
+    full re-recording of every scenario but the customization one, 143
+    records, on 2026-11-21, which with that one matched every fact the tests
+    hold the records to. It was not committed, so that the reviewed records
+    stay as they were.
+  - **The earlier sandbox** (no `isolation`): the other 110 records, made
+    before this revision. It mounted the host root read-only, with `/tmp` a
+    tmpfs and the probe's root writable, gave `agy` an empty `HOME`, a
+    minimal environment and namespaces of its own for pids and the network,
+    and started the helper with the caller's environment. A temporary home
+    is no filesystem boundary: during those runs `agy` could read any host
+    file the operator can, path-based sockets under the host root were
+    there to open, and the caller's whole environment was in the helper's
+    `/proc/<pid>/environ` (the canary test, run against that sandbox, finds
+    the checkout, the caller's home, `/run`, all of `/etc`, and the canary
+    variable's value in the environment of two processes of the sandbox).
+    Nothing could leave the sandbox, which had no route out, and a scan of
+    every committed record for credential-shaped strings (GitHub,
+    Anthropic, OpenAI and Google keys and tokens, AWS keys, private keys,
+    bearer headers) finds none; the tests repeat it. **What those runs do
+    not prove is that `agy` read nothing of the host's:** they cannot. None
+    of the facts they show depends on it: the private-root re-recording,
+    with none of it in reach, shows every one again.
 - **Not measured:** the real Gemini API (its error bodies and details, such
   as the per-day quota `QuotaFailure` the changelog says stops retries at
   once; its latency; tool use by a real model), the Google sign-in and ADC
@@ -35,28 +76,38 @@
   and Windows, and `agy` driven through AutoForge's own executor. Each is
   marked where it matters.
 - **Re-measure:** `AUTOFORGE_AGY_PROBE_BIN=/path/to/agy uv run pytest
-  tests/test_antigravity_probe.py` (Linux with `bwrap`, about three minutes,
-  no model call) runs every scenario again against that binary and fails on
-  any fact here that no longer holds. It holds the fresh records to the
-  behaviour, not to the label: they name whatever version the binary
-  printed, and only the committed records must say 1.5.13. The version is
-  asked like every other scenario, in the sandbox and under a timeout
-  (`version`): the probe never runs the binary on the host.
-  `python3 -I tests/antigravity_probe.py record --agy /path/to/agy --out
-  DIR` writes the records. For another build, `DIR` is a directory of its
-  own (`tests/fixtures/antigravity/<version>/`), and `python3 -I
-  tests/antigravity_probe.py table --records DIR` writes its table of
-  removed characters (§3) beside them. The 1.5.13 records stay as they
-  are.
+  tests/test_antigravity_probe.py` (Linux with `bwrap` and `/usr/bin/python3`,
+  about four minutes, no model call) runs every scenario again against that
+  binary, in the private root, and fails on any fact here that no longer
+  holds. It holds the fresh records to the behaviour, not to the label:
+  they name whatever version the binary printed, and only the committed
+  records must say 1.5.13. The version is asked like every other scenario,
+  in the sandbox and under a timeout (`version`): the probe never runs the
+  binary on the host. `python3 -I tests/antigravity_probe.py record --agy
+  /path/to/agy --out DIR` writes the records. For another build, `DIR` is a
+  directory of its own (`tests/fixtures/antigravity/<version>/`), and
+  `python3 -I tests/antigravity_probe.py table --records DIR` writes its
+  table of removed characters (§3) beside them. `table` refuses, and leaves
+  any table there as it was, unless the directory holds the records of one
+  build, both complete measurements of §3, each clean and covering every
+  scalar value once, and the two agree: an empty, partial or mixed
+  directory would give a table that cannot tell no removal from no
+  measurement. The 1.5.13 records stay as they are. Appendix B runs one
+  scenario by hand, in the same private root.
 
 ## 1. Summary
 
 `agy -p` has a usable unattended contract. `--output-format stream-json`
-writes one JSON record per line. A run ends in exactly one `result` record
-that says `SUCCESS` or `ERROR`, says why a turn ended early, and lists the
-tool actions it refused. Model API failures exit with 3 and print a typed
-`AGY_ERROR` line. Exit 0 alone proves nothing, and three traps would make a
-naive adapter read a failure as a completed run:
+writes one JSON record per line. Every recorded one-shot run that was given
+a prompt and ended on its own ended in exactly one `result` record, which
+says `SUCCESS` or `ERROR`, says why a turn ended early, and lists the tool
+actions it refused. Not every run writes one: an empty stdin (as text, or
+as `stream-json`, which writes `init` and stops), a run killed by an
+outside limit, and a refusal of the arguments end with none, and a
+`stream-json` input session writes one per turn (§4, §6). Model API
+failures exit with 3 and print a typed `AGY_ERROR` line. Exit 0 alone
+proves nothing, and three traps would make a naive adapter read a failure
+as a completed run:
 
 1. **A refused tool call is a `SUCCESS`.** Headless mode cannot ask, so a
    call that needs a permission is refused and the run ends at once: exit 0,
@@ -70,16 +121,19 @@ naive adapter read a failure as a completed run:
 3. **The prompt the model gets is not always the prompt sent.** Every
    character of Unicode general category C is removed, but TAB, LF, VT, FF,
    CR and NEL: controls, format characters, private use, and every code
-   point unassigned in Unicode 17.0 (`fidelity-all-*`, which sends every
-   scalar value). A message over about 192 KB loses everything after that
-   point, including the wrapper's closing tag, with no sign in the output
+   point unassigned in Unicode 17.0. That was measured over every scalar
+   value through two inputs, text on stdin and the recommended framed
+   message, with the same result (`fidelity-all-*`, `fidelity-framed-*`).
+   A message over about 192 KB loses everything after that point,
+   including the wrapper's closing tag, with no sign in the output
    (`fidelity-size-*`).
 
 One finding blocks a production adapter as AutoForge's invariants stand.
 **The repository's own `.agents/hooks.json` hooks and `.agents/mcp_config.json`
 MCP servers run in a headless run, before the model is asked, the hooks
-with `GEMINI_API_KEY` in their environment, and no flag or setting turns
-them off** (`repository-customizations`, `-untrusted`, `-sandbox`). AutoForge
+with `GEMINI_API_KEY` in their environment, and no flag or setting tried
+turns them off** (`repository-customizations`, `-untrusted`, `-sandbox`,
+and `-recommended`, the recommended launch itself). AutoForge
 keeps every agent CLI's hooks and MCP servers off (`--safe-mode` and
 `--strict-mcp-config` for Claude Code, #165), so `agy` needs an equivalent
 before it can run on a pull request's tree.
@@ -149,18 +203,29 @@ turn, a note naming the selected model. Inside the wrapper the prompt
 arrives as sent, newlines, CR LF, tabs, leading and trailing spaces, quotes,
 backslashes, CJK, Hebrew and a literal `</USER_REQUEST>` included
 (`fidelity-unicode-argv`, `fidelity-unicode-stdin`,
-`fidelity-unicode-stream-json`), with three exceptions that hold on every
-input:
+`fidelity-unicode-stream-json`), with three exceptions, each measured on
+the inputs it names:
 
 - **Characters removed.** Measured over every Unicode scalar value: all
   1,112,064 of them, each sent once in ascending order, in 31 prompts that
-  each stay well below the cut at 192 KB (`fidelity-all-nul`, NUL alone,
-  and `fidelity-all-00` to `fidelity-all-29`). Every prompt arrived framed
-  as sent, its characters in order and none added or changed, so what was
-  missing was removed. 952,427 code points were removed and 159,637 kept.
-  The removed ones are listed, as 744 ranges, in
-  `tests/fixtures/antigravity/1.5.13/dropped.txt`, which the tests hold the
-  records to exactly. Read with Unicode 17.0's database (Python 3.15's),
+  each stay well below the cut at 192 KB, through two inputs:
+  - as text on stdin (`fidelity-all-nul`, NUL alone, and `fidelity-all-00`
+    to `fidelity-all-29`);
+  - framed, as the recommended transport sends a prompt: each prompt as one
+    `stream-json` message, written as `json.dumps` writes it, so every
+    non-ASCII character is a `\u` escape, an astral one a surrogate pair,
+    and a line is up to three times its prompt's UTF-8 (450,082 bytes at
+    most; `fidelity-framed-nul` and `fidelity-framed-00` to
+    `fidelity-framed-29`).
+
+  Every prompt arrived framed by agy's wrapper as sent, its characters in
+  order and none added or changed, so what was missing was removed. Both
+  inputs removed the same characters: 952,427 code points removed and
+  159,637 kept. The removed ones are listed, as 744 ranges, in
+  `tests/fixtures/antigravity/1.5.13/dropped.txt`, which the tests hold
+  both measurements to exactly. The argv input was not swept: of it only
+  the texts of `fidelity-unicode-argv` and `argv-leading-dash` were
+  measured. Read with Unicode 17.0's database (Python 3.15's),
   the table is exactly general category C less six controls. Every Cc
   (control) is removed except TAB, LF, VT, FF, CR and NEL. So is every Cf
   (format: zero-width space and joiners, bidirectional controls, the BOM,
@@ -175,15 +240,26 @@ input:
   between markers) agrees. The emoji sequence `👩‍💻` therefore arrives as
   two emoji. Not measured: whether a character fares otherwise in other
   company. Each code point was sent once, after its predecessor; the
-  texts of `fidelity-unicode-*` and `fidelity-sweep` are the only other
-  contexts.
-- **Invalid UTF-8** becomes U+FFFD (`fidelity-invalid-utf8`).
-- **Size.** A 190,000-byte prompt arrived whole (`fidelity-size-190000`).
-  At 196,608 bytes and above (`fidelity-size-196608`, `fidelity-size-262144`,
-  `fidelity-size-262144-stream-json`), the message the model received was its
-  first 192,001 bytes: the 15-byte opening tag and the prompt's first 191,986
-  bytes, then `<truncated N bytes>`. The closing tag and the metadata were
-  lost. The run still exited 0 with `SUCCESS`.
+  texts of `fidelity-unicode-*`, `fidelity-sweep` and
+  `fidelity-near-limit-stream-json` are the only other contexts.
+- **Invalid UTF-8** becomes U+FFFD, as text on stdin
+  (`fidelity-invalid-utf8`). A framed message cannot carry it: the adapter
+  writes the prompt as JSON, from a string.
+- **Size.** As text on stdin, a 190,000-byte prompt arrived whole
+  (`fidelity-size-190000`). At 196,608 bytes and above
+  (`fidelity-size-196608`, `fidelity-size-262144`, and framed,
+  `fidelity-size-262144-stream-json`), the message the model received was
+  its first 192,001 bytes: the 15-byte opening tag and the prompt's first
+  191,986 bytes, then `<truncated N bytes>`. The closing tag and the
+  metadata were lost. The run still exited 0 with `SUCCESS`. Framed, the
+  cut counts the prompt's UTF-8, not the line's: a prompt of 160,000 UTF-8
+  bytes, the bound §10 proposes, made mostly of astral characters (with
+  CJK, Latin, quotes, a backslash, a tab, CR LF and a literal
+  `</USER_REQUEST>` on every line), was framed into a line of 416,882
+  bytes and arrived identical, closing tag and metadata kept
+  (`fidelity-near-limit-stream-json`). The sizes between 160,000 and
+  191,986 bytes were not measured framed, nor any framed prompt of
+  characters other than that one's, at that size.
 
 An empty stdin is not refused cleanly. As text, `agy` tries to start its
 terminal UI, prints `CLI error: bubbletea: error opening TTY ...` on
@@ -195,11 +271,14 @@ prompt fails properly: exit 1 and an `ERROR` result saying `empty prompt`
 ## 4. The event stream and its terminal proof (question 3)
 
 Every line of `--output-format stream-json` is one JSON object with an
-`event` member. In every one-shot run that ended on its own, the stream was
-`init`, then `step_update` records, then exactly one `result`, and then the
-process exited, or, when no session began, a lone `ERROR` result. None wrote
-a malformed line or a second `result`. Only a `stream-json` input session
-writes several (§6).
+`event` member, ended by LF. In every recorded one-shot run that was given
+a prompt and ended on its own, the stream was `init`, then `step_update`
+records, then exactly one `result`, and then the process exited, or, when
+no session began, a lone `ERROR` result. None wrote a malformed line, a
+blank line, a member twice or a second `result`. Only a `stream-json` input
+session writes several (§6). Some runs write no `result` at all: an empty
+`stream-json` input writes `init` and exits 0 (`stdin-stream-json-empty`),
+and a run an outside limit killed ends wherever it was (`hang-no-limit`).
 
 | Record | Fields seen | Meaning |
 |---|---|---|
@@ -251,6 +330,18 @@ one of two shapes, and the contract admits no other:
   `conversation_id`, when no session began (`stdin-whitespace`,
   `no-login-argv-prompt`). It is a failure, never a completed run.
 
+**Framing.** Every record is one line: one JSON object and the LF that
+ends it, nothing else. Each of these is a protocol failure, never a line to
+skip or repair: a line without its LF (the last line, when the writer
+stopped mid-record: a terminal object without its LF is no terminal
+record), an empty or blank line, whitespace around the object (a CR before
+the LF among it), a line longer than the reader's bound or cut by one, a
+member given twice in one object (`{"status":"ERROR","status":"SUCCESS"}`:
+which one counts would be the parser's choice), and a number JSON does not
+have (`NaN`, `Infinity`, or one too large to be finite). The reader's
+bound must allow at least twice the largest reply accepted, since the
+`result` carries the whole joined response (§6).
+
 Each record must have its shape, checked before anything in it is read:
 
 - `init` is the first record, with a non-empty `conversation_id` and an
@@ -261,20 +352,47 @@ Each record must have its shape, checked before anything in it is read:
 - Steps begin in index order: a step's first update has an index above
   every earlier step's. A step keeps its type. Nothing updates a step after
   it ended (`DONE` or `ERROR`). Every recorded stream kept to these rules.
-- The `result` carries the init's `conversation_id` and a `status` of
-  `SUCCESS` or `ERROR`. Its `response`, `error` and `finished_reason` are
-  strings when present, and its `denied_actions` is a list of objects with
-  a string `action`.
+- The `result` carries the init's `conversation_id`, a `status` of
+  `SUCCESS` or `ERROR`, a string `response`, and one of the two shapes
+  every recorded result had, never a mix:
+  - **`SUCCESS`:** no `error` member and no `finished_reason`, and
+    `denied_actions` either absent or a non-empty list of objects, each
+    with a non-empty string `action`. A `null`, an empty list, or a
+    `SUCCESS` that also carries an `error` (even an empty one) or a
+    `finished_reason` contradicts itself.
+  - **`ERROR`:** a non-empty string `error`, a `finished_reason` of
+    `error`, `interrupted` or `print_timeout`, and no `denied_actions`.
 
 Anything else is a protocol failure: a line that is not JSON or not a
-known event, a value of another type in any of these places, a record out
-of this order, a record of another conversation, or a record after the
-`result`.
+known event, a value of another type in any of these places, a
+contradictory result, a record out of this order, a record of another
+conversation, or a record after the `result`.
 
-**Terminal proof** for a one-shot run is a run of that shape: its one
-`result` written as the last record, followed by the process's exit. A run
-whose stream ends without a `result` has no terminal proof, whatever its
-exit status (`hang-no-limit`, `stdin-stream-json-empty`).
+**The capture.** What the reader saw proves nothing unless it saw the
+whole stream, and only the executor can say so. Completion also needs all
+three of these, and a capture short of any of them never completes a run
+(it cannot turn a failure into anything else):
+
+- the process **exited on its own**: no idle or runtime limit, kill or
+  signal of the executor's ended it;
+- stdout was **read to EOF**: no process left behind still held the pipe,
+  so the capture was not abandoned (the executor's `capture_abandoned`);
+- **no capture bound dropped output** (the executor's `stdout_truncated`),
+  and no line was skipped past the reader's per-line bound.
+
+The probe reports the same for its records: a private-root record says
+whether each pipe reached EOF (`capture`). The earlier records do not; the
+tests count one as read to EOF only when no process was left in its
+sandbox after the run, since nothing could then hold the pipe. Of the 110,
+only `sigterm-background-task` does not, and it failed anyway. Every
+private-root record, the 143 of the full re-recording among them, reached
+EOF on both pipes, survivors and all.
+
+**Terminal proof** for a one-shot run is a run of that shape and framing:
+its one `result` written as the last record and ended by its LF, followed
+by the process's exit on its own and EOF on stdout, with nothing dropped. A
+run whose stream ends without a `result` has no terminal proof, whatever
+its exit status (`hang-no-limit`, `stdin-stream-json-empty`).
 
 **The reply** is the concatenated `text_delta` of the run's last step,
 which must be an `agent_response` that ended `DONE`. `agy` ends it with a
@@ -395,8 +513,8 @@ same system prompt, compared after removing conversation ids (`fresh-first`,
 `fresh-second`). `-c` resumed the most recent conversation in the home, the
 second run's, not the first (`continue-latest`). With runs in parallel,
 "most recent" is whichever finished last. Session resume is out of scope
-(#491). An adapter must never pass `-c`, `--continue` or `--conversation`,
-and must refuse them in `extra_args`.
+(#491). An adapter must never pass `-c`, `--continue` or `--conversation`:
+its argv is fixed, and it takes no `extra_args` (§10).
 
 Each run leaves its conversation in the home, under
 `~/.gemini/antigravity-cli/`: `conversations/<id>.db`,
@@ -424,23 +542,42 @@ What the workspace contributes is a separate matter:
   Neither `trustedWorkspaces: []` (`repository-customizations-untrusted`)
   nor `--sandbox` (`repository-customizations-sandbox`) changes it, and the
   settings catalogue has no key that might (`settings-catalogue`). The
-  bundled customization guide says discovery walks up from the working
-  directory to the repository root and also reads `.agent/`, `_agents/` and
-  `_agent/`. That was not measured.
+  recommended launch of §10 itself, the prompt framed on stdin with
+  `--disable-slash-commands` and `--dangerously-skip-permissions`, runs them
+  the same way (`repository-customizations-recommended`).
+
+**What those four scenarios measured, and no more.** One layout: a git
+repository whose root is the launch's working directory, holding
+`AGENTS.md`, `GEMINI.md`, `.agents/rules/r.md`, `.agents/hooks.json` (one
+`SessionStart`, `PreInvocation` and `Stop` command each) and
+`.agents/mcp_config.json` (one stdio server), with an empty home. Four
+launches of it: `-p` with `--output-format json`, the same with
+`trustedWorkspaces: []`, the same with `--sandbox`, and the recommended
+launch. **Not measured:** the other directories the bundled customization
+guide names (`.agent/`, `_agents/`, `_agent/`) and its other files
+(`plugins.json`, `skills.json`, `plugins/`, workflows, skills);
+customizations in a directory above the working directory, below it, or
+above the repository root; a working directory below the repository root;
+a symbolic link on the way; `--add-dir`, `--agent`, `--mode`, `--project`
+and the remote flags; the home's own customizations (`~/.gemini/`); `acp`
+sessions; and whether `agy` reads a hooks or MCP file written during the
+run (by the agent itself, which can write files) after its session began.
+The guide says discovery walks up from the working directory to the
+repository root. That is the vendor's statement, not a measurement here.
 
 ## 9. Mapping to AutoForge's result (question 8)
 
 | `AgentExecutionResult` | From | Status |
 |---|---|---|
 | `command`, `exit_code`, `stdout`, `stderr`, times, `timed_out`, truncation, leftovers | the executor, as for any CLI | available |
-| `stdout` (the reply) | the last `agent_response` step's text | available |
-| `provider_failure` | a refusal (`denied_actions`), an `ERROR` result, a missing or second `result`, a record out of §4's shape or order, an `unknown` step, a step or reply that never ended, an empty reply | available |
-| `transient_failure` | `AGY_ERROR` with `code_kind: http` and `error_code` 408 or 5xx | available; 500 is not retried by `agy` itself |
-| `usage_limit` | `AGY_ERROR` with `error_code` 429 | available; per-minute and per-day limits not told apart (unverified) |
+| `stdout` (the reply) | the last `agent_response` step's text, of a completed run only | available |
+| `provider_failure` | a refusal (`denied_actions`), an `ERROR` result, a `SUCCESS` at a nonzero exit or with an `AGY_ERROR` line, a missing or second `result`, a record out of §4's framing, shape or order, a contradictory result, an `unknown` step, a step or reply that never ended, an empty reply; and a run that would otherwise complete but whose capture is not whole (§4) | available |
+| `transient_failure` | the one `AGY_ERROR` line of an `ERROR` result has `code_kind: http` and an `error_code` that is an integer (never a float, a bool or a string) equal to 408 or from 500 to 599 | available; 500 is not retried by `agy` itself |
+| `usage_limit` | the same, with an integer `error_code` of 429 | available; per-minute and per-day limits not told apart (unverified) |
 | `usage_reset_at` | nothing | unknown |
-| `result_less_exit` | `init` and a tool step seen, no `result`, exit on its own | derivable; not observed |
+| `result_less_exit` | only all of these: `init` and at least one step (a turn began), no `result`, no violation of §4, the process exited on its own (no limit, kill or signal of the executor's), the capture whole (EOF, nothing dropped or skipped), and no `AGY_ERROR` line (no model API failure the CLI reported). The engine may relaunch on it, so anything less leaves it unset | derivable; no record has it (the tests check each) |
 | `failed_before_limit` | `AGY_ERROR` comes only at the end; mid-run `error_message` steps carry no code | not derivable before the end |
-| `reply_delivered` | the `result` itself: the stream holds replies back while background tasks run (§4) | only at the end |
+| `reply_delivered` | **never set in the MVP.** The flag lets the engine accept the reply of a launch that failed after it (ADR 0012 D12), so it needs proof of a complete, successful final reply. A `result` record is no such proof: it may be an error or a refusal, or a successful turn that further activity followed (`background-task`, `timer`). `agy` writes a reply only with its result, at the end, so a launch that failed after it has none the stream proves whole | unset |
 | `model`, `effort` | what was asked: no record names the model used | requested only; no read-back |
 | `provider_summary` | `conversation_id`, `num_turns`, `usage`, `status`, `finished_reason`, number of `denied_actions` | available |
 | `interaction` | `failed` when a refusal failed the run (as #258 does for the other CLIs) | available |
@@ -455,6 +592,11 @@ and an effort that contradicts the model id's suffix
 `gemini-4-argon-medium` sends `MEDIUM` (`model-with-effort-suffix`); the
 default is `gemini-3.1-pro-preview` with a 1,024-token thinking budget
 (`model-default`).
+
+Anything else in `AGY_ERROR` types nothing, and the failure stays an
+error: another code or kind, a code of another JSON type (`429.0`, `true`,
+`"429"`), a code outside 100 to 599 (`600`), a line that does not parse or
+gives a member twice, and more than one `AGY_ERROR` line in the run.
 
 **What cannot be told apart safely:**
 
@@ -475,19 +617,22 @@ default is `gemini-3.1-pro-preview` with a 1,024-token thinking budget
 |---|---|---|
 | one-shot, argv `-p` | documented, simplest | 131,071-byte argv limit on Linux; a prompt that spells a flag is refused; with no sign-in it waits 60 s for a pasted code |
 | one-shot, text on stdin | no size or flag limit below `agy`'s own; fails at once with no sign-in | documented only in a refusal's wording; empty input exits 0 with no result |
-| **one-shot, one `stream-json` message on stdin, then EOF** | no argv or flag limit either, and the input is framed: a message cut short fails with exit 1 (`stream-input-cut`) instead of running as a shorter prompt | the message shape is undocumented (§3); empty input exits 0 with only `init` |
+| **one-shot, one `stream-json` message on stdin, then EOF** | no argv or flag limit either, and the input is framed: a message cut short fails with exit 1 (`stream-input-cut`) instead of running as a shorter prompt; what it does to a prompt is measured over every scalar value and at the proposed bound (§3) | the message shape is undocumented (§3); empty input exits 0 with only `init` |
 | `stream-json` session, several messages | one process for several turns | several `result` records to tell apart; a bad line adds an `ERROR` result that carries the previous turn's response; the process waits until stdin closes |
 | `agy acp` (Agent Client Protocol over stdio) | `session/request_permission` reaches the client, which can answer it (`acp-permission-rejected`); `stopReason` per prompt | an extra conversation-title model request per session (`acp-text`, `title_requests: 1`), which `-p` does not make; a rejection still ends the turn as `end_turn` with no reply; a JSON-RPC session to drive; the changelog fixes several `acp` defects in 1.5.12 and 1.5.13 |
 
 **Recommended:** one-shot, `--input-format stream-json --output-format
-stream-json`, one message on stdin, stdin closed after it. Text on stdin is
-the fallback if a later build changes the message shape. The completion
-condition is bounded and unambiguous. The stream must be a run of the shape
-of §4, with exactly one `result` as the last record, and the process must
-exit under the executor's idle and runtime limits. The run's last step must
-be an ended `agent_response`, and no step may be of a type the contract
-does not know. ACP is worth a separate look once AutoForge wants `agy` to
-ask a human (ADR 0007, #490). It buys nothing for the MVP.
+stream-json`, one message on stdin, written as `json.dumps` writes it
+(ASCII escapes, one line, LF), stdin closed after it. Text on stdin is the
+fallback if a later build changes the message shape. The completion
+condition is bounded and unambiguous. The stream must be a run of the
+framing and shape of §4, with exactly one `result` as the last record,
+ended by its LF, and the process must exit on its own under the executor's
+idle and runtime limits, with stdout read to EOF and nothing dropped. The
+run's last step must be an ended `agent_response`, and no step may be of a
+type the contract does not know. ACP is worth a separate look once
+AutoForge wants `agy` to ask a human (ADR 0007, #490). It buys nothing for
+the MVP.
 
 **Version gate:** exactly 1.5.13 until the probe passes on another build.
 `doctor` would run `agy --version` and refuse any other output. The release
@@ -501,57 +646,106 @@ characters among them, is a finding to resolve before the gate moves.
 
 ### Suggested adapter contract
 
-- **`providers.py`, an `AntigravityProvider`.** `agy --input-format
-  stream-json --output-format stream-json --settings
-  '{"modelProvider":"gemini"}' --model <base id> --effort <effort>
-  --disable-slash-commands --dangerously-skip-permissions`, the prompt as
-  `stdin_payload`, run on the duplex handle with a reducer of its own (an
+- **`providers.py`, an `AntigravityProvider`.** It runs the prompt as
+  `stdin_payload` on the duplex handle, with a reducer of its own (an
   `agy_stream.py` beside `claude_stream.py`). `tests/antigravity_probe.py`'s
-  `classify` is a prototype of that reducer's rules, held to every record by
-  the tests.
+  `classify` and `result_flags` are a prototype of that reducer's rules,
+  held to every record and to synthetic faults by the tests.
+- **A fixed argv, and no `extra_args`.** The adapter builds the whole
+  command itself and refuses any `extra_args` in `validate_profile`, as the
+  Pi and SDK adapters do:
+
+  ```sh
+  agy --input-format stream-json --output-format stream-json \
+      --settings '{"modelProvider":"gemini"}' --model <id> --effort <effort> \
+      --print-timeout <seconds>s --disable-slash-commands --dangerously-skip-permissions
+  ```
+
+  Only three values vary, each one the adapter checks: a model id from the
+  configuration's allow-list, one of the five efforts, and a timeout it
+  computes. No other flag is ever passed. Among those that would change
+  where `agy` looks or what it loads: `--add-dir` (it widens the
+  workspace, and with it where customizations are found), a second
+  `--settings` (it would replace the guarded `modelProvider`, and a later
+  build's keys are unknown), `--agent`, `--mode`, `--sandbox`, `--project`,
+  `--new-project`, `--remote-agent`, `--remote-control`, `-c`,
+  `--continue`, `--conversation`, `--log-file`, `--json-schema`, `-i` and
+  `--prompt-interactive`, and every subcommand. A denylist would admit the
+  next flag a release adds; the allow-list cannot.
   - `--dangerously-skip-permissions` is needed because headless mode
     refuses anything that would ask and then ends the run. Containment
     comes from the outer sandbox, as for Claude Code's `bypassPermissions`.
-  - `--disable-slash-commands` keeps a prompt that starts with `/` from
-    running as a command or a skill; it was not exercised here.
-  - Refuse `-c`, `--continue`, `--conversation`, `--remote-*`, `--project`
-    and `--new-project` in `extra_args`.
-  - Pass `--print-timeout` a little below `max_runtime_seconds`, so `agy`
+  - `--disable-slash-commands` is meant to keep a prompt that starts with
+    `/` from running as a command or a skill. The recommended launch ran
+    with it (`repository-customizations-recommended`), but no prompt
+    starting with `/` was sent.
+  - `--print-timeout` a little below `max_runtime_seconds`, so `agy`
     terminates its own background tasks and says so
     (`print-timeout-background`). The executor's limit stays the backstop.
 - **The reducer.**
-  - It checks every record against §4's shapes and order before reading it,
-    so no record makes it raise. A violation is a protocol failure.
-  - Completed only when all of these hold: a run of §4's shape with no
-    violation; its `result` `SUCCESS`, with no `finished_reason` and no
-    `denied_actions`; exit 0; every step of a known type (`user_input`,
-    `agent_response`, `tool`, `error_message`, `system_message`) and ended;
-    the run's last step an `agent_response` that ended `DONE`, with a
-    non-blank text.
+  - It checks every line against §4's framing and every record against its
+    shape and order before reading it, so no record makes it raise. A
+    violation is a protocol failure. No line is skipped: a blank line, a
+    line over its bound or cut, a record without its LF, a member given
+    twice, a contradictory result are each a violation.
+  - Completed only when all of these hold: a run of §4's framing and shape
+    with no violation; its `result` `SUCCESS` of the `SUCCESS` shape, with
+    no `denied_actions`; exit 0 and no `AGY_ERROR` line; every step of a
+    known type (`user_input`, `agent_response`, `tool`, `error_message`,
+    `system_message`) and ended; the run's last step an `agent_response`
+    that ended `DONE`, with a non-blank text; and the capture whole: the
+    process exited on its own, stdout reached EOF (no `capture_abandoned`)
+    and nothing was dropped (no `stdout_truncated`).
   - Anything else is a `provider_failure` naming what failed:
     `interrupted`, `print_timeout`, a refusal, a protocol violation, an
-    ambiguous step (an unanswered question), no result, no reply.
+    ambiguous step (an unanswered question), no result, no reply, a capture
+    that was not whole. The typed failures and the two recovery flags are
+    §9's: an integer HTTP code alone types a failure, `result_less_exit`
+    only on a whole capture of a session that began, `reply_delivered`
+    never.
   - A daemon task leaves its step `ACTIVE`, and the prototype fails such a
     run. Whether a run that started a daemon may still complete is a G1
     decision.
-- **Preflight (`integration_preflight`, `validate_profile`).**
-  - Refuse a launch whose worktree, or any directory above it up to the
-    repository root, has `.agents/`, `.agent/`, `_agents/` or `_agent/` with
-    a `hooks.json`, `mcp_config.json`, `plugins.json`, `skills.json` or
-    `plugins/`. This is the substitute for the missing switch (§11, C1).
-  - Refuse a prompt over a margin below the measured cut (160,000 bytes
-    leaves room for the metadata).
-  - Refuse, or strip and record, a prompt holding a character that the
-    pinned build's measured table (`dropped.txt`, §3) lists. Look the
-    character up in that table, never in a Unicode category: AutoForge's
-    Python has its own Unicode version, and `agy` removes by its own.
-    Then what the run log records is what the model saw, for the build
-    the table measured, as far as §3's measurements reach: every
-    character alone, and the texts measured. Other contexts are
-    unmeasured.
-  - A build without such a table, or a table that does not cover every
-    scalar value, is unverified: the preflight refuses every prompt rather
-    than promise fidelity.
+- **Launch checks, on the request: in `execute(req)`, not in a profile
+  hook.** `integration_preflight(env_allowlist)` and
+  `validate_profile(profile)` see neither the launch's working directory
+  nor its prompt, so they cannot make these checks; `validate_profile`
+  keeps the static half (no `extra_args`, the model and effort allow-lists).
+  The adapter makes them in `execute(req)`, on the request it is about to
+  launch, after `build_command(req)` and `sandboxed(...)` and before
+  anything is spawned, and refuses with a typed error, as the sandbox
+  refuses a launch its policy forbids. `doctor` runs the same scan on the
+  checkout, as an early warning only.
+  - **The launch tree.** On `req.cwd` resolved as the launch sees it:
+    refuse when a directory named `.agents`, `.agent`, `_agents` or
+    `_agent`, or a symbolic link of one of those names, exists in the
+    working directory, in any directory above it up to the filesystem root,
+    or anywhere below it, whatever it holds. The guide's file names and its
+    "up to the repository root" are not measured (§8), so the scan does not
+    lean on them: it refuses the directory, not a file list, and looks past
+    the repository root and below the working directory. The launch's home
+    is the adapter's own and empty (Home, below). This substitutes for the
+    missing switch only under C1 (§11). It runs once, before the launch: a
+    customization the agent writes during the run is not caught, and
+    whether `agy` would read one is one of C1's conditions.
+  - **The prompt, on the bytes the adapter frames** (`stdin_payload(req)`),
+    for the pinned build and the framing measured, and for nothing else.
+    Refuse a prompt over 160,000 UTF-8 bytes: the cut is at 191,986, and a
+    160,000-byte prompt with the widest escaping arrived whole (§3). Refuse,
+    or strip and record, a prompt holding a character the build's table
+    lists (`dropped.txt`, §3). Look the character up in that table, never in
+    a Unicode category: AutoForge's Python has its own Unicode version, and
+    `agy` removes by its own. Then what the run log records is what the
+    model saw, as far as §3's measurements reach: every character alone,
+    through text on stdin and through the framing, and the texts measured.
+    Other contexts are unmeasured.
+  - **Fail closed outside what was verified.** The gate admits a prompt
+    only for a build whose records hold both complete measurements, each
+    clean and covering every scalar value, which agree (what `table`
+    checks, §3), and only on the transport measured: the framing above or
+    text on stdin. It refuses every prompt for any other build, for a build
+    whose two measurements differ, and on any other input (argv, which was
+    not swept, or a message written another way).
 - **Credentials (`credential_routes`).**
   - `GEMINI_API_KEY`, projected like the other providers' keys.
   - The Google sign-in is an OAuth login with a refresh token
@@ -570,7 +764,7 @@ characters among them, is a finding to resolve before the gate moves.
   model lacks is a hard failure, which `agy` already enforces before any
   request.
 - **`doctor.py`.** A version row (the pinned build), a `--help` row (every
-  flag the adapter passes), a `GEMINI_API_KEY` presence row (never its
+  flag of the fixed argv), a `GEMINI_API_KEY` presence row (never its
   value), and the customization scan of the checkout. `-p /config
   --output-format json` checks the settings keys without a turn; under
   this probe it worked with no network.
@@ -579,8 +773,9 @@ characters among them, is a finding to resolve before the gate moves.
   the re-measurement for a new build.
 
 **Approximate split:** the reducer and its tests (small); the adapter,
-configuration and fake (medium); the preflights and the per-launch home
-(medium); the `doctor` rows (small); a bounded live smoke test with the
+configuration and fake (medium); the launch checks and the per-launch home
+(medium); the measurements C1 needs, as probe scenarios (small to
+medium); the `doctor` rows (small); a bounded live smoke test with the
 operator's approval (small, plus its budget); operator documentation and a
 `docs/compatibility.md` row (small).
 
@@ -590,16 +785,26 @@ operator's approval (small, plus its budget); operator documentation and a
 behind these conditions, with no default routing change:
 
 - **C1, the blocker.** Repository hooks and MCP servers run in every
-  headless run, before the model is asked, the hooks with the model key in
-  their environment, and nothing turns them off (§8). AutoForge runs agents on
-  untrusted trees, a pull request under review among them, and requires
-  every agent CLI's hooks and MCP servers off. The maintainer must decide
-  whether the preflight refusal of §10 is an acceptable substitute for a
-  switch. Its weakness is that its completeness rests on the discovery
-  rules of one build, read from the bundled guide and partly measured. If
-  the answer is no, this record's decision is **NO-GO** until `agy` ships a
-  switch, and the probe's three customization scenarios are the test of
-  one.
+  headless run tried, before the model is asked, the hooks with the model
+  key in their environment, and nothing tried turns them off (§8).
+  AutoForge runs agents on untrusted trees, a pull request under review
+  among them, and requires every agent CLI's hooks and MCP servers off. The
+  maintainer must decide whether the request-aware refusal of §10 (the
+  launch tree, with the fixed argv) is an acceptable substitute for a
+  switch. What was measured covers one layout and four launches (§8), so
+  accepting it is conditional on first measuring, for the pinned build,
+  each discovery rule and launch mode the scan relies on, as a probe
+  scenario each: every directory and file name the guide names; each at
+  the working directory, above it (to and past the repository root) and
+  below it; a working directory below the repository root; a symbolic link
+  on the way; the home's `~/.gemini/` customizations; whether a hooks or
+  MCP file written during a run is read after it began; and
+  `--disable-slash-commands` with a prompt that starts with `/`. A rule
+  known only from the guide is not a property of the scan. If one of these
+  finds a customization the scan would miss, the scan changes and is
+  measured again. If the answer is no, this record's decision is
+  **NO-GO** until `agy` ships a switch, and the probe's four customization
+  scenarios are the test of one.
 - **C2.** One bounded live smoke test on the real Gemini API, with the
   operator's approval and a budget: a reply, one real tool call, and one
   real 4xx error body. It would confirm that the stand-in's success and
@@ -608,9 +813,11 @@ behind these conditions, with no default routing change:
   another build.
 
 Not blockers, but required of any adapter: typing a refusal as a failure,
-holding the stream to §4's shapes, failing a run with an `unknown` step,
-taking the reply from the last step, the prompt preflight with the pinned
-build's table, a home of its own per launch, and never `-c`.
+holding the stream to §4's framing and shapes and the capture to whole,
+failing a run with an `unknown` step, taking the reply from the last step,
+the flags of §9 (`reply_delivered` never, `result_less_exit` narrowly), the
+fixed argv, the launch checks on the request with the pinned build's
+table, a home of its own per launch, and never `-c`.
 
 Against a go: `agy` changes print-mode behaviour often, its `stream-json`
 input shape is undocumented, a reply cannot be seen before the process ends,
@@ -667,16 +874,45 @@ Available subcommands:
 
 ## Appendix B: reproducing one scenario by hand
 
-The probe does this for every scenario. By hand, with a stand-in of your
-own listening on `127.0.0.1:PORT` and an empty home:
+Run it through the probe, which builds the private root of the header for
+it, starts the stand-in inside the sandbox's own loopback, and writes the
+record:
 
 ```sh
-env -i HOME="$EMPTY_HOME" PATH=/usr/bin:/bin LANG=C.UTF-8 \
-  GEMINI_API_KEY=synthetic GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:PORT \
-  agy --input-format stream-json --output-format stream-json \
-      --settings '{"modelProvider":"gemini"}' \
-  <<<'{"event":"user","message":{"content":"Say hello"}}'
+python3 -I tests/antigravity_probe.py record --agy /path/to/agy \
+    --out "$(mktemp -d)" --only success-stream-json
 ```
 
-Without `GOOGLE_GEMINI_BASE_URL` and with a real key, the same command
-calls the real Gemini API and spends quota.
+The sandbox is this `bwrap` command (`sandbox_argv` in the probe), with
+`BASE` the run's directory holding `home/` and `work/`, `SPEC` its spec
+directory, and the three synthetic `/etc` files the probe writes in
+`SPEC/etc/`. It is started with an empty environment of its own (`env -i`),
+and its helper with another (`--clearenv`):
+
+```sh
+env -i /usr/bin/bwrap --unshare-all --die-with-parent --new-session --clearenv \
+  --ro-bind /usr /usr --tmpfs /usr/local \
+  --symlink usr/bin /bin --symlink usr/sbin /sbin \
+  --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+  --dev /dev --proc /proc --tmpfs /tmp --dir /etc \
+  --ro-bind /etc/ld.so.cache /etc/ld.so.cache \
+  --ro-bind "$SPEC/etc/passwd" /etc/passwd --ro-bind "$SPEC/etc/group" /etc/group \
+  --ro-bind "$SPEC/etc/hosts" /etc/hosts \
+  --ro-bind tests/antigravity_probe.py /probe/antigravity_probe.py \
+  --ro-bind /path/to/agy /probe/agy \
+  --bind "$BASE" "$BASE" --bind "$SPEC" "$SPEC" \
+  --chdir / -- /usr/bin/python3 -I -S /probe/antigravity_probe.py inner "$SPEC/spec.json"
+```
+
+(On a host whose `/bin` or `/lib` is a directory rather than a link, the
+probe binds it read-only instead.) Inside, the helper starts the stand-in
+on `127.0.0.1` and runs `agy` with the environment it builds and nothing
+else: `HOME`, `PATH=/usr/bin:/bin`, `LANG=C.UTF-8`, `TERM=dumb`, the four
+`XDG_*_HOME` under the home, the synthetic `GEMINI_API_KEY` and
+`GOOGLE_GEMINI_BASE_URL`.
+
+Do not reproduce a scenario by running `agy` on the host, even under
+`env -i` with an empty `HOME`: that is no filesystem boundary, and the
+host's files, sockets and network stay in reach. Without
+`GOOGLE_GEMINI_BASE_URL` and with a real key, the same command calls the
+real Gemini API and spends quota.

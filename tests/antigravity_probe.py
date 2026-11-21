@@ -15,12 +15,16 @@ facts the report states, and with ``AUTOFORGE_AGY_PROBE_BIN`` set runs the
 scenarios again against that binary and holds the fresh records to the
 same facts.
 
-**No model is called and no credential is read.** Each scenario runs
-``agy`` once, inside ``bwrap`` with a network namespace of its own (no
-route out, only loopback) and a pid namespace of its own (every process
-the run left behind is seen, and killed when the namespace ends), with an
-empty temporary ``HOME`` and a minimal environment. The model API is a
-loopback stand-in of the Gemini API (:class:`StandIn`), reached through
+**No model is called, and agy is given no credential.** Each scenario
+runs ``agy`` once, inside ``bwrap``, in a private root (:func:`sandbox_argv`):
+never the host's root, only ``/usr`` read-only, three synthetic files of
+``/etc``, the probe and the binary read-only, and the run's own empty
+``HOME``, workspace and spec directory; the helper that starts agy has an
+empty environment, and agy the minimal one the helper builds. It has
+namespaces of its own for users, pids (every process the run left behind
+is seen, and killed when the namespace ends), the network (no route out,
+only loopback), IPC, UTS and cgroups. The model API is a loopback stand-in
+of the Gemini API (:class:`StandIn`), reached through
 the Gemini SDK's documented ``GOOGLE_GEMINI_BASE_URL`` with a synthetic
 ``GEMINI_API_KEY`` and ``--settings '{"modelProvider":"gemini"}'``, the
 CLI's own API-key route (its changelog, 1.x: "point
@@ -34,10 +38,10 @@ What the stand-in cannot show is what the real Gemini API sends: its
 error bodies and details, its latency, real tool use by a real model.
 The report marks those claims unverified.
 
-Linux only: it needs ``bwrap`` with unprivileged user namespaces, and
-``/proc``. Standard library only, and it imports nothing of the package,
-because the inner half (``inner``) runs under ``python3 -I`` inside the
-sandbox.
+Linux only: it needs ``bwrap`` with unprivileged user namespaces,
+``/proc``, and the host's ``/usr/bin/python3`` (3.10 or later), which runs
+the inner half (``inner``) inside the sandbox under ``-I -S``. Standard
+library only, and it imports nothing of the package, for the same reason.
 """
 
 from __future__ import annotations
@@ -50,6 +54,7 @@ import hashlib
 import http.server
 import itertools
 import json
+import math
 import os
 import re
 import shutil
@@ -75,7 +80,9 @@ REPLY = (
     '{"phase": "PROBE", "status": "success"}\n<<<END_CONTROL_RESULT>>>'
 )
 # Each stdout or stderr line a record keeps, and each excerpt of a request.
+# A longer line is cut, and ends with PROBE_CUT and its length.
 LINE_LIMIT = 4000
+PROBE_CUT = "<cut by the probe: "
 EXCERPT_LIMIT = 600
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 OAUTH_QUERY = re.compile(r"\b(client_id|code_challenge|state)=[^&\s\"\\]+")
@@ -159,6 +166,36 @@ def all_chunks() -> list[list[tuple[int, int]]]:
             start = end + 1
     chunks.append(spans)
     return chunks
+
+
+# The same measurement through the recommended transport
+# (``fidelity-framed-*``): each prompt as one stream-json message, escaped
+# as :func:`stream_message` writes it (every non-ASCII character a ``\\u``
+# escape, an astral one a surrogate pair), so that its line is up to three
+# times the prompt's UTF-8.
+FRAMED_PREFIX = "fidelity-framed-"
+# The prompt bound the report proposes (UTF-8 bytes), and the near-limit
+# prompt measured through the framing at it (``fidelity-near-limit-stream-json``).
+PROMPT_LIMIT = 160_000
+NEAR_LIMIT = "fidelity-near-limit-stream-json"
+
+
+def near_limit_prompt(size: int = PROMPT_LIMIT) -> str:
+    """A prompt of exactly ``size`` UTF-8 bytes whose framed line is as long as it gets.
+
+    Numbered lines of astral characters (12 escaped bytes for 4 of UTF-8),
+    with CJK, Latin, a quote, a backslash, a tab and a CR LF on each, every
+    character one agy 1.5.13 keeps: it must arrive identical.
+    """
+    lines, n, used = [], 0, 0
+    while True:
+        line = f"{n:05d}|" + "\U0001f680\U00020000" * 12 + '智é"\\\t</USER_REQUEST>\r\n'
+        if used + len(line.encode()) > size:
+            break
+        lines.append(line)
+        used += len(line.encode())
+        n += 1
+    return "".join(lines) + "x" * (size - used)
 
 
 def all_prompt(label: str, spans: list[tuple[int, int]]) -> str:
@@ -248,9 +285,10 @@ def is_dropped(c: int, table: tuple[tuple[int, int], ...] | None = None) -> bool
     return i >= 0 and ranges[i][0] <= c <= ranges[i][1]
 
 
-def stripped(text: str) -> str:
-    """``text`` without the characters agy 1.5.13 removes from a prompt."""
-    return "".join(ch for ch in text if not is_dropped(ord(ch)))
+def stripped(text: str, table: tuple[tuple[int, int], ...] | None = None) -> str:
+    """``text`` without the characters agy 1.5.13 (or ``table``'s build) removes."""
+    ranges = dropped_1_5_13() if table is None else table
+    return "".join(ch for ch in text if not is_dropped(ord(ch), ranges))
 
 
 def stream_message(text: str) -> str:
@@ -449,10 +487,17 @@ def scenarios() -> list[Scenario]:
             sent_prompt=big,
         )
     )
-    # every scalar value, NUL on its own
-    for label, spans in [("nul", [(0, 0)]), *((f"{i:02d}", c) for i, c in enumerate(all_chunks()))]:
+    # every scalar value, NUL on its own, as text on stdin and then framed
+    chunks = [("nul", [(0, 0)]), *((f"{i:02d}", c) for i, c in enumerate(all_chunks()))]
+    for label, spans in chunks:
         text = all_prompt(label, spans)
         add(Scenario(ALL_PREFIX + label, stdin_run(), stdin=text.encode(), sent_prompt=text))
+    for label, spans in chunks:
+        text = all_prompt("framed-" + label, spans)
+        framed = stream_message(text).encode()
+        add(Scenario(FRAMED_PREFIX + label, sj_run(), stdin=framed, sent_prompt=text))
+    near = near_limit_prompt()
+    add(Scenario(NEAR_LIMIT, sj_run(), stdin=stream_message(near).encode(), sent_prompt=near))
     # tools, permissions and questions
     add(Scenario("deny-command", p_run(), steps=[CMD_IN_WORKSPACE, text_step()]))
     add(Scenario("deny-command-json", p_run(fmt="json"), steps=[CMD_IN_WORKSPACE, text_step()]))
@@ -738,6 +783,15 @@ def scenarios() -> list[Scenario]:
         Scenario(
             "repository-customizations-sandbox",
             p_run("--sandbox", fmt="json"),
+            workspace="customized",
+        )
+    )
+    # the recommended launch itself (the report's section 10), prompt framed on stdin
+    add(
+        Scenario(
+            "repository-customizations-recommended",
+            sj_run("--disable-slash-commands", SKIP),
+            stdin=stream_message("do it").encode(),
             workspace="customized",
         )
     )
@@ -1055,7 +1109,8 @@ def _feeder(
 
 
 def inner(spec_path: str) -> int:
-    spec = json.loads(Path(spec_path).read_text())
+    spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    table = tuple((first, last) for first, last in spec["strip_table"])
     sc = Scenario(**{k: v for k, v in spec["scenario"].items() if k != "stdin"})
     stdin_bytes = bytes.fromhex(spec["stdin_hex"]) if spec["stdin_hex"] is not None else None
     stand_in = StandIn(sc.steps)
@@ -1101,8 +1156,8 @@ def inner(spec_path: str) -> int:
                 [round(time.monotonic() - started, 2), line.decode("utf-8", "replace")]
             )
 
-    readers = [threading.Thread(target=reader, args=(n,), daemon=True) for n in lines]
-    for t in readers:
+    readers = {n: threading.Thread(target=reader, args=(n,), daemon=True) for n in lines}
+    for t in readers.values():
         t.start()
     if sc.feed is not None:
         threading.Thread(
@@ -1138,15 +1193,20 @@ def inner(spec_path: str) -> int:
         os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()
     seconds = round(time.monotonic() - started, 1)
-    for t in readers:
+    for t in readers.values():
         t.join(timeout=5)
     time.sleep(1.0)
     left = [p for p in _processes(me) if p["pid"] != proc.pid]
     server.shutdown()
+    # Whether each pipe was read to its end: a reader still waiting holds a
+    # stream some process left behind still had open, and what it read is
+    # not the whole stream (the reducer's abandoned capture).
+    capture = {f"{n}_eof": not t.is_alive() for n, t in readers.items()}
     record = {
         "argv": argv,
         "exit": proc.returncode,
         "killed_by_probe": killed,
+        "capture": capture,
         "signalled": signalled,
         "seconds": seconds,
         "stdout": lines["stdout"],
@@ -1165,10 +1225,10 @@ def inner(spec_path: str) -> int:
             if Path(work, m).exists()
         },
         "outside_file_written": Path(work).parent.joinpath("outside-written-by-agent").exists(),
-        "facts": _facts(sc, stand_in.requests, root, home),
+        "facts": _facts(sc, stand_in.requests, root, home, table),
         "home_files": _home_files(Path(home)),
     }
-    Path(spec["result"]).write_text(json.dumps(record, ensure_ascii=False))
+    Path(spec["result"]).write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
     for p in left:
         try:
             os.kill(p["pid"], signal.SIGKILL)
@@ -1218,7 +1278,13 @@ def _home_files(home: Path) -> list[str]:
     return sorted(found)[:80]
 
 
-def _facts(sc: Scenario, requests: list[dict[str, Any]], root: str, home: str) -> dict[str, Any]:
+def _facts(
+    sc: Scenario,
+    requests: list[dict[str, Any]],
+    root: str,
+    home: str,
+    table: tuple[tuple[int, int], ...] | None = None,
+) -> dict[str, Any]:
     facts: dict[str, Any] = {}
     if requests:
         system = "".join(
@@ -1259,11 +1325,11 @@ def _facts(sc: Scenario, requests: list[dict[str, Any]], root: str, home: str) -
             "sent_bytes": len(want.encode()),
             "received_bytes": len(got.encode()) if got is not None else None,
             "identical": got == want,
-            "identical_after_strip": got == stripped(want),
+            "identical_after_strip": got == stripped(want, table),
             "truncated_bytes": int(cut.group(1)) if cut else None,
             "kept_before_cut_bytes": len(got[: cut.start()].encode()) if cut and got else None,
         }
-        if sc.name.startswith(ALL_PREFIX) and got is not None:
+        if sc.name.startswith((ALL_PREFIX, FRAMED_PREFIX)) and got is not None:
             facts["all"] = measure_all(want, got)
         if sc.name == "fidelity-sweep" and got is not None:
             dropped, kept = [], []
@@ -1287,7 +1353,17 @@ def _facts(sc: Scenario, requests: list[dict[str, Any]], root: str, home: str) -
 #   refusal  result, status ERROR            then the end of stdout
 #
 # A refusal is agy's answer when no session began (``stdin-whitespace``,
-# ``no-login-argv-prompt``): never a completed run. Each record's shape:
+# ``no-login-argv-prompt``): never a completed run.
+#
+# Framing. Every record is one line: one JSON object and the LF that ends
+# it, nothing else. A line without its LF (the last one, when the writer
+# stopped mid-record), an empty or blank line, whitespace around the object,
+# a line longer than the reader's bound or cut by one (the probe's
+# PROBE_CUT), a member given twice in one object (whose value a reader
+# would have to pick), and a number that is not finite are violations:
+# never skipped, never repaired.
+#
+# Each record's shape:
 #
 # - init: ``{"event": "init", "conversation_id": C, "init": {...}}``, C a
 #   non-empty string, and the first record.
@@ -1298,16 +1374,27 @@ def _facts(sc: Scenario, requests: list[dict[str, Any]], root: str, home: str) -
 #   earlier step's; a step keeps its type; nothing updates a step that
 #   ended (DONE or ERROR).
 # - result: ``{"event": "result", "result": {"conversation_id": C,
-#   "status": "SUCCESS" or "ERROR", ...}}``, the last record, its
-#   ``response``, ``error`` and ``finished_reason`` strings when present
-#   and its ``denied_actions`` a list of objects with a string ``action``.
+#   "status": S, "response": R, ...}}``, the last record, R a string, and
+#   one of the two shapes every recorded result had:
+#   - SUCCESS: no ``error``, no ``finished_reason``, and ``denied_actions``
+#     absent or a non-empty list of objects each with a non-empty string
+#     ``action``;
+#   - ERROR: ``error`` a non-empty string, ``finished_reason`` one of
+#     FINISHED_REASONS, no ``denied_actions``.
 #   A refusal's conversation_id is ``""``, as agy writes it.
 #
 # Anything else (a line that is not JSON, an unknown event, a value of
-# another type in one of these places, a record out of this order or of
-# another conversation) is a violation, and a run with one is a protocol
-# failure. Nothing in a record is read before its type is checked, so no
-# record raises.
+# another type in one of these places, a contradictory result, a record
+# out of this order or of another conversation) is a violation, and a run
+# with one is a protocol failure. Nothing in a record is read before its
+# type is checked, so no record raises.
+#
+# Capture. What the reducer read proves nothing unless the whole stream was
+# read: the process exited on its own (no limit, kill or signal of the
+# executor's ended it), stdout was read to EOF (no process left holding it
+# open, so the capture was not abandoned), and no capture bound dropped
+# output. :class:`Capture` is that report, which only the executor can
+# make; a capture short of any of the three never completes a run.
 
 EVENTS = ("init", "step_update", "result")
 STEP_STATES = ("ACTIVE", "DONE", "ERROR")
@@ -1318,6 +1405,64 @@ ENDED = ("DONE", "ERROR")
 # and nothing tells it from any other ``unknown`` step.
 STEP_TYPES = ("user_input", "agent_response", "tool", "error_message", "system_message")
 RESULT_STATUSES = ("SUCCESS", "ERROR")
+FINISHED_REASONS = ("error", "interrupted", "print_timeout")
+# The reader's bound on one record line, in characters. The result line
+# carries the run's whole joined response, so a bound must allow at least
+# twice the largest reply accepted; a longer line is a violation.
+LINE_BOUND = 1 << 20
+
+
+@dataclass(frozen=True)
+class Capture:
+    """How a run's output was read: the executor's report, never the stream's.
+
+    ``exited``: the process exited on its own, not ended by a limit, a kill
+    or a signal of the executor's. ``eof``: stdout was read to its end, so
+    no process left behind still held it and the capture was not abandoned.
+    ``truncated``: a capture bound dropped output.
+    """
+
+    exited: bool
+    eof: bool
+    truncated: bool = False
+
+    @property
+    def whole(self) -> bool:
+        return self.exited and self.eof and not self.truncated
+
+
+WHOLE = Capture(exited=True, eof=True)
+
+
+class _Duplicate(ValueError):
+    pass
+
+
+def _object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise _Duplicate(key)
+        out[key] = value
+    return out
+
+
+def _finite(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(text)
+    return value
+
+
+def _not_a_number(text: str) -> float:
+    raise ValueError(text)
+
+
+def strict_json(text: str) -> Any:
+    """JSON with no member twice in one object and no number that is not finite."""
+    return json.loads(
+        text, object_pairs_hook=_object, parse_float=_finite, parse_constant=_not_a_number
+    )
 
 
 @dataclass
@@ -1340,6 +1485,7 @@ class Reduction:
     steps: dict[int, Step] = field(default_factory=dict)  # by step index
     last_index: int = -1
     agy_error: dict[str, Any] | None = None
+    agy_errors: int = 0  # how many AGY_ERROR lines stderr held
 
     @property
     def init(self) -> bool:
@@ -1399,6 +1545,16 @@ def _step(red: Reduction, obj: dict[str, Any], n: int) -> str:
     return ""
 
 
+def _denied_ok(denied: object) -> bool:
+    return (
+        isinstance(denied, list)
+        and bool(denied)
+        and all(
+            isinstance(d, dict) and isinstance(d.get("action"), str) and d["action"] for d in denied
+        )
+    )
+
+
 def _result(red: Reduction, obj: dict[str, Any], n: int) -> str:
     res = obj.get("result")
     if not isinstance(res, dict):
@@ -1411,31 +1567,65 @@ def _result(red: Reduction, obj: dict[str, Any], n: int) -> str:
         return f"conversation_id {cid!r}, not the init's"
     if not red.init and (n != 1 or status != "ERROR" or cid != ""):
         return "a result with no init that is not a refusal (an ERROR result alone)"
-    for key in ("response", "error", "finished_reason"):
-        if key in res and not isinstance(res[key], str):
-            return f"{key} {res[key]!r}"
-    denied = res.get("denied_actions")
-    if denied is not None and not (
-        isinstance(denied, list)
-        and all(isinstance(d, dict) and isinstance(d.get("action"), str) for d in denied)
-    ):
-        return f"denied_actions {denied!r}"
+    if not isinstance(res.get("response"), str):
+        return f"response {res.get('response')!r}"
+    if status == "SUCCESS":
+        for key in ("error", "finished_reason"):
+            if key in res:  # a success that also says it failed, or why it ended early
+                return f"a SUCCESS result with {key} {res[key]!r}"
+        if "denied_actions" in res and not _denied_ok(res["denied_actions"]):
+            return f"denied_actions {res['denied_actions']!r}"
+        return ""
+    error, reason = res.get("error"), res.get("finished_reason")
+    if not isinstance(error, str) or not error:
+        return f"an ERROR result with error {error!r}"
+    if reason not in FINISHED_REASONS:
+        return f"an ERROR result with finished_reason {reason!r}"
+    if "denied_actions" in res:
+        return "an ERROR result with denied_actions"
     return ""
 
 
 _RECORD_CHECKS = {"init": _init, "step_update": _step, "result": _result}
 
 
-def reduce_stream(stdout: Iterable[str], stderr: Iterable[str]) -> Reduction:
-    """Every record of the run, checked against the grammar above."""
+def _framing(line: str, bound: int) -> str:
+    """Why ``line`` is no record line, or ``""``."""
+    if len(line) > bound:
+        return f"is longer than the line bound ({len(line)} > {bound} characters)"
+    if PROBE_CUT in line:
+        return "was cut by the probe's line limit"
+    if not line.endswith("\n"):
+        return "is not ended by LF (a record cut short)"
+    body = line[:-1]
+    if not body.strip():
+        return "is blank"
+    if body != body.strip():
+        return "has whitespace around its object"
+    return ""
+
+
+def reduce_stream(
+    stdout: Iterable[str], stderr: Iterable[str], line_bound: int = LINE_BOUND
+) -> Reduction:
+    """Every record of the run, checked against the grammar above.
+
+    ``stdout`` is the stream's lines as read, each with its LF (the last
+    one without, when the stream ended mid-record).
+    """
     red = Reduction()
     for line in stdout:
-        if not line.strip():
-            continue
         red.records += 1
         n = red.records
+        problem = _framing(line, line_bound)
+        if problem:
+            red.violations.append(f"record {n} {problem}")
+            continue
         try:
-            obj = json.loads(line)
+            obj = strict_json(line)
+        except _Duplicate as dup:
+            red.violations.append(f"record {n} gives the member {dup.args[0]!r} twice")
+            continue
         except (ValueError, RecursionError):  # nested too deep is not JSON either
             red.violations.append(f"record {n} is not JSON")
             continue
@@ -1451,8 +1641,9 @@ def reduce_stream(stdout: Iterable[str], stderr: Iterable[str]) -> Reduction:
             red.violations.append(f"record {n} ({event}): {problem}")
     for line in stderr:
         if line.startswith("AGY_ERROR: "):
+            red.agy_errors += 1
             try:
-                err = json.loads(line[len("AGY_ERROR: ") :])
+                err = strict_json(line[len("AGY_ERROR: ") :])
             except (ValueError, RecursionError):
                 err = None
             red.agy_error = err if isinstance(err, dict) else {"unparsed": True}
@@ -1468,15 +1659,42 @@ class Outcome:
     reply: str = ""
 
 
-def classify(red: Reduction, exit_code: int) -> Outcome:
+def _http_code(err: dict[str, Any]) -> int | None:
+    """The HTTP status of a typed model API error: an integer of 100 to 599, or None."""
+    code = err.get("error_code")
+    if err.get("code_kind") == "http" and _is_int(code) and 100 <= code <= 599:
+        return code
+    return None
+
+
+def _failure(red: Reduction, reason: str) -> Outcome:
+    """A failed turn, typed from its one ``AGY_ERROR`` line, never from ``retryable``.
+
+    An integer 429 is a usage limit; an integer 408, or one of 500 to 599,
+    is transient; anything else (another code, a float, a bool, a string, a
+    code of another kind, no line, a line that does not parse, or more than
+    one line) is an error.
+    """
+    code = _http_code(red.agy_error or {}) if red.agy_errors == 1 else None
+    if code == 429:
+        return Outcome("usage_limit", "model API 429")
+    if code is not None and (code == 408 or 500 <= code <= 599):
+        return Outcome("transient", f"model API {code}")
+    return Outcome("error", reason)
+
+
+def classify(red: Reduction, exit_code: int, capture: Capture) -> Outcome:
     """A one-shot run's outcome, by the suggested contract; never from exit 0 alone.
 
     ``completed`` only when all of these hold: the stream is a ``run`` with
-    no violation; its result is SUCCESS with no finished_reason and no
-    denied_actions; the exit is 0; every step is of a type the contract
-    knows (:data:`STEP_TYPES`) and ended; and the run's last step is an
-    agent_response that ended DONE with a non-blank text, which is the
-    reply. The first that fails names the outcome.
+    no violation (framing included); its result is SUCCESS, of the SUCCESS
+    shape, with no denied_actions; the exit is 0 and stderr holds no
+    ``AGY_ERROR``; every step is of a type the contract knows
+    (:data:`STEP_TYPES`) and ended; the run's last step is an agent_response
+    that ended DONE with a non-blank text, which is the reply; and the
+    capture is whole (:class:`Capture`). The first that fails names the
+    outcome. A capture short of whole can only stop a run from completing:
+    a failure read from it stays a failure.
     """
     if red.violations:
         more = len(red.violations) - 1
@@ -1484,19 +1702,17 @@ def classify(red: Reduction, exit_code: int) -> Outcome:
     if not red.results:
         return Outcome("no_result", "no result record" + (" after init" if red.init else ""))
     result = red.results[0]
-    reason = result.get("finished_reason", "")
-    if reason == "interrupted":
-        return Outcome("interrupted", "finished_reason interrupted")
-    if reason == "print_timeout":
-        return Outcome("print_timeout", "finished_reason print_timeout")
-    if result["status"] != "SUCCESS" or reason or exit_code != 0:
-        err = red.agy_error or {}
-        code = err.get("error_code")
-        if err.get("code_kind") == "http" and code == 429:
-            return Outcome("usage_limit", "model API 429")
-        if err.get("code_kind") == "http" and _is_int(code) and (code == 408 or code >= 500):
-            return Outcome("transient", f"model API {code}")
-        return Outcome("error", f"status {result['status']}, exit {exit_code}")
+    if result["status"] == "ERROR":
+        reason = result["finished_reason"]
+        if reason == "interrupted":
+            return Outcome("interrupted", "finished_reason interrupted")
+        if reason == "print_timeout":
+            return Outcome("print_timeout", "finished_reason print_timeout")
+        return _failure(red, f"status ERROR, exit {exit_code}")
+    if exit_code != 0:
+        return Outcome("error", f"a SUCCESS result, exit {exit_code}")
+    if red.agy_errors:
+        return Outcome("error", "a SUCCESS result, and AGY_ERROR on stderr")
     denied = result.get("denied_actions") or []
     if denied:
         names = ", ".join(sorted({d["action"] for d in denied}))
@@ -1523,15 +1739,66 @@ def classify(red: Reduction, exit_code: int) -> Outcome:
         return Outcome("protocol", f"the last agent response ended {last.state}")
     if not last.text.strip():
         return Outcome("empty_reply", "the last agent response is empty")
+    if not capture.exited:
+        return Outcome("killed", "a limit or a signal of the executor's ended the process")
+    if not capture.eof:
+        return Outcome(
+            "incomplete_capture", "stdout was not read to EOF: the capture was abandoned"
+        )
+    if capture.truncated:
+        return Outcome("incomplete_capture", "a capture bound dropped output")
     return Outcome("completed", reply=last.text)
+
+
+def result_flags(record: dict[str, Any]) -> dict[str, bool]:
+    """The two flags of ``AgentExecutionResult`` that can start recovery, by the contract.
+
+    ``reply_delivered`` is never set: agy shows a reply only with its
+    result, at the end, so no launch that failed after it has a reply the
+    stream proves complete, and a result record alone proves no reply (it
+    may be an error, a refusal, or a turn that more activity followed).
+    ``result_less_exit`` only for a session that began (init and at least
+    one step), wrote no result and no violation, exited on its own (no
+    limit, kill or signal of the executor's), was read whole, and reported
+    no model API error (no ``AGY_ERROR``).
+    """
+    red = reduce_stream(*_streams(record))
+    capture = capture_of(record)
+    result_less = (
+        red.init
+        and bool(red.steps)
+        and not red.results
+        and not red.violations
+        and red.agy_errors == 0
+        and capture.whole
+        and record.get("signalled") is None
+    )
+    return {"reply_delivered": False, "result_less_exit": result_less}
+
+
+def capture_of(record: dict[str, Any]) -> Capture:
+    """The probe's capture of a record, as the executor would report it.
+
+    A record of the private-root probe says whether stdout was read to EOF
+    (``capture``). The 1.5.13 records made before it do not: for them the
+    stream counts as read to EOF only when no process was left in the
+    sandbox when the probe listed them after the run, so that nothing could
+    still hold the pipe; otherwise it counts as abandoned. A run the probe
+    killed at its timeout, or signalled, did not exit on its own.
+    """
+    cap = record.get("capture")
+    eof = bool(cap["stdout_eof"]) if cap is not None else not record["processes_left"]
+    exited = not record["killed_by_probe"] and record.get("signalled") is None
+    return Capture(exited=exited, eof=eof)
+
+
+def _streams(record: dict[str, Any]) -> tuple[list[str], list[str]]:
+    return [x[1] for x in record["stdout"]], [x[1].rstrip("\n") for x in record["stderr"]]
 
 
 def outcome_of(record: dict[str, Any]) -> Outcome:
     """:func:`classify` of a committed or fresh record."""
-    red = reduce_stream(
-        (x[1] for x in record["stdout"]), (x[1].rstrip("\n") for x in record["stderr"])
-    )
-    return classify(red, record["exit"])
+    return classify(reduce_stream(*_streams(record)), record["exit"], capture_of(record))
 
 
 # -- the outer half: sandbox, normalize, write ---------------------------------
@@ -1555,72 +1822,134 @@ def prepare(sc: Scenario, root: Path, shared: Shared) -> tuple[Path, Path]:
     return home, work
 
 
+# -- the sandbox: a private root, an empty environment ---------------------------
+#
+# Each run's sandbox is bwrap's own empty root with only what the run needs,
+# never the host's root: /usr read-only (the host's programs and libraries,
+# /usr/local hidden), the loader's cache, three synthetic files of /etc, the
+# probe module and the binary under measurement read-only at fixed paths, and
+# the run's own home, workspace and spec directory read-write. No home of the
+# host, no credential store, no /run, /var or /srv, and so no path-based
+# socket of the host (D-Bus, an SSH or GPG agent, a container daemon) is
+# there to open. The helper starts with an empty environment (--clearenv),
+# so nothing of the caller's is in /proc/<pid>/environ for agy to read, and
+# agy itself gets only the minimal one the helper builds. It has namespaces
+# of its own for users, pids, the network (loopback alone: no route out and
+# no socket of the host's, abstract ones included), IPC, UTS and cgroups.
+#
+# Records written this way say so (``isolation``). The 1.5.13 records
+# committed before it, which name none, were made in the earlier sandbox:
+# the host root read-only, /tmp a tmpfs, the helper with the caller's
+# environment (the report's header says what that means for them).
+
+ISOLATION = "private-root"
+# The inner half's interpreter: the host's own, under /usr. Not the caller's,
+# which a virtual environment or Homebrew keeps under a home.
+SANDBOX_PYTHON = "/usr/bin/python3"
+SANDBOX_DIR = "/probe"
+SANDBOX_PROBE = SANDBOX_DIR + "/antigravity_probe.py"
+SANDBOX_AGY = SANDBOX_DIR + "/agy"
+# The merged-/usr links of the root, recreated as links (a host whose /bin
+# is a directory has it bound read-only instead).
+ROOT_LINKS = ("bin", "sbin", "lib", "lib32", "lib64", "libx32")
+# The one host file of /etc the sandbox shows: the dynamic loader's cache.
+HOST_ETC = ("ld.so.cache",)
+
+
+def _synthetic_etc(directory: Path, home: Path) -> dict[str, Path]:
+    """The synthetic files of the sandbox's /etc: one user (the caller's ids), localhost."""
+    directory.mkdir()
+    uid, gid = os.getuid(), os.getgid()
+    files = {
+        "passwd": f"probe:x:{uid}:{gid}:probe:{home}:/bin/sh\n",
+        "group": f"probe:x:{gid}:\n",
+        "hosts": "127.0.0.1 localhost\n::1 localhost\n",
+    }
+    out = {}
+    for name, content in files.items():
+        out[name] = directory / name
+        out[name].write_text(content, encoding="ascii")
+    return out
+
+
+def sandbox_argv(
+    agy: str, base: Path, spec_dir: Path, home: Path, inner_args: list[str]
+) -> list[str]:
+    """The ``bwrap`` command of one run: a private root, an empty environment.
+
+    ``base`` holds the run's home and workspace (and is where a write
+    outside the workspace lands); ``spec_dir`` its spec and result. Both are
+    shown read-write at their own paths, so that a record's paths are the
+    host's under ``<root>``; nothing else is writable.
+    """
+    bwrap = shutil.which("bwrap")
+    if bwrap is None:
+        raise ProbeError("bwrap is required")
+    cmd = [bwrap, "--unshare-all", "--die-with-parent", "--new-session", "--clearenv"]
+    cmd += ["--ro-bind", "/usr", "/usr"]
+    if Path("/usr/local").is_dir():
+        cmd += ["--tmpfs", "/usr/local"]
+    for name in ROOT_LINKS:
+        host = Path("/", name)
+        if host.is_symlink():
+            cmd += ["--symlink", os.readlink(host), str(host)]
+        elif host.is_dir():
+            cmd += ["--ro-bind", str(host), str(host)]
+    cmd += ["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--dir", "/etc"]
+    for name in HOST_ETC:
+        if Path("/etc", name).exists():
+            cmd += ["--ro-bind", f"/etc/{name}", f"/etc/{name}"]
+    for name, path in _synthetic_etc(spec_dir / "etc", home).items():
+        cmd += ["--ro-bind", str(path), f"/etc/{name}"]
+    cmd += ["--ro-bind", str(Path(__file__).resolve()), SANDBOX_PROBE]
+    cmd += ["--ro-bind", str(Path(agy).resolve()), SANDBOX_AGY]
+    cmd += ["--bind", str(base), str(base), "--bind", str(spec_dir), str(spec_dir)]
+    cmd += ["--chdir", "/", "--", SANDBOX_PYTHON, "-I", "-S", SANDBOX_PROBE, *inner_args]
+    return cmd
+
+
 def run_one(agy: str, sc: Scenario, root: Path, shared: Shared) -> dict[str, Any]:
     home, work = prepare(sc, root, shared)
     spec_dir = Path(tempfile.mkdtemp(prefix=f"spec-{sc.name}.", dir=root))
     spec = {
         "scenario": {k: v for k, v in asdict(sc).items() if k != "stdin"},
         "stdin_hex": sc.stdin.hex() if sc.stdin is not None else None,
-        "agy": agy,
+        "agy": SANDBOX_AGY,
         "home": str(home),
         "work": str(work),
         "root": str(root),
         "result": str(spec_dir / "result.json"),
+        # what a prompt is held to after agy's removals: the pinned build's table
+        "strip_table": [list(r) for r in dropped_1_5_13()],
     }
-    (spec_dir / "spec.json").write_text(json.dumps(spec))
-    me = Path(__file__).resolve()
-    agy_dir = str(Path(agy).resolve().parent)
-    cmd = [
-        "bwrap",
-        "--ro-bind",
-        "/",
-        "/",
-        "--dev",
-        "/dev",
-        "--proc",
-        "/proc",
-        "--tmpfs",
-        "/tmp",
-        "--bind",
-        str(root),
-        str(root),
-        "--ro-bind",
-        str(me.parent),
-        str(me.parent),
-        "--ro-bind",
-        agy_dir,
-        agy_dir,
-        "--unshare-net",
-        "--unshare-pid",
-        "--die-with-parent",
-        "--new-session",
-        "--",
-        sys.executable,
-        "-I",
-        str(me),
-        "inner",
-        str(spec_dir / "spec.json"),
-    ]
-    subprocess.run(cmd, check=True, timeout=sc.timeout + 60)
-    record = json.loads((spec_dir / "result.json").read_text())
+    (spec_dir / "spec.json").write_text(json.dumps(spec), encoding="utf-8")
+    cmd = sandbox_argv(agy, work.parent, spec_dir, home, ["inner", str(spec_dir / "spec.json")])
+    # bwrap itself gets no variable of the caller's either
+    subprocess.run(cmd, check=True, timeout=sc.timeout + 60, env={})
+    record = json.loads((spec_dir / "result.json").read_text(encoding="utf-8"))
     return normalize(record, root, sc, agy)
 
 
 def normalize(record: dict[str, Any], root: Path, sc: Scenario, agy: str) -> dict[str, Any]:
-    """The record as committed: no probe or binary path, no OAuth query value, bounded lines."""
+    """The record as committed: no probe or binary path, no OAuth query value, bounded lines.
+
+    A line longer than :data:`LINE_LIMIT` is cut, and says so with
+    :data:`PROBE_CUT`; the reducer never reads a cut line as a record.
+    """
     text = json.dumps(record, ensure_ascii=False)
-    text = text.replace(str(root), "<root>").replace(agy, "agy")
+    text = text.replace(str(root), "<root>").replace(agy, "agy").replace(SANDBOX_AGY, "agy")
     text = OAUTH_QUERY.sub(lambda m: m.group(1) + "=<redacted>", text)
     out = json.loads(text)
     for stream in ("stdout", "stderr"):
         for item in out[stream]:
             if len(item[1]) > LINE_LIMIT:
-                item[1] = item[1][:LINE_LIMIT] + f"<cut by the probe: {len(item[1])} chars>"
+                item[1] = item[1][:LINE_LIMIT] + f"{PROBE_CUT}{len(item[1])} chars>"
     if len(out["argv"]) and any(len(a) > EXCERPT_LIMIT for a in out["argv"]):
         out["argv"] = [
             a if len(a) <= EXCERPT_LIMIT else a[:80] + f"<{len(a)} chars>" for a in out["argv"]
         ]
     out["scenario"] = sc.name
+    out["isolation"] = ISOLATION
     if sc.note:
         out["note"] = sc.note
     if sc.stdin is not None:
@@ -1682,6 +2011,8 @@ def record_all(agy: str, out: Path, only: set[str] | None = None, workers: int =
     """
     if shutil.which("bwrap") is None:
         raise SystemExit("bwrap is required")
+    if not Path(SANDBOX_PYTHON).is_file():
+        raise SystemExit(f"{SANDBOX_PYTHON} is required: the sandbox's interpreter")
     chosen = [s for s in SCENARIOS if only is None or s.name in only]
     groups: dict[str, list[Scenario]] = {}
     for sc in chosen:
@@ -1717,16 +2048,21 @@ def record_all(agy: str, out: Path, only: set[str] | None = None, workers: int =
     return written
 
 
-def dropped_of(records: Iterable[dict[str, Any]]) -> list[list[int]]:
-    """The union of the ``fidelity-all-*`` records' dropped runs, merged.
+# The two complete measurements of what a prompt loses: as text on stdin,
+# and framed as the recommended transport sends it.
+SWEEPS = (ALL_PREFIX, FRAMED_PREFIX)
 
-    Only a clean measurement counts (:func:`measure_all`); the tests check
-    separately that every scalar value was measured cleanly.
+
+def dropped_of(records: Iterable[dict[str, Any]], prefix: str = ALL_PREFIX) -> list[list[int]]:
+    """The union of the ``prefix*`` records' dropped runs, merged.
+
+    Only a clean measurement counts (:func:`measure_all`);
+    :func:`sweep_problems` says whether every scalar value was measured.
     """
     runs = sorted(
         (first, last)
         for rec in records
-        if rec["scenario"].startswith(ALL_PREFIX)
+        if rec["scenario"].startswith(prefix)
         and (rec["facts"].get("all") or {}).get("dropped") is not None
         for first, last in rec["facts"]["all"]["dropped"]
     )
@@ -1739,21 +2075,108 @@ def dropped_of(records: Iterable[dict[str, Any]]) -> list[list[int]]:
     return merged
 
 
+def scalar_values_in(first: int, last: int) -> int:
+    """How many scalar values (code points but surrogates) ``first..last`` holds."""
+    surrogates = max(0, min(last, 0xDFFF) - max(first, 0xD800) + 1)
+    return last - first + 1 - surrogates
+
+
+def sweep_problems(found: dict[str, dict[str, Any]], prefix: str = ALL_PREFIX) -> list[str]:
+    """Why the ``prefix*`` records are not one complete, clean measurement, or ``[]``.
+
+    Complete: every prompt of the sweep is there, and together they sent
+    every scalar value once, in order, with no gap and no overlap. Clean:
+    each prompt reached the stand-in and arrived framed, in order, with
+    nothing that was not sent (:func:`measure_all`), so that what is missing
+    was removed. With none of the records, nothing was measured: that is a
+    problem, never an empty table.
+    """
+    names = [s.name for s in SCENARIOS if s.name.startswith(prefix)]
+    problems = [f"{name}: no record" for name in names if name not in found]
+    spans = []
+    for name in names:
+        record = found.get(name)
+        if record is None:
+            continue
+        measured = record["facts"].get("all")
+        if not measured or measured.get("dropped") is None:
+            clean = {k: (measured or {}).get(k) for k in ("framed", "ordered", "foreign")}
+            problems.append(f"{name}: not measured cleanly {clean}")
+            continue
+        spans.append((measured["first"], measured["last"], measured["sent"], name))
+    following = 0
+    for first, last, sent, name in sorted(spans):
+        if following == 0xD800:
+            following = 0xE000
+        if first != following:
+            problems.append(f"{name}: starts at U+{first:04X}, not U+{following:04X}")
+        if sent != scalar_values_in(first, last):
+            problems.append(f"{name}: sent {sent} code points of U+{first:04X}..U+{last:04X}")
+        following = last + 1
+    if following != 0x110000 or sum(s[2] for s in spans) != SCALAR_VALUES:
+        problems.append(f"the {prefix}* measurement does not cover every scalar value once")
+    return problems
+
+
+def build_problems(found: dict[str, dict[str, Any]]) -> list[str]:
+    """Why ``found`` is not the records of one build, or ``[]``.
+
+    Every record names the same version, and the ``version`` record, when
+    there is one, printed it.
+    """
+    if not found:
+        return ["no record"]
+    labels = sorted({str(r.get("agy_version")) for r in found.values()})
+    if len(labels) != 1:
+        return [f"the records name more than one build: {labels}"]
+    if "version" in found and version_printed(found["version"]) != labels[0]:
+        return ["the version record did not print the version the records name"]
+    return []
+
+
 TABLE_HEADER = """\
 What agy {version} removes from a prompt, measured over every Unicode scalar
-value by tests/antigravity_probe.py: the union of the dropped runs of the
-fidelity-all-* records beside this file. One inclusive range per line, in
+value by tests/antigravity_probe.py, as text on stdin (fidelity-all-*) and
+framed as one stream-json message (fidelity-framed-*): the union of the
+dropped runs of each, which are the same. One inclusive range per line, in
 hexadecimal. Written by
   python3 -I tests/antigravity_probe.py table --records DIR"""
 
 
+def table_problems(found: dict[str, dict[str, Any]]) -> list[str]:
+    """Why ``found`` cannot give a build's table, or ``[]``: the refusals of ``table``."""
+    problems = build_problems(found)
+    for prefix in SWEEPS:
+        problems += sweep_problems(found, prefix)
+    if not problems and dropped_of(found.values(), ALL_PREFIX) != dropped_of(
+        found.values(), FRAMED_PREFIX
+    ):
+        problems.append(
+            "text on stdin and the framed message lose different characters: "
+            "one table cannot describe both"
+        )
+    return problems
+
+
 def write_table(records_dir: Path) -> Path:
-    """Write ``records_dir``'s measured table as ``dropped.txt`` beside its records."""
-    found = [json.loads(p.read_text(encoding="utf-8")) for p in records_dir.glob("*.json")]
-    versions = sorted({r.get("agy_version", "?") for r in found})
+    """Write ``records_dir``'s measured table as ``dropped.txt`` beside its records.
+
+    Refused (:class:`ProbeError`, and the table already there left as it
+    is) unless the records are one build's (:func:`build_problems`) and
+    hold both complete, clean measurements (:func:`sweep_problems`), which
+    agree: an empty or partial directory, or one of mixed builds, would
+    otherwise give a table that cannot tell no removal from no measurement.
+    """
+    found = {p.stem: json.loads(p.read_text(encoding="utf-8")) for p in records_dir.glob("*.json")}
+    problems = table_problems(found)
+    if problems:
+        raise ProbeError("no table written: " + "; ".join(problems[:10]))
+    version = next(iter(found.values()))["agy_version"]
     path = records_dir / "dropped.txt"
-    header = TABLE_HEADER.format(version=", ".join(versions))
-    path.write_text(format_table(dropped_of(found), header), encoding="ascii")
+    staged = records_dir / "dropped.txt.new"
+    header = TABLE_HEADER.format(version=version)
+    staged.write_text(format_table(dropped_of(found.values()), header), encoding="ascii")
+    staged.replace(path)
     return path
 
 
@@ -1772,7 +2195,11 @@ def main() -> int:
     if a.mode == "inner":
         return inner(a.spec)
     if a.mode == "table":
-        print(write_table(a.records))
+        try:
+            print(write_table(a.records))
+        except ProbeError as e:
+            print(e, file=sys.stderr)
+            return 1
         return 0
     only = {x for x in a.only.split(",") if x} or None
     names = record_all(str(Path(a.agy).expanduser().resolve()), a.out, only)
