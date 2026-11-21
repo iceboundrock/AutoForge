@@ -287,6 +287,14 @@ docs/antigravity-cli-spike.md          #528's spike of the Antigravity CLI (`agy
                                        fidelity, lifetime, fresh context, repository hooks that no
                                        setting tried turns off, the transport and adapter contract, a
                                        proposed conditional go; no adapter
+docs/antigravity-cli-security-spike.md #529's security spike of the Antigravity CLI (`agy` 1.5.13):
+                                       auth routes, disk writes and models false positive, child_env
+                                       preservation and shell startup, full customization canary
+                                       matrix (four dot-dirs, plugins, JSON manifests, HTTP MCP,
+                                       worktree traversal, symlinks, mid-session writes), permission
+                                       rules and bypasses, real bwrap/Landlock and subreaper checks,
+                                       redaction gaps, fail-closed policy, doctor plan, and proposed
+                                       conditional go; no adapter
 docs/releasing.md                      distribution name, version and tag scheme, changelog, the
                                        maintainer's release procedure, PyPI Trusted Publishing
                                        (`pypi-publish.yml`) and its one-time setup
