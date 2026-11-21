@@ -76,7 +76,40 @@ GIT_ENV = {
     "GIT_COMMITTER_EMAIL": "probe@example.invalid",
 }
 
-FIXED_ARGV = base_probe.fixed_argv()
+PROPOSED_SETTINGS = json.dumps(
+    {
+        "modelProvider": "gemini",
+        "toolPermission": "always-proceed",
+        "allowNonWorkspaceAccess": False,
+    },
+    separators=(",", ":"),
+)
+
+
+def proposed_argv(
+    model: str = base_probe.FIXED_MODEL,
+    effort: str = base_probe.FIXED_EFFORT,
+    timeout: str = base_probe.FIXED_TIMEOUT,
+) -> list[str]:
+    """The #529 §8.3 fail-closed argv, refining #528's ``fixed_argv``."""
+    return [
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--settings",
+        PROPOSED_SETTINGS,
+        "--model",
+        model,
+        "--effort",
+        effort,
+        "--print-timeout",
+        timeout,
+        "--disable-slash-commands",
+    ]
+
+
+FIXED_ARGV = proposed_argv()
 SJ_PROMPT = base_probe.stream_message("do it")
 
 

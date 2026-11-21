@@ -36,6 +36,7 @@ import http.server
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import socketserver
@@ -495,6 +496,45 @@ def test_report_cites_every_security_scenario_and_build_identity() -> None:
     assert not missing, f"report does not cite scenario(s): {missing}"
 
 
+def test_proposed_argv_matches_report_and_recorded_canaries() -> None:
+    """The §8.3 fail-closed argv is the exact argv run by every FIXED_ARGV
+    scenario (customization canaries, env checks, state checks) and listed in
+    the doctor required-flags row."""
+    report = REPORT.read_text(encoding="utf-8")
+    section = report[report.index("### Fail-closed launch policy") :]
+    start = section.index("```sh\n") + 6
+    block = section[start : section.index("```", start)]
+    argv = shlex.split(block.replace("\\\n", " "))
+    assert argv == [
+        "agy",
+        *sec_probe.proposed_argv("<allowlisted-id>", "<low|medium|high|xhigh|max>", "<seconds>s"),
+    ]
+    doctor_line = next(
+        line for line in report.splitlines() if line.startswith("| `antigravity required flags` |")
+    )
+    for flag in (
+        "--input-format",
+        "--output-format",
+        "--settings",
+        "--model",
+        "--effort",
+        "--print-timeout",
+        "--disable-slash-commands",
+    ):
+        assert f"`{flag}`" in doctor_line, f"doctor required-flags row missing {flag}"
+
+    fixed_scenarios = [sc.name for sc in sec_probe.SCENARIOS if sc.argv == sec_probe.FIXED_ARGV]
+    assert len(fixed_scenarios) >= 19
+    for name in fixed_scenarios:
+        rec = json.loads((FIXTURES / f"{name}.json").read_text(encoding="utf-8"))
+        assert rec["argv"] == sec_probe.proposed_argv(), name
+        if rec["requests"]:
+            init = json.loads(rec["stdout"][0][1])
+            assert init["event"] == "init", name
+            assert init["init"]["model"] == base_probe.FIXED_MODEL, name
+            assert init["init"]["permission_mode"] == "always-proceed", name
+
+
 def test_package_never_imports_security_probe() -> None:
     for path in sorted((REPO / "src" / "autoforge").rglob("*.py")):
         body = path.read_text(encoding="utf-8")
@@ -833,7 +873,7 @@ def test_installed_agy_inside_autoforge_sandbox_and_subreaper(tmp_path: Path) ->
             ]
             res = execute(
                 ExecutionRequest(
-                    command=[needs.executable, *base_probe.fixed_argv()],
+                    command=[needs.executable, *sec_probe.proposed_argv()],
                     cwd=str(wt),
                     env_allowlist=(),
                     env=launch_env,
@@ -874,7 +914,7 @@ def test_installed_agy_inside_autoforge_sandbox_and_subreaper(tmp_path: Path) ->
             ]
             ores = execute(
                 ExecutionRequest(
-                    command=[agy, *base_probe.fixed_argv()],
+                    command=[agy, *sec_probe.proposed_argv()],
                     cwd=str(owork),
                     env_allowlist=(),
                     env={

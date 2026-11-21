@@ -235,10 +235,13 @@ switch), the decision is **NO-GO** until `agy` adds an explicit switch.
    invalid RE2 regexes and unknown nested keys under `permissions` fail open
    silently; and shell denylists are bypassed by `sh -c`.
 2. **Blanket `--dangerously-skip-permissions` is not required.**
-   `--settings '{"modelProvider":"gemini","toolPermission":"always-proceed","allowNonWorkspaceAccess":false,"permissions":{"deny":[...]}}'`
-   runs read/edit/write/shell tools unattended while keeping explicit
-   `permissions.deny` rules active (e.g., denying `write_file(*)` on read-only
-   `REVIEW` profiles as defence in depth, though shell commands still require
+   `--settings '{"modelProvider":"gemini","toolPermission":"always-proceed","allowNonWorkspaceAccess":false}'`
+   (the base `--settings` of §8.3, replacing #528 §10's
+   `--dangerously-skip-permissions`) runs read/edit/write/shell tools
+   unattended (`init.permission_mode: "always-proceed"`), and adding
+   `"permissions":{"deny":[...]}` keeps explicit deny rules active (e.g.,
+   denying `write_file(*)` on read-only `REVIEW` profiles as a G1 defence-in-depth
+   option once each rule is tested, though shell commands still require
    outer-sandbox containment). For phases that only need a small fixed set of
    commands, `request-review` + `permissions.allow` works and surfaces any
    unlisted command via `denied_actions`.
@@ -342,13 +345,26 @@ output; pinned offline in `tests/test_antigravity_security_probe.py`):
    of #528 C3), verify its SHA-256 against the approved table
    (`c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65` for
    1.5.13), and refuse any unapproved binary before spawning.
-3. **Fixed argv, no `extra_args`:**
+3. **Fixed argv, no `extra_args` (refines #528 §10):**
    ```sh
    agy --input-format stream-json --output-format stream-json \
        --settings '{"modelProvider":"gemini","toolPermission":"always-proceed","allowNonWorkspaceAccess":false}' \
        --model <allowlisted-id> --effort <low|medium|high|xhigh|max> \
-       --disable-slash-commands
+       --print-timeout <seconds>s --disable-slash-commands
    ```
+   This replaces #528 §10's `--dangerously-skip-permissions` with explicit
+   `toolPermission: "always-proceed"` and `allowNonWorkspaceAccess: false` in
+   `--settings`, while keeping `--model`, `--effort`,
+   `--print-timeout <seconds>s`, and `--disable-slash-commands`. Every
+   customization canary (`custom-*` except the minimal `/config` A/B pair),
+   both `env-*` scenarios, `state-xdg-vs-home`, `auth-google-api-key-only`,
+   and the real `sandbox_bwrap` + subreaper verification (§6) ran this exact
+   argv (`init.permission_mode: "always-proceed"`, matching #528's argv).
+   Retaining `--print-timeout <seconds>s` preserves #528's run bound below
+   `max_runtime_seconds`; per #528 §10, whether G1 keeps `--print-timeout`
+   (and at what margin) remains a G1 check, and if G1 selects this argv over
+   #528's `--dangerously-skip-permissions`, it should re-verify #528's
+   `print-timeout-background-recommended` scenario under `always-proceed`.
    Never pass `--add-dir`, `-c`, `--continue`, `--conversation`,
    `--remote-agent`, `--remote-control`, `--agent`, `--mode`, `--project`,
    `--new-project`, `--log-file`, `-i`, or user `extra_args`. (Optional
@@ -373,7 +389,7 @@ output; pinned offline in `tests/test_antigravity_security_probe.py`):
 | `doctor` row | Read-only provable? | Method (never prints secret values) | Failure / warning text |
 |---|---|---|---|
 | `antigravity binary digest` | Yes (0 writes) | Resolve executable, hash SHA-256, run `agy --version` (0 home writes; inside `bwrap` when sandbox enabled) | `FAIL`: unapproved binary SHA-256 (names digest and version printed; points to re-measurement probe) |
-| `antigravity required flags` | Yes (0 writes) | Run `agy --help` (0 home writes); assert `--input-format`, `--output-format`, `--settings`, `--model`, `--effort`, `--disable-slash-commands` are listed | `FAIL`: missing required CLI flag(s) |
+| `antigravity required flags` | Yes (0 writes) | Run `agy --help` (0 home writes); assert `--input-format`, `--output-format`, `--settings`, `--model`, `--effort`, `--print-timeout`, `--disable-slash-commands` are listed | `FAIL`: missing required CLI flag(s) |
 | `antigravity customization scan` | Yes (filesystem walk only) | Scan checkout and ancestors/descendants for `.agents`, `.agent`, `_agents`, `_agent` (dir/file/symlink) | `FAIL`: forbidden repository customization directory found (names path; explains hooks/MCP cannot be disabled in `agy` 1.5.13) |
 | `antigravity credential` | Presence only (not validity) | Check `GEMINI_API_KEY` is non-empty in launch env; fail if `AGY_ADC_AUTH` is set | `FAIL`: `GEMINI_API_KEY` not set (or unsupported `AGY_ADC_AUTH` set) |
 | `antigravity model access / entitlement` | **No** (requires live API call; `agy models` is a false positive) | Do not invoke `agy models` or any API endpoint | `SKIP`: cannot verify API key validity or model entitlement without a live model call |
@@ -438,7 +454,9 @@ below** (and #528's C2/C3). If any condition is declined, the verdict is
 - **S3 (Sandbox & permissions):** Require `sandbox.mode: required` (Linux
   `bwrap` + Landlock) for unattended `agy` launches; mark `disabled`
   unattended and macOS unsupported; pin `toolPermission` explicitly in
-  `--settings` rather than relying on CLI defaults or `--mode`.
+  `--settings` (refining #528 §10's `--dangerously-skip-permissions` while
+  retaining `--print-timeout <seconds>s` for G1 reconciliation) rather than
+  relying on CLI defaults or `--mode`.
 - **S4 (Redaction):** Before shipping the adapter, add `GEMINI_API_KEY`,
   `GOOGLE_API_KEY`, and `ANTIGRAVITY_CSRF_TOKEN` to `src/autoforge/redaction.py`
   (and evaluate Google OAuth token patterns `ya29.`, `1//`, `GOCSPX-` under

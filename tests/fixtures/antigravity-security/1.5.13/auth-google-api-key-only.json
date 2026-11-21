@@ -7,15 +7,14 @@
   "--output-format",
   "stream-json",
   "--settings",
-  "{\"modelProvider\":\"gemini\"}",
+  "{\"modelProvider\":\"gemini\",\"toolPermission\":\"always-proceed\",\"allowNonWorkspaceAccess\":false}",
   "--model",
   "gemini-4-argon",
   "--effort",
   "high",
   "--print-timeout",
   "60s",
-  "--disable-slash-commands",
-  "--dangerously-skip-permissions"
+  "--disable-slash-commands"
  ],
  "capture": {
   "stderr_eof": true,
@@ -40,7 +39,7 @@
  "session_keyring": "own",
  "stderr": [
   [
-   0.2,
+   0.15,
    "modelProvider is set to \"gemini\" in settings.json, but the GEMINI_API_KEY environment variable is not set. Set GEMINI_API_KEY to your Gemini API key, or remove \"modelProvider\" from settings.json to use the default backend.\n"
   ]
  ],
