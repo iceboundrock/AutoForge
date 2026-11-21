@@ -223,6 +223,7 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/pi_fake.py": (),
     "tests/remote_sandbox_prototype.py": (),  # ADR 0014's prototype (#276)
     "tests/antigravity_probe.py": (),  # #528's probe of the Antigravity CLI
+    "tests/antigravity_security_probe.py": (),  # #529's security probe of the Antigravity CLI
     "tests/claude_sdk_fake.py": ("test_claude_sdk",),
     "tests/sandbox_host.py": (),
     "tests/scheduler_worker.py": ("test_scheduler", "test_epic_commands", "test_epic_recovery"),
@@ -233,6 +234,8 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/fixtures/suite_performance_audit/": ("test_suite_performance_audit",),
     # #528's records of agy 1.5.13, which its report is held to
     "tests/fixtures/antigravity/": ("test_antigravity_probe",),
+    # #529's security records of agy 1.5.13, which its report is held to
+    "tests/fixtures/antigravity-security/": ("test_antigravity_security_probe",),
 }
 
 NOT_EVIDENCE = (

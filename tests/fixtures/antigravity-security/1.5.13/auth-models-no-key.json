@@ -1,0 +1,36 @@
+{
+ "agy_sha256": "c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65",
+ "agy_version": "1.5.13",
+ "argv": [
+  "models"
+ ],
+ "capture": {
+  "stderr_eof": true,
+  "stderr_error": null,
+  "stderr_truncated": false,
+  "stdout_eof": true,
+  "stdout_error": null,
+  "stdout_truncated": false
+ },
+ "exit": 1,
+ "home_files": [
+  ".gemini/antigravity-cli/cli.log",
+  ".gemini/antigravity-cli/log/cli-<time>.log",
+  ".gemini/antigravity-cli/settings.json"
+ ],
+ "isolation": "private-root",
+ "killed_by_probe": false,
+ "markers": {},
+ "other_requests": [],
+ "requests": [],
+ "scenario": "auth-models-no-key",
+ "seconds": 0.2,
+ "session_keyring": "own",
+ "stderr": [
+  [
+   0.2,
+   "modelProvider is set to \"gemini\" in settings.json, but the GEMINI_API_KEY environment variable is not set. Set GEMINI_API_KEY to your Gemini API key, or remove \"modelProvider\" from settings.json to use the default backend.\n"
+  ]
+ ],
+ "stdout": []
+}
