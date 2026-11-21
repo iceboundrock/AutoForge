@@ -15,16 +15,9 @@ read it before adding tests for a listed area.
   use real local Python subprocesses only. One exception is an opt-in
   probe, skipped unless its variable names an installed runtime
   (`AUTOFORGE_PI_E2E_BIN`, `AUTOFORGE_CLAUDE_SDK_PROBE_CLI`,
-  `AUTOFORGE_CLAUDE_SDK_PROBE_PYTHON`, `AUTOFORGE_OPENCODE_SDK_PROBE_SERVER`,
-  `AUTOFORGE_AGY_PROBE_BIN`). Such a probe uses a temporary home
-  and synthetic credentials, and calls no model: the Claude and `agy`
-  probes answer from a loopback stand-in, and the `agy` probe runs each
-  scenario in a private root of its own (no host root, no home of the
-  host's, an empty environment for its helper, a session keyring of its
-  own joined before `bwrap` runs, each workspace set up inside it, and the
-  record read back from its stdout with a bound, never from a file it
-  could write), checked by canaries; a keyring canary is a key a helper of
-  the test's puts in a session keyring of its own, never the operator's. The other is the live Pi smoke test
+  `AUTOFORGE_CLAUDE_SDK_PROBE_PYTHON`, `AUTOFORGE_OPENCODE_SDK_PROBE_SERVER`). Such a probe uses a temporary home
+  and synthetic credentials, and calls no model: the Claude probe answers
+  from a loopback stand-in. The other is the live Pi smoke test
   (`tests/test_live_pi.py`, #135), whose one test (a REMOTE REVIEW, one
   model call) is the only one that makes a model call: marked `live`, deselected by default (`pyproject.toml` adds
   `-m 'not live'`), and skipped unless `AUTOFORGE_LIVE_PI=1`. It uses the
@@ -634,14 +627,6 @@ the evaluation protocol (#318)        test_evaluation.py (the pins, what arms ho
 troubleshooting guide (#260)          test_troubleshooting_guide.py (every scenario row names
                                       a test that exists; the guide's links and the links
                                       into it resolve)
-Antigravity CLI spikes (#528, #529)   test_antigravity_probe.py (#528: 147 records in
-                                      tests/fixtures/antigravity/1.5.13/, dropped.txt,
-                                      prototype reducer, private-root bwrap boundary),
-                                      test_antigravity_security_probe.py (#529: 51 security
-                                      records in tests/fixtures/antigravity-security/1.5.13/,
-                                      report alignment, child_env, sandbox_policy, redaction
-                                      audit, and opt-in real bwrap/subreaper verification
-                                      when AUTOFORGE_AGY_PROBE_BIN is set)
 ```
 
 Add a new test next to the behaviour's existing file; create a new file only
