@@ -1,0 +1,191 @@
+{
+ "agy_version": "1.5.13",
+ "argv": [
+  "--help"
+ ],
+ "exit": 0,
+ "facts": {},
+ "home_files": [],
+ "killed_by_probe": false,
+ "markers": {},
+ "other_requests": [],
+ "outside_file_written": false,
+ "processes_during": [],
+ "processes_left": [],
+ "requests": [],
+ "scenario": "help",
+ "seconds": 0.2,
+ "signalled": null,
+ "stderr": [
+  [
+   0.21,
+   "Usage of agy:\n"
+  ],
+  [
+   0.21,
+   "  --add-dir                       Add a directory to the workspace (repeatable) (default [])\n"
+  ],
+  [
+   0.21,
+   "  --agent                         Agent for the current CLI session\n"
+  ],
+  [
+   0.21,
+   "  -c                              Short alias for --continue\n"
+  ],
+  [
+   0.21,
+   "  --continue                      Continue the most recent conversation\n"
+  ],
+  [
+   0.21,
+   "  --conversation                  Resume a previous conversation by ID\n"
+  ],
+  [
+   0.21,
+   "  --dangerously-skip-permissions  Auto-approve all tool permission requests without prompting\n"
+  ],
+  [
+   0.21,
+   "  --disable-slash-commands        Disable slash command and skill expansion in print mode\n"
+  ],
+  [
+   0.21,
+   "  --effort                        Reasoning effort for the current CLI session (low|medium|high|xhigh|max)\n"
+  ],
+  [
+   0.21,
+   "  -i                              Short alias for --prompt-interactive\n"
+  ],
+  [
+   0.21,
+   "  --input-format                  Input format for print mode (text, stream-json). stream-json reads one NDJSON message per line from stdin and runs a turn for each; it requires --output-format stream-json (default text)\n"
+  ],
+  [
+   0.21,
+   "  --json-schema                   Optional JSON schema string or path to a schema file to enforce structured output (for stream-json, only applicable to the final result)\n"
+  ],
+  [
+   0.21,
+   "  --log-file                      Override CLI log file path\n"
+  ],
+  [
+   0.21,
+   "  --mode                          Set the agent execution mode for this session (accept-edits, auto, plan)\n"
+  ],
+  [
+   0.21,
+   "  --model                         Model for the current CLI session\n"
+  ],
+  [
+   0.21,
+   "  --new-project                   Create a new project for this session\n"
+  ],
+  [
+   0.21,
+   "  --output-format                 Output format for print mode (text, json, stream-json) (default text)\n"
+  ],
+  [
+   0.21,
+   "  -p                              Short alias for --print\n"
+  ],
+  [
+   0.21,
+   "  --print                         Run a single prompt non-interactively and print the response\n"
+  ],
+  [
+   0.21,
+   "  --print-timeout                 Optional time limit for print mode; 0 waits until the turn completes (default 0s)\n"
+  ],
+  [
+   0.21,
+   "  --project                       Project ID or project name for the current CLI session\n"
+  ],
+  [
+   0.21,
+   "  --prompt                        Alias for --print\n"
+  ],
+  [
+   0.21,
+   "  --prompt-interactive            Run an initial prompt interactively and continue the session\n"
+  ],
+  [
+   0.21,
+   "  --remote-agent                  Run this session's conversations using remote agents; --project then names a remote project by ID or name, otherwise they open in this machine's default remote project\n"
+  ],
+  [
+   0.21,
+   "  --remote-control                Create a remote connection for the CLI session on start up\n"
+  ],
+  [
+   0.21,
+   "  --sandbox                       Run in a sandbox with terminal restrictions enabled\n"
+  ],
+  [
+   0.21,
+   "  --settings                      Settings for this session only, never saved: a JSON object of settings.json keys, inline or as a file path\n"
+  ],
+  [
+   0.21,
+   "\n"
+  ],
+  [
+   0.21,
+   "Available subcommands:\n"
+  ],
+  [
+   0.21,
+   "  acp             Start the Agent Client Protocol (ACP) stdio server\n"
+  ],
+  [
+   0.21,
+   "  agent           List available agents\n"
+  ],
+  [
+   0.21,
+   "  agents          List available agents\n"
+  ],
+  [
+   0.21,
+   "  changelog       Show changelog and release notes\n"
+  ],
+  [
+   0.21,
+   "  help            Show help for subcommands\n"
+  ],
+  [
+   0.21,
+   "  install         Configure environment paths and shell settings\n"
+  ],
+  [
+   0.21,
+   "  mcp             Manage MCP servers (add, remove, list, enable, disable)\n"
+  ],
+  [
+   0.21,
+   "  mic-serve       Serve this machine's microphone to a CLI on another host\n"
+  ],
+  [
+   0.21,
+   "  models          List available models\n"
+  ],
+  [
+   0.21,
+   "  plugin          Manage plugins (install, uninstall, list, enable, disable)\n"
+  ],
+  [
+   0.21,
+   "  plugins         Alias for plugin\n"
+  ],
+  [
+   0.21,
+   "  remote-control  Manage the remote-control background daemon (start, status, stop)\n"
+  ],
+  [
+   0.21,
+   "  update          Update CLI\n"
+  ]
+ ],
+ "stdout": [],
+ "title_requests": 0
+}

@@ -1,0 +1,42 @@
+{
+ "agy_version": "1.5.13",
+ "argv": [
+  "--output-format",
+  "stream-json",
+  "--settings",
+  "{\"modelProvider\":\"gemini\"}"
+ ],
+ "exit": 0,
+ "facts": {},
+ "home_files": [
+  ".gemini/antigravity-cli/cache/default_project_id.txt",
+  ".gemini/antigravity-cli/cli.log",
+  ".gemini/antigravity-cli/conversation_summaries.db",
+  ".gemini/antigravity-cli/installation_id",
+  ".gemini/antigravity-cli/jetski_state.pbtxt",
+  ".gemini/antigravity-cli/log/cli-<time>.log",
+  ".gemini/config/.migrated",
+  ".gemini/config/config.json",
+  ".gemini/config/mcp_config.json",
+  ".gemini/config/projects/default-cli-project.json"
+ ],
+ "killed_by_probe": false,
+ "markers": {},
+ "other_requests": [],
+ "outside_file_written": false,
+ "processes_during": [],
+ "processes_left": [],
+ "requests": [],
+ "scenario": "stdin-empty",
+ "seconds": 0.4,
+ "signalled": null,
+ "stderr": [],
+ "stdin_bytes": 0,
+ "stdout": [
+  [
+   0.31,
+   "CLI error: bubbletea: error opening TTY: bubbletea: could not open TTY: open /dev/tty: no such device or address\n"
+  ]
+ ],
+ "title_requests": 0
+}

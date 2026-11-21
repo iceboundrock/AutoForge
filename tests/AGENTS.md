@@ -15,9 +15,10 @@ read it before adding tests for a listed area.
   use real local Python subprocesses only. One exception is an opt-in
   probe, skipped unless its variable names an installed runtime
   (`AUTOFORGE_PI_E2E_BIN`, `AUTOFORGE_CLAUDE_SDK_PROBE_CLI`,
-  `AUTOFORGE_CLAUDE_SDK_PROBE_PYTHON`, `AUTOFORGE_OPENCODE_SDK_PROBE_SERVER`). Such a probe uses a temporary home
-  and synthetic credentials, and calls no model: the Claude probe answers
-  from a loopback stand-in. The other is the live Pi smoke test
+  `AUTOFORGE_CLAUDE_SDK_PROBE_PYTHON`, `AUTOFORGE_OPENCODE_SDK_PROBE_SERVER`,
+  `AUTOFORGE_AGY_PROBE_BIN`). Such a probe uses a temporary home
+  and synthetic credentials, and calls no model: the Claude and `agy`
+  probes answer from a loopback stand-in. The other is the live Pi smoke test
   (`tests/test_live_pi.py`, #135), whose one test (a REMOTE REVIEW, one
   model call) is the only one that makes a model call: marked `live`, deselected by default (`pyproject.toml` adds
   `-m 'not live'`), and skipped unless `AUTOFORGE_LIVE_PI=1`. It uses the

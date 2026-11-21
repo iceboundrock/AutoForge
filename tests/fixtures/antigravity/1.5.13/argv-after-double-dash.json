@@ -1,0 +1,35 @@
+{
+ "agy_version": "1.5.13",
+ "argv": [
+  "--output-format",
+  "json",
+  "--",
+  "-p",
+  "hi"
+ ],
+ "exit": 2,
+ "facts": {},
+ "home_files": [],
+ "killed_by_probe": false,
+ "markers": {},
+ "other_requests": [],
+ "outside_file_written": false,
+ "processes_during": [],
+ "processes_left": [],
+ "requests": [],
+ "scenario": "argv-after-double-dash",
+ "seconds": 0.2,
+ "signalled": null,
+ "stderr": [
+  [
+   0.15,
+   "Error: unexpected argument \"-p\".\n"
+  ],
+  [
+   0.15,
+   "Prompts are read only from -p/--print, -i/--prompt-interactive, or stdin, so this argument would have been ignored.\n"
+  ]
+ ],
+ "stdout": [],
+ "title_requests": 0
+}

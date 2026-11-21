@@ -281,6 +281,12 @@ docs/recovery-mvp-evaluation.md        EPIC #354's deterministic recovery MVP ev
                                        regressions and their tests, gates D and A, the
                                        maintainer's go, roll-forward, rollback and operator
                                        sign-off as recorded on #375
+docs/antigravity-cli-spike.md          #528's spike of the Antigravity CLI (`agy` 1.5.13), measured
+                                       against a loopback stand-in of the Gemini API: the stream and
+                                       its terminal proof, exit codes, soft refusals, prompt
+                                       fidelity, lifetime, fresh context, repository hooks that no
+                                       setting turns off, the transport and adapter contract, a
+                                       proposed conditional go; no adapter
 docs/releasing.md                      distribution name, version and tag scheme, changelog, the
                                        maintainer's release procedure, PyPI Trusted Publishing
                                        (`pypi-publish.yml`) and its one-time setup

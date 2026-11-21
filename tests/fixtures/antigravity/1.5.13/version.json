@@ -1,0 +1,27 @@
+{
+ "agy_version": "1.5.13",
+ "argv": [
+  "--version"
+ ],
+ "exit": 0,
+ "facts": {},
+ "home_files": [],
+ "killed_by_probe": false,
+ "markers": {},
+ "other_requests": [],
+ "outside_file_written": false,
+ "processes_during": [],
+ "processes_left": [],
+ "requests": [],
+ "scenario": "version",
+ "seconds": 0.2,
+ "signalled": null,
+ "stderr": [],
+ "stdout": [
+  [
+   0.2,
+   "1.5.13\n"
+  ]
+ ],
+ "title_requests": 0
+}
