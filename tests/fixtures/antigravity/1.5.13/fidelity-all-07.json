@@ -1,4 +1,5 @@
 {
+ "agy_sha256": "c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65",
  "agy_version": "1.5.13",
  "argv": [
   "--output-format",
@@ -6,6 +7,12 @@
   "--settings",
   "{\"modelProvider\":\"gemini\"}"
  ],
+ "capture": {
+  "stderr_eof": true,
+  "stderr_truncated": false,
+  "stdout_eof": true,
+  "stdout_truncated": false
+ },
  "exit": 0,
  "facts": {
   "all": {
@@ -37,7 +44,7 @@
   },
   "names_app_data_dir": true,
   "system_prompt_chars": 16867,
-  "system_prompt_sha256": "0ed4d6ddfd68254fc9e37d8fcfb0f685f65bf4577a983dd13d025e615232ef2a"
+  "system_prompt_sha256": "7bd93c55e29da80baff812955f733d4e76311680ebac2291bcd9f12a930899d9"
  },
  "home_files": [
   ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript/00000000.jsonl",
@@ -54,13 +61,17 @@
   ".gemini/antigravity-cli/installation_id",
   ".gemini/antigravity-cli/jetbox_summaries_proto.pb",
   ".gemini/antigravity-cli/jetski_state.pbtxt",
+  ".gemini/antigravity-cli/last_check.timestamp",
   ".gemini/antigravity-cli/log/cli-<time>.log",
   ".gemini/antigravity-cli/presence/<id>.lock",
+  ".gemini/antigravity-cli/updater/update.lock",
+  ".gemini/antigravity-cli/updater/update_status.json",
   ".gemini/config/.migrated",
   ".gemini/config/config.json",
   ".gemini/config/mcp_config.json",
   ".gemini/config/projects/default-cli-project.json"
  ],
+ "isolation": "private-root",
  "killed_by_probe": false,
  "markers": {},
  "other_requests": [],
@@ -70,9 +81,10 @@
  "requests": [
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\n[07 044983-04DBFE]\n\n[END]\n\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T01:30:05Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\n[07 044983-04DBFE]\n\n[END]\n\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:54:58Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
+   "markers_present": [],
    "model_path": "/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent",
    "thinking": {
     "includeThoughts": true,
@@ -98,26 +110,26 @@
   }
  ],
  "scenario": "fidelity-all-07",
- "seconds": 0.5,
+ "seconds": 0.4,
  "signalled": null,
  "stderr": [],
  "stdin_bytes": 150026,
  "stdout": [
   [
-   0.36,
-   "{\"event\":\"init\",\"conversation_id\":\"10deaa34-9d63-4c63-bb05-64b578f357ac\",\"init\":{\"cwd\":\"<root>/fidelity-all-07.8po4ho2t/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"request-review\"}}\n"
+   0.27,
+   "{\"event\":\"init\",\"conversation_id\":\"c4e973c1-159f-4c73-9b14-4d9e049c31a0\",\"init\":{\"cwd\":\"<root>/fidelity-all-07.pg6pqfj5/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"request-review\"}}\n"
   ],
   [
-   0.42,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"10deaa34-9d63-4c63-bb05-64b578f357ac\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
+   0.3,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"c4e973c1-159f-4c73-9b14-4d9e049c31a0\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
   ],
   [
-   0.45,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"10deaa34-9d63-4c63-bb05-64b578f357ac\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.005111438,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+   0.32,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"c4e973c1-159f-4c73-9b14-4d9e049c31a0\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.004413795,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
   ],
   [
-   0.45,
-   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"10deaa34-9d63-4c63-bb05-64b578f357ac\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.055390747,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+   0.32,
+   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"c4e973c1-159f-4c73-9b14-4d9e049c31a0\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.039470521,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
   ]
  ],
  "title_requests": 0

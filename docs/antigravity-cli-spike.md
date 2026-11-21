@@ -11,8 +11,11 @@
   2026-11-21. Every behaviour below comes from a run of that binary recorded
   by `tests/antigravity_probe.py` under `tests/fixtures/antigravity/1.5.13/`,
   one JSON record per scenario named in backticks (`deny-command` is
-  `deny-command.json`). `tests/test_antigravity_probe.py` holds the records
-  to what this document says and fails when they differ.
+  `deny-command.json`), 147 in all. Each names the version the binary
+  printed and the binary's sha256 (`agy_version`, `agy_sha256`), which the
+  probe hashed before the first run and after the last.
+  `tests/test_antigravity_probe.py` holds the records to what this document
+  says and fails when they differ.
 - **How:** each scenario runs `agy` once inside `bwrap`, against a loopback
   stand-in of the Gemini API that answers each request with a scripted
   step: a reply, a reply in chunks, a tool call, an HTTP error, a stream cut
@@ -24,48 +27,59 @@
   synthetic key (the tests check each one). The issue allows live calls
   only with the operator's explicit approval and a budget, and this run had
   neither.
-- **Two sandboxes, and which record was made in which.** Each record says
-  (`isolation`); the tests hold every record to the list below.
-  - **The private root** (`isolation: private-root`), the probe's sandbox
-    now. `bwrap`'s own empty root, never the host's, holding only `/usr`
-    read-only (with `/usr/local` hidden), the loader's cache, synthetic
-    `/etc/passwd`, `/etc/group` and `/etc/hosts`, the probe and the binary
-    read-only, and the run's own home, workspace and spec directory. The
-    helper that starts `agy` has an empty environment (`--clearenv`; `bwrap`
-    sets `PWD=/`), and `agy` gets only the variables the helper sets, ten
-    at most. It has namespaces of its own for users, pids, the network
-    (loopback only: no route out, and no socket of the host's, abstract ones
-    included), IPC, UTS and cgroups. A test measures this with a fake `agy`
-    and harmless canaries: a file of the test's, the checkout, the caller's
-    home, `/run`, `/var` and the rest of `/etc` are not there; the value of
-    a variable set in the caller's environment is in no process's
-    `/proc/<pid>/environ`; a socket by path, an abstract socket and a
-    loopback port of the host's refuse the connection. 34 records were made
-    this way: `fidelity-framed-nul`, `fidelity-framed-00` to
-    `fidelity-framed-29`, `fidelity-near-limit-stream-json`,
-    `repository-customizations-recommended` and `detached-child`. So was a
-    full re-recording of every scenario but the customization one, 143
-    records, on 2026-11-21, which with that one matched every fact the tests
-    hold the records to. It was not committed, so that the reviewed records
-    stay as they were.
-  - **The earlier sandbox** (no `isolation`): the other 110 records, made
-    before this revision. It mounted the host root read-only, with `/tmp` a
-    tmpfs and the probe's root writable, gave `agy` an empty `HOME`, a
-    minimal environment and namespaces of its own for pids and the network,
-    and started the helper with the caller's environment. A temporary home
-    is no filesystem boundary: during those runs `agy` could read any host
-    file the operator can, path-based sockets under the host root were
-    there to open, and the caller's whole environment was in the helper's
-    `/proc/<pid>/environ` (the canary test, run against that sandbox, finds
-    the checkout, the caller's home, `/run`, all of `/etc`, and the canary
-    variable's value in the environment of two processes of the sandbox).
-    Nothing could leave the sandbox, which had no route out, and a scan of
-    every committed record for credential-shaped strings (GitHub,
-    Anthropic, OpenAI and Google keys and tokens, AWS keys, private keys,
-    bearer headers) finds none; the tests repeat it. **What those runs do
-    not prove is that `agy` read nothing of the host's:** they cannot. None
-    of the facts they show depends on it: the private-root re-recording,
-    with none of it in reach, shows every one again.
+- **The sandbox** (`isolation: private-root`, which every record names).
+  `bwrap`'s own empty root, never the host's, holding only `/usr`
+  read-only (with `/usr/local` hidden), the loader's cache, synthetic
+  `/etc/passwd`, `/etc/group` and `/etc/hosts`, the probe, the binary and
+  the run's spec directory read-only, and the run's own home and workspace
+  read-write. The helper that starts `agy` has an empty environment
+  (`--clearenv`; `bwrap` sets `PWD=/`), and `agy` gets only the variables
+  the helper sets, ten at most. It has namespaces of its own for users,
+  pids, the network (loopback only: no route out, and no socket of the
+  host's, abstract ones included), IPC, UTS and cgroups.
+  - **Setup inside it.** A workspace's setup is made by the helper inside
+    the sandbox, before `agy` starts: the customized repository's `git
+    init --template=` runs there with an environment of its own and every
+    git configuration file off. Nothing of the caller's git (a `GIT_DIR`,
+    a configuration, a template) is in reach, and the host starts no
+    process for it.
+  - **The record comes back as a stream, never as a file.** The helper
+    writes the record on its stdout. The host reads that pipe to its end
+    with a bound of 64 MiB: past it, the sandbox is killed and the record
+    refused unread. Anything but one JSON object, from a sandbox that
+    exited 0 in time, is refused too. The host gives the sandbox
+    `/dev/null` as stdin and pipes of its own as stdout and stderr. A
+    process of the run can open those three through `bwrap`'s own process
+    inside (`/proc/1/fd/*`), which is why none of them may be the host's
+    terminal or one of its files. It can also write into the record's
+    pipe, so what arrives is the sandbox's claim, parsed strictly. The
+    host opens no path the sandbox could write: the spec
+    directory is read-only inside, and the home and workspace are never
+    read after the run.
+  - **Measured with a fake `agy` and harmless canaries.** A file of the
+    test's, the checkout, the caller's home, `/run`, `/var` and the rest of
+    `/etc` are not there. The value of a variable set in the caller's
+    environment is in no process's `/proc/<pid>/environ`. A socket by
+    path, an abstract socket and a loopback port of the host's refuse the
+    connection. A link or a FIFO planted in the spec directory fails with
+    `EROFS`. Junk, or more than the bound, written into the record's pipe
+    stops the recording with nothing written. The caller's `GIT_DIR`,
+    `GIT_TEMPLATE_DIR` and global configuration leave their directories
+    untouched, and the workspace is the repository.
+  - **All 147 records were made this way**, in one recording on 2026-11-21.
+- **Earlier revisions of this PR** recorded in another sandbox. It mounted
+  the host root read-only, with `/tmp` a tmpfs, gave `agy` an empty `HOME`,
+  a minimal environment and namespaces of its own for pids and the network,
+  started the helper with the caller's environment, ran the customized
+  repository's `git init` on the host in the caller's environment, and read
+  each record back from a file the sandbox could write. During those runs
+  `agy` could read any host file the operator can, the caller's
+  environment was in the helper's `/proc/<pid>/environ`, and path-based
+  sockets of the host were there to connect to. Its network namespace had
+  no route out, but that does not rule out that something left through
+  one of those sockets to a service of the host's. Nothing shows what
+  `agy` did with that access. None of those records remains: every
+  committed record was made again in the sandbox above.
 - **Not measured:** the real Gemini API (its error bodies and details, such
   as the per-day quota `QuotaFailure` the changelog says stops retries at
   once; its latency; tool use by a real model), the Google sign-in and ADC
@@ -78,36 +92,64 @@
 - **Re-measure:** `AUTOFORGE_AGY_PROBE_BIN=/path/to/agy uv run pytest
   tests/test_antigravity_probe.py` (Linux with `bwrap` and `/usr/bin/python3`,
   about four minutes, no model call) runs every scenario again against that
-  binary, in the private root, and fails on any fact here that no longer
+  binary, in the sandbox above, and fails on any fact here that no longer
   holds. It holds the fresh records to the behaviour, not to the label:
   they name whatever version the binary printed, and only the committed
   records must say 1.5.13. The version is asked like every other scenario,
   in the sandbox and under a timeout (`version`): the probe never runs the
   binary on the host. `python3 -I tests/antigravity_probe.py record --agy
-  /path/to/agy --out DIR` writes the records. For another build, `DIR` is a
-  directory of its own (`tests/fixtures/antigravity/<version>/`), and
-  `python3 -I tests/antigravity_probe.py table --records DIR` writes its
-  table of removed characters (§3) beside them. `table` refuses, and leaves
-  any table there as it was, unless the directory holds the records of one
-  build, both complete measurements of §3, each clean and covering every
-  scalar value once, and the two agree: an empty, partial or mixed
-  directory would give a table that cannot tell no removal from no
+  /path/to/agy --out DIR` writes the records, all of them only once every
+  run has returned and the binary's hash has not changed. For another
+  build, `DIR` is a directory of its own
+  (`tests/fixtures/antigravity/<version>/`), and `python3 -I
+  tests/antigravity_probe.py table --records DIR` writes its table of
+  removed characters (§3) beside them. `table` refuses, and leaves any
+  table there as it was, unless all of these hold:
+  - every record is readable JSON and names the same version and sha256,
+    and the `version` record printed that version;
+  - both complete measurements of §3 are there;
+  - each of their records is the run its plan made: the scenario's argv
+    and stdin (the transport), a whole capture of a run that completed at
+    exit 0, one model request with the synthetic key, and the prompt whole
+    in `agy`'s wrapper;
+  - each measured cleanly exactly its planned span: in order, nothing
+    foreign, the dropped runs inside the span and apart, and received plus
+    dropped equal to what was sent;
+  - together they cover every scalar value once, and the two agree.
+
+  An empty, partial, unlabelled or mixed directory, or a record that does
+  not add up, would give a table that cannot tell no removal from no
   measurement. The 1.5.13 records stay as they are. Appendix B runs one
-  scenario by hand, in the same private root.
+  scenario by hand, in the same sandbox.
 
 ## 1. Summary
 
 `agy -p` has a usable unattended contract. `--output-format stream-json`
-writes one JSON record per line. Every recorded one-shot run that was given
-a prompt and ended on its own ended in exactly one `result` record, which
-says `SUCCESS` or `ERROR`, says why a turn ended early, and lists the tool
-actions it refused. Not every run writes one: an empty stdin (as text, or
-as `stream-json`, which writes `init` and stops), a run killed by an
-outside limit, and a refusal of the arguments end with none, and a
-`stream-json` input session writes one per turn (§4, §6). Model API
-failures exit with 3 and print a typed `AGY_ERROR` line. Exit 0 alone
-proves nothing, and three traps would make a naive adapter read a failure
-as a completed run:
+writes one JSON record per line. Every recorded one-shot run that sent the
+model a request and ended on its own, under `stream-json` or `json`
+output, wrote exactly one `result` record, which says `SUCCESS` or
+`ERROR`, says why a turn ended early, and lists the tool actions it
+refused. A run refused before any request wrote one `ERROR` result (alone,
+or after `init` once it had begun to read `stream-json` input:
+`stream-input-wrong-shape`, `stream-input-cut`), or nothing at all. Being
+given a prompt is not enough for a result:
+
+- These runs were given one, ended on their own and wrote **nothing on
+  stdout**, each refused before any request: a prompt that spells a flag
+  (`argv-flag-name`), a stray argument after `--`
+  (`argv-after-double-dash`) and a flag of `acp` only
+  (`acp-flag-in-print-mode`), each exit 2; an unknown setting
+  (`settings-unknown-key`) and the API-key route with no key
+  (`api-key-route-without-key`), each exit 1.
+- An empty stdin wrote no result: as text, a terminal error on stdout
+  (`stdin-empty`); as `stream-json`, `init` alone
+  (`stdin-stream-json-empty`). Both exit 0.
+- A run an outside limit killed ends wherever it was, and a `stream-json`
+  input session writes one result per turn (§4, §6).
+
+Model API failures exit with 3 and print a typed `AGY_ERROR` line. Exit 0
+alone proves nothing, and three traps would make a naive adapter read a
+failure as a completed run:
 
 1. **A refused tool call is a `SUCCESS`.** Headless mode cannot ask, so a
    call that needs a permission is refused and the run ends at once: exit 0,
@@ -130,17 +172,22 @@ as a completed run:
 
 One finding blocks a production adapter as AutoForge's invariants stand.
 **The repository's own `.agents/hooks.json` hooks and `.agents/mcp_config.json`
-MCP servers run in a headless run, before the model is asked, the hooks
-with `GEMINI_API_KEY` in their environment, and no flag or setting tried
-turns them off** (`repository-customizations`, `-untrusted`, `-sandbox`,
-and `-recommended`, the recommended launch itself). AutoForge
-keeps every agent CLI's hooks and MCP servers off (`--safe-mode` and
-`--strict-mcp-config` for Claude Code, #165), so `agy` needs an equivalent
-before it can run on a pull request's tree.
+MCP servers run in a headless run, the hooks with `GEMINI_API_KEY` in
+their environment, and no flag or setting tried turns them off**
+(`repository-customizations`, `-untrusted`, `-sandbox`, and
+`-recommended`, which is the fixed argv of §10, every flag of it). In each
+of those four runs, the `SessionStart` and `PreInvocation` hooks had run
+and the MCP server had started when the first model request arrived; the
+`Stop` hook ran after (§8). AutoForge keeps every agent CLI's hooks and
+MCP servers off (`--safe-mode` and `--strict-mcp-config` for Claude Code,
+#165), so `agy` needs an equivalent before it can run on a pull request's
+tree.
 
 The recommended transport is one-shot, the prompt on stdin as one
-`stream-json` message (§10). The adapter contract is in §10 and the decision
-in §11.
+`stream-json` message (§10). On it, `--print-timeout` bounds a run and
+cleans nothing up: during a background task it ended the run at exit 0
+with a `SUCCESS` result naming the timeout, and left the task running
+(§7). The adapter contract is in §10 and the decision in §11.
 
 ## 2. Discovery (question 1)
 
@@ -214,7 +261,7 @@ the inputs it names:
   - framed, as the recommended transport sends a prompt: each prompt as one
     `stream-json` message, written as `json.dumps` writes it, so every
     non-ASCII character is a `\u` escape, an astral one a surrogate pair,
-    and a line is up to three times its prompt's UTF-8 (450,082 bytes at
+    and a line is about three times its prompt's UTF-8 (450,082 bytes at
     most; `fidelity-framed-nul` and `fidelity-framed-00` to
     `fidelity-framed-29`).
 
@@ -240,8 +287,8 @@ the inputs it names:
   between markers) agrees. The emoji sequence `👩‍💻` therefore arrives as
   two emoji. Not measured: whether a character fares otherwise in other
   company. Each code point was sent once, after its predecessor; the
-  texts of `fidelity-unicode-*`, `fidelity-sweep` and
-  `fidelity-near-limit-stream-json` are the only other contexts.
+  texts of `fidelity-unicode-*`, `fidelity-sweep` and the three framed
+  prompts at the bound below are the only other contexts.
 - **Invalid UTF-8** becomes U+FFFD, as text on stdin
   (`fidelity-invalid-utf8`). A framed message cannot carry it: the adapter
   writes the prompt as JSON, from a string.
@@ -251,15 +298,29 @@ the inputs it names:
   `fidelity-size-262144-stream-json`), the message the model received was
   its first 192,001 bytes: the 15-byte opening tag and the prompt's first
   191,986 bytes, then `<truncated N bytes>`. The closing tag and the
-  metadata were lost. The run still exited 0 with `SUCCESS`. Framed, the
-  cut counts the prompt's UTF-8, not the line's: a prompt of 160,000 UTF-8
-  bytes, the bound §10 proposes, made mostly of astral characters (with
-  CJK, Latin, quotes, a backslash, a tab, CR LF and a literal
-  `</USER_REQUEST>` on every line), was framed into a line of 416,882
-  bytes and arrived identical, closing tag and metadata kept
-  (`fidelity-near-limit-stream-json`). The sizes between 160,000 and
-  191,986 bytes were not measured framed, nor any framed prompt of
-  characters other than that one's, at that size.
+  metadata were lost. The run still exited 0 with `SUCCESS`.
+- **Framed at the bound.** Framed, the cut counts the prompt's UTF-8, not
+  the line's. Three prompts of 160,000 UTF-8 bytes, the bound §10
+  proposes, each of characters `agy` keeps, were framed and each arrived
+  identical, closing tag and metadata kept:
+  - a large mixed sample, mostly astral characters with CJK, Latin,
+    quotes, a backslash, a tab, CR LF and a literal `</USER_REQUEST>` on
+    every line, in a line of 416,882 bytes
+    (`fidelity-near-limit-stream-json`);
+  - one astral character, U+1F680, 40,000 times: 480,046 bytes, three
+    framed bytes for each of UTF-8 (`fidelity-astral-stream-json`);
+  - the widest line any prompt of that size the gate admits can make: a
+    `|` and then VT (U+000B), which `json.dumps` writes as the six bytes
+    `\u000b`, 159,999 times, in a line of 960,041 bytes
+    (`fidelity-widest-stream-json`). No character `agy` keeps takes more
+    than six framed bytes for one of UTF-8; every other takes three at
+    most (the tests check every scalar value). A prompt of VTs alone is
+    blank, which `agy` refuses (`stdin-whitespace`).
+
+  So the framed line of an admitted prompt is at most 960,041 bytes, and
+  that line was measured. The sizes between 160,000 and 191,986 bytes were
+  not measured framed, nor any framed prompt at the bound other than these
+  three.
 
 An empty stdin is not refused cleanly. As text, `agy` tries to start its
 terminal UI, prints `CLI error: bubbletea: error opening TTY ...` on
@@ -271,20 +332,25 @@ prompt fails properly: exit 1 and an `ERROR` result saying `empty prompt`
 ## 4. The event stream and its terminal proof (question 3)
 
 Every line of `--output-format stream-json` is one JSON object with an
-`event` member, ended by LF. In every recorded one-shot run that was given
-a prompt and ended on its own, the stream was `init`, then `step_update`
-records, then exactly one `result`, and then the process exited, or, when
-no session began, a lone `ERROR` result. None wrote a malformed line, a
-blank line, a member twice or a second `result`. Only a `stream-json` input
-session writes several (§6). Some runs write no `result` at all: an empty
-`stream-json` input writes `init` and exits 0 (`stdin-stream-json-empty`),
-and a run an outside limit killed ends wherever it was (`hang-no-limit`).
+`event` member, ended by LF. In every recorded one-shot `stream-json` run
+that sent the model a request and ended on its own, the stream was `init`,
+then `step_update` records, then exactly one `result`, and then the
+process exited. A run refused before any request wrote one `ERROR` result,
+alone (`stdin-whitespace`, `no-login-argv-prompt`) or after `init`
+(`stream-input-cut`). None wrote a malformed line, a blank line, a member
+twice or a second `result`. Only a `stream-json` input session writes
+several (§6). Some runs write no `result` at all: an empty `stream-json`
+input writes `init` and exits 0 (`stdin-stream-json-empty`), an empty text
+stdin writes a terminal error that is no JSON (`stdin-empty`), a run an
+outside limit killed ends wherever it was (`hang-no-limit`), and under
+`--output-format json` a refusal before any request can write nothing at
+all (`api-key-route-without-key`, §1).
 
 | Record | Fields seen | Meaning |
 |---|---|---|
-| `init` | `conversation_id`; `init.cwd`, `init.tools` (60 names), `init.permission_mode` (`request-review`, or `always-proceed` under `--dangerously-skip-permissions`) | first record, written before the model is asked. Names no model. |
+| `init` | `conversation_id`; `init.cwd`, `init.tools` (60 names), `init.permission_mode` (`request-review`, or `always-proceed` under `--dangerously-skip-permissions`); `init.model` only when `--model` gave one | first record, written before the model is asked. Names the model only as asked (`init.model` repeats `--model`, `repository-customizations-recommended`), never the one that served the run. |
 | `step_update` | `conversation_id`, `step_index`, `state` (`ACTIVE`, `DONE`), `step_type` (`user_input`, `agent_response`, `tool`, `error_message`, `system_message`, `unknown`), and, as they apply, `text_delta`, `tool_name`, `tool_info` (`name`, `parameters`, `output`), `usage`, `duration_seconds` | one step's progress. An `agent_response` is sent as deltas while `ACTIVE`, then a `DONE` whose delta is `\n` (`success-chunks`). |
-| `result` | `conversation_id`, `status` (`SUCCESS` or `ERROR`), `response`, `error`, `duration_seconds`, `num_turns`, `usage` (`input_tokens`, `output_tokens`, `thinking_tokens`, `cache_read_tokens`, `total_tokens`), `finished_reason` (`error`, `interrupted`, `print_timeout`; absent on a normal end), `denied_actions` (`action`, `display_name`) | the run's end |
+| `result` | `conversation_id`, `status` (`SUCCESS` or `ERROR`), `response`, `error`, `duration_seconds`, `num_turns`, `usage` (`input_tokens`, `output_tokens`, `thinking_tokens`, `cache_read_tokens`, `total_tokens`), `finished_reason` (`error`, `interrupted`, `print_timeout`; absent on a normal end, and on a `SUCCESS` but once: a print timeout on the framed transport, §7), `denied_actions` (`action`, `display_name`) | the run's end |
 
 `--output-format json` writes the `result` object alone, as one line,
 when the run ends (`success-json`, `deny-command-json`), and `text` writes
@@ -368,25 +434,34 @@ known event, a value of another type in any of these places, a
 contradictory result, a record out of this order, a record of another
 conversation, or a record after the `result`.
 
-**The capture.** What the reader saw proves nothing unless it saw the
-whole stream, and only the executor can say so. Completion also needs all
-three of these, and a capture short of any of them never completes a run
+**The capture.** What the reader saw proves nothing unless it saw both
+streams whole, and only the executor can say so. Completion also needs
+all of these, and a capture short of any of them never completes a run
 (it cannot turn a failure into anything else):
 
-- the process **exited on its own**: no idle or runtime limit, kill or
-  signal of the executor's ended it;
-- stdout was **read to EOF**: no process left behind still held the pipe,
-  so the capture was not abandoned (the executor's `capture_abandoned`);
-- **no capture bound dropped output** (the executor's `stdout_truncated`),
-  and no line was skipped past the reader's per-line bound.
+- the process **exited on its own**: it ended by exiting, with a status of
+  its own. No idle or runtime limit, kill or signal ended it, the
+  executor's or any other: a negative status is a signal's, whoever sent
+  it;
+- stdout and stderr were each **read to EOF**: no process left behind
+  still held either pipe, so the capture was not abandoned (the
+  executor's `capture_abandoned`);
+- **no capture bound dropped output** of either (the executor's
+  `stdout_truncated` and `stderr_truncated`), and no line was skipped past
+  the reader's per-line bound.
 
-The probe reports the same for its records: a private-root record says
-whether each pipe reached EOF (`capture`). The earlier records do not; the
-tests count one as read to EOF only when no process was left in its
-sandbox after the run, since nothing could then hold the pipe. Of the 110,
-only `sigterm-background-task` does not, and it failed anyway. Every
-private-root record, the 143 of the full re-recording among them, reached
-EOF on both pipes, survivors and all.
+Stderr counts as much as stdout. Completion needs the absence of an
+`AGY_ERROR` line, and typing a failure needs it to be the only one (§9).
+Neither absence nor uniqueness can be read from part of a stream, so a
+stderr not read whole stops a run from completing and leaves its failure
+untyped.
+
+The probe reports the same for its records: each says, for stdout and for
+stderr, whether it reached EOF and whether a bound dropped any of it
+(`capture`). The helper keeps at most 2 MiB and 20,000 lines of each
+stream and reads on to the end past that, and a line cut for the record
+(over 4,000 characters) counts as dropped. Every committed record reached
+EOF on both streams and lost nothing, survivors and all.
 
 **Terminal proof** for a one-shot run is a run of that shape and framing:
 its one `result` written as the last record and ended by its LF, followed
@@ -403,10 +478,13 @@ arrives is a protocol failure, however whole its text looks.
 **Liveness.** `agy` writes nothing while a model request is open. A request
 the stand-in never answered kept it silent until the probe killed it at
 120 seconds (`hang-no-limit`), with no retry and no timeout of its own.
+What it wrote before is `init` and the `user_input` step: both come before
+the model answers, so neither shows a model at work (§9,
+`result_less_exit`).
 While a background task runs, the stream holds back even records that have
 happened. In `background-task`, `agy` said on stderr at 0.8 seconds that
 the agent was idle, its reply received (`root agent idle; waiting for 1
-background task(s) to finish`), yet the stream wrote that reply at 15.2
+background task(s) to finish`), yet the stream wrote that reply at 15.3
 seconds, when the task ended. Nothing else was written in between. Unlike
 Claude Code's stream, this one does not show a reply before `agy` ends.
 
@@ -417,16 +495,22 @@ Claude Code's stream, this one does not show a reply before `agy` ends.
 | 0 | `result` with `SUCCESS` | `success-stream-json`, `api-503-then-success` |
 | 0 | **`SUCCESS` after a refused tool call, with an empty response** | `deny-command`, `deny-command-json` |
 | 0 | no `result` at all: empty stdin | `stdin-empty`, `stdin-stream-json-empty` |
+| 0 | **`--print-timeout` expired on the framed transport**: a `SUCCESS` result that names `finished_reason: print_timeout`, and an `AGY_ERROR` (`DEADLINE_EXCEEDED`) | `print-timeout-background-recommended` |
 | 1 | a setting, a model selection, a missing credential, stream input that does not decode, or a stop by SIGINT or SIGTERM (`finished_reason: interrupted`) | `settings-unknown-key`, `model-unknown`, `api-key-route-without-key`, `stream-input-cut`, `sigint-during-request` |
 | 2 | a usage error: an unknown flag, a stray argument, a prompt that spells a flag | `argv-flag-name`, `argv-after-double-dash` |
-| 3 | a turn ended on a model or agent error (`finished_reason: error`), or `--print-timeout` expired (`print_timeout`) | `api-400`, `hang-print-timeout` |
+| 3 | a turn ended on a model or agent error (`finished_reason: error`), or `--print-timeout` expired in argv print mode (`print_timeout`) | `api-400`, `hang-print-timeout`, `print-timeout-background` |
 
 `result.status` was only ever `SUCCESS` or `ERROR`. No `WAITING`,
 `CANCELED` or `INVALID` status appeared in any record. `finished_reason`
 separates a failure, an interruption and a print timeout, and is absent on a
-normal end, as the changelog says. The definitive terminal states are
-therefore `SUCCESS` with no `finished_reason` and no `denied_actions`, and
-the three `finished_reason` values.
+normal end, as the changelog says. One record breaks that pairing: on the
+framed transport, a print timeout during a background task ended in
+`SUCCESS` with `finished_reason: print_timeout`, at exit 0
+(`print-timeout-background-recommended`, §7). The definitive terminal
+states are therefore `SUCCESS` with no `finished_reason` and no
+`denied_actions`, and `ERROR` with one of the three `finished_reason`
+values. A `SUCCESS` that names a `finished_reason` contradicts itself, and
+the contract reads it as a protocol failure (§4), never as completed.
 
 **Soft refusals.** Without `--dangerously-skip-permissions`, a
 `run_command` the default `request-review` permission needs to ask about is
@@ -497,8 +581,16 @@ reaches them.
 | normal end, a child that ran `setsid -f` | it survives, re-parented, in its own session | `detached-child` |
 | SIGINT or SIGTERM during a model request | exit 1 at once, after a `result` with `interrupted`. Nothing left. | `sigint-during-request`, `sigterm-during-request`, `sigint-during-request-json` |
 | SIGTERM during a background task | exit 1, `interrupted`. **The task's shell survives**, re-parented, with its `sleep`. | `sigterm-background-task` |
-| `--print-timeout` during a background task | exit 3, `print_timeout`, the task terminated and named in `AGY_ERROR`. Nothing left. | `print-timeout-background` |
-| `--print-timeout` during a model request | exit 3, `print_timeout` | `hang-print-timeout` |
+| `--print-timeout` during a background task, argv print mode (`-p`) | exit 3, `print_timeout`, the task terminated and named in `AGY_ERROR`. Nothing left. | `print-timeout-background` |
+| `--print-timeout` during a background task, **the fixed argv of §10** (the prompt framed on stdin) | exit **0**, a `SUCCESS` result with `finished_reason: print_timeout`, `AGY_ERROR` `DEADLINE_EXCEEDED` with no task named. **The task is not terminated:** its shell survives, re-parented, in its own session, with its `sleep`. | `print-timeout-background-recommended` |
+| `--print-timeout` during a model request, argv print mode | exit 3, `print_timeout` | `hang-print-timeout` |
+
+The two print timeouts during a background task differ only in the
+transport: the same scripted steps and the same 5 seconds, `-p` against
+the fixed argv. On the transport §10 recommends, `--print-timeout` bounds
+the run but cleans nothing up, and the run's end reads as a protocol
+failure (§5). A print timeout during a model request was measured in argv
+print mode only.
 
 So `agy` does not guarantee that nothing outlives it. On Linux, AutoForge's
 executor collects re-parented descendants as a child subreaper (ADR 0002).
@@ -542,18 +634,29 @@ What the workspace contributes is a separate matter:
   Neither `trustedWorkspaces: []` (`repository-customizations-untrusted`)
   nor `--sandbox` (`repository-customizations-sandbox`) changes it, and the
   settings catalogue has no key that might (`settings-catalogue`). The
-  recommended launch of §10 itself, the prompt framed on stdin with
-  `--disable-slash-commands` and `--dangerously-skip-permissions`, runs them
-  the same way (`repository-customizations-recommended`).
+  recommended launch of §10 itself runs them the same way
+  (`repository-customizations-recommended`): the fixed argv, every flag of
+  it, with `--model gemini-4-argon --effort high --print-timeout 60s`, and
+  the prompt framed on stdin.
+- **When they ran.** The stand-in noted which of the hooks' and the
+  server's marker files were in the workspace when each model request
+  arrived (`markers_present`). In each of the four launches, the
+  `SessionStart` and `PreInvocation` hooks had run and the MCP server had
+  started before the first model request, and the `Stop` hook ran after
+  it. That is one run of each launch. A server that takes longer to start
+  might still be starting when the model is first asked; that it is
+  started at all, before the run ends, is what every run shows.
 
 **What those four scenarios measured, and no more.** One layout: a git
-repository whose root is the launch's working directory, holding
+repository (made by `git init --template=` inside the sandbox) whose root
+is the launch's working directory, holding
 `AGENTS.md`, `GEMINI.md`, `.agents/rules/r.md`, `.agents/hooks.json` (one
 `SessionStart`, `PreInvocation` and `Stop` command each) and
 `.agents/mcp_config.json` (one stdio server), with an empty home. Four
 launches of it: `-p` with `--output-format json`, the same with
 `trustedWorkspaces: []`, the same with `--sandbox`, and the recommended
-launch. **Not measured:** the other directories the bundled customization
+launch with the values above. Other models, efforts and timeouts in the
+fixed argv were not measured with the repository. **Not measured:** the other directories the bundled customization
 guide names (`.agent/`, `_agents/`, `_agent/`) and its other files
 (`plugins.json`, `skills.json`, `plugins/`, workflows, skills);
 customizations in a directory above the working directory, below it, or
@@ -571,14 +674,14 @@ repository root. That is the vendor's statement, not a measurement here.
 |---|---|---|
 | `command`, `exit_code`, `stdout`, `stderr`, times, `timed_out`, truncation, leftovers | the executor, as for any CLI | available |
 | `stdout` (the reply) | the last `agent_response` step's text, of a completed run only | available |
-| `provider_failure` | a refusal (`denied_actions`), an `ERROR` result, a `SUCCESS` at a nonzero exit or with an `AGY_ERROR` line, a missing or second `result`, a record out of §4's framing, shape or order, a contradictory result, an `unknown` step, a step or reply that never ended, an empty reply; and a run that would otherwise complete but whose capture is not whole (§4) | available |
-| `transient_failure` | the one `AGY_ERROR` line of an `ERROR` result has `code_kind: http` and an `error_code` that is an integer (never a float, a bool or a string) equal to 408 or from 500 to 599 | available; 500 is not retried by `agy` itself |
-| `usage_limit` | the same, with an integer `error_code` of 429 | available; per-minute and per-day limits not told apart (unverified) |
+| `provider_failure` | a refusal (`denied_actions`), an `ERROR` result, a `SUCCESS` at a nonzero exit or with an `AGY_ERROR` line, a missing or second `result`, a record out of §4's framing, shape or order, a contradictory result (a `SUCCESS` that names a `finished_reason`, as the framed print timeout writes), an `unknown` step, a step or reply that never ended, an empty reply; and a run that would otherwise complete but whose capture is not whole, on stdout or stderr (§4) | available |
+| `transient_failure` | the one `AGY_ERROR` line of an `ERROR` result has `code_kind: http` and an `error_code` that is an integer (never a float, a bool or a string) equal to 408 or from 500 to 599, and stderr was read whole (to EOF, nothing dropped), so that the line is known to be the only one | available; 500 is not retried by `agy` itself |
+| `usage_limit` | the same, with an integer `error_code` of 429, on a whole stderr | available; per-minute and per-day limits not told apart (unverified) |
 | `usage_reset_at` | nothing | unknown |
-| `result_less_exit` | only all of these: `init` and at least one step (a turn began), no `result`, no violation of §4, the process exited on its own (no limit, kill or signal of the executor's), the capture whole (EOF, nothing dropped or skipped), and no `AGY_ERROR` line (no model API failure the CLI reported). The engine may relaunch on it, so anything less leaves it unset | derivable; no record has it (the tests check each) |
+| `result_less_exit` | **never set in the MVP.** The engine relaunches on it (ADR 0012, #434), so it needs proof that the CLI exited on its own inside a session that was running: for Claude Code, a tool call of the model's before the exit. `init` and the `user_input` step are written before the model answers (`hang-no-limit`), so they show no running session, and no recorded run exited on its own, without a result, after the model had begun. A G1 adapter may set it only once a probe scenario shows such an exit, with both streams whole and an exit status of the process's own | unset; no evidence yet |
 | `failed_before_limit` | `AGY_ERROR` comes only at the end; mid-run `error_message` steps carry no code | not derivable before the end |
 | `reply_delivered` | **never set in the MVP.** The flag lets the engine accept the reply of a launch that failed after it (ADR 0012 D12), so it needs proof of a complete, successful final reply. A `result` record is no such proof: it may be an error or a refusal, or a successful turn that further activity followed (`background-task`, `timer`). `agy` writes a reply only with its result, at the end, so a launch that failed after it has none the stream proves whole | unset |
-| `model`, `effort` | what was asked: no record names the model used | requested only; no read-back |
+| `model`, `effort` | what was asked: `init.model` repeats `--model`, and no record names the model used | requested only; no read-back |
 | `provider_summary` | `conversation_id`, `num_turns`, `usage`, `status`, `finished_reason`, number of `denied_actions` | available |
 | `interaction` | `failed` when a refusal failed the run (as #258 does for the other CLIs) | available |
 | progress, loop detection | `step_update`: step types, tool names and parameters | available |
@@ -596,7 +699,8 @@ default is `gemini-3.1-pro-preview` with a 1,024-token thinking budget
 Anything else in `AGY_ERROR` types nothing, and the failure stays an
 error: another code or kind, a code of another JSON type (`429.0`, `true`,
 `"429"`), a code outside 100 to 599 (`600`), a line that does not parse or
-gives a member twice, and more than one `AGY_ERROR` line in the run.
+gives a member twice, more than one `AGY_ERROR` line in the run, and one
+line on a stderr not read whole, which may have held another.
 
 **What cannot be told apart safely:**
 
@@ -607,7 +711,9 @@ gives a member twice, and more than one `AGY_ERROR` line in the run.
   (§10);
 - which model actually served the run;
 - a per-minute 429 from an exhausted quota, until a real body is seen;
-- a daemon task `agy` killed at exit, except by a stderr notice.
+- a daemon task `agy` killed at exit, except by a stderr notice;
+- a background task a print timeout left running on the framed transport,
+  except by the processes left (§7): its `AGY_ERROR` names no task.
 
 ## 10. Transport and adapter contract (deliverables 3 and 5)
 
@@ -663,9 +769,14 @@ characters among them, is a finding to resolve before the gate moves.
 
   Only three values vary, each one the adapter checks: a model id from the
   configuration's allow-list, one of the five efforts, and a timeout it
-  computes. No other flag is ever passed. Among those that would change
-  where `agy` looks or what it loads: `--add-dir` (it widens the
-  workspace, and with it where customizations are found), a second
+  computes. **Two records ran exactly this argv**, with `gemini-4-argon`,
+  `high`, and `60s` (`repository-customizations-recommended`) or `5s`
+  (`print-timeout-background-recommended`), each with its prompt framed on
+  stdin; the tests hold both records and the block above to it. Other
+  models, efforts and timeouts are G1 checks, measured again for each value
+  the configuration admits. No other flag is ever passed. Among those that
+  would change where `agy` looks or what it loads: `--add-dir` (it widens
+  the workspace, and with it where customizations are found), a second
   `--settings` (it would replace the guarded `modelProvider`, and a later
   build's keys are unknown), `--agent`, `--mode`, `--sandbox`, `--project`,
   `--new-project`, `--remote-agent`, `--remote-control`, `-c`,
@@ -676,12 +787,19 @@ characters among them, is a finding to resolve before the gate moves.
     refuses anything that would ask and then ends the run. Containment
     comes from the outer sandbox, as for Claude Code's `bypassPermissions`.
   - `--disable-slash-commands` is meant to keep a prompt that starts with
-    `/` from running as a command or a skill. The recommended launch ran
-    with it (`repository-customizations-recommended`), but no prompt
-    starting with `/` was sent.
-  - `--print-timeout` a little below `max_runtime_seconds`, so `agy`
-    terminates its own background tasks and says so
-    (`print-timeout-background`). The executor's limit stays the backstop.
+    `/` from running as a command or a skill. Both records ran with it,
+    but no prompt starting with `/` was sent.
+  - `--print-timeout` bounds the run below `max_runtime_seconds`, and
+    nothing more. On this transport it is **no cleanup**: during a
+    background task it ended the run at its time with exit 0, a `SUCCESS`
+    result naming `finished_reason: print_timeout`, which the reducer reads
+    as a protocol failure, and left the task's shell running
+    (`print-timeout-background-recommended`, §7). Only argv print mode
+    terminated the task (`print-timeout-background`). A survivor is
+    therefore the executor's to collect, as for any CLI (§7), and the
+    executor's limit stays the backstop. Whether the argv keeps the flag,
+    and at what margin below the limit, is a G1 check; a print timeout
+    during a model request was not measured on this transport.
 - **The reducer.**
   - It checks every line against §4's framing and every record against its
     shape and order before reading it, so no record makes it raise. A
@@ -694,15 +812,16 @@ characters among them, is a finding to resolve before the gate moves.
     known type (`user_input`, `agent_response`, `tool`, `error_message`,
     `system_message`) and ended; the run's last step an `agent_response`
     that ended `DONE`, with a non-blank text; and the capture whole: the
-    process exited on its own, stdout reached EOF (no `capture_abandoned`)
-    and nothing was dropped (no `stdout_truncated`).
+    process exited on its own (no signal's negative status, whoever sent
+    it), stdout and stderr each reached EOF (no `capture_abandoned`), and
+    nothing of either was dropped (no `stdout_truncated`, no
+    `stderr_truncated`).
   - Anything else is a `provider_failure` naming what failed:
     `interrupted`, `print_timeout`, a refusal, a protocol violation, an
     ambiguous step (an unanswered question), no result, no reply, a capture
     that was not whole. The typed failures and the two recovery flags are
-    §9's: an integer HTTP code alone types a failure, `result_less_exit`
-    only on a whole capture of a session that began, `reply_delivered`
-    never.
+    §9's: an integer HTTP code alone types a failure, and only on a whole
+    stderr; neither `result_less_exit` nor `reply_delivered` is ever set.
   - A daemon task leaves its step `ACTIVE`, and the prototype fails such a
     run. Whether a run that started a daemon may still complete is a G1
     decision.
@@ -730,8 +849,11 @@ characters among them, is a finding to resolve before the gate moves.
     whether `agy` would read one is one of C1's conditions.
   - **The prompt, on the bytes the adapter frames** (`stdin_payload(req)`),
     for the pinned build and the framing measured, and for nothing else.
-    Refuse a prompt over 160,000 UTF-8 bytes: the cut is at 191,986, and a
-    160,000-byte prompt with the widest escaping arrived whole (§3). Refuse,
+    Refuse a prompt over 160,000 UTF-8 bytes. The cut is at 191,986 bytes
+    of the prompt's UTF-8, and at 160,000 three framed prompts arrived
+    whole (§3): a large mixed sample, one astral character alone, and the
+    widest framing an admitted prompt can have, whose 960,041-byte line is
+    the longest the adapter would ever write. Refuse,
     or strip and record, a prompt holding a character the build's table
     lists (`dropped.txt`, §3). Look the character up in that table, never in
     a Unicode category: AutoForge's Python has its own Unicode version, and
@@ -785,8 +907,9 @@ operator's approval (small, plus its budget); operator documentation and a
 behind these conditions, with no default routing change:
 
 - **C1, the blocker.** Repository hooks and MCP servers run in every
-  headless run tried, before the model is asked, the hooks with the model
-  key in their environment, and nothing tried turns them off (§8).
+  headless run tried, the hooks with the model key in their environment,
+  and nothing tried turns them off (§8). In each run, every hook but `Stop`
+  had run and the MCP server had started when the model was first asked.
   AutoForge runs agents on untrusted trees, a pull request under review
   among them, and requires every agent CLI's hooks and MCP servers off. The
   maintainer must decide whether the request-aware refusal of §10 (the
@@ -815,13 +938,16 @@ behind these conditions, with no default routing change:
 Not blockers, but required of any adapter: typing a refusal as a failure,
 holding the stream to §4's framing and shapes and the capture to whole,
 failing a run with an `unknown` step, taking the reply from the last step,
-the flags of §9 (`reply_delivered` never, `result_less_exit` narrowly), the
+the flags of §9 (neither `reply_delivered` nor `result_less_exit`), the
 fixed argv, the launch checks on the request with the pinned build's
-table, a home of its own per launch, and never `-c`.
+table, a home of its own per launch, collecting a run's survivors without
+relying on `--print-timeout` (§7), and never `-c`.
 
 Against a go: `agy` changes print-mode behaviour often, its `stream-json`
 input shape is undocumented, a reply cannot be seen before the process ends,
-and the model that served a run cannot be read back. None of these makes the
+the model that served a run cannot be read back, and `--print-timeout`
+behaves otherwise on the recommended transport than in argv print mode
+(exit 0, a contradictory `SUCCESS`, a task left running: §7). None of these makes the
 contract ambiguous. Together they make an adapter more expensive to keep
 correct than its first version suggests.
 
@@ -874,9 +1000,9 @@ Available subcommands:
 
 ## Appendix B: reproducing one scenario by hand
 
-Run it through the probe, which builds the private root of the header for
-it, starts the stand-in inside the sandbox's own loopback, and writes the
-record:
+Run it through the probe, which builds the sandbox of the header for it,
+starts the stand-in inside the sandbox's own loopback, sets up the
+scenario's workspace inside it, and writes the record:
 
 ```sh
 python3 -I tests/antigravity_probe.py record --agy /path/to/agy \
@@ -886,8 +1012,11 @@ python3 -I tests/antigravity_probe.py record --agy /path/to/agy \
 The sandbox is this `bwrap` command (`sandbox_argv` in the probe), with
 `BASE` the run's directory holding `home/` and `work/`, `SPEC` its spec
 directory, and the three synthetic `/etc` files the probe writes in
-`SPEC/etc/`. It is started with an empty environment of its own (`env -i`),
-and its helper with another (`--clearenv`):
+`SPEC/etc/`. It is started with an empty environment of its own (`env -i`)
+and `/dev/null` as stdin, and its helper with another environment
+(`--clearenv`). The helper writes the record on stdout, and nothing else
+there; the probe reads it from a pipe with a bound, and opens no file of
+the sandbox's:
 
 ```sh
 env -i /usr/bin/bwrap --unshare-all --die-with-parent --new-session --clearenv \
@@ -900,16 +1029,20 @@ env -i /usr/bin/bwrap --unshare-all --die-with-parent --new-session --clearenv \
   --ro-bind "$SPEC/etc/hosts" /etc/hosts \
   --ro-bind tests/antigravity_probe.py /probe/antigravity_probe.py \
   --ro-bind /path/to/agy /probe/agy \
-  --bind "$BASE" "$BASE" --bind "$SPEC" "$SPEC" \
-  --chdir / -- /usr/bin/python3 -I -S /probe/antigravity_probe.py inner "$SPEC/spec.json"
+  --bind "$BASE" "$BASE" --ro-bind "$SPEC" "$SPEC" \
+  --chdir / -- /usr/bin/python3 -I -S /probe/antigravity_probe.py inner "$SPEC/spec.json" \
+  < /dev/null > record.json
 ```
 
 (On a host whose `/bin` or `/lib` is a directory rather than a link, the
-probe binds it read-only instead.) Inside, the helper starts the stand-in
-on `127.0.0.1` and runs `agy` with the environment it builds and nothing
-else: `HOME`, `PATH=/usr/bin:/bin`, `LANG=C.UTF-8`, `TERM=dumb`, the four
-`XDG_*_HOME` under the home, the synthetic `GEMINI_API_KEY` and
-`GOOGLE_GEMINI_BASE_URL`.
+probe binds it read-only instead.) Inside, the helper makes the
+scenario's workspace, starts the stand-in on `127.0.0.1` and runs `agy`
+with the environment it builds and nothing else: `HOME`,
+`PATH=/usr/bin:/bin`, `LANG=C.UTF-8`, `TERM=dumb`, the four `XDG_*_HOME`
+under the home, the synthetic `GEMINI_API_KEY` and
+`GOOGLE_GEMINI_BASE_URL`. By hand, `record.json` is the sandbox's claim
+like any record: read it as data, with a bound, after the sandbox has
+exited.
 
 Do not reproduce a scenario by running `agy` on the host, even under
 `env -i` with an empty `HOME`: that is no filesystem boundary, and the

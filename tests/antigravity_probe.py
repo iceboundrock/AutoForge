@@ -18,12 +18,16 @@ same facts.
 **No model is called, and agy is given no credential.** Each scenario
 runs ``agy`` once, inside ``bwrap``, in a private root (:func:`sandbox_argv`):
 never the host's root, only ``/usr`` read-only, three synthetic files of
-``/etc``, the probe and the binary read-only, and the run's own empty
-``HOME``, workspace and spec directory; the helper that starts agy has an
-empty environment, and agy the minimal one the helper builds. It has
+``/etc``, the probe, the binary and the run's spec directory read-only, and
+the run's own empty ``HOME`` and workspace read-write; the helper that
+starts agy has an empty environment, and agy the minimal one the helper
+builds. A workspace's setup (a git repository, a saved setting) is made
+inside it too, never on the host (:data:`WORKSPACES`). It has
 namespaces of its own for users, pids (every process the run left behind
 is seen, and killed when the namespace ends), the network (no route out,
-only loopback), IPC, UTS and cgroups. The model API is a loopback stand-in
+only loopback), IPC, UTS and cgroups. The record comes back on the
+sandbox's stdout, read by the host with a bound (:func:`run_sandboxed`):
+the host opens no path the sandbox could write. The model API is a loopback stand-in
 of the Gemini API (:class:`StandIn`), reached through
 the Gemini SDK's documented ``GOOGLE_GEMINI_BASE_URL`` with a synthetic
 ``GEMINI_API_KEY`` and ``--settings '{"modelProvider":"gemini"}'``, the
@@ -60,6 +64,7 @@ import re
 import shutil
 import signal
 import socketserver
+import stat
 import subprocess
 import sys
 import tempfile
@@ -171,21 +176,35 @@ def all_chunks() -> list[list[tuple[int, int]]]:
 # The same measurement through the recommended transport
 # (``fidelity-framed-*``): each prompt as one stream-json message, escaped
 # as :func:`stream_message` writes it (every non-ASCII character a ``\\u``
-# escape, an astral one a surrogate pair), so that its line is up to three
-# times the prompt's UTF-8.
+# escape, an astral one a surrogate pair), so that its line is about three
+# times the prompt's UTF-8 (the first prompt's few C0 controls take six
+# bytes each, as VT does in :func:`widest_prompt`).
 FRAMED_PREFIX = "fidelity-framed-"
-# The prompt bound the report proposes (UTF-8 bytes), and the near-limit
-# prompt measured through the framing at it (``fidelity-near-limit-stream-json``).
+# The prompt bound the report proposes (UTF-8 bytes), and the three prompts
+# measured through the framing at it: a large mixed sample
+# (``fidelity-near-limit-stream-json``), the widest framing of all
+# (``fidelity-widest-stream-json``) and the widest of characters that are no
+# control (``fidelity-astral-stream-json``).
 PROMPT_LIMIT = 160_000
 NEAR_LIMIT = "fidelity-near-limit-stream-json"
+WIDEST = "fidelity-widest-stream-json"
+ASTRAL = "fidelity-astral-stream-json"
+AT_THE_BOUND = (NEAR_LIMIT, WIDEST, ASTRAL)
+# Framed bytes per UTF-8 byte, at most, of a character agy 1.5.13 keeps:
+# VT (U+000B) is one byte of UTF-8 and the six of ``\\u000b``. Every other
+# kept character takes three at most (an astral one: 4 bytes, 12 escaped),
+# and the characters agy removes are refused or stripped before framing.
+WIDEST_ESCAPE = 6
 
 
 def near_limit_prompt(size: int = PROMPT_LIMIT) -> str:
-    """A prompt of exactly ``size`` UTF-8 bytes whose framed line is as long as it gets.
+    """A large mixed sample of exactly ``size`` UTF-8 bytes, every character kept.
 
     Numbered lines of astral characters (12 escaped bytes for 4 of UTF-8),
     with CJK, Latin, a quote, a backslash, a tab and a CR LF on each, every
-    character one agy 1.5.13 keeps: it must arrive identical.
+    character one agy 1.5.13 keeps: it must arrive identical. Its framed
+    line is about 2.6 times its UTF-8, so it is not the widest framing a
+    prompt of that size can have (:func:`widest_prompt` is).
     """
     lines, n, used = [], 0, 0
     while True:
@@ -198,11 +217,41 @@ def near_limit_prompt(size: int = PROMPT_LIMIT) -> str:
     return "".join(lines) + "x" * (size - used)
 
 
+def widest_prompt(size: int = PROMPT_LIMIT) -> str:
+    """The prompt of ``size`` UTF-8 bytes, of kept characters, whose framed line is longest.
+
+    Every character a VT (:data:`WIDEST_ESCAPE` framed bytes for one of
+    UTF-8) but the first, a ``|``: a prompt of VTs alone is blank, and agy
+    refuses a blank prompt (``stdin-whitespace``). Framed, it is
+    ``WIDEST_ESCAPE * size - 5 + 46`` bytes: 960,041 at the bound.
+    """
+    return "|" + "\x0b" * (size - 1)
+
+
+def astral_prompt(size: int = PROMPT_LIMIT) -> str:
+    """``size`` UTF-8 bytes of one kept astral character (U+1F680): 3 framed bytes per byte."""
+    return "\U0001f680" * (size // 4)
+
+
 def all_prompt(label: str, spans: list[tuple[int, int]]) -> str:
     """One ``fidelity-all-*`` prompt: a header naming it, its code points, a trailer."""
     header = f"[{label} {spans[0][0]:06X}-{spans[-1][1]:06X}]\n"
     body = "".join("".join(map(chr, range(a, b + 1))) for a, b in spans)
     return header + body + ALL_TRAILER
+
+
+def _sweep_plan() -> dict[str, tuple[str, list[tuple[int, int]], bool]]:
+    """Each complete-measurement scenario: (its prompt, its spans, whether framed)."""
+    chunks = [("nul", [(0, 0)]), *((f"{i:02d}", c) for i, c in enumerate(all_chunks()))]
+    plan = {ALL_PREFIX + label: (all_prompt(label, spans), spans, False) for label, spans in chunks}
+    for label, spans in chunks:
+        plan[FRAMED_PREFIX + label] = (all_prompt("framed-" + label, spans), spans, True)
+    return plan
+
+
+# What each prompt of the two complete measurements sent, and how: what
+# ``table`` holds each record to before it combines them (sweep_problems).
+SWEEP_PLAN = _sweep_plan()
 
 
 def ranges_of(points: Iterable[int]) -> list[list[int]]:
@@ -367,6 +416,29 @@ def sj_run(*extra: str) -> list[str]:
 
 
 SKIP = "--dangerously-skip-permissions"
+# The fixed argv the report proposes (its section 10), with the values of
+# the recorded launches: three vary, and the adapter checks each one.
+FIXED_MODEL = "gemini-4-argon"
+FIXED_EFFORT = "high"
+FIXED_TIMEOUT = "60s"
+
+
+def fixed_argv(
+    model: str = FIXED_MODEL, effort: str = FIXED_EFFORT, timeout: str = FIXED_TIMEOUT
+) -> list[str]:
+    """The report's fixed argv, its prompt framed on stdin: nothing added, nothing left out."""
+    return sj_run(
+        "--model",
+        model,
+        "--effort",
+        effort,
+        "--print-timeout",
+        timeout,
+        "--disable-slash-commands",
+        SKIP,
+    )
+
+
 CMD_IN_WORKSPACE = call_step(
     "run_command",
     CommandLine="echo hi > in-workspace.txt",
@@ -488,16 +560,16 @@ def scenarios() -> list[Scenario]:
         )
     )
     # every scalar value, NUL on its own, as text on stdin and then framed
-    chunks = [("nul", [(0, 0)]), *((f"{i:02d}", c) for i, c in enumerate(all_chunks()))]
-    for label, spans in chunks:
-        text = all_prompt(label, spans)
-        add(Scenario(ALL_PREFIX + label, stdin_run(), stdin=text.encode(), sent_prompt=text))
-    for label, spans in chunks:
-        text = all_prompt("framed-" + label, spans)
-        framed = stream_message(text).encode()
-        add(Scenario(FRAMED_PREFIX + label, sj_run(), stdin=framed, sent_prompt=text))
-    near = near_limit_prompt()
-    add(Scenario(NEAR_LIMIT, sj_run(), stdin=stream_message(near).encode(), sent_prompt=near))
+    for name, (text, _spans, framed) in SWEEP_PLAN.items():
+        sent = stream_message(text).encode() if framed else text.encode()
+        add(Scenario(name, sj_run() if framed else stdin_run(), stdin=sent, sent_prompt=text))
+    # framed at the proposed bound: a large mixed sample, the widest line, astral alone
+    for name, prompt in (
+        (NEAR_LIMIT, near_limit_prompt()),
+        (WIDEST, widest_prompt()),
+        (ASTRAL, astral_prompt()),
+    ):
+        add(Scenario(name, sj_run(), stdin=stream_message(prompt).encode(), sent_prompt=prompt))
     # tools, permissions and questions
     add(Scenario("deny-command", p_run(), steps=[CMD_IN_WORKSPACE, text_step()]))
     add(Scenario("deny-command-json", p_run(fmt="json"), steps=[CMD_IN_WORKSPACE, text_step()]))
@@ -601,20 +673,31 @@ def scenarios() -> list[Scenario]:
             ],
         )
     )
+    background = [
+        call_step(
+            "run_command",
+            CommandLine="sleep 15; echo bg-done",
+            toolSummary="Background sleep",
+            WaitMsBeforeAsync=500,
+        ),
+        text_step(),
+    ]
     add(
         Scenario(
             "print-timeout-background",
             p_run(SKIP, "--print-timeout", "5s"),
             timeout=60,
-            steps=[
-                call_step(
-                    "run_command",
-                    CommandLine="sleep 15; echo bg-done",
-                    toolSummary="Background sleep",
-                    WaitMsBeforeAsync=500,
-                ),
-                text_step(),
-            ],
+            steps=background,
+        )
+    )
+    # the same through the fixed argv itself, its prompt framed on stdin
+    add(
+        Scenario(
+            "print-timeout-background-recommended",
+            fixed_argv(timeout="5s"),
+            stdin=stream_message("do it").encode(),
+            timeout=60,
+            steps=background,
         )
     )
     # a model request that never answers
@@ -786,11 +869,12 @@ def scenarios() -> list[Scenario]:
             workspace="customized",
         )
     )
-    # the recommended launch itself (the report's section 10), prompt framed on stdin
+    # the recommended launch itself: the fixed argv of the report's section
+    # 10, every flag of it, prompt framed on stdin
     add(
         Scenario(
             "repository-customizations-recommended",
-            sj_run("--disable-slash-commands", SKIP),
+            fixed_argv(),
             stdin=stream_message("do it").encode(),
             workspace="customized",
         )
@@ -840,6 +924,11 @@ def scenarios() -> list[Scenario]:
             timeout=20,
         )
     )
+    for sc in s:
+        # a workspace is set up in its own run's sandbox (inner): a home and
+        # workspace runs share would be set up again by each
+        if sc.workspace and sc.share:
+            raise ValueError(f"{sc.name}: a shared home and workspace takes no setup")
     return s
 
 
@@ -847,11 +936,42 @@ SCENARIOS = scenarios()
 
 
 # -- workspaces --------------------------------------------------------------
+#
+# Each is made by the inner half, inside the run's sandbox, before agy
+# starts (:func:`inner`), never on the host: the host's environment, git
+# configuration and templates are not there to be inherited (R3-F2 of PR
+# #530: a git started on the host with the caller's GIT_DIR initialized
+# that directory instead of the workspace's).
+
+# The sandbox's git: the host's /usr, nothing of the caller's. Its
+# environment is this alone, every git configuration file is turned off
+# (no /etc/gitconfig is in the sandbox anyway, and the home is the run's
+# empty one), and ``--template=`` copies no template.
+GIT = "/usr/bin/git"
+GIT_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "LANG": "C.UTF-8",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+}
+
+
+def _git_init(work: Path, home: Path) -> None:
+    """``git init`` of the workspace, bounded, with :data:`GIT_ENV` and no template."""
+    subprocess.run(
+        [GIT, "init", "-q", "--template=", str(work)],
+        cwd=work,
+        env={**GIT_ENV, "HOME": str(home)},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    )
 
 
 def _customized(work: Path, home: Path) -> None:
     """A repository that ships agy customizations: rules, hooks, an MCP server."""
-    subprocess.run(["git", "init", "-q", str(work)], check=True)
+    _git_init(work, home)
     (work / "AGENTS.md").write_text("AGENTS-RULE-MARKER\n")
     (work / "GEMINI.md").write_text("GEMINI-RULE-MARKER\n")
     agents = work / ".agents"
@@ -883,7 +1003,28 @@ WORKSPACES: dict[str, Callable[[Path, Path], None]] = {
     "customized": _customized,
     "persisted-gemini": _persisted_gemini,
 }
+# What the customized workspace's hooks and MCP server leave in it when they
+# run. The stand-in notes which were there at each model request, so that a
+# record shows what ran before the model was asked, not only by the exit.
 MARKERS = ("hook-session-start", "hook-pre-invocation", "hook-stop", "mcp-started")
+
+
+def _markers_in(work: str) -> list[str]:
+    return [m for m in MARKERS if os.path.lexists(os.path.join(work, m))]
+
+
+def _small_text(path: Path, limit: int = 200) -> str | None:
+    """A regular file's first ``limit`` bytes, or None: never a link, a FIFO or a device."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        return os.read(fd, limit).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
 
 
 # -- the stand-in of the Gemini API -------------------------------------------
@@ -892,8 +1033,9 @@ MARKERS = ("hook-session-start", "hook-pre-invocation", "hook-stop", "mcp-starte
 class StandIn:
     """The scripted answers and the record of every request."""
 
-    def __init__(self, steps: list[dict[str, Any]]) -> None:
+    def __init__(self, steps: list[dict[str, Any]], work: str = "") -> None:
         self.steps = steps
+        self.work = work  # whose MARKERS each model request notes
         self.requests: list[dict[str, Any]] = []
         self.titles = 0
         self.others: list[str] = []
@@ -973,6 +1115,8 @@ def make_handler(stand_in: StandIn) -> type[http.server.BaseHTTPRequestHandler]:
                 if self.headers.get("x-goog-api-key") == SYNTHETIC_KEY
                 else ("other" if self.headers.get("x-goog-api-key") else "absent"),
                 "body": body,
+                # what had run in the workspace when the model was asked
+                "markers": _markers_in(stand_in.work) if stand_in.work else [],
             }
             self.answer(stand_in.next_step(record))
 
@@ -1108,15 +1252,31 @@ def _feeder(
             return
 
 
+# Each stream's capture bound in the inner half: the bytes and the lines a
+# record keeps. Past either, the stream is still read to its end (so agy
+# never blocks on a full pipe) and dropped, and the record says so
+# (``capture``: ``<stream>_truncated``), as the executor's capture bounds do.
+CAPTURE_BYTES = 2 << 20
+CAPTURE_LINES = 20_000
+
+
 def inner(spec_path: str) -> int:
+    """One run, inside the sandbox: its record is written on stdout, and nowhere else.
+
+    The host reads that stream with a bound (:func:`run_sandboxed`) and
+    opens no file of the sandbox's. The workspace's setup, when the
+    scenario names one, is made here first, inside the sandbox.
+    """
     spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
     table = tuple((first, last) for first, last in spec["strip_table"])
     sc = Scenario(**{k: v for k, v in spec["scenario"].items() if k != "stdin"})
     stdin_bytes = bytes.fromhex(spec["stdin_hex"]) if spec["stdin_hex"] is not None else None
-    stand_in = StandIn(sc.steps)
+    home, work, root = spec["home"], spec["work"], spec["root"]
+    if sc.workspace:
+        WORKSPACES[sc.workspace](Path(work), Path(home))
+    stand_in = StandIn(sc.steps, work)
     server = _Server(("127.0.0.1", 0), make_handler(stand_in))
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    home, work, root = spec["home"], spec["work"], spec["root"]
     env = {
         "HOME": home,
         "PATH": "/usr/bin:/bin",
@@ -1148,10 +1308,23 @@ def inner(spec_path: str) -> int:
         start_new_session=True,
     )
     lines: dict[str, list[list[Any]]] = {"stdout": [], "stderr": []}
+    truncated = {"stdout": False, "stderr": False}
 
     def reader(name: str) -> None:
         stream = getattr(proc, name)
-        for line in iter(stream.readline, b""):
+        kept = 0
+        while True:
+            if truncated[name]:  # past the bound: read on to the end, keep nothing
+                if not stream.read1(1 << 16):
+                    return
+                continue
+            line = stream.readline(CAPTURE_BYTES - kept + 1)
+            if not line:
+                return
+            if kept + len(line) > CAPTURE_BYTES or len(lines[name]) >= CAPTURE_LINES:
+                truncated[name] = True
+                continue
+            kept += len(line)
             lines[name].append(
                 [round(time.monotonic() - started, 2), line.decode("utf-8", "replace")]
             )
@@ -1198,10 +1371,19 @@ def inner(spec_path: str) -> int:
     time.sleep(1.0)
     left = [p for p in _processes(me) if p["pid"] != proc.pid]
     server.shutdown()
-    # Whether each pipe was read to its end: a reader still waiting holds a
+    # Whether each pipe was read to its end (a reader still waiting holds a
     # stream some process left behind still had open, and what it read is
-    # not the whole stream (the reducer's abandoned capture).
-    capture = {f"{n}_eof": not t.is_alive() for n, t in readers.items()}
+    # not the whole stream: the reducer's abandoned capture), and whether a
+    # bound dropped any of it. ``exit`` is negative when a signal ended agy.
+    capture: dict[str, bool] = {}
+    for n, t in readers.items():
+        capture[f"{n}_eof"] = not t.is_alive()
+        capture[f"{n}_truncated"] = truncated[n]
+    markers = {}
+    for m in MARKERS:
+        if os.path.lexists(os.path.join(work, m)):
+            content = _small_text(Path(work, m))
+            markers[m] = (content or "").strip() or "present"
     record = {
         "argv": argv,
         "exit": proc.returncode,
@@ -1209,8 +1391,8 @@ def inner(spec_path: str) -> int:
         "capture": capture,
         "signalled": signalled,
         "seconds": seconds,
-        "stdout": lines["stdout"],
-        "stderr": lines["stderr"],
+        "stdout": list(lines["stdout"]),
+        "stderr": list(lines["stderr"]),
         "requests": [_request_summary(r) for r in stand_in.requests],
         "title_requests": stand_in.titles,
         "other_requests": stand_in.others,
@@ -1219,16 +1401,18 @@ def inner(spec_path: str) -> int:
             {"cmd": p["cmd"], "own_session": p["sid"] == p["pid"], "reparented": p["ppid"] == 1}
             for p in left
         ],
-        "markers": {
-            m: (Path(work, m).read_text().strip() or "present")
-            for m in MARKERS
-            if Path(work, m).exists()
-        },
-        "outside_file_written": Path(work).parent.joinpath("outside-written-by-agent").exists(),
+        "markers": markers,
+        "outside_file_written": os.path.lexists(
+            os.path.join(os.path.dirname(work), "outside-written-by-agent")
+        ),
         "facts": _facts(sc, stand_in.requests, root, home, table),
         "home_files": _home_files(Path(home)),
     }
-    Path(spec["result"]).write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+    # ASCII, so that no character (a lone surrogate from a request's JSON
+    # among them) can fail to encode: the host parses it as JSON.
+    out = (json.dumps(record) + "\n").encode("ascii")
+    sys.stdout.buffer.write(out)
+    sys.stdout.buffer.flush()
     for p in left:
         try:
             os.kill(p["pid"], signal.SIGKILL)
@@ -1265,6 +1449,7 @@ def _request_summary(request: dict[str, Any]) -> dict[str, Any]:
         "first_user_text": _user_text(request)[:EXCERPT_LIMIT],
         "last_role": last.get("role"),
         "tool_results": tool_results,
+        "markers_present": request.get("markers", []),
     }
 
 
@@ -1389,12 +1574,16 @@ def _facts(
 # with one is a protocol failure. Nothing in a record is read before its
 # type is checked, so no record raises.
 #
-# Capture. What the reducer read proves nothing unless the whole stream was
-# read: the process exited on its own (no limit, kill or signal of the
-# executor's ended it), stdout was read to EOF (no process left holding it
-# open, so the capture was not abandoned), and no capture bound dropped
-# output. :class:`Capture` is that report, which only the executor can
-# make; a capture short of any of the three never completes a run.
+# Capture. What the reducer read proves nothing unless both streams were
+# read whole: the process exited on its own (it called exit: no limit,
+# kill or signal ended it, the executor's or any other), stdout and stderr
+# were each read to EOF (no process left holding one open, so the capture
+# was not abandoned), and no capture bound dropped output of either.
+# :class:`Capture` is that report, which only the executor can make; a
+# capture short of any of these never completes a run. Stderr counts as
+# much as stdout: completion needs the absence of an ``AGY_ERROR`` line,
+# and a failure's type needs it to be the only one, and neither absence
+# nor uniqueness can be read from part of a stream.
 
 EVENTS = ("init", "step_update", "result")
 STEP_STATES = ("ACTIVE", "DONE", "ERROR")
@@ -1416,22 +1605,31 @@ LINE_BOUND = 1 << 20
 class Capture:
     """How a run's output was read: the executor's report, never the stream's.
 
-    ``exited``: the process exited on its own, not ended by a limit, a kill
-    or a signal of the executor's. ``eof``: stdout was read to its end, so
-    no process left behind still held it and the capture was not abandoned.
-    ``truncated``: a capture bound dropped output.
+    ``exited``: the process ended by exiting, with a status of its own: no
+    limit, kill or signal ended it, the executor's or any other (a negative
+    status is a signal's). ``stdout_eof`` / ``stderr_eof``: that stream was
+    read to its end, so no process left behind still held it and its
+    capture was not abandoned. ``stdout_truncated`` / ``stderr_truncated``:
+    a capture bound dropped output of that stream.
     """
 
     exited: bool
-    eof: bool
-    truncated: bool = False
+    stdout_eof: bool
+    stderr_eof: bool
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+
+    @property
+    def stderr_whole(self) -> bool:
+        """Stderr was read to its end and nothing of it was dropped."""
+        return self.stderr_eof and not self.stderr_truncated
 
     @property
     def whole(self) -> bool:
-        return self.exited and self.eof and not self.truncated
+        return self.exited and self.stdout_eof and not self.stdout_truncated and self.stderr_whole
 
 
-WHOLE = Capture(exited=True, eof=True)
+WHOLE = Capture(exited=True, stdout_eof=True, stderr_eof=True)
 
 
 class _Duplicate(ValueError):
@@ -1667,15 +1865,19 @@ def _http_code(err: dict[str, Any]) -> int | None:
     return None
 
 
-def _failure(red: Reduction, reason: str) -> Outcome:
+def _failure(red: Reduction, reason: str, capture: Capture) -> Outcome:
     """A failed turn, typed from its one ``AGY_ERROR`` line, never from ``retryable``.
 
     An integer 429 is a usage limit; an integer 408, or one of 500 to 599,
     is transient; anything else (another code, a float, a bool, a string, a
     code of another kind, no line, a line that does not parse, or more than
-    one line) is an error.
+    one line) is an error. Only on a whole stderr (``capture.stderr_whole``):
+    a stderr not read to its end, or with output dropped, may have held
+    another ``AGY_ERROR`` line, so its one line proves no type, and the
+    failure stays an error.
     """
-    code = _http_code(red.agy_error or {}) if red.agy_errors == 1 else None
+    one = red.agy_errors == 1 and capture.stderr_whole
+    code = _http_code(red.agy_error or {}) if one else None
     if code == 429:
         return Outcome("usage_limit", "model API 429")
     if code is not None and (code == 408 or 500 <= code <= 599):
@@ -1692,9 +1894,11 @@ def classify(red: Reduction, exit_code: int, capture: Capture) -> Outcome:
     ``AGY_ERROR``; every step is of a type the contract knows
     (:data:`STEP_TYPES`) and ended; the run's last step is an agent_response
     that ended DONE with a non-blank text, which is the reply; and the
-    capture is whole (:class:`Capture`). The first that fails names the
-    outcome. A capture short of whole can only stop a run from completing:
-    a failure read from it stays a failure.
+    capture is whole (:class:`Capture`: both streams to EOF, nothing of
+    either dropped, an exit of the process's own). The first that fails
+    names the outcome. A capture short of whole can only stop a run from
+    completing, or keep a failure from being typed (:func:`_failure`): a
+    failure read from it stays a failure.
     """
     if red.violations:
         more = len(red.violations) - 1
@@ -1708,7 +1912,7 @@ def classify(red: Reduction, exit_code: int, capture: Capture) -> Outcome:
             return Outcome("interrupted", "finished_reason interrupted")
         if reason == "print_timeout":
             return Outcome("print_timeout", "finished_reason print_timeout")
-        return _failure(red, f"status ERROR, exit {exit_code}")
+        return _failure(red, f"status ERROR, exit {exit_code}", capture)
     if exit_code != 0:
         return Outcome("error", f"a SUCCESS result, exit {exit_code}")
     if red.agy_errors:
@@ -1740,56 +1944,69 @@ def classify(red: Reduction, exit_code: int, capture: Capture) -> Outcome:
     if not last.text.strip():
         return Outcome("empty_reply", "the last agent response is empty")
     if not capture.exited:
-        return Outcome("killed", "a limit or a signal of the executor's ended the process")
-    if not capture.eof:
+        return Outcome("killed", "it did not exit on its own: a limit or a signal ended it")
+    unread = [n for n in ("stdout", "stderr") if not getattr(capture, f"{n}_eof")]
+    if unread:
         return Outcome(
-            "incomplete_capture", "stdout was not read to EOF: the capture was abandoned"
+            "incomplete_capture",
+            " and ".join(unread) + " not read to EOF: the capture was abandoned",
         )
-    if capture.truncated:
-        return Outcome("incomplete_capture", "a capture bound dropped output")
+    lost = [n for n in ("stdout", "stderr") if getattr(capture, f"{n}_truncated")]
+    if lost:
+        dropped = " and ".join(lost)
+        return Outcome("incomplete_capture", f"a capture bound dropped output of {dropped}")
     return Outcome("completed", reply=last.text)
 
 
 def result_flags(record: dict[str, Any]) -> dict[str, bool]:
-    """The two flags of ``AgentExecutionResult`` that can start recovery, by the contract.
+    """The two flags of ``AgentExecutionResult`` that can start recovery: neither, in the MVP.
 
     ``reply_delivered`` is never set: agy shows a reply only with its
     result, at the end, so no launch that failed after it has a reply the
     stream proves complete, and a result record alone proves no reply (it
     may be an error, a refusal, or a turn that more activity followed).
-    ``result_less_exit`` only for a session that began (init and at least
-    one step), wrote no result and no violation, exited on its own (no
-    limit, kill or signal of the executor's), was read whole, and reported
-    no model API error (no ``AGY_ERROR``).
+
+    ``result_less_exit`` is never set either. The engine relaunches on it
+    (ADR 0012, #434), so it needs proof that the CLI exited on its own
+    inside a session that was running: for Claude Code, a tool call of the
+    model's seen before the exit. Nothing in agy's stream shows a model at
+    work until a step of the model's arrives, ``init`` and a ``user_input``
+    step are written before any request, and no recorded run exited on its
+    own without a result after the model had begun (R3-F3 of PR #530). Until
+    a probe scenario shows such an exit, with both streams whole and an exit
+    status of its own, a run without a result is a provider failure and no
+    more. ``record`` is not read.
     """
-    red = reduce_stream(*_streams(record))
-    capture = capture_of(record)
-    result_less = (
-        red.init
-        and bool(red.steps)
-        and not red.results
-        and not red.violations
-        and red.agy_errors == 0
-        and capture.whole
-        and record.get("signalled") is None
-    )
-    return {"reply_delivered": False, "result_less_exit": result_less}
+    del record
+    return {"reply_delivered": False, "result_less_exit": False}
 
 
 def capture_of(record: dict[str, Any]) -> Capture:
     """The probe's capture of a record, as the executor would report it.
 
-    A record of the private-root probe says whether stdout was read to EOF
-    (``capture``). The 1.5.13 records made before it do not: for them the
-    stream counts as read to EOF only when no process was left in the
-    sandbox when the probe listed them after the run, so that nothing could
-    still hold the pipe; otherwise it counts as abandoned. A run the probe
-    killed at its timeout, or signalled, did not exit on its own.
+    Every record says, for each stream, whether it was read to EOF and
+    whether a bound dropped any of it (``capture``); a record without that
+    report, or with a value that is not a boolean, has an incomplete
+    capture. A run the probe killed at its timeout or signalled, or whose
+    exit status is a signal's (negative) or no integer, did not exit on its
+    own.
     """
     cap = record.get("capture")
-    eof = bool(cap["stdout_eof"]) if cap is not None else not record["processes_left"]
-    exited = not record["killed_by_probe"] and record.get("signalled") is None
-    return Capture(exited=exited, eof=eof)
+    cap = cap if isinstance(cap, dict) else {}
+    code = record.get("exit")
+    exited = (
+        record.get("killed_by_probe") is False
+        and record.get("signalled") is None
+        and _is_int(code)
+        and code >= 0
+    )
+    return Capture(
+        exited=exited,
+        stdout_eof=cap.get("stdout_eof") is True,
+        stderr_eof=cap.get("stderr_eof") is True,
+        stdout_truncated=cap.get("stdout_truncated") is not False,
+        stderr_truncated=cap.get("stderr_truncated") is not False,
+    )
 
 
 def _streams(record: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -1808,15 +2025,17 @@ Shared = dict[str, tuple[Path, Path]]
 
 
 def prepare(sc: Scenario, root: Path, shared: Shared) -> tuple[Path, Path]:
-    """The scenario's home and workspace: its own, or its group's."""
+    """The scenario's home and workspace, empty: its own, or its group's.
+
+    Two empty directories and nothing else: the workspace's setup is made
+    inside the sandbox (:func:`inner`), so nothing runs on the host.
+    """
     if sc.share and sc.share in shared:
         return shared[sc.share]
     base = Path(tempfile.mkdtemp(prefix=f"{sc.name}.", dir=root))
     home, work = base / "home", base / "work"
     home.mkdir()
     work.mkdir()
-    if sc.workspace:
-        WORKSPACES[sc.workspace](work, home)
     if sc.share:
         shared[sc.share] = (home, work)
     return home, work
@@ -1827,8 +2046,8 @@ def prepare(sc: Scenario, root: Path, shared: Shared) -> tuple[Path, Path]:
 # Each run's sandbox is bwrap's own empty root with only what the run needs,
 # never the host's root: /usr read-only (the host's programs and libraries,
 # /usr/local hidden), the loader's cache, three synthetic files of /etc, the
-# probe module and the binary under measurement read-only at fixed paths, and
-# the run's own home, workspace and spec directory read-write. No home of the
+# probe module, the binary under measurement and the run's spec directory
+# read-only, and the run's own home and workspace read-write. No home of the
 # host, no credential store, no /run, /var or /srv, and so no path-based
 # socket of the host (D-Bus, an SSH or GPG agent, a container daemon) is
 # there to open. The helper starts with an empty environment (--clearenv),
@@ -1837,10 +2056,17 @@ def prepare(sc: Scenario, root: Path, shared: Shared) -> tuple[Path, Path]:
 # of its own for users, pids, the network (loopback alone: no route out and
 # no socket of the host's, abstract ones included), IPC, UTS and cgroups.
 #
-# Records written this way say so (``isolation``). The 1.5.13 records
-# committed before it, which name none, were made in the earlier sandbox:
-# the host root read-only, /tmp a tmpfs, the helper with the caller's
-# environment (the report's header says what that means for them).
+# What comes back is one stream: the helper writes the record on its
+# stdout, a pipe the host reads with a bound (run_sandboxed), and stderr is
+# another, kept short. Stdin is /dev/null. These three are all the sandbox
+# holds of the host's: bwrap's own process inside it (pid 1) holds them
+# too, and a process of the run can open its /proc/1/fd/*, so they are
+# never the host's terminal or files, only pipes the host reads as
+# untrusted data. Nothing the host reads after the run is a path: the spec
+# directory is read-only inside, and the home and workspace, which agy
+# writes, are never read by the host (R3-F1 of PR #530).
+#
+# Every committed record was made this way, and says so (``isolation``).
 
 ISOLATION = "private-root"
 # The inner half's interpreter: the host's own, under /usr. Not the caller's,
@@ -1878,9 +2104,10 @@ def sandbox_argv(
     """The ``bwrap`` command of one run: a private root, an empty environment.
 
     ``base`` holds the run's home and workspace (and is where a write
-    outside the workspace lands); ``spec_dir`` its spec and result. Both are
-    shown read-write at their own paths, so that a record's paths are the
-    host's under ``<root>``; nothing else is writable.
+    outside the workspace lands), shown read-write; ``spec_dir`` its spec
+    and the synthetic ``/etc`` files, shown read-only. Both are at their own
+    paths, so that a record's paths are the host's under ``<root>``; nothing
+    else is writable, and the record leaves on stdout (:func:`inner`).
     """
     bwrap = shutil.which("bwrap")
     if bwrap is None:
@@ -1903,9 +2130,86 @@ def sandbox_argv(
         cmd += ["--ro-bind", str(path), f"/etc/{name}"]
     cmd += ["--ro-bind", str(Path(__file__).resolve()), SANDBOX_PROBE]
     cmd += ["--ro-bind", str(Path(agy).resolve()), SANDBOX_AGY]
-    cmd += ["--bind", str(base), str(base), "--bind", str(spec_dir), str(spec_dir)]
+    cmd += ["--bind", str(base), str(base), "--ro-bind", str(spec_dir), str(spec_dir)]
     cmd += ["--chdir", "/", "--", SANDBOX_PYTHON, "-I", "-S", SANDBOX_PROBE, *inner_args]
     return cmd
+
+
+# The bound on the record a run's sandbox writes on stdout, in bytes: past
+# it the sandbox is killed and the record refused, never read on. A record
+# keeps at most CAPTURE_BYTES of each stream, escaped as ASCII JSON (six
+# bytes a character at most), so a well-formed one stays far below it.
+RESULT_BOUND = 64 << 20
+# What the host keeps of the sandbox's stderr: the start of a refusal's message.
+NOTICE_BOUND = 1 << 16
+
+
+def run_sandboxed(cmd: list[str], timeout: float, bound: int | None = None) -> dict[str, Any]:
+    """Run one sandbox and read the record its helper writes on stdout (:func:`inner`).
+
+    The host gives the sandbox no stream of its own: stdin is /dev/null,
+    stdout and stderr pipes it reads itself, with no variable of the
+    caller's (``env={}``). Stdout is read to its end with a bound
+    (``bound``, :data:`RESULT_BOUND`): past it the sandbox is killed and the
+    record refused unread. The record must then be one JSON object, from a
+    sandbox that exited 0 within ``timeout``; anything else is a
+    :class:`ProbeError`. A process of the run can write to that pipe too
+    (bwrap's process inside holds it), so what arrives is the sandbox's
+    claim, parsed strictly and never trusted further: no path of the
+    sandbox's is opened on the host, whatever it says.
+    """
+    limit = RESULT_BOUND if bound is None else bound
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={},  # bwrap itself gets no variable of the caller's either
+    )
+    got = {"stdout": bytearray(), "stderr": bytearray()}
+    keep = {"stdout": limit, "stderr": NOTICE_BOUND}
+    over = {"stdout": False, "stderr": False}
+
+    def drain(name: str) -> None:
+        stream = getattr(proc, name)
+        while chunk := stream.read1(1 << 16):
+            room = keep[name] - len(got[name])
+            if len(chunk) > room:
+                got[name] += chunk[: max(room, 0)]
+                if name == "stdout" and not over[name]:
+                    proc.kill()  # bwrap's end takes the sandbox with it (--die-with-parent)
+                over[name] = True
+            else:
+                got[name] += chunk
+
+    readers = [threading.Thread(target=drain, args=(n,), daemon=True) for n in got]
+    for t in readers:
+        t.start()
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        proc.wait()
+    for t in readers:
+        t.join(timeout=10)
+    notice = got["stderr"].decode("utf-8", "replace").strip()[-600:]
+    if any(t.is_alive() for t in readers):
+        raise ProbeError("the sandbox's pipes stayed open after it ended")
+    if over["stdout"]:
+        raise ProbeError(f"the sandbox's record is over {limit} bytes: refused, not read on")
+    if timed_out:
+        raise ProbeError(f"the sandbox did not end within {timeout} s: {notice!r}")
+    if proc.returncode != 0:
+        raise ProbeError(f"the sandbox exited {proc.returncode}: {notice!r}")
+    try:
+        record = strict_json(got["stdout"].decode("ascii"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as e:
+        raise ProbeError("the sandbox's record is not one JSON object") from e
+    if not isinstance(record, dict):
+        raise ProbeError("the sandbox's record is not one JSON object")
+    return record
 
 
 def run_one(agy: str, sc: Scenario, root: Path, shared: Shared) -> dict[str, Any]:
@@ -1918,23 +2222,21 @@ def run_one(agy: str, sc: Scenario, root: Path, shared: Shared) -> dict[str, Any
         "home": str(home),
         "work": str(work),
         "root": str(root),
-        "result": str(spec_dir / "result.json"),
         # what a prompt is held to after agy's removals: the pinned build's table
         "strip_table": [list(r) for r in dropped_1_5_13()],
     }
     (spec_dir / "spec.json").write_text(json.dumps(spec), encoding="utf-8")
     cmd = sandbox_argv(agy, work.parent, spec_dir, home, ["inner", str(spec_dir / "spec.json")])
-    # bwrap itself gets no variable of the caller's either
-    subprocess.run(cmd, check=True, timeout=sc.timeout + 60, env={})
-    record = json.loads((spec_dir / "result.json").read_text(encoding="utf-8"))
-    return normalize(record, root, sc, agy)
+    return normalize(run_sandboxed(cmd, sc.timeout + 60), root, sc, agy)
 
 
 def normalize(record: dict[str, Any], root: Path, sc: Scenario, agy: str) -> dict[str, Any]:
     """The record as committed: no probe or binary path, no OAuth query value, bounded lines.
 
     A line longer than :data:`LINE_LIMIT` is cut, and says so with
-    :data:`PROBE_CUT`; the reducer never reads a cut line as a record.
+    :data:`PROBE_CUT`; the reducer never reads a cut line as a record, and
+    the record's capture says that stream lost output
+    (``<stream>_truncated``).
     """
     text = json.dumps(record, ensure_ascii=False)
     text = text.replace(str(root), "<root>").replace(agy, "agy").replace(SANDBOX_AGY, "agy")
@@ -1944,6 +2246,7 @@ def normalize(record: dict[str, Any], root: Path, sc: Scenario, agy: str) -> dic
         for item in out[stream]:
             if len(item[1]) > LINE_LIMIT:
                 item[1] = item[1][:LINE_LIMIT] + f"{PROBE_CUT}{len(item[1])} chars>"
+                out["capture"][f"{stream}_truncated"] = True
     if len(out["argv"]) and any(len(a) > EXCERPT_LIMIT for a in out["argv"]):
         out["argv"] = [
             a if len(a) <= EXCERPT_LIMIT else a[:80] + f"<{len(a)} chars>" for a in out["argv"]
@@ -2002,12 +2305,25 @@ def discover_version(
     return version, record
 
 
+def binary_sha256(path: str) -> str:
+    """The binary's sha256: the build's identity, which every record names (``agy_sha256``)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while block := f.read(1 << 20):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def record_all(agy: str, out: Path, only: set[str] | None = None, workers: int = 8) -> list[str]:
     """Run the scenarios (groups in order, the rest in parallel) and write one record each.
 
     The ``version`` scenario runs first, always (:func:`discover_version`):
-    every record names the version it printed, and its own record is
-    written when it is chosen.
+    every record names the version it printed and the binary's sha256, its
+    build's identity, and the version's own record is written when it is
+    chosen. The binary is hashed before the first run and after the last,
+    and the records are written only once both agree and every run has
+    returned: a failed run, or a binary replaced during the recording,
+    writes nothing.
     """
     if shutil.which("bwrap") is None:
         raise SystemExit("bwrap is required")
@@ -2018,20 +2334,13 @@ def record_all(agy: str, out: Path, only: set[str] | None = None, workers: int =
     for sc in chosen:
         if sc is not VERSION_SCENARIO:
             groups.setdefault(sc.group or sc.name, []).append(sc)
-    written: list[str] = []
+    identity = binary_sha256(agy)
+    made: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="agy-probe.") as tmp:
         root = Path(tmp).resolve()
         version, version_record = discover_version(agy, root)
-        out.mkdir(parents=True, exist_ok=True)
-
-        def write(rec: dict[str, Any]) -> None:
-            rec["agy_version"] = version
-            path = out / f"{rec['scenario']}.json"
-            path.write_text(json.dumps(rec, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
-            written.append(rec["scenario"])
-
         if VERSION_SCENARIO in chosen:
-            write(version_record)
+            made.append(version_record)
         shared: dict[str, tuple[Path, Path]] = {}
 
         def run_group(members: list[Scenario]) -> list[dict[str, Any]]:
@@ -2043,9 +2352,17 @@ def record_all(agy: str, out: Path, only: set[str] | None = None, workers: int =
 
         with concurrent.futures.ThreadPoolExecutor(workers) as pool:
             for records in pool.map(run_group, groups.values()):
-                for rec in records:
-                    write(rec)
-    return written
+                made.extend(records)
+    if binary_sha256(agy) != identity:
+        raise ProbeError("the binary changed during the recording: no record written")
+    out.mkdir(parents=True, exist_ok=True)
+    for rec in made:
+        rec["agy_version"] = version
+        rec["agy_sha256"] = identity
+        path = out / f"{rec['scenario']}.json"
+        text = json.dumps(rec, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
+        path.write_text(text, encoding="utf-8")
+    return [rec["scenario"] for rec in made]
 
 
 # The two complete measurements of what a prompt loses: as text on stdin,
@@ -2081,28 +2398,149 @@ def scalar_values_in(first: int, last: int) -> int:
     return last - first + 1 - surrogates
 
 
-def sweep_problems(found: dict[str, dict[str, Any]], prefix: str = ALL_PREFIX) -> list[str]:
+SCENARIO_NAMED = {s.name: s for s in SCENARIOS}
+SHA256 = re.compile(r"[0-9a-f]{64}")
+# What a check that meets a value of an unexpected type or shape raises: the
+# record is then one the checks cannot read, a problem, never a crash.
+_UNREADABLE = (KeyError, TypeError, ValueError, IndexError, AttributeError, RecursionError)
+
+
+def _same(value: object, want: object) -> bool:
+    """``value == want``, and of the same type: ``1`` is not ``True``, ``0.0`` not ``0``."""
+    return type(value) is type(want) and value == want
+
+
+def _sweep_record_problems(name: str, record: object) -> list[str]:
+    """Why one complete-measurement record cannot go into a table, or ``[]``.
+
+    It must be the run its plan made (:data:`SWEEP_PLAN`): the scenario's
+    argv and stdin (the transport: text, or the framed message), a whole
+    capture of a run that completed at exit 0, one model request with the
+    synthetic key, its prompt whole in agy's wrapper (no cut, the closing
+    tag kept, the bytes sent), and a clean measurement of exactly the
+    plan's spans: framed, in order, nothing foreign, the dropped runs
+    ascending and apart, each inside a span, and received plus dropped
+    adding up to what was sent. Anything less, a value of another type
+    among it, is a problem: what is missing from what arrived was then not
+    shown to be removed.
+    """
+    if not isinstance(record, dict):
+        return [f"{name}: not a record"]
+    text, spans, framed = SWEEP_PLAN[name]
+    sc = SCENARIO_NAMED[name]
+    problems: list[str] = []
+
+    def bad(why: str) -> None:
+        problems.append(f"{name}: {why}")
+
+    if not _same(record.get("scenario"), name):
+        bad(f"names the scenario {record.get('scenario')!r}")
+    if record.get("argv") != sc.argv:
+        bad("was not run with its scenario's argv: another transport")
+    stdin = sc.stdin or b""
+    if not _same(record.get("stdin_bytes"), len(stdin)):
+        how = "framed message" if framed else "text"
+        bad(f"sent {record.get('stdin_bytes')!r} bytes on stdin, not its {how}'s {len(stdin)}")
+    if not _same(record.get("exit"), 0):
+        bad(f"exit {record.get('exit')!r}")
+    if not capture_of(record).whole:
+        bad(f"its capture is not whole: {record.get('capture')!r}")
+    try:
+        kind = outcome_of(record).kind
+    except _UNREADABLE:
+        kind = "unreadable"
+    if kind != "completed":
+        bad(f"the run is {kind}, not completed")
+    requests = record.get("requests")
+    if not isinstance(requests, list) or len(requests) != 1:
+        bad(f"{len(requests) if isinstance(requests, list) else requests!r} model requests, not 1")
+    elif not isinstance(requests[0], dict) or requests[0].get("key") != "synthetic":
+        bad("its model request did not carry the synthetic key")
+    facts = record.get("facts")
+    facts = facts if isinstance(facts, dict) else {}
+    fidelity = facts.get("fidelity")
+    fidelity = fidelity if isinstance(fidelity, dict) else {}
+    for key, want in (
+        ("wrapped", True),
+        ("closing_tag_kept", True),
+        ("truncated_bytes", None),
+        ("sent_bytes", len(text.encode())),
+    ):
+        if key not in fidelity or not _same(fidelity[key], want):
+            bad(f"its request's fidelity {key} is {fidelity.get(key, 'absent')!r}, not {want!r}")
+    measured = facts.get("all")
+    if not isinstance(measured, dict):
+        bad("not measured cleanly: no measurement")
+        return problems
+    sent = sum(last - first + 1 for first, last in spans)
+    for key, want in (
+        ("first", spans[0][0]),
+        ("last", spans[-1][1]),
+        ("sent", sent),
+        ("framed", True),
+        ("ordered", True),
+        ("foreign", []),
+    ):
+        if key not in measured or not _same(measured[key], want):
+            bad(f"not measured cleanly: {key} is {measured.get(key, 'absent')!r}, not {want!r}")
+    dropped = measured.get("dropped")
+    runs_ok = isinstance(dropped, list) and all(
+        isinstance(r, list) and len(r) == 2 and all(_is_int(x) for x in r) and r[0] <= r[1]
+        for r in dropped
+    )
+    if not runs_ok:
+        bad(f"not measured cleanly: dropped is {str(dropped)[:80]}, not [first, last] runs")
+        return problems
+    # the spans as runs of consecutive code points: a dropped run may cross
+    # from one span into the next (U+007F..U+009F), never into a gap
+    sent_runs: list[list[int]] = []
+    for a, b in spans:
+        if sent_runs and sent_runs[-1][1] + 1 == a:
+            sent_runs[-1][1] = b
+        else:
+            sent_runs.append([a, b])
+    previous = -2
+    for first, last in dropped:
+        if first <= previous + 1:
+            bad(f"not measured cleanly: the dropped run U+{first:04X} is not after the last, apart")
+            break
+        if not any(a <= first and last <= b for a, b in sent_runs):
+            bad(f"not measured cleanly: the dropped run U+{first:04X} is outside what was sent")
+            break
+        previous = last
+    removed = sum(last - first + 1 for first, last in dropped)
+    if not _same(measured.get("received"), sent - removed):
+        bad(
+            f"not measured cleanly: received {measured.get('received')!r} of {sent} sent, "
+            f"{removed} dropped: the counts do not add up"
+        )
+    return problems
+
+
+def sweep_problems(found: dict[str, Any], prefix: str = ALL_PREFIX) -> list[str]:
     """Why the ``prefix*`` records are not one complete, clean measurement, or ``[]``.
 
     Complete: every prompt of the sweep is there, and together they sent
     every scalar value once, in order, with no gap and no overlap. Clean:
-    each prompt reached the stand-in and arrived framed, in order, with
-    nothing that was not sent (:func:`measure_all`), so that what is missing
-    was removed. With none of the records, nothing was measured: that is a
-    problem, never an empty table.
+    each record is the run its plan made and measured cleanly
+    (:func:`_sweep_record_problems`), so that what is missing from what
+    arrived was removed. With none of the records, nothing was measured:
+    that is a problem, never an empty table.
     """
-    names = [s.name for s in SCENARIOS if s.name.startswith(prefix)]
+    names = [name for name in SWEEP_PLAN if name.startswith(prefix)]
     problems = [f"{name}: no record" for name in names if name not in found]
     spans = []
     for name in names:
-        record = found.get(name)
-        if record is None:
+        if name not in found:
             continue
-        measured = record["facts"].get("all")
-        if not measured or measured.get("dropped") is None:
-            clean = {k: (measured or {}).get(k) for k in ("framed", "ordered", "foreign")}
-            problems.append(f"{name}: not measured cleanly {clean}")
+        try:
+            mine = _sweep_record_problems(name, found[name])
+        except _UNREADABLE as e:
+            mine = [f"{name}: a record the checks cannot read ({type(e).__name__})"]
+        if mine:
+            problems += mine
             continue
+        measured = found[name]["facts"]["all"]
         spans.append((measured["first"], measured["last"], measured["sent"], name))
     following = 0
     for first, last, sent, name in sorted(spans):
@@ -2118,32 +2556,57 @@ def sweep_problems(found: dict[str, dict[str, Any]], prefix: str = ALL_PREFIX) -
     return problems
 
 
-def build_problems(found: dict[str, dict[str, Any]]) -> list[str]:
-    """Why ``found`` is not the records of one build, or ``[]``.
+def build_problems(found: dict[str, Any]) -> list[str]:
+    """Why ``found`` is not the records of one identified build, or ``[]``.
 
-    Every record names the same version, and the ``version`` record, when
-    there is one, printed it.
+    Every record names a version (:data:`VERSION_TEXT`) and the binary's
+    sha256, all the same: a missing or malformed one is no label, never
+    one more of a kind. The ``version`` record is there and printed that
+    version.
     """
     if not found:
         return ["no record"]
-    labels = sorted({str(r.get("agy_version")) for r in found.values()})
-    if len(labels) != 1:
-        return [f"the records name more than one build: {labels}"]
-    if "version" in found and version_printed(found["version"]) != labels[0]:
+    problems, versions, digests = [], set(), set()
+    for name, record in sorted(found.items()):
+        if not isinstance(record, dict):
+            problems.append(f"{name}: not a record")
+            continue
+        version, digest = record.get("agy_version"), record.get("agy_sha256")
+        if isinstance(version, str) and VERSION_TEXT.fullmatch(version):
+            versions.add(version)
+        else:
+            problems.append(f"{name}: names no build version ({version!r})")
+        if isinstance(digest, str) and SHA256.fullmatch(digest):
+            digests.add(digest)
+        else:
+            problems.append(f"{name}: names no build sha256 ({digest!r})")
+    if problems:
+        return problems
+    if len(versions) != 1 or len(digests) != 1:
+        return [f"the records name more than one build: {sorted(versions)} {sorted(digests)}"]
+    if "version" not in found:
+        return ["no version record: nothing shows what the build printed"]
+    try:
+        printed = version_printed(found["version"])
+    except _UNREADABLE:
+        printed = None
+    if printed != next(iter(versions)):
         return ["the version record did not print the version the records name"]
     return []
 
 
 TABLE_HEADER = """\
-What agy {version} removes from a prompt, measured over every Unicode scalar
-value by tests/antigravity_probe.py, as text on stdin (fidelity-all-*) and
-framed as one stream-json message (fidelity-framed-*): the union of the
-dropped runs of each, which are the same. One inclusive range per line, in
-hexadecimal. Written by
+What agy {version} removes from a prompt, measured over every Unicode
+scalar value by tests/antigravity_probe.py, as text on stdin
+(fidelity-all-*) and framed as one stream-json message (fidelity-framed-*):
+the union of the dropped runs of each, which are the same. One inclusive
+range per line, in hexadecimal. The build's sha256:
+  {sha256}
+Written by
   python3 -I tests/antigravity_probe.py table --records DIR"""
 
 
-def table_problems(found: dict[str, dict[str, Any]]) -> list[str]:
+def table_problems(found: dict[str, Any]) -> list[str]:
     """Why ``found`` cannot give a build's table, or ``[]``: the refusals of ``table``."""
     problems = build_problems(found)
     for prefix in SWEEPS:
@@ -2162,19 +2625,27 @@ def write_table(records_dir: Path) -> Path:
     """Write ``records_dir``'s measured table as ``dropped.txt`` beside its records.
 
     Refused (:class:`ProbeError`, and the table already there left as it
-    is) unless the records are one build's (:func:`build_problems`) and
-    hold both complete, clean measurements (:func:`sweep_problems`), which
-    agree: an empty or partial directory, or one of mixed builds, would
-    otherwise give a table that cannot tell no removal from no measurement.
+    is) unless every record is readable JSON, the records are one
+    identified build's (:func:`build_problems`), and they hold both
+    complete, clean measurements (:func:`sweep_problems`), which agree: an
+    empty, partial, unlabelled or mixed directory, or one whose records do
+    not add up, would otherwise give a table that cannot tell no removal
+    from no measurement.
     """
-    found = {p.stem: json.loads(p.read_text(encoding="utf-8")) for p in records_dir.glob("*.json")}
-    problems = table_problems(found)
+    found: dict[str, Any] = {}
+    problems = []
+    for path in sorted(records_dir.glob("*.json")):
+        try:
+            found[path.stem] = strict_json(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+            problems.append(f"{path.name}: not readable JSON")
+    problems += table_problems(found)
     if problems:
         raise ProbeError("no table written: " + "; ".join(problems[:10]))
-    version = next(iter(found.values()))["agy_version"]
+    first = found["version"]
     path = records_dir / "dropped.txt"
     staged = records_dir / "dropped.txt.new"
-    header = TABLE_HEADER.format(version=version)
+    header = TABLE_HEADER.format(version=first["agy_version"], sha256=first["agy_sha256"])
     staged.write_text(format_table(dropped_of(found.values()), header), encoding="ascii")
     staged.replace(path)
     return path

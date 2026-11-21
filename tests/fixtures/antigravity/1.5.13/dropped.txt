@@ -1,8 +1,10 @@
-# What agy 1.5.13 removes from a prompt, measured over every Unicode scalar
-# value by tests/antigravity_probe.py, as text on stdin (fidelity-all-*) and
-# framed as one stream-json message (fidelity-framed-*): the union of the
-# dropped runs of each, which are the same. One inclusive range per line, in
-# hexadecimal. Written by
+# What agy 1.5.13 removes from a prompt, measured over every Unicode
+# scalar value by tests/antigravity_probe.py, as text on stdin
+# (fidelity-all-*) and framed as one stream-json message (fidelity-framed-*):
+# the union of the dropped runs of each, which are the same. One inclusive
+# range per line, in hexadecimal. The build's sha256:
+#   c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65
+# Written by
 #   python3 -I tests/antigravity_probe.py table --records DIR
 0000..0008
 000E..001F

@@ -1,4 +1,5 @@
 {
+ "agy_sha256": "c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65",
  "agy_version": "1.5.13",
  "argv": [
   "-p",
@@ -9,6 +10,12 @@
   "{\"modelProvider\":\"gemini\"}",
   "--dangerously-skip-permissions"
  ],
+ "capture": {
+  "stderr_eof": true,
+  "stderr_truncated": false,
+  "stdout_eof": true,
+  "stdout_truncated": false
+ },
  "exit": 0,
  "facts": {
   "context_markers": [
@@ -16,7 +23,7 @@
   ],
   "names_app_data_dir": true,
   "system_prompt_chars": 16835,
-  "system_prompt_sha256": "fef8a6b188398b472af48ec1e3300cf95055aa1c31f697eae3656e42af4b48ad"
+  "system_prompt_sha256": "8c2f2a628e3dddfabc4efd29a345c6be7f00aa1168d0eda8437c6f0c130f367c"
  },
  "home_files": [
   ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript/00000000.jsonl",
@@ -33,13 +40,17 @@
   ".gemini/antigravity-cli/installation_id",
   ".gemini/antigravity-cli/jetbox_summaries_proto.pb",
   ".gemini/antigravity-cli/jetski_state.pbtxt",
+  ".gemini/antigravity-cli/last_check.timestamp",
   ".gemini/antigravity-cli/log/cli-<time>.log",
   ".gemini/antigravity-cli/presence/<id>.lock",
+  ".gemini/antigravity-cli/updater/update.lock",
+  ".gemini/antigravity-cli/updater/update_status.json",
   ".gemini/config/.migrated",
   ".gemini/config/config.json",
   ".gemini/config/mcp_config.json",
   ".gemini/config/projects/default-cli-project.json"
  ],
+ "isolation": "private-root",
  "killed_by_probe": false,
  "markers": {},
  "other_requests": [],
@@ -49,9 +60,10 @@
  "requests": [
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\nfirst MARKER-ALPHA-123\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T00:57:36Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\nfirst MARKER-ALPHA-123\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:55:47Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
+   "markers_present": [],
    "model_path": "/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent",
    "thinking": {
     "includeThoughts": true,
@@ -82,8 +94,8 @@
  "stderr": [],
  "stdout": [
   [
-   0.25,
-   "{\"conversation_id\":\"1ec129c2-3635-4aa5-a51b-2acef00b2eb5\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.021191256,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}\n"
+   0.27,
+   "{\"conversation_id\":\"c64018bf-ddbc-4046-84ce-d4ec76d90f22\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.024654779,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}\n"
   ]
  ],
  "title_requests": 0

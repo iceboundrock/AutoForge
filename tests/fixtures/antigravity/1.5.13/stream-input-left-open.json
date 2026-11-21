@@ -1,4 +1,5 @@
 {
+ "agy_sha256": "c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65",
  "agy_version": "1.5.13",
  "argv": [
   "--input-format",
@@ -9,12 +10,18 @@
   "{\"modelProvider\":\"gemini\"}",
   "--dangerously-skip-permissions"
  ],
+ "capture": {
+  "stderr_eof": true,
+  "stderr_truncated": false,
+  "stdout_eof": true,
+  "stdout_truncated": false
+ },
  "exit": -9,
  "facts": {
   "context_markers": [],
   "names_app_data_dir": true,
   "system_prompt_chars": 16923,
-  "system_prompt_sha256": "41bd11bb3f3c7bbdd33a1a0d875947068fa025d8e4d14855b4cae15520364da6"
+  "system_prompt_sha256": "3e8ca07815d18182f2783f4b465b0d625c8ec1a5458e7b928464c29d08131518"
  },
  "home_files": [
   ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript/00000000.jsonl",
@@ -36,28 +43,33 @@
   ".gemini/antigravity-cli/installation_id",
   ".gemini/antigravity-cli/jetbox_summaries_proto.pb",
   ".gemini/antigravity-cli/jetski_state.pbtxt",
+  ".gemini/antigravity-cli/last_check.timestamp",
   ".gemini/antigravity-cli/log/cli-<time>.log",
   ".gemini/antigravity-cli/presence/<id>.lock",
+  ".gemini/antigravity-cli/updater/update.lock",
+  ".gemini/antigravity-cli/updater/update_status.json",
   ".gemini/config/.migrated",
   ".gemini/config/config.json",
   ".gemini/config/mcp_config.json",
   ".gemini/config/projects/default-cli-project.json"
  ],
+ "isolation": "private-root",
  "killed_by_probe": true,
  "markers": {},
  "note": "the probe kills it at its timeout",
  "other_requests": [],
  "outside_file_written": false,
  "processes_during": [
-  "agy --input-format stream-json --output-format stream-json --settings {\"modelProvider\":\"gemini\"}"
+  "agy --input-format stream-json --output-format stream-json --settings {\"modelProvider\":\"gemini\"} --dangerously-sk"
  ],
  "processes_left": [],
  "requests": [
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\nonly\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T00:57:28Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\nonly\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:55:37Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
+   "markers_present": [],
    "model_path": "/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent",
    "thinking": {
     "includeThoughts": true,
@@ -88,20 +100,20 @@
  "stderr": [],
  "stdout": [
   [
-   0.23,
-   "{\"event\":\"init\",\"conversation_id\":\"de182ad9-8798-45a9-9706-73c6529c84c3\",\"init\":{\"cwd\":\"<root>/stream-input-left-open.mc0hkt3u/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"always-proceed\"}}\n"
+   0.22,
+   "{\"event\":\"init\",\"conversation_id\":\"e2527fd0-a410-4b9f-a8e6-d7ad4e130c9d\",\"init\":{\"cwd\":\"<root>/stream-input-left-open.e003q0ea/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"always-proceed\"}}\n"
   ],
   [
    0.26,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"de182ad9-8798-45a9-9706-73c6529c84c3\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
-  ],
-  [
-   0.26,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"de182ad9-8798-45a9-9706-73c6529c84c3\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.003407111,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"e2527fd0-a410-4b9f-a8e6-d7ad4e130c9d\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
   ],
   [
    0.28,
-   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"de182ad9-8798-45a9-9706-73c6529c84c3\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.022642718,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"e2527fd0-a410-4b9f-a8e6-d7ad4e130c9d\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.003755511,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+  ],
+  [
+   0.28,
+   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"e2527fd0-a410-4b9f-a8e6-d7ad4e130c9d\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.030218304,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
   ]
  ],
  "title_requests": 0

@@ -20,7 +20,9 @@ read it before adding tests for a listed area.
   and synthetic credentials, and calls no model: the Claude and `agy`
   probes answer from a loopback stand-in, and the `agy` probe runs each
   scenario in a private root of its own (no host root, no home of the
-  host's, an empty environment for its helper), checked by canaries. The other is the live Pi smoke test
+  host's, an empty environment for its helper, each workspace set up
+  inside it, and the record read back from its stdout with a bound, never
+  from a file it could write), checked by canaries. The other is the live Pi smoke test
   (`tests/test_live_pi.py`, #135), whose one test (a REMOTE REVIEW, one
   model call) is the only one that makes a model call: marked `live`, deselected by default (`pyproject.toml` adds
   `-m 'not live'`), and skipped unless `AUTOFORGE_LIVE_PI=1`. It uses the

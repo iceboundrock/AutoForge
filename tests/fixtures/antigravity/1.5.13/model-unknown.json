@@ -1,4 +1,5 @@
 {
+ "agy_sha256": "c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65",
  "agy_version": "1.5.13",
  "argv": [
   "-p",
@@ -10,6 +11,12 @@
   "--model",
   "no-such-model"
  ],
+ "capture": {
+  "stderr_eof": true,
+  "stderr_truncated": false,
+  "stdout_eof": true,
+  "stdout_truncated": false
+ },
  "exit": 1,
  "facts": {},
  "home_files": [
@@ -20,12 +27,16 @@
   ".gemini/antigravity-cli/implicit/<id>.pb",
   ".gemini/antigravity-cli/installation_id",
   ".gemini/antigravity-cli/jetski_state.pbtxt",
+  ".gemini/antigravity-cli/last_check.timestamp",
   ".gemini/antigravity-cli/log/cli-<time>.log",
+  ".gemini/antigravity-cli/updater/update.lock",
+  ".gemini/antigravity-cli/updater/update_status.json",
   ".gemini/config/.migrated",
   ".gemini/config/config.json",
   ".gemini/config/mcp_config.json",
   ".gemini/config/projects/default-cli-project.json"
  ],
+ "isolation": "private-root",
  "killed_by_probe": false,
  "markers": {},
  "other_requests": [],
@@ -38,117 +49,117 @@
  "signalled": null,
  "stderr": [
   [
-   0.21,
+   0.23,
    "error: invalid model selection (--model \"no-such-model\" --effort \"\"): model no-such-model is not recognized as a known model or custom model in settings\n"
   ],
   [
-   0.21,
+   0.23,
    "Available models:\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 4 Neon (High)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 4 Neon (XHigh)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 4 Neon (Medium)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 4 Neon (Low)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 4 Carbon (High)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 4 Carbon (Medium)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 4 Carbon (Low)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 4 Hydrogen (High)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 4 Hydrogen (XHigh)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 4 Hydrogen (Medium)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 4 Hydrogen (Low)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 4 Argon (High)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 4 Argon (Medium)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 4 Argon (Low)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 3.8 Flash (High)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 3.8 Flash (Medium)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 3.8 Flash (Low)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 3.7 Flash (High)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 3.7 Flash (Medium)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 3.7 Flash (Low)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 3.6 Flash (High)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 3.6 Flash (Medium)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 3.6 Flash (Low)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 3.1 Pro (High)\n"
   ],
   [
-   0.21,
+   0.23,
    "  Gemini 3.1 Pro (Low)\n"
   ]
  ],
  "stdout": [
   [
-   0.21,
+   0.23,
    "{\"conversation_id\":\"\",\"status\":\"ERROR\",\"response\":\"\",\"error\":\"invalid model selection (--model \\\"no-such-model\\\" --effort \\\"\\\"): model no-such-model is not recognized as a known model or custom model in settings\\nAvailable models:\\n  Gemini 4 Neon (High)\\n  Gemini 4 Neon (XHigh)\\n  Gemini 4 Neon (Medium)\\n  Gemini 4 Neon (Low)\\n  Gemini 4 Carbon (High)\\n  Gemini 4 Carbon (Medium)\\n  Gemini 4 Carbon (Low)\\n  Gemini 4 Hydrogen (High)\\n  Gemini 4 Hydrogen (XHigh)\\n  Gemini 4 Hydrogen (Medium)\\n  Gemini 4 Hydrogen (Low)\\n  Gemini 4 Argon (High)\\n  Gemini 4 Argon (Medium)\\n  Gemini 4 Argon (Low)\\n  Gemini 3.8 Flash (High)\\n  Gemini 3.8 Flash (Medium)\\n  Gemini 3.8 Flash (Low)\\n  Gemini 3.7 Flash (High)\\n  Gemini 3.7 Flash (Medium)\\n  Gemini 3.7 Flash (Low)\\n  Gemini 3.6 Flash (High)\\n  Gemini 3.6 Flash (Medium)\\n  Gemini 3.6 Flash (Low)\\n  Gemini 3.1 Pro (High)\\n  Gemini 3.1 Pro (Low)\",\"duration_seconds\":0,\"num_turns\":0,\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":0},\"finished_reason\":\"error\"}\n"
   ]
  ],

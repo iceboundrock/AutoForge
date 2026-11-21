@@ -13,14 +13,20 @@ the contract the report suggests, on the records and on faults ``agy``
 cannot be made to produce (a malformed line or value, a record without its
 LF, a blank or cut line, a member given twice, a contradictory or
 incomplete result, a duplicate or misplaced result, a missing init, a
-response or tool that never ends, an ambiguous step, a capture that was
-abandoned, truncated or ended by a limit), the complete measurements of
-what a prompt loses, as text on stdin (``fidelity-all-*``) and framed as
-the recommended transport sends it (``fidelity-framed-*``), are held to the
-committed table ``dropped.txt``, the ``table`` command is held to refuse
-incomplete evidence, and the records are checked to carry no path of the
-host, no OAuth query value and no key, and to name the sandbox they were
-made in. The package never imports the probe.
+response or tool that never ends, an ambiguous step, a capture of stdout
+or stderr that was abandoned or truncated, an exit by a limit or a
+signal), the complete measurements of what a prompt loses, as text on
+stdin (``fidelity-all-*``) and framed as the recommended transport sends
+it (``fidelity-framed-*``), are held to the committed table
+``dropped.txt``, the ``table`` command is held to refuse incomplete,
+unidentified or inconsistent evidence, and the records are checked to
+carry no path of the host, no OAuth query value and no key, and to name
+the sandbox they were made in. The recorder is held to its boundary: with
+a fake ``agy`` in ``bwrap``, by harmless canaries of the host's files,
+environment and sockets, a link and a FIFO planted where the host could
+read them, junk written into the record's pipe, and a caller's
+``GIT_DIR``; without ``bwrap``, by its bounded read of the record. The
+package never imports the probe.
 
 Opt-in, ``AUTOFORGE_AGY_PROBE_BIN`` names an installed ``agy``: the probe
 records every scenario again with that binary (Linux and ``bwrap`` only;
@@ -43,6 +49,7 @@ import copy
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -59,6 +66,8 @@ import autoforge
 from . import antigravity_probe as probe
 from .antigravity_probe import (
     ALL_PREFIX,
+    ASTRAL,
+    AT_THE_BOUND,
     DROPPED_TABLE,
     FRAMED_PREFIX,
     ISOLATION,
@@ -67,18 +76,22 @@ from .antigravity_probe import (
     REPLY,
     SANDBOX_PYTHON,
     SCALAR_VALUES,
+    SCENARIO_NAMED,
     SCENARIOS,
     SWEEPS,
     SYNTHETIC_KEY,
     VERSION_SCENARIO,
     WHOLE,
+    WIDEST,
     Capture,
     Outcome,
     ProbeError,
+    build_problems,
     capture_of,
     classify,
     discover_version,
     dropped_of,
+    fixed_argv,
     is_dropped,
     measure_all,
     outcome_of,
@@ -86,6 +99,7 @@ from .antigravity_probe import (
     record_all,
     reduce_stream,
     result_flags,
+    run_sandboxed,
     sandbox_argv,
     stripped,
     sweep_problems,
@@ -98,6 +112,8 @@ REPO = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "antigravity" / "1.5.13"
 REPORT = REPO / "docs" / "antigravity-cli-spike.md"
 PINNED = "1.5.13"
+# The binary the committed records were made with (the report's header).
+PINNED_SHA256 = "c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65"
 PROBE_BIN = os.environ.get("AUTOFORGE_AGY_PROBE_BIN", "")
 # An absolute path of the host: one not spelt after the probe's <root>.
 HOST_PATH = re.compile(r"(?<![\w.>-])/(?:home|Users|root|tmp|var|private)/")
@@ -173,6 +189,10 @@ def derive(record: dict[str, Any]) -> dict[str, Any]:
         "result_less_exit": result_flags(record)["result_less_exit"],
         "left": len(record["processes_left"]),
         "markers": sorted(record["markers"]),
+        # what had run in the workspace when the model was first asked
+        "markers_first_request": sorted(
+            record["requests"][0]["markers_present"] if record["requests"] else []
+        ),
         "outside_file": record["outside_file_written"],
         "identical": fidelity.get("identical"),
         "identical_after_strip": fidelity.get("identical_after_strip"),
@@ -185,11 +205,13 @@ def derive(record: dict[str, Any]) -> dict[str, Any]:
 OK = {"exit": 0, "status": "SUCCESS", "outcome": "completed", "results": 1}
 PROTOCOL_IS_NOT_STREAM = {"outcome": "protocol"}  # not stream-json: the classifier refuses it
 API_ERROR = {"exit": 3, "status": "ERROR", "finished_reason": "error", "results": 1}
-# The repository's rules are loaded, and its hooks and MCP server run, whatever the settings.
+# The repository's rules are loaded, and its hooks and MCP server run, whatever the
+# settings: every one but the Stop hook before the first model request.
 CUSTOMIZED = {
     "exit": 0,
     "status": "SUCCESS",
     "markers": ["hook-pre-invocation", "hook-session-start", "hook-stop", "mcp-started"],
+    "markers_first_request": ["hook-pre-invocation", "hook-session-start", "mcp-started"],
     "context_markers": ["AGENTS-RULE-MARKER", "GEMINI-RULE-MARKER", "DOTAGENTS-RULE-MARKER"],
 }
 
@@ -307,6 +329,17 @@ EXPECTED: dict[str, dict[str, Any]] = {
         "left": 0,
         "outcome": "print_timeout",
     },
+    # the same on the fixed argv, framed: exit 0, a SUCCESS that names the
+    # timeout (contradictory, so a protocol failure), and the task left running
+    "print-timeout-background-recommended": {
+        "exit": 0,
+        "status": "SUCCESS",
+        "finished_reason": "print_timeout",
+        "error_status": "DEADLINE_EXCEEDED",
+        "response_blocks": 1,
+        "left": 2,
+        "outcome": "protocol",
+    },
     "hang-no-limit": {"killed": True, "results": 0, "requests": 1, "outcome": "no_result"},
     "hang-print-timeout": {
         "exit": 3,
@@ -412,7 +445,7 @@ EXPECTED: dict[str, dict[str, Any]] = {
     "repository-customizations": CUSTOMIZED,
     "repository-customizations-untrusted": CUSTOMIZED,
     "repository-customizations-sandbox": CUSTOMIZED,
-    # the recommended launch itself: stream-json in, the two flags the adapter passes
+    # the recommended launch itself: the fixed argv, every flag of it, prompt framed
     "repository-customizations-recommended": {**CUSTOMIZED, "outcome": "completed"},
     "fresh-first": {"exit": 0, "requests": 1, "context_markers": ["MARKER-ALPHA-123"]},
     "fresh-second": {"exit": 0, "requests": 1, "context_markers": []},
@@ -439,15 +472,17 @@ for _sc in SCENARIOS:
             "closing_tag_kept": True,
             "identical_after_strip": True,
         }
-# The proposed prompt bound, with the widest escaping, framed: whole and unchanged.
-EXPECTED[NEAR_LIMIT] = {
-    **OK,
-    "requests": 1,
-    "identical": True,
-    "truncated": False,
-    "closing_tag_kept": True,
-}
-# No committed record is an exit without a result the adapter could relaunch on.
+# Framed at the proposed prompt bound: a large mixed sample, the widest
+# framing of all, and one astral character alone: each whole and unchanged.
+for _name in AT_THE_BOUND:
+    EXPECTED[_name] = {
+        **OK,
+        "requests": 1,
+        "identical": True,
+        "truncated": False,
+        "closing_tag_kept": True,
+    }
+# No record sets result_less_exit: the MVP never does (result_flags).
 for _want in EXPECTED.values():
     _want.setdefault("result_less_exit", False)
 
@@ -498,12 +533,7 @@ def complete_sweep_problems(found: dict[str, dict[str, Any]]) -> list[str]:
 
 def cross_record_problems(found: dict[str, dict[str, Any]]) -> list[str]:
     """The facts that compare two records."""
-    problems = []
-    labels = {r["agy_version"] for r in found.values()}
-    if len(labels) != 1:
-        problems.append(f"the records name more than one build: {sorted(labels)}")
-    elif version_printed(found["version"]) != next(iter(labels)):
-        problems.append("the version record did not print the version the records name")
+    problems = build_problems(found)  # one build: one version, one sha256, as printed
     problems += complete_sweep_problems(found)
     first, second = found["fresh-first"], found["fresh-second"]
     if first["facts"]["system_prompt_sha256"] != second["facts"]["system_prompt_sha256"]:
@@ -597,6 +627,8 @@ def test_every_scenario_has_a_committed_record_of_the_pinned_build(committed):
     assert sorted(committed) == sorted(s.name for s in SCENARIOS)
     assert sorted(EXPECTED) == sorted(committed)
     assert {r["agy_version"] for r in committed.values()} == {PINNED}
+    assert {r["agy_sha256"] for r in committed.values()} == {PINNED_SHA256}
+    assert PINNED_SHA256 in REPORT.read_text(encoding="utf-8")
     assert version_printed(committed["version"]) == PINNED
     assert [line for _, line in committed["version"]["stdout"]] == [PINNED + "\n"]
 
@@ -613,14 +645,6 @@ CREDENTIAL = re.compile(
     r"|\bsk-[A-Za-z0-9]{20,}|\bAIza[\w-]{35}\b|\bya29\.[\w-]{20,}|\bAKIA[0-9A-Z]{16}\b"
     r"|-----BEGIN [A-Z ]*PRIVATE KEY-----|(?i:authorization: *bearer +[\w.-]{20,})"
 )
-# The records the private-root probe made (the report's header); every
-# other committed record is the earlier sandbox's.
-PRIVATE_ROOT = {
-    *(s.name for s in SCENARIOS if s.name.startswith(FRAMED_PREFIX)),
-    NEAR_LIMIT,
-    "repository-customizations-recommended",
-    "detached-child",
-}
 
 
 def test_the_committed_records_carry_no_host_path_query_value_or_key(committed):
@@ -635,18 +659,120 @@ def test_the_committed_records_carry_no_host_path_query_value_or_key(committed):
     assert DROPPED_TABLE.read_text(encoding="ascii").isascii()
 
 
+CAPTURE_KEYS = {"stdout_eof", "stderr_eof", "stdout_truncated", "stderr_truncated"}
+
+
 def test_each_committed_record_names_the_sandbox_it_was_made_in(committed):
-    """The private root's records say so and say whether each pipe reached
-    EOF; the earlier sandbox's (the host root read-only, the helper with the
-    caller's environment) say neither, and the report tells them apart."""
-    fresh = {name for name, r in committed.items() if r.get("isolation") == ISOLATION}
-    earlier = {name for name, r in committed.items() if "isolation" not in r}
-    assert fresh == PRIVATE_ROOT and len(fresh) == 34
-    assert earlier == set(committed) - PRIVATE_ROOT and len(earlier) == 110
-    for name in fresh:
-        assert committed[name]["capture"] == {"stdout_eof": True, "stderr_eof": True}, name
-    assert not any("capture" in committed[name] for name in earlier)
+    """Every record was made in the private root (the report's header), and
+    says, for each stream, whether it reached EOF and whether a bound
+    dropped any of it. Each reached EOF on both, and lost nothing."""
+    assert {r.get("isolation") for r in committed.values()} == {ISOLATION}
+    for name, record in committed.items():
+        assert set(record["capture"]) == CAPTURE_KEYS, name
+        assert record["capture"] == {
+            "stdout_eof": True,
+            "stderr_eof": True,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }, name
     assert CREDENTIAL.search("token ghp_" + "a" * 36) and CREDENTIAL.search("AIza" + "b" * 35)
+
+
+# The runs that were given a prompt and ended on their own without exactly
+# one result (the report's sections 1 and 4), by why. Every other such run
+# wrote one result: a run's last record, or a refusal's only one.
+NOT_ONE_RESULT = {
+    # refused before any request, with nothing on stdout
+    "argv-flag-name": "usage",
+    "argv-after-double-dash": "usage",
+    "acp-flag-in-print-mode": "usage",
+    "settings-unknown-key": "setting",
+    "api-key-route-without-key": "no key",
+    # an empty stdin
+    "stdin-empty": "empty",
+    "stdin-stream-json-empty": "empty",
+    # no result records at all: the text output and the ACP server
+    "success-text": "text",
+    "acp-text": "acp",
+    "acp-permission-rejected": "acp",
+    # a stream-json input session: one result per turn
+    "stream-input-two-turns": "session",
+    "stream-input-malformed-after-turn": "session",
+}
+
+
+def test_the_runs_without_one_result_are_the_ones_the_report_names(committed):
+    """R2-F7, R3-F5 of PR #530: "every run given a prompt that ended on its
+    own wrote one result" is not so. These are the exceptions, each of them:
+    the refusals before any request wrote nothing on stdout at all
+    (``api-key-route-without-key`` among them, given a prompt), and an empty
+    stdin, the text output, ACP and an input session are the rest."""
+    found = {}
+    for sc in SCENARIOS:
+        record = committed[sc.name]
+        prompted = "-p" in sc.argv or any(a.startswith("-p=") for a in sc.argv)
+        prompted = prompted or sc.stdin is not None or sc.feed is not None
+        own = not record["killed_by_probe"] and record["signalled"] is None
+        count = sum(
+            1
+            for _, line in record["stdout"]
+            if (obj := _json_or_none(line)) is not None
+            and (obj.get("event") == "result" or {"status", "conversation_id"} <= set(obj))
+        )
+        if prompted and own and count != 1:
+            found[sc.name] = count
+    assert set(found) == set(NOT_ONE_RESULT)
+    for name, why in NOT_ONE_RESULT.items():
+        record = committed[name]
+        if why in ("usage", "setting", "no key"):
+            assert not text(record, "stdout").strip() and record["requests"] == [], name
+            assert record["exit"] == (2 if why == "usage" else 1), name
+        if why == "session":
+            assert found[name] == 2, name
+    report = " ".join(REPORT.read_text(encoding="utf-8").split())
+    summary = report[report.index("## 1. Summary") : report.index("## 2. Discovery")]
+    for name, why in NOT_ONE_RESULT.items():
+        if why in ("usage", "setting", "no key", "empty"):
+            assert f"`{name}`" in summary, name
+
+
+def _json_or_none(line: str) -> dict[str, Any] | None:
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def test_the_recommended_launches_are_the_fixed_argv(committed):
+    """R3-F5 of PR #530: the launches the report calls the recommended one
+    ran the fixed argv of its section 10, every flag of it, with the prompt
+    framed on stdin: the customized repository's (whose hooks and MCP
+    server ran before the model was asked) and a print timeout during a
+    background task. The report's argv is that argv, its three values
+    left open."""
+    for name, timeout in (
+        ("repository-customizations-recommended", probe.FIXED_TIMEOUT),
+        ("print-timeout-background-recommended", "5s"),
+    ):
+        record = committed[name]
+        assert record["argv"] == fixed_argv(timeout=timeout) == SCENARIO_NAMED[name].argv
+        assert record["stdin_bytes"] == len(probe.stream_message("do it").encode()), name
+        request = record["requests"][0]
+        assert f"/models/{probe.FIXED_MODEL}:" in request["model_path"], name
+        assert request["thinking"] == {"includeThoughts": True, "thinkingLevel": "HIGH"}, name
+        init = json.loads(record["stdout"][0][1])
+        assert init["event"] == "init" and init["init"]["model"] == probe.FIXED_MODEL, name
+    report = REPORT.read_text(encoding="utf-8")
+    section = report[report.index("### Suggested adapter contract") :]
+    block = section[
+        section.index("```sh\n") + 6 : section.index("```", section.index("```sh\n") + 6)
+    ]
+    argv = shlex.split(block.replace("\\\n", " "))
+    assert argv == ["agy", *fixed_argv("<id>", "<effort>", "<seconds>s")]
+    # the hooks and the MCP server had run when the model was first asked
+    first = committed["repository-customizations-recommended"]["requests"][0]
+    assert sorted(first["markers_present"]) == CUSTOMIZED["markers_first_request"]
 
 
 def test_the_report_cites_every_scenario():
@@ -904,10 +1030,10 @@ def test_no_value_anywhere_in_a_recorded_stream_raises(committed):
                     assert classify(reduce_stream(junk, []), 0, WHOLE).kind in KINDS, (name, path)
 
 
-def typed(err: object, exit_code: int = 3, *more: str) -> str:
+def typed(err: object, exit_code: int = 3, *more: str, capture: Capture = WHOLE) -> str:
     lines = stream(INIT, result("ERROR", finished_reason="error"))
     line = err if isinstance(err, str) else json.dumps(err)
-    return classify(reduce_stream(lines, ["AGY_ERROR: " + line, *more]), exit_code, WHOLE).kind
+    return classify(reduce_stream(lines, ["AGY_ERROR: " + line, *more]), exit_code, capture).kind
 
 
 @pytest.mark.parametrize(
@@ -958,6 +1084,24 @@ def test_an_agy_error_of_another_shape_or_count_types_nothing():
     # two typed lines: which one failed the turn is not known
     twice = json.dumps({"error_code": 429, "code_kind": "http"})
     assert typed(twice, 3, "AGY_ERROR: " + twice) == "error"
+
+
+@pytest.mark.parametrize(
+    "capture",
+    [
+        Capture(exited=True, stdout_eof=True, stderr_eof=False),
+        Capture(exited=True, stdout_eof=True, stderr_eof=True, stderr_truncated=True),
+    ],
+    ids=["stderr-not-at-eof", "stderr-truncated"],
+)
+def test_a_partial_stderr_types_no_failure(capture):
+    """A stderr not read to its end, or with output dropped, may have held a
+    second ``AGY_ERROR`` line: its one line proves no type (R3-F3 of PR
+    #530), and the failure stays an error. The exit and stdout change nothing."""
+    for code in (429, 503, 408):
+        err = {"error_code": code, "code_kind": "http"}
+        assert typed(err) != "error"
+        assert typed(err, capture=capture) == "error"
 
 
 def test_a_success_with_any_sign_of_failure_is_not_completed():
@@ -1036,43 +1180,42 @@ def test_a_line_over_the_reader_bound_is_a_violation_not_a_skip():
     assert classify(reduce_stream(GOOD_LINES, [], line_bound=10_000), 0, WHOLE).kind == "completed"
 
 
+def partial(**flags: bool) -> Capture:
+    """A capture of a process that exited on its own, whole but for ``flags``."""
+    return Capture(**{"exited": True, "stdout_eof": True, "stderr_eof": True, **flags})
+
+
 @pytest.mark.parametrize(
     ("capture", "kind"),
     [
         (WHOLE, "completed"),
-        (Capture(exited=False, eof=True), "killed"),
-        (Capture(exited=True, eof=False), "incomplete_capture"),
-        (Capture(exited=True, eof=True, truncated=True), "incomplete_capture"),
-        (Capture(exited=False, eof=False, truncated=True), "killed"),
+        (partial(exited=False), "killed"),
+        (partial(stdout_eof=False), "incomplete_capture"),
+        (partial(stderr_eof=False), "incomplete_capture"),
+        (partial(stdout_truncated=True), "incomplete_capture"),
+        (partial(stderr_truncated=True), "incomplete_capture"),
+        (Capture(False, False, False, True, True), "killed"),
+    ],
+    ids=[
+        "whole",
+        "not-exited",
+        "stdout-not-at-eof",
+        "stderr-not-at-eof",
+        "stdout-truncated",
+        "stderr-truncated",
+        "nothing-whole",
     ],
 )
 def test_a_whole_looking_run_completes_only_on_a_whole_capture(capture, kind):
     """A stream read short proves nothing: the process ended by a limit or a
     signal, a pipe some survivor still held (an abandoned capture), or a
     capture bound that dropped output each keep a well-formed stream from
-    completing. They never turn a failure into anything else."""
+    completing, on stderr as on stdout: completion needs no ``AGY_ERROR``
+    line, and part of stderr cannot show there was none (R3-F3 of PR #530).
+    They never turn a failure into anything else."""
     assert classify(reduce_stream(GOOD_LINES, []), 0, capture).kind == kind
     failed = stream(INIT, result("ERROR"))
     assert classify(reduce_stream(failed, []), 3, capture).kind == "error"
-
-
-def test_a_committed_record_is_read_with_its_own_capture(committed):
-    """A private-root record says whether each pipe reached EOF; the earlier
-    1.5.13 records count as read whole only when no process was left to
-    hold the pipe."""
-    assert capture_of(committed["success-stream-json"]) == WHOLE
-    assert "capture" not in committed["success-stream-json"]
-    assert committed["detached-child"]["capture"]["stdout_eof"] is True
-    assert capture_of(committed["detached-child"]) == WHOLE
-    assert capture_of(committed["hang-no-limit"]).exited is False
-    assert capture_of(committed["sigint-during-request"]).exited is False
-    legacy = copy.deepcopy(committed["success-stream-json"])
-    legacy["processes_left"] = [{"cmd": "sleep 300", "own_session": True, "reparented": True}]
-    assert capture_of(legacy).eof is False
-    assert outcome_of(legacy).kind == "incomplete_capture"
-    abandoned = copy.deepcopy(committed["detached-child"])
-    abandoned["capture"]["stdout_eof"] = False
-    assert outcome_of(abandoned).kind == "incomplete_capture"
 
 
 def run_record(lines: list[str], exit_code: int = 1, **more: Any) -> dict[str, Any]:
@@ -1083,29 +1226,83 @@ def run_record(lines: list[str], exit_code: int = 1, **more: Any) -> dict[str, A
         "killed_by_probe": False,
         "signalled": None,
         "processes_left": [],
-        "capture": {"stdout_eof": True, "stderr_eof": True},
+        "capture": {
+            "stdout_eof": True,
+            "stderr_eof": True,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        },
     }
     record.update(more)
     return record
 
 
-def test_reply_delivered_is_never_set_and_result_less_exit_only_on_a_whole_capture(committed):
+def test_a_record_is_read_with_its_own_capture(committed):
+    """Each record's ``capture`` is the executor's report for it; a record
+    without one, or with a flag that is not a boolean, has no whole capture,
+    and an exit status that is a signal's is no exit of the process's own,
+    whoever sent it (R3-F3 of PR #530)."""
+    assert capture_of(committed["success-stream-json"]) == WHOLE
+    assert capture_of(committed["detached-child"]) == WHOLE
+    assert capture_of(committed["hang-no-limit"]).exited is False
+    assert capture_of(committed["sigint-during-request"]).exited is False
+    good = run_record(stream(*GOOD), exit_code=0)
+    assert capture_of(good) == WHOLE and outcome_of(good).kind == "completed"
+    # the synthetic success the review built: whole on stdout, stderr not at its end
+    for key, value in (
+        ("stderr_eof", False),
+        ("stdout_eof", False),
+        ("stderr_truncated", True),
+        ("stdout_truncated", True),
+        ("stderr_eof", None),
+        ("stderr_truncated", None),
+        ("stdout_truncated", 0),
+    ):
+        short = copy.deepcopy(good)
+        short["capture"][key] = value
+        assert not capture_of(short).whole, (key, value)
+        assert outcome_of(short).kind == "incomplete_capture", (key, value)
+    for key in CAPTURE_KEYS:
+        short = copy.deepcopy(good)
+        del short["capture"][key]
+        assert outcome_of(short).kind == "incomplete_capture", key
+    assert outcome_of({**good, "capture": None}).kind == "incomplete_capture"
+    # a signal the probe did not send: the status is negative, the run no exit of its own
+    for code in (-11, -9, -15, 1.0, None, True):
+        assert capture_of({**good, "exit": code}).exited is False, code
+    began = stream(INIT, USER, agent(1, "half", "ACTIVE"))
+    assert outcome_of(run_record(began, exit_code=-11)).kind == "no_result"
+
+
+def test_neither_recovery_flag_is_ever_set(committed):
     """The flags that reach the engine's recovery (the report's section 9).
     ``reply_delivered`` stays unset: agy writes a reply only with its result.
-    ``result_less_exit`` needs a session that began and wrote no result,
-    exited on its own, read whole, with no violation and no model API error."""
+    ``result_less_exit`` stays unset too: the engine relaunches on it, and
+    nothing recorded shows an exit of agy's own, without a result, inside a
+    session the model had begun; ``init`` and a ``user_input`` step are
+    written before the model answers (``hang-no-limit``), so they show no
+    running session (R3-F3 of PR #530). Not even on a whole capture of a
+    stream the model had begun to answer."""
     for name, record in committed.items():
         assert result_flags(record) == {"reply_delivered": False, "result_less_exit": False}, name
+    assert [json.loads(line)["event"] for _, line in committed["hang-no-limit"]["stdout"]] == [
+        "init",
+        "step_update",
+    ]
+    assert '"user_input"' in committed["hang-no-limit"]["stdout"][1][1]
     began = stream(INIT, USER, agent(1, "half", "ACTIVE"))
-    assert result_flags(run_record(began))["result_less_exit"] is True
-    assert result_flags(run_record(began, exit_code=0))["result_less_exit"] is True
+    called = stream(INIT, USER, agent(1, ""), tool(2, "ACTIVE"))
     err = "AGY_ERROR: " + json.dumps({"error_code": 503, "code_kind": "http"})
     for record in (
-        run_record(stream(INIT)),  # no step: nothing shows a turn began
+        run_record(began),
+        run_record(began, exit_code=0),
+        run_record(called),
+        run_record(stream(INIT, USER)),  # what agy writes before any answer
+        run_record(stream(INIT)),
         run_record([]),
+        run_record(began, exit_code=-11),  # a signal nobody in the probe sent
         run_record(began, killed_by_probe=True),
         run_record(began, signalled="SIGTERM"),
-        run_record(began, capture={"stdout_eof": False, "stderr_eof": True}),
         run_record(began, stderr=[[0.2, err + "\n"]]),
         run_record([*began[:-1], began[-1].rstrip("\n")]),  # its last line cut short
         run_record(stream(INIT, USER, agent(1, "a"), result())),
@@ -1185,17 +1382,45 @@ def test_the_complete_measurements_cover_every_scalar_value_and_are_the_table(co
 
 
 def test_the_proposed_prompt_bound_arrives_whole_through_the_framing(committed):
-    """``fidelity-near-limit-stream-json``: a prompt of 160,000 UTF-8 bytes,
-    the bound the report proposes, mostly astral, framed into a line of
-    416,882 bytes, arrived identical, closing tag and metadata kept."""
-    record = committed[NEAR_LIMIT]
-    sent = probe.near_limit_prompt()
-    assert len(sent.encode()) == probe.PROMPT_LIMIT == 160_000
-    assert record["stdin_bytes"] == len(probe.stream_message(sent).encode()) == 416_882
-    assert not any(is_dropped(ord(c)) for c in sent)
-    fidelity = record["facts"]["fidelity"]
-    assert fidelity["identical"] and fidelity["closing_tag_kept"]
-    assert fidelity["truncated_bytes"] is None
+    """Three prompts of 160,000 UTF-8 bytes, the bound the report proposes,
+    each of characters agy keeps, framed, arrived identical, closing tag and
+    metadata kept: a large mixed sample, mostly astral, in a line of 416,882
+    bytes (``fidelity-near-limit-stream-json``); one astral character
+    alone, 480,046 bytes (``fidelity-astral-stream-json``); and the widest
+    framing any prompt the gate admits can have, VTs, 960,041 bytes
+    (``fidelity-widest-stream-json``, R3-F6 of PR #530)."""
+    lines = {}
+    for name, make in (
+        (NEAR_LIMIT, probe.near_limit_prompt),
+        (ASTRAL, probe.astral_prompt),
+        (WIDEST, probe.widest_prompt),
+    ):
+        record, sent = committed[name], make()
+        assert len(sent.encode()) == probe.PROMPT_LIMIT == 160_000, name
+        assert SCENARIO_NAMED[name].argv == probe.sj_run(), name
+        lines[name] = record["stdin_bytes"]
+        assert lines[name] == len(probe.stream_message(sent).encode()), name
+        assert not any(is_dropped(ord(c)) for c in sent), name
+        fidelity = record["facts"]["fidelity"]
+        assert fidelity["identical"] and fidelity["closing_tag_kept"], name
+        assert fidelity["truncated_bytes"] is None, name
+        assert fidelity["sent_bytes"] == fidelity["received_bytes"] == 160_000, name
+    assert lines == {NEAR_LIMIT: 416_882, ASTRAL: 480_046, WIDEST: 960_041}
+    # the widest: no character agy keeps takes more framed bytes per byte of UTF-8
+    envelope = len(probe.stream_message("").encode())
+    escaped = json.encoder.encode_basestring_ascii  # what stream_message's json.dumps uses
+    assert probe.stream_message("\x0b\U0001f680") == probe.stream_message("")[:-4] + (
+        escaped("\x0b\U0001f680")[1:-1] + '"}}\n'
+    )
+    widths = {}
+    for c in range(0x110000):
+        if 0xD800 <= c <= 0xDFFF or is_dropped(c):
+            continue
+        ch = chr(c)
+        widths[c] = (len(escaped(ch)) - 2) / len(ch.encode())
+    assert max(widths.values()) == probe.WIDEST_ESCAPE == widths[0x0B]
+    assert [c for c, w in widths.items() if w == probe.WIDEST_ESCAPE] == [0x0B]
+    assert lines[WIDEST] == probe.WIDEST_ESCAPE * 160_000 - 5 + envelope
 
 
 def test_a_measurement_that_lost_a_prompt_or_a_value_is_caught(committed):
@@ -1207,9 +1432,7 @@ def test_a_measurement_that_lost_a_prompt_or_a_value_is_caught(committed):
         unclean = copy.deepcopy(committed)
         unclean[prefix + "nul"]["facts"]["all"]["dropped"] = None
         assert any("not measured cleanly" in p for p in sweep_problems(unclean, prefix))
-        kept = copy.deepcopy(committed)
-        kept[prefix + "00"]["facts"]["all"]["dropped"].pop(0)
-        assert complete_sweep_problems(kept) == [
+        assert complete_sweep_problems(_kept(committed, prefix + "00")) == [
             f"what the {prefix}* prompts lost is not the table of dropped.txt"
         ]
         assert sweep_problems({}, prefix)[-1].endswith("does not cover every scalar value once")
@@ -1223,6 +1446,128 @@ def table_dir(tmp_path: Path, found: dict[str, dict[str, Any]]) -> Path:
     return out
 
 
+def _without(found: dict[str, dict[str, Any]], *names: str) -> dict[str, dict[str, Any]]:
+    return {k: v for k, v in found.items() if k not in names}
+
+
+def _changed(found: dict[str, Any], name: str, path: tuple[str, ...], value: Any) -> dict:
+    """``found`` with one member of one record set to ``value`` (removed for GONE)."""
+    out = copy.deepcopy(found)
+    holder = out[name]
+    for key in path[:-1]:
+        holder = holder[key]
+    if value is GONE:
+        del holder[path[-1]]
+    else:
+        holder[path[-1]] = value
+    return out
+
+
+def _kept(found: dict[str, Any], name: str) -> dict[str, Any]:
+    """``found`` as if ``name`` had kept its first dropped run, counts kept consistent."""
+    out = copy.deepcopy(found)
+    measured = out[name]["facts"]["all"]
+    first, last = measured["dropped"].pop(0)
+    measured["received"] += last - first + 1
+    return out
+
+
+def _unlabelled(found: dict[str, Any]) -> dict[str, Any]:
+    """No build named anywhere, and no version record to say what printed it."""
+    out = copy.deepcopy(_without(found, "version"))
+    for record in out.values():
+        del record["agy_version"], record["agy_sha256"]
+    return out
+
+
+def _both(found: dict[str, Any], path: tuple[str, ...], value: Any) -> dict[str, Any]:
+    """The same change to the two NUL captures, as text and framed."""
+    once = _changed(found, ALL_PREFIX + "nul", path, value)
+    return _changed(once, FRAMED_PREFIX + "nul", path, value)
+
+
+A00, F00, F05 = ALL_PREFIX + "00", FRAMED_PREFIX + "00", FRAMED_PREFIX + "05"
+OTHER_SHA = "0" * 64
+# (the evidence, what the refusal names): each a directory ``table`` refuses
+REFUSALS = {
+    "empty": (lambda c: {}, "no record"),
+    "no-sweep": (lambda c: _without(c, *(n for n in c if n.startswith(SWEEPS))), "no record"),
+    "partial": (lambda c: _without(c, ALL_PREFIX + "17"), f"{ALL_PREFIX}17: no record"),
+    "partial-framed": (lambda c: _without(c, FRAMED_PREFIX + "nul"), "nul: no record"),
+    "mixed": (lambda c: _changed(c, ALL_PREFIX + "05", ("agy_version",), "1.6.0"), "more than"),
+    "mixed-other": (lambda c: _changed(c, "help", ("agy_version",), "1.6.0"), "more than one"),
+    "mixed-sha": (lambda c: _changed(c, "help", ("agy_sha256",), OTHER_SHA), "more than one"),
+    # no label at all, and no version record: never one more label of a kind
+    "unlabelled": (_unlabelled, "names no build version (None)"),
+    "no-sha": (lambda c: _changed(c, A00, ("agy_sha256",), GONE), "names no build sha256"),
+    "bad-version": (
+        lambda c: _changed(c, A00, ("agy_version",), "None"),
+        "names no build version ('None')",
+    ),
+    "no-version-record": (lambda c: _without(c, "version"), "no version record"),
+    "version-not-printed": (
+        lambda c: _changed(c, "version", ("stdout",), [[0.1, "9.9.9\n"]]),
+        "did not print the version",
+    ),
+    # the two NUL captures with no model request: nothing was measured
+    "nul-no-request": (lambda c: _both(c, ("requests",), []), "0 model requests, not 1"),
+    "two-requests": (
+        lambda c: _changed(c, F00, ("requests",), c[F00]["requests"] * 2),
+        "2 model requests",
+    ),
+    "other-key": (
+        lambda c: _changed(c, F00, ("requests",), [{**c[F00]["requests"][0], "key": "other"}]),
+        "did not carry the synthetic key",
+    ),
+    "unclean": (
+        lambda c: _changed(c, ALL_PREFIX + "02", ("facts", "all", "dropped"), None),
+        "not measured cleanly",
+    ),
+    "not-framed": (lambda c: _changed(c, A00, ("facts", "all", "framed"), False), "framed is"),
+    "framed-1": (lambda c: _changed(c, A00, ("facts", "all", "framed"), 1), "framed is 1"),
+    "unordered": (lambda c: _changed(c, F05, ("facts", "all", "ordered"), False), "ordered is"),
+    "foreign": (lambda c: _changed(c, F05, ("facts", "all", "foreign"), ["U+0041"]), "foreign"),
+    # nothing dropped, yet fewer received than sent: the counts do not add up
+    "empty-dropped": (lambda c: _changed(c, A00, ("facts", "all", "dropped"), []), "add up"),
+    "dropped-junk": (
+        lambda c: _changed(c, A00, ("facts", "all", "dropped"), [[3, 1]]),
+        "not [first, last] runs",
+    ),
+    "dropped-outside": (
+        lambda c: _changed(c, A00, ("facts", "all", "dropped"), [[0x10FFFF, 0x10FFFF]]),
+        "outside what was sent",
+    ),
+    "dropped-overlap": (
+        lambda c: _changed(c, A00, ("facts", "all", "dropped"), [[1, 8], [5, 9]]),
+        "is not after the last",
+    ),
+    "received": (lambda c: _changed(c, F00, ("facts", "all", "received"), 7), "do not add up"),
+    "spans": (lambda c: _changed(c, F00, ("facts", "all", "first"), 2), "first is 2"),
+    "sent": (lambda c: _changed(c, F00, ("facts", "all", "sent"), 1), "sent is 1"),
+    "transport": (lambda c: _changed(c, F00, ("argv",), probe.stdin_run()), "another transport"),
+    "stdin-bytes": (lambda c: _changed(c, F00, ("stdin_bytes",), 12), "sent 12 bytes on stdin"),
+    "prompt-cut": (
+        lambda c: _changed(c, F00, ("facts", "fidelity", "truncated_bytes"), 9),
+        "truncated_bytes is 9",
+    ),
+    "tag-lost": (
+        lambda c: _changed(c, F00, ("facts", "fidelity", "closing_tag_kept"), False),
+        "closing_tag_kept is False",
+    ),
+    "capture": (
+        lambda c: _changed(c, F00, ("capture", "stderr_eof"), False),
+        "capture is not whole",
+    ),
+    "exit": (lambda c: _changed(c, A00, ("exit",), 1), "exit 1"),
+    "not-completed": (
+        lambda c: _changed(c, A00, ("stdout",), c[A00]["stdout"][:-1]),
+        "the run is no_result",
+    ),
+    "not-a-record": (lambda c: {**c, A00: [1, 2]}, f"{A00}: not a record"),
+    "differ": (lambda c: _kept(c, F00), "lose different characters"),
+}
+
+
 def test_the_table_command_writes_the_committed_table_from_the_committed_records(
     committed, tmp_path
 ):
@@ -1230,69 +1575,43 @@ def test_the_table_command_writes_the_committed_table_from_the_committed_records
     assert write_table(out) == out / "dropped.txt"
     assert (out / "dropped.txt").read_bytes() == DROPPED_TABLE.read_bytes()
     assert not (out / "dropped.txt.new").exists()
+    assert PINNED_SHA256 in DROPPED_TABLE.read_text(encoding="ascii")
 
 
-def _without(found: dict[str, dict[str, Any]], *names: str) -> dict[str, dict[str, Any]]:
-    return {k: v for k, v in found.items() if k not in names}
+BEFORE = "# the table before\n0000\n"
 
 
-def _relabel(found: dict[str, dict[str, Any]], name: str, version: str) -> dict[str, Any]:
-    out = copy.deepcopy(found)
-    out[name]["agy_version"] = version
-    return out
-
-
-def _unclean(found: dict[str, dict[str, Any]], name: str) -> dict[str, Any]:
-    out = copy.deepcopy(found)
-    out[name]["facts"]["all"]["dropped"] = None
-    return out
-
-
-def _framed_kept(found: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    out = copy.deepcopy(found)
-    out[FRAMED_PREFIX + "00"]["facts"]["all"]["dropped"].pop(0)
-    return out
-
-
-@pytest.mark.parametrize(
-    ("evidence", "refusal"),
-    [
-        (lambda c: {}, "no record"),
-        (lambda c: _without(c, *(n for n in c if n.startswith(SWEEPS))), "no record"),
-        (lambda c: _without(c, ALL_PREFIX + "17"), f"{ALL_PREFIX}17: no record"),
-        (lambda c: _without(c, FRAMED_PREFIX + "nul"), f"{FRAMED_PREFIX}nul: no record"),
-        (lambda c: _relabel(c, ALL_PREFIX + "05", "1.6.0"), "more than one build"),
-        (lambda c: _relabel(c, "help", "1.6.0"), "more than one build"),
-        (lambda c: _unclean(c, ALL_PREFIX + "02"), "not measured cleanly"),
-        (_framed_kept, "lose different characters"),
-    ],
-    ids=[
-        "empty",
-        "no-sweep",
-        "partial",
-        "partial-framed",
-        "mixed",
-        "mixed-other",
-        "unclean",
-        "differ",
-    ],
-)
-def test_the_table_command_refuses_incomplete_evidence_and_keeps_the_table(
+@pytest.mark.parametrize(("evidence", "refusal"), REFUSALS.values(), ids=REFUSALS.keys())
+def test_the_table_command_refuses_invalid_evidence_and_keeps_the_table(
     committed, tmp_path, evidence, refusal
 ):
-    """An empty, partial, unclean or mixed directory would give a table that
-    cannot tell no removal from no measurement: ``table`` writes nothing,
-    and the table already there stays as it was."""
+    """An empty, partial, unlabelled or mixed directory, or a record that is
+    not the run its plan made (another transport, another span, a cut
+    prompt, no model request), not a whole capture of a completed run, or
+    not a clean measurement that adds up, would give a table that cannot
+    tell no removal from no measurement (R2-F5, R3-F4 of PR #530): ``table``
+    writes nothing, and the table already there stays as it was."""
     out = table_dir(tmp_path, evidence(committed))
-    (out / "dropped.txt").write_text("# the table before\n0000\n", encoding="ascii")
-    with pytest.raises(ProbeError, match=refusal):
+    (out / "dropped.txt").write_text(BEFORE, encoding="ascii")
+    with pytest.raises(ProbeError, match=re.escape(refusal)):
         write_table(out)
-    assert (out / "dropped.txt").read_text(encoding="ascii") == "# the table before\n0000\n"
+    assert (out / "dropped.txt").read_text(encoding="ascii") == BEFORE
     assert not (out / "dropped.txt.new").exists()
+
+
+def test_the_table_command_refuses_on_its_command_line_too(committed, tmp_path):
+    """The command itself: exit 1, the refusal on stderr, the table as it was,
+    also for a record file that is not JSON at all."""
+    out = table_dir(tmp_path, _without(committed, ALL_PREFIX + "17"))
+    (out / "dropped.txt").write_text(BEFORE, encoding="ascii")
+    (out / "junk.json").write_text("{not json", encoding="utf-8")
     argv = [sys.executable, "-I", str(Path(probe.__file__)), "table", "--records", str(out)]
     done = subprocess.run(argv, capture_output=True, text=True, env={})
     assert done.returncode == 1 and "no table written" in done.stderr
-    assert (out / "dropped.txt").read_text(encoding="ascii") == "# the table before\n0000\n"
+    assert "junk.json: not readable JSON" in done.stderr
+    assert f"{ALL_PREFIX}17: no record" in done.stderr
+    assert (out / "dropped.txt").read_text(encoding="ascii") == BEFORE
+    assert not (out / "dropped.txt.new").exists()
 
 
 def test_measure_all_reads_only_a_clean_subsequence():
@@ -1366,6 +1685,7 @@ def test_the_version_is_asked_in_the_sandbox_never_on_the_host(monkeypatch, tmp_
         raise AssertionError(f"the probe started a process on the host: {args!r}")
 
     monkeypatch.setattr(probe, "run_one", run_one)
+    monkeypatch.setattr(probe, "binary_sha256", lambda path: OTHER_SHA)
     monkeypatch.setattr(probe, "SANDBOX_PYTHON", sys.executable)
     monkeypatch.setattr(probe.subprocess, "run", on_the_host)
     monkeypatch.setattr(probe.subprocess, "Popen", on_the_host)
@@ -1378,7 +1698,8 @@ def test_the_version_is_asked_in_the_sandbox_never_on_the_host(monkeypatch, tmp_
     assert record_all("/opt/agy", out, only={"success-stream-json"}) == ["success-stream-json"]
     assert [c[1] for c in calls] == ["version", "success-stream-json"]
     assert calls[0][3] == VERSION_SCENARIO.timeout == 15
-    assert json.loads((out / "success-stream-json.json").read_text())["agy_version"] == "9.9.9"
+    written = json.loads((out / "success-stream-json.json").read_text())
+    assert (written["agy_version"], written["agy_sha256"]) == ("9.9.9", OTHER_SHA)
     assert not (out / "version.json").exists()
     calls.clear()
     assert sorted(record_all("/opt/agy", out, only={"version"})) == ["version"]
@@ -1400,6 +1721,7 @@ def test_a_version_run_that_printed_no_version_stops_the_recording(
     monkeypatch, tmp_path, stdout, exit_code, killed
 ):
     monkeypatch.setattr(probe, "run_one", version_run(stdout, exit_code, killed))
+    monkeypatch.setattr(probe, "binary_sha256", lambda path: OTHER_SHA)
     monkeypatch.setattr(probe, "SANDBOX_PYTHON", sys.executable)
     monkeypatch.setattr(probe.shutil, "which", lambda name: f"/usr/bin/{name}")
     with pytest.raises(ProbeError, match="printed no version"):
@@ -1417,6 +1739,7 @@ def relabelled(found: dict[str, dict[str, Any]], version: str) -> dict[str, dict
     out = copy.deepcopy(found)
     for record in out.values():
         record["agy_version"] = version
+        record["agy_sha256"] = OTHER_SHA
     out["version"]["stdout"] = [[0.2, version + "\n"]]
     return out
 
@@ -1469,7 +1792,10 @@ needs_bwrap = pytest.mark.skipif(
 # A fake agy, run by the sandbox's interpreter: asked its version, it
 # reports on stderr what it can reach of the host (each canary the test
 # planted: a file, a variable's value, a socket by path, an abstract
-# socket and a loopback port), and prints a version.
+# socket and a loopback port), tries to plant a link and a FIFO where the
+# host could read them (the spec directory), and to write into the
+# record's channel when told to, and prints a version. Asked anything
+# else, it reports what it finds of the workspace's git repository.
 FAKE_AGY = """#!SANDBOX_PYTHON -I
 import errno, json, os, socket, sys, time
 
@@ -1478,9 +1804,30 @@ if log:  # only a launch in the caller's environment sees it
     with open(log, "a") as f:
         f.write(" ".join(sys.argv[1:]) + "\\n")
 canary = CANARY
+
+
+def attempt(action):
+    try:
+        action()
+        return "done"
+    except OSError as e:
+        return errno.errorcode.get(e.errno, str(e.errno))
+
+
 if sys.argv[1:] == ["--version"]:
     if HANG:
         time.sleep(600)
+    # the spec directory: the last argument of the helper that started us
+    args = open(f"/proc/{os.getppid()}/cmdline", "rb").read().split(b"\\0")
+    spec_dir = os.path.dirname(args[-2].decode())
+    planted = {
+        "link": attempt(lambda: os.symlink(canary["file"], spec_dir + "/result.json")),
+        "fifo": attempt(lambda: os.mkfifo(spec_dir + "/result.json")),
+        "spec": attempt(lambda: open(spec_dir + "/spec.json", "a").close()),
+    }
+    if canary.get("flood"):  # into the record's channel, through bwrap's own process
+        with open("/proc/1/fd/1", "wb") as f:
+            f.write(canary["flood"].encode() * canary.get("times", 1))
 
     def reach(family, address):
         s = socket.socket(family, socket.SOCK_STREAM)
@@ -1501,6 +1848,8 @@ if sys.argv[1:] == ["--version"]:
             except OSError:
                 pass
     seen = {
+        "planted": planted,
+        "pid1_fds": {fd: os.readlink(f"/proc/1/fd/{fd}").split(":")[0] for fd in "012"},
         "home": os.environ.get("HOME", ""),
         "cwd": os.getcwd(),
         "env": sorted(os.environ),
@@ -1521,6 +1870,13 @@ if sys.argv[1:] == ["--version"]:
     }
     print("SEEN " + json.dumps(seen), file=sys.stderr)
     print("9.9.9")
+else:
+    work = {
+        "git_head": os.path.isfile(".git/HEAD"),
+        "git_files": sorted(os.listdir(".git")) if os.path.isdir(".git") else [],
+        "git_env": sorted(k for k in os.environ if k.startswith("GIT")),
+    }
+    print("WORK " + json.dumps(work), file=sys.stderr)
 """
 
 
@@ -1529,6 +1885,7 @@ def fake_agy(directory: Path, canary: dict[str, Any] | None = None, hang: bool =
     path.parent.mkdir(parents=True, exist_ok=True)
     plan = canary or {"value": "-", "paths": [], "socket": "/nonexistent", "abstract": "-"}
     plan.setdefault("port", 9)
+    plan.setdefault("file", "/nonexistent")
     script = FAKE_AGY.replace("SANDBOX_PYTHON", SANDBOX_PYTHON).replace("HANG", str(hang))
     path.write_text(script.replace("CANARY", repr(plan)))
     path.chmod(0o755)
@@ -1548,9 +1905,9 @@ def test_the_sandbox_is_a_private_root_with_an_empty_environment(tmp_path):
     mounts = [argv[i : i + 3] for i, a in enumerate(argv) if a in ("--bind", "--ro-bind")]
     sources = {m[1] for m in mounts}
     assert "/" not in sources and str(Path.home()) not in sources
-    writable = sorted(m[1] for m in mounts if m[0] == "--bind")
-    assert writable == sorted([str(base), str(spec)])
-    assert {m[2] for m in mounts if m[0] == "--ro-bind"} >= {"/usr", probe.SANDBOX_AGY}
+    # the home and workspace alone are writable; the spec directory is not (R3-F1)
+    assert [m[1] for m in mounts if m[0] == "--bind"] == [str(base)]
+    assert {m[2] for m in mounts if m[0] == "--ro-bind"} >= {"/usr", probe.SANDBOX_AGY, str(spec)}
     etc = sorted(m[2] for m in mounts if m[2].startswith("/etc/"))
     assert etc == sorted(["/etc/group", "/etc/hosts", "/etc/passwd"] + SHOWN_ETC)
     assert argv[argv.index("--") + 1 :][:3] == [SANDBOX_PYTHON, "-I", "-S"]
@@ -1639,6 +1996,170 @@ def test_a_fake_agy_reaches_no_canary_of_the_host(tmp_path, monkeypatch):
     assert seen["loopback"] == "ECONNREFUSED"  # the sandbox's own loopback
     assert seen["net"] == "ENETUNREACH"  # no route out
     assert not host_log.exists()
+    # nothing of the host's streams: bwrap's own process holds /dev/null and two pipes
+    assert seen["pid1_fds"] == {"0": "/dev/null", "1": "pipe", "2": "pipe"}
+    # the spec directory is read-only: no link or FIFO for the host to open
+    assert seen["planted"] == {"link": "EROFS", "fifo": "EROFS", "spec": "EROFS"}
+
+
+def test_the_host_reads_the_record_from_the_channel_never_from_a_path(tmp_path, monkeypatch):
+    """R3-F1 of PR #530: the host once read ``result.json`` from a directory
+    the sandbox could write, so a link there would have been followed in the
+    host's namespace, and a FIFO or a huge file would have defeated the
+    bound. Now the record is the sandbox's stdout, read with a bound. Here
+    the "sandbox" is a plain process that plants a link to a host canary
+    and a FIFO as ``result.json`` in the spec directory, writable for once,
+    and writes its record on stdout: the host takes the stdout's record, and
+    the canary's content goes nowhere."""
+    canary = tmp_path / "host-canary"
+    secret = "host-canary-" + os.urandom(8).hex()
+    canary.write_text(secret)
+    plant = (
+        "import json, os, sys\n"
+        "spec = os.path.dirname(sys.argv[-1])\n"
+        "os.symlink(sys.argv[1], spec + '/result.json')\n"
+        "os.mkfifo(spec + '/result.fifo')\n"
+        "rec = {'argv': [], 'stdout': [], 'stderr': [], 'capture': {}, 'from': 'stdout'}\n"
+        "print(json.dumps(rec))\n"
+    )
+
+    def sandbox(agy: str, base: Path, spec_dir: Path, home: Path, inner: list[str]) -> list[str]:
+        return [sys.executable, "-I", "-c", plant, str(canary), *inner]
+
+    monkeypatch.setattr(probe, "sandbox_argv", sandbox)
+    root = tmp_path / "root"
+    root.mkdir()
+    record = probe.run_one("/opt/agy", SCENARIO_NAMED["success-stream-json"], root, {})
+    assert record["from"] == "stdout"
+    assert secret not in json.dumps(record)
+    spec_dir = next(root.glob("spec-success-stream-json.*"))
+    assert (spec_dir / "result.json").is_symlink()  # planted, and never opened
+
+
+@pytest.mark.parametrize(
+    ("script", "refusal"),
+    [
+        ("sys.stdout.write('x' * 5000)", "over 4096 bytes"),
+        ("sys.stdout.write('[1, 2]')", "not one JSON object"),
+        ('sys.stdout.write(\'{"a": 1}{"b": 2}\')', "not one JSON object"),
+        ('sys.stdout.write(\'{"a": 1, "a": 2}\')', "not one JSON object"),
+        ("sys.stdout.write('{}'); sys.exit(3)", "the sandbox exited 3"),
+        ("sys.stdout.write('{\"\u00e9\": 1}')", "not one JSON object"),
+        ("import time; time.sleep(30)", "did not end within"),
+    ],
+    ids=["oversized", "array", "two-objects", "member-twice", "exit", "not-ascii", "hang"],
+)
+def test_a_record_channel_out_of_bounds_or_shape_is_refused(script, refusal):
+    """The bounded read itself: past the bound the sandbox is killed and the
+    record refused unread; a stream that is not one JSON object of ASCII, a
+    failed sandbox and one that outlives its timeout are refused too."""
+    cmd = [sys.executable, "-I", "-c", "import sys\n" + script]
+    with pytest.raises(ProbeError, match=refusal):
+        run_sandboxed(cmd, timeout=3, bound=4096)
+    assert run_sandboxed([sys.executable, "-I", "-c", "print('{}')"], timeout=10) == {}
+
+
+@needs_bwrap
+@pytest.mark.parametrize(
+    ("flood", "times", "refusal"),
+    [("garbage\n", 1, "not one JSON object"), ("x" * 65536, 64, "over 1048576 bytes")],
+    ids=["garbage", "oversized"],
+)
+def test_a_fake_agy_that_writes_into_the_record_channel_is_refused(
+    tmp_path, monkeypatch, flood, times, refusal
+):
+    """A process of the run can open bwrap's own end of the channel
+    (/proc/1/fd/1) and write into it: what arrives is then not the helper's
+    record, or is over the bound, and the recording stops with nothing
+    written. It cannot make the host read anything else."""
+    monkeypatch.setattr(probe, "RESULT_BOUND", 1 << 20)
+    agy = fake_agy(
+        tmp_path,
+        {
+            "value": "-",
+            "paths": [],
+            "socket": "/x",
+            "abstract": "-",
+            "flood": flood,
+            "times": times,
+        },
+    )
+    with pytest.raises(ProbeError, match=refusal):
+        record_all(agy, tmp_path / "out", only={"version"})
+    assert not (tmp_path / "out").exists()
+
+
+def _tree(path: Path) -> dict[str, bytes]:
+    return {
+        p.relative_to(path).as_posix(): p.read_bytes() if p.is_file() else b"<dir>"
+        for p in sorted(path.rglob("*"))
+    }
+
+
+def callers_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The caller's git variables, each pointing somewhere harmless of the test's own."""
+    alt = tmp_path / "callers-git-dir"
+    alt.mkdir()
+    (alt / "untouched").write_text("the caller's\n")
+    template = tmp_path / "callers-template"
+    (template / "hooks").mkdir(parents=True)
+    (template / "hooks" / "from-the-callers-template").write_text("x")
+    config = tmp_path / "callers-gitconfig"
+    config.write_text(f"[init]\n\ttemplateDir = {template}\n")
+    monkeypatch.setenv("GIT_DIR", str(alt))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path))
+    monkeypatch.setenv("GIT_TEMPLATE_DIR", str(template))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    return alt
+
+
+def test_the_host_sets_up_no_workspace(tmp_path, monkeypatch):
+    """R3-F2 of PR #530: the customized workspace's ``git init`` once ran on
+    the host, with the caller's environment and git configuration, and a
+    caller's ``GIT_DIR`` was initialized instead of the workspace. Now the
+    host makes two empty directories and starts nothing; the setup is the
+    sandbox's (the next test)."""
+    alt = callers_git(tmp_path, monkeypatch)
+    before = _tree(alt)
+
+    def on_the_host(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError(f"the probe started a process on the host: {args!r}")
+
+    monkeypatch.setattr(probe.subprocess, "run", on_the_host)
+    monkeypatch.setattr(probe.subprocess, "Popen", on_the_host)
+    root = tmp_path / "root"
+    root.mkdir()
+    sc = SCENARIO_NAMED["repository-customizations"]
+    assert sc.workspace == "customized"
+    home, work = probe.prepare(sc, root, {})
+    assert list(home.iterdir()) == [] and list(work.iterdir()) == []
+    assert _tree(alt) == before
+
+
+@needs_bwrap
+def test_the_workspace_repository_is_made_in_the_sandbox_with_nothing_of_the_callers(
+    tmp_path, monkeypatch
+):
+    """The setup runs inside the sandbox, whose environment is empty, with
+    git's own environment set and no template: whatever git variables the
+    caller has, its alternate git directory stays as it was, the workspace
+    is the repository, and no template of the caller's is copied."""
+    alt = callers_git(tmp_path, monkeypatch)
+    before = _tree(alt)
+    out = tmp_path / "out"
+    assert record_all(fake_agy(tmp_path), out, only={"repository-customizations"}) == [
+        "repository-customizations"
+    ]
+    assert _tree(alt) == before
+    record = json.loads((out / "repository-customizations.json").read_text())
+    work = next(
+        json.loads(line[len("WORK ") :]) for _, line in record["stderr"] if line.startswith("WORK ")
+    )
+    assert work == {
+        "git_head": True,
+        "git_files": ["HEAD", "config", "objects", "refs"],
+        "git_env": [],
+    }
 
 
 @needs_bwrap

@@ -1,4 +1,5 @@
 {
+ "agy_sha256": "c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65",
  "agy_version": "1.5.13",
  "argv": [
   "--output-format",
@@ -7,9 +8,16 @@
   "-p",
   "hi"
  ],
+ "capture": {
+  "stderr_eof": true,
+  "stderr_truncated": false,
+  "stdout_eof": true,
+  "stdout_truncated": false
+ },
  "exit": 2,
  "facts": {},
  "home_files": [],
+ "isolation": "private-root",
  "killed_by_probe": false,
  "markers": {},
  "other_requests": [],
@@ -22,11 +30,11 @@
  "signalled": null,
  "stderr": [
   [
-   0.15,
+   0.13,
    "Error: unexpected argument \"-p\".\n"
   ],
   [
-   0.15,
+   0.13,
    "Prompts are read only from -p/--print, -i/--prompt-interactive, or stdin, so this argument would have been ignored.\n"
   ]
  ],

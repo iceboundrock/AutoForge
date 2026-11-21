@@ -1,4 +1,5 @@
 {
+ "agy_sha256": "c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65",
  "agy_version": "1.5.13",
  "argv": [
   "--input-format",
@@ -10,7 +11,9 @@
  ],
  "capture": {
   "stderr_eof": true,
-  "stdout_eof": true
+  "stderr_truncated": false,
+  "stdout_eof": true,
+  "stdout_truncated": false
  },
  "exit": 0,
  "facts": {
@@ -43,7 +46,7 @@
   },
   "names_app_data_dir": true,
   "system_prompt_chars": 16891,
-  "system_prompt_sha256": "f9ac2197ee43d429a9f7293633f5e28e1f9989f0e9626f122c6b7ef91da2a97e"
+  "system_prompt_sha256": "676c2afccd2f9b799f0504ded6a39670cc7bcf83addda7f389c5dbcb049d5550"
  },
  "home_files": [
   ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript/00000000.jsonl",
@@ -84,6 +87,7 @@
    "first_user_text": "<USER_REQUEST>\n[framed-03 01FF93-02920E]\n𠀀𠀁𠀂𠀃𠀄𠀅𠀆𠀇𠀈𠀉𠀊𠀋𠀌𠀍𠀎𠀏𠀐𠀑𠀒𠀓𠀔𠀕𠀖𠀗𠀘𠀙𠀚𠀛𠀜𠀝𠀞𠀟𠀠𠀡𠀢𠀣𠀤𠀥𠀦𠀧𠀨𠀩𠀪𠀫𠀬𠀭𠀮𠀯𠀰𠀱𠀲𠀳𠀴𠀵𠀶𠀷𠀸𠀹𠀺𠀻𠀼𠀽𠀾𠀿𠁀𠁁𠁂𠁃𠁄𠁅𠁆𠁇𠁈𠁉𠁊𠁋𠁌𠁍𠁎𠁏𠁐𠁑𠁒𠁓𠁔𠁕𠁖𠁗𠁘𠁙𠁚𠁛𠁜𠁝𠁞𠁟𠁠𠁡𠁢𠁣𠁤𠁥𠁦𠁧𠁨𠁩𠁪𠁫𠁬𠁭𠁮𠁯𠁰𠁱𠁲𠁳𠁴𠁵𠁶𠁷𠁸𠁹𠁺𠁻𠁼𠁽𠁾𠁿𠂀𠂁𠂂𠂃𠂄𠂅𠂆𠂇𠂈𠂉𠂊𠂋𠂌𠂍𠂎𠂏𠂐𠂑𠂒𠂓𠂔𠂕𠂖𠂗𠂘𠂙𠂚𠂛𠂜𠂝𠂞𠂟𠂠𠂡𠂢𠂣𠂤𠂥𠂦𠂧𠂨𠂩𠂪𠂫𠂬𠂭𠂮𠂯𠂰𠂱𠂲𠂳𠂴𠂵𠂶𠂷𠂸𠂹𠂺𠂻𠂼𠂽𠂾𠂿𠃀𠃁𠃂𠃃𠃄𠃅𠃆𠃇𠃈𠃉𠃊𠃋𠃌𠃍𠃎𠃏𠃐𠃑𠃒𠃓𠃔𠃕𠃖𠃗𠃘𠃙𠃚𠃛𠃜𠃝𠃞𠃟𠃠𠃡𠃢𠃣𠃤𠃥𠃦𠃧𠃨𠃩𠃪𠃫𠃬𠃭𠃮𠃯𠃰𠃱𠃲𠃳𠃴𠃵𠃶𠃷𠃸𠃹𠃺𠃻𠃼𠃽𠃾𠃿𠄀𠄁𠄂𠄃𠄄𠄅𠄆𠄇𠄈𠄉𠄊𠄋𠄌𠄍𠄎𠄏𠄐𠄑𠄒𠄓𠄔𠄕𠄖𠄗𠄘𠄙𠄚𠄛𠄜𠄝𠄞𠄟𠄠𠄡𠄢𠄣𠄤𠄥𠄦𠄧𠄨𠄩𠄪𠄫𠄬𠄭𠄮𠄯𠄰𠄱𠄲𠄳𠄴𠄵𠄶𠄷𠄸𠄹𠄺𠄻𠄼𠄽𠄾𠄿𠅀𠅁𠅂𠅃𠅄𠅅𠅆𠅇𠅈𠅉𠅊𠅋𠅌𠅍𠅎𠅏𠅐𠅑𠅒𠅓𠅔𠅕𠅖𠅗𠅘𠅙𠅚𠅛𠅜𠅝𠅞𠅟𠅠𠅡𠅢𠅣𠅤𠅥𠅦𠅧𠅨𠅩𠅪𠅫𠅬𠅭𠅮𠅯𠅰𠅱𠅲𠅳𠅴𠅵𠅶𠅷𠅸𠅹𠅺𠅻𠅼𠅽𠅾𠅿𠆀𠆁𠆂𠆃𠆄𠆅𠆆𠆇𠆈𠆉𠆊𠆋𠆌𠆍𠆎𠆏𠆐𠆑𠆒𠆓𠆔𠆕𠆖𠆗𠆘𠆙𠆚𠆛𠆜𠆝𠆞𠆟𠆠𠆡𠆢𠆣𠆤𠆥𠆦𠆧𠆨𠆩𠆪𠆫𠆬𠆭𠆮𠆯𠆰𠆱𠆲𠆳𠆴𠆵𠆶𠆷𠆸𠆹𠆺𠆻𠆼𠆽𠆾𠆿𠇀𠇁𠇂𠇃𠇄𠇅𠇆𠇇𠇈𠇉𠇊𠇋𠇌𠇍𠇎𠇏𠇐𠇑𠇒𠇓𠇔𠇕𠇖𠇗𠇘𠇙𠇚𠇛𠇜𠇝𠇞𠇟𠇠𠇡𠇢𠇣𠇤𠇥𠇦𠇧𠇨𠇩𠇪𠇫𠇬𠇭𠇮𠇯𠇰𠇱𠇲𠇳𠇴𠇵𠇶𠇷𠇸𠇹𠇺𠇻𠇼𠇽𠇾𠇿𠈀𠈁𠈂𠈃𠈄𠈅𠈆𠈇𠈈𠈉𠈊𠈋𠈌𠈍𠈎𠈏𠈐𠈑𠈒𠈓𠈔𠈕𠈖𠈗𠈘𠈙𠈚𠈛𠈜𠈝𠈞𠈟𠈠𠈡𠈢𠈣𠈤𠈥𠈦𠈧𠈨𠈩𠈪𠈫𠈬𠈭𠈮",
    "key": "synthetic",
    "last_role": "user",
+   "markers_present": [],
    "model_path": "/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent",
    "thinking": {
     "includeThoughts": true,
@@ -109,26 +113,26 @@
   }
  ],
  "scenario": "fidelity-framed-03",
- "seconds": 0.5,
+ "seconds": 0.4,
  "signalled": null,
  "stderr": [],
  "stdin_bytes": 450082,
  "stdout": [
   [
-   0.31,
-   "{\"event\":\"init\",\"conversation_id\":\"0c6206c7-ca78-4201-8aed-35a69fc84c8f\",\"init\":{\"cwd\":\"<root>/fidelity-framed-03._1v1hf3w/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"request-review\"}}\n"
+   0.22,
+   "{\"event\":\"init\",\"conversation_id\":\"aa8a808a-85eb-45b3-9e01-23ecde029a4c\",\"init\":{\"cwd\":\"<root>/fidelity-framed-03.ax620vhd/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"request-review\"}}\n"
   ],
   [
-   0.42,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"0c6206c7-ca78-4201-8aed-35a69fc84c8f\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
+   0.27,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"aa8a808a-85eb-45b3-9e01-23ecde029a4c\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
   ],
   [
-   0.47,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"0c6206c7-ca78-4201-8aed-35a69fc84c8f\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.018709531,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+   0.29,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"aa8a808a-85eb-45b3-9e01-23ecde029a4c\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.005730966,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
   ],
   [
-   0.47,
-   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"0c6206c7-ca78-4201-8aed-35a69fc84c8f\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.092744934,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+   0.29,
+   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"aa8a808a-85eb-45b3-9e01-23ecde029a4c\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.031064566,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
   ]
  ],
  "title_requests": 0
