@@ -1,0 +1,149 @@
+{
+ "agy_version": "1.5.13",
+ "argv": [
+  "--output-format",
+  "stream-json",
+  "--settings",
+  "{\"modelProvider\":\"gemini\"}"
+ ],
+ "exit": 0,
+ "facts": {
+  "all": {
+   "dropped": [
+    [
+     173792,
+     173823
+    ],
+    [
+     178206,
+     178207
+    ],
+    [
+     183982,
+     183983
+    ],
+    [
+     191457,
+     191471
+    ],
+    [
+     192094,
+     194559
+    ],
+    [
+     195102,
+     196607
+    ],
+    [
+     201547,
+     201551
+    ]
+   ],
+   "first": 168463,
+   "foreign": [],
+   "framed": true,
+   "last": 205962,
+   "ordered": true,
+   "received": 33472,
+   "sent": 37500
+  },
+  "context_markers": [],
+  "fidelity": {
+   "closing_tag_kept": true,
+   "identical": false,
+   "identical_after_strip": true,
+   "kept_before_cut_bytes": null,
+   "message_bytes": 134327,
+   "received_bytes": 133914,
+   "sent_bytes": 150026,
+   "truncated_bytes": null,
+   "wrapped": true
+  },
+  "names_app_data_dir": true,
+  "system_prompt_chars": 16867,
+  "system_prompt_sha256": "a1595d890240b51c8a05a1045b4e8f3e9611b624b4d79422bd78ef745975d963"
+ },
+ "home_files": [
+  ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript/00000000.jsonl",
+  ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript_full/00000000.jsonl",
+  ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript_full/00000001.jsonl",
+  ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl",
+  ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript_full.jsonl",
+  ".gemini/antigravity-cli/cache/default_project_id.txt",
+  ".gemini/antigravity-cli/cache/last_conversations.json",
+  ".gemini/antigravity-cli/cache/onboarding.json",
+  ".gemini/antigravity-cli/cli.log",
+  ".gemini/antigravity-cli/conversation_summaries.db",
+  ".gemini/antigravity-cli/conversations/<id>.db",
+  ".gemini/antigravity-cli/implicit/<id>.pb",
+  ".gemini/antigravity-cli/installation_id",
+  ".gemini/antigravity-cli/jetbox_summaries_proto.pb",
+  ".gemini/antigravity-cli/jetski_state.pbtxt",
+  ".gemini/antigravity-cli/log/cli-<time>.log",
+  ".gemini/antigravity-cli/presence/<id>.lock",
+  ".gemini/config/.migrated",
+  ".gemini/config/config.json",
+  ".gemini/config/mcp_config.json",
+  ".gemini/config/projects/default-cli-project.json"
+ ],
+ "killed_by_probe": false,
+ "markers": {},
+ "other_requests": [],
+ "outside_file_written": false,
+ "processes_during": [],
+ "processes_left": [],
+ "requests": [
+  {
+   "contents": 1,
+   "first_user_text": "<USER_REQUEST>\n[04 02920F-03248A]\n𩈏𩈐𩈑𩈒𩈓𩈔𩈕𩈖𩈗𩈘𩈙𩈚𩈛𩈜𩈝𩈞𩈟𩈠𩈡𩈢𩈣𩈤𩈥𩈦𩈧𩈨𩈩𩈪𩈫𩈬𩈭𩈮𩈯𩈰𩈱𩈲𩈳𩈴𩈵𩈶𩈷𩈸𩈹𩈺𩈻𩈼𩈽𩈾𩈿𩉀𩉁𩉂𩉃𩉄𩉅𩉆𩉇𩉈𩉉𩉊𩉋𩉌𩉍𩉎𩉏𩉐𩉑𩉒𩉓𩉔𩉕𩉖𩉗𩉘𩉙𩉚𩉛𩉜𩉝𩉞𩉟𩉠𩉡𩉢𩉣𩉤𩉥𩉦𩉧𩉨𩉩𩉪𩉫𩉬𩉭𩉮𩉯𩉰𩉱𩉲𩉳𩉴𩉵𩉶𩉷𩉸𩉹𩉺𩉻𩉼𩉽𩉾𩉿𩊀𩊁𩊂𩊃𩊄𩊅𩊆𩊇𩊈𩊉𩊊𩊋𩊌𩊍𩊎𩊏𩊐𩊑𩊒𩊓𩊔𩊕𩊖𩊗𩊘𩊙𩊚𩊛𩊜𩊝𩊞𩊟𩊠𩊡𩊢𩊣𩊤𩊥𩊦𩊧𩊨𩊩𩊪𩊫𩊬𩊭𩊮𩊯𩊰𩊱𩊲𩊳𩊴𩊵𩊶𩊷𩊸𩊹𩊺𩊻𩊼𩊽𩊾𩊿𩋀𩋁𩋂𩋃𩋄𩋅𩋆𩋇𩋈𩋉𩋊𩋋𩋌𩋍𩋎𩋏𩋐𩋑𩋒𩋓𩋔𩋕𩋖𩋗𩋘𩋙𩋚𩋛𩋜𩋝𩋞𩋟𩋠𩋡𩋢𩋣𩋤𩋥𩋦𩋧𩋨𩋩𩋪𩋫𩋬𩋭𩋮𩋯𩋰𩋱𩋲𩋳𩋴𩋵𩋶𩋷𩋸𩋹𩋺𩋻𩋼𩋽𩋾𩋿𩌀𩌁𩌂𩌃𩌄𩌅𩌆𩌇𩌈𩌉𩌊𩌋𩌌𩌍𩌎𩌏𩌐𩌑𩌒𩌓𩌔𩌕𩌖𩌗𩌘𩌙𩌚𩌛𩌜𩌝𩌞𩌟𩌠𩌡𩌢𩌣𩌤𩌥𩌦𩌧𩌨𩌩𩌪𩌫𩌬𩌭𩌮𩌯𩌰𩌱𩌲𩌳𩌴𩌵𩌶𩌷𩌸𩌹𩌺𩌻𩌼𩌽𩌾𩌿𩍀𩍁𩍂𩍃𩍄𩍅𩍆𩍇𩍈𩍉𩍊𩍋𩍌𩍍𩍎𩍏𩍐𩍑𩍒𩍓𩍔𩍕𩍖𩍗𩍘𩍙𩍚𩍛𩍜𩍝𩍞𩍟𩍠𩍡𩍢𩍣𩍤𩍥𩍦𩍧𩍨𩍩𩍪𩍫𩍬𩍭𩍮𩍯𩍰𩍱𩍲𩍳𩍴𩍵𩍶𩍷𩍸𩍹𩍺𩍻𩍼𩍽𩍾𩍿𩎀𩎁𩎂𩎃𩎄𩎅𩎆𩎇𩎈𩎉𩎊𩎋𩎌𩎍𩎎𩎏𩎐𩎑𩎒𩎓𩎔𩎕𩎖𩎗𩎘𩎙𩎚𩎛𩎜𩎝𩎞𩎟𩎠𩎡𩎢𩎣𩎤𩎥𩎦𩎧𩎨𩎩𩎪𩎫𩎬𩎭𩎮𩎯𩎰𩎱𩎲𩎳𩎴𩎵𩎶𩎷𩎸𩎹𩎺𩎻𩎼𩎽𩎾𩎿𩏀𩏁𩏂𩏃𩏄𩏅𩏆𩏇𩏈𩏉𩏊𩏋𩏌𩏍𩏎𩏏𩏐𩏑𩏒𩏓𩏔𩏕𩏖𩏗𩏘𩏙𩏚𩏛𩏜𩏝𩏞𩏟𩏠𩏡𩏢𩏣𩏤𩏥𩏦𩏧𩏨𩏩𩏪𩏫𩏬𩏭𩏮𩏯𩏰𩏱𩏲𩏳𩏴𩏵𩏶𩏷𩏸𩏹𩏺𩏻𩏼𩏽𩏾𩏿𩐀𩐁𩐂𩐃𩐄𩐅𩐆𩐇𩐈𩐉𩐊𩐋𩐌𩐍𩐎𩐏𩐐𩐑𩐒𩐓𩐔𩐕𩐖𩐗𩐘𩐙𩐚𩐛𩐜𩐝𩐞𩐟𩐠𩐡𩐢𩐣𩐤𩐥𩐦𩐧𩐨𩐩𩐪𩐫𩐬𩐭𩐮𩐯𩐰𩐱𩐲𩐳𩐴𩐵𩐶𩐷𩐸𩐹𩐺𩐻𩐼𩐽𩐾𩐿𩑀𩑁𩑂𩑃𩑄",
+   "key": "synthetic",
+   "last_role": "user",
+   "model_path": "/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent",
+   "thinking": {
+    "includeThoughts": true,
+    "thinkingBudget": 1024
+   },
+   "tool_results": [],
+   "tools": [
+    "read_file",
+    "run_command",
+    "manage_task",
+    "send_message",
+    "schedule",
+    "invoke_subagent",
+    "define_subagent",
+    "manage_subagents",
+    "write_file",
+    "edit_file",
+    "search_web",
+    "run_workflow",
+    "swarm",
+    "ask_question"
+   ]
+  }
+ ],
+ "scenario": "fidelity-all-04",
+ "seconds": 0.5,
+ "signalled": null,
+ "stderr": [],
+ "stdin_bytes": 150026,
+ "stdout": [
+  [
+   0.37,
+   "{\"event\":\"init\",\"conversation_id\":\"8e7811be-a6d4-4aca-89dc-9ebb0bd82c6c\",\"init\":{\"cwd\":\"<root>/fidelity-all-04.562v0g95/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"request-review\"}}\n"
+  ],
+  [
+   0.43,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"8e7811be-a6d4-4aca-89dc-9ebb0bd82c6c\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
+  ],
+  [
+   0.43,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"8e7811be-a6d4-4aca-89dc-9ebb0bd82c6c\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.006939186,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+  ],
+  [
+   0.45,
+   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"8e7811be-a6d4-4aca-89dc-9ebb0bd82c6c\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.050387719,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+  ]
+ ],
+ "title_requests": 0
+}

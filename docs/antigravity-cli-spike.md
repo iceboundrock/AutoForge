@@ -37,8 +37,17 @@
 - **Re-measure:** `AUTOFORGE_AGY_PROBE_BIN=/path/to/agy uv run pytest
   tests/test_antigravity_probe.py` (Linux with `bwrap`, about three minutes,
   no model call) runs every scenario again against that binary and fails on
-  any fact here that no longer holds. `python3 -I tests/antigravity_probe.py
-  record --agy /path/to/agy --out DIR` writes the records.
+  any fact here that no longer holds. It holds the fresh records to the
+  behaviour, not to the label: they name whatever version the binary
+  printed, and only the committed records must say 1.5.13. The version is
+  asked like every other scenario, in the sandbox and under a timeout
+  (`version`): the probe never runs the binary on the host.
+  `python3 -I tests/antigravity_probe.py record --agy /path/to/agy --out
+  DIR` writes the records. For another build, `DIR` is a directory of its
+  own (`tests/fixtures/antigravity/<version>/`), and `python3 -I
+  tests/antigravity_probe.py table --records DIR` writes its table of
+  removed characters (§3) beside them. The 1.5.13 records stay as they
+  are.
 
 ## 1. Summary
 
@@ -58,10 +67,13 @@ naive adapter read a failure as a completed run:
    (`cut-stream-then-success`) and both replies when a background task opened
    a second turn (`background-task`, `timer`). The reply is the last
    `agent_response` step's text.
-3. **The prompt the model gets is not always the prompt sent.** Control,
-   format and private-use characters are removed (`fidelity-sweep`). A
-   message over about 192 KB loses everything after that point, including
-   the wrapper's closing tag, with no sign in the output (`fidelity-size-*`).
+3. **The prompt the model gets is not always the prompt sent.** Every
+   character of Unicode general category C is removed, but TAB, LF, VT, FF,
+   CR and NEL: controls, format characters, private use, and every code
+   point unassigned in Unicode 17.0 (`fidelity-all-*`, which sends every
+   scalar value). A message over about 192 KB loses everything after that
+   point, including the wrapper's closing tag, with no sign in the output
+   (`fidelity-size-*`).
 
 One finding blocks a production adapter as AutoForge's invariants stand.
 **The repository's own `.agents/hooks.json` hooks and `.agents/mcp_config.json`
@@ -140,13 +152,31 @@ backslashes, CJK, Hebrew and a literal `</USER_REQUEST>` included
 `fidelity-unicode-stream-json`), with three exceptions that hold on every
 input:
 
-- **Characters removed.** Every character of Unicode categories Cf
+- **Characters removed.** Measured over every Unicode scalar value: all
+  1,112,064 of them, each sent once in ascending order, in 31 prompts that
+  each stay well below the cut at 192 KB (`fidelity-all-nul`, NUL alone,
+  and `fidelity-all-00` to `fidelity-all-29`). Every prompt arrived framed
+  as sent, its characters in order and none added or changed, so what was
+  missing was removed. 952,427 code points were removed and 159,637 kept.
+  The removed ones are listed, as 744 ranges, in
+  `tests/fixtures/antigravity/1.5.13/dropped.txt`, which the tests hold the
+  records to exactly. Read with Unicode 17.0's database (Python 3.15's),
+  the table is exactly general category C less six controls. Every Cc
+  (control) is removed except TAB, LF, VT, FF, CR and NEL. So is every Cf
   (format: zero-width space and joiners, bidirectional controls, the BOM,
-  tag characters) and Co (private use), and every Cc (control) except TAB,
-  LF, VT, FF, CR and NEL (`fidelity-sweep`, which tests 110 code points:
-  90 removed, 20 kept, the no-break and ideographic spaces, variation
-  selectors and U+FFFD among them). The emoji sequence `👩‍💻` therefore
-  arrives as two emoji.
+  tag characters), every Co (private use), and every Cn (unassigned, the
+  noncharacters among them). Everything else arrived as sent: the
+  no-break and ideographic spaces, the line and paragraph separators,
+  variation selectors, combining marks and U+FFFD among them. An older
+  database calls some characters unassigned that `agy` keeps: Python
+  3.14's Unicode 16.0 lacks the 4,803 that 17.0 added. So the rule follows
+  `agy`'s own Unicode version, and a prompt holding a character newer than
+  that version loses it. `fidelity-sweep` (110 chosen code points, each
+  between markers) agrees. The emoji sequence `👩‍💻` therefore arrives as
+  two emoji. Not measured: whether a character fares otherwise in other
+  company. Each code point was sent once, after its predecessor; the
+  texts of `fidelity-unicode-*` and `fidelity-sweep` are the only other
+  contexts.
 - **Invalid UTF-8** becomes U+FFFD (`fidelity-invalid-utf8`).
 - **Size.** A 190,000-byte prompt arrived whole (`fidelity-size-190000`).
   At 196,608 bytes and above (`fidelity-size-196608`, `fidelity-size-262144`,
@@ -167,8 +197,9 @@ prompt fails properly: exit 1 and an `ERROR` result saying `empty prompt`
 Every line of `--output-format stream-json` is one JSON object with an
 `event` member. In every one-shot run that ended on its own, the stream was
 `init`, then `step_update` records, then exactly one `result`, and then the
-process exited. None wrote a malformed line or a second `result`. Only a
-`stream-json` input session writes several (§6).
+process exited, or, when no session began, a lone `ERROR` result. None wrote
+a malformed line or a second `result`. Only a `stream-json` input session
+writes several (§6).
 
 | Record | Fields seen | Meaning |
 |---|---|---|
@@ -211,12 +242,45 @@ stateDiagram-v2
     Ended --> [*]: exit 0, 1 or 3
 ```
 
-**Terminal proof** for a one-shot run is one `result`, written as the last
-record, followed by the process's exit. **The reply** is the concatenated
-`text_delta` of the highest-indexed `agent_response` step, which `agy` ends
-with a `\n` the model did not send. `result.response` is not the reply
-(§1, item 2). A run whose stream ends without a `result` has no terminal
-proof, whatever its exit status: `hang-no-limit`, `stdin-stream-json-empty`.
+**The admissible streams.** Every one-shot record that ended on its own was
+one of two shapes, and the contract admits no other:
+
+- **a run:** `init`, then `step_update` records, then one `result`, then
+  the end of stdout;
+- **a refusal:** one `result` with `status: ERROR` and an empty
+  `conversation_id`, when no session began (`stdin-whitespace`,
+  `no-login-argv-prompt`). It is a failure, never a completed run.
+
+Each record must have its shape, checked before anything in it is read:
+
+- `init` is the first record, with a non-empty `conversation_id` and an
+  `init` object.
+- A `step_update` carries the init's `conversation_id`, an integer
+  `step_index` of 0 or more, a `state` of `ACTIVE`, `DONE` or `ERROR`, a
+  non-empty `step_type` and, when present, a string `text_delta`.
+- Steps begin in index order: a step's first update has an index above
+  every earlier step's. A step keeps its type. Nothing updates a step after
+  it ended (`DONE` or `ERROR`). Every recorded stream kept to these rules.
+- The `result` carries the init's `conversation_id` and a `status` of
+  `SUCCESS` or `ERROR`. Its `response`, `error` and `finished_reason` are
+  strings when present, and its `denied_actions` is a list of objects with
+  a string `action`.
+
+Anything else is a protocol failure: a line that is not JSON or not a
+known event, a value of another type in any of these places, a record out
+of this order, a record of another conversation, or a record after the
+`result`.
+
+**Terminal proof** for a one-shot run is a run of that shape: its one
+`result` written as the last record, followed by the process's exit. A run
+whose stream ends without a `result` has no terminal proof, whatever its
+exit status (`hang-no-limit`, `stdin-stream-json-empty`).
+
+**The reply** is the concatenated `text_delta` of the run's last step,
+which must be an `agent_response` that ended `DONE`. `agy` ends it with a
+`\n` the model did not send. A response still `ACTIVE` when the `result`
+arrives is a protocol failure, however whole its text looks.
+`result.response` is not the reply (§1, item 2).
 
 **Liveness.** `agy` writes nothing while a model request is open. A request
 the stand-in never answered kept it silent until the probe killed it at
@@ -258,10 +322,15 @@ outside the workspace was **not** refused under the default permission
 (`write-outside-default`), so `request-review` is no containment.
 
 **Questions.** An `ask_question` call is answered at once with an empty
-answer (`A1: ` in the tool result the model gets), and the run goes on. The
-stream shows the step as `step_type: unknown` with no tool name, so a
-question asked and answered with nothing cannot be told from any other
-unknown step (`ask-question`).
+answer (`A1: ` in the tool result the model gets), and the run goes on to
+a `SUCCESS` with a whole reply, at exit 0. The stream shows the step as
+`step_type: unknown` with no tool name, so a question asked and answered
+with nothing cannot be told from any other unknown step (`ask-question`).
+The contract therefore fails closed: a run with any step of a type it
+does not know, `unknown` among them, is ambiguous and never completed. The
+cost is a false failure on any other step `agy` reports as `unknown`. None
+of the other records has one. Whether `ask_question` can be removed from
+the tool set was not measured.
 
 ## 6. Failures (question 5)
 
@@ -365,7 +434,7 @@ What the workspace contributes is a separate matter:
 |---|---|---|
 | `command`, `exit_code`, `stdout`, `stderr`, times, `timed_out`, truncation, leftovers | the executor, as for any CLI | available |
 | `stdout` (the reply) | the last `agent_response` step's text | available |
-| `provider_failure` | a refusal (`denied_actions`), an `ERROR` result, a missing or second `result`, a malformed line, an empty reply | available |
+| `provider_failure` | a refusal (`denied_actions`), an `ERROR` result, a missing or second `result`, a record out of §4's shape or order, an `unknown` step, a step or reply that never ended, an empty reply | available |
 | `transient_failure` | `AGY_ERROR` with `code_kind: http` and `error_code` 408 or 5xx | available; 500 is not retried by `agy` itself |
 | `usage_limit` | `AGY_ERROR` with `error_code` 429 | available; per-minute and per-day limits not told apart (unverified) |
 | `usage_reset_at` | nothing | unknown |
@@ -390,9 +459,10 @@ default is `gemini-3.1-pro-preview` with a 1,024-token thinking budget
 **What cannot be told apart safely:**
 
 - a question the agent asked and got no answer to, from any other
-  `unknown` step;
+  `unknown` step. So every run with an `unknown` step fails (§5);
 - a prompt that was stripped or truncated, from one that was not: nothing
-  in the output says so, so only a check before the launch can prevent it;
+  in the output says so, so only a check before the launch can prevent it
+  (§10);
 - which model actually served the run;
 - a per-minute 429 from an exhausted quota, until a real body is seen;
 - a daemon task `agy` killed at exit, except by a stderr notice.
@@ -412,16 +482,22 @@ default is `gemini-3.1-pro-preview` with a 1,024-token thinking budget
 **Recommended:** one-shot, `--input-format stream-json --output-format
 stream-json`, one message on stdin, stdin closed after it. Text on stdin is
 the fallback if a later build changes the message shape. The completion
-condition is bounded and unambiguous: exactly one `result` as the last
-record, then exit, under the executor's idle and runtime limits. ACP is
-worth a separate look once AutoForge wants `agy` to ask a human (ADR 0007,
-#490). It buys nothing for the MVP.
+condition is bounded and unambiguous. The stream must be a run of the shape
+of §4, with exactly one `result` as the last record, and the process must
+exit under the executor's idle and runtime limits. The run's last step must
+be an ended `agent_response`, and no step may be of a type the contract
+does not know. ACP is worth a separate look once AutoForge wants `agy` to
+ask a human (ADR 0007, #490). It buys nothing for the MVP.
 
 **Version gate:** exactly 1.5.13 until the probe passes on another build.
 `doctor` would run `agy --version` and refuse any other output. The release
 notes change print-mode behaviour often: a failed turn's exit status went
 from 1 to 3, the default agent mode of a `-p` run became Auto where
 available, and how a run waits for background tasks changed several times.
+Admitting a build is the re-measurement in the header, which the tests make
+possible for any version string. The build's records go in a directory of
+their own, held to every fact here. A changed fact, its table of removed
+characters among them, is a finding to resolve before the gate moves.
 
 ### Suggested adapter contract
 
@@ -444,12 +520,17 @@ available, and how a run waits for background tasks changed several times.
     terminates its own background tasks and says so
     (`print-timeout-background`). The executor's limit stays the backstop.
 - **The reducer.**
-  - Completed only when all of these hold: one `result`, last; `SUCCESS`;
-    no `finished_reason`; no `denied_actions`; every tool step `DONE` or
-    `ERROR`; exit 0; a non-empty last `agent_response`.
+  - It checks every record against §4's shapes and order before reading it,
+    so no record makes it raise. A violation is a protocol failure.
+  - Completed only when all of these hold: a run of §4's shape with no
+    violation; its `result` `SUCCESS`, with no `finished_reason` and no
+    `denied_actions`; exit 0; every step of a known type (`user_input`,
+    `agent_response`, `tool`, `error_message`, `system_message`) and ended;
+    the run's last step an `agent_response` that ended `DONE`, with a
+    non-blank text.
   - Anything else is a `provider_failure` naming what failed:
-    `interrupted`, `print_timeout`, a refusal, a protocol violation, no
-    result.
+    `interrupted`, `print_timeout`, a refusal, a protocol violation, an
+    ambiguous step (an unanswered question), no result, no reply.
   - A daemon task leaves its step `ACTIVE`, and the prototype fails such a
     run. Whether a run that started a daemon may still complete is a G1
     decision.
@@ -459,9 +540,18 @@ available, and how a run waits for background tasks changed several times.
     a `hooks.json`, `mcp_config.json`, `plugins.json`, `skills.json` or
     `plugins/`. This is the substitute for the missing switch (§11, C1).
   - Refuse a prompt over a margin below the measured cut (160,000 bytes
-    leaves room for the metadata), and refuse, or strip and record, a
-    prompt holding a character §3 says `agy` removes. Then what the run log
-    records is what the model saw.
+    leaves room for the metadata).
+  - Refuse, or strip and record, a prompt holding a character that the
+    pinned build's measured table (`dropped.txt`, §3) lists. Look the
+    character up in that table, never in a Unicode category: AutoForge's
+    Python has its own Unicode version, and `agy` removes by its own.
+    Then what the run log records is what the model saw, for the build
+    the table measured, as far as §3's measurements reach: every
+    character alone, and the texts measured. Other contexts are
+    unmeasured.
+  - A build without such a table, or a table that does not cover every
+    scalar value, is unverified: the preflight refuses every prompt rather
+    than promise fidelity.
 - **Credentials (`credential_routes`).**
   - `GEMINI_API_KEY`, projected like the other providers' keys.
   - The Google sign-in is an OAuth login with a refresh token
@@ -518,8 +608,9 @@ behind these conditions, with no default routing change:
   another build.
 
 Not blockers, but required of any adapter: typing a refusal as a failure,
-taking the reply from the last step, the prompt preflight, a home of its
-own per launch, and never `-c`.
+holding the stream to §4's shapes, failing a run with an `unknown` step,
+taking the reply from the last step, the prompt preflight with the pinned
+build's table, a home of its own per launch, and never `-c`.
 
 Against a go: `agy` changes print-mode behaviour often, its `stream-json`
 input shape is undocumented, a reply cannot be seen before the process ends,

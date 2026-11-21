@@ -43,9 +43,12 @@ sandbox.
 from __future__ import annotations
 
 import argparse
+import bisect
 import concurrent.futures
+import functools
 import hashlib
 import http.server
+import itertools
 import json
 import os
 import re
@@ -57,9 +60,8 @@ import sys
 import tempfile
 import threading
 import time
-import unicodedata
 from collections.abc import Callable, Iterable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -116,22 +118,139 @@ def ascii_prompt(size: int) -> str:
     return (line * (size // 100 + 1))[:size]
 
 
-def stripped(text: str) -> str:
-    """``text`` without the characters agy 1.5.13 removes from a prompt.
+# The complete measurement (``fidelity-all-*``): every Unicode scalar value
+# in ascending order, each once, cut into prompts of at most ALL_CHUNK_BYTES
+# so that none reaches the measured cut (191,986 bytes). NUL has a prompt of
+# its own (``fidelity-all-nul``), so that a build that ends a prompt at NUL
+# cannot take the rest of a chunk with it. A surrogate is no scalar value,
+# and UTF-8 cannot carry one.
+ALL_PREFIX = "fidelity-all-"
+ALL_CHUNK_BYTES = 150_000
+ALL_TRAILER = "\n[END]\n"
+# (first, last, UTF-8 bytes per code point) of the scalar values but NUL
+SCALAR_SEGMENTS = (
+    (0x01, 0x7F, 1),
+    (0x80, 0x7FF, 2),
+    (0x800, 0xD7FF, 3),
+    (0xE000, 0xFFFF, 3),
+    (0x10000, 0x10FFFF, 4),
+)
+SCALAR_VALUES = 0x110000 - 0x800  # every code point but the 2,048 surrogates
 
-    What the sweep showed (``fidelity-sweep``): every character of the
-    Unicode categories Cf (format) and Co (private use), and every Cc
-    (control) but TAB, LF, VT, FF, CR and NEL. Everything else arrived as
-    sent.
+
+def all_chunks() -> list[list[tuple[int, int]]]:
+    """The scalar values but NUL, as chunks of ascending (first, last) spans.
+
+    Each chunk's UTF-8 is at most :data:`ALL_CHUNK_BYTES`; together they hold
+    every value once, in order.
     """
-    keep = "\t\n\x0b\x0c\r\x85"
+    chunks: list[list[tuple[int, int]]] = []
+    spans: list[tuple[int, int]] = []
+    room = ALL_CHUNK_BYTES
+    for first, last, width in SCALAR_SEGMENTS:
+        start = first
+        while start <= last:
+            if room < width:
+                chunks.append(spans)
+                spans, room = [], ALL_CHUNK_BYTES
+            end = min(last, start + room // width - 1)
+            spans.append((start, end))
+            room -= (end - start + 1) * width
+            start = end + 1
+    chunks.append(spans)
+    return chunks
+
+
+def all_prompt(label: str, spans: list[tuple[int, int]]) -> str:
+    """One ``fidelity-all-*`` prompt: a header naming it, its code points, a trailer."""
+    header = f"[{label} {spans[0][0]:06X}-{spans[-1][1]:06X}]\n"
+    body = "".join("".join(map(chr, range(a, b + 1))) for a, b in spans)
+    return header + body + ALL_TRAILER
+
+
+def ranges_of(points: Iterable[int]) -> list[list[int]]:
+    """Ascending code points as inclusive ``[first, last]`` runs."""
+    out: list[list[int]] = []
+    for c in points:
+        if out and out[-1][1] == c - 1:
+            out[-1][1] = c
+        else:
+            out.append([c, c])
+    return out
+
+
+def measure_all(sent: str, got: str) -> dict[str, Any]:
+    """What one ``fidelity-all-*`` prompt lost: its dropped code points as runs.
+
+    The prompt holds each of its code points once, in ascending order. If
+    what arrived is framed alike, ascending, and holds nothing that was not
+    sent, it is a subsequence of what was sent, and what is missing was
+    removed. Anything else (a character changed, added or moved) shows as
+    not ``framed``, not ``ordered`` or ``foreign``, and the measurement does
+    not count (``dropped`` is then None).
+    """
+    header = sent[: sent.index("\n") + 1]
+    framed = got.startswith(header) and got.endswith(ALL_TRAILER)
+    body_sent = sent[len(header) : -len(ALL_TRAILER)]
+    body_got = got[len(header) : -len(ALL_TRAILER)] if framed else got
+    sent_points = {ord(c) for c in body_sent}
+    got_points = [ord(c) for c in body_got]
+    foreign = sorted({c for c in got_points if c not in sent_points})
+    ordered = all(a < b for a, b in itertools.pairwise(got_points))
+    clean = framed and ordered and not foreign
+    return {
+        "first": ord(body_sent[0]),
+        "last": ord(body_sent[-1]),
+        "sent": len(body_sent),
+        "received": len(got_points),
+        "framed": framed,
+        "ordered": ordered,
+        "foreign": [f"U+{c:04X}" for c in foreign[:20]],
+        "dropped": ranges_of(sorted(sent_points - set(got_points))) if clean else None,
+    }
+
+
+# What agy 1.5.13 removes from a prompt: the union of the ``fidelity-all-*``
+# records' dropped runs, over every Unicode scalar value, one inclusive range
+# per line. The tests hold the committed records to it exactly. It is a
+# table, not a rule of Unicode categories: no Python's ``unicodedata`` (whose
+# version is the interpreter's) decides what agy removes.
+DROPPED_TABLE = Path(__file__).resolve().parent / "fixtures/antigravity/1.5.13/dropped.txt"
+
+
+def read_table(path: Path = DROPPED_TABLE) -> tuple[tuple[int, int], ...]:
+    """A table of inclusive code point ranges, ``XXXX..YYYY`` or ``XXXX`` per line."""
     out = []
-    for ch in text:
-        cat = unicodedata.category(ch)
-        if cat in ("Cf", "Co") or (cat == "Cc" and ch not in keep):
-            continue
-        out.append(ch)
-    return "".join(out)
+    for raw in path.read_text(encoding="ascii").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            first, _, last = line.partition("..")
+            out.append((int(first, 16), int(last or first, 16)))
+    return tuple(out)
+
+
+def format_table(ranges: Iterable[Iterable[int]], header: str) -> str:
+    lines = [f"# {h}".rstrip() for h in header.splitlines()]
+    for first, last in ranges:
+        lines.append(f"{first:04X}" if first == last else f"{first:04X}..{last:04X}")
+    return "\n".join(lines) + "\n"
+
+
+@functools.cache
+def dropped_1_5_13() -> tuple[tuple[int, int], ...]:
+    return read_table()
+
+
+def is_dropped(c: int, table: tuple[tuple[int, int], ...] | None = None) -> bool:
+    """Whether agy 1.5.13 (or ``table``'s build) removes the code point ``c``."""
+    ranges = dropped_1_5_13() if table is None else table
+    i = bisect.bisect_right(ranges, (c, 0x10FFFF)) - 1
+    return i >= 0 and ranges[i][0] <= c <= ranges[i][1]
+
+
+def stripped(text: str) -> str:
+    """``text`` without the characters agy 1.5.13 removes from a prompt."""
+    return "".join(ch for ch in text if not is_dropped(ord(ch)))
 
 
 def stream_message(text: str) -> str:
@@ -237,7 +356,7 @@ def scenarios() -> list[Scenario]:
     s: list[Scenario] = []
     add = s.append
     # discovery
-    add(Scenario("version", ["--version"], steps=[]))
+    add(Scenario("version", ["--version"], steps=[], timeout=15))
     add(Scenario("help", ["--help"], steps=[]))
     add(Scenario("settings-catalogue", p_run(fmt="json", prompt="/config"), steps=[]))
     add(Scenario("settings-unknown-key", ["-p", "hi", "--settings", '{"noSuchKey": true}']))
@@ -330,6 +449,10 @@ def scenarios() -> list[Scenario]:
             sent_prompt=big,
         )
     )
+    # every scalar value, NUL on its own
+    for label, spans in [("nul", [(0, 0)]), *((f"{i:02d}", c) for i, c in enumerate(all_chunks()))]:
+        text = all_prompt(label, spans)
+        add(Scenario(ALL_PREFIX + label, stdin_run(), stdin=text.encode(), sent_prompt=text))
     # tools, permissions and questions
     add(Scenario("deny-command", p_run(), steps=[CMD_IN_WORKSPACE, text_step()]))
     add(Scenario("deny-command-json", p_run(fmt="json"), steps=[CMD_IN_WORKSPACE, text_step()]))
@@ -1140,6 +1263,8 @@ def _facts(sc: Scenario, requests: list[dict[str, Any]], root: str, home: str) -
             "truncated_bytes": int(cut.group(1)) if cut else None,
             "kept_before_cut_bytes": len(got[: cut.start()].encode()) if cut and got else None,
         }
+        if sc.name.startswith(ALL_PREFIX) and got is not None:
+            facts["all"] = measure_all(want, got)
         if sc.name == "fidelity-sweep" and got is not None:
             dropped, kept = [], []
             for c in SWEEP:
@@ -1155,8 +1280,53 @@ def _facts(sc: Scenario, requests: list[dict[str, Any]], root: str, home: str) -
 # adapter) says a one-shot ``--output-format stream-json`` run means, written
 # down so the committed records can be held to it. A G1 adapter would put
 # its own, reviewed, in the provider layer (as claude_stream.py is).
+#
+# The streams it admits (the report's section 4), and no other:
+#
+#   run      init, step_update*, result      then the end of stdout
+#   refusal  result, status ERROR            then the end of stdout
+#
+# A refusal is agy's answer when no session began (``stdin-whitespace``,
+# ``no-login-argv-prompt``): never a completed run. Each record's shape:
+#
+# - init: ``{"event": "init", "conversation_id": C, "init": {...}}``, C a
+#   non-empty string, and the first record.
+# - step_update: ``{"event": "step_update", "step_update": {"conversation_id":
+#   C, "step_index": N, "state": S, "step_type": T, "text_delta": D}}``, N
+#   an integer >= 0, S one of STEP_STATES, T a non-empty string, D (when
+#   present) a string. A step's first update has an index above every
+#   earlier step's; a step keeps its type; nothing updates a step that
+#   ended (DONE or ERROR).
+# - result: ``{"event": "result", "result": {"conversation_id": C,
+#   "status": "SUCCESS" or "ERROR", ...}}``, the last record, its
+#   ``response``, ``error`` and ``finished_reason`` strings when present
+#   and its ``denied_actions`` a list of objects with a string ``action``.
+#   A refusal's conversation_id is ``""``, as agy writes it.
+#
+# Anything else (a line that is not JSON, an unknown event, a value of
+# another type in one of these places, a record out of this order or of
+# another conversation) is a violation, and a run with one is a protocol
+# failure. Nothing in a record is read before its type is checked, so no
+# record raises.
 
 EVENTS = ("init", "step_update", "result")
+STEP_STATES = ("ACTIVE", "DONE", "ERROR")
+ENDED = ("DONE", "ERROR")
+# The step types whose meaning the contract knows. Any other, ``unknown``
+# among them, makes a run ambiguous and never completed: an ``ask_question``
+# answered with nothing is an ``unknown`` step with no name (``ask-question``),
+# and nothing tells it from any other ``unknown`` step.
+STEP_TYPES = ("user_input", "agent_response", "tool", "error_message", "system_message")
+RESULT_STATUSES = ("SUCCESS", "ERROR")
+
+
+@dataclass
+class Step:
+    """One step of the run, from its updates."""
+
+    step_type: str
+    state: str
+    text: str = ""  # its text_delta values, joined
 
 
 @dataclass
@@ -1164,52 +1334,128 @@ class Reduction:
     """What one run's stdout and stderr say, record by record."""
 
     records: int = 0
-    malformed: int = 0  # a line that is not a JSON object with a known event
-    init: bool = False
+    violations: list[str] = field(default_factory=list)
+    conversation_id: str | None = None  # the init's
     results: list[dict[str, Any]] = field(default_factory=list)
-    result_last: bool = True
-    # each agent_response step's text, by step index, from its deltas
-    agent_text: dict[int, str] = field(default_factory=dict)
-    # each tool step's last state, by step index
-    tools: dict[int, str] = field(default_factory=dict)
+    steps: dict[int, Step] = field(default_factory=dict)  # by step index
+    last_index: int = -1
     agy_error: dict[str, Any] | None = None
+
+    @property
+    def init(self) -> bool:
+        return self.conversation_id is not None
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_index(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _init(red: Reduction, obj: dict[str, Any], n: int) -> str:
+    cid = obj.get("conversation_id")
+    if n != 1 or red.init:
+        return "not the first record"
+    if not isinstance(cid, str) or not cid:
+        return f"conversation_id {cid!r}"
+    if not isinstance(obj.get("init"), dict):
+        return "init is not an object"
+    red.conversation_id = cid
+    return ""
+
+
+def _step(red: Reduction, obj: dict[str, Any], n: int) -> str:
+    step = obj.get("step_update")
+    if not red.init:
+        return "before init"
+    if not isinstance(step, dict):
+        return "step_update is not an object"
+    index, state, kind = step.get("step_index"), step.get("state"), step.get("step_type")
+    delta = step.get("text_delta", "")
+    if step.get("conversation_id") != red.conversation_id:
+        return f"conversation_id {step.get('conversation_id')!r}, not the init's"
+    if not _is_index(index):
+        return f"step_index {index!r}"
+    if state not in STEP_STATES:
+        return f"state {state!r}"
+    if not isinstance(kind, str) or not kind:
+        return f"step_type {kind!r}"
+    if not isinstance(delta, str):
+        return f"text_delta {delta!r}"
+    known = red.steps.get(index)
+    if known is None:
+        if index < red.last_index:
+            return f"step {index} begins after step {red.last_index}"
+        known = red.steps[index] = Step(kind, state)
+        red.last_index = index
+    elif known.step_type != kind:
+        return f"step {index} changed type from {known.step_type} to {kind}"
+    elif known.state in ENDED:
+        return f"step {index} updated after it ended {known.state}"
+    known.state = state
+    known.text += delta
+    return ""
+
+
+def _result(red: Reduction, obj: dict[str, Any], n: int) -> str:
+    res = obj.get("result")
+    if not isinstance(res, dict):
+        return "result is not an object"
+    red.results.append(res)
+    status, cid = res.get("status"), res.get("conversation_id")
+    if status not in RESULT_STATUSES:
+        return f"status {status!r}"
+    if red.init and cid != red.conversation_id:
+        return f"conversation_id {cid!r}, not the init's"
+    if not red.init and (n != 1 or status != "ERROR" or cid != ""):
+        return "a result with no init that is not a refusal (an ERROR result alone)"
+    for key in ("response", "error", "finished_reason"):
+        if key in res and not isinstance(res[key], str):
+            return f"{key} {res[key]!r}"
+    denied = res.get("denied_actions")
+    if denied is not None and not (
+        isinstance(denied, list)
+        and all(isinstance(d, dict) and isinstance(d.get("action"), str) for d in denied)
+    ):
+        return f"denied_actions {denied!r}"
+    return ""
+
+
+_RECORD_CHECKS = {"init": _init, "step_update": _step, "result": _result}
 
 
 def reduce_stream(stdout: Iterable[str], stderr: Iterable[str]) -> Reduction:
+    """Every record of the run, checked against the grammar above."""
     red = Reduction()
     for line in stdout:
         if not line.strip():
             continue
         red.records += 1
+        n = red.records
         try:
             obj = json.loads(line)
-        except ValueError:
-            red.malformed += 1
+        except (ValueError, RecursionError):  # nested too deep is not JSON either
+            red.violations.append(f"record {n} is not JSON")
             continue
         event = obj.get("event") if isinstance(obj, dict) else None
         if event not in EVENTS:
-            red.malformed += 1
+            red.violations.append(f"record {n} is not a known event")
             continue
         if red.results:
-            red.result_last = False  # anything after a result
-        if event == "init":
-            red.init = True
-        elif event == "result":
-            red.results.append(obj.get("result") or {})
-            red.result_last = True
-        else:
-            step = obj.get("step_update") or {}
-            index = step.get("step_index", -1)
-            if step.get("step_type") == "agent_response":
-                red.agent_text[index] = red.agent_text.get(index, "") + step.get("text_delta", "")
-            elif step.get("step_type") == "tool":
-                red.tools[index] = step.get("state", "")
+            red.violations.append(f"record {n} ({event}) follows the result")
+            continue
+        problem = _RECORD_CHECKS[event](red, obj, n)
+        if problem:
+            red.violations.append(f"record {n} ({event}): {problem}")
     for line in stderr:
         if line.startswith("AGY_ERROR: "):
             try:
-                red.agy_error = json.loads(line[len("AGY_ERROR: ") :])
-            except ValueError:
-                red.agy_error = {"unparsed": True}
+                err = json.loads(line[len("AGY_ERROR: ") :])
+            except (ValueError, RecursionError):
+                err = None
+            red.agy_error = err if isinstance(err, dict) else {"unparsed": True}
     return red
 
 
@@ -1223,45 +1469,61 @@ class Outcome:
 
 
 def classify(red: Reduction, exit_code: int) -> Outcome:
-    """A one-shot run's outcome, by the suggested contract; never from exit 0 alone."""
-    if red.malformed:
-        return Outcome("protocol", f"{red.malformed} line(s) not a known event")
+    """A one-shot run's outcome, by the suggested contract; never from exit 0 alone.
+
+    ``completed`` only when all of these hold: the stream is a ``run`` with
+    no violation; its result is SUCCESS with no finished_reason and no
+    denied_actions; the exit is 0; every step is of a type the contract
+    knows (:data:`STEP_TYPES`) and ended; and the run's last step is an
+    agent_response that ended DONE with a non-blank text, which is the
+    reply. The first that fails names the outcome.
+    """
+    if red.violations:
+        more = len(red.violations) - 1
+        return Outcome("protocol", red.violations[0] + (f" (and {more} more)" if more else ""))
     if not red.results:
         return Outcome("no_result", "no result record" + (" after init" if red.init else ""))
-    if len(red.results) > 1:
-        return Outcome("protocol", f"{len(red.results)} result records in a one-shot run")
-    if not red.result_last:
-        return Outcome("protocol", "a record after the result")
     result = red.results[0]
     reason = result.get("finished_reason", "")
     if reason == "interrupted":
         return Outcome("interrupted", "finished_reason interrupted")
     if reason == "print_timeout":
         return Outcome("print_timeout", "finished_reason print_timeout")
-    if result.get("status") != "SUCCESS" or reason or exit_code != 0:
+    if result["status"] != "SUCCESS" or reason or exit_code != 0:
         err = red.agy_error or {}
         code = err.get("error_code")
         if err.get("code_kind") == "http" and code == 429:
             return Outcome("usage_limit", "model API 429")
-        if (
-            err.get("code_kind") == "http"
-            and isinstance(code, int)
-            and (code == 408 or code >= 500)
-        ):
+        if err.get("code_kind") == "http" and _is_int(code) and (code == 408 or code >= 500):
             return Outcome("transient", f"model API {code}")
-        return Outcome("error", f"status {result.get('status')}, exit {exit_code}")
+        return Outcome("error", f"status {result['status']}, exit {exit_code}")
     denied = result.get("denied_actions") or []
     if denied:
-        names = ", ".join(sorted({str(d.get("action")) for d in denied}))
+        names = ", ".join(sorted({d["action"] for d in denied}))
         return Outcome("denied", f"refused without a prompt: {names}")
-    if any(state not in ("DONE", "ERROR") for state in red.tools.values()):
-        return Outcome("protocol", "a tool step never ended")
-    if not red.agent_text:
-        return Outcome("empty_reply", "no agent response")
-    reply = red.agent_text[max(red.agent_text)]
-    if not reply.strip():
+    odd = [f"{i} ({s.step_type})" for i, s in red.steps.items() if s.step_type not in STEP_TYPES]
+    if odd:
+        return Outcome(
+            "ambiguous",
+            "a step the contract cannot read: "
+            + ", ".join(odd)
+            + "; an unanswered ask_question is one",
+        )
+    unended = [f"{i} ({s.step_type})" for i, s in red.steps.items() if s.state not in ENDED]
+    if unended:
+        return Outcome("protocol", "a step never ended: " + ", ".join(unended))
+    if not red.steps:
+        return Outcome("empty_reply", "no step")
+    last = red.steps[red.last_index]
+    if last.step_type != "agent_response":
+        return Outcome(
+            "empty_reply", f"the run's last step, {red.last_index}, is a {last.step_type} step"
+        )
+    if last.state != "DONE":
+        return Outcome("protocol", f"the last agent response ended {last.state}")
+    if not last.text.strip():
         return Outcome("empty_reply", "the last agent response is empty")
-    return Outcome("completed", reply=reply)
+    return Outcome("completed", reply=last.text)
 
 
 def outcome_of(record: dict[str, Any]) -> Outcome:
@@ -1366,19 +1628,79 @@ def normalize(record: dict[str, Any], root: Path, sc: Scenario, agy: str) -> dic
     return out
 
 
+class ProbeError(RuntimeError):
+    """The probe could not measure the binary it was given."""
+
+
+VERSION_SCENARIO = next(s for s in SCENARIOS if s.name == "version")
+# What ``agy --version`` prints: a dotted version, perhaps a suffix, alone.
+VERSION_TEXT = re.compile(r"\d+(?:\.\d+)+(?:[-+][0-9A-Za-z.+-]+)?")
+
+
+def version_printed(record: dict[str, Any]) -> str | None:
+    """The version a ``version`` record printed, or None if it printed none.
+
+    One line on stdout, a version and nothing else, from a run that exited 0
+    on its own.
+    """
+    printed = "".join(line for _, line in record["stdout"]).splitlines()
+    if record["killed_by_probe"] or record["exit"] != 0 or len(printed) != 1:
+        return None
+    return printed[0] if VERSION_TEXT.fullmatch(printed[0]) else None
+
+
+def discover_version(
+    agy: str, root: Path, timeout: float | None = None
+) -> tuple[str, dict[str, Any]]:
+    """``agy --version``, run as the ``version`` scenario: sandboxed and bounded.
+
+    Never on the host: the binary under measurement is what the probe does
+    not trust, and its version is the first thing asked of it. So it runs
+    as every scenario does (:func:`run_one`): in ``bwrap`` with no network,
+    an empty home under ``root``, a minimal environment, and killed at the
+    scenario's timeout. Returns the version and the record; raises
+    :class:`ProbeError` if the run printed no version.
+    """
+    sc = VERSION_SCENARIO if timeout is None else replace(VERSION_SCENARIO, timeout=timeout)
+    record = run_one(agy, sc, root, {})
+    version = version_printed(record)
+    if version is None:
+        stdout = "".join(line for _, line in record["stdout"])
+        raise ProbeError(
+            f"agy --version, in the sandbox, printed no version: exit {record['exit']}, "
+            f"killed {record['killed_by_probe']}, stdout {stdout[:120]!r}"
+        )
+    return version, record
+
+
 def record_all(agy: str, out: Path, only: set[str] | None = None, workers: int = 8) -> list[str]:
-    """Run the scenarios (groups in order, the rest in parallel) and write one record each."""
+    """Run the scenarios (groups in order, the rest in parallel) and write one record each.
+
+    The ``version`` scenario runs first, always (:func:`discover_version`):
+    every record names the version it printed, and its own record is
+    written when it is chosen.
+    """
     if shutil.which("bwrap") is None:
         raise SystemExit("bwrap is required")
-    version = subprocess.run([agy, "--version"], capture_output=True, text=True).stdout.strip()
-    out.mkdir(parents=True, exist_ok=True)
     chosen = [s for s in SCENARIOS if only is None or s.name in only]
     groups: dict[str, list[Scenario]] = {}
     for sc in chosen:
-        groups.setdefault(sc.group or sc.name, []).append(sc)
+        if sc is not VERSION_SCENARIO:
+            groups.setdefault(sc.group or sc.name, []).append(sc)
     written: list[str] = []
     with tempfile.TemporaryDirectory(prefix="agy-probe.") as tmp:
         root = Path(tmp).resolve()
+        version, version_record = discover_version(agy, root)
+        out.mkdir(parents=True, exist_ok=True)
+
+        def write(rec: dict[str, Any]) -> None:
+            rec["agy_version"] = version
+            path = out / f"{rec['scenario']}.json"
+            path.write_text(json.dumps(rec, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
+            written.append(rec["scenario"])
+
+        if VERSION_SCENARIO in chosen:
+            write(version_record)
         shared: dict[str, tuple[Path, Path]] = {}
 
         def run_group(members: list[Scenario]) -> list[dict[str, Any]]:
@@ -1391,13 +1713,48 @@ def record_all(agy: str, out: Path, only: set[str] | None = None, workers: int =
         with concurrent.futures.ThreadPoolExecutor(workers) as pool:
             for records in pool.map(run_group, groups.values()):
                 for rec in records:
-                    rec["agy_version"] = version
-                    path = out / f"{rec['scenario']}.json"
-                    path.write_text(
-                        json.dumps(rec, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
-                    )
-                    written.append(rec["scenario"])
+                    write(rec)
     return written
+
+
+def dropped_of(records: Iterable[dict[str, Any]]) -> list[list[int]]:
+    """The union of the ``fidelity-all-*`` records' dropped runs, merged.
+
+    Only a clean measurement counts (:func:`measure_all`); the tests check
+    separately that every scalar value was measured cleanly.
+    """
+    runs = sorted(
+        (first, last)
+        for rec in records
+        if rec["scenario"].startswith(ALL_PREFIX)
+        and (rec["facts"].get("all") or {}).get("dropped") is not None
+        for first, last in rec["facts"]["all"]["dropped"]
+    )
+    merged: list[list[int]] = []
+    for first, last in runs:
+        if merged and first <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], last)
+        else:
+            merged.append([first, last])
+    return merged
+
+
+TABLE_HEADER = """\
+What agy {version} removes from a prompt, measured over every Unicode scalar
+value by tests/antigravity_probe.py: the union of the dropped runs of the
+fidelity-all-* records beside this file. One inclusive range per line, in
+hexadecimal. Written by
+  python3 -I tests/antigravity_probe.py table --records DIR"""
+
+
+def write_table(records_dir: Path) -> Path:
+    """Write ``records_dir``'s measured table as ``dropped.txt`` beside its records."""
+    found = [json.loads(p.read_text(encoding="utf-8")) for p in records_dir.glob("*.json")]
+    versions = sorted({r.get("agy_version", "?") for r in found})
+    path = records_dir / "dropped.txt"
+    header = TABLE_HEADER.format(version=", ".join(versions))
+    path.write_text(format_table(dropped_of(found), header), encoding="ascii")
+    return path
 
 
 def main() -> int:
@@ -1407,11 +1764,16 @@ def main() -> int:
     rec.add_argument("--agy", required=True)
     rec.add_argument("--out", required=True, type=Path)
     rec.add_argument("--only", default="")
+    tab = sub.add_parser("table")
+    tab.add_argument("--records", required=True, type=Path)
     inn = sub.add_parser("inner")
     inn.add_argument("spec")
     a = ap.parse_args()
     if a.mode == "inner":
         return inner(a.spec)
+    if a.mode == "table":
+        print(write_table(a.records))
+        return 0
     only = {x for x in a.only.split(",") if x} or None
     names = record_all(str(Path(a.agy).expanduser().resolve()), a.out, only)
     print(f"{len(names)} records in {a.out}")

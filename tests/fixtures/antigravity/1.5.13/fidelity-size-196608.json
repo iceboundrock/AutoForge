@@ -22,7 +22,7 @@
   },
   "names_app_data_dir": true,
   "system_prompt_chars": 16907,
-  "system_prompt_sha256": "d949faa441109e533c641128e0cc878e0b1dec937227313fa24d347537a6bff4"
+  "system_prompt_sha256": "fc14dd9a9002e60f332cc42696e9aff97b9cca7913ae9254b315a9810f86d581"
  },
  "home_files": [
   ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript/00000000.jsonl",
@@ -84,26 +84,26 @@
   }
  ],
  "scenario": "fidelity-size-196608",
- "seconds": 0.4,
+ "seconds": 0.5,
  "signalled": null,
  "stderr": [],
  "stdin_bytes": 196608,
  "stdout": [
   [
-   0.24,
-   "{\"event\":\"init\",\"conversation_id\":\"e9e82d86-0dd0-4de7-8e2f-e8083a6493b8\",\"init\":{\"cwd\":\"<root>/fidelity-size-196608.7zrxd92b/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"request-review\"}}\n"
+   0.36,
+   "{\"event\":\"init\",\"conversation_id\":\"50141a9d-97ca-46e1-a123-6146971bd557\",\"init\":{\"cwd\":\"<root>/fidelity-size-196608.mqgr0wkv/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"request-review\"}}\n"
   ],
   [
-   0.27,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"e9e82d86-0dd0-4de7-8e2f-e8083a6493b8\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
+   0.41,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"50141a9d-97ca-46e1-a123-6146971bd557\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
   ],
   [
-   0.29,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"e9e82d86-0dd0-4de7-8e2f-e8083a6493b8\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.00813149,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+   0.46,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"50141a9d-97ca-46e1-a123-6146971bd557\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.0061404,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
   ],
   [
-   0.29,
-   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"e9e82d86-0dd0-4de7-8e2f-e8083a6493b8\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.041194751,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+   0.46,
+   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"50141a9d-97ca-46e1-a123-6146971bd557\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.090995722,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
   ]
  ],
  "title_requests": 0
