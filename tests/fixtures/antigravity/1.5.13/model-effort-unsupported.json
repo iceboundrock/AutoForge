@@ -15,8 +15,10 @@
  ],
  "capture": {
   "stderr_eof": true,
+  "stderr_error": null,
   "stderr_truncated": false,
   "stdout_eof": true,
+  "stdout_error": null,
   "stdout_truncated": false
  },
  "exit": 1,
@@ -48,16 +50,17 @@
  "requests": [],
  "scenario": "model-effort-unsupported",
  "seconds": 0.3,
+ "session_keyring": "own",
  "signalled": null,
  "stderr": [
   [
-   0.23,
+   0.25,
    "error: invalid model selection (--model \"gemini-4-argon\" --effort \"max\"): gemini-4-argon has no \"max\" effort (available: low, medium, high)\n"
   ]
  ],
  "stdout": [
   [
-   0.23,
+   0.25,
    "{\"conversation_id\":\"\",\"status\":\"ERROR\",\"response\":\"\",\"error\":\"invalid model selection (--model \\\"gemini-4-argon\\\" --effort \\\"max\\\"): gemini-4-argon has no \\\"max\\\" effort (available: low, medium, high)\",\"duration_seconds\":0,\"num_turns\":0,\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":0},\"finished_reason\":\"error\"}\n"
   ]
  ],

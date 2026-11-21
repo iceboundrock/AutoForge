@@ -11,8 +11,10 @@
  ],
  "capture": {
   "stderr_eof": true,
+  "stderr_error": null,
   "stderr_truncated": false,
   "stdout_eof": true,
+  "stdout_error": null,
   "stdout_truncated": false
  },
  "exit": 0,
@@ -20,7 +22,7 @@
   "context_markers": [],
   "names_app_data_dir": true,
   "system_prompt_chars": 16859,
-  "system_prompt_sha256": "927095f634abc2acaa35fed117cd40d288737f322c2bd694dea981cf6cb510b5"
+  "system_prompt_sha256": "1572ac7d293e25aae9b36f67bca89113f53b83d4c7840ef04e31feb10a32c510"
  },
  "home_files": [
   ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript/00000000.jsonl",
@@ -57,7 +59,7 @@
  "requests": [
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\nargv prompt\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:54:51Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\nargv prompt\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T04:52:28Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
    "markers_present": [],
@@ -87,25 +89,26 @@
  ],
  "scenario": "stdin-and-argv",
  "seconds": 0.6,
+ "session_keyring": "own",
  "signalled": null,
  "stderr": [],
  "stdin_bytes": 13,
  "stdout": [
   [
-   0.44,
-   "{\"event\":\"init\",\"conversation_id\":\"065d56c2-0dd9-484e-9928-1d2f2d4c9e1a\",\"init\":{\"cwd\":\"<root>/stdin-and-argv.c9mxycqn/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"request-review\"}}\n"
+   0.4,
+   "{\"event\":\"init\",\"conversation_id\":\"d9d9b1bd-eda9-48a6-8e75-72c288a57dca\",\"init\":{\"cwd\":\"<root>/stdin-and-argv.azxxpsoc/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"request-review\"}}\n"
   ],
   [
-   0.49,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"065d56c2-0dd9-484e-9928-1d2f2d4c9e1a\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
+   0.46,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"d9d9b1bd-eda9-48a6-8e75-72c288a57dca\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
   ],
   [
-   0.52,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"065d56c2-0dd9-484e-9928-1d2f2d4c9e1a\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.010337796,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+   0.48,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"d9d9b1bd-eda9-48a6-8e75-72c288a57dca\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.015671515,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
   ],
   [
-   0.52,
-   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"065d56c2-0dd9-484e-9928-1d2f2d4c9e1a\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.0629507,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+   0.51,
+   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"d9d9b1bd-eda9-48a6-8e75-72c288a57dca\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.069661276,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
   ]
  ],
  "title_requests": 0

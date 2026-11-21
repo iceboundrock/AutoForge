@@ -11,8 +11,10 @@
  ],
  "capture": {
   "stderr_eof": true,
+  "stderr_error": null,
   "stderr_truncated": false,
   "stdout_eof": true,
+  "stdout_error": null,
   "stdout_truncated": false
  },
  "exit": 0,
@@ -20,7 +22,7 @@
   "context_markers": [],
   "names_app_data_dir": true,
   "system_prompt_chars": 16843,
-  "system_prompt_sha256": "7fc9197168c582c8dde6173ae58021bf0f3dbcf2ad6855ed7206bfcd58b2aa1e"
+  "system_prompt_sha256": "da8bfeb4c732198123db060d73fe230651858783c9635a5b62e33241b3320fd9"
  },
  "home_files": [
   ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript/00000000.jsonl",
@@ -57,7 +59,7 @@
  "requests": [
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:54:51Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T04:52:27Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
    "markers_present": [],
@@ -87,23 +89,24 @@
  ],
  "scenario": "success-text",
  "seconds": 0.4,
+ "session_keyring": "own",
  "signalled": null,
  "stderr": [],
  "stdout": [
   [
-   0.32,
+   0.38,
    "Finished.\n"
   ],
   [
-   0.32,
+   0.38,
    "<<<CONTROL_RESULT>>>\n"
   ],
   [
-   0.32,
+   0.38,
    "{\"phase\": \"PROBE\", \"status\": \"success\"}\n"
   ],
   [
-   0.32,
+   0.38,
    "<<<END_CONTROL_RESULT>>>\n"
   ]
  ],

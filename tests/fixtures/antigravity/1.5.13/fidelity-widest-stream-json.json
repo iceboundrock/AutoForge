@@ -11,8 +11,10 @@
  ],
  "capture": {
   "stderr_eof": true,
+  "stderr_error": null,
   "stderr_truncated": false,
   "stdout_eof": true,
+  "stdout_error": null,
   "stdout_truncated": false
  },
  "exit": 0,
@@ -31,7 +33,7 @@
   },
   "names_app_data_dir": true,
   "system_prompt_chars": 16963,
-  "system_prompt_sha256": "735f6beb06a391a8268cf330d438f9fec9a3026fc33e7af593dd0209559c1d49"
+  "system_prompt_sha256": "17f1315c89baa0b213d7bdc1fa53e7a2f1347c748ab4aecf18216ee842ec4308"
  },
  "home_files": [
   ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript/00000000.jsonl",
@@ -107,25 +109,26 @@
  ],
  "scenario": "fidelity-widest-stream-json",
  "seconds": 0.4,
+ "session_keyring": "own",
  "signalled": null,
  "stderr": [],
  "stdin_bytes": 960041,
  "stdout": [
   [
-   0.25,
-   "{\"event\":\"init\",\"conversation_id\":\"7c326697-9832-433d-a9a2-7da807626d14\",\"init\":{\"cwd\":\"<root>/fidelity-widest-stream-json.5dnwtqrc/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"request-review\"}}\n"
+   0.22,
+   "{\"event\":\"init\",\"conversation_id\":\"72f08183-5ad6-4d6f-bf99-7942d2a7457c\",\"init\":{\"cwd\":\"<root>/fidelity-widest-stream-json.qwqm9sb9/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"request-review\"}}\n"
   ],
   [
-   0.31,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"7c326697-9832-433d-a9a2-7da807626d14\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
+   0.27,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"72f08183-5ad6-4d6f-bf99-7942d2a7457c\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
   ],
   [
-   0.36,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"7c326697-9832-433d-a9a2-7da807626d14\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.026502858,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+   0.29,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"72f08183-5ad6-4d6f-bf99-7942d2a7457c\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.01868482,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
   ],
   [
-   0.36,
-   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"7c326697-9832-433d-a9a2-7da807626d14\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.069196473,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+   0.32,
+   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"72f08183-5ad6-4d6f-bf99-7942d2a7457c\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.0494483,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
   ]
  ],
  "title_requests": 0

@@ -12,8 +12,10 @@
  ],
  "capture": {
   "stderr_eof": true,
+  "stderr_error": null,
   "stderr_truncated": false,
   "stdout_eof": true,
+  "stdout_error": null,
   "stdout_truncated": false
  },
  "exit": 0,
@@ -25,7 +27,7 @@
   ],
   "names_app_data_dir": true,
   "system_prompt_chars": 21272,
-  "system_prompt_sha256": "e80ce80e2f3e41054adcdfd14eba6568e4d35bc73a1ff88dea4603980fd301e6"
+  "system_prompt_sha256": "d0b03d717d83d3730b2b4ee420f2cd764470ad713068b0ebff1a75cac375129d"
  },
  "home_files": [
   ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript/00000000.jsonl",
@@ -66,7 +68,7 @@
  "requests": [
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:55:45Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T04:53:21Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
    "markers_present": [
@@ -100,12 +102,13 @@
  ],
  "scenario": "repository-customizations-sandbox",
  "seconds": 0.3,
+ "session_keyring": "own",
  "signalled": null,
  "stderr": [],
  "stdout": [
   [
    0.27,
-   "{\"conversation_id\":\"097c6bcc-c5cd-4601-b663-f01c401439cc\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.033612016,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}\n"
+   "{\"conversation_id\":\"abb2c144-6054-417d-92f0-13514ac0abe1\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.031032916,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}\n"
   ]
  ],
  "title_requests": 0

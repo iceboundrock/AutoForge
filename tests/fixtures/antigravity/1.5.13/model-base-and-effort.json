@@ -15,8 +15,10 @@
  ],
  "capture": {
   "stderr_eof": true,
+  "stderr_error": null,
   "stderr_truncated": false,
   "stdout_eof": true,
+  "stdout_error": null,
   "stdout_truncated": false
  },
  "exit": 0,
@@ -24,7 +26,7 @@
   "context_markers": [],
   "names_app_data_dir": true,
   "system_prompt_chars": 16915,
-  "system_prompt_sha256": "a052d066af1897cc2f0cfaaa32f338945333de93130673add8d66babe1874d1c"
+  "system_prompt_sha256": "abe93c830741855c36fe4af26cb1c1531d9196ac9f45569fd92559d16fab8a7c"
  },
  "home_files": [
   ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript/00000000.jsonl",
@@ -61,7 +63,7 @@
  "requests": [
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:55:33Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Argon (High). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T04:53:09Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Argon (High). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
    "markers_present": [],
@@ -91,12 +93,13 @@
  ],
  "scenario": "model-base-and-effort",
  "seconds": 0.4,
+ "session_keyring": "own",
  "signalled": null,
  "stderr": [],
  "stdout": [
   [
    0.31,
-   "{\"conversation_id\":\"26f6eab2-c06a-4dc4-962f-b8e037dc7170\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.022131585,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}\n"
+   "{\"conversation_id\":\"eba22775-c6ce-452d-b495-5b75fba138df\",\"status\":\"SUCCESS\",\"response\":\"Finished.\\n\\u003c\\u003c\\u003cCONTROL_RESULT\\u003e\\u003e\\u003e\\n{\\\"phase\\\": \\\"PROBE\\\", \\\"status\\\": \\\"success\\\"}\\n\\u003c\\u003c\\u003cEND_CONTROL_RESULT\\u003e\\u003e\\u003e\\n\",\"duration_seconds\":0.021976176,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}\n"
   ]
  ],
  "title_requests": 0

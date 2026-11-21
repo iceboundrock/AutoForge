@@ -11,8 +11,10 @@
  ],
  "capture": {
   "stderr_eof": true,
+  "stderr_error": null,
   "stderr_truncated": false,
   "stdout_eof": true,
+  "stdout_error": null,
   "stdout_truncated": false
  },
  "exit": 1,
@@ -31,6 +33,7 @@
  "requests": [],
  "scenario": "api-key-route-without-key",
  "seconds": 0.1,
+ "session_keyring": "own",
  "signalled": null,
  "stderr": [
   [

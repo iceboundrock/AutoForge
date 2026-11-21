@@ -10,8 +10,10 @@
  ],
  "capture": {
   "stderr_eof": true,
+  "stderr_error": null,
   "stderr_truncated": false,
   "stdout_eof": true,
+  "stdout_error": null,
   "stdout_truncated": false
  },
  "exit": 2,
@@ -27,14 +29,15 @@
  "requests": [],
  "scenario": "argv-after-double-dash",
  "seconds": 0.2,
+ "session_keyring": "own",
  "signalled": null,
  "stderr": [
   [
-   0.13,
+   0.16,
    "Error: unexpected argument \"-p\".\n"
   ],
   [
-   0.13,
+   0.16,
    "Prompts are read only from -p/--print, -i/--prompt-interactive, or stdin, so this argument would have been ignored.\n"
   ]
  ],

@@ -10,8 +10,10 @@
  ],
  "capture": {
   "stderr_eof": true,
+  "stderr_error": null,
   "stderr_truncated": false,
   "stdout_eof": true,
+  "stdout_error": null,
   "stdout_truncated": false
  },
  "exit": 2,
@@ -27,14 +29,15 @@
  "requests": [],
  "scenario": "argv-flag-name",
  "seconds": 0.2,
+ "session_keyring": "own",
  "signalled": null,
  "stderr": [
   [
-   0.14,
+   0.12,
    "Error: -p took \"--version\" as its prompt, so the intended prompt was left as an argument and ignored.\n"
   ],
   [
-   0.14,
+   0.12,
    "Attach the prompt to the flag (-p='your prompt') and move --version elsewhere on the command line.\n"
   ]
  ],

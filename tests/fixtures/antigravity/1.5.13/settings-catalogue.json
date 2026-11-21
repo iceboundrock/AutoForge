@@ -11,8 +11,10 @@
  ],
  "capture": {
   "stderr_eof": true,
+  "stderr_error": null,
   "stderr_truncated": false,
   "stdout_eof": true,
+  "stdout_error": null,
   "stdout_truncated": false
  },
  "exit": 0,
@@ -43,12 +45,13 @@
  "processes_left": [],
  "requests": [],
  "scenario": "settings-catalogue",
- "seconds": 0.4,
+ "seconds": 0.3,
+ "session_keyring": "own",
  "signalled": null,
  "stderr": [],
  "stdout": [
   [
-   0.35,
+   0.28,
    "{\"conversation_id\":\"\",\"status\":\"SUCCESS\",\"response\":\"agentMode\\tauto\\nallowNonWorkspaceAccess\\tfalse\\naltScreenMode\\tdefault\\nartifactReviewPolicy\\tasks-for-review\\nclearScrollbackOnResize\\ttrue\\ncolorScheme\\tterminal\\ncontextWindow\\t\\ncopyOnSelect\\ttrue\\ncustomModelsConfig\\t\\ndisableSlashCommands\\tfalse\\neditor\\tauto\\neditorMode\\tdefault\\nenableTerminalSandbox\\tfalse\\ngcp\\t\\nhideActiveItems\\tfalse\\nhistorySize\\t2000\\nmodel\\t\\nmodelProvider\\tgemini\\nnotifications\\tfalse\\npermissions\\t\\npickerGrouping\\tnone\\nqueuedMessages\\tqueue\\nrunningLightSpeed\\tmedium\\nsandboxProxy\\t\\nseasonalThemesOff\\t\\nseasonalThemesOptIn\\t\\nshowFeedbackSurvey\\ttrue\\nshowTips\\ttrue\\nstatusLine\\t\\ntitle\\t\\ntoolPermission\\trequest-review\\ntrustedWorkspaces\\t\\nuseG1Credits\\tfalse\\nuseTerminalCursor\\tfalse\\nverbosity\\tmedium\\nvimInsertFirst\\tfalse\\n\",\"duration_seconds\":0,\"num_turns\":0,\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":0},\"command\":{\"name\":\"config\",\"data\":{\"config\":{\"agentMode\":\"auto\",\"allowNonWorkspaceAccess\":false,\"altScreenMode\":\"default\",\"artifactReviewPolicy\":\"asks-for-review\",\"clearScrollbackOnResize\":true,\"colorScheme\":\"terminal\",\"contextWindow\":\"\",\"copyOnSelect\":true,\"customModelsConfig\":null,\"disableSlashCommands\":false,\"editor\":\"auto\",\"editorMode\":\"default\",\"enableTerminalSandbox\":false,\"gcp\":null,\"hideActiveItems\":false,\"historySize\":2000,\"model\":\"\",\"modelProvider\":\"gemini\",\"notifications\":false,\"permissions\":null,\"pickerGrouping\":\"none\",\"queuedMessages\":\"queue\",\"runningLightSpeed\":\"medium\",\"sandboxProxy\":null,\"seasonalThemesOff\":\"\",\"seasonalThemesOptIn\":\"\",\"showFeedbackSurvey\":true,\"showTips\":true,\"statusLine\":null,\"title\":null,\"toolPermission\":\"request-review\",\"trustedWorkspaces\":null,\"useG1Credits\":false,\"useTerminalCursor\":false,\"verbosity\":\"medium\",\"vimInsertFirst\":false}}}}\n"
   ]
  ],

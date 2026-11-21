@@ -27,16 +27,31 @@
   synthetic key (the tests check each one). The issue allows live calls
   only with the operator's explicit approval and a budget, and this run had
   neither.
-- **The sandbox** (`isolation: private-root`, which every record names).
+- **The sandbox** (`isolation: private-root` and `session_keyring: own`,
+  which every record names).
   `bwrap`'s own empty root, never the host's, holding only `/usr`
   read-only (with `/usr/local` hidden), the loader's cache, synthetic
   `/etc/passwd`, `/etc/group` and `/etc/hosts`, the probe, the binary and
   the run's spec directory read-only, and the run's own home and workspace
   read-write. The helper that starts `agy` has an empty environment
   (`--clearenv`; `bwrap` sets `PWD=/`), and `agy` gets only the variables
-  the helper sets, ten at most. It has namespaces of its own for users,
-  pids, the network (loopback only: no route out, and no socket of the
-  host's, abstract ones included), IPC, UTS and cgroups.
+  the helper sets, ten at most. It has namespaces of its own for users
+  (`--unshare-user`, so mandatory), pids, the network (loopback only: no
+  route out, and no socket of the host's, abstract ones included), IPC, UTS
+  and cgroups.
+  - **A session keyring of its own.** `--new-session` makes a process
+    session, not a keyring, and a key in the session keyring a process
+    inherits stays readable inside a `bwrap` user namespace (ADR 0005
+    D10.1). So the process that becomes `bwrap` first joins a new
+    anonymous session keyring, checks that it holds it, and only then
+    execs `bwrap`. A host where it cannot (no `keyctl(2)`, an architecture
+    whose call number the probe does not know, a join that fails) is
+    refused, and nothing of the run starts. The helper inside checks again
+    before anything else: a session keyring that is still the caller's, or
+    none, stops the run with no record. The user keyring is per user
+    namespace, and so the run's own. Nothing reads a key: the caller's
+    session keyring is named only by its serial, so that the helper can
+    tell it from its own.
   - **Setup inside it.** A workspace's setup is made by the helper inside
     the sandbox, before `agy` starts: the customized repository's `git
     init --template=` runs there with an environment of its own and every
@@ -52,34 +67,52 @@
     process of the run can open those three through `bwrap`'s own process
     inside (`/proc/1/fd/*`), which is why none of them may be the host's
     terminal or one of its files. It can also write into the record's
-    pipe, so what arrives is the sandbox's claim, parsed strictly. The
-    host opens no path the sandbox could write: the spec
-    directory is read-only inside, and the home and workspace are never
-    read after the run.
+    pipe, so what arrives is the sandbox's claim, parsed strictly, and
+    only once a read of the pipe has returned EOF. The host opens no path
+    the sandbox could write: the spec directory is read-only inside, and
+    the home and workspace are never read after the run.
   - **Measured with a fake `agy` and harmless canaries.** A file of the
     test's, the checkout, the caller's home, `/run`, `/var` and the rest of
     `/etc` are not there. The value of a variable set in the caller's
     environment is in no process's `/proc/<pid>/environ`. A socket by
     path, an abstract socket and a loopback port of the host's refuse the
-    connection. A link or a FIFO planted in the spec directory fails with
-    `EROFS`. Junk, or more than the bound, written into the record's pipe
-    stops the recording with nothing written. The caller's `GIT_DIR`,
-    `GIT_TEMPLATE_DIR` and global configuration leave their directories
-    untouched, and the workspace is the repository.
-  - **All 147 records were made this way**, in one recording on 2026-11-21.
-- **Earlier revisions of this PR** recorded in another sandbox. It mounted
-  the host root read-only, with `/tmp` a tmpfs, gave `agy` an empty `HOME`,
-  a minimal environment and namespaces of its own for pids and the network,
-  started the helper with the caller's environment, ran the customized
-  repository's `git init` on the host in the caller's environment, and read
-  each record back from a file the sandbox could write. During those runs
-  `agy` could read any host file the operator can, the caller's
-  environment was in the helper's `/proc/<pid>/environ`, and path-based
-  sockets of the host were there to connect to. Its network namespace had
-  no route out, but that does not rule out that something left through
-  one of those sockets to a service of the host's. Nothing shows what
-  `agy` did with that access. None of those records remains: every
-  committed record was made again in the sandbox above.
+    connection. A harmless key that a helper of the test's put in a session
+    keyring of its own (never the operator's), and found there, is in none
+    of the run's keyrings (session, user, user session: `ENOKEY`), while a
+    `bwrap` that joined no keyring finds it. With the launcher left out,
+    the helper refuses the run. A link or a FIFO planted in the spec
+    directory fails with `EROFS`. Junk, or more than the bound, written
+    into the record's pipe stops the recording with nothing written. The
+    caller's `GIT_DIR`, `GIT_TEMPLATE_DIR` and global configuration leave
+    their directories untouched, and the workspace is the repository.
+  - **The streams are read as they are.** Each stream of `agy` counts as
+    read to its end only when a read of it returned EOF; a read that
+    failed says so, and the record names why (`capture`:
+    `<stream>_error`). A byte that is not UTF-8 is kept as it is, never
+    replaced, so the reducer refuses it (§4).
+  - **All 147 records were made this way**, in one recording on 2026-11-21,
+    each with a session keyring of its own.
+- **Earlier revisions of this PR** recorded otherwise, and none of their
+  records remains: every committed record was made again in the sandbox
+  above.
+  - **The revision review round 4 read** had the private root, the
+    empty environment and the pipes above, but no session keyring of its
+    own: each run inherited the caller's, and a key there was readable
+    inside (D10.1). Its reader also counted a stream whose read had failed
+    as read to EOF, and replaced bytes that were not UTF-8. Nothing shows
+    what `agy` did with the keyring.
+  - **The revisions before** mounted the host root read-only, with `/tmp`
+    a tmpfs, gave `agy` an empty `HOME`, a minimal environment and
+    namespaces of its own for pids and the network, started the helper
+    with the caller's environment, ran the customized repository's `git
+    init` on the host in the caller's environment, and read each record
+    back from a file the sandbox could write. During those runs `agy`
+    could read any host file the operator can, the caller's environment
+    was in the helper's `/proc/<pid>/environ`, and path-based sockets of
+    the host were there to connect to. Its network namespace had no route
+    out, but that does not rule out that something left through one of
+    those sockets to a service of the host's. Nothing shows what `agy` did
+    with that access.
 - **Not measured:** the real Gemini API (its error bodies and details, such
   as the per-day quota `QuotaFailure` the changelog says stops retries at
   once; its latency; tool use by a real model), the Google sign-in and ADC
@@ -90,8 +123,8 @@
   and Windows, and `agy` driven through AutoForge's own executor. Each is
   marked where it matters.
 - **Re-measure:** `AUTOFORGE_AGY_PROBE_BIN=/path/to/agy uv run pytest
-  tests/test_antigravity_probe.py` (Linux with `bwrap` and `/usr/bin/python3`,
-  about four minutes, no model call) runs every scenario again against that
+  tests/test_antigravity_probe.py` (Linux with `bwrap`, `keyctl(2)` and
+  `/usr/bin/python3`, about four minutes, no model call) runs every scenario again against that
   binary, in the sandbox above, and fails on any fact here that no longer
   holds. It holds the fresh records to the behaviour, not to the label:
   they name whatever version the binary printed, and only the committed
@@ -107,6 +140,8 @@
   table there as it was, unless all of these hold:
   - every record is readable JSON and names the same version and sha256,
     and the `version` record printed that version;
+  - every record is a scenario's own, in the file named after it: no
+    stale, copied or relabelled record, of a measurement or not;
   - both complete measurements of §3 are there;
   - each of their records is the run its plan made: the scenario's argv
     and stdin (the transport), a whole capture of a run that completed at
@@ -117,10 +152,14 @@
     dropped equal to what was sent;
   - together they cover every scalar value once, and the two agree.
 
-  An empty, partial, unlabelled or mixed directory, or a record that does
-  not add up, would give a table that cannot tell no removal from no
-  measurement. The 1.5.13 records stay as they are. Appendix B runs one
-  scenario by hand, in the same sandbox.
+  The table is the union of exactly the records those checks passed,
+  each read by its file's name: no other record reaches it. An empty,
+  partial, unlabelled or mixed directory, or a record that does not add
+  up, would give a table that cannot tell no removal from no measurement;
+  a stale copy that dropped an ordinary letter, one per transport, would
+  give a table that strips it. The 1.5.13 records stay as they are.
+  Appendix B runs one scenario, through the recorder: the only runnable
+  route.
 
 ## 1. Summary
 
@@ -184,10 +223,13 @@ MCP servers off (`--safe-mode` and `--strict-mcp-config` for Claude Code,
 tree.
 
 The recommended transport is one-shot, the prompt on stdin as one
-`stream-json` message (§10). On it, `--print-timeout` bounds a run and
-cleans nothing up: during a background task it ended the run at exit 0
-with a `SUCCESS` result naming the timeout, and left the task running
-(§7). The adapter contract is in §10 and the decision in §11.
+`stream-json` message (§10). With the fixed argv of §10 on it,
+`--print-timeout` bounded a run and cleaned nothing up: during a
+background task it ended the run at exit 0 with a `SUCCESS` result naming
+the timeout, and left the task running (§7). The `-p` launch that
+terminated the task differs from it in more than the transport, so which
+difference decides it is not known. The adapter contract is in §10 and
+the decision in §11.
 
 ## 2. Discovery (question 1)
 
@@ -309,18 +351,22 @@ the inputs it names:
     (`fidelity-near-limit-stream-json`);
   - one astral character, U+1F680, 40,000 times: 480,046 bytes, three
     framed bytes for each of UTF-8 (`fidelity-astral-stream-json`);
-  - the widest line any prompt of that size the gate admits can make: a
-    `|` and then VT (U+000B), which `json.dumps` writes as the six bytes
-    `\u000b`, 159,999 times, in a line of 960,041 bytes
-    (`fidelity-widest-stream-json`). No character `agy` keeps takes more
-    than six framed bytes for one of UTF-8; every other takes three at
-    most (the tests check every scalar value). A prompt of VTs alone is
-    blank, which `agy` refuses (`stdin-whitespace`).
+  - the widest framing measured: a `|` and then VT (U+000B), which
+    `json.dumps` writes as the six bytes `\u000b`, 159,999 times, in a
+    line of 960,041 bytes (`fidelity-widest-stream-json`). No character
+    `agy` keeps takes more than six framed bytes for one of UTF-8, and only
+    VT takes six; every other takes three at most (the tests check every
+    scalar value).
 
-  So the framed line of an admitted prompt is at most 960,041 bytes, and
-  that line was measured. The sizes between 160,000 and 191,986 bytes were
-  not measured framed, nor any framed prompt at the bound other than these
-  three.
+  That is not the longest line the gate of §10 admits. 160,000 VTs pass
+  both of its checks, the size bound and the table, and frame to
+  **960,046 bytes**: the upper bound, five bytes more than the largest
+  frame measured. That prompt is blank, and its line was not measured.
+  `agy` refused a blank prompt only as text on stdin (`stdin-whitespace`:
+  five bytes of spaces and newlines, exit 1), and no blank prompt was
+  framed, so what `agy` does with one is not known. The sizes between
+  160,000 and 191,986 bytes were not measured framed either, nor any
+  framed prompt at the bound other than these three.
 
 An empty stdin is not refused cleanly. As text, `agy` tries to start its
 terminal UI, prints `CLI error: bubbletea: error opening TTY ...` on
@@ -350,7 +396,7 @@ all (`api-key-route-without-key`, §1).
 |---|---|---|
 | `init` | `conversation_id`; `init.cwd`, `init.tools` (60 names), `init.permission_mode` (`request-review`, or `always-proceed` under `--dangerously-skip-permissions`); `init.model` only when `--model` gave one | first record, written before the model is asked. Names the model only as asked (`init.model` repeats `--model`, `repository-customizations-recommended`), never the one that served the run. |
 | `step_update` | `conversation_id`, `step_index`, `state` (`ACTIVE`, `DONE`), `step_type` (`user_input`, `agent_response`, `tool`, `error_message`, `system_message`, `unknown`), and, as they apply, `text_delta`, `tool_name`, `tool_info` (`name`, `parameters`, `output`), `usage`, `duration_seconds` | one step's progress. An `agent_response` is sent as deltas while `ACTIVE`, then a `DONE` whose delta is `\n` (`success-chunks`). |
-| `result` | `conversation_id`, `status` (`SUCCESS` or `ERROR`), `response`, `error`, `duration_seconds`, `num_turns`, `usage` (`input_tokens`, `output_tokens`, `thinking_tokens`, `cache_read_tokens`, `total_tokens`), `finished_reason` (`error`, `interrupted`, `print_timeout`; absent on a normal end, and on a `SUCCESS` but once: a print timeout on the framed transport, §7), `denied_actions` (`action`, `display_name`) | the run's end |
+| `result` | `conversation_id`, `status` (`SUCCESS` or `ERROR`), `response`, `error`, `duration_seconds`, `num_turns`, `usage` (`input_tokens`, `output_tokens`, `thinking_tokens`, `cache_read_tokens`, `total_tokens`), `finished_reason` (`error`, `interrupted`, `print_timeout`; absent on a normal end, and on a `SUCCESS` but once: a print timeout under the fixed argv, §7), `denied_actions` (`action`, `display_name`) | the run's end |
 
 `--output-format json` writes the `result` object alone, as one line,
 when the run ends (`success-json`, `deny-command-json`), and `text` writes
@@ -387,8 +433,8 @@ stateDiagram-v2
     Ended --> [*]: exit 0, 1 or 3
 ```
 
-**The admissible streams.** Every one-shot record that ended on its own was
-one of two shapes, and the contract admits no other:
+**The admissible streams.** The contract admits two shapes of stream, and
+no other:
 
 - **a run:** `init`, then `step_update` records, then one `result`, then
   the end of stdout;
@@ -396,12 +442,24 @@ one of two shapes, and the contract admits no other:
   `conversation_id`, when no session began (`stdin-whitespace`,
   `no-login-argv-prompt`). It is a failure, never a completed run.
 
-**Framing.** Every record is one line: one JSON object and the LF that
-ends it, nothing else. Each of these is a protocol failure, never a line to
-skip or repair: a line without its LF (the last line, when the writer
-stopped mid-record: a terminal object without its LF is no terminal
+These are the shapes the contract accepts, not what every run wrote. Of
+the recorded runs that ended on their own, others wrote nothing on stdout
+(the five refusals of §1, each given a prompt), `init` alone
+(`stdin-stream-json-empty`), a terminal error that is no JSON
+(`stdin-empty`), the `json` and `text` formats' own output, an ACP
+server's JSON-RPC, and, in an input session, a `result` per turn (§6).
+Each of those is a failure to the contract: a stream of neither shape, or
+no stream at all. (`init` and then an `ERROR` result, as
+`stream-input-cut` and `stream-input-wrong-shape` wrote, is a run with no
+step, and a failure by its result.)
+
+**Framing.** Every record is one line: one JSON object of UTF-8 and the LF
+that ends it, nothing else. Each of these is a protocol failure, never a
+line to skip or repair: a line without its LF (the last line, when the
+writer stopped mid-record: a terminal object without its LF is no terminal
 record), an empty or blank line, whitespace around the object (a CR before
-the LF among it), a line longer than the reader's bound or cut by one, a
+the LF among it), a byte that is not UTF-8 (read as it is, never replaced:
+a replacement would make a record of it), a line longer than the reader's bound or cut by one, a
 member given twice in one object (`{"status":"ERROR","status":"SUCCESS"}`:
 which one counts would be the parser's choice), and a number JSON does not
 have (`NaN`, `Infinity`, or one too large to be finite). The reader's
@@ -443,29 +501,38 @@ all of these, and a capture short of any of them never completes a run
   its own. No idle or runtime limit, kill or signal ended it, the
   executor's or any other: a negative status is a signal's, whoever sent
   it;
-- stdout and stderr were each **read to EOF**: no process left behind
-  still held either pipe, so the capture was not abandoned (the
-  executor's `capture_abandoned`);
+- stdout and stderr were each **read to EOF**: a read of each returned
+  EOF. No process left behind still held either pipe, so the capture was
+  not abandoned (the executor's `capture_abandoned`), and no read failed
+  first: a reader that stopped on an error read part of a stream, however
+  whole it looks;
 - **no capture bound dropped output** of either (the executor's
   `stdout_truncated` and `stderr_truncated`), and no line was skipped past
-  the reader's per-line bound.
+  the reader's per-line bound;
+- **both were UTF-8**, read as they are: a stdout byte that is not UTF-8
+  is a framing violation (above), and a stderr that holds one was not
+  read as it is.
 
 Stderr counts as much as stdout. Completion needs the absence of an
 `AGY_ERROR` line, and typing a failure needs it to be the only one (§9).
-Neither absence nor uniqueness can be read from part of a stream, so a
-stderr not read whole stops a run from completing and leaves its failure
-untyped.
+Neither absence nor uniqueness can be read from part of a stream, or from
+one with bytes that are not UTF-8, so a stderr not read whole and as it is
+stops a run from completing and leaves its failure untyped.
 
 The probe reports the same for its records: each says, for stdout and for
-stderr, whether it reached EOF and whether a bound dropped any of it
-(`capture`). The helper keeps at most 2 MiB and 20,000 lines of each
-stream and reads on to the end past that, and a line cut for the record
-(over 4,000 characters) counts as dropped. Every committed record reached
-EOF on both streams and lost nothing, survivors and all.
+stderr, whether a read of it returned EOF, why a read failed first, if
+one did, and whether a bound dropped any of it (`capture`). The helper
+keeps at most 2 MiB and 20,000 lines of each stream and reads on to the
+end past that, a line cut for the record (over 4,000 characters) counts
+as dropped, and a byte that is not UTF-8 is kept in the record as it is
+(`surrogateescape`), so the reducer refuses it. Every committed record
+reached EOF on both streams, met no failed read, lost nothing and held
+only UTF-8, survivors and all.
 
 **Terminal proof** for a one-shot run is a run of that shape and framing:
 its one `result` written as the last record and ended by its LF, followed
-by the process's exit on its own and EOF on stdout, with nothing dropped. A
+by the process's exit on its own and EOF on stdout and on stderr, with
+nothing of either dropped and both UTF-8. A
 run whose stream ends without a `result` has no terminal proof, whatever
 its exit status (`hang-no-limit`, `stdin-stream-json-empty`).
 
@@ -495,16 +562,16 @@ Claude Code's stream, this one does not show a reply before `agy` ends.
 | 0 | `result` with `SUCCESS` | `success-stream-json`, `api-503-then-success` |
 | 0 | **`SUCCESS` after a refused tool call, with an empty response** | `deny-command`, `deny-command-json` |
 | 0 | no `result` at all: empty stdin | `stdin-empty`, `stdin-stream-json-empty` |
-| 0 | **`--print-timeout` expired on the framed transport**: a `SUCCESS` result that names `finished_reason: print_timeout`, and an `AGY_ERROR` (`DEADLINE_EXCEEDED`) | `print-timeout-background-recommended` |
+| 0 | **`--print-timeout` expired under the fixed argv** (§10: the prompt framed on stdin, `--model`, `--effort`, `--disable-slash-commands`): a `SUCCESS` result that names `finished_reason: print_timeout`, and an `AGY_ERROR` (`DEADLINE_EXCEEDED`) | `print-timeout-background-recommended` |
 | 1 | a setting, a model selection, a missing credential, stream input that does not decode, or a stop by SIGINT or SIGTERM (`finished_reason: interrupted`) | `settings-unknown-key`, `model-unknown`, `api-key-route-without-key`, `stream-input-cut`, `sigint-during-request` |
 | 2 | a usage error: an unknown flag, a stray argument, a prompt that spells a flag | `argv-flag-name`, `argv-after-double-dash` |
-| 3 | a turn ended on a model or agent error (`finished_reason: error`), or `--print-timeout` expired in argv print mode (`print_timeout`) | `api-400`, `hang-print-timeout`, `print-timeout-background` |
+| 3 | a turn ended on a model or agent error (`finished_reason: error`), or `--print-timeout` expired on a `-p` launch (`print_timeout`) | `api-400`, `hang-print-timeout`, `print-timeout-background` |
 
 `result.status` was only ever `SUCCESS` or `ERROR`. No `WAITING`,
 `CANCELED` or `INVALID` status appeared in any record. `finished_reason`
 separates a failure, an interruption and a print timeout, and is absent on a
-normal end, as the changelog says. One record breaks that pairing: on the
-framed transport, a print timeout during a background task ended in
+normal end, as the changelog says. One record breaks that pairing: under
+the fixed argv, a print timeout during a background task ended in
 `SUCCESS` with `finished_reason: print_timeout`, at exit 0
 (`print-timeout-background-recommended`, §7). The definitive terminal
 states are therefore `SUCCESS` with no `finished_reason` and no
@@ -581,16 +648,22 @@ reaches them.
 | normal end, a child that ran `setsid -f` | it survives, re-parented, in its own session | `detached-child` |
 | SIGINT or SIGTERM during a model request | exit 1 at once, after a `result` with `interrupted`. Nothing left. | `sigint-during-request`, `sigterm-during-request`, `sigint-during-request-json` |
 | SIGTERM during a background task | exit 1, `interrupted`. **The task's shell survives**, re-parented, with its `sleep`. | `sigterm-background-task` |
-| `--print-timeout` during a background task, argv print mode (`-p`) | exit 3, `print_timeout`, the task terminated and named in `AGY_ERROR`. Nothing left. | `print-timeout-background` |
-| `--print-timeout` during a background task, **the fixed argv of §10** (the prompt framed on stdin) | exit **0**, a `SUCCESS` result with `finished_reason: print_timeout`, `AGY_ERROR` `DEADLINE_EXCEEDED` with no task named. **The task is not terminated:** its shell survives, re-parented, in its own session, with its `sleep`. | `print-timeout-background-recommended` |
-| `--print-timeout` during a model request, argv print mode | exit 3, `print_timeout` | `hang-print-timeout` |
+| `--print-timeout` during a background task, a `-p` launch (the prompt in argv, the default model and effort, slash commands on) | exit 3, `print_timeout`, the task terminated and named in `AGY_ERROR`. Nothing left. | `print-timeout-background` |
+| `--print-timeout` during a background task, **the fixed argv of §10** (the prompt framed on stdin, `--model gemini-4-argon --effort high`, `--disable-slash-commands`) | exit **0**, a `SUCCESS` result with `finished_reason: print_timeout`, `AGY_ERROR` `DEADLINE_EXCEEDED` with no task named. **The task is not terminated:** its shell survives, re-parented, in its own session, with its `sleep`. | `print-timeout-background-recommended` |
+| `--print-timeout` during a model request, a `-p` launch | exit 3, `print_timeout` | `hang-print-timeout` |
 
-The two print timeouts during a background task differ only in the
-transport: the same scripted steps and the same 5 seconds, `-p` against
-the fixed argv. On the transport §10 recommends, `--print-timeout` bounds
-the run but cleans nothing up, and the run's end reads as a protocol
-failure (§5). A print timeout during a model request was measured in argv
-print mode only.
+The two print timeouts during a background task had the same scripted
+steps, the same 5 seconds and `--dangerously-skip-permissions`, and differ
+in four ways: where the prompt travels (`-p` against one framed message
+on stdin, with `--input-format stream-json`), the model (the default,
+`gemini-3.1-pro-preview` with a thinking budget, against `gemini-4-argon`),
+the effort (the default against `high`), and `--disable-slash-commands`. What each did is above; which of the four
+differences makes the outcome differ was not measured, and no run held
+three of them constant. So the record supports this and no more: under
+the fixed argv §10 recommends, `--print-timeout` bounded the run but
+cleaned nothing up, and the run's end reads as a protocol failure (§5).
+A print timeout during a model request was measured on a `-p` launch
+only.
 
 So `agy` does not guarantee that nothing outlives it. On Linux, AutoForge's
 executor collects re-parented descendants as a child subreaper (ADR 0002).
@@ -674,9 +747,9 @@ repository root. That is the vendor's statement, not a measurement here.
 |---|---|---|
 | `command`, `exit_code`, `stdout`, `stderr`, times, `timed_out`, truncation, leftovers | the executor, as for any CLI | available |
 | `stdout` (the reply) | the last `agent_response` step's text, of a completed run only | available |
-| `provider_failure` | a refusal (`denied_actions`), an `ERROR` result, a `SUCCESS` at a nonzero exit or with an `AGY_ERROR` line, a missing or second `result`, a record out of §4's framing, shape or order, a contradictory result (a `SUCCESS` that names a `finished_reason`, as the framed print timeout writes), an `unknown` step, a step or reply that never ended, an empty reply; and a run that would otherwise complete but whose capture is not whole, on stdout or stderr (§4) | available |
-| `transient_failure` | the one `AGY_ERROR` line of an `ERROR` result has `code_kind: http` and an `error_code` that is an integer (never a float, a bool or a string) equal to 408 or from 500 to 599, and stderr was read whole (to EOF, nothing dropped), so that the line is known to be the only one | available; 500 is not retried by `agy` itself |
-| `usage_limit` | the same, with an integer `error_code` of 429, on a whole stderr | available; per-minute and per-day limits not told apart (unverified) |
+| `provider_failure` | a refusal (`denied_actions`), an `ERROR` result, a `SUCCESS` at a nonzero exit or with an `AGY_ERROR` line, a missing or second `result`, a record out of §4's framing (a stdout byte that is not UTF-8 among it), shape or order, a contradictory result (a `SUCCESS` that names a `finished_reason`, as the print timeout under the fixed argv writes), an `unknown` step, a step or reply that never ended, an empty reply; and a run that would otherwise complete but whose capture is not whole, on stdout or stderr, or whose stderr is not UTF-8 (§4) | available |
+| `transient_failure` | the one `AGY_ERROR` line of an `ERROR` result has `code_kind: http` and an `error_code` that is an integer (never a float, a bool or a string) equal to 408 or from 500 to 599, and stderr was read whole (to EOF, nothing dropped) and as it is (all UTF-8), so that the line is known to be the only one | available; 500 is not retried by `agy` itself |
+| `usage_limit` | the same, with an integer `error_code` of 429, on a whole stderr of UTF-8 | available; per-minute and per-day limits not told apart (unverified) |
 | `usage_reset_at` | nothing | unknown |
 | `result_less_exit` | **never set in the MVP.** The engine relaunches on it (ADR 0012, #434), so it needs proof that the CLI exited on its own inside a session that was running: for Claude Code, a tool call of the model's before the exit. `init` and the `user_input` step are written before the model answers (`hang-no-limit`), so they show no running session, and no recorded run exited on its own, without a result, after the model had begun. A G1 adapter may set it only once a probe scenario shows such an exit, with both streams whole and an exit status of the process's own | unset; no evidence yet |
 | `failed_before_limit` | `AGY_ERROR` comes only at the end; mid-run `error_message` steps carry no code | not derivable before the end |
@@ -700,7 +773,8 @@ Anything else in `AGY_ERROR` types nothing, and the failure stays an
 error: another code or kind, a code of another JSON type (`429.0`, `true`,
 `"429"`), a code outside 100 to 599 (`600`), a line that does not parse or
 gives a member twice, more than one `AGY_ERROR` line in the run, and one
-line on a stderr not read whole, which may have held another.
+line on a stderr not read whole, or with a byte that is not UTF-8, which
+may have held another.
 
 **What cannot be told apart safely:**
 
@@ -712,7 +786,7 @@ line on a stderr not read whole, which may have held another.
 - which model actually served the run;
 - a per-minute 429 from an exhausted quota, until a real body is seen;
 - a daemon task `agy` killed at exit, except by a stderr notice;
-- a background task a print timeout left running on the framed transport,
+- a background task a print timeout left running under the fixed argv,
   except by the processes left (§7): its `AGY_ERROR` names no task.
 
 ## 10. Transport and adapter contract (deliverables 3 and 5)
@@ -734,21 +808,53 @@ fallback if a later build changes the message shape. The completion
 condition is bounded and unambiguous. The stream must be a run of the
 framing and shape of §4, with exactly one `result` as the last record,
 ended by its LF, and the process must exit on its own under the executor's
-idle and runtime limits, with stdout read to EOF and nothing dropped. The
-run's last step must be an ended `agent_response`, and no step may be of a
-type the contract does not know. ACP is worth a separate look once
+idle and runtime limits, with **both** streams captured whole: stdout and
+stderr each read to EOF, nothing of either dropped, and every byte of
+both UTF-8, read as it is. The run's last step must be an ended
+`agent_response`, and no step may be of a type the contract does not
+know. ACP is worth a separate look once
 AutoForge wants `agy` to ask a human (ADR 0007, #490). It buys nothing for
 the MVP.
 
-**Version gate:** exactly 1.5.13 until the probe passes on another build.
-`doctor` would run `agy --version` and refuse any other output. The release
-notes change print-mode behaviour often: a failed turn's exit status went
-from 1 to 3, the default agent mode of a `-p` run became Auto where
-available, and how a run waits for background tasks changed several times.
-Admitting a build is the re-measurement in the header, which the tests make
-possible for any version string. The build's records go in a directory of
-their own, held to every fact here. A changed fact, its table of removed
-characters among them, is a finding to resolve before the gate moves.
+**Build gate:** the measured build, by its digest, until the probe passes
+on another. Everything here, the table of removed characters among it, is
+a fact of one binary: sha256
+`c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65`, which
+printed 1.5.13. The version string is the binary's claim about itself,
+not its identity: a replacement that prints 1.5.13 (a rebuild, a patched
+or a substituted file, an `agy update` in place) would pass a check of
+`agy --version` without being the build measured. So G1 admits a launch
+by the executable it will run, not by what it prints:
+
+- The configuration holds the approved builds: each a sha256 and the
+  directory of its records (`tests/fixtures/antigravity/<version>/`,
+  whose records name that sha256 in `agy_sha256`, and its `dropped.txt`).
+  The prompt gate uses that build's table, and no other.
+- On each launch request, the adapter resolves the configured command to
+  the file the launch would execute (the path the command names, links
+  resolved), hashes that file, and refuses with a typed error a digest
+  that is not approved. What `--version` prints is read only to report it.
+- The hash and the execution must name the same bytes. A file that can
+  change between the two leaves a race, so G1 closes it: for example, the
+  launch runs a copy of the approved binary that the controller made in a
+  directory it owns, which no agent and no other process of the
+  operator's writes, hashed after the copy and again before each launch.
+  A read-only bind into the sandbox is not enough alone: it shows the
+  file as it is on the host, changes included. Which mechanism, and its
+  tests, are G1's.
+- `doctor` reports the digest of the binary it finds and whether it is
+  approved, and warns about any other.
+- A binary whose digest is not approved, whatever version it prints, is
+  admitted only by the re-measurement in the header: a fresh recording of
+  that binary, in a directory of its own, held to every fact here, and
+  its own table written by `table`. The release notes change print-mode
+  behaviour often: a failed turn's exit status went from 1 to 3, the
+  default agent mode of a `-p` run became Auto where available, and how a
+  run waits for background tasks changed several times. A changed fact,
+  its table of removed characters among them, is a finding to resolve
+  before the digest is approved.
+
+None of this is built here: no production gate changes in this spike.
 
 ### Suggested adapter contract
 
@@ -790,22 +896,41 @@ characters among them, is a finding to resolve before the gate moves.
     `/` from running as a command or a skill. Both records ran with it,
     but no prompt starting with `/` was sent.
   - `--print-timeout` bounds the run below `max_runtime_seconds`, and
-    nothing more. On this transport it is **no cleanup**: during a
+    nothing more. Under this argv it was **no cleanup**: during a
     background task it ended the run at its time with exit 0, a `SUCCESS`
     result naming `finished_reason: print_timeout`, which the reducer reads
     as a protocol failure, and left the task's shell running
-    (`print-timeout-background-recommended`, §7). Only argv print mode
-    terminated the task (`print-timeout-background`). A survivor is
+    (`print-timeout-background-recommended`, §7). A `-p` launch terminated
+    the task (`print-timeout-background`), but it differs from this argv
+    in the transport, the model, the effort and the slash-command flag,
+    and which of these decides it was not measured. A survivor is
     therefore the executor's to collect, as for any CLI (§7), and the
     executor's limit stays the backstop. Whether the argv keeps the flag,
     and at what margin below the limit, is a G1 check; a print timeout
-    during a model request was not measured on this transport.
+    during a model request was not measured under this argv.
 - **The reducer.**
   - It checks every line against §4's framing and every record against its
     shape and order before reading it, so no record makes it raise. A
     violation is a protocol failure. No line is skipped: a blank line, a
-    line over its bound or cut, a record without its LF, a member given
-    twice, a contradictory result are each a violation.
+    line over its bound or cut, a record without its LF, a CR before the
+    LF, a byte that is not UTF-8, a member given twice, a contradictory
+    result are each a violation.
+  - **It needs the bytes, and the duplex handle does not give all of
+    them.** `executor_duplex.py`'s framer splits stdout on LF and strips
+    one trailing CR from each record before it returns it (`Record.data`),
+    so a reducer on today's handle cannot see the CR the framing rule
+    refuses. G1 therefore changes the handle, with its own tests: a
+    `Record` says whether its LF ending was a CR LF (or the framing keeps
+    the CR, for a launch that asks), and the `agy` reducer refuses such a
+    record, while Claude Code's reducer keeps its behaviour. The reducer
+    decodes each record's bytes as strict UTF-8, and a record that does
+    not decode is a violation, never a replacement. An `Oversize` record
+    is a violation, a `Fragment` at EOF a record cut short, and an
+    `Overflow` a capture that is not whole. Stderr is the same: today the
+    executor decodes its bounded capture with replacement, so G1 gives
+    the reducer stderr's bytes, or a fact saying whether they decoded, and
+    a stderr that did not decode stops completion and leaves a failure
+    untyped. None of this changes production code in this spike.
   - Completed only when all of these hold: a run of §4's framing and shape
     with no violation; its `result` `SUCCESS` of the `SUCCESS` shape, with
     no `denied_actions`; exit 0 and no `AGY_ERROR` line; every step of a
@@ -848,12 +973,16 @@ characters among them, is a finding to resolve before the gate moves.
     customization the agent writes during the run is not caught, and
     whether `agy` would read one is one of C1's conditions.
   - **The prompt, on the bytes the adapter frames** (`stdin_payload(req)`),
-    for the pinned build and the framing measured, and for nothing else.
+    for the approved build and the framing measured, and for nothing else.
     Refuse a prompt over 160,000 UTF-8 bytes. The cut is at 191,986 bytes
     of the prompt's UTF-8, and at 160,000 three framed prompts arrived
     whole (§3): a large mixed sample, one astral character alone, and the
-    widest framing an admitted prompt can have, whose 960,041-byte line is
-    the longest the adapter would ever write. Refuse,
+    widest framing measured, 960,041 bytes. The longest line these checks
+    admit is **960,046 bytes** (160,000 VTs, a blank prompt), five bytes
+    more, and that line was not measured: the adapter's writer and every
+    bound on the line allow 960,046 bytes, and G1 either measures that
+    line framed or adds a refusal of blank prompts before framing and
+    measures the widest line that leaves. Refuse,
     or strip and record, a prompt holding a character the build's table
     lists (`dropped.txt`, §3). Look the character up in that table, never in
     a Unicode category: AutoForge's Python has its own Unicode version, and
@@ -865,9 +994,10 @@ characters among them, is a finding to resolve before the gate moves.
     only for a build whose records hold both complete measurements, each
     clean and covering every scalar value, which agree (what `table`
     checks, §3), and only on the transport measured: the framing above or
-    text on stdin. It refuses every prompt for any other build, for a build
-    whose two measurements differ, and on any other input (argv, which was
-    not swept, or a message written another way).
+    text on stdin. It refuses every prompt for any other build (a digest
+    the build gate does not approve), for a build whose two measurements
+    differ, and on any other input (argv, which was not swept, or a
+    message written another way).
 - **Credentials (`credential_routes`).**
   - `GEMINI_API_KEY`, projected like the other providers' keys.
   - The Google sign-in is an OAuth login with a refresh token
@@ -885,7 +1015,8 @@ characters among them, is a finding to resolve before the gate moves.
   command, base model ids, `effort` mapped to `--effort`. An effort the
   model lacks is a hard failure, which `agy` already enforces before any
   request.
-- **`doctor.py`.** A version row (the pinned build), a `--help` row (every
+- **`doctor.py`.** A build row (the sha256 of the executable it finds,
+  approved or not, and the version it prints), a `--help` row (every
   flag of the fixed argv), a `GEMINI_API_KEY` presence row (never its
   value), and the customization scan of the checkout. `-p /config
   --output-format json` checks the settings keys without a turn; under
@@ -915,7 +1046,7 @@ behind these conditions, with no default routing change:
   maintainer must decide whether the request-aware refusal of §10 (the
   launch tree, with the fixed argv) is an acceptable substitute for a
   switch. What was measured covers one layout and four launches (§8), so
-  accepting it is conditional on first measuring, for the pinned build,
+  accepting it is conditional on first measuring, for the approved build,
   each discovery rule and launch mode the scan relies on, as a probe
   scenario each: every directory and file name the guide names; each at
   the working directory, above it (to and past the repository root) and
@@ -932,23 +1063,30 @@ behind these conditions, with no default routing change:
   operator's approval and a budget: a reply, one real tool call, and one
   real 4xx error body. It would confirm that the stand-in's success and
   error shapes are the API's.
-- **C3.** The version gate of §10, with this probe as the step that admits
-  another build.
+- **C3.** The build gate of §10: a launch is admitted by the sha256 of
+  the executable it will run, against the approved digests, each with its
+  records and table; the version `agy` prints is never the admission. The
+  approved digest is the measured binary's
+  (`c3fd2c848abf88a243936f33e25bf5970802a7651840b5199318fcd8eb3fdb65`,
+  1.5.13), and this probe's re-measurement is the step that approves any
+  other, whatever version it reports.
 
 Not blockers, but required of any adapter: typing a refusal as a failure,
 holding the stream to §4's framing and shapes and the capture to whole,
 failing a run with an `unknown` step, taking the reply from the last step,
 the flags of §9 (neither `reply_delivered` nor `result_less_exit`), the
-fixed argv, the launch checks on the request with the pinned build's
-table, a home of its own per launch, collecting a run's survivors without
-relying on `--print-timeout` (§7), and never `-c`.
+fixed argv, the launch checks on the request with the approved build's
+table, a reducer that sees every byte of both streams (the CR and UTF-8
+evidence the duplex handle drops today, §10), a home of its own per
+launch, collecting a run's survivors without relying on `--print-timeout`
+(§7), and never `-c`.
 
 Against a go: `agy` changes print-mode behaviour often, its `stream-json`
 input shape is undocumented, a reply cannot be seen before the process ends,
 the model that served a run cannot be read back, and `--print-timeout`
-behaves otherwise on the recommended transport than in argv print mode
-(exit 0, a contradictory `SUCCESS`, a task left running: §7). None of these makes the
-contract ambiguous. Together they make an adapter more expensive to keep
+behaved otherwise under the fixed argv than on the `-p` launch measured
+(exit 0, a contradictory `SUCCESS`, a task left running: §7), for a reason
+not isolated. None of these makes the contract ambiguous. Together they make an adapter more expensive to keep
 correct than its first version suggests.
 
 ## Appendix A: `agy --help` (1.5.13, verbatim)
@@ -998,54 +1136,53 @@ Available subcommands:
   update          Update CLI
 ```
 
-## Appendix B: reproducing one scenario by hand
+## Appendix B: reproducing one scenario
 
-Run it through the probe, which builds the sandbox of the header for it,
-starts the stand-in inside the sandbox's own loopback, sets up the
-scenario's workspace inside it, and writes the record:
+The recorder is the only runnable route. It builds the sandbox of the
+header for the scenario, starts the stand-in inside the sandbox's own
+loopback, sets up the scenario's workspace inside it, and writes the
+record:
 
 ```sh
 python3 -I tests/antigravity_probe.py record --agy /path/to/agy \
     --out "$(mktemp -d)" --only success-stream-json
 ```
 
-The sandbox is this `bwrap` command (`sandbox_argv` in the probe), with
-`BASE` the run's directory holding `home/` and `work/`, `SPEC` its spec
-directory, and the three synthetic `/etc` files the probe writes in
-`SPEC/etc/`. It is started with an empty environment of its own (`env -i`)
-and `/dev/null` as stdin, and its helper with another environment
-(`--clearenv`). The helper writes the record on stdout, and nothing else
-there; the probe reads it from a pipe with a bound, and opens no file of
-the sandbox's:
+What the recorder does around `bwrap` is part of the boundary, and a
+command run by hand would lack it:
 
-```sh
-env -i /usr/bin/bwrap --unshare-all --die-with-parent --new-session --clearenv \
-  --ro-bind /usr /usr --tmpfs /usr/local \
-  --symlink usr/bin /bin --symlink usr/sbin /sbin \
-  --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
-  --dev /dev --proc /proc --tmpfs /tmp --dir /etc \
-  --ro-bind /etc/ld.so.cache /etc/ld.so.cache \
-  --ro-bind "$SPEC/etc/passwd" /etc/passwd --ro-bind "$SPEC/etc/group" /etc/group \
-  --ro-bind "$SPEC/etc/hosts" /etc/hosts \
-  --ro-bind tests/antigravity_probe.py /probe/antigravity_probe.py \
-  --ro-bind /path/to/agy /probe/agy \
-  --bind "$BASE" "$BASE" --ro-bind "$SPEC" "$SPEC" \
-  --chdir / -- /usr/bin/python3 -I -S /probe/antigravity_probe.py inner "$SPEC/spec.json" \
-  < /dev/null > record.json
-```
+- **The session keyring.** The process that becomes `bwrap` first joins
+  a new anonymous session keyring (`KEYRING_LAUNCHER`), and the helper
+  inside refuses a run that still holds the caller's. A shell's `bwrap`
+  inherits the shell's session keyring.
+- **Both streams, bounded and timed.** The host gives the sandbox
+  `/dev/null` as stdin and two pipes of its own as stdout and stderr, and
+  reads both continuously: stdout up to 64 MiB, past which the sandbox is
+  killed and the record refused unread, and stderr up to 64 KiB, the rest
+  drained and dropped. The sandbox is killed at the scenario's timeout
+  plus 60 seconds. The record counts only when a read of stdout returned
+  EOF, from a sandbox that exited 0, and is then parsed strictly. A
+  redirection to a file has no bound on what is written, and a stderr
+  left to a terminal hands the run the terminal.
+- **An empty environment for `bwrap` itself** (`env={}`), and the spec
+  directory written by the host before the run, read-only inside.
 
-(On a host whose `/bin` or `/lib` is a directory rather than a link, the
-probe binds it read-only instead.) Inside, the helper makes the
-scenario's workspace, starts the stand-in on `127.0.0.1` and runs `agy`
-with the environment it builds and nothing else: `HOME`,
-`PATH=/usr/bin:/bin`, `LANG=C.UTF-8`, `TERM=dumb`, the four `XDG_*_HOME`
-under the home, the synthetic `GEMINI_API_KEY` and
-`GOOGLE_GEMINI_BASE_URL`. By hand, `record.json` is the sandbox's claim
-like any record: read it as data, with a bound, after the sandbox has
-exited.
+So no `bwrap` command is given here to run by hand. Its options are
+`sandbox_argv` in the probe, to read: `--unshare-all --unshare-user
+--die-with-parent --new-session --clearenv`, `/usr` read-only with
+`/usr/local` hidden, the root's links to it, `/dev`, `/proc`, a `/tmp`
+tmpfs, the loader's cache and the three synthetic `/etc` files, the
+probe and the binary read-only under `/probe`, the run's directory
+read-write and its spec directory read-only, and then `/usr/bin/python3
+-I -S /probe/antigravity_probe.py inner SPEC`. Inside, the helper checks
+its session keyring, makes the scenario's workspace, starts the stand-in
+on `127.0.0.1` and runs `agy` with the environment it builds and nothing
+else: `HOME`, `PATH=/usr/bin:/bin`, `LANG=C.UTF-8`, `TERM=dumb`, the four
+`XDG_*_HOME` under the home, the synthetic `GEMINI_API_KEY` and
+`GOOGLE_GEMINI_BASE_URL`.
 
 Do not reproduce a scenario by running `agy` on the host, even under
 `env -i` with an empty `HOME`: that is no filesystem boundary, and the
-host's files, sockets and network stay in reach. Without
+host's files, sockets, keyrings and network stay in reach. Without
 `GOOGLE_GEMINI_BASE_URL` and with a real key, the same command calls the
 real Gemini API and spends quota.

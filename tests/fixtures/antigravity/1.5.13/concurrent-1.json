@@ -12,8 +12,10 @@
  ],
  "capture": {
   "stderr_eof": true,
+  "stderr_error": null,
   "stderr_truncated": false,
   "stdout_eof": true,
+  "stdout_error": null,
   "stdout_truncated": false
  },
  "exit": 0,
@@ -21,7 +23,7 @@
   "context_markers": [],
   "names_app_data_dir": true,
   "system_prompt_chars": 16843,
-  "system_prompt_sha256": "3f7a06ecd99b1492c2eb08820eccfbf7d540f2be64fb6eb85f968868c18b0cda"
+  "system_prompt_sha256": "080d4d53eece8cca9b8d750cb77bedb02cd54a97381c802349ac9320246be91d"
  },
  "home_files": [
   ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript/00000000.jsonl",
@@ -58,7 +60,7 @@
  "requests": [
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\nconcurrent prompt 1\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:55:48Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\nconcurrent prompt 1\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T04:53:24Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
    "markers_present": [],
@@ -87,13 +89,14 @@
   }
  ],
  "scenario": "concurrent-1",
- "seconds": 2.3,
+ "seconds": 2.4,
+ "session_keyring": "own",
  "signalled": null,
  "stderr": [],
  "stdout": [
   [
-   2.29,
-   "{\"conversation_id\":\"7c9baf71-43d6-46f1-b66a-d338d4cb536a\",\"status\":\"SUCCESS\",\"response\":\"slow reply\\n\",\"duration_seconds\":2.034205185,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}\n"
+   2.31,
+   "{\"conversation_id\":\"782f5e3b-d7be-4bd8-a513-1540d9a3554d\",\"status\":\"SUCCESS\",\"response\":\"slow reply\\n\",\"duration_seconds\":2.023985565,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}\n"
   ]
  ],
  "title_requests": 0

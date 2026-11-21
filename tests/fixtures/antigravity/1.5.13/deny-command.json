@@ -11,8 +11,10 @@
  ],
  "capture": {
   "stderr_eof": true,
+  "stderr_error": null,
   "stderr_truncated": false,
   "stdout_eof": true,
+  "stdout_error": null,
   "stdout_truncated": false
  },
  "exit": 0,
@@ -20,7 +22,7 @@
   "context_markers": [],
   "names_app_data_dir": true,
   "system_prompt_chars": 16843,
-  "system_prompt_sha256": "3b9ee537157a25ead79f76492b72df6933acd370b1f213d8a33e43986d0f71c8"
+  "system_prompt_sha256": "355b1b605f295c631a3a1381833d99723e744d760de1c92f779230657a69b6ed"
  },
  "home_files": [
   ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript/00000000.jsonl",
@@ -57,7 +59,7 @@
  "requests": [
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:55:13Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T04:52:50Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
    "markers_present": [],
@@ -86,38 +88,39 @@
   }
  ],
  "scenario": "deny-command",
- "seconds": 0.4,
+ "seconds": 0.3,
+ "session_keyring": "own",
  "signalled": null,
  "stderr": [
   [
-   0.32,
+   0.3,
    "jetski: no output produced — a tool required the \"command\" permission that headless mode cannot prompt for, so it was auto-denied. Add an allow-rule under permissions.allow in settings.json (e.g. command(<target>)). Alternatively, re-run with --dangerously-skip-permissions to auto-approve all tools.\n"
   ]
  ],
  "stdout": [
   [
-   0.26,
-   "{\"event\":\"init\",\"conversation_id\":\"131840c8-a486-47fd-b6ce-002e76f7d227\",\"init\":{\"cwd\":\"<root>/deny-command.0ifp1wca/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"request-review\"}}\n"
+   0.24,
+   "{\"event\":\"init\",\"conversation_id\":\"73e2565c-2f88-43b2-aef0-955391e2c59a\",\"init\":{\"cwd\":\"<root>/deny-command.w4qgbk8l/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"request-review\"}}\n"
   ],
   [
-   0.29,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"131840c8-a486-47fd-b6ce-002e76f7d227\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
+   0.27,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"73e2565c-2f88-43b2-aef0-955391e2c59a\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
   ],
   [
-   0.31,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"131840c8-a486-47fd-b6ce-002e76f7d227\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"duration_seconds\":0.003779314,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
+   0.27,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"73e2565c-2f88-43b2-aef0-955391e2c59a\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"duration_seconds\":0.004162961,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18}}}\n"
   ],
   [
-   0.31,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"131840c8-a486-47fd-b6ce-002e76f7d227\",\"step_index\":2,\"state\":\"ACTIVE\",\"step_type\":\"tool\",\"tool_name\":\"run_command\",\"tool_info\":{\"name\":\"run_command\",\"parameters\":{\"CommandLine\":\"echo hi \\u003e in-workspace.txt\"}}}}\n"
+   0.27,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"73e2565c-2f88-43b2-aef0-955391e2c59a\",\"step_index\":2,\"state\":\"ACTIVE\",\"step_type\":\"tool\",\"tool_name\":\"run_command\",\"tool_info\":{\"name\":\"run_command\",\"parameters\":{\"CommandLine\":\"echo hi \\u003e in-workspace.txt\"}}}}\n"
   ],
   [
-   0.31,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"131840c8-a486-47fd-b6ce-002e76f7d227\",\"step_index\":2,\"state\":\"ERROR\",\"step_type\":\"tool\",\"tool_name\":\"run_command\",\"duration_seconds\":0.004812014,\"tool_info\":{\"name\":\"run_command\",\"parameters\":{\"CommandLine\":\"echo hi \\u003e in-workspace.txt\"},\"error\":{\"type\":\"TOOL_ERROR\",\"message\":\"permission check failed for command \\\"echo hi \\u003e in-workspace.txt\\\": user denied permission to run command:\\necho hi \\u003e in-workspace.txt\\nDo not attempt to circumvent this denial by rephrasing the command, using alternative tools/scripts (e.g. python, sh, curl), or accessing the same target resource. Proceed without performing this action.\"}}}}\n"
+   0.3,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"73e2565c-2f88-43b2-aef0-955391e2c59a\",\"step_index\":2,\"state\":\"ERROR\",\"step_type\":\"tool\",\"tool_name\":\"run_command\",\"duration_seconds\":0.008332969,\"tool_info\":{\"name\":\"run_command\",\"parameters\":{\"CommandLine\":\"echo hi \\u003e in-workspace.txt\"},\"error\":{\"type\":\"TOOL_ERROR\",\"message\":\"permission check failed for command \\\"echo hi \\u003e in-workspace.txt\\\": user denied permission to run command:\\necho hi \\u003e in-workspace.txt\\nDo not attempt to circumvent this denial by rephrasing the command, using alternative tools/scripts (e.g. python, sh, curl), or accessing the same target resource. Proceed without performing this action.\"}}}}\n"
   ],
   [
-   0.31,
-   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"131840c8-a486-47fd-b6ce-002e76f7d227\",\"status\":\"SUCCESS\",\"response\":\"\",\"duration_seconds\":0.033144446,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18},\"denied_actions\":[{\"action\":\"command\",\"display_name\":\"Bash\"}]}}\n"
+   0.3,
+   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"73e2565c-2f88-43b2-aef0-955391e2c59a\",\"status\":\"SUCCESS\",\"response\":\"\",\"duration_seconds\":0.033412777,\"num_turns\":1,\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":18},\"denied_actions\":[{\"action\":\"command\",\"display_name\":\"Bash\"}]}}\n"
   ]
  ],
  "title_requests": 0

@@ -12,8 +12,10 @@
  ],
  "capture": {
   "stderr_eof": true,
+  "stderr_error": null,
   "stderr_truncated": false,
   "stdout_eof": true,
+  "stdout_error": null,
   "stdout_truncated": false
  },
  "exit": 3,
@@ -21,7 +23,7 @@
   "context_markers": [],
   "names_app_data_dir": true,
   "system_prompt_chars": 16803,
-  "system_prompt_sha256": "0474287bef09daa6c1e2ff90dba44f43bee18cda7298845c9329f29fd8d17ef5"
+  "system_prompt_sha256": "c1a3dbf0a27b1651afd9a2d997f2378f2195e35bc0dba9da7e20653b95db4434"
  },
  "home_files": [
   ".gemini/antigravity-cli/brain/<id>/.system_generated/logs/chunks/transcript/00000000.jsonl",
@@ -58,7 +60,7 @@
  "requests": [
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:55:25Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T04:53:01Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
    "markers_present": [],
@@ -87,7 +89,7 @@
   },
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:55:25Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T04:53:01Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
    "markers_present": [],
@@ -116,7 +118,7 @@
   },
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:55:25Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T04:53:01Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
    "markers_present": [],
@@ -145,7 +147,7 @@
   },
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:55:25Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T04:53:01Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
    "markers_present": [],
@@ -174,7 +176,7 @@
   },
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:55:25Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T04:53:01Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
    "markers_present": [],
@@ -203,7 +205,7 @@
   },
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:55:25Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T04:53:01Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
    "markers_present": [],
@@ -232,7 +234,7 @@
   },
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:55:25Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T04:53:01Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
    "markers_present": [],
@@ -261,7 +263,7 @@
   },
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:55:25Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T04:53:01Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
    "markers_present": [],
@@ -290,7 +292,7 @@
   },
   {
    "contents": 1,
-   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T03:55:25Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
+   "first_user_text": "<USER_REQUEST>\ndo it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-21T04:53:01Z.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>",
    "key": "synthetic",
    "last_role": "user",
    "markers_present": [],
@@ -319,66 +321,67 @@
   }
  ],
  "scenario": "api-429",
- "seconds": 138.6,
+ "seconds": 147.9,
+ "session_keyring": "own",
  "signalled": null,
  "stderr": [
   [
-   138.52,
+   147.84,
    "error: agent executor error: generating and executing: Error 429, Message: Resource has been exhausted (e.g. check quota)., Status: RESOURCE_EXHAUSTED, Details: []\n"
   ],
   [
-   138.52,
-   "AGY_ERROR: {\"short_error\":\"agent executor error: generating and executing: Error 429, Message: Resource has been exhausted (e.g. check quota)., Status: RESOURCE_EXHAUSTED, Details: []\",\"status\":\"RESOURCE_EXHAUSTED\",\"error_code\":429,\"code_kind\":\"http\",\"retryable\":true,\"error_id\":\"f1a6d1cf-99b2-414c-9010-b0d7ea465883-9\"}\n"
+   147.84,
+   "AGY_ERROR: {\"short_error\":\"agent executor error: generating and executing: Error 429, Message: Resource has been exhausted (e.g. check quota)., Status: RESOURCE_EXHAUSTED, Details: []\",\"status\":\"RESOURCE_EXHAUSTED\",\"error_code\":429,\"code_kind\":\"http\",\"retryable\":true,\"error_id\":\"a9b93147-15c6-4e56-8372-a551eeacef2c-9\"}\n"
   ]
  ],
  "stdout": [
   [
-   0.21,
-   "{\"event\":\"init\",\"conversation_id\":\"4c4e05ae-1654-41e8-bc2b-13f755786984\",\"init\":{\"cwd\":\"<root>/api-429.5w1xi8s9/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"always-proceed\"}}\n"
+   0.27,
+   "{\"event\":\"init\",\"conversation_id\":\"e29c98da-3345-4d27-9420-45f3b15d8ade\",\"init\":{\"cwd\":\"<root>/api-429.69u64h_l/work\",\"tools\":[\"ask_custom_permission\",\"ask_permission\",\"ask_question\",\"browser_click_element\",\"browser_drag_pixel_to_pixel\",\"browser_get_dom\",\"browser_get_network_request\",\"browser_input\",\"browser_list_network_requests\",\"browser_mouse_down\",\"browser_mouse_up\",\"browser_move_mouse\",\"browser_press_key\",\"browser_refresh_page\",\"browser_resize_window\",\"browser_scroll\",\"browser_scroll_dom\",\"browser_select_option\",\"browser_subagent\",\"call_mcp_tool\",\"capture_browser_console_logs\",\"capture_browser_screenshot\",\"click_browser_pixel\",\"command_status\",\"define_subagent\",\"delete_knowledge\",\"execute_browser_javascript\",\"find_by_name\",\"finish\",\"generate_image\",\"grep_search\",\"invoke_subagent\",\"list_browser_pages\",\"list_dir\",\"list_permissions\",\"list_plugin_accounts\",\"list_resources\",\"manage_inbox\",\"manage_subagents\",\"manage_task\",\"multi_replace_file_content\",\"notebook_edit\",\"notebook_execution\",\"open_browser_url\",\"read_browser_page\",\"read_resource\",\"read_url_content\",\"replace_file_content\",\"run_command\",\"run_workflow\",\"schedule\",\"search_marketplace\",\"search_web\",\"sed_file\",\"send_command_input\",\"send_message\",\"view_file\",\"wait\",\"wait_5_seconds\",\"write_to_file\"],\"permission_mode\":\"always-proceed\"}}\n"
   ],
   [
-   0.24,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"4c4e05ae-1654-41e8-bc2b-13f755786984\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
+   0.3,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"e29c98da-3345-4d27-9420-45f3b15d8ade\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n"
   ],
   [
-   0.26,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"4c4e05ae-1654-41e8-bc2b-13f755786984\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"error_message\",\"duration_seconds\":0}}\n"
+   0.32,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"e29c98da-3345-4d27-9420-45f3b15d8ade\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"error_message\",\"duration_seconds\":0}}\n"
   ],
   [
-   4.25,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"4c4e05ae-1654-41e8-bc2b-13f755786984\",\"step_index\":2,\"state\":\"DONE\",\"step_type\":\"error_message\",\"duration_seconds\":0}}\n"
+   4.31,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"e29c98da-3345-4d27-9420-45f3b15d8ade\",\"step_index\":2,\"state\":\"DONE\",\"step_type\":\"error_message\",\"duration_seconds\":0}}\n"
   ],
   [
-   9.79,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"4c4e05ae-1654-41e8-bc2b-13f755786984\",\"step_index\":3,\"state\":\"DONE\",\"step_type\":\"error_message\",\"duration_seconds\":0}}\n"
+   11.47,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"e29c98da-3345-4d27-9420-45f3b15d8ade\",\"step_index\":3,\"state\":\"DONE\",\"step_type\":\"error_message\",\"duration_seconds\":0}}\n"
   ],
   [
-   20.61,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"4c4e05ae-1654-41e8-bc2b-13f755786984\",\"step_index\":4,\"state\":\"DONE\",\"step_type\":\"error_message\",\"duration_seconds\":0}}\n"
+   21.32,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"e29c98da-3345-4d27-9420-45f3b15d8ade\",\"step_index\":4,\"state\":\"DONE\",\"step_type\":\"error_message\",\"duration_seconds\":0}}\n"
   ],
   [
-   42.94,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"4c4e05ae-1654-41e8-bc2b-13f755786984\",\"step_index\":5,\"state\":\"DONE\",\"step_type\":\"error_message\",\"duration_seconds\":0}}\n"
+   41.46,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"e29c98da-3345-4d27-9420-45f3b15d8ade\",\"step_index\":5,\"state\":\"DONE\",\"step_type\":\"error_message\",\"duration_seconds\":0}}\n"
   ],
   [
-   69.56,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"4c4e05ae-1654-41e8-bc2b-13f755786984\",\"step_index\":6,\"state\":\"DONE\",\"step_type\":\"error_message\",\"duration_seconds\":0}}\n"
+   68.52,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"e29c98da-3345-4d27-9420-45f3b15d8ade\",\"step_index\":6,\"state\":\"DONE\",\"step_type\":\"error_message\",\"duration_seconds\":0}}\n"
   ],
   [
-   94.49,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"4c4e05ae-1654-41e8-bc2b-13f755786984\",\"step_index\":7,\"state\":\"DONE\",\"step_type\":\"error_message\",\"duration_seconds\":0}}\n"
+   95.73,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"e29c98da-3345-4d27-9420-45f3b15d8ade\",\"step_index\":7,\"state\":\"DONE\",\"step_type\":\"error_message\",\"duration_seconds\":0}}\n"
   ],
   [
-   117.53,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"4c4e05ae-1654-41e8-bc2b-13f755786984\",\"step_index\":8,\"state\":\"DONE\",\"step_type\":\"error_message\",\"duration_seconds\":0}}\n"
+   120.44,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"e29c98da-3345-4d27-9420-45f3b15d8ade\",\"step_index\":8,\"state\":\"DONE\",\"step_type\":\"error_message\",\"duration_seconds\":0}}\n"
   ],
   [
-   138.52,
-   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"4c4e05ae-1654-41e8-bc2b-13f755786984\",\"step_index\":9,\"state\":\"DONE\",\"step_type\":\"error_message\"}}\n"
+   147.84,
+   "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"e29c98da-3345-4d27-9420-45f3b15d8ade\",\"step_index\":9,\"state\":\"DONE\",\"step_type\":\"error_message\"}}\n"
   ],
   [
-   138.52,
-   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"4c4e05ae-1654-41e8-bc2b-13f755786984\",\"status\":\"ERROR\",\"response\":\"\",\"error\":\"agent executor error: generating and executing: Error 429, Message: Resource has been exhausted (e.g. check quota)., Status: RESOURCE_EXHAUSTED, Details: []\",\"duration_seconds\":117.303596307,\"num_turns\":1,\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":0},\"finished_reason\":\"error\"}}\n"
+   147.84,
+   "{\"event\":\"result\",\"result\":{\"conversation_id\":\"e29c98da-3345-4d27-9420-45f3b15d8ade\",\"status\":\"ERROR\",\"response\":\"\",\"error\":\"agent executor error: generating and executing: Error 429, Message: Resource has been exhausted (e.g. check quota)., Status: RESOURCE_EXHAUSTED, Details: []\",\"duration_seconds\":120.160211783,\"num_turns\":1,\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"thinking_tokens\":0,\"cache_read_tokens\":0,\"total_tokens\":0},\"finished_reason\":\"error\"}}\n"
   ]
  ],
  "title_requests": 0

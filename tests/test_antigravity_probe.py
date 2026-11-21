@@ -23,9 +23,12 @@ unidentified or inconsistent evidence, and the records are checked to
 carry no path of the host, no OAuth query value and no key, and to name
 the sandbox they were made in. The recorder is held to its boundary: with
 a fake ``agy`` in ``bwrap``, by harmless canaries of the host's files,
-environment and sockets, a link and a FIFO planted where the host could
-read them, junk written into the record's pipe, and a caller's
-``GIT_DIR``; without ``bwrap``, by its bounded read of the record. The
+environment, sockets and session keyring (a key a helper of the test's
+puts in a session keyring of its own), a link and a FIFO planted where
+the host could read them, junk written into the record's pipe, and a
+caller's ``GIT_DIR``; without ``bwrap``, by its bounded read of the
+record, and by its read of agy's streams at their bytes (EOF only when a
+read returned it, a byte that is not UTF-8 kept and refused). The
 package never imports the probe.
 
 Opt-in, ``AUTOFORGE_AGY_PROBE_BIN`` names an installed ``agy``: the probe
@@ -46,8 +49,10 @@ failure there on a new build is the point: the report's claims hold for
 from __future__ import annotations
 
 import copy
+import errno
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -55,6 +60,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -95,6 +101,7 @@ from .antigravity_probe import (
     is_dropped,
     measure_all,
     outcome_of,
+    read_stream,
     read_table,
     record_all,
     reduce_stream,
@@ -526,7 +533,7 @@ def complete_sweep_problems(found: dict[str, dict[str, Any]]) -> list[str]:
     problems = []
     for prefix in SWEEPS:
         problems += sweep_problems(found, prefix)
-        if dropped_of(found.values(), prefix) != want:
+        if dropped_of(found, prefix) != want:
             problems.append(f"what the {prefix}* prompts lost is not the table of dropped.txt")
     return problems
 
@@ -659,22 +666,37 @@ def test_the_committed_records_carry_no_host_path_query_value_or_key(committed):
     assert DROPPED_TABLE.read_text(encoding="ascii").isascii()
 
 
-CAPTURE_KEYS = {"stdout_eof", "stderr_eof", "stdout_truncated", "stderr_truncated"}
+CAPTURE_KEYS = {
+    "stdout_eof",
+    "stderr_eof",
+    "stdout_truncated",
+    "stderr_truncated",
+    "stdout_error",
+    "stderr_error",
+}
+WHOLE_CAPTURE = {
+    "stdout_eof": True,
+    "stderr_eof": True,
+    "stdout_truncated": False,
+    "stderr_truncated": False,
+    "stdout_error": None,
+    "stderr_error": None,
+}
 
 
 def test_each_committed_record_names_the_sandbox_it_was_made_in(committed):
-    """Every record was made in the private root (the report's header), and
-    says, for each stream, whether it reached EOF and whether a bound
-    dropped any of it. Each reached EOF on both, and lost nothing."""
+    """Every record was made in the private root, with a session keyring of
+    its own (the report's header, R4-F1 of PR #530), and says, for each
+    stream, whether a read of it returned EOF, whether one failed first,
+    and whether a bound dropped any of it. Each reached EOF on both, lost
+    nothing, and held only UTF-8 (R4-F3)."""
     assert {r.get("isolation") for r in committed.values()} == {ISOLATION}
+    assert {r.get("session_keyring") for r in committed.values()} == {"own"}
     for name, record in committed.items():
         assert set(record["capture"]) == CAPTURE_KEYS, name
-        assert record["capture"] == {
-            "stdout_eof": True,
-            "stderr_eof": True,
-            "stdout_truncated": False,
-            "stderr_truncated": False,
-        }, name
+        assert record["capture"] == WHOLE_CAPTURE, name
+        for stream_name in ("stdout", "stderr"):
+            assert all(probe.utf8(line) for _, line in record[stream_name]), name
     assert CREDENTIAL.search("token ghp_" + "a" * 36) and CREDENTIAL.search("AIza" + "b" * 35)
 
 
@@ -1114,7 +1136,25 @@ def test_a_success_with_any_sign_of_failure_is_not_completed():
     assert classify(reduce_stream(good, [err]), 0, WHOLE).kind == "error"
 
 
+def test_a_stderr_that_is_not_utf8_neither_completes_nor_types():
+    """A stderr line with a byte that is not UTF-8 was not read as it is:
+    no AGY_ERROR line can be ruled out, or known to be the only one (R4-F3
+    of PR #530). A genuine U+FFFD is UTF-8, and changes nothing."""
+    good = stream(*GOOD)
+    assert classify(reduce_stream(good, ["notice \ufffd"]), 0, WHOLE).kind == "completed"
+    red = reduce_stream(good, ["notice \udcff"])
+    assert red.stderr_undecodable == 1
+    outcome = classify(red, 0, WHOLE)
+    assert outcome.kind == "incomplete_capture" and "not UTF-8" in outcome.reason
+    err = {"error_code": 503, "code_kind": "http"}
+    assert typed(err) == "transient"
+    assert typed(err, 3, "notice \udcff") == "error"
+    assert typed(json.dumps(err)[:-1] + ', "x": "\udcff"}') == "error"
+
+
 GOOD_LINES = stream(*GOOD)
+# GOOD's reply with the byte 0xFF in its text, as read_stream carries it
+NOT_UTF8_REPLY = GOOD_LINES[2].replace("reply", "reply \udcff")
 DUPLICATE_STATUS = (
     '{"event": "result", "result": {"conversation_id": "c", "status": "ERROR", '
     '"status": "SUCCESS", "response": ""}}\n'
@@ -1152,6 +1192,12 @@ DUPLICATE_STATUS = (
             [*GOOD_LINES[:-1], GOOD_LINES[-1][:-2] + ', "duration_seconds": 1e999}\n'],
             "record 4 is not JSON",
         ),
+        # a byte that is not UTF-8, as the recorder carries it (read_stream):
+        # inside a JSON string, where a replacement would have made it a record
+        (
+            [*GOOD_LINES[:2], NOT_UTF8_REPLY, GOOD_LINES[3]],
+            "record 3 is not UTF-8",
+        ),
     ],
     ids=[
         "result-without-lf",
@@ -1165,6 +1211,7 @@ DUPLICATE_STATUS = (
         "duplicate-top-level",
         "nan",
         "infinite",
+        "not-utf8",
     ],
 )
 def test_a_record_that_is_not_one_whole_line_is_a_violation(lines, violation):
@@ -1226,12 +1273,7 @@ def run_record(lines: list[str], exit_code: int = 1, **more: Any) -> dict[str, A
         "killed_by_probe": False,
         "signalled": None,
         "processes_left": [],
-        "capture": {
-            "stdout_eof": True,
-            "stderr_eof": True,
-            "stdout_truncated": False,
-            "stderr_truncated": False,
-        },
+        "capture": dict(WHOLE_CAPTURE),
     }
     record.update(more)
     return record
@@ -1257,6 +1299,10 @@ def test_a_record_is_read_with_its_own_capture(committed):
         ("stderr_eof", None),
         ("stderr_truncated", None),
         ("stdout_truncated", 0),
+        # a read that failed: whatever it read, it stopped before the end (R4-F3)
+        ("stdout_error", "OSError: [Errno 5] Input/output error"),
+        ("stderr_error", "ValueError: I/O operation on closed file"),
+        ("stdout_error", ""),
     ):
         short = copy.deepcopy(good)
         short["capture"][key] = value
@@ -1272,6 +1318,110 @@ def test_a_record_is_read_with_its_own_capture(committed):
         assert capture_of({**good, "exit": code}).exited is False, code
     began = stream(INIT, USER, agent(1, "half", "ACTIVE"))
     assert outcome_of(run_record(began, exit_code=-11)).kind == "no_result"
+
+
+# -- the recorder's read of agy's streams, at their bytes ------------------------
+
+
+def _read(data: bytes) -> probe.StreamRead:
+    """``data`` as agy writes it on a pipe, read by the recorder's own reader."""
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(write_fd, "wb") as w:
+        w.write(data)
+    got = probe.StreamRead()
+    with os.fdopen(read_fd, "rb") as r:
+        read_stream(r, time.monotonic(), got)
+    return got
+
+
+def _record_of_bytes(stdout: bytes, stderr: bytes = b"", exit_code: int = 0) -> dict[str, Any]:
+    """A run's record as the recorder makes it from these bytes on stdout and stderr."""
+    record = run_record([], exit_code=exit_code)
+    for name, data in (("stdout", stdout), ("stderr", stderr)):
+        got = _read(data)
+        record[name] = got.lines
+        record["capture"].update(
+            {f"{name}_eof": got.eof, f"{name}_truncated": got.truncated, f"{name}_error": got.error}
+        )
+    return record
+
+
+GOOD_BYTES = "".join(stream(*GOOD)).encode()
+# GOOD's reply with the byte 0xFF inside its JSON string, and with a genuine U+FFFD
+INVALID_BYTES = GOOD_BYTES.replace(b'"reply"', b'"reply \xff"')
+GENUINE_FFFD = GOOD_BYTES.replace(b'"reply"', b'"reply \xef\xbf\xbd"')
+
+
+def test_the_recorder_reads_agys_bytes_as_they_are():
+    """R4-F3 of PR #530, at the byte-reading boundary: the recorder once
+    decoded each line with replacement, so a reply holding a byte that is
+    not UTF-8 inside its JSON string became an admissible record, and the
+    run completed. Now the byte is carried as it is (``surrogateescape``),
+    the line is a violation, and the record is written and read back with
+    it; a genuine U+FFFD, three bytes of UTF-8, is a character like any
+    other, and its run completes."""
+    assert outcome_of(_record_of_bytes(GOOD_BYTES)).kind == "completed"
+    genuine = outcome_of(_record_of_bytes(GENUINE_FFFD))
+    assert (genuine.kind, genuine.reply) == ("completed", "reply \ufffd")
+    invalid = _record_of_bytes(INVALID_BYTES)
+    outcome = outcome_of(invalid)
+    assert outcome.kind == "protocol" and "record 3 is not UTF-8" in outcome.reason
+    # what replacement made of the same bytes: a whole record, and a completed run
+    replaced = [line.decode("utf-8", "replace") for line in INVALID_BYTES.splitlines(True)]
+    assert classify(reduce_stream(replaced, []), 0, WHOLE).kind == "completed"
+    # written as committed and read back, the byte is still there
+    text = probe.record_text(invalid)
+    assert text.isascii() and json.loads(text) == invalid
+    assert outcome_of(json.loads(text)).kind == "protocol"
+    assert not probe.record_text(_record_of_bytes(GENUINE_FFFD)).isascii()
+    # on stderr: not read as it is, so no completion, and no failure typed from it
+    assert outcome_of(_record_of_bytes(GOOD_BYTES, b"notice \xef\xbf\xbd\n")).kind == "completed"
+    assert outcome_of(_record_of_bytes(GOOD_BYTES, b"notice \xff\n")).kind == "incomplete_capture"
+    failed = "".join(stream(INIT, result("ERROR", finished_reason="error"))).encode()
+    err = b"AGY_ERROR: " + json.dumps({"error_code": 503, "code_kind": "http"}).encode() + b"\n"
+    assert outcome_of(_record_of_bytes(failed, err, 3)).kind == "transient"
+    assert outcome_of(_record_of_bytes(failed, err + b"\xfe\n", 3)).kind == "error"
+
+
+class _FailingStream:
+    """A binary stream whose reads give ``lines``, one each, then fail as a broken pipe would."""
+
+    def __init__(self, *lines: bytes) -> None:
+        self.lines = list(lines)
+
+    def readline(self, limit: int = -1) -> bytes:
+        if self.lines:
+            return self.lines.pop(0)
+        raise OSError(errno.EIO, "Input/output error")
+
+    def read1(self, size: int = -1) -> bytes:
+        raise OSError(errno.EIO, "Input/output error")
+
+
+def test_only_a_read_that_returned_eof_is_eof(monkeypatch):
+    """R4-F3 of PR #530: a reader that stopped on an exception was once
+    reported as having reached EOF, so a whole-looking stdout of a run
+    whose read failed completed it. Now only a read that returned no byte
+    sets ``eof``; one that raised says why, before the bound and past it,
+    and the run is no completed one."""
+    lines = stream(*GOOD)
+    got = probe.StreamRead()
+    read_stream(_FailingStream(*(line.encode() for line in lines)), time.monotonic(), got)
+    assert [line for _, line in got.lines] == lines
+    assert got.eof is False and got.error == "OSError: [Errno 5] Input/output error"
+    record = _record_of_bytes(GOOD_BYTES)
+    assert outcome_of(record).kind == "completed"
+    record["stdout"] = got.lines
+    record["capture"].update(stdout_eof=got.eof, stdout_error=got.error)
+    assert outcome_of(record).kind == "incomplete_capture"
+    # past the capture bound the stream is read on, and held to the same rule
+    monkeypatch.setattr(probe, "CAPTURE_LINES", 1)
+    past = probe.StreamRead()
+    read_stream(_FailingStream(b"one\n", b"two\n"), time.monotonic(), past)
+    assert (past.truncated, past.eof, past.error is not None) == (True, False, True)
+    ended = _read(b"one\ntwo\nthree")
+    assert (ended.truncated, ended.eof, ended.error) == (True, True, None)
+    assert [line for _, line in ended.lines] == ["one\n"]
 
 
 def test_neither_recovery_flag_is_ever_set(committed):
@@ -1371,7 +1521,7 @@ def test_the_complete_measurements_cover_every_scalar_value_and_are_the_table(co
         measured = [r for name, r in committed.items() if name.startswith(prefix)]
         assert sum(r["facts"]["all"]["sent"] for r in measured) == SCALAR_VALUES == 1_112_064
         assert len(measured) == 31
-        assert dropped_of(measured, prefix) == [list(r) for r in read_table()]
+        assert dropped_of(committed, prefix) == [list(r) for r in read_table()]
     framed = [committed[s.name] for s in SCENARIOS if s.name.startswith(FRAMED_PREFIX)]
     assert max(r["stdin_bytes"] for r in framed) == 450_082
     assert DROPPED_TABLE.parent == FIXTURES
@@ -1387,8 +1537,11 @@ def test_the_proposed_prompt_bound_arrives_whole_through_the_framing(committed):
     metadata kept: a large mixed sample, mostly astral, in a line of 416,882
     bytes (``fidelity-near-limit-stream-json``); one astral character
     alone, 480,046 bytes (``fidelity-astral-stream-json``); and the widest
-    framing any prompt the gate admits can have, VTs, 960,041 bytes
-    (``fidelity-widest-stream-json``, R3-F6 of PR #530)."""
+    framing measured, a ``|`` and VTs, 960,041 bytes
+    (``fidelity-widest-stream-json``, R3-F6 of PR #530). It is not the
+    longest line the gate admits: 160,000 VTs pass its size bound and its
+    table and frame to 960,046 bytes, a blank prompt whose line was not
+    measured (R4-F6), and the report states that bound as the one to use."""
     lines = {}
     for name, make in (
         (NEAR_LIMIT, probe.near_limit_prompt),
@@ -1421,6 +1574,14 @@ def test_the_proposed_prompt_bound_arrives_whole_through_the_framing(committed):
     assert max(widths.values()) == probe.WIDEST_ESCAPE == widths[0x0B]
     assert [c for c, w in widths.items() if w == probe.WIDEST_ESCAPE] == [0x0B]
     assert lines[WIDEST] == probe.WIDEST_ESCAPE * 160_000 - 5 + envelope
+    # the longest line the gate admits: 160,000 VTs, blank, not measured (R4-F6)
+    assert envelope == probe.ENVELOPE_BYTES == 46
+    blank = "\x0b" * probe.PROMPT_LIMIT
+    assert len(blank.encode()) == probe.PROMPT_LIMIT and not any(is_dropped(ord(c)) for c in blank)
+    assert len(probe.stream_message(blank).encode()) == probe.FRAMED_BOUND == 960_046
+    assert lines[WIDEST] == probe.FRAMED_BOUND - 5 == max(lines.values())
+    report = " ".join(REPORT.read_text(encoding="utf-8").split())
+    assert "960,046" in report and "960,041" in report
 
 
 def test_a_measurement_that_lost_a_prompt_or_a_value_is_caught(committed):
@@ -1484,6 +1645,23 @@ def _both(found: dict[str, Any], path: tuple[str, ...], value: Any) -> dict[str,
     """The same change to the two NUL captures, as text and framed."""
     once = _changed(found, ALL_PREFIX + "nul", path, value)
     return _changed(once, FRAMED_PREFIX + "nul", path, value)
+
+
+def _nul_copies(found: dict[str, Any], name_of: Any) -> dict[str, Any]:
+    """``found`` and a copy of each NUL record, named ``name_of(prefix)``, that dropped U+0041.
+
+    The review's case (R4-F4 of PR #530): one copy per transport, of the
+    same build, its ``scenario`` its own name (one that starts with the
+    sweep's prefix), and a dropped run of an ordinary letter.
+    """
+    out = copy.deepcopy(found)
+    for prefix in SWEEPS:
+        name = name_of(prefix)
+        extra = copy.deepcopy(found[prefix + "nul"])
+        extra["scenario"] = name
+        extra["facts"]["all"]["dropped"] = [[0x41, 0x41]]
+        out[name] = extra
+    return out
 
 
 A00, F00, F05 = ALL_PREFIX + "00", FRAMED_PREFIX + "00", FRAMED_PREFIX + "05"
@@ -1565,6 +1743,20 @@ REFUSALS = {
     ),
     "not-a-record": (lambda c: {**c, A00: [1, 2]}, f"{A00}: not a record"),
     "differ": (lambda c: _kept(c, F00), "lose different characters"),
+    # a record the plan does not name, whatever it holds: stale, copied or
+    # relabelled, it could otherwise put an ordinary letter in the table (R4-F4)
+    "stale-copies": (
+        lambda c: _nul_copies(c, lambda prefix: prefix + "nul-stale"),
+        f"{ALL_PREFIX}nul-stale: no scenario of the probe's",
+    ),
+    "unplanned-chunk": (
+        lambda c: _nul_copies(c, lambda prefix: prefix + "99"),
+        f"{FRAMED_PREFIX}99: no scenario of the probe's",
+    ),
+    "relabelled": (
+        lambda c: {**c, "help": copy.deepcopy(c[ALL_PREFIX + "nul"])},
+        f"help: names the scenario '{ALL_PREFIX}nul', not its own",
+    ),
 }
 
 
@@ -1597,6 +1789,35 @@ def test_the_table_command_refuses_invalid_evidence_and_keeps_the_table(
         write_table(out)
     assert (out / "dropped.txt").read_text(encoding="ascii") == BEFORE
     assert not (out / "dropped.txt.new").exists()
+
+
+def test_no_record_outside_the_plan_reaches_the_table(committed, tmp_path):
+    """R4-F4 of PR #530: the union once took every record whose own
+    ``scenario`` started with a sweep's prefix, so two stale copies of the
+    NUL records, one per transport, that had dropped U+0041 put it in both
+    unions; the two agreed, and ``table`` would have written a table that
+    strips an ordinary letter. Now the union reads the plan's records alone,
+    by their names, so no extra record changes it, and ``table`` refuses
+    such a directory and leaves the table as it was."""
+    table = [list(r) for r in read_table()]
+    for i, name_of in enumerate(
+        (
+            lambda prefix: prefix + "nul-stale",
+            lambda prefix: prefix + "99",
+            lambda prefix: "copy-of-" + prefix + "nul",
+        )
+    ):
+        extra = _nul_copies(committed, name_of)
+        for prefix in SWEEPS:
+            assert dropped_of(extra, prefix) == table, name_of(prefix)
+        assert any("no scenario of the probe's" in p for p in probe.table_problems(extra))
+        (tmp_path / str(i)).mkdir()
+        out = table_dir(tmp_path / str(i), extra)
+        (out / "dropped.txt").write_bytes(DROPPED_TABLE.read_bytes())
+        with pytest.raises(ProbeError, match="no scenario of the probe's"):
+            write_table(out)
+        assert (out / "dropped.txt").read_bytes() == DROPPED_TABLE.read_bytes()
+    assert probe.record_name_problems(committed) == []
 
 
 def test_the_table_command_refuses_on_its_command_line_too(committed, tmp_path):
@@ -1687,6 +1908,7 @@ def test_the_version_is_asked_in_the_sandbox_never_on_the_host(monkeypatch, tmp_
     monkeypatch.setattr(probe, "run_one", run_one)
     monkeypatch.setattr(probe, "binary_sha256", lambda path: OTHER_SHA)
     monkeypatch.setattr(probe, "SANDBOX_PYTHON", sys.executable)
+    monkeypatch.setattr(probe, "keyctl_number", lambda: 250)
     monkeypatch.setattr(probe.subprocess, "run", on_the_host)
     monkeypatch.setattr(probe.subprocess, "Popen", on_the_host)
     monkeypatch.setattr(probe.shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -1723,6 +1945,7 @@ def test_a_version_run_that_printed_no_version_stops_the_recording(
     monkeypatch.setattr(probe, "run_one", version_run(stdout, exit_code, killed))
     monkeypatch.setattr(probe, "binary_sha256", lambda path: OTHER_SHA)
     monkeypatch.setattr(probe, "SANDBOX_PYTHON", sys.executable)
+    monkeypatch.setattr(probe, "keyctl_number", lambda: 250)
     monkeypatch.setattr(probe.shutil, "which", lambda name: f"/usr/bin/{name}")
     with pytest.raises(ProbeError, match="printed no version"):
         discover_version("/opt/agy", tmp_path)
@@ -1773,12 +1996,21 @@ def test_a_build_of_another_version_is_assessed_by_its_behaviour(committed, tmp_
 
 
 def _bwrap_works() -> bool:
+    """bwrap with unprivileged user namespaces, the sandbox's interpreter, and a
+    session keyring the launch can join (a container's seccomp may refuse it)."""
     if sys.platform != "linux" or shutil.which("bwrap") is None:
         return False
     if not Path(SANDBOX_PYTHON).is_file():
         return False
     argv = ["bwrap", "--ro-bind", "/", "/", "--unshare-net", "--unshare-pid", "--", "true"]
-    return subprocess.run(argv, capture_output=True).returncode == 0
+    if subprocess.run(argv, capture_output=True).returncode != 0:
+        return False
+    try:
+        launch = probe.keyring_launcher()
+    except ProbeError:
+        return False
+    true = shutil.which("true") or "/bin/true"
+    return subprocess.run([*launch, true], capture_output=True).returncode == 0
 
 
 # The host's one file of /etc the sandbox shows, where the host has it.
@@ -1786,7 +2018,8 @@ SHOWN_ETC = [f"/etc/{n}" for n in probe.HOST_ETC if Path("/etc", n).exists()]
 
 needs_bwrap = pytest.mark.skipif(
     not _bwrap_works(),
-    reason=f"needs Linux, {SANDBOX_PYTHON} and bwrap with unprivileged user namespaces",
+    reason=f"needs Linux, {SANDBOX_PYTHON}, bwrap with unprivileged user namespaces "
+    "and keyctl(2) to join a session keyring",
 )
 
 # A fake agy, run by the sandbox's interpreter: asked its version, it
@@ -1840,6 +2073,23 @@ if sys.argv[1:] == ["--version"]:
         finally:
             s.close()
 
+    keyring = {}
+    if canary.get("key"):  # a key the test put in the caller's session keyring
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.syscall.restype = ctypes.c_long
+        for where, ring in (("session", -3), ("user", -4), ("user-session", -5)):
+            rc = libc.syscall(
+                ctypes.c_long(canary["keyctl"]),
+                ctypes.c_long(10),  # KEYCTL_SEARCH
+                ctypes.c_long(ring),
+                b"user",
+                canary["key"].encode(),
+                ctypes.c_long(0),
+            )
+            keyring[where] = "found" if rc >= 0 else errno.errorcode.get(ctypes.get_errno(), "?")
+
     environs = {}
     for pid in os.listdir("/proc"):
         if pid.isdigit():
@@ -1848,6 +2098,7 @@ if sys.argv[1:] == ["--version"]:
             except OSError:
                 pass
     seen = {
+        "keyring": keyring,
         "planted": planted,
         "pid1_fds": {fd: os.readlink(f"/proc/1/fd/{fd}").split(":")[0] for fd in "012"},
         "home": os.environ.get("HOME", ""),
@@ -1892,16 +2143,24 @@ def fake_agy(directory: Path, canary: dict[str, Any] | None = None, hang: bool =
     return str(path)
 
 
-def test_the_sandbox_is_a_private_root_with_an_empty_environment(tmp_path):
+def test_the_sandbox_is_a_private_root_with_an_empty_environment(tmp_path, monkeypatch):
     """No host root, no home, nothing writable but the run's own
     directories, and an empty environment for the helper, whatever the
-    caller's (R2-F1 of PR #530)."""
+    caller's (R2-F1 of PR #530); a user namespace that is mandatory, and a
+    launch that joins a session keyring of its own before bwrap (R4-F1).
+    The argv alone is under test: on a host without bwrap or keyctl(2)
+    (macOS), both are simulated."""
+    monkeypatch.setattr(probe.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(probe, "keyctl_number", lambda: 250)
     agy = tmp_path / "agy"
     agy.write_text("")
     base, spec, home = tmp_path / "base", tmp_path / "spec", tmp_path / "base" / "home"
     spec.mkdir()
     argv = sandbox_argv(str(agy), base, spec, home, ["inner", str(spec / "spec.json")])
-    assert "--clearenv" in argv and "--unshare-all" in argv
+    launch = probe.keyring_launcher()
+    assert launch == [sys.executable, "-I", "-S", "-c", probe.KEYRING_LAUNCHER, "250"]
+    assert argv[: len(launch)] == launch and argv[len(launch)] == "/usr/bin/bwrap"
+    assert "--clearenv" in argv and "--unshare-all" in argv and "--unshare-user" in argv
     mounts = [argv[i : i + 3] for i, a in enumerate(argv) if a in ("--bind", "--ro-bind")]
     sources = {m[1] for m in mounts}
     assert "/" not in sources and str(Path.home()) not in sources
@@ -2027,6 +2286,8 @@ def test_the_host_reads_the_record_from_the_channel_never_from_a_path(tmp_path, 
         return [sys.executable, "-I", "-c", plant, str(canary), *inner]
 
     monkeypatch.setattr(probe, "sandbox_argv", sandbox)
+    monkeypatch.setattr(probe, "keyctl_number", lambda: 250)  # a Linux host, simulated
+    monkeypatch.setattr(probe, "session_keyring", lambda number: 1)
     root = tmp_path / "root"
     root.mkdir()
     record = probe.run_one("/opt/agy", SCENARIO_NAMED["success-stream-json"], root, {})
@@ -2087,6 +2348,156 @@ def test_a_fake_agy_that_writes_into_the_record_channel_is_refused(
     with pytest.raises(ProbeError, match=refusal):
         record_all(agy, tmp_path / "out", only={"version"})
     assert not (tmp_path / "out").exists()
+
+
+# add_key(2)'s number, on the architectures the keyring canary runs on.
+_SYS_ADD_KEY = {"x86_64": 248, "aarch64": 217}
+
+# The keyring canary's helper. It joins a session keyring of its own first,
+# so that the operator's is never touched, adds a harmless key to it and
+# finds it there. As the control, it looks for the key from a bwrap that
+# joined no keyring, which finds it (ADR 0005 D10.1's measurement). Then it
+# records the ``version`` scenario with a fake agy through the probe's own
+# command line, in its session keyring, the key's.
+_KEYRING_HELPER = """
+import ctypes, json, subprocess, sys
+probe_py, agy, out, name = sys.argv[1:5]
+add_key, keyctl = int(sys.argv[5]), int(sys.argv[6])
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+L = ctypes.c_long
+assert libc.syscall(L(keyctl), L(1), None) > 0  # KEYCTL_JOIN_SESSION_KEYRING: its own
+key = libc.syscall(L(add_key), b"user", name.encode(), b"harmless", ctypes.c_size_t(8), L(-3))
+found = libc.syscall(L(keyctl), L(10), L(-3), b"user", name.encode(), L(0))  # KEYCTL_SEARCH @s
+search = (
+    "import ctypes, errno\\n"
+    "libc = ctypes.CDLL(None, use_errno=True)\\n"
+    "libc.syscall.restype = ctypes.c_long\\n"
+    f"rc = libc.syscall(ctypes.c_long({keyctl}), ctypes.c_long(10), ctypes.c_long(-3), "
+    f"b'user', {name.encode()!r}, ctypes.c_long(0))\\n"
+    "print('found' if rc >= 0 else errno.errorcode[ctypes.get_errno()])\\n"
+)
+bwrap = ["bwrap", "--unshare-all", "--ro-bind", "/", "/", "--"]
+control = subprocess.run(
+    [*bwrap, "/usr/bin/python3", "-I", "-S", "-c", search],
+    capture_output=True, text=True, timeout=60,
+)
+recorded = subprocess.run(
+    [sys.executable, "-I", probe_py, "record", "--agy", agy, "--out", out, "--only", "version"],
+    capture_output=True, text=True, timeout=120,
+)
+print(json.dumps({
+    "key": key, "found": found, "control": control.stdout.strip(),
+    "recorded": recorded.returncode, "stderr": recorded.stderr[-2000:],
+}))
+"""
+
+
+def _seen(record: dict[str, Any]) -> dict[str, Any]:
+    return next(
+        json.loads(line[len("SEEN ") :]) for _, line in record["stderr"] if line.startswith("SEEN ")
+    )
+
+
+@needs_bwrap
+def test_a_key_in_the_callers_session_keyring_is_out_of_the_runs_reach(tmp_path):
+    """R4-F1 of PR #530: the recorder gave agy a private root and an empty
+    environment, but the caller's session keyring came with it, and a key
+    there is readable inside a bwrap user namespace (the control below).
+    Now the launch joins a session keyring of its own before bwrap runs: a
+    harmless key the caller holds is in none of the run's keyrings, and the
+    record says the keyring was the run's own."""
+    machine = platform.machine().lower()
+    if machine not in _SYS_ADD_KEY:
+        pytest.skip(f"no add_key(2) number for {machine}")
+    name = "autoforge-agy-canary-" + os.urandom(8).hex()
+    keyctl = probe.SYS_KEYCTL[machine]
+    plan = {"value": "-", "paths": [], "socket": "/x", "abstract": "-", "key": name}
+    agy = fake_agy(tmp_path, {**plan, "keyctl": keyctl})
+    out = tmp_path / "out"
+    argv = [str(Path(probe.__file__)), agy, str(out), name, str(_SYS_ADD_KEY[machine]), str(keyctl)]
+    done = subprocess.run(
+        [sys.executable, "-I", "-c", _KEYRING_HELPER, *argv],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=True,
+    )
+    helper = json.loads(done.stdout)
+    assert helper["key"] > 0 and helper["found"] == helper["key"]  # the canary is there
+    assert helper["control"] == "found"  # and in reach of a bwrap that joined no keyring
+    assert helper["recorded"] == 0, helper["stderr"]
+    record = json.loads((out / "version.json").read_text())
+    assert record["session_keyring"] == "own"
+    assert _seen(record)["keyring"] == {
+        "session": "ENOKEY",
+        "user": "ENOKEY",
+        "user-session": "ENOKEY",
+    }
+
+
+@needs_bwrap
+def test_a_run_that_would_hold_the_callers_session_keyring_is_refused(tmp_path, monkeypatch):
+    """The helper's own check, with the launcher left out: the run's session
+    keyring is then the caller's (or none, where the caller's was revoked),
+    and the helper refuses before it sets anything up or starts agy. The
+    recording stops, and writes nothing."""
+    monkeypatch.setattr(probe, "keyring_launcher", lambda: [])
+    out = tmp_path / "out"
+    with pytest.raises(ProbeError, match="session keyring.*refused, nothing started"):
+        record_all(fake_agy(tmp_path), out, only={"version"})
+    assert not out.exists()
+
+
+def test_a_host_where_no_session_keyring_can_be_joined_records_nothing(tmp_path, monkeypatch):
+    """An architecture whose keyctl(2) number the probe does not know, or a
+    host that has no keyctl(2): no run could get a session keyring of its
+    own, so the recording is refused before it starts anything."""
+
+    def on_the_host(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError(f"the probe started a process: {args!r}")
+
+    monkeypatch.setattr(probe, "SYS_KEYCTL", {})
+    monkeypatch.setattr(probe, "SANDBOX_PYTHON", sys.executable)
+    monkeypatch.setattr(probe.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(probe, "binary_sha256", lambda path: OTHER_SHA)
+    monkeypatch.setattr(probe.subprocess, "Popen", on_the_host)
+    monkeypatch.setattr(probe.subprocess, "run", on_the_host)
+    with pytest.raises(ProbeError, match="keyctl"):
+        record_all("/opt/agy", tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+# getpid(2)'s number: a call that succeeds and joins nothing, so that the
+# launcher's join cannot have happened.
+_SYS_GETPID = {"x86_64": 39, "aarch64": 172}
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="keyctl(2) is Linux's")
+def test_the_launcher_joins_a_session_keyring_of_its_own_or_starts_nothing(tmp_path):
+    """The launcher, on its own: the command it execs holds a session
+    keyring that is not this process's; and when the join cannot have
+    happened (here a call that joins nothing stands in for keyctl), it
+    refuses with its own status, and the command never starts."""
+    number = probe.keyctl_number()
+    show = f"""
+import ctypes, json
+libc = ctypes.CDLL(None)
+libc.syscall.restype = ctypes.c_long
+args = [ctypes.c_long(a) for a in ({number}, 0, -3, 0)]  # KEYCTL_GET_KEYRING_ID @s
+print(json.dumps({{"own": libc.syscall(*args)}}))
+"""
+    launched = run_sandboxed([*probe.keyring_launcher(), sys.executable, "-I", "-c", show], 30)
+    assert launched["own"] > 0 and launched["own"] != probe.session_keyring(number)
+    machine = platform.machine().lower()
+    if machine not in _SYS_GETPID:
+        pytest.skip(f"no getpid(2) number for {machine}")
+    marker = tmp_path / "started"
+    launch = [*probe.keyring_launcher()[:-1], str(_SYS_GETPID[machine])]
+    started = f"open({str(marker)!r}, 'w').close(); print('{{}}')"
+    with pytest.raises(ProbeError, match="could not join a session keyring of its own"):
+        run_sandboxed([*launch, sys.executable, "-I", "-c", started], 30)
+    assert not marker.exists()
 
 
 def _tree(path: Path) -> dict[str, bytes]:

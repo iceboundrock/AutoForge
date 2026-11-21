@@ -13,8 +13,10 @@
  ],
  "capture": {
   "stderr_eof": true,
+  "stderr_error": null,
   "stderr_truncated": false,
   "stdout_eof": true,
+  "stdout_error": null,
   "stdout_truncated": false
  },
  "exit": 1,
@@ -46,6 +48,7 @@
  "requests": [],
  "scenario": "model-unknown",
  "seconds": 0.3,
+ "session_keyring": "own",
  "signalled": null,
  "stderr": [
   [

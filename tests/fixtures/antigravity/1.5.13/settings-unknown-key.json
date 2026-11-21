@@ -9,8 +9,10 @@
  ],
  "capture": {
   "stderr_eof": true,
+  "stderr_error": null,
   "stderr_truncated": false,
   "stdout_eof": true,
+  "stdout_error": null,
   "stdout_truncated": false
  },
  "exit": 1,
@@ -25,11 +27,12 @@
  "processes_left": [],
  "requests": [],
  "scenario": "settings-unknown-key",
- "seconds": 0.2,
+ "seconds": 0.3,
+ "session_keyring": "own",
  "signalled": null,
  "stderr": [
   [
-   0.15,
+   0.21,
    "Error: --settings: unknown setting \"noSuchKey\"\n"
   ]
  ],
