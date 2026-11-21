@@ -726,6 +726,31 @@ def scenarios() -> list[SecurityScenario]:
     )
     add(
         SecurityScenario(
+            "custom-mid-session-write-hooks-control",
+            FIXED_ARGV,
+            stdin=SJ_PROMPT,
+            git_inits=["{work}"],
+            files=[{"path": "{work}/.agents/hooks.json", "content": dyn_hooks}],
+            steps=[
+                _cmd_step("echo step2 > {work}/m-step2", "Step 2"),
+                {"kind": "text", "text": "DONE"},
+            ],
+            watch_files=[
+                "{work}/m-step2",
+                "{work}/m-dyn-pretool",
+                "{work}/m-dyn-posttool",
+                "{work}/m-dyn-preinv",
+                "{work}/m-dyn-postinv",
+                "{work}/m-dyn-stop",
+            ],
+            note=(
+                "positive startup control for custom-mid-session-write-hooks "
+                "using identical hooks.json"
+            ),
+        )
+    )
+    add(
+        SecurityScenario(
             "custom-foreign-configs-ignored",
             FIXED_ARGV,
             stdin=SJ_PROMPT,

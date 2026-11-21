@@ -15,7 +15,7 @@
   glibc: `libresolv`, `libpthread`, `libm`, `libdl`, `librt`, `libc`),
   installed at `~/.local/bin/agy`, on Linux 7.0.14 x86_64 (Debian 13),
   `bwrap` 0.12.0, Landlock ABI 8, on 2026-11-21.
-- **Evidence:** 50 scenarios recorded by `tests/antigravity_security_probe.py`
+- **Evidence:** 51 scenarios recorded by `tests/antigravity_security_probe.py`
   under `tests/fixtures/antigravity-security/1.5.13/`, one JSON file per
   scenario named in backticks (`custom-dir-dot-agents` is
   `custom-dir-dot-agents.json`), each run in the same private-root `bwrap`
@@ -181,7 +181,7 @@ customization surfaces listed in #529 under the fixed headless argv.
 | Symlink pointing outside workspace (`.agents -> {base}/elsewhere`) | **Not followed** (0 markers) | `custom-symlink-outside-workspace` |
 | Global home (`~/.gemini/config/`, `~/.gemini/GEMINI.md`, `~/.agents/`) | `~/.gemini/config/hooks.json`, `mcp_config.json`, `AGENTS.md`, and `~/.gemini/GEMINI.md` **all loaded/executed**; `~/.agents/hooks.json` did not | `custom-global-home` |
 | `--add-dir {base}/extra` | **Widens discovery:** executes `{base}/extra/.agents/hooks.json` and loads `{base}/extra/AGENTS.md` | `custom-add-dir-widening` |
-| Mid-session write of `.agents/hooks.json` during a run | **Not hot-reloaded:** after `write_file` created `.agents/hooks.json` and a subsequent `run_command` executed, 0 of 5 lifecycle hooks (`PreToolUse`, `PostToolUse`, `PreInvocation`, `PostInvocation`, `Stop`) fired in that session | `custom-mid-session-write-hooks` |
+| Mid-session write of `.agents/hooks.json` during a run (with startup positive control) | **Not hot-reloaded:** after `write_file` created `.agents/hooks.json` and a subsequent `run_command` executed, 0 of 5 lifecycle hooks (`PreToolUse`, `PostToolUse`, `PreInvocation`, `PostInvocation`, `Stop`) fired in that session; with the identical `hooks.json` present at startup, all 5 fired | `custom-mid-session-write-hooks`, `custom-mid-session-write-hooks-control` |
 | Foreign configs (`.mcp.json`, `.gemini/hooks.json`, `.antigravity/settings.json`, `.claude/settings.json`, `CLAUDE.md`) | **Ignored** (0 markers, 0 system markers) | `custom-foreign-configs-ignored` |
 | Prompt `/config` without vs with `--disable-slash-commands` | Without flag: exit 2 (`unavailable with --input-format stream-json`); with flag: sent verbatim to model | `custom-slash-config-without-disable`, `custom-slash-config-with-disable` |
 

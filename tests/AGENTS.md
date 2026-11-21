@@ -637,7 +637,7 @@ troubleshooting guide (#260)          test_troubleshooting_guide.py (every scena
 Antigravity CLI spikes (#528, #529)   test_antigravity_probe.py (#528: 147 records in
                                       tests/fixtures/antigravity/1.5.13/, dropped.txt,
                                       prototype reducer, private-root bwrap boundary),
-                                      test_antigravity_security_probe.py (#529: 50 security
+                                      test_antigravity_security_probe.py (#529: 51 security
                                       records in tests/fixtures/antigravity-security/1.5.13/,
                                       report alignment, child_env, sandbox_policy, redaction
                                       audit, and opt-in real bwrap/subreaper verification

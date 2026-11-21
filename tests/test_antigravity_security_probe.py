@@ -2,7 +2,7 @@
 
 ``tests/antigravity_security_probe.py`` runs ``agy`` against a loopback stand-in
 of the Gemini API in a private-root ``bwrap`` sandbox with its own anonymous
-session keyring and writes one JSON record per scenario. The 50 records of
+session keyring and writes one JSON record per scenario. The 51 records of
 ``agy`` 1.5.13 are committed under ``tests/fixtures/antigravity-security/1.5.13/``,
 and ``docs/antigravity-cli-security-spike.md`` states what they show.
 
@@ -44,6 +44,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -58,7 +59,7 @@ from autoforge.child_env import (
 )
 from autoforge.executor import ExecutionRequest, execute
 from autoforge.redaction import credential_classes, redact
-from autoforge.sandbox import Access, NetworkPosition, compile_launch
+from autoforge.sandbox import TEARDOWN_UNCOUNTED, Access, NetworkPosition, compile_launch
 from autoforge.sandbox_bwrap import probe as probe_bwrap
 from autoforge.sandbox_policy import (
     AuthItem,
@@ -281,6 +282,18 @@ EXPECTED: dict[str, dict[str, Any]] = {
         "requests": 3,
         "markers": ["{work}/.agents/hooks.json", "{work}/m-step2"],
     },
+    "custom-mid-session-write-hooks-control": {
+        "exit": 0,
+        "requests": 2,
+        "markers": [
+            "{work}/m-dyn-postinv",
+            "{work}/m-dyn-posttool",
+            "{work}/m-dyn-preinv",
+            "{work}/m-dyn-pretool",
+            "{work}/m-dyn-stop",
+            "{work}/m-step2",
+        ],
+    },
     "custom-foreign-configs-ignored": {
         "exit": 0,
         "requests": 1,
@@ -438,7 +451,7 @@ def test_committed_inventory_matches_scenarios_and_expected() -> None:
     records = _load_committed()
     scenario_names = {sc.name for sc in sec_probe.SCENARIOS}
     assert set(records) == scenario_names == set(EXPECTED)
-    assert len(records) == 50
+    assert len(records) == 51
 
 
 @pytest.mark.parametrize("name", sorted(EXPECTED))
@@ -645,6 +658,32 @@ def test_installed_agy_security_probe_matches_expected(tmp_path: Path) -> None:
     for name, want in EXPECTED.items():
         record = json.loads((tmp_path / f"{name}.json").read_text(encoding="utf-8"))
         _assert_matches(record, want, pinned=False)
+
+
+def _detached_sleeper_cmd(ready: Path, token: str, seconds: int) -> str:
+    """Start a detached ``setsid`` Python sleeper and wait until it signals readiness."""
+    py = (
+        f"import pathlib, time; pathlib.Path({str(ready)!r}).write_text('1'); time.sleep({seconds})"
+    )
+    return (
+        f'setsid -f python3 -c "{py}" {token} >/dev/null 2>&1 && '
+        f"for _ in $(seq 1 40); do [ -f {ready} ] && break; sleep 0.05; done"
+    )
+
+
+def _alive(token: str) -> list[int]:
+    """Host processes whose ``/proc/<pid>/cmdline`` carries ``token``."""
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                if token.encode() in fh.read():
+                    found.append(int(entry))
+        except OSError:
+            continue
+    return found
 
 
 @pytest.mark.skipif(not PROBE_BIN, reason="AUTOFORGE_AGY_PROBE_BIN names no agy binary")
@@ -854,6 +893,8 @@ def test_installed_agy_inside_autoforge_sandbox_and_subreaper(tmp_path: Path) ->
                 network=NetworkPosition.HOST,
             )
             desc = describe_launch(facts, needs, launch_env)
+            sbx_token = f"autoforge-agy-sbx-{uuid.uuid4().hex}"
+            sbx_ready = wt / "detached-started"
             req_count[0] = 0
             steps_box[0] = [
                 {
@@ -863,7 +904,7 @@ def test_installed_agy_inside_autoforge_sandbox_and_subreaper(tmp_path: Path) ->
                         "CommandLine": (
                             f"python3 {wt}/run_canary.py && echo changed >> {wt}/a.txt && "
                             "git add a.txt && git commit -q -m 'agent commit' && "
-                            "setsid -f sleep 297 >/dev/null 2>&1"
+                            + _detached_sleeper_cmd(sbx_ready, sbx_token, 297)
                         ),
                         "toolSummary": "Canary and commit",
                         "WaitMsBeforeAsync": 5000,
@@ -883,6 +924,9 @@ def test_installed_agy_inside_autoforge_sandbox_and_subreaper(tmp_path: Path) ->
                 )
             )
             assert res.ok and res.sandbox is not None and res.sandbox.enforced
+            assert res.sandbox.teardown == TEARDOWN_UNCOUNTED
+            assert sbx_ready.exists(), "detached child did not start inside sandbox"
+            assert _alive(sbx_token) == [], "detached sandbox child survived namespace teardown"
             assert not (tmp_path / "host-hook-ran").exists()
             canary = json.loads((wt / "sbx-canary.json").read_text())
             for k in ("ssh", "gh", "netrc", "state", "config", "checkout", "host_gemini"):
@@ -891,7 +935,8 @@ def test_installed_agy_inside_autoforge_sandbox_and_subreaper(tmp_path: Path) ->
             assert canary["common_write"].startswith("OSError:30")
             assert canary["dotgit_write"].startswith("OSError:30")
             assert canary["gh_token"] == "autoforge-no-github-credential"
-            assert any(p.is_file() for p in priv_obj.rglob("*"))
+            obj_files = [p for p in priv_obj.rglob("*") if p.is_file()]
+            assert len(obj_files) == 3, obj_files
 
         # Unsandboxed Linux child subreaper test (ADR 0002)
         with tempfile.TemporaryDirectory(prefix="af-agy-orphan.") as otmp:
@@ -899,13 +944,18 @@ def test_installed_agy_inside_autoforge_sandbox_and_subreaper(tmp_path: Path) ->
             owork = Path(otmp) / "work"
             ohome.mkdir()
             owork.mkdir()
+            orphan_token = f"autoforge-agy-orphan-{uuid.uuid4().hex}"
+            orphan_ready = owork / "orphan-started"
             req_count[0] = 0
             steps_box[0] = [
                 {
                     "kind": "call",
                     "name": "run_command",
                     "args": {
-                        "CommandLine": "setsid -f sleep 296 >/dev/null 2>&1; echo launched",
+                        "CommandLine": (
+                            _detached_sleeper_cmd(orphan_ready, orphan_token, 296)
+                            + " && echo launched"
+                        ),
                         "toolSummary": "Detached sleep",
                         "WaitMsBeforeAsync": 5000,
                     },
@@ -931,6 +981,8 @@ def test_installed_agy_inside_autoforge_sandbox_and_subreaper(tmp_path: Path) ->
                 )
             )
             assert ores.ok
+            assert orphan_ready.exists(), "detached child did not start"
+            assert _alive(orphan_token) == [], "detached orphan survived subreaper cleanup"
             assert ores.orphans_killed is True
             assert ores.orphan_survived_kill is False
             assert ores.orphans_unchecked is False
