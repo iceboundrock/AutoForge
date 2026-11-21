@@ -200,10 +200,17 @@ the exact boundary on the pinned build:
 3. **Fail-closed mitigation (until `agy` adds a native switch):** refuse any
    launch in `execute(req)` whenever `.agents`, `.agent`, `_agents`, or
    `_agent` (directory, file, or symlink, whatever it contains) exists at
-   `cwd`, in any ancestor directory up to `/`, or anywhere below `cwd`, and
-   never pass `--add-dir` or `extra_args`. Scanning before every launch also
-   blocks a hook or MCP file written by an earlier phase (`ANALYZE_EXECUTE`)
-   from executing on the next phase (`REVIEW`/`FIX`).
+   `cwd`, in any ancestor up to the repository/worktree root (stopping at the
+   `.git` directory or `.git` file, or falling back to `/` only if no `.git`
+   boundary exists), or anywhere below `cwd`, and never pass `--add-dir` or
+   `extra_args`. Bounding the ancestor walk at `.git` narrows #528's
+   pre-measurement "up to `/`" rule using `custom-traversal-above-repo-root`,
+   `custom-traversal-git-worktree`, and `custom-global-home` (and under
+   `sandbox.mode: required`, host ancestors above the worktree are not mounted
+   into `bwrap`), preventing an unrelated operator `~/.agents/` from blocking
+   every launch. Scanning before every launch also blocks a hook or MCP file
+   written by an earlier phase (`ANALYZE_EXECUTE`) from executing on the next
+   phase (`REVIEW`/`FIX`).
 
 If the maintainer considers refusing repositories with `.agents/` unacceptable
 (or prefers not to rely on pre-launch directory refusal instead of a CLI
@@ -377,7 +384,12 @@ output; pinned offline in `tests/test_antigravity_security_probe.py`):
 5. **Pre-launch workspace customization scan (in `execute(req)`):** resolve
    `req.cwd` and refuse with `ConfigurationError` if `.agents`, `.agent`,
    `_agents`, or `_agent` (directory, file, or symlink) exists at `cwd`, in
-   any ancestor up to `/`, or anywhere below `cwd`.
+   any ancestor up to the `.git` directory or worktree `.git` file (falling
+   back to `/` only when no `.git` boundary is present), or anywhere below
+   `cwd`. This narrows #528's pre-measurement "up to `/`" scan to the measured
+   discovery boundary (`custom-traversal-above-repo-root`,
+   `custom-traversal-git-worktree`, `custom-global-home`) so an unrelated
+   operator `~/.agents/` does not refuse every launch.
 6. **Prompt and stream gates:** enforce #528's 160,000-byte UTF-8 bound,
    `dropped.txt` table check, strict NDJSON/UTF-8/LF-only reducer (including
    G1 carry-forward `R5-F2` unpaired-surrogate check and `R5-F7`
@@ -390,8 +402,8 @@ output; pinned offline in `tests/test_antigravity_security_probe.py`):
 |---|---|---|---|
 | `antigravity binary digest` | Yes (0 writes) | Resolve executable, hash SHA-256, run `agy --version` (0 home writes; inside `bwrap` when sandbox enabled) | `FAIL`: unapproved binary SHA-256 (names digest and version printed; points to re-measurement probe) |
 | `antigravity required flags` | Yes (0 writes) | Run `agy --help` (0 home writes); assert `--input-format`, `--output-format`, `--settings`, `--model`, `--effort`, `--print-timeout`, `--disable-slash-commands` are listed | `FAIL`: missing required CLI flag(s) |
-| `antigravity customization scan` | Yes (filesystem walk only) | Scan checkout and ancestors/descendants for `.agents`, `.agent`, `_agents`, `_agent` (dir/file/symlink) | `FAIL`: forbidden repository customization directory found (names path; explains hooks/MCP cannot be disabled in `agy` 1.5.13) |
-| `antigravity credential` | Presence only (not validity) | Check `GEMINI_API_KEY` is non-empty in launch env; fail if `AGY_ADC_AUTH` is set | `FAIL`: `GEMINI_API_KEY` not set (or unsupported `AGY_ADC_AUTH` set) |
+| `antigravity customization scan` | Yes (filesystem walk only) | Scan checkout (`cwd`, ancestors up to `.git` root, and descendants below `cwd`) for `.agents`, `.agent`, `_agents`, `_agent` (dir/file/symlink) | `FAIL`: forbidden repository customization directory found (names path; explains hooks/MCP cannot be disabled in `agy` 1.5.13) |
+| `antigravity credential` | Presence only (not validity) | Check `GEMINI_API_KEY` is non-empty in launch env; fail if `AGY_ADC_AUTH` or `GOOGLE_APPLICATION_CREDENTIALS` is set | `FAIL`: `GEMINI_API_KEY` not set (or unsupported `AGY_ADC_AUTH` / `GOOGLE_APPLICATION_CREDENTIALS` set) |
 | `antigravity model access / entitlement` | **No** (requires live API call; `agy models` is a false positive) | Do not invoke `agy models` or any API endpoint | `SKIP`: cannot verify API key validity or model entitlement without a live model call |
 | `outer sandbox` rows (existing) | Yes | Existing `doctor_sandbox.py` capability, mode, compiled `ProviderRequirements`, and sandboxed `agy --version` | `FAIL` if `sandbox.mode: required` cannot be enforced on this host |
 | `no credential reaches a launch` (existing) | Yes | Existing `child_env.preflight` (`git config`, `~/.netrc`, login shell startup) | `FAIL` on any forbidden git/netrc/shell route |
@@ -442,11 +454,12 @@ below** (and #528's C2/C3). If any condition is declined, the verdict is
 
 - **S1 (Blocker — Maintainer decision required):** Accept the pre-launch
   refusal of `.agents`, `.agent`, `_agents`, and `_agent` (at `cwd`, any
-  ancestor, or any descendant) combined with a fresh per-launch empty `HOME`
-  and fixed argv (no `--add-dir`, no `extra_args`) as the MVP substitute for
-  a missing CLI hooks/MCP switch — **knowing** that repositories committing
-  those directories cannot run `agy`. If a native CLI switch is required
-  instead, this spike's verdict is **NO-GO** until `agy` ships one.
+  ancestor up to the `.git` root, or any descendant) combined with a fresh
+  per-launch empty `HOME` and fixed argv (no `--add-dir`, no `extra_args`) as
+  the MVP substitute for a missing CLI hooks/MCP switch — **knowing** that
+  repositories committing those directories cannot run `agy`. If a native CLI
+  switch is required instead, this spike's verdict is **NO-GO** until `agy`
+  ships one.
 - **S2 (Auth scope):** Support `GEMINI_API_KEY` with
   `--settings '{"modelProvider":"gemini"}'` ONLY; explicitly refuse Google
   OAuth sign-in and `AGY_ADC_AUTH` / `GOOGLE_APPLICATION_CREDENTIALS`, and
