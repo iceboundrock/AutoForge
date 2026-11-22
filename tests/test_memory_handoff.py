@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hashlib
 import importlib.util
 import itertools
 import json
@@ -1874,6 +1875,55 @@ def test_a_crash_between_the_projection_and_the_intent_save_renders_it_again(
     assert eng2.step().next_phase == "REVIEW"
     assert seen.memory[1] == written[0]
     assert "launch: 2" in written[0] and "a lesson" in written[0]
+    eng2.close()
+
+
+def test_a_crash_after_the_read_context_is_on_disk_leaves_it_orphaned_and_writes_a_new_one(
+    tmp_state_dir, pi_home
+):
+    """W1 with the files already written (R5-F2 of PR #536): ``memory.md`` and
+    the rest of the read context are on disk before the intent save, so a
+    crash between them (here as the prompt naming them is rendered, the last
+    step before that save) leaves the directory behind and the checkpoint
+    and the launch ordinal as they were. The next command never adopts the
+    orphan: it renders the same projection for the same ordinal into a new
+    directory of its own, and the orphan stays as it was written."""
+    gh = FakeGitHub()
+    seen = Seen(stopping("blocked", [add("note", "a lesson")]), implement)
+    eng, _ = producing(tmp_state_dir, gh, seen)
+    eng.step()
+    eng.unblock("go")
+    before = eng.paths.state_file.read_bytes()
+    assert saved(eng).launch_seq == 1
+    orphans: list[Path] = []
+    render = eng.render_prompt_for
+
+    def rendered_then_crashed(*args, **kwargs):
+        prompt = render(*args, **kwargs)
+        if not eng._read_context_dir:
+            return prompt  # the step's plan, rendered before any launch
+        orphans.append(Path(eng._read_context_dir))
+        raise KeyboardInterrupt
+
+    eng.render_prompt_for = rendered_then_crashed
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    (orphan,) = orphans
+    orphaned = (orphan / MEMORY_FILE).read_bytes()
+    assert b"launch: 2" in orphaned and b"a lesson" in orphaned
+    assert eng.paths.state_file.read_bytes() == before
+    assert saved(eng).launch_seq == 1
+    eng.render_prompt_for = render
+    eng2, _ = resumed(eng, gh, seen)
+    assert eng2.step().next_phase == "REVIEW"
+    fresh = read_context_of(seen.prompts[1])
+    assert fresh != orphan and fresh.parent == orphan.parent
+    assert str(orphan) not in seen.prompts[1]
+    assert (fresh / MEMORY_FILE).read_bytes() == orphaned
+    assert (orphan / MEMORY_FILE).read_bytes() == orphaned
+    logged = execution_records(eng2)[-1]["metadata"]["memory"]
+    assert logged["launch"] == 2 == saved(eng2).launch_seq
+    assert logged["sha256"] == hashlib.sha256(orphaned).hexdigest()
     eng2.close()
 
 

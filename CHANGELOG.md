@@ -13,15 +13,23 @@ records that apply to it, and its prompt names the file. Which records
 apply to the commit a launch starts from is decided locally, from the run's
 own validation records and the local object store: Memory adds no GitHub
 call to a launch, and no fetch, not even of a commit a partial clone lacks.
-The controller records each validation failure of the phase's candidates,
-citing the validation record, in the save that keeps that record, so the
-relaunch after a failure is shown it, however many commits the failed
-candidate holds. An agent may add up to eight notes, or correct or retract
-an earlier proposal its `memory.md` shows, through an optional `memory`
-list in its result. They are kept only with a result the controller
-accepts: a success, in the save of the plan that publishes it (they stay if
-that push or pull request then fails), or a `blocked` or `failure` result,
-whose notes the launch after an `unblock` is shown. A launch whose starting
+The controller observes each validation failure of the phase's
+candidates in the save that appends its validation record, citing that
+record, so the relaunch after a failure is shown it, however many commits
+the failed candidate holds. The observation is kept only if the ledger
+admits it: one already at a bound (64 records, 256 events, 1 MiB) refuses
+it and counts the refusal, and the validation record is kept without it.
+The run keeps at most 64 validation records, the oldest evicted first, so
+a later one can evict the record an observation cites, after which the
+observation is at most shown as needing revalidation. An agent may add up
+to eight notes, or correct or retract an earlier proposal its `memory.md`
+shows, through an optional `memory` list in its result. They are kept only
+with a result the controller accepts: a success, in the save of the plan
+that publishes it (they stay if that push or pull request then fails), or a
+`blocked` or `failure` result, in its stop save. The launch after an `unblock` of a
+`blocked` result is shown its notes; a `failure` ends the run in `FAILED`,
+which has no `unblock`, so its notes stay in the ledger for `memory show`
+and no later launch of the run is shown them. A launch whose starting
 commit cannot be read adds no note. A reply kept across a restart (one
 delivered before its launch timed out or exited badly) is recovered as
 before but adds no entry. Each launch's run log records what it was shown,

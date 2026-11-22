@@ -2631,15 +2631,24 @@ Two writers add to the store, each in the save that already records what
 the record rests on, so no crash separates them:
 
 - **The controller's validation-failure record.** When a candidate of the
-  phase fails `validation.commands`, the record cites that validation
-  record and is saved with it. It carries the controller's account of the
-  record and the ends of its redacted output, and is bound to the failing
-  commit and the base it was checked against. On that commit the
-  projection shows the failure as established by the retained record. On
-  a later commit built on the same base it is shown with its source
-  commit and counted as needing revalidation. Otherwise it is omitted and
-  counted. The same record observed again, after a crash or a relaunch
-  that reports the same commit, adds nothing.
+  phase fails `validation.commands`, the controller observes the
+  validation record just appended: the observation cites that record
+  and, if the store admits it, is saved in the same save. It carries the
+  controller's account of the record and the ends of its redacted
+  output, and is bound to the failing commit and the base it was checked
+  against. On that commit the projection shows the failure as
+  established by the retained record. On a later commit built on the
+  same base it is shown with its source commit and counted as needing
+  revalidation. Otherwise it is omitted and counted. The same record
+  observed again, after a crash or a relaunch that reports the same
+  commit, adds nothing. The observation and its record do not always
+  exist together: a ledger already at one of its bounds (64 records, 256
+  events, 1 MiB) refuses the observation and counts it in
+  `memory show`'s refusals, and the validation record is saved without
+  it; and the run keeps at most 64 validation records, the oldest
+  evicted first, so a later one can evict the record an observation
+  cites, which is then never shown as established, at most as needing
+  revalidation with its receipt unavailable.
 - **An accepted result's proposals.** The agent may list up to eight
   entries in an optional `memory` field of its result: a note to add
   (`hypothesis`, `note`, `failed-approach`, `handoff` or
@@ -2656,11 +2665,14 @@ the record rests on, so no crash separates them:
   could not be read adds nothing: each entry it adds is refused and
   counted, while its corrections and retractions are kept. After an
   `unblock`, the next launch is shown a blocked result's entries as
-  proposals. A refused or corrected reply, one whose commit fails
-  validation and one lost to a crash keep none. An entry the store refuses
-  (past a bound, text the redactor would change, a revision of the
-  controller's or the operator's record, or of a record the launch was not
-  shown) is counted in `memory show`'s refusals and changes nothing else.
+  proposals. A `failure` result's entries stay in the ledger, which
+  `memory show` lists, but `FAILED` has no `unblock`, so no later launch
+  of the run is shown them. A refused or corrected reply, one whose
+  commit fails validation and one lost to a crash keep none. An entry the
+  store refuses (past a bound, text the redactor would change, a revision
+  of the controller's or the operator's record, or of a record the launch
+  was not shown) is counted in `memory show`'s refusals and changes
+  nothing else.
   A note past 2,048 bytes is refused, and a reason past 256 bytes is
   redacted and cut, when the reply is parsed: the controller never holds
   more of an entry than the store would keep.

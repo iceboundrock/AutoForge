@@ -30,7 +30,7 @@ the fake baseline. Neither launches a model, holds a credential or writes to Git
 | Arm | What it is | Status |
 |---|---|---|
 | `single_agent_no_memory` | existing AutoForge, with its validation and independent review | available |
-| `single_agent_issue_memory` | the same, with bounded Issue Working Memory | not evaluated: needs #317, #333 |
+| `single_agent_issue_memory` | the same, with bounded Issue Working Memory | not evaluated: its registered needs, #317 and #333, are in the code; its collector, a fixture report and every run are not (section 6) |
 | `fixed_role_multi_agent_issue_memory` | deterministic fixed roles, with Issue Memory | not evaluated: needs #319, #333 |
 | `adaptive_manager_worker_issue_memory` | adaptive Manager/Worker, with Issue Memory | not evaluated: needs #319, #333 |
 | `parallel_read_only_ideation_issue_memory` | optional: fixed roles with parallel read-only ideation | not evaluated: needs #319, #333 |
@@ -388,10 +388,19 @@ These hold today and are stated so nobody discovers them after spending money:
   protocol holds equal. Lifting this means the controller recording those settings when it creates a run,
   a change to the state file that this protocol does not make and that belongs on #23 first. Until then the
   best any real comparison can reach is `INCONCLUSIVE`, whatever else it measures.
-- **Arm 2 does not exist,** so `memory_benefit` is `NOT_EVALUATED` until #317 and #333 land. The
-  no-memory baseline alone can be smoke-tested.
-- **The crash gate needs a fixture of the treatment arm.** The scenario of section 8 covers arm 1
-  only; an arm owes its own when it lands.
+- **Arm 2 cannot be scored yet, so `memory_benefit` is `NOT_EVALUATED`.** The prerequisites the
+  manifest registers for it are in the code: #317's store and seed, and #333's delivery of
+  `memory.md` to `ANALYZE_EXECUTE` with what each launch was shown in its run log. Their offline
+  tests (`tests/test_memory_handoff.py`, section 8) hold the controller's handoff, not the arm. What
+  is still missing is the arm's collector (section 3.5), which reads the seed's digest and each
+  launch's `metadata.memory` back into a record; without it no treatment run has a record to score,
+  the Memory gates of section 5 have nothing to read, and no treatment run or real comparison has
+  been made. The manifest keeps the arm `not_evaluated` with the prerequisites it was registered
+  with, which is what the tool reports. The no-memory baseline alone can be smoke-tested.
+- **The crash gate needs a fixture report that covers the treatment arm.** It reads that report
+  (section 5), and `make eval-fixture` runs arm 1 only, so the gate is `unknown` for arm 2. #333's
+  offline tests cover the crash windows of every Memory write and launch, but as controller tests,
+  not as a fixture report of the arm.
 
 ## 7. Deterministic control-plane tests
 
@@ -458,14 +467,16 @@ A Manager does not exist yet, so `correct_candidate_overwritten` uses a review f
 and `stale_completed_node` uses a review round as the node. Those arms owe the same fixtures on their
 own objects.
 
-**Owed by a Memory arm, not evaluated until #317 and #333:** obsolete memory, current memory,
+**Owed by a Memory arm, and not evaluated:** obsolete memory, current memory,
 conflicting memories, corrected memory, volatile GitHub state, scope boundary, negative debugging
 lesson, hallucinated lesson candidate, prompt-injection string, incomplete index watermark. The
 retrieval metrics (Recall@K, MRR) and offline-distillation costs belong to EPIC #331's optional
 evaluation, not to this one. #333 holds each of them that applies to its slice offline, through
 Memory delivery to `ANALYZE_EXECUTE`, in `tests/test_memory_handoff.py`; ADR 0015's implementation
 note names the test for each, and the incomplete index watermark waits for #326's index. Those are
-controller-correctness tests like section 7's, not a Memory-arm result: arm 2 stays `NOT_EVALUATED`.
+controller-correctness tests like section 7's, not a Memory-arm result. The manifest keeps these
+cases `not_evaluated`, under the prerequisites it registered: the fixture mode above drives arm 1
+only, so no fixture report of arm 2 scores them, and arm 2 stays `NOT_EVALUATED` (section 6).
 
 ## 9. Real runs
 
