@@ -47,6 +47,7 @@ from autoforge.memory_retrieval import (
     fts5_available,
     query_terms,
     render_hits,
+    text_tokens,
 )
 from autoforge.redaction import redact
 from autoforge.transitions import Phase
@@ -144,6 +145,20 @@ def ids(result):
     return [hit.id for hit in result.hits]
 
 
+def retriever_for(w, **kwargs):
+    """A retriever whose source is ``w``'s store as it is at each read."""
+    return MemoryRetriever(REPO, RUN, lambda: w.store, **kwargs)
+
+
+def dropped(retriever):
+    """The reasons a retriever counted, the controller's diagnostic alone."""
+    return {
+        name.removeprefix("dropped_"): n
+        for name, n in retriever.metrics.snapshot().items()
+        if name.startswith("dropped_") and n
+    }
+
+
 # -- the default backend ---------------------------------------------------------------
 
 
@@ -158,14 +173,14 @@ def test_the_fts5_index_answers_a_small_corpus_in_memory_without_a_file_or_the_n
     monkeypatch.chdir(tmp_path)
     assert fts5_available()
     w = corpus()
-    retriever = MemoryRetriever(REPO, RUN)
-    status = retriever.sync(w.store)
+    retriever = retriever_for(w)
+    status = retriever.sync()
     assert (status.state, status.indexed_through_seq, status.generation) == (
         IndexState.CURRENT,
         w.store.revision,
         1,
     )
-    result = retriever.search_memory(w.store, REQ, "trailing comma tokenizer")
+    result = retriever.search_memory(REQ, "trailing comma tokenizer")
     assert ids(result)[0] == w.ids["tokenizer"]
     hit = result.hits[0]
     assert hit.provenance.backend == "sqlite-fts5" and hit.provenance.rank == 1
@@ -193,14 +208,14 @@ def test_partitions_keep_one_issues_scores_and_rows_apart():
     alone.add("tokenizer", "The tokenizer drops the final element after a trailing comma.")
     alone.add("uv", "Run the suite with uv run pytest, never with the system interpreter.")
     alone.add("ruff", "Lint is ruff with a 100 character line limit.")
-    one, two = MemoryRetriever(REPO, RUN), MemoryRetriever(REPO, RUN)
-    one.sync(w.store)
-    two.sync(alone.store)
-    a = one.search_memory(w.store, REQ, "trailing commas legal HTTP")
-    b = two.search_memory(alone.store, REQ, "trailing commas legal HTTP")
-    assert [(h.id, h.provenance.score) for h in a.hits] == [
-        (h.id, h.provenance.score) for h in b.hits
-    ]
+    one, two = retriever_for(w), retriever_for(alone)
+    one.sync()
+    two.sync()
+    a = one.search_memory(REQ, "trailing commas legal HTTP")
+    b = two.search_memory(REQ, "trailing commas legal HTTP")
+    assert a.hits == b.hits and a.status == b.status
+    terms = query_terms("trailing commas legal HTTP")
+    assert one.backend.search(ISSUE, terms, 64) == two.backend.search(ISSUE, terms, 64)
     assert w.ids["other"] not in ids(a)
     assert {p for p, *_ in one.backend.entries()} == {ISSUE, OTHER}
 
@@ -210,37 +225,35 @@ def test_partitions_keep_one_issues_scores_and_rows_apart():
 
 def test_a_corrected_record_is_served_only_as_it_is_now_even_before_the_index_catches_up():
     w = corpus()
-    retriever = MemoryRetriever(REPO, RUN)
-    retriever.sync(w.store)
+    retriever = retriever_for(w)
+    retriever.sync()
     w.revise(Action.CORRECT, "uv", text="Run the suite through make check, which pins the lock.")
-    stale = retriever.status(w.store)
+    stale = retriever.status()
     assert (stale.state, stale.pending, stale.lag) == (IndexState.STALE, 1, 1)
-    old = retriever.search_memory(w.store, REQ, "system interpreter")
-    assert ids(old) == [] and dict(old.dropped) == {"stale": 1}
-    new = retriever.search_memory(w.store, REQ, "make check pins")
+    old = retriever.search_memory(REQ, "system interpreter")
+    assert ids(old) == [] and dropped(retriever) == {"stale": 1}
+    new = retriever.search_memory(REQ, "make check pins")
     assert ids(new) == [w.ids["uv"]] and new.hits[0].provenance.backend == TAIL_BACKEND
     assert new.hits[0].summary == "Run the suite through make check, which pins the lock."
     assert new.complete and not new.status.is_current
-    retriever.sync(w.store)
-    after = retriever.search_memory(w.store, REQ, "make check pins")
+    retriever.sync()
+    after = retriever.search_memory(REQ, "make check pins")
     assert ids(after) == [w.ids["uv"]] and after.hits[0].provenance.backend == "sqlite-fts5"
-    assert retriever.search_memory(w.store, REQ, "system interpreter").hits == ()
+    assert retriever.search_memory(REQ, "system interpreter").hits == ()
 
 
 def test_a_retracted_record_is_unservable_at_once_and_a_failed_sync_never_reopens_it():
     w = corpus()
     backend = FailingFts5()
-    retriever = MemoryRetriever(REPO, RUN, backend=backend)
-    retriever.sync(w.store)
+    retriever = retriever_for(w, backend=backend)
+    retriever.sync()
     w.revise(Action.RETRACT, "tokenizer")
-    result = retriever.search_memory(w.store, REQ, "tokenizer trailing comma")
-    assert w.ids["tokenizer"] not in ids(result) and ("retracted", 1) in result.dropped
-    assert retriever.fetch_memory(w.store, REQ, w.ids["tokenizer"]).visibility is (
-        Visibility.RETRACTED
-    )
+    result = retriever.search_memory(REQ, "tokenizer trailing comma")
+    assert w.ids["tokenizer"] not in ids(result) and dropped(retriever) == {"retracted": 1}
+    assert retriever.fetch_memory(REQ, w.ids["tokenizer"]).item is None
     w.add("later", "A later lesson, so that the sync inserts a row and fails there.")
     backend.fail_on = 1
-    status = retriever.sync(w.store)
+    status = retriever.sync()
     assert (status.state, status.failed, status.reason) == (
         IndexState.STALE,
         1,
@@ -249,10 +262,10 @@ def test_a_retracted_record_is_unservable_at_once_and_a_failed_sync_never_reopen
     # The failed update published nothing: the old row is still there, and
     # the store still refuses it.
     assert w.ids["tokenizer"] in [record for _, record, _, _ in backend.entries()]
-    result = retriever.search_memory(w.store, REQ, "tokenizer trailing comma")
+    result = retriever.search_memory(REQ, "tokenizer trailing comma")
     assert w.ids["tokenizer"] not in ids(result)
     backend.fail_on = 0
-    assert retriever.sync(w.store).state is IndexState.CURRENT
+    assert retriever.sync().state is IndexState.CURRENT
     assert w.ids["tokenizer"] not in [record for _, record, _, _ in backend.entries()]
 
 
@@ -262,36 +275,39 @@ def test_withheld_duplicates_and_superseded_records_are_never_served():
     w.add("b", "Clear the pytest cache when imports look wrong.")
     w.add("old", "The bug is in the YAML loader.")
     w.add("new", "The YAML loader is not involved; the INI reader fails alone.")
-    retriever = MemoryRetriever(REPO, RUN)
-    retriever.sync(w.store)
+    retriever = retriever_for(w)
+    retriever.sync()
     w.revise(Action.RETRACT, "a")
     w.revise(Action.SUPERSEDE, "old", replacement=w.ids["new"])
     for synced in (False, True):
         if synced:
-            retriever.sync(w.store)
-        cache = retriever.search_memory(w.store, REQ, "pytest cache imports")
+            retriever.sync()
+        cache = retriever.search_memory(REQ, "pytest cache imports")
         assert cache.hits == ()
-        loader = retriever.search_memory(w.store, REQ, "YAML loader bug")
+        loader = retriever.search_memory(REQ, "YAML loader bug")
         assert ids(loader) == [w.ids["new"]]
-    assert retriever.fetch_memory(w.store, REQ, w.ids["b"]).visibility is Visibility.WITHHELD
-    assert retriever.fetch_memory(w.store, REQ, w.ids["old"]).visibility is Visibility.SUPERSEDED
+    before = dropped(retriever)
+    assert retriever.fetch_memory(REQ, w.ids["b"]).item is None
+    assert retriever.fetch_memory(REQ, w.ids["old"]).item is None
+    after = dropped(retriever)
+    assert after["withheld"] == before["withheld"] + 1
+    assert after["superseded"] == before.get("superseded", 0) + 1
 
 
 def test_another_issues_records_are_never_searched_fetched_or_counted():
     w = corpus()
-    retriever = MemoryRetriever(REPO, RUN)
-    retriever.sync(w.store)
-    result = retriever.search_memory(w.store, REQ, "HTTP header lists legal")
-    assert ids(result) == [] and result.dropped == ()
-    assert retriever.fetch_memory(w.store, REQ, w.ids["other"]) == (
-        memory_retrieval.FetchResult(Visibility.FOREIGN, None)
-    )
-    catalog = retriever.catalog(w.store, REQ)
+    retriever = retriever_for(w)
+    retriever.sync()
+    result = retriever.search_memory(REQ, "HTTP header lists legal")
+    assert ids(result) == [] and dropped(retriever) == {}
+    assert retriever.fetch_memory(REQ, w.ids["other"]) == retriever.fetch_memory(REQ, 999)
+    assert retriever.fetch_memory(REQ, w.ids["other"]).item is None
+    catalog = retriever.catalog(REQ)
     assert catalog.topics == (("hypothesis", 3),)
     assert "HTTP" not in catalog.render()
     other = replace(REQ, step=StepKey(Phase.ANALYZE_EXECUTE, OTHER, "", 0, 1))
-    assert retriever.catalog(w.store, other).topics == (("hypothesis", 1),)
-    assert ids(retriever.search_memory(w.store, other, "HTTP header")) == [w.ids["other"]]
+    assert retriever.catalog(other).topics == (("hypothesis", 1),)
+    assert ids(retriever.search_memory(other, "HTTP header")) == [w.ids["other"]]
 
 
 @pytest.mark.parametrize("field", ["repository", "run"])
@@ -313,8 +329,6 @@ def test_a_store_of_another_repository_or_run_is_refused_by_every_read(field):
     else:
         raw = dict(w.store.encode(), run_id="20260101T000000Z-fedcba")
         foreign = MemoryStore(REPO, "20260101T000000Z-fedcba", 128, raw)
-    retriever = MemoryRetriever(REPO, RUN)
-    retriever.sync(w.store)
     request = replace(REQ, run_id=foreign.run_id)
     if field == "repository":
         request = replace(
@@ -323,16 +337,26 @@ def test_a_store_of_another_repository_or_run_is_refused_by_every_read(field):
                 Phase.ANALYZE_EXECUTE, "https://github.com/owner/elsewhere/issues/2", "", 0, 1
             ),
         )
+    holder = Writer(w.store)
+    retriever = retriever_for(holder)
+    retriever.sync()
+    # The source now gives another repository's or run's store: every read refuses it.
+    holder.store = foreign
     for read in (
-        lambda: retriever.sync(foreign),
-        lambda: retriever.status(foreign),
-        lambda: retriever.search_memory(foreign, request, "tokenizer"),
-        lambda: retriever.fetch_memory(foreign, request, 1),
-        lambda: retriever.catalog(foreign, request),
-        lambda: retriever.verify(foreign),
+        retriever.sync,
+        retriever.status,
+        retriever.rebuild,
+        retriever.verify,
+        lambda: retriever.search_memory(request, "tokenizer"),
+        lambda: retriever.fetch_memory(request, 1),
+        lambda: retriever.catalog(request),
     ):
         with pytest.raises(RetrievalError, match="projects another store"):
             read()
+    with pytest.raises(RetrievalError, match="projects another store"):
+        MemoryRetriever(REPO, RUN, lambda: w.store.encode()).status()
+    with pytest.raises(ConfigurationError):
+        MemoryRetriever(REPO, RUN, w.store)
 
 
 def test_candidate_drift_ranges_and_environments_decide_applicability_not_the_index():
@@ -350,22 +374,26 @@ def test_candidate_drift_ranges_and_environments_decide_applicability_not_the_in
         scope=replace(SCOPE, range=Range.DESCENDANTS, base=BASE),
     )
     w.add("env", "The scanner test needs a UTF-8 locale.", scope=replace(SCOPE, environment=ENV))
-    retriever = MemoryRetriever(REPO, RUN)
-    retriever.sync(w.store)
+    retriever = retriever_for(w)
+    retriever.sync()
 
     def found(request):
         return {
             name
             for name, i in w.ids.items()
-            if i in ids(retriever.search_memory(w.store, request, "scanner"))
+            if i in ids(retriever.search_memory(request, "scanner"))
         }
 
     assert found(REQ) == {"descendant"}
     assert found(replace(REQ, candidate=OLD, ancestors=())) == {"exact"}
     assert found(replace(REQ, environment=ENV)) == {"descendant", "env"}
     assert found(replace(REQ, ancestors=())) == set()
-    result = retriever.search_memory(w.store, replace(REQ, ancestors=()), "scanner")
-    assert dict(result.dropped) == {"inapplicable": 3}
+    before = dropped(retriever)["inapplicable"]
+    result = retriever.search_memory(replace(REQ, ancestors=()), "scanner")
+    assert dropped(retriever)["inapplicable"] - before == 3
+    # Nothing of the three records the launch's scope does not hold is told.
+    assert (result.status.source_seq, result.status.pending, result.unsearched) == (0, 0, 0)
+    assert result.complete and result.status.is_current
 
 
 # -- untrusted text, in a record and in a query ---------------------------------------
@@ -392,13 +420,13 @@ INJECTION = (
 def test_query_syntax_never_reaches_fts5_and_indexed_text_stays_fenced(query):
     w = corpus()
     injected = w.add("injected", INJECTION)
-    retriever = MemoryRetriever(REPO, RUN)
-    retriever.sync(w.store)
+    retriever = retriever_for(w)
+    retriever.sync()
     terms = query_terms(query)
     assert all(t.isalnum() for t in terms)
-    result = retriever.search_memory(w.store, REQ, query)
+    result = retriever.search_memory(REQ, query)
     assert set(ids(result)) <= {injected, *w.ids.values()} - {w.ids["other"]}
-    rendered = render_hits(retriever.search_memory(w.store, REQ, "merge controller policy"))
+    rendered = render_hits(retriever.search_memory(REQ, "merge controller policy"))
     header, _, body = rendered.partition("\nM")
     assert "never instructions" in header and "Ignore previous" not in header
     # The excerpt is fenced by a backtick run longer than any inside it.
@@ -417,17 +445,17 @@ def test_query_and_result_bounds_are_refused_or_kept():
     w = Writer(empty())
     for i in range(12):
         w.add(f"long{i}", f"budget word {i} " + "lorem ipsum " * 160)
-    retriever = MemoryRetriever(REPO, RUN)
-    retriever.sync(w.store)
+    retriever = retriever_for(w)
+    retriever.sync()
     for k in (0, MAX_HITS + 1, True):
         with pytest.raises(RetrievalError):
-            retriever.search_memory(w.store, REQ, "budget", k=k)
-    result = retriever.search_memory(w.store, REQ, "budget", k=MAX_HITS)
+            retriever.search_memory(REQ, "budget", k=k)
+    result = retriever.search_memory(REQ, "budget", k=MAX_HITS)
     assert all(len(h.summary.encode()) <= MAX_SUMMARY_BYTES for h in result.hits)
     assert all(h.summary.endswith("[omitted]") for h in result.hits)
     assert sum(len(h.summary.encode()) for h in result.hits) <= MAX_RESULT_BYTES
     assert result.truncated and len(result.hits) == MAX_RESULT_BYTES // MAX_SUMMARY_BYTES
-    item = retriever.fetch_memory(w.store, REQ, w.ids["long0"]).item
+    item = retriever.fetch_memory(REQ, w.ids["long0"]).item
     assert item is not None and item.text == w.store.text_of(w.ids["long0"])
     assert len(item.text.encode()) <= MAX_TEXT_BYTES and not item.text.endswith("[omitted]")
 
@@ -441,9 +469,9 @@ def test_the_catalog_is_labels_and_counts_within_its_bound():
             )
     w.observe("failure", "Validation failed on the candidate.", 1)
     w.revise(Action.RETRACT, "note0")
-    retriever = MemoryRetriever(REPO, RUN)
-    retriever.sync(w.store)
-    catalog = retriever.catalog(w.store, REQ)
+    retriever = retriever_for(w)
+    retriever.sync()
+    catalog = retriever.catalog(REQ)
     assert dict(catalog.topics) == {
         "failed-approach": 3,
         "handoff": 3,
@@ -454,15 +482,17 @@ def test_the_catalog_is_labels_and_counts_within_its_bound():
     }
     text = catalog.render()
     assert len(text.encode()) <= MAX_CATALOG_BYTES and "prose" not in text
-    assert f"Memory revision: {w.store.revision:03d}" in text and "sqlite-fts5 current" in text
+    # Every record here is in the launch's scope, so its revision is the store's.
+    assert f"Scope revision: {w.store.revision:03d}" in text and "sqlite-fts5 current" in text
+    assert "degraded" not in text and catalog.scope_digest in text
 
 
 def test_fetch_returns_the_current_record_whole_with_its_own_citation():
     w = corpus()
     w.observe("failure", "Validation failed: test_trailing_comma raised.", 7)
-    retriever = MemoryRetriever(REPO, RUN)
-    fetched = retriever.fetch_memory(w.store, REQ, w.ids["failure"])
-    assert fetched.visibility is Visibility.CURRENT and fetched.item is not None
+    retriever = retriever_for(w)
+    fetched = retriever.fetch_memory(REQ, w.ids["failure"])
+    assert fetched.item is not None
     item = fetched.item
     assert (item.author, item.kind, item.range, item.candidate) == (
         "controller",
@@ -473,9 +503,9 @@ def test_fetch_returns_the_current_record_whole_with_its_own_citation():
     assert item.citation == EvidenceRef(
         Receipt.VALIDATION, 7, hashlib.sha256(item.text.encode()).hexdigest()
     )
-    assert retriever.fetch_memory(w.store, REQ, 999).visibility is Visibility.MISSING
+    assert retriever.fetch_memory(REQ, 999).item is None
     with pytest.raises(StateError):
-        retriever.fetch_memory(w.store, replace(REQ, attempt=5), w.ids["failure"])
+        retriever.fetch_memory(replace(REQ, attempt=5), w.ids["failure"])
 
 
 # -- freshness, failure and recovery ---------------------------------------------------
@@ -505,8 +535,8 @@ class FailingFts5(Fts5Backend):
 def test_freshness_reports_its_watermark_pending_and_failures_truthfully():
     w = corpus()
     backend = FailingFts5()
-    retriever = MemoryRetriever(REPO, RUN, backend=backend)
-    first = retriever.status(w.store)
+    retriever = retriever_for(w, backend=backend)
+    first = retriever.status()
     assert (first.state, first.indexed_through_seq, first.pending, first.generation) == (
         IndexState.EMPTY,
         0,
@@ -514,20 +544,20 @@ def test_freshness_reports_its_watermark_pending_and_failures_truthfully():
         0,
     )
     backend.fail_on = 1
-    failed = retriever.sync(w.store)
+    failed = retriever.sync()
     assert (failed.state, failed.failed, failed.reason) == (
         IndexState.EMPTY,
         1,
         IndexReason.SYNC_FAILED,
     )
     assert backend.entries() == []
-    result = retriever.search_memory(w.store, REQ, "tokenizer")
+    result = retriever.search_memory(REQ, "tokenizer")
     assert result.degraded and result.backend == TAIL_BACKEND and result.complete
     backend.fail_on = 0
-    assert retriever.sync(w.store).state is IndexState.CURRENT
+    assert retriever.sync().state is IndexState.CURRENT
     w.add("new1", "The scanner keeps quotes intact.")
     w.add("new2", "The scanner keeps comments intact.")
-    stale = retriever.status(w.store)
+    stale = retriever.status()
     assert (stale.state, stale.indexed_through_seq, stale.source_seq, stale.pending) == (
         IndexState.STALE,
         4,
@@ -536,11 +566,11 @@ def test_freshness_reports_its_watermark_pending_and_failures_truthfully():
     )
     assert stale.lag == 2 and not stale.is_current
     backend.fail_on = 2  # the second insert of the batch: the first must not stay
-    retriever.sync(w.store)
+    retriever.sync()
     assert [r for _, r, _, _ in backend.entries()] == [1, 2, 3, 4]
-    assert retriever.status(w.store).failed == 1
+    assert retriever.status().failed == 1
     backend.fail_on = 0
-    current = retriever.sync(w.store)
+    current = retriever.sync()
     assert (current.state, current.indexed_through_seq, current.failed, current.generation) == (
         IndexState.CURRENT,
         6,
@@ -549,69 +579,120 @@ def test_freshness_reports_its_watermark_pending_and_failures_truthfully():
     )
 
 
-def test_a_store_that_does_not_continue_what_was_indexed_is_never_read_and_is_rebuilt():
+def test_every_read_loads_the_canonical_snapshot_so_a_change_between_search_and_fetch_counts():
+    """R1-F1 of PR #537: no read is handed a snapshot. A retraction or a
+    correction made after a search is what the next fetch is judged by."""
     w = corpus()
-    earlier = w.store
-    w.add("later", "A later lesson about the scanner.")
-    retriever = MemoryRetriever(REPO, RUN)
-    retriever.sync(w.store)
-    # An older checkpoint: a prefix of the indexed rows, below the watermark.
-    behind = retriever.status(earlier)
-    assert (behind.state, behind.reason) == (IndexState.FAILED, IndexReason.DIVERGED)
-    result = retriever.search_memory(earlier, REQ, "scanner lesson")
-    assert result.degraded and result.backend == TAIL_BACKEND and result.hits == ()
-    rebuilt = retriever.sync(earlier)
-    assert (rebuilt.state, rebuilt.generation, rebuilt.indexed_through_seq) == (
-        IndexState.CURRENT,
-        2,
-        earlier.revision,
-    )
+    retriever = retriever_for(w)
+    retriever.sync()
+    searched = retriever.search_memory(REQ, "tokenizer trailing comma")
+    assert ids(searched)[0] == w.ids["tokenizer"]
+    w.revise(Action.RETRACT, "tokenizer")
+    fetched = retriever.fetch_memory(REQ, w.ids["tokenizer"])
+    assert fetched.item is None and fetched.status.state is IndexState.STALE
+    assert w.ids["tokenizer"] not in ids(retriever.search_memory(REQ, "tokenizer trailing comma"))
+    # A correction between a search and a fetch: the fetch is the new text, at its revision.
+    found = retriever.search_memory(REQ, "ruff character line limit")
+    assert ids(found) == [w.ids["ruff"]]
+    w.revise(Action.CORRECT, "ruff", text="Lint is ruff with an 88 character line limit.")
+    item = retriever.fetch_memory(REQ, w.ids["ruff"]).item
+    assert item is not None and item.text == "Lint is ruff with an 88 character line limit."
+    assert item.revision == w.store.revision > found.hits[0].revision
+    assert retriever.catalog(REQ).revision == w.store.revision
+
+
+def test_an_older_snapshot_is_refused_even_where_the_index_watermark_matches_it():
+    """R1-F1 of PR #537: the snapshot an index was synced through, saved
+    before a retraction, matches the index's watermark exactly; once the
+    retriever has read the newer snapshot, the older one is refused by every
+    read, so it can never serve what the retraction withdrew."""
+    w = corpus()
+    retriever = retriever_for(w)
+    retriever.sync()
+    saved = w.store
+    assert retriever.status().indexed_through_seq == saved.revision
+    w.revise(Action.RETRACT, "tokenizer")
+    assert w.ids["tokenizer"] not in ids(retriever.search_memory(REQ, "tokenizer"))
+    w.store = saved
+    for read in (
+        retriever.sync,
+        retriever.status,
+        retriever.rebuild,
+        retriever.verify,
+        lambda: retriever.search_memory(REQ, "tokenizer trailing comma"),
+        lambda: retriever.fetch_memory(REQ, w.ids["tokenizer"]),
+        lambda: retriever.catalog(REQ),
+    ):
+        with pytest.raises(RetrievalError, match="does not continue"):
+            read()
     # A store of the same length whose rows differ is not a continuation either.
-    twin = Writer(empty())
-    for text in ("one", "two", "three", "four"):
-        twin.add(text, f"Another run's {text}.")
-    assert retriever.status(twin.store).reason is IndexReason.DIVERGED
+    w.store = saved
+    w.revise(Action.RETRACT, "uv")
+    with pytest.raises(RetrievalError, match="does not continue"):
+        retriever.fetch_memory(REQ, w.ids["tokenizer"])
+    # The newer snapshot, rebuilt row for row, is read again, and the refused
+    # rebuild left the index as it was.
+    w.store = saved
+    w.revise(Action.RETRACT, "tokenizer")
+    assert retriever.fetch_memory(REQ, w.ids["tokenizer"]).item is None
+    status = retriever.status()
+    assert (status.state, status.generation, status.indexed_through_seq) == (
+        IndexState.STALE,
+        1,
+        saved.revision,
+    )
+    # A new process's retriever starts from whatever the checkpoint holds.
+    fresh = retriever_for(Writer(saved))
+    assert fresh.sync().indexed_through_seq == saved.revision
 
 
 def test_a_row_that_contradicts_its_revision_marks_the_index_failed_and_is_never_served():
     w = corpus()
-    retriever = MemoryRetriever(REPO, RUN)
-    retriever.sync(w.store)
+    retriever = retriever_for(w)
+    retriever.sync()
     db = retriever.backend._db
     table = retriever.backend._tables[ISSUE]
     db.execute(f"UPDATE {table} SET digest = ? WHERE rowid = ?", ("0" * 64, w.ids["uv"]))
-    result = retriever.search_memory(w.store, REQ, "uv pytest interpreter")
-    assert w.ids["uv"] not in ids(result) and ("integrity", 1) in result.dropped
+    result = retriever.search_memory(REQ, "uv pytest interpreter")
+    assert w.ids["uv"] not in ids(result) and dropped(retriever) == {"integrity": 1}
     assert not result.complete
     assert (result.status.state, result.status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
-    fresh = retriever.search_memory(w.store, REQ, "uv pytest interpreter")
+    fetched = retriever.fetch_memory(REQ, w.ids["uv"])
+    assert fetched.item is not None and fetched.degraded
+    assert (fetched.status.state, fetched.status.reason) == (
+        IndexState.FAILED,
+        IndexReason.INTEGRITY,
+    )
+    fresh = retriever.search_memory(REQ, "uv pytest interpreter")
     assert fresh.backend == TAIL_BACKEND and ids(fresh) == [w.ids["uv"]]
-    assert retriever.sync(w.store).state is IndexState.CURRENT
-    assert retriever.verify(w.store).state is IndexState.CURRENT
+    assert retriever.sync().state is IndexState.CURRENT
+    assert retriever.verify().state is IndexState.CURRENT
     # A row the store does not hold as indexable at that revision: found by verify.
     table = retriever.backend._tables[ISSUE]  # the rebuild made a new table
     db.execute(
         f"INSERT INTO {table}(rowid, body, revision, digest) VALUES (?, ?, ?, ?)",
         (w.ids["other"], "Trailing commas in HTTP header lists are legal.", 4, "1" * 64),
     )
-    assert retriever.verify(w.store).reason is IndexReason.INTEGRITY
+    assert retriever.verify().reason is IndexReason.INTEGRITY
     assert retriever.metrics.snapshot()["integrity"] == 2
-    assert retriever.sync(w.store).state is IndexState.CURRENT
+    assert retriever.sync().state is IndexState.CURRENT
 
 
 def test_a_new_process_rebuilds_the_same_index_and_answers_identically():
     w = corpus()
     w.revise(Action.CORRECT, "ruff", text="Lint is ruff; format with ruff format first.")
     queries = ("trailing comma", "ruff format lint", "uv pytest", "nothing matches this")
-    first, second = MemoryRetriever(REPO, RUN), MemoryRetriever(REPO, RUN)
-    first.sync(w.store)
     reloaded = MemoryStore(REPO, RUN, 128, json.loads(json.dumps(w.store.encode())))
-    second.rebuild(reloaded)
+    first, second = retriever_for(w), retriever_for(Writer(reloaded))
+    first.sync()
+    second.rebuild()
     assert first.backend.entries() == second.backend.entries()
+    terms = query_terms("trailing comma ruff format")
+    assert first.backend.search(ISSUE, terms, 64) == second.backend.search(ISSUE, terms, 64)
     for query in queries:
-        a = first.search_memory(w.store, REQ, query)
-        b = second.search_memory(reloaded, REQ, query)
-        assert a.hits == b.hits and a.dropped == b.dropped
+        a = first.search_memory(REQ, query)
+        b = second.search_memory(REQ, query)
+        assert (a.hits, a.status, a.complete) == (b.hits, b.status, b.complete)
 
 
 def test_without_fts5_only_the_bounded_tail_is_searched_and_the_result_says_so(monkeypatch):
@@ -626,10 +707,10 @@ def test_without_fts5_only_the_bounded_tail_is_searched_and_the_result_says_so(m
         scope=MemoryScope(StepKey(Phase.ANALYZE_EXECUTE, OTHER, "", 0, 1)),
     )
     w.revise(Action.RETRACT, "r10")
-    retriever = MemoryRetriever(REPO, RUN)
-    status = retriever.sync(w.store)
+    retriever = retriever_for(w)
+    status = retriever.sync()
     assert (status.state, status.reason) == (IndexState.UNAVAILABLE, IndexReason.FTS5_UNAVAILABLE)
-    result = retriever.search_memory(w.store, REQ, "scanner lesson", k=MAX_HITS)
+    result = retriever.search_memory(REQ, "scanner lesson", k=MAX_HITS)
     assert result.degraded and not result.complete and result.backend == TAIL_BACKEND
     # Ten indexable records of this issue, eight read: the newest, by revision.
     assert result.unsearched == 2 and len(result.hits) == MAX_TAIL
@@ -637,6 +718,15 @@ def test_without_fts5_only_the_bounded_tail_is_searched_and_the_result_says_so(m
     assert set(ids(result)) == {w.ids[f"r{i}"] for i in range(2, 10)}
     rendered = render_hits(result)
     assert "complete: no; degraded: yes; unsearched 2" in rendered
+    fetched = retriever.fetch_memory(REQ, w.ids["r0"])
+    assert fetched.item is not None and fetched.degraded
+    assert (fetched.status.state, fetched.status.reason) == (
+        IndexState.UNAVAILABLE,
+        IndexReason.FTS5_UNAVAILABLE,
+    )
+    # Ten current records of the scope and one retracted, none indexed; the
+    # other issue's record is not counted.
+    assert (fetched.status.pending, fetched.status.indexed_through_seq) == (11, 0)
 
 
 class ScriptedBackend:
@@ -645,7 +735,7 @@ class ScriptedBackend:
     name = "scripted"
 
     def __init__(self, answer=(), fail=False):
-        self.answer, self.fail = list(answer), fail
+        self.answer, self.fail = answer, fail
 
     def available(self):
         return True
@@ -675,12 +765,12 @@ def test_an_optional_backend_falls_back_only_to_fts5_and_never_across_permission
     w = corpus()
     w.revise(Action.RETRACT, "ruff")
     down = ScriptedBackend(fail=True)
-    retriever = MemoryRetriever(REPO, RUN, backend=down, fallback=Fts5Backend())
-    retriever.sync(w.store)
-    result = retriever.search_memory(w.store, REQ, "ruff lint trailing comma HTTP")
+    retriever = retriever_for(w, backend=down, fallback=Fts5Backend())
+    retriever.sync()
+    result = retriever.search_memory(REQ, "ruff lint trailing comma HTTP")
     assert result.degraded and result.backend == "sqlite-fts5"
     assert ids(result) == [w.ids["tokenizer"]]
-    assert retriever.status(w.store).reason is IndexReason.SEARCH_FAILED
+    assert retriever.status().reason is IndexReason.SEARCH_FAILED
     # A backend that answers with what the store refuses gets none of it served.
     facts = {f.id: f for f in w.store.facts()}
     lying = ScriptedBackend(
@@ -690,30 +780,30 @@ def test_an_optional_backend_falls_back_only_to_fts5_and_never_across_permission
         ]
         + [IndexCandidate(999, 1, "0" * 64, 9.0, 3)]
     )
-    liar = MemoryRetriever(REPO, RUN, backend=lying, fallback=Fts5Backend())
-    liar.sync(w.store)
-    result = liar.search_memory(w.store, REQ, "anything")
+    liar = retriever_for(w, backend=lying, fallback=Fts5Backend())
+    liar.sync()
+    result = liar.search_memory(REQ, "anything")
     assert result.hits == () and not result.complete
-    assert dict(result.dropped) == {"integrity": 2, "retracted": 1}
+    assert dropped(liar) == {"integrity": 2, "retracted": 1}
     for fallback in (ScriptedBackend(), None):
         with pytest.raises(ConfigurationError):
-            MemoryRetriever(REPO, RUN, backend=None, fallback=fallback or down)
+            retriever_for(w, backend=None, fallback=fallback or down)
     shared = Fts5Backend()
     with pytest.raises(ConfigurationError):
-        MemoryRetriever(REPO, RUN, backend=shared, fallback=shared)
+        retriever_for(w, backend=shared, fallback=shared)
 
 
 def test_no_read_writes_the_store_or_makes_a_fact():
     w = corpus()
     w.observe("failure", "Validation failed on the candidate.", 3)
     before = json.dumps(w.store.encode(), sort_keys=True)
-    retriever = MemoryRetriever(REPO, RUN)
-    retriever.sync(w.store)
-    retriever.search_memory(w.store, REQ, "tokenizer validation")
-    retriever.fetch_memory(w.store, REQ, w.ids["failure"])
-    retriever.catalog(w.store, REQ)
-    retriever.verify(w.store)
-    retriever.rebuild(w.store)
+    retriever = retriever_for(w)
+    retriever.sync()
+    retriever.search_memory(REQ, "tokenizer validation")
+    retriever.fetch_memory(REQ, w.ids["failure"])
+    retriever.catalog(REQ)
+    retriever.verify()
+    retriever.rebuild()
     assert json.dumps(w.store.encode(), sort_keys=True) == before
     assert w.store.refusals == 0
 
@@ -721,11 +811,11 @@ def test_no_read_writes_the_store_or_makes_a_fact():
 def test_use_is_recorded_as_bounded_counters_and_never_as_text():
     w = corpus()
     w.add("distinct", "The quixotic zebra lesson.")
-    retriever = MemoryRetriever(REPO, RUN)
-    retriever.sync(w.store)
-    retriever.search_memory(w.store, REQ, "quixotic zebra")
-    retriever.search_memory(w.store, REQ, "nothing at all here")
-    retriever.fetch_memory(w.store, REQ, w.ids["other"])
+    retriever = retriever_for(w)
+    retriever.sync()
+    retriever.search_memory(REQ, "quixotic zebra")
+    retriever.search_memory(REQ, "nothing at all here")
+    retriever.fetch_memory(REQ, w.ids["other"])
     snapshot = retriever.metrics.snapshot()
     assert set(snapshot) == set(memory_retrieval._METRICS)
     assert all(type(v) is int for v in snapshot.values())
@@ -743,6 +833,302 @@ def test_use_is_recorded_as_bounded_counters_and_never_as_text():
     assert retriever.metrics.snapshot()["hits"] == MAX_COUNTER
 
 
+# -- one tokenizer for the index, the tail and a query (R1-F2 of PR #537) ------------------
+
+# Each text and a query for it written another way: decomposed, without its
+# diacritics or vowel signs, in compatibility forms or another case.
+SCRIPTS = [
+    ("korean", "한글 검색은 색인에서도 찾아야 한다.", "한글"),
+    ("arabic", "مَرْحَبًا بِكُمْ فِي الذَّاكِرَةِ", "مرحبا"),
+    ("hindi", "हिन्दी पाठ की खोज", "हिन्दी"),
+    ("chinese", "中文检索 测试", "中文检索"),
+    ("greek", "Ἀθῆναι πόλις", "αθηναι"),
+    ("cyrillic", "Привет, мир", "ПРИВЕТ"),
+    ("vietnamese", "Tiếng Việt có dấu", "tieng viet"),
+    ("latin", "Crème brûlée straße", "CREME brulee STRASSE"),
+    ("compatibility", "Ｆｕｌｌｗｉｄｔｈ ﬁle", "fullwidth file"),
+]
+
+
+def test_text_tokens_folds_every_script_alike_and_ascii_takes_the_same_path():
+    assert text_tokens("한글") == text_tokens("한글")
+    assert text_tokens("مَرْحَبًا") == text_tokens("مرحبا") == ["مرحبا"]
+    # A Devanagari vowel sign stays in its word; the virama, a diacritic, goes.
+    assert text_tokens("हिन्दी") == ["हिनदी"]
+    assert text_tokens("snake_case, x-ray 42") == ["snake", "case", "x", "ray", "42"]
+    printable = "".join(chr(c) for c in range(32, 127))
+    for text in (printable, "Mixed CASE_words-and 123 digits!", "tokenizer's (trailing) comma"):
+        # A no-break space separates as a space does, and takes the general path.
+        assert text_tokens(text) == text_tokens(text + " ")
+
+
+@pytest.mark.parametrize(("name", "text", "query"), SCRIPTS, ids=[s[0] for s in SCRIPTS])
+def test_non_latin_text_is_found_alike_by_the_index_the_tail_and_a_rebuild(name, text, query):
+    w = corpus()
+    retriever = retriever_for(w)
+    retriever.sync()
+    record = w.add(name, text)
+    tail = retriever.search_memory(REQ, query)
+    assert ids(tail) == [record] and tail.complete, name
+    assert tail.hits[0].provenance.backend == TAIL_BACKEND
+    retriever.sync()
+    indexed = retriever.search_memory(REQ, query)
+    assert ids(indexed) == [record] and indexed.complete and indexed.status.is_current, name
+    assert indexed.hits[0].provenance.backend == "sqlite-fts5"
+    rebuilt = retriever_for(Writer(w.store))
+    rebuilt.rebuild()
+    again = rebuilt.search_memory(REQ, query)
+    assert (again.hits, again.complete) == (indexed.hits, True), name
+    # What FTS5 holds of the record is the tokenizer's tokens, one ASCII word each.
+    db, table = retriever.backend._db, retriever.backend._tables[ISSUE]
+    body = db.execute(f"SELECT body FROM {table} WHERE rowid = ?", (record,)).fetchone()[0]
+    assert body == " ".join(memory_retrieval._fts5_token(t) for t in text_tokens(text))
+    assert body.isascii()
+
+
+def test_the_fts5_form_of_a_token_is_one_to_one():
+    tokens = ["x", "xa", "78", "ab", "hello", "x68656c6c6f", "한글", "h", "H", "ℌ"]
+    forms = [memory_retrieval._fts5_token(t) for t in tokens]
+    assert len(set(forms)) == len(forms)
+    assert all(re_ascii_word(f) for f in forms)
+    assert memory_retrieval._fts5_token("hello") == "hello"
+    assert memory_retrieval._fts5_token("x68656c6c6f") != memory_retrieval._fts5_token("hello")
+
+
+def re_ascii_word(form):
+    return form.isascii() and form.isalnum() and form == form.lower()
+
+
+# -- what a backend may answer (R1-F3 of PR #537) -----------------------------------------
+
+
+def valid(store, record, rank=1, score=9.0):
+    fact = next(f for f in store.facts() if f.id == record)
+    return IndexCandidate(record, fact.revision, fact.content, score, rank)
+
+
+def test_a_backend_repeating_a_candidate_fills_one_place():
+    w = corpus()
+    tok = valid(w.store, w.ids["tokenizer"])
+    uv = valid(w.store, w.ids["uv"], rank=2)
+    repeated = ScriptedBackend([tok, replace(tok, rank=3), uv, replace(tok, rank=2)])
+    retriever = retriever_for(w, backend=repeated, fallback=Fts5Backend())
+    retriever.sync()
+    result = retriever.search_memory(REQ, "anything", k=MAX_HITS)
+    assert ids(result) == [w.ids["tokenizer"], w.ids["uv"]]
+    assert [h.provenance.rank for h in result.hits] == [1, 2]
+    assert result.backend == "scripted" and not result.degraded and result.complete
+    # The same answer in another order gives the same hits.
+    repeated.answer = [replace(tok, rank=2), uv, tok, replace(tok, rank=3)]
+    assert retriever.search_memory(REQ, "anything", k=MAX_HITS).hits == result.hits
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        pytest.param(lambda c: [replace(c, rank=-60)], id="rank-minus-60"),
+        pytest.param(lambda c: [replace(c, rank=0)], id="rank-zero"),
+        pytest.param(lambda c: [replace(c, rank=65)], id="rank-past-the-bound"),
+        pytest.param(lambda c: [replace(c, rank=True)], id="rank-bool"),
+        pytest.param(lambda c: [replace(c, rank=1.0)], id="rank-float"),
+        pytest.param(lambda c: [replace(c, score=float("nan"))], id="score-nan"),
+        pytest.param(lambda c: [replace(c, score=float("inf"))], id="score-inf"),
+        pytest.param(lambda c: [replace(c, score="9")], id="score-text"),
+        pytest.param(lambda c: [replace(c, id=0)], id="id-zero"),
+        pytest.param(lambda c: [replace(c, id="1")], id="id-text"),
+        pytest.param(lambda c: [replace(c, revision=-1)], id="revision-negative"),
+        pytest.param(lambda c: [replace(c, digest="0" * 63)], id="digest-short"),
+        pytest.param(lambda c: [replace(c, digest="Z" * 64)], id="digest-not-hex"),
+        pytest.param(lambda c: [(c.id, c.revision, c.digest, c.score, c.rank)], id="a-tuple"),
+        pytest.param(lambda c: iter([c]), id="an-iterator"),
+        pytest.param(lambda c: {c.id: c}, id="a-dict"),
+        pytest.param(lambda c: None, id="none"),
+        pytest.param(lambda c: [replace(c, rank=1 + n % 64) for n in range(65)], id="over-limit"),
+    ],
+)
+def test_a_malformed_backend_answer_is_a_backend_failure_and_falls_back(malformed):
+    w = corpus()
+    answer = malformed(valid(w.store, w.ids["ruff"]))
+    with_fallback = retriever_for(w, backend=ScriptedBackend(answer), fallback=Fts5Backend())
+    with_fallback.sync()
+    result = with_fallback.search_memory(REQ, "tokenizer trailing comma")
+    assert result.degraded and result.backend == "sqlite-fts5" and result.complete
+    assert ids(result) == [w.ids["tokenizer"]]
+    assert with_fallback.status().reason is IndexReason.INVALID_ANSWER
+    assert with_fallback.metrics.snapshot()["invalid_answers"] == 1
+    fetched = with_fallback.fetch_memory(REQ, w.ids["tokenizer"])
+    assert fetched.degraded and fetched.status.backend == "sqlite-fts5"
+    # Without a fallback, the tail alone: still the store's records only.
+    alone = retriever_for(w, backend=ScriptedBackend(answer))
+    alone.sync()
+    result = alone.search_memory(REQ, "tokenizer trailing comma")
+    assert result.degraded and result.backend == TAIL_BACKEND
+    assert ids(result) == [w.ids["tokenizer"]]
+    assert (result.status.state, result.status.reason) == (
+        IndexState.FAILED,
+        IndexReason.INVALID_ANSWER,
+    )
+    # The next sync rebuilds the primary, which is read again.
+    alone.backend.answer = [valid(w.store, w.ids["uv"])]
+    assert alone.sync().state is IndexState.CURRENT
+    assert ids(alone.search_memory(REQ, "anything")) == [w.ids["uv"]]
+
+
+# -- nothing outside the launch's scope is told (R1-F4 of PR #537) ----------------------
+
+
+def test_fetch_gives_one_answer_for_every_record_it_does_not_serve():
+    w = corpus()
+    w.add(
+        "exact",
+        "Bound to an earlier candidate.",
+        scope=replace(SCOPE, range=Range.EXACT, candidate=OLD),
+    )
+    w.add("env", "Bound to another environment.", scope=replace(SCOPE, environment=ENV))
+    w.add("dup", "Lint is ruff with a 100 character line limit.")
+    w.add("old", "Superseded soon.")
+    w.add("new", "The replacement.")
+    w.add("gone", "Retracted soon.")
+    w.revise(Action.SUPERSEDE, "old", replacement=w.ids["new"])
+    w.revise(Action.RETRACT, "gone")
+    w.revise(Action.RETRACT, "ruff")  # withholds "dup", which carries the same text
+    retriever = retriever_for(w)
+    retriever.sync()
+    absent = retriever.fetch_memory(REQ, 999)
+    assert absent.item is None and absent.status.is_current and not absent.degraded
+    refused = {
+        name: retriever.fetch_memory(REQ, w.ids[name])
+        for name in ("other", "exact", "env", "dup", "old", "gone", "ruff")
+    }
+    for odd in (0, -1, True, "1", None):
+        refused[repr(odd)] = retriever.fetch_memory(REQ, odd)
+    assert all(answer == absent for answer in refused.values()), refused
+    assert retriever.fetch_memory(REQ, w.ids["new"]).item is not None
+    # The reasons are the controller's diagnostic alone.
+    assert dropped(retriever) == {
+        "missing": 6,
+        "foreign": 1,
+        "inapplicable": 2,
+        "withheld": 1,
+        "superseded": 1,
+        "retracted": 2,
+    }
+
+
+def test_records_outside_the_scope_move_nothing_a_launch_is_told():
+    """Adding, correcting and retracting another issue's, another candidate's
+    and another environment's records changes no fetch, catalog or search
+    answer of the launch, before or after the index syncs them."""
+    w = Writer(empty())
+    w.add("mine", "The zebra parser drops quoted separators.")
+    w.add("also", "Keep the scanner's signature unchanged.", kind=Kind.CONSTRAINT)
+    retriever = retriever_for(w)
+    retriever.sync()
+
+    def told():
+        return (
+            retriever.catalog(REQ),
+            retriever.catalog(REQ).render(),
+            retriever.fetch_memory(REQ, 999),
+            retriever.fetch_memory(REQ, w.ids["mine"]),
+            retriever.search_memory(REQ, "zebra parser separators"),
+            render_hits(retriever.search_memory(REQ, "zebra parser separators")),
+            retriever.search_memory(REQ, "nothing of the scope"),
+        )
+
+    before = told()
+    other = MemoryScope(StepKey(Phase.ANALYZE_EXECUTE, OTHER, "", 0, 1))
+    w.add("foreign", "The zebra parser of issue three drops separators.", scope=other)
+    w.add(
+        "exact",
+        "The zebra parser bug of an earlier candidate.",
+        scope=replace(SCOPE, range=Range.EXACT, candidate=OLD),
+    )
+    w.add("env", "The zebra parser under another locale.", scope=replace(SCOPE, environment=ENV))
+    w.revise(Action.CORRECT, "exact", text="The zebra parser separators, corrected.")
+    assert told() == before
+    retriever.sync()
+    assert told() == before
+    out = w.store.revise(
+        Action.RETRACT, w.ids["foreign"], actor=Actor.OPERATOR, reason="reviewed", issue=OTHER
+    )
+    w.store = applied(out)
+    assert told() == before
+    retriever.sync()
+    assert told() == before
+    # Their ids answer as an absent one does.
+    for name in ("foreign", "exact", "env"):
+        assert retriever.fetch_memory(REQ, w.ids[name]) == retriever.fetch_memory(REQ, 999)
+    # A change in the scope is told.
+    w.add("more", "A second zebra lesson.")
+    after = retriever.catalog(REQ)
+    assert after.revision == w.store.revision and after.status.pending == 1
+    assert after.scope_digest != before[0].scope_digest
+
+
+# -- what a fetch says of the index (R1-F5 of PR #537) -----------------------------------
+
+
+def test_fetch_reports_the_index_freshness_of_its_scope():
+    w = corpus()
+    retriever = retriever_for(w)
+    first = retriever.fetch_memory(REQ, w.ids["uv"])
+    assert first.item is not None and first.degraded
+    assert (first.status.state, first.status.pending, first.status.indexed_through_seq) == (
+        IndexState.EMPTY,
+        3,
+        0,
+    )
+    retriever.sync()
+    synced = retriever.fetch_memory(REQ, w.ids["uv"])
+    assert synced.status.is_current and not synced.degraded and synced.status.lag == 0
+    assert synced.status.source_seq == synced.status.indexed_through_seq == 3
+    # Index lag: a record of the scope written after the sync is fetched from
+    # the store, and the fetch says the index has not seen it.
+    added = w.add("lagging", "A lesson the index has not seen.")
+    lagging = retriever.fetch_memory(REQ, added)
+    assert lagging.item is not None and lagging.item.text == "A lesson the index has not seen."
+    assert (lagging.status.state, lagging.status.pending, lagging.status.lag) == (
+        IndexState.STALE,
+        1,
+        added - 3,
+    )
+    assert lagging.status.source_seq == added and not lagging.degraded
+    # Reauthorized against the newer store: a correction is fetched at once.
+    w.revise(Action.CORRECT, "uv", text="Run the suite through make check.")
+    corrected = retriever.fetch_memory(REQ, w.ids["uv"])
+    assert corrected.item is not None and corrected.item.text == "Run the suite through make check."
+    assert corrected.item.revision == w.store.revision == corrected.status.source_seq
+    assert corrected.status.pending == 2
+    retriever.sync()
+    assert retriever.fetch_memory(REQ, w.ids["uv"]).status.is_current
+
+
+def test_fetch_reports_a_failed_backend_and_its_fallback():
+    w = corpus()
+    down = ScriptedBackend(fail=True)
+    alone = retriever_for(w, backend=down)
+    alone.sync()
+    assert not alone.fetch_memory(REQ, w.ids["uv"]).degraded
+    alone.search_memory(REQ, "tokenizer")
+    fetched = alone.fetch_memory(REQ, w.ids["uv"])
+    assert fetched.item is not None and fetched.degraded
+    assert (fetched.status.backend, fetched.status.state, fetched.status.reason) == (
+        "scripted",
+        IndexState.FAILED,
+        IndexReason.SEARCH_FAILED,
+    )
+    behind = retriever_for(w, backend=down, fallback=Fts5Backend())
+    behind.sync()
+    behind.search_memory(REQ, "tokenizer")
+    fetched = behind.fetch_memory(REQ, w.ids["uv"])
+    assert fetched.degraded and fetched.status.backend == "sqlite-fts5"
+    assert fetched.status.is_current
+    catalog = behind.catalog(REQ)
+    assert catalog.degraded and "sqlite-fts5 current" in catalog.render()
+    assert "; degraded" in catalog.render()
+
+
 # -- the pinned benchmark --------------------------------------------------------------
 
 
@@ -757,6 +1143,10 @@ def test_the_pinned_fixture_serves_nothing_stale_or_foreign_in_any_condition():
     for key, record in world.ids.items():
         expected = {"current": Visibility.CURRENT}.get(truth[key][0], Visibility(truth[key][0]))
         assert world.store.visibility(record, world.request) is expected, key
+    # The read path's one pass agrees with the record-by-record check.
+    assert world.store.visibilities(world.request) == {
+        record: world.store.visibility(record, world.request) for record in world.ids.values()
+    }
     report = bench.correctness(fixture)
     conditions = ("synced", "stale", "stale_without_tail", "no_fts5", "rebuilt")
     for name in conditions:

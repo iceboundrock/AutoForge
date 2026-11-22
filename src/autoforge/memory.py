@@ -817,6 +817,19 @@ class MemoryStore:
         fact = self._facts.get(record) if type(record) is int else None
         if fact is None:
             return Visibility.MISSING
+        return self._visibility(fact, bound)
+
+    def visibilities(self, request: ProjectionRequest) -> dict[int, Visibility]:
+        """Every record's :meth:`visibility` for ``request``'s launch, bound once (#324).
+
+        A read path's one pass over the snapshot: which records the launch's
+        scope holds (neither ``foreign`` nor ``inapplicable``) and which of
+        them it is served, by id.
+        """
+        bound = bind_request(self, request)
+        return {i: self._visibility(self._facts[i], bound) for i in sorted(self._facts)}
+
+    def _visibility(self, fact: MemoryFact, bound: ProjectionRequest) -> Visibility:
         if fact.scope.step.issue_url != bound.step.issue_url:
             return Visibility.FOREIGN
         if not fact.scope.applies(bound):

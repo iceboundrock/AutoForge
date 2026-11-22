@@ -241,7 +241,7 @@ def _condition(world: World, retriever: MemoryRetriever, *, k: int = K) -> dict:
 
     def search(query: str) -> tuple[SearchResult, list[str]]:
         nonlocal served, stale, permission
-        result = retriever.search_memory(world.store, world.request, query, k=k)
+        result = retriever.search_memory(world.request, query, k=k)
         keys = [world.key(hit.id) for hit in result.hits]
         for hit, key in zip(result.hits, keys, strict=True):
             state, text = truth[key]
@@ -272,7 +272,7 @@ def _condition(world: World, retriever: MemoryRetriever, *, k: int = K) -> dict:
         "correction_new_text_visible": new_visible / corrections,
         "complete_searches": sum(complete),
         "searches": len(complete),
-        "status": retriever.status(world.store).encode(),
+        "status": retriever.status().encode(),
         "ranked": [keys for keys, _ in ranked],
     }
 
@@ -284,34 +284,36 @@ def correctness(fixture: dict | None = None) -> dict:
     report: dict = {"fixture_sha256": fixture_digest(), "k": K}
 
     world = build(fixture)
-    synced = MemoryRetriever(repo, run)
-    synced.sync(world.store)
+    synced = MemoryRetriever(repo, run, lambda: world.store)
+    synced.sync()
     report["synced"] = _condition(world, synced)
 
     for name, tail in (("stale", memory_retrieval.MAX_TAIL), ("stale_without_tail", 0)):
-        world = build(fixture, operations=False)
-        lagging = MemoryRetriever(repo, run, tail=tail)
-        lagging.sync(world.store)
-        apply_operations(world)
-        report[name] = _condition(world, lagging)
+        lagged = build(fixture, operations=False)
+        lagging = MemoryRetriever(repo, run, lambda w=lagged: w.store, tail=tail)
+        lagging.sync()
+        apply_operations(lagged)
+        report[name] = _condition(lagged, lagging)
 
     world = build(fixture)
     with mock.patch.object(memory_retrieval, "_open_memory_database", return_value=None):
-        no_index = MemoryRetriever(repo, run)
-    no_index.sync(world.store)
+        no_index = MemoryRetriever(repo, run, lambda: world.store)
+    no_index.sync()
     report["no_fts5"] = _condition(world, no_index)
 
-    rebuilt = MemoryRetriever(repo, run)
-    rebuilt.rebuild(world.store)
-    report["rebuilt"] = _condition(world, rebuilt)
+    # A new process: the checkpoint read back from its JSON, the index rebuilt.
+    reloaded = MemoryStore(repo, run, LAUNCH_SEQ, json.loads(json.dumps(world.store.encode())))
+    rebuilt = MemoryRetriever(repo, run, lambda: reloaded)
+    rebuilt.rebuild()
+    report["rebuilt"] = _condition(replace(world, store=reloaded), rebuilt)
     report["rebuilt_matches_synced"] = report["rebuilt"]["ranked"] == report["synced"]["ranked"]
 
     empty = MemoryStore(
         repo, run, LAUNCH_SEQ, dict(enabled=True, run_id=run, events=[], texts={}, refusals=0)
     )
-    blank = MemoryRetriever(repo, run)
-    blank.sync(empty)
-    result = blank.search_memory(empty, world.request, fixture["queries"][0]["query"])
+    blank = MemoryRetriever(repo, run, lambda: empty)
+    blank.sync()
+    result = blank.search_memory(world.request, fixture["queries"][0]["query"])
     report["empty_store"] = {
         "hits": len(result.hits),
         "complete": result.complete,
@@ -388,30 +390,51 @@ def _store_at_bound(fixture: dict) -> World:
     return world
 
 
-def _store_costs(world: World, queries: Sequence[str], *, rounds: int = 20) -> dict:
-    """One store's index: its build, its searches, its size and what k=8 hits render to."""
-    fixture = world.fixture
-    retriever = MemoryRetriever(fixture["repository"], fixture["run_id"])
-    store, request = world.store, world.request
-    build_ns, _ = _timed(lambda: retriever.sync(store))
+def _searches(retriever: MemoryRetriever, request, queries: Sequence[str], rounds: int):
     for query in queries:  # warm
-        retriever.search_memory(store, request, query)
+        retriever.search_memory(request, query)
     cpu = time.process_time()
     samples = []
     for _ in range(rounds):
         for query in queries:
-            ns, _ = _timed(lambda q=query: retriever.search_memory(store, request, q))
+            ns, _ = _timed(lambda q=query: retriever.search_memory(request, q))
             samples.append(ns)
-    cpu_ms = (time.process_time() - cpu) * 1000 / len(samples)
-    rendered = [
-        len(render_hits(retriever.search_memory(store, request, q, k=8)).encode()) for q in queries
-    ]
+    return samples, (time.process_time() - cpu) * 1000 / len(samples)
+
+
+def _store_costs(world: World, queries: Sequence[str], *, rounds: int = 20) -> dict:
+    """One store's index: its build, its searches, its size and what k=8 hits render to.
+
+    Searched twice: with the snapshot held, a source that returns the
+    validated store it has (the read path's own cost), and with a source
+    that reconstructs and validates the store from the checkpoint's value
+    at every read, as ``AutoForgeState.memory`` does (the cost of loading
+    the canonical snapshot included). ``snapshot_load`` is that
+    reconstruction alone.
+    """
+    store, request = world.store, world.request
+    repo, run, checkpoint = store.repository, store.run_id, store.encode()
+
+    def reload() -> MemoryStore:
+        return MemoryStore(repo, run, LAUNCH_SEQ, checkpoint)
+
+    held = MemoryRetriever(repo, run, lambda: store)
+    build_ns, _ = _timed(held.sync)
+    samples, cpu_ms = _searches(held, request, queries, rounds)
+    loading = MemoryRetriever(repo, run, reload)
+    loading.sync()
+    loaded, loaded_cpu_ms = _searches(loading, request, queries, max(rounds // 4, 1))
+    loads = [_timed(reload)[0] for _ in range(max(rounds * 5, 5))]
+    rendered = [len(render_hits(held.search_memory(request, q, k=8)).encode()) for q in queries]
     return {
         "records": len(store.facts()),
         "build_ms": round(build_ns / 1e6, 4),
         "search": _percentiles(samples),
         "search_cpu_ms_per_query": round(cpu_ms, 4),
-        "index_bytes": retriever.backend.size_bytes(),
+        "search_loading_the_snapshot": _percentiles(loaded),
+        "search_loading_the_snapshot_cpu_ms_per_query": round(loaded_cpu_ms, 4),
+        "snapshot_load": _percentiles(loads),
+        "index_bytes": held.backend.size_bytes(),
         "rendered_hits_bytes_k8": {
             "max": max(rendered),
             "mean": round(statistics.fmean(rendered), 1),
@@ -433,8 +456,8 @@ def performance(
     # Ingestion to visibility: a record added after the index was synced is
     # served by the tail at once, and by the index after the next sync.
     world = build(fixture)
-    retriever = MemoryRetriever(repo, run)
-    retriever.sync(world.store)
+    retriever = MemoryRetriever(repo, run, lambda: world.store)
+    retriever.sync()
     marker = "zephyrquill"
     n = len(world.ids) + 1
     out = world.store.add(
@@ -447,13 +470,9 @@ def performance(
         accepted=True,
     )
     world.store = _applied(out)
-    tail_ns, tail_result = _timed(
-        lambda: retriever.search_memory(world.store, world.request, marker)
-    )
-    sync_ns, _ = _timed(lambda: retriever.sync(world.store))
-    index_ns, index_result = _timed(
-        lambda: retriever.search_memory(world.store, world.request, marker)
-    )
+    tail_ns, tail_result = _timed(lambda: retriever.search_memory(world.request, marker))
+    sync_ns, _ = _timed(retriever.sync)
+    index_ns, index_result = _timed(lambda: retriever.search_memory(world.request, marker))
     report["ingestion_to_visibility"] = {
         "tail_search_ms": round(tail_ns / 1e6, 4),
         "tail_served": [h.provenance.backend for h in tail_result.hits],

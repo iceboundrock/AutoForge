@@ -1416,17 +1416,22 @@ D5.3): a crash after it re-verifies the receipt and launches nothing.
   is visible.
 - **Implementation note (#324).** `src/autoforge/memory_retrieval.py` is
   that read interface, and nothing of the package calls it yet: a launch is
-  shown this section's render alone. The index records the Memory revision
-  it was synced through and the digest of the audit rows up to it, so a
-  store that does not continue what was indexed is never read. Every hit is
-  judged by `MemoryStore.visibility`, which applies the projection's checks
-  in its order, and its excerpt is the store's text, never the index's. A
-  correction or retraction is therefore served or refused as the snapshot
-  says at the next search, however stale the index
+  shown this section's render alone. A retriever is bound to the store's
+  source (`AutoForgeState.memory`) and loads the canonical snapshot at
+  every read. A snapshot that does not continue the newest one it has read
+  is refused, so an older checkpoint is never the authority of a read. The
+  index records the Memory revision it was synced through. Every hit is
+  judged by `MemoryStore.visibilities`, which applies the projection's
+  checks in its order, and its excerpt is the store's text, never the
+  index's. A correction or retraction is therefore served or refused as the
+  snapshot says at the next search or fetch, however stale the index
   (`test_a_corrected_record_is_served_only_as_it_is_now_even_before_the_index_catches_up`,
-  `test_a_retracted_record_is_unservable_at_once_and_a_failed_sync_never_reopens_it`).
+  `test_a_retracted_record_is_unservable_at_once_and_a_failed_sync_never_reopens_it`,
+  `test_every_read_loads_the_canonical_snapshot_so_a_change_between_search_and_fetch_counts`).
   The records changed after the watermark are read on the store itself, up
-  to a bound, and a search says when it could not read them all. LTSearch
+  to a bound, and a search says when it could not read them all. What a
+  launch is told (a fetch's refusal, the catalog, every freshness figure)
+  is of its scope alone: its issue's records that apply to it. LTSearch
   was evaluated and is a no-go for now (`docs/memory-retrieval.md`).
 - **No agent-callable search in the MVP.** An agent's only channels to the
   controller are the files it is given and its reply. A `search_memory` or
