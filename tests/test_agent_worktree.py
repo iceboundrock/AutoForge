@@ -32,6 +32,7 @@ from autoforge.agent_worktree import (
     import_private_objects,
     private_objects_problem,
     read_candidate,
+    read_head_id,
     registered_worktree_roots,
     uncommitted_entries,
 )
@@ -303,30 +304,38 @@ def test_a_registry_that_cannot_be_read_is_refused(repo):
 
 # ---------------------------------------------------------------- candidate
 
+# The candidate read, and Memory's read of HEAD's id alone (R4-F1 of PR #536),
+# which shares its admin dir, common dir and checks.
+READERS = pytest.mark.parametrize("reader", [read_candidate, read_head_id])
 
-def test_the_candidate_is_the_detached_head(repo):
+
+@READERS
+def test_the_candidate_is_the_detached_head(repo, reader):
     head = _git("-C", str(repo["root"]), "rev-parse", "HEAD")
-    candidate = read_candidate(repo["common"], repo["admin"], str(repo["worktree"]), None)
+    candidate = reader(repo["common"], repo["admin"], str(repo["worktree"]), None)
     assert candidate.attached is False and candidate.head == head and not candidate.problem
 
 
-def test_an_attached_head_is_reported(repo):
+@READERS
+def test_an_attached_head_is_reported(repo, reader):
     _git("-C", str(repo["worktree"]), "switch", "-q", "-c", "agent-branch")
-    candidate = read_candidate(repo["common"], repo["admin"], str(repo["worktree"]), None)
-    assert candidate.attached is True
+    candidate = reader(repo["common"], repo["admin"], str(repo["worktree"]), None)
+    assert candidate.attached is True and candidate.head == ""
 
 
-def test_a_head_link_is_not_read(repo):
+@READERS
+def test_a_head_link_is_not_read(repo, reader):
     head = repo["admin"] / "HEAD"
     target = repo["base"] / "elsewhere-HEAD"
     target.write_text(head.read_text())
     head.unlink()
     head.symlink_to(target)
-    candidate = read_candidate(repo["common"], repo["admin"], str(repo["worktree"]), None)
+    candidate = reader(repo["common"], repo["admin"], str(repo["worktree"]), None)
     assert candidate.head == "" and "not a regular file" in candidate.problem
 
 
-def test_pointer_rewrites_do_not_move_the_candidate(repo):
+@READERS
+def test_pointer_rewrites_do_not_move_the_candidate(repo, reader):
     """The decoy repository's HEAD is never what the controller reads (D6.3)."""
     head = _git("-C", str(repo["root"]), "rev-parse", "HEAD")
     decoy = repo["base"] / "decoy"
@@ -335,8 +344,25 @@ def test_pointer_rewrites_do_not_move_the_candidate(repo):
     (repo["worktree"] / ".git").write_text(f"gitdir: {decoy / '.git'}\n")
     (repo["admin"] / "commondir").write_text(f"{decoy / '.git'}\n")
     (repo["admin"] / "gitdir").write_text(f"{decoy / '.git'}\n")
-    candidate = read_candidate(repo["common"], repo["admin"], str(repo["worktree"]), None)
+    candidate = reader(repo["common"], repo["admin"], str(repo["worktree"]), None)
     assert candidate.head == head
+
+
+def test_the_head_id_is_read_without_reading_the_object_it_names(repo):
+    """R4-F1 of PR #536: ``read_head_id`` returns the id a detached ``HEAD``
+    names whether or not the store holds that object, since it opens none;
+    the candidate read, which peels it to a commit, finds none. A ``HEAD``
+    git cannot read as a reference at all is inconclusive for both, never a
+    guess."""
+    missing = "e" * 40
+    (repo["admin"] / "HEAD").write_text(missing + "\n")
+    args = (repo["common"], repo["admin"], str(repo["worktree"]), None)
+    assert read_head_id(*args) == Candidate(False, missing)
+    assert read_candidate(*args) == Candidate(False, "")
+    (repo["admin"] / "HEAD").write_text("e" * 12 + "\n")
+    for reader in (read_head_id, read_candidate):
+        with pytest.raises(VerificationError, match="whether HEAD is detached"):
+            reader(*args)
 
 
 def test_an_attached_head_naming_a_linked_reference_opens_nothing(repo):

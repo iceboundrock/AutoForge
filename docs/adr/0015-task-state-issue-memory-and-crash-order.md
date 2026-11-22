@@ -1704,6 +1704,141 @@ citation resolves to a typed retention result: established (a validation
 record only), retained or unavailable. This slice admits validation,
 candidate and launch receipts, not review, effect or Git references.
 
+**Implementation note (#333).** The handoff ships for D13's first scope,
+`ANALYZE_EXECUTE`, through `autoforge.memory_handoff`, and nothing of D1 to
+D19 changes. Every launch of that phase in a run whose recorded setting
+keeps Memory is given D12's `memory.md`, rendered from the snapshot its
+intent save commits, for the ordinal that save spends, before anything of
+the launch is saved. A render the store refuses refuses the launch there
+(D18). The projection is bound to the launch's candidate: the worktree's
+`HEAD` after the strict import when that is not the entry's base, and none
+otherwise, with each base of a range-bound record that the candidate
+descends from proved locally, never by asking GitHub or fetching, so D12's
+render stays free of the network (R3-F1 of PR #536). On the very commit a
+retained validation record of the run names, that record proves its base,
+since the producer gate validates only a candidate whose range from that
+base the controller proved; so a retry on a failed commit is shown its
+failure however long its history (R4-F2). Any other base is proved by a
+breadth-first walk from the candidate through commits read as their own
+bytes and re-hashed, at most 64 of them; a base neither proves is not
+proved and its record is omitted. `HEAD` is read through the admin dir the
+registry binds and the common dir, never through the worktree's `.git`
+file, which an earlier launch of the step can rewrite before a correction
+or a retry, and only its id is read there: the commit is read from the
+shared store's objects through the controller's private git directory,
+which names no promisor remote, so no git version fetches a commit the
+store lacks (R4-F1). A binding the registry does not confirm, a `HEAD`
+naming no commit the store holds, and a launch that seeds, bind no
+candidate. The prompt names the file in a section rendered only while the
+run keeps Memory. The prompt label moves to `v19`, an evaluation amendment, as D19
+says, and that move is the one exception to §4.2's byte-identical
+Memory-off prompt: against what the release before rendered and saved for
+the same Memory-off run (PR #536's merge base, captured by
+`tests/fixtures/memory_off_baseline/`), a Memory-off run differs in the
+label alone, in the first line of the prompt and in the checkpoint's
+`prompt_version`. That holds for a run created with Memory off; a run
+created earlier keeps the label it was created with, and one that turns
+Memory off keeps its ledger. The run log records
+what each launch was shown (sizes, counts, digests, the commit it started
+from, or none when it could not be read, the commits the walk read, and
+the time of Memory's whole preparation, the ledger's reconstruction from
+the checkpoint, the candidate read and the walk included (R4-F4), with the
+render's share), never a record's text. Two writers exist. The controller's
+`validation-failure` record of a failed candidate cites its validation
+record and is added by the producer's failure counter, in the save that
+counts the failure (D11 stage 4): the one appending the record, or, for a
+terminal record the producer gate reuses and the ledger does not cite
+yet (one appended while Memory was off, say), the step's later save. It
+is bound to the failing commit and to its base, so on that commit it is
+established and on a descendant of the base it is shown with its source
+and needs revalidation. An accepted
+result's proposals come from an optional `memory` list of the result, which
+no required field and no parser rule changes. They are admitted in the plan
+save of a success or in the stop save of a `blocked` or `failure` result
+(D9.8, D4.6), keyed by the launch ordinal, the commit the launch started
+from as the controller read it before the launch (the entry's base only
+when it started there) and the entry's position, so the same result
+admitted again is a replay. A launch whose start could not be read keys
+none: its adds are refused and counted, never keyed by a guessed commit,
+and its revisions are admitted as usual (R4-F3). The key is provenance, and
+an added record applies to the issue's launches of the phase whatever
+commit they start from. The list is bound
+to its launch when the reply is parsed: a `correct` or `retract` only of a
+record that launch's projection showed, against the revision it showed, no
+text past the store's bound or that the redactor would change, and each
+reason redacted and bounded as the store keeps it. That binding is the controller's,
+held by the process that parsed the reply and never written into the
+result, so the result's `memory` key stays the agent's data whatever its
+shape. A reply kept across a restart (#479) is kept as Memory off keeps
+it, recovered as before, and admits none of its entries, whichever
+controller kept it and whether or not its launch was shown Memory; and
+nothing the binding adds counts against the reply's bound. Keeping a
+binding across a restart is a persisted field and a protocol bump, which
+belongs with #332's receipt (D5.3).
+Launch ends and refused candidates are not collected yet: no candidate or
+launch receipt has a producer, and a record citing one would be shown only
+as needing revalidation. `FIX`, `REVIEW`, `REPLAN_REEXECUTE` and
+`UPDATE_EPIC` stay unsupported, as `doctor` and the operator documentation
+say. The evaluation's Memory collector is not part of this slice. No Memory
+launch has run against a live repository, under the real bwrap backend, or
+with a real Pi. `tests/test_memory_handoff.py` holds §4.2's Memory items
+for this slice: the retry after a validation failure
+(`test_a_validation_failure_reaches_the_retry_as_an_observed_record`), the
+candidate binding
+(`test_a_failure_on_an_earlier_commit_is_labelled_stale_on_its_descendant`,
+`test_a_relaunch_reads_its_candidate_through_the_bound_admin_dir_not_the_dotgit_file`),
+the corrected and retracted hypotheses across a crash and `resume`
+(`test_a_correction_survives_a_crash_and_the_next_launch_never_sees_what_it_replaced`),
+the stop save
+(`test_a_stop_results_proposals_land_in_its_stop_save_and_nowhere_before`),
+a kept reply in its own process
+(`test_a_kept_reply_admits_what_its_launch_could_in_the_process_that_parsed_it`)
+and across a restart, a Memory-off launch's and a legacy checkpoint's
+included
+(`test_a_reply_kept_across_a_restart_is_recovered_and_admits_no_proposal`,
+`test_a_memory_off_reply_kept_across_a_restart_admits_nothing_once_memory_is_on`,
+`test_a_legacy_kept_reply_holding_a_bound_form_admits_nothing`), a reply at
+the parser's bound
+(`test_a_reply_at_the_parsers_bound_is_kept_and_recovered_with_memory_on`),
+the refused reply
+(`test_a_refused_or_corrected_reply_leaves_no_proposal`), the seeded
+secrets
+(`test_no_seeded_secret_reaches_memory_a_projection_a_log_or_the_state`)
+and the Memory-off prompt and checkpoint
+(`test_with_memory_off_the_prompt_read_context_state_and_run_are_unchanged`,
+`test_a_memory_off_run_renders_and_saves_what_the_release_before_did_but_its_label`).
+§4.2's owed evaluation fixtures, and §8's of the evaluation protocol, are
+held through Memory delivery as follows. Obsolete memory: an operator's
+retraction and an agent's
+(`test_an_operator_retraction_is_absent_from_the_next_launch`, the
+corrected-hypothesis test above). Current memory: a blocked result's
+proposals at the next launch
+(`test_a_blocked_results_proposals_reach_the_launch_after_unblock`).
+Corrected memory: the corrected-hypothesis test. Conflicting memories and a
+hallucinated lesson: two contradicting hypotheses and a note claiming, in
+the controller's words, a validation pass are shown as proposals, never
+as the controller's account, and validation still fails the candidate and
+is shown established at the retry
+(`test_conflicting_and_false_lessons_stay_proposals_and_validation_still_decides`).
+Volatile GitHub state: a note that the issue is closed and the PR merged
+is a proposal in `memory.md`, while `issue.md` is the controller's fresh
+read and the controller opens the PR and counts no merge
+(`test_a_remembered_github_status_never_replaces_the_controllers_fresh_read`).
+Scope boundary: a record for another candidate is labelled or omitted, and
+`REVIEW` is shown none
+(`test_a_failure_on_an_earlier_commit_is_labelled_stale_on_its_descendant`,
+`test_review_is_shown_no_memory_and_its_launch_reads_no_projection`).
+Negative debugging lesson: the controller's validation failure and an
+agent's `failed-approach` (the retry and stop-save tests above). Prompt
+injection: an instruction-like note stays inside its untrusted fence in
+`memory.md`, out of the prompt, and changes no decision
+(`test_an_instruction_like_proposal_stays_fenced_and_changes_no_decision`).
+An incomplete index watermark is not applicable to this slice: it is the
+watermark of D17's layer 2 export to #326's index, which does not exist;
+the layer 2 rule nearest it, that a launch up to a revision's watermark
+cannot revise what it changed, is the store's
+(`test_a_proposal_from_a_launch_before_a_records_latest_change_is_refused`).
+
 | Needs | Does not need |
 |---|---|
 | two state fields and a recorded setting, in one bump (D19.1 to D19.3) | #332's reducer or task table |

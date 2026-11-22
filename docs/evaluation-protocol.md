@@ -30,7 +30,7 @@ the fake baseline. Neither launches a model, holds a credential or writes to Git
 | Arm | What it is | Status |
 |---|---|---|
 | `single_agent_no_memory` | existing AutoForge, with its validation and independent review | available |
-| `single_agent_issue_memory` | the same, with bounded Issue Working Memory | not evaluated: needs #317, #333 |
+| `single_agent_issue_memory` | the same, with bounded Issue Working Memory | not evaluated: its registered needs, #317 and #333, are in the code; its collector, a fixture report and every run are not (section 6) |
 | `fixed_role_multi_agent_issue_memory` | deterministic fixed roles, with Issue Memory | not evaluated: needs #319, #333 |
 | `adaptive_manager_worker_issue_memory` | adaptive Manager/Worker, with Issue Memory | not evaluated: needs #319, #333 |
 | `parallel_read_only_ideation_issue_memory` | optional: fixed roles with parallel read-only ideation | not evaluated: needs #319, #333 |
@@ -159,8 +159,14 @@ evidence commit, as a hidden test runs; `pin_verification.json` records that all
 A record of a seeded arm carries the digest of the lesson its Memory collector read back, and an unseeded
 arm's carries none. Anything else leaves the contrast `NOT_EVALUATED`: another Memory is another
 intervention. #317's `run --memory-seed` holds the lesson unchanged and
-records its digest. The collector and prompt handoff are still owed by
-#333; this protocol records no Memory-arm result.
+records its digest. #333 delivers it to every Memory launch of
+ANALYZE_EXECUTE as `memory.md` and records what each launch was shown in
+its run log (`metadata.memory`: sizes, counts, digests and the time of
+Memory's whole preparation before the launch, `projection_ms`, the
+ledger's reconstruction from the state file, the candidate's read and its
+local ancestry walk included, never a record's text). The arm's collector,
+which reads that digest and those measures back into a record, is still
+owed; this protocol records no Memory-arm result.
 
 A lesson is the author's summary of its evidence, not a transcript of a real attempt: these commits are
 the closest thing this repository holds to earlier verified experience on the same code. Whether a lesson
@@ -382,10 +388,19 @@ These hold today and are stated so nobody discovers them after spending money:
   protocol holds equal. Lifting this means the controller recording those settings when it creates a run,
   a change to the state file that this protocol does not make and that belongs on #23 first. Until then the
   best any real comparison can reach is `INCONCLUSIVE`, whatever else it measures.
-- **Arm 2 does not exist,** so `memory_benefit` is `NOT_EVALUATED` until #317 and #333 land. The
-  no-memory baseline alone can be smoke-tested.
-- **The crash gate needs a fixture of the treatment arm.** The scenario of section 8 covers arm 1
-  only; an arm owes its own when it lands.
+- **Arm 2 cannot be scored yet, so `memory_benefit` is `NOT_EVALUATED`.** The prerequisites the
+  manifest registers for it are in the code: #317's store and seed, and #333's delivery of
+  `memory.md` to `ANALYZE_EXECUTE` with what each launch was shown in its run log. Their offline
+  tests (`tests/test_memory_handoff.py`, section 8) hold the controller's handoff, not the arm. What
+  is still missing is the arm's collector (section 3.5), which reads the seed's digest and each
+  launch's `metadata.memory` back into a record; without it no treatment run has a record to score,
+  the Memory gates of section 5 have nothing to read, and no treatment run or real comparison has
+  been made. The manifest keeps the arm `not_evaluated` with the prerequisites it was registered
+  with, which is what the tool reports. The no-memory baseline alone can be smoke-tested.
+- **The crash gate needs a fixture report that covers the treatment arm.** It reads that report
+  (section 5), and `make eval-fixture` runs arm 1 only, so the gate is `unknown` for arm 2. #333's
+  offline tests cover the crash windows of every Memory write and launch, but as controller tests,
+  not as a fixture report of the arm.
 
 ## 7. Deterministic control-plane tests
 
@@ -452,11 +467,16 @@ A Manager does not exist yet, so `correct_candidate_overwritten` uses a review f
 and `stale_completed_node` uses a review round as the node. Those arms owe the same fixtures on their
 own objects.
 
-**Owed by a Memory arm, not evaluated until #317 and #333:** obsolete memory, current memory,
+**Owed by a Memory arm, and not evaluated:** obsolete memory, current memory,
 conflicting memories, corrected memory, volatile GitHub state, scope boundary, negative debugging
 lesson, hallucinated lesson candidate, prompt-injection string, incomplete index watermark. The
 retrieval metrics (Recall@K, MRR) and offline-distillation costs belong to EPIC #331's optional
-evaluation, not to this one.
+evaluation, not to this one. #333 holds each of them that applies to its slice offline, through
+Memory delivery to `ANALYZE_EXECUTE`, in `tests/test_memory_handoff.py`; ADR 0015's implementation
+note names the test for each, and the incomplete index watermark waits for #326's index. Those are
+controller-correctness tests like section 7's, not a Memory-arm result. The manifest keeps these
+cases `not_evaluated`, under the prerequisites it registered: the fixture mode above drives arm 1
+only, so no fixture report of arm 2 scores them, and arm 2 stays `NOT_EVALUATED` (section 6).
 
 ## 9. Real runs
 
@@ -565,9 +585,9 @@ An amendment changes the files of section 1 and these digests in one reviewed ch
 **and states whether any real run had been made.** A record carries the digests it was made under, and a
 report refuses to decide over records of another, so criteria cannot move under results.
 
-- `manifest.json`: `7b76d1faac1d008bfcee143153f58b9b8220d704791ead89fe08435aa8ee90f1`
-- `preregistration.json`: `59556c0ca4587dd5b90851a25e05fa52c8964c6a67091add39da8e0b79fc8060`
-- `real_run_config.yaml`: `00c4def539ba6327ec16de60066b397dd8d107767777fdf8b4aa9547926cf2a5`
+- `manifest.json`: `b9a2ce04720e91223ec6fc375db1eae3357c3d57da3d7c0c4d3d79321b0f3bf9`
+- `preregistration.json`: `469feb38ccf2f226c71a9365fd0fd345b6f5dd5c87607c59e5fd6349e954d3bc`
+- `real_run_config.yaml`: `0314fa68a9af6a6e2879410735bec0a3d7bacf351f994249029c80605ed4f346`
 
 | Date | Change | Why | Real runs before it |
 |---|---|---|---|
@@ -576,3 +596,4 @@ report refuses to decide over records of another, so criteria cannot move under 
 | 2026-11-07 | Two allow-list keys are added under `execution`, which moves the settings digest and the digests that hold it. | #286 gives agent launches and repository commands an allow-list key each. `real_run_config.yaml` sets neither, so every launch of every arm gets the names it got before, and no threshold, task or other setting changes. `tests/evaluation.py` reads the repository commands' names, as the engine now does, so its copy of the validation policy stays the engine's. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |
 | 2026-11-11 | The prompt label moves from `v17` to `v18`, which moves the settings digest and the digests that hold it. | #433 changed the prompts: a FIX agent that must report `blocked` may list the findings it fixed and the ones it left, and the controller publishes the commits it verifies; a REVIEW agent is told how such a partial fix is carried to it. Every arm runs one controller commit with one label, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |
 | 2026-11-16 | Four keys are added under `sandbox.container`, which moves the settings digest and the digests that hold it. | #292 adds the container backend's seed settings (`history_depth`, `history_tags`, `seed_max_bytes`, `seed_max_objects`). Nothing reads them before that backend is selectable, `real_run_config.yaml` sets none, and every launch of every arm is what it was, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added to the repository since. |
+| 2026-11-22 | The prompt label moves from `v18` to `v19`, which moves the settings digest and the digests that hold it. | #333 delivers Issue Working Memory to ANALYZE_EXECUTE: a run that keeps Memory gets a section naming its `memory.md` and an optional `memory` list in its result. A run without Memory renders the prompt it rendered before but for the label in its first line, and saves the state it saved but for `prompt_version` (`tests/test_memory_handoff.py` holds both against the release before), so an arm without Memory runs what it ran, and the Memory arm's treatment is what it measures. Every arm runs one controller commit with one label, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added to the repository since. |

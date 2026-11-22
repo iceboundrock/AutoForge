@@ -469,6 +469,68 @@ whole with `published_payload_problem`. Each refusal is an ordinary
 correction with nothing pushed or created
 ([github-safety.md](github-safety.md), "After ANALYZE_EXECUTE").
 
+### ANALYZE_EXECUTE's optional `memory` list (#333)
+
+A run that keeps Issue Working Memory (ADR 0015 D13; `memory.enabled`)
+tells its `ANALYZE_EXECUTE` agent it may add an optional `memory` list to
+its result, of `success`, `blocked` or `failure`. No required field of any
+phase changes, the parser reads no `memory` key, and with Memory off the
+key is ignored exactly as any other unknown key is. The engine reads it
+only where it accepts the result (`autoforge.memory_handoff`): in the plan
+save of a success, or the stop save of a `blocked` or `failure` result
+(ADR 0015 D9.8, D4.6). A reply the controller refuses or corrects, one
+whose candidate fails validation, and one lost to a crash before that save
+leave no entry. Each entry is an object with exactly the keys of one row
+below, `op` included, and `op` set to that row's value:
+
+| `op` | Keys, exactly | Values |
+|---|---|---|
+| `"add"` | `op`, `kind`, `text` | `kind`: `hypothesis`, `note`, `failed-approach`, `handoff` or `repository-constraint`; `text`: the note |
+| `"correct"` | `op`, `record`, `text`, `reason` | `record`: the integer `n` of a proposal the launch was shown as `M<n>`; `text`: the corrected note; `reason`: why |
+| `"retract"` | `op`, `record`, `reason` | `record`: as for `correct`; `reason`: why |
+
+For example `{"op": "retract", "record": 3, "reason": "the lexer test now passes"}`
+withdraws the proposal shown as `M3`.
+
+At most `MAX_PROPOSALS` (8) entries are read; each one past it, and each
+entry of another shape (an unknown `op` or key, a `record` that is not a
+positive integer, a `kind` that is the controller's or the operator's), is
+refused and counted in the store's refusals. The store holds the rest to
+its own rules (`autoforge.memory`): a `text` of at most 2,048 bytes and one
+the run-log redactor would leave unchanged, a `reason` redacted and cut to
+256 bytes, and a `correct` or `retract` only of an agent's proposal, never
+of the controller's observation or the operator's seed, and never from a
+launch that started before the record last changed. The controller binds
+the list to its launch when it parses the reply (R1-F2, R1-F3 of PR #536):
+a `correct` or `retract` of a record that launch's `memory.md` did not show
+(one left out for the budget, one the same list adds, any other number) is
+refused there, and one it showed is made against the record revision it
+showed, so a second change of one record in one result is stale. A `text`
+the store would not keep as it is (past 2,048 bytes, blank, or one the
+redactor would change) is refused at that point too, and a `reason` is
+held redacted and cut to 256 bytes, so the binding never holds more of an
+entry than the store keeps (R3-F4 of PR #536). The binding also holds the
+commit the launch started from, as the controller read it before the
+launch, which keys each `add` with the launch ordinal and the entry's
+position (R3-F2); the key is provenance, and an added record applies to
+the issue's later launches of the phase whatever commit they start from.
+When that commit could not be read, the input is unknown and never the
+base in its place: each `add` is refused and counted, and a `correct` or
+`retract`, which no key names, is admitted as usual (R4-F3).
+That binding is the controller's: it is held by the process
+that parsed the reply and is never written into the result, so the `memory`
+key stays the agent's data, whatever its shape (R2-F1 of PR #536). A reply
+kept across a restart (#479) is kept as Memory off keeps it, the agent's
+list included, and is recovered as before. Nothing of its list is admitted
+or counted: the state keeps no controller record of what its launch was
+shown, so no shape the list takes, even one written by a controller before
+this rule, can authorize an `add`, a `correct` or a `retract`. Nothing
+Memory adds counts against the reply's bound either (R2-F2), so a reply is
+kept or refused exactly as with Memory off.
+A refusal is counted and changes nothing else: the result is handled as it
+would be without the list, so Memory never refuses, corrects or delays a
+result.
+
 ### FIX fields
 
 The fixer publishes nothing in REMOTE `FIX` (ADR 0004, #163): it commits on

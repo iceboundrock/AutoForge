@@ -5,6 +5,57 @@ so.
 
 ## Unreleased
 
+### Issue Working Memory reaches ANALYZE_EXECUTE's launches (#333)
+
+A run with `memory.enabled: true` now uses its Memory. Every
+`ANALYZE_EXECUTE` launch is given `memory.md` in its read context, with the
+records that apply to it, and its prompt names the file. Which records
+apply to the commit a launch starts from is decided locally, from the run's
+own validation records and the local object store: Memory adds no GitHub
+call to a launch, and no fetch, not even of a commit a partial clone lacks.
+The controller observes each validation failure of the phase's
+candidates, citing its validation record, so the relaunch after a failure
+is shown it, however many commits the failed candidate holds. A record
+the validation just appended is observed in the save that appends it. A
+record the controller reuses instead (a terminal failure of the same
+commit, command and policy) goes to the same failure counter and is
+observed in the later save that counts the failure, unless the ledger
+already cites it: a record appended while Memory was off gains its first
+observation that way once Memory is on. The observation is kept only if
+the ledger admits it: one already at a bound (64 records, 256 events,
+1 MiB) refuses it and counts the refusal, and the validation record is
+kept without it. The run keeps at most 64 validation records and, past
+that, evicts the oldest one that is not pinned (a record a review's
+evidence or certificate names, the one the failure counter last counted,
+and the set being validated are pinned), so a later one can evict the
+record an observation cites, after which the observation is at most
+shown as needing revalidation. An agent may add up
+to eight notes, or correct or retract an earlier proposal its `memory.md`
+shows, through an optional `memory` list in its result. They are kept only
+with a result the controller accepts: a success, in the save of the plan
+that publishes it (they stay if that push or pull request then fails), or a
+`blocked` or `failure` result, in its stop save. The launch after an `unblock` of a
+`blocked` result is shown its notes; a `failure` ends the run in `FAILED`,
+which has no `unblock`, so its notes stay in the ledger for `memory show`
+and no later launch of the run is shown them. A launch whose starting
+commit cannot be read adds no note. A reply kept across a restart (one
+delivered before its launch timed out or exited badly) is recovered as
+before but adds no entry. Each launch's run log records what it was shown,
+by size, count and digest, the commit it started from (`null` when it could
+not be read), and how long Memory's preparation took, the reconstruction of
+the ledger from the state file, the candidate's read and the ancestry walk
+included. `REVIEW`, `FIX`, `REPLAN_REEXECUTE` and
+`UPDATE_EPIC` get no Memory, and `doctor` has a row that says so. The
+prompt label moves from v18 to v19, and the evaluation protocol records the
+amendment. With Memory off, which stays the default, read contexts are
+unchanged and a `memory` field in a result is ignored. A run created with
+Memory off renders the prompts and saves the state file the previous
+release did for it but for that label, in the first line of every prompt
+and in the state's `prompt_version`. A run created before this release
+keeps the label it was created with, and a run that turns Memory off keeps
+its records. No state protocol change. No Memory launch has yet been run
+against a live repository.
+
 ### `claim-ambiguous`: `status` goes by what the reason names (#375)
 
 When more than one open PR carries the issue's implementation marker and

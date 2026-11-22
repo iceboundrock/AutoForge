@@ -369,14 +369,16 @@ def head_problem(common: Path, admin: Path) -> str | None:
     return None
 
 
-def read_candidate(common: Path, admin: Path, worktree: str, runner: Runner | None) -> Candidate:
-    """The candidate: ``worktrees/<id>/HEAD`` addressed through the common dir (D6.3).
+def _detached_head(
+    common: Path, admin: Path, worktree: str, runner: Runner | None
+) -> Candidate | str:
+    """``worktrees/<id>/HEAD``'s name when it is detached, else the :class:`Candidate` there is.
 
     Whether ``HEAD`` is attached is asked with ``symbolic-ref --no-recurse``,
     which reads ``HEAD`` alone: without it git resolves the reference
     ``HEAD`` names, and so a link the agent planted at
-    ``worktrees/<id>/refs/...`` to any file on the host (#223). An
-    inconclusive git read is a :class:`VerificationError`, never a guess.
+    ``worktrees/<id>/refs/...`` to any file on the host (#223). No object
+    is read.
     """
     problem = head_problem(common, admin)
     if problem:
@@ -393,6 +395,19 @@ def read_candidate(common: Path, admin: Path, worktree: str, runner: Runner | No
         # Never a candidate: the reference it names (one the agent may have
         # written in its admin dir) is neither opened nor resolved.
         return Candidate(True, "")
+    return ref
+
+
+def read_candidate(common: Path, admin: Path, worktree: str, runner: Runner | None) -> Candidate:
+    """The candidate: ``worktrees/<id>/HEAD`` addressed through the common dir (D6.3).
+
+    Attached or not as :func:`_detached_head` reads it; a detached ``HEAD``
+    is peeled to the commit it names. An inconclusive git read is a
+    :class:`VerificationError`, never a guess.
+    """
+    ref = _detached_head(common, admin, worktree, runner)
+    if isinstance(ref, Candidate):
+        return ref
     found, head = _admin_git(
         common,
         ["rev-parse", "--verify", "-q", f"{ref}^{{commit}}"],
@@ -400,6 +415,30 @@ def read_candidate(common: Path, admin: Path, worktree: str, runner: Runner | No
         "the HEAD commit",
         worktree,
     )
+    if found != 0 or not _SHA_RE.fullmatch(head):
+        head = ""
+    return Candidate(False, head)
+
+
+def read_head_id(common: Path, admin: Path, worktree: str, runner: Runner | None) -> Candidate:
+    """The object id the worktree's detached ``HEAD`` names, with no object read (R4-F1 of PR #536).
+
+    Through the same admin dir, common dir and checks as
+    :func:`read_candidate`, but ``HEAD`` is never peeled: ``rev-parse
+    --verify`` of the reference alone reads the reference and opens no
+    object, so git never looks for one the shared store lacks and never
+    fetches it from a promisor remote that store's configuration names, as
+    the peel to a commit does on every git that supports partial clones.
+    ``head`` is therefore an id only, "" when ``HEAD`` names no full one:
+    that the store holds it and that it is a commit are the caller's to
+    prove, through a reader that cannot fetch
+    (:meth:`~autoforge.git_transport.GitTransport.read_local_commit`). An
+    inconclusive git read is a :class:`VerificationError`, never a guess.
+    """
+    ref = _detached_head(common, admin, worktree, runner)
+    if isinstance(ref, Candidate):
+        return ref
+    found, head = _admin_git(common, ["rev-parse", "--verify", "-q", ref], runner, "HEAD", worktree)
     if found != 0 or not _SHA_RE.fullmatch(head):
         head = ""
     return Candidate(False, head)

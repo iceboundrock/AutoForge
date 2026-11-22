@@ -171,6 +171,33 @@ def _bounded_redaction(text: str, limit: int) -> str:
     return "[details omitted]"
 
 
+def admissible_text(text: object) -> bool:
+    """Whether the store keeps ``text`` as an agent's record text, unchanged (D9.6, D9.9).
+
+    What :meth:`MemoryStore.add` and :meth:`MemoryStore.revise` require of
+    an agent's text: a string of at most :data:`MAX_TEXT_BYTES` bytes, not
+    blank, with no NUL, that the run-log redactor leaves as it is. A caller
+    that holds an agent's text before the store sees it refuses one that
+    fails here instead of holding it (R3-F4 of PR #536).
+    """
+    try:
+        _string(text, MAX_TEXT_BYTES)
+    except StateError:
+        return False
+    return True
+
+
+def bounded_reason(reason: str) -> str:
+    """``reason`` as the store keeps a revision's reason: redacted, then bounded (D9.6).
+
+    Cut to :data:`MAX_REASON_BYTES` with an omission marker, as
+    :meth:`MemoryStore.revise` saves it; bounding a reason this returned
+    again changes nothing, so the store keeps it as it is. A blank reason
+    is the caller's to refuse first: the store refuses one.
+    """
+    return _bounded_redaction(reason, MAX_REASON_BYTES)
+
+
 def _issue(url: object) -> str:
     raw = _string(url, 192)
     try:
@@ -685,6 +712,61 @@ class MemoryStore:
             return WriteOutcome(self._refused(), "refused")
         return WriteOutcome(candidate, "applied", event.get("target", len(candidate._events)))
 
+    def cites(self, ref: EvidenceRef) -> bool:
+        """Whether an observed record already cites ``ref`` (ADR 0015 D9.7).
+
+        Deriving that observation again adds nothing, whichever launch the
+        controller is at: the caller skips the write instead of sending one
+        that would differ from the saved row only by its launch ordinal.
+        """
+        return ref in self._citations
+
+    def revision_of(self, record: int) -> int | None:
+        """The record revision ``record`` is at now, or ``None`` when there is no such record.
+
+        An agent's correction or retraction names the record it acts on, and
+        the controller supplies this revision: the store still refuses one
+        from a launch earlier than the record's latest change.
+        """
+        fact = self._facts.get(record) if type(record) is int else None
+        return None if fact is None else fact.revision
+
+    def range_bases(self, issue_url: str) -> tuple[str, ...]:
+        """The distinct bases of ``issue_url``'s records that apply to a base's descendants.
+
+        A projection's request names which of them the current candidate
+        descends from (:class:`ProjectionRequest`'s ``ancestors``); sorted,
+        and never more than the store's record bound.
+        """
+        if not self._facts:
+            return ()
+        issue = _issue(issue_url)
+        return tuple(
+            sorted(
+                {
+                    f.scope.base
+                    for f in self._facts.values()
+                    if f.scope.step.issue_url == issue
+                    and f.scope.range is Range.DESCENDANTS
+                    and not f.withdrawn
+                }
+            )
+        )
+
+    def refused(self, count: int = 1) -> MemoryStore:
+        """The store with ``count`` more refusals, for writes refused before they reached it.
+
+        An agent's proposal the controller refuses at its own parse (an
+        unknown operation, a field of the wrong type, one past the per-result
+        bound) is counted like a write the store refuses (D9.6). With Memory
+        off nothing is counted.
+        """
+        if not self.enabled or count <= 0:
+            return self
+        raw = self.encode()
+        raw["refusals"] = min(self.refusals + count, MAX_COUNTER)
+        return MemoryStore(self.repository, self.run_id, self.launch_seq, raw)
+
     def _refused(self) -> MemoryStore:
         """The store after a refused write: its count one more while Memory is on.
 
@@ -1104,6 +1186,42 @@ def _established(
         record.definition_digest,
         record.policy_digest,
         record.outcome,
+    )
+
+
+def established_bases(
+    store: MemoryStore, request: ProjectionRequest, *, validation_records: Sequence[dict] = ()
+) -> tuple[str, ...]:
+    """The bases ``request``'s candidate is proved to descend from by a retained receipt.
+
+    One per observation bound to a base's descendants whose validation
+    record, retained, establishes it on this very candidate as
+    :func:`render_projection` would (:func:`_established`: the run's own
+    record of the issue's worktree candidate, of this commit, checked
+    against that base, enforced where its mode requires, its digest the
+    citation's). The controller validates a producer's candidate only once
+    it has proved that the candidate descends from the base it is checked
+    against, and the record keeps that base, so on the record's own commit
+    the base needs no walk of its history (R4-F2 of PR #536). On any other
+    commit, and with no candidate, nothing is proved here: the caller's
+    own proof decides. Sorted; ``validation_records`` refused as
+    :func:`render_projection` refuses them.
+    """
+    if not store.enabled or not request.candidate:
+        return ()
+    receipts = _validation_facts(store, validation_records)
+    issue = _issue(request.step.issue_url)
+    return tuple(
+        sorted(
+            {
+                fact.scope.base
+                for fact in store._facts.values()
+                if fact.scope.range is Range.DESCENDANTS
+                and fact.scope.step.issue_url == issue
+                and fact.scope.candidate == request.candidate
+                and _established(fact, request, receipts) is not None
+            }
+        )
     )
 
 

@@ -2585,8 +2585,136 @@ shows no record ends with a notice saying why (a budget cut, a withdrawal
 or nothing applicable), and a budget that cannot hold the header and the
 longest notice is refused whatever the records.
 
-No launch is shown Memory and no observations are captured automatically
-yet; that is #333. With Memory on, enforcement is mandatory: a Memory
+### What a Memory run's launches are shown and what is collected
+
+Memory is delivered to `ANALYZE_EXECUTE` alone (#333, ADR 0015 D13).
+Every launch of that phase in a run that keeps Memory, a correction,
+a retry and the relaunch after a validation failure included, is given
+`memory.md` in its read context, and its prompt names it and says that
+it is advisory, untrusted data. The file is the projection above,
+rendered from the checkpoint the launch's intent save commits, for the
+launch ordinal that save spends, just before it: a crash before the save
+renders the same file again, and a correction or retraction the operator
+or an earlier launch saved is shown at the next launch, never the text it
+replaced. It is bound to the launch's candidate: the worktree's `HEAD`
+after the strict import when that is not the entry's base (the commit a
+validation failure left), and none otherwise. `HEAD` is read through the
+worktree's registry entry, as the candidate is after a launch, never
+through its `.git` file, which an earlier launch of the step could have
+rewritten. Only the commit id `HEAD` names is read in the repository's
+own git directory; the commit itself is read from the shared object store
+through a private git directory of the controller's, which names no
+promisor remote, so a commit the store lacks (in a partial clone, say) is
+never fetched, not even attempted. When that binding cannot be confirmed,
+or `HEAD` names no commit the store holds, no candidate is bound and every
+record bound to one is left out. Whether the candidate descends from the
+base a record is bound to is proved locally, and nothing asks GitHub or
+fetches, so Memory adds no network call to a launch and a retry on the
+commit that failed is shown that failure whatever GitHub answers. On the
+very commit a validation record of the run names, that record proves its
+base: the controller validates a candidate only after proving it descends
+from that base, so a retry on a failed commit is shown its failure however
+many commits it holds. Any other base is proved by reading each commit
+from the candidate down as its own bytes, re-hashed, at most 64 of them.
+A base neither proves is not proved, and a record bound to it is left
+out. The controller never reads the file back. The launch's run log
+records what it was shown in `request.json`'s `metadata.memory`: the
+revision and digests, the counts, the file's size and its SHA-256, the
+commit the launch started from (`input`, `null` when it could not be read:
+never the base in its place), how many commits the ancestry walk read
+(`ancestry_reads`), and how long Memory's preparation took, the ledger's
+reconstruction from the state file, the candidate's read, the walk and the
+render together (`projection_ms`, the per-launch latency the evaluation
+reads), with the render's share (`render_ms`), never a record's text.
+
+Two writers add to the store, each in a save the step already makes, so
+no crash leaves a record without what it rests on:
+
+- **The controller's validation-failure record.** When a candidate of the
+  phase fails `validation.commands`, the controller observes the failed
+  validation record, and the observation cites it. A record the
+  validation just appended is observed, if the store admits the
+  observation, in the save that appends the record. A record the
+  controller reuses instead, a terminal `FAIL` or `TIMEOUT` of the same
+  commit, command and policy, goes to the same failure counter, and its
+  observation is saved later, in the save that counts the failure. The
+  observation carries the controller's account of the record and the
+  ends of its redacted output, and is bound to the failing commit and
+  the base it was checked against. On that commit the projection shows
+  the failure as established by the retained record. On a later commit
+  built on the same base it is shown with its source commit and counted
+  as needing revalidation. Otherwise it is omitted and counted. A record
+  the ledger already cites, observed again after a crash or by a
+  relaunch that reports the same commit, adds nothing. One it does not
+  cite yet is observed when it is reused: a record appended while Memory
+  was off gains its first observation that way once Memory is turned on.
+  The observation and its record do not always exist together: a ledger
+  already at one of its bounds (64 records, 256 events, 1 MiB) refuses
+  the observation and counts it in `memory show`'s refusals, and the
+  validation record is saved without it; and the run keeps at most 64
+  validation records and, past that, evicts the oldest one that is not
+  pinned (a record a review's evidence binding or certificate names, the
+  one the failure counter last counted, and the set being validated are
+  pinned), so a later one can evict the record an observation cites,
+  which is then never shown as established, at most as needing
+  revalidation with its receipt unavailable.
+- **An accepted result's proposals.** The agent may list up to eight
+  entries in an optional `memory` field of its result: a note to add
+  (`hypothesis`, `note`, `failed-approach`, `handoff` or
+  `repository-constraint`), or a correction or retraction of a proposal its
+  `memory.md` showed, against the revision it showed
+  ([CONTROL_RESULT protocol](agent-guides/control-result-protocol.md#analyze_executes-optional-memory-list-333)).
+  They are saved only with a result the controller accepts: the plan of a
+  success, in the save that plans its push and pull request, so they stay
+  if either then fails, or the stop of a `blocked` or `failure` result.
+  Each added entry is keyed by its launch, the commit that launch started
+  from and its place in the list, so the same result admitted again adds
+  nothing; it applies to every later launch of the phase on the issue,
+  whichever commit that launch starts from. A launch whose starting commit
+  could not be read adds nothing: each entry it adds is refused and
+  counted, while its corrections and retractions are kept. After an
+  `unblock`, the next launch is shown a blocked result's entries as
+  proposals. A `failure` result's entries stay in the ledger, which
+  `memory show` lists, but `FAILED` has no `unblock`, so no later launch
+  of the run is shown them. A refused or corrected reply, one whose
+  commit fails validation and one lost to a crash keep none. An entry the
+  store refuses (past a bound, text the redactor would change, a revision
+  of the controller's or the operator's record, or of a record the launch
+  was not shown) is counted in `memory show`'s refusals and changes
+  nothing else.
+  A note past 2,048 bytes is refused, and a reason past 256 bytes is
+  redacted and cut, when the reply is parsed: the controller never holds
+  more of an entry than the store would keep.
+  A reply the state keeps because its launch delivered it and then timed
+  out or exited badly (#479) is recovered across a restart as before, but
+  its entries are not admitted: which records its launch was shown is
+  known only to the process that parsed the reply, and the result's own
+  `memory` field is never trusted for it. Only a restart loses them; in
+  the process that launched, they are admitted as usual.
+
+Nothing else is collected. A launch's typed end (a timeout, a failed
+exit) and a candidate the controller's checks refuse are not recorded,
+and no record of this release cites a review, an effect or a Git object.
+`REVIEW`, `FIX`, `REPLAN_REEXECUTE` and `UPDATE_EPIC` get no `memory.md`,
+no Memory section in their prompt and add nothing to the store: the
+reviewer is the independent check, and `FIX` follows once
+`ANALYZE_EXECUTE` has an evaluation result (ADR 0015 D13). `doctor`'s
+`Issue Working Memory` row says the same. With Memory off, every read
+context is what it was before this release and a `memory` field in a
+result is ignored. A run created with Memory off renders every prompt and
+saves the state file the previous release did for it but in one place: the
+prompt label, `v19` where it was `v18`, in the first line of every prompt
+and in the state's `prompt_version` (ADR 0015 D19 moves it with the prompt
+change that names `memory.md`). A run created before this release keeps
+the label it was created with
+([Configuration](configuration.md#validation-every-key-must-be-one-the-controller-reads)),
+and a run that turns Memory off keeps its records, which `memory show`
+still lists. No Memory launch has yet been run against a live repository
+and a real Pi.
+
+### Enforcement
+
+With Memory on, enforcement is mandatory: a Memory
 `ANALYZE_EXECUTE` launch runs only inside the outer sandbox, with Pi's
 agent directory in its private home
 ([Configuration](configuration.md#issue-working-memory)). It runs under
