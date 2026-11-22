@@ -130,6 +130,12 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/loop_guard.py": (*LOOP, "test_routing"),
     "src/autoforge/memory.py": ("test_memory", "test_cli", "test_adr_0015"),
     "src/autoforge/memory_handoff.py": (*LOOP, "test_memory_handoff", "test_validation_gates"),
+    # #324: the retrieval read path, which nothing of the package imports yet.
+    "src/autoforge/memory_retrieval.py": (
+        "test_memory_retrieval",
+        "test_memory_handoff",
+        "test_adr_0015",
+    ),
     "src/autoforge/profiles.py": LOOP,
     "src/autoforge/progress.py": LOOP,
     "src/autoforge/read_context.py": LOOP,
@@ -219,6 +225,7 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/fast_targets.py": (),
     "tests/stop_corpus.py": (),
     "tests/live_pi.py": (),
+    "tests/memory_retrieval_bench.py": ("test_memory_retrieval",),
     "tests/operator_comment_fidelity.py": (),
     "tests/parallel_bench.py": ("test_suite_performance_audit",),  # via suite_comparison
     "tests/pi_fake.py": (),
@@ -229,6 +236,8 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/suite_comparison.py": (),
     # The evaluation protocol's pinned tasks, thresholds and fixtures (#318)
     "tests/fixtures/evaluation/": ("test_evaluation", "test_evaluation_fixture"),
+    # #324's pinned retrieval fixture, which its benchmark and tests read
+    "tests/fixtures/memory_retrieval/": ("test_memory_retrieval",),
     # EPIC #338's exit audit: its runs' records, which its section 1 is held to
     "tests/fixtures/suite_performance_audit/": ("test_suite_performance_audit",),
 }

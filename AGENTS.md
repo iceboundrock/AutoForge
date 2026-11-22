@@ -275,6 +275,10 @@ docs/evaluation-protocol.md            the pre-registered evaluation of Issue Me
 docs/test-suite-performance-audit.md   EPIC #338's exit audit: the suite at the EPIC's baseline and on
                                        main, measured on one host; each exit criterion and invariant
                                        with its verdict and tests; what only GitHub holds
+docs/memory-retrieval.md               Memory's retrieval read path (#324): the store decides what is
+                                       served and the FTS5 index only ranks, freshness and failure,
+                                       the in-memory index, the measured BM25 baseline, LTSearch's
+                                       go/no-go (no-go)
 docs/recovery-mvp-evaluation.md        EPIC #354's deterministic recovery MVP evaluated (#375): the
                                        before/after matrix of 17 real-engine stops, each gold
                                        resolution held by the controller's read-back, the safety
@@ -364,7 +368,9 @@ matches none of them needs only this file and the scoped `AGENTS.md`.
   the task reducer (#332), or roles below a phase (#319), or changing what
   a launch is shown of earlier launches or how an adapter starts a fresh
   session, read `docs/adr/0015-task-state-issue-memory-and-crash-order.md`
-  in addition to `docs/evaluation-protocol.md`.
+  in addition to `docs/evaluation-protocol.md`. If changing Memory's
+  retrieval read path (`src/autoforge/memory_retrieval.py`, #324) or adding
+  a retrieval backend, read `docs/memory-retrieval.md` too.
 - If adding or changing tests, or changing behaviour in a high-priority
   coverage area, read `tests/AGENTS.md` and `docs/agent-guides/testing.md`.
 - If changing `tests/evaluation.py`, `tests/evaluation_fixture.py` or

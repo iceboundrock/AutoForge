@@ -5,6 +5,24 @@ so.
 
 ## Unreleased
 
+### A retrieval read path for Issue Working Memory, not yet used by any launch (#324)
+
+The package gains Memory's search, fetch and catalog over an SQLite FTS5
+(BM25) index (`autoforge.memory_retrieval`), for the projection's later
+callers. Nothing calls it yet: what an `ANALYZE_EXECUTE` launch is shown is
+unchanged, no agent can search, and there is no configuration key, state
+change or prompt change. The index lives in memory only (no file, temporary
+file or attached database) and is rebuilt from the checkpoint at will.
+Whether a record may be served is decided by the current store alone, with
+the projection's own checks. So a corrected, retracted, withheld, superseded,
+inapplicable or other issue's record is never served from a stale index, and
+a search says when it could not read every current record. Where the
+interpreter's SQLite lacks FTS5, a search reads only the eight newest
+records and says it is degraded and incomplete. LTSearch was evaluated as an
+optional hybrid backend and is a no-go: it has no license, its filters run
+after retrieval, and it needs three HTTP processes. `docs/memory-retrieval.md`
+records the decisions, the measured BM25 baseline and the evidence.
+
 ### Issue Working Memory reaches ANALYZE_EXECUTE's launches (#333)
 
 A run with `memory.enabled: true` now uses its Memory. Every

@@ -224,6 +224,12 @@ memory_handoff.py   Memory's single-agent handoff (#333, ADR 0015 D11 to D13): t
                     projection of an ANALYZE_EXECUTE launch, the controller's validation-
                     failure observation and an accepted result's proposals; decides no
                     phase, write, budget or merge, and reads no file or network
+memory_retrieval.py Memory's retrieval read path (#324, ADR 0015 D8 layer 4, D12): search,
+                    fetch and catalog over an in-memory FTS5 index partitioned by issue,
+                    every hit judged by the store, never the index; watermark, hot tail,
+                    atomic sync and rebuild, the optional backend seam and its FTS5-only
+                    fallback; imported by nothing in the package yet; no file, network
+                    or store write
 provenance.py       the running controller's identity (imported package file, interpreter,
                     version, protocol) and the protocol-mismatch diagnostic the CLI prints;
                     reads and writes nothing (#265)
@@ -467,4 +473,5 @@ error messages                                    -> docs/agent-guides/secrets-a
 memory.py, memory_handoff.py, engine.py (what a
 launch is shown of earlier launches)              -> docs/adr/0015-task-state-issue-memory-and-
                                                      crash-order.md + docs/evaluation-protocol.md
+memory_retrieval.py                               -> the same, + docs/memory-retrieval.md
 ```

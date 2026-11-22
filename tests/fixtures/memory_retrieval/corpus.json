@@ -1,0 +1,79 @@
+{
+  "description": "Issue #324's pinned retrieval fixture: one run's Issue Working Memory for issue 2 (trailing commas in config lists) beside issue 3's records, with retracted, withheld, superseded, corrected, candidate-bound and foreign records as adversarial negatives. Relevance is judged by hand, per query, over the records the launch may be served.",
+  "repository": "owner/repo",
+  "run_id": "20260101T000000Z-abcdef",
+  "issues": {
+    "main": "https://github.com/owner/repo/issues/2",
+    "other": "https://github.com/owner/repo/issues/3"
+  },
+  "candidates": {
+    "current": "cccccccccccccccccccccccccccccccccccccccc",
+    "old": "dddddddddddddddddddddddddddddddddddddddd",
+    "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "records": [
+    {"key": "m19", "issue": "main", "actor": "operator", "kind": "seed", "text": "Prefer small commits: one behavioural change per commit, each with its test."},
+    {"key": "m1", "issue": "main", "actor": "agent", "kind": "hypothesis", "text": "The config parser rejects trailing commas because tokenize_list stops at the first empty element."},
+    {"key": "m2", "issue": "main", "actor": "agent", "kind": "failed-approach", "text": "Stripping commas with a regex before parsing broke quoted strings that contain commas; reverted."},
+    {"key": "m3", "issue": "main", "actor": "controller", "kind": "validation-failure", "range": "exact", "candidate": "current", "text": "Validation failed: tests/test_config.py::test_trailing_comma raised ConfigSyntaxError on the candidate."},
+    {"key": "m4", "issue": "main", "actor": "agent", "kind": "repository-constraint", "text": "Run the suite with uv run pytest; plain pytest picks up the system interpreter and misses the locked dependencies."},
+    {"key": "m5", "issue": "main", "actor": "agent", "kind": "note", "text": "Lint uses ruff with a 100 character line limit; ruff format must pass before every commit."},
+    {"key": "m6", "issue": "main", "actor": "agent", "kind": "hypothesis", "text": "Empty list elements should raise a typed ConfigSyntaxError that names the line and column."},
+    {"key": "m7", "issue": "main", "actor": "agent", "kind": "handoff", "text": "Next step: add a parametrized test for nested lists with trailing commas in tests/test_config.py."},
+    {"key": "m8", "issue": "main", "actor": "agent", "kind": "note", "text": "mypy runs in strict mode on src only; the tests are not type checked."},
+    {"key": "m9", "issue": "main", "actor": "agent", "kind": "failed-approach", "text": "Catching ValueError around json.loads hid the line number of the syntax error; do not wrap it."},
+    {"key": "m10", "issue": "main", "actor": "agent", "kind": "candidate-finding", "range": "exact", "candidate": "current", "text": "The tokenizer drops the final element when a list ends with a comma followed by a newline."},
+    {"key": "m11", "issue": "main", "actor": "agent", "kind": "candidate-finding", "range": "exact", "candidate": "old", "text": "On the earlier candidate the scanner looped forever on a lone separator."},
+    {"key": "m12", "issue": "main", "actor": "agent", "kind": "hypothesis", "text": "Windows CRLF endings cause the trailing comma failure."},
+    {"key": "m13", "issue": "main", "actor": "agent", "kind": "hypothesis", "text": "The bug is in the YAML loader, not in the list tokenizer."},
+    {"key": "m14", "issue": "main", "actor": "agent", "kind": "hypothesis", "text": "The YAML loader is not involved: the failure reproduces with the INI reader alone."},
+    {"key": "m15", "issue": "main", "actor": "agent", "kind": "note", "text": "Fixture files live in the samples directory."},
+    {"key": "m16", "issue": "main", "actor": "agent", "kind": "note", "text": "Cache folders under .pytest_cache can hold stale bytecode; clear them when imports look wrong."},
+    {"key": "m17", "issue": "main", "actor": "agent", "kind": "note", "text": "Cache folders under .pytest_cache can hold stale bytecode; clear them when imports look wrong."},
+    {"key": "m18", "issue": "main", "actor": "agent", "kind": "repository-constraint", "range": "descendants", "text": "Every change to the parser keeps the public parse_config signature unchanged."},
+    {"key": "m20", "issue": "main", "actor": "agent", "kind": "note", "text": "Benchmarks in benchmarks/parse_speed.py are not part of the suite; never run them in validation."},
+    {"key": "m21", "issue": "main", "actor": "agent", "kind": "hypothesis", "text": "A Unicode BOM at the start of the file shifts the reported columns by one."},
+    {"key": "m22", "issue": "main", "actor": "agent", "kind": "failed-approach", "text": "Raising SyntaxError instead of ConfigSyntaxError broke the error formatter of the CLI."},
+    {"key": "m23", "issue": "main", "actor": "controller", "kind": "validation-failure", "range": "exact", "candidate": "current", "text": "Validation failed: ruff check reported E501 in src/config/tokens.py on the candidate."},
+    {"key": "m24", "issue": "main", "actor": "agent", "kind": "note", "text": "The CLI prints parse errors through format_config_error; keep its message format stable for the docs."},
+    {"key": "m25", "issue": "main", "actor": "agent", "kind": "handoff", "text": "Remaining work: document trailing comma support in docs/configuration.md."},
+    {"key": "o1", "issue": "other", "actor": "agent", "kind": "note", "text": "Trailing commas in HTTP header lists are legal; the retry parser must keep them."},
+    {"key": "o2", "issue": "other", "actor": "agent", "kind": "repository-constraint", "text": "Run the suite with uv run pytest -k http to keep it under a minute."},
+    {"key": "o3", "issue": "other", "actor": "agent", "kind": "hypothesis", "text": "The retry backoff doubles each attempt up to thirty seconds."},
+    {"key": "o4", "issue": "other", "actor": "agent", "kind": "hypothesis", "text": "Windows CRLF endings break the HTTP fixture parser."}
+  ],
+  "operations": [
+    {"op": "retract", "key": "m12", "reason": "disproved: the failure reproduces with LF endings"},
+    {"op": "retract", "key": "m16", "reason": "the cache was not involved"},
+    {"op": "supersede", "key": "m13", "by": "m14", "reason": "the INI reader reproduces it alone"},
+    {"op": "correct", "key": "m15", "text": "Fixture files live under tests/fixtures/config_lists.", "reason": "the folder was renamed"}
+  ],
+  "queries": [
+    {"query": "trailing comma tokenizer", "relevant": ["m1", "m10", "m3"]},
+    {"query": "run test suite uv", "relevant": ["m4"]},
+    {"query": "ruff line length lint", "relevant": ["m5", "m23"]},
+    {"query": "ConfigSyntaxError line column", "relevant": ["m6", "m9", "m22"]},
+    {"query": "regex strip commas quoted strings", "relevant": ["m2"]},
+    {"query": "mypy type checking", "relevant": ["m8"]},
+    {"query": "YAML loader", "relevant": ["m14"]},
+    {"query": "fixture files location", "relevant": ["m15"]},
+    {"query": "public parse_config signature", "relevant": ["m18"]},
+    {"query": "commit size", "relevant": ["m19"]},
+    {"query": "benchmarks in validation", "relevant": ["m20"]},
+    {"query": "BOM columns unicode", "relevant": ["m21"]},
+    {"query": "error message format CLI", "relevant": ["m24", "m22"]},
+    {"query": "documentation trailing comma support", "relevant": ["m25"]},
+    {"query": "nested lists parametrized test", "relevant": ["m7"]}
+  ],
+  "negatives": [
+    {"query": "windows CRLF", "why": "only the retracted m12 and issue 3's o4"},
+    {"query": "looped forever", "why": "only m11, bound to an earlier candidate"},
+    {"query": "retry backoff", "why": "only issue 3's o3"},
+    {"query": "samples directory", "why": "only m15's corrected-away text"},
+    {"query": "stale bytecode", "why": "only the retracted m16 and its withheld duplicate m17"},
+    {"query": "HTTP header", "why": "only issue 3's o1 and o4"}
+  ],
+  "corrections": [
+    {"key": "m15", "new_query": "config_lists", "old_query": "samples directory"}
+  ]
+}

@@ -46,7 +46,9 @@
     candidates' refs coexist, as D7.7 relies on
     (`test_adr_0015_a_candidates_ref_is_created_and_never_moved`);
     and what D10 says of SQLite holds
-    (`test_the_package_opens_sqlite_only_for_the_opencode_probe`).
+    (`test_the_package_opens_sqlite_only_for_the_opencode_probe_and_the_memory_index`,
+    renamed by #324 when D10's implementation note added the in-memory
+    index).
   - *Revised* on 2026-11-18, after review round 1 of PR #512: an
     attempt's identity is a run-wide launch ordinal, not `state.attempt`
     (D2.1); a result passes through receipt, parse, verification and
@@ -1292,6 +1294,17 @@ an interpreter's `sqlite3` module is linked against, so a supported
 interpreter may lack it. A later FTS5 projection reports itself unavailable
 rather than failing a launch, and the MVP has none.
 
+**Implementation note (#324).** The package now opens SQLite in a second
+place: `memory_retrieval._open_memory_database`, the FTS5 retrieval index.
+It is an in-memory database (`:memory:`) with `temp_store` in memory and no
+database attachable (`SQLITE_LIMIT_ATTACHED` set to 0), so it opens no
+pathname, journal, WAL or temporary file. The objection above, which is to
+SQLite's opens by pathname, does not reach it. It holds no authority: it is
+rebuilt from the checkpoint at will, lost with its process, and every hit is
+read again from the store (D12). A SQLite without FTS5 makes it report
+`unavailable`, as planned here. An index kept on disk across processes would
+still need a decision of its own in this section.
+
 ### D11. Commit order and crash reconciliation
 
 One attempt, each stage durable before the next begins:
@@ -1401,6 +1414,20 @@ D5.3): a crash after it re-verifies the receipt and launches nothing.
   behind the snapshot can miss a new record, and can never show a
   retracted one. Rank is never authority, and an index never decides what
   is visible.
+- **Implementation note (#324).** `src/autoforge/memory_retrieval.py` is
+  that read interface, and nothing of the package calls it yet: a launch is
+  shown this section's render alone. The index records the Memory revision
+  it was synced through and the digest of the audit rows up to it, so a
+  store that does not continue what was indexed is never read. Every hit is
+  judged by `MemoryStore.visibility`, which applies the projection's checks
+  in its order, and its excerpt is the store's text, never the index's. A
+  correction or retraction is therefore served or refused as the snapshot
+  says at the next search, however stale the index
+  (`test_a_corrected_record_is_served_only_as_it_is_now_even_before_the_index_catches_up`,
+  `test_a_retracted_record_is_unservable_at_once_and_a_failed_sync_never_reopens_it`).
+  The records changed after the watermark are read on the store itself, up
+  to a bound, and a search says when it could not read them all. LTSearch
+  was evaluated and is a no-go for now (`docs/memory-retrieval.md`).
 - **No agent-callable search in the MVP.** An agent's only channels to the
   controller are the files it is given and its reply. A `search_memory` or
   `fetch_memory` call would be a new channel; if #319 or #324 adds one, it

@@ -103,6 +103,26 @@ class Action(StrEnum):
     SUPERSEDE = "supersede"
 
 
+class Visibility(StrEnum):
+    """What the current snapshot says of one record for one launch (#324).
+
+    The projection's own order of checks: another issue's record is
+    ``foreign``; one whose applicability does not take the launch
+    ``inapplicable``; then ``retracted``, or ``withheld`` by the withdrawal
+    of the very text it carries; then ``superseded``. Only ``current`` is
+    served by a read path. A search index's copy of a record decides none
+    of this (ADR 0015 D12).
+    """
+
+    CURRENT = "current"
+    MISSING = "missing"
+    FOREIGN = "foreign"
+    INAPPLICABLE = "inapplicable"
+    RETRACTED = "retracted"
+    WITHHELD = "withheld"
+    SUPERSEDED = "superseded"
+
+
 def _invalid() -> NoReturn:
     # Input, including identity fields, may itself contain a credential.
     raise StateError("invalid Issue Working Memory data")
@@ -196,6 +216,16 @@ def bounded_reason(reason: str) -> str:
     is the caller's to refuse first: the store refuses one.
     """
     return _bounded_redaction(reason, MAX_REASON_BYTES)
+
+
+def bounded_text(text: str, limit: int) -> str:
+    """``text`` redacted, then cut to ``limit`` bytes with an omission marker.
+
+    The rule the store applies to the controller's own text (D9.9), for a
+    read path that shows a bounded excerpt of a record (#324): never longer
+    than ``limit`` bytes, and left as it is by the run-log redactor.
+    """
+    return _bounded_redaction(text, limit)
 
 
 def _issue(url: object) -> str:
@@ -753,6 +783,52 @@ class MemoryStore:
             )
         )
 
+    @property
+    def revision(self) -> int:
+        """The Memory revision: how many rows the audit table holds."""
+        return len(self._events)
+
+    def digest(self) -> str:
+        """The digest of the store's value, as a projection's header names it."""
+        return _digest(_json(self.encode()))
+
+    def facts(self) -> tuple[MemoryFact, ...]:
+        """Every record as the snapshot holds it, by id; frozen values, never the text."""
+        return tuple(self._facts[i] for i in sorted(self._facts))
+
+    def text_of(self, record: int) -> str:
+        """The live text of ``record``, or ``""`` for one retracted, missing or never kept."""
+        fact = self._facts.get(record) if type(record) is int else None
+        if fact is None or fact.withdrawn:
+            return ""
+        return self._texts.get(fact.content, "")
+
+    def visibility(self, record: int, request: ProjectionRequest) -> Visibility:
+        """Whether the snapshot serves ``record`` to ``request``'s launch (#324).
+
+        The request is bound as the projection binds it (:func:`bind_request`),
+        and the record is judged by the projection's own rules, in its order
+        (:class:`Visibility`), on this snapshot alone: a record corrected,
+        retracted, withheld or superseded since any index saw it is refused
+        here at once. A superseded record is never served, whatever claim
+        its citation may establish: the projection decides that.
+        """
+        bound = bind_request(self, request)
+        fact = self._facts.get(record) if type(record) is int else None
+        if fact is None:
+            return Visibility.MISSING
+        if fact.scope.step.issue_url != bound.step.issue_url:
+            return Visibility.FOREIGN
+        if not fact.scope.applies(bound):
+            return Visibility.INAPPLICABLE
+        if fact.withdrawn:
+            return Visibility.RETRACTED
+        if any(w.binds(fact) and w.scope.applies(bound) for w in self._withdrawals):
+            return Visibility.WITHHELD
+        if fact.replacement:
+            return Visibility.SUPERSEDED
+        return Visibility.CURRENT
+
     def refused(self, count: int = 1) -> MemoryStore:
         """The store with ``count`` more refusals, for writes refused before they reached it.
 
@@ -1252,6 +1328,36 @@ def _downgraded(fact: MemoryFact, retention: Retention | None) -> bool:
     return retention is Retention.UNAVAILABLE or fact.evidence.kind is Receipt.VALIDATION
 
 
+def bind_request(store: MemoryStore, request: ProjectionRequest) -> ProjectionRequest:
+    """``request`` checked against ``store`` and canonical, or :class:`StateError`.
+
+    The one binding of a read of the store for a launch: the projection's
+    (:func:`render_projection`) and the retrieval read path's (#324,
+    ``memory_retrieval``). Memory on, the store's run, an ``ANALYZE_EXECUTE``
+    step of the store's repository, the next launch ordinal of the snapshot
+    (an earlier one would label later records as what that launch was
+    shown), the budgets, the candidate, its ancestors and the environment
+    digest each in their bounds. The step is returned as :func:`_step`
+    saves it.
+    """
+    _require(store.enabled and request.run_id == store.run_id)
+    step = _step(request.step.to_dict(), store.repository)
+    _require(step.phase is Phase.ANALYZE_EXECUTE)
+    _require(_integer(request.attempt, 1, MAX_LAUNCH_SEQ) == store.launch_seq + 1)
+    _integer(request.max_chars, 1, MAX_PROJECTION_CHARS)
+    _integer(request.max_bytes, 1, MAX_PROJECTION_BYTES)
+    _require(
+        len(request.ancestors) <= MAX_FACTS and (bool(request.candidate) or not request.ancestors)
+    )
+    if request.candidate != "":
+        _sha(request.candidate)
+    for ancestor in request.ancestors:
+        _sha(ancestor)
+    if request.environment != "":
+        _match(request.environment, _DIGEST, 64)
+    return replace(request, step=step)
+
+
 def render_projection(
     store: MemoryStore,
     request: ProjectionRequest,
@@ -1280,24 +1386,8 @@ def render_projection(
     that establishes no claim never changes which claims are shown (only a
     withdrawal of the very text a record carries withholds that record).
     """
-    _require(store.enabled and request.run_id == store.run_id)
-    step = _step(request.step.to_dict(), store.repository)
-    _require(step.phase is Phase.ANALYZE_EXECUTE)
-    # The launch this snapshot is rendered for is the next one: an earlier
-    # ordinal would label later records as what that launch was shown.
-    _require(_integer(request.attempt, 1, MAX_LAUNCH_SEQ) == store.launch_seq + 1)
-    _integer(request.max_chars, 1, MAX_PROJECTION_CHARS)
-    _integer(request.max_bytes, 1, MAX_PROJECTION_BYTES)
-    _require(
-        len(request.ancestors) <= MAX_FACTS and (bool(request.candidate) or not request.ancestors)
-    )
-    if request.candidate != "":
-        _sha(request.candidate)
-    for ancestor in request.ancestors:
-        _sha(ancestor)
-    if request.environment != "":
-        _match(request.environment, _DIGEST, 64)
-    request = replace(request, step=step)
+    request = bind_request(store, request)
+    step = request.step
     receipts = _validation_facts(store, validation_records)
     held = _retained_refs(retained)
     resolved: dict[int, tuple[Retention | None, tuple | None]] = {}

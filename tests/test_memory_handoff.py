@@ -2624,8 +2624,10 @@ DECIDING_MODULES = (
     "transitions",
 )
 # The modules that may: the store's checkpoint, the orchestration that saves
-# Memory beside the step, the operator's commands and doctor's row.
-MEMORY_IMPORTERS = {"cli", "doctor", "engine", "memory_handoff", "state"}
+# Memory beside the step, the operator's commands, doctor's row and the
+# retrieval read path (#324), which nothing of the package imports yet.
+MEMORY_IMPORTERS = {"cli", "doctor", "engine", "memory_handoff", "memory_retrieval", "state"}
+MEMORY_MODULES = {"memory", "memory_handoff", "memory_retrieval"}
 
 
 def _imports(path: Path) -> set[str]:
@@ -2652,8 +2654,8 @@ def test_no_module_that_decides_imports_memory_and_its_importers_are_known():
     importers = {
         path.stem
         for path in package.glob("*.py")
-        if {"memory", "memory_handoff"} & _imports(path) and path.stem != "memory"
+        if MEMORY_MODULES & _imports(path) and path.stem != "memory"
     }
     assert importers == MEMORY_IMPORTERS
     for name in DECIDING_MODULES:
-        assert not {"memory", "memory_handoff"} & _imports(package / f"{name}.py"), name
+        assert not MEMORY_MODULES & _imports(package / f"{name}.py"), name
