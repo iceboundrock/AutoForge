@@ -5,6 +5,26 @@ so.
 
 ## Unreleased
 
+### Issue Working Memory reaches ANALYZE_EXECUTE's launches (#333)
+
+A run with `memory.enabled: true` now uses its Memory. Every
+`ANALYZE_EXECUTE` launch is given `memory.md` in its read context, with the
+records that apply to it, and its prompt names the file. The controller
+records each validation failure of the phase's candidates, citing the
+validation record, in the save that keeps that record, so the relaunch
+after a failure is shown it. An agent may add up to eight notes, or correct
+or retract its own earlier ones, through an optional `memory` list in its
+result. They are kept only with a result the controller accepts: a
+published success, or a `blocked` or `failure` result, whose notes the
+launch after an `unblock` is shown. Each launch's run log records what it
+was shown, by size, count and digest. `REVIEW`, `FIX`, `REPLAN_REEXECUTE`
+and `UPDATE_EPIC` get no Memory, and `doctor` has a row that says so.
+With Memory off, which stays the default, prompts, read contexts and state
+files are unchanged, and a `memory` field in a result is ignored. The
+prompt label moves from v18 to v19, and the evaluation protocol records the
+amendment. No state protocol change. No Memory launch has yet been run
+against a live repository.
+
 ### `claim-ambiguous`: `status` goes by what the reason names (#375)
 
 When more than one open PR carries the issue's implementation marker and

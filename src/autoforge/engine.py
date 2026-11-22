@@ -473,6 +473,21 @@ from .loop_guard import (
 from .materialize import METHOD as MATERIALIZATION_METHOD
 from .materialize import materialize, read_object_format
 from .memory import MAX_LAUNCH_SEQ
+from .memory_handoff import (
+    MAX_PROPOSALS,
+    MAX_REASON_BYTES,
+    MAX_TEXT_BYTES,
+    MEMORY_FILE,
+    MEMORY_FILE_DESCRIPTION,
+    LaunchProjection,
+    admit_proposals,
+    observe_validation_failure,
+    parse_proposals,
+    projection_request,
+    render_launch_projection,
+    validation_failure_text,
+)
+from .memory_handoff import supported as memory_supported
 from .premerge import (
     commit_is_local,
     describe_definition_difference,
@@ -1126,6 +1141,8 @@ def render_worktree_state(entries: Sequence[StatusEntry], head_sha: str, branch:
 # (ADR 0006 D5.4, D9.1, D9.2), each rendered from records in state only.
 VALIDATION_EVIDENCE_TEMPLATE = "validation_evidence.md"
 VALIDATION_FAILURE_TEMPLATE = "validation_failure.md"
+# What a Memory launch of ANALYZE_EXECUTE is told of its memory.md (#333).
+MEMORY_CONTEXT_TEMPLATE = "memory_context.md"
 # What ``{{VALIDATION_EVIDENCE}}`` holds outside a launch (a plan or a dry
 # run): the REVIEW entry validates, or reuses, before the reviewer starts.
 VALIDATION_EVIDENCE_PENDING = (
@@ -2091,6 +2108,11 @@ class ControllerEngine:
         # D10.2): the absolute path of its per-launch directory, set only
         # while `_invoke_phase` renders that launch's prompt.
         self._read_context_dir: str | None = None
+        # The Issue Working Memory projection of the launch whose read
+        # context is being written (#333, ADR 0015 D12): set by
+        # `_invoke_phase` only around that write, so no other launch's read
+        # context, and no other phase's, ever holds a memory.md.
+        self._memory_projection: LaunchProjection | None = None
         # Why the read context of this process's last FIX launch does not show
         # the PR body a K12 update would replace, "" when it shows it whole
         # (#423, PR #467 R1-F2). Not persisted: a result is only ever checked
@@ -4834,6 +4856,133 @@ class ControllerEngine:
         view = next(r for r in s.validation_evidence() if r.seq == seq)
         return render_validation_failure(view, counter["count"])
 
+    def _format_memory_context(self) -> str:
+        """``{{MEMORY_CONTEXT}}``: the Memory section of ANALYZE_EXECUTE's prompt, or "" (#333).
+
+        Rendered while the run keeps Memory (its recorded setting, which a
+        launch's gate holds to the configuration), whether or not the store
+        holds a record: the section names ``memory.md`` and the optional
+        ``memory`` list, never a record's text. With Memory off it is "", so
+        the prompt is byte for byte the one a Memory-off release renders.
+        """
+        if not self._require_state().issue_memory.get("enabled"):
+            return ""
+        section = render(
+            load_template(MEMORY_CONTEXT_TEMPLATE),
+            {
+                "MEMORY_FILE": MEMORY_FILE,
+                "MAX_PROPOSALS": MAX_PROPOSALS,
+                "MAX_TEXT_BYTES": MAX_TEXT_BYTES,
+                "MAX_REASON_BYTES": MAX_REASON_BYTES,
+            },
+        )
+        return "\n\n" + section.strip()
+
+    def _memory_step(self, phase: Phase) -> StepKey:
+        """The step Memory binds a record or a projection of ``phase`` to (ADR 0015 D2)."""
+        s = self._require_state()
+        return StepKey(
+            phase=phase,
+            issue_url=s.current_issue_url,
+            pr_url=s.current_pr_url,
+            review_round=s.review_round,
+            execution_attempt=s.execution_attempt,
+        )
+
+    def _launch_memory(self, phase: Phase, cwd: str) -> LaunchProjection | None:
+        """The projection of the launch about to be saved and started (#333, ADR 0015 D12).
+
+        ``None`` for a phase Memory does not support (D13) and for a run whose
+        recorded setting keeps Memory off: the run's own record decides, as
+        every Memory write does, and a configuration that differs from it is
+        accepted onto the run (``--accept-config-change``) before any launch.
+        Otherwise rendered from the snapshot the launch-intent save commits,
+        for the ordinal that save spends, and bound to the launch's candidate: the
+        worktree's ``HEAD`` after the strict import, when it is not the
+        entry's base (a relaunch after a validation failure starts from the
+        commit that failed), and none otherwise. The bases of the store's
+        range-bound records the candidate descends from are proved through
+        the controller's transport; one whose ancestry cannot be read is left
+        out, so a record bound to it is omitted, never shown as current. A
+        read of ``HEAD`` that fails binds no candidate, which omits every
+        record bound to one. A store that cannot be rendered refuses the
+        launch here, before anything of it is saved (D18): Memory is never
+        dropped from a Memory launch.
+        """
+        state = self._require_state()
+        if not memory_supported(phase) or not state.issue_memory.get("enabled"):
+            return None
+        store = state.memory()
+        entry = self._analyze_entry
+        base = entry.base_sha if entry is not None else ""
+        try:
+            head = GitWorkspace(cwd, runner=self._runner).head_sha()
+        except (AutoForgeError, OSError):
+            head = ""
+        candidate = (
+            head if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head) and head != base else ""
+        )
+        ancestors: list[str] = []
+        if candidate:
+            transport = self._git_transport()
+            for ancestor in store.range_bases(state.current_issue_url):
+                if ancestor == candidate:
+                    continue
+                try:
+                    if transport.descends_from(candidate, ancestor):
+                        ancestors.append(ancestor)
+                except (AutoForgeError, OSError):
+                    continue
+        request = projection_request(
+            store, self._memory_step(phase), candidate=candidate, ancestors=ancestors
+        )
+        return render_launch_projection(store, request, validation_records=state.validation_records)
+
+    def _admit_memory(self, phase: Phase, raw: object) -> None:
+        """Admit an accepted result's proposals into the run's Memory, for the caller's save.
+
+        Called only where the result is accepted, before the save that
+        accepts it: ANALYZE_EXECUTE's plan save, or the stop save of its
+        ``blocked`` or ``failure`` result (ADR 0015 D9.8, D4.6). Nothing for a
+        phase Memory does not support, with Memory off, or for an entry the
+        step has not read. What the store refuses is counted there and never
+        changes the step.
+        """
+        state = self._require_state()
+        entry = self._analyze_entry
+        if not memory_supported(phase) or not state.issue_memory.get("enabled") or entry is None:
+            return
+        admission = admit_proposals(
+            state.memory(),
+            parse_proposals(raw),
+            step=self._memory_step(phase),
+            attempt=state.launch_seq,
+            input_sha=entry.base_sha,
+        )
+        if admission.offered:
+            state.issue_memory = admission.store.encode()
+
+    def _observe_validation_failure(self, view: RecordView) -> None:
+        """The controller's observation of a failed ANALYZE_EXECUTE candidate, for the next save.
+
+        Called with the producer's failure counter, so the record and the
+        observation citing it land in one save (ADR 0015 D11 stage 4). A
+        record already cited adds nothing; with Memory off nothing is written.
+        """
+        state = self._require_state()
+        if not state.issue_memory.get("enabled"):
+            return
+        store = state.memory()
+        outcome = observe_validation_failure(
+            store,
+            self._memory_step(Phase.ANALYZE_EXECUTE),
+            view,
+            attempt=state.launch_seq,
+            text=validation_failure_text(_validation_failure_text(view), view),
+        )
+        if outcome is not None and outcome.store is not store:
+            state.issue_memory = outcome.store.encode()
+
     def _prompt_variables(self) -> dict[str, str | int | None]:
         s = self._require_state()
         upcoming_round = s.review_round + 1
@@ -4901,6 +5050,7 @@ class ControllerEngine:
             ),
             "VALIDATION_EVIDENCE": self._format_validation_evidence(),
             "VALIDATION_FAILURE": self._format_validation_failure(),
+            "MEMORY_CONTEXT": self._format_memory_context(),
             **REVIEW_BOUND_VARIABLES,
             **FIX_BOUND_VARIABLES,
         }
@@ -5010,6 +5160,11 @@ class ControllerEngine:
         """
         s = self._require_state()
         context = ReadContext()
+        if self._memory_projection is not None and memory_supported(phase):
+            # First, so the directory's total bound never cuts it: the
+            # projection is bounded on its own (ADR 0015 D12) and rendered from
+            # the snapshot the launch-intent save commits.
+            context.add(MEMORY_FILE, MEMORY_FILE_DESCRIPTION, self._memory_projection.text)
         issue_url = s.current_issue_url
         pr_url = s.current_pr_url
         if phase == Phase.REPLAN_REEXECUTE:
@@ -6838,6 +6993,9 @@ class ControllerEngine:
                 redact(str(payload.get("message", "") or f"agent reported {status}"))
             )
             stop = agent_status(str(status), previous)
+            # #333 (ADR 0015 D4.6, D9.8): the stop is this result's acceptance,
+            # so its Memory proposals are admitted in the same save.
+            self._admit_memory(previous, payload.get("memory"))
             state.phase = nxt
             state.block_reason = message
             # #374: the code goes with the stop it names, for a later status.
@@ -7641,6 +7799,10 @@ class ControllerEngine:
         state.producer_validation_failure = failure_counter(
             phase.value, state.producer_validation_failure, view
         )
+        if memory_supported(phase):
+            # #333: the controller's own observation of the failure, citing
+            # the record, in the save that keeps the record (ADR 0015 D11).
+            self._observe_validation_failure(view)
 
     def _gate_producer(self, phase: Phase, commit: str, base_revision: str) -> str:
         """D5.1, D5.2 for ``ANALYZE_EXECUTE`` and ``FIX``: "" when the candidate passed.
@@ -17175,11 +17337,20 @@ class ControllerEngine:
                         f"refusing to launch {phase.value} with Memory: profile "
                         f"{profile.name!r} {refusal}; or turn Memory off"
                     )
+            # #333 (ADR 0015 D12): a Memory launch's projection, rendered from
+            # the snapshot the intent save below commits and for the ordinal it
+            # spends, then written into the read context as memory.md. A
+            # refusal to render lands here, before anything is saved.
+            memory = self._launch_memory(phase, cwd)
             # What the agent reads from GitHub, read by the controller (it
             # holds no credential to read it itself) and written before the
             # prompt that names it is rendered; nothing is saved yet.
             read_context = ""
-            read_context = self._write_read_context(phase, state.attempt + 1)
+            self._memory_projection = memory
+            try:
+                read_context = self._write_read_context(phase, state.attempt + 1)
+            finally:
+                self._memory_projection = None
             self._read_context_dir = read_context
             # What an earlier launch left uncommitted in the worktree, read
             # for every launch of a write phase, a relaunch included (#187).
@@ -17288,6 +17459,10 @@ class ControllerEngine:
             )
             if worktree_note is not None:
                 record.metadata["worktree_state"] = worktree_note
+            if memory is not None:
+                # What the launch was shown of Memory: counts, sizes, digests
+                # and the render's time, never a record's text (#333).
+                record.metadata["memory"] = memory.metadata()
             if previous_reply is not None:
                 # The quoted reply's sizes, never its text (#393).
                 record.metadata["correction_reply"] = previous_reply.metadata()
@@ -18272,7 +18447,9 @@ class ControllerEngine:
     # -- verification + state application -------------------------------------------
     def _verify_and_apply(self, phase: Phase, payload: dict) -> tuple[Phase, str]:
         if phase == Phase.ANALYZE_EXECUTE:
-            return self._apply_analyze(AnalyzeExecuteResult.from_payload(payload))
+            return self._apply_analyze(
+                AnalyzeExecuteResult.from_payload(payload), payload.get("memory")
+            )
         if phase == Phase.REVIEW:
             return self._apply_review(ReviewResult.from_payload(payload))
         if phase == Phase.FIX:
@@ -18283,7 +18460,7 @@ class ControllerEngine:
             return self._apply_update_epic(payload)
         raise StateTransitionError(f"phase {phase.value} does not accept agent results")
 
-    def _apply_analyze(self, res: AnalyzeExecuteResult) -> tuple[Phase, str]:
+    def _apply_analyze(self, res: AnalyzeExecuteResult, memory: object = None) -> tuple[Phase, str]:
         """Plan, publish and complete ANALYZE_EXECUTE from the accepted candidate (#161).
 
         The result was checked before it was accepted
@@ -18296,7 +18473,10 @@ class ControllerEngine:
         planned or sent (ADR 0004 D9.4, K2, K3). The push (K1) and
         the PR (K2 to open it, K3 to adopt) are planned and saved with the
         completion context in one save, and :meth:`_complete_analyze` does
-        the rest from what was saved, as a later entry would.
+        the rest from what was saved, as a later entry would. The result's
+        Memory proposals (``memory``, #333) are admitted in that plan save,
+        the save that accepts the result, and in no earlier one: a result
+        that stops before its plan leaves none (ADR 0015 D9.8).
         """
         state = self._require_state()
         entry = self._analyze_entry
@@ -18416,6 +18596,7 @@ class ControllerEngine:
         # the entry observation the pre-launch save persisted: a plan that
         # fails is never written.
         state.phase_effects()
+        self._admit_memory(Phase.ANALYZE_EXECUTE, memory)
         self._save_plan()
         return self._complete_analyze()
 

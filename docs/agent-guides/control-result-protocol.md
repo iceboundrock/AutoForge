@@ -469,6 +469,37 @@ whole with `published_payload_problem`. Each refusal is an ordinary
 correction with nothing pushed or created
 ([github-safety.md](github-safety.md), "After ANALYZE_EXECUTE").
 
+### ANALYZE_EXECUTE's optional `memory` list (#333)
+
+A run that keeps Issue Working Memory (ADR 0015 D13; `memory.enabled`)
+tells its `ANALYZE_EXECUTE` agent it may add an optional `memory` list to
+its result, of `success`, `blocked` or `failure`. No required field of any
+phase changes, the parser reads no `memory` key, and with Memory off the
+key is ignored exactly as any other unknown key is. The engine reads it
+only where it accepts the result (`autoforge.memory_handoff`): in the plan
+save of a success, or the stop save of a `blocked` or `failure` result
+(ADR 0015 D9.8, D4.6). A reply the controller refuses or corrects, one
+whose candidate fails validation, and one lost to a crash before that save
+leave no entry. Each entry is exactly one of:
+
+| Entry | Keys |
+|---|---|
+| `add` | `kind` (`hypothesis`, `note`, `failed-approach`, `handoff` or `repository-constraint`), `text` |
+| `correct` | `record` (the number of a proposal the launch was shown, `M<n>`), `text`, `reason` |
+| `retract` | `record`, `reason` |
+
+At most `MAX_PROPOSALS` (8) entries are read; each one past it, and each
+entry of another shape (an unknown `op` or key, a `record` that is not a
+positive integer, a `kind` that is the controller's or the operator's), is
+refused and counted in the store's refusals. The store holds the rest to
+its own rules (`autoforge.memory`): a `text` of at most 2,048 bytes and one
+the run-log redactor would leave unchanged, a `reason` redacted and cut to
+256 bytes, and a `correct` or `retract` only of an agent's proposal, never
+of the controller's observation or the operator's seed, and never from a
+launch that started before the record last changed. A refusal is counted
+and changes nothing else: the result is handled as it would be without
+the list, so Memory never refuses, corrects or delays a result.
+
 ### FIX fields
 
 The fixer publishes nothing in REMOTE `FIX` (ADR 0004, #163): it commits on

@@ -1155,7 +1155,11 @@ and writes to the ledger, but does not erase the ledger. The one write left
 is the operator's `memory retract`, which still withdraws a record of the
 current issue, under the repository lock, without turning Memory on or
 advancing the run; the record stays withdrawn when Memory is turned on
-again. Automatic collection and delivery are not part of this release.
+again. With Memory on, each `ANALYZE_EXECUTE` launch is given `memory.md` in
+its read context, and the controller records the phase's validation
+failures and an accepted result's proposals; no other phase is shown
+Memory or adds to it
+([Usage](usage.md#what-a-memory-runs-launches-are-shown-and-what-is-collected)).
 
 ## Candidate validation
 

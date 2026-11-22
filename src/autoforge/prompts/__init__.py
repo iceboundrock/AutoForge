@@ -55,6 +55,11 @@ TEMPLATE_FILES = (
     # and fix.md's {{VALIDATION_FAILURE}} on the relaunch after one.
     "validation_evidence.md",
     "validation_failure.md",
+    # Issue Working Memory (#333, ADR 0015 D12): what a Memory launch of
+    # ANALYZE_EXECUTE is told of its memory.md and of the optional "memory"
+    # list, rendered into analyze_execute.md's {{MEMORY_CONTEXT}} only while
+    # the run keeps Memory; "" otherwise, so that prompt is unchanged.
+    "memory_context.md",
     # What an agent is told of its own CLI alone (#440), rendered into
     # common.md's {{PROVIDER_SECTION}} for the provider that names it
     # (``AgentProvider.prompt_section``).

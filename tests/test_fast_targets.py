@@ -416,6 +416,7 @@ def test_a_given_path_is_read_relative_to_the_repository(capsys):
         "tests/test_certificate.py",
         "tests/test_evidence.py",
         "tests/test_memory.py",
+        "tests/test_memory_handoff.py",
     ]
 
 

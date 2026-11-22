@@ -159,8 +159,12 @@ evidence commit, as a hidden test runs; `pin_verification.json` records that all
 A record of a seeded arm carries the digest of the lesson its Memory collector read back, and an unseeded
 arm's carries none. Anything else leaves the contrast `NOT_EVALUATED`: another Memory is another
 intervention. #317's `run --memory-seed` holds the lesson unchanged and
-records its digest. The collector and prompt handoff are still owed by
-#333; this protocol records no Memory-arm result.
+records its digest. #333 delivers it to every Memory launch of
+ANALYZE_EXECUTE as `memory.md` and records what each launch was shown in
+its run log (`metadata.memory`: sizes, counts, digests and the render's
+time, never a record's text). The arm's collector, which reads that digest
+and those measures back into a record, is still owed; this protocol
+records no Memory-arm result.
 
 A lesson is the author's summary of its evidence, not a transcript of a real attempt: these commits are
 the closest thing this repository holds to earlier verified experience on the same code. Whether a lesson
@@ -565,9 +569,9 @@ An amendment changes the files of section 1 and these digests in one reviewed ch
 **and states whether any real run had been made.** A record carries the digests it was made under, and a
 report refuses to decide over records of another, so criteria cannot move under results.
 
-- `manifest.json`: `7b76d1faac1d008bfcee143153f58b9b8220d704791ead89fe08435aa8ee90f1`
-- `preregistration.json`: `59556c0ca4587dd5b90851a25e05fa52c8964c6a67091add39da8e0b79fc8060`
-- `real_run_config.yaml`: `00c4def539ba6327ec16de60066b397dd8d107767777fdf8b4aa9547926cf2a5`
+- `manifest.json`: `b9a2ce04720e91223ec6fc375db1eae3357c3d57da3d7c0c4d3d79321b0f3bf9`
+- `preregistration.json`: `23b0b5d0de1ca4a53563b734a885ebfdd5383b96ae8541f099e9edbfb63faa2b`
+- `real_run_config.yaml`: `0314fa68a9af6a6e2879410735bec0a3d7bacf351f994249029c80605ed4f346`
 
 | Date | Change | Why | Real runs before it |
 |---|---|---|---|
@@ -576,3 +580,4 @@ report refuses to decide over records of another, so criteria cannot move under 
 | 2026-11-07 | Two allow-list keys are added under `execution`, which moves the settings digest and the digests that hold it. | #286 gives agent launches and repository commands an allow-list key each. `real_run_config.yaml` sets neither, so every launch of every arm gets the names it got before, and no threshold, task or other setting changes. `tests/evaluation.py` reads the repository commands' names, as the engine now does, so its copy of the validation policy stays the engine's. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |
 | 2026-11-11 | The prompt label moves from `v17` to `v18`, which moves the settings digest and the digests that hold it. | #433 changed the prompts: a FIX agent that must report `blocked` may list the findings it fixed and the ones it left, and the controller publishes the commits it verifies; a REVIEW agent is told how such a partial fix is carried to it. Every arm runs one controller commit with one label, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |
 | 2026-11-16 | Four keys are added under `sandbox.container`, which moves the settings digest and the digests that hold it. | #292 adds the container backend's seed settings (`history_depth`, `history_tags`, `seed_max_bytes`, `seed_max_objects`). Nothing reads them before that backend is selectable, `real_run_config.yaml` sets none, and every launch of every arm is what it was, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added to the repository since. |
+| 2026-11-22 | The prompt label moves from `v18` to `v19`, which moves the settings digest and the digests that hold it. | #333 delivers Issue Working Memory to ANALYZE_EXECUTE: a run that keeps Memory gets a section naming its `memory.md` and an optional `memory` list in its result. A run without Memory renders the prompt it rendered before, byte for byte, so an arm without Memory runs what it ran, and the Memory arm's treatment is what it measures. Every arm runs one controller commit with one label, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added to the repository since. |

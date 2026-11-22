@@ -685,6 +685,61 @@ class MemoryStore:
             return WriteOutcome(self._refused(), "refused")
         return WriteOutcome(candidate, "applied", event.get("target", len(candidate._events)))
 
+    def cites(self, ref: EvidenceRef) -> bool:
+        """Whether an observed record already cites ``ref`` (ADR 0015 D9.7).
+
+        Deriving that observation again adds nothing, whichever launch the
+        controller is at: the caller skips the write instead of sending one
+        that would differ from the saved row only by its launch ordinal.
+        """
+        return ref in self._citations
+
+    def revision_of(self, record: int) -> int | None:
+        """The record revision ``record`` is at now, or ``None`` when there is no such record.
+
+        An agent's correction or retraction names the record it acts on, and
+        the controller supplies this revision: the store still refuses one
+        from a launch earlier than the record's latest change.
+        """
+        fact = self._facts.get(record) if type(record) is int else None
+        return None if fact is None else fact.revision
+
+    def range_bases(self, issue_url: str) -> tuple[str, ...]:
+        """The distinct bases of ``issue_url``'s records that apply to a base's descendants.
+
+        A projection's request names which of them the current candidate
+        descends from (:class:`ProjectionRequest`'s ``ancestors``); sorted,
+        and never more than the store's record bound.
+        """
+        if not self._facts:
+            return ()
+        issue = _issue(issue_url)
+        return tuple(
+            sorted(
+                {
+                    f.scope.base
+                    for f in self._facts.values()
+                    if f.scope.step.issue_url == issue
+                    and f.scope.range is Range.DESCENDANTS
+                    and not f.withdrawn
+                }
+            )
+        )
+
+    def refused(self, count: int = 1) -> MemoryStore:
+        """The store with ``count`` more refusals, for writes refused before they reached it.
+
+        An agent's proposal the controller refuses at its own parse (an
+        unknown operation, a field of the wrong type, one past the per-result
+        bound) is counted like a write the store refuses (D9.6). With Memory
+        off nothing is counted.
+        """
+        if not self.enabled or count <= 0:
+            return self
+        raw = self.encode()
+        raw["refusals"] = min(self.refusals + count, MAX_COUNTER)
+        return MemoryStore(self.repository, self.run_id, self.launch_seq, raw)
+
     def _refused(self) -> MemoryStore:
         """The store after a refused write: its count one more while Memory is on.
 

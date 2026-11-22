@@ -2585,8 +2585,68 @@ shows no record ends with a notice saying why (a budget cut, a withdrawal
 or nothing applicable), and a budget that cannot hold the header and the
 longest notice is refused whatever the records.
 
-No launch is shown Memory and no observations are captured automatically
-yet; that is #333. With Memory on, enforcement is mandatory: a Memory
+### What a Memory run's launches are shown and what is collected
+
+Memory is delivered to `ANALYZE_EXECUTE` alone (#333, ADR 0015 D13).
+Every launch of that phase in a run that keeps Memory, a correction,
+a retry and the relaunch after a validation failure included, is given
+`memory.md` in its read context, and its prompt names it and says that
+it is advisory, untrusted data. The file is the projection above,
+rendered from the checkpoint the launch's intent save commits, for the
+launch ordinal that save spends, just before it: a crash before the save
+renders the same file again, and a correction or retraction the operator
+or an earlier launch saved is shown at the next launch, never the text it
+replaced. It is bound to the launch's candidate: the worktree's `HEAD`
+after the strict import when that is not the entry's base (the commit a
+validation failure left), and none otherwise. The controller never reads
+it back. The launch's run log records what it was shown in
+`request.json`'s `metadata.memory`: the revision and digests, the counts,
+the file's size and its SHA-256, and how long the render took
+(`render_ms`), never a record's text.
+
+Two writers add to the store, each in the save that already records what
+the record rests on, so no crash separates them:
+
+- **The controller's validation-failure record.** When a candidate of the
+  phase fails `validation.commands`, the record cites that validation
+  record and is saved with it. It carries the controller's account of the
+  record and the ends of its redacted output, and is bound to the failing
+  commit and the base it was checked against. On that commit the
+  projection shows the failure as established by the retained record. On
+  a later commit built on the same base it is shown with its source
+  commit and counted as needing revalidation. Otherwise it is omitted and
+  counted. The same record observed again, after a crash or a relaunch
+  that reports the same commit, adds nothing.
+- **An accepted result's proposals.** The agent may list up to eight
+  entries in an optional `memory` field of its result: a note to add
+  (`hypothesis`, `note`, `failed-approach`, `handoff` or
+  `repository-constraint`), or a correction or retraction of a proposal it
+  was shown
+  ([CONTROL_RESULT protocol](agent-guides/control-result-protocol.md#analyze_executes-optional-memory-list-333)).
+  They are saved only with a result the controller accepts: the plan of a
+  success, or the stop of a `blocked` or `failure` result. After an
+  `unblock`, the next launch is shown a blocked result's entries as
+  proposals. A refused or corrected reply, one whose commit fails
+  validation and one lost to a crash keep none. An entry the store refuses
+  (past a bound, text the redactor would change, a revision of the
+  controller's or the operator's record) is counted in `memory show`'s
+  refusals and changes nothing else.
+
+Nothing else is collected. A launch's typed end (a timeout, a failed
+exit) and a candidate the controller's checks refuse are not recorded,
+and no record of this release cites a review, an effect or a Git object.
+`REVIEW`, `FIX`, `REPLAN_REEXECUTE` and `UPDATE_EPIC` get no `memory.md`,
+no Memory section in their prompt and add nothing to the store: the
+reviewer is the independent check, and `FIX` follows once
+`ANALYZE_EXECUTE` has an evaluation result (ADR 0015 D13). `doctor`'s
+`Issue Working Memory` row says the same. With Memory off, every prompt,
+read context and state file is what it was before this release, and a
+`memory` field in a result is ignored. No Memory launch has yet been run
+against a live repository and a real Pi.
+
+### Enforcement
+
+With Memory on, enforcement is mandatory: a Memory
 `ANALYZE_EXECUTE` launch runs only inside the outer sandbox, with Pi's
 agent directory in its private home
 ([Configuration](configuration.md#issue-working-memory)). It runs under

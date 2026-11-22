@@ -216,6 +216,13 @@ certificate.py      review certificates: issuance from the review binding, appli
 result_parser.py    CONTROL_RESULT extraction and strict per-phase validation
 state.py            persisted controller state, atomic writes, schema/protocol checks; the
                     protocol label's classification (protocol_support, #265)
+memory.py           Issue Working Memory (#317, ADR 0015 D9, D10, D12): the store in the
+                    checkpoint, its lifecycle validator and the pure, budgeted projection;
+                    launches nothing and advances nothing
+memory_handoff.py   Memory's single-agent handoff (#333, ADR 0015 D11 to D13): the
+                    projection of an ANALYZE_EXECUTE launch, the controller's validation-
+                    failure observation and an accepted result's proposals; decides no
+                    phase, write, budget or merge, and reads no file or network
 provenance.py       the running controller's identity (imported package file, interpreter,
                     version, protocol) and the protocol-mismatch diagnostic the CLI prints;
                     reads and writes nothing (#265)
@@ -456,4 +463,7 @@ recovery_package.py, engine.py (unblock_preview) -> docs/adr/0011-typed-stop-cla
                                                      and-advisor-gates.md for the package)
 redaction.py, runlog.py, doctor.py (env rows),
 error messages                                    -> docs/agent-guides/secrets-and-logging.md
+memory.py, memory_handoff.py, engine.py (what a
+launch is shown of earlier launches)              -> docs/adr/0015-task-state-issue-memory-and-
+                                                     crash-order.md + docs/evaluation-protocol.md
 ```

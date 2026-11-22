@@ -401,6 +401,42 @@ class Doctor:
             name, True, f"{len(commands)} definition(s): {listed}; {mode}", required=False
         )
 
+    def check_memory(self) -> CheckResult:
+        """What Issue Working Memory does for a run of this configuration (#333; informational).
+
+        The supported phase, provider and mode, named as ADR 0015 D13 and D20
+        decide them, and every agent phase that gets no projection and adds
+        nothing, so no parity is claimed for it. Whether a launch may run is
+        decided by the launch's own checks, which the ``outer sandbox: mode``
+        row and the step's refusal report; this row runs nothing.
+        """
+        from .memory_handoff import MEMORY_FILE, SUPPORTED_PHASES, UNSUPPORTED_PHASES
+
+        name = "Issue Working Memory"
+        cfg = self.config
+        if cfg is None:
+            return CheckResult(name, False, "(config check failed)", required=False)
+        if not cfg.memory.enabled:
+            return CheckResult(
+                name,
+                True,
+                "off (memory.enabled: false): no launch is shown Memory and nothing is collected",
+                required=False,
+            )
+        phases = ", ".join(phase.value for phase in SUPPORTED_PHASES)
+        unsupported = "; ".join(
+            f"{phase.value} ({why})" for phase, why in UNSUPPORTED_PHASES.items()
+        )
+        detail = (
+            f"on: {phases} only, through the pi provider of profile 'analyze_execute' inside the "
+            f"enforced outer sandbox (sandbox.mode: required). Each launch reads {MEMORY_FILE} in "
+            "its read context; the controller records its validation failures and an accepted "
+            "result's proposals. Not supported, no projection and nothing collected: "
+            f"{unsupported}. Launch ends and refused candidates are not collected. No live run "
+            "of a Memory launch is recorded"
+        )
+        return CheckResult(name, True, detail, required=False)
+
     def check_controller(self) -> CheckResult:
         """The controller this ``doctor`` runs as (#265): informational, never a failure.
 
@@ -1936,6 +1972,7 @@ class Doctor:
             self.check_merge_gate(),
             self.check_premerge_verification(),
             self.check_candidate_validation(),
+            self.check_memory(),
         ]
         cfg = self.config
         gh = cfg.github.command if cfg else "gh"
