@@ -480,9 +480,9 @@ from .memory_handoff import (
     MEMORY_FILE,
     MEMORY_FILE_DESCRIPTION,
     LaunchProjection,
+    Proposals,
     admit_proposals,
     bind_proposals,
-    bound_proposals,
     observe_validation_failure,
     projection_request,
     render_launch_projection,
@@ -2114,6 +2114,14 @@ class ControllerEngine:
         # `_invoke_phase` only around that write, so no other launch's read
         # context, and no other phase's, ever holds a memory.md.
         self._memory_projection: LaunchProjection | None = None
+        # The Memory proposals of the reply this process parsed for the
+        # launch of ordinal ``launch_seq``, bound to what that launch was
+        # shown (R2-F1 of PR #536): the controller's own record, never the
+        # result's ``memory`` field and never persisted. Set by
+        # `_invoke_phase` on a Memory launch's fresh reply and cleared when
+        # it is entered again, so a reply kept across a restart, or gone on
+        # from by a later invocation, admits nothing.
+        self._memory_binding: tuple[int, Proposals] | None = None
         # Why the read context of this process's last FIX launch does not show
         # the PR body a K12 update would replace, "" when it shows it whole
         # (#423, PR #467 R1-F2). Not persisted: a result is only ever checked
@@ -4966,26 +4974,34 @@ class ControllerEngine:
             return ""
         return read.head if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", read.head) else ""
 
-    def _admit_memory(self, phase: Phase, raw: object) -> None:
+    def _admit_memory(self, phase: Phase) -> None:
         """Admit an accepted result's proposals into the run's Memory, for the caller's save.
 
         Called only where the result is accepted, before the save that
         accepts it: ANALYZE_EXECUTE's plan save, or the stop save of its
-        ``blocked`` or ``failure`` result (ADR 0015 D9.8, D4.6). ``raw`` is
-        the result's ``memory`` field as the reply's launch bound it
-        (:func:`~autoforge.memory_handoff.bind_proposals`), whether the step
-        goes on from a fresh reply or from one kept across a restart; a field
-        nothing bound admits nothing. Nothing for a phase Memory does not
-        support, with Memory off, or for an entry the step has not read. What
-        the store refuses is counted there and never changes the step.
+        ``blocked`` or ``failure`` result (ADR 0015 D9.8, D4.6). What is
+        admitted is what this process bound when it parsed the reply of the
+        run's latest launch (:attr:`_memory_binding`,
+        :func:`~autoforge.memory_handoff.bind_proposals`), never the result's
+        ``memory`` field: a matching shape is the agent's, and authorizes
+        nothing (R2-F1 of PR #536). So a step that goes on from a reply kept
+        across a restart (#479) admits none, whichever controller kept it and
+        whether or not its launch was shown Memory, and counts none: the
+        state keeps no controller record of what that launch was shown.
+        Nothing for a phase Memory does not support, with Memory off, or for
+        an entry the step has not read. What the store refuses is counted
+        there and never changes the step.
         """
         state = self._require_state()
+        binding, self._memory_binding = self._memory_binding, None
         entry = self._analyze_entry
         if not memory_supported(phase) or not state.issue_memory.get("enabled") or entry is None:
             return
+        if binding is None or binding[0] != state.launch_seq:
+            return
         admission = admit_proposals(
             state.memory(),
-            bound_proposals(raw),
+            binding[1],
             step=self._memory_step(phase),
             attempt=state.launch_seq,
             input_sha=entry.base_sha,
@@ -7026,7 +7042,7 @@ class ControllerEngine:
             stop = agent_status(str(status), previous)
             # #333 (ADR 0015 D4.6, D9.8): the stop is this result's acceptance,
             # so its Memory proposals are admitted in the same save.
-            self._admit_memory(previous, payload.get("memory"))
+            self._admit_memory(previous)
             state.phase = nxt
             state.block_reason = message
             # #374: the code goes with the stop it names, for a later status.
@@ -17218,6 +17234,8 @@ class ControllerEngine:
         """
         assert_shared_git_lock_free(f"launch the {phase.value} agent")
         state = self._require_state()
+        # R2-F1 of PR #536: only the reply this invocation parses binds Memory.
+        self._memory_binding = None
         profile = profile_for_phase(self.config, phase, state.review_round)
         provider = self.providers.get(profile)
         provider.validate_profile(profile)
@@ -17808,13 +17826,17 @@ class ControllerEngine:
                 raise ControlResultValidationError(failed) from exc
             record.parsed_result = payload
             if memory is not None:
-                # R1-F2, R1-F3 of PR #536: the result's Memory proposals bound
-                # to this launch, once, while what it was shown is known: a
-                # revision only of a record it was shown, at that revision,
-                # and no text the redactor would change. The step goes on from
-                # the bound form and a kept reply keeps it, so a restart admits
-                # what this process would have, and never a secret redacted.
-                payload = {**payload, "memory": bind_proposals(payload.get("memory"), memory.shown)}
+                # R1-F2 of PR #536: the result's Memory proposals bound to this
+                # launch, once, while what it was shown is known: a revision
+                # only of a record it was shown, at that revision, and no text
+                # the redactor would change. Held here, beside the payload and
+                # never in it (R2-F1, R2-F2): the payload stays what Memory off
+                # would keep, and a kept reply carries no binding a restart
+                # could mistake for the controller's.
+                self._memory_binding = (
+                    state.launch_seq,
+                    bind_proposals(payload.get("memory"), memory.shown),
+                )
             if launch_failure is not None and delivery is not None:
                 # #479: provisional, never yet accepted (R1-F4 of PR #481).
                 # The launch's end stays on its record as the facts it is
@@ -18486,9 +18508,7 @@ class ControllerEngine:
     # -- verification + state application -------------------------------------------
     def _verify_and_apply(self, phase: Phase, payload: dict) -> tuple[Phase, str]:
         if phase == Phase.ANALYZE_EXECUTE:
-            return self._apply_analyze(
-                AnalyzeExecuteResult.from_payload(payload), payload.get("memory")
-            )
+            return self._apply_analyze(AnalyzeExecuteResult.from_payload(payload))
         if phase == Phase.REVIEW:
             return self._apply_review(ReviewResult.from_payload(payload))
         if phase == Phase.FIX:
@@ -18499,7 +18519,7 @@ class ControllerEngine:
             return self._apply_update_epic(payload)
         raise StateTransitionError(f"phase {phase.value} does not accept agent results")
 
-    def _apply_analyze(self, res: AnalyzeExecuteResult, memory: object = None) -> tuple[Phase, str]:
+    def _apply_analyze(self, res: AnalyzeExecuteResult) -> tuple[Phase, str]:
         """Plan, publish and complete ANALYZE_EXECUTE from the accepted candidate (#161).
 
         The result was checked before it was accepted
@@ -18513,9 +18533,10 @@ class ControllerEngine:
         the PR (K2 to open it, K3 to adopt) are planned and saved with the
         completion context in one save, and :meth:`_complete_analyze` does
         the rest from what was saved, as a later entry would. The result's
-        Memory proposals (``memory``, #333) are admitted in that plan save,
-        the save that accepts the result, and in no earlier one: a result
-        that stops before its plan leaves none (ADR 0015 D9.8).
+        Memory proposals (#333), as the process that parsed its reply bound
+        them, are admitted in that plan save, the save that accepts the
+        result, and in no earlier one: a result that stops before its plan
+        leaves none (ADR 0015 D9.8).
         """
         state = self._require_state()
         entry = self._analyze_entry
@@ -18635,7 +18656,7 @@ class ControllerEngine:
         # the entry observation the pre-launch save persisted: a plan that
         # fails is never written.
         state.phase_effects()
-        self._admit_memory(Phase.ANALYZE_EXECUTE, memory)
+        self._admit_memory(Phase.ANALYZE_EXECUTE)
         self._save_plan()
         return self._complete_analyze()
 

@@ -16,14 +16,17 @@ after a failure is shown it. An agent may add up to eight notes, or correct
 or retract an earlier proposal its `memory.md` shows, through an optional
 `memory` list in its result. They are kept only with a result the controller accepts: a
 published success, or a `blocked` or `failure` result, whose notes the
-launch after an `unblock` is shown. Each launch's run log records what it
+launch after an `unblock` is shown. A reply kept across a restart (one
+delivered before its launch timed out or exited badly) is recovered as
+before but adds no entry. Each launch's run log records what it
 was shown, by size, count and digest. `REVIEW`, `FIX`, `REPLAN_REEXECUTE`
 and `UPDATE_EPIC` get no Memory, and `doctor` has a row that says so.
-With Memory off, which stays the default, prompts, read contexts and state
-files are unchanged, and a `memory` field in a result is ignored. The
-prompt label moves from v18 to v19, and the evaluation protocol records the
-amendment. No state protocol change. No Memory launch has yet been run
-against a live repository.
+The prompt label moves from v18 to v19, and the evaluation protocol records
+the amendment. With Memory off, which stays the default, read contexts are
+unchanged, a `memory` field in a result is ignored, and prompts and state
+files differ from the previous release's only by that label: the first line
+of every prompt and the state's `prompt_version`. No state protocol change.
+No Memory launch has yet been run against a live repository.
 
 ### `claim-ambiguous`: `status` goes by what the reason names (#375)
 

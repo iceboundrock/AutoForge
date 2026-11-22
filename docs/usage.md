@@ -2635,8 +2635,12 @@ the record rests on, so no crash separates them:
   (past a bound, text the redactor would change, a revision of the
   controller's or the operator's record, or of a record the launch was not
   shown) is counted in `memory show`'s refusals and changes nothing else.
-  A reply kept across a restart admits the same entries the fresh reply
-  would have.
+  A reply the state keeps because its launch delivered it and then timed
+  out or exited badly (#479) is recovered across a restart as before, but
+  its entries are not admitted: which records its launch was shown is
+  known only to the process that parsed the reply, and the result's own
+  `memory` field is never trusted for it. Only a restart loses them; in
+  the process that launched, they are admitted as usual.
 
 Nothing else is collected. A launch's typed end (a timeout, a failed
 exit) and a candidate the controller's checks refuse are not recorded,
@@ -2645,10 +2649,13 @@ and no record of this release cites a review, an effect or a Git object.
 no Memory section in their prompt and add nothing to the store: the
 reviewer is the independent check, and `FIX` follows once
 `ANALYZE_EXECUTE` has an evaluation result (ADR 0015 D13). `doctor`'s
-`Issue Working Memory` row says the same. With Memory off, every prompt,
-read context and state file is what it was before this release, and a
-`memory` field in a result is ignored. No Memory launch has yet been run
-against a live repository and a real Pi.
+`Issue Working Memory` row says the same. With Memory off, every read
+context is what it was before this release, a `memory` field in a result is
+ignored, and every prompt and state file differs from the previous
+release's in one place only: the prompt label, `v19` where it was `v18`, in
+the first line of every prompt and in the state's `prompt_version` (ADR
+0015 D19 moves it with the prompt change that names `memory.md`). No
+Memory launch has yet been run against a live repository and a real Pi.
 
 ### Enforcement
 

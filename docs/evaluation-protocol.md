@@ -460,7 +460,10 @@ own objects.
 conflicting memories, corrected memory, volatile GitHub state, scope boundary, negative debugging
 lesson, hallucinated lesson candidate, prompt-injection string, incomplete index watermark. The
 retrieval metrics (Recall@K, MRR) and offline-distillation costs belong to EPIC #331's optional
-evaluation, not to this one.
+evaluation, not to this one. #333 holds each of them that applies to its slice offline, through
+Memory delivery to `ANALYZE_EXECUTE`, in `tests/test_memory_handoff.py`; ADR 0015's implementation
+note names the test for each, and the incomplete index watermark waits for #326's index. Those are
+controller-correctness tests like section 7's, not a Memory-arm result: arm 2 stays `NOT_EVALUATED`.
 
 ## 9. Real runs
 
@@ -570,7 +573,7 @@ An amendment changes the files of section 1 and these digests in one reviewed ch
 report refuses to decide over records of another, so criteria cannot move under results.
 
 - `manifest.json`: `b9a2ce04720e91223ec6fc375db1eae3357c3d57da3d7c0c4d3d79321b0f3bf9`
-- `preregistration.json`: `23b0b5d0de1ca4a53563b734a885ebfdd5383b96ae8541f099e9edbfb63faa2b`
+- `preregistration.json`: `469feb38ccf2f226c71a9365fd0fd345b6f5dd5c87607c59e5fd6349e954d3bc`
 - `real_run_config.yaml`: `0314fa68a9af6a6e2879410735bec0a3d7bacf351f994249029c80605ed4f346`
 
 | Date | Change | Why | Real runs before it |
@@ -580,4 +583,4 @@ report refuses to decide over records of another, so criteria cannot move under 
 | 2026-11-07 | Two allow-list keys are added under `execution`, which moves the settings digest and the digests that hold it. | #286 gives agent launches and repository commands an allow-list key each. `real_run_config.yaml` sets neither, so every launch of every arm gets the names it got before, and no threshold, task or other setting changes. `tests/evaluation.py` reads the repository commands' names, as the engine now does, so its copy of the validation policy stays the engine's. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |
 | 2026-11-11 | The prompt label moves from `v17` to `v18`, which moves the settings digest and the digests that hold it. | #433 changed the prompts: a FIX agent that must report `blocked` may list the findings it fixed and the ones it left, and the controller publishes the commits it verifies; a REVIEW agent is told how such a partial fix is carried to it. Every arm runs one controller commit with one label, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |
 | 2026-11-16 | Four keys are added under `sandbox.container`, which moves the settings digest and the digests that hold it. | #292 adds the container backend's seed settings (`history_depth`, `history_tags`, `seed_max_bytes`, `seed_max_objects`). Nothing reads them before that backend is selectable, `real_run_config.yaml` sets none, and every launch of every arm is what it was, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added to the repository since. |
-| 2026-11-22 | The prompt label moves from `v18` to `v19`, which moves the settings digest and the digests that hold it. | #333 delivers Issue Working Memory to ANALYZE_EXECUTE: a run that keeps Memory gets a section naming its `memory.md` and an optional `memory` list in its result. A run without Memory renders the prompt it rendered before, byte for byte, so an arm without Memory runs what it ran, and the Memory arm's treatment is what it measures. Every arm runs one controller commit with one label, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added to the repository since. |
+| 2026-11-22 | The prompt label moves from `v18` to `v19`, which moves the settings digest and the digests that hold it. | #333 delivers Issue Working Memory to ANALYZE_EXECUTE: a run that keeps Memory gets a section naming its `memory.md` and an optional `memory` list in its result. A run without Memory renders the prompt it rendered before but for the label in its first line, and saves the state it saved but for `prompt_version` (`tests/test_memory_handoff.py` holds both against the release before), so an arm without Memory runs what it ran, and the Memory arm's treatment is what it measures. Every arm runs one controller commit with one label, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added to the repository since. |

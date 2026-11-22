@@ -503,9 +503,16 @@ a `correct` or `retract` of a record that launch's `memory.md` did not show
 refused there, and one it showed is made against the record revision it
 showed, so a second change of one record in one result is stale. A `text`
 the redactor would change is refused at that point too, and a `reason` is
-kept redacted. A reply kept across a restart (#479) holds the bound list,
-not the agent's, so it admits exactly what the fresh reply would have, and
-the redaction of a kept reply never turns a refused text into a kept one.
+kept redacted. That binding is the controller's: it is held by the process
+that parsed the reply and is never written into the result, so the `memory`
+key stays the agent's data, whatever its shape (R2-F1 of PR #536). A reply
+kept across a restart (#479) is kept as Memory off keeps it, the agent's
+list included, and is recovered as before. Nothing of its list is admitted
+or counted: the state keeps no controller record of what its launch was
+shown, so no shape the list takes, even one written by a controller before
+this rule, can authorize an `add`, a `correct` or a `retract`. Nothing
+Memory adds counts against the reply's bound either (R2-F2), so a reply is
+kept or refused exactly as with Memory off.
 A refusal is counted and changes nothing else: the result is handled as it
 would be without the list, so Memory never refuses, corrects or delays a
 result.

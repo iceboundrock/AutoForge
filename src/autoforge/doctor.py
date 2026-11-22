@@ -429,7 +429,8 @@ class Doctor:
         )
         detail = (
             f"on: {phases} only, through the pi provider of profile 'analyze_execute' inside the "
-            f"enforced outer sandbox (sandbox.mode: required). Each launch reads {MEMORY_FILE} in "
+            "enforced outer sandbox (sandbox.mode: required, or preferred, its alias; never "
+            f"disabled). Each launch reads {MEMORY_FILE} in "
             "its read context; the controller records its validation failures and an accepted "
             "result's proposals. Not supported, no projection and nothing collected: "
             f"{unsupported}. Launch ends and refused candidates are not collected. No live run "
