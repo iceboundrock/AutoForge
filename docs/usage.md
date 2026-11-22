@@ -5,6 +5,10 @@ the commands, where a run stops and what to do there, and how to recover.
 For the config file see [Configuration](configuration.md). Installation and
 prerequisites are in the [README](../README.md#prerequisites); a stopped or
 failed run, by symptom, in [Troubleshooting and recovery](troubleshooting.md).
+Some of what this page describes is experimental, among it the
+controller's merge and `UPDATE_EPIC`, the parallel EPIC scheduler and the
+outer sandbox: [What works today](../README.md#what-works-today) gives each
+capability's status and its evidence.
 
 The commands are written `uv run autoforge ...`, the form inside a
 development clone of AutoForge. With the command installed

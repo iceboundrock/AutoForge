@@ -334,7 +334,7 @@ The [Pi policy](pi-policy.md) is authoritative. In short:
 ## Unattended use
 
 AutoForge as a whole does not claim unattended production operation yet
-([README](../README.md#current-maturity)). For Pi the decision is the one
+([README](../README.md#known-limitations)). For Pi the decision is the one
 ADR 0002 §4b and the [Pi policy](pi-policy.md) §10 record:
 
 - **On Linux**, Pi meets the same bar as the other providers: what its

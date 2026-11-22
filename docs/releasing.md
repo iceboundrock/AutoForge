@@ -93,8 +93,9 @@ the `gh` commands of steps 3 and 8 find the repository from it.
    turn `## Unreleased` into the release's section; re-check every cell of
    [the compatibility matrix](compatibility.md) against this commit and the
    current releases of each tool, and record the date; update
-   [`SECURITY.md`](../SECURITY.md) if the supported versions change. The
-   maintainer reviews and merges it. A pull request that touches
+   [`SECURITY.md`](../SECURITY.md) if the supported versions change; run
+   the [documentation accuracy checklist](#documentation-accuracy-checklist)
+   on its head. The maintainer reviews and merges it. A pull request that touches
    `.github/workflows/` is never merged by AutoForge's controller
    (`safety.protected_merge_paths`).
 2. **Wait for a green `ci` on the merge commit of `main`**, including
@@ -173,6 +174,95 @@ the `gh` commands of steps 3 and 8 find the repository from it.
       say which release carries the fixes of the rows marked *Fixed on
       `main`*, whose introduction says that no release does yet;
     - link the record of step 10 on #256 and #255 from the pull request.
+
+## Documentation accuracy checklist
+
+Gate 6 of the Public Alpha
+([#255](https://github.com/iceboundrock/AutoForge/issues/255)) asks that
+every operator-facing statement match the release candidate. This
+checklist is that check, run on the head of the release-prep pull request
+(step 1) and again whenever a later commit changes the candidate. It
+covers [`README.md`](../README.md), the [documentation index](README.md),
+[Getting started](getting-started.md), the opening sections of
+[Running the remote workflow](usage.md) and [Configuration](configuration.md),
+the comments of [`autoforge.example.yaml`](../autoforge.example.yaml) and
+the [starters](../examples), and each ADR's status line with its index
+row. [Compatibility](compatibility.md) has its own re-check in step 1.
+
+**Offline items**, which an agent or CI can run with no credential. Their
+result goes in the release-prep pull request, one line per item.
+
+1. **The documentation tests pass**, as part of `make check`.
+   `tests/test_readme.py` holds the README's first screen (what AutoForge
+   is, its status, the Getting started link), the feature matrix (one
+   status of three and an evidence link per row, and no status claimed
+   outside the matrices), the provider matrix against `default_config()`
+   and `doctor`'s agent rows, the version floors the Prerequisites state
+   against the ones `doctor` enforces, Configuration's table of built-in
+   profiles against `default_config()`, and every link of the README and
+   the index, and every link into the README, against the files and
+   headings that exist. The troubleshooting guide, the demonstration
+   procedure and the ADRs have link and citation tests of their own
+   (`tests/test_troubleshooting_guide.py`, `tests/test_demo_guide.py`,
+   `tests/test_container_backend_record.py`, `tests/test_adr_0015.py`).
+2. **The commands that need no credential run as shown.** `make
+   dist-check` installs the built wheel and runs `--version`, `--help`,
+   `doctor`'s rows that need no sign-in and a dry run with each starter
+   ([Clean-room first run](clean-room.md)). Beyond it, run the README's
+   install from the candidate's commit (`uv tool install --python 3.12
+   'git+https://github.com/iceboundrock/AutoForge@<commit>'`, then
+   `autoforge --version`), fetch each starter from that commit with the
+   Quick start's `curl`, and run the Contributing section's `uv sync`,
+   `uv run autoforge --help` and `make check` in a fresh clone.
+3. **Each status still matches the code.** For every row of the README's
+   "What works today", read the code and the evidence its link names at
+   the candidate: a capability built since the last check gets a row, and
+   a row whose evidence moved says so. A row changes status only on
+   evidence; promoting an Experimental row is a maintainer item (below).
+4. **Nothing experimental or unavailable reads as supported.** Read the
+   covered documents for each capability the matrix marks Experimental or
+   Not available, and for the words that claim maturity:
+
+   ```bash
+   grep -nwiE 'supported|stable|production|works' README.md docs/README.md \
+     docs/getting-started.md autoforge.example.yaml examples/*.yaml
+   ```
+
+   Each hit either agrees with the matrix or is fixed.
+5. **The release notes match `CHANGELOG.md`.** The notes file of step 8
+   is the text of the release's changelog section, byte for byte, and
+   that section names no change the candidate does not hold.
+6. **Every link resolves.** The tests of item 1 check the relative ones.
+   Check the absolute ones of the README and the index, none of which
+   needs a credential:
+
+   ```bash
+   grep -ohE '\]\(https://[^)]+\)' README.md docs/README.md |
+     sed -E 's/^\]\(//; s/\)$//' | sort -u |
+     while read -r url; do
+       printf '%s %s\n' "$(curl -sIL -o /dev/null -w '%{http_code}' "$url")" "$url"
+     done
+   ```
+
+   Every line starts with `200`. A link to `main` that the candidate's
+   own copy does not have yet is listed in the pull request instead.
+
+**Maintainer items**, which need credentials or judgement. Their result
+goes on #255.
+
+1. **The credentialed commands run as shown.** The Quick start and
+   Getting started steps that need a `gh` sign-in and agent logins
+   (`gh repo create`, `doctor`, the dry run, the real run) run as written
+   on the candidate: the [clean-room first run](clean-room.md) of Gates 1
+   and 2 is this item's record.
+2. **The positioning still holds.** The README's opening, "Why
+   AutoForge?" and each differentiator's evidence still describe what a
+   run does, and the status line names the release being cut (the Public
+   Alpha only once #255 records its Go).
+3. **The statuses are the ones #255 decided.** Each Experimental row whose
+   exit condition is a recorded run (the outer sandbox on a capable host,
+   operator actions on another repository) stays Experimental until that
+   record exists, and moves only by the maintainer's decision.
 
 ## Publishing to PyPI
 

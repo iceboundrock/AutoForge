@@ -1,13 +1,14 @@
 # ADR 0008. Parallel EPIC scheduler: authority, run identity, durable claims and lock decomposition
 
-- **Status:** accepted for implementation. This is a design record; nothing
-  in it is implemented. It is implemented by #178 (run identities and
-  namespaces), #179 (dependency snapshots and the ready set), #180 (lock
-  domains), #181 (scheduler claims and restart reconciliation), #182 (the
-  bounded worker supervisor) and #183 (the `epic` commands and the
-  end-to-end recovery tests). The number is assigned when the record
-  merges: if another ADR merges first, this record takes the next free
-  number, and its index entries move with it.
+- **Status:** accepted, and implemented. The record merged as a design
+  record, with nothing in it implemented (#177, 2026-10-17); #178 (run
+  identities and namespaces), #179 (dependency snapshots and the ready
+  set), #180 (lock domains), #181 (scheduler claims and restart
+  reconciliation), #182 (the bounded worker supervisor) and #183 (the
+  `epic` commands and the end-to-end recovery tests) implemented it
+  between 2026-10-18 and 2026-10-20. The scheduler is experimental: it is
+  verified offline and has not driven a real EPIC
+  ([README](../../README.md#what-works-today)).
 - **Note:** [ADR 0009](0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md) removed LOCAL mode (#388). D17.5 (LOCAL
   excluded from scheduler runs by L0) and the LOCAL mentions in §1.1, §2.5,
   §2.12, §3 and §4 no longer apply; ADR 0009 D4's rule for a standalone
