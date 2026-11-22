@@ -479,13 +479,11 @@ from .memory_handoff import (
     MAX_TEXT_BYTES,
     MEMORY_FILE,
     MEMORY_FILE_DESCRIPTION,
+    LaunchBinding,
     LaunchProjection,
-    Proposals,
     admit_proposals,
-    bind_proposals,
     observe_validation_failure,
-    projection_request,
-    render_launch_projection,
+    prepare_launch_projection,
     validation_failure_text,
 )
 from .memory_handoff import supported as memory_supported
@@ -2116,12 +2114,13 @@ class ControllerEngine:
         self._memory_projection: LaunchProjection | None = None
         # The Memory proposals of the reply this process parsed for the
         # launch of ordinal ``launch_seq``, bound to what that launch was
-        # shown (R2-F1 of PR #536): the controller's own record, never the
-        # result's ``memory`` field and never persisted. Set by
-        # `_invoke_phase` on a Memory launch's fresh reply and cleared when
-        # it is entered again, so a reply kept across a restart, or gone on
-        # from by a later invocation, admits nothing.
-        self._memory_binding: tuple[int, Proposals] | None = None
+        # shown and beside the commit it started from (R2-F1, R3-F2 of PR
+        # #536): the controller's own record, never the result's ``memory``
+        # field and never persisted. Set by `_invoke_phase` on a Memory
+        # launch's fresh reply and cleared when it is entered again, so a
+        # reply kept across a restart, or gone on from by a later
+        # invocation, admits nothing.
+        self._memory_binding: LaunchBinding | None = None
         # Why the read context of this process's last FIX launch does not show
         # the PR body a K12 update would replace, "" when it shows it whole
         # (#423, PR #467 R1-F2). Not persisted: a result is only ever checked
@@ -4872,7 +4871,12 @@ class ControllerEngine:
         launch's gate holds to the configuration), whether or not the store
         holds a record: the section names ``memory.md`` and the optional
         ``memory`` list, never a record's text. With Memory off it is "", so
-        the prompt is byte for byte the one a Memory-off release renders.
+        the prompt holds nothing of Memory. That is not byte for byte the
+        previous release's prompt: a run created now names the label this
+        release moved to (``v19``, ADR 0015 D19) in its first line, which is
+        all a new Memory-off run's prompt differs by
+        (``tests/fixtures/memory_off_baseline/``), and a run created earlier
+        keeps naming the label it was created with (R3-F5 of PR #536).
         """
         if not self._require_state().issue_memory.get("enabled"):
             return ""
@@ -4911,36 +4915,49 @@ class ControllerEngine:
         import, read as the candidate is, when it is not the entry's base (a
         relaunch after a validation failure starts from the commit that
         failed), and none otherwise. The bases of the store's range-bound
-        records the candidate descends from are proved through the
-        controller's transport; one whose ancestry cannot be read is left
-        out, so a record bound to it is omitted, never shown as current. A
-        store that cannot be rendered refuses the launch here, before
-        anything of it is saved (D18): Memory is never dropped from a Memory
-        launch.
+        records the candidate descends from are proved by a bounded walk of
+        the shared store's own commits (:meth:`_memory_parents`,
+        :func:`~autoforge.memory_handoff.local_ancestors`), never by asking
+        GitHub or fetching (R3-F1 of PR #536): one the walk does not reach
+        is left out, so a record bound to it is omitted, never shown as
+        current. The commit read is the launch's input, which keys its
+        proposals (R3-F2), and the whole preparation is timed. A store that
+        cannot be rendered refuses the launch here, before anything of it is
+        saved (D18): Memory is never dropped from a Memory launch.
         """
         state = self._require_state()
         if not memory_supported(phase) or not state.issue_memory.get("enabled"):
             return None
-        store = state.memory()
         entry = self._analyze_entry
-        base = entry.base_sha if entry is not None else ""
-        head = self._memory_candidate(cwd)
-        candidate = head if head != base else ""
-        ancestors: list[str] = []
-        if candidate:
-            transport = self._git_transport()
-            for ancestor in store.range_bases(state.current_issue_url):
-                if ancestor == candidate:
-                    continue
-                try:
-                    if transport.descends_from(candidate, ancestor):
-                        ancestors.append(ancestor)
-                except (AutoForgeError, OSError):
-                    continue
-        request = projection_request(
-            store, self._memory_step(phase), candidate=candidate, ancestors=ancestors
+        return prepare_launch_projection(
+            state.memory(),
+            self._memory_step(phase),
+            base=entry.base_sha if entry is not None else "",
+            read_head=lambda: self._memory_candidate(cwd),
+            read_parents=self._memory_parents(),
+            validation_records=state.validation_records,
         )
-        return render_launch_projection(store, request, validation_records=state.validation_records)
+
+    def _memory_parents(self) -> Callable[[str], tuple[str, ...] | None]:
+        """A reader of a commit's parents for the projection's ancestry walk (R3-F1 of PR #536).
+
+        Each commit is read as its own bytes from the shared store, re-hashed
+        and never substituted (:meth:`GitTransport.read_local_commit`): one
+        the store does not hold is ``None``, never fetched, and nothing asks
+        GitHub, so Memory adds no network call to a launch. The transport is
+        made on the first read, so a projection with no range-bound record
+        to prove makes none.
+        """
+        transport: GitTransport | None = None
+
+        def parents(sha: str) -> tuple[str, ...] | None:
+            nonlocal transport
+            if transport is None:
+                transport = self._git_transport()
+            record = transport.read_local_commit(sha)
+            return None if record is None else record.parents
+
+        return parents
 
     def _memory_candidate(self, cwd: str) -> str:
         """The commit a Memory launch in ``cwd`` starts from, or "" for none (R1-F1 of PR #536).
@@ -4997,14 +5014,17 @@ class ControllerEngine:
         entry = self._analyze_entry
         if not memory_supported(phase) or not state.issue_memory.get("enabled") or entry is None:
             return
-        if binding is None or binding[0] != state.launch_seq:
+        if binding is None or binding.launch != state.launch_seq:
             return
+        # Keyed by the commit the launch started from, as this process read
+        # it before the launch (R3-F2 of PR #536), never the entry's base: a
+        # retry on a failed candidate started from that candidate.
         admission = admit_proposals(
             state.memory(),
-            binding[1],
+            binding.proposals,
             step=self._memory_step(phase),
             attempt=state.launch_seq,
-            input_sha=entry.base_sha,
+            input_sha=binding.input_sha,
         )
         if admission.offered:
             state.issue_memory = admission.store.encode()
@@ -17828,15 +17848,14 @@ class ControllerEngine:
             if memory is not None:
                 # R1-F2 of PR #536: the result's Memory proposals bound to this
                 # launch, once, while what it was shown is known: a revision
-                # only of a record it was shown, at that revision, and no text
-                # the redactor would change. Held here, beside the payload and
-                # never in it (R2-F1, R2-F2): the payload stays what Memory off
-                # would keep, and a kept reply carries no binding a restart
-                # could mistake for the controller's.
-                self._memory_binding = (
-                    state.launch_seq,
-                    bind_proposals(payload.get("memory"), memory.shown),
-                )
+                # only of a record it was shown, at that revision, no text past
+                # the store's bounds or that the redactor would change, and
+                # each reason redacted and bounded (R3-F4), beside the commit
+                # the launch started from (R3-F2). Held here, beside the
+                # payload and never in it (R2-F1, R2-F2): the payload stays
+                # what Memory off would keep, and a kept reply carries no
+                # binding a restart could mistake for the controller's.
+                self._memory_binding = memory.bind(payload.get("memory"), state.launch_seq)
             if launch_failure is not None and delivery is not None:
                 # #479: provisional, never yet accepted (R1-F4 of PR #481).
                 # The launch's end stays on its record as the facts it is

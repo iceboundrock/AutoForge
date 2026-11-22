@@ -2602,11 +2602,20 @@ validation failure left), and none otherwise. `HEAD` is read through the
 worktree's registry entry, as the candidate is after a launch, never
 through its `.git` file, which an earlier launch of the step could have
 rewritten; when that binding cannot be confirmed, no candidate is bound and
-every record bound to one is left out. The controller never reads
-it back. The launch's run log records what it was shown in
+every record bound to one is left out. Whether the candidate descends from
+the base a record is bound to is read from the local object store alone:
+each commit from the candidate down is read as its own bytes and re-hashed,
+at most 64 of them, and nothing asks GitHub or fetches, so Memory adds no
+network call to a launch and a retry on the commit that failed is shown
+that failure whatever GitHub answers. A base the walk does not reach is
+not proved, and a record bound to it is left out. The controller never
+reads the file back. The launch's run log records what it was shown in
 `request.json`'s `metadata.memory`: the revision and digests, the counts,
-the file's size and its SHA-256, and how long the render took
-(`render_ms`), never a record's text.
+the file's size and its SHA-256, the commit the launch started from
+(`input`), how many commits the ancestry walk read (`ancestry_reads`), and
+how long Memory's preparation took, the candidate's read, the walk and the
+render together (`projection_ms`, the per-launch latency the evaluation
+reads), with the render's share (`render_ms`), never a record's text.
 
 Two writers add to the store, each in the save that already records what
 the record rests on, so no crash separates them:
@@ -2628,13 +2637,21 @@ the record rests on, so no crash separates them:
   `memory.md` showed, against the revision it showed
   ([CONTROL_RESULT protocol](agent-guides/control-result-protocol.md#analyze_executes-optional-memory-list-333)).
   They are saved only with a result the controller accepts: the plan of a
-  success, or the stop of a `blocked` or `failure` result. After an
+  success, in the save that plans its push and pull request, so they stay
+  if either then fails, or the stop of a `blocked` or `failure` result.
+  Each added entry is keyed by its launch, the commit that launch started
+  from and its place in the list, so the same result admitted again adds
+  nothing; it applies to every later launch of the phase on the issue,
+  whichever commit that launch starts from. After an
   `unblock`, the next launch is shown a blocked result's entries as
   proposals. A refused or corrected reply, one whose commit fails
   validation and one lost to a crash keep none. An entry the store refuses
   (past a bound, text the redactor would change, a revision of the
   controller's or the operator's record, or of a record the launch was not
   shown) is counted in `memory show`'s refusals and changes nothing else.
+  A note past 2,048 bytes is refused, and a reason past 256 bytes is
+  redacted and cut, when the reply is parsed: the controller never holds
+  more of an entry than the store would keep.
   A reply the state keeps because its launch delivered it and then timed
   out or exited badly (#479) is recovered across a restart as before, but
   its entries are not admitted: which records its launch was shown is
@@ -2650,12 +2667,17 @@ no Memory section in their prompt and add nothing to the store: the
 reviewer is the independent check, and `FIX` follows once
 `ANALYZE_EXECUTE` has an evaluation result (ADR 0015 D13). `doctor`'s
 `Issue Working Memory` row says the same. With Memory off, every read
-context is what it was before this release, a `memory` field in a result is
-ignored, and every prompt and state file differs from the previous
-release's in one place only: the prompt label, `v19` where it was `v18`, in
-the first line of every prompt and in the state's `prompt_version` (ADR
-0015 D19 moves it with the prompt change that names `memory.md`). No
-Memory launch has yet been run against a live repository and a real Pi.
+context is what it was before this release and a `memory` field in a
+result is ignored. A run created with Memory off renders every prompt and
+saves the state file the previous release did for it but in one place: the
+prompt label, `v19` where it was `v18`, in the first line of every prompt
+and in the state's `prompt_version` (ADR 0015 D19 moves it with the prompt
+change that names `memory.md`). A run created before this release keeps
+the label it was created with
+([Configuration](configuration.md#validation-every-key-must-be-one-the-controller-reads)),
+and a run that turns Memory off keeps its records, which `memory show`
+still lists. No Memory launch has yet been run against a live repository
+and a real Pi.
 
 ### Enforcement
 

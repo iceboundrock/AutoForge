@@ -161,8 +161,10 @@ arm's carries none. Anything else leaves the contrast `NOT_EVALUATED`: another M
 intervention. #317's `run --memory-seed` holds the lesson unchanged and
 records its digest. #333 delivers it to every Memory launch of
 ANALYZE_EXECUTE as `memory.md` and records what each launch was shown in
-its run log (`metadata.memory`: sizes, counts, digests and the render's
-time, never a record's text). The arm's collector, which reads that digest
+its run log (`metadata.memory`: sizes, counts, digests and the time of
+Memory's whole preparation before the launch, `projection_ms`, the
+candidate's read and its local ancestry walk included, never a record's
+text). The arm's collector, which reads that digest
 and those measures back into a record, is still owed; this protocol
 records no Memory-arm result.
 

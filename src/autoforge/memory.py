@@ -171,6 +171,33 @@ def _bounded_redaction(text: str, limit: int) -> str:
     return "[details omitted]"
 
 
+def admissible_text(text: object) -> bool:
+    """Whether the store keeps ``text`` as an agent's record text, unchanged (D9.6, D9.9).
+
+    What :meth:`MemoryStore.add` and :meth:`MemoryStore.revise` require of
+    an agent's text: a string of at most :data:`MAX_TEXT_BYTES` bytes, not
+    blank, with no NUL, that the run-log redactor leaves as it is. A caller
+    that holds an agent's text before the store sees it refuses one that
+    fails here instead of holding it (R3-F4 of PR #536).
+    """
+    try:
+        _string(text, MAX_TEXT_BYTES)
+    except StateError:
+        return False
+    return True
+
+
+def bounded_reason(reason: str) -> str:
+    """``reason`` as the store keeps a revision's reason: redacted, then bounded (D9.6).
+
+    Cut to :data:`MAX_REASON_BYTES` with an omission marker, as
+    :meth:`MemoryStore.revise` saves it; bounding a reason this returned
+    again changes nothing, so the store keeps it as it is. A blank reason
+    is the caller's to refuse first: the store refuses one.
+    """
+    return _bounded_redaction(reason, MAX_REASON_BYTES)
+
+
 def _issue(url: object) -> str:
     raw = _string(url, 192)
     try:

@@ -1713,7 +1713,11 @@ the launch is saved. A render the store refuses refuses the launch there
 (D18). The projection is bound to the launch's candidate: the worktree's
 `HEAD` after the strict import when that is not the entry's base, and none
 otherwise, with each base of a range-bound record that the candidate
-descends from proved through the controller's transport. `HEAD` is read as
+descends from proved from the local store alone: a breadth-first walk from
+the candidate through commits read as their own bytes and re-hashed, at
+most 64 of them, which never asks GitHub and never fetches, so D12's
+render stays free of the network and a base the walk does not reach is not
+proved and its record is omitted (R3-F1 of PR #536). `HEAD` is read as
 the candidate is, through the admin dir the registry binds and the common
 dir, never through the worktree's `.git` file, which an earlier launch of
 the step can rewrite before a correction or a retry; a binding the
@@ -1725,8 +1729,12 @@ Memory-off prompt: against what the release before rendered and saved for
 the same Memory-off run (PR #536's merge base, captured by
 `tests/fixtures/memory_off_baseline/`), a Memory-off run differs in the
 label alone, in the first line of the prompt and in the checkpoint's
-`prompt_version`. The run log records
-what each launch was shown (sizes, counts, digests and the render's time),
+`prompt_version`. That holds for a run created with Memory off; a run
+created earlier keeps the label it was created with, and one that turns
+Memory off keeps its ledger. The run log records
+what each launch was shown (sizes, counts, digests, the commit it started
+from, the commits the walk read, and the time of Memory's whole
+preparation, candidate read and walk included, with the render's share),
 never a record's text. Two writers exist. The controller's
 `validation-failure` record of a failed candidate cites its validation
 record and is added by the producer's failure counter, in the save that
@@ -1736,11 +1744,16 @@ base it is shown with its source and needs revalidation. An accepted
 result's proposals come from an optional `memory` list of the result, which
 no required field and no parser rule changes. They are admitted in the plan
 save of a success or in the stop save of a `blocked` or `failure` result
-(D9.8, D4.6), keyed by the launch ordinal, the entry's base and the entry's
-position, so the same result admitted again is a replay. The list is bound
+(D9.8, D4.6), keyed by the launch ordinal, the commit the launch started
+from as the controller read it before the launch (the entry's base only
+when it started there or no `HEAD` could be read) and the entry's position,
+so the same result admitted again is a replay; the key is provenance, and
+an added record applies to the issue's launches of the phase whatever
+commit they start from. The list is bound
 to its launch when the reply is parsed: a `correct` or `retract` only of a
-record that launch's projection showed, against the revision it showed,
-and no text the redactor would change. That binding is the controller's,
+record that launch's projection showed, against the revision it showed, no
+text past the store's bound or that the redactor would change, and each
+reason redacted and bounded as the store keeps it. That binding is the controller's,
 held by the process that parsed the reply and never written into the
 result, so the result's `memory` key stays the agent's data whatever its
 shape. A reply kept across a restart (#479) is kept as Memory off keeps

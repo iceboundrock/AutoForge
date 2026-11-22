@@ -502,8 +502,15 @@ a `correct` or `retract` of a record that launch's `memory.md` did not show
 (one left out for the budget, one the same list adds, any other number) is
 refused there, and one it showed is made against the record revision it
 showed, so a second change of one record in one result is stale. A `text`
-the redactor would change is refused at that point too, and a `reason` is
-kept redacted. That binding is the controller's: it is held by the process
+the store would not keep as it is (past 2,048 bytes, blank, or one the
+redactor would change) is refused at that point too, and a `reason` is
+held redacted and cut to 256 bytes, so the binding never holds more of an
+entry than the store keeps (R3-F4 of PR #536). The binding also holds the
+commit the launch started from, as the controller read it before the
+launch, which keys each `add` with the launch ordinal and the entry's
+position (R3-F2); the key is provenance, and an added record applies to
+the issue's later launches of the phase whatever commit they start from.
+That binding is the controller's: it is held by the process
 that parsed the reply and is never written into the result, so the `memory`
 key stays the agent's data, whatever its shape (R2-F1 of PR #536). A reply
 kept across a restart (#479) is kept as Memory off keeps it, the agent's
