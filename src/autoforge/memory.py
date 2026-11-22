@@ -1189,6 +1189,42 @@ def _established(
     )
 
 
+def established_bases(
+    store: MemoryStore, request: ProjectionRequest, *, validation_records: Sequence[dict] = ()
+) -> tuple[str, ...]:
+    """The bases ``request``'s candidate is proved to descend from by a retained receipt.
+
+    One per observation bound to a base's descendants whose validation
+    record, retained, establishes it on this very candidate as
+    :func:`render_projection` would (:func:`_established`: the run's own
+    record of the issue's worktree candidate, of this commit, checked
+    against that base, enforced where its mode requires, its digest the
+    citation's). The controller validates a producer's candidate only once
+    it has proved that the candidate descends from the base it is checked
+    against, and the record keeps that base, so on the record's own commit
+    the base needs no walk of its history (R4-F2 of PR #536). On any other
+    commit, and with no candidate, nothing is proved here: the caller's
+    own proof decides. Sorted; ``validation_records`` refused as
+    :func:`render_projection` refuses them.
+    """
+    if not store.enabled or not request.candidate:
+        return ()
+    receipts = _validation_facts(store, validation_records)
+    issue = _issue(request.step.issue_url)
+    return tuple(
+        sorted(
+            {
+                fact.scope.base
+                for fact in store._facts.values()
+                if fact.scope.range is Range.DESCENDANTS
+                and fact.scope.step.issue_url == issue
+                and fact.scope.candidate == request.candidate
+                and _established(fact, request, receipts) is not None
+            }
+        )
+    )
+
+
 def _resolve(
     fact: MemoryFact,
     request: ProjectionRequest,

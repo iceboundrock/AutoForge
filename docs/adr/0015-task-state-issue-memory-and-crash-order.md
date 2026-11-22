@@ -1713,17 +1713,24 @@ the launch is saved. A render the store refuses refuses the launch there
 (D18). The projection is bound to the launch's candidate: the worktree's
 `HEAD` after the strict import when that is not the entry's base, and none
 otherwise, with each base of a range-bound record that the candidate
-descends from proved from the local store alone: a breadth-first walk from
-the candidate through commits read as their own bytes and re-hashed, at
-most 64 of them, which never asks GitHub and never fetches, so D12's
-render stays free of the network and a base the walk does not reach is not
-proved and its record is omitted (R3-F1 of PR #536). `HEAD` is read as
-the candidate is, through the admin dir the registry binds and the common
-dir, never through the worktree's `.git` file, which an earlier launch of
-the step can rewrite before a correction or a retry; a binding the
-registry does not confirm, and a launch that seeds, bind no candidate. The
-prompt names the file in a section rendered only while the run keeps
-Memory. The prompt label moves to `v19`, an evaluation amendment, as D19
+descends from proved locally, never by asking GitHub or fetching, so D12's
+render stays free of the network (R3-F1 of PR #536). On the very commit a
+retained validation record of the run names, that record proves its base,
+since the producer gate validates only a candidate whose range from that
+base the controller proved; so a retry on a failed commit is shown its
+failure however long its history (R4-F2). Any other base is proved by a
+breadth-first walk from the candidate through commits read as their own
+bytes and re-hashed, at most 64 of them; a base neither proves is not
+proved and its record is omitted. `HEAD` is read through the admin dir the
+registry binds and the common dir, never through the worktree's `.git`
+file, which an earlier launch of the step can rewrite before a correction
+or a retry, and only its id is read there: the commit is read from the
+shared store's objects through the controller's private git directory,
+which names no promisor remote, so no git version fetches a commit the
+store lacks (R4-F1). A binding the registry does not confirm, a `HEAD`
+naming no commit the store holds, and a launch that seeds, bind no
+candidate. The prompt names the file in a section rendered only while the
+run keeps Memory. The prompt label moves to `v19`, an evaluation amendment, as D19
 says, and that move is the one exception to §4.2's byte-identical
 Memory-off prompt: against what the release before rendered and saved for
 the same Memory-off run (PR #536's merge base, captured by
@@ -1733,9 +1740,10 @@ label alone, in the first line of the prompt and in the checkpoint's
 created earlier keeps the label it was created with, and one that turns
 Memory off keeps its ledger. The run log records
 what each launch was shown (sizes, counts, digests, the commit it started
-from, the commits the walk read, and the time of Memory's whole
-preparation, candidate read and walk included, with the render's share),
-never a record's text. Two writers exist. The controller's
+from, or none when it could not be read, the commits the walk read, and
+the time of Memory's whole preparation, the ledger's reconstruction from
+the checkpoint, the candidate read and the walk included (R4-F4), with the
+render's share), never a record's text. Two writers exist. The controller's
 `validation-failure` record of a failed candidate cites its validation
 record and is added by the producer's failure counter, in the save that
 keeps the record (D11 stage 4). It is bound to the failing commit and to
@@ -1746,8 +1754,10 @@ no required field and no parser rule changes. They are admitted in the plan
 save of a success or in the stop save of a `blocked` or `failure` result
 (D9.8, D4.6), keyed by the launch ordinal, the commit the launch started
 from as the controller read it before the launch (the entry's base only
-when it started there or no `HEAD` could be read) and the entry's position,
-so the same result admitted again is a replay; the key is provenance, and
+when it started there) and the entry's position, so the same result
+admitted again is a replay. A launch whose start could not be read keys
+none: its adds are refused and counted, never keyed by a guessed commit,
+and its revisions are admitted as usual (R4-F3). The key is provenance, and
 an added record applies to the issue's launches of the phase whatever
 commit they start from. The list is bound
 to its launch when the reply is parsed: a `correct` or `retract` only of a

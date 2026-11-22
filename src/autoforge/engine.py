@@ -163,6 +163,7 @@ from .agent_worktree import (
     holds_objects,
     import_private_objects,
     read_candidate,
+    read_head_id,
     registered_worktree_roots,
     uncommitted_entries,
 )
@@ -2121,6 +2122,10 @@ class ControllerEngine:
         # reply kept across a restart, or gone on from by a later
         # invocation, admits nothing.
         self._memory_binding: LaunchBinding | None = None
+        # The clock Memory's preparation before a launch is timed by, the
+        # ledger's reconstruction included (R4-F4 of PR #536); a test sets
+        # its own so the measurement is held without a wall time.
+        self._memory_clock: Callable[[], float] = time.perf_counter
         # Why the read context of this process's last FIX launch does not show
         # the PR body a K12 update would replace, "" when it shows it whole
         # (#423, PR #467 R1-F2). Not persisted: a result is only ever checked
@@ -4912,84 +4917,116 @@ class ControllerEngine:
         Otherwise rendered from the snapshot the launch-intent save commits,
         for the ordinal that save spends, and bound to the launch's candidate
         (:meth:`_memory_candidate`): the worktree's ``HEAD`` after the strict
-        import, read as the candidate is, when it is not the entry's base (a
-        relaunch after a validation failure starts from the commit that
-        failed), and none otherwise. The bases of the store's range-bound
-        records the candidate descends from are proved by a bounded walk of
-        the shared store's own commits (:meth:`_memory_parents`,
+        import, read as the candidate is but without any object git could
+        fetch (R4-F1 of PR #536), when it is not the entry's base (a relaunch
+        after a validation failure starts from the commit that failed), and
+        none otherwise. The bases of the store's range-bound records the
+        candidate descends from are proved by the controller's own retained
+        validation record of that very commit or by a bounded walk of the
+        shared store's own commits (:meth:`_memory_parents`,
         :func:`~autoforge.memory_handoff.local_ancestors`), never by asking
-        GitHub or fetching (R3-F1 of PR #536): one the walk does not reach
-        is left out, so a record bound to it is omitted, never shown as
-        current. The commit read is the launch's input, which keys its
-        proposals (R3-F2), and the whole preparation is timed. A store that
-        cannot be rendered refuses the launch here, before anything of it is
-        saved (D18): Memory is never dropped from a Memory launch.
+        GitHub or fetching (R3-F1, R4-F2): one neither proves is left out,
+        so a record bound to it is omitted, never shown as current. The
+        commit read is the launch's input, which keys its proposals (R3-F2);
+        when none could be read the input is unknown, never the base
+        (R4-F3). The whole preparation is timed by :attr:`_memory_clock`,
+        from the ledger's reconstruction on (R4-F4). A store that cannot be
+        rendered refuses the launch here, before anything of it is saved
+        (D18): Memory is never dropped from a Memory launch.
         """
         state = self._require_state()
         if not memory_supported(phase) or not state.issue_memory.get("enabled"):
             return None
         entry = self._analyze_entry
+        transport = self._memory_transport()
         return prepare_launch_projection(
-            state.memory(),
+            state.memory,
             self._memory_step(phase),
             base=entry.base_sha if entry is not None else "",
-            read_head=lambda: self._memory_candidate(cwd),
-            read_parents=self._memory_parents(),
+            read_head=lambda: self._memory_candidate(cwd, transport),
+            read_parents=self._memory_parents(transport),
             validation_records=state.validation_records,
+            clock=self._memory_clock,
         )
 
-    def _memory_parents(self) -> Callable[[str], tuple[str, ...] | None]:
+    def _memory_transport(self) -> Callable[[], GitTransport]:
+        """One projection's reader of the shared store, made on its first use (R4-F1 of PR #536).
+
+        The controller's git transport (:meth:`_git_transport`), whose reads
+        run in a private git directory over the shared store's objects: no
+        promisor remote, no network protocol, so a missing object is never
+        fetched. Made once for the candidate's read and the ancestry walk,
+        and not at all by a projection that reads neither.
+        """
+        made: list[GitTransport] = []
+
+        def transport() -> GitTransport:
+            if not made:
+                made.append(self._git_transport())
+            return made[0]
+
+        return transport
+
+    def _memory_parents(
+        self, transport: Callable[[], GitTransport] | None = None
+    ) -> Callable[[str], tuple[str, ...] | None]:
         """A reader of a commit's parents for the projection's ancestry walk (R3-F1 of PR #536).
 
         Each commit is read as its own bytes from the shared store, re-hashed
         and never substituted (:meth:`GitTransport.read_local_commit`): one
         the store does not hold is ``None``, never fetched, and nothing asks
         GitHub, so Memory adds no network call to a launch. The transport is
-        made on the first read, so a projection with no range-bound record
-        to prove makes none.
+        ``transport``'s (:meth:`_memory_transport`), made on the first read.
         """
-        transport: GitTransport | None = None
+        store = transport or self._memory_transport()
 
         def parents(sha: str) -> tuple[str, ...] | None:
-            nonlocal transport
-            if transport is None:
-                transport = self._git_transport()
-            record = transport.read_local_commit(sha)
+            record = store().read_local_commit(sha)
             return None if record is None else record.parents
 
         return parents
 
-    def _memory_candidate(self, cwd: str) -> str:
+    def _memory_candidate(
+        self, cwd: str, transport: Callable[[], GitTransport] | None = None
+    ) -> str:
         """The commit a Memory launch in ``cwd`` starts from, or "" for none (R1-F1 of PR #536).
 
-        Read as the latest launch's candidate is (:meth:`_candidate_read`):
         ``worktrees/<id>/HEAD`` of the admin dir the registry binds the
-        worktree to, through the common dir
-        (:func:`~autoforge.agent_worktree.read_candidate`), never through the
+        worktree to, through the common dir, as the latest launch's
+        candidate is read (:meth:`_candidate_read`), never through the
         worktree's ``.git`` file. An earlier launch of the step, the one a
         correction or a transient retry follows, can rewrite that file to
         name any git directory, whose ``HEAD`` would then decide which
-        records the projection shows as established. A binding the registry
-        no longer confirms, a ``HEAD`` that is attached, not a regular file
-        or not a commit the shared store holds, and a read that fails bind
-        no candidate, which omits every record bound to one. So does a
-        launch of a backend that seeds (ADR 0013 D4): its workspace is not
-        the host worktree, whose ``HEAD`` it never started from.
+        records the projection shows as established. Unlike that read, no
+        object is opened in the shared git directory, whose configuration
+        can name a promisor remote git would fetch a missing object from
+        (R4-F1): ``HEAD``'s id is read alone
+        (:func:`~autoforge.agent_worktree.read_head_id`), and the commit it
+        names is read as its own bytes and re-hashed through ``transport``
+        (:meth:`_memory_transport`), which cannot fetch. A binding the
+        registry no longer confirms, a ``HEAD`` that is attached, not a
+        regular file, or naming no commit the shared store holds, and a read
+        that fails bind no candidate, which omits every record bound to one,
+        and leave the launch's input unknown (R4-F3). So does a launch of a
+        backend that seeds (ADR 0013 D4): its workspace is not the host
+        worktree, whose ``HEAD`` it never started from.
         """
         try:
             if self._launch_seeds():
                 return ""
-            read = read_candidate(
+            read = read_head_id(
                 self.workspace().git_dirs()[-1],
                 self._agent_admin_dir(Path(cwd)),
                 cwd,
                 self._runner,
             )
+            if read.attached or read.problem or not read.head:
+                return ""
+            if (transport or self._memory_transport())().read_local_commit(read.head) is None:
+                return ""
         except (AutoForgeError, OSError):
             return ""
-        if read.attached or read.problem:
-            return ""
-        return read.head if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", read.head) else ""
+        return read.head
 
     def _admit_memory(self, phase: Phase) -> None:
         """Admit an accepted result's proposals into the run's Memory, for the caller's save.
@@ -5018,7 +5055,10 @@ class ControllerEngine:
             return
         # Keyed by the commit the launch started from, as this process read
         # it before the launch (R3-F2 of PR #536), never the entry's base: a
-        # retry on a failed candidate started from that candidate.
+        # retry on a failed candidate started from that candidate. When no
+        # commit could be read the input is unknown, and each add is refused
+        # and counted rather than keyed by a guess (R4-F3); the result is
+        # handled as it would be without them.
         admission = admit_proposals(
             state.memory(),
             binding.proposals,

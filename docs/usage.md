@@ -2601,19 +2601,29 @@ after the strict import when that is not the entry's base (the commit a
 validation failure left), and none otherwise. `HEAD` is read through the
 worktree's registry entry, as the candidate is after a launch, never
 through its `.git` file, which an earlier launch of the step could have
-rewritten; when that binding cannot be confirmed, no candidate is bound and
-every record bound to one is left out. Whether the candidate descends from
-the base a record is bound to is read from the local object store alone:
-each commit from the candidate down is read as its own bytes and re-hashed,
-at most 64 of them, and nothing asks GitHub or fetches, so Memory adds no
-network call to a launch and a retry on the commit that failed is shown
-that failure whatever GitHub answers. A base the walk does not reach is
-not proved, and a record bound to it is left out. The controller never
-reads the file back. The launch's run log records what it was shown in
-`request.json`'s `metadata.memory`: the revision and digests, the counts,
-the file's size and its SHA-256, the commit the launch started from
-(`input`), how many commits the ancestry walk read (`ancestry_reads`), and
-how long Memory's preparation took, the candidate's read, the walk and the
+rewritten. Only the commit id `HEAD` names is read in the repository's
+own git directory; the commit itself is read from the shared object store
+through a private git directory of the controller's, which names no
+promisor remote, so a commit the store lacks (in a partial clone, say) is
+never fetched, not even attempted. When that binding cannot be confirmed,
+or `HEAD` names no commit the store holds, no candidate is bound and every
+record bound to one is left out. Whether the candidate descends from the
+base a record is bound to is proved locally, and nothing asks GitHub or
+fetches, so Memory adds no network call to a launch and a retry on the
+commit that failed is shown that failure whatever GitHub answers. On the
+very commit a validation record of the run names, that record proves its
+base: the controller validates a candidate only after proving it descends
+from that base, so a retry on a failed commit is shown its failure however
+many commits it holds. Any other base is proved by reading each commit
+from the candidate down as its own bytes, re-hashed, at most 64 of them.
+A base neither proves is not proved, and a record bound to it is left
+out. The controller never reads the file back. The launch's run log
+records what it was shown in `request.json`'s `metadata.memory`: the
+revision and digests, the counts, the file's size and its SHA-256, the
+commit the launch started from (`input`, `null` when it could not be read:
+never the base in its place), how many commits the ancestry walk read
+(`ancestry_reads`), and how long Memory's preparation took, the ledger's
+reconstruction from the state file, the candidate's read, the walk and the
 render together (`projection_ms`, the per-launch latency the evaluation
 reads), with the render's share (`render_ms`), never a record's text.
 
@@ -2642,7 +2652,9 @@ the record rests on, so no crash separates them:
   Each added entry is keyed by its launch, the commit that launch started
   from and its place in the list, so the same result admitted again adds
   nothing; it applies to every later launch of the phase on the issue,
-  whichever commit that launch starts from. After an
+  whichever commit that launch starts from. A launch whose starting commit
+  could not be read adds nothing: each entry it adds is refused and
+  counted, while its corrections and retractions are kept. After an
   `unblock`, the next launch is shown a blocked result's entries as
   proposals. A refused or corrected reply, one whose commit fails
   validation and one lost to a crash keep none. An entry the store refuses

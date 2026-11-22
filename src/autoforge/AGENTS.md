@@ -157,10 +157,11 @@ sandbox_policy.py   which host resources a launch gets by launch class (ADR 0005
                     what a provider's declaration makes writable (declared_writable)
 agent_worktree.py   the agent worktree's git surface in every sandbox.mode: registry
                     binding and listing (D6.4, #223), candidate read through the
-                    common dir (D6.3), the uncommitted-change reads through the bound
-                    admin dir and against the reviewed tree's bytes (#428),
-                    strict import of private objects (D6.5); git only through the
-                    executor's hardened local request (#168)
+                    common dir (D6.3) and, for Memory, HEAD's id alone with no object
+                    opened, so no git fetches one lazily (#333), the uncommitted-change
+                    reads through the bound admin dir and against the reviewed tree's
+                    bytes (#428), strict import of private objects (D6.5); git only
+                    through the executor's hardened local request (#168)
 github.py           GitHubClient over `gh`, the only holder of a GitHub credential:
                     verification reads, the reads behind an agent's read context, typed
                     controller writes (never retried on an ambiguous outcome) +

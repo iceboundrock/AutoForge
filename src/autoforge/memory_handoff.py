@@ -7,9 +7,11 @@ release supports, ``ANALYZE_EXECUTE`` (D13), and nothing more:
   launch ordinal the intent save spends next and to the worktree's candidate,
   which the engine writes into the launch's read context as ``memory.md``
   (D12): rendered once, never changed while the launch runs, never read back.
-  Which range-bound records apply to the candidate is proved from the local
-  store's own commits, never asked of GitHub (R3-F1 of PR #536), and the
-  whole preparation is timed, not the render alone;
+  Which range-bound records apply to the candidate is proved from the run's
+  own retained validation record of that very commit or from the local
+  store's own commits, never asked of GitHub (R3-F1, R4-F2 of PR #536), and
+  the whole preparation is timed, from the ledger's reconstruction on, not
+  the render alone (R4-F4);
 - after it, the controller's own observation of a validation failure, added
   in the save of the validation record it cites (D11 stage 4), and the
   proposals of an accepted result, added in the save that accepts it: the
@@ -20,18 +22,19 @@ release supports, ``ANALYZE_EXECUTE`` (D13), and nothing more:
   shown, at the revision it was shown, no text past the store's bounds or
   that the redactor would change, and every reason redacted and bounded
   (R3-F4), beside the commit the launch started from, which keys its adds
-  (R3-F2). The binding is the controller's and lives in the process that
-  parsed the reply, never in the result: the ``memory`` field stays the
-  agent's data, so a reply kept across a restart (#479) admits none of it
-  (R2-F1 of PR #536), and what is kept of a reply is what Memory off keeps
-  (R2-F2).
+  (R3-F2): a launch whose start could not be read keys none, and its adds
+  are refused (R4-F3). The binding is the controller's and lives in the
+  process that parsed the reply, never in the result: the ``memory`` field
+  stays the agent's data, so a reply kept across a restart (#479) admits
+  none of it (R2-F1 of PR #536), and what is kept of a reply is what Memory
+  off keeps (R2-F2).
 
 Nothing here reads a file, the network or a model, and nothing here decides a
 phase, a write, a budget or a merge: the engine supplies every value, and
-the readers of the candidate and of a commit's parents, and saves what comes
-back. Memory stays advisory (D8): a store that refuses a
-write leaves the step as it would have been without Memory, the refusal only
-counted.
+the loader of the ledger and the readers of the candidate and of a commit's
+parents, and saves what comes back. Memory stays advisory (D8): a store that
+refuses a write leaves the step as it would have been without Memory, the
+refusal only counted.
 """
 
 from __future__ import annotations
@@ -62,6 +65,7 @@ from .memory import (
     WriteOutcome,
     admissible_text,
     bounded_reason,
+    established_bases,
     render_projection,
 )
 from .transitions import Phase
@@ -90,7 +94,9 @@ MAX_PROPOSALS = 8
 # R3-F1 of PR #536). A candidate is the base plus the commits the step's
 # launches made on it, a handful; each read is one local git process, so the
 # bound is also what bounds the walk's share of a launch's latency. A base
-# further below is not proved, and a record bound to it is omitted.
+# further below is not proved by the walk, and a record bound to it is
+# omitted, but on the very commit a retained validation record names it is
+# proved by that record, with no walk (R4-F2).
 MAX_ANCESTRY_COMMITS = 64
 # What an agent may add: the kinds that are neither the controller's
 # observations nor the operator's seed, and need no exact candidate.
@@ -134,10 +140,12 @@ class LaunchProjection:
     that launch's result may correct or retract, and the revisions it acts
     on (R1-F2 of PR #536). ``input_sha`` is the commit the launch starts
     from, as the controller read it (:func:`prepare_launch_projection`):
-    what its proposals are keyed by (R3-F2). ``render_ms`` times the render
-    alone; ``projection_ms`` everything Memory adds before the launch, the
-    candidate's read and the ancestry walk included (R3-F1), and
-    ``ancestry_reads`` counts the commits that walk read.
+    what its proposals are keyed by (R3-F2), and "" when it could not be
+    read, which keys none (R4-F3). ``render_ms`` times the render alone;
+    ``projection_ms`` everything Memory adds before the launch, the
+    ledger's reconstruction, the candidate's read and the ancestry walk
+    included (R3-F1, R4-F4), and ``ancestry_reads`` counts the commits that
+    walk read.
     """
 
     request: ProjectionRequest
@@ -163,19 +171,21 @@ class LaunchProjection:
     def metadata(self) -> dict:
         """What the run log records of the projection: counts, sizes, digests, never its text.
 
+        ``input`` is the commit the launch started from, ``None`` when it
+        could not be read (R4-F3 of PR #536): never the base in its place.
         ``projection_ms`` is the controller's own measurement of Memory's
-        whole work before the launch (the candidate's read, the ancestry
-        walk and the render), the wall time the evaluation reads against
-        ADR 0015 D12's 1,000 ms ceiling per launch; ``render_ms`` is the
-        render's share of it. Both are recorded, never checked: nothing
-        decides on them.
+        whole work before the launch (the ledger's reconstruction, the
+        candidate's read, the ancestry walk and the render: R4-F4), the wall
+        time the evaluation reads against ADR 0015 D12's 1,000 ms ceiling
+        per launch; ``render_ms`` is the render's share of it. Both are
+        recorded, never checked: nothing decides on them.
         """
         freshness = self.projection.freshness
         text = self.projection.text
         return {
             "file": MEMORY_FILE,
             "launch": self.request.attempt,
-            "input": self.input_sha,
+            "input": self.input_sha or None,
             "candidate": self.request.candidate,
             "revision": freshness.revision,
             "memory_digest": freshness.memory_digest,
@@ -199,8 +209,9 @@ class LaunchBinding:
     """What the process that parsed a launch's reply holds of it for Memory (R2-F1 of PR #536).
 
     ``launch`` is the launch's ordinal, ``input_sha`` the commit it started
-    from (:attr:`LaunchProjection.input_sha`, R3-F2) and ``proposals`` its
-    result's list as :func:`bind_proposals` bound it: every text already
+    from (:attr:`LaunchProjection.input_sha`, R3-F2; "" when it could not
+    be read, R4-F3) and ``proposals`` its result's list as
+    :func:`bind_proposals` bound it: every text already
     within the store's bounds and every reason redacted and bounded
     (R3-F4), so nothing the store would not keep is held. Never written
     into the result or the state.
@@ -318,7 +329,7 @@ def render_launch_projection(
 
 
 def prepare_launch_projection(
-    store: MemoryStore,
+    load_store: Callable[[], MemoryStore],
     step: StepKey,
     *,
     base: str,
@@ -328,40 +339,54 @@ def prepare_launch_projection(
     clock: Callable[[], float] = time.perf_counter,
     max_commits: int = MAX_ANCESTRY_COMMITS,
 ) -> LaunchProjection:
-    """The next launch's projection, from its candidate's read to its render, timed whole (D12).
+    """The next launch's projection, from its ledger's load to its render, timed whole (D12).
 
-    ``read_head`` reads the commit the launch starts from ("" when it
-    cannot be read); it is the projection's candidate when it is not the
-    entry's ``base``, and none otherwise. The bases of the store's
-    range-bound records it descends from are proved by
-    :func:`local_ancestors` through ``read_parents``, never through GitHub
-    (R3-F1 of PR #536). ``input_sha`` is that commit, or ``base`` when none
-    could be read, as the projection then binds none (R3-F2): the input the
-    launch's proposals are keyed by. ``projection_ms`` covers all of it, so
-    the per-launch latency the run log records is Memory's whole cost
-    before the launch, never the render's alone. A store that cannot be
-    rendered raises as :func:`render_launch_projection` does.
+    ``load_store`` reconstructs and validates the committed snapshot,
+    inside the measurement: it runs before every Memory launch (R4-F4 of
+    PR #536). ``read_head`` reads the commit the launch starts from (""
+    when it cannot be read); it is the projection's candidate when it is
+    not the entry's ``base``, and none otherwise. Of the store's range-bound
+    records' bases, those the candidate descends from are proved, never
+    through GitHub (R3-F1): by the run's own retained validation record of
+    that very commit (:func:`~autoforge.memory.established_bases`, R4-F2),
+    so a retry on the commit that failed is shown its failure however long
+    its history, and the rest by :func:`local_ancestors` through
+    ``read_parents``, at most ``max_commits`` commits read. ``input_sha``
+    is the commit read, the base included when the launch starts there,
+    and "" when none could be read: the input is then unknown, never
+    guessed, so no ``add`` of the launch is keyed by it (R3-F2, R4-F3,
+    :func:`admit_proposals`). ``projection_ms`` covers all of it, so the
+    per-launch latency the run log records is Memory's whole cost before
+    the launch, never the render's alone. A store that cannot be rendered
+    raises as :func:`render_launch_projection` does.
     """
     started = clock()
+    store = load_store()
     head = read_head()
     candidate = head if head != base else ""
-    ancestors, reads = (
-        local_ancestors(
+    ancestors: tuple[str, ...] = ()
+    reads = 0
+    if candidate:
+        bases = store.range_bases(step.issue_url)
+        held = established_bases(
+            store,
+            projection_request(store, step, candidate=candidate),
+            validation_records=validation_records,
+        )
+        walked, reads = local_ancestors(
             candidate,
-            store.range_bases(step.issue_url),
+            [b for b in bases if b not in held],
             read_parents,
             max_commits=max_commits,
         )
-        if candidate
-        else ((), 0)
-    )
+        ancestors = tuple(b for b in bases if b in held or b in walked)
     request = projection_request(store, step, candidate=candidate, ancestors=ancestors)
     launch = render_launch_projection(
         store, request, validation_records=validation_records, clock=clock
     )
     return replace(
         launch,
-        input_sha=head or base,
+        input_sha=head,
         projection_ms=(clock() - started) * 1000.0,
         ancestry_reads=reads,
     )
@@ -604,7 +629,10 @@ def admit_proposals(
     R3-F2 of PR #536) and its position in the agent's list, so the same
     result admitted again is a replay, never a second record. The key is
     provenance only: what the record applies to is its scope, the whole
-    issue's launches of the phase, whichever commit they start from. A
+    issue's launches of the phase, whichever commit they start from. With
+    no ``input_sha``, a launch whose start the controller could not read,
+    each ``add`` is refused and counted, never keyed by a guessed commit
+    (R4-F3); its revisions, which no key names, are admitted as usual. A
     ``correct`` or ``retract`` names a record the launch was shown and the
     revision it was shown (:func:`bind_proposals`); the store refuses one of
     a record that is not a proposal, that changed since that revision or
@@ -615,7 +643,13 @@ def admit_proposals(
         return Admission(store)
     scope = MemoryScope(step)
     applied = replayed = refused = 0
+    # Refused here, before the store sees them, and counted with the
+    # parse's refusals (R4-F3 of PR #536).
+    unkeyed = 0
     for proposal in proposals.entries:
+        if proposal.action is Action.ADD and not input_sha:
+            unkeyed += 1
+            continue
         if proposal.action is Action.ADD:
             assert proposal.kind is not None and proposal.text is not None
             out = store.add(
@@ -646,8 +680,8 @@ def admit_proposals(
             replayed += 1
         else:
             refused += 1
-    store = store.refused(proposals.refused)
-    return Admission(store, applied, replayed, refused + proposals.refused)
+    store = store.refused(proposals.refused + unkeyed)
+    return Admission(store, applied, replayed, refused + proposals.refused + unkeyed)
 
 
 __all__ = [

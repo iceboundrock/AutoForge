@@ -510,6 +510,9 @@ commit the launch started from, as the controller read it before the
 launch, which keys each `add` with the launch ordinal and the entry's
 position (R3-F2); the key is provenance, and an added record applies to
 the issue's later launches of the phase whatever commit they start from.
+When that commit could not be read, the input is unknown and never the
+base in its place: each `add` is refused and counted, and a `correct` or
+`retract`, which no key names, is admitted as usual (R4-F3).
 That binding is the controller's: it is held by the process
 that parsed the reply and is never written into the result, so the `memory`
 key stays the agent's data, whatever its shape (R2-F1 of PR #536). A reply

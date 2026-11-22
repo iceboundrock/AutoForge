@@ -12,7 +12,8 @@ backend. What is held:
 - the projection reaches every Memory launch of ANALYZE_EXECUTE as
   ``memory.md`` of its read context, rendered from the committed snapshot for
   the ordinal its intent save spends and bound to its candidate, whose
-  ancestry is read from the local store alone, with no GitHub call; no
+  ancestry is proved locally, by the run's own validation record of that
+  commit or from the store's commits, with no GitHub call and no fetch; no
   other phase gets one;
 - the controller's validation-failure observation is saved with the record
   it cites, and an accepted result's proposals with its acceptance, never
@@ -27,6 +28,7 @@ The store's own rules are in ``tests/test_memory.py``.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import importlib.util
 import itertools
@@ -40,11 +42,12 @@ from pathlib import Path
 import pytest
 
 import autoforge
+from autoforge.agent_worktree import read_candidate
 from autoforge.auto_recovery import StepKey
 from autoforge.config import MemoryConfig, default_config
 from autoforge.delivered_result import payload_digest, payload_text
 from autoforge.doctor import Doctor
-from autoforge.errors import GitHubUnavailableError, GitTransportError
+from autoforge.errors import GitHubUnavailableError, GitTransportError, VerificationError
 from autoforge.evidence import MAX_FAILURE_COUNT, WorktreeProvenance, parse_record
 from autoforge.executor import execute
 from autoforge.git_transport import GitRemote, GitTransport
@@ -59,6 +62,7 @@ from autoforge.memory import (
     Kind,
     MemoryScope,
     MemoryStore,
+    established_bases,
 )
 from autoforge.memory_handoff import (
     MAX_ANCESTRY_COMMITS,
@@ -84,7 +88,7 @@ from autoforge.result_parser import BEGIN, END, MAX_CONTROL_RESULT_CHARS
 from autoforge.sandbox import TEARDOWN_UNCOUNTED, SandboxFacts
 from autoforge.state import load_state
 from autoforge.transitions import AGENT_PHASES, Phase
-from tests.test_evidence import RUN, record, remote
+from tests.test_evidence import RUN, policy, record, remote
 from tests.test_memory import PiShaped, pi_profile
 
 from .conftest import (
@@ -350,7 +354,9 @@ def test_a_validation_failure_reaches_the_retry_as_an_observed_record(tmp_state_
     # CPU time.
     assert all(type(m["render_ms"]) is float and m["render_ms"] >= 0 for m in logged)
     assert all(m["projection_ms"] >= m["render_ms"] for m in logged)
-    assert [m["ancestry_reads"] for m in logged] == [0, 1]
+    # The retry starts on the commit that failed, whose base its own
+    # retained record proves (R4-F2 of PR #536): no commit is walked.
+    assert [m["ancestry_reads"] for m in logged] == [0, 0]
     assert logged[1]["candidate"] == commit and logged[1]["memory_digest"]
     assert all("fixed.txt is missing" not in json.dumps(m) for m in logged)
     assert pi.calls and all(r.fresh_context for r in pi.calls)
@@ -430,11 +436,11 @@ def test_a_relaunch_reads_its_candidate_through_the_bound_admin_dir_not_the_dotg
     assert f"Candidate: {c2}" in corrected and f"Candidate: {c1}" not in corrected
     assert f"Source candidate: {c1}" in corrected and "needs revalidation 01" in corrected
     assert f"FAIL on {c1}" not in corrected, "C1's failure is not established on C2"
-    assert [m["candidate"] for m in (r["metadata"]["memory"] for r in execution_records(eng))] == [
-        "",
-        c1,
-        c2,
-    ]
+    logged = [r["metadata"]["memory"] for r in execution_records(eng)]
+    assert [m["candidate"] for m in logged] == ["", c1, c2]
+    # C1's base is proved by C1's own record; C2 has none, so the walk
+    # proves it, C2 then C1 read (R4-F2 of PR #536).
+    assert [m["ancestry_reads"] for m in logged] == [0, 0, 2]
     eng.close()
 
 
@@ -458,6 +464,73 @@ def test_a_binding_the_registry_does_not_confirm_binds_no_candidate(tmp_state_di
     eng.close()
 
 
+def traced_git(runner, trace: Path):
+    """``runner`` with ``GIT_TRACE`` set for every git process, so a git it starts is logged."""
+
+    def run(request):
+        if request.command[:1] == ["git"]:
+            env = {**(request.env or {}), "GIT_TRACE": str(trace)}
+            request = dataclasses.replace(request, env=env)
+        return runner(request)
+
+    return run
+
+
+def test_a_head_the_store_lacks_binds_no_candidate_and_no_git_tries_to_fetch_it(
+    tmp_state_dir, pi_home, tmp_path
+):
+    """R4-F1 of PR #536. The shared git directory names a promisor remote and
+    the worktree's ``HEAD`` names a commit the store lacks, as a partial
+    clone's can. Memory's read of the launch's candidate opens no object in
+    that directory: ``HEAD``'s id is read alone, and the commit through the
+    controller's private git directory, which names no promisor remote. So
+    no git process it starts even tries a fetch (each is traced), no
+    candidate is bound, every record bound to one is omitted and the input
+    is unknown. The candidate read after a launch, which peels ``HEAD`` to a
+    commit in the shared directory, does start a fetch here: the trace sees
+    one when there is one."""
+    gh = FakeGitHub()
+    eng, _ = producing(tmp_state_dir, gh, scripted(implement), FAILS)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    work = str(eng.agent_worktree_path())
+    common = eng.workspace().git_dirs()[-1]
+    admin = eng._agent_admin_dir(Path(work))
+    missing = "e" * 40
+    assert not eng._git_transport().has_commit(missing)
+    kept = (admin / "HEAD").read_text()
+    promisor = {
+        "remote.promised.url": str(tmp_path / "nowhere"),
+        "remote.promised.promisor": "true",
+        "extensions.partialClone": "promised",
+    }
+    for key, value in promisor.items():
+        git_out("--git-dir", str(common), "config", key, value)
+    (admin / "HEAD").write_text(missing + "\n")
+    trace = tmp_path / "git.trace"
+    runner = eng._runner
+    eng._runner = traced_git(runner, trace)
+    try:
+        assert eng._memory_candidate(work) == ""
+        launch = eng._launch_memory(Phase.ANALYZE_EXECUTE, work)
+        assert launch is not None and (launch.request.candidate, launch.input_sha) == ("", "")
+        assert "Shown 00;" in launch.text and "inapplicable 01" in launch.text
+        assert launch.metadata()["input"] is None
+        logged = trace.read_text()
+        assert "rev-parse --verify -q worktrees/" in logged and "cat-file --batch" in logged
+        assert "fetch" not in logged, "a git process Memory started tried a fetch"
+        # The peeling read in the shared directory does try one: the trace
+        # would have seen it.
+        with contextlib.suppress(VerificationError):
+            read_candidate(common, admin, work, eng._runner)
+        assert "fetch promised" in trace.read_text()
+    finally:
+        eng._runner = runner
+        (admin / "HEAD").write_text(kept)
+        for key in promisor:
+            git_out("--git-dir", str(common), "config", "--unset", key)
+    eng.close()
+
+
 def history_calls(gh, since=0) -> list[tuple]:
     """The GitHub ancestry questions the controller asked since call ``since``."""
     return [c for c in gh.calls[since:] if c[0] == "commit_in_history"]
@@ -468,11 +541,12 @@ def test_a_retry_on_the_failed_commit_is_shown_its_failure_with_no_github_call(
 ):
     """R3-F1 of PR #536. Launch 1's one commit C1 fails validation, and the
     retry starts on C1. From the end of the first step until the retry is
-    launched every GitHub ancestry answer fails, and Memory asks none: that
-    C1 descends from the failure's base is read from C1's own bytes in the
-    local store, so the retry is shown the failure as established on its own
-    commit. Its run log times the candidate's read and the walk with the
-    render, and counts the one commit the walk read."""
+    launched every GitHub ancestry answer fails, and Memory asks none: C1
+    is read from the local store, and that it descends from the failure's
+    base is proved by the run's own retained record of C1 (R4-F2), so the
+    retry is shown the failure as established on its own commit with no
+    commit walked. Its run log times the candidate's read with the
+    render."""
     gh = FakeGitHub()
     mark: dict[str, int] = {}
     asked: list[tuple] = []
@@ -499,7 +573,7 @@ def test_a_retry_on_the_failed_commit_is_shown_its_failure_with_no_github_call(
     assert f"Observed validation {failed['seq']} ({failed['digest']}): FAIL on {c1}" in shown
     assert "inapplicable 00" in shown and "needs revalidation 00" in shown
     logged = execution_records(eng)[1]["metadata"]["memory"]
-    assert (logged["candidate"], logged["input"], logged["ancestry_reads"]) == (c1, c1, 1)
+    assert (logged["candidate"], logged["input"], logged["ancestry_reads"]) == (c1, c1, 0)
     assert type(logged["projection_ms"]) is float
     assert logged["projection_ms"] >= logged["render_ms"] >= 0
     eng.close()
@@ -530,6 +604,97 @@ def test_a_retrys_proposals_are_keyed_by_the_commit_it_started_from(tmp_state_di
     assert proposal["text"] == lesson and proposal["attempt"] == 2
     assert proposal["scope"]["range"] == "any"
     assert proposal["scope"]["candidate"] == proposal["scope"]["base"] == ""
+    eng.close()
+
+
+def test_a_retry_whose_start_cannot_be_read_records_no_input_and_keys_no_add(
+    tmp_state_dir, pi_home, monkeypatch
+):
+    """R4-F3 of PR #536. The retry after a validation failure starts on the
+    failed commit C1, but Memory's read of it fails. The launch is recorded
+    as what it is: no candidate and no input, never the entry's base in
+    their place, so C1's failure is omitted. Its result is handled as
+    usual and goes on to REVIEW; the note it adds is refused and counted
+    rather than keyed by a commit nobody read."""
+    gh = FakeGitHub()
+    lesson = "The validator wants fixed.txt at the root."
+    seen = Seen(implement, lambda req: repaired(req, memory=[add("failed-approach", lesson)]))
+    eng, _ = producing(tmp_state_dir, gh, seen, NEEDS_FIX)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    (failed,) = saved(eng).validation_records
+    base = failed["candidate"]["provenance"]["base_revision"]
+
+    def unreadable(*args):
+        raise VerificationError("cannot read HEAD of the agent worktree")
+
+    monkeypatch.setattr("autoforge.engine.read_head_id", unreadable)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    logged = execution_records(eng)[1]["metadata"]["memory"]
+    assert (logged["candidate"], logged["input"], logged["ancestry_reads"]) == ("", None, 0)
+    shown = seen.memory[1]
+    assert "Shown 00;" in shown and "inapplicable 01" in shown and "FAIL on" not in shown
+    s = saved(eng)
+    assert s.validation_records[-1]["outcome"] == "PASS"
+    assert [r["author"] for r in records(s)] == ["controller"]
+    assert not [e for e in s.issue_memory["events"] if e.get("key")]
+    assert base not in json.dumps(s.issue_memory["events"][1:])
+    assert s.memory().refusals == 1
+    eng.close()
+
+
+def long_history(req):
+    """An implementer whose candidate is one commit more than the walk reads above the base."""
+    head = git_out("-C", req.cwd, "rev-parse", "HEAD")
+    tree = git_out("-C", req.cwd, "rev-parse", f"{head}^{{tree}}")
+    for n in range(MAX_ANCESTRY_COMMITS + 1):
+        message = f"Implement the feature, part {n} (#2)"
+        head = git_out("-C", req.cwd, *GIT_IDENT, "commit-tree", tree, "-p", head, "-m", message)
+    git_out("-C", req.cwd, "update-ref", "--no-deref", "HEAD", head)
+    return block(analyze_payload(head))
+
+
+def test_a_retry_on_a_candidate_past_the_walk_bound_is_shown_its_own_failure(
+    tmp_state_dir, pi_home
+):
+    """R4-F2 of PR #536. Launch 1's candidate C is MAX_ANCESTRY_COMMITS + 1
+    commits above the base, past what the ancestry walk reads, and fails
+    validation. The retry starts on C itself: the run's retained record of
+    C, which the controller made only after proving C's range from that
+    base, proves the base, so the retry is shown its failure as established
+    with no commit walked. It commits C2 on C and returns no result; the
+    correction that follows starts on C2, which has no record of its own,
+    so only the walk can prove the base, and it does not reach it: C's
+    failure is omitted there, never shown as current."""
+    gh = FakeGitHub()
+
+    def unfinished(req):
+        commit_in(req.cwd)
+        return "Still working on it; no CONTROL_RESULT yet."
+
+    seen = Seen(long_history, unfinished, repaired)
+    eng, _ = producing(tmp_state_dir, gh, seen, NEEDS_FIX)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    (failed,) = saved(eng).validation_records
+    c = failed["candidate"]["commit"]
+    base = failed["candidate"]["provenance"]["base_revision"]
+    work = str(eng.agent_worktree_path())
+    count = int(git_out("-C", work, "rev-list", "--count", f"{base}..{c}"))
+    assert count == MAX_ANCESTRY_COMMITS + 1
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    retry = seen.memory[1]
+    assert f"Candidate: {c}" in retry
+    assert f"Observed validation {failed['seq']} ({failed['digest']}): FAIL on {c}" in retry
+    assert "inapplicable 00" in retry and "needs revalidation 00" in retry
+    logged = [r["metadata"]["memory"] for r in execution_records(eng)]
+    c2 = logged[2]["candidate"]
+    assert git_out("-C", work, "rev-parse", f"{c2}^") == c
+    corrected = seen.memory[2]
+    assert f"Candidate: {c2}" in corrected and "inapplicable 01" in corrected
+    assert f"FAIL on {c}" not in corrected and f"Source candidate: {c}" not in corrected
+    assert [(m["candidate"], m["input"]) for m in logged[1:]] == [(c, c), (c2, c2)]
+    assert [m["ancestry_reads"] for m in logged] == [0, 0, MAX_ANCESTRY_COMMITS]
     eng.close()
 
 
@@ -681,6 +846,80 @@ def test_the_ancestry_walk_proves_a_base_at_most_its_bound_below_the_candidate()
     assert local_ancestors(tip, [far], parents_from(graph)) == ((), MAX_ANCESTRY_COMMITS)
 
 
+def prepared(store, head, graph, receipts, reads=None):
+    return prepare_launch_projection(
+        lambda: store,
+        STEP,
+        base=BASE,
+        read_head=lambda: head,
+        read_parents=parents_from(graph, reads),
+        validation_records=list(receipts),
+    )
+
+
+def test_a_failure_past_the_walk_bound_is_proved_on_its_own_commit_by_its_receipt_alone():
+    """R4-F2 of PR #536. C is MAX_ANCESTRY_COMMITS + 1 commits above BASE and
+    failed validation. On C itself, the failure's retained record proves the
+    base: it is shown as established and nothing is walked. Nothing else is
+    relaxed. On a child of C the walk alone decides, and it does not reach
+    the base; on C with the record gone, or with a record that does not
+    establish the failure (unenforced under ``required``), neither proves
+    it; with no candidate nothing does. Each time the failure is omitted."""
+    commits, graph = chain(MAX_ANCESTRY_COMMITS + 1)
+    c = commits[0]
+    graph[commits[-1]] = (BASE,)
+    rec = failing_record(commit=c)
+    store = observe_validation_failure(
+        enabled(), STEP, parse_record(rec), attempt=1, text="definition [0] failed"
+    ).store
+    assert local_ancestors(c, [BASE], parents_from(graph)) == ((), MAX_ANCESTRY_COMMITS)
+    reads: list = []
+    on_it = prepared(store, c, graph, [rec], reads)
+    assert on_it.request.ancestors == (BASE,) and (on_it.ancestry_reads, reads) == (0, [])
+    assert f"Observed validation 1 ({rec['digest']}): FAIL on {c}" in on_it.text
+    assert "inapplicable 00" in on_it.text
+    child = sha_of(10**6)
+    unenforced = failing_record(commit=c, pol=policy(mode="required"))
+    assert parse_record(unenforced).enforced is False
+    cited = observe_validation_failure(
+        enabled(), STEP, parse_record(unenforced), attempt=1, text="definition [0] failed"
+    ).store
+    for observed, head, receipts in (
+        (store, child, [rec]),
+        (store, c, []),
+        (cited, c, [unenforced]),
+        (store, "", [rec]),
+    ):
+        launch = prepared(observed, head, {**graph, child: (c,)}, receipts)
+        assert launch.request.ancestors == ()
+        assert "Shown 00;" in launch.text and "inapplicable 01" in launch.text
+        assert launch.ancestry_reads == (MAX_ANCESTRY_COMMITS if head else 0)
+
+
+def test_only_an_established_observation_on_the_candidate_proves_its_base():
+    """R4-F2 of PR #536: :func:`established_bases` names the base of each
+    observation the candidate's own retained record establishes, and no
+    other: not on another commit, not with no candidate, not for an
+    observation whose record is gone, and not with Memory off."""
+    rec, other = failing_record(), failing_record(2, commit=C2, base=C1)
+    store = enabled()
+    for view in (rec, other):
+        store = observe_validation_failure(
+            store, STEP, parse_record(view), attempt=1, text="failed"
+        ).store
+    assert store.range_bases(ISSUE) == tuple(sorted((BASE, C1)))
+
+    def bases(candidate, receipts):
+        request = projection_request(store, STEP, candidate=candidate)
+        return established_bases(store, request, validation_records=receipts)
+
+    assert bases(C1, [rec, other]) == (BASE,)
+    assert bases(C2, [rec, other]) == (C1,)
+    assert bases(C1, [other]) == bases("", [rec, other]) == bases(sha_of(9), [rec]) == ()
+    off = MemoryStore(REPO, RUN, 1, {})
+    assert established_bases(off, projection_request(store, STEP, candidate=C1)) == ()
+
+
 def test_the_engines_ancestry_reader_reads_commits_as_their_bytes_and_never_github(
     tmp_state_dir, pi_home
 ):
@@ -716,26 +955,33 @@ def test_the_engines_ancestry_reader_reads_commits_as_their_bytes_and_never_gith
     eng.close()
 
 
-def test_the_projection_time_covers_the_candidate_read_and_the_walk():
-    """R3-F1 of PR #536: the latency a launch records is Memory's whole work
-    before it, the candidate's read and the ancestry walk with the render,
-    by the controller's clock; ``render_ms`` is the render's share."""
+def test_the_projection_time_covers_the_ledger_the_candidate_read_and_the_walk():
+    """R3-F1, R4-F4 of PR #536: the latency a launch records is Memory's whole
+    work before it, by the controller's clock: the ledger's reconstruction,
+    the candidate's read and the ancestry walk with the render;
+    ``render_ms`` is the render's share. C2 is built on C1, whose failure is
+    bound to BASE; C2 has no record of its own, so the walk proves the base,
+    reading C2 and then C1."""
     rec = failing_record()
     store = observe_validation_failure(
         enabled(), STEP, parse_record(rec), attempt=1, text="definition [0] failed"
     ).store
     now = [10.0]
 
+    def load():
+        now[0] += 0.0625
+        return store
+
     def head():
         now[0] += 0.125
-        return C1
+        return C2
 
     def parents(sha):
         now[0] += 0.25
-        return {C1: (BASE,)}.get(sha)
+        return {C2: (C1,), C1: (BASE,)}.get(sha)
 
     launch = prepare_launch_projection(
-        store,
+        load,
         STEP,
         base=BASE,
         read_head=head,
@@ -743,27 +989,62 @@ def test_the_projection_time_covers_the_candidate_read_and_the_walk():
         validation_records=[rec],
         clock=lambda: now[0],
     )
-    assert (launch.request.candidate, launch.request.ancestors) == (C1, (BASE,))
-    assert f"FAIL on {C1}" in launch.text
-    assert (launch.input_sha, launch.ancestry_reads) == (C1, 1)
-    assert (launch.projection_ms, launch.render_ms) == (375.0, 0.0)
+    assert (launch.request.candidate, launch.request.ancestors) == (C2, (BASE,))
+    assert f"Source candidate: {C1}" in launch.text and "needs revalidation 01" in launch.text
+    assert (launch.input_sha, launch.ancestry_reads) == (C2, 2)
+    assert (launch.projection_ms, launch.render_ms) == (687.5, 0.0)
     meta = launch.metadata()
-    assert (meta["projection_ms"], meta["render_ms"], meta["ancestry_reads"]) == (375.0, 0.0, 1)
-    assert meta["input"] == meta["candidate"] == C1
+    assert (meta["projection_ms"], meta["render_ms"], meta["ancestry_reads"]) == (687.5, 0.0, 2)
+    assert meta["input"] == meta["candidate"] == C2
+
+
+def test_the_engines_projection_time_includes_the_ledgers_reconstruction(
+    tmp_state_dir, pi_home, monkeypatch
+):
+    """R4-F4 of PR #536, at the engine's boundary: the time a Memory launch
+    records starts before the run's ledger is reconstructed and validated
+    from the checkpoint (``state.memory()``), which runs before every Memory
+    launch. The engine's clock is a fake that only the reconstruction moves,
+    so the measurement is held exactly, with no wall time: the whole of it
+    is the reconstruction's, and none of it the render's."""
+    gh = FakeGitHub()
+    eng, _ = producing(tmp_state_dir, gh, scripted(implement), FAILS)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    now = [100.0]
+    eng._memory_clock = lambda: now[0]
+    state_type = type(eng.state)
+    reconstruct = state_type.memory
+    calls = []
+
+    def timed_reconstruction(self):
+        calls.append(self)
+        now[0] += 1.5
+        return reconstruct(self)
+
+    monkeypatch.setattr(state_type, "memory", timed_reconstruction)
+    launch = eng._launch_memory(Phase.ANALYZE_EXECUTE, str(eng.agent_worktree_path()))
+    assert launch is not None and calls == [eng.state]
+    assert (launch.projection_ms, launch.render_ms) == (1500.0, 0.0)
+    assert launch.request.candidate and "FAIL on" in launch.text
+    meta = launch.metadata()
+    assert (meta["projection_ms"], meta["render_ms"]) == (1500.0, 0.0)
+    eng.close()
 
 
 @pytest.mark.parametrize(
     "head, candidate, input_sha",
-    [(BASE, "", BASE), ("", "", BASE), (C1, C1, C1)],
+    [(BASE, "", BASE), ("", "", ""), (C1, C1, C1)],
     ids=["on-the-base", "unread", "on-a-candidate"],
 )
-def test_a_launchs_input_is_the_commit_it_starts_from_or_the_base(head, candidate, input_sha):
-    """R3-F2 of PR #536: the input a launch's proposals are keyed by is the
-    commit read as its start; on the base, or when none could be read, the
-    projection binds no candidate and the input is the base. Nothing is
-    walked without a candidate."""
+def test_a_launchs_input_is_the_commit_it_starts_from_and_never_a_guess(head, candidate, input_sha):
+    """R3-F2, R4-F3 of PR #536: the input a launch's proposals are keyed by is
+    the commit read as its start, the base when it starts on the base. When
+    none could be read the projection binds no candidate and the input is
+    unknown, never the base: the run log says so (``None``), and the add the
+    launch's result makes is refused and counted when it is admitted,
+    keyed by nothing. Nothing is walked without a candidate."""
     launch = prepare_launch_projection(
-        enabled(),
+        enabled,
         STEP,
         base=BASE,
         read_head=lambda: head,
@@ -771,8 +1052,34 @@ def test_a_launchs_input_is_the_commit_it_starts_from_or_the_base(head, candidat
         validation_records=[],
     )
     assert (launch.request.candidate, launch.input_sha) == (candidate, input_sha)
+    assert launch.metadata()["input"] == (input_sha or None)
     binding = launch.bind([add("note", "a lesson")], 2)
     assert (binding.launch, binding.input_sha, len(binding.proposals.entries)) == (2, input_sha, 1)
+    admission = admit_proposals(
+        enabled(2), binding.proposals, step=STEP, attempt=2, input_sha=binding.input_sha
+    )
+    keys = [e["key"] for e in admission.store.encode()["events"] if e.get("key")]
+    if input_sha:
+        assert (admission.applied, admission.refused, admission.store.refusals) == (1, 0, 0)
+        assert keys == [["analyze-execute", 2, "producer", input_sha, 0]]
+    else:
+        assert (admission.applied, admission.refused, admission.store.refusals) == (0, 1, 1)
+        assert keys == [] and admission.store.catalog(ISSUE)["records"] == []
+
+
+def test_a_launch_with_no_known_input_still_revises_what_it_was_shown():
+    """R4-F3 of PR #536: no key names a revision, so a ``correct`` of a record
+    the launch was shown is admitted whatever its input; only the same
+    result's ``add`` is refused, and counted."""
+    store = MemoryStore(REPO, RUN, 2, notes(1, seq=1).encode())
+    entries = (
+        Proposal(Action.CORRECT, record=1, text="lesson 1, checked", reason="re-read", revision=1),
+        Proposal(Action.ADD, kind=Kind.NOTE, text="a new lesson", slot=1),
+    )
+    out = admit_proposals(store, Proposals(entries), step=STEP, attempt=2, input_sha="")
+    assert (out.applied, out.refused, out.store.refusals) == (1, 1, 1)
+    (row,) = out.store.catalog(ISSUE)["records"]
+    assert (row["text"], row["status"]) == ("lesson 1, checked", "current")
 
 
 def test_an_ancestry_walk_at_its_bound_costs_far_less_cpu_than_the_ceiling(tmp_path):
@@ -1110,10 +1417,13 @@ def test_the_render_time_recorded_is_the_clocks_measurement_of_the_render():
 
 
 def test_a_render_at_the_stores_record_bound_costs_far_less_cpu_than_the_ceiling():
-    """ADR 0015 D12 holds a render to the evaluation's 1,000 ms ceiling. The
-    cost measured is the CPU time this process spends rendering a store at
-    its record bound, each record's text at its own bound, never a wall
-    time, which other workers on the host stretch (tests/AGENTS.md)."""
+    """ADR 0015 D12 holds Memory's work before a launch to the evaluation's
+    1,000 ms ceiling. The cost measured is the CPU time this process spends
+    reconstructing and validating a ledger at its record bound from its
+    checkpoint value, as ``state.memory()`` does before every Memory launch
+    (R4-F4 of PR #536), and rendering it, each record's text at its own
+    bound; never a wall time, which other workers on the host stretch
+    (tests/AGENTS.md)."""
     pad = (MAX_TEXT_BYTES - len(b"lesson 64: ")) // 2
 
     def text(n):
@@ -1122,10 +1432,11 @@ def test_a_render_at_the_stores_record_bound_costs_far_less_cpu_than_the_ceiling
     store = notes(MAX_FACTS, seq=MAX_FACTS, text=text)
     rows = store.catalog(ISSUE)["records"]
     assert len(rows) == MAX_FACTS and all(len(r["text"].encode()) <= MAX_TEXT_BYTES for r in rows)
+    checkpoint = json.loads(json.dumps(store.encode()))
     rounds = 5
     started = time.process_time()
     for _ in range(rounds):
-        launch = project(store)
+        launch = project(MemoryStore(REPO, RUN, MAX_FACTS, checkpoint))
     cpu_ms = (time.process_time() - started) * 1000.0 / rounds
     assert launch.projection.freshness.omitted > 0, "the budget cut the store"
     assert cpu_ms < 1000.0

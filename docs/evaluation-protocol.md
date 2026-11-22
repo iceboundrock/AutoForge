@@ -163,10 +163,10 @@ records its digest. #333 delivers it to every Memory launch of
 ANALYZE_EXECUTE as `memory.md` and records what each launch was shown in
 its run log (`metadata.memory`: sizes, counts, digests and the time of
 Memory's whole preparation before the launch, `projection_ms`, the
-candidate's read and its local ancestry walk included, never a record's
-text). The arm's collector, which reads that digest
-and those measures back into a record, is still owed; this protocol
-records no Memory-arm result.
+ledger's reconstruction from the state file, the candidate's read and its
+local ancestry walk included, never a record's text). The arm's collector,
+which reads that digest and those measures back into a record, is still
+owed; this protocol records no Memory-arm result.
 
 A lesson is the author's summary of its evidence, not a transcript of a real attempt: these commits are
 the closest thing this repository holds to earlier verified experience on the same code. Whether a lesson
