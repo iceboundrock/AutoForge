@@ -4,19 +4,28 @@
 exhaustive reference: it lists every key the controller reads, with its
 default and a comment on what it enforces. This page explains how a config
 file is created, loaded and validated, and gives an overview of the
-sections. It does not repeat every option.
+sections. It does not repeat every option. A key that exists is not a
+claim that what it turns on is supported: the README's
+[What works today](../README.md#what-works-today) gives each capability's
+status.
 
 ## Creating and passing a config file
 
+Start from a starter configuration under [`examples/`](../examples), which
+writes out a routing and the merge gate's settings, or from
+`autoforge.example.yaml`, which sets every key. Take it from the same
+revision of AutoForge as the command you installed, so that it names only
+keys and models that version knows
+([Getting started, step 4](getting-started.md#4-write-a-configuration)
+fetches a starter that way). Then pass it to every command:
+
 ```bash
-cp autoforge.example.yaml autoforge.yaml     # local to one checkout: keep it out of git
-uv run autoforge --config autoforge.yaml doctor
-uv run autoforge --config autoforge.yaml run --epic <EPIC URL> --issue <issue URL>
+autoforge --config autoforge.yaml doctor
+autoforge --config autoforge.yaml run --epic <EPIC URL> --issue <issue URL>
 ```
 
-(`uv run autoforge` is the form inside a development clone of AutoForge;
-with the command installed, see [Installation](../README.md#installation),
-it is `autoforge --config autoforge.yaml ...`.)
+(Inside a development clone of AutoForge, the command is
+`uv run autoforge`; see [Installation](../README.md#installation).)
 
 `--config` and `--state-dir` are options of the `autoforge` command itself,
 so they go before the subcommand. Without `--config` the controller uses its
@@ -48,7 +57,8 @@ checked against the locally installed CLIs (Claude Code 2.1.263, OpenCode
 
 ## Formats
 
-YAML (`uv sync --extra yaml` for PyYAML, else a minimal built-in subset
+YAML (PyYAML when it is installed: the `autoforge-cli[yaml]` extra, or
+`uv sync --extra yaml` in a development clone; else a minimal built-in subset
 parser), TOML (stdlib), and JSON (stdlib) are accepted; the file extension
 (`.yaml` / `.yml`, `.toml`, `.json`) selects the parser. A file that does not
 parse is reported as `cannot parse config <path>: ...` whichever parser read

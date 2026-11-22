@@ -252,7 +252,8 @@ request and its checks yourself before you merge. An existing repository
 may have a rule already: the row is `OK` when an active rule that nobody
 can bypass requires every check `safety.required_checks` names, and
 otherwise the same `WARN` or `SKIP` says what is missing. The row matters
-once you want AutoForge to merge; then:
+once you want AutoForge to merge, which is experimental
+([What works today](../README.md#what-works-today)); then:
 
 1. have CI report a status check on every pull request, and put its name in
    `safety.required_checks` (the starters say `ci`, AutoForge's own check);

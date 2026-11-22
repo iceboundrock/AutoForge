@@ -5,6 +5,35 @@ so.
 
 ## Unreleased
 
+### The README says what works today, held to the code (#262)
+
+The README's "Current maturity" table mixed levels ("opt-in", "opt-in,
+experimental", "not yet") and cited no evidence. It is now
+[What works today](README.md#what-works-today): each capability has
+exactly one status, Supported, Experimental or Not available, and an
+evidence link. Two things moved since the old table was written:
+`claude-sdk` launches and is experimental, and the controller does give
+the reviewer the PR's checks, so that is no longer listed as missing. A
+provider matrix gives each provider's share of the built-in routing and
+its status, and links the compatibility matrix for versions and sign-in.
+New sections say where a human decides (and that an agent cannot ask you
+anything mid-run through the CLI providers) and list the known
+limitations, among them GitHub.com only and no spending limit.
+
+`tests/test_readme.py` fails when the provider matrix and
+`default_config()` or `doctor`'s agent rows disagree, when a feature row
+lacks one status or an evidence link, when the Prerequisites' version
+floors differ from what `doctor` enforces, when Configuration's table of
+built-in profiles differs from `default_config()`, or when a link of the
+README or the documentation index, or one into the README, reaches no
+file or heading. The README's Prerequisites and Installation link
+absolutely again, since PyPI shows that page and resolves no relative
+link. [Releasing](docs/releasing.md#documentation-accuracy-checklist)
+gains the documentation accuracy checklist a release candidate is held to
+(Gate 6 of #255), in offline and maintainer items.
+
+No behaviour changes.
+
 ### `claim-ambiguous`: `status` goes by what the reason names (#375)
 
 When more than one open PR carries the issue's implementation marker and

@@ -459,8 +459,9 @@ profiles:
       output_format: default
       auto_approve: false
 
-  # Future milestone (reachable only after a controller-performed merge, which
-  # is gated by safety.allow_merge + --allow-merge). There is no `merge` agent
+  # Reached only after a controller-performed merge, which the merge gate
+  # (safety.allow_merge + --allow-merge) keeps off by default; experimental,
+  # like that merge (README, "What works today"). There is no `merge` agent
   # profile: MERGE is executed by the controller, see `merge:` above.
   update_epic:
     provider: opencode

@@ -223,7 +223,8 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        acceptance of a result delivered before a
                                        failed launch end (#479), no pre-BLOCK pause;
                                        the container sandbox backend (accepted with
-                                       required changes, nothing implemented): the
+                                       required changes; parts built, none
+                                       selectable before #273): the
                                        lifecycle seam, the death-watch that replaces
                                        --die-with-parent, rootless only, bind or
                                        copy-in per runtime, the invariant map;
@@ -234,7 +235,8 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        what reopens it and the SSH-first direction
                                        for a reopening, which is not a go);
                                        task state below a phase and Issue Memory
-                                       (accepted, nothing implemented): task
+                                       (accepted; #317's opt-in Memory checkpoint
+                                       built, shown to no launch before #333): task
                                        identities, states and transitions, the
                                        TaskResult / PhaseResult split, launch intent,
                                        the reducer's types, roles and one mutating
@@ -283,11 +285,13 @@ docs/recovery-mvp-evaluation.md        EPIC #354's deterministic recovery MVP ev
                                        sign-off as recorded on #375
 docs/releasing.md                      distribution name, version and tag scheme, changelog, the
                                        maintainer's release procedure, PyPI Trusted Publishing
-                                       (`pypi-publish.yml`) and its one-time setup
+                                       (`pypi-publish.yml`) and its one-time setup, the
+                                       documentation accuracy checklist (Gate 6 of #255)
 docs/security.md                       operator guide: security boundaries, what AutoForge does and
                                        does not protect, GitHub token permissions, recommended settings
-README.md                              operator-facing landing page: overview, key properties,
-                                       install, quick start, maturity
+README.md                              operator-facing landing page: overview, the feature and
+                                       provider matrices (tests/test_readme.py holds them to the
+                                       code), install, quick start, where a human decides, limits
 examples/                              starter configurations; tests load each one, and the
                                        install smoke runs doctor and a dry run with each
 SECURITY.md                            security policy: supported versions, private reporting, scope
