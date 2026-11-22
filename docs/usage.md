@@ -2627,27 +2627,36 @@ reconstruction from the state file, the candidate's read, the walk and the
 render together (`projection_ms`, the per-launch latency the evaluation
 reads), with the render's share (`render_ms`), never a record's text.
 
-Two writers add to the store, each in the save that already records what
-the record rests on, so no crash separates them:
+Two writers add to the store, each in a save the step already makes, so
+no crash leaves a record without what it rests on:
 
 - **The controller's validation-failure record.** When a candidate of the
-  phase fails `validation.commands`, the controller observes the
-  validation record just appended: the observation cites that record
-  and, if the store admits it, is saved in the same save. It carries the
-  controller's account of the record and the ends of its redacted
-  output, and is bound to the failing commit and the base it was checked
-  against. On that commit the projection shows the failure as
-  established by the retained record. On a later commit built on the
-  same base it is shown with its source commit and counted as needing
-  revalidation. Otherwise it is omitted and counted. The same record
-  observed again, after a crash or a relaunch that reports the same
-  commit, adds nothing. The observation and its record do not always
-  exist together: a ledger already at one of its bounds (64 records, 256
-  events, 1 MiB) refuses the observation and counts it in
-  `memory show`'s refusals, and the validation record is saved without
-  it; and the run keeps at most 64 validation records, the oldest
-  evicted first, so a later one can evict the record an observation
-  cites, which is then never shown as established, at most as needing
+  phase fails `validation.commands`, the controller observes the failed
+  validation record, and the observation cites it. A record the
+  validation just appended is observed, if the store admits the
+  observation, in the save that appends the record. A record the
+  controller reuses instead, a terminal `FAIL` or `TIMEOUT` of the same
+  commit, command and policy, goes to the same failure counter, and its
+  observation is saved later, in the save that counts the failure. The
+  observation carries the controller's account of the record and the
+  ends of its redacted output, and is bound to the failing commit and
+  the base it was checked against. On that commit the projection shows
+  the failure as established by the retained record. On a later commit
+  built on the same base it is shown with its source commit and counted
+  as needing revalidation. Otherwise it is omitted and counted. A record
+  the ledger already cites, observed again after a crash or by a
+  relaunch that reports the same commit, adds nothing. One it does not
+  cite yet is observed when it is reused: a record appended while Memory
+  was off gains its first observation that way once Memory is turned on.
+  The observation and its record do not always exist together: a ledger
+  already at one of its bounds (64 records, 256 events, 1 MiB) refuses
+  the observation and counts it in `memory show`'s refusals, and the
+  validation record is saved without it; and the run keeps at most 64
+  validation records and, past that, evicts the oldest one that is not
+  pinned (a record a review's evidence binding or certificate names, the
+  one the failure counter last counted, and the set being validated are
+  pinned), so a later one can evict the record an observation cites,
+  which is then never shown as established, at most as needing
   revalidation with its receipt unavailable.
 - **An accepted result's proposals.** The agent may list up to eight
   entries in an optional `memory` field of its result: a note to add

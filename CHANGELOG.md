@@ -14,14 +14,22 @@ apply to the commit a launch starts from is decided locally, from the run's
 own validation records and the local object store: Memory adds no GitHub
 call to a launch, and no fetch, not even of a commit a partial clone lacks.
 The controller observes each validation failure of the phase's
-candidates in the save that appends its validation record, citing that
-record, so the relaunch after a failure is shown it, however many commits
-the failed candidate holds. The observation is kept only if the ledger
-admits it: one already at a bound (64 records, 256 events, 1 MiB) refuses
-it and counts the refusal, and the validation record is kept without it.
-The run keeps at most 64 validation records, the oldest evicted first, so
-a later one can evict the record an observation cites, after which the
-observation is at most shown as needing revalidation. An agent may add up
+candidates, citing its validation record, so the relaunch after a failure
+is shown it, however many commits the failed candidate holds. A record
+the validation just appended is observed in the save that appends it. A
+record the controller reuses instead (a terminal failure of the same
+commit, command and policy) goes to the same failure counter and is
+observed in the later save that counts the failure, unless the ledger
+already cites it: a record appended while Memory was off gains its first
+observation that way once Memory is on. The observation is kept only if
+the ledger admits it: one already at a bound (64 records, 256 events,
+1 MiB) refuses it and counts the refusal, and the validation record is
+kept without it. The run keeps at most 64 validation records and, past
+that, evicts the oldest one that is not pinned (a record a review's
+evidence or certificate names, the one the failure counter last counted,
+and the set being validated are pinned), so a later one can evict the
+record an observation cites, after which the observation is at most
+shown as needing revalidation. An agent may add up
 to eight notes, or correct or retract an earlier proposal its `memory.md`
 shows, through an optional `memory` list in its result. They are kept only
 with a result the controller accepts: a success, in the save of the plan

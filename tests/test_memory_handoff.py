@@ -1501,6 +1501,53 @@ def test_a_crash_after_the_record_save_keeps_both_and_rederiving_adds_nothing(
     eng2.close()
 
 
+def test_a_reused_record_no_observation_cites_is_observed_in_the_save_that_counts_it(
+    tmp_state_dir, pi_home
+):
+    """A terminal record the producer gate reuses is passed to the same
+    failure counter as a new one, so its observation is written when the
+    ledger does not cite it yet. Here it was appended while Memory was off.
+    Once Memory is turned on (``--accept-config-change``), the next launch,
+    which reports the same failing commit, reuses that record, and its first
+    observation is made with the failure count, in a later save than the
+    one that appended the record. The launch after that one is shown it."""
+    gh = FakeGitHub()
+    eng, _ = producing(tmp_state_dir, gh, scripted(implement), NEEDS_FIX, memory=False)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    s = saved(eng)
+    (failed,) = s.validation_records
+    commit = failed["candidate"]["commit"]
+    assert s.issue_memory == {} and s.producer_validation_failure["count"] == 1
+    eng.close()
+
+    def same_commit(req):
+        return block(analyze_payload(git_out("-C", req.cwd, "rev-parse", "HEAD")))
+
+    seen = Seen(same_commit, repaired)
+    eng2, _ = memory_engine(
+        eng.paths.state_dir, gh, seen, cfg=memory_config(NEEDS_FIX), workdir=eng.workdir, new=False
+    )
+    connect_origin(eng2, eng.origin)
+    eng2.origin = eng.origin
+    eng2.load()
+    eng2.check_run_configuration(("resume",), accept_change=True)
+    assert saved(eng2).issue_memory["enabled"] is True
+    assert eng2.step().next_phase == "ANALYZE_EXECUTE"
+    s = saved(eng2)
+    assert s.validation_records == [failed], "the terminal record was reused, not appended"
+    assert s.producer_validation_failure["count"] == 2
+    (observed,) = records(s)
+    assert observed["kind"] == "validation-failure" and observed["author"] == "controller"
+    assert observed["citation"] == ["validation", failed["seq"], failed["digest"]]
+    assert observed["scope"]["candidate"] == commit
+    assert observed["attempt"] == s.launch_seq == 2
+    assert "[No current record applies]" in seen.memory[0], "launch 2 started before it"
+    assert eng2.step().next_phase == "REVIEW"
+    shown = seen.memory[1]
+    assert f"Observed validation {failed['seq']} ({failed['digest']}): FAIL on {commit}" in shown
+    eng2.close()
+
+
 def stop_save_crash(eng):
     """Crash at the save that would record the agent's own stop."""
     save = eng._save

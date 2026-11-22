@@ -5072,9 +5072,12 @@ class ControllerEngine:
     def _observe_validation_failure(self, view: RecordView) -> None:
         """The controller's observation of a failed ANALYZE_EXECUTE candidate, for the next save.
 
-        Called with the producer's failure counter, so the record and the
-        observation citing it land in one save (ADR 0015 D11 stage 4). A
-        record already cited adds nothing; with Memory off nothing is written.
+        Called with the producer's failure counter, so the observation lands in
+        the save that counts the failure (ADR 0015 D11 stage 4): the one that
+        appends the record, or, for a record the gate reused, the caller's next
+        save. A record already cited adds nothing, and a reused one not cited
+        yet (appended while Memory was off) is observed then; with Memory off
+        nothing is written.
         """
         state = self._require_state()
         if not state.issue_memory.get("enabled"):
@@ -7908,7 +7911,7 @@ class ControllerEngine:
         )
         if memory_supported(phase):
             # #333: the controller's own observation of the failure, citing
-            # the record, in the save that keeps the record (ADR 0015 D11).
+            # the record, in the save that counts the failure (ADR 0015 D11).
             self._observe_validation_failure(view)
 
     def _gate_producer(self, phase: Phase, commit: str, base_revision: str) -> str:

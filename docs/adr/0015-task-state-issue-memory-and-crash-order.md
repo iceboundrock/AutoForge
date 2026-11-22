@@ -1746,9 +1746,12 @@ the checkpoint, the candidate read and the walk included (R4-F4), with the
 render's share), never a record's text. Two writers exist. The controller's
 `validation-failure` record of a failed candidate cites its validation
 record and is added by the producer's failure counter, in the save that
-keeps the record (D11 stage 4). It is bound to the failing commit and to
-its base, so on that commit it is established and on a descendant of the
-base it is shown with its source and needs revalidation. An accepted
+counts the failure (D11 stage 4): the one appending the record, or, for a
+terminal record the producer gate reuses and the ledger does not cite
+yet (one appended while Memory was off, say), the step's later save. It
+is bound to the failing commit and to its base, so on that commit it is
+established and on a descendant of the base it is shown with its source
+and needs revalidation. An accepted
 result's proposals come from an optional `memory` list of the result, which
 no required field and no parser rule changes. They are admitted in the plan
 save of a success or in the stop save of a `blocked` or `failure` result
