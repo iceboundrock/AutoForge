@@ -137,6 +137,15 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/result_parser.py": (*LOOP, "test_validation_gates", "test_routing"),
     "src/autoforge/runlog.py": LOOP,
     "src/autoforge/safefs.py": LOOP,
+    # #320: the producing step's recovery decisions, and the ledger every state
+    # load checks.
+    "src/autoforge/task_recovery.py": (
+        *LOOP,
+        "test_task_recovery",
+        "test_producer_recovery",
+        "test_validation_gates",
+        "test_state",
+    ),
     "src/autoforge/validation.py": LOOP,  # every issue, PR and comment URL
     # -- the package: one feature each ----------------------------------------
     "src/autoforge/AGENTS.md": ("test_packaging",),  # package data or deliberately not

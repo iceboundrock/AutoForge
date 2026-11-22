@@ -329,6 +329,13 @@ workflow:
   # the EPIC complete). `merged_since_epic_update` resets only after that
   # read-back. 1 updates after every merge.
   epic_update_every: 1
+  # A producing step (ANALYZE_EXECUTE, FIX) whose relaunch hands back a
+  # candidate that made no objective progress -- the same tree, failing the same
+  # validation definition the same way -- is relaunched once per producing
+  # task with a request to change approach. Off by default: that relaunch is
+  # then a plain retry. Either way no launch is added: the step still stops
+  # at its third validation failure, with every candidate it judged kept.
+  producer_strategy_change: false
 
 review:
   # After a review with findings, the controller (never an agent) may abandon

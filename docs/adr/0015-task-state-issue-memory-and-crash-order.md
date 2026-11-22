@@ -779,6 +779,23 @@ defaults of D7.2's bounds. It may route the single-agent path through the
 reducer only if prompts, launches and effects stay identical, which §4.1's
 tests hold.
 
+**Implementation note (#320).** The single-agent path's producing task now
+keeps receipts and takes its retry decision through a pure function
+(`src/autoforge/task_recovery.py`), ahead of #332's reducer and without its
+task table. It covers the `Retry` and `Stop` proposals of one producing
+task: a candidate's verdict (`pass`, `fail`, `infra-error`, `not-run`, and
+`inconclusive` only for D7.5), its progress against the task's previous
+candidate by objective deltas, and a decision that, with the opt-in
+strategy change off, is exactly ADR 0006 D5.2's rule. Its receipts are a
+field of the state, validated whole on load, bounded and announced on #23
+with their own bump; they are not D19 item 4, which #332 and #319 still
+own, nor D5.3's receipt of every reply. With the key off, prompts, launches
+and effects stay identical, as this decision requires. Nothing of D7.5 to
+D7.7 is implemented: no independent verification, counterexample or
+`refs/autoforge/` ref; a stop names the candidate that passed the most
+ordinary validation definitions, kept by commit and tree in the receipts,
+never as a verified candidate.
+
 ### D7. Roles, the step's task graph and one mutating worker
 
 The Memdoor addendum of #316, as the contract #319 implements.

@@ -582,7 +582,9 @@ DIAGNOSES: dict[StopReasonCode, Diagnosis] = {
     StopReasonCode.PRODUCER_VALIDATION_BOUND: Diagnosis(
         "the agent's candidate failed the configured validation commands as often as the "
         "bound allows (ADR 0006)",
-        "inspect the validation records and the candidate in the agent worktree; fix the "
+        "inspect the validation records, the candidate in the agent worktree and the "
+        "step's recovery receipts ('Producer recovery'), which name every candidate the task "
+        "judged and the one that passed the most definitions; fix the "
         f"code or the validation commands, {_UNBLOCK_AFTER}: it sets the validation override "
         "watermark, so the next gate validates again",
     ),

@@ -55,6 +55,10 @@ TEMPLATE_FILES = (
     # and fix.md's {{VALIDATION_FAILURE}} on the relaunch after one.
     "validation_evidence.md",
     "validation_failure.md",
+    # The bounded strategy change of a producing task (#320), rendered after
+    # validation_failure.md into {{VALIDATION_FAILURE}} only on the relaunch
+    # the controller authorized as a ``retry-new-approach``.
+    "strategy_change.md",
     # What an agent is told of its own CLI alone (#440), rendered into
     # common.md's {{PROVIDER_SECTION}} for the provider that names it
     # (``AgentProvider.prompt_section``).

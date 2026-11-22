@@ -104,6 +104,20 @@ Expected state includes data such as:
   `validation_records`, `validation_attempt`, `review_evidence`,
   `review_certificate`, `producer_validation_failure` and
   `validation_override_seq`
+- the recovery receipts of the producing step that judged a candidate last
+  (`producer_recovery`, #320; `src/autoforge/task_recovery.py`,
+  [workflow.md](workflow.md#producer-recovery-receipts-and-the-strategy-change)):
+  `{}` when no step judged one, otherwise its step (`auto_recovery.StepKey`),
+  its current producing task and at most 16 receipts, each a candidate's
+  commit and tree, verdict, failing definition, progress, the failure count
+  and policy the decision read, and the decision. Validated whole on load:
+  each receipt's shape, its verdict's consistency, and that its decision is
+  the one its own recorded inputs give (a task's one strategy change
+  included); a ledger naming another issue than the state's is refused. It
+  outlives the step's `BLOCKED` and its transition (the failure counter
+  does not), is replaced by the next producing step's first judgment, is
+  reopened for a new producing task by an `unblock` into its step, and is
+  cleared with the validation evidence at an issue switch
 - timestamps
 
 Besides these, the state records the review loop: `review_round`,
@@ -634,6 +648,22 @@ applies, and a value that would leave an open record without its
 retraction reserve (one event slot and its bytes) is refused. The number
 is the implementation's (`main` was at 19 when it was written); it is
 settled on #23 before the change merges.
+
+Protocol 20 → 21 (#320) adds `producer_recovery`. Every protocol-21 save
+writes it, `{}` included, so an absent one is refused as a truncation or a
+hand edit. A protocol-20 file, or any older file its own rules load, loads
+with `producer_recovery: {}` in every phase and is relabelled on the next
+save: no candidate was judged under receipts, and the failure counter it
+carries still bounds a step in progress, because the bound reads the
+counter, not the receipts. An older label carrying the field, even `{}`, is
+refused. Its crash windows add none: a failure's receipt is in the save
+that appends its record and counts it (or, for a reused terminal record,
+the save that ends the step), so a crash leaves both or neither; a stop at
+the bound is in that save too, and the next entry blocks before relaunching
+as it did; a promoted candidate's receipt is in memory until its plan save,
+so a crash before it leaves none, and the relaunch judges the candidate
+again. The number is the implementation's (`main` was at 20 when it was
+written); it is settled on #23 before the change merges.
 
 **Numbering a new protocol.** A change that adds or changes persisted state takes N + 1, where N is `__protocol_version__` on `main` when its PR is ready to merge, and it makes that bump alone: two independent persisted changes never share one. Before the PR merges, its issue announces N → N + 1, the new fields and the migration rule on #23, the home of protocol numbering. If `main` moves past N first, the PR rebases, takes the new N + 1 and says so there; after the merge, #23 records the squash commit. No number is reserved ahead of time. Label 6 stays skipped: never written, and refused as unknown like a future label (`tests/test_state.py`, `test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged`). Each bump states its migration rule in this section, in the form above: what a file of the previous protocol loads as, what an older-labelled file carrying the new state is refused as, and which new field a file of the new protocol must carry.
 

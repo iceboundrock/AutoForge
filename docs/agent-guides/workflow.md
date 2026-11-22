@@ -361,6 +361,62 @@ stops at its first non-`PASS`.
   its PR, candidate or round. A PR found already MERGED is reconciled and
   counted once with no certificate (D12.4).
 
+
+### Producer recovery: receipts and the strategy change
+
+#320 (`src/autoforge/task_recovery.py`) makes what follows a producer's
+validation the controller's decision, recorded with the evidence it was
+taken on. It changes no phase, edge, bound or default prompt.
+
+- **The verdict.** Each candidate an `ANALYZE_EXECUTE` or `FIX` result names
+  is judged once its check accepted it: `pass` (every definition passed for
+  that commit and tree), `fail` (a `FAIL` or `TIMEOUT` record: a definitive
+  negative that vetoes the agent's `success`), `infra-error` (the controller
+  could not run the set: `validation-inconclusive`), or `not-run` (no
+  `validation.commands`). `not-run` is never a pass: nothing vetoes the
+  candidate, so it goes on to the review as before, but no receipt, message
+  or `status` line calls it validated. `inconclusive` is reserved for ADR
+  0015 D7.5's independent verification (#319) and stops the step if it ever
+  occurs.
+- **Progress** compares the candidate with the producing task's previous
+  conclusive one, under the same validation set, by objective deltas only:
+  more definitions pass (`new-pass`), fewer (`regressed`), another failure by
+  definition, outcome or exit status (`changed-failure`), the same failure
+  on another tree (`changed-candidate`), or the same tree failing the same
+  way (`none`). Output tails and agent text never enter it.
+- **The decision** (`authorize`) is a pure function of the verdict, the
+  progress, the task's earlier receipts, ADR 0006 D5.2's failure count and
+  the configuration: `promote` for `pass` and `not-run`, `stop` at the
+  failure bound or on `infra-error`, otherwise `retry`, or `retry-new-approach`
+  when `workflow.producer_strategy_change` is on, the progress is `none` and
+  the task has not changed approach yet. With the key off, the default, the
+  decisions are exactly the rule before #320, and so is every prompt. The
+  agent proposes approaches; it never authorizes a launch.
+- **The strategy change** adds the `strategy_change.md` section after the
+  validation failure in the next launch's prompt, once per producing task.
+  It adds no launch: the third failure still stops the step (`BLOCKED`,
+  `producer-validation-bound`), and a second stagnation is a plain `retry`.
+- **Receipts.** Each judgment's receipt (task, launch ordinal, commit, tree,
+  verdict, the failure's definition, outcome, exit status and record seq,
+  progress, failure count, policy and decision) lands in the save that holds
+  its evidence: a failure's with the record and the counter, a promoted
+  candidate's with its plan, a stop's with the stop. The ledger
+  (`producer_recovery`) keeps the step that judged a candidate last; it
+  outlives the step's stop and its transition, is replaced by the next
+  producing step's first judgment (another phase entry, review round,
+  execution attempt or issue never reads it), and an `unblock` into the same
+  step opens a new producing task in it whose progress, failures and strategy
+  change start afresh. A stop at the bound names the last candidate (left in
+  the agent worktree) and the one that passed the most definitions, both
+  kept by commit and tree in the receipts; nothing of either is published,
+  and no ref is made for them (D7.7's refs are for verified candidates, #319).
+- **What a receipt is not.** A decision is the controller's authorization,
+  not a launch: the step budget, an agent's own `blocked` (a partial `FIX`
+  included) and every other existing check still run after it. The loader
+  refuses a receipt whose decision its own recorded inputs do not give, so a
+  hand edit or an agent rewriting the state cannot authorize an attempt.
+  `REPLAN_REEXECUTE` keeps its rejection path and records no receipt.
+
 ---
 
 ## Bind reviews to PR HEAD SHA and to the PR identity

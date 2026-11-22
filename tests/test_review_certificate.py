@@ -491,13 +491,18 @@ def _relabelled(data: dict, label: str) -> dict:
         label,
         ("pr_body_outcomes", "stop_code", "partial_fix", "auto_recovery", "delivered_reply"),
     )
-    data = {k: v for k, v in data.items() if k not in (*newer, "issue_memory", "launch_seq")}
+    # Protocol 21's field (#320) is newer than every older label, and protocol
+    # 20's (#317) than every label before it.
+    memory = () if label == "20" else ("issue_memory", "launch_seq")
+    if label == "20":
+        newer = ()
+    data = {k: v for k, v in data.items() if k not in (*newer, *memory, "producer_recovery")}
     if label == "12":
         return {**data, **LOCAL_STATE_FIELDS, "protocol_version": "12"}
     return {**data, "protocol_version": label}
 
 
-@pytest.mark.parametrize("label", ["20", "19", "18", "17", "16", "15", "12"])
+@pytest.mark.parametrize("label", ["21", "20", "19", "18", "17", "16", "15", "12"])
 @pytest.mark.parametrize(
     ("plant", "needle"),
     [(_with_record, "end_fingerprint"), (_with_certificate, "review_certificate'.kind")],

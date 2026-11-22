@@ -300,6 +300,15 @@ delivered_result.py a reply delivered before its launch failed (#479, ADR 0012 D
                     to, and marked applied by the save of the plan made from it);
                     accepts nothing itself; pure,
                     persists nothing itself
+task_recovery.py    a producing step's recovery decisions (#320, ADR 0015 D3, D6, D7): the
+                    controller's verdict on a candidate (pass, fail, infra-error, not-run,
+                    which is never a pass; inconclusive for #319), progress from objective
+                    deltas (passing count, failing definition, outcome, exit status, tree;
+                    never output or agent text), retry authorization as a pure function of
+                    the receipts, the failure count and the policy, the opt-in strategy
+                    change once per producing task, and the ledger of receipts the state
+                    keeps (producer_recovery), whose decisions its loader re-derives; pure,
+                    persists nothing itself
 recovery_package.py status's recovery action package (#374): from a loaded state, its
                     classification, the configuration and, for 'status --live',
                     unblock's dry-run decision: the diagnosis of the saved stop code,
@@ -312,7 +321,8 @@ recovery_package.py status's recovery action package (#374): from a loaded state
 prompts/            file-based templates ({{VAR}}): common.md (trust boundary), phase
                     templates, update_epic_rerequest.md, correction.md,
                     worktree_state.md (#187), claude_background_work.md (#440, the
-                    section ClaudeCodeProvider names); renderer in prompts/__init__.py
+                    section ClaudeCodeProvider names), strategy_change.md (#320);
+                    renderer in prompts/__init__.py
 ```
 
 ## Rules for production code
@@ -438,6 +448,11 @@ agent_worktree.py, git_workspace.py, engine.py
 (strict import, candidate read, checkout anchor) -> docs/agent-guides/github-safety.md
                                                      and state-and-recovery.md + ADR 0005
                                                      D6
+task_recovery.py, engine.py (_gate_producer, the
+receipts), prompts/strategy_change.md             -> docs/agent-guides/workflow.md (Producer
+                                                     recovery) + docs/agent-guides/state-and-
+                                                     recovery.md + docs/adr/0015-task-state-
+                                                     issue-memory-and-crash-order.md
 result_parser.py, prompts/*.md                    -> docs/agent-guides/control-result-protocol.md
 auto_recovery.py, engine.py (run's recovery path,
 _automatic_recovery and the K13 audit)          -> docs/adr/0012-recovery-and-escalation-stop-

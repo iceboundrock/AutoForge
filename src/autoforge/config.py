@@ -698,6 +698,7 @@ WORKFLOW_KEYS = (
     "stagnation_unchanged_count_rounds",
     "max_total_steps",
     "epic_update_every",
+    "producer_strategy_change",
 )
 
 
@@ -737,6 +738,14 @@ class WorkflowConfig:
     # resets ``merged_since_epic_update``, once that many merges have
     # accumulated since the last verified write. 1 updates after every merge.
     epic_update_every: int = 1
+    # A producing step (ANALYZE_EXECUTE, FIX) whose relaunch hands back a
+    # candidate that made no objective progress (the same tree, failing the
+    # same validation definition the same way) is relaunched once per
+    # producing task with a request to change approach (#320,
+    # ``task_recovery.py``). Off by default: the relaunch is then the plain
+    # retry it always was. Neither value adds a launch: every relaunch stays
+    # within the validation failure bound and ``max_total_steps``.
+    producer_strategy_change: bool = False
 
 
 SANDBOX_DISABLED = "disabled"
@@ -1695,6 +1704,10 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                     f"(the rule compares consecutive review rounds), got {value}"
                 )
             setattr(base.workflow, key, value)
+    if "producer_strategy_change" in workflow:
+        base.workflow.producer_strategy_change = _as_bool(
+            workflow["producer_strategy_change"], source, "workflow.producer_strategy_change"
+        )
     if base.review.replan.hard_threshold > base.workflow.max_review_rounds:
         raise ConfigurationError(
             f"{source}: 'review.replan.hard_threshold' must be <= 'workflow.max_review_rounds'"

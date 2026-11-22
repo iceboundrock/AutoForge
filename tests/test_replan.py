@@ -6155,6 +6155,7 @@ def _protocol_1_state_file(
     data.pop("delivered_reply", None)  # protocol 19's own field (#479)
     data.pop("issue_memory", None)
     data.pop("launch_seq", None)
+    data.pop("producer_recovery", None)
     data["phase"] = Phase.REPLAN_REEXECUTE.value
     data["current_issue_url"] = ISSUE
     data["current_pr_url"] = PR
@@ -6383,12 +6384,12 @@ def test_a_protocol_4_journal_before_the_write_loads_and_relabels(tmp_state_dir,
     eng.save()
     _protocol_1_state_file(eng, _protocol_4_journal(stage), protocol="4")
     loaded = eng.load()
-    assert loaded.protocol_version == "20"
+    assert loaded.protocol_version == "21"
     txn = _txn(eng)
     assert txn.stage is stage and not txn.journal_defects
     assert txn.source_closed_event_count == 0 and txn.close_attempts == 0
     eng.save()
-    assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "20"
+    assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "21"
     if stage is ReplanStage.VERIFIED:
         # The write proceeds from the relabelled journal and records the
         # watermark the protocol-4 controller never did.
@@ -6479,10 +6480,10 @@ def test_r7f1_a_legacy_state_without_a_replan_in_flight_loads_as_current(tmp_sta
         data["phase"] = "REVIEW" if not journal else "BLOCKED"
         eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
         loaded = eng.load()
-        assert loaded.protocol_version == "20"
+        assert loaded.protocol_version == "21"
         assert loaded.replan_transaction == journal
         eng.save()
-        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "20"
+        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "21"
     # A legacy file that predates the journal field altogether is the same
     # case: no replan in flight.
     data = json.loads(eng.paths.state_file.read_text())
@@ -6492,7 +6493,7 @@ def test_r7f1_a_legacy_state_without_a_replan_in_flight_loads_as_current(tmp_sta
         del data[key]
     del data["operator_comment_outcomes"], data["sandbox_pin"], data["pr_body_outcomes"]
     del data["stop_code"], data["partial_fix"], data["auto_recovery"], data["delivered_reply"]
-    del data["issue_memory"], data["launch_seq"]
+    del data["issue_memory"], data["launch_seq"], data["producer_recovery"]
     eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
     assert eng.load().replan_transaction == {}
 
@@ -6534,7 +6535,7 @@ def test_r7f1_the_version_label_decides_not_the_journal_shape(tmp_state_dir):
     # this controller wrote the journal, so a missing field is a missing
     # field, whichever protocol step introduced it.
     data = json.loads(eng.paths.state_file.read_text())
-    data["protocol_version"] = "20"
+    data["protocol_version"] = "21"
     data["acceptance_outcomes"] = []
     data["config_fingerprint"] = {}
     data["operator_comment_outcomes"] = []
@@ -6545,6 +6546,7 @@ def test_r7f1_the_version_label_decides_not_the_journal_shape(tmp_state_dir):
     data["auto_recovery"] = {}
     data["issue_memory"] = {}
     data["launch_seq"] = 0
+    data["producer_recovery"] = {}
     data["delivered_reply"] = {}
     data.update(
         validation_records=[],

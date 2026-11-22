@@ -653,6 +653,9 @@ from .stop_classification import (
     blocked_by_controller,
     reason_code,
 )
+from .task_recovery import Decision as ProducerDecision
+from .task_recovery import Judgment, Ledger, Receipt, Verdict, judged_run, judged_without_a_run
+from .task_recovery import Policy as RecoveryPolicy
 from .transitions import (
     AGENT_PHASES,
     STOP_PHASES,
@@ -1126,6 +1129,7 @@ def render_worktree_state(entries: Sequence[StatusEntry], head_sha: str, branch:
 # (ADR 0006 D5.4, D9.1, D9.2), each rendered from records in state only.
 VALIDATION_EVIDENCE_TEMPLATE = "validation_evidence.md"
 VALIDATION_FAILURE_TEMPLATE = "validation_failure.md"
+STRATEGY_CHANGE_TEMPLATE = "strategy_change.md"
 # What ``{{VALIDATION_EVIDENCE}}`` holds outside a launch (a plan or a dry
 # run): the REVIEW entry validates, or reuses, before the reviewer starts.
 VALIDATION_EVIDENCE_PENDING = (
@@ -1234,9 +1238,14 @@ def render_validation_evidence(candidate: EvidenceCandidate, records: Sequence[R
     )
 
 
-def render_validation_failure(view: RecordView, count: int) -> str:
-    """``{{VALIDATION_FAILURE}}``: the record a producer's failure counter names (D5.4)."""
-    return render(
+def render_validation_failure(view: RecordView, count: int, new_approach: bool = False) -> str:
+    """``{{VALIDATION_FAILURE}}``: the record a producer's failure counter names (D5.4).
+
+    With ``new_approach`` (#320), the controller's request for another
+    approach follows it: the relaunch its receipt authorized as a
+    ``retry-new-approach``. Without it the text is what it always was.
+    """
+    text = render(
         load_template(VALIDATION_FAILURE_TEMPLATE),
         {
             "FAILED_CANDIDATE": _candidate_text(view.candidate),
@@ -1246,6 +1255,13 @@ def render_validation_failure(view: RecordView, count: int) -> str:
             "FAILED_OUTPUT": _untrusted_output(view),
         },
     )
+    if not new_approach:
+        return text
+    strategy = render(
+        load_template(STRATEGY_CHANGE_TEMPLATE),
+        {"CANDIDATE": _candidate_text(view.candidate), "MAX_FAILURE_COUNT": MAX_FAILURE_COUNT},
+    )
+    return f"{text.rstrip()}\n\n{strategy}"
 
 
 # How much of a refused launch's final reply its correction quotes (#393):
@@ -4832,7 +4848,14 @@ class ControllerEngine:
             return ""
         seq = counter["last_record_seq"]
         view = next(r for r in s.validation_evidence() if r.seq == seq)
-        return render_validation_failure(view, counter["count"])
+        receipt = self._producer_ledger(s.phase).last()
+        new_approach = (
+            receipt is not None
+            and receipt.decision is ProducerDecision.RETRY_NEW_APPROACH
+            and receipt.judgment.failure is not None
+            and receipt.judgment.failure.record_seq == seq
+        )
+        return render_validation_failure(view, counter["count"], new_approach)
 
     def _prompt_variables(self) -> dict[str, str | int | None]:
         s = self._require_state()
@@ -7611,6 +7634,17 @@ class ControllerEngine:
         :class:`~autoforge.errors.ValidationInconclusiveError`, with nothing
         written but the records it made.
         """
+        run = self._producer_run(phase, commit, base_revision, on_failure)
+        return None if run is None else run.evidence().failed
+
+    def _producer_run(
+        self,
+        phase: Phase,
+        commit: str,
+        base_revision: str,
+        on_failure: Callable[[RecordView], None],
+    ) -> ValidationRun | None:
+        """:meth:`_producer_gate`'s run itself, or ``None`` for an empty set (nothing ran)."""
         state = self._require_state()
         if not self.config.validation.commands:
             return None
@@ -7633,47 +7667,132 @@ class ControllerEngine:
         failure = run.evidence().failed
         if failure is not None and failure.seq not in applied:
             on_failure(failure)
-        return failure
+        return run
 
-    def _count_producer_failure(self, phase: Phase, view: RecordView) -> None:
-        """D5.2: one more validation failure of ``phase``'s candidates, in the caller's save."""
+    # -- evidence-driven recovery of a producing step (#320) -------------------
+    def _producer_step(self, phase: Phase) -> StepKey:
+        """The step a producer's judgment belongs to: the phase entry (ADR 0012 D11.4)."""
+        state = self._require_state()
+        return StepKey(
+            phase=phase,
+            issue_url=parse_issue_url(state.current_issue_url).canonical,
+            pr_url=parse_pr_url(state.current_pr_url).canonical if state.current_pr_url else "",
+            review_round=state.review_round,
+            execution_attempt=state.execution_attempt,
+        )
+
+    def _producer_ledger(self, phase: Phase) -> Ledger:
+        """The receipts of ``phase``'s current step, or a fresh ledger for it."""
+        state = self._require_state()
+        return Ledger.from_dict(state.producer_recovery).for_step(self._producer_step(phase))
+
+    def _judge_producer(self, phase: Phase, judgment: Judgment) -> Receipt:
+        """Record ``judgment``'s receipt and the controller's decision, in memory.
+
+        The caller's save persists it: the one that appends the failing
+        record and counts it, the plan save of a promoted candidate, or the
+        stop's. The decision reads the failure counter as that save holds it.
+        """
+        state = self._require_state()
+        counter = state.producer_validation_failure
+        count = counter.get("count", 0) if counter.get("phase") == phase.value else 0
+        ledger, receipt = self._producer_ledger(phase).judged(
+            judgment,
+            launch_seq=state.launch_seq,
+            failure_count=count,
+            policy=RecoveryPolicy(strategy_change=self.config.workflow.producer_strategy_change),
+        )
+        state.producer_recovery = ledger.to_dict()
+        return receipt
+
+    def _count_producer_failure(
+        self, phase: Phase, set_digest: str, size: int, view: RecordView
+    ) -> None:
+        """D5.2: one more validation failure of ``phase``'s candidates, in the caller's save.
+
+        Its receipt (#320) lands in the same save, so the count, the record
+        and the decision taken on them are never apart on disk.
+        """
         state = self._require_state()
         state.producer_validation_failure = failure_counter(
             phase.value, state.producer_validation_failure, view
         )
+        candidate = view.candidate
+        self._judge_producer(
+            phase, judged_run(candidate.commit, candidate.tree, set_digest, size, view)
+        )
 
     def _gate_producer(self, phase: Phase, commit: str, base_revision: str) -> str:
-        """D5.1, D5.2 for ``ANALYZE_EXECUTE`` and ``FIX``: "" when the candidate passed.
+        """D5.1, D5.2 for ``ANALYZE_EXECUTE`` and ``FIX``: "" when the candidate may be published.
 
-        A failure below the bound raises :class:`_ProducerValidationFailed`
+        The controller judges the candidate and decides (#320,
+        :mod:`autoforge.task_recovery`); the agent's ``success`` decides
+        nothing. A ``pass``, or ``not-run`` for an empty set, which is no
+        pass, returns "" and its receipt goes into the plan save. A failure
+        whose decision is a retry raises :class:`_ProducerValidationFailed`
         (the step ends without a transition); at the bound it returns the
         ``BLOCKED`` reason. An inconclusive run returns one too (D10.5).
         """
+        defs = definitions(self.config.validation.commands)
+        set_digest = validation_set_digest(defs)
         try:
-            failure = self._producer_gate(
-                phase, commit, base_revision, partial(self._count_producer_failure, phase)
+            run = self._producer_run(
+                phase,
+                commit,
+                base_revision,
+                partial(self._count_producer_failure, phase, set_digest, len(defs)),
             )
         except ValidationInconclusiveError as exc:
+            self._judge_producer(
+                phase, judged_without_a_run(commit, Verdict.INFRA_ERROR, set_digest, len(defs))
+            )
             return CodedReason(
                 StopReasonCode.VALIDATION_INCONCLUSIVE,
                 f"the controller could not validate the candidate {commit[:12]} before "
                 f"publishing it: {exc}. Nothing was pushed or published. Fix the cause, then "
                 "'unblock'",
             )
-        if failure is None:
+        if run is None:
+            self._judge_producer(
+                phase, judged_without_a_run(commit, Verdict.NOT_RUN, set_digest, 0)
+            )
             return ""
-        count = self._require_state().producer_validation_failure["count"]
-        if count >= MAX_FAILURE_COUNT:
+        failure = run.evidence().failed
+        if failure is None:
+            candidate = run.candidate
+            self._judge_producer(
+                phase, judged_run(candidate.commit, candidate.tree, set_digest, len(defs), None)
+            )
+            return ""
+        receipt = self._producer_ledger(phase).last()
+        if (
+            receipt is None
+            or receipt.judgment.failure is None
+            or (receipt.judgment.failure.record_seq != failure.seq)
+        ):
+            raise StateError(
+                f"{phase.value}: the failing validation of {commit[:12]} left no receipt"
+            )
+        count = receipt.failure_count
+        if receipt.decision is ProducerDecision.STOP:
             return CodedReason(
                 StopReasonCode.PRODUCER_VALIDATION_BOUND,
                 self._producer_bound_text(phase, failure, count),
             )
+        if receipt.decision is ProducerDecision.RETRY_NEW_APPROACH:
+            next_launch = (
+                "the next step launches the agent again with the failure in its prompt and asks "
+                "it for another approach, since this candidate made no progress on the last one "
+                "(the same tree, failing the same way); this is the task's one strategy change"
+            )
+        else:
+            next_launch = "the next step launches the agent again with the failure in its prompt"
         raise _ProducerValidationFailed(
             f"{phase.value}: the controller's validation of the candidate did not pass: "
             f"{_validation_failure_text(failure)}. Nothing was pushed or published, and no "
-            f"review started. This is failure {count} of {MAX_FAILURE_COUNT}: the next step "
-            f"launches the agent again with the failure in its prompt, and failure "
-            f"{MAX_FAILURE_COUNT} enters BLOCKED"
+            f"review started. This is failure {count} of {MAX_FAILURE_COUNT} (progress "
+            f"{receipt.progress.value}): {next_launch}, and failure {MAX_FAILURE_COUNT} enters "
+            "BLOCKED"
         )
 
     def _producer_bound_text(self, phase: Phase, view: RecordView, count: int) -> str:
@@ -7682,10 +7801,30 @@ class ControllerEngine:
             f"{count} time(s), which is the bound of {MAX_FAILURE_COUNT}; the last: "
             f"{_validation_failure_text(view)}. Nothing was pushed or published, and no review "
             f"started; the controller will not launch the agent at {phase.value} again "
-            "unattended. Read the record's run log for the full output, repair the change or "
-            "validation.commands, then 'unblock': the unblock makes the failures recorded so "
-            "far historical, so the next candidate is validated afresh"
+            f"unattended. {self._kept_candidates_text(phase)}Read the record's run log for the "
+            "full output, repair the change or validation.commands, then 'unblock': the "
+            "unblock makes the failures recorded so far historical, so the next candidate is "
+            "validated afresh"
         )
+
+    def _kept_candidates_text(self, phase: Phase) -> str:
+        """What a stop keeps for the operator (#320): the task's candidates, from its receipts."""
+        ledger = self._producer_ledger(phase)
+        last, best = ledger.last(), ledger.best()
+        if last is None or best is None:
+            return ""
+        text = (
+            f"The step's recovery receipts ('status') keep every candidate this producing task "
+            f"judged, by commit and tree; the last is {last.candidate_commit[:12]}, left in the "
+            "agent worktree"
+        )
+        if best.candidate_commit != last.candidate_commit:
+            text += (
+                f", and the one that passed the most validation definitions is "
+                f"{best.candidate_commit[:12]} ({best.judgment.passed} of "
+                f"{best.judgment.definitions})"
+            )
+        return text + ". "
 
     def _spent_producer_failures(self, phase: Phase) -> str:
         """The ``BLOCKED`` reason when ``phase``'s failure counter is at its bound, else "".
@@ -7863,6 +8002,13 @@ class ControllerEngine:
                 "published, and REVIEW requires evidence for the PR head before the "
                 "reviewer launches; a record names the exact commit and tree it ran against"
             )
+            if self.config.workflow.producer_strategy_change:
+                notes.append(
+                    "workflow.producer_strategy_change is on: an ANALYZE_EXECUTE or FIX "
+                    "relaunch whose candidate made no objective progress (the same tree, "
+                    "failing the same way) asks the agent for another approach, once per "
+                    "producing task; it adds no launch, and the third failure still blocks"
+                )
             if state.validation_override_seq is not None:
                 notes.append(
                     f"validation override watermark: seq {state.validation_override_seq} "
@@ -9733,6 +9879,14 @@ class ControllerEngine:
                 RecoveryJournal.from_dict(state.auto_recovery, state.run_id).reopened().to_dict()
             )
         state.validation_override_seq = watermark
+        if target in (Phase.ANALYZE_EXECUTE, Phase.FIX) and state.producer_recovery:
+            # #320 (ADR 0015 D3): an unblock into the step a candidate was
+            # judged in admits a new producing task there; its progress,
+            # failures and strategy change start afresh, as the watermark
+            # makes the recorded failures historical. The receipts stay.
+            ledger = Ledger.from_dict(state.producer_recovery)
+            if ledger.step == self._producer_step(target):
+                state.producer_recovery = ledger.reopened().to_dict()
         state.block_reason = ""
         state.stop_code = ""
         state.phase = target
