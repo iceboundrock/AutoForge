@@ -565,9 +565,9 @@ An amendment changes the files of section 1 and these digests in one reviewed ch
 **and states whether any real run had been made.** A record carries the digests it was made under, and a
 report refuses to decide over records of another, so criteria cannot move under results.
 
-- `manifest.json`: `7b76d1faac1d008bfcee143153f58b9b8220d704791ead89fe08435aa8ee90f1`
-- `preregistration.json`: `59556c0ca4587dd5b90851a25e05fa52c8964c6a67091add39da8e0b79fc8060`
-- `real_run_config.yaml`: `00c4def539ba6327ec16de60066b397dd8d107767777fdf8b4aa9547926cf2a5`
+- `manifest.json`: `4ec8facaae4ba35ac18028af3ccda79bfc36cd8987c614f53bdff220cf592030`
+- `preregistration.json`: `53252af51d6f5010a8e97435e1ce6f2a2f7cbe47636f54a4e0b21552169345c8`
+- `real_run_config.yaml`: `423418404217582d537a1241d936016b803996b71b832ef2accf455df4ba5e19`
 
 | Date | Change | Why | Real runs before it |
 |---|---|---|---|
@@ -576,3 +576,4 @@ report refuses to decide over records of another, so criteria cannot move under 
 | 2026-11-07 | Two allow-list keys are added under `execution`, which moves the settings digest and the digests that hold it. | #286 gives agent launches and repository commands an allow-list key each. `real_run_config.yaml` sets neither, so every launch of every arm gets the names it got before, and no threshold, task or other setting changes. `tests/evaluation.py` reads the repository commands' names, as the engine now does, so its copy of the validation policy stays the engine's. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |
 | 2026-11-11 | The prompt label moves from `v17` to `v18`, which moves the settings digest and the digests that hold it. | #433 changed the prompts: a FIX agent that must report `blocked` may list the findings it fixed and the ones it left, and the controller publishes the commits it verifies; a REVIEW agent is told how such a partial fix is carried to it. Every arm runs one controller commit with one label, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |
 | 2026-11-16 | Four keys are added under `sandbox.container`, which moves the settings digest and the digests that hold it. | #292 adds the container backend's seed settings (`history_depth`, `history_tags`, `seed_max_bytes`, `seed_max_objects`). Nothing reads them before that backend is selectable, `real_run_config.yaml` sets none, and every launch of every arm is what it was, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added to the repository since. |
+| 2026-11-22 | One key is added under `workflow`, which moves the settings digest and the digests that hold it. | #320 adds `workflow.producer_strategy_change`, the opt-in request for another approach after a producing step's relaunch made no objective progress, off by default. `real_run_config.yaml` does not set it, so every launch and every prompt of every arm is what it was, and no threshold, task or other setting changes. It stays held equal: an arm that turned it on would differ in its prompts. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added to the repository since. |

@@ -5,6 +5,32 @@ so.
 
 ## Unreleased
 
+### A producing step keeps a receipt of every candidate it judged (#320)
+
+`ANALYZE_EXECUTE` and `FIX` now record, for each candidate the controller
+validated, its commit and tree, the verdict, the progress against the
+task's previous candidate and the decision taken on it, in the same save as
+the evidence. `status` shows them under "Producer recovery", and they stay
+after the step stops: a step stopped at its third validation failure
+(`producer-validation-bound`) now names the last candidate, left in the
+agent worktree, and the one that passed the most validation definitions,
+so the operator can start from either. An empty `validation.commands` is
+shown as `not-run`, never as a pass; the candidate still goes on to the
+review as before.
+
+Progress is read from objective changes only: more or fewer definitions
+passing, another failing definition, outcome or exit status, or another
+tree. Turning on the new `workflow.producer_strategy_change` (default
+`false`) makes a relaunch whose candidate is the same tree failing the same
+way ask the agent for a different approach, once per producing task. It
+adds no launch: the third failure still stops the step. With the key off,
+every decision and every prompt is what it was.
+
+The state file moves to protocol 21. A protocol-20 state loads and is
+relabelled on its next save; a controller that speaks protocol 20 refuses
+a protocol-21 state, so do not switch an upgraded run back to an older
+controller.
+
 ### `claim-ambiguous`: `status` goes by what the reason names (#375)
 
 When more than one open PR carries the issue's implementation marker and

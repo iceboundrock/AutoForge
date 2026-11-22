@@ -122,14 +122,14 @@ def test_previous_protocol_loads_without_memory_and_keeps_step_watermark(tmp_pat
     path = tmp_path / "state.json"
     data = state(step_count=19, phase=phase).to_dict()
     data["protocol_version"] = "19"
-    del data["launch_seq"], data["issue_memory"]
+    del data["launch_seq"], data["issue_memory"], data["producer_recovery"]
     path.write_text(json.dumps(data))
     before = path.read_bytes()
     loaded = load_state(path)
     assert path.read_bytes() == before
     assert loaded.launch_seq == 19 and not loaded.memory().enabled and loaded.phase is phase
     save_state(loaded, path)
-    assert load_state(path).protocol_version == "20"
+    assert load_state(path).protocol_version == "21"
     loaded.reset_for_new_issue(OTHER)
     assert loaded.launch_seq == 19
 

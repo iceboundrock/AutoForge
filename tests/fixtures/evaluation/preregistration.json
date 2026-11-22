@@ -31,6 +31,12 @@
       "change": "Four keys are added under `sandbox.container`, which moves the settings digest and the digests that hold it",
       "why": "#292 adds the container backend's seed settings (`history_depth`, `history_tags`, `seed_max_bytes`, `seed_max_objects`). Nothing reads them before that backend is selectable, `real_run_config.yaml` sets none, and every launch of every arm is what it was, so what is compared does not move, and no threshold, task or other setting changes",
       "real_runs_before": "None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added to the repository since"
+    },
+    {
+      "date": "2026-11-22",
+      "change": "One key is added under `workflow`, which moves the settings digest and the digests that hold it",
+      "why": "#320 adds `workflow.producer_strategy_change`, the opt-in request for another approach after a producing step's relaunch made no objective progress, off by default. `real_run_config.yaml` does not set it, so every launch and every prompt of every arm is what it was, and no threshold, task or other setting changes. It stays held equal: an arm that turned it on would differ in its prompts",
+      "real_runs_before": "None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added to the repository since"
     }
   ],
   "statistics": {

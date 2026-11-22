@@ -361,7 +361,8 @@ matches none of them needs only this file and the scoped `AGENTS.md`.
   `docs/adr/0014-remote-execution-sandboxes-contract-and-no-go.md` in
   addition to ADR 0013.
 - If implementing Issue Working Memory (#317, #333), a persisted task or
-  the task reducer (#332), or roles below a phase (#319), or changing what
+  the task reducer (#332), roles below a phase (#319) or a producing step's
+  recovery receipts and decisions (#320), or changing what
   a launch is shown of earlier launches or how an adapter starts a fresh
   session, read `docs/adr/0015-task-state-issue-memory-and-crash-order.md`
   in addition to `docs/evaluation-protocol.md`.

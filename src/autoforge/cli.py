@@ -194,6 +194,7 @@ from .stop_classification import (
     classify_exception,
     classify_state,
 )
+from .task_recovery import Ledger
 from .transitions import TERMINAL_PHASES, Phase
 from .validation import GitHubIssueRef, parse_issue_url
 
@@ -2698,8 +2699,10 @@ def cmd_status(args) -> int:
         }
         print(json.dumps(redact_dict(document), indent=2, sort_keys=True))
         return 0
-    evidence = _render_outer_sandbox(state, engine.config) + _render_validation_evidence(
-        state, engine.config, certificate
+    evidence = (
+        _render_outer_sandbox(state, engine.config)
+        + _render_validation_evidence(state, engine.config, certificate)
+        + _render_producer_recovery(state)
     )
     actions = (
         _render_acceptance_actions(state, engine)
@@ -2991,6 +2994,35 @@ def _review_certificate_status(
         "problem": problem,
         "note": NOT_A_PERMISSION,
     }
+
+
+def _render_producer_recovery(state: AutoForgeState) -> list[str]:
+    """The receipts of the producing step that judged a candidate last (#320; the caller redacts).
+
+    Every candidate the step judged, by commit and tree, with the verdict,
+    the progress and the controller's decision; ``not-run``,
+    ``infra-error`` and ``inconclusive`` say they are no pass. Kept after the
+    step's stop and its transition, so a ``BLOCKED`` step shows what it kept.
+    """
+    ledger = Ledger.from_dict(state.producer_recovery)
+    if ledger.step is None:
+        return []
+    step = ledger.step
+    lines = [
+        "",
+        "Producer recovery:",
+        f"  Step:    {step.phase.value} of {step.pr_url or step.issue_url}, review round "
+        f"{step.review_round}, producing task {ledger.task}",
+    ]
+    lines += [f"  - {receipt.describe()}" for receipt in ledger.receipts]
+    best = ledger.best()
+    if best is not None and best.judgment.definitions:
+        lines.append(
+            f"  Most validation definitions passed by this task: commit "
+            f"{best.candidate_commit[:12]} ({best.judgment.passed} of "
+            f"{best.judgment.definitions}); kept by commit and tree, never published by this"
+        )
+    return lines
 
 
 def _render_validation_evidence(

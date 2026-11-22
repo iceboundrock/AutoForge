@@ -76,6 +76,7 @@ from .result_parser import (
 from .runlog import RUN_ID_RE, validate_run_id
 from .safefs import HardLinksUnavailable, ReadLimitExceeded, SafeRoot, entry_kind
 from .sandbox_pin import SandboxPin
+from .task_recovery import Ledger
 from .transitions import Phase, WorkflowMode
 from .validation import parse_comment_url, parse_issue_url, parse_pr_url, same_pr_url
 
@@ -263,6 +264,13 @@ _PRE_AUTO_RECOVERY_PROTOCOL = "17"
 # file that carries the field is refused (:func:`_refuse_delivered_reply`).
 _PRE_DELIVERED_REPLY_PROTOCOL = "18"
 _PREVIOUS_PROTOCOL = "19"
+# The label before a producing step kept its recovery receipts (#320). A
+# protocol-20 file is this protocol's shape without ``producer_recovery``: it
+# is loaded in every phase with ``producer_recovery: {}`` (no candidate judged
+# under the receipts, which is all an older controller could leave: the
+# failure counter it kept still bounds the step), and relabelled. An older
+# file that carries the field is refused.
+_PRE_PRODUCER_RECOVERY_PROTOCOL = "20"
 # Every label :meth:`AutoForgeState.from_dict` has a rule for: the current
 # one and each older one it migrates or refuses by its own rule. Any other
 # label is refused by :func:`protocol_support`'s classification before the
@@ -283,6 +291,7 @@ SUPPORTED_PROTOCOLS: frozenset[str] = frozenset(
         _PRE_AUTO_RECOVERY_PROTOCOL,
         _PRE_DELIVERED_REPLY_PROTOCOL,
         _PREVIOUS_PROTOCOL,
+        _PRE_PRODUCER_RECOVERY_PROTOCOL,
         __protocol_version__,
     }
 )
@@ -350,6 +359,10 @@ _AUTO_RECOVERY_FIELDS = ("auto_recovery",)
 # delivered before it timed out or exited badly, kept with its binding while
 # the step's checks decide on it, ``{}`` when none is.
 _DELIVERED_REPLY_FIELDS = ("delivered_reply",)
+# The field protocol 21 added (#320): the recovery receipts of the producing
+# step that judged a candidate last (:class:`autoforge.task_recovery.Ledger`),
+# ``{}`` when none did.
+_PRODUCER_RECOVERY_FIELDS = ("producer_recovery",)
 _PARTIAL_FIX_KEYS = (
     "round",
     "pr_url",
@@ -946,6 +959,11 @@ class AutoForgeState:
     # ADR 0015 D19: advisory store and monotonic launch-intent identity.
     issue_memory: dict = field(default_factory=dict)
     launch_seq: int = 0
+    # #320: the recovery receipts of the producing step that judged a
+    # candidate last (``task_recovery.Ledger``): each candidate's verdict,
+    # progress and the controller's decision. Kept across the step's stop and
+    # its transition; replaced by the next producing step's first judgment.
+    producer_recovery: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -1279,6 +1297,7 @@ class AutoForgeState:
             _PRE_AUTO_RECOVERY_PROTOCOL,
             _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
+            _PRE_PRODUCER_RECOVERY_PROTOCOL,
             __protocol_version__,
         ):
             # Unreachable while SUPPORTED_PROTOCOLS names exactly the labels
@@ -1354,6 +1373,7 @@ class AutoForgeState:
             _PRE_AUTO_RECOVERY_PROTOCOL,
             _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
+            _PRE_PRODUCER_RECOVERY_PROTOCOL,
             __protocol_version__,
         ):
             # Every protocol-15 save writes it, ``[]`` included, so an absent
@@ -1372,6 +1392,7 @@ class AutoForgeState:
             _PRE_AUTO_RECOVERY_PROTOCOL,
             _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
+            _PRE_PRODUCER_RECOVERY_PROTOCOL,
             __protocol_version__,
         ):
             # 13 -> 14 (#414): K11 is planned from protocol 14 on.
@@ -1381,6 +1402,7 @@ class AutoForgeState:
             _PRE_AUTO_RECOVERY_PROTOCOL,
             _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
+            _PRE_PRODUCER_RECOVERY_PROTOCOL,
             __protocol_version__,
         ):
             # Every protocol-16 save writes it, ``""`` included, so an absent
@@ -1395,6 +1417,7 @@ class AutoForgeState:
             _PRE_AUTO_RECOVERY_PROTOCOL,
             _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
+            _PRE_PRODUCER_RECOVERY_PROTOCOL,
             __protocol_version__,
         ):
             # Every protocol-17 save writes it, ``{}`` included, so an absent
@@ -1413,6 +1436,7 @@ class AutoForgeState:
         if raw_protocol in (
             _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
+            _PRE_PRODUCER_RECOVERY_PROTOCOL,
             __protocol_version__,
         ):
             # Every protocol-18 save writes it, ``{}`` included, so an absent
@@ -1429,7 +1453,11 @@ class AutoForgeState:
             # 17 -> 18 (#434): the recovery journal is written from protocol
             # 18 on.
             _refuse_auto_recovery_state(data, str(raw_protocol))
-        if raw_protocol in (_PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol in (
+            _PREVIOUS_PROTOCOL,
+            _PRE_PRODUCER_RECOVERY_PROTOCOL,
+            __protocol_version__,
+        ):
             # Every protocol-19 save writes it, ``{}`` included, so an absent
             # one is a truncation or a hand edit: read as the empty default it
             # would drop a reply the step goes on from and launch the agent
@@ -1446,7 +1474,7 @@ class AutoForgeState:
             # only.
             _refuse_delivered_reply(data, str(raw_protocol))
         memory_fields = ("issue_memory", "launch_seq")
-        if raw_protocol == __protocol_version__:
+        if raw_protocol in (_PRE_PRODUCER_RECOVERY_PROTOCOL, __protocol_version__):
             _require_fields(
                 data,
                 raw_protocol,
@@ -1458,13 +1486,36 @@ class AutoForgeState:
             raise StateError(
                 "older state protocol never wrote 'issue_memory' or 'launch_seq'; refusing to load"
             )
+        if raw_protocol == __protocol_version__:
+            # Every protocol-21 save writes it, ``{}`` included, so an absent
+            # one is a truncation or a hand edit: read as the empty default it
+            # would drop the receipts a stopped step keeps for the operator,
+            # and the strategy change its task already spent.
+            _require_fields(
+                data,
+                raw_protocol,
+                _PRODUCER_RECOVERY_FIELDS,
+                "producer recovery receipts",
+                "not a run that judged no candidate",
+            )
+        elif any(name in data for name in _PRODUCER_RECOVERY_FIELDS):
+            # 20 -> 21 (#320): the receipts are written from protocol 21 on.
+            raise StateError(
+                f"protocol_version {_shown_label(raw_protocol)} never wrote "
+                "'producer_recovery', which protocol 21 introduced; the file is a hand edit or "
+                "not this controller's; refusing to load"
+            )
         kwargs = dict(data)
         kwargs["phase"] = phase
         kwargs["mode"] = mode
         kwargs["protocol_version"] = __protocol_version__
-        if raw_protocol != __protocol_version__:
+        if raw_protocol not in (_PRE_PRODUCER_RECOVERY_PROTOCOL, __protocol_version__):
             kwargs["launch_seq"] = data.get("step_count", 0)
             kwargs["issue_memory"] = {}
+        if raw_protocol != __protocol_version__:
+            # Before protocol 21 (#320): no candidate was judged under the
+            # receipts; the failure counter still bounds a step in progress.
+            kwargs["producer_recovery"] = {}
         if raw_protocol not in (
             _PRE_CONFIG_PROTOCOL,
             _PRE_VALIDATION_PROTOCOL,
@@ -1478,6 +1529,7 @@ class AutoForgeState:
             _PRE_AUTO_RECOVERY_PROTOCOL,
             _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
+            _PRE_PRODUCER_RECOVERY_PROTOCOL,
             __protocol_version__,
         ):
             # Before protocol 8 only: a protocol-8 file carries its own
@@ -1493,6 +1545,7 @@ class AutoForgeState:
             _PRE_AUTO_RECOVERY_PROTOCOL,
             _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
+            _PRE_PRODUCER_RECOVERY_PROTOCOL,
             __protocol_version__,
         ):
             # Before protocol 11 (#243): over the acceptance migration, so a
@@ -1504,6 +1557,7 @@ class AutoForgeState:
             _PRE_AUTO_RECOVERY_PROTOCOL,
             _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
+            _PRE_PRODUCER_RECOVERY_PROTOCOL,
             __protocol_version__,
         ):
             # Before protocol 15 (#423): over the migrations above, so an older
@@ -1514,6 +1568,7 @@ class AutoForgeState:
             _PRE_AUTO_RECOVERY_PROTOCOL,
             _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
+            _PRE_PRODUCER_RECOVERY_PROTOCOL,
             __protocol_version__,
         ):
             # Before protocol 16 (#374): a stop saved with no code, which
@@ -1523,6 +1578,7 @@ class AutoForgeState:
             _PRE_AUTO_RECOVERY_PROTOCOL,
             _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
+            _PRE_PRODUCER_RECOVERY_PROTOCOL,
             __protocol_version__,
         ):
             # Before protocol 17 (#433): over the migrations above, so a FIX
@@ -1531,12 +1587,17 @@ class AutoForgeState:
         if raw_protocol not in (
             _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
+            _PRE_PRODUCER_RECOVERY_PROTOCOL,
             __protocol_version__,
         ):
             # Before protocol 18 (#434): no recovery decision was taken, so
             # every step's allowance is unspent.
             kwargs["auto_recovery"] = {}
-        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol not in (
+            _PREVIOUS_PROTOCOL,
+            _PRE_PRODUCER_RECOVERY_PROTOCOL,
+            __protocol_version__,
+        ):
             # Before protocol 19 (#479): no reply was kept; an older controller
             # held one in memory only.
             kwargs["delivered_reply"] = {}
@@ -1558,6 +1619,7 @@ class AutoForgeState:
             _PRE_AUTO_RECOVERY_PROTOCOL,
             _PRE_DELIVERED_REPLY_PROTOCOL,
             _PREVIOUS_PROTOCOL,
+            _PRE_PRODUCER_RECOVERY_PROTOCOL,
             __protocol_version__,
         ):
             _drop_local_fields(kwargs, str(raw_protocol))
@@ -1654,6 +1716,7 @@ class AutoForgeState:
         _validate_stop_code(state)
         _validate_partial_fix(state)
         _validate_auto_recovery(state)
+        _validate_producer_recovery(state)
         _validate_delivered_reply(state)
         if not 0 <= state.launch_seq <= MAX_LAUNCH_SEQ:
             raise StateError("state field 'launch_seq' is out of range")
@@ -1720,13 +1783,17 @@ class AutoForgeState:
         )
 
     def clear_validation_evidence(self) -> None:
-        """All six fields, empty (D11.4): the next issue starts with none."""
+        """All six fields, empty (D11.4), and the receipts that cite them (#320).
+
+        The next issue starts with none.
+        """
         self.validation_records = []
         self.validation_attempt = {}
         self.review_evidence = {}
         self.review_certificate = {}
         self.producer_validation_failure = {}
         self.validation_override_seq = None
+        self.producer_recovery = {}
 
     # -- controller-owned effects (ADR 0004) -------------------------------
     def effect_binding(self) -> Binding:
@@ -2310,6 +2377,30 @@ def _validate_delivered_reply(state: AutoForgeState) -> None:
 def _validate_auto_recovery(state: AutoForgeState) -> None:
     """``auto_recovery`` (#434): the journal's whole shape, bound to the state's run."""
     RecoveryJournal.from_dict(state.auto_recovery, state.run_id)
+
+
+def _validate_producer_recovery(state: AutoForgeState) -> None:
+    """``producer_recovery`` (#320): the ledger's whole shape, bound to the state's issue.
+
+    A ledger outlives its step, never its issue: the issue switch clears it
+    with the evidence its receipts cite, so one naming another issue is a
+    hand edit or a foreign file.
+    """
+    ledger = Ledger.from_dict(state.producer_recovery)
+    if ledger.step is not None and ledger.step.issue_url != _canonical_or_raw(
+        state.current_issue_url
+    ):
+        raise StateError(
+            "state field 'producer_recovery' names the step of another issue "
+            f"({ledger.step.issue_url}), not the state's current issue"
+        )
+
+
+def _canonical_or_raw(url: str) -> str:
+    try:
+        return parse_issue_url(url).canonical if url else url
+    except ConfigurationError:
+        return url
 
 
 def _partial_fix_migration(data: dict) -> dict:

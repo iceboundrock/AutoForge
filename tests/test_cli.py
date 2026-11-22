@@ -721,7 +721,7 @@ def test_status_json_reads_a_legacy_memory_off_checkpoint_with_no_issue_url(
         updated_at="2026-01-01T00:00:00+00:00",
     ).to_dict()
     data["protocol_version"] = "19"
-    del data["launch_seq"], data["issue_memory"]
+    del data["launch_seq"], data["issue_memory"], data["producer_recovery"]
     (state_dir / "state.json").write_text(json.dumps(data))
     loaded = load_state(state_dir / "state.json")
     assert loaded.current_issue_url == "" and loaded.issue_memory == {}
@@ -1508,7 +1508,7 @@ def test_status_json_carries_none_of_the_local_fields_since_protocol_13(
     capsys.readouterr()
     assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
     printed = json.loads(capsys.readouterr().out)
-    assert printed["protocol_version"] == "20" and printed["mode"] == "REMOTE"
+    assert printed["protocol_version"] == "21" and printed["mode"] == "REMOTE"
     assert not set(LOCAL_STATE_FIELDS) & set(printed)
     state_file = tmp_path / ".autoforge" / "state.json"
     data = json.loads(state_file.read_text())
@@ -1519,14 +1519,14 @@ def test_status_json_carries_none_of_the_local_fields_since_protocol_13(
     del data["partial_fix"]  # protocol 17's own field (#433)
     del data["auto_recovery"]  # protocol 18's own field (#434)
     del data["delivered_reply"]  # protocol 19's own field (#479)
-    del data["issue_memory"], data["launch_seq"]
+    del data["issue_memory"], data["launch_seq"], data["producer_recovery"]
     data.update({name: type(empty)() for name, empty in LOCAL_STATE_FIELDS.items()})
     state_file.write_text(json.dumps(data))
     before = state_file.read_bytes()
     assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
     printed = json.loads(capsys.readouterr().out)
     assert not set(LOCAL_STATE_FIELDS) & set(printed)
-    assert printed["protocol_version"] == "20"
+    assert printed["protocol_version"] == "21"
     assert state_file.read_bytes() == before
 
 
@@ -2986,7 +2986,7 @@ def test_run_refuses_a_state_that_does_not_load_and_force_moves_it_aside_whole(
 
 
 def _newer_controllers_run(tmp_path, capsys) -> tuple[Path, bytes]:
-    """A run started in ``tmp_path/.autoforge``, then relabelled as protocol 21 wrote it.
+    """A run started in ``tmp_path/.autoforge``, then relabelled as protocol 22 wrote it.
 
     Its phase is one this controller does not have, so a refusal that read
     the phase before the label would misreport it. The run's logs stay.
@@ -2998,8 +2998,8 @@ def _newer_controllers_run(tmp_path, capsys) -> tuple[Path, bytes]:
     state_file = sd / "state.json"
     data = json.loads(state_file.read_text(encoding="utf-8"))
     data.update(
-        protocol_version="21",
-        phase="A_PHASE_OF_PROTOCOL_21",
+        protocol_version="22",
+        phase="A_PHASE_OF_PROTOCOL_22",
         controller_version="0.2.0",
         run_id="af-written-by-protocol-20",
         # The run's own recovery decisions name its run id (#434): none of this one's.
@@ -3013,16 +3013,16 @@ def _assert_the_newer_run_is_named(err: str, state_file: Path, flags: str) -> No
     import autoforge
 
     assert (
-        f"autoforge: error: state file {state_file}: unsupported protocol_version '21' "
-        "(controller speaks '20'): a newer AutoForge wrote it\n"
+        f"autoforge: error: state file {state_file}: unsupported protocol_version '22' "
+        "(controller speaks '21'): a newer AutoForge wrote it\n"
     ) in err
     assert "AutoForge controller/state protocol mismatch" in err
-    assert f"  state:      {state_file} (protocol_version '21')" in err
+    assert f"  state:      {state_file} (protocol_version '22')" in err
     assert "  recorded:   run af-written-by-protocol-20, written by autoforge 0.2.0" in err
     assert f"  import:     {os.path.abspath(autoforge.__file__)}\n" in err
     assert f"  python:     {sys.executable}\n" in err
     assert f"  cwd:        {os.getcwd()}\n" in err
-    assert f"<an autoforge that speaks protocol 21> {flags}status\n" in err
+    assert f"<an autoforge that speaks protocol 22> {flags}status\n" in err
     assert "unknown phase" not in err and "--force" not in err and "repair" not in err
     _assert_the_result_claims_only_what_holds(err)
 
@@ -3111,7 +3111,7 @@ def test_a_state_a_newer_controller_replaced_after_the_first_load_is_refused_und
     sd, newer = _newer_controllers_run(tmp_path, capsys)
     state_file = sd / "state.json"
     data = json.loads(newer)
-    data.update(protocol_version="20", phase="ANALYZE_EXECUTE")
+    data.update(protocol_version="21", phase="ANALYZE_EXECUTE")
     state_file.write_text(json.dumps(data), encoding="utf-8")
     assert load_state(state_file).phase is Phase.ANALYZE_EXECUTE
     real = ControllerEngine.locked
@@ -3145,7 +3145,7 @@ def test_the_refusal_under_the_lock_claims_no_more_than_it_established(
     sd, newer = _newer_controllers_run(tmp_path, capsys)
     state_file = sd / "state.json"
     data = json.loads(newer)
-    data.update(protocol_version="20", phase="ANALYZE_EXECUTE")
+    data.update(protocol_version="21", phase="ANALYZE_EXECUTE")
     state_file.write_text(json.dumps(data), encoding="utf-8")
     lock_file = repository_lock_path(tmp_path)
     real = ControllerEngine.locked
@@ -3191,7 +3191,7 @@ def test_run_over_a_label_no_protocol_has_suggests_no_force(
         err = captured.err
         assert captured.out == ""
         assert (
-            f"unsupported protocol_version {label!r} (controller speaks '20'): no AutoForge "
+            f"unsupported protocol_version {label!r} (controller speaks '21'): no AutoForge "
             "protocol has that label\n"
         ) in err
         assert "AutoForge controller/state protocol mismatch" in err
@@ -3221,7 +3221,7 @@ def _a_newer_state_at(sd: Path) -> None:
     )
     save_state(state, sd / "state.json")
     data = json.loads((sd / "state.json").read_text(encoding="utf-8"))
-    data.update(protocol_version="21")
+    data.update(protocol_version="22")
     (sd / "state.json").write_text(json.dumps(data), encoding="utf-8")
 
 
@@ -3272,9 +3272,9 @@ def test_an_odd_state_dir_or_config_never_reaches_the_diagnostic_raw(
         assert line.isprintable(), line
         assert len(line) <= 2 * MAX_PATH_CHARS + 300, len(line)
         assert not line.startswith("autoforge: error: forged")
-    (command,) = [line for line in lines if "<an autoforge that speaks protocol 21>" in line]
+    (command,) = [line for line in lines if "<an autoforge that speaks protocol 22>" in line]
     assert command.strip() == (
-        "<an autoforge that speaks protocol 21> --config <the --config value this command was "
+        "<an autoforge that speaks protocol 22> --config <the --config value this command was "
         "given> --state-dir <the --state-dir value this command was given> status"
     )
     assert "put back the value you typed" in err
@@ -6309,7 +6309,7 @@ def test_an_old_state_file_without_a_recorded_configuration_loads_and_resumes(
     del data["partial_fix"]  # protocol 17's own field (#433)
     del data["auto_recovery"]  # protocol 18's own field (#434)
     del data["delivered_reply"]  # protocol 19's own field (#479)
-    del data["issue_memory"], data["launch_seq"]
+    del data["issue_memory"], data["launch_seq"], data["producer_recovery"]
     data["protocol_version"] = "8"
     with open(state_file, "w", encoding="utf-8") as handle:
         json.dump(data, handle)
@@ -6327,7 +6327,7 @@ def test_an_old_state_file_without_a_recorded_configuration_loads_and_resumes(
     assert f"--config {cfg} is recorded as the run's" in out.err
     assert "ANALYZE_EXECUTE -> REVIEW" in out.out
     saved = load_state(state_file)
-    assert saved.protocol_version == "20"
+    assert saved.protocol_version == "21"
     assert saved.config_fingerprint["source"] == "upgraded"
     assert saved.sandbox_pin["mode"] == "disabled" and saved.sandbox_pin["source"] == "upgraded"
     assert saved.config_fingerprint["profiles"]["analyze_execute"]["model"] == "opus"
