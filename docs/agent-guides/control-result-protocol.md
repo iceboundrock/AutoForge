@@ -480,13 +480,17 @@ only where it accepts the result (`autoforge.memory_handoff`): in the plan
 save of a success, or the stop save of a `blocked` or `failure` result
 (ADR 0015 D9.8, D4.6). A reply the controller refuses or corrects, one
 whose candidate fails validation, and one lost to a crash before that save
-leave no entry. Each entry is exactly one of:
+leave no entry. Each entry is an object with exactly the keys of one row
+below, `op` included, and `op` set to that row's value:
 
-| Entry | Keys |
-|---|---|
-| `add` | `kind` (`hypothesis`, `note`, `failed-approach`, `handoff` or `repository-constraint`), `text` |
-| `correct` | `record` (the number of a proposal the launch was shown, `M<n>`), `text`, `reason` |
-| `retract` | `record`, `reason` |
+| `op` | Keys, exactly | Values |
+|---|---|---|
+| `"add"` | `op`, `kind`, `text` | `kind`: `hypothesis`, `note`, `failed-approach`, `handoff` or `repository-constraint`; `text`: the note |
+| `"correct"` | `op`, `record`, `text`, `reason` | `record`: the integer `n` of a proposal the launch was shown as `M<n>`; `text`: the corrected note; `reason`: why |
+| `"retract"` | `op`, `record`, `reason` | `record`: as for `correct`; `reason`: why |
+
+For example `{"op": "retract", "record": 3, "reason": "the lexer test now passes"}`
+withdraws the proposal shown as `M3`.
 
 At most `MAX_PROPOSALS` (8) entries are read; each one past it, and each
 entry of another shape (an unknown `op` or key, a `record` that is not a

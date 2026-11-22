@@ -15,9 +15,12 @@ backend. What is held:
   ancestry is proved locally, by the run's own validation record of that
   commit or from the store's commits, with no GitHub call and no fetch; no
   other phase gets one;
-- the controller's validation-failure observation is saved with the record
-  it cites, and an accepted result's proposals with its acceptance, never
-  with a refused, corrected or lost reply;
+- the controller's validation-failure observation is saved with the failure
+  count, never before the record it cites: in the save appending a new
+  record, or the step's later save (its step save below the bound, its
+  BLOCKED save at it) for a record the producer gate reuses; and an accepted
+  result's proposals with its acceptance, never with a refused, corrected or
+  lost reply;
 - with Memory off, the prompt, the read context, the state and the run's
   behaviour are what they were;
 - crashes on both sides of every Memory write and every launch, secrets,
@@ -48,7 +51,12 @@ from autoforge.auto_recovery import StepKey
 from autoforge.config import MemoryConfig, default_config
 from autoforge.delivered_result import payload_digest, payload_text
 from autoforge.doctor import Doctor
-from autoforge.errors import GitHubUnavailableError, GitTransportError, VerificationError
+from autoforge.errors import (
+    GitHubUnavailableError,
+    GitTransportError,
+    StateTransitionError,
+    VerificationError,
+)
 from autoforge.evidence import MAX_FAILURE_COUNT, WorktreeProvenance, parse_record
 from autoforge.executor import execute
 from autoforge.git_transport import GitRemote, GitTransport
@@ -88,6 +96,7 @@ from autoforge.redaction import redact_dict
 from autoforge.result_parser import BEGIN, END, MAX_CONTROL_RESULT_CHARS
 from autoforge.sandbox import TEARDOWN_UNCOUNTED, SandboxFacts
 from autoforge.state import load_state
+from autoforge.stop_classification import StopReasonCode
 from autoforge.transitions import AGENT_PHASES, Phase
 from tests.test_evidence import RUN, policy, record, remote
 from tests.test_memory import PiShaped, pi_profile
@@ -1152,6 +1161,27 @@ def test_a_results_memory_list_is_parsed_without_raising(raw, entries, refused):
     assert (len(parsed.entries), parsed.refused) == (entries, refused)
 
 
+PROTOCOL_GUIDE = Path(__file__).parents[1] / "docs" / "agent-guides" / "control-result-protocol.md"
+
+
+def test_an_entry_built_from_the_protocol_guides_memory_table_is_accepted():
+    """R7-F2 of PR #536: each row of the guide's ``memory`` schema names its
+    ``op`` value and exactly the keys the parser accepts for it, ``op``
+    included, so an entry made from the row's key list is read, not refused."""
+    text = PROTOCOL_GUIDE.read_text(encoding="utf-8")
+    section = text.split("### ANALYZE_EXECUTE's optional `memory` list (#333)", 1)[1]
+    rows = re.findall(r'^\| `"(\w+)"` \| ([^|]+) \|', section.split("\n### ", 1)[0], re.M)
+    assert [op for op, _ in rows] == ["add", "correct", "retract"]
+    values = {"kind": "note", "text": "a lesson", "record": 1, "reason": "why"}
+    for op, keys in rows:
+        named = re.findall(r"`(\w+)`", keys)
+        assert named[0] == "op"
+        entry = {key: (op if key == "op" else values[key]) for key in named}
+        parsed = parse_proposals([entry])
+        assert (len(parsed.entries), parsed.refused) == (1, 0), entry
+        assert parsed.entries[0].action.value == op
+
+
 def admitted(store, *entries, attempt=1, refused=0):
     return admit_proposals(
         store, Proposals(tuple(entries), refused), step=STEP, attempt=attempt, input_sha=BASE
@@ -1446,6 +1476,31 @@ def test_a_render_at_the_stores_record_bound_costs_far_less_cpu_than_the_ceiling
 # -- crash windows of each Memory write and each launch (D11) ------------------------------------
 
 
+def same_commit(req):
+    """An implementer that commits nothing: it reports the worktree's HEAD again."""
+    return block(analyze_payload(git_out("-C", req.cwd, "rev-parse", "HEAD")))
+
+
+def turned_on(eng, gh, script):
+    """A new controller process on ``eng``'s Memory-off run, Memory turned on as
+    ``resume --accept-config-change`` turns it on."""
+    eng.close()
+    eng2, pi = memory_engine(
+        eng.paths.state_dir,
+        gh,
+        script,
+        cfg=memory_config(NEEDS_FIX),
+        workdir=eng.workdir,
+        new=False,
+    )
+    connect_origin(eng2, eng.origin)
+    eng2.origin = eng.origin
+    eng2.load()
+    eng2.check_run_configuration(("resume",), accept_change=True)
+    assert saved(eng2).issue_memory["enabled"] is True
+    return eng2, pi
+
+
 def test_a_crash_before_the_record_save_leaves_neither_record_nor_observation(
     tmp_state_dir, pi_home
 ):
@@ -1486,10 +1541,6 @@ def test_a_crash_after_the_record_save_keeps_both_and_rederiving_adds_nothing(
         eng.step()
     s = saved(eng)
     assert len(s.validation_records) == 1 and len(records(s)) == 1
-
-    def same_commit(req):
-        return block(analyze_payload(git_out("-C", req.cwd, "rev-parse", "HEAD")))
-
     seen = Seen(same_commit)
     eng2, _ = resumed(eng, gh, seen)
     assert eng2.step().next_phase == "ANALYZE_EXECUTE"
@@ -1518,20 +1569,8 @@ def test_a_reused_record_no_observation_cites_is_observed_in_the_save_that_count
     (failed,) = s.validation_records
     commit = failed["candidate"]["commit"]
     assert s.issue_memory == {} and s.producer_validation_failure["count"] == 1
-    eng.close()
-
-    def same_commit(req):
-        return block(analyze_payload(git_out("-C", req.cwd, "rev-parse", "HEAD")))
-
     seen = Seen(same_commit, repaired)
-    eng2, _ = memory_engine(
-        eng.paths.state_dir, gh, seen, cfg=memory_config(NEEDS_FIX), workdir=eng.workdir, new=False
-    )
-    connect_origin(eng2, eng.origin)
-    eng2.origin = eng.origin
-    eng2.load()
-    eng2.check_run_configuration(("resume",), accept_change=True)
-    assert saved(eng2).issue_memory["enabled"] is True
+    eng2, _ = turned_on(eng, gh, seen)
     assert eng2.step().next_phase == "ANALYZE_EXECUTE"
     s = saved(eng2)
     assert s.validation_records == [failed], "the terminal record was reused, not appended"
@@ -1546,6 +1585,165 @@ def test_a_reused_record_no_observation_cites_is_observed_in_the_save_that_count
     shown = seen.memory[1]
     assert f"Observed validation {failed['seq']} ({failed['digest']}): FAIL on {commit}" in shown
     eng2.close()
+
+
+def reused_while_memory_was_off(state_dir, gh, failures):
+    """A Memory-off run whose one validation record has counted ``failures`` failures.
+
+    The first launch's candidate fails :data:`NEEDS_FIX`, and each launch
+    after it reports the same commit, so the producer gate reuses that
+    terminal record. Memory being off, nothing cites it yet.
+    """
+    eng, _ = producing(
+        state_dir, gh, scripted(implement, *[same_commit] * failures), NEEDS_FIX, memory=False
+    )
+    for _ in range(failures):
+        assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    s = saved(eng)
+    (failed,) = s.validation_records
+    assert s.producer_validation_failure["count"] == failures and s.issue_memory == {}
+    return eng, failed
+
+
+def crash_at_the_save_after_the_gate(eng, *, written):
+    """Crash at the first save after the producer gate, the save that counts the
+    failure: before it writes anything or, when ``written``, once it has. The
+    process is gone after that, so no later save is written either. Returns
+    what that save carries, read when it is called."""
+    gate, save = eng._gate_producer, eng._save
+    carried: dict = {}
+
+    def gated(*args):
+        try:
+            return gate(*args)
+        finally:
+            carried["gated"] = True
+
+    def crashing():
+        if "gated" not in carried:
+            return save()
+        if "phase" not in carried:
+            state = eng._require_state()
+            carried["phase"] = state.phase
+            carried["count"] = state.producer_validation_failure["count"]
+            carried["records"] = records(state)
+            if written:
+                save()
+        raise KeyboardInterrupt
+
+    eng._gate_producer = gated
+    eng._save = crashing
+    return carried
+
+
+# The save that counts a reused record's failure, and so first observes it:
+# the step's save below the bound, the BLOCKED save at it.
+COUNTING_SAVES = pytest.mark.parametrize(
+    "failures", [1, MAX_FAILURE_COUNT - 1], ids=["step-save", "blocked-save"]
+)
+
+
+def counted_in(failures) -> str:
+    return "BLOCKED" if failures + 1 >= MAX_FAILURE_COUNT else "ANALYZE_EXECUTE"
+
+
+def assert_counted(s, count):
+    """``count`` failures of the phase's candidates are on disk: in the phase's
+    counter below the bound; at it, as the BLOCKED stop that reached it, whose
+    save clears the counter as every save that leaves the phase does."""
+    if count < MAX_FAILURE_COUNT:
+        assert s.phase == Phase.ANALYZE_EXECUTE
+        assert s.producer_validation_failure["count"] == count
+    else:
+        assert s.phase == Phase.BLOCKED
+        assert s.stop_code == StopReasonCode.PRODUCER_VALIDATION_BOUND.value
+        assert f"failed {count} time(s)" in s.block_reason
+        assert s.producer_validation_failure == {}
+
+
+@COUNTING_SAVES
+def test_a_crash_before_the_save_that_first_observes_a_reused_record_leaves_it_as_it_was(
+    tmp_state_dir, pi_home, failures
+):
+    """R7-F1 of PR #536: a reused record's first observation is not made in
+    the save that appended the record but in the later one that counts the
+    failure, the step's save below the bound or its BLOCKED save at it. A
+    crash just before that save leaves the record as it was on disk, with
+    neither the new failure count nor an observation citing it. The next
+    process relaunches the agent, which reports the same commit again: the
+    record is reused once more, and that save counts the failure and makes
+    the one observation."""
+    gh = FakeGitHub()
+    eng, failed = reused_while_memory_was_off(tmp_state_dir, gh, failures)
+    seen = Seen(same_commit, same_commit)
+    eng2, _ = turned_on(eng, gh, seen)
+    carried = crash_at_the_save_after_the_gate(eng2, written=False)
+    with pytest.raises(KeyboardInterrupt):
+        eng2.step()
+    assert carried["phase"].value == counted_in(failures)
+    assert carried["count"] == failures + 1 and len(carried["records"]) == 1, (
+        "the save the crash prevented is the one that counts and observes the failure"
+    )
+    s = saved(eng2)
+    assert s.phase == Phase.ANALYZE_EXECUTE and s.validation_records == [failed]
+    assert s.producer_validation_failure["count"] == failures, "the new failure is not counted"
+    assert records(s) == [], "and the record gained no observation"
+
+    eng3, _ = resumed(eng2, gh, seen)
+    assert eng3.step().next_phase == counted_in(failures)
+    s = saved(eng3)
+    assert s.validation_records == [failed], "the record is reused again, not appended"
+    assert_counted(s, failures + 1)
+    (observed,) = records(s)
+    assert observed["citation"] == ["validation", failed["seq"], failed["digest"]]
+    assert observed["attempt"] == s.launch_seq and s.memory().refusals == 0
+    assert all("[No current record applies]" in shown for shown in seen.memory)
+    eng3.close()
+
+
+@COUNTING_SAVES
+def test_a_crash_after_the_save_that_first_observes_a_reused_record_keeps_both_once(
+    tmp_state_dir, pi_home, failures
+):
+    """R7-F1 of PR #536: a crash just after the save that counts a reused
+    record's failure leaves the count and the record's first observation
+    together on disk. Replaying the step never observes the record twice:
+    below the bound the next launch reports the same commit, the record is
+    reused and its failure counted once more, and it is cited already; at
+    the bound the run stays BLOCKED, and the launch after ``unblock`` is
+    shown the one observation."""
+    gh = FakeGitHub()
+    eng, failed = reused_while_memory_was_off(tmp_state_dir, gh, failures)
+    seen = Seen(same_commit, same_commit if failures + 1 < MAX_FAILURE_COUNT else repaired)
+    eng2, _ = turned_on(eng, gh, seen)
+    carried = crash_at_the_save_after_the_gate(eng2, written=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng2.step()
+    s = saved(eng2)
+    assert s.phase.value == counted_in(failures) == carried["phase"].value
+    assert s.validation_records == [failed]
+    assert_counted(s, failures + 1)
+    (observed,) = records(s)
+    assert observed["citation"] == ["validation", failed["seq"], failed["digest"]]
+    assert records(s) == carried["records"]
+
+    eng3, _ = resumed(eng2, gh, seen)
+    if failures + 1 < MAX_FAILURE_COUNT:
+        assert eng3.step().next_phase == counted_in(failures + 1)
+        assert_counted(saved(eng3), failures + 2)
+    else:
+        with pytest.raises(StateTransitionError, match="terminal phase BLOCKED"):
+            eng3.step()
+        assert len(seen.memory) == 1, "a replay of the stop launches nothing"
+        assert records(saved(eng3)) == [observed]
+        eng3.unblock("repaired")
+        assert eng3.step().next_phase == "REVIEW"
+    s = saved(eng3)
+    assert s.validation_records[0] == failed
+    assert records(s) == [observed] and s.memory().refusals == 0, "no second observation"
+    shown = seen.memory[1]
+    assert shown.count(f"Observed validation {failed['seq']} ({failed['digest']}): FAIL") == 1
+    eng3.close()
 
 
 def stop_save_crash(eng):

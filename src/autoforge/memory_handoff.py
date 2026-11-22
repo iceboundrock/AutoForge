@@ -12,10 +12,20 @@ release supports, ``ANALYZE_EXECUTE`` (D13), and nothing more:
   store's own commits, never asked of GitHub (R3-F1, R4-F2 of PR #536), and
   the whole preparation is timed, from the ledger's reconstruction on, not
   the render alone (R4-F4);
-- after it, the controller's own observation of a validation failure, added
-  in the save of the validation record it cites (D11 stage 4), and the
-  proposals of an accepted result, added in the save that accepts it: the
-  phase's plan save, or a ``blocked`` or ``failure`` result's stop save
+- after it, the controller's own observation of a validation failure of
+  the candidate, citing the failed validation record and added in the save
+  that counts the failure (D11 stage 4), so never before that record. Which
+  save that is depends on the record. For a record the validation just
+  appended, it is the save that appends the record. For a terminal record
+  the producer gate reuses instead (ADR 0006 D10.6) that nothing cites yet,
+  such as one appended while Memory was off, it is a later save of the step:
+  the save that ends the step below the failure bound, or its ``BLOCKED``
+  save at the bound. A crash before that later save leaves the reused record
+  as it was, unobserved and its failure uncounted; one after it leaves both,
+  and a record already cited is never observed again (R6-F2, R7-F1 of PR
+  #536);
+- and the proposals of an accepted result, added in the save that accepts
+  it: the phase's plan save, or a ``blocked`` or ``failure`` result's stop save
   (D9.8, D4.6). A refused, corrected or lost reply leaves no proposal. The
   result's list is bound to its launch as soon as the reply is parsed
   (:func:`bind_proposals`): a revision only of a record the launch was
