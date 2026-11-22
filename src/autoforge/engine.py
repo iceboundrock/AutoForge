@@ -481,8 +481,9 @@ from .memory_handoff import (
     MEMORY_FILE_DESCRIPTION,
     LaunchProjection,
     admit_proposals,
+    bind_proposals,
+    bound_proposals,
     observe_validation_failure,
-    parse_proposals,
     projection_request,
     render_launch_projection,
     validation_failure_text,
@@ -4897,17 +4898,17 @@ class ControllerEngine:
         every Memory write does, and a configuration that differs from it is
         accepted onto the run (``--accept-config-change``) before any launch.
         Otherwise rendered from the snapshot the launch-intent save commits,
-        for the ordinal that save spends, and bound to the launch's candidate: the
-        worktree's ``HEAD`` after the strict import, when it is not the
-        entry's base (a relaunch after a validation failure starts from the
-        commit that failed), and none otherwise. The bases of the store's
-        range-bound records the candidate descends from are proved through
-        the controller's transport; one whose ancestry cannot be read is left
+        for the ordinal that save spends, and bound to the launch's candidate
+        (:meth:`_memory_candidate`): the worktree's ``HEAD`` after the strict
+        import, read as the candidate is, when it is not the entry's base (a
+        relaunch after a validation failure starts from the commit that
+        failed), and none otherwise. The bases of the store's range-bound
+        records the candidate descends from are proved through the
+        controller's transport; one whose ancestry cannot be read is left
         out, so a record bound to it is omitted, never shown as current. A
-        read of ``HEAD`` that fails binds no candidate, which omits every
-        record bound to one. A store that cannot be rendered refuses the
-        launch here, before anything of it is saved (D18): Memory is never
-        dropped from a Memory launch.
+        store that cannot be rendered refuses the launch here, before
+        anything of it is saved (D18): Memory is never dropped from a Memory
+        launch.
         """
         state = self._require_state()
         if not memory_supported(phase) or not state.issue_memory.get("enabled"):
@@ -4915,13 +4916,8 @@ class ControllerEngine:
         store = state.memory()
         entry = self._analyze_entry
         base = entry.base_sha if entry is not None else ""
-        try:
-            head = GitWorkspace(cwd, runner=self._runner).head_sha()
-        except (AutoForgeError, OSError):
-            head = ""
-        candidate = (
-            head if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head) and head != base else ""
-        )
+        head = self._memory_candidate(cwd)
+        candidate = head if head != base else ""
         ancestors: list[str] = []
         if candidate:
             transport = self._git_transport()
@@ -4938,15 +4934,50 @@ class ControllerEngine:
         )
         return render_launch_projection(store, request, validation_records=state.validation_records)
 
+    def _memory_candidate(self, cwd: str) -> str:
+        """The commit a Memory launch in ``cwd`` starts from, or "" for none (R1-F1 of PR #536).
+
+        Read as the latest launch's candidate is (:meth:`_candidate_read`):
+        ``worktrees/<id>/HEAD`` of the admin dir the registry binds the
+        worktree to, through the common dir
+        (:func:`~autoforge.agent_worktree.read_candidate`), never through the
+        worktree's ``.git`` file. An earlier launch of the step, the one a
+        correction or a transient retry follows, can rewrite that file to
+        name any git directory, whose ``HEAD`` would then decide which
+        records the projection shows as established. A binding the registry
+        no longer confirms, a ``HEAD`` that is attached, not a regular file
+        or not a commit the shared store holds, and a read that fails bind
+        no candidate, which omits every record bound to one. So does a
+        launch of a backend that seeds (ADR 0013 D4): its workspace is not
+        the host worktree, whose ``HEAD`` it never started from.
+        """
+        try:
+            if self._launch_seeds():
+                return ""
+            read = read_candidate(
+                self.workspace().git_dirs()[-1],
+                self._agent_admin_dir(Path(cwd)),
+                cwd,
+                self._runner,
+            )
+        except (AutoForgeError, OSError):
+            return ""
+        if read.attached or read.problem:
+            return ""
+        return read.head if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", read.head) else ""
+
     def _admit_memory(self, phase: Phase, raw: object) -> None:
         """Admit an accepted result's proposals into the run's Memory, for the caller's save.
 
         Called only where the result is accepted, before the save that
         accepts it: ANALYZE_EXECUTE's plan save, or the stop save of its
-        ``blocked`` or ``failure`` result (ADR 0015 D9.8, D4.6). Nothing for a
-        phase Memory does not support, with Memory off, or for an entry the
-        step has not read. What the store refuses is counted there and never
-        changes the step.
+        ``blocked`` or ``failure`` result (ADR 0015 D9.8, D4.6). ``raw`` is
+        the result's ``memory`` field as the reply's launch bound it
+        (:func:`~autoforge.memory_handoff.bind_proposals`), whether the step
+        goes on from a fresh reply or from one kept across a restart; a field
+        nothing bound admits nothing. Nothing for a phase Memory does not
+        support, with Memory off, or for an entry the step has not read. What
+        the store refuses is counted there and never changes the step.
         """
         state = self._require_state()
         entry = self._analyze_entry
@@ -4954,7 +4985,7 @@ class ControllerEngine:
             return
         admission = admit_proposals(
             state.memory(),
-            parse_proposals(raw),
+            bound_proposals(raw),
             step=self._memory_step(phase),
             attempt=state.launch_seq,
             input_sha=entry.base_sha,
@@ -17776,6 +17807,14 @@ class ControllerEngine:
                     continue
                 raise ControlResultValidationError(failed) from exc
             record.parsed_result = payload
+            if memory is not None:
+                # R1-F2, R1-F3 of PR #536: the result's Memory proposals bound
+                # to this launch, once, while what it was shown is known: a
+                # revision only of a record it was shown, at that revision,
+                # and no text the redactor would change. The step goes on from
+                # the bound form and a kept reply keeps it, so a restart admits
+                # what this process would have, and never a secret redacted.
+                payload = {**payload, "memory": bind_proposals(payload.get("memory"), memory.shown)}
             if launch_failure is not None and delivery is not None:
                 # #479: provisional, never yet accepted (R1-F4 of PR #481).
                 # The launch's end stays on its record as the facts it is

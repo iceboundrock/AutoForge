@@ -1713,37 +1713,48 @@ the launch is saved. A render the store refuses refuses the launch there
 (D18). The projection is bound to the launch's candidate: the worktree's
 `HEAD` after the strict import when that is not the entry's base, and none
 otherwise, with each base of a range-bound record that the candidate
-descends from proved through the controller's transport. The prompt names
-the file in a section rendered only while the run keeps Memory, so a
-Memory-off prompt is unchanged byte for byte. The prompt label moves to
-`v19`, an evaluation amendment, as D19 says. The run log records what each
-launch was shown (sizes, counts, digests and the render's time), never a
-record's text. Two writers exist. The controller's `validation-failure`
-record of a failed candidate cites its validation record and is added by
-the producer's failure counter, in the save that keeps the record (D11
-stage 4). It is bound to the failing commit and to its base, so on that
-commit it is established and on a descendant of the base it is shown with
-its source and needs revalidation. An accepted result's proposals come
-from an optional `memory` list of the result, which no required field and
-no parser rule changes. They are admitted in the plan save of a success or
-in the stop save of a `blocked` or `failure` result (D9.8, D4.6), keyed by
-the launch ordinal, the entry's base and the entry's position, so the same
-result admitted again is a replay. Launch ends and refused candidates are
-not collected yet: no candidate or launch receipt has a producer, and a
-record citing one would be shown only as needing revalidation. `FIX`,
-`REVIEW`, `REPLAN_REEXECUTE` and `UPDATE_EPIC` stay unsupported, as
-`doctor` and the operator documentation say. The evaluation's Memory
-collector is not part of this slice. No Memory launch has run against a
-live repository, under the real bwrap backend, or with a real Pi.
-`tests/test_memory_handoff.py` holds §4.2's Memory items for this slice:
-the retry after a validation failure
+descends from proved through the controller's transport. `HEAD` is read as
+the candidate is, through the admin dir the registry binds and the common
+dir, never through the worktree's `.git` file, which an earlier launch of
+the step can rewrite before a correction or a retry; a binding the
+registry does not confirm, and a launch that seeds, bind no candidate. The
+prompt names the file in a section rendered only while the run keeps
+Memory, so a Memory-off prompt is unchanged byte for byte. The prompt label
+moves to `v19`, an evaluation amendment, as D19 says. The run log records
+what each launch was shown (sizes, counts, digests and the render's time),
+never a record's text. Two writers exist. The controller's
+`validation-failure` record of a failed candidate cites its validation
+record and is added by the producer's failure counter, in the save that
+keeps the record (D11 stage 4). It is bound to the failing commit and to
+its base, so on that commit it is established and on a descendant of the
+base it is shown with its source and needs revalidation. An accepted
+result's proposals come from an optional `memory` list of the result, which
+no required field and no parser rule changes. They are admitted in the plan
+save of a success or in the stop save of a `blocked` or `failure` result
+(D9.8, D4.6), keyed by the launch ordinal, the entry's base and the entry's
+position, so the same result admitted again is a replay. The list is bound
+to its launch when the reply is parsed: a `correct` or `retract` only of a
+record that launch's projection showed, against the revision it showed,
+and no text the redactor would change. The step and a reply kept across a
+restart (#479) go on from that bound list, so both admit the same entries.
+Launch ends and refused candidates are not collected yet: no candidate or
+launch receipt has a producer, and a record citing one would be shown only
+as needing revalidation. `FIX`, `REVIEW`, `REPLAN_REEXECUTE` and
+`UPDATE_EPIC` stay unsupported, as `doctor` and the operator documentation
+say. The evaluation's Memory collector is not part of this slice. No Memory
+launch has run against a live repository, under the real bwrap backend, or
+with a real Pi. `tests/test_memory_handoff.py` holds §4.2's Memory items
+for this slice: the retry after a validation failure
 (`test_a_validation_failure_reaches_the_retry_as_an_observed_record`), the
 candidate binding
-(`test_a_failure_on_an_earlier_commit_is_labelled_stale_on_its_descendant`),
+(`test_a_failure_on_an_earlier_commit_is_labelled_stale_on_its_descendant`,
+`test_a_relaunch_reads_its_candidate_through_the_bound_admin_dir_not_the_dotgit_file`),
 the corrected and retracted hypotheses across a crash and `resume`
 (`test_a_correction_survives_a_crash_and_the_next_launch_never_sees_what_it_replaced`),
 the stop save
 (`test_a_stop_results_proposals_land_in_its_stop_save_and_nowhere_before`),
+a reply kept across a crash
+(`test_a_kept_reply_admits_what_its_launch_could_whether_or_not_the_controller_restarts`),
 the refused reply
 (`test_a_refused_or_corrected_reply_leaves_no_proposal`), the seeded
 secrets

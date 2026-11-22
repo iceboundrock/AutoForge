@@ -2598,7 +2598,11 @@ renders the same file again, and a correction or retraction the operator
 or an earlier launch saved is shown at the next launch, never the text it
 replaced. It is bound to the launch's candidate: the worktree's `HEAD`
 after the strict import when that is not the entry's base (the commit a
-validation failure left), and none otherwise. The controller never reads
+validation failure left), and none otherwise. `HEAD` is read through the
+worktree's registry entry, as the candidate is after a launch, never
+through its `.git` file, which an earlier launch of the step could have
+rewritten; when that binding cannot be confirmed, no candidate is bound and
+every record bound to one is left out. The controller never reads
 it back. The launch's run log records what it was shown in
 `request.json`'s `metadata.memory`: the revision and digests, the counts,
 the file's size and its SHA-256, and how long the render took
@@ -2620,8 +2624,8 @@ the record rests on, so no crash separates them:
 - **An accepted result's proposals.** The agent may list up to eight
   entries in an optional `memory` field of its result: a note to add
   (`hypothesis`, `note`, `failed-approach`, `handoff` or
-  `repository-constraint`), or a correction or retraction of a proposal it
-  was shown
+  `repository-constraint`), or a correction or retraction of a proposal its
+  `memory.md` showed, against the revision it showed
   ([CONTROL_RESULT protocol](agent-guides/control-result-protocol.md#analyze_executes-optional-memory-list-333)).
   They are saved only with a result the controller accepts: the plan of a
   success, or the stop of a `blocked` or `failure` result. After an
@@ -2629,8 +2633,10 @@ the record rests on, so no crash separates them:
   proposals. A refused or corrected reply, one whose commit fails
   validation and one lost to a crash keep none. An entry the store refuses
   (past a bound, text the redactor would change, a revision of the
-  controller's or the operator's record) is counted in `memory show`'s
-  refusals and changes nothing else.
+  controller's or the operator's record, or of a record the launch was not
+  shown) is counted in `memory show`'s refusals and changes nothing else.
+  A reply kept across a restart admits the same entries the fresh reply
+  would have.
 
 Nothing else is collected. A launch's typed end (a timeout, a failed
 exit) and a candidate the controller's checks refuse are not recorded,

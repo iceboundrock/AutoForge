@@ -13,8 +13,8 @@ records that apply to it, and its prompt names the file. The controller
 records each validation failure of the phase's candidates, citing the
 validation record, in the save that keeps that record, so the relaunch
 after a failure is shown it. An agent may add up to eight notes, or correct
-or retract its own earlier ones, through an optional `memory` list in its
-result. They are kept only with a result the controller accepts: a
+or retract an earlier proposal its `memory.md` shows, through an optional
+`memory` list in its result. They are kept only with a result the controller accepts: a
 published success, or a `blocked` or `failure` result, whose notes the
 launch after an `unblock` is shown. Each launch's run log records what it
 was shown, by size, count and digest. `REVIEW`, `FIX`, `REPLAN_REEXECUTE`

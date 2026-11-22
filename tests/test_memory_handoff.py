@@ -30,6 +30,7 @@ import dataclasses
 import json
 import re
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,7 @@ from autoforge.doctor import Doctor
 from autoforge.evidence import MAX_FAILURE_COUNT, WorktreeProvenance, parse_record
 from autoforge.executor import execute
 from autoforge.memory import (
+    MAX_FACTS,
     MAX_PROJECTION_BYTES,
     MAX_PROJECTION_CHARS,
     MAX_TEXT_BYTES,
@@ -58,6 +60,8 @@ from autoforge.memory_handoff import (
     Proposal,
     Proposals,
     admit_proposals,
+    bind_proposals,
+    bound_proposals,
     observe_validation_failure,
     parse_proposals,
     projection_request,
@@ -65,6 +69,7 @@ from autoforge.memory_handoff import (
 )
 from autoforge.prompts import load_template
 from autoforge.providers import ProviderRegistry
+from autoforge.redaction import redact_dict
 from autoforge.sandbox import TEARDOWN_UNCOUNTED, SandboxFacts
 from autoforge.state import load_state
 from autoforge.transitions import AGENT_PHASES, Phase
@@ -321,7 +326,12 @@ def test_a_validation_failure_reaches_the_retry_as_an_observed_record(tmp_state_
     logged = [r["metadata"]["memory"] for r in execution_records(eng)]
     assert [m["launch"] for m in logged] == [1, 2]
     assert [m["shown"] for m in logged] == [0, 1]
-    assert all(m["chars"] <= MAX_PROJECTION_CHARS and m["render_ms"] < 1000 for m in logged)
+    assert all(m["chars"] <= MAX_PROJECTION_CHARS for m in logged)
+    # The render's time is recorded as the controller measured it, never
+    # checked here: a wall time is a fact of the host's load (tests/AGENTS.md).
+    # Its computation and the ceiling are held below, by a fake clock and in
+    # CPU time.
+    assert all(type(m["render_ms"]) is float and m["render_ms"] >= 0 for m in logged)
     assert logged[1]["candidate"] == commit and logged[1]["memory_digest"]
     assert all("fixed.txt is missing" not in json.dumps(m) for m in logged)
     assert pi.calls and all(r.fresh_context for r in pi.calls)
@@ -351,6 +361,81 @@ def test_a_failure_on_an_earlier_commit_is_labelled_stale_on_its_descendant(tmp_
     assert "needs revalidation 01" in shown
     # Each failure is observed once, bound to its own commit.
     assert [r["scope"]["candidate"] for r in records(s)] == [first, second, third]
+    eng.close()
+
+
+def test_a_relaunch_reads_its_candidate_through_the_bound_admin_dir_not_the_dotgit_file(
+    tmp_state_dir, pi_home, tmp_path
+):
+    """R1-F1 of PR #536. Launch 1's C1 fails validation. Launch 2 commits C2
+    on it, rewrites the worktree's ``.git`` file to name a git directory of
+    its own whose ``HEAD`` is C1, and returns no result. The correction it
+    gets is shown Memory for the candidate the worktree holds, read through
+    the admin dir the registry binds: C2, with C1's failure needing
+    revalidation, never C1's failure as established for this launch."""
+    gh = FakeGitHub()
+    decoy = tmp_path / "decoy"
+    seen_at: dict[str, str] = {}
+
+    def redirected(req):
+        work = Path(req.cwd)
+        seen_at["c1"] = git_out("-C", req.cwd, "rev-parse", "HEAD")
+        (work / "fixed.txt").write_text("ok\n", encoding="utf-8")
+        git_out("-C", req.cwd, "add", "fixed.txt")
+        git_out("-C", req.cwd, *GIT_IDENT, "commit", "-q", "-m", "Implement the feature (#2)")
+        seen_at["c2"] = git_out("-C", req.cwd, "rev-parse", "HEAD")
+        common = (work / git_out("-C", req.cwd, "rev-parse", "--git-common-dir")).resolve()
+        (decoy / "objects" / "info").mkdir(parents=True)
+        (decoy / "refs").mkdir()
+        (decoy / "objects" / "info" / "alternates").write_text(f"{common}/objects\n")
+        (decoy / "HEAD").write_text(seen_at["c1"] + "\n")
+        seen_at["dotgit"] = (work / ".git").read_text()
+        (work / ".git").write_text(f"gitdir: {decoy}\n")
+        assert git_out("-C", req.cwd, "rev-parse", "HEAD") == seen_at["c1"], "git is redirected"
+        return "The work is done, but I wrote no CONTROL_RESULT."
+
+    def restored(req):
+        (Path(req.cwd) / ".git").write_text(seen_at["dotgit"])
+        return block(analyze_payload(git_out("-C", req.cwd, "rev-parse", "HEAD")))
+
+    seen = Seen(implement, redirected, restored)
+    eng, _ = producing(tmp_state_dir, gh, seen, NEEDS_FIX)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    (failed,) = saved(eng).validation_records
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    c1, c2 = seen_at["c1"], seen_at["c2"]
+    assert failed["candidate"]["commit"] == c1
+    corrected = seen.memory[2]
+    assert corrected is not None and "launch: 3" in corrected
+    assert f"Candidate: {c2}" in corrected and f"Candidate: {c1}" not in corrected
+    assert f"Source candidate: {c1}" in corrected and "needs revalidation 01" in corrected
+    assert f"FAIL on {c1}" not in corrected, "C1's failure is not established on C2"
+    assert [m["candidate"] for m in (r["metadata"]["memory"] for r in execution_records(eng))] == [
+        "",
+        c1,
+        c2,
+    ]
+    eng.close()
+
+
+def test_a_binding_the_registry_does_not_confirm_binds_no_candidate(tmp_state_dir, pi_home):
+    """R1-F1 of PR #536: a worktree whose ``.git`` file no longer names its
+    registry entry, read with no binding established yet in this process,
+    binds no candidate, so every record bound to one is omitted; the
+    worktree's own ``.git`` is never followed to find one."""
+    gh = FakeGitHub()
+    eng, _ = producing(tmp_state_dir, gh, scripted(implement), FAILS)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    work = eng.agent_worktree_path()
+    head = git_out("-C", str(work), "rev-parse", "HEAD")
+    assert eng._memory_candidate(str(work)) == head
+    eng._agent_admin_dirs.clear()
+    (work / ".git").write_text(f"gitdir: {eng.workspace().git_dirs()[-1]}\n")
+    assert eng._memory_candidate(str(work)) == ""
+    launch = eng._launch_memory(Phase.ANALYZE_EXECUTE, str(work))
+    assert launch is not None and launch.request.candidate == ""
+    assert "Shown 00;" in launch.text and "inapplicable 01" in launch.text
     eng.close()
 
 
@@ -456,15 +541,19 @@ def test_an_accepted_results_proposals_are_admitted_once_and_counted_when_refuse
     later = MemoryStore(REPO, RUN, 2, again.store.encode())
     fixed = admitted(
         later,
-        Proposal(Action.CORRECT, record=1, text="the lexer is fine", reason="checked"),
+        Proposal(Action.CORRECT, record=1, text="the lexer is fine", reason="checked", revision=1),
         attempt=2,
     )
     assert fixed.applied == 1
     assert fixed.store.catalog(ISSUE)["records"][0]["text"] == "the lexer is fine"
-    gone = admitted(fixed.store, Proposal(Action.RETRACT, record=1, reason="wrong"), attempt=2)
+    gone = admitted(
+        fixed.store, Proposal(Action.RETRACT, record=1, reason="wrong", revision=2), attempt=2
+    )
     assert gone.store.catalog(ISSUE)["records"][0]["status"] == "retracted"
     # A record that does not exist, and Memory off: nothing changes the step.
-    missing = admitted(gone.store, Proposal(Action.RETRACT, record=9, reason="no"), attempt=2)
+    missing = admitted(
+        gone.store, Proposal(Action.RETRACT, record=9, reason="no", revision=1), attempt=2
+    )
     assert (missing.applied, missing.refused) == (0, 1)
     off = admitted(MemoryStore(REPO, RUN, 1, {}), note, refused=1)
     assert (off.applied, off.refused, off.store.encode()) == (0, 0, {})
@@ -474,8 +563,8 @@ def test_an_agent_cannot_revise_the_controllers_or_the_operators_record():
     rec = parse_record(failing_record())
     store = observe_validation_failure(enabled(2), STEP, rec, attempt=1, text="failed").store
     for proposal in (
-        Proposal(Action.CORRECT, record=1, text="it passed", reason="trust me"),
-        Proposal(Action.RETRACT, record=1, reason="hide it"),
+        Proposal(Action.CORRECT, record=1, text="it passed", reason="trust me", revision=1),
+        Proposal(Action.RETRACT, record=1, reason="hide it", revision=1),
     ):
         out = admitted(store, proposal, attempt=2)
         assert (out.applied, out.refused) == (0, 1)
@@ -491,18 +580,18 @@ def test_an_agent_cannot_revise_the_controllers_or_the_operators_record():
         .store
     )
     seeded = MemoryStore(REPO, RUN, 1, seeded.encode())
-    out = admitted(seeded, Proposal(Action.RETRACT, record=1, reason="hide it"))
+    out = admitted(seeded, Proposal(Action.RETRACT, record=1, reason="hide it", revision=1))
     assert out.refused == 1 and out.store.catalog(ISSUE)["records"][0]["status"] == "current"
 
 
 def test_a_proposal_from_a_launch_before_a_records_latest_change_is_refused():
-    """The controller names the record's current revision; the store still
-    refuses a revision from a launch that started before the record changed."""
+    """Even at the record's current revision, the store refuses a revision
+    from a launch that started before the record changed."""
     note = Proposal(Action.ADD, kind=Kind.NOTE, text="first note")
     store = MemoryStore(REPO, RUN, 3, admitted(enabled(3), note, attempt=3).store.encode())
     late = admitted(
         store,
-        Proposal(Action.CORRECT, record=1, text="from an older launch", reason="late"),
+        Proposal(Action.CORRECT, record=1, text="from an older launch", reason="late", revision=1),
         attempt=2,
     )
     assert (late.applied, late.refused) == (0, 1)
@@ -516,6 +605,131 @@ def test_a_seeded_secret_in_a_proposal_is_refused_and_never_kept():
     )
     assert (out.applied, out.refused) == (0, 2)
     assert SECRET not in json.dumps(out.store.encode())
+
+
+def project(store, candidate="", ancestors=(), receipts=(), **kwargs):
+    request = projection_request(store, STEP, candidate=candidate, ancestors=ancestors)
+    return render_launch_projection(store, request, validation_records=list(receipts), **kwargs)
+
+
+def bound(raw, launch):
+    """``raw`` as the engine admits it: bound to ``launch`` on the reply's parse, read back."""
+    return bound_proposals(bind_proposals(raw, launch.shown))
+
+
+def notes(count, *, seq=64, text=lambda n: f"lesson {n}: " + "é" * 900):
+    """A store holding ``count`` agent notes, one per launch, at launch ordinal ``seq``."""
+    store = enabled(seq)
+    for n in range(1, count + 1):
+        store = admitted(store, Proposal(Action.ADD, kind=Kind.NOTE, text=text(n)), attempt=n).store
+    return store
+
+
+def test_a_revision_names_only_a_record_its_launch_was_shown_at_the_revision_shown():
+    """R1-F2 of PR #536: a ``correct`` or ``retract`` of a record the launch's
+    projection left out for the budget, of the record the same result adds,
+    or of a number nobody was shown is refused and counted, whatever the
+    store holds. A record the projection showed is revised, against the
+    revision it showed. A list no launch bound admits nothing."""
+    store = notes(39)
+    launch = project(store)
+    assert 39 in launch.shown and 1 not in launch.shown, "the oldest is left out for the budget"
+    assert launch.shown[39] == store.revision_of(39) and set(launch.shown) == set(
+        launch.projection.ids
+    )
+    raw = [
+        {"op": "retract", "record": 1, "reason": "left out for the budget"},
+        add("hypothesis", "a new guess"),
+        {"op": "retract", "record": 40, "reason": "added by this same result"},
+        {"op": "retract", "record": 63, "reason": "a number guessed"},
+        {"op": "correct", "record": 39, "text": "lesson 39, corrected", "reason": "checked"},
+    ]
+    after = MemoryStore(REPO, RUN, 65, store.encode())
+    out = admit_proposals(after, bound(raw, launch), step=STEP, attempt=65, input_sha=BASE)
+    assert (out.applied, out.refused) == (2, 3) and out.store.refusals == 3
+    rows = {r["id"]: r for r in out.store.catalog(ISSUE)["records"]}
+    assert rows[1]["status"] == rows[40]["status"] == "current"
+    assert rows[40]["text"] == "a new guess" and rows[39]["text"] == "lesson 39, corrected"
+    unbound = admit_proposals(after, bound_proposals(raw), step=STEP, attempt=65, input_sha=BASE)
+    assert (unbound.applied, unbound.refused) == (0, 1)
+    assert unbound.store.catalog(ISSUE)["records"] == after.catalog(ISSUE)["records"]
+
+
+def test_a_second_change_of_one_record_in_one_result_is_stale_against_what_was_shown():
+    store = MemoryStore(REPO, RUN, 2, notes(1, seq=1).encode())
+    launch = project(store)
+    raw = [
+        {"op": "correct", "record": 1, "text": "a better lesson", "reason": "checked"},
+        {"op": "retract", "record": 1, "reason": "on second thought"},
+    ]
+    out = admit_proposals(store, bound(raw, launch), step=STEP, attempt=2, input_sha=BASE)
+    assert (out.applied, out.refused) == (1, 1)
+    (row,) = out.store.catalog(ISSUE)["records"]
+    assert (row["status"], row["text"]) == ("current", "a better lesson")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        [add("note", "x")],
+        {"entries": [], "refused": 0, "extra": 1},
+        {"entries": "x", "refused": 0},
+        {"entries": [], "refused": -1},
+        {"entries": [{"op": "add", "kind": "note", "text": "x"}], "refused": 0},
+        {"entries": [{"op": "add", "kind": "note", "text": "x", "slot": 8}], "refused": 0},
+        {"entries": [{"op": "add", "kind": "note", "text": "x", "slot": True}], "refused": 0},
+        {"entries": [{"op": "retract", "record": 1, "reason": "r", "slot": 0}], "refused": 0},
+        {
+            "entries": [{"op": "retract", "record": 1, "reason": "r", "slot": 0, "revision": 0}],
+            "refused": 0,
+        },
+    ],
+    ids=[
+        "agent-list",
+        "extra-key",
+        "entries-not-a-list",
+        "negative-count",
+        "no-slot",
+        "slot-past-bound",
+        "bool-slot",
+        "no-revision",
+        "revision-zero",
+    ],
+)
+def test_a_memory_field_not_in_the_bound_form_admits_nothing(raw):
+    parsed = bound_proposals(raw)
+    assert parsed.entries == () and parsed.refused >= 1
+
+
+def test_a_bound_list_keeps_no_text_the_redactor_would_change_and_counts_it_refused():
+    """R1-F3 of PR #536: a kept reply is redacted before it is saved, and a
+    redacted text passes the store's own check. So the bound form refuses
+    such a text itself and keeps a redacted reason, as the store would:
+    redacting it again changes nothing, the admission after a restart is
+    the fresh reply's, and the credential is nowhere. Bound after the
+    redaction instead, the redacted note would have been kept."""
+    store = MemoryStore(REPO, RUN, 2, notes(1, seq=1).encode())
+    launch = project(store)
+    raw = [
+        add("note", f"use {SECRET}"),
+        {"op": "correct", "record": 1, "text": f"it was {SECRET}", "reason": "leaked"},
+        {"op": "retract", "record": 1, "reason": f"the reason names {SECRET}"},
+        add("note", "a clean note"),
+    ]
+    form = bind_proposals(raw, launch.shown)
+    assert SECRET not in json.dumps(form) and redact_dict({"memory": form}) == {"memory": form}
+    assert form["refused"] == 2 and [e["slot"] for e in form["entries"]] == [2, 3]
+
+    def admit(value):
+        return admit_proposals(store, bound_proposals(value), step=STEP, attempt=2, input_sha=BASE)
+
+    fresh, kept = admit(form), admit(redact_dict({"memory": form})["memory"])
+    assert fresh.store.encode() == kept.store.encode()
+    assert (fresh.applied, fresh.refused) == (2, 2)
+    assert [r["status"] for r in fresh.store.catalog(ISSUE)["records"]] == ["retracted", "current"]
+    assert SECRET not in json.dumps(fresh.store.encode())
+    late = admit(bind_proposals(redact_dict({"memory": raw})["memory"], launch.shown))
+    assert late.applied == 3, "the redacted note would have passed the store's check"
 
 
 def test_a_seeded_secret_in_a_validators_output_is_redacted_before_memory_and_projection():
@@ -540,6 +754,34 @@ def test_the_projection_stays_within_its_bounds_and_says_what_it_cut():
     assert shown + omitted == 39 and omitted > 0
     # Newest first among proposals: the latest lessons are the ones shown.
     assert "lesson 39:" in text and "lesson 1:" not in text
+
+
+def test_the_render_time_recorded_is_the_clocks_measurement_of_the_render():
+    ticks = iter([10.0, 10.25])
+    launch = project(enabled(), clock=lambda: next(ticks))
+    assert launch.render_ms == 250.0 and launch.metadata()["render_ms"] == 250.0
+
+
+def test_a_render_at_the_stores_record_bound_costs_far_less_cpu_than_the_ceiling():
+    """ADR 0015 D12 holds a render to the evaluation's 1,000 ms ceiling. The
+    cost measured is the CPU time this process spends rendering a store at
+    its record bound, each record's text at its own bound, never a wall
+    time, which other workers on the host stretch (tests/AGENTS.md)."""
+    pad = (MAX_TEXT_BYTES - len(b"lesson 64: ")) // 2
+
+    def text(n):
+        return f"lesson {n:02d}: " + "é" * pad
+
+    store = notes(MAX_FACTS, seq=MAX_FACTS, text=text)
+    rows = store.catalog(ISSUE)["records"]
+    assert len(rows) == MAX_FACTS and all(len(r["text"].encode()) <= MAX_TEXT_BYTES for r in rows)
+    rounds = 5
+    started = time.process_time()
+    for _ in range(rounds):
+        launch = project(store)
+    cpu_ms = (time.process_time() - started) * 1000.0 / rounds
+    assert launch.projection.freshness.omitted > 0, "the budget cut the store"
+    assert cpu_ms < 1000.0
 
 
 # -- crash windows of each Memory write and each launch (D11) ------------------------------------
@@ -631,6 +873,82 @@ def test_a_stop_results_proposals_land_in_its_stop_save_and_nowhere_before(
     assert texts(s) == ["Bumping the timeout did not help."]
     assert s.launch_seq == 2 and records(s)[0]["attempt"] == 2
     eng2.close()
+
+
+class KilledAfterItsReply(PiShaped):
+    """Pi-shaped; each launch numbered in ``killed`` delivers its reply and is
+    then killed at its idle limit, the end #479 completes on that reply."""
+
+    def __init__(self, script, *killed):
+        super().__init__(script)
+        self.killed = set(killed)
+
+    def execute(self, req):
+        result = super().execute(req)
+        if len(self.calls) in self.killed:
+            result.exit_code = -1
+            result.timed_out = True
+            result.timeout_limit = "idle"
+            result.reply_delivered = True
+        return result
+
+
+@pytest.mark.parametrize("restart", [False, True], ids=["in-process", "after-a-restart"])
+def test_a_kept_reply_admits_what_its_launch_could_whether_or_not_the_controller_restarts(
+    tmp_state_dir, pi_home, restart
+):
+    """R1-F2, R1-F3 of PR #536, through #479's kept reply. Launch 2 delivers
+    a ``blocked`` result and is killed at its idle limit, so its reply is
+    kept in the state before the stop save. With or without a crash before
+    that save, what is admitted is what launch 2 could: the correction of a
+    record it was shown, and its clean hypothesis. A note carrying a
+    credential, a retraction of the record the same result adds, and one of
+    a record it was never shown stay refused, and the credential is nowhere."""
+    gh = FakeGitHub()
+    first = [add("hypothesis", "The cache is stale."), add("note", "Run make check first.")]
+    # A record's number is the Memory revision that added it: M3 is the
+    # hypothesis this result adds, before its correction of M1.
+    second = [
+        add("note", f"the deploy key is {SECRET}"),
+        add("hypothesis", "The locale comes from LANG."),
+        {"op": "correct", "record": 1, "text": "The cache key omits the locale.", "reason": "seen"},
+        {"op": "retract", "record": 3, "reason": "added by this same result"},
+        {"op": "retract", "record": 7, "reason": "a number never shown"},
+    ]
+    script = scripted(
+        stopping("blocked", first, "decide"), stopping("blocked", second, "decide again")
+    )
+    eng, _ = memory_engine(tmp_state_dir, gh, script)
+    pi = KilledAfterItsReply(script, 2)
+    eng.providers = ProviderRegistry(
+        overrides={"pi": pi, "claude": eng.provider, "opencode": eng.provider}
+    )
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    assert eng.step().next_phase == "BLOCKED"
+    eng.unblock("go on")
+    if restart:
+        stop_save_crash(eng)
+        with pytest.raises(KeyboardInterrupt):
+            eng.step()
+        s = saved(eng)
+        assert s.phase == Phase.ANALYZE_EXECUTE and s.delivered_reply
+        assert len(records(s)) == 2, "nothing is admitted before the stop save"
+        assert SECRET not in eng.paths.state_file.read_text(encoding="utf-8")
+        eng, later = resumed(eng, gh, scripted(lambda req: "the agent must not run again"))
+        assert eng.step().next_phase == "BLOCKED"
+        assert later.calls == []
+    else:
+        assert eng.step().next_phase == "BLOCKED"
+    assert len(pi.calls) == 2
+    s = saved(eng)
+    assert {r["id"]: (r["status"], r["text"]) for r in records(s)} == {
+        1: ("current", "The cache key omits the locale."),
+        2: ("current", "Run make check first."),
+        3: ("current", "The locale comes from LANG."),
+    }
+    assert s.memory().refusals == 3
+    assert SECRET not in state_tree_text(eng)
+    eng.close()
 
 
 def test_a_blocked_results_proposals_reach_the_launch_after_unblock(tmp_state_dir, pi_home):

@@ -28,13 +28,14 @@ at most {{MAX_PROPOSALS}} entries, each one of:
   proposal `M<N>`.
 
 A note is at most {{MAX_TEXT_BYTES}} bytes and a reason at most
-{{MAX_REASON_BYTES}}. Only a proposal can be corrected or retracted, never
-the controller's or the operator's record. The controller keeps your
-entries only with a result it accepts: a success it publishes, or a
-`blocked` or `failure` result. A result it refuses, or whose commit fails
-validation, keeps none. An entry it cannot admit is counted and dropped,
-and that never changes how your result is handled. Write lasting lessons:
-an approach that failed and why, a corrected hypothesis, a constraint of
-this repository. Do not record live GitHub state (a pull request, a check,
-a branch head), a transcript, a secret or a credential: text the run-log
-redactor would change is refused.
+{{MAX_REASON_BYTES}}. Only a proposal `{{MEMORY_FILE}}` shows can be
+corrected or retracted, once per result, never the controller's or the
+operator's record, and never a note your own list adds. The controller
+keeps your entries only with a result it accepts: a success it publishes,
+or a `blocked` or `failure` result. A result it refuses, or whose commit
+fails validation, keeps none. An entry it cannot admit is counted and
+dropped, and that never changes how your result is handled. Write
+lasting lessons: an approach that failed and why, a corrected hypothesis,
+a constraint of this repository. Do not record live GitHub state (a pull
+request, a check, a branch head), a transcript, a secret or a credential:
+text the run-log redactor would change is refused.

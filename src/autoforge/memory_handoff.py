@@ -11,7 +11,12 @@ release supports, ``ANALYZE_EXECUTE`` (D13), and nothing more:
   in the save of the validation record it cites (D11 stage 4), and the
   proposals of an accepted result, added in the save that accepts it: the
   phase's plan save, or a ``blocked`` or ``failure`` result's stop save
-  (D9.8, D4.6). A refused, corrected or lost reply leaves no proposal.
+  (D9.8, D4.6). A refused, corrected or lost reply leaves no proposal. The
+  result's list is bound to its launch as soon as the reply is parsed
+  (:func:`bind_proposals`): a revision only of a record the launch was
+  shown, at the revision it was shown, and nothing the redactor would
+  change. The step, and a reply kept across a restart, go on from that
+  bound form, so both admit the same entries.
 
 Nothing here reads a file, the network or a model, and nothing here decides a
 phase, a write, a budget or a merge: the engine supplies every value and
@@ -24,8 +29,8 @@ from __future__ import annotations
 
 import hashlib
 import time
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 
 from .auto_recovery import StepKey
 from .evidence import Outcome, RecordView, WorktreeProvenance
@@ -46,6 +51,7 @@ from .memory import (
     WriteOutcome,
     render_projection,
 )
+from .redaction import redact
 from .transitions import Phase
 
 # The read-context file a Memory launch is given (D12).
@@ -91,6 +97,13 @@ _OPERATIONS = {
     Action.CORRECT.value: (Action.CORRECT, _CORRECT_KEYS),
     Action.RETRACT.value: (Action.RETRACT, _RETRACT_KEYS),
 }
+# The bound form's keys (:func:`bind_proposals`): what the controller keeps of
+# an entry, its position in the agent's list and, for a revision, the record
+# revision the launch was shown. No agent entry has them all, so a list the
+# controller did not bind is never read as bound.
+_BOUND_KEYS = frozenset({"entries", "refused"})
+_SLOT = "slot"
+_REVISION = "revision"
 
 
 def supported(phase: Phase) -> bool:
@@ -103,11 +116,18 @@ def supported(phase: Phase) -> bool:
 
 @dataclass(frozen=True)
 class LaunchProjection:
-    """One launch's ``memory.md``, what it was rendered from and how long that took."""
+    """One launch's ``memory.md``, what it was rendered from and how long that took.
+
+    ``shown`` maps each record the projection shows to the record revision
+    it showed, read from the snapshot it was rendered from: the only records
+    that launch's result may correct or retract, and the revisions it acts
+    on (R1-F2 of PR #536).
+    """
 
     request: ProjectionRequest
     projection: ContextProjection
     render_ms: float
+    shown: Mapping[int, int]
 
     @property
     def text(self) -> str:
@@ -117,7 +137,8 @@ class LaunchProjection:
         """What the run log records of the projection: counts, sizes, digests, never its text.
 
         ``render_ms`` is the controller's own measurement of the render, the
-        number ADR 0015 D12 holds to the evaluation's 1,000 ms ceiling.
+        wall time the evaluation reads against ADR 0015 D12's 1,000 ms
+        ceiling. It is recorded, never checked: nothing decides on it.
         """
         freshness = self.projection.freshness
         text = self.projection.text
@@ -181,7 +202,13 @@ def render_launch_projection(
     """
     started = clock()
     projection = render_projection(store, request, validation_records=validation_records)
-    return LaunchProjection(request, projection, (clock() - started) * 1000.0)
+    elapsed = (clock() - started) * 1000.0
+    shown = {
+        record: revision
+        for record in projection.ids
+        if (revision := store.revision_of(record)) is not None
+    }
+    return LaunchProjection(request, projection, elapsed, shown)
 
 
 # -- after the launch: the controller's observation (D8, D11 stage 4) --------------------
@@ -256,13 +283,33 @@ def observe_validation_failure(
 
 @dataclass(frozen=True)
 class Proposal:
-    """One entry of a result's ``memory`` list, as the controller parsed it."""
+    """One entry of a result's ``memory`` list, as the controller parsed it.
+
+    ``slot`` is its position in the agent's list, which keys an ``add``
+    (D9.7). ``revision`` is, for a ``correct`` or ``retract``, the record
+    revision the launch was shown, and 0 until the entry is bound to its
+    launch (:func:`bind_proposals`).
+    """
 
     action: Action
     kind: Kind | None = None
     record: int = 0
     text: str | None = None
     reason: str = ""
+    slot: int = 0
+    revision: int = 0
+
+    def encode(self) -> dict:
+        """The entry in the bound form :func:`bound_proposals` reads."""
+        out: dict = {"op": self.action.value, _SLOT: self.slot}
+        if self.action is Action.ADD:
+            assert self.kind is not None
+            out.update(kind=self.kind.value, text=self.text)
+            return out
+        out.update(record=self.record, reason=self.reason, **{_REVISION: self.revision})
+        if self.action is Action.CORRECT:
+            out["text"] = self.text
+        return out
 
 
 @dataclass(frozen=True)
@@ -273,13 +320,19 @@ class Proposals:
     refused: int = 0
 
 
-def _entry(raw: object) -> Proposal | None:
+_AGENT_KINDS = {k.value: k for k in AGENT_KINDS}
+
+
+def _entry(raw: object, slot: int, *, bound: bool = False) -> Proposal | None:
+    """One entry, the agent's (exactly its keys) or, with ``bound``, the controller's."""
     if not isinstance(raw, dict):
         return None
     op = raw.get("op")
     if not isinstance(op, str) or op not in _OPERATIONS:
         return None
     action, keys = _OPERATIONS[op]
+    if bound:
+        keys = keys | {_SLOT} | (frozenset() if action is Action.ADD else {_REVISION})
     if raw.keys() != keys:
         return None
     if action is Action.ADD:
@@ -287,21 +340,23 @@ def _entry(raw: object) -> Proposal | None:
         text = raw["text"]
         if not isinstance(text, str) or not isinstance(kind, str):
             return None
-        known = {k.value: k for k in AGENT_KINDS}
-        if kind not in known:
+        if kind not in _AGENT_KINDS:
             return None
-        return Proposal(Action.ADD, kind=known[kind], text=text)
+        return Proposal(Action.ADD, kind=_AGENT_KINDS[kind], text=text, slot=slot)
     record, reason = raw["record"], raw["reason"]
     if type(record) is not int or record < 1 or not isinstance(reason, str):
+        return None
+    revision = raw[_REVISION] if bound else 0
+    if bound and (type(revision) is not int or revision < 1):
         return None
     text = raw.get("text") if action is Action.CORRECT else None
     if action is Action.CORRECT and not isinstance(text, str):
         return None
-    return Proposal(action, record=record, text=text, reason=reason)
+    return Proposal(action, record=record, text=text, reason=reason, slot=slot, revision=revision)
 
 
 def parse_proposals(raw: object) -> Proposals:
-    """A result's optional ``memory`` field; never raises (D9.8).
+    """A result's optional ``memory`` field, as the agent wrote it; never raises (D9.8).
 
     Absent (``None``) is no proposal. Anything that is not a list is one
     refusal. Each entry is ``add`` (``kind``, ``text``), ``correct``
@@ -309,7 +364,7 @@ def parse_proposals(raw: object) -> Proposals:
     ``reason``) with exactly those keys; any other entry, and every entry
     past :data:`MAX_PROPOSALS`, is refused and counted. Text bounds and
     redaction are the store's (D9.6, D9.9): an agent's text the run-log
-    redactor would change is refused there, never kept redacted.
+    redactor would change is refused, never kept redacted.
     """
     if raw is None:
         return Proposals()
@@ -318,12 +373,93 @@ def parse_proposals(raw: object) -> Proposals:
     entries: list[Proposal] = []
     refused = 0
     for index, item in enumerate(raw):
-        entry = _entry(item) if index < MAX_PROPOSALS else None
+        entry = _entry(item, index) if index < MAX_PROPOSALS else None
         if entry is None:
             refused += 1
         else:
             entries.append(entry)
     return Proposals(tuple(entries), refused)
+
+
+def _unchanged_by_redaction(text: str | None) -> bool:
+    """Whether the run-log redactor leaves ``text`` as it is (D9.9); ``None`` is no text."""
+    if text is None:
+        return True
+    try:
+        text.encode()
+    except UnicodeError:
+        return False
+    return redact(text) == text
+
+
+def bind_proposals(raw: object, shown: Mapping[int, int]) -> dict:
+    """A result's ``memory`` field bound to the launch that returned it (R1-F2, R1-F3 of PR #536).
+
+    Called once, on the parse of a fresh reply, with what that launch's
+    projection showed (:attr:`LaunchProjection.shown`); the step goes on
+    from the bound form, and a reply kept across a restart (#479) keeps it,
+    so both admit exactly the same entries (:func:`bound_proposals`). Each
+    entry :func:`parse_proposals` refuses stays refused, and so is, counted
+    with them and never kept:
+
+    - a ``correct`` or ``retract`` of a record the projection did not show
+      (one left out for the budget, one bound to another candidate, one
+      the same result adds): the agent never saw it, whatever its number;
+    - an entry whose ``text`` the run-log redactor would change (D9.9). A
+      kept reply is redacted before it is saved, and a redacted text would
+      pass the store's own check after a restart; refusing it here is
+      what keeps a secret refused rather than kept redacted.
+
+    A ``correct`` or ``retract`` the projection showed carries the record
+    revision it showed, which the store holds the change to: one made after
+    the record changed again (by an earlier entry of the same result, say)
+    is stale and refused there. Its ``reason`` is kept redacted, as the
+    store keeps it, so the bound form holds no credential either.
+    """
+    parsed = parse_proposals(raw)
+    entries: list[dict] = []
+    refused = parsed.refused
+    for proposal in parsed.entries:
+        if proposal.action is not Action.ADD:
+            revision = shown.get(proposal.record)
+            if revision is None:
+                refused += 1
+                continue
+            proposal = replace(proposal, revision=revision, reason=redact(proposal.reason))
+        if not _unchanged_by_redaction(proposal.text):
+            refused += 1
+            continue
+        entries.append(proposal.encode())
+    return {"entries": entries, "refused": refused}
+
+
+def bound_proposals(raw: object) -> Proposals:
+    """The proposals of a ``memory`` field :func:`bind_proposals` bound; never raises.
+
+    Absent (``None``) is no proposal. A value that is not the bound form
+    (a list the controller did not bind, say) is one refusal and admits
+    nothing, so no entry reaches the store without its launch's binding.
+    """
+    if raw is None:
+        return Proposals()
+    if not isinstance(raw, dict) or raw.keys() != _BOUND_KEYS:
+        return Proposals(refused=1)
+    items, refused = raw["entries"], raw["refused"]
+    if not isinstance(items, list) or type(refused) is not int or refused < 0:
+        return Proposals(refused=1)
+    entries: list[Proposal] = []
+    slots: set[int] = set()
+    for item in items[:MAX_PROPOSALS]:
+        slot = item.get(_SLOT) if isinstance(item, dict) else None
+        entry = None
+        if type(slot) is int and 0 <= slot < MAX_PROPOSALS and slot not in slots:
+            entry = _entry(item, slot, bound=True)
+        if entry is None:
+            refused += 1
+        else:
+            slots.add(entry.slot)
+            entries.append(entry)
+    return Proposals(tuple(entries), refused + max(0, len(items) - MAX_PROPOSALS))
 
 
 @dataclass(frozen=True)
@@ -352,19 +488,22 @@ def admit_proposals(
     """Admit an accepted result's proposals, in order, into ``store`` (D9.4, D9.8).
 
     Called only for a result the controller accepts, in the save that
-    accepts it. Each ``add`` is a proposal of the step's producer, keyed by
-    its launch ordinal (``attempt``), the input it was launched on
-    (``input_sha``) and its position in the list, so the same result
-    admitted again is a replay, never a second record. A ``correct`` or
-    ``retract`` names a record of the projection; the store refuses one of a
-    record that is not a proposal, that changed after this launch started,
-    or of another issue. With Memory off nothing is admitted or counted.
+    accepts it, with the proposals of its bound ``memory`` field
+    (:func:`bound_proposals`). Each ``add`` is a proposal of the step's
+    producer, keyed by its launch ordinal (``attempt``), the input it was
+    launched on (``input_sha``) and its position in the agent's list, so the
+    same result admitted again is a replay, never a second record. A
+    ``correct`` or ``retract`` names a record the launch was shown and the
+    revision it was shown (:func:`bind_proposals`); the store refuses one of
+    a record that is not a proposal, that changed since that revision or
+    after this launch started, or of another issue. With Memory off nothing
+    is admitted or counted.
     """
     if not store.enabled:
         return Admission(store)
     scope = MemoryScope(step)
     applied = replayed = refused = 0
-    for slot, proposal in enumerate(proposals.entries):
+    for proposal in proposals.entries:
         if proposal.action is Action.ADD:
             assert proposal.kind is not None and proposal.text is not None
             out = store.add(
@@ -373,11 +512,10 @@ def admit_proposals(
                 scope=scope,
                 text=proposal.text,
                 attempt=attempt,
-                key=ProposalKey(PRODUCER_TASK, attempt, PRODUCER_ROLE, input_sha, slot),
+                key=ProposalKey(PRODUCER_TASK, attempt, PRODUCER_ROLE, input_sha, proposal.slot),
                 accepted=True,
             )
         else:
-            expected = store.revision_of(proposal.record)
             out = store.revise(
                 proposal.action,
                 proposal.record,
@@ -386,7 +524,7 @@ def admit_proposals(
                 step=step,
                 attempt=attempt,
                 text=proposal.text,
-                expected=expected if expected is not None else 0,
+                expected=proposal.revision,
                 accepted=True,
             )
         store = out.store
@@ -414,6 +552,8 @@ __all__ = [
     "Proposal",
     "Proposals",
     "admit_proposals",
+    "bind_proposals",
+    "bound_proposals",
     "observe_validation_failure",
     "parse_proposals",
     "projection_request",

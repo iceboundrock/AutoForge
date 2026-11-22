@@ -496,9 +496,19 @@ its own rules (`autoforge.memory`): a `text` of at most 2,048 bytes and one
 the run-log redactor would leave unchanged, a `reason` redacted and cut to
 256 bytes, and a `correct` or `retract` only of an agent's proposal, never
 of the controller's observation or the operator's seed, and never from a
-launch that started before the record last changed. A refusal is counted
-and changes nothing else: the result is handled as it would be without
-the list, so Memory never refuses, corrects or delays a result.
+launch that started before the record last changed. The controller binds
+the list to its launch when it parses the reply (R1-F2, R1-F3 of PR #536):
+a `correct` or `retract` of a record that launch's `memory.md` did not show
+(one left out for the budget, one the same list adds, any other number) is
+refused there, and one it showed is made against the record revision it
+showed, so a second change of one record in one result is stale. A `text`
+the redactor would change is refused at that point too, and a `reason` is
+kept redacted. A reply kept across a restart (#479) holds the bound list,
+not the agent's, so it admits exactly what the fresh reply would have, and
+the redaction of a kept reply never turns a refused text into a kept one.
+A refusal is counted and changes nothing else: the result is handled as it
+would be without the list, so Memory never refuses, corrects or delays a
+result.
 
 ### FIX fields
 
