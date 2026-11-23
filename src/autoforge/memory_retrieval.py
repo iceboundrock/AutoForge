@@ -80,10 +80,13 @@ class IndexStatus:
 
     ``source_seq`` is the ledger's audit position (its row count) and
     ``indexed_through_seq`` the position through which the published
-    generation holds this binding's corpus. ``pending`` is the number of audit
-    rows after it, whichever records they touch. Only ``status``, ``sync``,
-    ``rebuild`` and ``verify`` return one; launch answers carry
-    :class:`ScopeFreshness`, which has no audit position.
+    generation holds this binding's corpus: ``None`` when none is published
+    or the published one is known damaged, which verifies no coverage.
+    ``pending`` is the number of audit rows after it (all of them when it is
+    ``None``), whichever records they touch. Only ``state`` says whether the
+    generation is current. Only ``status``, ``sync``, ``rebuild`` and
+    ``verify`` return one; launch answers carry :class:`ScopeFreshness`,
+    which has no audit position.
     """
 
     backend: Backend
@@ -113,15 +116,23 @@ class IndexStatus:
 class ScopeFreshness:
     """A launch answer's index freshness over the binding's authorized corpus.
 
-    It holds no audit position. ``revision`` is a digest of the authorized
-    records' kinds and current text, without their IDs (creation positions):
-    any reader of the same checkpoint and binding reports the same one.
+    It holds no audit position. ``revision`` is a digest of each authorized
+    record's scope-local identity (its ordinal among the records added that
+    apply to the binding, never its ID, an audit position), kind and current
+    text. It changes whenever an authorized record is added, corrected,
+    superseded (even by a record of the same kind and text) or withdrawn,
+    and any reader of the same checkpoint and binding reports the same one.
     Citation retention is resolved afresh for each answer and is not part of
-    it. ``pending`` is the number of authorized records the generation does
-    not hold at their current version, plus the records it holds that are no
-    longer authorized: zero exactly when the state is current. A write to a
-    record the binding cannot read changes neither. ``generation`` counts
-    this reader's publications and is not comparable across readers.
+    it. ``pending`` counts the work to make the index current: the
+    authorized records the answering generation does not verifiably hold at
+    their current version, plus the records it holds that are no longer
+    authorized. A generation known damaged verifies nothing, so every
+    authorized record is pending. A write to a record the binding cannot
+    read changes neither field. Only ``state`` says whether the index is
+    current: a current one has nothing pending, but nothing pending does not
+    make one current (an index never built, or damaged, over an empty corpus
+    has nothing pending). ``generation`` counts this reader's publications
+    and is not comparable across readers.
     """
 
     backend: Backend
@@ -342,10 +353,13 @@ class _View:
 
     @property
     def revision(self) -> str:
-        # Kinds and text digests only: an ID or a record revision is a ledger
-        # position, which would count writes this binding cannot read.
+        # Scope-local identity, kind and text digest. An ID or a record
+        # revision is a ledger position, which would count writes this
+        # binding cannot read; the ordinal counts only records that apply.
         return hashlib.sha256(
-            json.dumps(sorted([r.fact.kind.value, r.fact.content] for r in self.records)).encode()
+            json.dumps(
+                sorted([r.ordinal, r.fact.kind.value, r.fact.content] for r in self.records)
+            ).encode()
         ).hexdigest()
 
 
@@ -399,7 +413,8 @@ def _status(slot: _Slot, view: _View) -> IndexStatus:
     """Maintenance status: the ledger's audit positions, never a launch's answer."""
     generation = slot.published
     source = view.store.source_seq
-    through = None if generation is None else generation.audit
+    # A generation known damaged verifies no coverage, whatever it was built from.
+    through = None if generation is None or slot.broken else generation.audit
     # A generation's audit position is the ledger length of the view it holds
     # (moved on only by rows that leave the binding's corpus as it was), and a
     # continued checkpoint of the same length has the same rows: equal
@@ -418,10 +433,12 @@ def _status(slot: _Slot, view: _View) -> IndexStatus:
 def _freshness(slot: _Slot, view: _View) -> ScopeFreshness:
     """A launch answer's status: scoped to the authorized corpus, no audit position."""
     generation = slot.published
-    held = dict(generation.versions) if generation is not None else {}
+    # Coverage is what an intact generation was verified to hold, never the
+    # manifest of one known damaged: that one holds no record verifiably.
+    held = dict(generation.versions) if generation is not None and not slot.broken else {}
     now = dict(view.versions)
-    # Each record whose indexed version differs counts once: added,
-    # corrected, or no longer authorized.
+    # Each record whose verified indexed version differs counts once: added,
+    # corrected, no longer authorized, or not verifiably held.
     pending = sum(held.get(i) != now.get(i) for i in held.keys() | now.keys())
     return ScopeFreshness(
         slot.backend,
@@ -601,7 +618,8 @@ class MemoryRetriever:
         topics = tuple(sorted(kinds.items()))
         index, degraded = self._answers(view)
         # No record IDs, global positions, source ancestry, or withdrawn hashes:
-        # the freshness's revision digests authorized kinds and text alone.
+        # the freshness's revision digests authorized records' scope-local
+        # ordinals, kinds and text alone.
         return MemoryCatalog(view.scope, topics, index, degraded)
 
     def _lookup(

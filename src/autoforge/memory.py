@@ -757,17 +757,24 @@ class MemoryStore:
 
         D12's special rendering of superseded observations can preserve a
         receipt's claim, but is not permission to retrieve their old prose.
+        Each record carries its ordinal among the records added that apply to
+        the binding, superseded and withdrawn ones included.
         """
         request = _projection_binding(self, request)
         receipts = _validation_facts(self, validation_records)
         held = _retained_refs(retained)
-        return tuple(
-            RetrievalRecord(
-                fact, self._texts[fact.content], _resolve(fact, request, receipts, held)[0]
-            )
-            for fact in self._facts.values()
-            if not fact.replacement and _readable(self, request, fact)
-        )
+        records = []
+        ordinal = 0
+        # Records are added, never removed, in ID order: a record's ordinal
+        # never changes, and no record the binding cannot read shifts it.
+        for fact in self._facts.values():
+            if not fact.scope.applies(request):
+                continue
+            ordinal += 1
+            if not fact.replacement and _readable(self, request, fact):
+                retention = _resolve(fact, request, receipts, held)[0]
+                records.append(RetrievalRecord(fact, self._texts[fact.content], retention, ordinal))
+        return tuple(records)
 
     def range_bases(self, issue_url: str) -> tuple[str, ...]:
         """The distinct bases of ``issue_url``'s records that apply to a base's descendants.
@@ -1072,11 +1079,18 @@ class ProjectionRequest:
 
 @dataclass(frozen=True)
 class RetrievalRecord:
-    """Store-authorized prose; provenance and citation retention do not verify it."""
+    """Store-authorized prose; provenance and citation retention do not verify it.
+
+    ``ordinal`` is the record's scope-local identity: its 1-based position
+    among the records added that apply to the binding, superseded and
+    withdrawn ones included. Unlike the ID, an audit position, it counts no
+    record the binding cannot read.
+    """
 
     fact: MemoryFact
     text: str
     retention: Retention | None
+    ordinal: int
 
 
 @dataclass(frozen=True)

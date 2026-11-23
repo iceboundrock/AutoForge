@@ -32,19 +32,35 @@ not concatenate it into instructions.
 Launch answers and controller maintenance report freshness in different
 types, because the run's audit positions count writes the binding cannot
 read. `ScopeFreshness`, on search, fetch and catalog, has no audit
-position. Its `revision` digests the kinds and current text of the
-binding's authorized records, without their IDs, so every reader of the
-same checkpoint and binding reports the same value, and a write to another
-issue or an inapplicable candidate range does not change it. Its `pending`
-counts records: authorized records the generation does not hold at their
-current version, plus held records no longer authorized. A record
-corrected twice counts once, and `pending` is zero exactly when the state
-is current. `IndexStatus`, from `status()`, `sync()`, `rebuild()` and
-`verify()`, carries the ledger's `source_seq` and the generation's
+position. Its `revision` digests each authorized record's scope-local
+identity, kind and current text. The identity is the record's ordinal
+among the records added that apply to the binding, superseded and
+withdrawn ones included. It is not the ID, which is an audit position.
+The revision changes when an authorized record is added, corrected,
+withdrawn or superseded, even by a record of the same kind and text, so a
+consumer can tell that a cached ID is obsolete. Every reader of the same
+checkpoint and binding reports the same value. A write to another issue
+or an inapplicable candidate range does not change it, even though it
+shifts the IDs of records added later.
+
+Its `pending` counts records: the authorized records the answering
+generation does not verifiably hold at their current version, plus held
+records no longer authorized. A record corrected twice counts once. A
+generation known damaged, by a failed or contradictory lookup or by
+`verify()`, verifies nothing whatever its manifest says: every authorized
+record is pending until a replacement is published. Only the state says
+whether the index is current. A current index has nothing pending, but
+nothing pending does not make an index current: an index never built over
+an empty corpus is `empty`, and a damaged one over an empty corpus is
+`failed`, each with nothing pending.
+
+`IndexStatus`, from `status()`, `sync()`, `rebuild()` and `verify()`,
+carries the ledger's `source_seq` and the generation's
 `indexed_through_seq`, and its `pending` counts audit rows, hidden ones
-included. Citation retention is resolved afresh for each answer and is
-part of neither the revision nor the index. The `generation` counter is
-per reader.
+included. A damaged generation has no `indexed_through_seq`, so every
+audit row is pending. Citation retention is resolved afresh for each
+answer and is part of neither the revision nor the index. The
+`generation` counter is per reader.
 
 The same store binding and applicability checks used by `memory.md` govern
 retrieval, including phase, issue, candidate range, environment and

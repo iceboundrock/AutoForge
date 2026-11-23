@@ -619,6 +619,91 @@ def test_writes_the_binding_cannot_read_leave_launch_freshness_unchanged():
     assert launch_freshness(fresh) == before
 
 
+def test_a_damaged_generation_is_credited_with_no_coverage(fts5):
+    """R2-F1 of PR #538: a generation known damaged holds no record verifiably."""
+    source, reader = instance(apply(proposal(empty(), "sole note", n=1)))
+    reader.sync()
+    index_of(reader)._connection.execute("DELETE FROM docs WHERE rowid=1")
+    result = reader.search_memory("note")
+    # The omission is detected, and the store's tail answers instead.
+    assert texts(result) == ["sole note"] and result.degraded and result.complete
+    damaged = launch_freshness(reader)
+    assert damaged == result.index and damaged.problem is IndexProblem.INTEGRITY
+    assert damaged.state is IndexState.FAILED and not damaged.is_current
+    assert damaged.pending == 1
+    assert "Index: failed; pending: 1;" in reader.catalog().render()
+    status = reader.status()
+    assert status.state is IndexState.FAILED and status.generation == 1
+    assert (status.indexed_through_seq, status.lag) == (None, None)
+    assert status.pending == status.source_seq == 1
+    # A later batch adds to the pending work; the damaged manifest credits none.
+    source[0] = apply(proposal(source[0], "second note", n=2))
+    assert launch_freshness(reader).pending == 2
+    assert reader.status().pending == 2
+    assert reader.sync().is_current
+    repaired = launch_freshness(reader)
+    assert repaired.is_current and repaired.pending == 0
+
+
+def test_nothing_pending_does_not_make_an_index_current():
+    """R2-F1 of PR #538: only the state says current, never a zero count."""
+    _, reader = instance(empty(), backend=ScriptedIndex)
+    # Never built, over an empty corpus.
+    unbuilt = launch_freshness(reader)
+    assert unbuilt.state is IndexState.EMPTY and unbuilt.pending == 0
+    assert not unbuilt.is_current
+    status = reader.status()
+    assert status.state is IndexState.EMPTY and status.pending == 0 and not status.is_current
+    assert launch_freshness(reader) == unbuilt
+    # Built over an empty corpus, then found damaged.
+    assert reader.sync().is_current
+
+    def damage():
+        raise BackendError("damaged")
+
+    index_of(reader).check = damage
+    status = reader.verify()
+    assert status.state is IndexState.FAILED and status.indexed_through_seq is None
+    assert status.pending == 0 and not status.is_current
+    damaged = launch_freshness(reader)
+    assert damaged.state is IndexState.FAILED and damaged.pending == 0
+    assert not damaged.is_current and damaged.problem is IndexProblem.INTEGRITY
+
+
+def test_revision_identifies_a_same_text_supersession():
+    """R2-F2 of PR #538: a cached ID is obsolete when its record is replaced."""
+    foreign = replace(SCOPE, step=replace(STEP, issue_url=OTHER))
+    old = replace(SCOPE, range=Range.EXACT, candidate=BASE)
+
+    def run(hidden):
+        store = apply(proposal(empty(), "same note", n=1))
+        if hidden:
+            # Writes the binding cannot read, which shift later IDs.
+            store = apply(proposal(store, "foreign note", n=2, scope=foreign))
+            store = apply(proposal(store, "old candidate note", n=3, scope=old))
+        source, reader = instance(store, backend=ScriptedIndex)
+        reader.sync()
+        before = launch_freshness(reader)
+        # One batch: a record of the same kind and text replaces record 1.
+        store = apply(proposal(source[0], "same note", n=4))
+        replacement = store.source_seq
+        source[0] = apply(revise(store, Action.SUPERSEDE, 1, replacement=replacement))
+        assert [h.item.id for h in reader.search_memory("same").hits] == [replacement]
+        after = launch_freshness(reader)
+        assert after.state is IndexState.STALE and after.pending == 2
+        assert after.revision != before.revision
+        # Any reader of the same checkpoint, reconstructed through JSON, agrees.
+        _, fresh = instance(reload(source[0]), backend=ScriptedIndex)
+        assert launch_freshness(fresh).revision == after.revision
+        assert reader.sync().is_current and launch_freshness(reader).revision == after.revision
+        # A later write the binding cannot read changes nothing.
+        source[0] = apply(proposal(source[0], "foreign later", n=5, scope=foreign))
+        assert launch_freshness(reader).revision == after.revision
+        return before.revision, after.revision
+
+    assert run(False) == run(True)
+
+
 def test_bm25_uses_nonmatching_authorized_documents_for_normalization():
     store = apply(proposal(empty(), "term", n=1))
     store = apply(proposal(store, "term term x x x", n=2))
