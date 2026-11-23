@@ -574,8 +574,13 @@ converted; a body no term matches is a served match left out. A search that meet
 store still serves as the index saw it marks the index `failed`
 (`integrity`: an FTS5 candidate is its row) and falls back on the same
 call, and one of a record withdrawn while the index answered decides
-nothing (above). `verify` reads every row back and raises
-`RetrievalIntegrityError` for any malformed one, whatever record it is of
+nothing (above). `verify` reads every row back, whatever record it is
+of. `Fts5Backend.entries()`, the read-back, raises
+`RetrievalIntegrityError` for a malformed row; `MemoryRetriever.verify()`
+catches it and returns a failed `IndexStatus`, reason `integrity`, and
+raises nothing for it. So a caller of `verify` learns of a malformed row,
+like every other integrity failure, from the status it returns, never
+from an exception: handling exceptions alone misses it
 (`test_a_malformed_fts5_row_is_an_integrity_failure_never_an_exception`).
 
 ### In memory, never on disk

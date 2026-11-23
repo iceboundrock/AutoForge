@@ -1646,6 +1646,10 @@ class MemoryRetriever:
         a read-back that is not exactly a list of as many rows as expected,
         checked before anything iterates it; or a failed backend check: each
         marks the index ``failed`` (``integrity``) until it is rebuilt.
+        Each is reported in the status returned, never raised: a
+        :class:`RetrievalBackendError` of the read-back or the check, the
+        :class:`RetrievalIntegrityError` ``entries`` raises for a malformed
+        row included, is caught here, so a caller checks that status.
 
         The rows are compared with the snapshot loaded before the backend
         read them back; the status returned is against the store loaded
