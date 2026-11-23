@@ -331,6 +331,27 @@ def correctness(fixture: dict | None = None) -> dict:
 # -- performance -------------------------------------------------------------------
 
 
+# The documents of a synthetic corpus each updated once, timed alone: the
+# first twenty, or every one of a smaller corpus (R10-F2 of PR #537).
+UPDATE_SAMPLES = 20
+
+
+def corpus_sizes(sizes: Sequence[int]) -> tuple[int, ...]:
+    """``sizes`` checked before anything is built: each a document count the backend holds.
+
+    From 1 to :data:`~autoforge.memory_retrieval.MAX_INDEX_DOCUMENTS`: an
+    empty corpus has nothing to search or update, and a larger one is past
+    the bound any backend's ``apply`` refuses. Anything else is a
+    :class:`ValueError` before the benchmark starts (R10-F2 of PR #537).
+    """
+    bound = memory_retrieval.MAX_INDEX_DOCUMENTS
+    checked = tuple(sizes)
+    for n in checked:
+        if type(n) is not int or not 1 <= n <= bound:
+            raise ValueError(f"a synthetic corpus holds 1 to {bound} documents, not {n!r}")
+    return checked
+
+
 def _percentiles(samples_ns: Sequence[int]) -> dict:
     ordered = sorted(samples_ns)
 
@@ -452,6 +473,7 @@ def _store_costs(world: World, queries: Sequence[str], *, rounds: int = 20) -> d
 def performance(
     fixture: dict | None = None, *, sizes: Sequence[int] = (1_000, 10_000), rounds: int = 20
 ) -> dict:
+    sizes = corpus_sizes(sizes)
     fixture = fixture or load_fixture()
     repo, run = fixture["repository"], fixture["run_id"]
     queries = [q["query"] for q in fixture["queries"]] + [q["query"] for q in fixture["negatives"]]
@@ -509,8 +531,8 @@ def performance(
             samples.append(ns)
         search_cpu = (time.process_time() - cpu) * 1000 / len(samples)
         updates = []
-        for i in range(20):
-            doc = replace(docs[i], revision=2, text=docs[i].text + " revised")
+        for original in docs[:UPDATE_SAMPLES]:
+            doc = replace(original, revision=2, text=original.text + " revised")
             ns, _ = _timed(lambda d=doc, b=backend: b.apply([d], ()))
             updates.append(ns)
         size = backend.size_bytes()
@@ -544,15 +566,33 @@ def host() -> dict:
     }
 
 
+def _sizes_argument(text: str) -> tuple[int, ...]:
+    """``--sizes``: comma-separated document counts, refused at parsing when any is not one."""
+    sizes = []
+    for item in (s for s in text.split(",") if s):
+        try:
+            sizes.append(int(item))
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"a corpus size is an integer, not {item!r}") from None
+    try:
+        return corpus_sizes(sizes)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--correctness", action="store_true", help="the correctness half only")
-    parser.add_argument("--sizes", default="1000,10000", help="synthetic corpus sizes")
+    parser.add_argument(
+        "--sizes",
+        default=(1_000, 10_000),
+        type=_sizes_argument,
+        help=f"synthetic corpus sizes, each 1 to {memory_retrieval.MAX_INDEX_DOCUMENTS} documents",
+    )
     args = parser.parse_args(argv)
     report: dict = {"host": host(), "correctness": correctness()}
     if not args.correctness:
-        sizes = tuple(int(s) for s in args.sizes.split(",") if s)
-        report["performance"] = performance(sizes=sizes)
+        report["performance"] = performance(sizes=args.sizes)
     json.dump(report, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
     return 0

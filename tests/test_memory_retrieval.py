@@ -3247,11 +3247,32 @@ def test_the_pinned_fixture_serves_nothing_stale_or_foreign_in_any_condition():
 
 @needs_fts5
 def test_the_benchmarks_cost_half_runs_on_a_small_corpus():
-    report = bench.performance(sizes=(200,), rounds=1)
+    # Corpora below the update sample included: the sampler indexed twenty
+    # documents whatever the size, and raised IndexError under it (R10-F2
+    # of PR #537). Twenty updates at every size from twenty up, as before.
+    report = bench.performance(sizes=(1, 10, 19, 20, 200), rounds=1)
     assert report["ingestion_to_visibility"]["tail_served"] == [TAIL_BACKEND]
     assert report["ingestion_to_visibility"]["index_served"] == ["sqlite-fts5"]
     assert report["store_at_bound"]["records"] == 64
-    assert report["backend_scale"]["200"]["index_bytes"] > 0
+    assert bench.UPDATE_SAMPLES == 20
+    for n in (1, 10, 19, 20, 200):
+        scale = report["backend_scale"][str(n)]
+        assert scale["index_bytes"] > 0 and scale["search"]["samples"] == 200
+        assert scale["update_one"]["samples"] == min(n, 20)
+
+
+@pytest.mark.parametrize("sizes", ["0", "-5", "100001", "1000,0", "ten", "1.5"])
+def test_the_benchmark_refuses_a_corpus_size_it_cannot_run_before_it_starts(sizes, capsys):
+    """R10-F2 of PR #537: a size the backend cannot hold, or no size at all,
+    is refused when the arguments are parsed, before either half runs."""
+    with pytest.raises(SystemExit) as stopped:
+        bench.main(["--sizes", sizes])
+    assert stopped.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == "" and "argument --sizes" in captured.err
+    for n in (0, -1, 100_001, True, 2.0):
+        with pytest.raises(ValueError):
+            bench.performance(sizes=(n,), rounds=1)
 
 
 # -- where the read path sits ----------------------------------------------------------
