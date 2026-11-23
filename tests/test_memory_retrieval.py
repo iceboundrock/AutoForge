@@ -3289,18 +3289,38 @@ def test_the_benchmarks_cost_half_runs_on_a_small_corpus():
         assert scale["update_one"]["samples"] == min(n, 20)
 
 
-@pytest.mark.parametrize("sizes", ["0", "-5", "100001", "1000,0", "ten", "1.5"])
-def test_the_benchmark_refuses_a_corpus_size_it_cannot_run_before_it_starts(sizes, capsys):
-    """R10-F2 of PR #537: a size the backend cannot hold, or no size at all,
-    is refused when the arguments are parsed, before either half runs."""
+@pytest.mark.parametrize(
+    "argv",
+    [
+        *(["--sizes", sizes] for sizes in ("0", "-5", "100001", "1000,0", "ten", "1.5")),
+        # An empty field is no size, never one fewer (R11-F2 of PR #537).
+        *(["--sizes", sizes] for sizes in ("", " ", ",", "10,,20", "10,", ",10")),
+        ["--sizes=,"],
+        ["--sizes="],
+    ],
+    ids=str,
+)
+def test_the_benchmark_refuses_a_corpus_size_it_cannot_run_before_it_starts(
+    argv, capsys, monkeypatch
+):
+    """R10-F2 and R11-F2 of PR #537: a size the backend cannot hold, an
+    empty field of the list, or no size at all, is refused when the
+    arguments are parsed, before either half runs. Until the eleventh round
+    an empty field was dropped, so ``10,,20`` ran as ``10,20`` and ``,``
+    ran the cost half with no synthetic corpus, its report silently short."""
+    for half in ("read_fixture", "correctness", "performance"):
+        monkeypatch.setattr(bench, half, lambda *a, **k: pytest.fail("a half ran"))
     with pytest.raises(SystemExit) as stopped:
-        bench.main(["--sizes", sizes])
+        bench.main(argv)
     assert stopped.value.code == 2
     captured = capsys.readouterr()
     assert captured.out == "" and "argument --sizes" in captured.err
-    for n in (0, -1, 100_001, True, 2.0):
+
+
+def test_the_benchmarks_cost_half_refuses_a_size_it_cannot_run_or_none():
+    for sizes in ((0,), (-1,), (100_001,), (True,), (2.0,), ()):
         with pytest.raises(ValueError):
-            bench.performance(sizes=(n,), rounds=1)
+            bench.performance(sizes=sizes, rounds=1)
 
 
 # -- where the read path sits ----------------------------------------------------------

@@ -936,9 +936,15 @@ Notes on the table:
   tenth review round the benchmark indexed twenty whatever the size, and
   raised `IndexError` below it. `--sizes` takes 1 to 100,000 documents
   per corpus, the bound a backend holds, and refuses any other size when
-  it parses its arguments, before either half runs
+  it parses its arguments, before either half runs. Every field of the
+  list is a size, so an empty one (`10,,20`, `10,`, `,`) is refused too,
+  and so is a list with no size: the cost half has no mode without a
+  synthetic corpus. Until the eleventh review round an empty field was
+  dropped, so `10,,20` ran as `10,20` and `,` exited successfully with no
+  synthetic corpus measured
   (`test_the_benchmarks_cost_half_runs_on_a_small_corpus`,
-  `test_the_benchmark_refuses_a_corpus_size_it_cannot_run_before_it_starts`).
+  `test_the_benchmark_refuses_a_corpus_size_it_cannot_run_before_it_starts`,
+  `test_the_benchmarks_cost_half_refuses_a_size_it_cannot_run_or_none`).
   The published sizes' twenty samples are unchanged.
 - **Where the time goes.** At the store's sizes, with the snapshot held,
   most of a search is Python: binding the request, the snapshot's verdict

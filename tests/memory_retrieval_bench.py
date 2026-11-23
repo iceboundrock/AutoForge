@@ -367,10 +367,15 @@ def corpus_sizes(sizes: Sequence[int]) -> tuple[int, ...]:
     From 1 to :data:`~autoforge.memory_retrieval.MAX_INDEX_DOCUMENTS`: an
     empty corpus has nothing to search or update, and a larger one is past
     the bound any backend's ``apply`` refuses. Anything else is a
-    :class:`ValueError` before the benchmark starts (R10-F2 of PR #537).
+    :class:`ValueError` before the benchmark starts (R10-F2 of PR #537), and
+    so is no size at all: the cost half has no mode without a synthetic
+    corpus, whose figures would be left out of its report without a word
+    (R11-F2 of PR #537).
     """
     bound = memory_retrieval.MAX_INDEX_DOCUMENTS
     checked = tuple(sizes)
+    if not checked:
+        raise ValueError("the benchmark measures at least one synthetic corpus")
     for n in checked:
         if type(n) is not int or not 1 <= n <= bound:
             raise ValueError(f"a synthetic corpus holds 1 to {bound} documents, not {n!r}")
@@ -592,9 +597,15 @@ def host() -> dict:
 
 
 def _sizes_argument(text: str) -> tuple[int, ...]:
-    """``--sizes``: comma-separated document counts, refused at parsing when any is not one."""
+    """``--sizes``: comma-separated document counts, refused at parsing when any is not one.
+
+    Every field must be a size: an empty one (``10,,20``, ``10,``, ``,``) is
+    refused, never read as one size fewer (R11-F2 of PR #537).
+    """
     sizes = []
-    for item in (s for s in text.split(",") if s):
+    for item in text.split(","):
+        if not item.strip():
+            raise argparse.ArgumentTypeError(f"{text!r} has an empty field, which is no size")
         try:
             sizes.append(int(item))
         except ValueError:
