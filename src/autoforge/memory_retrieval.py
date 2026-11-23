@@ -358,8 +358,13 @@ class IndexBackend(Protocol):
     (R9-F1 of PR #537). That includes a value the backend cannot even
     decode: FTS5 answers TEXT that is not UTF-8 as an
     :class:`UndecodableText` (R10-F1). ``entries`` raises
-    :class:`RetrievalIntegrityError` for a row it finds malformed, and must
-    return exactly a list. An answer that is not exactly a list or a tuple
+    :class:`RetrievalIntegrityError` for a row it cannot read as an entry
+    (FTS5: a column of another type, TEXT that is not UTF-8, a token form
+    it never writes), returns every other row with its values as they are,
+    and must return exactly a list. Whether those values are any a sync
+    could have written (a revision of ``0``, a digest that is not one) is
+    :meth:`MemoryRetriever.verify`'s to check, never the backend's (R12-F3
+    of PR #537). An answer that is not exactly a list or a tuple
     (never a subclass) of at most :data:`MAX_CANDIDATES` candidates is
     treated as an error (:func:`_candidates`), as is a malformed candidate
     of a record the store still serves as the index saw it. A candidate
@@ -638,6 +643,18 @@ class Fts5Backend:
         return found
 
     def entries(self) -> list[IndexEntry]:
+        """Every row, each read as the entry it holds; :class:`RetrievalIntegrityError` if not.
+
+        A row is unreadable when a column is of another type than this
+        index writes (an integer rowid and revision, a text digest and
+        body), holds TEXT that is not UTF-8 (an :class:`UndecodableText`),
+        or its body holds a token form :func:`_fts5_token` never produces.
+        A row of the right types is returned with its values as it holds
+        them, whatever they are: an integer revision of ``0`` included.
+        :meth:`MemoryRetriever.verify` checks those values
+        (:func:`_well_formed_entry`) and compares them with the store, and
+        reports either failure in the status it returns (R12-F3 of PR #537).
+        """
         db = self._require()
         try:
             rows = [
@@ -1652,8 +1669,11 @@ class MemoryRetriever:
         marks the index ``failed`` (``integrity``) until it is rebuilt.
         Each is reported in the status returned, never raised: a
         :class:`RetrievalBackendError` of the read-back or the check, the
-        :class:`RetrievalIntegrityError` ``entries`` raises for a malformed
-        row included, is caught here, so a caller checks that status.
+        :class:`RetrievalIntegrityError` ``entries`` raises for a row it
+        cannot read included, is caught here, so a caller checks that
+        status. A row ``entries`` can read but whose values no sync wrote,
+        a revision of ``0`` say, it returns as it is: this method's own
+        checks find it (R12-F3 of PR #537).
 
         The rows are compared with the snapshot loaded before the backend
         read them back; the status returned is against the store loaded

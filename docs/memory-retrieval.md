@@ -575,13 +575,21 @@ store still serves as the index saw it marks the index `failed`
 (`integrity`: an FTS5 candidate is its row) and falls back on the same
 call, and one of a record withdrawn while the index answered decides
 nothing (above). `verify` reads every row back, whatever record it is
-of. `Fts5Backend.entries()`, the read-back, raises
-`RetrievalIntegrityError` for a malformed row; `MemoryRetriever.verify()`
-catches it and returns a failed `IndexStatus`, reason `integrity`, and
-raises nothing for it. So a caller of `verify` learns of a malformed row,
-like every other integrity failure, from the status it returns, never
-from an exception: handling exceptions alone misses it
-(`test_a_malformed_fts5_row_is_an_integrity_failure_never_an_exception`).
+of, and two layers check what it reads. `Fts5Backend.entries()`, the
+read-back, raises `RetrievalIntegrityError` for a row it cannot read as an
+entry: a column of another type than the index writes, TEXT that is not
+UTF-8, or a body holding a form `_fts5_token` never produces. A row of the
+right types it returns with its values as they are, whatever they hold:
+an integer revision of `0` or past the store's counter, or a digest that
+is not 64 lower-case hex digits. `MemoryRetriever.verify()` checks every
+row it is given against those bounds before it compares any with the
+store. Either way `verify()` returns a failed `IndexStatus`, reason
+`integrity`, and raises nothing: it catches the error `entries()` raises.
+So a caller of `verify` learns of a malformed row, like every other
+integrity failure, from the status it returns, never from an exception:
+handling exceptions alone misses it
+(`test_a_malformed_fts5_row_is_an_integrity_failure_never_an_exception`,
+`test_fts5_reads_back_a_row_of_its_types_whose_values_only_verify_refuses`).
 
 ### In memory, never on disk
 

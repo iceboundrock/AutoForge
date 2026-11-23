@@ -2372,6 +2372,35 @@ def test_a_malformed_fts5_row_is_an_integrity_failure_never_an_exception(column,
     assert (result.status.state, result.status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
 
 
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        pytest.param("revision", 0, id="revision-zero"),
+        pytest.param("revision", MAX_COUNTER + 1, id="revision-past-the-counter"),
+        pytest.param("digest", "not-a-digest", id="digest-not-a-digest"),
+    ],
+)
+@needs_fts5
+def test_fts5_reads_back_a_row_of_its_types_whose_values_only_verify_refuses(column, value):
+    """R12-F3 of PR #537: ``Fts5Backend.entries()`` raises only for a row it
+    cannot read as an entry, a column of another type, TEXT that is not
+    UTF-8 or a token form it never writes (the test above). A row of the
+    right types whose values no sync wrote it returns as it holds them, and
+    ``verify()`` finds them by its own checks: a failed status, reason
+    ``integrity``, nothing raised."""
+    w = corpus()
+    retriever = retriever_for(w)
+    retriever.sync()
+    db, table = retriever.backend._db, retriever.backend._tables[ISSUE]
+    db.execute(f"UPDATE {table} SET {column} = ? WHERE rowid = ?", (value, w.ids["uv"]))
+    (row,) = (r for r in retriever.backend.entries() if r.id == w.ids["uv"])
+    assert getattr(row, column) == value
+    status = retriever.verify()
+    assert (status.state, status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
+    assert retriever.sync().state is IndexState.CURRENT
+    assert retriever.verify().state is IndexState.CURRENT
+
+
 @needs_fts5
 def test_text_that_is_not_utf8_is_a_malformed_value_of_its_row_never_a_query_error():
     """R10-F1 of PR #537: Python's sqlite3 raises inside ``fetchall()`` for a
