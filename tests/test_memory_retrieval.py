@@ -546,7 +546,20 @@ def launch_freshness(reader, query="note"):
     (freshness,) = answers
     assert type(freshness) is ScopeFreshness
     assert not hasattr(freshness, "source_seq") and not hasattr(freshness, "indexed_through_seq")
+    # IDs are audit positions: the identity revision is not on the catalog.
+    assert not hasattr(freshness, "revision")
     return freshness
+
+
+def launch_revision(reader, query="note"):
+    """Search and fetch, which show IDs, agree on one identity revision."""
+    revisions = {reader.search_memory(query).revision, reader.fetch_memory(1).revision}
+    assert len(revisions) == 1
+    catalog = reader.catalog()
+    assert not hasattr(catalog, "revision") and "Revision" not in catalog.render()
+    (revision,) = revisions
+    assert revision != launch_freshness(reader, query).fingerprint
+    return revision
 
 
 def test_launch_freshness_counts_a_batch_and_agrees_with_a_reconstructed_reader():
@@ -561,18 +574,22 @@ def test_launch_freshness_counts_a_batch_and_agrees_with_a_reconstructed_reader(
     # Four authorized records appended before one read: four pending, not one.
     stale = launch_freshness(reader)
     assert stale.state is IndexState.STALE and stale.pending == 4
-    assert stale.revision != synced.revision
+    assert stale.fingerprint != synced.fingerprint
+    revision = launch_revision(reader)
     # A reader built afresh over the same checkpoint, round-tripped through
-    # JSON, reports the same revision, with the whole corpus pending.
+    # JSON, reports the same fingerprint and revision, with the whole corpus
+    # pending.
     _, fresh = instance(reload(source[0]), backend=ScriptedIndex)
     unsynced = launch_freshness(fresh)
     assert unsynced.state is IndexState.EMPTY and unsynced.pending == 5
-    assert unsynced.revision == stale.revision
+    assert unsynced.fingerprint == stale.fingerprint
+    assert launch_revision(fresh) == revision
     for each in (reader, fresh):
         assert each.sync().is_current
         current = launch_freshness(each)
         assert current.is_current and current.pending == 0
-        assert current.revision == stale.revision
+        assert current.fingerprint == stale.fingerprint
+        assert launch_revision(each) == revision
     assert reader.status() == replace(fresh.status(), generation=2)
 
 
@@ -596,27 +613,29 @@ def test_launch_pending_counts_records_while_maintenance_counts_audit_rows():
     stale = launch_freshness(reader)
     assert stale.state is IndexState.STALE and stale.pending == 3
     assert texts(reader.search_memory("recorrected")) == ["recorrected note"]
+    revision = launch_revision(reader)
     assert reader.sync().is_current
-    assert launch_freshness(reader).revision == stale.revision
+    assert launch_freshness(reader).fingerprint == stale.fingerprint
+    assert launch_revision(reader) == revision
 
 
 def test_writes_the_binding_cannot_read_leave_launch_freshness_unchanged():
     source, reader = instance(apply(proposal(empty(), "local note", n=1)), backend=ScriptedIndex)
     reader.sync()
-    before = launch_freshness(reader)
+    before = launch_freshness(reader), launch_revision(reader)
     foreign = replace(SCOPE, step=replace(STEP, issue_url=OTHER))
     old = replace(SCOPE, range=Range.EXACT, candidate=BASE)
     source[0] = apply(proposal(source[0], "foreign note", n=2, scope=foreign))
     source[0] = apply(proposal(source[0], "old candidate note", n=3, scope=old))
     status = reader.status()
     assert status.state is IndexState.STALE and status.pending == 2
-    assert launch_freshness(reader) == before
+    assert (launch_freshness(reader), launch_revision(reader)) == before
     assert reader.sync().is_current
-    assert reader.status().generation == before.generation
-    assert launch_freshness(reader) == before
+    assert reader.status().generation == before[0].generation
+    assert (launch_freshness(reader), launch_revision(reader)) == before
     _, fresh = instance(source[0], backend=ScriptedIndex)
     fresh.sync()
-    assert launch_freshness(fresh) == before
+    assert (launch_freshness(fresh), launch_revision(fresh)) == before
 
 
 def test_a_damaged_generation_is_credited_with_no_coverage(fts5):
@@ -671,7 +690,12 @@ def test_nothing_pending_does_not_make_an_index_current():
 
 
 def test_revision_identifies_a_same_text_supersession():
-    """R2-F2 of PR #538: a cached ID is obsolete when its record is replaced."""
+    """R2-F2 of PR #538: a cached ID is obsolete when its record is replaced.
+
+    Search and fetch, which show IDs, carry the identity revision. The
+    catalog shows no ID: its fingerprint, like the rest of it, is unchanged
+    (R3-F1).
+    """
     foreign = replace(SCOPE, step=replace(STEP, issue_url=OTHER))
     old = replace(SCOPE, range=Range.EXACT, candidate=BASE)
 
@@ -683,25 +707,83 @@ def test_revision_identifies_a_same_text_supersession():
             store = apply(proposal(store, "old candidate note", n=3, scope=old))
         source, reader = instance(store, backend=ScriptedIndex)
         reader.sync()
-        before = launch_freshness(reader)
+        before, cached = launch_freshness(reader), launch_revision(reader)
+        rendered = reader.catalog().render()
         # One batch: a record of the same kind and text replaces record 1.
         store = apply(proposal(source[0], "same note", n=4))
         replacement = store.source_seq
         source[0] = apply(revise(store, Action.SUPERSEDE, 1, replacement=replacement))
         assert [h.item.id for h in reader.search_memory("same").hits] == [replacement]
-        after = launch_freshness(reader)
+        after, revision = launch_freshness(reader), launch_revision(reader)
         assert after.state is IndexState.STALE and after.pending == 2
-        assert after.revision != before.revision
+        assert revision != cached
+        assert after.fingerprint == before.fingerprint
         # Any reader of the same checkpoint, reconstructed through JSON, agrees.
         _, fresh = instance(reload(source[0]), backend=ScriptedIndex)
-        assert launch_freshness(fresh).revision == after.revision
-        assert reader.sync().is_current and launch_freshness(reader).revision == after.revision
-        # A later write the binding cannot read changes nothing.
+        assert launch_revision(fresh) == revision
+        assert launch_freshness(fresh).fingerprint == after.fingerprint
+        assert reader.sync().is_current and launch_revision(reader) == revision
+        assert reader.catalog().render() == rendered
+        # A later write the binding cannot read changes neither.
         source[0] = apply(proposal(source[0], "foreign later", n=5, scope=foreign))
-        assert launch_freshness(reader).revision == after.revision
-        return before.revision, after.revision
+        assert launch_revision(reader) == revision
+        assert launch_freshness(reader).fingerprint == after.fingerprint
+        return replacement, after.fingerprint, cached, revision
 
-    assert run(False) == run(True)
+    plain, hidden = run(False), run(True)
+    # The hidden writes shift the replacement's ID, which search and fetch
+    # show: the revision follows the IDs, the fingerprint does not.
+    assert (plain[0], hidden[0]) == (2, 4)
+    assert plain[1] == hidden[1]
+    assert plain[2] == hidden[2] and plain[3] != hidden[3]
+
+
+def withheld_before_visible(withheld, local):
+    """A record the binding cannot read, then a visible one, and the visible ID.
+
+    ``local`` puts the withheld record on the launch's issue, where it
+    applies; otherwise on another issue. Either way the audit rows are as
+    many, so the visible record has the same ID.
+    """
+    scope, issue = (
+        (SCOPE, ISSUE) if local else (replace(SCOPE, step=replace(STEP, issue_url=OTHER)), OTHER)
+    )
+    store = apply(proposal(empty(), "withheld wording", n=1, scope=scope))
+    if withheld is Action.RETRACT:
+        # Withdrawn before the visible record is added.
+        store = apply(revise(store, Action.RETRACT, 1, issue=issue))
+        return apply(proposal(store, "visible note", n=2)), 3
+    store = apply(proposal(store, "visible note", n=2))
+    if local:
+        return apply(revise(store, Action.SUPERSEDE, 1, replacement=2)), 2
+    # Another issue's record cannot be superseded from here: withdrawn instead.
+    return apply(revise(store, Action.RETRACT, 1, issue=issue)), 2
+
+
+@pytest.mark.parametrize("withheld", [Action.RETRACT, Action.SUPERSEDE])
+def test_withheld_history_before_a_visible_record_changes_no_answer(withheld):
+    """R3-F1 of PR #538: whether an earlier record the launch cannot read was
+    the launch's issue's or another's changes neither the catalog nor search
+    or fetch, the fingerprint and the identity revision included."""
+
+    def answers(local):
+        store, visible = withheld_before_visible(withheld, local)
+        results = []
+        for checkpoint in (store, reload(store)):
+            _, reader = instance(checkpoint, backend=ScriptedIndex)
+            reader.sync()
+            search = reader.search_memory("note")
+            assert [h.item.id for h in search.hits] == [visible]
+            assert not reader.search_memory("withheld").hits
+            assert reader.fetch_memory(1).item is None
+            catalog = reader.catalog()
+            assert catalog.index.is_current and catalog.topics == ((Kind.HYPOTHESIS, 1),)
+            results.append((search, reader.fetch_memory(visible), catalog, catalog.render()))
+        # A reader reconstructed through JSON gives the same answers.
+        assert results[0] == results[1]
+        return results[0]
+
+    assert answers(local=True) == answers(local=False)
 
 
 def test_bm25_uses_nonmatching_authorized_documents_for_normalization():

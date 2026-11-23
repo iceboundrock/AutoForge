@@ -18,37 +18,56 @@ ordinal change. It is not a cache to share between issues or launches.
 `search_memory` returns `MemoryHit` records with bounded excerpts,
 applicability, citation and retention, and score provenance. `fetch_memory`
 looks the ID up afresh and returns the current bounded item or `None`;
-missing and forbidden IDs are indistinguishable. Both return `ReadScope`
-and `ScopeFreshness`, even when there are no hits. IDs remain
-run-local as in `memory.md`; they are not stable references across runs.
-`catalog()` renders a fixed vocabulary of authorized kinds and their counts,
-and the same freshness. It includes no record titles, IDs, ancestry proofs
-or digests of withheld text, and its length has a fixed bound whatever the
-records. Metrics are saturating
+missing and forbidden IDs are indistinguishable. Both return `ReadScope`,
+`ScopeFreshness` and the identity `revision`, even when there are no hits.
+IDs remain run-local as in `memory.md`; they are not stable references
+across runs. `catalog()` renders a fixed vocabulary of authorized kinds and
+their counts, and the same freshness. It includes no record titles, IDs,
+identity revision, ancestry proofs or digests of withheld text, and its
+length has a fixed bound whatever the records. Metrics are saturating
 aggregate counts, not queries, session data, raw backend errors or prompts.
 All returned prose is untrusted; a future consumer must fence it as data,
 not concatenate it into instructions.
 
 Launch answers and controller maintenance report freshness in different
 types, because the run's audit positions count writes the binding cannot
-read. `ScopeFreshness`, on search, fetch and catalog, has no audit
-position. Its `revision` digests each authorized record's scope-local
-identity, kind and current text. The identity is the record's ordinal
-among the records added that apply to the binding, superseded and
-withdrawn ones included. It is not the ID, which is an audit position.
-The revision changes when an authorized record is added, corrected,
-withdrawn or superseded, even by a record of the same kind and text, so a
-consumer can tell that a cached ID is obsolete. Every reader of the same
-checkpoint and binding reports the same value. A write to another issue
-or an inapplicable candidate range does not change it, even though it
-shifts the IDs of records added later.
+read. Launch answers carry two digests, and they answer different
+questions:
 
-Its `pending` counts records: the authorized records the answering
-generation does not verifiably hold at their current version, plus held
-records no longer authorized. A record corrected twice counts once. A
-generation known damaged, by a failed or contradictory lookup or by
-`verify()`, verifies nothing whatever its manifest says: every authorized
-record is pending until a replacement is published. Only the state says
+- The **fingerprint**, `ScopeFreshness.fingerprint` on search, fetch and
+  catalog, digests the authorized records' kinds and current text, and
+  nothing else: no ID and no count of other records. It changes when the
+  kinds or text the binding can read change. It is the same for every
+  checkpoint that presents the same kinds and text, whatever withheld
+  history led there: withdrawn and superseded records, inapplicable ones,
+  and other issues' records, before or after the visible ones. It is the
+  catalog's revision. It cannot see a same-text supersession, and neither
+  can the catalog, which shows no ID.
+- The identity **revision**, `revision` on search and fetch answers only,
+  digests each authorized record's ID with its kind and current text: the
+  records as those answers can show them (fetch answers any authorized
+  ID). It also changes when a record is superseded by one of the same kind
+  and text, since the replacement has an ID of its own, so a consumer that
+  caches IDs can tell when one is obsolete. IDs are audit positions,
+  assigned once: two histories that present the same kinds and text can
+  number them differently, and the revision then differs, as the IDs a
+  search shows do. The catalog does not carry it.
+
+Every reader of the same checkpoint and binding reports the same values. A
+write the binding cannot read, such as one to another issue or to an
+inapplicable candidate range, changes neither digest. The fingerprint
+depends on no record the binding cannot read. The revision depends on such
+a record only through the IDs of the visible records, which the answers
+show anyway, never through whether it applies to the binding. So an
+earlier record withheld from the launch (withdrawn, or superseded) leaves
+both digests as they would be had it been another issue's record.
+
+`ScopeFreshness.pending` counts records: the authorized records the
+answering generation does not verifiably hold at their current version,
+plus held records no longer authorized. A record corrected twice counts
+once. A generation known damaged, by a failed or contradictory lookup or
+by `verify()`, verifies nothing whatever its manifest says: every
+authorized record is pending until a replacement is published. Only the state says
 whether the index is current. A current index has nothing pending, but
 nothing pending does not make an index current: an index never built over
 an empty corpus is `empty`, and a damaged one over an empty corpus is
@@ -59,7 +78,7 @@ carries the ledger's `source_seq` and the generation's
 `indexed_through_seq`, and its `pending` counts audit rows, hidden ones
 included. A damaged generation has no `indexed_through_seq`, so every
 audit row is pending. Citation retention is resolved afresh for each
-answer and is part of neither the revision nor the index. The
+answer and is part of neither digest nor the index. The
 `generation` counter is per reader.
 
 The same store binding and applicability checks used by `memory.md` govern
@@ -192,7 +211,7 @@ Python 3.14.10 and SQLite 3.54.1, with other local validation active:
 At 64 records the mean CPU cost was 2.45 ms per held read and 47.82 ms per
 reconstructed read. A separately traced held read peaked at about 65 KiB
 of Python allocations; process-wide peak RSS was about 34 MiB. The sample
-returns 264 summary bytes and a 187-byte catalog. Those counts are a
+returns 264 summary bytes and a 190-byte catalog. Those counts are a
 conservative upper bound for byte-level tokenizers, not measured model
 tokens. No hybrid or model measurements are implied.
 

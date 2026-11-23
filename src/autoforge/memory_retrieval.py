@@ -116,12 +116,16 @@ class IndexStatus:
 class ScopeFreshness:
     """A launch answer's index freshness over the binding's authorized corpus.
 
-    It holds no audit position. ``revision`` is a digest of each authorized
-    record's scope-local identity (its ordinal among the records added that
-    apply to the binding, never its ID, an audit position), kind and current
-    text. It changes whenever an authorized record is added, corrected,
-    superseded (even by a record of the same kind and text) or withdrawn,
-    and any reader of the same checkpoint and binding reports the same one.
+    Search, fetch and catalog carry the same one. It holds no audit position
+    and no record ID. ``fingerprint`` is a digest of the authorized records'
+    kinds and current text, as a multiset: it changes whenever the kinds or
+    text the binding can read change (a record added, corrected, withdrawn,
+    or superseded by one of another kind or text), and it is the same for
+    every checkpoint that presents the same kinds and text, whatever withheld
+    history (withdrawn, superseded, inapplicable or other issues' records)
+    led to it (R3-F1 of PR #538). It does not identify records: a same-text
+    supersession leaves it unchanged. The answers that show IDs, search and
+    fetch, also carry the identity revision for that (:class:`SearchResult`).
     Citation retention is resolved afresh for each answer and is not part of
     it. ``pending`` counts the work to make the index current: the
     authorized records the answering generation does not verifiably hold at
@@ -137,7 +141,7 @@ class ScopeFreshness:
 
     backend: Backend
     state: IndexState
-    revision: str
+    fingerprint: str
     pending: int
     generation: int | None
     problem: IndexProblem | None
@@ -181,9 +185,26 @@ class MemoryHit:
 
 @dataclass(frozen=True)
 class SearchResult:
+    """Ranked hits, with the identity revision of the binding's authorized records.
+
+    ``revision`` is a digest of each authorized record's ID, kind and current
+    text: what search and fetch can show of the corpus (fetch answers any
+    authorized ID). It changes whenever an authorized record is added,
+    corrected, withdrawn or superseded, a same-text supersession included,
+    since the replacement has an ID of its own, so a consumer that caches
+    IDs can tell when one is obsolete. A write the binding cannot read
+    never changes it (IDs are assigned once), and any reader of the same
+    checkpoint and binding reports the same one. Because IDs are audit
+    positions, two histories presenting the same kinds and text can number
+    their records differently; the revision then differs, as the IDs do,
+    and only :class:`ScopeFreshness`'s ``fingerprint`` is the same. The
+    catalog shows no ID and carries no revision.
+    """
+
     scope: ReadScope
     hits: tuple[MemoryHit, ...]
     index: ScopeFreshness
+    revision: str
     complete: bool
     degraded: bool
     tail_used: bool
@@ -191,9 +212,12 @@ class SearchResult:
 
 @dataclass(frozen=True)
 class FetchResult:
+    """The current item or ``None``, with the same identity revision as search."""
+
     scope: ReadScope
     item: MemoryItem | None
     index: ScopeFreshness
+    revision: str
     degraded: bool
 
 
@@ -205,16 +229,17 @@ class MemoryCatalog:
     degraded: bool
 
     def render(self) -> str:
-        """Static labels only; no record titles, text, receipts or internal proofs.
+        """Static labels only; no record titles, IDs, text, receipts or internal proofs.
 
-        Its length has a fixed bound, whatever the records: one digest, and
-        one count per kind and a pending count, each at most ``MAX_FACTS``.
+        Its length has a fixed bound, whatever the records: one digest (the
+        content fingerprint), and one count per kind and a pending count,
+        each at most ``MAX_FACTS``.
         """
         topics = ", ".join(f"{kind.value}: {count}" for kind, count in self.topics) or "(none)"
         return (
             "Issue Working Memory catalog (advisory, untrusted)\n"
             f"Topics: {topics}\n"
-            f"Revision: {self.index.revision}\n"
+            f"Fingerprint: {self.index.fingerprint}\n"
             f"Index: {self.index.state.value}; pending: {self.index.pending}; "
             f"degraded: {str(self.degraded).lower()}\n"
         )
@@ -352,15 +377,25 @@ class _View:
         return frozenset((r.fact.id, r.fact.revision) for r in self.records)
 
     @property
+    def fingerprint(self) -> str:
+        # Kinds and text digests of the authorized records alone: no ID and
+        # no count of other records, both of which withheld history moves.
+        return _digest_rows(
+            "fingerprint", [[r.fact.kind.value, r.fact.content] for r in self.records]
+        )
+
+    @property
     def revision(self) -> str:
-        # Scope-local identity, kind and text digest. An ID or a record
-        # revision is a ledger position, which would count writes this
-        # binding cannot read; the ordinal counts only records that apply.
-        return hashlib.sha256(
-            json.dumps(
-                sorted([r.ordinal, r.fact.kind.value, r.fact.content] for r in self.records)
-            ).encode()
-        ).hexdigest()
+        # IDs too, which search and fetch show: a same-text replacement has
+        # a new one. Never on the catalog, which shows no ID.
+        return _digest_rows(
+            "revision", [[r.fact.id, r.fact.kind.value, r.fact.content] for r in self.records]
+        )
+
+
+def _digest_rows(label: str, rows: list[list]) -> str:
+    # The label keeps the two digests apart, even over an empty corpus.
+    return hashlib.sha256(json.dumps([label, sorted(rows)]).encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -443,7 +478,7 @@ def _freshness(slot: _Slot, view: _View) -> ScopeFreshness:
     return ScopeFreshness(
         slot.backend,
         _state(slot, view, current=not pending),
-        view.revision,
+        view.fingerprint,
         pending,
         None if generation is None else generation.serial,
         slot.problem,
@@ -609,7 +644,7 @@ class MemoryRetriever:
         self._count(fetch=True, hits=int(found is not None), degraded=degraded)
         # The store's record bound, not the search budget (a fetch is one record).
         item = _item(found, MAX_TEXT_BYTES, MAX_TEXT_BYTES) if found else None
-        return FetchResult(view.scope, item, index, degraded)
+        return FetchResult(view.scope, item, index, view.revision, degraded)
 
     def catalog(self) -> MemoryCatalog:
         view = self._read()
@@ -618,8 +653,8 @@ class MemoryRetriever:
         topics = tuple(sorted(kinds.items()))
         index, degraded = self._answers(view)
         # No record IDs, global positions, source ancestry, or withdrawn hashes:
-        # the freshness's revision digests authorized records' scope-local
-        # ordinals, kinds and text alone.
+        # the freshness's fingerprint digests authorized kinds and text alone,
+        # and the identity revision, which digests IDs, stays off the catalog.
         return MemoryCatalog(view.scope, topics, index, degraded)
 
     def _lookup(
@@ -687,7 +722,7 @@ class MemoryRetriever:
             assert view.scope is not None
             index, degraded = self._answers(view)
             self._count(fetch=False, hits=0, degraded=degraded)
-            return SearchResult(view.scope, (), index, True, degraded, False)
+            return SearchResult(view.scope, (), index, view.revision, True, degraded, False)
         primary, view, covered, matches = self._lookup(self._primary, view, terms)
         used = primary
         # A successful empty generation has no covered rows either.
@@ -721,6 +756,7 @@ class MemoryRetriever:
             view.scope,
             hits,
             _freshness(used, view),
+            view.revision,
             len(tail) <= TAIL_RECORDS,
             degraded,
             bool(selected),
