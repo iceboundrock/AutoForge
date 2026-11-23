@@ -37,7 +37,14 @@ That is the case of a host where `gh` works through a proxy and this
 direct read does not. A probe that cannot make the empty directory `gh auth
 token` runs in fails naming the temporary directory, sending nothing, and a
 reply that nests deeper than the JSON decoder follows fails as a reply
-that is not JSON; neither ends `doctor`'s report any more. No state
+that is not JSON; neither ends `doctor`'s report any more. A certificate
+that does not verify is named by OpenSSL's verify code, and its remedy
+follows the code: the trust store Python reads only when no trusted CA
+issued the certificate; the proxy and how `api.github.com` resolves for a
+hostname mismatch, which a trusted CA can issue; the clock for one
+outside its dates. A redirect, an unexpected status or a reply that is not
+one JSON object points to the proxy and the network path that may be
+answering in GitHub's place; a read-back's error names the same. No state
 protocol or default changes.
 
 ### Optional Issue Working Memory retrieval (#324)

@@ -1739,7 +1739,16 @@ a stated reason it has none. The coverage that must keep working:
   token`'s stderr, is not in the row, which keeps its status, exit code
   and remedy, and the Content-Type's and the stderr's are in neither of
   `doctor`'s output modes (R1-F1 of PR #539, `tests/test_doctor.py`,
-  `tests/test_cli.py`, `tests/test_github.py`)
+  `tests/test_cli.py`, `tests/test_github.py`); a certificate's remedy
+  follows its OpenSSL verify code and names a missing CA only for no
+  trusted issuer, a hostname mismatch naming the proxy and the path and
+  never the CA, against this machine's OpenSSL too (a loopback HTTPS
+  stand-in whose certificate names another host, trusted and not, skipped
+  without an `openssl` command to make it), and every refused reply (a
+  redirect, an unexpected status, one that is not one JSON object) names
+  the proxy and the network path and not the trust store, the row being
+  the controller's words alone (R3-F1 of PR #539, `tests/test_doctor.py`,
+  `tests/test_github.py`)
 - text the controller writes back or verifies (#328, `tests/test_effects.py`,
   `tests/test_engine.py`, `tests/test_operator_actions.py`): for K3 and K6
   a base holding escape text, control characters or caret text is written

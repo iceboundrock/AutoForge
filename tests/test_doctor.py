@@ -1,13 +1,17 @@
 """Doctor: read-only checks with a fake command runner."""
 
 import errno
+import http.server
 import json
 import os
+import re
 import shutil
 import ssl
 import subprocess
 import tempfile
+import threading
 import urllib.error
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,7 +23,13 @@ from autoforge.config import default_config
 from autoforge.doctor import Doctor
 from autoforge.errors import ExecutionError
 from autoforge.executor import ExecutionResult, execute
-from autoforge.github import EXACT_READ_ROOT, GH_WORKDIR_PREFIX, HttpsReply, HttpsRequest
+from autoforge.github import (
+    EXACT_READ_ROOT,
+    GH_WORKDIR_PREFIX,
+    HttpsReply,
+    HttpsRequest,
+    https_get,
+)
 from autoforge.redaction import redact
 from tests.conftest import (
     DOTDOT_SPELLINGS,
@@ -1659,6 +1669,16 @@ def test_the_exact_read_row_fails_any_other_conclusive_answer_without_quoting_it
 _ECHOED = "zq7-synthetic-echo-4f19c2-not-a-known-format"
 
 
+def _certificate_refused(code: int | None) -> urllib.error.URLError:
+    """What urllib raises when OpenSSL refuses the certificate with verify ``code``
+    (``None``: an error that carries none). Its texts echo a value the row never shows."""
+    error = ssl.SSLCertVerificationError(1, f"certificate verify failed: {_ECHOED}")
+    if code is not None:
+        error.verify_code = code
+        error.verify_message = f"certificate is not valid for '{_ECHOED}'"
+    return urllib.error.URLError(error)
+
+
 @pytest.mark.parametrize(
     ("kwargs", "reply", "raises", "label", "cause"),
     [
@@ -1721,6 +1741,24 @@ _ECHOED = "zq7-synthetic-echo-4f19c2-not-a-known-format"
             "FAIL",
             "the TLS certificate did not verify",
         ),
+        (
+            {},
+            None,
+            _certificate_refused(62),
+            "FAIL",
+            "the TLS certificate did not verify (OpenSSL verify code 62: a hostname mismatch)",
+        ),
+        (
+            {},
+            HttpsReply(
+                302,
+                {"location": f"https://{_ECHOED}.example/", "content-type": f"text/{_ECHOED}"},
+                _ECHOED.encode(),
+            ),
+            None,
+            "FAIL",
+            "api.github.com answered HTTP 302 (a redirect, which is never followed)",
+        ),
     ],
     ids=[
         "content-type",
@@ -1730,6 +1768,8 @@ _ECHOED = "zq7-synthetic-echo-4f19c2-not-a-known-format"
         "token-stderr-transient",
         "proxy-reason-phrase",
         "certificate",
+        "hostname-mismatch",
+        "redirect",
     ],
 )
 def test_the_exact_read_row_never_shows_what_github_a_proxy_or_gh_sent(
@@ -1754,6 +1794,258 @@ def test_the_exact_read_row_never_shows_what_github_a_proxy_or_gh_sent(
     else:
         assert "would block" in row.detail
     _no_secret_in(row)
+
+
+def _blocking_row(cause: str, remedy: str) -> str:
+    """The whole detail of an exact-read row that FAILs on a conclusive answer."""
+    return (
+        f"exact read probe (GET /rate_limit): {cause}; {remedy}; "
+        "a read-back that needs this read would block"
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "cause", "remedy"),
+    [
+        (
+            62,
+            "the TLS certificate did not verify (OpenSSL verify code 62: a hostname mismatch)",
+            github_module.EXACT_READ_CERTIFICATE_NAME_REMEDY,
+        ),
+        (
+            64,
+            "the TLS certificate did not verify (OpenSSL verify code 64: an IP address mismatch)",
+            github_module.EXACT_READ_CERTIFICATE_NAME_REMEDY,
+        ),
+        (
+            20,
+            "the TLS certificate did not verify (OpenSSL verify code 20: no trusted issuer)",
+            github_module.EXACT_READ_CERTIFICATE_ISSUER_REMEDY,
+        ),
+        (
+            19,
+            "the TLS certificate did not verify (OpenSSL verify code 19: a self-signed CA in "
+            "its chain)",
+            github_module.EXACT_READ_CERTIFICATE_ISSUER_REMEDY,
+        ),
+        (
+            10,
+            "the TLS certificate did not verify (OpenSSL verify code 10: expired)",
+            github_module.EXACT_READ_CERTIFICATE_DATES_REMEDY,
+        ),
+        (
+            23,
+            "the TLS certificate did not verify (OpenSSL verify code 23)",
+            github_module.EXACT_READ_CERTIFICATE_REMEDY,
+        ),
+        (
+            None,
+            "the TLS certificate did not verify",
+            github_module.EXACT_READ_CERTIFICATE_REMEDY,
+        ),
+    ],
+    ids=[
+        "hostname-mismatch",
+        "ip-mismatch",
+        "no-issuer",
+        "self-signed-ca",
+        "expired",
+        "other",
+        "no-code",
+    ],
+)
+def test_the_exact_read_row_s_certificate_remedy_asserts_only_what_the_verify_code_shows(
+    tmp_path, code, cause, remedy
+):
+    """R3-F1 of PR #539: the row put every certificate that did not verify down to a CA
+    missing from this machine's trust store, a hostname mismatch included, which a CA the
+    machine trusts can issue. The remedy follows OpenSSL's verify code now: a certificate
+    valid for another name says adding a CA would not help and points at the proxy and
+    how api.github.com resolves; only no trusted issuer names a missing CA; one outside
+    its dates names the clock; any other code, or none, asserts no cause. The row is the
+    controller's words alone, whatever OpenSSL's message or the answer held."""
+    row, _, gets = _exact_read(tmp_path, raises=_certificate_refused(code))
+
+    assert not row.ok and row.required and row.label == "FAIL"
+    assert row.detail == _blocking_row(cause, remedy)
+    names_a_missing_ca = remedy == github_module.EXACT_READ_CERTIFICATE_ISSUER_REMEDY
+    assert ("does not chain to a CA" in row.detail) == names_a_missing_ca
+    if remedy == github_module.EXACT_READ_CERTIFICATE_NAME_REMEDY:
+        assert "would not fix this" in row.detail
+        assert "HTTPS_PROXY" in row.detail and "how api.github.com resolves" in row.detail
+    assert len(gets) == 1
+    assert _ECHOED not in row.detail
+    _no_secret_in(row)
+
+
+@pytest.mark.parametrize(
+    ("reply", "cause"),
+    [
+        (
+            HttpsReply(302, {"location": f"https://{_ECHOED}.example/"}, b""),
+            "api.github.com answered HTTP 302 (a redirect, which is never followed)",
+        ),
+        (
+            HttpsReply(200, {"content-type": "text/html"}, _REPLY_SECRET),
+            "the reply's Content-Type is not JSON (application/json)",
+        ),
+        (
+            HttpsReply(200, {"content-type": "application/json"}, b"<html>" + _REPLY_SECRET),
+            "the reply is not UTF-8 JSON",
+        ),
+        (
+            HttpsReply(200, {"content-type": "application/json"}, b'["' + _REPLY_SECRET + b'"]'),
+            "the reply is not a JSON object",
+        ),
+        (
+            HttpsReply(410, {"content-type": "application/json"}, _REPLY_SECRET),
+            "api.github.com answered HTTP 410",
+        ),
+    ],
+    ids=["redirect", "not-json", "not-utf8-json", "not-an-object", "unexpected-status"],
+)
+def test_the_exact_read_row_points_a_refused_reply_at_the_proxy_and_the_network_path(
+    tmp_path, reply, cause
+):
+    """R3-F1 of PR #539: a redirect, an unexpected status or a reply that is not one JSON
+    object FAILed saying only that a read-back would block. GitHub answers
+    `GET /rate_limit` with one JSON object, so the row now says the answer may not be
+    GitHub's and names the proxy variables, the proxy and the network path, without
+    asserting which, and without the trust store: a certificate that verified rules
+    out a missing CA. Nothing of the answer (a header, the body) is shown."""
+    row, _, gets = _exact_read(tmp_path, reply)
+
+    assert not row.ok and row.required and row.label == "FAIL"
+    assert row.detail == _blocking_row(cause, github_module.EXACT_READ_REPLY_REMEDY)
+    assert "may not be GitHub's" in row.detail and "HTTPS_PROXY" in row.detail
+    assert "trust store" not in row.detail
+    assert len(gets) == 1
+    assert _ECHOED not in row.detail
+    _no_secret_in(row)
+
+
+# A certificate valid for `other.example` alone, self-signed, so that a trust store can
+# hold it as its CA: `openssl req` reads every setting from this file, which LibreSSL's
+# `openssl` reads as OpenSSL's does.
+_STAND_IN_CERTIFICATE_CONFIG = """\
+[req]
+prompt = no
+distinguished_name = dn
+x509_extensions = ext
+[dn]
+CN = other.example
+[ext]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, digitalSignature
+subjectAltName = DNS:other.example
+"""
+
+
+class _RateLimitStandIn(http.server.BaseHTTPRequestHandler):
+    """Answers every GET as GitHub answers `/rate_limit`; records each path it was asked."""
+
+    def log_message(self, *args) -> None:  # keep pytest's output clean
+        pass
+
+    def do_GET(self) -> None:
+        self.server.seen.append(self.path)
+        body = b'{"rate": {"limit": 5000}}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.mark.skipif(
+    shutil.which("openssl") is None,
+    reason="no `openssl` command to make the stand-in's certificate",
+)
+def test_the_exact_read_row_tells_a_hostname_mismatch_from_an_untrusted_ca_over_real_tls(
+    tmp_path, monkeypatch
+):
+    """R3-F1 of PR #539, against this machine's OpenSSL: a loopback HTTPS stand-in that
+    presents a certificate valid for `other.example` alone, asked for as `localhost`.
+
+    With a trust store that does not hold its CA, OpenSSL refuses the issuer before it
+    looks at the name, and the row names the trust store. With one that holds it (a CA
+    this machine trusts, as a TLS-inspecting proxy's may be), OpenSSL refuses the name
+    alone (verify code 62), and the row says adding a CA would not help and points at
+    the proxy and how api.github.com resolves. Either way the handshake fails before
+    the request, so the token never reaches the stand-in, and the row quotes nothing of
+    OpenSSL's message, which names the host asked for."""
+    for name in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.upper(), raising=False)
+    config, key, cert = (tmp_path / n for n in ("cert.cnf", "key.pem", "cert.pem"))
+    config.write_text(_STAND_IN_CERTIFICATE_CONFIG)
+    subprocess.run(
+        ["openssl", "req", "-x509", "-config", str(config), "-newkey", "rsa:2048", "-nodes"]
+        + ["-keyout", str(key), "-out", str(cert), "-days", "2"],
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _RateLimitStandIn)
+    server.daemon_threads = True
+    server.seen = []
+    serving = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    serving.load_cert_chain(str(cert), str(key))
+    server.socket = serving.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    )
+    thread.start()
+    url = f"https://localhost:{server.server_address[1]}/rate_limit"
+    sent: list[HttpsRequest] = []
+
+    def https(request: HttpsRequest) -> HttpsReply:
+        sent.append(request)
+        # The transport imported, not the stand-in the autouse fixtures put in its place.
+        return https_get(replace(request, url=url))
+
+    def row():
+        d = Doctor(cwd=str(tmp_path), runner=_runner_factory(), timeout_seconds=10, https=https)
+        return d.check_exact_read("gh")
+
+    try:
+        untrusted = row()
+        make = github_module._tls_context
+
+        def trusting() -> ssl.SSLContext:
+            context = make()
+            context.load_verify_locations(cafile=str(cert))
+            return context
+
+        monkeypatch.setattr(github_module, "_tls_context", trusting)
+        mismatched = row()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    issuer = re.fullmatch(
+        r"exact read probe \(GET /rate_limit\): the TLS certificate did not verify "
+        r"\(OpenSSL verify code (\d+): [^)]*\); (.*); a read-back that needs this read "
+        r"would block",
+        untrusted.detail,
+    )
+    assert issuer, untrusted
+    assert int(issuer.group(1)) in (2, 18, 19, 20, 21)  # OpenSSL's codes for no trusted issuer
+    assert issuer.group(2) == github_module.EXACT_READ_CERTIFICATE_ISSUER_REMEDY
+    assert not untrusted.ok and untrusted.label == "FAIL"
+
+    assert not mismatched.ok and mismatched.required and mismatched.label == "FAIL"
+    assert mismatched.detail == _blocking_row(
+        "the TLS certificate did not verify (OpenSSL verify code 62: a hostname mismatch)",
+        github_module.EXACT_READ_CERTIFICATE_NAME_REMEDY,
+    )
+    assert "does not chain to a CA" not in mismatched.detail
+    for detail in (untrusted.detail, mismatched.detail):
+        assert "localhost" not in detail and "other.example" not in detail
+    assert len(sent) == 2 and server.seen == []
+    _no_secret_in(untrusted)
+    _no_secret_in(mismatched)
 
 
 def test_the_exact_read_row_is_unread_when_gh_cannot_be_started(tmp_path):
@@ -1811,6 +2103,7 @@ def test_the_exact_read_row_fails_a_reply_nested_deeper_than_the_decoder_follows
     assert not row.ok and row.required and row.label == "FAIL"
     assert f"exact read probe (GET /rate_limit): {_TOO_DEEP_CAUSE}" in row.detail
     assert "would block" in row.detail and "trust store" not in row.detail
+    assert github_module.EXACT_READ_REPLY_REMEDY in row.detail
     assert len(gets) == 1
     _no_secret_in(row)
 

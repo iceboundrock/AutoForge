@@ -984,15 +984,24 @@ class Doctor:
 
         OK when GitHub answered one JSON object. A credential failure (no
         token, a 401, a 403 that is no rate limit), a certificate that does
-        not verify and any other conclusive answer FAIL with their remedy. A
-        transient failure (no connection, a timeout, a 5xx or a rate limit)
-        WARNs: it may pass on the next run, and if it does not, the proxy or
-        the network between this machine and the API is to check. A probe
-        that could not prepare its read (no empty directory in which to start
-        `gh auth token`) FAILs naming the temporary directory, with no GET
-        sent, and a reply that nests deeper than the JSON decoder follows
-        FAILs as any reply that is not GitHub's JSON: the client classifies
-        both, so neither ends the report (R2-F1 of PR #539).
+        not verify and any other conclusive answer FAIL with their remedy,
+        which the client chose for the failure and which asserts no cause
+        the failure does not show (R3-F1 of PR #539). A certificate's remedy
+        follows OpenSSL's verify code: the trust store for no trusted issuer,
+        the proxy and the network path for a certificate valid for another
+        name (whichever CA issued it), the clock for one outside its dates,
+        both the trust store and the path for any other code. A reply the
+        read refuses (a redirect, a status it does not expect, one that is
+        not one JSON object) names the proxy and the network path that may be
+        answering in GitHub's place. A transient failure (no connection, a
+        timeout, a 5xx or a rate limit) WARNs: it may pass on the next run,
+        and if it does not, the proxy or the network between this machine
+        and the API is to check. A probe that could not prepare its read (no
+        empty directory in which to start `gh auth token`) FAILs naming the
+        temporary directory, with no GET sent, and a reply that nests deeper
+        than the JSON decoder follows FAILs as any reply that is not GitHub's
+        JSON: the client classifies both, so neither ends the report (R2-F1
+        of PR #539).
 
         The row shows the failure's :meth:`~autoforge.github.ExactReadFailure.
         summary` and nothing else of it: the controller's own words and
@@ -1035,9 +1044,10 @@ class Doctor:
                 "read-back that needs this read would stop until it works",
                 required=False,
             )
-        # The failure's own remedy says what to check (a certificate's names the
-        # trust store, no directory for `gh` the temporary directory): nothing
-        # is added that applies to another failure (R2-F1 of PR #539).
+        # The failure's own remedy says what to check (a certificate's by its verify
+        # code, a refused reply's the proxy and the network path, no directory for `gh`
+        # the temporary directory): nothing is added that applies to another failure
+        # (R2-F1, R3-F1 of PR #539).
         return CheckResult(name, False, f"{summary}; a read-back that needs this read would block")
 
     def sandbox_checks(self) -> list[CheckResult]:

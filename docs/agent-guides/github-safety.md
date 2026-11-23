@@ -1778,18 +1778,43 @@ errno name and, as the remedy, the temporary directory (`TMPDIR`, else
 `/tmp`), with no GET sent. A reply within the byte bound that nests deeper
 than the JSON decoder follows, where `json.loads` raises `RecursionError`
 rather than `ValueError`, is a `FAIL` like any reply that is not GitHub's
-JSON. Each remedy travels with the failure it applies to: the trust store
-is named for a certificate that does not verify, and for nothing else.
+JSON. Each remedy travels with the failure it applies to and asserts no
+cause the failure does not show (R3-F1 of PR #539):
+
+- a certificate that does not verify is told apart by OpenSSL's verify
+  code, a number this machine's OpenSSL gives, never the server's text:
+  no trusted issuer (codes 2, 18 to 21) names the trust store the Python
+  running AutoForge reads (`SSL_CERT_FILE`, `SSL_CERT_DIR`, else OpenSSL's
+  default paths, which need not be the store `gh` uses), where a
+  TLS-inspecting proxy's CA belongs if one is meant to be in the path; a
+  certificate valid for another name (62, a hostname mismatch, or 64, an
+  IP address mismatch), which a CA this machine trusts can issue, says
+  adding a CA would not help and names the proxy variables, the proxy and
+  how `api.github.com` resolves; one outside its dates (9, 10) names the
+  clock first; any other code, or none, names both the trust store and
+  that path without asserting either;
+- a reply the read refuses (a redirect, a status it does not expect, a
+  reply that is not one JSON object within the bound) names its status as
+  `api.github.com`'s, not GitHub's, says the answer may not be GitHub's
+  and names the proxy variables, the proxy and the network
+  path that may be substituting its own response; a certificate that
+  verified rules a missing CA out, so the trust store is not named;
+- no directory for `gh` names the temporary directory, and a credential
+  failure names `gh auth status` and `gh auth token`.
+
+The trust store is named for a certificate alone. A read-back's error
+carries the same remedy as the row.
 
 The row shows nothing anyone but the controller wrote (R1-F1 of PR #539).
 `probe_exact_read` returns the failure as a `github.ExactReadFailure`:
 its class, a cause built from the controller's own words and numbers (an
 HTTP status, `gh auth token`'s exit code, the transport failure's classes
-and errno name, the status a proxy refused the tunnel with) and a fixed
-remedy. The row shows those alone. A response header or body, a proxy's
-reason phrase, a certificate error's text and `gh`'s stderr can hold a
-credential of any shape, and redaction recognizes only the shapes it
-knows, so they never reach the row, redacted or not. The operator reads
+and errno name, the status a proxy refused the tunnel with, a
+certificate's OpenSSL verify code) and a fixed remedy. The row shows
+those alone. A response header or body, a proxy's reason phrase, a
+certificate error's text and `gh`'s stderr can hold a credential of any
+shape, and redaction recognizes only the shapes it knows, so they never
+reach the row, redacted or not. The operator reads
 `gh`'s own words by running the commands the remedy names. The exact read
 of a read-back keeps `gh`'s stderr and the transport's message, redacted
 and bounded, in the reason it raises, as before; the reply's headers and

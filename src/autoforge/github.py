@@ -794,10 +794,67 @@ EXACT_READ_CREDENTIAL_REMEDY = (
     "`gh auth status` and `gh auth token --hostname github.com` must work for the user "
     "running AutoForge, and the token must be accepted by GitHub's REST API"
 )
-# What a certificate the exact read cannot verify tells the operator to check (#329).
+# What a certificate the exact read cannot verify tells the operator to check (#329),
+# by OpenSSL's verify code (R3-F1 of PR #539). Each says what the code shows and no
+# more: a CA missing from the trust store is named only where the code says no trusted
+# CA issued the certificate. A certificate for another name can come from a CA this
+# machine trusts, and a code the controller does not know proves no cause at all.
+# Python's TLS reads OpenSSL's trust store, not `gh`'s: what `gh` accepts, it may not.
+_PYTHON_TRUST_STORE = (
+    "the trust store the Python running AutoForge reads (SSL_CERT_FILE or SSL_CERT_DIR "
+    "when set, else OpenSSL's default paths, which `ssl.get_default_verify_paths()` names)"
+)
+_PROXY_PATH = (
+    "the proxy variables (HTTPS_PROXY, NO_PROXY), the proxy's configuration and how "
+    "api.github.com resolves on this machine"
+)
+# No CA in that trust store issued the certificate (OpenSSL verify codes 2, 18-21).
+EXACT_READ_CERTIFICATE_ISSUER_REMEDY = (
+    "the certificate presented for api.github.com does not chain to a CA in "
+    f"{_PYTHON_TRUST_STORE}: if a TLS-inspecting proxy is meant to be in the path, its CA "
+    "belongs there; if not, something else may be answering for api.github.com, so check "
+    f"{_PROXY_PATH}"
+)
+# The certificate names another host or address (codes 62, 64), whoever issued it.
+EXACT_READ_CERTIFICATE_NAME_REMEDY = (
+    "the certificate presented is not valid for api.github.com, whichever CA issued it, so "
+    "adding a CA to the trust store would not fix this: a proxy, a captive portal, or a DNS "
+    f"or hosts-file entry may be sending the connection to another host; check {_PROXY_PATH}"
+)
+# The certificate is outside its validity period by this machine's clock (codes 9, 10).
+EXACT_READ_CERTIFICATE_DATES_REMEDY = (
+    "the certificate presented is expired or not yet valid by this machine's clock: check "
+    "the clock first; if it is right, something else may be answering for api.github.com, "
+    f"so check {_PROXY_PATH}"
+)
+# Any other code, or none: the failure proves that the answer is not known to be
+# GitHub's, and nothing about why.
 EXACT_READ_CERTIFICATE_REMEDY = (
-    "this machine's trust store does not hold the CA of whatever answered for "
-    "api.github.com (a TLS-inspecting proxy, for one)"
+    "whatever answered for api.github.com is not proven to be GitHub; check "
+    f"{_PYTHON_TRUST_STORE}, then {_PROXY_PATH}"
+)
+# OpenSSL's verify codes (``x509_vfy.h``) the certificate remedies tell apart, with
+# the controller's own words for each (R3-F1 of PR #539).
+_CERTIFICATE_FAILURES: dict[int, tuple[str, str]] = {
+    2: ("no trusted issuer", EXACT_READ_CERTIFICATE_ISSUER_REMEDY),
+    9: ("not yet valid", EXACT_READ_CERTIFICATE_DATES_REMEDY),
+    10: ("expired", EXACT_READ_CERTIFICATE_DATES_REMEDY),
+    18: ("self-signed", EXACT_READ_CERTIFICATE_ISSUER_REMEDY),
+    19: ("a self-signed CA in its chain", EXACT_READ_CERTIFICATE_ISSUER_REMEDY),
+    20: ("no trusted issuer", EXACT_READ_CERTIFICATE_ISSUER_REMEDY),
+    21: ("no trusted issuer", EXACT_READ_CERTIFICATE_ISSUER_REMEDY),
+    62: ("a hostname mismatch", EXACT_READ_CERTIFICATE_NAME_REMEDY),
+    64: ("an IP address mismatch", EXACT_READ_CERTIFICATE_NAME_REMEDY),
+}
+# What a reply the exact read refuses tells the operator to check (R3-F1 of PR #539):
+# a status it does not expect, a redirect, or a reply that is not one JSON object.
+# Whoever answered passed TLS verification for api.github.com, but that is GitHub or
+# a host this machine's trust store lets stand in for it (a TLS-inspecting proxy).
+EXACT_READ_REPLY_REMEDY = (
+    "the exact read expects one JSON object and follows no redirect, and an answer other "
+    "than that may not be GitHub's: a proxy, a captive portal or another host on the "
+    "network path may be substituting its own response (a TLS-inspecting proxy whose CA "
+    f"this machine trusts passes the certificate check); check {_PROXY_PATH}"
 )
 # What an exact read that could not start `gh auth token` tells the operator to
 # check (R2-F1 of PR #539): every `gh` the controller runs needs an empty
@@ -1059,14 +1116,16 @@ class ExactReadFailure:
     ``error`` is the class the read raises, which is its classification.
     ``cause`` says what failed in the controller's own words and numbers
     alone: an HTTP status, an exit code, a timeout, a transport failure's
-    class and errno name, a proxy's tunnel status. It never holds text that
+    class and errno name, a proxy's tunnel status, a certificate's OpenSSL
+    verify code and the controller's name for it. It never holds text that
     GitHub, a proxy or `gh` sent: no header, body, reason phrase or stderr.
     So it is safe to show without recognizing any credential format in it.
-    ``remedy`` is fixed text naming what to check. ``detail`` is the rest,
-    redacted and bounded: `gh`'s stderr, the transport's own message. Only
-    :meth:`error_for` adds it, for the controller's reasons and the run log.
-    ``doctor`` shows :meth:`summary`, never ``detail``
-    (:meth:`GitHubClient.probe_exact_read`).
+    ``remedy`` is fixed text naming what to check, chosen for the failure
+    and asserting no cause it does not show (R3-F1 of PR #539).
+    ``detail`` is the rest, redacted and bounded: `gh`'s stderr, the
+    transport's own message. Only :meth:`error_for` adds it, for the
+    controller's reasons and the run log. ``doctor`` shows :meth:`summary`,
+    never ``detail`` (:meth:`GitHubClient.probe_exact_read`).
     """
 
     error: type[GitHubError]
@@ -1146,20 +1205,26 @@ def _exact_transport_failure(exc: Exception) -> ExactReadFailure:
     """What a failure the exact read's transport raised means; no reply was read.
 
     A certificate that does not verify is conclusive (whoever answered is
-    not known to be GitHub); a connection that failed or broke is
-    inconclusive, as `gh`'s own are; anything else is conclusive. The
-    exception's text, redacted and bounded, is the failure's ``detail``
-    alone, and not even that for an ``http.client.HTTPException``, whose
-    text can quote what the server sent (``BadStatusLine`` its status line).
+    not known to be GitHub), its remedy chosen by OpenSSL's verify code
+    (:data:`_CERTIFICATE_FAILURES`, R3-F1 of PR #539); a connection that
+    failed or broke is inconclusive, as `gh`'s own are; anything else is
+    conclusive. The exception's text, redacted and bounded, is the
+    failure's ``detail`` alone, and not even that for an
+    ``http.client.HTTPException``, whose text can quote what the server
+    sent (``BadStatusLine`` its status line).
     """
     reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
     if isinstance(reason, ssl.SSLCertVerificationError):
+        # The code is this machine's OpenSSL's verdict, a number: never the server's text.
         code = getattr(reason, "verify_code", None)
-        verify = f" (OpenSSL verify code {code})" if isinstance(code, int) else ""
+        verify, remedy = "", EXACT_READ_CERTIFICATE_REMEDY
+        if isinstance(code, int):
+            label, remedy = _CERTIFICATE_FAILURES.get(code, ("", remedy))
+            verify = f" (OpenSSL verify code {code}{f': {label}' if label else ''})"
         return ExactReadFailure(
             GitHubError,
             f"the TLS certificate did not verify{verify}",
-            remedy=EXACT_READ_CERTIFICATE_REMEDY,
+            remedy=remedy,
             detail=f"{redact(str(reason)):.200}",
         )
     quotes_reply = isinstance(exc, http.client.HTTPException) or isinstance(
@@ -2326,7 +2391,11 @@ class GitHubClient:
         decoder follows included), or no empty directory to start `gh auth
         token` in a conclusive GitHubError. No failure quotes the reply, not
         even a header of it: a cause is built from the status and fixed
-        words alone. Every failure of these steps is so classified, so none
+        words alone. A refused reply (any other status, a redirect, one that
+        is not one JSON object within the bound) carries
+        :data:`EXACT_READ_REPLY_REMEDY`, which names the proxy and the
+        network path that may be answering in GitHub's place (R3-F1 of PR
+        #539). Every failure of these steps is so classified, so none
         escapes as anything but :class:`_ExactReadFailed` (R2-F1 of PR
         #539), save a `gh` that cannot be started at all (ExecutionError)
         and a controller bug (LockOrderError).
@@ -2347,6 +2416,11 @@ class GitHubClient:
 
         def failed(error: type[GitHubError], cause: str, remedy: str = "") -> NoReturn:
             raise _ExactReadFailed(ExactReadFailure(error, cause, remedy=remedy))
+
+        def refused(cause: str) -> NoReturn:
+            # A reply the read does not take: whatever answered may not be GitHub, so the
+            # remedy names the path to it (R3-F1 of PR #539); the cause quotes none of it.
+            failed(GitHubError, cause, remedy=EXACT_READ_REPLY_REMEDY)
 
         status = reply.status
         # A primary limit sends its headers; a secondary limit may send neither,
@@ -2370,23 +2444,24 @@ class GitHubClient:
                 remedy=EXACT_READ_CREDENTIAL_REMEDY,
             )
         if status != 200:
+            # Named by the host asked, not as GitHub: the answer may not be its (R3-F1).
             redirect = " (a redirect, which is never followed)" if 300 <= status < 400 else ""
-            failed(GitHubError, f"GitHub answered HTTP {status}{redirect}")
+            refused(f"api.github.com answered HTTP {status}{redirect}")
         # The header is matched, never quoted: whoever answered wrote it (R1-F1 of PR #539).
         if not _JSON_CONTENT_TYPE_RE.match(reply.headers.get("content-type", "")):
-            failed(GitHubError, "the reply's Content-Type is not JSON (application/json)")
+            refused("the reply's Content-Type is not JSON (application/json)")
         if len(reply.body) > EXACT_READ_MAX_BYTES:
-            failed(GitHubError, f"the reply is over {EXACT_READ_MAX_BYTES} bytes")
+            refused(f"the reply is over {EXACT_READ_MAX_BYTES} bytes")
         try:
             data = json.loads(reply.body.decode("utf-8"))
         except ValueError:
-            failed(GitHubError, "the reply is not UTF-8 JSON")
+            refused("the reply is not UTF-8 JSON")
         except RecursionError:
             # A reply within the byte bound can still nest deeper than the decoder
             # follows: an answer no GitHub object is, never a crash (R2-F1 of PR #539).
-            failed(GitHubError, "the reply nests deeper than the JSON decoder follows")
+            refused("the reply nests deeper than the JSON decoder follows")
         if not isinstance(data, dict):
-            failed(GitHubError, "the reply is not a JSON object")
+            refused("the reply is not a JSON object")
         return data
 
     def _exact_reread(self, path: str, what: str) -> dict:
@@ -3868,12 +3943,16 @@ class GitHubClient:
 
 
 __all__ = [
+    "EXACT_READ_CERTIFICATE_DATES_REMEDY",
+    "EXACT_READ_CERTIFICATE_ISSUER_REMEDY",
+    "EXACT_READ_CERTIFICATE_NAME_REMEDY",
     "EXACT_READ_CERTIFICATE_REMEDY",
     "EXACT_READ_CREDENTIAL_REMEDY",
     "EXACT_READ_ERROR_BYTES",
     "EXACT_READ_MAX_BYTES",
     "EXACT_READ_PROBE_PATH",
     "EXACT_READ_PROBE_WHAT",
+    "EXACT_READ_REPLY_REMEDY",
     "EXACT_READ_ROOT",
     "EXACT_READ_WORKDIR_REMEDY",
     "MAX_BODY_CHARS",

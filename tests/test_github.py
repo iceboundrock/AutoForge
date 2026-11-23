@@ -29,11 +29,15 @@ from autoforge.errors import (
 )
 from autoforge.executor import ExecutionResult
 from autoforge.github import (
+    EXACT_READ_CERTIFICATE_DATES_REMEDY,
+    EXACT_READ_CERTIFICATE_ISSUER_REMEDY,
+    EXACT_READ_CERTIFICATE_NAME_REMEDY,
     EXACT_READ_CERTIFICATE_REMEDY,
     EXACT_READ_CREDENTIAL_REMEDY,
     EXACT_READ_ERROR_BYTES,
     EXACT_READ_MAX_BYTES,
     EXACT_READ_PROBE_WHAT,
+    EXACT_READ_REPLY_REMEDY,
     EXACT_READ_ROOT,
     EXACT_READ_WORKDIR_REMEDY,
     GH_WORKDIR_PREFIX,
@@ -4545,7 +4549,7 @@ _UNRECOGNIZED = "zq7-synthetic-echo-4f19c2-not-a-known-format"
             HttpsReply(302, {"location": f"https://{_UNRECOGNIZED}.example/"}, b""),
             None,
             GitHubError,
-            "GitHub answered HTTP 302 (a redirect, which is never followed)",
+            "api.github.com answered HTTP 302 (a redirect, which is never followed)",
         ),
         (
             None,
@@ -4681,6 +4685,61 @@ def test_an_exact_read_classifies_a_reply_nested_deeper_than_the_json_decoder_fo
     assert len(gets) == 1
 
 
+@pytest.mark.parametrize(
+    ("reply", "cause"),
+    [
+        (
+            HttpsReply(302, {"location": f"https://{_UNRECOGNIZED}.example/"}, b""),
+            "api.github.com answered HTTP 302 (a redirect, which is never followed)",
+        ),
+        (
+            HttpsReply(301, {"location": f"https://{_UNRECOGNIZED}.example/"}, b""),
+            "api.github.com answered HTTP 301 (a redirect, which is never followed)",
+        ),
+        (_json_reply({"message": _UNRECOGNIZED}, status=410), "api.github.com answered HTTP 410"),
+        (
+            HttpsReply(200, {"content-type": "text/html"}, f"<p>{_UNRECOGNIZED}</p>".encode()),
+            "the reply's Content-Type is not JSON (application/json)",
+        ),
+        (
+            HttpsReply(200, {"content-type": "application/json"}, b"\xff" + _UNRECOGNIZED.encode()),
+            "the reply is not UTF-8 JSON",
+        ),
+        (_json_reply([_UNRECOGNIZED]), "the reply is not a JSON object"),
+        (
+            _json_reply({"x": _UNRECOGNIZED + "y" * EXACT_READ_MAX_BYTES}),
+            f"the reply is over {EXACT_READ_MAX_BYTES} bytes",
+        ),
+        (_TOO_DEEP_REPLY, "the reply nests deeper than the JSON decoder follows"),
+    ],
+    ids=["302", "301", "410", "html", "not-utf8", "array", "oversize", "too-deep"],
+)
+def test_a_reply_the_exact_read_refuses_names_the_proxy_and_the_network_path(reply, cause):
+    """R3-F1 of PR #539: a redirect, an unexpected status or a reply that is not one
+    JSON object said only what was refused, so doctor's row said only that a read-back
+    would block. Each now carries :data:`EXACT_READ_REPLY_REMEDY`: the answer may not
+    be GitHub's, and the proxy variables, the proxy and the network path are where to
+    look. It asserts no cause, names no trust store, and the summary is the controller's
+    words alone: no header, no body. Conclusive, so read once."""
+    _, gets, client = _exact_client(reply, retries=3)
+    failure = client.probe_exact_read()
+
+    assert isinstance(failure, ExactReadFailure) and failure.error is GitHubError
+    assert failure.cause == cause and failure.remedy == EXACT_READ_REPLY_REMEDY
+    summary = failure.summary(EXACT_READ_PROBE_WHAT)
+    assert summary == f"{EXACT_READ_PROBE_WHAT}: {cause}; {EXACT_READ_REPLY_REMEDY}"
+    assert "HTTPS_PROXY" in summary and "may not be GitHub's" in summary
+    assert "trust store" not in summary
+    assert _UNRECOGNIZED not in summary and _UNRECOGNIZED not in repr(failure)
+
+    with pytest.raises(GitHubError) as info:
+        client.get_pr_exact(_EXACT_PR_URL)
+    assert type(info.value) is GitHubError
+    assert str(info.value).endswith(f"{cause}; {EXACT_READ_REPLY_REMEDY}")
+    assert _UNRECOGNIZED not in str(info.value) and _EXACT_TOKEN not in str(info.value)
+    assert len(gets) == 2
+
+
 def test_an_exact_read_with_no_directory_for_gh_auth_token_sends_nothing(monkeypatch):
     """R2-F1 of PR #539: `gh auth token` runs in an empty directory of its own (#283).
     One that cannot be made raised `gh_workdir`'s GitHubError past the probe, which
@@ -4714,18 +4773,96 @@ def test_an_exact_read_with_no_directory_for_gh_auth_token_sends_nothing(monkeyp
     assert gh_calls == [] and gets == []
 
 
-def test_a_certificate_the_exact_read_cannot_verify_names_the_trust_store():
-    """The remedy travels with the failure it applies to (R2-F1 of PR #539): the trust
-    store is named for a certificate that does not verify, and for nothing else."""
-    _, _, client = _exact_client(
-        raises=urllib.error.URLError(ssl.SSLCertVerificationError(1, "self-signed"))
-    )
+def _certificate_refused(code: int | None) -> urllib.error.URLError:
+    """What urllib raises when OpenSSL refuses the certificate with verify ``code``
+    (``None``: an error that carries none). Its texts hold a value no summary repeats."""
+    error = ssl.SSLCertVerificationError(1, f"certificate verify failed: {_UNRECOGNIZED}")
+    if code is not None:
+        error.verify_code = code
+        error.verify_message = f"certificate is not valid for '{_UNRECOGNIZED}'"
+    return urllib.error.URLError(error)
+
+
+@pytest.mark.parametrize(
+    ("code", "label", "remedy"),
+    [
+        (2, "no trusted issuer", EXACT_READ_CERTIFICATE_ISSUER_REMEDY),
+        (18, "self-signed", EXACT_READ_CERTIFICATE_ISSUER_REMEDY),
+        (19, "a self-signed CA in its chain", EXACT_READ_CERTIFICATE_ISSUER_REMEDY),
+        (20, "no trusted issuer", EXACT_READ_CERTIFICATE_ISSUER_REMEDY),
+        (21, "no trusted issuer", EXACT_READ_CERTIFICATE_ISSUER_REMEDY),
+        (62, "a hostname mismatch", EXACT_READ_CERTIFICATE_NAME_REMEDY),
+        (64, "an IP address mismatch", EXACT_READ_CERTIFICATE_NAME_REMEDY),
+        (9, "not yet valid", EXACT_READ_CERTIFICATE_DATES_REMEDY),
+        (10, "expired", EXACT_READ_CERTIFICATE_DATES_REMEDY),
+        (23, "", EXACT_READ_CERTIFICATE_REMEDY),
+        (None, "", EXACT_READ_CERTIFICATE_REMEDY),
+    ],
+    ids=[
+        "unable-to-get-issuer",
+        "self-signed",
+        "self-signed-in-chain",
+        "unable-to-get-local-issuer",
+        "unable-to-verify-leaf",
+        "hostname-mismatch",
+        "ip-address-mismatch",
+        "not-yet-valid",
+        "expired",
+        "revoked",
+        "no-code",
+    ],
+)
+def test_a_certificate_s_remedy_asserts_only_what_its_verify_code_shows(code, label, remedy):
+    """R3-F1 of PR #539: every certificate that did not verify was put down to a CA
+    missing from this machine's trust store, a hostname mismatch included, which a CA the
+    machine trusts can issue. The remedy now follows OpenSSL's verify code: only no
+    trusted issuer names a missing CA; a certificate valid for another name says adding
+    one would not help and names the proxy and the path; one outside its dates names the
+    clock; any other code, or none, asserts no cause. The cause names the code in the
+    controller's words, never OpenSSL's message, which names the host asked for, and the
+    read-back's error carries the same remedy. A certificate is conclusive: read once."""
+    _, gets, client = _exact_client(raises=_certificate_refused(code), retries=3)
     failure = client.probe_exact_read()
-    assert isinstance(failure, ExactReadFailure)
-    assert failure.remedy == EXACT_READ_CERTIFICATE_REMEDY
-    _, _, client = _exact_client(_json_reply([1]))
-    failure = client.probe_exact_read()
-    assert isinstance(failure, ExactReadFailure) and failure.remedy == ""
+
+    assert isinstance(failure, ExactReadFailure) and failure.error is GitHubError
+    verify = "" if code is None else f" (OpenSSL verify code {code}{label and f': {label}'})"
+    assert failure.cause == f"the TLS certificate did not verify{verify}"
+    assert failure.remedy == remedy
+    summary = failure.summary(EXACT_READ_PROBE_WHAT)
+    assert summary == f"{EXACT_READ_PROBE_WHAT}: {failure.cause}; {remedy}"
+    assert ("does not chain to a CA" in summary) == (remedy == EXACT_READ_CERTIFICATE_ISSUER_REMEDY)
+    assert ("would not fix this" in summary) == (remedy == EXACT_READ_CERTIFICATE_NAME_REMEDY)
+    assert ("clock" in summary) == (remedy == EXACT_READ_CERTIFICATE_DATES_REMEDY)
+    assert "HTTPS_PROXY" in summary and EXACT_READ_REPLY_REMEDY not in summary
+    assert _UNRECOGNIZED not in summary and _UNRECOGNIZED not in repr(failure)
+
+    with pytest.raises(GitHubError) as info:
+        client.get_pr_exact(_EXACT_PR_URL)
+    assert type(info.value) is GitHubError and remedy in str(info.value)
+    assert _EXACT_TOKEN not in str(info.value)
+    assert len(gets) == 2
+
+
+def test_the_reply_remedy_travels_with_a_refused_reply_alone():
+    """The proxy-and-path remedy of a refused reply (R3-F1 of PR #539) is not given to a
+    failure the client classified otherwise: a credential, a rate limit, a 5xx, a 404,
+    a connection or a certificate keep their own (or none)."""
+    for reply in (
+        _json_reply({"message": "x"}, status=401),
+        _json_reply({"message": "x"}, status=403),
+        _json_reply({}, status=404),
+        _json_reply({}, status=429, **{"retry-after": "1"}),
+        _json_reply({}, status=502),
+    ):
+        failure = _exact_client(reply)[2].probe_exact_read()
+        assert isinstance(failure, ExactReadFailure), reply
+        assert failure.remedy != EXACT_READ_REPLY_REMEDY, reply
+    for raised in (
+        urllib.error.URLError(ConnectionRefusedError(111, "refused")),
+        _certificate_refused(62),
+    ):
+        failure = _exact_client(raises=raised)[2].probe_exact_read()
+        assert isinstance(failure, ExactReadFailure) and failure.remedy != EXACT_READ_REPLY_REMEDY
 
 
 # -- the exact read's transport, against a loopback server ---------------------------------
