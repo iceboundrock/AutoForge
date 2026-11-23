@@ -375,11 +375,8 @@ def test_adr_0015_a_candidates_ref_is_created_and_never_moved(tmp_path):
     assert (resolves(kept), resolves(new)) == (c1, c2)
 
 
-def test_the_package_opens_sqlite_only_for_the_opencode_probe():
-    """D10 refuses SQLite as authoritative storage and says the package
-    opens it in one place, read-only: the probe of OpenCode's organization
-    integrations. A second connection, or a writable one, is a decision
-    D10 has to take first."""
+def test_sqlite_is_only_for_the_read_only_probe_and_disposable_index():
+    """D10 prohibits pathname-opened SQLite for Memory or its index."""
     callers = []
     for path in sorted(PACKAGE.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -395,7 +392,19 @@ def test_the_package_opens_sqlite_only_for_the_opencode_probe():
                     and node.func.value.id == "sqlite3"
                 ):
                     callers.append((path.relative_to(PACKAGE).as_posix(), function.name))
-                    assert "mode=ro" in ast.get_source_segment(path.read_text(), function)
+                    source = ast.get_source_segment(path.read_text(), function)
+                    if path.name == "memory_fts5.py":
+                        assert tuple(map(ast.literal_eval, node.args)) == (":memory:",)
+                        assert {kw.arg: ast.literal_eval(kw.value) for kw in node.keywords} == {
+                            "check_same_thread": False,
+                        }
+                        assert "PRAGMA temp_store = MEMORY" in source
+                        assert "setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)" in source
+                    else:
+                        assert "mode=ro" in source
         if "sqlite3" in path.read_text(encoding="utf-8"):
-            assert path.name == "providers.py", path
-    assert sorted(set(callers)) == [("providers.py", "_opencode_database_problems")]
+            assert path.name in ("providers.py", "memory_fts5.py"), path
+    assert sorted(callers) == [
+        ("memory_fts5.py", "__init__"),
+        ("providers.py", "_opencode_database_problems"),
+    ]

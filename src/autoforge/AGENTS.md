@@ -220,6 +220,9 @@ state.py            persisted controller state, atomic writes, schema/protocol c
 memory.py           Issue Working Memory (#317, ADR 0015 D9, D10, D12): the store in the
                     checkpoint, its lifecycle validator and the pure, budgeted projection;
                     launches nothing and advances nothing
+memory_retrieval.py, memory_fts5.py  the optional next-launch read API (#324): current-store
+                    authorization and BM25 ranking, with disposable in-memory FTS5
+                    candidate generations; no import from a launcher or decision module
 memory_handoff.py   Memory's single-agent handoff (#333, ADR 0015 D11 to D13): the
                     projection of an ANALYZE_EXECUTE launch, the controller's validation-
                     failure observation and an accepted result's proposals; decides no
@@ -464,7 +467,8 @@ recovery_package.py, engine.py (unblock_preview) -> docs/adr/0011-typed-stop-cla
                                                      and-advisor-gates.md for the package)
 redaction.py, runlog.py, doctor.py (env rows),
 error messages                                    -> docs/agent-guides/secrets-and-logging.md
-memory.py, memory_handoff.py, engine.py (what a
+memory.py, memory_handoff.py, memory_retrieval.py,
+memory_fts5.py, engine.py (what a
 launch is shown of earlier launches)              -> docs/adr/0015-task-state-issue-memory-and-
                                                      crash-order.md + docs/evaluation-protocol.md
 ```

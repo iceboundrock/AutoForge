@@ -5,6 +5,27 @@ so.
 
 ## Unreleased
 
+### Optional Issue Working Memory retrieval (#324)
+
+The controller-side `MemoryRetriever` offers bounded search, fetch and a
+scope-local catalog. SQLite FTS5 finds candidates in a disposable
+in-memory generation; the current store authorizes results and supplies
+the text used for ranking. A stale generation that could still contain
+withdrawn text is skipped in favor of a bounded tail, with incomplete
+coverage reported where applicable. Answers report freshness over the
+binding's authorized records, never the ledger's audit positions, and
+their excerpts fit the request's character and byte budgets. The catalog
+carries a content fingerprint that no withheld record moves; search and
+fetch also carry an identity revision that changes when a record is
+replaced by one of the same text. A configured FTS5 fallback answers,
+marked degraded, whenever the optional backend cannot or a failed refresh
+left it holding fewer records. A failed refresh and a lookup outage are
+reported separately: a failed refresh never makes an unavailable generation
+answer, and a recovered lookup never cancels the refresh's retry. No launch
+wiring or default changes.
+See the [retrieval guide](docs/memory-retrieval.md) for freshness and
+fallback behavior, fixture results and the LTSearch no-go.
+
 ### Issue Working Memory reaches ANALYZE_EXECUTE's launches (#333)
 
 A run with `memory.enabled: true` now uses its Memory. Every
