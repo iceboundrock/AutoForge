@@ -483,11 +483,38 @@ because nothing yet depends on the answer.
 
 ### An optional backend falls back only to FTS5
 
-A primary backend other than FTS5 (none ships) may be configured only with
-an `Fts5Backend` as its fallback. When the primary cannot answer, the
-fallback does: the result is `degraded` and names the backend that
-answered, and the primary is rebuilt by the next sync. Either way, the
-same check of the store applies to every candidate.
+A primary backend other than FTS5 (none ships) may be given a fallback,
+and only a separate `Fts5Backend` can be one. The fallback is optional. A
+search reads the primary when it is readable: built, not marked `failed`,
+and available. When it is not, or when its answer is discarded, the search
+reads the fallback, if one was given and it is readable itself. Otherwise
+it answers from the bounded store tail alone, at most the scope's eight
+newest current records, as without FTS5. An answer from the fallback or
+the tail alone is `degraded` and names what answered. Whatever answers,
+the same check of the store applies to every candidate.
+
+The primary can be out of service in two ways, and they differ in what
+brings it back:
+
+- **Its search failed.** It raised a `RetrievalBackendError`
+  (`search-failed`), gave an answer the checks below refuse
+  (`invalid-answer`), or gave one the store contradicts or one that omits
+  a served match (`integrity`). The primary is marked `failed`, and no
+  search reads it again until a sync or a rebuild, made while the backend
+  can run, commits a new index of it. A sync that fails leaves it
+  `failed`.
+- **It is unavailable.** Its health check (`available`) answered anything
+  but `True`, or raised a `RetrievalBackendError`. That makes it
+  unavailable for that read only, and marks nothing. The next read asks
+  again, and once the check answers `True`, searches read the primary's
+  index as it was, at the same generation, with no rebuild. A sync skips a
+  backend while it is unavailable, so its index may come back stale, which
+  the tail covers as it does for any stale index.
+
+The regressions hold both, with a fallback and without one
+(`test_an_optional_backend_falls_back_only_to_fts5_and_never_across_permissions`,
+`test_a_backend_whose_health_check_fails_is_unavailable_and_the_fallback_answers`,
+`test_an_unavailable_primary_is_asked_again_and_a_failed_one_waits_for_a_rebuild`).
 
 A backend's answer is checked before it is used. It must be exactly a
 list or a tuple, never a subclass, of at most 64 candidates. Its type and

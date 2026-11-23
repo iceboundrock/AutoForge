@@ -1757,6 +1757,58 @@ def test_a_backend_whose_health_check_fails_is_unavailable_and_the_fallback_answ
     assert alone.search_memory(REQ, "tokenizer trailing comma").backend == "scripted"
 
 
+@pytest.mark.parametrize(
+    ("fallback", "answered"),
+    [(Fts5Backend, "sqlite-fts5"), (None, TAIL_BACKEND)],
+    ids=["fts5-fallback", "no-fallback"],
+)
+def test_an_unavailable_primary_is_asked_again_and_a_failed_one_waits_for_a_rebuild(
+    fallback, answered
+):
+    """R7-F4 of PR #537: the two ways an optional primary is out of service.
+    A health check that fails marks nothing: that read is answered by the
+    fallback, or by the store's tail where none was given, and once the
+    check answers ``True`` the primary's index is read again as it was, with
+    no rebuild. A search that fails marks the primary ``failed``: no search
+    reads it again, healthy or not, until a sync rebuilds it."""
+    w = corpus()
+    query = "tokenizer trailing comma"
+    primary = Unwell([valid(w.store, w.ids["tokenizer"])], True)
+    retriever = retriever_for(w, backend=primary, fallback=fallback and fallback())
+    assert retriever.sync().generation == 1
+    assert retriever.search_memory(REQ, query).backend == "scripted"
+
+    def answered_without_the_primary():
+        result = retriever.search_memory(REQ, query)
+        assert ids(result) == [w.ids["tokenizer"]] and result.complete
+        assert result.degraded and result.backend == answered
+
+    primary.health = False
+    answered_without_the_primary()
+    status = retriever.status()
+    assert (status.state, status.reason) == (IndexState.UNAVAILABLE, IndexReason.UNAVAILABLE)
+    primary.health = True
+    status = retriever.status()
+    assert (status.state, status.reason, status.generation) == (
+        IndexState.CURRENT,
+        IndexReason.NONE,
+        1,
+    )
+    back = retriever.search_memory(REQ, query)
+    assert back.backend == "scripted" and not back.degraded
+    # A failed search: the primary stays out until a sync rebuilds it.
+    primary.fail = True
+    answered_without_the_primary()
+    primary.fail = False
+    answered_without_the_primary()
+    status = retriever.status()
+    assert (status.state, status.reason) == (IndexState.FAILED, IndexReason.SEARCH_FAILED)
+    rebuilt = retriever.sync()
+    assert (rebuilt.state, rebuilt.generation) == (IndexState.CURRENT, 2)
+    again = retriever.search_memory(REQ, query)
+    assert again.backend == "scripted" and not again.degraded
+
+
 # -- nothing of a backend is read after a read's last load (R4-F1 of PR #537) ----------
 
 
