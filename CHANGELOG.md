@@ -31,7 +31,8 @@ answer names the launch it is for and each record's applicability. A
 search asks the index only about the records the launch is served, and
 judges its answer by the store loaded after it, so no row of any other
 record, nor of one withdrawn while the index answered, damaged or not,
-changes what the launch is told; the controller's verify checks every row. An index found not to match the
+its text decodable or not, changes what the launch is told; the
+controller's verify checks every row. An index found not to match the
 store, by a row it returns or a match it leaves out, is marked failed, and
 the search that found it answers from the fallback or the store at once;
 so is an answer that is not exactly a list or a tuple. A failed rebuild

@@ -95,9 +95,10 @@ no row holding an earlier text, damaged or not, moves an answer, a status,
 a flag or a catalog. The regression keeps everything the launch is
 served the same, varies only that text (another candidate's record, one
 superseded or retracted since the sync, the earlier text of one corrected
-since), damages its row three ways (a body the query matches, a wrong
-digest, a malformed revision), and compares every answer the launch could
-get, which must be identical and not degraded
+since), damages its row five ways (a body the query matches, a wrong
+digest, a malformed revision, and a digest or a revision that is not
+UTF-8, below), and compares every answer the launch could get, which must
+be identical and not degraded
 (`test_a_damaged_row_of_text_the_launch_cannot_read_moves_nothing_it_is_told`).
 Those rows are the controller's to check: `verify` reads every row (below).
 The filter is on rows. Damage to FTS5's own structures, its shadow tables,
@@ -123,9 +124,9 @@ whose row held a malformed revision, made the search and the catalog after
 it `failed` and `degraded` when the query matched its text, and ordinary
 `stale` when it did not. The regression withdraws the record inside the
 call, before and after FTS5 reads its rows, three ways (retracted,
-superseded, corrected), damages its row three ways, varies only whether its
-text holds the query's term, and compares every answer, which must be
-identical, `stale` and not degraded
+superseded, corrected), damages its row the same five ways, varies only
+whether its text holds the query's term, and compares every answer,
+which must be identical, `stale` and not degraded
 (`test_a_damaged_row_of_a_record_withdrawn_while_the_index_answers_moves_nothing`).
 The same damage to a record the store still serves falls back on that
 search, with an FTS5 fallback and without one
@@ -135,6 +136,28 @@ meanwhile is set aside while the same candidate of a served record is an
 invalid answer
 (`test_an_optional_backends_malformed_candidate_of_a_record_withdrawn_meanwhile_is_set_aside`).
 `verify` still reads every row.
+
+"As the row holds it" reaches down to how Python reads a value. SQLite
+stores TEXT as the bytes it is given, and Python's `sqlite3` decodes every
+TEXT value it fetches as UTF-8 and, by default, raises for one it cannot
+decode, inside `fetchall()`: an error of the whole query, whichever row
+held the value, before the retriever can tell whose row it was. Until the
+tenth review round that error was FTS5's search failing, so a row of a
+withdrawn record whose digest or revision held bytes that are not UTF-8
+made the search that matched it `failed` (`search-failed`) and
+`degraded`, and the catalog after it said so, while the same damage in a
+row the query did not match left ordinary `stale`: the eighth and ninth
+rounds' channel again, one level lower. The index's connection now decodes
+each TEXT value alone, strictly, as `sqlite3` itself does, and one that is
+not UTF-8 is an `UndecodableText` value of its own row, never an error of
+the query. A candidate holding one is malformed like any other: set aside
+unread when its record was withdrawn meanwhile, an integrity failure that
+falls back on the same search when the store still serves it, and found
+by `verify`'s read-back wherever it is. The regressions above damage a row
+those two ways too (a digest and a revision that are not UTF-8), among
+records the launch is not served, records withdrawn inside the call and
+records still served
+(`test_text_that_is_not_utf8_is_a_malformed_value_of_its_row_never_a_query_error`).
 
 The rows a search no longer reads include those the fourth review round
 found taken for ordinary staleness: a row of a record first added after
@@ -543,10 +566,11 @@ launch is served decide whether its search is `degraded` ("The store
 decides" above).
 
 A row no sync could have written is a typed failure, never a Python
-exception: a revision that is not an integer, a digest that is not text, or
-a body holding a form `_fts5_token` never produces. FTS5's search answers
-such a row as it holds it, never converted; a body no term matches is a
-served match left out. A search that meets such a row of a record the
+exception: a revision that is not an integer, a digest that is not text,
+a column holding TEXT that is not UTF-8 (read as an `UndecodableText`, not
+raised inside `fetchall()`), or a body holding a form `_fts5_token` never
+produces. FTS5's search answers such a row as it holds it, never
+converted; a body no term matches is a served match left out. A search that meets such a row of a record the
 store still serves as the index saw it marks the index `failed`
 (`integrity`: an FTS5 candidate is its row) and falls back on the same
 call, and one of a record withdrawn while the index answered decides
@@ -760,13 +784,15 @@ the index only about the records the launch is served; maintenance reports
 freshness against the store after its backend work), except four costs
 labelled with the sessions they come from: the coverage check's (the third
 round's), the corpus statistics' (the sixth round's), the eighth
-round's search filter and the ninth round's answer check, each run back
-to back against the code before it. The ninth round changed the search's
-code after that run; its back-to-back runs (the cost notes below) show no
-change these runs can measure, and the table is not run again.
+round's search filter, the ninth round's answer check and the tenth
+round's decoding, each run back to back against the code before it. The
+ninth and tenth rounds changed the search's code after that run; their
+back-to-back runs (the cost notes below) show no change past the runs'
+own spread, and the table is not run again.
 The correctness table, every ranking included, is what the reviewed head
-of the eighth round, `086aa34`, gives, run beside it, and what `e16071d`
-and `ecb5718` give in the ninth round's session; its figures are
+of the eighth round, `086aa34`, gives, run beside it, what `e16071d`
+and `ecb5718` give in the ninth round's session, and what `9ac3a68` and
+`94113e7` give in the tenth's; its figures are
 those measured after the third to sixth rounds too (the sixth round's
 statistics moved one pair of places in the no-FTS5 condition, which no
 figure shows). No embedding of any kind is computed, so nothing below is
@@ -886,9 +912,27 @@ Notes on the table:
   check of a backend's answer after that load, and FTS5's row check into
   it, costs nothing these runs can tell from their own spread. The
   correctness half gives the same output at both, every ranking included.
-- **Updates.** Updating one document is 0.07 ms at the median at every
+- **Decoding each TEXT value alone.** Measured in the tenth review round's
+  session: four runs of the benchmark each, alternating the reviewed
+  head's code (`9ac3a68`) and `94113e7`, whose module is the tenth
+  round's, snapshot held. The reviewed head searched in 0.73 to 0.79 ms
+  at the fixture's median (0.76 on average) and 1.24 to 1.27 ms at the
+  bound (1.26); `94113e7` in 0.76 to 0.82 ms (0.78) and 1.23 to 1.33 ms
+  (1.28). A Python call per TEXT value a search reads, one digest per row
+  it answers, costs about 0.02 ms at the median, inside the runs' own
+  spread. The correctness half gives the same output in all eight runs.
+- **Updates.** Each of a corpus's first twenty documents is updated once,
+  timed alone. Updating one document is 0.07 ms at the median at every
   size. The 95th percentile is 1.8 ms at 1,000 documents, 14.6 ms at
-  10,000 and 28.3 ms at 50,000, where FTS5 merges its segments.
+  10,000 and 28.3 ms at 50,000, where FTS5 merges its segments. A corpus
+  smaller than twenty documents updates each of its own once: until the
+  tenth review round the benchmark indexed twenty whatever the size, and
+  raised `IndexError` below it. `--sizes` takes 1 to 100,000 documents
+  per corpus, the bound a backend holds, and refuses any other size when
+  it parses its arguments, before either half runs
+  (`test_the_benchmarks_cost_half_runs_on_a_small_corpus`,
+  `test_the_benchmark_refuses_a_corpus_size_it_cannot_run_before_it_starts`).
+  The published sizes' twenty samples are unchanged.
 - **Where the time goes.** At the store's sizes, with the snapshot held,
   most of a search is Python: binding the request, the snapshot's verdict
   on every record, the scope's sequence, tokenizing the served records to
