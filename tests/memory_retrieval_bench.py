@@ -406,11 +406,12 @@ def _store_costs(world: World, queries: Sequence[str], *, rounds: int = 20) -> d
     """One store's index: its build, its searches, its size and what k=8 hits render to.
 
     Searched twice: with the snapshot held, a source that returns the
-    validated store it has (the read path's own cost), and with a source
+    validated store object it has, which a search's reload after its
+    backend answers reuses (the read path's own cost), and with a source
     that reconstructs and validates the store from the checkpoint's value
-    at every read, as ``AutoForgeState.memory`` does (the cost of loading
-    the canonical snapshot included). ``snapshot_load`` is that
-    reconstruction alone.
+    at every call, as ``AutoForgeState.memory`` does, which a search calls
+    twice (the cost of loading the canonical snapshot included).
+    ``snapshot_load`` is one reconstruction alone.
     """
     store, request = world.store, world.request
     repo, run, checkpoint = store.repository, store.run_id, store.encode()

@@ -14,19 +14,26 @@ unchanged, no agent can search, and there is no configuration key, state
 change or prompt change. The index lives in memory only (no file, temporary
 file or attached database) and is rebuilt from the checkpoint at will.
 Whether a record may be served is decided by the canonical store alone,
-loaded at every read, with the projection's own checks. So a corrected,
-retracted, withheld, superseded, inapplicable or other issue's record is
-never served from a stale index or an older snapshot, and a search says when
-it could not read every current record. What a launch is told is of its own
-scope only: a fetch answers alike for every record it does not serve, and
-the catalog's counts and the freshness a search or fetch reports leave out
-other issues' and other candidates' records. The index, the hot tail and a
-query share one Unicode tokenizer, so a record in any script is found alike
-before and after the index syncs it. Where the interpreter's SQLite lacks
-FTS5, a search reads only the eight newest records and says it is degraded. LTSearch was evaluated as an
-optional hybrid backend and is a no-go: it has no license, its filters run
-after retrieval, and it needs three HTTP processes. `docs/memory-retrieval.md`
-records the decisions, the measured BM25 baseline and the evidence.
+loaded at every read, and by a search again after its index answers, with
+the projection's own checks. So a corrected, retracted, withheld,
+superseded, inapplicable or other issue's record is never served from a
+stale index, an older snapshot or a write made while the index answered,
+and a search says when it could not read every current record. What a
+launch is told is of its own scope only: hits are ranked by BM25 over the
+records the launch is served, a fetch answers alike for every record it
+does not serve, and every revision and freshness figure is the scope's own
+count, so no record outside the scope moves a hit or leaves a gap. Every
+answer names the launch it is for and each record's applicability. An index
+found not to match the store is marked failed, and the search that found
+it answers from the fallback or the store at once. The index, the hot tail
+and a query share one Unicode tokenizer, so a record in any script is found
+alike before and after the index syncs it. Where the interpreter's SQLite
+lacks FTS5, a search reads only the eight newest records and says it is
+degraded. LTSearch was evaluated as an optional hybrid backend and is a
+no-go from its source: it has no license, its filters run after retrieval,
+and it needs three HTTP processes; it was not measured and its licensing is
+not cleared. `docs/memory-retrieval.md` records the decisions, the measured
+BM25 baseline and the evidence.
 
 ### Issue Working Memory reaches ANALYZE_EXECUTE's launches (#333)
 

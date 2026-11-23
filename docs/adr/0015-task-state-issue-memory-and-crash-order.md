@@ -1418,8 +1418,10 @@ D5.3): a crash after it re-verifies the receipt and launches nothing.
   that read interface, and nothing of the package calls it yet: a launch is
   shown this section's render alone. A retriever is bound to the store's
   source (`AutoForgeState.memory`) and loads the canonical snapshot at
-  every read. A snapshot that does not continue the newest one it has read
-  is refused, so an older checkpoint is never the authority of a read. The
+  every read, and a search loads it again after its index answers, so a
+  write made meanwhile is in force for that search. A snapshot that does
+  not continue the newest one it has read is refused, so an older
+  checkpoint is never the authority of a read. The
   index records the Memory revision it was synced through. Every hit is
   judged by `MemoryStore.visibilities`, which applies the projection's
   checks in its order, and its excerpt is the store's text, never the
@@ -1430,9 +1432,11 @@ D5.3): a crash after it re-verifies the receipt and launches nothing.
   `test_every_read_loads_the_canonical_snapshot_so_a_change_between_search_and_fetch_counts`).
   The records changed after the watermark are read on the store itself, up
   to a bound, and a search says when it could not read them all. What a
-  launch is told (a fetch's refusal, the catalog, every freshness figure)
-  is of its scope alone: its issue's records that apply to it. LTSearch
-  was evaluated and is a no-go for now (`docs/memory-retrieval.md`).
+  launch is told (a fetch's refusal, the catalog, a hit's place, every
+  freshness figure, in the scope's own sequence) is of its scope alone:
+  its issue's records that apply to it. Rank is BM25 over the records the
+  launch is served, never the index's. LTSearch was evaluated and is a
+  no-go for now, from its source alone (`docs/memory-retrieval.md`).
 - **No agent-callable search in the MVP.** An agent's only channels to the
   controller are the files it is given and its reply. A `search_memory` or
   `fetch_memory` call would be a new channel; if #319 or #324 adds one, it
