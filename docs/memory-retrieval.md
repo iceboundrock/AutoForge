@@ -388,10 +388,14 @@ a sync of a current index after a failed rebuild did nothing, and `failed`
 1 and `sync-failed` stayed until another rebuild was asked for
 (`test_a_failed_rebuild_keeps_the_index_it_would_replace_in_service`,
 `test_a_rebuild_that_failed_or_could_not_run_is_made_by_the_next_sync`).
-The index lives in memory, so a crash loses it, and the next process
-rebuilds it from the checkpoint. Given the same snapshot, the rebuild gives
-the same rows, the same backend scores and the same answers
-(`test_a_new_process_rebuilds_the_same_index_and_answers_identically`).
+The index lives in memory, so a crash loses it, and the next process must
+rebuild it from the checkpoint. The test holds that the rebuild depends on
+the checkpoint alone, not that a restart works: two retrievers in one
+process, the second over a store decoded from the first's checkpoint after
+a JSON round trip and rebuilt from it alone, hold the same rows and give
+the same backend scores and the same answers
+(`test_a_retriever_rebuilt_from_a_json_round_tripped_checkpoint_answers_identically`).
+No other interpreter is started, so no restart is observed.
 `verify` reads every row back and compares it with what a sync through the
 watermark wrote, replayed from the store's audit table: one row for each
 record indexable then, of its issue, at the revision and content digest it

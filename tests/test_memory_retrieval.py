@@ -869,7 +869,14 @@ def test_a_row_that_contradicts_its_revision_marks_the_index_failed_and_is_never
     assert retriever.sync().state is IndexState.CURRENT
 
 
-def test_a_new_process_rebuilds_the_same_index_and_answers_identically():
+def test_a_retriever_rebuilt_from_a_json_round_tripped_checkpoint_answers_identically():
+    """R6-F4 and R7-F2 of PR #537: two retrievers in this one process, the
+    second over a store decoded from the first's checkpoint after a JSON
+    round trip, and rebuilt from it alone. Both hold the same rows and give
+    the same backend scores and the same answers: the rebuild is
+    deterministic from the checkpoint, which is all a new process would
+    start from. No other interpreter is started, so this is not an observed
+    restart."""
     w = corpus()
     w.revise(Action.CORRECT, "ruff", text="Lint is ruff; format with ruff format first.")
     queries = ("trailing comma", "ruff format lint", "uv pytest", "nothing matches this")
