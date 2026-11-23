@@ -51,6 +51,7 @@ from autoforge.memory_retrieval import (
     text_tokens,
 )
 from autoforge.redaction import redact
+from autoforge.state import AutoForgeState
 from autoforge.transitions import Phase
 from tests import memory_retrieval_bench as bench
 
@@ -1100,6 +1101,95 @@ def test_a_malformed_backend_answer_is_a_backend_failure_and_falls_back(malforme
     assert ids(alone.search_memory(REQ, "uv pytest")) == [w.ids["uv"]]
 
 
+class Lying(list):
+    """A list that reports one item, whatever it holds."""
+
+    def __len__(self):
+        return 1
+
+
+class Raising(list):
+    """A list whose iteration raises what no backend error is."""
+
+    def __iter__(self):
+        raise ValueError("the container's own code ran")
+
+
+class Pair(tuple):
+    """A tuple subclass that changes nothing: refused for its type alone."""
+
+
+@pytest.mark.parametrize(
+    "container",
+    [
+        pytest.param(lambda c: Lying([replace(c, rank=1 + n % 64) for n in range(65)]), id="lying"),
+        pytest.param(lambda c: Raising([c]), id="raising"),
+        pytest.param(lambda c: Pair((c,)), id="a-tuple-subclass"),
+    ],
+)
+def test_a_backend_answers_container_is_checked_before_anything_iterates_it(container):
+    """R5-F3 of PR #537: a list subclass's length and iteration are the
+    backend's code. One that reports one candidate while it holds 65 was
+    read whole and its backend reported healthy; one whose iteration raises
+    escaped the fallback. Each is an invalid answer, and the fallback
+    answers the same search."""
+    w = corpus()
+    tok = valid(w.store, w.ids["tokenizer"])
+    retriever = retriever_for(w, backend=ScriptedBackend(container(tok)), fallback=Fts5Backend())
+    retriever.sync()
+    result = retriever.search_memory(REQ, "tokenizer trailing comma")
+    assert result.degraded and result.backend == "sqlite-fts5" and result.complete
+    assert ids(result) == [w.ids["tokenizer"]]
+    assert retriever.status().reason is IndexReason.INVALID_ANSWER
+    assert retriever.metrics.snapshot()["invalid_answers"] == 1
+    # The same candidates in an exact list or tuple are the primary's answer.
+    for exact in ([tok], (tok,)):
+        retriever.backend.answer = exact
+        retriever.sync()
+        result = retriever.search_memory(REQ, "tokenizer trailing comma")
+        assert not result.degraded and result.backend == "scripted" and result.complete
+        assert ids(result) == [w.ids["tokenizer"]]
+
+
+class ReadBack(Fts5Backend):
+    """An FTS5 index whose rows are read back through ``wrap``."""
+
+    def __init__(self, wrap):
+        super().__init__()
+        self.wrap = wrap
+
+    def entries(self):
+        return self.wrap(super().entries())
+
+
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        pytest.param(Lying, id="lying"),
+        pytest.param(Raising, id="raising"),
+        pytest.param(tuple, id="a-tuple"),
+        pytest.param(lambda rows: rows + rows[:1], id="a-row-past-the-store"),
+        pytest.param(lambda rows: rows[1:], id="a-row-short"),
+    ],
+)
+def test_verify_checks_the_read_backs_container_and_size_before_it_iterates_it(wrap):
+    """R5-F3 of PR #537, for ``verify``: the rows read back must be exactly
+    a list of one row per record a sync through the watermark wrote, checked
+    before anything iterates them. Anything else is an integrity failure,
+    and the next search answers from the tail."""
+    w = corpus()
+    retriever = retriever_for(w, backend=ReadBack(wrap))
+    retriever.sync()
+    status = retriever.verify()
+    assert (status.state, status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
+    result = retriever.search_memory(REQ, "tokenizer trailing comma")
+    assert result.backend == TAIL_BACKEND and result.degraded
+    # Read back as it is, the rebuilt index verifies.
+    retriever.backend.wrap = lambda rows: rows
+    retriever.rebuild()
+    assert retriever.verify().state is IndexState.CURRENT
+
+
 # -- nothing outside the launch's scope is told (R1-F4 of PR #537) ----------------------
 
 
@@ -1190,6 +1280,51 @@ def test_records_outside_the_scope_move_nothing_a_launch_is_told():
     after = retriever.catalog(REQ)
     assert after.revision == 3 and after.status.pending == 1
     assert after.scope_digest != before[0].scope_digest
+
+
+def test_the_catalog_says_nothing_of_text_the_store_refuses_to_serve():
+    """R5-F2 of PR #537: two stores alike but for the text of a retracted, a
+    withheld and a superseded record give the same catalog, its digest and
+    its rendering included, before and after the index syncs. The digest
+    held each such record's content digest, a hash a reader could test a
+    guess at the withdrawn text against. The text of a served record still
+    moves it."""
+
+    def world(gone, old, kept="Keep the scanner's signature unchanged."):
+        w = Writer(empty())
+        w.add("mine", "The zebra parser drops quoted separators.")
+        w.add("kept", kept, kind=Kind.CONSTRAINT)
+        w.add("gone", gone)
+        w.add("dup", gone)  # withheld once "gone" is retracted: it carries its text
+        w.add("old", old)
+        w.add("new", "The replacement lesson.")
+        retriever = retriever_for(w)
+        retriever.sync()
+        w.revise(Action.RETRACT, "gone")
+        w.revise(Action.SUPERSEDE, "old", replacement=w.ids["new"])
+        verdicts = w.store.visibilities(REQ)
+        assert [verdicts[w.ids[n]] for n in ("gone", "dup", "old")] == [
+            Visibility.RETRACTED,
+            Visibility.WITHHELD,
+            Visibility.SUPERSEDED,
+        ]
+        stale = retriever.catalog(REQ)
+        retriever.sync()
+        synced = retriever.catalog(REQ)
+        return [(catalog, catalog.render()) for catalog in (stale, synced)]
+
+    first = world("The guess is alpha.", "The bug is in the YAML loader.")
+    assert world("The guess is bravo.", "The bug is in the INI reader.") == first
+    (stale, _), (synced, _) = first
+    assert dict(synced.topics) == {"hypothesis": 2, "repository-constraint": 1}
+    assert stale.status.state is IndexState.STALE and synced.status.is_current
+    # What the launch is served still moves the digest, and nothing else of the catalog.
+    served = world(
+        "The guess is alpha.", "The bug is in the YAML loader.", kept="Keep the scanner stable."
+    )
+    for (catalog, _), (other, _) in zip(served, first, strict=True):
+        assert catalog.scope_digest != other.scope_digest
+        assert replace(catalog, scope_digest=other.scope_digest) == other
 
 
 def test_the_projections_own_binding_tells_no_base_of_a_record_the_launch_is_not_served():
@@ -1701,6 +1836,103 @@ def test_a_checkpoint_from_before_a_launch_is_refused_once_the_launch_was_read()
     assert retriever.fetch_memory(later, w.ids["tokenizer"]).item is not None
     w.store = MemoryStore(REPO, RUN, 130, saved.encode())
     assert retriever.catalog(replace(REQ, attempt=131)).revision == 3
+
+
+def _every_read(retriever, record):
+    return (
+        retriever.sync,
+        retriever.status,
+        retriever.rebuild,
+        retriever.verify,
+        lambda: retriever.search_memory(REQ, "tokenizer trailing comma"),
+        lambda: retriever.fetch_memory(REQ, record),
+        lambda: retriever.catalog(REQ),
+    )
+
+
+def test_a_checkpoint_from_before_an_opt_out_never_reopens_the_read_path():
+    """R5-F1 of PR #537: the controller turns Memory off
+    (``AutoForgeState.memory_setting``) without changing the audit rows or
+    the launch ordinal, so a checkpoint from before the opt-out continues
+    the opted-out one row for row. Once the retriever has read the opt-out,
+    every read refuses it. The controller's own opt-in gives that very value
+    back, so it is refused alike until the controller rebinds the
+    retriever."""
+    w = corpus()
+    state = AutoForgeState(
+        run_id=RUN, repository=REPO, launch_seq=128, issue_memory=w.store.encode()
+    )
+    retriever = MemoryRetriever(REPO, RUN, state.memory)
+    retriever.sync()
+    record = w.ids["tokenizer"]
+    assert retriever.fetch_memory(REQ, record).item is not None
+    saved = state.issue_memory
+    state.issue_memory = state.memory_setting(False)
+    off = state.memory()
+    assert (off.enabled, off.revision, off.launch_seq) == (False, w.store.revision, 128)
+    # Memory off: no launch is bound to read for, and the index is still told of.
+    with pytest.raises(StateError):
+        retriever.fetch_memory(REQ, record)
+    assert retriever.status().state is IndexState.CURRENT
+    # The checkpoint from before the opt-out: the same rows, the same ordinal.
+    state.issue_memory = saved
+    for read in _every_read(retriever, record):
+        with pytest.raises(RetrievalError, match="Memory was off"):
+            read()
+    # The controller's opt-in is the same value, which nothing tells apart.
+    state.issue_memory = off.encode()
+    state.issue_memory = state.memory_setting(True)
+    assert state.issue_memory == saved
+    with pytest.raises(RetrievalError, match="Memory was off"):
+        retriever.fetch_memory(REQ, record)
+    # A rebind while Memory is still off is refused, and the opt-out stands.
+    state.issue_memory = off.encode()
+    with pytest.raises(RetrievalError, match="Memory is off"):
+        retriever.rebind()
+    state.issue_memory = saved
+    with pytest.raises(RetrievalError, match="Memory was off"):
+        retriever.fetch_memory(REQ, record)
+    # The controller rebinds once it has turned Memory on: the record is served.
+    retriever.rebind()
+    assert retriever.fetch_memory(REQ, record).item is not None
+    assert retriever.catalog(REQ).revision == 3
+    # A later opt-out closes the read path again.
+    state.issue_memory = off.encode()
+    retriever.status()
+    state.issue_memory = saved
+    with pytest.raises(RetrievalError, match="Memory was off"):
+        retriever.search_memory(REQ, "tokenizer")
+
+
+@pytest.mark.parametrize("proof", ["a-later-launch", "a-later-row"])
+def test_a_snapshot_proven_newer_than_an_opt_out_is_read_without_a_rebind(proof):
+    """A launch counted, or a row written, after the opt-out is what no
+    checkpoint from before it has: such a snapshot is read again, and the
+    checkpoint from before the opt-out is refused as one that does not
+    continue it."""
+    w = corpus()
+    state = AutoForgeState(
+        run_id=RUN, repository=REPO, launch_seq=128, issue_memory=w.store.encode()
+    )
+    retriever = MemoryRetriever(REPO, RUN, state.memory)
+    retriever.sync()
+    record = w.ids["tokenizer"]
+    saved = state.issue_memory
+    state.issue_memory = state.memory_setting(False)
+    retriever.status()
+    state.issue_memory = state.memory_setting(True)
+    request = REQ
+    if proof == "a-later-launch":
+        state.launch_seq, request = 129, replace(REQ, attempt=130)
+    else:
+        later = Writer(state.memory())
+        later.n = 10
+        later.add("new", "A lesson written once Memory came back.")
+        state.issue_memory = later.store.encode()
+    assert retriever.fetch_memory(request, record).item is not None
+    state.issue_memory, state.launch_seq = saved, 128
+    with pytest.raises(RetrievalError, match="does not continue"):
+        retriever.fetch_memory(REQ, record)
 
 
 # -- nothing the launch is not served moves a hit (R2-F2 of PR #537) ---------------------

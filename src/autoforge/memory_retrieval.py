@@ -27,7 +27,11 @@ A fetch and the catalog read no backend's answer and load it once. A
 snapshot that does not continue the newest one the retriever has read (an
 older checkpoint, a saved copy, another history, an earlier launch
 ordinal) is refused, so no read is ever judged by a snapshot a later write
-or launch replaced.
+or launch replaced. Turning Memory off moves neither the rows nor the
+ordinal, so once the newest snapshot read has Memory off, one with Memory
+on is read only with a row or a launch past it, or after the controller's
+:meth:`MemoryRetriever.rebind`: a checkpoint from before the opt-out never
+reopens the read path.
 
 **The launch's scope.** What a launch is told is computed from its scope
 alone: its issue's records that apply to it (neither ``foreign`` nor
@@ -36,7 +40,8 @@ serve, whether it is missing, another issue's, another candidate's or
 refused. Every revision and freshness figure a launch is shown is the
 scope's own sequence (its records' changes, numbered 1, 2, ...), never a
 position in the store's audit table, so a write outside the scope leaves no
-gap in it; the catalog's digest numbers its records in that sequence too.
+gap in it; the catalog's digest numbers the records the launch is served
+in that sequence too, and holds nothing of a record it is not served.
 Record ids stay the run's, which a fetch and a citation need. A hit's place
 is BM25 over the store's text with its statistics over the records the
 launch is served alone (:func:`_scores`): what the launch is not served
@@ -309,8 +314,10 @@ class IndexBackend(Protocol):
     every row back. ``available`` answers ``True`` when the backend can run;
     anything else, or an error, is a backend that cannot. Errors are
     :class:`RetrievalBackendError`, and a row the backend finds malformed
-    :class:`RetrievalIntegrityError`; an answer that is not a bounded list
-    of well-formed candidates is treated as an error (:func:`_candidates`).
+    :class:`RetrievalIntegrityError`; an answer that is not exactly a list
+    or a tuple (never a subclass) of at most :data:`MAX_CANDIDATES`
+    well-formed candidates is treated as an error (:func:`_candidates`),
+    and ``entries`` must return exactly a list.
 
     ``name`` is read once, when a retriever is made, and must be lower-case
     words joined by hyphens, at most :data:`MAX_BACKEND_NAME` characters,
@@ -641,16 +648,20 @@ def _candidate(raw: object, limit: int) -> IndexCandidate:
 def _candidates(answer: object, limit: int) -> list[IndexCandidate]:
     """A backend's answer checked, bounded and deduplicated, in its rank order.
 
-    A list of at most ``limit`` candidates, each with positive integer id and
-    revision, a content digest, a finite score and a rank from 1 to
-    ``limit``; anything else is :class:`RetrievalBackendError`, a backend
-    failure like any other, and nothing of it is converted on the way. One
+    Exactly a list or a tuple, never a subclass, of at most ``limit``
+    candidates, each with positive integer id and revision, a content
+    digest, a finite score and a rank from 1 to ``limit``; anything else is
+    :class:`RetrievalBackendError`, a backend failure like any other, and
+    nothing of it is converted on the way. The container's type and length
+    are checked before anything iterates it: a subclass's ``__len__`` or
+    ``__iter__`` is the backend's code, which could report one length and
+    yield more, or raise what no fallback catches (R5-F3 of PR #537). One
     record answered with two revisions or digests is two rows of it, which
     no sync writes: :class:`RetrievalIntegrityError`, found before anything
     is deduplicated. Ordered by rank, then id, the first of each id kept:
     one record fills one place, whatever the backend repeats.
     """
-    if not isinstance(answer, list | tuple):
+    if type(answer) is not list and type(answer) is not tuple:
         raise RetrievalBackendError("a backend's answer is a list of candidates")
     if len(answer) > limit:
         raise RetrievalBackendError("a backend answered past its bound")
@@ -914,7 +925,9 @@ class MemoryCatalog:
     the launch's scope alone (its issue's records that apply to it), and
     ``status`` is the index's freshness over that scope, so nothing outside
     the scope, of another issue, candidate, environment or repository,
-    moves any of them.
+    moves any of them. The digest covers the scope's revision and the
+    records the launch is served, never the content of one it is not
+    (:func:`_scope_digest`).
     """
 
     scope: ReadScope
@@ -1081,19 +1094,26 @@ class _Scope:
 
 
 def _scope_digest(store: MemoryStore, scope: _Scope) -> str:
-    """The digest of the scope's records, each numbered in the scope's own sequence.
+    """The digest of what the launch is served, each record numbered in the scope's own sequence.
 
-    A record is its add's number and its latest change's in that sequence,
-    its content digest and the snapshot's verdict: never its run id, the
-    add's position in the store's audit table, so a write outside the scope
-    changes nothing of it, wherever it falls between the scope's writes.
+    The scope's revision, and each record the launch is served: its add's
+    number and its latest change's in that sequence and its content digest,
+    which a fetch of it gives. Never a run id, the add's position in the
+    store's audit table, so a write outside the scope changes nothing of
+    it, wherever it falls between the scope's writes. A record of the scope
+    the launch is not served (retracted, withheld, superseded) adds its
+    changes to the revision and nothing else: neither its content digest, a
+    hash of text the store refuses to serve, which a reader could test a
+    guess against, nor which refusal it is, which a fetch does not tell
+    either (R5-F2 of PR #537).
     """
     rows = [
-        [scope.seq(f.id), scope.seq(f.revision), f.content, scope.verdicts[f.id].value]
+        [scope.seq(f.id), scope.seq(f.revision), f.content]
         for f in store.facts()
-        if scope.holds(f.id)
+        if scope.served(f.id)
     ]
-    return hashlib.sha256(json.dumps(rows, separators=(",", ":")).encode()).hexdigest()
+    encoded = json.dumps([scope.source, rows], separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 def _applicability(fact: MemoryFact) -> Applicability:
@@ -1150,7 +1170,9 @@ class MemoryRetriever:
     loaded last alone, calling no backend and reading nothing of one after
     that load (its name and kind are its slot's, read once, here). A
     snapshot of another repository or run, or one that does not continue
-    the newest snapshot read before, is refused (:class:`RetrievalError`).
+    the newest snapshot read before, is refused (:class:`RetrievalError`),
+    and so is one with Memory on that nothing proves newer than an opt-out
+    read before, until the controller calls :meth:`rebind`.
     ``backend`` defaults to :class:`Fts5Backend`; ``fallback``, when given,
     must be one, and is used only when the primary cannot answer.
     """
@@ -1183,9 +1205,9 @@ class MemoryRetriever:
             self._slots.append(_slot(fallback))
         self.tail = tail
         self.metrics = RetrievalMetrics()
-        # The newest snapshot read: its revision, the digest of its rows and
-        # its launch ordinal.
-        self._seen = (0, _prefix_digest([], 0), 0)
+        # The newest snapshot read: its revision, the digest of its rows, its
+        # launch ordinal and whether Memory was on in it.
+        self._seen: tuple[int, str, int, bool] = (0, _prefix_digest([], 0), 0, True)
         self._last: _Snapshot | None = None
 
     @property
@@ -1197,7 +1219,7 @@ class MemoryRetriever:
         for slot in self._slots:
             slot.backend.close()
 
-    def _load(self) -> _Snapshot:
+    def _load(self, *, rebind: bool = False) -> _Snapshot:
         """The canonical snapshot, from the source, now; refused when it went back.
 
         The store's audit table only grows, so a snapshot whose rows up to
@@ -1209,6 +1231,16 @@ class MemoryRetriever:
         rows and an earlier ordinal is a checkpoint from before a launch,
         which would bind that launch's request again (an obsolete binding,
         :func:`~autoforge.memory.bind_request`), and is refused alike.
+
+        Turning Memory off changes neither the rows nor the ordinal
+        (:meth:`~autoforge.state.AutoForgeState.memory_setting`), so a
+        checkpoint from before an opt-out continues the opted-out one row
+        for row. Once the newest snapshot read has Memory off, a snapshot
+        with Memory on is read only with proof that it is newer than that
+        opt-out: a row past it or a later launch ordinal, which no
+        checkpoint from before the opt-out can have. Without that proof
+        only the controller can say Memory is on again (:meth:`rebind`);
+        until it does, every read is refused (R5-F1 of PR #537).
 
         The very store object read last is that snapshot again: a store is
         never changed once made (a write makes a new one), and the
@@ -1224,14 +1256,40 @@ class MemoryRetriever:
             raise RetrievalError("this memory index projects another store")
         encoded = store.encode()
         snap = _Snapshot(store, encoded.get("events", []), encoded.get("texts", {}))
-        revision, digest, launch = self._seen
+        revision, digest, launch, on = self._seen
         if snap.revision < revision or snap.prefix(revision) != digest or store.launch_seq < launch:
             raise RetrievalError(
                 "the memory source's snapshot does not continue the one this retriever read"
             )
-        self._seen = (snap.revision, snap.prefix(snap.revision), store.launch_seq)
+        enabled = store.enabled is True
+        # Equal, not just no lower: the check above refused fewer rows and an
+        # earlier ordinal, so a row or a launch past the opt-out is its proof.
+        unproven = (snap.revision, store.launch_seq) == (revision, launch)
+        if enabled and not on and not rebind and unproven:
+            raise RetrievalError(
+                "Memory was off in the newest snapshot this retriever read, and nothing proves "
+                "the source's is newer; the controller rebinds the retriever once it turns "
+                "Memory on"
+            )
+        self._seen = (snap.revision, snap.prefix(snap.revision), store.launch_seq, enabled)
         self._last = snap
         return snap
+
+    def rebind(self) -> None:
+        """Read the source again as the controller's word that Memory is on.
+
+        For the controller, once it has turned Memory on again after an
+        opt-out this retriever read: a snapshot with the opt-out's rows and
+        launch ordinal and Memory on is either that opt-in or a checkpoint
+        from before the opt-out, and only the controller knows which
+        (:meth:`_load`). The snapshot must still continue the newest one
+        read, and must have Memory on; otherwise this is refused
+        (:class:`RetrievalError`) and the opt-out stands. A rebind with no
+        opt-out to end only reads the snapshot, as any read does.
+        """
+        snap = self._load(rebind=True)
+        if snap.store.enabled is not True:
+            raise RetrievalError("Memory is off in the memory source's snapshot")
 
     def _scope(self, snap: _Snapshot, request: ProjectionRequest) -> _Scope:
         bound = bind_request(snap.store, request)
@@ -1399,8 +1457,10 @@ class MemoryRetriever:
         added after the watermark, at a revision past it, at another
         revision or digest than the record had then, or of a record not
         indexable then; a missing or second row; a row indexed by other
-        tokens; a malformed row or a failed backend check: each marks the
-        index ``failed`` (``integrity``) until it is rebuilt.
+        tokens; a malformed row; a read-back that is not exactly a list of
+        as many rows as expected, checked before anything iterates it; or a
+        failed backend check: each marks the index ``failed``
+        (``integrity``) until it is rebuilt.
         """
         health = self._health()
         snap = self._load()
@@ -1421,7 +1481,15 @@ class MemoryRetriever:
             healthy = slot.backend.check() is True
         except RetrievalBackendError:
             rows, healthy = [], False
-        if healthy and isinstance(rows, list) and all(_well_formed_entry(r) for r in rows):
+        # Exactly a list, never a subclass whose length or iteration is the
+        # backend's code, of one row per record expected, checked before
+        # anything iterates it or is derived from it (R5-F3 of PR #537).
+        if (
+            healthy
+            and type(rows) is list
+            and len(rows) == len(expected)
+            and all(_well_formed_entry(r) for r in rows)
+        ):
             keys = [(row.partition, row.id, row.revision, row.digest) for row in rows]
             # One row per record, each as the store says it was, and no other.
             healthy = (
