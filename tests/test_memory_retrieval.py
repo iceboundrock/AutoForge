@@ -3679,7 +3679,7 @@ def test_the_oracle_withholds_a_text_only_where_its_withdrawal_applies(variant):
         assert set(current) <= served, name
 
 
-@needs_fts5
+# No FTS5 needed: the benchmark judges what the tail serves alike.
 def test_a_withheld_copy_of_a_corrected_text_is_judged_by_the_oracle_never_the_store(
     monkeypatch,
 ):
