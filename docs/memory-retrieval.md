@@ -491,6 +491,16 @@ failure mid-batch publishes nothing and keeps the old watermark, and the
 store still refuses anything stale in it. So a failed or partial build
 cannot reopen a fact retracted since
 (`test_a_retracted_record_is_unservable_at_once_and_a_failed_sync_never_reopens_it`).
+That holds whatever stops the batch. Until the fifteenth review round only
+SQLite's own errors rolled it back: one Python raises binding a parameter,
+such as `OverflowError` for an id past SQLite's 64-bit integers, escaped
+with the transaction still open, so a search on the same connection read
+the batch's earlier replacement instead of the original row. Now any error
+rolls the batch back and is reported as the backend's typed failure, and
+an interrupt is rolled back and raised as it is
+(`test_an_update_python_cannot_bind_is_rolled_back_whole_and_the_next_one_commits`,
+`test_an_interrupted_update_is_rolled_back_and_the_interrupt_raised_as_it_is`).
+A store's own records never carry such an id; the bound is the backend's.
 
 A rebuild asked for explicitly is one transaction too, and the index it
 would replace stays in service until the new one commits. If it fails,

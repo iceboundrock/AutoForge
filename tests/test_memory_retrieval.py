@@ -757,6 +757,96 @@ def test_a_failed_rebuild_keeps_the_index_it_would_replace_in_service():
 
 
 @needs_fts5
+@pytest.mark.parametrize(
+    "unbindable",
+    [
+        {"id": 2**63},
+        {"revision": -(2**63) - 1},
+        {"digest": "\ud800"},
+        {"text": None},
+        {"delete": 2**63},
+    ],
+    ids=["id-past-int64", "revision-past-int64", "digest-not-utf8", "text-not-text", "delete-id"],
+)
+def test_an_update_python_cannot_bind_is_rolled_back_whole_and_the_next_one_commits(unbindable):
+    """R15-F1 of PR #537: ``apply`` is all or nothing for what Python
+    raises inside the transaction as for SQLite's own errors. A batch that
+    replaces a record, deletes another and adds a third issue's, then meets
+    a parameter ``sqlite3`` cannot bind (an integer past SQLite's 64 bits is
+    ``OverflowError``, a lone surrogate ``UnicodeEncodeError``) or a text
+    that is not text, is rolled back whole and reported as the typed
+    backend error: no search, read-back or count sees any of it, and the
+    next valid batch commits."""
+    original, second = "a" * 64, "b" * 64
+    backend = Fts5Backend()
+    backend.apply(
+        [
+            memory_retrieval.IndexDocument(ISSUE, 1, 1, original, "the original scanner lesson"),
+            memory_retrieval.IndexDocument(ISSUE, 2, 1, original, "a second scanner lesson"),
+        ],
+        [],
+    )
+    before, found = backend.entries(), backend.search(ISSUE, ["original"], [1, 2], 8)
+    assert [c.id for c in found] == [1]
+    batch = [
+        memory_retrieval.IndexDocument(ISSUE, 1, 2, second, "the replacement scanner lesson"),
+        memory_retrieval.IndexDocument(OTHER, 3, 1, original, "another issue's lesson"),
+    ]
+    deletes = [(ISSUE, 2)]
+    if "delete" in unbindable:
+        deletes.append((ISSUE, unbindable["delete"]))
+    else:
+        late = memory_retrieval.IndexDocument(ISSUE, 4, 1, original, "a late lesson")
+        batch.append(replace(late, **unbindable))
+    with pytest.raises(RetrievalBackendError, match="could not be updated"):
+        backend.apply(batch, deletes)
+    assert not backend._db.in_transaction
+    assert backend.entries() == before and backend.documents == 2
+    assert backend.search(ISSUE, ["original"], [1, 2], 8) == found
+    assert backend.search(ISSUE, ["second"], [1, 2], 8)[0].id == 2
+    assert backend.search(ISSUE, ["replacement"], [1, 2], 8) == []
+    assert backend.search(OTHER, ["another"], [3], 8) == [] and backend.check()
+    # The next valid batch commits, as it would have before the failure.
+    backend.apply(batch[:2], [(ISSUE, 2)])
+    assert [(e.partition, e.id, e.revision, e.digest) for e in backend.entries()] == [
+        (ISSUE, 1, 2, second),
+        (OTHER, 3, 1, original),
+    ]
+    assert [c.id for c in backend.search(ISSUE, ["replacement"], [1], 8)] == [1]
+    assert backend.search(ISSUE, ["original"], [1], 8) == [] and backend.documents == 2
+
+
+@needs_fts5
+def test_an_interrupted_update_is_rolled_back_and_the_interrupt_raised_as_it_is():
+    """R15-F1 of PR #537: an interrupt mid-batch is no update's failure to
+    report, but the transaction it stopped is still rolled back before it
+    propagates, so no later read sees part of the batch."""
+
+    class Interrupted(Fts5Backend):
+        def _insert(self, db, table, doc):
+            if doc.id == 3:
+                raise KeyboardInterrupt
+            super()._insert(db, table, doc)
+
+    digest = "a" * 64
+    backend = Interrupted()
+    backend.apply([memory_retrieval.IndexDocument(ISSUE, 1, 1, digest, "the original")], [])
+    before = backend.entries()
+    with pytest.raises(KeyboardInterrupt):
+        backend.apply(
+            [
+                memory_retrieval.IndexDocument(ISSUE, 1, 2, digest, "the replacement"),
+                memory_retrieval.IndexDocument(ISSUE, 3, 1, digest, "never indexed"),
+            ],
+            [],
+        )
+    assert not backend._db.in_transaction and backend.entries() == before
+    assert [c.id for c in backend.search(ISSUE, ["original"], [1], 8)] == [1]
+    backend.apply([memory_retrieval.IndexDocument(ISSUE, 1, 2, digest, "the replacement")], [])
+    assert [c.revision for c in backend.search(ISSUE, ["replacement"], [1], 8)] == [2]
+
+
+@needs_fts5
 def test_a_rebuild_that_failed_or_could_not_run_is_made_by_the_next_sync():
     """R4-F2 of PR #537: a rebuild asked for is owed until one commits. The
     index it would replace is still current, so with no store write between,

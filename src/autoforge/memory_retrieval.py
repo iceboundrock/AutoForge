@@ -595,9 +595,18 @@ class Fts5Backend:
             if count > MAX_INDEX_DOCUMENTS:
                 raise RetrievalBackendError("the index is past its document bound")
             db.execute("COMMIT")
-        except (sqlite3.Error, RetrievalBackendError):
+        except BaseException as exc:
+            # Whatever stopped the update is rolled back before anything else
+            # reads the connection, so no search sees part of it: SQLite's own
+            # errors, and as much what Python raises binding a parameter it
+            # cannot pass (an integer past SQLite's 64 bits is OverflowError,
+            # a string that is not UTF-8 UnicodeEncodeError), or an interrupt
+            # (R15-F1 of PR #537). An interrupt is raised again as it is; any
+            # other error is the update's failure, typed.
             if db.in_transaction:
                 db.execute("ROLLBACK")
+            if not isinstance(exc, Exception):
+                raise
             raise RetrievalBackendError("the FTS5 index could not be updated") from None
         self._tables, self._documents = tables, count
 
