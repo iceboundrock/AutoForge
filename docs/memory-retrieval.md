@@ -164,13 +164,20 @@ watermark without forcing a healthy generation to be rebuilt: the next
 Without FTS5 the index is unavailable and only the bounded tail is used.
 An optional controller-supplied lexical backend has no output channel
 besides bounded IDs. If explicitly configured, a separate, usable FTS5
-fallback can answer on the same call. Search, fetch and catalog report the
-answering fallback's status with `degraded=true`; controller `status()`
-still reports the primary. Without a usable fallback the tail reports the
-primary's status. Transient search unavailability is retried on the next
-eligible query, whereas a contradictory or failed lookup disqualifies
-that generation. Neither availability nor failures are shared across
-readers of different launch scopes.
+fallback answers in the primary's place when the primary cannot answer,
+on the same call, and when it holds more of the authorized records than
+the primary. Both are refreshed from the same corpus, so only a failed
+refresh of the primary, which keeps its last generation, leaves the
+fallback ahead; on equal coverage the primary answers. If the preferred
+generation cannot answer a search, the other is asked on the same call,
+so an older generation still serves its records and the tail the rest.
+Search, fetch and catalog report the answering fallback's status with
+`degraded=true`; controller `status()` still reports the primary. Without
+a usable fallback the tail reports the primary's status. Transient search
+unavailability is retried on the next eligible query, whereas a
+contradictory or failed lookup disqualifies that generation. Neither
+availability nor failures are shared across readers of different launch
+scopes.
 
 ## Offline evidence
 

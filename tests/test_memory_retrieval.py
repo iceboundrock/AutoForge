@@ -7,6 +7,7 @@ from dataclasses import replace
 
 import pytest
 
+from autoforge import memory_fts5
 from autoforge import memory_retrieval as retrieval
 from autoforge.errors import StateError
 from autoforge.memory import Action, Actor, EvidenceRef, Kind, Range, Receipt, Retention
@@ -511,6 +512,91 @@ def test_bad_batch_and_failed_forced_rebuild_keep_the_previous_generation(fts5, 
     assert texts(optional.search_memory("key")) == ["key original"]
     fail[0] = False
     assert optional.sync().failed == 0 and optional.status().generation == before.generation + 1
+
+
+def left_behind(before_refresh=lambda: None, **kwargs):
+    """The optional backend holds one record; nine matches follow and its refresh fails."""
+    fail = [False]
+
+    def factory(docs):
+        if fail[0]:
+            raise BackendError("refresh failed")
+        return ScriptedIndex(docs)
+
+    source, reader = instance(
+        apply(proposal(empty(), "unrelated record", n=1)), backend=factory, **kwargs
+    )
+    reader.sync()
+    for n in range(2, 11):
+        source[0] = apply(proposal(source[0], f"match {n}", n=n))
+    fail[0] = True
+    before_refresh()
+    status = reader.sync()
+    # Controller status reports the primary, whichever slot answers launches.
+    assert status.backend is Backend.OPTIONAL and status.problem is IndexProblem.BUILD
+    assert status.state is IndexState.STALE and status.pending == 9
+    return fail, reader
+
+
+def test_a_current_fallback_answers_for_a_primary_a_failed_refresh_left_behind(fts5):
+    # R4-F1 of PR #538: the old generation answered for one record of ten.
+    fail, reader = left_behind(fallback_to_fts5=True)
+    result = reader.search_memory("match", k=16)
+    assert sorted(h.item.id for h in result.hits) == list(range(2, 11))
+    assert result.complete and not result.tail_used and result.degraded
+    assert result.index.backend is Backend.FTS5 and result.index.is_current
+    fetched, catalog = reader.fetch_memory(2), reader.catalog()
+    assert fetched.item.id == 2 and fetched.degraded and catalog.degraded
+    assert fetched.index == catalog.index == result.index
+    assert "degraded: true" in catalog.render()
+    assert reader.metrics == retrieval.ReadMetrics(1, 1, 10, 2)
+    assert reader.status().problem is IndexProblem.BUILD
+    fail[0] = False
+    assert reader.sync().is_current
+    recovered = reader.search_memory("match", k=16)
+    assert recovered.hits == result.hits and recovered.complete and not recovered.degraded
+    assert recovered.index.backend is Backend.OPTIONAL and recovered.index.is_current
+    assert not reader.fetch_memory(2).degraded and not reader.catalog().degraded
+
+
+def test_the_older_generation_still_answers_when_no_better_fallback_can(fts5, monkeypatch):
+    _, alone = left_behind()
+    expected = alone.search_memory("match", k=16)
+    assert len(expected.hits) == 8 and not expected.complete and expected.tail_used
+    assert not expected.degraded and expected.index.backend is Backend.OPTIONAL
+    assert expected.index.state is IndexState.STALE
+    assert expected.index.problem is IndexProblem.BUILD
+
+    # The better fallback is unavailable on this call: the primary answers it.
+    _, reader = left_behind(fallback_to_fts5=True)
+    fallback = reader._fallback.published.index
+
+    def unavailable(terms):
+        raise IndexUnavailable("transient")
+
+    fallback.search = unavailable
+    answer = reader.search_memory("match", k=16)
+    assert answer.hits == expected.hits and answer.index == expected.index
+    assert not answer.degraded and not answer.complete
+    assert reader.fetch_memory(2).index == reader.catalog().index == answer.index
+    assert not reader.fetch_memory(2).degraded and not reader.catalog().degraded
+    # The next search retries it.
+    del fallback.search
+    retried = reader.search_memory("match", k=16)
+    assert len(retried.hits) == 9 and retried.complete and retried.degraded
+    assert retried.index.backend is Backend.FTS5 and retried.index.is_current
+    assert reader.catalog().degraded
+
+    # A fallback whose own refresh failed holds no more than the primary.
+    def refuse(docs):
+        raise BackendError("refresh failed")
+
+    _, both = left_behind(
+        lambda: monkeypatch.setattr(memory_fts5, "Fts5Index", refuse), fallback_to_fts5=True
+    )
+    held = both.search_memory("match", k=16)
+    assert held.hits == expected.hits and held.index == expected.index and not held.degraded
+    assert not both.fetch_memory(2).degraded and not both.catalog().degraded
 
 
 def test_maintenance_reports_freshness_after_backend_work():

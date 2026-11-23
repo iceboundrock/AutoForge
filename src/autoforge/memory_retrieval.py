@@ -423,6 +423,14 @@ class _Slot:
             and self.published.versions <= view.versions
         )
 
+    def answers(self, view: _View) -> bool:
+        return self.usable(view) and self.problem is not IndexProblem.UNAVAILABLE
+
+    def coverage(self) -> int:
+        # The authorized records a usable generation holds at their current
+        # version: all it holds, since a usable one holds nothing else.
+        return 0 if self.published is None else len(self.published.versions)
+
 
 def _manifest(documents: tuple[IndexDocument, ...]) -> tuple[DocumentSeal, ...]:
     result = []
@@ -624,17 +632,32 @@ class MemoryRetriever:
             view = self._read(serving=False)
         return _status(self._primary, view)
 
-    def _answers(self, view: _View) -> tuple[ScopeFreshness, bool]:
-        if self._primary.usable(view) and self._primary.problem is not IndexProblem.UNAVAILABLE:
-            return _freshness(self._primary, view), False
+    def _prefers_fallback(self, view: _View, *, searching: bool = False) -> bool:
+        """Whether the fallback answers in the primary's place (R4-F1 of PR #538).
+
+        It does when it can answer and the primary either cannot or holds
+        fewer of the authorized records: a failed refresh of the primary
+        keeps its last generation, which a successful refresh of the
+        fallback overtakes. Both are refreshed from the same view, so
+        nothing else leaves them apart. On equal coverage the primary
+        answers. A search also asks a generation whose last lookup was
+        unavailable, to retry it.
+        """
+
+        def ready(slot: _Slot) -> bool:
+            return slot.usable(view) if searching else slot.answers(view)
+
         fallback = self._fallback
-        if (
-            fallback is not None
-            and fallback.usable(view)
-            and fallback.problem is not IndexProblem.UNAVAILABLE
-        ):
-            return _freshness(fallback, view), True
-        return _freshness(self._primary, view), True
+        if fallback is None or not ready(fallback):
+            return False
+        primary = self._primary
+        return not ready(primary) or fallback.coverage() > primary.coverage()
+
+    def _answers(self, view: _View) -> tuple[ScopeFreshness, bool]:
+        if self._prefers_fallback(view):
+            assert self._fallback is not None
+            return _freshness(self._fallback, view), True
+        return _freshness(self._primary, view), not self._primary.answers(view)
 
     def fetch_memory(self, record: int) -> FetchResult:
         view = self._read()
@@ -723,25 +746,31 @@ class MemoryRetriever:
             index, degraded = self._answers(view)
             self._count(fetch=False, hits=0, degraded=degraded)
             return SearchResult(view.scope, (), index, view.revision, True, degraded, False)
-        primary, view, covered, matches = self._lookup(self._primary, view, terms)
-        used = primary
-        # A successful empty generation has no covered rows either.
-        answered = used.usable(view) and used.problem is not IndexProblem.UNAVAILABLE
-        if not answered and self._fallback is not None:
-            self._fallback, view, covered, matches = self._lookup(self._fallback, view, terms)
-            if (
-                self._fallback.usable(view)
-                and self._fallback.problem is not IndexProblem.UNAVAILABLE
-            ):
-                used = self._fallback
-                answered = True
-            if not self._primary.usable(view):
-                # The fallback's authority read can invalidate the primary's
-                # (so far unrecorded) diagnosis as well as its candidates.
-                if used is primary:
-                    used = self._primary
-                primary = self._primary
-        self._primary = primary
+        primary, fallback = self._primary, self._fallback
+        order = [primary] if fallback is None else [primary, fallback]
+        if self._prefers_fallback(view, searching=True):
+            # The other slot is still asked if the preferred one cannot
+            # answer: an older generation is better than the tail alone.
+            order.reverse()
+        diagnosed: list[tuple[_Slot, _Slot]] = []
+        used: _Slot | None = None
+        covered: frozenset[tuple[int, int]] = frozenset()
+        matches: set[int] = set()
+        for slot in order:
+            after, view, held, found = self._lookup(slot, view, terms)
+            diagnosed.append((slot, after))
+            # A successful empty generation has no covered rows either.
+            if after.answers(view):
+                used, covered, matches = after, held, found
+                break
+        for slot, after in diagnosed:
+            # A later lookup's authority read can invalidate an earlier one's
+            # (so far unrecorded) diagnosis as well as its candidates.
+            kept = after if slot.usable(view) else slot
+            if slot is primary:
+                self._primary = kept
+            else:
+                self._fallback = kept
         tail = sorted(
             (r for r in view.records if (r.fact.id, r.fact.revision) not in covered),
             key=lambda r: r.fact.revision,
@@ -750,12 +779,12 @@ class MemoryRetriever:
         selected = tail[:TAIL_RECORDS]
         hits = _rank(view.records, matches, selected, terms, k, self._request)
         assert view.scope is not None
-        degraded = not answered or used is not self._primary
+        degraded = used is None or used is not self._primary
         self._count(fetch=False, hits=len(hits), degraded=degraded)
         return SearchResult(
             view.scope,
             hits,
-            _freshness(used, view),
+            _freshness(self._primary if used is None else used, view),
             view.revision,
             len(tail) <= TAIL_RECORDS,
             degraded,

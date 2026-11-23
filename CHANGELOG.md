@@ -17,7 +17,9 @@ binding's authorized records, never the ledger's audit positions, and
 their excerpts fit the request's character and byte budgets. The catalog
 carries a content fingerprint that no withheld record moves; search and
 fetch also carry an identity revision that changes when a record is
-replaced by one of the same text. No launch wiring or default changes.
+replaced by one of the same text. A configured FTS5 fallback answers,
+marked degraded, whenever the optional backend cannot or a failed refresh
+left it holding fewer records. No launch wiring or default changes.
 See the [retrieval guide](docs/memory-retrieval.md) for freshness and
 fallback behavior, fixture results and the LTSearch no-go.
 
