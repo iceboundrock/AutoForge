@@ -502,6 +502,31 @@ an interrupt is rolled back and raised as it is
 `test_an_interrupted_update_is_rolled_back_and_the_interrupt_raised_as_it_is`).
 A store's own records never carry such an id; the bound is the backend's.
 
+What an update publishes is as atomic as its rows. The FTS5 backend's map
+of the table each partition is in, and its count of documents, are rows of
+the same in-memory database, written by the update's transaction, so a
+commit publishes them with the rows; nothing of the index is kept beside
+it in Python. Until the seventeenth review round the map was a Python
+dictionary replaced after the commit: an interrupt just after a rebuild's
+COMMIT left it naming the tables the rebuild had dropped, while the status
+said `current`, the next search failed, and every later sync and rebuild
+failed dropping them again. A transaction an interrupt leaves open, one
+stopped before its rollback ran, is rolled back by the backend's next call
+before that call reads anything. The retriever marks an update in flight
+from just before it hands it to the backend until it has recorded the
+outcome. A read that finds one still marked, an interrupt having stopped
+the update before or after its commit or while the retriever recorded it,
+counts it a failed sync (`failed` 1, `sync-failed`) and owes a rebuild.
+The index stays in service as it was: an update is atomic, so the index
+holds every record unchanged since the watermark as the sync through it
+wrote it, and a search asks it about no other record. `verify` reports a
+row an interrupted sync committed past the watermark, which no sync is
+known to have written, as `integrity`. The next sync or rebuild makes the
+rebuild, and only its commit clears the failure
+(`test_an_interrupted_rebuild_is_reported_failed_and_the_next_sync_rebuilds`,
+`test_an_interrupt_after_an_incremental_syncs_commit_is_settled_and_rebuilt`,
+`test_an_interrupt_that_stops_a_rollback_leaves_it_to_the_next_call`).
+
 A rebuild asked for explicitly is one transaction too, and the index it
 would replace stays in service until the new one commits. If it fails,
 SQLite keeps the old rows, and the retriever keeps the old index's

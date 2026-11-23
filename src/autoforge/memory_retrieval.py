@@ -197,6 +197,9 @@ _ASCII_TOKEN = re.compile(r"[a-z0-9]+")
 # starting with ``x``, which marks every other token's hex form.
 _LITERAL_TOKEN = re.compile(r"[a-wyz0-9][a-z0-9]*")
 _DIGEST = re.compile(r"[a-f0-9]{64}")
+# An FTS5 table of a partition: the backend's own serial, never the
+# partition's text (:class:`Fts5Backend`).
+_TABLE_NAME = re.compile(r"p[1-9][0-9]*")
 # A partition is a record's issue URL, which a store bounds to 192
 # characters (``memory._issue``).
 MAX_PARTITION = 192
@@ -532,23 +535,86 @@ def _match_expression(terms: Sequence[str]) -> str:
 
 
 class Fts5Backend:
-    """BM25 over SQLite FTS5, in memory, one table per partition."""
+    """BM25 over SQLite FTS5, in memory, one table per partition.
+
+    The database is the whole index: each partition's table, the map naming
+    the table of each partition (``partitions``) and the count of documents
+    held (``counts``), each written by the one transaction of an update.
+    Nothing of the index is kept beside it in Python, so an update that
+    commits has published all of it, and one stopped anywhere leaves the
+    map naming exactly the tables the database holds. Until the seventeenth
+    review round the map was a Python dictionary replaced after the commit:
+    an interrupt between the two left it naming the tables a rebuild had
+    just dropped, so every search failed, and every later sync and rebuild
+    failed dropping them again (R17-F1 of PR #537). A transaction an
+    interrupt left open, one stopped before its rollback ran, is rolled back
+    before any later call reads the connection (:meth:`_require`).
+    """
 
     name = FTS5_BACKEND
 
     def __init__(self) -> None:
-        self._db = _open_memory_database()
-        self._tables: dict[str, str] = {}
-        self._documents = 0
+        db = _open_memory_database()
+        if db is not None:
+            try:
+                db.execute(
+                    "CREATE TABLE partitions(partition TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE)"
+                )
+                db.execute("CREATE TABLE counts(documents INTEGER NOT NULL)")
+                db.execute("INSERT INTO counts(documents) VALUES (0)")
+            except sqlite3.Error:
+                db.close()
+                db = None
+        self._db = db
         self._serial = 0
 
     def available(self) -> bool:
         return self._db is not None
 
     def _require(self) -> sqlite3.Connection:
-        if self._db is None:
+        """The connection, with no transaction open.
+
+        No call leaves one open on return; one is open here only when an
+        interrupt stopped :meth:`apply` before its rollback ran. It holds
+        part of an update, so it is rolled back here, before the call reads
+        anything: no search, read-back or count sees any of it.
+        """
+        db = self._db
+        if db is None:
             raise RetrievalBackendError("this SQLite has no FTS5")
-        return self._db
+        if db.in_transaction:
+            try:
+                db.execute("ROLLBACK")
+            except sqlite3.Error:
+                raise RetrievalBackendError("the FTS5 index could not be rolled back") from None
+        return db
+
+    @staticmethod
+    def _table_map(db: sqlite3.Connection) -> dict[str, str]:
+        """Each partition's table, as the database names it.
+
+        A name is checked to be one this backend gives before any statement
+        is built with it: anything else is :class:`RetrievalIntegrityError`.
+        """
+        try:
+            rows = db.execute("SELECT partition, name FROM partitions").fetchall()
+        except sqlite3.Error:
+            raise RetrievalBackendError("the FTS5 index could not be read") from None
+        tables = {}
+        for partition, name in rows:
+            if (
+                type(partition) is not str
+                or type(name) is not str
+                or not _TABLE_NAME.fullmatch(name)
+            ):
+                raise RetrievalIntegrityError("the FTS5 index names a table it never made")
+            tables[partition] = name
+        return tables
+
+    @property
+    def _tables(self) -> dict[str, str]:
+        """Each partition's table, as the database names it now (:meth:`_table_map`)."""
+        return self._table_map(self._require())
 
     @staticmethod
     def _insert(db: sqlite3.Connection, table: str, doc: IndexDocument) -> None:
@@ -567,15 +633,27 @@ class Fts5Backend:
     ) -> None:
         db = self._require()
         # Table names are the backend's own serial (p1, p2, ...), never a
-        # partition's text; the mapping is replaced only once the transaction
-        # commits, so a rolled-back update leaves it as it was.
-        tables = {} if clear else dict(self._tables)
-        count = 0 if clear else self._documents
+        # partition's text. The map of them and the count of documents are
+        # read and written inside the transaction, with the tables: a
+        # rolled-back update leaves all three as they were, and one that
+        # commits has published all three, whatever stops this call after
+        # its COMMIT (R17-F1 of PR #537).
         try:
             db.execute("BEGIN IMMEDIATE")
             if clear:
-                for old in self._tables.values():
-                    db.execute(f"DROP TABLE {old}")
+                # Every partition table the database holds, whatever the map
+                # names: a rebuild replaces the whole index.
+                for (old,) in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall():
+                    if type(old) is str and _TABLE_NAME.fullmatch(old):
+                        db.execute(f"DROP TABLE {old}")
+                db.execute("DELETE FROM partitions")
+                tables: dict[str, str] = {}
+                count = 0
+            else:
+                tables = self._table_map(db)
+                (count,) = db.execute("SELECT documents FROM counts").fetchone()
             for partition, record in deletes:
                 if (gone := tables.get(partition)) is not None:
                     count -= db.execute(f"DELETE FROM {gone} WHERE rowid = ?", (record,)).rowcount
@@ -588,12 +666,17 @@ class Fts5Backend:
                         f"CREATE VIRTUAL TABLE {table} USING fts5(body, revision UNINDEXED, "
                         f"digest UNINDEXED, tokenize = '{FTS5_TOKENIZER}')"
                     )
+                    db.execute(
+                        "INSERT INTO partitions(partition, name) VALUES (?, ?)",
+                        (doc.partition, table),
+                    )
                     tables[doc.partition] = table
                 count -= db.execute(f"DELETE FROM {table} WHERE rowid = ?", (doc.id,)).rowcount
                 self._insert(db, table, doc)
                 count += 1
             if count > MAX_INDEX_DOCUMENTS:
                 raise RetrievalBackendError("the index is past its document bound")
+            db.execute("UPDATE counts SET documents = ?", (count,))
             db.execute("COMMIT")
         except BaseException as exc:
             # Whatever stopped the update is rolled back before anything else
@@ -602,19 +685,19 @@ class Fts5Backend:
             # cannot pass (an integer past SQLite's 64 bits is OverflowError,
             # a string that is not UTF-8 UnicodeEncodeError), or an interrupt
             # (R15-F1 of PR #537). An interrupt is raised again as it is; any
-            # other error is the update's failure, typed.
+            # other error is the update's failure, typed. One that stops this
+            # rollback leaves the transaction to the next call's (_require).
             if db.in_transaction:
                 db.execute("ROLLBACK")
             if not isinstance(exc, Exception):
                 raise
             raise RetrievalBackendError("the FTS5 index could not be updated") from None
-        self._tables, self._documents = tables, count
 
     def search(
         self, partition: str, terms: Sequence[str], records: Sequence[int], limit: int
     ) -> list[IndexCandidate]:
         db = self._require()
-        table = self._tables.get(partition)
+        table = self._table_map(db).get(partition)
         if len(records) > limit or not all(type(r) is int for r in records):
             raise RetrievalBackendError("an FTS5 search is asked about at most its limit of ids")
         if table is None or not terms or not records:
@@ -665,10 +748,11 @@ class Fts5Backend:
         reports either failure in the status it returns (R12-F3 of PR #537).
         """
         db = self._require()
+        tables = self._table_map(db)
         try:
             rows = [
                 (partition, row)
-                for partition, table in self._tables.items()
+                for partition, table in tables.items()
                 for row in db.execute(f"SELECT rowid, revision, digest, body FROM {table}")
             ]
         except sqlite3.Error:
@@ -691,9 +775,9 @@ class Fts5Backend:
     def check(self) -> bool:
         db = self._require()
         try:
-            for table in self._tables.values():
+            for table in self._table_map(db).values():
                 db.execute(f"INSERT INTO {table}({table}) VALUES ('integrity-check')")
-        except sqlite3.Error:
+        except (sqlite3.Error, RetrievalBackendError):
             return False
         return True
 
@@ -704,7 +788,14 @@ class Fts5Backend:
 
     @property
     def documents(self) -> int:
-        return self._documents
+        """How many documents the index holds, as its database counts them; 0 without FTS5."""
+        if self._db is None:
+            return 0
+        try:
+            (count,) = self._require().execute("SELECT documents FROM counts").fetchone()
+        except sqlite3.Error:
+            raise RetrievalBackendError("the FTS5 index could not be read") from None
+        return int(count)
 
     def close(self) -> None:
         if self._db is not None:
@@ -1154,7 +1245,11 @@ class _Slot:
     ``name`` and ``fts5`` were read from the backend when the retriever was
     made (:func:`_slot`), so a read that reports them runs none of its code.
     ``owed`` is a rebuild asked for that has not committed: the next sync
-    makes it, however current the index it would replace.
+    makes it, however current the index it would replace. ``updating`` is
+    an update handed to the backend whose outcome is not yet recorded here:
+    set just before ``apply`` is called and cleared only once the outcome
+    is, so it is still set after an interrupt that stopped either, and the
+    next read settles it (:meth:`MemoryRetriever._settle`).
     """
 
     backend: IndexBackend
@@ -1166,6 +1261,7 @@ class _Slot:
     failures: int = 0
     broken: IndexReason = IndexReason.NONE
     owed: bool = False
+    updating: bool = False
 
 
 def _slot(backend: IndexBackend) -> _Slot:
@@ -1508,6 +1604,34 @@ class MemoryRetriever:
 
     # -- freshness ------------------------------------------------------------
 
+    def _settle(self) -> None:
+        """Count each update whose outcome no slot recorded a failed sync, and owe a rebuild.
+
+        An interrupt, or an error ``apply`` raises other than
+        :class:`RetrievalBackendError`, leaves :meth:`_sync` with the slot
+        still ``updating``. The backend may have committed the update or
+        not, and the slot's watermark, generation and failure count may be
+        those from before it or part of what follows a commit. An update is
+        atomic, so the index holds what a sync through the watermark wrote,
+        or that and the update. Either way it holds each record the store
+        has not changed since the watermark as that sync wrote it, and a
+        search asks it about no other record (:meth:`_asked`): it stays
+        readable as it was. But no sync is known to have made it what it
+        holds. So the update is a failed sync, counted and reported
+        ``sync-failed``, and a rebuild is owed: the next sync or rebuild
+        makes it, whatever the backend holds, and only its commit clears
+        the failure, as after any failed rebuild. Until the seventeenth
+        review round nothing recorded such an update: an interrupt after an
+        FTS5 rebuild's commit left the index reported ``current`` with no
+        failure, though no search could read it (R17-F1 of PR #537).
+        """
+        for slot in self._slots:
+            if slot.updating:
+                slot.failures = min(slot.failures + 1, MAX_COUNTER)
+                slot.owed = True
+                self.metrics.count("sync_failures")
+                slot.updating = False
+
     def _health(self) -> tuple[bool, ...]:
         """Whether each slot's backend can run, asked once per read, before the store is loaded.
 
@@ -1516,8 +1640,10 @@ class MemoryRetriever:
         snapshot that judges the read. An answer other than ``True``, or a
         :class:`RetrievalBackendError`, is a backend that cannot run now:
         the read goes to the fallback or the tail, and the next read asks
-        again.
+        again. Every read starts here, so an update an interrupt stopped is
+        settled first (:meth:`_settle`), before anything reports a slot.
         """
+        self._settle()
         health = []
         for slot in self._slots:
             try:
@@ -1642,25 +1768,34 @@ class MemoryRetriever:
             return
         store = snap.store
         status = self._status(slot, up, snap)
+        rebuilding = slot.owed or status.state in (IndexState.EMPTY, IndexState.FAILED)
+        if rebuilding:
+            docs = [d for f in store.facts() if (d := _document(store, f)) is not None]
+        elif status.state is IndexState.STALE:
+            changed = [f for f in store.facts() if f.revision > slot.through]
+            upserts = [d for f in changed if (d := _document(store, f)) is not None]
+            deletes = [(f.scope.step.issue_url, f.id) for f in changed if not _indexable(f)]
+        else:
+            return
+        # From here until the outcome is recorded, whatever stops this call
+        # leaves the update for the next read to settle (_settle).
+        slot.updating = True
         try:
-            if slot.owed or status.state in (IndexState.EMPTY, IndexState.FAILED):
-                docs = [d for f in store.facts() if (d := _document(store, f)) is not None]
+            if rebuilding:
                 slot.backend.apply(docs, (), clear=True)
-                slot.generation += 1
-                self.metrics.count("rebuilds")
-            elif status.state is IndexState.STALE:
-                changed = [f for f in store.facts() if f.revision > slot.through]
-                upserts = [d for f in changed if (d := _document(store, f)) is not None]
-                deletes = [(f.scope.step.issue_url, f.id) for f in changed if not _indexable(f)]
-                slot.backend.apply(upserts, deletes)
             else:
-                return
+                slot.backend.apply(upserts, deletes)
         except RetrievalBackendError:
             slot.failures = min(slot.failures + 1, MAX_COUNTER)
             self.metrics.count("sync_failures")
+            slot.updating = False
             return
+        if rebuilding:
+            slot.generation += 1
+            self.metrics.count("rebuilds")
         slot.built, slot.broken, slot.failures, slot.owed = True, IndexReason.NONE, 0, False
         slot.through = snap.revision
+        slot.updating = False
 
     def verify(self) -> IndexStatus:
         """Compare every row of the primary index with the canonical store at its watermark.

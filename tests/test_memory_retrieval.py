@@ -848,6 +848,213 @@ def test_an_interrupted_update_is_rolled_back_and_the_interrupt_raised_as_it_is(
     assert [c.revision for c in backend.search(ISSUE, ["replacement"], [1], 8)] == [2]
 
 
+class Interrupting:
+    """A backend's connection that raises ``KeyboardInterrupt`` once at ``statement``.
+
+    After SQLite has run it, or, with ``before``, instead of running it:
+    an interrupt arriving at that exact point of :meth:`Fts5Backend.apply`.
+    Every other statement and attribute is the connection's own.
+    """
+
+    def __init__(self, db, statement, *, before=False):
+        self.db, self.statement, self.before, self.fired = db, statement, before, False
+
+    def __getattr__(self, name):
+        return getattr(self.db, name)
+
+    def execute(self, sql, *args):
+        armed = sql == self.statement and not self.fired
+        if armed and self.before:
+            self.fired = True
+            raise KeyboardInterrupt
+        cursor = self.db.execute(sql, *args)
+        if armed:
+            self.fired = True
+            raise KeyboardInterrupt
+        return cursor
+
+
+def _table_exists(db, name):
+    return db.execute("SELECT count(*) FROM sqlite_master WHERE name = ?", (name,)).fetchone()[0]
+
+
+@needs_fts5
+@pytest.mark.parametrize("where", ["after the commit", "after apply returned", "while recorded"])
+def test_an_interrupted_rebuild_is_reported_failed_and_the_next_sync_rebuilds(where, monkeypatch):
+    """R17-F1 of PR #537: an interrupt that stops a rebuild after its
+    commit, before anything has recorded it, leaves the same retriever a
+    truthful status and an index it can search and rebuild. Until the
+    seventeenth review round the FTS5 backend replaced its map of partition
+    tables in Python after the commit: an interrupt just after COMMIT left
+    the map naming the tables the rebuild had dropped, while the status
+    said ``current``, the next search failed, and every later sync and
+    rebuild failed dropping them again. The map now lives in the database,
+    written by the rebuild's transaction, so a committed rebuild has
+    published it. The retriever marks an update in flight until it has
+    recorded its outcome: wherever the interrupt lands (in the backend
+    after COMMIT, after ``apply`` returned, or while the retriever records
+    the rebuild), the next read counts it a failed sync and owes a rebuild.
+    The index stays in service, the next sync makes the rebuild, and an
+    explicit rebuild after it commits too."""
+    w = corpus()
+    backend = Fts5Backend()
+    retriever = retriever_for(w, backend=backend)
+    synced = retriever.sync()
+    rows, table = backend.entries(), backend._tables[ISSUE]
+    whole = retriever.search_memory(REQ, "trailing comma tokenizer")
+    assert whole.backend == "sqlite-fts5" and whole.complete and not whole.degraded
+    db = backend._db
+    if where == "after the commit":
+        backend._db = Interrupting(db, "COMMIT")
+    elif where == "after apply returned":
+        commit = backend.apply
+
+        def apply(*args, **kwargs):
+            commit(*args, **kwargs)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(backend, "apply", apply)
+    else:
+        count = retriever.metrics.count
+
+        def counted(name, n=1):
+            if name == "rebuilds":
+                raise KeyboardInterrupt
+            count(name, n)
+
+        monkeypatch.setattr(retriever.metrics, "count", counted)
+    with pytest.raises(KeyboardInterrupt):
+        retriever.rebuild()
+    monkeypatch.undo()
+    # The rebuild committed: a new table holds the same rows, the old one is
+    # gone, and the map names exactly the table the database holds.
+    assert not db.in_transaction and backend.entries() == rows
+    assert backend._tables[ISSUE] != table and not _table_exists(db, table)
+    assert _table_exists(db, backend._tables[ISSUE]) and backend.documents == 4
+    # Recorded as far as the interrupt let it: in the third case the new
+    # generation was counted before the interrupt.
+    generation = synced.generation + (where == "while recorded")
+    status = retriever.status()
+    assert (status.state, status.generation, status.indexed_through_seq) == (
+        IndexState.CURRENT,
+        generation,
+        synced.indexed_through_seq,
+    )
+    assert (status.failed, status.reason) == (1, IndexReason.SYNC_FAILED)
+    assert retriever.metrics.snapshot()["sync_failures"] == 1
+    # The index is still in service, and as complete as before.
+    again = retriever.search_memory(REQ, "trailing comma tokenizer")
+    assert again.backend == "sqlite-fts5" and again.complete and not again.degraded
+    assert [(h.id, h.summary, h.provenance.score) for h in again.hits] == [
+        (h.id, h.summary, h.provenance.score) for h in whole.hits
+    ]
+    assert again.status == retriever.catalog(REQ).status and again.status.failed == 1
+    assert retriever.verify() == status
+    # The next sync makes the rebuild it owes, and only its commit clears the
+    # failure; an explicit rebuild after it commits too.
+    rebuilt = retriever.sync()
+    assert (rebuilt.state, rebuilt.generation, rebuilt.failed, rebuilt.reason) == (
+        IndexState.CURRENT,
+        generation + 1,
+        0,
+        IndexReason.NONE,
+    )
+    assert retriever.rebuild().generation == generation + 2
+    assert retriever.verify().state is IndexState.CURRENT and backend.entries() == rows
+    final = retriever.search_memory(REQ, "trailing comma tokenizer")
+    assert final.backend == "sqlite-fts5" and final.complete and not final.degraded
+    assert {h.provenance.generation for h in final.hits} == {generation + 2}
+    assert retriever.metrics.snapshot()["sync_failures"] == 1
+
+
+@needs_fts5
+def test_an_interrupt_after_an_incremental_syncs_commit_is_settled_and_rebuilt():
+    """R17-F1 of PR #537, an incremental sync's half: an interrupt after its
+    commit leaves the index holding a record written after the watermark
+    the retriever still reports. The status says so, ``stale`` with one
+    pending and the sync failed, and a search reads that record on the
+    store (the tail) and is complete. ``verify``, which compares every row
+    with what a sync through the watermark wrote, finds that record's row
+    past it and reports the index ``failed``: no sync is known to have
+    written it. The next sync rebuilds the index either way."""
+    w = corpus()
+    backend = Fts5Backend()
+    retriever = retriever_for(w, backend=backend)
+    synced = retriever.sync()
+    added = w.add("scanner", "The scanner keeps a trailing comma's quotes intact.")
+    db = backend._db
+    backend._db = Interrupting(db, "COMMIT")
+    with pytest.raises(KeyboardInterrupt):
+        retriever.sync()
+    assert backend._db.fired and not db.in_transaction
+    assert added in [e.id for e in backend.entries()] and backend.documents == 5
+    status = retriever.status()
+    assert (status.state, status.indexed_through_seq, status.pending, status.generation) == (
+        IndexState.STALE,
+        synced.indexed_through_seq,
+        1,
+        synced.generation,
+    )
+    assert (status.failed, status.reason) == (1, IndexReason.SYNC_FAILED)
+    result = retriever.search_memory(REQ, "trailing comma")
+    assert result.backend == "sqlite-fts5" and result.complete and not result.degraded
+    (hit,) = (hit for hit in result.hits if hit.id == added)
+    assert hit.provenance.backend == TAIL_BACKEND
+    checked = retriever.verify()
+    assert (checked.state, checked.reason, checked.failed) == (
+        IndexState.FAILED,
+        IndexReason.INTEGRITY,
+        1,
+    )
+    recovered = retriever.sync()
+    assert (recovered.state, recovered.generation, recovered.failed, recovered.reason) == (
+        IndexState.CURRENT,
+        synced.generation + 1,
+        0,
+        IndexReason.NONE,
+    )
+    assert retriever.verify().state is IndexState.CURRENT
+    found = retriever.search_memory(REQ, "trailing comma")
+    (hit,) = (hit for hit in found.hits if hit.id == added)
+    assert hit.provenance.backend == "sqlite-fts5" and found.complete
+
+
+@needs_fts5
+def test_an_interrupt_that_stops_a_rollback_leaves_it_to_the_next_call():
+    """R17-F1 of PR #537, the rollback's own boundary: an interrupt that
+    stops :meth:`Fts5Backend.apply` before its rollback runs leaves the
+    failed batch's transaction open. The next call rolls it back before it
+    reads anything, so no search, read-back or count sees part of the
+    batch, and the next update commits. The rollback of a batch stopped
+    mid-transaction is as before
+    (``test_an_interrupted_update_is_rolled_back_and_the_interrupt_raised_as_it_is``)."""
+    digest = "a" * 64
+    backend = FailingFts5()
+    backend.apply([memory_retrieval.IndexDocument(ISSUE, 1, 1, digest, "the original")], [])
+    before = backend.entries()
+    db = backend._db
+    backend._db = Interrupting(db, "ROLLBACK", before=True)
+    backend.fail_on = 2
+    with pytest.raises(KeyboardInterrupt):
+        backend.apply(
+            [
+                memory_retrieval.IndexDocument(ISSUE, 1, 2, digest, "the replacement"),
+                memory_retrieval.IndexDocument(OTHER, 3, 1, digest, "never indexed"),
+            ],
+            [],
+        )
+    # The batch is still open on the connection, its replacement in it.
+    assert db.in_transaction
+    assert [c.id for c in backend.search(ISSUE, ["original"], [1], 8)] == [1]
+    assert not db.in_transaction
+    assert backend.search(ISSUE, ["replacement"], [1], 8) == []
+    assert backend.entries() == before and backend.documents == 1 and backend.check()
+    assert set(backend._tables) == {ISSUE}
+    backend.fail_on = 0
+    backend.apply([memory_retrieval.IndexDocument(ISSUE, 1, 2, digest, "the replacement")], [])
+    assert [c.revision for c in backend.search(ISSUE, ["replacement"], [1], 8)] == [2]
+
+
 @needs_fts5
 def test_a_rebuild_that_failed_or_could_not_run_is_made_by_the_next_sync():
     """R4-F2 of PR #537: a rebuild asked for is owed until one commits. The
