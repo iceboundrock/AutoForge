@@ -89,9 +89,15 @@ candidate's, a retracted or superseded one's, or an earlier text of a
 record corrected since, is read by a launch's search, so no row of one,
 damaged or not, moves the answer, its status or whether it is degraded
 (R8-F1 of PR #537): such records are the tail's or no one's, and
-:meth:`MemoryRetriever.verify`, the controller's, checks their rows. A
-search proves its index's coverage before it says ``complete``: every
-record it asked about that holds a query term must be among the
+:meth:`MemoryRetriever.verify`, the controller's, checks their rows. The
+same holds of a record the store withdraws or corrects while the backend
+answers: the answer is judged only once the store has been loaded after
+it, and only about the records asked about that the store still serves as
+the index saw them, so a row of one withdrawn meanwhile, malformed or
+not, fails nothing either (R9-F1). For that, a backend answers each row it
+matched as the row holds it, never raising for one. A search proves its
+index's coverage before it says ``complete``: every record it asked about
+that the store still serves and that holds a query term must be among the
 candidates. An index whose answer about those records is not a projection
 of the store (a malformed row, two rows of one record, a candidate the
 store contradicts, a match it omits, or, by ``verify``, any row no sync
@@ -336,12 +342,21 @@ class IndexBackend(Protocol):
     is an integrity failure. ``entries`` reads every row back.
     ``available`` answers ``True`` when the backend can run; anything else,
     or an error, is a backend that cannot. Errors are
-    :class:`RetrievalBackendError`, and a row the backend finds malformed
-    :class:`RetrievalIntegrityError`; an answer that is not exactly a list
-    or a tuple (never a subclass) of at most :data:`MAX_CANDIDATES`
-    well-formed candidates is treated as an error (:func:`_candidates`),
-    and ``entries`` must return exactly a list. A candidate naming a record
-    the search did not ask about is set aside, unread.
+    :class:`RetrievalBackendError`, and one ``search`` raises is the whole
+    search's failure, whatever row it was of. So ``search`` answers each
+    row it matched as the row holds it, malformed or not, rather than raise
+    for one: the store may withdraw a record while the backend answers, and
+    only the retriever, once it has loaded the store after the answer, can
+    tell whether a malformed row is of a record the launch is still served
+    (R9-F1 of PR #537). ``entries`` raises
+    :class:`RetrievalIntegrityError` for a row it finds malformed, and must
+    return exactly a list. An answer that is not exactly a list or a tuple
+    (never a subclass) of at most :data:`MAX_CANDIDATES` candidates is
+    treated as an error (:func:`_candidates`), as is a malformed candidate
+    of a record the store still serves as the index saw it. A candidate
+    naming a record the search did not ask about, or one the store stopped
+    serving as the index saw it while the backend answered, is set aside
+    with its other fields unread.
 
     ``name`` is read once, when a retriever is made, and must be lower-case
     words joined by hyphens, at most :data:`MAX_BACKEND_NAME` characters,
@@ -560,20 +575,19 @@ class Fts5Backend:
             ).fetchall()
         except sqlite3.Error:
             raise RetrievalBackendError("the FTS5 index could not be searched") from None
+        # Each row as it holds it, never converted, and nothing raised for
+        # one: an error would fail the whole search, whichever record the
+        # row was of, before anything could say whether the launch is still
+        # served that record. A column no sync wrote (a revision that is not
+        # an integer, a digest that is not text) is the retriever's to judge,
+        # against the store after the retrieval (R9-F1 of PR #537).
         found = []
         for n, (rowid, revision, digest, score) in enumerate(rows, 1):
-            # A column a sync wrote is an integer, a text or bm25()'s float;
-            # anything else is a row no sync wrote, never converted.
-            if not (
-                type(rowid) is int
-                and type(revision) is int
-                and type(digest) is str
-                and type(score) is float
-                and math.isfinite(score)
-            ):
-                raise RetrievalIntegrityError("the FTS5 index holds a malformed row")
-            # bm25() is lower for a better match; the score is its negation.
-            found.append(IndexCandidate(rowid, revision, digest, round(-score, 6), n))
+            # bm25() is lower for a better match; the score is its negation,
+            # which orders this answer and nothing a launch is shown.
+            if type(score) is float:
+                score = round(-score, 6)
+            found.append(IndexCandidate(rowid, revision, digest, score, n))
         return found
 
     def entries(self) -> list[IndexEntry]:
@@ -696,9 +710,25 @@ def _candidate(raw: object, limit: int) -> IndexCandidate:
     return raw
 
 
+@dataclass(frozen=True)
+class _Answer:
+    """A backend's answer as the store after the retrieval judges it (:func:`_candidates`).
+
+    ``found``: the checked candidates of the records still standing, in
+    rank order. ``withdrawn``: the records asked about that the store
+    stopped serving as the index saw them while the backend answered, each
+    once, whose candidates were set aside. ``unasked``: how many candidates
+    named a record the search did not ask about.
+    """
+
+    found: list[IndexCandidate]
+    withdrawn: tuple[int, ...]
+    unasked: int
+
+
 def _candidates(
-    answer: object, limit: int, asked: frozenset[int]
-) -> tuple[list[IndexCandidate], int]:
+    answer: object, limit: int, asked: frozenset[int], standing: frozenset[int]
+) -> _Answer:
     """A backend's answer checked, bounded and deduplicated, in its rank order.
 
     Exactly a list or a tuple, never a subclass, of at most ``limit``
@@ -714,25 +744,33 @@ def _candidates(
     is deduplicated. Ordered by rank, then id, the first of each id kept:
     one record fills one place, whatever the backend repeats.
 
-    A candidate whose id is not one of ``asked``, the records the search
-    asked about, says nothing of them: it is set aside once its type and
-    id are read, and counted (the second value), so nothing a backend
-    answers of a record the launch is not served moves what it is told,
-    not even a malformed field of one (R8-F1 of PR #537).
+    Only a candidate of a record ``standing`` is checked beyond its type
+    and id: one of the records asked about (``asked``) that the store
+    after the retrieval still serves, unchanged since the watermark. A
+    candidate of any other record says nothing of what the launch is
+    served, and is set aside once its type and id are read: counted when
+    the search did not ask about it (R8-F1 of PR #537), and named among
+    those withdrawn when the store stopped serving it as the index saw it
+    while the backend answered (R9-F1). So no field of a row of either,
+    malformed or not, moves what a launch is told, its status or whether a
+    fallback answers.
     """
     if type(answer) is not list and type(answer) is not tuple:
         raise RetrievalBackendError("a backend's answer is a list of candidates")
     if len(answer) > limit:
         raise RetrievalBackendError("a backend answered past its bound")
     kept: list[IndexCandidate] = []
+    withdrawn: set[int] = set()
     unasked = 0
     for raw in answer:
         if type(raw) is not IndexCandidate:
             raise RetrievalBackendError("a backend answered with something other than a candidate")
         if type(raw.id) is not int or not 1 <= raw.id <= MAX_COUNTER:
             raise RetrievalBackendError("a backend answered with a malformed candidate")
-        if raw.id in asked:
+        if raw.id in standing:
             kept.append(_candidate(raw, limit))
+        elif raw.id in asked:
+            withdrawn.add(raw.id)
         else:
             unasked += 1
     checked = sorted(kept, key=lambda c: (c.rank, c.id, c.revision, c.digest))
@@ -744,7 +782,7 @@ def _candidates(
     first: dict[int, IndexCandidate] = {}
     for candidate in checked:
         first.setdefault(candidate.id, candidate)
-    return list(first.values()), unasked
+    return _Answer(list(first.values()), tuple(sorted(withdrawn)), unasked)
 
 
 def _prefix_digest(events: list, through: int) -> str:
@@ -1640,57 +1678,78 @@ class MemoryRetriever:
 
     def _ask(
         self, slot: _Slot, issue: str, terms: Sequence[str], asked: frozenset[int]
-    ) -> list[IndexCandidate] | None:
-        """``slot``'s checked candidates among ``asked``, or ``None`` when it failed, marked so."""
+    ) -> tuple[object] | None:
+        """``slot``'s answer about ``asked``, unchecked, in a 1-tuple; ``None`` when it raised.
+
+        An error the backend raises is the whole search's, whichever row it
+        met, and marks the index failed. Nothing of the answer is read
+        here, not even whether it is ``None``: it is judged once the store
+        has been loaded after it (:meth:`_judge`), so no row of a record
+        withdrawn while the backend answered decides whether the index
+        failed (R9-F1 of PR #537).
+        """
         try:
-            answer = slot.backend.search(issue, terms, tuple(sorted(asked)), MAX_CANDIDATES)
+            return (slot.backend.search(issue, terms, tuple(sorted(asked)), MAX_CANDIDATES),)
         except RetrievalIntegrityError:
             slot.broken = IndexReason.INTEGRITY
             self.metrics.count("integrity")
-            return None
         except RetrievalBackendError:
             slot.broken = IndexReason.SEARCH_FAILED
             self.metrics.count("search_failures")
-            return None
+        return None
+
+    def _judge(
+        self, slot: _Slot, answer: object, asked: frozenset[int], standing: frozenset[int]
+    ) -> _Answer | None:
+        """``slot``'s answer checked against the store after it; ``None``, marked failed, if not.
+
+        ``standing`` is the records of ``asked`` the store loaded after the
+        answer still serves as the index saw them; only their candidates
+        are checked beyond their type and id (:func:`_candidates`). An FTS5
+        backend's candidates are its rows as it holds them, never converted
+        (:meth:`Fts5Backend.search`), so a malformed one is a row no sync
+        wrote: ``integrity``. Any other backend's is an invalid answer.
+        """
         try:
-            found, unasked = _candidates(answer, MAX_CANDIDATES, asked)
+            judged = _candidates(answer, MAX_CANDIDATES, asked, standing)
         except RetrievalIntegrityError:
             slot.broken = IndexReason.INTEGRITY
             self.metrics.count("integrity")
             return None
         except RetrievalBackendError:
-            slot.broken = IndexReason.INVALID_ANSWER
-            self.metrics.count("invalid_answers")
+            if slot.fts5:
+                slot.broken = IndexReason.INTEGRITY
+                self.metrics.count("integrity")
+            else:
+                slot.broken = IndexReason.INVALID_ANSWER
+                self.metrics.count("invalid_answers")
             return None
-        self.metrics.count("unasked", unasked)
-        return found
+        self.metrics.count("unasked", judged.unasked)
+        return judged
 
     @staticmethod
     def _contradicted(
         found: Sequence[IndexCandidate],
         facts: dict[int, MemoryFact],
-        scope: _Scope,
-        through: int,
         tokens: Callable[[int], list[str]],
         wanted: set[str],
     ) -> int:
-        """How many of ``found``, all asked about, no index synced through ``through`` could hold.
+        """How many of ``found``, each a record standing, are rows no sync wrote.
 
-        Each was a record the launch is served, unchanged since the
-        watermark (:meth:`_asked`). If the store after the retrieval still
-        says so, the row must be the record as it is: at its revision and
-        content digest, and holding a query term in the store's text, which
-        the launch is served, since a search matches by term. Anything else
-        is a row no sync wrote. A record corrected, retracted or withheld
-        while the backend answered is not judged here: the store's verdict
-        and the tail decide it, as for any record changed since the
-        watermark. Only the text the launch is served is ever read.
+        Each is a record the launch was served when the search asked about
+        it, unchanged since the watermark (:meth:`_asked`), that the store
+        after the retrieval still serves so (:func:`_candidates`). Its row
+        must be the record as it is: at its revision and content digest, and
+        holding a query term in the store's text, which the launch is
+        served, since a search matches by term. Anything else is a row no
+        sync wrote. A record corrected, retracted or withheld while the
+        backend answered is not judged: the store's verdict and the tail
+        decide it, as for any record changed since the watermark. Only the
+        text the launch is served is ever read.
         """
         count = 0
         for candidate in found:
             fact = facts[candidate.id]
-            if fact.revision > through or not scope.served(fact.id):
-                continue
             if (fact.revision, fact.content) != (
                 candidate.revision,
                 candidate.digest,
@@ -1701,33 +1760,27 @@ class MemoryRetriever:
     @staticmethod
     def _omitted(
         found: Sequence[IndexCandidate],
-        facts: dict[int, MemoryFact],
-        scope: _Scope,
-        asked: frozenset[int],
-        through: int,
+        standing: frozenset[int],
         tokens: Callable[[int], list[str]],
         wanted: set[str],
     ) -> int:
-        """How many records the search asked about that ``found`` should hold and does not.
+        """How many records standing that ``found`` should hold and does not.
 
         A backend returns every record it is asked about that holds a query
         term (:class:`IndexBackend`). Each record asked about was indexed as
         it is now, so each one the store after the retrieval still serves,
-        unchanged, that holds a term must be a candidate. One missing means
-        the index is no projection of the store, and a search that read it
-        could not say it is complete. This is the coverage a search proves
-        before it does: it reads the store's text of every record asked
-        about, at most :data:`~autoforge.memory.MAX_FACTS`, and of no other.
-        A record changed after the watermark is the tail's.
+        unchanged (``standing``), that holds a term must be a candidate. One
+        missing means the index is no projection of the store, and a search
+        that read it could not say it is complete. This is the coverage a
+        search proves before it does: it reads the store's text of every
+        record standing, at most :data:`~autoforge.memory.MAX_FACTS`, and
+        of no other. A record changed after the watermark is the tail's.
         """
         returned = {candidate.id for candidate in found}
         return sum(
             1
-            for record in asked
-            if record not in returned
-            and facts[record].revision <= through
-            and scope.served(record)
-            and not wanted.isdisjoint(tokens(record))
+            for record in standing
+            if record not in returned and not wanted.isdisjoint(tokens(record))
         )
 
     def search_memory(
@@ -1750,11 +1803,15 @@ class MemoryRetriever:
         only about the records the launch is served that it saw as they are
         now (:meth:`_asked`), so nothing it holds of any other record, nor
         any text the launch may not read, moves the answer, its status or
-        whether it is degraded. An answer the snapshot contradicts, or one
-        that omits a record asked about that holds a query term, is
-        discarded, its index marked ``failed`` (``integrity``), and the
-        fallback, else the tail alone, answers the same search, reported
-        ``degraded``.
+        whether it is degraded. The answer is judged by the snapshot loaded
+        after it, against the records asked about that it still serves as
+        the index saw them: a candidate of one withdrawn or corrected while
+        the backend answered is set aside, whatever its row holds (R9-F1 of
+        PR #537). An answer the snapshot contradicts, a malformed candidate
+        of a record it still serves, or an answer that omits such a record
+        that holds a query term, is discarded, its index marked ``failed``,
+        and the fallback, else the tail alone, answers the same search,
+        reported ``degraded``.
         """
         health = self._health()
         snap = self._load()
@@ -1783,7 +1840,7 @@ class MemoryRetriever:
             return cache[digest]
 
         used: _Slot | None = None
-        found: list[IndexCandidate] = []
+        indexed: list[int] = []
         for slot, up in zip(self._slots, health, strict=True):
             if not self._readable(slot, up):
                 continue
@@ -1792,39 +1849,40 @@ class MemoryRetriever:
                 # Nothing to ask it: whatever it holds, the tail reads the rest.
                 used = slot
                 break
-            answer = self._ask(slot, scope.issue, terms, asked)
+            reply = self._ask(slot, scope.issue, terms, asked)
             # The authority is the store as it is after the retrieval: the
             # same snapshot, bound as it was, when the source has not moved.
             if (after := self._load()) is not snap:
                 snap, scope = after, self._scope(after, request)
                 facts = {f.id: f for f in snap.store.facts()}
-            if answer is None:
+            if reply is None:
                 continue
-            bad = self._contradicted(answer, facts, scope, slot.through, tokens, wanted)
-            missed = self._omitted(answer, facts, scope, asked, slot.through, tokens, wanted)
+            # Only what that store still serves as the index saw it judges
+            # the answer: a record withdrawn while the backend answered is
+            # the store's to refuse, and nothing its row holds, malformed or
+            # not, fails the index or moves the search (R9-F1 of PR #537).
+            standing = asked & self._asked(facts, scope, slot.through)
+            judged = self._judge(slot, reply[0], asked, standing)
+            if judged is None:
+                continue
+            bad = self._contradicted(judged.found, facts, tokens, wanted)
+            missed = self._omitted(judged.found, standing, tokens, wanted)
             if bad or missed:
                 slot.broken = IndexReason.INTEGRITY
                 self.metrics.count("integrity")
                 self.metrics.count("omitted", missed)
                 drop("integrity", bad)
                 continue
-            used, found = slot, answer
+            used, indexed = slot, [candidate.id for candidate in judged.found]
+            for record in judged.withdrawn:
+                # Changed while the backend answered: the tail reads the
+                # record as it is now, if the store still serves it; if
+                # not, the store's reason is the drop's.
+                verdict = scope.verdicts[record]
+                drop("stale" if verdict is Visibility.CURRENT else verdict.value)
             break
         store = snap.store
         through = used.through if used is not None else 0
-        indexed: list[int] = []
-        for candidate in found:
-            fact = facts[candidate.id]
-            verdict = scope.verdicts[fact.id]
-            if fact.revision > through:
-                # The row predates the record's latest change: the tail reads
-                # the record as it is now, if the store still serves it; if
-                # not, the store's reason is the drop's.
-                drop("stale" if verdict is Visibility.CURRENT else verdict.value)
-            elif verdict is Visibility.CURRENT:
-                indexed.append(fact.id)
-            else:
-                drop(verdict.value)
         # What the search found the index to be, a failure it met included,
         # from the health read before the snapshot: no backend is called now.
         if used is not None:

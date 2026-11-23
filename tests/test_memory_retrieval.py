@@ -2751,6 +2751,183 @@ def test_the_same_damage_to_a_row_the_launch_is_served_falls_back_on_that_search
     assert retriever.catalog(REQ).status.reason is IndexReason.INTEGRITY
 
 
+# -- a record withdrawn while the index answers moves nothing either (R9-F1 of PR #537) --
+
+
+class Interleaved(Fts5Backend):
+    """FTS5 whose next search runs ``during`` inside its call: before it reads
+    a row (``before-reading``) or once it has read its answer
+    (``after-reading``)."""
+
+    def __init__(self):
+        super().__init__()
+        self.when, self.during = "before-reading", None
+
+    def _then(self, when):
+        if when == self.when and self.during is not None:
+            during, self.during = self.during, None
+            during()
+
+    def search(self, partition, terms, records, limit):
+        self._then("before-reading")
+        answer = super().search(partition, terms, records, limit)
+        self._then("after-reading")
+        return answer
+
+
+def _withdrawn_inside(kind, word, when, **kwargs):
+    """A synced store whose ``hidden`` record, served when a search asks about
+    it, holds ``word``, and is withdrawn by the next search's backend call,
+    ``when`` it says: ``retracted``, ``superseded``, or ``corrected`` to a
+    text without ``word``. Everything the launch is served once it is
+    withdrawn is the same whatever ``word`` is."""
+    w = Writer(empty())
+    w.add("zebra", "The zebra lesson, which the launch is served.")
+    w.add("steady", "A steady lesson about separators.")
+    w.add("hidden", f"The hidden note about the {word} parser.")
+    backend = Interleaved()
+    retriever = retriever_for(w, backend=backend, **kwargs)
+    retriever.sync()
+
+    def withdraw():
+        if kind == "retracted":
+            w.revise(Action.RETRACT, "hidden")
+        elif kind == "superseded":
+            w.add("replacement", "The hidden note's replacement.")
+            w.revise(Action.SUPERSEDE, "hidden", replacement=w.ids["replacement"])
+        else:
+            w.revise(Action.CORRECT, "hidden", text="The hidden note, corrected.")
+
+    backend.when, backend.during = when, withdraw
+    return w, retriever, backend
+
+
+@pytest.mark.parametrize("when", ["before-reading", "after-reading"])
+@pytest.mark.parametrize("damage", ["body", "digest", "revision"])
+@pytest.mark.parametrize("kind", ["retracted", "superseded", "corrected"])
+def test_a_damaged_row_of_a_record_withdrawn_while_the_index_answers_moves_nothing(
+    kind, damage, when
+):
+    """R9-F1 of PR #537: the search asks about ``hidden``, which the launch is
+    served when it asks, and the store withdraws it inside the backend's
+    call. Two stores alike in everything the launch is then served, the one
+    difference whether ``hidden``'s text holds the query's term; the same
+    damage to its row. A malformed revision made FTS5's search raise for the
+    row it matched, and the retriever marked the index failed before it
+    loaded the store again: the search and the catalog after it said
+    ``failed`` and ``degraded`` by that text alone, and ordinary staleness
+    otherwise. The answer is now judged by the store after it, about the
+    records it still serves as the index saw them, so every answer, status,
+    flag and catalog is the same, and nothing is degraded. ``verify``, the
+    controller's, still finds the damage wherever the store holds a text to
+    compare."""
+    told = []
+    for word in (UNREAD, "walrus"):
+        w, retriever, backend = _withdrawn_inside(kind, word, when)
+        _damage(retriever, w.ids["hidden"], damage)
+        told.append(_told(w, retriever))
+        assert backend.during is None  # withdrawn inside the first search's call
+        first = told[-1][0]
+        assert ids(first) == [w.ids["zebra"]] and first.hits[0].provenance.backend == "sqlite-fts5"
+        assert not first.degraded and first.complete and first.backend == "sqlite-fts5"
+        assert (first.status.state, first.status.reason) == (IndexState.STALE, IndexReason.NONE)
+        assert retriever.metrics.snapshot()["integrity"] == 0
+        lost = damage == "body" and kind in ("retracted", "corrected")
+        verified = retriever.verify()
+        assert verified.reason is (IndexReason.NONE if lost else IndexReason.INTEGRITY)
+    assert told[0] == told[1]
+
+
+@pytest.mark.parametrize("when", ["before-reading", "after-reading"])
+@pytest.mark.parametrize("fallback", [False, True], ids=["tail", "fts5-fallback"])
+@pytest.mark.parametrize(
+    ("damage", "query"), [("body", UNREAD), ("digest", "zebra"), ("revision", "zebra")]
+)
+def test_damage_to_a_row_still_served_falls_back_on_the_search_that_withdrew_another(
+    damage, query, fallback, when
+):
+    """R9-F1 of PR #537, its other half: while ``hidden`` is withdrawn inside
+    the backend's call, the same damage to the row of ``zebra``, which the
+    store still serves as the index saw it, is found by that search, which
+    answers from the fallback, else the tail, on the same call, degraded,
+    and the index stays failed for the reads after it."""
+    kwargs = {"fallback": Fts5Backend()} if fallback else {}
+    w, retriever, backend = _withdrawn_inside("retracted", UNREAD, when, **kwargs)
+    _damage(retriever, w.ids["zebra"], damage)
+    result = retriever.search_memory(REQ, query)
+    assert backend.during is None
+    assert result.degraded and result.backend == ("sqlite-fts5" if fallback else TAIL_BACKEND)
+    assert ids(result) == ([] if damage == "body" else [w.ids["zebra"]])
+    assert w.ids["hidden"] not in ids(result)
+    # The status is of the index that answered: the fallback, synced before
+    # the withdrawal, or, with none, the primary the search found failed.
+    if fallback:
+        assert (result.status.state, result.status.reason) == (IndexState.STALE, IndexReason.NONE)
+    else:
+        assert (result.status.state, result.status.reason) == (
+            IndexState.FAILED,
+            IndexReason.INTEGRITY,
+        )
+    assert retriever.status().reason is IndexReason.INTEGRITY
+    assert retriever.metrics.snapshot()["integrity"] == 1
+    assert retriever.catalog(REQ).degraded
+
+
+class Withdrawing(ScriptedBackend):
+    """An optional backend that runs ``during`` before it answers."""
+
+    def __init__(self, answer=(), during=None):
+        super().__init__(answer)
+        self.during = during
+
+    def search(self, partition, terms, records, limit):
+        if self.during is not None:
+            during, self.during = self.during, None
+            during()
+        return self.answer
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        pytest.param(lambda c: replace(c, revision="abc"), id="revision-text"),
+        pytest.param(lambda c: replace(c, digest="Z" * 64), id="digest-not-hex"),
+        pytest.param(lambda c: replace(c, score=float("nan")), id="score-nan"),
+        pytest.param(lambda c: replace(c, rank=0), id="rank-zero"),
+    ],
+)
+def test_an_optional_backends_malformed_candidate_of_a_record_withdrawn_meanwhile_is_set_aside(
+    malformed,
+):
+    """R9-F1 of PR #537, for an optional backend: a malformed candidate of a
+    record the store retracted while the backend answered is set aside with
+    its fields unread, and the rest of the answer stands. The same candidate
+    of a record the store still serves is an invalid answer, and the
+    fallback answers the same search."""
+    w = corpus()
+    tok, uv = valid(w.store, w.ids["tokenizer"]), valid(w.store, w.ids["uv"], rank=2)
+    answer = [tok, malformed(uv)]
+    backend = Withdrawing(answer, during=lambda: w.revise(Action.RETRACT, "uv"))
+    retriever = retriever_for(w, backend=backend, fallback=Fts5Backend())
+    retriever.sync()
+    result = retriever.search_memory(REQ, "tokenizer pytest interpreter")
+    assert backend.during is None
+    assert ids(result) == [w.ids["tokenizer"]] and result.complete
+    assert not result.degraded and result.backend == "scripted"
+    assert (result.status.state, result.status.reason) == (IndexState.STALE, IndexReason.NONE)
+    assert dropped(retriever) == {"retracted": 1}
+    assert retriever.metrics.snapshot()["invalid_answers"] == 0
+    # Still served: the same candidate is the primary's failure, on that search.
+    w = corpus()
+    tok, uv = valid(w.store, w.ids["tokenizer"]), valid(w.store, w.ids["uv"], rank=2)
+    retriever = retriever_for(w, backend=Withdrawing([tok, malformed(uv)]), fallback=Fts5Backend())
+    retriever.sync()
+    result = retriever.search_memory(REQ, "tokenizer pytest interpreter")
+    assert sorted(ids(result)) == sorted([w.ids["tokenizer"], w.ids["uv"]])
+    assert result.degraded and result.backend == "sqlite-fts5"
+    assert retriever.status().reason is IndexReason.INVALID_ANSWER
+
+
 # -- maintenance reports freshness against the store after it (R8-F2 of PR #537) --------
 
 
