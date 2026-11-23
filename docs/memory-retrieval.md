@@ -609,9 +609,11 @@ The primary can be out of service in two ways, and they differ in what
 brings it back:
 
 - **Its search failed.** It raised a `RetrievalBackendError`
-  (`search-failed`), gave an answer the checks below refuse
-  (`invalid-answer`), or gave one the store contradicts or one that omits
-  a served match (`integrity`). The primary is marked `failed`, and no
+  (`search-failed`), whichever row it met. Or, judged by the store loaded
+  after the answer, about the records that store still serves as the index
+  saw them, it gave an answer the checks below refuse (`invalid-answer`),
+  or one the store contradicts or one that omits a served match
+  (`integrity`). The primary is marked `failed`, and no
   search reads it again until a sync or a rebuild, made while the backend
   can run, commits a new index of it. A sync that fails leaves it
   `failed`.
@@ -755,12 +757,16 @@ SQLite 3.54.1. These are single runs of a local benchmark, not a
 comparison across hosts. Every figure below is from one full run on
 `d8ab97a`, the code after the eighth review round's changes (a search asks
 the index only about the records the launch is served; maintenance reports
-freshness against the store after its backend work), except three costs
+freshness against the store after its backend work), except four costs
 labelled with the sessions they come from: the coverage check's (the third
-round's), the corpus statistics' (the sixth round's) and the eighth
-round's search filter, each run back to back against the code before it.
+round's), the corpus statistics' (the sixth round's), the eighth
+round's search filter and the ninth round's answer check, each run back
+to back against the code before it. The ninth round changed the search's
+code after that run; its back-to-back runs (the cost notes below) show no
+change these runs can measure, and the table is not run again.
 The correctness table, every ranking included, is what the reviewed head
-of the eighth round, `086aa34`, gives, run beside it; its figures are
+of the eighth round, `086aa34`, gives, run beside it, and what `e16071d`
+and `ecb5718` give in the ninth round's session; its figures are
 those measured after the third to sixth rounds too (the sixth round's
 statistics moved one pair of places in the no-FTS5 condition, which no
 figure shows). No embedding of any kind is computed, so nothing below is
@@ -871,6 +877,15 @@ Notes on the table:
   alone in 3.47 / 10.9 ms at 10,000 documents. `+rowid IN (...)` keeps the
   filter out of FTS5's own lookups: one match scan, which SQLite filters
   before it computes a column or `bm25()` of a row.
+- **Judging the answer after the store's second load.** Measured in the
+  ninth review round's session: two runs of the cost half each, back to
+  back, of the reviewed head's code (`e16071d`) and of `ecb5718`, whose
+  module is the ninth round's, snapshot held. The reviewed head searched in
+  0.73 and 0.76 ms at the fixture's median and 1.27 and 1.31 ms at the
+  bound; `ecb5718` in 0.74 and 0.73 ms and 1.26 and 1.31 ms. Moving the
+  check of a backend's answer after that load, and FTS5's row check into
+  it, costs nothing these runs can tell from their own spread. The
+  correctness half gives the same output at both, every ranking included.
 - **Updates.** Updating one document is 0.07 ms at the median at every
   size. The 95th percentile is 1.8 ms at 1,000 documents, 14.6 ms at
   10,000 and 28.3 ms at 50,000, where FTS5 merges its segments.
