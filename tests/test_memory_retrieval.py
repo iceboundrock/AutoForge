@@ -3431,6 +3431,56 @@ def _oracle_agrees_with_the_store(fixture: dict) -> dict[str, tuple[str, str]]:
     return truth
 
 
+@pytest.mark.parametrize("shown", [None, "earlier", "earlier, restated"])
+def test_an_append_only_correction_shown_as_it_is_now_is_never_old_text(shown, monkeypatch):
+    """R13-F1 of PR #537: the correction probe counted any hit holding the
+    earlier text, so a correction that only appends to it, served exactly
+    as the record is now, was old text served: an append-only correction
+    of m10 gave one in every condition that served m10, with no stale
+    leak. A hit the oracle judges current, showing the excerpt of its
+    current text, is not counted. A search made to show the earlier text
+    whole, alone or inside other bytes, still is, and is a stale leak; a
+    stale excerpt still is too
+    (``test_a_hit_past_a_hits_bound_showing_anything_but_its_excerpt_is_still_a_leak``),
+    and so is a withheld copy
+    (``test_a_withheld_copy_of_a_corrected_text_is_judged_by_the_oracle_never_the_store``)."""
+    fixture = bench.read_fixture().data()
+    earlier = _record(fixture, "m10")["text"]
+    current = earlier + " Verified again on the current candidate by its bracken test."
+    fixture["operations"].append(
+        {"op": "correct", "key": "m10", "text": current, "reason": "verification appended"}
+    )
+    fixture["corrections"].append(
+        {"key": "m10", "new_query": "bracken", "old_query": "tokenizer final element"}
+    )
+    truth = _oracle_agrees_with_the_store(fixture)
+    assert truth["m10"] == ("current", current) and earlier in bench.excerpt(current)
+    source = bench.Fixture(json.dumps(fixture).encode())
+    record = bench.build(fixture).ids["m10"]
+    if shown is not None:
+        summary = {"earlier": earlier, "earlier, restated": f"Restated: {earlier}"}[shown]
+        real = MemoryRetriever.search_memory
+
+        def search(self, request, query, **kwargs):
+            result = real(self, request, query, **kwargs)
+            hits = tuple(
+                replace(hit, summary=summary) if hit.id == record else hit for hit in result.hits
+            )
+            return replace(result, hits=hits)
+
+        monkeypatch.setattr(MemoryRetriever, "search_memory", search)
+    report = bench.correctness(source)
+    # Every condition serves m10 as it is now but the stale index without
+    # its tail, which reads no record changed since its watermark.
+    serving = ("synced", "stale", "no_fts5", "rebuilt")
+    for name in _CONDITIONS:
+        c = report[name]
+        judged = shown is not None and name in serving
+        assert c["correction_new_text_visible"] == (name in serving), name
+        assert (c["stale_leak_rate"] > 0.0) is judged and c["permission_leak_rate"] == 0.0, name
+        assert c["correction_old_text_served"] == judged, name
+
+
 def _copy_of(fixture: dict, key: str, **declared) -> None:
     """``fixture`` with a record ``m26`` added: a copy of ``key``'s text, as ``declared``."""
     original = _record(fixture, key)

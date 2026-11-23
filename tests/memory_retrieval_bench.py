@@ -307,6 +307,26 @@ def excerpt(text: str) -> str:
     return bounded_text(text, MAX_SUMMARY_BYTES)
 
 
+def _shows_earlier_text(summary: str, earlier: str, state: str, text: str) -> bool:
+    """Whether a correction probe's hit shows a corrected record's ``earlier`` text.
+
+    A hit shows it when its summary holds that text whole, or is its excerpt
+    (a text past a hit's bound is never whole in a summary: R12-F1 of PR
+    #537). A hit of a record the oracle judges ``current`` whose summary is
+    exactly the excerpt of the ``text`` the oracle judges current shows what
+    its record is now, which may hold the earlier text: a correction that
+    only appends to it, or a long text whose excerpt the correction left
+    unchanged. Until the thirteenth review round such a hit was counted, so
+    an append-only correction of ``m10`` gave one old text served in every
+    condition that served it (R13-F1 of PR #537). Any other hit is judged:
+    the earlier text of a record now corrected, a withheld or retracted
+    copy of it, or its excerpt where the record now shows another.
+    """
+    if state == "current" and summary == excerpt(text):
+        return False
+    return earlier in summary or summary == excerpt(earlier)
+
+
 def _dcg(gains: Sequence[int]) -> float:
     return sum(g / math.log2(i + 2) for i, g in enumerate(gains))
 
@@ -360,11 +380,8 @@ def _condition(world: World, retriever: MemoryRetriever, *, k: int = K) -> dict:
         old_text = next(r["text"] for r in fixture["records"] if r["key"] == correction["key"])
         new_visible += correction["key"] in search(correction["new_query"])[1]
         result, keys = search(correction["old_query"])
-        # The earlier text whole, or its excerpt where that is not what the
-        # hit's record now shows: a text past a hit's bound is never whole in
-        # a summary (R12-F1 of PR #537).
         old_served += any(
-            old_text in hit.summary or hit.summary == excerpt(old_text) != excerpt(truth[key][1])
+            _shows_earlier_text(hit.summary, old_text, *truth[key])
             for hit, key in zip(result.hits, keys, strict=True)
         )
     corrections = len(fixture["corrections"])

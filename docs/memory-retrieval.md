@@ -846,8 +846,13 @@ stale leak when the oracle judges its record retracted, withheld or
 superseded, or when its summary is anything but the excerpt a hit shows of
 the text the oracle judges current: that text redacted, then cut to 512
 bytes with an omission marker. "Old text served" counts a probe search
-with a hit that shows the earlier text whole, or its excerpt where that
-differs from what the hit's record now shows.
+with a hit that shows the earlier text whole or as its excerpt, except a
+hit of a record the oracle judges current whose summary is exactly the
+excerpt of its current text. That hit shows the record as it is now, which
+may still hold the earlier text: a correction that only appends to it, or
+a long text whose excerpt the correction left unchanged. Every other hit
+showing the earlier text counts: the corrected record's earlier text or
+its excerpt, and a withheld copy of it.
 
 Until the thirteenth review round the oracle withdrew only retracted
 texts, by their declared text and whatever their scope. Retracting an
@@ -857,7 +862,11 @@ of it left the copy current to the oracle, though the store withholds it,
 so serving the copy would have gone uncounted
 (`test_the_oracle_withholds_a_text_only_where_its_withdrawal_applies`,
 `test_a_withheld_copy_of_a_corrected_text_is_judged_by_the_oracle_never_the_store`).
-The pinned fixture has neither case, and its correctness report is
+Old text served counted any hit holding the earlier text, so a
+correction that only appended to `m10`'s text gave 1 in every condition
+that served `m10`, with no stale leak
+(`test_an_append_only_correction_shown_as_it_is_now_is_never_old_text`).
+The pinned fixture has none of these cases, and its correctness report is
 unchanged, byte for byte.
 
 Until the twelfth review
