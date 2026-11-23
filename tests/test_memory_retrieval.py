@@ -3993,6 +3993,99 @@ def test_a_correction_past_a_hits_bound_finds_its_record_but_shows_no_new_text(
 
 
 # No FTS5 needed: the benchmark judges what the tail serves alike.
+@pytest.mark.parametrize("corrected", ["the earlier excerpt", "a shorter prefix and the marker"])
+def test_a_correction_to_what_a_hit_showed_of_its_earlier_text_shows_no_new_text(
+    corrected, monkeypatch
+):
+    """R17-F2 of PR #537, the reverse of the boundary case above: m15 is
+    declared past a hit's 512-byte bound and corrected to the exact excerpt
+    a hit showed of it, its literal omission marker included. That is a
+    text within the bound, which a hit shows as it is: the same bytes as
+    before the correction. The new-text query asks for the marker's word,
+    which only the corrected text holds, so every condition that serves
+    m15 finds it. Until the seventeenth review round the check read the
+    corrected text as shown whole, which no earlier text equals, and gave
+    a new text visible of 1 in each of those four conditions, where the
+    excerpt comparison it had replaced gave 0. Both checks apply now, and
+    it is 0. So it is for a correction to a shorter prefix of the earlier
+    text and the marker: not the earlier excerpt's bytes, but read as that
+    text cut sooner, which is all a hit can tell of it. Either hit shows
+    the record as it is now: no stale leak, no old text served."""
+    fixture = bench.read_fixture().data()
+    (probe,) = fixture["corrections"]
+    (correction,) = [op for op in fixture["operations"] if op["op"] == "correct"]
+    assert probe["key"] == correction["key"] == "m15"
+    m15 = _record(fixture, "m15")
+    m15["text"] = _past_a_hits_bound(m15["text"], "sandwort", 600)
+    earlier = m15["text"]
+    cut = bench.excerpt(earlier)
+    prefix = cut.removesuffix(bench.OMISSION)
+    assert len(cut.encode()) == MAX_SUMMARY_BYTES and prefix != cut and earlier.startswith(prefix)
+    correction["text"] = {
+        "the earlier excerpt": cut,
+        "a shorter prefix and the marker": prefix[:300] + bench.OMISSION,
+    }[corrected]
+    probe["new_query"] = "omitted"
+    # The probe's term is the corrected text's alone, and the new-text search
+    # changes no other figure of the report.
+    assert not any("omitted" in record["text"] for record in fixture["records"])
+    assert "omitted" not in [q["query"] for q in fixture["queries"] + fixture["negatives"]]
+    truth = _oracle_agrees_with_the_store(fixture)
+    state, current = truth["m15"]
+    assert state == "current" and current == correction["text"] != earlier
+    assert bench.earlier_texts(fixture, "m15") == [earlier]
+    # A hit shows the corrected text as it is, within the bound: the earlier
+    # excerpt's bytes, or not, and read as a prefix of the earlier text cut.
+    assert bench.excerpt(current) == current
+    assert (current == cut) is (corrected == "the earlier excerpt")
+    view = current.removesuffix(bench.OMISSION)
+    assert bench.shown(current) == (view, False) and earlier.startswith(view)
+    source = bench.Fixture(json.dumps(fixture).encode())
+    serving = ("synced", "stale", "no_fts5", "rebuilt")
+
+    report = bench.correctness(source)
+    for name in _CONDITIONS:
+        c = report[name]
+        assert c["correction_new_text_visible"] == 0.0, name
+        assert (c["stale_leak_rate"], c["permission_leak_rate"]) == (0.0, 0.0), name
+        assert c["correction_old_text_served"] == 0, name
+
+    # With a text within the bound read as shown whole, as until this round,
+    # the excerpt comparison alone still leaves out the earlier excerpt's
+    # bytes; only reading the marker as the cut it looks like leaves out the
+    # shorter prefix.
+    whole = bench.shown
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            bench,
+            "shown",
+            lambda text: (text, True) if bench.excerpt(text) == text else whole(text),
+        )
+        alone = bench.correctness(source)
+    for name in _CONDITIONS:
+        shorter = corrected != "the earlier excerpt" and name in serving
+        assert alone[name]["correction_new_text_visible"] == shorter, name
+
+    # The record is found and shown as it is now: with no earlier text to
+    # compare what it shows with, every condition that serves m15 counts it,
+    # and nothing else of the report moves.
+    monkeypatch.setattr(bench, "earlier_texts", lambda fixture, key: [])
+    found = bench.correctness(source)
+    for name in _CONDITIONS:
+        c, before = found[name], report[name]
+        assert c["correction_new_text_visible"] == (name in serving), name
+        assert {k: v for k, v in c.items() if k != "correction_new_text_visible"} == {
+            k: v for k, v in before.items() if k != "correction_new_text_visible"
+        }, name
+    world = bench.build(fixture)
+    retriever = MemoryRetriever(fixture["repository"], fixture["run_id"], lambda: world.store)
+    retriever.sync()
+    result = retriever.search_memory(world.request, "omitted")
+    (hit,) = (hit for hit in result.hits if hit.id == world.ids["m15"])
+    assert hit.summary == current
+
+
+# No FTS5 needed: the benchmark judges what the tail serves alike.
 @pytest.mark.parametrize("current", ["restated", "appended"])
 def test_an_intermediate_correction_shown_again_is_old_text_served(current, monkeypatch):
     """R16-F3 of PR #537: the old-text probe judged a hit only against the

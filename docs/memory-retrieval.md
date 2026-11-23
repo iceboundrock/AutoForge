@@ -904,14 +904,17 @@ that shows anything else, its earlier text's excerpt included, shows no
 correction, and neither does any hit of it while the oracle does not
 judge it current. Nor does a hit whose excerpt shows nothing that an
 earlier text of the record (the declared text, or an earlier
-correction's) does not hold. An excerpt within the bound shows its whole
-text, which only that same text holds; a cut excerpt shows the prefix
-before its omission marker, which every text it begins holds. Finding the
-current record is not showing its correction, and a correction that only
-changes what lies past the prefix a hit shows is not visible in any hit,
-whether its excerpt is an earlier one's exactly or differs from it only
-by where it is cut. Such a hit still shows the record as it is now, so it
-is neither a stale leak nor old text served.
+correction's) does not hold, or whose excerpt is an earlier text's byte
+for byte. An excerpt that ends with the omission marker after a prefix of
+its text shows that prefix, which every text it begins holds, whether the
+store cut the text there or the text itself ends with the marker: a hit's
+bytes cannot tell the two apart. Any other excerpt within the bound shows
+its whole text, which only that same text holds. Finding the current
+record is not showing its correction, and a correction that only changes
+what lies past the prefix a hit shows is not visible in any hit, whether
+its excerpt is an earlier one's exactly or differs from it only by where
+it is cut. Such a hit still shows the record as it is now, so it is
+neither a stale leak nor old text served.
 
 Until the fourteenth review round "new text visible" counted any hit of
 the corrected record on the new-text search, whatever it showed: on the
@@ -932,6 +935,17 @@ which a hit shows whole, and corrected by appending a term the new-text
 query asked for, it gave 1 of 1 in the same four conditions, though each
 hit showed only a shorter prefix of the earlier text and the omission
 marker (the same test's third case).
+Until the seventeenth the check that replaced the excerpt comparison read
+a text within the bound as shown whole, whatever it ended with. With
+`m15` declared past the bound, corrected to the exact 512-byte excerpt a
+hit had shown of it, the literal omission marker included, and the
+new-text query asking for the marker's word, it gave 1 of 1 in the same
+four conditions, though each hit showed the same bytes as before the
+correction; the excerpt comparison had given 0. Both checks apply now,
+and so does reading the marker as the cut it looks like, so a correction
+to a shorter prefix of the earlier text and the marker shows no new text
+either
+(`test_a_correction_to_what_a_hit_showed_of_its_earlier_text_shows_no_new_text`).
 The pinned fixture's correctness report is unchanged by each of them,
 byte for byte: its correction of `m15` rewrites the text a hit shows
 whole.

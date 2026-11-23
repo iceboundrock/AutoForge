@@ -28,8 +28,10 @@ probe's new text is visible only on a hit of the corrected record the
 oracle judges current, showing that excerpt of its corrected text, and
 only when that excerpt shows something no earlier text of the record
 holds (:func:`_shows_corrected_text`): finding the current record is not
-showing its correction, and neither is an excerpt changed only by where
-it is cut. Its old text is served by any other hit showing a text the
+showing its correction, and neither is an excerpt byte for byte an earlier
+text's, nor one changed only by where it is cut, nor one that ends with the
+omission marker, cut or not, after what an earlier text holds. Its old
+text is served by any other hit showing a text the
 record held before, its declared text or an earlier correction's
 (:func:`_shows_earlier_text`).
 
@@ -363,20 +365,29 @@ OMISSION = "\n[omitted]"
 def shown(text: str) -> tuple[str, bool]:
     """What a hit of ``text`` shows of it: those characters, and whether they are all of it.
 
-    A text within a hit's bound is shown whole: its :func:`excerpt` is the
-    text. A longer one is shown as the prefix its excerpt holds before the
-    omission marker, which says only that more follows; an excerpt that is
-    neither (the store's constant fallback when cutting would make a fresh
-    redaction match) shows none of it. The oracle's texts are those the
-    store keeps (:func:`check_declared_texts`), which redaction leaves as
-    they are.
+    Read from its :func:`excerpt`, as a reader of the hit reads it. An
+    excerpt that ends with the omission marker after a prefix of the text
+    shows that prefix, and says only that more follows: a longer text cut
+    there, or a text that itself ends with the marker, whose excerpt is the
+    same bytes. Any other excerpt that is the whole text, one within a
+    hit's bound, shows it whole; an excerpt that is neither (the store's
+    constant fallback when cutting would make a fresh redaction match)
+    shows none of it. The oracle's texts are those the store keeps
+    (:func:`check_declared_texts`), which redaction leaves as they are.
+
+    Until the seventeenth review round a text within the bound was shown
+    whole whatever it ended with: ``m15`` corrected to the exact 512-byte
+    excerpt a hit had shown of its longer earlier text, the marker
+    included, was a whole text no earlier one equals, so a hit showing the
+    same bytes as before the correction counted it shown (R17-F2 of PR
+    #537).
     """
     cut = excerpt(text)
-    if cut == text:
-        return text, True
     prefix = cut.removesuffix(OMISSION)
     if prefix != cut and text.startswith(prefix):
         return prefix, False
+    if cut == text:
+        return text, True
     return "", False
 
 
@@ -478,10 +489,19 @@ def _shows_corrected_text(
     text past the bound, and the excerpt, a shorter prefix of the earlier
     text and the omission marker, gave 1 of 1 in every condition that found
     the record, though none of the correction was shown (R16-F2 of PR
-    #537).
+    #537). That round's check replaced the comparison of the excerpts
+    themselves, and read a text within the bound as shown whole: ``m15``
+    corrected to the exact excerpt a hit had shown of its earlier text,
+    the omission marker included, gave 1 of 1 in the same four conditions,
+    though each hit showed the same bytes as before the correction (R17-F2
+    of PR #537). Both checks apply now: an excerpt byte for byte an earlier
+    text's shows no correction, nor does one whose view (:func:`shown`), a
+    marker the text itself ends with read as the cut it looks like, an
+    earlier text holds.
     """
-    view = shown(truth[target][1])
-    if any(_holds_what_is_shown(before, view) for before in earlier):
+    text = truth[target][1]
+    view, rendered = shown(text), excerpt(text)
+    if any(excerpt(before) == rendered or _holds_what_is_shown(before, view) for before in earlier):
         return False
     return any(
         key == target and _shows_record_as_it_is(summary, *truth[key]) for key, summary in hits
