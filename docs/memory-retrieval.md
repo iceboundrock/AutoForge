@@ -593,14 +593,15 @@ Run with `uv run python -m tests.memory_retrieval_bench --sizes
 1000,10000,50000` on one host: x86_64, 8 CPUs, Linux 7.0.14, Python 3.14.10,
 SQLite 3.54.1. These are single runs of a local benchmark, not a
 comparison across hosts. Every figure below is from one full run after
-the fifth review round's changes (the opt-out check, the catalog digest
-over what the launch is served, the exact containers), except the coverage
-check's cost, which is labelled with the third round's session it comes
-from. The correctness figures are identical to those measured after the
-third and fourth rounds, and the store-sized search figures are within
-run-to-run noise of them (0.69 ms at the fixture's median after the third
-round, 0.70 ms now). No embedding of any kind is computed, so nothing below
-is evidence about semantic retrieval.
+the sixth review round's changes (the ranking's statistics over the whole
+served corpus, the query bound checked before encoding), except two costs
+labelled with the sessions they come from: the coverage check's (the third
+round's) and the corpus statistics' (the sixth round's, run back to back
+against the fifth round's code). The correctness figures are identical to
+those measured after the third, fourth and fifth rounds: the new
+statistics moved one pair of places, in the no-FTS5 condition, which no
+figure shows. No embedding of any kind is computed, so nothing below is
+evidence about semantic retrieval.
 
 ### Correctness on the pinned fixture
 
@@ -621,15 +622,21 @@ the fixture's declarations, not from `MemoryStore.visibility`.
 | index stale (synced before the 4 revisions), hot tail on | 0.28 | 1.00 | 1.00 | 0.990 | 0 / 56 | 0 / 56 | 0 / 6 | 0 | 1 / 1 | 23 / 23 |
 | index stale, hot tail off | 0.27 | 0.93 | 0.93 | 0.924 | 0 / 54 | 0 / 54 | 0 / 6 | 0 | 0 / 1 | 0 / 23 |
 | no FTS5 (tail of 8 only) | 0.12 | 0.46 | 0.53 | 0.472 | 0 / 22 | 0 / 22 | 0 / 6 | 0 | 1 / 1 | 0 / 23 |
-| a new process's rebuild | 0.28 | 1.00 | 1.00 | 0.990 | 0 / 56 | 0 / 56 | 0 / 6 | 0 | 1 / 1 | 23 / 23 |
+| a fresh retriever's rebuild from the checkpoint read back from its JSON, in the same process | 0.28 | 1.00 | 1.00 | 0.990 | 0 / 56 | 0 / 56 | 0 / 6 | 0 | 1 / 1 | 23 / 23 |
 
 P@5 of 0.28 is this fixture's ceiling: 21 relevant judgments over 15
 queries of five places each. The rebuild's rankings equal the synced
-index's, and so do the stale index's with the tail on. An empty store gives
-no hit, `complete`. The test holds the safety columns at zero in every
-condition. It also holds R@5 and MRR at 1.00 wherever the search is
-complete, and the stale and rebuilt rankings equal to the synced one. It does not hold the quality figures
-of the degraded conditions, which only show what each degradation costs.
+index's, and so do the stale index's with the tail on. The rebuild is
+measured in the benchmark's own process: a second retriever, with a new
+in-memory index, over a store decoded from the checkpoint's JSON. That
+shows the rebuild is deterministic from the checkpoint alone, which is
+what a new process would start from; no other interpreter is started, so
+it is not an observed restart. An empty store gives no hit, `complete`.
+The test holds the safety columns at zero in every condition. It also
+holds R@5 and MRR at 1.00 wherever the search is complete, and the stale
+and rebuilt rankings equal to the synced one. It does not hold the
+quality figures of the degraded conditions, which only show what each
+degradation costs.
 
 Without the tail, the corrected record is not served at all until the next
 sync, and every such search says it is incomplete. Without FTS5, recall
@@ -640,11 +647,11 @@ or foreign.
 
 | Corpus | Build | Search p50 / p95, snapshot held | Search p50 / p95, snapshot loaded per read | Index size |
 |---|---|---|---|---|
-| the fixture's store, 29 records (the whole read path) | 1.5 ms | 0.70 / 1.28 ms | 19.6 / 21.6 ms | 44 KiB |
-| a store at Memory's bound, 64 records (the whole read path) | 3.1 ms | 1.16 / 1.67 ms | 45.6 / 46.8 ms | 76 KiB |
+| the fixture's store, 29 records (the whole read path) | 1.5 ms | 0.73 / 1.29 ms | 19.5 / 20.3 ms | 44 KiB |
+| a store at Memory's bound, 64 records (the whole read path) | 3.0 ms | 1.27 / 1.79 ms | 46.1 / 47.7 ms | 76 KiB |
 | 1,000 synthetic documents (the backend alone) | 27 ms | 0.22 / 0.50 ms | | 0.8 MiB |
-| 10,000 synthetic documents (the backend alone) | 276 ms | 0.78 / 3.15 ms | | 7.3 MiB |
-| 50,000 synthetic documents (the backend alone) | 1,424 ms | 2.25 / 10.3 ms | | 32.8 MiB |
+| 10,000 synthetic documents (the backend alone) | 271 ms | 0.77 / 3.09 ms | | 7.3 MiB |
+| 50,000 synthetic documents (the backend alone) | 1,412 ms | 2.23 / 10.4 ms | | 32.8 MiB |
 
 Notes on the table:
 
@@ -654,7 +661,7 @@ Notes on the table:
   read" is a source that reconstructs and validates the store from the
   checkpoint's value at every call, as `AutoForgeState.memory` does. A
   search calls it twice, before and after its backend answers. That
-  reconstruction alone is 8.6 / 9.0 ms at 29 records and 21.0 / 22.4 ms
+  reconstruction alone is 8.6 / 8.8 ms at 29 records and 21.0 / 21.8 ms
   at 64, so it dominates. It is Memory's own fold, the same load the
   projection pays before every launch. A caller that searches several
   times between two writes could keep the store object and hand back the
@@ -670,21 +677,30 @@ Notes on the table:
   bound with the snapshot held. Reading the store's text of every served
   record the index has seen, to prove its answer left none out, added
   about 0.06 ms at 29 records and 0.37 ms at 64 at the median.
+- **The corpus statistics.** Measured in the sixth review round's session,
+  not in this run: two runs of the cost half each, back to back, of the
+  fifth round's code and of this one, snapshot held. The fifth round's
+  searched in 0.70 and 0.71 ms at the fixture's median and 1.15 and 1.17
+  ms at the bound; this one in 0.72 and 0.73 ms and 1.23 ms in both. Every
+  served record's lengths and terms, rather than only the found records',
+  add about 0.02 ms at 29 records and 0.07 ms at 64 at the median: most
+  of the text is already tokenized for the coverage check.
 - **Updates.** Updating one document is 0.06 ms at the median at every
-  size. The 95th percentile is 1.7 ms at 1,000 documents, 13.8 ms at
-  10,000 and 27.4 ms at 50,000, where FTS5 merges its segments.
+  size. The 95th percentile is 1.7 ms at 1,000 documents, 13.4 ms at
+  10,000 and 31.6 ms at 50,000, where FTS5 merges its segments.
 - **Where the time goes.** At the store's sizes, with the snapshot held,
   most of a search is Python: binding the request, the snapshot's verdict
   on every record, the scope's sequence, tokenizing the served records to
-  check the index's coverage, and ranking the found ones. With a snapshot loaded per call, the two reconstructions
-  and the digest of the audit rows that proves each snapshot continues the
-  last one are most of it.
+  check the index's coverage and for the ranking's statistics, and
+  ranking the found ones. With a snapshot loaded per call, the two
+  reconstructions and the digest of the audit rows that proves each
+  snapshot continues the last one are most of it.
 - **Memory and CPU.** The index's memory is its database pages, the sizes
   above. Python's own allocations during a 50,000-document build peaked
   at 24 KiB, a figure that excludes SQLite's heap. CPU time per search,
-  snapshot held, is 0.8 ms on the fixture's store and 1.2 ms at the bound.
+  snapshot held, is 0.8 ms on the fixture's store and 1.3 ms at the bound.
 - **Ingestion to visibility.** A record written after the last sync is
-  served at the next search, from the tail, in 1.5 ms. An incremental sync
+  served at the next search, from the tail, in 1.4 ms. An incremental sync
   takes 0.1 ms, and the index then serves the record itself. Each is one
   sample.
 - **Context.** Eight hits rendered by `render_hits` came to at most 1,917
@@ -693,8 +709,8 @@ Notes on the table:
   byte-level tokenizer, against the projection's 16,384-byte budget.
 
 Against the evaluation protocol's `memory_overhead` ceiling of 1,000 ms of
-latency per launch, the read path at the store's bound costs under 1.7 ms
-per search at p95 with the snapshot held, and about 47 ms at p95 loading it
+latency per launch, the read path at the store's bound costs under 1.8 ms
+per search at p95 with the snapshot held, and about 48 ms at p95 loading it
 twice per search.
 
 ## LTSearch feasibility: no-go
