@@ -405,7 +405,18 @@ anything iterates it, as a search's answer is
 (`test_verify_checks_the_read_backs_container_and_size_before_it_iterates_it`).
 The store keeps only the texts of live records, so the stale row of a
 corrected or retracted record is checked by its revision and digest alone
-(`test_verify_finds_a_row_no_sync_through_the_watermark_wrote`). `verify`
+(`test_verify_finds_a_row_no_sync_through_the_watermark_wrote`). Its
+tokens cannot be compared, but their digest is still checked for its form.
+Every row read back must be well formed before any is compared with the
+store: a partition no longer than an issue URL (192 characters), an id and
+a revision from 1 to the store's counter bound, and a content digest and a
+token digest of 64 lower-case hex digits. Until the seventh review round
+only the fields' types were checked, so a stale row whose text was gone
+passed with `not-a-digest` as its token digest, taken for ordinary
+staleness rather than an integrity failure. Any well-formed digest is all
+a lost text lets `verify` check, so such a row stays stale
+(`test_verify_rejects_a_malformed_stale_row_whose_text_the_store_no_longer_holds`).
+`verify`
 also runs FTS5's own integrity check, which proves FTS5's inverted index
 matches the rows it holds. Once `verify` marks the index `failed`, searches
 answer from the tail or the fallback until a sync rebuilds it

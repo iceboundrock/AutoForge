@@ -173,6 +173,9 @@ _ASCII_TOKEN = re.compile(r"[a-z0-9]+")
 # starting with ``x``, which marks every other token's hex form.
 _LITERAL_TOKEN = re.compile(r"[a-wyz0-9][a-z0-9]*")
 _DIGEST = re.compile(r"[a-f0-9]{64}")
+# A partition is a record's issue URL, which a store bounds to 192
+# characters (``memory._issue``).
+MAX_PARTITION = 192
 
 
 class RetrievalError(StateError):
@@ -1490,10 +1493,12 @@ class MemoryRetriever:
         added after the watermark, at a revision past it, at another
         revision or digest than the record had then, or of a record not
         indexable then; a missing or second row; a row indexed by other
-        tokens; a malformed row; a read-back that is not exactly a list of
-        as many rows as expected, checked before anything iterates it; or a
-        failed backend check: each marks the index ``failed``
-        (``integrity``) until it is rebuilt.
+        tokens; a malformed row, any field of it outside its type or bounds
+        (:func:`_well_formed_entry`, checked of every row before any is
+        compared, a stale row's token digest included where its text is gone);
+        a read-back that is not exactly a list of as many rows as expected,
+        checked before anything iterates it; or a failed backend check: each
+        marks the index ``failed`` (``integrity``) until it is rebuilt.
         """
         health = self._health()
         snap = self._load()
@@ -1516,7 +1521,10 @@ class MemoryRetriever:
             rows, healthy = [], False
         # Exactly a list, never a subclass whose length or iteration is the
         # backend's code, of one row per record expected, checked before
-        # anything iterates it or is derived from it (R5-F3 of PR #537).
+        # anything iterates it or is derived from it (R5-F3 of PR #537); and
+        # every row well formed, its digests included, before any key is
+        # hashed or compared: a stale row's tokens that nothing can compare
+        # still are a digest (R7-F1 of PR #537).
         if (
             healthy
             and type(rows) is list
@@ -1877,14 +1885,29 @@ class MemoryRetriever:
 
 
 def _well_formed_entry(row: object) -> bool:
-    """Whether a backend's row read back is an :class:`IndexEntry` of the types it names."""
+    """Whether a backend's row read back is an :class:`IndexEntry` any sync could have written.
+
+    Each field of the type it names and within its bounds: a partition no
+    longer than an issue URL, a positive id and revision no larger than a
+    store's counter, and a content digest and a token digest of 64
+    lower-case hex digits. Checked before any row's key is hashed or
+    compared with the store. A stale row whose text the store no longer
+    holds has tokens nothing can compare, so this is the only check its
+    token digest gets: ``not-a-digest`` there was taken for ordinary
+    staleness (R7-F1 of PR #537).
+    """
     return (
         type(row) is IndexEntry
         and type(row.partition) is str
+        and 0 < len(row.partition) <= MAX_PARTITION
         and type(row.id) is int
+        and 1 <= row.id <= MAX_COUNTER
         and type(row.revision) is int
+        and 1 <= row.revision <= MAX_COUNTER
         and type(row.digest) is str
+        and _DIGEST.fullmatch(row.digest) is not None
         and type(row.tokens) is str
+        and _DIGEST.fullmatch(row.tokens) is not None
     )
 
 

@@ -34,6 +34,7 @@ from autoforge.memory_handoff import prepare_launch_projection
 from autoforge.memory_retrieval import (
     MAX_CATALOG_BYTES,
     MAX_HITS,
+    MAX_PARTITION,
     MAX_QUERY_BYTES,
     MAX_QUERY_TERMS,
     MAX_RESULT_BYTES,
@@ -51,6 +52,7 @@ from autoforge.memory_retrieval import (
     query_terms,
     render_hits,
     text_tokens,
+    tokens_digest,
 )
 from autoforge.redaction import redact
 from autoforge.state import AutoForgeState
@@ -2434,6 +2436,57 @@ def test_verify_finds_a_row_no_sync_through_the_watermark_wrote(kind):
     _write_impossible_row(kind, w, retriever)
     status = retriever.verify()
     assert (status.state, status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
+    assert retriever.sync().state is IndexState.CURRENT
+    assert retriever.verify().state is IndexState.CURRENT
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("tokens", "not-a-digest", id="tokens-not-a-digest"),
+        pytest.param("tokens", "", id="tokens-empty"),
+        pytest.param("tokens", "A" * 64, id="tokens-upper-case"),
+        pytest.param("tokens", "0" * 63, id="tokens-short"),
+        pytest.param("tokens", "0" * 64 + "\n", id="tokens-and-a-newline"),
+        pytest.param("digest", "not-a-digest", id="digest-not-a-digest"),
+        pytest.param("partition", ISSUE + "0" * MAX_PARTITION, id="partition-too-long"),
+        pytest.param("id", 0, id="id-zero"),
+        pytest.param("revision", MAX_COUNTER + 1, id="revision-past-the-counter"),
+    ],
+)
+def test_verify_rejects_a_malformed_stale_row_whose_text_the_store_no_longer_holds(field, value):
+    """R7-F1 of PR #537: the stale row of a record corrected since the
+    watermark, whose earlier text the store no longer holds, has tokens
+    nothing can compare. Only their form can be checked, and it is, as
+    every field's bounds are, before any row is compared with the store: a
+    token digest that is not 64 lower-case hex digits is a row no sync
+    wrote, an integrity failure. It used to be taken for ordinary
+    staleness. Any well-formed token digest is all a lost text lets verify
+    check, so that row stays stale."""
+    w = corpus()
+    ruff = w.ids["ruff"]
+    retriever = retriever_for(w, backend=ReadBack(lambda rows: rows))
+    retriever.sync()
+    _changed_since_the_watermark(w)
+    row = next(r for r in retriever.backend.entries() if r.id == ruff)
+    # The row is the record's before its correction, whose text is gone.
+    assert row.revision < next(f.revision for f in w.store.facts() if f.id == ruff)
+    assert row.digest not in w.store.encode()["texts"]
+
+    def verified(**fields):
+        retriever.backend.wrap = lambda rows: [
+            replace(r, **fields) if r.id == ruff else r for r in rows
+        ]
+        return retriever.verify()
+
+    for tokens in (row.tokens, "0" * 64, tokens_digest(["unrelated"])):
+        status = verified(tokens=tokens)
+        assert (status.state, status.reason) == (IndexState.STALE, IndexReason.NONE)
+    status = verified(**{field: value})
+    assert (status.state, status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
+    assert retriever.metrics.snapshot()["integrity"] == 1
+    # Read back as it is, the rebuilt index verifies.
+    retriever.backend.wrap = lambda rows: rows
     assert retriever.sync().state is IndexState.CURRENT
     assert retriever.verify().state is IndexState.CURRENT
 
