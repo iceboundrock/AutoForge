@@ -809,7 +809,14 @@ candidate and one bound to a base's descendants. There are 15 queries with
 hand-judged relevant records (21 judgments), six adversarial negatives
 whose terms appear only in records the launch must not be served, and one
 correction probe. Each served hit is checked against an oracle derived from
-the fixture's declarations, not from `MemoryStore.visibility`.
+the fixture's declarations, not from `MemoryStore.visibility`. The report
+names its input by the SHA-256 of the bytes it parsed (`fixture_sha256`),
+so a run on any other input, one query changed or the same data written
+out again, carries that input's digest, never the pinned one. Until the
+eleventh review round the correctness half took a parsed fixture and
+named it by the pinned file's digest whatever it held: one query changed
+gave R@5 0.93 under the pinned digest
+(`test_a_correctness_report_names_the_bytes_it_measured_never_the_pinned_fixture`).
 
 | Condition | P@5 | R@5 | MRR | nDCG@5 | stale leaks | permission leaks | negatives with a hit | old text served | new text visible | complete searches |
 |---|---|---|---|---|---|---|---|---|---|---|

@@ -76,12 +76,32 @@ K = 5
 LAUNCH_SEQ = 128
 
 
-def load_fixture(path: Path = FIXTURE) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+@dataclass(frozen=True)
+class Fixture:
+    """A benchmark's input as the bytes read: its digest and its data are both of them.
+
+    A report names its input by :attr:`sha256`, the digest of the very bytes
+    :meth:`data` parses, so no figure is attributed to an input it was not
+    measured on: an input changed in any way is other bytes, with a digest
+    of its own. Until the eleventh review round ``correctness`` took a
+    parsed dictionary and named it by the pinned file's digest whatever it
+    held (R11-F1 of PR #537).
+    """
+
+    raw: bytes
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.raw).hexdigest()
+
+    def data(self) -> dict:
+        """:attr:`raw` parsed afresh: a change to one parse is never another's."""
+        return json.loads(self.raw.decode("utf-8"))
 
 
-def fixture_digest(path: Path = FIXTURE) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def read_fixture(path: Path = FIXTURE) -> Fixture:
+    """``path``'s bytes, read once: the pinned fixture by default."""
+    return Fixture(path.read_bytes())
 
 
 @dataclass
@@ -281,11 +301,16 @@ def _condition(world: World, retriever: MemoryRetriever, *, k: int = K) -> dict:
     }
 
 
-def correctness(fixture: dict | None = None) -> dict:
-    """Every condition's metrics on the pinned fixture."""
-    fixture = fixture or load_fixture()
+def correctness(source: Fixture | None = None) -> dict:
+    """Every condition's metrics on ``source``, the pinned fixture by default.
+
+    ``fixture_sha256`` is the digest of the bytes measured, which is the
+    pinned one only when those bytes are the pinned file's.
+    """
+    source = read_fixture() if source is None else source
+    fixture = source.data()
     repo, run = fixture["repository"], fixture["run_id"]
-    report: dict = {"fixture_sha256": fixture_digest(), "k": K}
+    report: dict = {"fixture_sha256": source.sha256, "k": K}
 
     world = build(fixture)
     synced = MemoryRetriever(repo, run, lambda: world.store)
@@ -471,10 +496,10 @@ def _store_costs(world: World, queries: Sequence[str], *, rounds: int = 20) -> d
 
 
 def performance(
-    fixture: dict | None = None, *, sizes: Sequence[int] = (1_000, 10_000), rounds: int = 20
+    source: Fixture | None = None, *, sizes: Sequence[int] = (1_000, 10_000), rounds: int = 20
 ) -> dict:
     sizes = corpus_sizes(sizes)
-    fixture = fixture or load_fixture()
+    fixture = (read_fixture() if source is None else source).data()
     repo, run = fixture["repository"], fixture["run_id"]
     queries = [q["query"] for q in fixture["queries"]] + [q["query"] for q in fixture["negatives"]]
     report: dict = {}
@@ -590,9 +615,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=f"synthetic corpus sizes, each 1 to {memory_retrieval.MAX_INDEX_DOCUMENTS} documents",
     )
     args = parser.parse_args(argv)
-    report: dict = {"host": host(), "correctness": correctness()}
+    # One read for both halves: the digest the report names is of their input.
+    source = read_fixture()
+    report: dict = {"host": host(), "correctness": correctness(source)}
     if not args.correctness:
-        report["performance"] = performance(sizes=args.sizes)
+        report["performance"] = performance(source, sizes=args.sizes)
     json.dump(report, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
     return 0

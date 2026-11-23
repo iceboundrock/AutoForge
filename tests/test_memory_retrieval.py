@@ -3195,8 +3195,9 @@ def test_answers_carry_the_launch_binding_and_each_records_applicability():
 def test_the_pinned_fixture_serves_nothing_stale_or_foreign_in_any_condition():
     """#324's correctness benchmark on its pinned fixture
     (``tests/memory_retrieval_bench.py``, ``docs/memory-retrieval.md``)."""
-    assert bench.fixture_digest() == PINNED_FIXTURE_SHA256
-    fixture = bench.load_fixture()
+    pinned = bench.read_fixture()
+    assert pinned.sha256 == PINNED_FIXTURE_SHA256
+    fixture = pinned.data()
     world = bench.build(fixture)
     truth = bench.oracle(fixture)
     # The oracle is the fixture's declarations, and the store agrees with it.
@@ -3207,7 +3208,8 @@ def test_the_pinned_fixture_serves_nothing_stale_or_foreign_in_any_condition():
     assert world.store.visibilities(world.request) == {
         record: world.store.visibility(record, world.request) for record in world.ids.values()
     }
-    report = bench.correctness(fixture)
+    report = bench.correctness()
+    assert report["fixture_sha256"] == PINNED_FIXTURE_SHA256
     conditions = ("synced", "stale", "stale_without_tail", "no_fts5", "rebuilt")
     for name in conditions:
         c = report[name]
@@ -3243,6 +3245,32 @@ def test_the_pinned_fixture_serves_nothing_stale_or_foreign_in_any_condition():
             "reason": "",
         },
     }
+
+
+@needs_fts5
+def test_a_correctness_report_names_the_bytes_it_measured_never_the_pinned_fixture(tmp_path):
+    """R11-F1 of PR #537: ``correctness`` took a parsed fixture and named it
+    by the pinned file's digest whatever it held, so a changed query's lower
+    recall was reported as the pinned fixture's. The digest is now of the
+    bytes the report's figures are measured on."""
+    pinned = bench.read_fixture()
+    changed = pinned.data()
+    changed["queries"][0]["query"] = "zephyrquill"
+    # Each parse is the caller's own: changing one changes no other.
+    assert pinned.data() != changed and pinned.sha256 == PINNED_FIXTURE_SHA256
+    path = tmp_path / "corpus.json"
+    path.write_text(json.dumps(changed), encoding="utf-8")
+    source = bench.read_fixture(path)
+    report = bench.correctness(source)
+    assert report["fixture_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert report["fixture_sha256"] != PINNED_FIXTURE_SHA256
+    # The figures are the changed input's: its first query finds nothing.
+    assert report["synced"]["recall_at_5"] == round(14 / 15, 4)
+    # The pinned data in other bytes is another input too, never the pinned one.
+    reserialized = bench.Fixture(json.dumps(pinned.data()).encode())
+    assert reserialized.data() == pinned.data()
+    assert bench.correctness(reserialized)["fixture_sha256"] == reserialized.sha256
+    assert reserialized.sha256 != PINNED_FIXTURE_SHA256
 
 
 @needs_fts5
