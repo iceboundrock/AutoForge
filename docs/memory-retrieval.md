@@ -463,9 +463,12 @@ holds exactly these two connections, and checks this one's arguments
 (`test_the_package_opens_sqlite_only_for_the_opencode_probe_and_the_memory_index`).
 
 The cost is a rebuild per process. On this host that is 1.5 ms for the
-fixture's 29 records and 3.1 ms at Memory's 64-record bound. A persisted
-index, for #325's repository-wide layer for example, would need a decision
-of its own in D10.
+fixture's 29 records and 3.0 ms at Memory's 64-record bound: the build
+column of the cost table below, from the same run. Until the seventh
+review round this paragraph gave 3.1 ms, the figure of the run after the
+fifth round's changes, which the table no longer shows. A persisted index,
+for #325's repository-wide layer for example, would need a decision of its
+own in D10.
 
 ### A SQLite without FTS5 is a documented, limited fallback
 
@@ -708,6 +711,11 @@ Notes on the table:
   projection pays before every launch. A caller that searches several
   times between two writes could keep the store object and hand back the
   same one; none exists yet.
+- **The store at the bound.** It is the fixture's 29 records, written
+  without the fixture's four revisions (two retractions, a supersession
+  and a correction), and 35 synthetic notes of 40 pseudo-words each, to
+  reach 64. It is timed, not judged: the correctness table above is the
+  fixture's alone.
 - **Synthetic corpora.** Their documents are 40 Zipf-distributed
   pseudo-words each. No store reaches these sizes: they bound what a
   larger, repository-wide layer would cost the backend. A build tokenizes
@@ -834,11 +842,33 @@ default branch's head when this was written. Paths below are in that tree.
 | (c) no integration; borrow algorithms only | yes, and nothing is borrowed from LTSearch | The read path ranks by Okapi BM25 (Robertson and others, "Okapi at TREC-3") computed over the store's text, written from the published formula with FTS5's constants. An earlier revision fused its index's and tail's lists by reciprocal rank fusion (k = 60, Cormack, Clarke and Büttcher, SIGIR 2009), the method LTSearch's router uses; one ranking over both lists replaced it. No LTSearch code was copied or translated. |
 
 **Decision: no-go for (a) and (b); FTS5 stays the default and only
-backend.** The measurement half of the go/no-go is the native baseline
-above. At Memory's scale of 64 records per run, BM25 serves every relevant
-record of the fixture within five places, at under 1.7 ms per search
-(about 47 ms loading the snapshot twice per search), with nothing stale or
-foreign. That leaves no measured gap for a hybrid backend to close.
+backend.** The no-go for each rests on what LTSearch's source shows, the
+reasons in the table. The measurement half of the go/no-go is the native
+baseline above, and its two results come from two different corpora:
+
+- **Quality and safety: the judged fixture, 29 records.** BM25 serves
+  every judged relevant record within five places (R@5 = MRR = 1.00) with
+  the index synced, stale with the tail, or rebuilt. No condition served
+  anything stale or foreign, and none served the corrected-away text. On
+  this fixture, that leaves no measured gap for a hybrid backend to close.
+- **Cost: a store at Memory's bound, 64 records.** A search takes 1.27 ms
+  at p50 and 1.79 ms at p95 when the source returns the store object it
+  holds. It takes 46.1 ms at p50 and 47.7 ms at p95 when the source
+  reconstructs the store at every call, as `AutoForgeState.memory` does,
+  which a search calls twice.
+
+The 64-record store is a timing corpus, not a judged one (the notes on
+the cost table). The benchmark measures neither its quality nor its
+safety. A check in the seventh review round's session scored it by the
+fixture's judgments anyway: R@5 0.98 and MRR 0.93. Two records that the
+fixture retracts or supersedes are current in this store, and each ranks
+first for one query; one of those queries' judged relevant records falls
+past five places. With the fixture's four revisions applied to the same
+store, the same check gave 1.00 for both, so the miss comes from the
+revisions the corpus leaves out, not from its size. Neither check is part
+of the benchmark or held by a test, and neither counted stale or foreign
+hits. Retrieval quality and the absence of stale or foreign hits are
+established at 29 records only, and at 64 only the cost.
 
 ### What this report does not settle, and the maintainer's decision
 
