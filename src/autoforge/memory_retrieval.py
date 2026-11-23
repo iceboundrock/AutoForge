@@ -23,7 +23,9 @@ candidates, gives the excerpts, picks the hot tail and reports the
 freshness is the store as it is after the retrieval, and nothing calls a
 backend after that load or reads any attribute of one: what a read reports
 of a backend, its name included, was captured when the retriever was made.
-A fetch and the catalog read no backend's answer and load it once. A
+A fetch and the catalog read no backend's answer and load it once. A sync,
+a rebuild and a verify load it again after their backend work, for the
+freshness they report, and call no backend after that load either. A
 snapshot that does not continue the newest one the retriever has read (an
 older checkpoint, a saved copy, another history, an earlier launch
 ordinal) is refused, so no read is ever judged by a snapshot a later write
@@ -1245,9 +1247,10 @@ class MemoryRetriever:
     returns the canonical snapshot as it is now (the controller's
     ``AutoForgeState.memory``). Every read, sync and status reads each
     backend's health first (:meth:`_health`), then calls it, a search once
-    more after each backend answers, and answers from the snapshot it
-    loaded last alone, calling no backend and reading nothing of one after
-    that load (its name and kind are its slot's, read once, here). A
+    more after each backend answers and a sync, a rebuild and a verify once
+    more after their backend work, and answers from the snapshot it loaded
+    last alone, calling no backend and reading nothing of one after that
+    load (its name and kind are its slot's, read once, here). A
     snapshot of another repository or run, or one that does not continue
     the newest snapshot read before, is refused (:class:`RetrievalError`),
     and so is one with Memory on that nothing proves newer than an opt-out

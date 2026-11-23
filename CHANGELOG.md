@@ -27,12 +27,17 @@ records the launch is served, a fetch answers alike for every record it
 does not serve, the catalog's digest covers only what the launch is
 served, and every revision and freshness figure is the scope's own
 count, so no record outside the scope moves a hit or leaves a gap. Every
-answer names the launch it is for and each record's applicability. An index
-found not to match the store, by a row it returns or a match it leaves out,
-is marked failed, and the search that found it answers from the fallback or
-the store at once; so is an answer that is not exactly a list or a tuple.
-A failed rebuild keeps the index it would have replaced until the next
-sync makes it.
+answer names the launch it is for and each record's applicability. A
+search asks the index only about the records the launch is served, so no
+row of any other record, damaged or not, changes what the launch is told;
+the controller's verify checks every row. An index found not to match the
+store, by a row it returns or a match it leaves out, is marked failed, and
+the search that found it answers from the fallback or the store at once;
+so is an answer that is not exactly a list or a tuple. A failed rebuild
+keeps the index it would have replaced until the next sync makes it, and a
+sync, a rebuild or a verify reports the freshness of the store as it is
+once the index's work is done, so a write made meanwhile is reported
+pending.
 The index, the hot tail and a query share one Unicode tokenizer, so a
 record in any script is found alike before and after the index syncs it.
 Where the interpreter's SQLite lacks FTS5, a search looks for matches only
