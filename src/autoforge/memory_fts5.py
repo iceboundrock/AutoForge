@@ -42,7 +42,9 @@ class Fts5Index:
                 raise BackendError("invalid index document")
             rows.append((doc.id, " ".join(doc.terms)))
         try:
-            connection = sqlite3.connect(":memory:")
+            # The controller serializes use. Garbage collection can retire an
+            # unreachable generation on a different thread.
+            connection = sqlite3.connect(":memory:", check_same_thread=False)
         except sqlite3.Error:
             raise BackendError("cannot open memory index") from None
         try:

@@ -2,6 +2,7 @@
 
 import math
 import sqlite3
+import threading
 from dataclasses import replace
 
 import pytest
@@ -312,7 +313,9 @@ def test_missing_fts5_keeps_tail_bounded_even_without_fts5_on_the_host(monkeypat
 
     for simulate in (False, True):
         if simulate:
-            monkeypatch.setattr(sqlite3, "connect", lambda path: original(path, factory=NoFts5))
+            monkeypatch.setattr(
+                sqlite3, "connect", lambda path, **kw: original(path, factory=NoFts5, **kw)
+            )
         _, reader = instance(store)
         status = reader.sync()
         if not simulate and status.is_current:
@@ -445,7 +448,9 @@ def test_interruption_after_sql_commit_leaves_old_generation_and_can_retry(fts5,
             super().close()
 
     with monkeypatch.context() as patch:
-        patch.setattr(sqlite3, "connect", lambda path: original(path, factory=Interrupted))
+        patch.setattr(
+            sqlite3, "connect", lambda path, **kw: original(path, factory=Interrupted, **kw)
+        )
         with pytest.raises(KeyboardInterrupt):
             reader.rebuild()
     assert closed == [True] and reader.status() == before
@@ -453,6 +458,25 @@ def test_interruption_after_sql_commit_leaves_old_generation_and_can_retry(fts5,
     source[0] = apply(proposal(source[0], "key added", n=2))
     assert reader.sync().is_current
     assert reader.verify().is_current
+
+
+def test_unreachable_generation_can_be_finalized_from_a_different_thread(fts5, monkeypatch):
+    original = sqlite3.connect
+    closed = []
+
+    class Observed(sqlite3.Connection):
+        def close(self):
+            super().close()
+            closed.append(threading.get_ident())
+
+    monkeypatch.setattr(
+        sqlite3, "connect", lambda path, **kw: original(path, factory=Observed, **kw)
+    )
+    refs = [Fts5Index(())]
+    worker = threading.Thread(target=refs.clear)
+    worker.start()
+    worker.join()
+    assert closed == [worker.ident]
 
 
 def test_bad_batch_and_failed_forced_rebuild_keep_the_previous_generation(fts5, monkeypatch):

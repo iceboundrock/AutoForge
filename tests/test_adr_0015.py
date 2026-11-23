@@ -395,7 +395,9 @@ def test_sqlite_is_only_for_the_read_only_probe_and_disposable_index():
                     source = ast.get_source_segment(path.read_text(), function)
                     if path.name == "memory_fts5.py":
                         assert tuple(map(ast.literal_eval, node.args)) == (":memory:",)
-                        assert not node.keywords
+                        assert {kw.arg: ast.literal_eval(kw.value) for kw in node.keywords} == {
+                            "check_same_thread": False,
+                        }
                         assert "PRAGMA temp_store = MEMORY" in source
                         assert "setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)" in source
                     else:
