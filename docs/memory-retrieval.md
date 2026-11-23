@@ -19,14 +19,32 @@ ordinal change. It is not a cache to share between issues or launches.
 applicability, citation and retention, and score provenance. `fetch_memory`
 looks the ID up afresh and returns the current bounded item or `None`;
 missing and forbidden IDs are indistinguishable. Both return `ReadScope`
-and typed index freshness, even when there are no hits. IDs remain
+and `ScopeFreshness`, even when there are no hits. IDs remain
 run-local as in `memory.md`; they are not stable references across runs.
 `catalog()` renders a fixed vocabulary of authorized kinds and their counts,
-an authorized-content fingerprint and freshness. It includes no record
-titles, ancestry proofs or digests of withheld text. Metrics are saturating
+and the same freshness. It includes no record titles, IDs, ancestry proofs
+or digests of withheld text, and its length has a fixed bound whatever the
+records. Metrics are saturating
 aggregate counts, not queries, session data, raw backend errors or prompts.
 All returned prose is untrusted; a future consumer must fence it as data,
 not concatenate it into instructions.
+
+Launch answers and controller maintenance report freshness in different
+types, because the run's audit positions count writes the binding cannot
+read. `ScopeFreshness`, on search, fetch and catalog, has no audit
+position. Its `revision` digests the kinds and current text of the
+binding's authorized records, without their IDs, so every reader of the
+same checkpoint and binding reports the same value, and a write to another
+issue or an inapplicable candidate range does not change it. Its `pending`
+counts records: authorized records the generation does not hold at their
+current version, plus held records no longer authorized. A record
+corrected twice counts once, and `pending` is zero exactly when the state
+is current. `IndexStatus`, from `status()`, `sync()`, `rebuild()` and
+`verify()`, carries the ledger's `source_seq` and the generation's
+`indexed_through_seq`, and its `pending` counts audit rows, hidden ones
+included. Citation retention is resolved afresh for each answer and is
+part of neither the revision nor the index. The `generation` counter is
+per reader.
 
 The same store binding and applicability checks used by `memory.md` govern
 retrieval, including phase, issue, candidate range, environment and
@@ -70,10 +88,21 @@ items returned. Later sync restores coverage after a correction or
 retraction retires a generation. Inputs are limited to 512 query UTF-8
 bytes and 16 requested hits. Oversized character counts and string
 subclasses fail before encoding (and before source/backend calls); the
-bounded remainder is encoded for the exact byte check. Excerpts are at
-most 512 UTF-8 bytes each, and their total fits the request's byte budget.
-An intentionally tiny budget can give a ranked ID an empty excerpt; fetch
-is bounded independently by the store's 2,048-byte record limit.
+bounded remainder is encoded for the exact byte check.
+
+Search excerpts share the request's `max_chars` and `max_bytes`: with `n`
+hits, each is cut to `max_chars // n` characters and `min(512, max_bytes // n)`
+UTF-8 bytes, its omission marker included, so together they fit both. An
+intentionally tiny budget can give a ranked ID an empty excerpt; fetch
+is bounded independently by the store's 2,048-byte record limit. That
+budget is the launch projection's whole budget, and the excerpts may fill
+it: a hit's typed metadata (ID, kind, applicability, citation, retention,
+score) and the catalog are not rendered into it here and are not counted.
+Nothing renders search answers into a launch today. A consumer that does
+must fit its rendered metadata and the excerpts together into
+`max_chars` and `max_bytes`, as `render_projection` fits its header, for
+example by constructing the reader with a request whose budget leaves room
+for the metadata.
 
 ## Publication and failure
 
@@ -92,10 +121,10 @@ row count, IDs, bounded byte bodies against that generation's seals, and
 FTS postings integrity. It can check a stale generation without retaining
 a second copy of old prose in the manifest. `verify()` returns a failed
 `IndexStatus` for index damage, rather than asking controller callers to
-catch a SQLite exception. Controller maintenance status carries the run's
-audit watermark and re-reads after backend work; launch status instead
-carries an observed revision of the authorized view. Hidden writes neither
-increment that revision nor force a healthy generation to be rebuilt.
+catch a SQLite exception. Maintenance status re-reads the store after
+backend work. A write the binding cannot read advances the audit
+watermark without forcing a healthy generation to be rebuilt: the next
+`sync()` moves `indexed_through_seq` forward and keeps the generation.
 
 Without FTS5 the index is unavailable and only the bounded tail is used.
 An optional controller-supplied lexical backend has no output channel
@@ -147,7 +176,7 @@ Python 3.14.10 and SQLite 3.54.1, with other local validation active:
 At 64 records the mean CPU cost was 2.45 ms per held read and 47.82 ms per
 reconstructed read. A separately traced held read peaked at about 65 KiB
 of Python allocations; process-wide peak RSS was about 34 MiB. The sample
-returned 264 summary bytes and a 191-byte catalog. Those counts are a
+returns 264 summary bytes and a 187-byte catalog. Those counts are a
 conservative upper bound for byte-level tokenizers, not measured model
 tokens. No hybrid or model measurements are implied.
 

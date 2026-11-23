@@ -38,6 +38,7 @@ MAX_HITS = 16
 TAIL_RECORDS = 8
 SUMMARY_BYTES = 512
 OMISSION = "\n[omitted]"
+PLACEHOLDER = "[details omitted]"
 
 
 class BackendError(RuntimeError):
@@ -75,7 +76,15 @@ class IndexProblem(StrEnum):
 
 @dataclass(frozen=True)
 class IndexStatus:
-    """Audit positions in maintenance; observed corpus revisions in launch answers."""
+    """The controller's maintenance diagnostic, in the run ledger's audit positions.
+
+    ``source_seq`` is the ledger's audit position (its row count) and
+    ``indexed_through_seq`` the position through which the published
+    generation holds this binding's corpus. ``pending`` is the number of audit
+    rows after it, whichever records they touch. Only ``status``, ``sync``,
+    ``rebuild`` and ``verify`` return one; launch answers carry
+    :class:`ScopeFreshness`, which has no audit position.
+    """
 
     backend: Backend
     state: IndexState
@@ -94,6 +103,37 @@ class IndexStatus:
         if self.indexed_through_seq is None:
             return None
         return self.source_seq - self.indexed_through_seq
+
+    @property
+    def failed(self) -> int:
+        return int(self.problem not in (None, IndexProblem.UNAVAILABLE))
+
+
+@dataclass(frozen=True)
+class ScopeFreshness:
+    """A launch answer's index freshness over the binding's authorized corpus.
+
+    It holds no audit position. ``revision`` is a digest of the authorized
+    records' kinds and current text, without their IDs (creation positions):
+    any reader of the same checkpoint and binding reports the same one.
+    Citation retention is resolved afresh for each answer and is not part of
+    it. ``pending`` is the number of authorized records the generation does
+    not hold at their current version, plus the records it holds that are no
+    longer authorized: zero exactly when the state is current. A write to a
+    record the binding cannot read changes neither. ``generation`` counts
+    this reader's publications and is not comparable across readers.
+    """
+
+    backend: Backend
+    state: IndexState
+    revision: str
+    pending: int
+    generation: int | None
+    problem: IndexProblem | None
+
+    @property
+    def is_current(self) -> bool:
+        return self.state is IndexState.CURRENT
 
     @property
     def failed(self) -> int:
@@ -132,7 +172,7 @@ class MemoryHit:
 class SearchResult:
     scope: ReadScope
     hits: tuple[MemoryHit, ...]
-    index: IndexStatus
+    index: ScopeFreshness
     complete: bool
     degraded: bool
     tail_used: bool
@@ -142,7 +182,7 @@ class SearchResult:
 class FetchResult:
     scope: ReadScope
     item: MemoryItem | None
-    index: IndexStatus
+    index: ScopeFreshness
     degraded: bool
 
 
@@ -150,18 +190,22 @@ class FetchResult:
 class MemoryCatalog:
     scope: ReadScope
     topics: tuple[tuple[Kind, int], ...]
-    fingerprint: str
-    index: IndexStatus
+    index: ScopeFreshness
     degraded: bool
 
     def render(self) -> str:
-        """Static labels only; no record titles, text, receipts or internal proofs."""
+        """Static labels only; no record titles, text, receipts or internal proofs.
+
+        Its length has a fixed bound, whatever the records: one digest, and
+        one count per kind and a pending count, each at most ``MAX_FACTS``.
+        """
         topics = ", ".join(f"{kind.value}: {count}" for kind, count in self.topics) or "(none)"
         return (
             "Issue Working Memory catalog (advisory, untrusted)\n"
             f"Topics: {topics}\n"
-            f"Revision: {self.index.source_seq}; fingerprint: {self.fingerprint}\n"
-            f"Index: {self.index.state.value}; degraded: {str(self.degraded).lower()}\n"
+            f"Revision: {self.index.revision}\n"
+            f"Index: {self.index.state.value}; pending: {self.index.pending}; "
+            f"degraded: {str(self.degraded).lower()}\n"
         )
 
 
@@ -248,19 +292,24 @@ def _query(text: str, k: int) -> tuple[str, ...]:
     raise ValueError("invalid memory query")
 
 
-def _excerpt(text: str, limit: int) -> str:
+def _excerpt(text: str, chars: int, size: int) -> str:
+    """``text`` redacted, in at most ``chars`` characters and ``size`` UTF-8 bytes.
+
+    The omission marker and the placeholder are ASCII, so each counts the same
+    in both bounds.
+    """
     text = redact(text)
-    data = text.encode()
-    if len(data) > limit:
-        if limit < len(OMISSION):
+    if len(text) > chars or len(text.encode()) > size:
+        if min(chars, size) < len(OMISSION):
             return ""
-        text = data[: limit - len(OMISSION)].decode(errors="ignore") + OMISSION
+        cut = text[: chars - len(OMISSION)].encode()[: size - len(OMISSION)]
+        text = cut.decode(errors="ignore") + OMISSION
     if redact(text) == text:
         return text
-    return "[details omitted]" if limit >= len("[details omitted]") else ""
+    return PLACEHOLDER if min(chars, size) >= len(PLACEHOLDER) else ""
 
 
-def _item(record: RetrievalRecord, bound: int) -> MemoryItem:
+def _item(record: RetrievalRecord, chars: int, size: int) -> MemoryItem:
     fact = record.fact
     return MemoryItem(
         fact.id,
@@ -269,7 +318,7 @@ def _item(record: RetrievalRecord, bound: int) -> MemoryItem:
         fact.scope,
         fact.evidence,
         record.retention,
-        _excerpt(record.text, bound),
+        _excerpt(record.text, chars, size),
     )
 
 
@@ -284,11 +333,20 @@ class _View:
     store: MemoryStore
     records: tuple[RetrievalRecord, ...]
     scope: ReadScope | None
-    revision: int
 
     @property
     def versions(self) -> frozenset[tuple[int, int]]:
+        # A readable record changes revision only by a correction, which
+        # changes its text: so these also identify what an index must hold.
         return frozenset((r.fact.id, r.fact.revision) for r in self.records)
+
+    @property
+    def revision(self) -> str:
+        # Kinds and text digests only: an ID or a record revision is a ledger
+        # position, which would count writes this binding cannot read.
+        return hashlib.sha256(
+            json.dumps(sorted([r.fact.kind.value, r.fact.content] for r in self.records)).encode()
+        ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -297,7 +355,6 @@ class _Generation:
     versions: frozenset[tuple[int, int]]
     manifest: tuple[DocumentSeal, ...]
     audit: int
-    revision: int
     serial: int
 
 
@@ -326,31 +383,52 @@ def _manifest(documents: tuple[IndexDocument, ...]) -> tuple[DocumentSeal, ...]:
     return tuple(result)
 
 
-def _status(slot: _Slot, view: _View, *, audit: bool) -> IndexStatus:
-    generation = slot.published
-    source = view.store.source_seq if audit else view.revision
-    through = None if generation is None else (generation.audit if audit else generation.revision)
+def _state(slot: _Slot, view: _View, *, current: bool) -> IndexState:
     if not view.store.enabled:
-        state = IndexState.DISABLED
-    elif slot.broken or (generation is None and slot.problem is IndexProblem.BUILD):
-        state = IndexState.FAILED
-    elif slot.problem is IndexProblem.UNAVAILABLE:
-        state = IndexState.UNAVAILABLE
-    elif through is None:
-        state = IndexState.EMPTY
-    elif source == through and generation is not None and generation.revision == view.revision:
-        state = IndexState.CURRENT
-    else:
-        state = IndexState.STALE
-    # Receipt retention can move the view without appending an audit row.
-    pending = max(source - (through or 0), int(state is IndexState.STALE))
+        return IndexState.DISABLED
+    if slot.broken or (slot.published is None and slot.problem is IndexProblem.BUILD):
+        return IndexState.FAILED
+    if slot.problem is IndexProblem.UNAVAILABLE:
+        return IndexState.UNAVAILABLE
+    if slot.published is None:
+        return IndexState.EMPTY
+    return IndexState.CURRENT if current else IndexState.STALE
+
+
+def _status(slot: _Slot, view: _View) -> IndexStatus:
+    """Maintenance status: the ledger's audit positions, never a launch's answer."""
+    generation = slot.published
+    source = view.store.source_seq
+    through = None if generation is None else generation.audit
+    # A generation's audit position is the ledger length of the view it holds
+    # (moved on only by rows that leave the binding's corpus as it was), and a
+    # continued checkpoint of the same length has the same rows: equal
+    # positions mean the generation holds the corpus exactly.
     return IndexStatus(
         slot.backend,
-        state,
+        _state(slot, view, current=source == through),
         source,
         through,
+        source - (through or 0),
+        None if generation is None else generation.serial,
+        slot.problem,
+    )
+
+
+def _freshness(slot: _Slot, view: _View) -> ScopeFreshness:
+    """A launch answer's status: scoped to the authorized corpus, no audit position."""
+    generation = slot.published
+    held = dict(generation.versions) if generation is not None else {}
+    now = dict(view.versions)
+    # Each record whose indexed version differs counts once: added,
+    # corrected, or no longer authorized.
+    pending = sum(held.get(i) != now.get(i) for i in held.keys() | now.keys())
+    return ScopeFreshness(
+        slot.backend,
+        _state(slot, view, current=not pending),
+        view.revision,
         pending,
-        generation.serial if generation is not None else None,
+        None if generation is None else generation.serial,
         slot.problem,
     )
 
@@ -398,10 +476,10 @@ class MemoryRetriever:
             raise StateError("memory retrieval needs an explicit binding after opt-out")
         if not store.enabled:
             self._opted_out = True
-            view = _View(store, (), None, (old.revision + bool(old.records)) if old else 0)
+            view = _View(store, (), None)
         else:
             # Remember even a newer checkpoint that refuses this launch binding.
-            self._view = _View(store, old.records if old else (), None, old.revision if old else 0)
+            self._view = _View(store, (), None)
             records = store.retrieval_records(
                 self._request,
                 validation_records=checkpoint.validation_records,
@@ -416,12 +494,7 @@ class MemoryRetriever:
                 request.candidate,
                 request.environment,
             )
-            view = _View(
-                store,
-                records,
-                scope,
-                (old.revision if old else 0) + (records != (old.records if old else ())),
-            )
+            view = _View(store, records, scope)
         self._view = view
         if serving and view.scope is None:
             raise StateError("memory retrieval is disabled")
@@ -429,7 +502,7 @@ class MemoryRetriever:
 
     def status(self) -> IndexStatus:
         """Controller diagnostic for the primary, with global audit positions."""
-        return _status(self._primary, self._read(serving=False), audit=True)
+        return _status(self._primary, self._read(serving=False))
 
     def _build(self, slot: _Slot, view: _View, *, force: bool) -> _Slot:
         old = slot.published
@@ -438,7 +511,7 @@ class MemoryRetriever:
             and slot.problem is None
             and not slot.broken
             and old is not None
-            and old.revision == view.revision
+            and old.versions == view.versions
         ):
             # Hidden writes don't create a new generation or trigger adapter work.
             return replace(slot, published=replace(old, audit=view.store.source_seq))
@@ -459,7 +532,6 @@ class MemoryRetriever:
             view.versions,
             manifest,
             view.store.source_seq,
-            view.revision,
             1 if old is None else old.serial + 1,
         )
         return _Slot(slot.backend, slot.factory, generation)
@@ -471,7 +543,7 @@ class MemoryRetriever:
             if self._fallback is not None:
                 self._fallback = self._build(self._fallback, view, force=force)
             view = self._read(serving=False)
-        return _status(self._primary, view, audit=True)
+        return _status(self._primary, view)
 
     def sync(self) -> IndexStatus:
         """Publish the complete bounded batch; retry a failed attempt even without writes."""
@@ -498,19 +570,19 @@ class MemoryRetriever:
             if self._fallback is not None:
                 self._fallback = self._verify(self._fallback)
             view = self._read(serving=False)
-        return _status(self._primary, view, audit=True)
+        return _status(self._primary, view)
 
-    def _answers(self, view: _View) -> tuple[IndexStatus, bool]:
+    def _answers(self, view: _View) -> tuple[ScopeFreshness, bool]:
         if self._primary.usable(view) and self._primary.problem is not IndexProblem.UNAVAILABLE:
-            return _status(self._primary, view, audit=False), False
+            return _freshness(self._primary, view), False
         fallback = self._fallback
         if (
             fallback is not None
             and fallback.usable(view)
             and fallback.problem is not IndexProblem.UNAVAILABLE
         ):
-            return _status(fallback, view, audit=False), True
-        return _status(self._primary, view, audit=False), True
+            return _freshness(fallback, view), True
+        return _freshness(self._primary, view), True
 
     def fetch_memory(self, record: int) -> FetchResult:
         view = self._read()
@@ -518,9 +590,9 @@ class MemoryRetriever:
         found = next((r for r in view.records if type(record) is int and r.fact.id == record), None)
         index, degraded = self._answers(view)
         self._count(fetch=True, hits=int(found is not None), degraded=degraded)
-        return FetchResult(
-            view.scope, _item(found, MAX_TEXT_BYTES) if found else None, index, degraded
-        )
+        # The store's record bound, not the search budget (a fetch is one record).
+        item = _item(found, MAX_TEXT_BYTES, MAX_TEXT_BYTES) if found else None
+        return FetchResult(view.scope, item, index, degraded)
 
     def catalog(self) -> MemoryCatalog:
         view = self._read()
@@ -528,11 +600,9 @@ class MemoryRetriever:
         kinds = Counter(r.fact.kind for r in view.records)
         topics = tuple(sorted(kinds.items()))
         index, degraded = self._answers(view)
-        # No record IDs, global positions, source ancestry, or withdrawn hashes.
-        fingerprint = hashlib.sha256(
-            json.dumps(sorted((r.fact.kind.value, r.text) for r in view.records)).encode()
-        ).hexdigest()
-        return MemoryCatalog(view.scope, topics, fingerprint, index, degraded)
+        # No record IDs, global positions, source ancestry, or withdrawn hashes:
+        # the freshness's revision digests authorized kinds and text alone.
+        return MemoryCatalog(view.scope, topics, index, degraded)
 
     def _lookup(
         self, slot: _Slot, view: _View, terms: tuple[str, ...]
@@ -587,6 +657,12 @@ class MemoryRetriever:
         )
 
     def search_memory(self, query: str, *, k: int = 5) -> SearchResult:
+        """At most ``k`` ranked hits; their excerpts together fit the binding's budget.
+
+        Each of ``n`` hits is cut to ``max_chars // n`` characters and
+        ``min(512, max_bytes // n)`` UTF-8 bytes of the request, its omission
+        marker included. No metadata is rendered or counted here.
+        """
         terms = _query(query, k)
         view = self._read()
         if not terms:
@@ -619,14 +695,14 @@ class MemoryRetriever:
             reverse=True,
         )
         selected = tail[:TAIL_RECORDS]
-        hits = _rank(view.records, matches, selected, terms, k, self._request.max_bytes)
+        hits = _rank(view.records, matches, selected, terms, k, self._request)
         assert view.scope is not None
         degraded = not answered or used is not self._primary
         self._count(fetch=False, hits=len(hits), degraded=degraded)
         return SearchResult(
             view.scope,
             hits,
-            _status(used, view, audit=False),
+            _freshness(used, view),
             len(tail) <= TAIL_RECORDS,
             degraded,
             bool(selected),
@@ -649,7 +725,7 @@ def _rank(
     tail: list[RetrievalRecord],
     terms: tuple[str, ...],
     k: int,
-    byte_budget: int,
+    budget: ProjectionRequest,
 ) -> tuple[MemoryHit, ...]:
     if not terms or (not matches and not tail):
         return ()
@@ -670,9 +746,14 @@ def _rank(
         if score:
             ranked.append((score, r))
     ranked.sort(key=lambda pair: (-pair[0], pair[1].fact.id))
-    # For byte-level tokenizers, encoded bytes bound the text tokens. The typed
-    # answer's metadata is separately bounded by the store and the result count.
     if not ranked:
         return ()
-    limit = min(SUMMARY_BYTES, byte_budget // min(k, len(ranked)))
-    return tuple(MemoryHit(_item(r, limit), score) for score, r in ranked[:k])
+    # The excerpts share the binding's whole budget, characters and UTF-8
+    # bytes alike (bytes bound a byte-level tokenizer's tokens): together they
+    # fit both. Nothing here renders the typed metadata, so none of it is
+    # counted; a consumer that renders hits must fit its metadata and the
+    # excerpts together into the launch's budget (docs/memory-retrieval.md).
+    shown = min(k, len(ranked))
+    chars = budget.max_chars // shown
+    size = min(SUMMARY_BYTES, budget.max_bytes // shown)
+    return tuple(MemoryHit(_item(r, chars, size), score) for score, r in ranked[:k])

@@ -21,6 +21,7 @@ from autoforge.memory_retrieval import (
     IndexState,
     IndexUnavailable,
     MemoryRetriever,
+    ScopeFreshness,
 )
 from tests.test_memory import (
     BASE,
@@ -292,11 +293,15 @@ def test_citations_and_ranges_are_typed_and_rechecked():
     assert ranges[Range.DESCENDANTS].base == BASE
     assert ranges[Range.EXACT].candidate == SHA
     assert ranges[Range.ANY].base == ""
-    assert reader.fetch_memory(1).item.retention is Retention.RETAINED
+    before = reader.fetch_memory(1)
+    assert before.item.retention is Retention.RETAINED
     checkpoint[0] = Checkpoint(store)
     hit = reader.fetch_memory(1)
     assert hit.item.retention is Retention.UNAVAILABLE and hit.item.evidence == receipt
-    assert hit.index.state is IndexState.STALE
+    # Retention is read afresh for each answer; the index holds lexical
+    # membership only, so a receipt's loss leaves it current and unrevised.
+    assert hit.index == before.index and hit.index.is_current and not hit.index.pending
+    assert reader.status().is_current
 
 
 def test_missing_fts5_keeps_tail_bounded_even_without_fts5_on_the_host(monkeypatch):
@@ -530,6 +535,90 @@ def test_maintenance_reports_freshness_after_backend_work():
     assert (status.source_seq, status.indexed_through_seq, status.pending) == (3, 1, 2)
 
 
+def launch_freshness(reader, query="note"):
+    """Search, fetch and catalog agree on one freshness, and it is scoped."""
+    answers = {
+        reader.search_memory(query).index,
+        reader.fetch_memory(1).index,
+        reader.catalog().index,
+    }
+    assert len(answers) == 1
+    (freshness,) = answers
+    assert type(freshness) is ScopeFreshness
+    assert not hasattr(freshness, "source_seq") and not hasattr(freshness, "indexed_through_seq")
+    return freshness
+
+
+def test_launch_freshness_counts_a_batch_and_agrees_with_a_reconstructed_reader():
+    source, reader = instance(apply(proposal(empty(), "first note", n=1)), backend=ScriptedIndex)
+    reader.sync()
+    synced = launch_freshness(reader)
+    assert synced.is_current and synced.pending == 0
+    for n in range(2, 6):
+        source[0] = apply(proposal(source[0], f"batched note {n}", n=n))
+    status = reader.status()
+    assert (status.source_seq, status.indexed_through_seq, status.pending) == (5, 1, 4)
+    # Four authorized records appended before one read: four pending, not one.
+    stale = launch_freshness(reader)
+    assert stale.state is IndexState.STALE and stale.pending == 4
+    assert stale.revision != synced.revision
+    # A reader built afresh over the same checkpoint, round-tripped through
+    # JSON, reports the same revision, with the whole corpus pending.
+    _, fresh = instance(reload(source[0]), backend=ScriptedIndex)
+    unsynced = launch_freshness(fresh)
+    assert unsynced.state is IndexState.EMPTY and unsynced.pending == 5
+    assert unsynced.revision == stale.revision
+    for each in (reader, fresh):
+        assert each.sync().is_current
+        current = launch_freshness(each)
+        assert current.is_current and current.pending == 0
+        assert current.revision == stale.revision
+    assert reader.status() == replace(fresh.status(), generation=2)
+
+
+def test_launch_pending_counts_records_while_maintenance_counts_audit_rows():
+    store = empty()
+    for n in range(1, 4):
+        store = apply(proposal(store, f"indexed note {n}", n=n))
+    source, reader = instance(store, backend=ScriptedIndex)
+    reader.sync()
+    foreign = replace(SCOPE, step=replace(STEP, issue_url=OTHER))
+    # One batch: record 2 corrected twice, record 3 retracted, a write the
+    # binding cannot read, and one authorized record added (ID 8).
+    batch = apply(revise(source[0], Action.CORRECT, 2, text="corrected note"))
+    batch = apply(revise(batch, Action.CORRECT, 2, text="recorrected note"))
+    batch = apply(revise(batch, Action.RETRACT, 3))
+    batch = apply(proposal(batch, "hidden note", n=4, scope=foreign))
+    source[0] = apply(proposal(batch, "appended note", n=5))
+    status = reader.status()
+    assert (status.source_seq, status.indexed_through_seq, status.pending) == (8, 3, 5)
+    # Three records differ from the generation: 2 (once), 3 and 8.
+    stale = launch_freshness(reader)
+    assert stale.state is IndexState.STALE and stale.pending == 3
+    assert texts(reader.search_memory("recorrected")) == ["recorrected note"]
+    assert reader.sync().is_current
+    assert launch_freshness(reader).revision == stale.revision
+
+
+def test_writes_the_binding_cannot_read_leave_launch_freshness_unchanged():
+    source, reader = instance(apply(proposal(empty(), "local note", n=1)), backend=ScriptedIndex)
+    reader.sync()
+    before = launch_freshness(reader)
+    foreign = replace(SCOPE, step=replace(STEP, issue_url=OTHER))
+    old = replace(SCOPE, range=Range.EXACT, candidate=BASE)
+    source[0] = apply(proposal(source[0], "foreign note", n=2, scope=foreign))
+    source[0] = apply(proposal(source[0], "old candidate note", n=3, scope=old))
+    status = reader.status()
+    assert status.state is IndexState.STALE and status.pending == 2
+    assert launch_freshness(reader) == before
+    assert reader.sync().is_current
+    assert reader.status().generation == before.generation
+    assert launch_freshness(reader) == before
+    _, fresh = instance(source[0], backend=ScriptedIndex)
+    fresh.sync()
+    assert launch_freshness(fresh) == before
+
+
 def test_bm25_uses_nonmatching_authorized_documents_for_normalization():
     store = apply(proposal(empty(), "term", n=1))
     store = apply(proposal(store, "term term x x x", n=2))
@@ -555,10 +644,51 @@ def test_prose_never_enters_catalog_or_metrics():
     assert reader.metrics.searches == reader.metrics.fetches == 1
 
 
-def test_tiny_search_budget_does_not_hide_ranked_ids_or_overrun_text_budget():
+@pytest.mark.parametrize("budget", [{"max_bytes": 1}, {"max_chars": 1}])
+def test_tiny_search_budget_does_not_hide_ranked_ids_or_overrun_text_budget(budget):
     store = apply(proposal(empty(), "word that is too long"))
-    reader = MemoryRetriever(lambda: Checkpoint(store), replace(REQ, max_bytes=1))
+    reader = MemoryRetriever(lambda: Checkpoint(store), replace(REQ, **budget))
     result = reader.search_memory("word")
     assert result.complete and result.hits[0].item.id == 1
     assert texts(result) == [""]
     assert reader.fetch_memory(1).item.text == "word that is too long"
+
+
+@pytest.mark.parametrize(
+    ("budget", "expected"),
+    [
+        # Characters are the tighter bound for multibyte text: 20 of 60 each.
+        (
+            {"max_chars": 60},
+            {1: "needle 界界界\n[omitted]", 2: "needle xxx\n[omitted]", 3: "needle short"},
+        ),
+        # Bytes are: 21 of 63 each, with no partial character.
+        (
+            {"max_bytes": 63},
+            {1: "needle 界\n[omitted]", 2: "needle xxxx\n[omitted]", 3: "needle short"},
+        ),
+        # Both: bytes bind the multibyte excerpt, characters the ASCII one.
+        (
+            {"max_chars": 60, "max_bytes": 63},
+            {1: "needle 界\n[omitted]", 2: "needle xxx\n[omitted]", 3: "needle short"},
+        ),
+        # One hit has the whole character budget.
+        ({"max_chars": 60, "k": 1}, {1: "needle " + "界" * 43 + "\n[omitted]"}),
+    ],
+)
+def test_search_excerpts_fit_the_character_and_the_byte_budget(budget, expected):
+    store = apply(proposal(empty(), "needle " + "界" * 300, n=1))
+    store = apply(proposal(store, "needle " + "x" * 300, n=2))
+    store = apply(proposal(store, "needle short", n=3))
+    budget = dict(budget)
+    k = budget.pop("k", 5)
+    request = replace(REQ, **budget)
+    reader = MemoryRetriever(lambda: Checkpoint(store), request, backend=ScriptedIndex)
+    reader.sync()
+    result = reader.search_memory("needle", k=k)
+    shown = {hit.item.id: hit.item.text for hit in result.hits}
+    assert shown == expected and result.complete
+    assert sum(len(text) for text in shown.values()) <= request.max_chars
+    assert sum(len(text.encode()) for text in shown.values()) <= request.max_bytes
+    # A fetch is one record, bounded by the store's record limit instead.
+    assert reader.fetch_memory(1).item.text == "needle " + "界" * 300
