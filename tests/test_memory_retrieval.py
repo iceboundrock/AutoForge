@@ -30,6 +30,8 @@ from autoforge.memory import (
     Range,
     Receipt,
     Visibility,
+    admissible_text,
+    bounded_text,
 )
 from autoforge.memory_handoff import prepare_launch_projection
 from autoforge.memory_retrieval import (
@@ -3688,31 +3690,31 @@ def test_a_corrected_record_the_oracle_does_not_judge_current_is_no_new_text_vis
 
 
 # No FTS5 needed: the benchmark judges what the tail serves alike.
-@pytest.mark.parametrize("corrections", ["once", "twice"])
+@pytest.mark.parametrize("corrections", ["once", "twice", "across the bound"])
 def test_a_correction_past_a_hits_bound_finds_its_record_but_shows_no_new_text(
     corrections, monkeypatch
 ):
-    """R15-F2 of PR #537: finding the corrected record is not showing its
-    correction. m15's text is lengthened past a hit's 512-byte bound and
-    its correction appends a term past it, which the new-text query asks
-    for: once, from its declared text, or twice, the pinned correction
-    lengthened and then appended to. Every condition that serves m15 finds
-    it by that term and shows it exactly as it is now, which is exactly
-    what it showed before: its excerpt is its earlier text's. Until the
-    fifteenth review round that gave a new text visible of 1 in each of
-    them. It is 0 now, and the hit, the record as it is, is no stale leak
-    and no old text served; the pinned fixture's report is unchanged
+    """R15-F2 and R16-F2 of PR #537: finding the corrected record is not
+    showing its correction. m15's correction appends a term past what a hit
+    shows of its text, and the new-text query asks for it: once, from its
+    declared text lengthened past a hit's 512-byte bound; twice, the pinned
+    correction lengthened and then appended to; or across the bound, from a
+    declared text of 511 bytes, which a hit shows whole, to one a hit cuts.
+    Every condition that serves m15 finds it by that term and shows it
+    exactly as it is now, and that shows nothing its earlier text does not
+    hold: the earlier text's excerpt itself (once, twice), or a shorter
+    prefix of the earlier text and the omission marker (across the bound).
+    Until the fifteenth review round the first two gave a new text visible
+    of 1 in each of them, and until the sixteenth the third did, its
+    excerpt differing from the earlier one by where it is cut. It is 0 now,
+    and the hit, the record as it is, is no stale leak and no old text
+    served; the pinned fixture's report is unchanged
     (``test_the_pinned_fixture_serves_nothing_stale_or_foreign_in_any_condition``)."""
     fixture = bench.read_fixture().data()
     (probe,) = fixture["corrections"]
     (correction,) = [op for op in fixture["operations"] if op["op"] == "correct"]
     assert probe["key"] == correction["key"] == "m15"
-    if corrections == "once":
-        m15 = _record(fixture, "m15")
-        m15["text"] = _past_a_hits_bound(m15["text"], "sandwort", 600)
-        earlier = m15["text"]
-        correction["text"] = f"{earlier} Its zygomorph lists are covered too."
-    else:
+    if corrections == "twice":
         correction["text"] = _past_a_hits_bound(correction["text"], "sandwort", 600)
         earlier = correction["text"]
         fixture["operations"].append(
@@ -3723,6 +3725,12 @@ def test_a_correction_past_a_hits_bound_finds_its_record_but_shows_no_new_text(
                 "reason": "a case was added",
             }
         )
+    else:
+        m15 = _record(fixture, "m15")
+        size = 600 if corrections == "once" else MAX_SUMMARY_BYTES - 1
+        m15["text"] = _past_a_hits_bound(m15["text"], "sandwort", 600)[:size]
+        earlier = m15["text"]
+        correction["text"] = f"{earlier} Its zygomorph lists are covered too."
     probe["new_query"] = "zygomorph"
     # The probe's term is m15's alone, and the new-text search changes no
     # other figure of the report.
@@ -3732,7 +3740,18 @@ def test_a_correction_past_a_hits_bound_finds_its_record_but_shows_no_new_text(
     state, current = truth["m15"]
     assert state == "current" and current != earlier
     assert bench.earlier_texts(fixture, "m15")[-1] == earlier
-    assert bench.excerpt(current) == bench.excerpt(earlier)
+    assert "zygomorph" not in bench.excerpt(current)
+    prefix = bench.excerpt(current).removesuffix("\n[omitted]")
+    if corrections == "across the bound":
+        # A hit showed the earlier text whole and shows the current one cut:
+        # the excerpts differ, but only by the cut, and the prefix the current
+        # one shows is the earlier text's.
+        assert bench.excerpt(earlier) == earlier
+        assert len(earlier.encode()) < MAX_SUMMARY_BYTES < len(current.encode())
+        assert bench.excerpt(current) != bench.excerpt(earlier)
+        assert len(prefix) < len(earlier) and earlier.startswith(prefix)
+    else:
+        assert bench.excerpt(current) == bench.excerpt(earlier)
     source = bench.Fixture(json.dumps(fixture).encode())
 
     report = bench.correctness(source)
@@ -3741,9 +3760,12 @@ def test_a_correction_past_a_hits_bound_finds_its_record_but_shows_no_new_text(
         assert c["correction_new_text_visible"] == 0.0, name
         assert (c["stale_leak_rate"], c["permission_leak_rate"]) == (0.0, 0.0), name
         assert c["correction_old_text_served"] == 0, name
+    # What a hit shows of the current text is that prefix, cut, and all of
+    # it is the earlier text's.
+    assert bench.shown(current) == (prefix, False) and bench.OMISSION == "\n[omitted]"
 
     # The record is found and shown as it is now: with no earlier text to
-    # compare its excerpt with, as until the fifteenth review round, every
+    # compare what it shows with, as until the fifteenth review round, every
     # condition that serves m15 counts it, and nothing else of the report
     # moves.
     monkeypatch.setattr(bench, "earlier_texts", lambda fixture, key: [])
@@ -3760,7 +3782,98 @@ def test_a_correction_past_a_hits_bound_finds_its_record_but_shows_no_new_text(
     retriever.sync()
     result = retriever.search_memory(world.request, "zygomorph")
     (hit,) = (hit for hit in result.hits if hit.id == world.ids["m15"])
-    assert hit.summary == bench.excerpt(current) == bench.excerpt(earlier)
+    assert hit.summary == bench.excerpt(current) and "zygomorph" not in hit.summary
+
+
+# No FTS5 needed: the benchmark judges what the tail serves alike.
+@pytest.mark.parametrize("current", ["restated", "appended"])
+def test_an_intermediate_correction_shown_again_is_old_text_served(current, monkeypatch):
+    """R16-F3 of PR #537: the old-text probe judged a hit only against the
+    corrected record's declared text. m15 is corrected twice, and the probe's
+    old-text query asks for a term of the first correction, which the
+    second keeps. The read path serves m15 as it is now, which is no old
+    text served, even where its current text holds the first correction
+    whole (appended): the hit shows the record as it is. A search made to
+    show the first correction's excerpt on that query serves an earlier
+    text: until the sixteenth review round that gave no old text served in
+    any condition, though the stale-leak rate counted it. It counts now in
+    every condition that serves m15 on that query, and nothing else of the
+    report moves."""
+    fixture = bench.read_fixture().data()
+    (probe,) = fixture["corrections"]
+    (correction,) = [op for op in fixture["operations"] if op["op"] == "correct"]
+    first = correction["text"]
+    assert probe["key"] == correction["key"] == "m15" and "config_lists" in first
+    latest = {
+        "restated": "Fixture lists now live under tests/data/zygomorph.",
+        "appended": f"{first} Its zygomorph cases are covered too.",
+    }[current]
+    fixture["operations"].append(
+        {"op": "correct", "key": "m15", "text": latest, "reason": "moved again"}
+    )
+    probe["new_query"], probe["old_query"] = "zygomorph", "config_lists"
+    # The probe's two searches are none of the report's other queries.
+    others = [q["query"] for q in fixture["queries"] + fixture["negatives"]]
+    assert "zygomorph" not in others and "config_lists" not in others
+    truth = _oracle_agrees_with_the_store(fixture)
+    assert truth["m15"] == ("current", latest)
+    declared = _record(fixture, "m15")["text"]
+    assert bench.earlier_texts(fixture, "m15") == [declared, first]
+    assert (first in latest) is (current == "appended")
+    source = bench.Fixture(json.dumps(fixture).encode())
+    record = bench.build(fixture).ids["m15"]
+    serving = ("synced", "stale", "no_fts5", "rebuilt")
+
+    honest = bench.correctness(source)
+    for name in _CONDITIONS:
+        c = honest[name]
+        assert (c["stale_leak_rate"], c["permission_leak_rate"]) == (0.0, 0.0), name
+        assert c["correction_old_text_served"] == 0, name
+        assert c["correction_new_text_visible"] == (name in serving), name
+    # m15 is a hit of the old-text query as it is now: the exemption, not
+    # its absence, keeps it out of the count.
+    world = bench.build(fixture)
+    retriever = MemoryRetriever(fixture["repository"], fixture["run_id"], lambda: world.store)
+    retriever.sync()
+    result = retriever.search_memory(world.request, "config_lists")
+    (hit,) = (hit for hit in result.hits if hit.id == record)
+    assert hit.summary == bench.excerpt(latest)
+
+    real = MemoryRetriever.search_memory
+
+    def search(self, request, query, **kwargs):
+        result = real(self, request, query, **kwargs)
+        if query != probe["old_query"]:
+            return result
+        hits = tuple(
+            replace(hit, summary=bench.excerpt(first)) if hit.id == record else hit
+            for hit in result.hits
+        )
+        return replace(result, hits=hits)
+
+    monkeypatch.setattr(MemoryRetriever, "search_memory", search)
+    tampered = bench.correctness(source)
+    unchanged = ("stale_leak_rate", "correction_old_text_served")
+    for name in _CONDITIONS:
+        c, before = tampered[name], honest[name]
+        if name not in serving:
+            assert c == before, name
+            continue
+        assert c["correction_old_text_served"] == 1, name
+        assert c["stale_leak_rate"] == 1 / c["served"], name
+        assert {k: v for k, v in c.items() if k not in unchanged} == {
+            k: v for k, v in before.items() if k not in unchanged
+        }, name
+
+    # Judged against the declared text alone, as until the sixteenth review
+    # round, the same search serves no old text in any condition, though the
+    # stale-leak rate still counts the hit.
+    monkeypatch.setattr(bench, "earlier_texts", lambda fixture, key: [declared])
+    missed = bench.correctness(source)
+    for name in serving:
+        c = missed[name]
+        assert c["correction_old_text_served"] == 0, name
+        assert c["stale_leak_rate"] == tampered[name]["stale_leak_rate"] > 0.0, name
 
 
 def _copy_of(fixture: dict, key: str, **declared) -> None:
@@ -3888,6 +4001,72 @@ def test_a_withheld_copy_of_a_corrected_text_is_judged_by_the_oracle_never_the_s
         assert any("m26" in ranked for ranked in c["ranked"]), name
         assert c["stale_leak_rate"] > 0.0 and c["permission_leak_rate"] == 0.0, name
         assert c["correction_old_text_served"] == 1, name
+
+
+# No FTS5 needed: the refusal comes before anything is searched, and the
+# miss it prevents is judged alike on what the tail serves.
+@pytest.mark.parametrize("declared", ["with a NUL", "past a record's bound"])
+def test_a_fixture_text_the_store_would_not_keep_as_declared_is_refused(declared, monkeypatch):
+    """R16-F1 of PR #537: the oracle judges records by their declared texts,
+    and the store normalizes the controller's text on admission (D9.9). The
+    controller's m3, declared with a NUL appended or past a record's 2,048
+    bytes, is kept without the NUL, or cut. Retracted beside an agent's copy
+    of the text the store kept, it withholds the copy in the store, while
+    the oracle, comparing the declared text, judged the copy current: a
+    store made to serve the copy counted no stale leak. Such a fixture is
+    refused now, by the oracle and by the benchmark before anything is
+    built; the pinned fixture's texts are all kept as declared
+    (``test_the_pinned_fixture_serves_nothing_stale_or_foreign_in_any_condition``)."""
+    fixture = bench.read_fixture().data()
+    m3 = _record(fixture, "m3")
+    assert m3["actor"] == "controller"
+    if declared == "with a NUL":
+        m3["text"] += "\0"
+    else:
+        m3["text"] = _past_a_hits_bound(m3["text"], "quillwort", MAX_TEXT_BYTES) + " quillwort"
+    kept = bounded_text(m3["text"], MAX_TEXT_BYTES)
+    assert kept != m3["text"] and admissible_text(kept) and not admissible_text(m3["text"])
+    _copy_of(fixture, "m3", text=kept, range="exact", candidate="current")
+    fixture["operations"].append({"op": "retract", "key": "m3", "reason": "obsolete"})
+    # The store admits m3 as it keeps it, and withholds the copy by that text.
+    admitted = bench.build(fixture, operations=False)
+    assert admitted.store.text_of(admitted.ids["m3"]) == kept
+    world = bench.build(fixture)
+    copy = world.ids["m26"]
+    assert world.store.visibility(copy, world.request) is Visibility.WITHHELD
+    source = bench.Fixture(json.dumps(fixture).encode())
+    refused = "would not keep a text of 'm3' as the fixture declares it"
+    with pytest.raises(ValueError, match=refused):
+        bench.oracle(fixture)
+    # Refused before any world is built.
+    monkeypatch.setattr(bench, "build", _unreachable)
+    with pytest.raises(ValueError, match=refused):
+        bench.correctness(source)
+    monkeypatch.undo()
+
+    # Judged by its declared text, as until the sixteenth review round, the
+    # copy is current to the oracle, and a store made to serve it counts no
+    # leak wherever it is served.
+    monkeypatch.setattr(bench, "check_declared_texts", lambda fixture: None)
+    assert bench.oracle(fixture)["m26"] == ("current", kept)
+    real = MemoryStore.visibilities
+
+    def visibilities(self, request):
+        verdicts = real(self, request)
+        if verdicts.get(copy) is Visibility.WITHHELD:
+            verdicts[copy] = Visibility.CURRENT
+        return verdicts
+
+    monkeypatch.setattr(MemoryStore, "visibilities", visibilities)
+    missed = bench.correctness(source)
+    for name in ("synced", "stale", "no_fts5", "rebuilt"):
+        c = missed[name]
+        assert any("m26" in ranked for ranked in c["ranked"]), name
+        assert (c["stale_leak_rate"], c["permission_leak_rate"]) == (0.0, 0.0), name
+
+
+def _unreachable(*args, **kwargs):
+    raise AssertionError("the benchmark built a world from a fixture it must refuse")
 
 
 @needs_fts5

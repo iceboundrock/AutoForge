@@ -19,13 +19,19 @@ declarations, never from :meth:`MemoryStore.visibility`, so a stale or
 permission leak is counted however the code decides. It replays the
 fixture's retractions and corrections, each withholding the text it
 withdrew where the withdrawn record's scope takes the launch
-(:func:`oracle`). A hit's summary is judged against the excerpt a hit of
-the oracle's text shows (:func:`excerpt`), never the whole text, which may
-be longer than a hit shows. A correction probe's new text is visible only
-on a hit of the corrected record the oracle judges current, showing that
-excerpt of its corrected text, and only when that excerpt is not one any
-earlier text of the record shows too (:func:`_shows_corrected_text`):
-finding the current record is not showing its correction.
+(:func:`oracle`), and judges by declared texts only: a fixture declaring
+a text the store would not keep exactly as declared is refused before
+anything runs (:func:`check_declared_texts`). A hit's summary is judged
+against the excerpt a hit of the oracle's text shows (:func:`excerpt`),
+never the whole text, which may be longer than a hit shows. A correction
+probe's new text is visible only on a hit of the corrected record the
+oracle judges current, showing that excerpt of its corrected text, and
+only when that excerpt shows something no earlier text of the record
+holds (:func:`_shows_corrected_text`): finding the current record is not
+showing its correction, and neither is an excerpt changed only by where
+it is cut. Its old text is served by any other hit showing a text the
+record held before, its declared text or an earlier correction's
+(:func:`_shows_earlier_text`).
 
 **Performance** times the same index on the fixture's store, on a store at
 Memory's record bound, and on synthetic corpora of the backend alone, which
@@ -69,6 +75,7 @@ from autoforge.memory import (
     ProposalKey,
     Range,
     Receipt,
+    admissible_text,
     bounded_text,
 )
 from autoforge.memory_retrieval import (
@@ -240,6 +247,39 @@ def applies(fixture: dict, record: dict) -> bool:
     return True
 
 
+def check_declared_texts(fixture: dict) -> None:
+    """Refuse ``fixture`` when the store would not keep each of its texts exactly as declared.
+
+    The oracle judges records by the texts the fixture declares: which
+    record carries a withdrawn text, and what a hit of each shows. The store
+    keeps an agent's or the operator's text, and a correction's, only as it
+    is, and refuses one it would change; the controller's it normalizes on
+    admission (ADR 0015 D9.9: redacted, NUL removed, cut to
+    :data:`~autoforge.memory.MAX_TEXT_BYTES` with an omission marker), and
+    withholds and serves by the text it kept. So every declared text must be
+    one the store keeps unchanged (:func:`~autoforge.memory.admissible_text`),
+    or no verdict of the oracle's is the store's specification: a
+    :class:`ValueError` here, before anything is built or searched. The
+    store's visibility is never asked.
+
+    Until the sixteenth review round such a fixture was measured: the
+    controller's ``m3`` declared with a NUL appended, retracted beside an
+    agent's copy of its text without the NUL, left the copy current to the
+    oracle while the store, which kept ``m3``'s text without the NUL,
+    withheld it, so a search made to serve the copy counted no stale leak
+    (R16-F1 of PR #537).
+    """
+    declared = [(record["key"], record["text"]) for record in fixture["records"]] + [
+        (op["key"], op["text"]) for op in fixture["operations"] if op["op"] == "correct"
+    ]
+    for key, text in declared:
+        if not admissible_text(text):
+            raise ValueError(
+                f"the store would not keep a text of {key!r} as the fixture declares it,"
+                " so the oracle cannot judge what it serves"
+            )
+
+
 def oracle(fixture: dict) -> dict[str, tuple[str, str]]:
     """Each record's expected state and text, from the fixture's declarations alone.
 
@@ -256,7 +296,12 @@ def oracle(fixture: dict) -> dict[str, tuple[str, str]]:
     of ``m10`` on the old candidate counted the current ``m10`` as a stale
     leak, and a duplicate of a corrected text was judged current (R13-F2 of
     PR #537).
+
+    Each declared text must be the text the store keeps
+    (:func:`check_declared_texts`): a fixture with one it would change is
+    refused here, never judged.
     """
+    check_declared_texts(fixture)
     records = {record["key"]: record for record in fixture["records"]}
     text = {key: record["text"] for key, record in records.items()}
     retracted: set[str] = set()
@@ -311,6 +356,40 @@ def excerpt(text: str) -> str:
     return bounded_text(text, MAX_SUMMARY_BYTES)
 
 
+# What :func:`~autoforge.memory.bounded_text` appends to a text it cuts.
+OMISSION = "\n[omitted]"
+
+
+def shown(text: str) -> tuple[str, bool]:
+    """What a hit of ``text`` shows of it: those characters, and whether they are all of it.
+
+    A text within a hit's bound is shown whole: its :func:`excerpt` is the
+    text. A longer one is shown as the prefix its excerpt holds before the
+    omission marker, which says only that more follows; an excerpt that is
+    neither (the store's constant fallback when cutting would make a fresh
+    redaction match) shows none of it. The oracle's texts are those the
+    store keeps (:func:`check_declared_texts`), which redaction leaves as
+    they are.
+    """
+    cut = excerpt(text)
+    if cut == text:
+        return text, True
+    prefix = cut.removesuffix(OMISSION)
+    if prefix != cut and text.startswith(prefix):
+        return prefix, False
+    return "", False
+
+
+def _holds_what_is_shown(earlier: str, view: tuple[str, bool]) -> bool:
+    """Whether ``earlier`` holds everything ``view`` (:func:`shown`) shows of a text.
+
+    A whole text is held only by itself. A prefix is held by every text it
+    begins: nothing it shows is new to that text, wherever the cut falls.
+    """
+    characters, whole = view
+    return earlier == characters if whole else earlier.startswith(characters)
+
+
 def _shows_record_as_it_is(summary: str, state: str, text: str) -> bool:
     """Whether a hit shows its record as the oracle judges it now.
 
@@ -322,24 +401,32 @@ def _shows_record_as_it_is(summary: str, state: str, text: str) -> bool:
     return state == "current" and summary == excerpt(text)
 
 
-def _shows_earlier_text(summary: str, earlier: str, state: str, text: str) -> bool:
-    """Whether a correction probe's hit shows a corrected record's ``earlier`` text.
+def _shows_earlier_text(summary: str, earlier: Sequence[str], state: str, text: str) -> bool:
+    """Whether a correction probe's hit shows any of a corrected record's ``earlier`` texts.
 
-    A hit shows it when its summary holds that text whole, or is its excerpt
-    (a text past a hit's bound is never whole in a summary: R12-F1 of PR
-    #537). A hit that shows its record as the oracle judges it now
-    (:func:`_shows_record_as_it_is`) shows what its record is, which may
-    hold the earlier text: a correction that only appends to it, or a long
+    ``earlier`` is every text the record held before its current one
+    (:func:`earlier_texts`): its declared text and each correction's but
+    the last. A hit shows one when its summary holds that text whole, or is
+    its excerpt (a text past a hit's bound is never whole in a summary:
+    R12-F1 of PR #537). A hit that shows its record as the oracle judges it
+    now (:func:`_shows_record_as_it_is`) shows what its record is, which may
+    hold an earlier text: a correction that only appends to it, or a long
     text whose excerpt the correction left unchanged. Until the thirteenth
     review round such a hit was counted, so an append-only correction of
     ``m10`` gave one old text served in every condition that served it
-    (R13-F1 of PR #537). Any other hit is judged: the earlier text of a
+    (R13-F1 of PR #537). Any other hit is judged: an earlier text of a
     record now corrected, a withheld or retracted copy of it, or its excerpt
     where the record now shows another.
+
+    Until the sixteenth review round only the record's declared text was
+    judged: ``m15`` corrected twice, a hit made to show the first
+    correction's excerpt on a search for its term gave no old text served
+    in any condition, though the stale-leak rate counted it (R16-F3 of PR
+    #537).
     """
     if _shows_record_as_it_is(summary, state, text):
         return False
-    return earlier in summary or summary == excerpt(earlier)
+    return any(before in summary or summary == excerpt(before) for before in earlier)
 
 
 def earlier_texts(fixture: dict, key: str) -> list[str]:
@@ -370,10 +457,12 @@ def _shows_corrected_text(
     hit of ``target`` counts only when it shows the record as the oracle
     judges it now (:func:`_shows_record_as_it_is`): current, with the
     excerpt of the corrected text. And that excerpt must show the
-    correction: when an earlier text's excerpt is the same bytes, a
-    correction that only changed what lies past a hit's 512-byte bound, no
-    hit shows it, however the record was found. Such a hit is no stale
-    leak and no old text served: it shows the record as it is now.
+    correction: something no earlier text holds (:func:`shown`). When an
+    earlier text holds all it shows, a correction that only changed what
+    lies past the prefix a hit shows, no hit shows it, however the record
+    was found, whether the excerpt is an earlier one's exactly or differs
+    from it only by where it is cut. Such a hit is no stale leak and no old
+    text served: it shows the record as it is now.
 
     Until the fourteenth review round any hit of ``target`` counted,
     whatever it showed, so ``m15``'s hit shown with its original text on
@@ -383,10 +472,16 @@ def _shows_corrected_text(
     even where that excerpt was also its earlier text's: a term appended to
     ``m15`` past the bound, the new-text query asking for it, gave 1 of 1 in
     every condition that found the record, though its hit showed exactly
-    what it had shown before the correction (R15-F2 of PR #537).
+    what it had shown before the correction (R15-F2 of PR #537). Until the
+    sixteenth, it counted one whose excerpt differed from every earlier
+    one's only by its cut: a term appended to a 511-byte ``m15`` took its
+    text past the bound, and the excerpt, a shorter prefix of the earlier
+    text and the omission marker, gave 1 of 1 in every condition that found
+    the record, though none of the correction was shown (R16-F2 of PR
+    #537).
     """
-    text = truth[target][1]
-    if any(excerpt(before) == excerpt(text) for before in earlier):
+    view = shown(truth[target][1])
+    if any(_holds_what_is_shown(before, view) for before in earlier):
         return False
     return any(
         key == target and _shows_record_as_it_is(summary, *truth[key]) for key, summary in hits
@@ -443,17 +538,17 @@ def _condition(world: World, retriever: MemoryRetriever, *, k: int = K) -> dict:
     negative_hits = sum(bool(search(q["query"])[1]) for q in fixture["negatives"])
     new_visible = old_served = 0
     for correction in fixture["corrections"]:
-        old_text = next(r["text"] for r in fixture["records"] if r["key"] == correction["key"])
+        earlier = earlier_texts(fixture, correction["key"])
         result, keys = search(correction["new_query"])
         new_visible += _shows_corrected_text(
             [(key, hit.summary) for hit, key in zip(result.hits, keys, strict=True)],
             correction["key"],
             truth,
-            earlier_texts(fixture, correction["key"]),
+            earlier,
         )
         result, keys = search(correction["old_query"])
         old_served += any(
-            _shows_earlier_text(hit.summary, old_text, *truth[key])
+            _shows_earlier_text(hit.summary, earlier, *truth[key])
             for hit, key in zip(result.hits, keys, strict=True)
         )
     corrections = len(fixture["corrections"])
@@ -481,6 +576,8 @@ def correctness(source: Fixture | None = None) -> dict:
     """
     source = read_fixture() if source is None else source
     fixture = source.data()
+    # A fixture the oracle cannot judge is refused before anything is built.
+    check_declared_texts(fixture)
     repo, run = fixture["repository"], fixture["run_id"]
     report: dict = {"fixture_sha256": source.sha256, "k": K}
 

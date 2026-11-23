@@ -851,28 +851,42 @@ text, or an earlier correction's. A withdrawal withholds another record of
 the same issue that carries that very text, by an author no higher than
 the withdrawn record's, and only when the withdrawn record's own scope
 takes the benchmark's launch: retracting a copy bound to another candidate
-leaves the launch's own record current. A hit is a
+leaves the launch's own record current. The oracle judges by the declared
+texts, so each must be one the store keeps exactly as declared
+(`memory.admissible_text`). The store refuses an agent's or the operator's
+text, or a correction's, that it would change; the controller's it
+normalizes on admission (redacted, NUL removed, cut to 2,048 bytes) and
+withholds and serves by what it kept. A fixture declaring any text the
+store would not keep as it is, record or correction, is refused, by the
+oracle and by the benchmark before anything is built. A hit is a
 stale leak when the oracle judges its record retracted, withheld or
 superseded, or when its summary is anything but the excerpt a hit shows of
 the text the oracle judges current: that text redacted, then cut to 512
 bytes with an omission marker. "Old text served" counts a probe search
-with a hit that shows the earlier text whole or as its excerpt, except a
-hit of a record the oracle judges current whose summary is exactly the
-excerpt of its current text. That hit shows the record as it is now, which
-may still hold the earlier text: a correction that only appends to it, or
-a long text whose excerpt the correction left unchanged. Every other hit
-showing the earlier text counts: the corrected record's earlier text or
-its excerpt, and a withheld copy of it. "New text visible" counts a probe
-whose new-text search has a hit of the corrected record that shows it as
-it is now: a record the oracle judges current, whose summary is exactly
-the excerpt of its current text. A hit of it that shows anything else,
-its earlier text's excerpt included, shows no correction, and neither does
-any hit of it while the oracle does not judge it current. Nor does a hit
-whose excerpt any earlier text of the record shows too: the declared text,
-or an earlier correction's. Finding the current record is not showing its
-correction, and a correction that only changes what lies past the 512-byte
-excerpt is not visible in any hit. Such a hit still shows the record as it
-is now, so it is neither a stale leak nor old text served.
+with a hit that shows an earlier text of the corrected record whole or as
+its excerpt: its declared text, or any of its corrections' but the last,
+which is the text it holds now. A hit of a record the oracle judges
+current whose summary is exactly the excerpt of its current text is not
+counted. That hit shows the record as it is now, which may still hold an
+earlier text: a correction that only appends to it, or a long text whose
+excerpt the correction left unchanged. Every other hit showing an earlier
+text counts: the corrected record's earlier text or its excerpt, an
+intermediate correction's included, and a withheld copy of one. "New text
+visible" counts a probe whose new-text search has a hit of the corrected
+record that shows it as it is now: a record the oracle judges current,
+whose summary is exactly the excerpt of its current text. A hit of it
+that shows anything else, its earlier text's excerpt included, shows no
+correction, and neither does any hit of it while the oracle does not
+judge it current. Nor does a hit whose excerpt shows nothing that an
+earlier text of the record (the declared text, or an earlier
+correction's) does not hold. An excerpt within the bound shows its whole
+text, which only that same text holds; a cut excerpt shows the prefix
+before its omission marker, which every text it begins holds. Finding the
+current record is not showing its correction, and a correction that only
+changes what lies past the prefix a hit shows is not visible in any hit,
+whether its excerpt is an earlier one's exactly or differs from it only
+by where it is cut. Such a hit still shows the record as it is now, so it
+is neither a stale leak nor old text served.
 
 Until the fourteenth review round "new text visible" counted any hit of
 the corrected record on the new-text search, whatever it showed: on the
@@ -887,8 +901,31 @@ the new-text query asked for, it gave 1 of 1 in every condition that
 served `m15` (synced, stale with the tail, without FTS5, rebuilt), though
 each hit showed exactly the excerpt it had shown before the correction
 (`test_a_correction_past_a_hits_bound_finds_its_record_but_shows_no_new_text`).
-The pinned fixture's correctness report is unchanged by either, byte for
-byte: its correction of `m15` rewrites the excerpt itself.
+Until the sixteenth it counted a hit whose excerpt differed from every
+earlier one's only by where it was cut. With `m15` declared at 511 bytes,
+which a hit shows whole, and corrected by appending a term the new-text
+query asked for, it gave 1 of 1 in the same four conditions, though each
+hit showed only a shorter prefix of the earlier text and the omission
+marker (the same test's third case).
+The pinned fixture's correctness report is unchanged by each of them,
+byte for byte: its correction of `m15` rewrites the text a hit shows
+whole.
+
+Until the sixteenth review round "old text served" judged a hit only
+against the corrected record's declared text. With `m15` corrected twice
+and the old-text query asking for a term of the first correction, a hit
+made to show that correction's excerpt counted no old text served in any
+condition that served it, while the stale-leak rate counted it
+(`test_an_intermediate_correction_shown_again_is_old_text_served`). And
+the oracle took each declared text for the text the store keeps. The
+controller's `m3` declared with a NUL appended, retracted beside an
+agent's copy of its text without the NUL, left the copy current to the
+oracle while the store, which kept `m3`'s text without the NUL, withheld
+it; a store made to serve the copy counted no stale leak
+(`test_a_fixture_text_the_store_would_not_keep_as_declared_is_refused`,
+which cuts a text past 2,048 bytes too). The pinned fixture has neither
+case: every text it declares is kept as it is, and its correctness report
+is unchanged, byte for byte.
 
 Until the thirteenth review round the oracle withdrew only retracted
 texts, by their declared text and whatever their scope. Retracting an
