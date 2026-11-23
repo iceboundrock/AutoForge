@@ -16,7 +16,9 @@ back from its JSON (in this same process: it shows the rebuild is
 deterministic, not that a restart was observed), and an empty store. Each
 served hit is checked against an oracle derived from the fixture's own
 declarations, never from :meth:`MemoryStore.visibility`, so a stale or
-permission leak is counted however the code decides.
+permission leak is counted however the code decides. A hit's summary is
+judged against the excerpt a hit of the oracle's text shows (:func:`excerpt`),
+never the whole text, which may be longer than a hit shows.
 
 **Performance** times the same index on the fixture's store, on a store at
 Memory's record bound, and on synthetic corpora of the backend alone, which
@@ -60,8 +62,10 @@ from autoforge.memory import (
     ProposalKey,
     Range,
     Receipt,
+    bounded_text,
 )
 from autoforge.memory_retrieval import (
+    MAX_SUMMARY_BYTES,
     Fts5Backend,
     IndexDocument,
     MemoryRetriever,
@@ -234,6 +238,21 @@ def oracle(fixture: dict) -> dict[str, tuple[str, str]]:
     return result
 
 
+def excerpt(text: str) -> str:
+    """What a hit of ``text`` shows: ``text`` redacted, then cut to a hit's bound.
+
+    The excerpt rule of a search's hits (:func:`~autoforge.memory.bounded_text`
+    at :data:`~autoforge.memory_retrieval.MAX_SUMMARY_BYTES`), applied to the
+    text the oracle judges current. A record's text may be up to four times a
+    hit's bound, cut then to at most 512 bytes with an omission marker, so a
+    summary is judged against this, never the whole text. Until the twelfth
+    review round it was judged against the whole text, so a correct excerpt
+    of a current record longer than the bound counted as a stale leak (R12-F1
+    of PR #537).
+    """
+    return bounded_text(text, MAX_SUMMARY_BYTES)
+
+
 def _dcg(gains: Sequence[int]) -> float:
     return sum(g / math.log2(i + 2) for i, g in enumerate(gains))
 
@@ -270,7 +289,11 @@ def _condition(world: World, retriever: MemoryRetriever, *, k: int = K) -> dict:
         for hit, key in zip(result.hits, keys, strict=True):
             state, text = truth[key]
             served += 1
-            stale += state not in ("current", "foreign", "inapplicable") or hit.summary != text
+            # Not current, or not the excerpt of the text the oracle judges
+            # current: an earlier text, another record's, or any other bytes.
+            stale += state not in ("current", "foreign", "inapplicable") or (
+                hit.summary != excerpt(text)
+            )
             permission += state in ("foreign", "inapplicable")
         complete.append(result.complete)
         return result, keys
@@ -282,8 +305,14 @@ def _condition(world: World, retriever: MemoryRetriever, *, k: int = K) -> dict:
     for correction in fixture["corrections"]:
         old_text = next(r["text"] for r in fixture["records"] if r["key"] == correction["key"])
         new_visible += correction["key"] in search(correction["new_query"])[1]
-        result, _ = search(correction["old_query"])
-        old_served += any(old_text in hit.summary for hit in result.hits)
+        result, keys = search(correction["old_query"])
+        # The earlier text whole, or its excerpt where that is not what the
+        # hit's record now shows: a text past a hit's bound is never whole in
+        # a summary (R12-F1 of PR #537).
+        old_served += any(
+            old_text in hit.summary or hit.summary == excerpt(old_text) != excerpt(truth[key][1])
+            for hit, key in zip(result.hits, keys, strict=True)
+        )
     corrections = len(fixture["corrections"])
     return {
         **quality(ranked, k),

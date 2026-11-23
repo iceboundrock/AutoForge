@@ -3273,6 +3273,102 @@ def test_a_correctness_report_names_the_bytes_it_measured_never_the_pinned_fixtu
     assert reserialized.sha256 != PINNED_FIXTURE_SHA256
 
 
+def _past_a_hits_bound(text: str, word: str, size: int) -> str:
+    """``text`` lengthened with ``word`` to ``size`` bytes, past a hit's 512-byte bound."""
+    assert text.isascii() and MAX_SUMMARY_BYTES < size <= MAX_TEXT_BYTES
+    while len(text) < size:
+        text += f" {word}"
+    return text[:size]
+
+
+@needs_fts5
+def test_a_current_record_past_a_hits_bound_is_judged_by_its_excerpt_never_its_whole_text():
+    """R12-F1 of PR #537: the benchmark compared each hit's summary with the
+    whole text the oracle judges current, so a correct excerpt of a current
+    record longer than a hit's 512 bytes counted as a stale leak. The pinned
+    fixture with only m10 lengthened to 691 bytes gave a synced stale-leak
+    rate of 2 in 56. A hit is now judged against that text's excerpt."""
+    fixture = bench.read_fixture().data()
+    m10 = next(record for record in fixture["records"] if record["key"] == "m10")
+    m10["text"] = _past_a_hits_bound(m10["text"], "quillwort", 691)
+    report = bench.correctness(bench.Fixture(json.dumps(fixture).encode()))
+    for name in ("synced", "stale", "stale_without_tail", "no_fts5", "rebuilt"):
+        c = report[name]
+        assert (c["stale_leak_rate"], c["permission_leak_rate"]) == (0.0, 0.0), name
+        assert c["correction_old_text_served"] == 0, name
+    assert "m10" in report["synced"]["ranked"][0]
+    # The record is served, as its excerpt: within a hit's bound, never whole.
+    world = bench.build(fixture)
+    retriever = MemoryRetriever(fixture["repository"], fixture["run_id"], lambda: world.store)
+    retriever.sync()
+    result = retriever.search_memory(world.request, fixture["queries"][0]["query"])
+    (hit,) = (hit for hit in result.hits if hit.id == world.ids["m10"])
+    assert hit.summary == bench.excerpt(m10["text"]) != m10["text"]
+    assert len(hit.summary.encode()) <= MAX_SUMMARY_BYTES < len(m10["text"].encode())
+    assert m10["text"].startswith(hit.summary.removesuffix("\n[omitted]"))
+
+
+@needs_fts5
+@pytest.mark.parametrize("shown", ["unbounded", "earlier", "another"])
+def test_a_hit_past_a_hits_bound_showing_anything_but_its_excerpt_is_still_a_leak(
+    shown, monkeypatch
+):
+    """R12-F1 of PR #537: judging a hit by its current text's excerpt ignores
+    no mismatch. m10 is lengthened past a hit's bound, then corrected to
+    another long text, and a probe's old query matches both, so the record
+    is a hit of it either way. The read path serves the corrected text's
+    excerpt, nothing stale and no earlier text. A search made to show m10's
+    current text unbounded, its earlier text's excerpt or another record's
+    text is a stale leak each time it serves m10; the earlier excerpt is the
+    earlier text served too, though a text past the bound is never whole in
+    a summary."""
+    fixture = bench.read_fixture().data()
+    m10 = next(record for record in fixture["records"] if record["key"] == "m10")
+    earlier = _past_a_hits_bound(m10["text"], "quillwort", 691)
+    current = _past_a_hits_bound("Corrected: " + m10["text"], "bracken", 700)
+    m10["text"] = earlier
+    fixture["operations"].append(
+        {"op": "correct", "key": "m10", "text": current, "reason": "the record was restated"}
+    )
+    fixture["corrections"].append(
+        {"key": "m10", "new_query": "bracken", "old_query": "tokenizer final element"}
+    )
+    source = bench.Fixture(json.dumps(fixture).encode())
+    record = bench.build(fixture).ids["m10"]
+    served = ("synced", "stale", "rebuilt")
+
+    honest = bench.correctness(source)
+    for name in ("synced", "stale", "stale_without_tail", "no_fts5", "rebuilt"):
+        c = honest[name]
+        assert (c["stale_leak_rate"], c["permission_leak_rate"]) == (0.0, 0.0), name
+        assert c["correction_old_text_served"] == 0, name
+    for name in served:
+        assert honest[name]["correction_new_text_visible"] == 1.0, name
+
+    other = next(r["text"] for r in fixture["records"] if r["key"] == "m1")
+    summary = {
+        "unbounded": current,
+        "earlier": bench.excerpt(earlier),
+        "another": bench.excerpt(other),
+    }[shown]
+    real = MemoryRetriever.search_memory
+
+    def search(self, request, query, **kwargs):
+        result = real(self, request, query, **kwargs)
+        hits = tuple(
+            replace(hit, summary=summary) if hit.id == record else hit for hit in result.hits
+        )
+        return replace(result, hits=hits)
+
+    monkeypatch.setattr(MemoryRetriever, "search_memory", search)
+    tampered = bench.correctness(source)
+    for name in served:
+        c, before = tampered[name], honest[name]
+        assert c["served"] == before["served"] and c["ranked"] == before["ranked"], name
+        assert c["stale_leak_rate"] > 0.0 and c["permission_leak_rate"] == 0.0, name
+        assert c["correction_old_text_served"] == (shown == "earlier"), name
+
+
 @needs_fts5
 def test_the_benchmarks_cost_half_runs_on_a_small_corpus():
     # Corpora below the update sample included: the sampler indexed twenty

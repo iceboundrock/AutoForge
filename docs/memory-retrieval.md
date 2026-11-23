@@ -814,7 +814,20 @@ candidate and one bound to a base's descendants. There are 15 queries with
 hand-judged relevant records (21 judgments), six adversarial negatives
 whose terms appear only in records the launch must not be served, and one
 correction probe. Each served hit is checked against an oracle derived from
-the fixture's declarations, not from `MemoryStore.visibility`. The report
+the fixture's declarations, not from `MemoryStore.visibility`. A hit is a
+stale leak when the oracle judges its record retracted, withheld or
+superseded, or when its summary is anything but the excerpt a hit shows of
+the text the oracle judges current: that text redacted, then cut to 512
+bytes with an omission marker. "Old text served" counts a probe search
+with a hit that shows the earlier text whole, or its excerpt where that
+differs from what the hit's record now shows. Until the twelfth review
+round both judged a summary by whole texts,
+so a correct excerpt of a current record longer than 512 bytes counted as
+a stale leak: the fixture with only `m10` lengthened to 691 bytes gave
+2 of 56 in the synced condition. The pinned fixture's longest record is
+114 bytes, so its correctness report is unchanged, byte for byte
+(`test_a_current_record_past_a_hits_bound_is_judged_by_its_excerpt_never_its_whole_text`,
+`test_a_hit_past_a_hits_bound_showing_anything_but_its_excerpt_is_still_a_leak`). The report
 names its input by the SHA-256 of the bytes it parsed (`fixture_sha256`),
 so a run on any other input, one query changed or the same data written
 out again, carries that input's digest, never the pinned one. Until the
