@@ -756,7 +756,13 @@ Vietnamese, accented Latin and full-width forms
 ### Untrusted text stays data
 
 A query becomes its tokens only: deduplicated, at most 16 terms of at most
-64 characters, from a query of at most 512 bytes. Each term is quoted
+64 characters, from a query of at most 512 bytes. A search checks that
+bound once it has read every backend's health, loaded the store and bound
+the request, as every read does first, and before it asks any backend. One
+of more than 512 characters is refused before anything of it is copied or
+encoded, so a query past the bound costs those reads and nothing more
+(`test_no_backend_is_called_after_a_reads_last_load_of_the_store`).
+Each term is quoted
 before it reaches FTS5, so no query is FTS5 syntax, a column filter or a
 scope. `render_hits` fences every excerpt with a backtick run longer than
 any inside it. A record that says "ignore previous instructions" or closes

@@ -694,10 +694,14 @@ def query_terms(query: object) -> tuple[str, ...]:
     the terms past :data:`MAX_QUERY_TERMS`. A query that is not a string, or
     is longer than :data:`MAX_QUERY_BYTES` in UTF-8, is refused.
 
-    The bound holds before any work: a character is at least one byte in
-    UTF-8, so a query of more characters than the bound is refused before
-    anything of it is copied or encoded, and only a query within it is
-    encoded to be measured exactly (R6-F2 of PR #537). Only ``str``'s own
+    The bound comes before anything else done with the query: a character
+    is at least one byte in UTF-8, so a query of more characters than the
+    bound is refused before anything of it is copied or encoded, and only a
+    query within it is encoded to be measured exactly (R6-F2 of PR #537).
+    That is all it precedes: :meth:`MemoryRetriever.search_memory` calls
+    this only once it has read every backend's health, loaded the store and
+    bound the request, so a query past the bound costs those reads, though
+    no backend search and no copy of it (R12-F2 of PR #537). Only ``str``'s own
     methods are called: a subclass's ``__len__``, ``encode`` or
     ``__str__`` would be the caller's code, so the query is measured by
     ``str.__len__`` and read as the exact string ``str.__str__`` copies.
@@ -1863,6 +1867,11 @@ class MemoryRetriever:
         that holds a query term, is discarded, its index marked ``failed``,
         and the fallback, else the tail alone, answers the same search,
         reported ``degraded``.
+
+        ``k`` and the query are checked after the health read, the first
+        load and the binding, before any backend is asked: a request past
+        either bound costs those reads and is refused (:func:`query_terms`;
+        R12-F2 of PR #537).
         """
         health = self._health()
         snap = self._load()

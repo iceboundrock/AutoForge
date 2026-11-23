@@ -1752,6 +1752,13 @@ def test_no_backend_is_called_after_a_reads_last_load_of_the_store():
         log.clear()
         read()
         assert log == calls
+    # A query past its bound is refused once the health is read, the store
+    # loaded and the request bound, and before any backend is asked: the
+    # bound precedes only copying and encoding the query (R12-F2 of PR #537).
+    log.clear()
+    with pytest.raises(RetrievalError, match=f"at most {MAX_QUERY_BYTES} bytes"):
+        retriever.search_memory(REQ, "x" * (MAX_QUERY_BYTES + 1))
+    assert log == ["available", "load"]
     # A primary that fails, then its fallback: each answer is followed by a load.
     down = ScriptedBackend(fail=True)
     fallback = Logged(log)
