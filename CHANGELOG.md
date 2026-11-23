@@ -28,9 +28,10 @@ does not serve, the catalog's digest covers only what the launch is
 served, and every revision and freshness figure is the scope's own
 count, so no record outside the scope moves a hit or leaves a gap. Every
 answer names the launch it is for and each record's applicability. A
-search asks the index only about the records the launch is served, so no
-row of any other record, damaged or not, changes what the launch is told;
-the controller's verify checks every row. An index found not to match the
+search asks the index only about the records the launch is served, and
+judges its answer by the store loaded after it, so no row of any other
+record, nor of one withdrawn while the index answered, damaged or not,
+changes what the launch is told; the controller's verify checks every row. An index found not to match the
 store, by a row it returns or a match it leaves out, is marked failed, and
 the search that found it answers from the fallback or the store at once;
 so is an answer that is not exactly a list or a tuple. A failed rebuild

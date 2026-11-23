@@ -231,7 +231,8 @@ memory_retrieval.py Memory's retrieval read path (#324, ADR 0015 D8 layer 4, D12
                     does not continue the last or nothing proves it newer than an
                     opt-out read before, every hit judged by the store, never the
                     index, which a search asks only about the records the launch is
-                    served; a launch told only of its scope, ranked by BM25 over its own
+                    served and whose answer it judges by the store loaded after it;
+                    a launch told only of its scope, ranked by BM25 over its own
                     served records, in the scope's own sequence, its binding and each
                     record's applicability in the answer; one tokenizer for index, tail
                     and query; watermark, hot tail, atomic sync and rebuild, a verify

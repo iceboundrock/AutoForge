@@ -298,8 +298,9 @@ class IndexDocument:
 class IndexCandidate:
     """A backend's answer: a record id and what it indexed of it, never a hit.
 
-    ``score`` and ``rank`` are checked (:func:`_candidates`) and never used:
-    a hit's place is computed over the launch's own records (:func:`_scores`).
+    ``score`` and ``rank`` are checked (:func:`_candidates`, for a record
+    the store still serves as the index saw it) and never used: a hit's
+    place is computed over the launch's own records (:func:`_scores`).
     """
 
     id: int

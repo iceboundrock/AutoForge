@@ -105,6 +105,37 @@ can fail the match scan itself, whatever rows it is filtered to and by
 which terms' postings it reads: that is FTS5's integrity check's to find,
 which `verify` runs.
 
+A record can also stop being served while the backend answers: retracted,
+superseded or corrected inside the backend's call, after the search chose
+the ids it asks about from the snapshot it loaded first. So the answer is
+judged only once the store has been loaded after it, and only about the
+records asked about that this store still serves as the index saw them.
+A candidate of any other record asked about is set aside with its fields
+unread, and counted as the store's refusal (`dropped_*`). For that to
+hold, a backend answers each row it matched as the row holds it and never
+raises for one: an error a search raises is the whole search's, whichever
+row it met, and it is raised before anything can say whether the launch
+is still served that row's record. Until the ninth review round, FTS5's
+search raised for a row with a malformed column, and the retriever checked
+every candidate it was asked about before it loaded the store again. So a
+record served when the search asked about it, withdrawn inside the call,
+whose row held a malformed revision, made the search and the catalog after
+it `failed` and `degraded` when the query matched its text, and ordinary
+`stale` when it did not. The regression withdraws the record inside the
+call, before and after FTS5 reads its rows, three ways (retracted,
+superseded, corrected), damages its row three ways, varies only whether its
+text holds the query's term, and compares every answer, which must be
+identical, `stale` and not degraded
+(`test_a_damaged_row_of_a_record_withdrawn_while_the_index_answers_moves_nothing`).
+The same damage to a record the store still serves falls back on that
+search, with an FTS5 fallback and without one
+(`test_damage_to_a_row_still_served_falls_back_on_the_search_that_withdrew_another`),
+and an optional backend's malformed candidate of a record withdrawn
+meanwhile is set aside while the same candidate of a served record is an
+invalid answer
+(`test_an_optional_backends_malformed_candidate_of_a_record_withdrawn_meanwhile_is_set_aside`).
+`verify` still reads every row.
+
 The rows a search no longer reads include those the fourth review round
 found taken for ordinary staleness: a row of a record first added after
 the watermark, or at a revision past it. A search never asks about such a
@@ -357,7 +388,12 @@ check. On the pinned fixture the change moved one pair of places: in the
 no-FTS5 condition, the third and fourth hits of one query traded places;
 every figure of the table below is as it was.
 
-*Rejected: FTS5's own `bm25()`.* Its statistics are over the issue's whole
+*Rejected: FTS5's own `bm25()`, for anything a launch is shown.*
+`Fts5Backend.search` still computes it, and orders its bounded answer by
+it (then by id); that answer holds every record asked about that a term
+matches, so the order decides no candidate, and the retriever discards it
+with the backend's scores and ranks. No hit's place or score comes from it.
+Its statistics are over the issue's whole
 table, which also holds the issue's records of other candidates and
 environments, withheld duplicates, and, until the next sync, records
 retracted since. Adding one record bound to an earlier candidate could turn
@@ -508,11 +544,14 @@ decides" above).
 
 A row no sync could have written is a typed failure, never a Python
 exception: a revision that is not an integer, a digest that is not text, or
-a body holding a form `_fts5_token` never produces. Each is
-`RetrievalIntegrityError`, or a served match left out. A search that meets
-such a row of a record it asked about marks the index `failed`
-(`integrity`) and falls back on the same call; `verify` reports the same of
-any row
+a body holding a form `_fts5_token` never produces. FTS5's search answers
+such a row as it holds it, never converted; a body no term matches is a
+served match left out. A search that meets such a row of a record the
+store still serves as the index saw it marks the index `failed`
+(`integrity`: an FTS5 candidate is its row) and falls back on the same
+call, and one of a record withdrawn while the index answered decides
+nothing (above). `verify` reads every row back and raises
+`RetrievalIntegrityError` for any malformed one, whatever record it is of
 (`test_a_malformed_fts5_row_is_an_integrity_failure_never_an_exception`).
 
 ### In memory, never on disk
@@ -546,6 +585,13 @@ served, as at every search). It is `degraded`, and
 excerpts still pass the store's check. Nothing broader is ever read, and no
 launch fails for it, since none uses retrieval. `doctor` has no row for it,
 because nothing yet depends on the answer.
+
+Its regression runs on every interpreter: with FTS5 simulated absent where
+SQLite has it, and with the interpreter's own SQLite where it does not
+(`test_without_fts5_only_the_bounded_tail_is_searched_and_the_result_says_so`).
+Only the tests that read a real index skip where FTS5 is missing; until the
+ninth review round a skip on the whole test module skipped this regression
+too, on the very builds it covers.
 
 ### An optional backend falls back only to FTS5
 
@@ -594,8 +640,12 @@ Each candidate must be exactly an `IndexCandidate` (not a subclass, whose
 fields could be computed when read), with a positive integer id and
 revision, a content digest, a finite score and a rank from 1 to 64. A
 score is checked without converting it: an integer is compared with 2^53,
-so `10**400` is refused rather than overflowing. Anything else is a backend
-failure like a raised error (`invalid-answer`), with the same fallback:
+so `10**400` is refused rather than overflowing. Beyond its type and id, a
+candidate is checked only when the store loaded after the answer still
+serves its record as the index saw it: one of a record withdrawn while the
+backend answered is set aside (above). Anything else is a backend
+failure like a raised error (`invalid-answer`; `integrity` for FTS5, whose
+candidates are its rows as it holds them), with the same fallback:
 another type, a rank of 0 or -60, a NaN score, a score past a float, a
 bool, or 65 candidates. A record answered twice with different revisions
 or digests is two rows of one record, an integrity failure, found before
