@@ -816,7 +816,7 @@ SQLite 3.54.1. These are single runs of a local benchmark, not a
 comparison across hosts. Every figure below is from one full run on
 `d8ab97a`, the code after the eighth review round's changes (a search asks
 the index only about the records the launch is served; maintenance reports
-freshness against the store after its backend work), except four costs
+freshness against the store after its backend work), except five costs
 labelled with the sessions they come from: the coverage check's (the third
 round's), the corpus statistics' (the sixth round's), the eighth
 round's search filter, the ninth round's answer check and the tenth
