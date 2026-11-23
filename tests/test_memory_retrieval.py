@@ -28,6 +28,7 @@ from autoforge.memory import (
     Receipt,
     Visibility,
 )
+from autoforge.memory_handoff import prepare_launch_projection
 from autoforge.memory_retrieval import (
     MAX_CATALOG_BYTES,
     MAX_HITS,
@@ -580,6 +581,66 @@ def test_freshness_reports_its_watermark_pending_and_failures_truthfully():
     )
 
 
+def test_a_failed_rebuild_keeps_the_index_it_would_replace_in_service():
+    """R3-F4 of PR #537: a rebuild is one transaction. One that fails leaves
+    the old index readable at its watermark and generation, says it failed,
+    and keeps a search complete past the tail's bound; an index already
+    known to be broken stays unreadable through it; the retry succeeds."""
+    w = Writer(empty())
+    for i in range(MAX_TAIL + 4):
+        w.add(f"r{i}", f"The scanner lesson number {i}.")
+    backend = FailingFts5()
+    retriever = retriever_for(w, backend=backend)
+    synced = retriever.sync()
+    rows = backend.entries()
+    whole = retriever.search_memory(REQ, "scanner lesson", k=MAX_HITS)
+    assert len(whole.hits) == MAX_TAIL + 4 and whole.complete and not whole.degraded
+    backend.fail_on = 3
+    failed = retriever.rebuild()
+    assert (failed.state, failed.generation, failed.indexed_through_seq) == (
+        IndexState.CURRENT,
+        synced.generation,
+        synced.indexed_through_seq,
+    )
+    assert (failed.failed, failed.reason) == (1, IndexReason.SYNC_FAILED)
+    assert backend.entries() == rows
+    again = retriever.search_memory(REQ, "scanner lesson", k=MAX_HITS)
+    assert (again.hits, again.complete, again.degraded) == (whole.hits, True, False)
+    assert again.status == retriever.catalog(REQ).status and again.status.failed == 1
+    assert retriever.metrics.snapshot()["sync_failures"] == 1
+    # The retry replaces it: a new generation, nothing failed.
+    backend.fail_on = 0
+    rebuilt = retriever.rebuild()
+    assert (rebuilt.state, rebuilt.generation, rebuilt.failed, rebuilt.reason) == (
+        IndexState.CURRENT,
+        synced.generation + 1,
+        0,
+        IndexReason.NONE,
+    )
+    placed = retriever.search_memory(REQ, "scanner lesson", k=MAX_HITS)
+    assert [(h.id, h.position, h.provenance.score) for h in placed.hits] == [
+        (h.id, h.position, h.provenance.score) for h in whole.hits
+    ]
+    assert {h.provenance.generation for h in placed.hits} == {rebuilt.generation}
+    # An index found broken stays unreadable through a failed rebuild.
+    db, table = backend._db, backend._tables[ISSUE]
+    db.execute(f"UPDATE {table} SET digest = ? WHERE rowid = ?", ("0" * 64, w.ids["r0"]))
+    assert retriever.verify().reason is IndexReason.INTEGRITY
+    backend.fail_on = 3
+    broken = retriever.rebuild()
+    assert (broken.state, broken.reason, broken.failed) == (
+        IndexState.FAILED,
+        IndexReason.INTEGRITY,
+        1,
+    )
+    tail = retriever.search_memory(REQ, "scanner lesson", k=MAX_HITS)
+    assert tail.backend == TAIL_BACKEND and tail.degraded and not tail.complete
+    assert tail.unsearched == 4 and len(tail.hits) == MAX_TAIL
+    backend.fail_on = 0
+    assert retriever.rebuild().state is IndexState.CURRENT
+    assert retriever.verify().state is IndexState.CURRENT
+
+
 def test_every_read_loads_the_canonical_snapshot_so_a_change_between_search_and_fetch_counts():
     """R1-F1 of PR #537: no read is handed a snapshot. A retraction or a
     correction made after a search is what the next fetch is judged by."""
@@ -1086,6 +1147,66 @@ def test_records_outside_the_scope_move_nothing_a_launch_is_told():
     assert after.scope_digest != before[0].scope_digest
 
 
+def test_the_projections_own_binding_tells_no_base_of_a_record_the_launch_is_not_served():
+    """R3-F2 of PR #537, on the binding the controller makes
+    (:func:`~autoforge.memory_handoff.prepare_launch_projection`): its
+    ancestors are the bases of every range-bound record of the issue the
+    candidate descends from, the inapplicable ones included. A record of
+    another environment bound to a base's descendants adds its base to them,
+    and changes nothing a launch is told, before or after the index syncs it."""
+    w = Writer(empty())
+    w.add(
+        "mine",
+        "The zebra parser drops quoted separators.",
+        scope=replace(SCOPE, range=Range.DESCENDANTS, base=BASE),
+    )
+    graph = {SHA: (BASE,), BASE: (OLD,), OLD: ()}
+
+    def bound():
+        return prepare_launch_projection(
+            lambda: w.store,
+            STEP,
+            base="a" * 40,
+            read_head=lambda: SHA,
+            read_parents=graph.get,
+            validation_records=[],
+        ).request
+
+    retriever = retriever_for(w)
+    retriever.sync()
+
+    def told(request):
+        catalog = retriever.catalog(request)
+        found = retriever.search_memory(request, "zebra parser separators")
+        return (
+            catalog,
+            catalog.render(),
+            retriever.fetch_memory(request, w.ids["mine"]),
+            retriever.fetch_memory(request, 999),
+            found,
+            render_hits(found),
+        )
+
+    first = bound()
+    assert first.ancestors == (BASE,)
+    before = told(first)
+    assert ids(before[4]) == [w.ids["mine"]]
+    assert before[0].scope == memory_retrieval.ReadScope(REPO, RUN, ISSUE, 129, SHA, "")
+    w.add(
+        "elsewhere",
+        "The zebra parser under another locale.",
+        scope=replace(SCOPE, range=Range.DESCENDANTS, base=OLD, environment=ENV),
+    )
+    later = bound()
+    # The controller's proof now names the other record's base too.
+    assert later.ancestors == (BASE, OLD)
+    assert w.store.visibility(w.ids["elsewhere"], later) is Visibility.INAPPLICABLE
+    assert told(later) == before
+    retriever.sync()
+    assert told(later) == before
+    assert OLD not in repr(told(later))
+
+
 # -- what a fetch says of the index (R1-F5 of PR #537) -----------------------------------
 
 
@@ -1245,6 +1366,167 @@ def test_a_launch_counted_while_a_backend_answers_refuses_the_search():
         retriever.search_memory(REQ, "tokenizer trailing comma")
 
 
+class Logged(Fts5Backend):
+    """FTS5 that notes each call of its own in ``log``, and runs ``during`` at
+    the first ``available`` after a ``search``: a write while the backend
+    reports its health, once it has answered."""
+
+    def __init__(self, log):
+        super().__init__()
+        self.log, self.during = log, None
+
+    def available(self):
+        if self.during is not None and "search" in self.log:
+            during, self.during = self.during, None
+            during()
+        self.log.append("available")
+        return super().available()
+
+    def search(self, partition, terms, limit):
+        self.log.append("search")
+        return super().search(partition, terms, limit)
+
+
+def test_no_backend_is_called_after_a_reads_last_load_of_the_store():
+    """R3-F1 of PR #537: every backend's health is read before the store is
+    loaded, and a search loads it again after its backend answers. Nothing
+    of a backend runs after a read's last load, so nothing a backend's call
+    lets happen escapes the snapshot that judges the read."""
+    w = corpus()
+    log: list[str] = []
+
+    def source():
+        log.append("load")
+        return w.store
+
+    primary = Logged(log)
+    retriever = MemoryRetriever(REPO, RUN, source, backend=primary)
+    retriever.sync()
+    for read, calls in (
+        (
+            lambda: retriever.search_memory(REQ, "tokenizer"),
+            ["available", "load", "search", "load"],
+        ),
+        (lambda: retriever.search_memory(REQ, "the"), ["available", "load", "search", "load"]),
+        (lambda: retriever.search_memory(REQ, "   "), ["available", "load"]),
+        (lambda: retriever.fetch_memory(REQ, w.ids["uv"]), ["available", "load"]),
+        (lambda: retriever.catalog(REQ), ["available", "load"]),
+        (retriever.status, ["available", "load"]),
+    ):
+        log.clear()
+        read()
+        assert log == calls
+    # A primary that fails, then its fallback: each answer is followed by a load.
+    down = ScriptedBackend(fail=True)
+    fallback = Logged(log)
+    both = MemoryRetriever(REPO, RUN, source, backend=down, fallback=fallback)
+    both.sync()
+    log.clear()
+    assert both.search_memory(REQ, "tokenizer").degraded
+    assert log == ["available", "load", "load", "search", "load"]
+
+
+def test_a_retraction_while_a_backend_reports_its_health_is_never_served():
+    """The case R3-F1 reproduced: a retraction during the health check that
+    used to follow the search's last load. The search serves only what the
+    store serves when it returns, and the fetch after it refuses the record."""
+    w = corpus()
+    log: list[str] = []
+    backend = Logged(log)
+    retriever = retriever_for(w, backend=backend)
+    retriever.sync()
+    tokenizer = w.ids["tokenizer"]
+    backend.during = lambda: w.revise(Action.RETRACT, "tokenizer")
+    result = retriever.search_memory(REQ, "tokenizer trailing comma")
+    for hit in result.hits:
+        assert w.store.visibility(hit.id, REQ) is Visibility.CURRENT
+    told = sum(1 for f in w.store.facts() if f.scope.step.issue_url == ISSUE)
+    assert result.status.source_seq == told + (backend.during is None)
+    # The next read's health check runs the retraction, before its load.
+    fetched = retriever.fetch_memory(REQ, tokenizer)
+    assert backend.during is None and fetched.item is None
+    assert tokenizer not in ids(retriever.search_memory(REQ, "tokenizer trailing comma"))
+
+
+class Unwell(ScriptedBackend):
+    """An optional backend whose health check raises, or answers ``health``."""
+
+    def __init__(self, answer=(), health=None):
+        super().__init__(answer)
+        self.health = health
+
+    def available(self):
+        if self.health is None:
+            raise RetrievalBackendError("the optional backend's health check failed")
+        return self.health
+
+
+@pytest.mark.parametrize("health", [None, False, 1, "yes"], ids=["raises", "false", "one", "text"])
+def test_a_backend_whose_health_check_fails_is_unavailable_and_the_fallback_answers(health):
+    """R3-F1 of PR #537: a typed failure of ``available`` is a backend that
+    cannot run, never an error of the read; only ``True`` is health."""
+    w = corpus()
+    answer = [valid(w.store, w.ids["tokenizer"])]
+    retriever = retriever_for(w, backend=Unwell(answer, health), fallback=Fts5Backend())
+    status = retriever.sync()
+    assert (status.state, status.reason) == (IndexState.UNAVAILABLE, IndexReason.UNAVAILABLE)
+    result = retriever.search_memory(REQ, "tokenizer trailing comma")
+    assert ids(result) == [w.ids["tokenizer"]] and result.complete
+    assert result.degraded and result.backend == "sqlite-fts5" and result.status.is_current
+    for read in (retriever.fetch_memory(REQ, w.ids["tokenizer"]), retriever.catalog(REQ)):
+        assert read.degraded and read.status.backend == "sqlite-fts5"
+    assert retriever.verify().state is IndexState.UNAVAILABLE
+    assert retriever.rebuild().state is IndexState.UNAVAILABLE
+    # Six reads, each of which asked once: sync, search, fetch, catalog,
+    # verify and rebuild.
+    assert retriever.metrics.snapshot()["unavailable"] == (6 if health is None else 0)
+    # Without a fallback, the tail alone, from the store.
+    alone = retriever_for(w, backend=Unwell(answer, health))
+    alone.sync()
+    result = alone.search_memory(REQ, "tokenizer trailing comma")
+    assert ids(result) == [w.ids["tokenizer"]] and result.backend == TAIL_BACKEND
+    assert result.degraded and result.status.state is IndexState.UNAVAILABLE
+    # Healthy again, it is read again.
+    alone.backend.health = True
+    assert alone.sync().state is IndexState.CURRENT
+    assert alone.search_memory(REQ, "tokenizer trailing comma").backend == "scripted"
+
+
+def test_a_checkpoint_from_before_a_launch_is_refused_once_the_launch_was_read():
+    """R3-F1 of PR #537: a launch adds no row to the audit table, so a
+    checkpoint from before it has the same rows. Once the retriever has read
+    the launch, that checkpoint is refused by every read: it would bind the
+    launch's request again, an obsolete binding."""
+    w = corpus()
+    retriever = retriever_for(w)
+    retriever.sync()
+    saved = w.store
+    assert retriever.fetch_memory(REQ, w.ids["tokenizer"]).item is not None
+    # Launch 129 is counted: the next launch is 130, and no row changed.
+    w.store = MemoryStore(REPO, RUN, 129, saved.encode())
+    later = replace(REQ, attempt=130)
+    assert retriever.fetch_memory(later, w.ids["tokenizer"]).item is not None
+    with pytest.raises(StateError):
+        retriever.fetch_memory(REQ, w.ids["tokenizer"])
+    w.store = saved
+    for read in (
+        retriever.sync,
+        retriever.status,
+        retriever.rebuild,
+        retriever.verify,
+        lambda: retriever.search_memory(REQ, "tokenizer trailing comma"),
+        lambda: retriever.fetch_memory(REQ, w.ids["tokenizer"]),
+        lambda: retriever.catalog(REQ),
+    ):
+        with pytest.raises(RetrievalError, match="does not continue"):
+            read()
+    # The launch's own snapshot, and a later one, are read again.
+    w.store = MemoryStore(REPO, RUN, 129, saved.encode())
+    assert retriever.fetch_memory(later, w.ids["tokenizer"]).item is not None
+    w.store = MemoryStore(REPO, RUN, 130, saved.encode())
+    assert retriever.catalog(replace(REQ, attempt=131)).revision == 3
+
+
 # -- nothing the launch is not served moves a hit (R2-F2 of PR #537) ---------------------
 
 
@@ -1310,8 +1592,9 @@ def _sequences(retriever, w, request=REQ):
         if retriever.fetch_memory(request, i).item is not None
     }
     return {
-        # The digest is over the scope's records by their run ids, which differ.
-        "catalog": (catalog.revision, catalog.status.encode(), catalog.render().split("\n")[3:]),
+        # The whole catalog: its digest numbers the scope's records in the
+        # scope's sequence, never by their run ids (R3-F2 of PR #537).
+        "catalog": (catalog, catalog.render()),
         "search": (result.status.encode(), result.complete, result.unsearched),
         "hits": [
             (name[h.id], h.revision, h.position, h.provenance.score, h.provenance.backend)
@@ -1355,7 +1638,7 @@ def test_writes_outside_the_scope_leave_no_gap_in_any_sequence_a_launch_is_told(
         "a": (3, "The zebra lesson, corrected."),
         "b": (2, "A second lesson about the parser."),
     }
-    assert synced["catalog"][0] == 3 and synced["search"][0]["indexed_through_seq"] == 3
+    assert synced["catalog"][0].revision == 3 and synced["search"][0]["indexed_through_seq"] == 3
     # The store's own audit positions are the controller's alone.
     assert retriever_for(w).status().source_seq == w.store.revision == 7
 
@@ -1380,10 +1663,8 @@ def test_a_malformed_fts5_row_is_an_integrity_failure_never_an_exception(column,
     db, table = retriever.backend._db, retriever.backend._tables[ISSUE]
     db.execute(f"UPDATE {table} SET {column} = ? WHERE rowid = ?", (value, w.ids["uv"]))
     result = retriever.search_memory(REQ, "uv pytest interpreter")
-    if column == "body":
-        # A body no sync wrote, which no term matches: only verify finds it.
-        assert result.backend == "sqlite-fts5" and ids(result) == []
-        return
+    # A body no sync wrote, which no term matches, is a served match the
+    # answer omits (R3-F3 of PR #537): found by the search itself too.
     assert ids(result) == [w.ids["uv"]] and result.degraded and result.backend == TAIL_BACKEND
     assert (result.status.state, result.status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
 
@@ -1447,6 +1728,72 @@ def test_a_contradicted_primary_answer_goes_to_the_fts5_fallback_on_the_same_cal
     assert retriever.metrics.snapshot()["integrity"] == 1
 
 
+def test_a_served_match_the_index_omits_falls_back_on_the_same_search():
+    """R3-F3 of PR #537: a search proves its index's coverage before it says
+    ``complete``. A body altered so that the only match is gone, and an
+    optional backend that leaves a match out, are each an integrity failure
+    on the first search: the fallback, else the tail, answers it, degraded."""
+    w = corpus()
+    retriever = retriever_for(w)
+    retriever.sync()
+    db, table = retriever.backend._db, retriever.backend._tables[ISSUE]
+    db.execute(f"UPDATE {table} SET body = ? WHERE rowid = ?", ("unrelated words", w.ids["uv"]))
+    result = retriever.search_memory(REQ, "uv pytest interpreter")
+    assert ids(result) == [w.ids["uv"]] and result.hits[0].provenance.backend == TAIL_BACKEND
+    assert result.degraded and result.backend == TAIL_BACKEND and result.complete
+    assert (result.status.state, result.status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
+    assert retriever.metrics.snapshot()["omitted"] == 1 and dropped(retriever) == {}
+    # An optional backend that answers one match of two: the fallback answers.
+    short = ScriptedBackend([valid(w.store, w.ids["tokenizer"])])
+    retriever = retriever_for(w, backend=short, fallback=Fts5Backend())
+    retriever.sync()
+    result = retriever.search_memory(REQ, "tokenizer pytest", k=MAX_HITS)
+    assert sorted(ids(result)) == [w.ids["tokenizer"], w.ids["uv"]]
+    assert result.degraded and result.backend == "sqlite-fts5" and result.complete
+    assert retriever.status().reason is IndexReason.INTEGRITY
+    # The whole answer: nothing is omitted, and it is read as it is.
+    fine = ScriptedBackend([valid(w.store, w.ids["tokenizer"]), valid(w.store, w.ids["uv"], 2)])
+    retriever = retriever_for(w, backend=fine, fallback=Fts5Backend())
+    retriever.sync()
+    result = retriever.search_memory(REQ, "tokenizer pytest", k=MAX_HITS)
+    assert result.backend == "scripted" and not result.degraded and result.complete
+    # A record the launch is not served moves no answer of its, even left out.
+    w.add(
+        "exact",
+        "The tokenizer of an earlier candidate.",
+        scope=replace(SCOPE, range=Range.EXACT, candidate=OLD),
+    )
+    retriever.sync()
+    result = retriever.search_memory(REQ, "tokenizer pytest", k=MAX_HITS)
+    assert result.backend == "scripted" and not result.degraded and result.complete
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    [
+        pytest.param(lambda c: [c, replace(c, digest="0" * 64, rank=2)], id="digest-second"),
+        pytest.param(
+            lambda c: [replace(c, digest="0" * 64), replace(c, rank=2)], id="digest-first"
+        ),
+        pytest.param(lambda c: [c, replace(c, revision=c.revision + 1)], id="revision"),
+    ],
+)
+def test_one_record_answered_with_two_rows_is_an_integrity_failure(conflict):
+    """R3-F3 of PR #537: a record answered twice with different revisions or
+    digests is two rows of it, which no sync writes. It is found before the
+    answer is deduplicated, whichever row comes first, and the fallback
+    answers the same search."""
+    w = corpus()
+    answer = conflict(valid(w.store, w.ids["uv"]))
+    retriever = retriever_for(w, backend=ScriptedBackend(answer), fallback=Fts5Backend())
+    retriever.sync()
+    result = retriever.search_memory(REQ, "uv pytest interpreter")
+    assert ids(result) == [w.ids["uv"]] and result.hits[0].provenance.backend == "sqlite-fts5"
+    assert result.degraded and result.backend == "sqlite-fts5" and result.complete
+    assert retriever.status().reason is IndexReason.INTEGRITY
+    assert retriever.metrics.snapshot()["integrity"] == 1
+
+
 # -- an answer says whose it is (R2-F5 of PR #537) -------------------------------------
 
 
@@ -1467,7 +1814,7 @@ def test_answers_carry_the_launch_binding_and_each_records_applicability():
     retriever = retriever_for(w)
     retriever.sync()
     request = replace(REQ, environment=ENV)
-    binding = memory_retrieval.ReadScope(REPO, RUN, ISSUE, 129, SHA, (BASE,), ENV)
+    binding = memory_retrieval.ReadScope(REPO, RUN, ISSUE, 129, SHA, ENV)
     result = retriever.search_memory(request, "scanner lesson", k=MAX_HITS)
     assert result.scope == binding
     phases = (Phase.ANALYZE_EXECUTE.value,)

@@ -1,9 +1,10 @@
 # Memory retrieval: the FTS5 read path and the LTSearch feasibility (#324)
 
 Written after the implementation, for #324 (EPIC #331), at `main`
-`5cad948`, and revised after two review rounds on PR #537. It records what
+`5cad948`, and revised after three review rounds on PR #537. It records what
 the read path decides and why, what was measured on one host, and the
-go/no-go on LTSearch. ADR 0015 is the
+go/no-go on LTSearch, on which the maintainer narrowed #324's acceptance to
+the source-based no-go recorded here. ADR 0015 is the
 authority this builds on: layer 4 of its four memory layers (D8), the
 "later retriever" of D12, and an implementation note in D10 for the
 SQLite connection this adds.
@@ -53,14 +54,19 @@ is.
 Some candidates are rows no sync of this store could have written, at a
 revision the index claims to have seen. That covers an id the issue does
 not hold, a record retracted or superseded before the watermark (the sync
-deleted its row), another revision or content digest, and a record whose
-text holds none of the query's terms, since a search matches by term. Any
-one of them means the index is not a projection of the store. The search
-discards that backend's whole answer, marks the index `failed`
+deleted its row), another revision or content digest, one record answered
+with two revisions or digests, and a record whose text holds none of the
+query's terms, since a search matches by term. An answer can also be wrong
+by what it leaves out: a record the launch is served, unchanged since the
+watermark, whose text holds a query term, must be among the candidates.
+Any one of these means the index is not a projection of the store. The
+search discards that backend's whole answer, marks the index `failed`
 (`integrity`) and answers the same call from the fallback, or from the tail
 alone, reported `degraded`. The index stays `failed` until a sync rebuilds
 it (`test_a_row_that_contradicts_its_revision_marks_the_index_failed_and_is_never_served`,
-`test_a_contradicted_primary_answer_goes_to_the_fts5_fallback_on_the_same_call`).
+`test_a_contradicted_primary_answer_goes_to_the_fts5_fallback_on_the_same_call`,
+`test_a_served_match_the_index_omits_falls_back_on_the_same_search`,
+`test_one_record_answered_with_two_rows_is_an_integrity_failure`).
 
 Rank is never authority. A backend that answers with ids of another
 issue's records, a retracted record or an id the store has never held gets
@@ -78,6 +84,15 @@ authority for everything the read answers. A retraction or a correction
 made between a search and a fetch is what the fetch is judged by
 (`test_every_read_loads_the_canonical_snapshot_so_a_change_between_search_and_fetch_counts`).
 
+Every read first asks each backend whether it can run (`available`), and
+only then loads the store. A backend's health check is a call into code the
+retriever does not control, like its search, so it comes before the
+snapshot that judges the read, never after it. Only `True` counts as
+healthy. A check that raises a `RetrievalBackendError`, or answers anything
+else, makes that backend unavailable for this read: the fallback or the
+tail answers, `degraded`, and the next read asks again
+(`test_a_backend_whose_health_check_fails_is_unavailable_and_the_fallback_answers`).
+
 A search calls the source again after each backend answers, and binds the
 request to that snapshot again. The snapshot loaded after the retrieval is
 the one that judges the candidates, gives the excerpts, picks the hot tail
@@ -91,10 +106,16 @@ request an earlier launch's, and the search is refused
 `test_a_scripted_backend_that_retracts_before_it_answers_gets_nothing_served`,
 `test_a_launch_counted_while_a_backend_answers_refuses_the_search`).
 Nothing runs between that load and the answer but computation on the
-snapshot, which is a value: no backend, no source, no write. The rejected
-alternative was a lock held across the retrieval. Nothing in the controller
-holds one around a read, and a lock would only prove what reloading shows
-directly.
+snapshot, which is a value: no backend, no source, no write. The status a
+search reports comes from the health it read before its first load, not
+from a new check. An earlier revision asked the backend again for the
+status, after the last load: a retraction made during that call left the
+search serving the record, which the next fetch refused
+(`test_no_backend_is_called_after_a_reads_last_load_of_the_store`,
+`test_a_retraction_while_a_backend_reports_its_health_is_never_served`).
+The rejected alternative was a lock held across the retrieval. Nothing in
+the controller holds one around a read, and a lock would only prove what
+reloading shows directly.
 
 When the source returns the very store object it returned last, the
 retriever uses the snapshot it already holds. A store is never changed once
@@ -112,14 +133,20 @@ could still serve a record a later write retracted, including one whose
 revision is exactly the index's watermark, since the index was synced
 through it
 (`test_an_older_snapshot_is_refused_even_where_the_index_watermark_matches_it`).
+The launch ordinal only grows too, and a launch adds no row, so the
+retriever keeps the newest ordinal it has read as well. A checkpoint from
+before a launch has the same rows and an earlier ordinal; it would bind
+that launch's request again, after the launch had been counted. It is
+refused alike
+(`test_a_checkpoint_from_before_a_launch_is_refused_once_the_launch_was_read`).
 A rollback of the checkpoint is therefore a new retriever's to read. That
 means a new process's, since the index is in memory. A source that kept
 returning one stale value from the start is beyond any check: the source is
 the definition of current, which is why it is the controller's state and
 not a value a caller hands in.
 
-Loading costs what reconstructing the store costs: about 9 ms at the
-fixture's 29 records and 22 ms at Memory's 64-record bound on this host,
+Loading costs what reconstructing the store costs: about 8.5 ms at the
+fixture's 29 records and 21 ms at Memory's 64-record bound on this host,
 and a search under a source that reconstructs it pays that twice (see the
 cost table below). It is the same load the projection pays before every
 Memory launch.
@@ -150,7 +177,9 @@ launch gets, before or after the index syncs it
   indistinguishable (`test_fetch_gives_one_answer_for_every_record_it_does_not_serve`).
 - **The catalog** counts the scope's current records by kind. It names the
   scope's revision and a digest of the scope's records, never the store's
-  revision or digest.
+  revision or digest. The digest numbers each record by its add's place in
+  the scope's sequence, not by its run id, so it too is what a store that
+  never had the writes outside the scope would give.
 - **Every sequence number a launch is told is the scope's own.** The
   scope's records' changes are numbered 1, 2, ... in the order the store
   made them. The scope's revision is how many there are. A hit's or a
@@ -159,8 +188,8 @@ launch gets, before or after the index syncs it
   the difference, and `pending` counts the records whose latest change the
   index has not seen. None of these is a position in the store's audit
   table. A write outside the scope, made between two writes in it, leaves no
-  gap: every figure, every hit, place and score is what a store that never
-  had that write would give
+  gap: every figure, the whole catalog, and every hit's place and score
+  are what a store that never had that write would give
   (`test_writes_outside_the_scope_leave_no_gap_in_any_sequence_a_launch_is_told`).
   The store's own revision is reported only to the controller (`status`,
   `sync`).
@@ -231,10 +260,13 @@ A search reads the scope's current records changed after the watermark on
 the store itself. This is the hot tail: at most eight records, newest
 first, matched on the same tokens and ranked with the index's by the one
 function above. `SearchResult.complete` holds only when every current
-record of the scope was searched, by an index synced through it or in the
-tail. Past the tail's bound, `unsearched` counts what was not read.
-`degraded` says the primary backend did not answer, or answered with what
-the store contradicts, and something else answered in its place.
+record of the scope was searched: by an index synced through it whose
+answer was checked to leave no matching record out ("Failures leave the
+index where it was" below), or in the tail. Past the tail's bound,
+`unsearched` counts what was not read. `degraded` says the primary backend
+could not run or did not answer, or answered with what the store
+contradicts or without a match it holds, and something else answered in
+its place.
 
 A fetch reads no index, but it reports the same freshness: the status, over
 the scope at the fetch's snapshot, of the index a search would read now,
@@ -252,6 +284,17 @@ failure mid-batch publishes nothing and keeps the old watermark, and the
 store still refuses anything stale in it. So a failed or partial build
 cannot reopen a fact retracted since
 (`test_a_retracted_record_is_unservable_at_once_and_a_failed_sync_never_reopens_it`).
+
+A rebuild asked for explicitly is one transaction too, and the index it
+would replace stays in service until the new one commits. If it fails,
+SQLite keeps the old rows, and the retriever keeps the old index's
+watermark and generation, so searches still read it and are as complete as
+before; the status reports the attempt (`failed` 1, `sync-failed`). An
+earlier revision marked the index unbuilt before trying, so a failed
+rebuild turned a healthy index `empty` at watermark 0, and searches fell
+back to the eight-record tail. An index already found `failed` stays
+unreadable through a failed rebuild. The next sync or rebuild tries again
+(`test_a_failed_rebuild_keeps_the_index_it_would_replace_in_service`).
 The index lives in memory, so a crash loses it, and the next process
 rebuilds it from the checkpoint. Given the same snapshot, the rebuild gives
 the same rows, the same backend scores and the same answers
@@ -261,22 +304,33 @@ watermark. Each row whose record has not changed since must have the
 record's revision, its content digest and the tokens of its text, decoded
 from what FTS5 holds. Each record indexable then must have exactly one row.
 It also runs FTS5's own integrity check, which proves FTS5's inverted index
-matches the rows it holds. A row whose text was replaced under its revision
-and digest is found this way and only this way: a search cannot tell that
-an index missed a record, and would still report `complete`. Once `verify`
-marks the index
-`failed`, searches answer from the tail or the fallback until a sync
-rebuilds it
+matches the rows it holds. Once `verify` marks the index `failed`, searches
+answer from the tail or the fallback until a sync rebuilds it
 (`test_verify_finds_a_row_indexed_by_other_tokens_and_a_rebuild_restores_it`).
-A row whose text was replaced so that it matches a term its record lacks is
-found by the search itself, which falls back on the same call
-(`test_a_row_matched_by_a_term_its_text_lacks_falls_back_on_the_first_search`).
+
+A search does not wait for `verify` to find a wrong row. A row whose text
+was replaced so that it matches a term its record lacks is a candidate the
+store contradicts. A row whose text was replaced so that it no longer
+matches is a served match the answer omits. Each is found by the search
+that meets it, which falls back on the same call
+(`test_a_row_matched_by_a_term_its_text_lacks_falls_back_on_the_first_search`,
+`test_a_served_match_the_index_omits_falls_back_on_the_same_search`).
+To find omissions, a search reads the store's text of every record the
+launch is served that the index has seen, at most 64, and checks that each
+one holding a query term was answered. That is what lets it say `complete`:
+the index's answer is checked against the store, not trusted. It costs
+about 0.4 ms per search at Memory's 64-record bound (the cost table below).
+Only records the launch is served are checked. Leaving out another
+candidate's record changes nothing the launch is answered, and checking
+those would let records outside the scope decide whether the launch's
+search is `degraded`.
 
 A row no sync could have written is a typed failure, never a Python
 exception: a revision that is not an integer, a digest that is not text, or
 a body holding a form `_fts5_token` never produces. Each is
-`RetrievalIntegrityError`. Searching marks the index `failed`
-(`integrity`) and falls back on the same call; `verify` reports the same
+`RetrievalIntegrityError`, or a served match left out. Searching marks the
+index `failed` (`integrity`) and falls back on the same call; `verify`
+reports the same
 (`test_a_malformed_fts5_row_is_an_integrity_failure_never_an_exception`).
 
 ### In memory, never on disk
@@ -290,8 +344,8 @@ can open one either. The test that held D10's "one SQLite connection" now
 holds exactly these two connections, and checks this one's arguments
 (`test_the_package_opens_sqlite_only_for_the_opencode_probe_and_the_memory_index`).
 
-The cost is a rebuild per process. On this host that is 1.5 ms for the
-fixture's 29 records and 3.1 ms at Memory's 64-record bound. A persisted
+The cost is a rebuild per process. On this host that is 1.6 ms for the
+fixture's 29 records and 3.2 ms at Memory's 64-record bound. A persisted
 index, for #325's repository-wide layer for example, would need a decision
 of its own in D10.
 
@@ -323,35 +377,51 @@ score is checked without converting it: an integer is compared with 2^53,
 so `10**400` is refused rather than overflowing. Anything else is a backend
 failure like a raised error (`invalid-answer`), with the same fallback:
 another type, a rank of 0 or -60, a NaN score, a score past a float, a
-bool, or 65 candidates. The candidates are ordered by rank, then id, and
-the first of each id is kept, so a backend that repeats a record fills one
-place with it (`test_a_backend_repeating_a_candidate_fills_one_place`,
-`test_a_malformed_backend_answer_is_a_backend_failure_and_falls_back`).
-Beyond that check, a backend's scores and ranks are never used.
+bool, or 65 candidates. A record answered twice with different revisions
+or digests is two rows of one record, an integrity failure, found before
+anything is deduplicated, whichever row ranks first. Otherwise the
+candidates are ordered by rank, then id, and the first of each id is kept,
+so a backend that repeats a record fills one place with it
+(`test_a_backend_repeating_a_candidate_fills_one_place`,
+`test_a_malformed_backend_answer_is_a_backend_failure_and_falls_back`,
+`test_one_record_answered_with_two_rows_is_an_integrity_failure`). Beyond
+that check, a backend's scores and ranks are never used.
 
 A backend must return every record of the partition that holds a query
 term, up to 64. A store holds at most 64 records, so FTS5 always does, and
-which records are candidates never depends on a backend's own ranking. A
-backend that cut its answer by its own ranking would make the candidates
-depend on records the launch is not served. Nothing can detect that short
-of reading every record, so it is part of the `IndexBackend` contract. A
-semantic backend, whose candidates need not hold a query term, would need
-a contract of its own.
+which records are candidates never depends on a backend's own ranking.
+Each search checks this for the records the launch is served, as above: a
+backend that cut its answer by its own ranking, or lost a row, is found by
+the search it would mislead. The check is affordable because a store holds
+at most 64 records; a larger corpus, such as #325's repository-wide layer,
+would need another way to prove coverage before it could say `complete`. A
+semantic backend, whose candidates need not hold a query term, would need a
+contract of its own.
 
 ### An answer says whose it is
 
 A search's, a fetch's and a catalog's answer carries a `ReadScope`: the
-repository, the run, the issue, the launch ordinal, the candidate, its
-ancestors and the environment digest of the binding `bind_request` checked.
-Every id in the answer is the run's, and every revision and count is in
-the scope's sequence, so they mean something only with it. Each hit and
-fetched record carries its `Applicability`: its range as the typed
-`Range`, the candidate an `exact` record applies to, the base a
-`descendants` record applies from, its environment and its phases. With
-these, an answer handed on still says why each record is the launch's
+repository, the run, the issue, the launch ordinal, the candidate and the
+environment digest of the binding `bind_request` checked. Every id in the
+answer is the run's, and every revision and count is in the scope's
+sequence, so they mean something only with it. Each hit and fetched record
+carries its `Applicability`: its range as the typed `Range`, the candidate
+an `exact` record applies to, the base a `descendants` record applies from,
+its environment and its phases. With these, an answer handed on still says
+why each record is the launch's
 (`test_answers_carry_the_launch_binding_and_each_records_applicability`).
 `render_hits` names the launch in its header and each record's
 applicability on its line.
+
+The binding's ancestors are not in the answer. The controller chooses them
+(`prepare_launch_projection`) from the bases of every range-bound record of
+the issue that the candidate descends from, before it is known which of
+those records apply to the launch. A record of another environment bound to
+a base's descendants therefore adds its base to them, and an earlier
+revision repeated them in `ReadScope`, so the catalog named a base that
+only an unserved record had. A served `descendants` record's own base, in
+its `Applicability`, is all that reading it needs
+(`test_the_projections_own_binding_tells_no_base_of_a_record_the_launch_is_not_served`).
 
 ### One tokenizer, in every script
 
@@ -410,7 +480,9 @@ a record's text or a prompt.
 Run with `uv run python -m tests.memory_retrieval_bench --sizes
 1000,10000,50000` on one host: x86_64, 8 CPUs, Linux 7.0.14, Python 3.14.10,
 SQLite 3.54.1. These are single runs of a local benchmark, not a
-comparison across hosts. No embedding of any kind is computed, so nothing
+comparison across hosts. The figures below were measured again after the
+third review round's changes (the coverage check, the health check read
+before the store, the rebuild that keeps the old index). No embedding of any kind is computed, so nothing
 below is evidence about semantic retrieval.
 
 ### Correctness on the pinned fixture
@@ -451,11 +523,11 @@ or foreign.
 
 | Corpus | Build | Search p50 / p95, snapshot held | Search p50 / p95, snapshot loaded per read | Index size |
 |---|---|---|---|---|
-| the fixture's store, 29 records (the whole read path) | 1.6 ms | 0.73 / 1.31 ms | 20.7 / 27.1 ms | 44 KiB |
-| a store at Memory's bound, 64 records (the whole read path) | 3.3 ms | 0.85 / 1.44 ms | 47.6 / 52.0 ms | 76 KiB |
-| 1,000 synthetic documents (the backend alone) | 29 ms | 0.24 / 0.70 ms | | 0.8 MiB |
-| 10,000 synthetic documents (the backend alone) | 293 ms | 0.84 / 3.31 ms | | 7.3 MiB |
-| 50,000 synthetic documents (the backend alone) | 1,457 ms | 2.39 / 10.3 ms | | 32.8 MiB |
+| the fixture's store, 29 records (the whole read path) | 1.6 ms | 0.69 / 1.27 ms | 19.1 / 20.0 ms | 44 KiB |
+| a store at Memory's bound, 64 records (the whole read path) | 3.2 ms | 1.12 / 1.65 ms | 45.1 / 48.0 ms | 76 KiB |
+| 1,000 synthetic documents (the backend alone) | 27 ms | 0.22 / 0.49 ms | | 0.8 MiB |
+| 10,000 synthetic documents (the backend alone) | 269 ms | 0.76 / 3.09 ms | | 7.3 MiB |
+| 50,000 synthetic documents (the backend alone) | 1,410 ms | 2.22 / 10.5 ms | | 32.8 MiB |
 
 Notes on the table:
 
@@ -465,7 +537,7 @@ Notes on the table:
   read" is a source that reconstructs and validates the store from the
   checkpoint's value at every call, as `AutoForgeState.memory` does. A
   search calls it twice, before and after its backend answers. That
-  reconstruction alone is 9.1 / 10.7 ms at 29 records and 21.9 / 24.0 ms
+  reconstruction alone is 8.5 / 8.9 ms at 29 records and 20.6 / 21.7 ms
   at 64, so it dominates. It is Memory's own fold, the same load the
   projection pays before every launch. A caller that searches several
   times between two writes could keep the store object and hand back the
@@ -475,19 +547,25 @@ Notes on the table:
   larger, repository-wide layer would cost the backend. A build tokenizes
   every document in Python (`text_tokens`) before FTS5 indexes it, which
   is most of the build time at these sizes.
+- **The coverage check.** Run in the same session, the reviewed head
+  before it (`11f15bb`) searched in 0.63 / 1.17 ms on the fixture's store
+  and 0.75 / 1.31 ms at the bound with the snapshot held. Reading the
+  store's text of every served record the index has seen, to prove its
+  answer left none out, adds about 0.06 ms at 29 records and 0.37 ms at 64
+  at the median.
 - **Updates.** Updating one document is 0.06 ms at the median at every
-  size. The 95th percentile is 1.7 ms at 1,000 documents, 13.7 ms at
-  10,000 and 29.0 ms at 50,000, where FTS5 merges its segments.
+  size. The 95th percentile is 1.7 ms at 1,000 documents, 14.0 ms at
+  10,000 and 27.2 ms at 50,000, where FTS5 merges its segments.
 - **Where the time goes.** At the store's sizes, with the snapshot held,
   most of a search is Python: binding the request, the snapshot's verdict
-  on every record, the scope's sequence, tokenizing the found records and
-  ranking them. With a snapshot loaded per call, the two reconstructions
+  on every record, the scope's sequence, tokenizing the served records to
+  check the index's coverage, and ranking the found ones. With a snapshot loaded per call, the two reconstructions
   and the digest of the audit rows that proves each snapshot continues the
   last one are most of it.
 - **Memory and CPU.** The index's memory is its database pages, the sizes
   above. Python's own allocations during a 50,000-document build peaked
   at 24 KiB, a figure that excludes SQLite's heap. CPU time per search,
-  snapshot held, is 0.8 ms on the fixture's store and 1.0 ms at the bound.
+  snapshot held, is 0.8 ms on the fixture's store and 1.2 ms at the bound.
 - **Ingestion to visibility.** A record written after the last sync is
   served at the next search, from the tail, in 1.3 ms. An incremental sync
   takes 0.1 ms, and the index then serves the record itself. Each is one
@@ -498,8 +576,8 @@ Notes on the table:
   byte-level tokenizer, against the projection's 16,384-byte budget.
 
 Against the evaluation protocol's `memory_overhead` ceiling of 1,000 ms of
-latency per launch, the read path at the store's bound costs under 1.5 ms
-per search at p95 with the snapshot held, and about 52 ms at p95 loading it
+latency per launch, the read path at the store's bound costs under 1.7 ms
+per search at p95 with the snapshot held, and about 48 ms at p95 loading it
 twice per search.
 
 ## LTSearch feasibility: no-go
@@ -583,13 +661,13 @@ default branch's head when this was written. Paths below are in that tree.
 **Decision: no-go for (a) and (b); FTS5 stays the default and only
 backend.** The measurement half of the go/no-go is the native baseline
 above. At Memory's scale of 64 records per run, BM25 serves every relevant
-record of the fixture within five places, at under 1.5 ms per search
-(about 52 ms loading the snapshot twice per search), with nothing stale or
+record of the fixture within five places, at under 1.7 ms per search
+(about 48 ms loading the snapshot twice per search), with nothing stale or
 foreign. That leaves no measured gap for a hybrid backend to close.
 
-### What this report does not settle
+### What this report does not settle, and the maintainer's decision
 
-#324's acceptance asks for a measured comparison and for licensing to be
+#324's acceptance asked for a measured comparison and for licensing to be
 confirmed, with the maintainers' clarification where a license is absent.
 Three of those checks were not done, and the no-go above rests on the
 source alone:
@@ -602,11 +680,15 @@ source alone:
   is for AutoForge's maintainer to do, and has not been done.
 - **The licenses of its 680 locked crates were not audited.**
 
-Neither the licensing nor the integration is cleared, and nothing here
-claims either. Whether #324 is accepted on a source-based no-go with these
-three left open, or they are done first, is for AutoForge's maintainer to
-decide. Either way, LTSearch stays out of the package, its dependencies
-and its runtime until the conditions below are met.
+AutoForge's maintainer has decided this
+([#324, 2026-11-23](https://github.com/iceboundrock/AutoForge/issues/324#issuecomment-7089522504)):
+#324's LTSearch criterion is narrowed to this source-based no-go, and the
+three checks are not required for it. They stay open, as limitations of
+this report: they are neither done nor owed by #324, and leaving them out
+of its scope clears nothing. LTSearch's licensing and its integration are
+not cleared, and nothing here claims either. LTSearch stays out of the
+package, its dependencies and its runtime until the conditions below are
+met, and whoever reopens it starts with these three checks.
 
 **What would reopen it:**
 
@@ -625,7 +707,8 @@ rule, not a dependency.
 
 ## What remains
 
-- **LTSearch's open checks**, as above, if the maintainer asks for them.
+- **LTSearch's three open checks**, outside #324 by the maintainer's
+  decision above; the first work of any reopening.
 - **Wiring into the projection.** Ordering or selecting what `memory.md`
   shows by a query would change what a launch sees. That needs a query
   source, the evaluation protocol's amendment rule (its section 11), and a

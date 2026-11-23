@@ -24,15 +24,18 @@ records the launch is served, a fetch answers alike for every record it
 does not serve, and every revision and freshness figure is the scope's own
 count, so no record outside the scope moves a hit or leaves a gap. Every
 answer names the launch it is for and each record's applicability. An index
-found not to match the store is marked failed, and the search that found
-it answers from the fallback or the store at once. The index, the hot tail
-and a query share one Unicode tokenizer, so a record in any script is found
-alike before and after the index syncs it. Where the interpreter's SQLite
-lacks FTS5, a search reads only the eight newest records and says it is
-degraded. LTSearch was evaluated as an optional hybrid backend and is a
-no-go from its source: it has no license, its filters run after retrieval,
-and it needs three HTTP processes; it was not measured and its licensing is
-not cleared. `docs/memory-retrieval.md` records the decisions, the measured
+found not to match the store, by a row it returns or a match it leaves out,
+is marked failed, and the search that found it answers from the fallback or
+the store at once; a failed rebuild keeps the index it would have replaced.
+The index, the hot tail and a query share one Unicode tokenizer, so a
+record in any script is found alike before and after the index syncs it.
+Where the interpreter's SQLite lacks FTS5, a search reads only the eight
+newest records and says it is degraded. LTSearch was evaluated as an
+optional hybrid backend and is a no-go from its source: it has no license,
+its filters run after retrieval, and it needs three HTTP processes. The
+maintainer narrowed #324's LTSearch criterion to that source-based no-go:
+LTSearch was not measured, and its licensing and integration are not
+cleared. `docs/memory-retrieval.md` records the decisions, the measured
 BM25 baseline and the evidence.
 
 ### Issue Working Memory reaches ANALYZE_EXECUTE's launches (#333)

@@ -15,13 +15,17 @@ budget or a merge imports it.
 **The canonical snapshot.** A retriever is bound to the store's source (the
 controller's reader of its committed checkpoint, ``AutoForgeState.memory``),
 never handed a snapshot by its caller: every read, sync and status loads
-the snapshot from it. A search loads it again after each backend answers,
-so the snapshot that judges the candidates, gives the excerpts, picks the
-hot tail and reports the freshness is the store as it is after the
-retrieval; a fetch and the catalog read no backend and load it once. A
-snapshot that does not continue the newest one the retriever has read (an
-older checkpoint, a saved copy, another history) is refused, so no read is
-ever judged by a snapshot a later write replaced.
+the snapshot from it. Every backend's health is read before that load
+(:meth:`MemoryRetriever._health`), and a health check that raises is a
+backend that cannot run, never an error of the read. A search loads the
+snapshot again after each backend answers, so the snapshot that judges the
+candidates, gives the excerpts, picks the hot tail and reports the
+freshness is the store as it is after the retrieval, and nothing calls a
+backend after that load; a fetch and the catalog read no backend's answer
+and load it once. A snapshot that does not continue the newest one the
+retriever has read (an older checkpoint, a saved copy, another history, an
+earlier launch ordinal) is refused, so no read is ever judged by a snapshot
+a later write or launch replaced.
 
 **The launch's scope.** What a launch is told is computed from its scope
 alone: its issue's records that apply to it (neither ``foreign`` nor
@@ -30,11 +34,13 @@ serve, whether it is missing, another issue's, another candidate's or
 refused. Every revision and freshness figure a launch is shown is the
 scope's own sequence (its records' changes, numbered 1, 2, ...), never a
 position in the store's audit table, so a write outside the scope leaves no
-gap in it. A hit's place is BM25 over the store's text with its statistics
-over the records the launch is served alone (:func:`_scores`): what the
-launch is not served moves no hit. Answers carry the launch's binding
-(:class:`ReadScope`) and each record's applicability
-(:class:`Applicability`). The reasons are counted in
+gap in it; the catalog's digest numbers its records in that sequence too.
+Record ids stay the run's, which a fetch and a citation need. A hit's place
+is BM25 over the store's text with its statistics over the records the
+launch is served alone (:func:`_scores`): what the launch is not served
+moves no hit. Answers carry the launch's binding (:class:`ReadScope`, which
+leaves out the ancestry the controller proved) and each record's
+applicability (:class:`Applicability`). The reasons are counted in
 :class:`RetrievalMetrics`, the controller's.
 
 **The default backend** is SQLite FTS5 in an in-memory database: no file,
@@ -42,7 +48,8 @@ no temporary file (``temp_store`` is memory), no attached database,
 partitioned by issue. It finds the candidates; it ranks nothing a launch
 sees. A SQLite built without FTS5 makes the backend ``unavailable``; the
 search then reads only the bounded hot tail below and says so
-(``degraded``, ``complete``), never anything broader.
+(``degraded``, and ``complete`` only when the tail held every current
+record of the scope), never anything broader.
 
 **One tokenizer.** The index, the hot tail, a query and the ranking are
 tokenized by :func:`text_tokens` alone. FTS5 is given its tokens encoded as
@@ -54,14 +61,17 @@ the Memory revision it was synced through (``indexed_through_seq``). An
 index row whose record changed after the watermark is dropped as ``stale``;
 a bounded hot tail (:data:`MAX_TAIL` of the scope's current records changed
 after the watermark, newest first) is searched on the store itself. A sync
-is one SQLite transaction: a failure leaves the index as it was, at its old
-watermark, and is counted. An index found not to be a projection of the
-store (a malformed row, a candidate the store contradicts, or, by
-:meth:`MemoryRetriever.verify`, a row whose tokens are not its record's) is
-``failed`` (``integrity``) until it is rebuilt, and the search that found
-it answers from the fallback or the tail instead. Since the index is in
-memory, a crash loses it and the next process rebuilds it from the
-checkpoint, deterministically.
+is one SQLite transaction, and so is a rebuild: a failure leaves the index
+as it was, at its old watermark and generation, and is counted. A search
+proves its index's coverage before it says ``complete``: every record the
+launch is served that the index has seen and that holds a query term must
+be among the candidates. An index found not to be a projection of the store
+(a malformed row, two rows of one record, a candidate the store
+contradicts, a served match it omits, or, by :meth:`MemoryRetriever.verify`,
+a row whose tokens are not its record's) is ``failed`` (``integrity``) until
+it is rebuilt, and the search that found it answers from the fallback or
+the tail instead. Since the index is in memory, a crash loses it and the
+next process rebuilds it from the checkpoint, deterministically.
 
 **Backends** implement :class:`IndexBackend` and return candidates only:
 record ids with the revision and content digest they indexed, checked and
@@ -284,11 +294,14 @@ class IndexBackend(Protocol):
     partition holding any of the ``terms`` (the same tokenizer's, from
     :func:`query_terms`, never query syntax), up to ``limit``: a partition
     holds at most one store's records, :data:`MAX_CANDIDATES`, so the
-    candidates never depend on a backend's own ranking. ``entries`` reads
-    every row back. Errors are :class:`RetrievalBackendError`, and a row the
-    backend finds malformed :class:`RetrievalIntegrityError`; an answer that
-    is not a bounded list of well-formed candidates is treated as an error
-    (:func:`_candidates`).
+    candidates never depend on a backend's own ranking. Each search checks
+    that: an answer that omits a record the launch is served, the index has
+    seen and a term matches is an integrity failure. ``entries`` reads
+    every row back. ``available`` answers ``True`` when the backend can run;
+    anything else, or an error, is a backend that cannot. Errors are
+    :class:`RetrievalBackendError`, and a row the backend finds malformed
+    :class:`RetrievalIntegrityError`; an answer that is not a bounded list
+    of well-formed candidates is treated as an error (:func:`_candidates`).
     """
 
     name: str
@@ -617,9 +630,11 @@ def _candidates(answer: object, limit: int) -> list[IndexCandidate]:
     A list of at most ``limit`` candidates, each with positive integer id and
     revision, a content digest, a finite score and a rank from 1 to
     ``limit``; anything else is :class:`RetrievalBackendError`, a backend
-    failure like any other, and nothing of it is converted on the way.
-    Ordered by (rank, id, revision, digest), the first of each id kept: one
-    record fills one place, whatever the backend repeats.
+    failure like any other, and nothing of it is converted on the way. One
+    record answered with two revisions or digests is two rows of it, which
+    no sync writes: :class:`RetrievalIntegrityError`, found before anything
+    is deduplicated. Ordered by rank, then id, the first of each id kept:
+    one record fills one place, whatever the backend repeats.
     """
     if not isinstance(answer, list | tuple):
         raise RetrievalBackendError("a backend's answer is a list of candidates")
@@ -629,6 +644,11 @@ def _candidates(answer: object, limit: int) -> list[IndexCandidate]:
         (_candidate(raw, limit) for raw in answer),
         key=lambda c: (c.rank, c.id, c.revision, c.digest),
     )
+    rows: dict[int, tuple[int, str]] = {}
+    for candidate in checked:
+        row = (candidate.revision, candidate.digest)
+        if rows.setdefault(candidate.id, row) != row:
+            raise RetrievalIntegrityError("a backend answered one record with two rows")
     kept: dict[int, IndexCandidate] = {}
     for candidate in checked:
         kept.setdefault(candidate.id, candidate)
@@ -670,6 +690,8 @@ _METRICS = (
     "degraded",
     "incomplete",
     "integrity",
+    "omitted",
+    "unavailable",
     "search_failures",
     "invalid_answers",
     "dropped_stale",
@@ -720,10 +742,17 @@ class ReadScope:
     A record id is the run's (the projection's ``M<id>``), meaningful within
     ``repository`` and ``run_id`` alone. Every revision and freshness figure
     is in the sequence of the scope: ``issue``'s records that apply to
-    launch ``launch``, made on ``candidate`` (whose ``ancestors`` a
-    ``descendants`` record's base is checked against), in ``environment``
-    (the controller's digest, or empty). The binding is the one
+    launch ``launch``, made on ``candidate``, in ``environment`` (the
+    controller's digest, or empty). The binding is the one
     :func:`~autoforge.memory.bind_request` checked, as the projection's is.
+
+    The request's ``ancestors`` are not told. They are the controller's
+    proof of which of the issue's range-bound bases the candidate descends
+    from, chosen from every such record of the issue before any applies
+    (:func:`~autoforge.memory_handoff.prepare_launch_projection`), so they
+    can name a base that only a record the launch is not served has. What
+    reading a served ``descendants`` record needs is its own base, in its
+    :class:`Applicability`.
     """
 
     repository: str
@@ -731,7 +760,6 @@ class ReadScope:
     issue: str
     launch: int
     candidate: str
-    ancestors: tuple[str, ...]
     environment: str
 
 
@@ -782,12 +810,14 @@ class SearchResult:
     """A search's hits, whose launch they are for, and how far they are all there is.
 
     ``complete`` holds only when every current record of the launch's scope
-    was searched: by an index synced through it, or in the hot tail.
-    ``degraded`` says the configured primary backend did not answer, or
-    answered with what the store contradicts, and the fallback or the tail
-    answered instead. ``unsearched`` counts the scope's current records past
-    the tail's bound that no index had seen; ``truncated`` that an
-    authorized hit did not fit the byte budget. ``status`` is the freshness
+    was searched: by an index synced through it whose answer held every
+    such record that matches (:meth:`MemoryRetriever._omitted`), or in the
+    hot tail. ``degraded`` says the configured primary backend could not
+    run or did not answer, or answered with what the store contradicts or
+    omitted a match, and the fallback or the tail answered instead.
+    ``unsearched`` counts the scope's current records past the tail's bound
+    that no index had seen; ``truncated`` that an authorized hit did not
+    fit the byte budget. ``status`` is the freshness
     of the index the search read (the primary's when none could be), over
     the scope. What the search dropped, and why, is counted in the
     retriever's metrics, never here.
@@ -969,14 +999,20 @@ class _Scope:
             bound.step.issue_url,
             bound.attempt,
             bound.candidate,
-            bound.ancestors,
             bound.environment,
         )
 
 
 def _scope_digest(store: MemoryStore, scope: _Scope) -> str:
+    """The digest of the scope's records, each numbered in the scope's own sequence.
+
+    A record is its add's number and its latest change's in that sequence,
+    its content digest and the snapshot's verdict: never its run id, the
+    add's position in the store's audit table, so a write outside the scope
+    changes nothing of it, wherever it falls between the scope's writes.
+    """
     rows = [
-        [f.id, scope.seq(f.revision), f.content, scope.verdicts[f.id].value]
+        [scope.seq(f.id), scope.seq(f.revision), f.content, scope.verdicts[f.id].value]
         for f in store.facts()
         if scope.holds(f.id)
     ]
@@ -1031,13 +1067,14 @@ class MemoryRetriever:
 
     Bound to one repository and run, and to ``source``: a callable that
     returns the canonical snapshot as it is now (the controller's
-    ``AutoForgeState.memory``). Every read, sync and status calls it, a
-    search once more after each backend answers, and answers from the
-    snapshot it loaded last alone; one of another repository or run, or one
-    that does not continue the newest snapshot read before, is refused
-    (:class:`RetrievalError`). ``backend`` defaults to :class:`Fts5Backend`;
-    ``fallback``, when given, must be one, and is used only when the primary
-    cannot answer.
+    ``AutoForgeState.memory``). Every read, sync and status reads each
+    backend's health first (:meth:`_health`), then calls it, a search once
+    more after each backend answers, and answers from the snapshot it
+    loaded last alone, calling no backend after that load; one of another
+    repository or run, or one that does not continue the newest snapshot
+    read before, is refused (:class:`RetrievalError`). ``backend`` defaults
+    to :class:`Fts5Backend`; ``fallback``, when given, must be one, and is
+    used only when the primary cannot answer.
     """
 
     def __init__(
@@ -1068,8 +1105,9 @@ class MemoryRetriever:
             self._slots.append(_Slot(fallback))
         self.tail = tail
         self.metrics = RetrievalMetrics()
-        # The newest snapshot read: its revision and the digest of its rows.
-        self._seen = (0, _prefix_digest([], 0))
+        # The newest snapshot read: its revision, the digest of its rows and
+        # its launch ordinal.
+        self._seen = (0, _prefix_digest([], 0), 0)
         self._last: _Snapshot | None = None
 
     @property
@@ -1088,7 +1126,11 @@ class MemoryRetriever:
         the newest revision read before differ, or that has fewer, is not
         the canonical store as it is now: an older checkpoint or a copy a
         later write replaced, which could still serve what that write
-        retracted, whatever index watermark it matches.
+        retracted, whatever index watermark it matches. Its launch ordinal
+        only grows too, and a launch adds no row: a snapshot with the same
+        rows and an earlier ordinal is a checkpoint from before a launch,
+        which would bind that launch's request again (an obsolete binding,
+        :func:`~autoforge.memory.bind_request`), and is refused alike.
 
         The very store object read last is that snapshot again: a store is
         never changed once made (a write makes a new one), and the
@@ -1103,12 +1145,12 @@ class MemoryRetriever:
         ):
             raise RetrievalError("this memory index projects another store")
         snap = _Snapshot(store, _events(store))
-        revision, digest = self._seen
-        if snap.revision < revision or snap.prefix(revision) != digest:
+        revision, digest, launch = self._seen
+        if snap.revision < revision or snap.prefix(revision) != digest or store.launch_seq < launch:
             raise RetrievalError(
                 "the memory source's snapshot does not continue the one this retriever read"
             )
-        self._seen = (snap.revision, snap.prefix(snap.revision))
+        self._seen = (snap.revision, snap.prefix(snap.revision), store.launch_seq)
         self._last = snap
         return snap
 
@@ -1124,15 +1166,38 @@ class MemoryRetriever:
 
     # -- freshness ------------------------------------------------------------
 
-    @staticmethod
-    def _readable(slot: _Slot) -> bool:
-        """Whether a search may read ``slot``'s index: built, not failed, and able to run."""
-        return slot.backend.available() and not slot.broken and slot.built
+    def _health(self) -> tuple[bool, ...]:
+        """Whether each slot's backend can run, asked once per read, before the store is loaded.
 
-    def _status(self, slot: _Slot, snap: _Snapshot, scope: _Scope | None = None) -> IndexStatus:
+        ``available`` is a backend's own call: nothing after a read's last
+        load calls a backend, so no write made during one goes unseen by the
+        snapshot that judges the read. An answer other than ``True``, or a
+        :class:`RetrievalBackendError`, is a backend that cannot run now:
+        the read goes to the fallback or the tail, and the next read asks
+        again.
+        """
+        health = []
+        for slot in self._slots:
+            try:
+                up = slot.backend.available() is True
+            except RetrievalBackendError:
+                self.metrics.count("unavailable")
+                up = False
+            health.append(up)
+        return tuple(health)
+
+    @staticmethod
+    def _readable(slot: _Slot, up: bool) -> bool:
+        """Whether a search may read ``slot``'s index: built, not failed, and able to run."""
+        return up and not slot.broken and slot.built
+
+    def _status(
+        self, slot: _Slot, up: bool, snap: _Snapshot, scope: _Scope | None = None
+    ) -> IndexStatus:
+        """``slot``'s freshness against ``snap``, its health ``up`` as :meth:`_health` read it."""
         backend, reason = slot.backend, slot.broken
         state: IndexState | None = None
-        if not backend.available():
+        if not up:
             state = IndexState.UNAVAILABLE
             reason = (
                 IndexReason.FTS5_UNAVAILABLE
@@ -1168,16 +1233,19 @@ class MemoryRetriever:
             reason,
         )
 
-    def _freshness(self, snap: _Snapshot, scope: _Scope) -> tuple[IndexStatus, bool]:
+    def _freshness(
+        self, health: tuple[bool, ...], snap: _Snapshot, scope: _Scope
+    ) -> tuple[IndexStatus, bool]:
         """The index a search would read now, over ``scope``, and whether it is degraded."""
-        for slot in self._slots:
-            if self._readable(slot):
-                return self._status(slot, snap, scope), slot is not self._slots[0]
-        return self._status(self._slots[0], snap, scope), True
+        for slot, up in zip(self._slots, health, strict=True):
+            if self._readable(slot, up):
+                return self._status(slot, up, snap, scope), slot is not self._slots[0]
+        return self._status(self._slots[0], health[0], snap, scope), True
 
     def status(self) -> IndexStatus:
         """The primary index's freshness against the canonical store, over the whole store."""
-        return self._status(self._slots[0], self._load())
+        health = self._health()
+        return self._status(self._slots[0], health[0], self._load())
 
     def sync(self) -> IndexStatus:
         """Bring every index up to the canonical store: incrementally, or rebuilt when it must be.
@@ -1185,28 +1253,35 @@ class MemoryRetriever:
         Each backend's update is one atomic unit. A failure keeps the index
         where it was and counts the failure; the next sync tries again.
         """
-        return self._sync_all(self._load())
+        health = self._health()
+        return self._sync_all(health, self._load(), rebuild=False)
 
     def rebuild(self) -> IndexStatus:
-        """Rebuild every index from the canonical store alone, whatever it held."""
-        snap = self._load()
-        for slot in self._slots:
-            slot.built = False
-        return self._sync_all(snap)
+        """Rebuild every index from the canonical store alone, whatever it held.
 
-    def _sync_all(self, snap: _Snapshot) -> IndexStatus:
-        for slot in self._slots:
-            self._sync(slot, snap)
+        Each rebuild is one atomic unit, as a sync is: the index it replaces
+        stays in service, at its watermark and generation, until the new one
+        commits. A rebuild that fails is counted, ``failed`` and
+        ``sync-failed`` in the status, and leaves the old index readable if
+        it was, and unreadable if it was already ``failed``; the next sync or
+        rebuild tries again.
+        """
+        health = self._health()
+        return self._sync_all(health, self._load(), rebuild=True)
+
+    def _sync_all(self, health: tuple[bool, ...], snap: _Snapshot, *, rebuild: bool) -> IndexStatus:
+        for slot, up in zip(self._slots, health, strict=True):
+            self._sync(slot, up, snap, rebuild=rebuild)
         self.metrics.count("syncs")
-        return self._status(self._slots[0], snap)
+        return self._status(self._slots[0], health[0], snap)
 
-    def _sync(self, slot: _Slot, snap: _Snapshot) -> None:
-        if not slot.backend.available():
+    def _sync(self, slot: _Slot, up: bool, snap: _Snapshot, *, rebuild: bool) -> None:
+        if not up:
             return
         store = snap.store
-        status = self._status(slot, snap)
+        status = self._status(slot, up, snap)
         try:
-            if status.state in (IndexState.EMPTY, IndexState.FAILED):
+            if rebuild or status.state in (IndexState.EMPTY, IndexState.FAILED):
                 docs = [d for f in store.facts() if (d := _document(store, f)) is not None]
                 slot.backend.apply(docs, (), clear=True)
                 slot.generation += 1
@@ -1236,9 +1311,10 @@ class MemoryRetriever:
         tokens than its text's, a malformed row or a failed backend check
         marks the index ``failed`` (``integrity``) until it is rebuilt.
         """
+        health = self._health()
         snap = self._load()
         store, slot = snap.store, self._slots[0]
-        status = self._status(slot, snap)
+        status = self._status(slot, health[0], snap)
         if not status.readable:
             return status
         expected = {
@@ -1272,7 +1348,7 @@ class MemoryRetriever:
         if not healthy:
             slot.broken = IndexReason.INTEGRITY
             self.metrics.count("integrity")
-        return self._status(slot, snap)
+        return self._status(slot, health[0], snap)
 
     # -- reads ----------------------------------------------------------------
 
@@ -1290,19 +1366,23 @@ class MemoryRetriever:
             return None
         try:
             return _candidates(answer, MAX_CANDIDATES)
+        except RetrievalIntegrityError:
+            slot.broken = IndexReason.INTEGRITY
+            self.metrics.count("integrity")
+            return None
         except RetrievalBackendError:
             slot.broken = IndexReason.INVALID_ANSWER
             self.metrics.count("invalid_answers")
             return None
 
+    @staticmethod
     def _contradicted(
-        self,
         found: Sequence[IndexCandidate],
-        snap: _Snapshot,
+        facts: dict[int, MemoryFact],
         scope: _Scope,
         through: int,
         tokens: Callable[[int], list[str]],
-        terms: Sequence[str],
+        wanted: set[str],
     ) -> int:
         """How many of ``found`` no index synced through ``through`` could hold.
 
@@ -1315,8 +1395,6 @@ class MemoryRetriever:
         watermark contradicts nothing: its row is stale, and the tail reads
         the record.
         """
-        facts = {f.id: f for f in snap.store.facts()}
-        wanted = set(terms)
         count = 0
         for candidate in found:
             fact = facts.get(candidate.id)
@@ -1332,6 +1410,37 @@ class MemoryRetriever:
             count += 1
         return count
 
+    @staticmethod
+    def _omitted(
+        found: Sequence[IndexCandidate],
+        facts: dict[int, MemoryFact],
+        scope: _Scope,
+        through: int,
+        tokens: Callable[[int], list[str]],
+        wanted: set[str],
+    ) -> int:
+        """How many records the launch is served that ``found`` should hold and does not.
+
+        A backend returns every record of the partition that holds a query
+        term (:class:`IndexBackend`). A record whose latest change is at or
+        before ``through`` was indexed as it is now, so each such record the
+        launch is served that holds a term must be a candidate. One missing
+        means the index is no projection of the store, and a search that
+        read it could not say it is complete. This is the coverage a search
+        proves before it does: it reads the store's text of every such
+        record, at most :data:`~autoforge.memory.MAX_FACTS`. A record changed
+        after the watermark is the tail's.
+        """
+        returned = {candidate.id for candidate in found}
+        return sum(
+            1
+            for fact in facts.values()
+            if fact.revision <= through
+            and fact.id not in returned
+            and scope.served(fact.id)
+            and not wanted.isdisjoint(tokens(fact.id))
+        )
+
     def search_memory(
         self,
         request: ProjectionRequest,
@@ -1341,39 +1450,50 @@ class MemoryRetriever:
     ) -> SearchResult:
         """Ranked, bounded hits for ``request``'s launch, each current in the canonical store.
 
+        Every backend's health is read first, then the canonical snapshot.
         The primary index is asked first, the fallback only when it cannot
-        answer. After each answer the canonical snapshot is loaded again and
-        the request bound to it again, so the store as it is after the
-        retrieval judges the candidates, gives the excerpts, picks the tail
-        and reports the freshness: a record corrected or retracted while a
-        backend answered is served as it is now, or not at all. An answer
-        the snapshot contradicts is discarded, its index marked ``failed``
-        (``integrity``), and the fallback, else the tail alone, answers the
-        same search, reported ``degraded``.
+        answer. After each answer the snapshot is loaded again and the
+        request bound to it again, so the store as it is after the retrieval
+        judges the candidates, gives the excerpts, picks the tail and
+        reports the freshness, and no backend is called after that load: a
+        record corrected or retracted while a backend answered or reported
+        its health is served as it is now, or not at all. An answer the
+        snapshot contradicts, or one that omits a record the launch is
+        served that the index has seen and that holds a query term, is
+        discarded, its index marked ``failed`` (``integrity``), and the
+        fallback, else the tail alone, answers the same search, reported
+        ``degraded``.
         """
+        health = self._health()
         snap = self._load()
         scope = self._scope(snap, request)
         if type(k) is not int or not 1 <= k <= MAX_HITS:
             raise RetrievalError(f"a memory search returns 1 to {MAX_HITS} hits")
         terms = query_terms(query)
+        wanted = set(terms)
         dropped: dict[str, int] = {}
 
         def drop(reason: str, n: int = 1) -> None:
             dropped[reason] = dropped.get(reason, 0) + n
 
+        facts = {f.id: f for f in snap.store.facts()}
         cache: dict[str, list[str]] = {}
 
         def tokens(record: int) -> list[str]:
-            # The store's own text, by its content digest: one text, one tokenization.
-            fact = facts[record]
-            if fact.content not in cache:
-                cache[fact.content] = text_tokens(snap.store.text_of(record))
-            return cache[fact.content]
+            # The store's own text, by its content digest: one text, one
+            # tokenization. A record with no live text has no tokens.
+            text = snap.store.text_of(record)
+            if not text:
+                return []
+            content = facts[record].content
+            if content not in cache:
+                cache[content] = text_tokens(text)
+            return cache[content]
 
         used: _Slot | None = None
         found: list[IndexCandidate] = []
-        for slot in self._slots:
-            if not self._readable(slot):
+        for slot, up in zip(self._slots, health, strict=True):
+            if not self._readable(slot, up):
                 continue
             if not terms:
                 used = slot
@@ -1383,18 +1503,20 @@ class MemoryRetriever:
             # same snapshot, bound as it was, when the source has not moved.
             if (after := self._load()) is not snap:
                 snap, scope = after, self._scope(after, request)
+                facts = {f.id: f for f in snap.store.facts()}
             if answer is None:
                 continue
-            facts = {f.id: f for f in snap.store.facts()}
-            if bad := self._contradicted(answer, snap, scope, slot.through, tokens, terms):
+            bad = self._contradicted(answer, facts, scope, slot.through, tokens, wanted)
+            missed = self._omitted(answer, facts, scope, slot.through, tokens, wanted)
+            if bad or missed:
                 slot.broken = IndexReason.INTEGRITY
                 self.metrics.count("integrity")
+                self.metrics.count("omitted", missed)
                 drop("integrity", bad)
                 continue
             used, found = slot, answer
             break
         store = snap.store
-        facts = {f.id: f for f in store.facts()}
         through = used.through if used is not None else 0
         indexed: list[int] = []
         for candidate in found:
@@ -1409,14 +1531,17 @@ class MemoryRetriever:
                 indexed.append(fact.id)
             else:
                 drop(verdict.value)
-        # What the search found the index to be, a failure it met included.
-        status = self._status(used or self._slots[0], snap, scope)
+        # What the search found the index to be, a failure it met included,
+        # from the health read before the snapshot: no backend is called now.
+        if used is not None:
+            status = self._status(used, True, snap, scope)
+        else:
+            status = self._status(self._slots[0], health[0], snap, scope)
         tail_facts = sorted(
             (f for f in facts.values() if f.revision > through and scope.served(f.id)),
             key=lambda f: (-f.revision, f.id),
         )
         read, unsearched = tail_facts[: self.tail], max(len(tail_facts) - self.tail, 0)
-        wanted = set(terms)
         tail = [f.id for f in read if not wanted.isdisjoint(tokens(f.id))]
         # One ranking for what the index and the tail found, over the store's
         # text and the launch's served records alone.
@@ -1489,14 +1614,16 @@ class MemoryRetriever:
         """``record`` whole, if the canonical snapshot serves it to ``request``'s launch.
 
         No index is read: a fetch is the snapshot's answer alone, loaded for
-        it, so an id a search returned before a correction or retraction, or
-        one from anywhere else, gets the same check. The index's freshness
-        over the launch's scope comes with it, and the launch's binding.
+        it after every backend's health was read, so an id a search returned
+        before a correction or retraction, or one from anywhere else, gets
+        the same check. The index's freshness over the launch's scope comes
+        with it, and the launch's binding.
         """
+        health = self._health()
         snap = self._load()
         scope = self._scope(snap, request)
         self.metrics.count("fetches")
-        status, degraded = self._freshness(snap, scope)
+        status, degraded = self._freshness(health, snap, scope)
         context = scope.read_scope()
         verdict = scope.verdicts.get(record) if type(record) is int else None
         if verdict is not Visibility.CURRENT:
@@ -1522,6 +1649,7 @@ class MemoryRetriever:
 
     def catalog(self, request: ProjectionRequest) -> MemoryCatalog:
         """The Memory Catalog of ``request``'s launch: labels, counts, revision, freshness."""
+        health = self._health()
         snap = self._load()
         scope = self._scope(snap, request)
         self.metrics.count("catalogs")
@@ -1529,7 +1657,7 @@ class MemoryRetriever:
         for fact in snap.store.facts():
             if scope.served(fact.id):
                 counts[fact.kind.value] = counts.get(fact.kind.value, 0) + 1
-        status, degraded = self._freshness(snap, scope)
+        status, degraded = self._freshness(health, snap, scope)
         return MemoryCatalog(
             scope.read_scope(),
             scope.source,
