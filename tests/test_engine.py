@@ -38,6 +38,7 @@ from autoforge.errors import (
     ControlResultValidationError,
     ExecutionError,
     ExecutionTimeoutError,
+    GitHubCredentialError,
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
@@ -1554,6 +1555,41 @@ def test_analyze_a_pr_body_gh_prints_otherwise_is_bound_on_its_exact_read(
     assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
     assert fake_github.prs[PR].body == f"{ESCAPE_BODY}\n\n{closing(eng.state.run_id)}"
     assert ("get_pr_exact", PR) in fake_github.calls
+
+
+def test_analyze_a_credential_failure_of_the_pr_s_exact_read_back_blocks_and_unblock_reads_again(
+    tmp_state_dir, fake_github
+):
+    """#329: outside a replan, a credential the exact read cannot use is a conclusive read
+    failure like any: the PR's read-back blocks (github-read-failed) with nothing sent
+    again, the reason naming what to check. Once `gh auth` works, 'unblock' re-enters
+    the phase, which reconciles the attempted create and binds the PR: one create, no
+    second agent launch."""
+    fake_github.gh_sanitizes = True
+    eng = make_engine(
+        tmp_state_dir,
+        lambda req: implement(req, pr_body=ESCAPE_BODY),
+        github=fake_github,
+        origin=True,
+    )
+    fake_github.exact_read_error = GitHubCredentialError(
+        f"exact read of {PR}: GitHub answered HTTP 401; `gh auth status` and "
+        "`gh auth token --hostname github.com` must work for the user running AutoForge"
+    )
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED", out.message
+    assert eng.state.stop_code == StopReasonCode.GITHUB_READ_FAILED.value
+    assert "GitHub answered HTTP 401" in eng.state.block_reason
+    assert "gh auth token --hostname github.com" in eng.state.block_reason
+    assert "nothing was sent again" in eng.state.block_reason
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+
+    fake_github.exact_read_error = None
+    assert eng.unblock("gh auth works again").unblocked
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert eng.state.current_pr_url == PR and len(eng.provider.calls) == 1
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
 
 
 def test_analyze_a_crash_after_a_landed_pr_gh_prints_otherwise_resumes_without_side_effects(

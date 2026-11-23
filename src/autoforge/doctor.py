@@ -63,6 +63,13 @@ fine-grained personal access token the check runs of a private repository,
 which no permission it can be given changes. PASS needs a check run read;
 no such pull request is UNKNOWN, never a PASS.
 
+The exact-read row (#329) makes the one read the controller makes past
+`gh`: ``gh auth token --hostname github.com``, never printing the token,
+then one ``GET https://api.github.com/rate_limit`` through
+:func:`autoforge.github.https_get` with it, never showing the reply. It
+catches a host where `gh` works but that direct read does not (a proxy,
+a trust store, a token the REST API refuses) before a read-back needs it.
+
 Every run shows the parallel EPIC scheduler's settings (``scheduler.*``,
 bounded by the configuration loader). ``doctor --epic <url>`` adds the
 scheduler's own checks (ADR 0008, #183): the coordination root (the git
@@ -107,6 +114,7 @@ from .errors import (
     ConfigurationError,
     ExecutionError,
     GitHubChecksAccessError,
+    GitHubCredentialError,
     GitHubError,
     GitHubNotFoundError,
     GitHubPlanLimitedError,
@@ -122,8 +130,10 @@ from .executor import (
     orphan_containment_available,
 )
 from .github import (
+    EXACT_READ_ROOT,
     GH_MIN_VERSION,
     GitHubClient,
+    HttpsGet,
     checks_access_remedy,
     gh_request,
     gh_workdir,
@@ -192,6 +202,8 @@ CHECKS_READ_ROW = "pull request check runs readable"
 # run: each is one `gh pr view`, and a candidate whose results are commit
 # statuses only proves nothing about check runs.
 CHECKS_READ_TRIES = 3
+# Name of the `doctor` row that tries the exact read past `gh` (#329).
+EXACT_READ_ROW = "exact read (api.github.com)"
 
 
 @dataclass
@@ -228,6 +240,7 @@ class Doctor:
         runner: Runner | None = None,
         timeout_seconds: int = 30,
         epic_url: str | None = None,
+        https: HttpsGet | None = None,
     ) -> None:
         self.config_path = config_path
         # ``doctor --epic``: the EPIC whose graph the scheduler rows read.
@@ -235,6 +248,9 @@ class Doctor:
         self.state_dir = state_dir
         self.cwd = cwd or os.getcwd()
         self._runner: Runner = runner or execute
+        # The exact read row's HTTPS transport: `github.https_get` unless a test
+        # gives its own.
+        self._https = https
         self.timeout = timeout_seconds
         self.config: AutoForgeConfig | None = None
         # 'owner/repo' of the `origin` remote, set exactly when `check_remote` passes.
@@ -946,6 +962,72 @@ class Doctor:
     def check_gh_auth(self, gh: str) -> CheckResult:
         ok, detail = self._run_gh([gh, "auth", "status"])
         return CheckResult("gh authenticated", ok, detail)
+
+    def check_exact_read(self, gh: str) -> CheckResult:
+        """Whether the exact read past `gh` can work from this machine (#329).
+
+        A create's read-back reads an object from GitHub's REST API itself
+        when `gh`'s sanitized print cannot prove its text
+        (:meth:`GitHubClient.get_pr_exact`), with the token
+        ``gh auth token --hostname github.com`` prints and Python's own HTTPS
+        (the proxy variables apply, the system's trust store verifies). A
+        host where `gh` works but that read does not would find out only when
+        a read-back needs it, and the phase would then stop. This row makes
+        the same read once, on ``GET /rate_limit``, which names no repository
+        and is not counted against the rate limit (:meth:`GitHubClient.
+        probe_exact_read`): ``gh auth token`` first, and the GET only with a
+        token it printed. The token and the reply are never shown, stored or
+        logged. Read-only.
+
+        OK when GitHub answered one JSON object. A credential failure (no
+        token, a 401, a 403 that is no rate limit), a certificate that does
+        not verify and any other conclusive answer FAIL with their remedy. A
+        transient failure (no connection, a timeout, a 5xx or a rate limit)
+        WARNs: it may pass on the next run, and if it does not, the proxy or
+        the network between this machine and the API is to check.
+        """
+        name = EXACT_READ_ROW
+        client = GitHubClient(
+            gh_command=gh,
+            timeout_seconds=self.timeout,
+            runner=self._runner,
+            transient_retries=0,
+            https=self._https,
+        )
+        try:
+            client.probe_exact_read()
+        except ExecutionError as exc:
+            return _gh_not_started(name, exc)
+        except GitHubCredentialError as exc:
+            return CheckResult(name, False, redact(f"no credential GitHub accepts: {exc}"))
+        except GitHubUnavailableError as exc:
+            return CheckResult(
+                name,
+                False,
+                redact(
+                    f"{EXACT_READ_ROOT} could not be read over HTTPS from this machine ({exc}); "
+                    "run doctor again, and if it persists while `gh` works, check the proxy "
+                    "variables (HTTPS_PROXY, NO_PROXY) and the network path to the API: a "
+                    "read-back that needs this read would stop until it works"
+                ),
+                required=False,
+            )
+        except GitHubError as exc:
+            return CheckResult(
+                name,
+                False,
+                redact(
+                    f"{exc}; a read-back that needs this read would block. A certificate that "
+                    "does not verify means this machine's trust store does not hold the CA of "
+                    "whatever answered (a TLS-inspecting proxy, for one)"
+                ),
+            )
+        return CheckResult(
+            name,
+            True,
+            f"`gh auth token` printed a token and {EXACT_READ_ROOT} answered with it over "
+            "verified HTTPS (the token and the reply are not shown)",
+        )
 
     def sandbox_checks(self) -> list[CheckResult]:
         """The outer sandbox's rows (ADR 0005 D12.4, D14.1; :mod:`autoforge.doctor_sandbox`)."""
@@ -1980,6 +2062,7 @@ class Doctor:
         results.append(self._version_check("git available", ["git", "--version"]))
         results.append(self.check_gh_version(gh))
         results.append(self.check_gh_auth(gh))
+        results.append(self.check_exact_read(gh))
         results.extend(self._remote_agent_checks(cfg))
         results.append(self.check_git_repo())
         results.append(self.check_remote())
@@ -2062,7 +2145,13 @@ def run_doctor(
     cwd: str | None = None,
     runner: Runner | None = None,
     epic_url: str | None = None,
+    https: HttpsGet | None = None,
 ) -> list[CheckResult]:
     return Doctor(
-        config_path=config_path, state_dir=state_dir, cwd=cwd, runner=runner, epic_url=epic_url
+        config_path=config_path,
+        state_dir=state_dir,
+        cwd=cwd,
+        runner=runner,
+        epic_url=epic_url,
+        https=https,
     ).run_all()

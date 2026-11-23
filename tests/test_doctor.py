@@ -3,18 +3,21 @@
 import json
 import os
 import shutil
+import ssl
 import subprocess
+import urllib.error
 from pathlib import Path
 
 import pytest
 
 import autoforge.doctor as doctor_module
 import autoforge.executor as executor_module
+import autoforge.github as github_module
 from autoforge.config import default_config
 from autoforge.doctor import Doctor
 from autoforge.errors import ExecutionError
 from autoforge.executor import ExecutionResult, execute
-from autoforge.github import GH_WORKDIR_PREFIX
+from autoforge.github import EXACT_READ_ROOT, GH_WORKDIR_PREFIX, HttpsReply, HttpsRequest
 from autoforge.redaction import redact
 from tests.conftest import (
     DOTDOT_SPELLINGS,
@@ -141,6 +144,35 @@ CLAUDE_HELP = (
 )
 
 
+# The token the fake `gh auth token --hostname github.com` prints (#329): a stand-in.
+EXACT_READ_TOKEN = "gho_" + "D" * 36
+GH_AUTH_TOKEN = ["gh", "auth", "token", "--hostname", "github.com"]
+# What GitHub answers `GET /rate_limit` with: one JSON object.
+RATE_LIMIT_REPLY = HttpsReply(
+    200,
+    {"content-type": "application/json; charset=utf-8"},
+    b'{"resources": {"core": {"limit": 5000, "remaining": 4999}}, "rate": {"limit": 5000}}',
+)
+
+
+@pytest.fixture(autouse=True)
+def _healthy_exact_read(monkeypatch):
+    """Every doctor here reads GitHub's rate limit from a stand-in, never the network.
+
+    The exact-read row (#329) builds its client without ``https=`` unless a
+    test gives one, so it takes ``github.https_get``: this answers
+    ``GET /rate_limit`` as GitHub does and fails the test for any other URL,
+    as conftest's ``_no_network_exact_read`` would.
+    """
+
+    def https(request: HttpsRequest) -> HttpsReply:
+        if request.url != EXACT_READ_ROOT + "rate_limit":
+            pytest.fail(f"doctor made an exact read of {request.url}")
+        return RATE_LIMIT_REPLY
+
+    monkeypatch.setattr(github_module, "https_get", https)
+
+
 def _runner_factory(
     git_remote="https://github.com/owner/repo.git",
     fail=(),
@@ -154,6 +186,7 @@ def _runner_factory(
     claude_help=CLAUDE_HELP,
     checks_probe=HEALTHY_PROBE,
     pr_views=None,
+    gh_token=EXACT_READ_TOKEN,
 ):
     """Fake runner. ``github`` maps a `gh api` endpoint to its JSON payload, or to
     an ``(exit_code, stderr)`` pair for a failed read; ``--paginate --slurp``
@@ -164,7 +197,9 @@ def _runner_factory(
     ``claude_help`` what ``claude --help`` does. ``checks_probe`` is the
     answer to the checks-read row's candidate listing (``gh api graphql``)
     and ``pr_views`` maps a PR URL to its status-check rollup (``gh pr
-    view``), each an answer or an ``(exit_code, stderr)`` pair (#291)."""
+    view``), each an answer or an ``(exit_code, stderr)`` pair (#291).
+    ``gh_token`` is what ``gh auth token --hostname github.com`` prints, or an
+    ``(exit_code, stderr)`` pair (#329)."""
     responses = dict(HEALTHY_GITHUB)
     responses.update(github or {})
     views = HEALTHY_PR_VIEWS if pr_views is None else pr_views
@@ -184,6 +219,10 @@ def _runner_factory(
             return ExecutionResult(argv, req.cwd, 1, "", "boom", "t", "t")
         if argv[0] == "git" and "config" in argv and "--show-scope" in argv:
             return ExecutionResult(argv, req.cwd, 0, git_config, "", "t", "t")
+        if argv == GH_AUTH_TOKEN:
+            if isinstance(gh_token, tuple):
+                return failed(argv, req.cwd, gh_token)
+            return ExecutionResult(argv, req.cwd, 0, gh_token + "\n", "", "t", "t")
         if argv[:3] == ["git", "remote", "get-url"]:
             out = git_remote
         elif argv[:2] == ["git", "rev-parse"]:
@@ -291,6 +330,7 @@ def test_all_checks_pass(tmp_path):
         "git available",
         "gh available",
         "gh authenticated",
+        "exact read (api.github.com)",
         "agent 'claude' available (analyze_execute, fix)",
         "agent 'claude' keeps integrations off (analyze_execute, fix)",
         CLAUDE_CONFIGURATION_ROW,
@@ -1333,8 +1373,9 @@ def test_checks_read_passes_only_on_the_merge_gate_s_own_read_of_a_check_run(tmp
     (view,) = _pr_views(calls)
     assert view[:4] == ["gh", "pr", "view", PROBE_PR]
     assert "statusCheckRollup" in view[view.index("--json") + 1].split(",")
-    # Read-only and token-free: no write, no `gh auth token`.
-    assert not any("token" in argv for argv in calls)
+    # Read-only and token-free: no write, and no `gh auth token` but the exact-read
+    # row's own one (#329), which this read never uses.
+    assert [argv for argv in calls if "token" in argv] == [GH_AUTH_TOKEN]
     assert not any(a in ("-X", "--method") for argv in calls for a in argv)
 
 
@@ -1458,6 +1499,170 @@ def test_checks_read_skipped_when_prerequisites_failed(tmp_path):
     row, calls = _checks_read(tmp_path, git_remote="git@gitlab.com:o/r.git")
     assert row.skipped and row.detail == "(GitHub remote check failed)"
     assert not any(argv[:3] == ["gh", "api", "graphql"] for argv in calls)
+
+
+# -- the exact-read row (#329) ------------------------------------------------------
+
+EXACT_READ_ROW = "exact read (api.github.com)"
+# Text an answer may hold that the row must never repeat.
+_REPLY_SECRET = b"reply-only-text-0123456789"
+
+
+def _exact_read(tmp_path, reply=None, *, raises=None, **kwargs):
+    """The exact-read row of a doctor whose HTTPS transport is recorded.
+
+    ``reply`` is GitHub's answer, ``raises`` what the transport raises
+    instead; ``kwargs`` reach the fake runner (``gh_token`` among them).
+    Returns the row, every argv the doctor ran and every request sent.
+    """
+    calls: list = []
+    gets: list[HttpsRequest] = []
+
+    def https(request: HttpsRequest) -> HttpsReply:
+        gets.append(request)
+        if raises is not None:
+            raise raises
+        return RATE_LIMIT_REPLY if reply is None else reply
+
+    d = Doctor(
+        cwd=str(tmp_path),
+        runner=_runner_factory(calls=calls, **kwargs),
+        timeout_seconds=11,
+        https=https,
+    )
+    return d.check_exact_read("gh"), calls, gets
+
+
+def _no_secret_in(row) -> None:
+    assert EXACT_READ_TOKEN not in row.detail, row
+    assert _REPLY_SECRET.decode() not in row.detail, row
+
+
+def test_the_exact_read_row_makes_one_get_of_the_rate_limit_and_shows_neither_token_nor_reply(
+    tmp_path,
+):
+    """OK: `gh auth token --hostname github.com` printed a token and GitHub answered one
+    JSON object to one GET of `/rate_limit`, which names no repository. The token goes
+    in the Authorization header alone; neither it nor the reply is in the row."""
+    reply = HttpsReply(
+        200,
+        {"content-type": "application/json"},
+        b'{"rate": {"limit": 5000}, "note": "' + _REPLY_SECRET + b'"}',
+    )
+    row, calls, gets = _exact_read(tmp_path, reply)
+
+    assert row.ok and row.required and row.label == "OK  "
+    assert [argv for argv in calls if "token" in argv] == [GH_AUTH_TOKEN]
+    (request,) = gets
+    assert request.url == "https://api.github.com/rate_limit"
+    assert dict(request.headers)["Authorization"] == f"Bearer {EXACT_READ_TOKEN}"
+    assert request.timeout_seconds == 11
+    assert EXACT_READ_TOKEN not in repr(request)
+    _no_secret_in(row)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "reply", "needle"),
+    [
+        (
+            {"gh_token": (1, "You are not logged into any GitHub hosts. Run gh auth login")},
+            None,
+            "not logged",
+        ),
+        ({"gh_token": "gho_one gho_two"}, None, "printed no usable credential"),
+        ({}, HttpsReply(401, {"content-type": "application/json"}, _REPLY_SECRET), "HTTP 401"),
+        (
+            {},
+            HttpsReply(
+                403,
+                {"content-type": "application/json"},
+                b'{"message": "Resource protected by organization SAML enforcement '
+                + _REPLY_SECRET
+                + b'"}',
+            ),
+            "HTTP 403",
+        ),
+    ],
+    ids=["not-logged-in", "unusable-token", "401", "403"],
+)
+def test_the_exact_read_row_fails_a_credential_github_does_not_accept_with_its_remedy(
+    tmp_path, kwargs, reply, needle
+):
+    """No credential the REST API accepts is a FAIL: a read-back that needs the exact
+    read would stop on it. The row names the cause and what to check, never the token
+    or GitHub's message; a token `gh` cannot print sends no request at all."""
+    row, _, gets = _exact_read(tmp_path, reply, **kwargs)
+
+    assert not row.ok and row.required and row.label == "FAIL"
+    assert needle in row.detail and "no credential GitHub accepts" in row.detail
+    assert "gh auth token --hostname github.com" in row.detail
+    assert len(gets) == (0 if "gh_token" in kwargs else 1)
+    assert "SAML" not in row.detail
+    _no_secret_in(row)
+
+
+@pytest.mark.parametrize(
+    ("reply", "raises"),
+    [
+        (None, urllib.error.URLError(ConnectionRefusedError(111, "refused"))),
+        (None, TimeoutError("timed out")),
+        (HttpsReply(502, {}, b""), None),
+        (HttpsReply(429, {"retry-after": "60"}, b""), None),
+    ],
+    ids=["no-connection", "timeout", "5xx", "rate-limited"],
+)
+def test_the_exact_read_row_warns_when_github_cannot_be_reached_over_https(tmp_path, reply, raises):
+    """A transient failure may pass on the next run, so it WARNs, and says where to look
+    when it does not: the proxy variables and the path to the API. One GET, never
+    read again."""
+    row, _, gets = _exact_read(tmp_path, reply, raises=raises)
+
+    assert not row.ok and not row.required and row.label == "WARN"
+    assert "could not be read over HTTPS from this machine" in row.detail
+    assert "HTTPS_PROXY" in row.detail and "run doctor again" in row.detail
+    assert len(gets) == 1
+    _no_secret_in(row)
+
+
+@pytest.mark.parametrize(
+    ("reply", "raises", "needle"),
+    [
+        (
+            None,
+            urllib.error.URLError(ssl.SSLCertVerificationError(1, "unable to get issuer")),
+            "did not verify",
+        ),
+        (HttpsReply(200, {"content-type": "text/html"}, _REPLY_SECRET), None, "not JSON"),
+        (HttpsReply(302, {"location": "https://elsewhere.example/"}, b""), None, "redirect"),
+    ],
+    ids=["certificate", "not-json", "redirect"],
+)
+def test_the_exact_read_row_fails_any_other_conclusive_answer_without_quoting_it(
+    tmp_path, reply, raises, needle
+):
+    """A certificate this machine's trust store does not verify (a TLS-inspecting proxy,
+    for one) and an answer that is not GitHub's JSON are FAILs, the reply never shown."""
+    row, _, _ = _exact_read(tmp_path, reply, raises=raises)
+
+    assert not row.ok and row.required and row.label == "FAIL"
+    assert needle in row.detail and "would block" in row.detail
+    assert "elsewhere.example" not in row.detail
+    _no_secret_in(row)
+
+
+def test_the_exact_read_row_is_unread_when_gh_cannot_be_started(tmp_path):
+    """`gh auth token` that cannot be started reads nothing: a SKIP naming the `gh` row."""
+
+    def runner(req):
+        if req.command == GH_AUTH_TOKEN:
+            raise ExecutionError("executable not found: gh")
+        return _runner_factory()(req)
+
+    gets: list = []
+    d = Doctor(cwd=str(tmp_path), runner=runner, https=gets.append)
+    row = d.check_exact_read("gh")
+    assert row.skipped and row.label == "SKIP" and "'gh available' row" in row.detail
+    assert gets == []
 
 
 def test_premerge_verification_reported_and_never_run(tmp_path):

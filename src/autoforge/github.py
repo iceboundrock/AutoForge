@@ -62,6 +62,7 @@ from urllib.parse import quote, urlencode
 from .errors import (
     ConfigurationError,
     GitHubChecksAccessError,
+    GitHubCredentialError,
     GitHubError,
     GitHubNotFoundError,
     GitHubPlanLimitedError,
@@ -787,6 +788,14 @@ _JSON_CONTENT_TYPE_RE = re.compile(r"^application/json\s*(?:;|$)", re.IGNORECASE
 # What `gh auth token` may print: visible ASCII, so it can never end the
 # Authorization header and start another.
 _API_TOKEN_RE = re.compile(r"[\x21-\x7e]{1,4096}")
+# What a credential failure of the exact read tells the operator to check (#329).
+EXACT_READ_CREDENTIAL_REMEDY = (
+    "`gh auth status` and `gh auth token --hostname github.com` must work for the user "
+    "running AutoForge, and the token must be accepted by GitHub's REST API"
+)
+# The endpoint `doctor` reads to prove the exact read works (#329): it names no
+# repository, and GitHub does not count it against the rate limit.
+EXACT_READ_PROBE_PATH = "rate_limit"
 
 
 # What `gh` prints of a text, without reading it again: the sanitizer's rewrites are
@@ -2123,7 +2132,10 @@ class GitHubClient:
         ``gh auth token`` prints the token `gh` itself would send (``GH_TOKEN``
         or ``GITHUB_TOKEN`` when set, else the login's). It stays in memory for
         the one request: never in argv, a file or a message. A failure names
-        the command and `gh`'s redacted stderr, never what it printed.
+        the command and `gh`'s redacted stderr, never what it printed. A
+        timeout or a transient exit is GitHubUnavailableError; any other
+        exit, or a print that is not one visible token, is
+        GitHubCredentialError (#329).
         """
         args = ["auth", "token", "--hostname", "github.com"]
         res = self._invoke(args)
@@ -2131,25 +2143,33 @@ class GitHubClient:
             raise GitHubUnavailableError(f"{what}: {self._timeout_message(args)}")
         if res.exit_code != 0:
             message, transient = self._exit_failure(args, res)
-            raise (GitHubUnavailableError if transient else GitHubError)(f"{what}: {message}")
+            if transient:
+                raise GitHubUnavailableError(f"{what}: {message}")
+            raise GitHubCredentialError(f"{what}: {message}; {EXACT_READ_CREDENTIAL_REMEDY}")
         token = "" if res.truncated else res.stdout.strip()
         if not _API_TOKEN_RE.fullmatch(token):
-            raise GitHubError(f"{what}: `gh auth token` printed no usable credential")
+            raise GitHubCredentialError(
+                f"{what}: `gh auth token` printed no usable credential; "
+                f"{EXACT_READ_CREDENTIAL_REMEDY}"
+            )
         return token
 
     def _exact_object(self, path: str, what: str) -> dict:
         """One REST object as GitHub holds it, past `gh`'s sanitizer (the exact read).
 
         ``path`` is relative to :data:`EXACT_READ_ROOT`, built by a typed
-        caller from a parsed URL, so the read reaches GitHub's API and nothing
-        else. It sends one GET with the credential `gh` holds, follows no
-        redirect and reads a bounded reply. Failures are classified as `gh`'s
-        are: no connection, a 5xx, a 429 or a rate-limited 403 (by its headers
-        or GitHub's message) is GitHubUnavailableError (inconclusive), a 404
-        GitHubNotFoundError, and
-        any other status, a redirect, a certificate that does not verify, or a
-        reply that is not one JSON object within the bound a conclusive
-        GitHubError. No message quotes the reply.
+        caller from a parsed URL (or :data:`EXACT_READ_PROBE_PATH`), so the
+        read reaches GitHub's API and nothing else. It sends one GET with the
+        credential `gh` holds, follows no redirect and reads a bounded reply.
+        Failures are classified as `gh`'s are: no connection, a 5xx, a 429 or
+        a rate-limited 403 (by its headers or GitHub's message) is
+        GitHubUnavailableError (inconclusive), a 404 GitHubNotFoundError
+        (which :meth:`_exact_reread` reads as inconclusive), a credential
+        `gh auth token` cannot print, a 401 or any other 403
+        GitHubCredentialError, and any other status, a redirect, a
+        certificate that does not verify, or a reply that is not one JSON
+        object within the bound a conclusive GitHubError. No message quotes
+        the reply.
         """
         assert_shared_git_lock_free("call GitHub")
         # The credential goes straight into the request, whose repr leaves the
@@ -2176,6 +2196,13 @@ class GitHubClient:
             raise GitHubUnavailableError(f"{what}: GitHub answered HTTP {status}")
         if status == 404:
             raise GitHubNotFoundError(f"{what}: GitHub answered HTTP 404")
+        if status in (401, 403):
+            # A 403 that is a rate limit was classified above: what is left is
+            # the credential refused (a bad or expired token, a scope or SSO
+            # authorization it lacks), not the object (#329).
+            raise GitHubCredentialError(
+                f"{what}: GitHub answered HTTP {status}; {EXACT_READ_CREDENTIAL_REMEDY}"
+            )
         if status != 200:
             redirect = " (a redirect, which is never followed)" if 300 <= status < 400 else ""
             raise GitHubError(f"{what}: GitHub answered HTTP {status}{redirect}")
@@ -2191,6 +2218,52 @@ class GitHubClient:
         if not isinstance(data, dict):
             raise GitHubError(f"{what}: the reply is not a JSON object")
         return data
+
+    def _exact_reread(self, path: str, what: str) -> dict:
+        """:meth:`_exact_object` of an object `gh` has just returned, read again within bounds.
+
+        Every exact read is the second read of an object: a listing or a
+        `gh` read found it a moment earlier, and its print could not prove
+        its text. A 404 then most plausibly means GitHub's REST read does
+        not see yet what its listing did (replica lag), not that the object
+        is gone (#329), so it is inconclusive like a 5xx: the read is made
+        again, up to :attr:`transient_retries` more times after
+        :attr:`retry_delay_seconds`, as `gh`'s reads are, and one still
+        unanswered is GitHubUnavailableError, for ``resume`` to read the
+        listing again. An object really deleted is then absent from it, and
+        the read-back decides on that listing as on any. Every conclusive
+        failure (the credential included) is raised at once, never read
+        again.
+        """
+        attempts = self.transient_retries + 1
+        last: GitHubUnavailableError | None = None
+        for attempt in range(attempts):
+            if attempt:
+                time.sleep(self.retry_delay_seconds)
+            try:
+                return self._exact_object(path, what)
+            except GitHubNotFoundError as exc:
+                last = GitHubUnavailableError(
+                    f"{exc}, for an object `gh` had just returned: GitHub's REST read does not "
+                    "see it yet, so this read is inconclusive"
+                )
+            except GitHubUnavailableError as exc:
+                last = exc
+        assert last is not None
+        if attempts == 1:
+            raise last
+        raise GitHubUnavailableError(f"{last} (read {attempts} times)")
+
+    def probe_exact_read(self) -> None:
+        """Whether the exact read can work from this machine: one GET of GitHub's rate limit.
+
+        ``doctor``'s row (#329). The same credential, transport, bounds and
+        classification as an exact read (:meth:`_exact_object`), on
+        :data:`EXACT_READ_PROBE_PATH`, which names no repository. Returns
+        nothing: the reply is checked to be one JSON object and dropped,
+        never shown; a failure raises as the exact read's does. Read-only.
+        """
+        self._exact_object(EXACT_READ_PROBE_PATH, "exact read probe (GET /rate_limit)")
 
     # -- environment / doctor --------------------------------------------
     def version(self) -> str:
@@ -2364,7 +2437,7 @@ class GitHubClient:
         ref = parse_issue_url(url)
         what = f"exact read of {ref.canonical}"
         path = f"repos/{_repository_path(ref.repository)}/issues/{ref.number}"
-        issue = _decode_issue(_rest_issue_row(self._exact_object(path, what)), what)
+        issue = _decode_issue(_rest_issue_row(self._exact_reread(path, what)), what)
         if not parse_issue_url(issue.url).same_target(ref):
             raise GitHubWrongTargetError(f"{what}: GitHub answered with {issue.url}", issue.url)
         return issue
@@ -2572,12 +2645,14 @@ class GitHubClient:
         and body; no checks, closing issues or mergeability. An effect's
         read-back makes it when the text `gh` printed differs from the
         payload, since `gh`'s sanitizer may have rewritten it. An answer
-        naming another PR is a conclusive GitHubError.
+        naming another PR is a conclusive GitHubError; a 404, on a PR `gh`
+        has just returned, is read again and then inconclusive
+        (:meth:`_exact_reread`, #329).
         """
         ref = parse_pr_url(url)
         what = f"exact read of {ref.canonical}"
         path = f"repos/{_repository_path(ref.repository)}/pulls/{ref.number}"
-        data = self._exact_object(path, what)
+        data = self._exact_reread(path, what)
         pr = self._pr_from_data(_rest_pr_row(data, what), what)
         if not parse_pr_url(pr.url).same_target(ref):
             raise GitHubError(f"{what}: GitHub answered with {pr.url}")
@@ -3603,15 +3678,17 @@ class GitHubClient:
         ref: GitHubCommentRef = parse_comment_url(comment_url)
         what = f"exact read of {ref.canonical}"
         path = f"repos/{_repository_path(ref.parent.repository)}/issues/comments/{ref.comment_id}"
-        comment = _decode_rest_comment(self._exact_object(path, what), ref)
+        comment = _decode_rest_comment(self._exact_reread(path, what), ref)
         if not parse_comment_url(comment.url).same_target(ref):
             raise GitHubError(f"{what}: GitHub answered with {comment.url}")
         return comment
 
 
 __all__ = [
+    "EXACT_READ_CREDENTIAL_REMEDY",
     "EXACT_READ_ERROR_BYTES",
     "EXACT_READ_MAX_BYTES",
+    "EXACT_READ_PROBE_PATH",
     "EXACT_READ_ROOT",
     "MAX_BODY_CHARS",
     "MAX_TITLE_CHARS",

@@ -903,7 +903,10 @@ The messages below are AutoForge's own refusals, grouped by subject.
   replacement's push and PR are journaled, `resume` completes them without
   running the agent again; before that it runs the agent again on the same
   base. A transient GitHub failure inside the transaction leaves it
-  resumable the same way.
+  resumable the same way, and so does a credential the replacement PR's
+  exact read could not use (#329: the error names `gh auth status` and
+  `gh auth token --hostname github.com`): fix the credential, check it with
+  `doctor`'s `exact read (api.github.com)` row, then `resume`.
 - **The replan policy refused a replan, and no transaction is on record**
   (`replan-refused`, with `replan_limit_exceeded` or `replan_evidence_truncated`
   in the reason): after a review round the policy called for a replacement

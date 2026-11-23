@@ -332,6 +332,8 @@ On a first run, expect these rows:
 | Row | What you may see | What it means, and what to do |
 |---|---|---|
 | `gh available`, `gh authenticated` | `FAIL` | `gh` is missing, older than 2.48.0, or not signed in. Install it, `gh auth login`, and run `doctor` again |
+| `exact read (api.github.com)` | `FAIL ... no credential GitHub accepts` | `gh auth token --hostname github.com` printed no token GitHub's REST API accepts (with `gh` not signed in, this follows from the row above). After `gh auth login`, run `doctor` again |
+| | `WARN ... could not be read over HTTPS from this machine` | `gh` may work while this direct read of `api.github.com` does not (a proxy, a firewall). The controller makes this read when `gh`'s print of a PR, issue or comment cannot prove its text; check `HTTPS_PROXY` and `NO_PROXY` and run `doctor` again |
 | `agent 'claude' available (...)`, `agent 'opencode' available (...)` | `FAIL ... executable not found: claude` | the CLI is not installed, or not on `PATH`. The row lists the profiles that use it: install it, or route those profiles to a CLI you have (the Claude-only starter) |
 | `agent 'claude' keeps integrations off (...)` | `FAIL` | this Claude Code does not list `--safe-mode`, `--strict-mcp-config` and `--setting-sources` in `claude --help`: update it, since every launch passes them |
 | | `SKIP ... stopped mid-line after 8192 bytes` | Claude Code wrote only part of its help to `doctor` (2.1.314 does when its output is a pipe), so the flags could not be looked up. A launch refuses a Claude Code without them anyway; to check by hand, run `claude --help > claude-help.txt` and look for the three flags in the file |

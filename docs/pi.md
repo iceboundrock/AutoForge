@@ -403,8 +403,8 @@ temporary directory the test:
 3. runs `autoforge doctor` with a configuration whose reviewers are Pi with
    the route's `require_oauth`, and checks the "available" and
    "auth ready" rows, with the route's `authType`. Its rows that need
-   GitHub (`gh available`, `gh authenticated`, the default branch's
-   required checks, the check runs read) fail or are skipped, as they must
+   GitHub (`gh available`, `gh authenticated`, the exact read, the default
+   branch's required checks, the check runs read) fail or are skipped, as they must
    without your login: the configuration's `github.command` is the
    stand-in's `gh`, which answers nothing. The report lists them apart
    from any other failure, and only the Pi rows decide the step;

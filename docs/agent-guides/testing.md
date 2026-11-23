@@ -1717,6 +1717,23 @@ a stated reason it has none. The coverage that must keep working:
   the #314 recovery (a conflict an earlier
   version recorded, `unblock`, `REVIEW`) launches no agent and writes and
   pushes nothing
+- the exact read's 404 and credential (#329, `tests/test_github.py`,
+  `tests/test_replan.py`, `tests/test_engine.py`, `tests/test_doctor.py`):
+  a 404 is read again within the transient bound and then
+  `GitHubUnavailableError`, never not-found, and the object a second GET
+  returns is the answer; a transient answer is read again too, a
+  conclusive one (the credential, a redirect, a reply that is not JSON)
+  never; `gh auth token` failing or printing no token, a 401 and a plain
+  403 are `GitHubCredentialError` naming what to check; in K7 that error
+  ends the command with the phase, the `PREPARED` transaction and the
+  records as persisted, and `resume` activates the replacement with one
+  create, a 404 there is pending for `resume`, and any other conclusive
+  failure still rejects; in K2 it blocks (`github-read-failed`) and
+  `unblock` binds the PR with one create; `doctor`'s exact-read row makes
+  one `GET /rate_limit` with the token `gh auth token` printed, none
+  without one, never shows the token or the reply, FAILs a credential or
+  another conclusive answer with its remedy, WARNs a transient one naming
+  the proxy variables, and SKIPs a `gh` that cannot start
 - text the controller writes back or verifies (#328, `tests/test_effects.py`,
   `tests/test_engine.py`, `tests/test_operator_actions.py`): for K3 and K6
   a base holding escape text, control characters or caret text is written

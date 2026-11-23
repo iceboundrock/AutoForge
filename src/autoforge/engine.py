@@ -363,6 +363,7 @@ from .errors import (
     ExecutionError,
     ExecutionTimeoutError,
     GitHubChecksAccessError,
+    GitHubCredentialError,
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
@@ -21962,8 +21963,9 @@ class ControllerEngine:
         every predicate binding always had, headed at exactly the pushed
         candidate and attesting the saved counts, and the source is
         superseded. A conflict or a conclusive failure rejects with the
-        records as persisted; an unavailable GitHub, or a write whose
-        outcome is not readable yet, propagates for 'resume'.
+        records as persisted; an unavailable GitHub, a write whose outcome
+        is not readable yet, or a credential the exact read could not use
+        (:class:`GitHubCredentialError`, #329) propagates for 'resume'.
         """
         state = self._require_state()
         effects = state.phase_effects()
@@ -22021,6 +22023,18 @@ class ControllerEngine:
                 )
                 driven = drive(record, op, self._persist_effect)
             except GitHubUnavailableError:
+                raise
+            except GitHubCredentialError as exc:
+                # #329: the exact read's credential says nothing about the
+                # replacement, and a replan block is final (no unblock enters
+                # this phase), so it is no refusal: the phase, the journal and
+                # the records stay as persisted for 'resume' to reconcile.
+                _add_line(
+                    exc,
+                    f"{record.describe()} could not be read back exactly. The replan is not "
+                    "rejected and nothing was sent again; fix the credential, then 'resume', "
+                    "which reconciles the plan with GitHub before anything is sent.",
+                )
                 raise
             except GitHubError as exc:
                 return self._reject_replan(

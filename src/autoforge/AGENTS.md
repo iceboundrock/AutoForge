@@ -16,7 +16,8 @@ cli.py              subcommands run / step / resume / unblock / status / doctor,
                     hidden `epic _worker` entry point of a scheduler's worker (#182)
 config.py           configuration loading and validation; owns config defaults and keys
 doctor.py           read-only environment checks; the scheduler rows (settings, and with
-                    `--epic` the coordination root and the EPIC's graph, #183)
+                    `--epic` the coordination root and the EPIC's graph, #183); the
+                    exact-read row (`gh auth token`, one GET of /rate_limit, #329)
 doctor_sandbox.py   doctor's outer-sandbox rows: capability and mode outcome, policy by
                     class, provider declarations and sandboxed --version, operator paths,
                     hard links, sandbox directories, TCP listeners; read-only (#169)

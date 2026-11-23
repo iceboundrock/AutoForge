@@ -540,6 +540,8 @@ EXCEPTION_CLASSES: dict[type[errors.AutoForgeError], tuple[StopOutcome, StopReas
     errors.GitHubUnavailableError: (_O.RESUMABLE_ERROR, _C.GITHUB_UNAVAILABLE),
     errors.GitHubNotFoundError: (_O.RESUMABLE_ERROR, _C.GITHUB_ERROR),
     errors.GitHubChecksAccessError: (_O.RESUMABLE_ERROR, _C.GITHUB_CHECKS_REFUSED),
+    # #329: the exact read's credential; K7 lets it end the command for 'resume'.
+    errors.GitHubCredentialError: (_O.RESUMABLE_ERROR, _C.GITHUB_ERROR),
     errors.GitHubPlanLimitedError: (_O.RESUMABLE_ERROR, _C.GITHUB_ERROR),
     errors.GitHubWrongTargetError: (_O.RESUMABLE_ERROR, _C.GITHUB_ERROR),
     errors.GitTransportError: (_O.RESUMABLE_ERROR, _C.GIT_TRANSPORT),

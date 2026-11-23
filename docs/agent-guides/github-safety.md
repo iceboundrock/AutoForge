@@ -1567,13 +1567,19 @@ reason to write. No connection, a timeout, a 5xx, a 429 or a rate-limited
 403 (by its headers, or by GitHub's message, which a secondary limit may
 send alone) is `GitHubUnavailableError`: nothing is saved or sent and `resume`
 reads again (after a write, `EffectPending`, the record still
-`attempted`). A 404 is `GitHubNotFoundError`; a 401, any other 403, a
-redirect, a certificate that does not verify, a reply that is not one
-`application/json` object within the bound, an answer naming another
-object, or a `gh auth token` that fails or prints anything but one visible
-token is a conclusive `GitHubError`, and the phase blocks with nothing
-sent again. No message quotes the reply; an error reply is read only to
-tell a rate limit from a refusal.
+`attempted`). Like a `gh` read, the exact read is made once more after
+such an answer, 2 s later (the client's transient bound,
+`GitHubClient.transient_retries` and `retry_delay_seconds`), before it
+raises. A 404 is inconclusive too,
+read again the same way and then `GitHubUnavailableError` (#329, below). A
+`gh auth token` that fails (other than transiently) or prints anything but
+one visible token, a 401, and any other 403 are `GitHubCredentialError`: the
+credential, not the object. A redirect, a certificate that does not verify,
+a reply that is not one `application/json` object within the bound, or an
+answer naming another object is a conclusive `GitHubError`. The phase
+blocks on any conclusive failure with nothing sent again, except in K7
+(below). No message quotes the reply; an error reply is read only to tell a
+rate limit from a refusal.
 
 **When it runs, and what stays strict.** In a create's completion
 read-back (K2 implementation PR, K4 review comment, K5 follow-up issue,
@@ -1669,9 +1675,65 @@ the print of the exact text the controller judges (above). A body
 the controller writes back is the one exception by design: it goes to
 GitHub as GitHub held it.
 
-**Not covered yet.** The open points of the exact read itself (#329): how
-a 404 or a credential failure of the exact read is classified in K7, where
-any conclusive failure ends the replan, and a `doctor` row for it.
+**A 404 and a credential failure of the exact read (#329).** Both were
+conclusive at first, and in K7 (the replan's replacement PR) every
+conclusive failure rejects the transaction for good: a replan block is
+final, since `unblock` refuses a run with a replan journal and
+`REPLAN_REEXECUTE` is no unblock target. Neither failure is a verdict on
+the object the read-back judges, so neither may end a replan. The decision:
+
+- *A 404 is inconclusive.* Every exact read is the second read of an object
+  a complete listing or a `gh` read returned a moment earlier, and is made
+  only because `gh`'s print could not prove its text. A 404 then most
+  plausibly means GitHub's REST read does not see yet what its listing did
+  (replica lag), not that the object is gone. `GitHubClient._exact_reread`
+  reads it again within the transient bound above; still 404, it is
+  `GitHubUnavailableError`: nothing is saved or sent, the record stays as it
+  was (`attempted` after a write, `EffectPending`), and `resume` reads the
+  listing again. An object really deleted in between (a comment, an issue)
+  is then absent from that listing, and the read-back decides on it as on
+  any listing: the bounded attempts, never a blind second write. This holds
+  for every caller of the exact read (the create read-backs, the bodies of
+  #328 and K11 and K12, the PR body FIX's entry digests, REVIEW's operator
+  evidence and `status`'s review provenance), since each reads exactly only
+  an object `gh` had just returned. `probe_exact_read` (`doctor`, below)
+  reads no listed object and keeps a 404 as `GitHubNotFoundError`.
+- *A credential failure blocks, and in K7 stops for `resume`.* A `gh auth
+  token` that fails or prints no usable token, a 401 and a 403 that is no
+  rate limit are `GitHubCredentialError`, whose text names what to check
+  (`gh auth status`, `gh auth token --hostname github.com`). Every write
+  path but K7 handles it as any conclusive failure: a create's read-back
+  blocks (`github-read-failed`) with nothing sent again, and once the
+  operator has fixed the credential, `unblock` re-enters the phase, which
+  reconciles the record again (K10 keeps it as a failed verification; the
+  reads that only report, REVIEW's operator evidence and `status`, report
+  it). K7 cannot block without ending the replan, so
+  `_complete_replan` lets the error end the command instead: the phase stays
+  `REPLAN_REEXECUTE`, the transaction `PREPARED`, the records as persisted,
+  the stop classified `resumable_error` (`github-error`), and `resume`
+  reconciles the plan once the credential works, sending nothing before its
+  read-back has read the PR. A credential failure is no verdict on the
+  replacement, so replaying it as `REJECTED` would only discard a
+  replacement the controller may already have created.
+
+Every other conclusive failure of the exact read (a redirect, a
+certificate that does not verify, a reply that is not GitHub's JSON, an
+answer naming another object) is about what answered, and still rejects in
+K7 and blocks elsewhere. `gh`'s own conclusive failures in K7 are
+unchanged: they reject as before.
+
+**`doctor`'s exact-read row.** `exact read (api.github.com)` makes the
+exact read once from the operator's machine: `gh auth token --hostname
+github.com`, then, only with a token it printed, one `GET
+https://api.github.com/rate_limit` (which names no repository and does not
+count against the rate limit) through `https_get`, with the same
+credential handling, TLS, bounds and classification, and no second read.
+It never shows the token or the reply. `OK` when GitHub answered one JSON
+object; `FAIL` on a credential failure or another conclusive answer, with
+the remedy; `WARN` on a transient one (no connection, a timeout, a 5xx, a
+rate limit), naming the proxy variables, since a host where `gh` works
+through a proxy but this direct read does not would otherwise find out
+only when a read-back needs it.
 
 **Troubleshooting.** A create that blocks with *"… carries its identity
 but is not the object the controller intended (another body, title, head
@@ -1685,7 +1747,10 @@ the read-back runs again with the exact read and observes the object, and
 nothing is written again. An exact read that keeps failing names its cause
 in the reason: `gh auth status` and `gh auth token --hostname github.com`
 must work for the user running AutoForge, and `api.github.com` must be
-reachable (the proxy variables apply, as they do to `gh`).
+reachable (the proxy variables apply, as they do to `gh`). `doctor`'s
+`exact read (api.github.com)` row checks both before a run needs them. A
+replan stopped on the exact read's credential is still `REPLAN_REEXECUTE`:
+fix the credential and `resume`.
 
 Work an earlier version left part done on such a body (#328) finishes
 without writing `gh`'s rewrite. An append it planned on `gh`'s print is

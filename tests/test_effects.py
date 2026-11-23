@@ -106,6 +106,7 @@ from autoforge.effects import (
 )
 from autoforge.errors import (
     EffectConflictError,
+    GitHubCredentialError,
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
@@ -2743,13 +2744,16 @@ EXACT_READ_FAILURES = [
     pytest.param(GitHubUnavailableError("exact read: timed out after 60s"), id="timeout"),
     pytest.param(GitHubUnavailableError("exact read: GitHub answered HTTP 502"), id="5xx"),
     pytest.param(GitHubUnavailableError("exact read: connection refused"), id="network"),
-    pytest.param(GitHubError("exact read: GitHub answered HTTP 401"), id="401"),
-    pytest.param(GitHubError("exact read: GitHub answered HTTP 403"), id="403"),
-    pytest.param(GitHubNotFoundError("exact read: GitHub answered HTTP 404"), id="404"),
+    pytest.param(GitHubCredentialError("exact read: GitHub answered HTTP 401"), id="401"),
+    pytest.param(GitHubCredentialError("exact read: GitHub answered HTTP 403"), id="403"),
+    # #329: a 404 of an object the listing just returned, read again, is inconclusive.
+    pytest.param(
+        GitHubUnavailableError("exact read: GitHub answered HTTP 404 (read 2 times)"), id="404"
+    ),
     pytest.param(GitHubError("exact read: the reply is not UTF-8 JSON"), id="invalid-json"),
     pytest.param(GitHubError("exact read: the reply is over 2097152 bytes"), id="oversize"),
     pytest.param(
-        GitHubError("exact read: `gh auth token` printed no usable credential"),
+        GitHubCredentialError("exact read: `gh auth token` printed no usable credential"),
         id="unauthenticated",
     ),
 ]

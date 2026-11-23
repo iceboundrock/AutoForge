@@ -1342,7 +1342,8 @@ class FakeGitHub:
         for known, info in self.issues.items():
             if parse_issue_url(known).same_target(ref):
                 return replace(info)
-        raise GitHubNotFoundError(f"exact read of {url}: GitHub answered HTTP 404")
+        # The client reads a 404 again and then calls it inconclusive (#329).
+        raise GitHubUnavailableError(f"exact read of {url}: GitHub answered HTTP 404")
 
     def get_comment_exact(self, url: str) -> CommentInfo:
         from autoforge.validation import parse_comment_url
@@ -1353,7 +1354,8 @@ class FakeGitHub:
             for c in cs:
                 if parse_comment_url(c.url).same_target(wanted):
                     return replace(c)
-        raise GitHubNotFoundError(f"exact read of {url}: GitHub answered HTTP 404")
+        # The client reads a 404 again and then calls it inconclusive (#329).
+        raise GitHubUnavailableError(f"exact read of {url}: GitHub answered HTTP 404")
 
     def merge_pr(self, url: str, method: str = "squash", match_head_sha: str = "") -> None:
         """Mimic `gh pr merge --<method> --match-head-commit <sha>` on the fake."""

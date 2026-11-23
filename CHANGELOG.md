@@ -5,6 +5,29 @@ so.
 
 ## Unreleased
 
+### The exact read: a 404 is read again, a credential failure no longer ends a replan, and a `doctor` row (#329)
+
+The exact read is the one read the controller makes past `gh`, of a PR,
+issue or comment whose text `gh`'s print cannot prove (#327). A 404 there
+now means the REST read has not caught up with the listing that returned
+the object a moment earlier. It is read again, as a transient failure
+is, and then reported as GitHub unavailable: nothing is saved or sent,
+and `resume` reads the listing again. It no longer counts as a missing
+object. A failed `gh auth token`, a 401, and a 403 that is not a rate limit
+now name what to check (`gh auth status`, `gh auth token --hostname
+github.com`). Outside a replan they block as before, and `unblock` reads
+again once the credential works. In `REPLAN_REEXECUTE` such a failure
+while reading back the replacement PR used to reject the replan for good.
+Now the command stops with the phase and the transaction unchanged, and
+`resume` finishes the replacement once the credential works. Any other
+conclusive failure still rejects it. `doctor` has a new `exact read
+(api.github.com)` row. It runs `gh auth token` and makes one
+`GET https://api.github.com/rate_limit` with the token, showing neither
+the token nor the reply. It fails on a credential or another conclusive
+answer, and warns when `api.github.com` cannot be reached over HTTPS.
+That is the case of a host where `gh` works through a proxy and this
+direct read does not. No state protocol or default changes.
+
 ### Optional Issue Working Memory retrieval (#324)
 
 The controller-side `MemoryRetriever` offers bounded search, fetch and a

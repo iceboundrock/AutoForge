@@ -445,7 +445,10 @@ because `gh` rewrites control characters in what it prints (#327, #328).
 That read is a `GET`, follows no redirect, verifies GitHub's certificate,
 ignores `SSLKEYLOGFILE` (so no TLS key log of that connection is written),
 and keeps the token in memory for the one request; it needs no permission
-beyond reading the object. Every call AutoForge makes is about the run's repository: none reads
+beyond reading the object. `autoforge doctor` makes that read once the same
+way on `https://api.github.com/rate_limit`, which names no repository and
+needs no permission, to check that it works from your machine (#329); it
+shows neither the token nor the reply. Every other call AutoForge makes is about the run's repository: none reads
 the user, an organization, a team or a project. The one exception is a
 "blocked by" link of an EPIC's issue to an issue in another repository,
 which `autoforge epic` reads; a token that cannot read it keeps that issue

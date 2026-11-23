@@ -20,6 +20,7 @@ import autoforge.github as github_module
 from autoforge.errors import (
     ConfigurationError,
     GitHubChecksAccessError,
+    GitHubCredentialError,
     GitHubError,
     GitHubNotFoundError,
     GitHubPlanLimitedError,
@@ -28,6 +29,7 @@ from autoforge.errors import (
 )
 from autoforge.executor import ExecutionResult
 from autoforge.github import (
+    EXACT_READ_CREDENTIAL_REMEDY,
     EXACT_READ_ERROR_BYTES,
     EXACT_READ_MAX_BYTES,
     EXACT_READ_ROOT,
@@ -4103,10 +4105,18 @@ def _json_reply(data: object, status: int = 200, **headers: str) -> HttpsReply:
     )
 
 
-def _exact_client(reply=None, *, token: ExecutionResult | None = None, raises=None):
-    """A client whose `gh` only prints a token and whose HTTPS transport is recorded."""
+def _exact_client(
+    reply=None, *, token: ExecutionResult | None = None, raises=None, replies=None, retries=1
+):
+    """A client whose `gh` only prints a token and whose HTTPS transport is recorded.
+
+    ``replies`` answers successive GETs (the last one repeated), each an
+    :class:`HttpsReply` or an exception to raise; ``reply`` and ``raises``
+    answer every GET alike. ``retries`` is the client's ``transient_retries``.
+    """
     gh_calls: list = []
     gets: list[HttpsRequest] = []
+    answers = list(replies or [])
 
     def runner(req):
         gh_calls.append(req)
@@ -4116,11 +4126,22 @@ def _exact_client(reply=None, *, token: ExecutionResult | None = None, raises=No
 
     def https(request: HttpsRequest) -> HttpsReply:
         gets.append(request)
+        if answers:
+            answer = answers.pop(0) if len(answers) > 1 else answers[0]
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
         if raises is not None:
             raise raises
         return reply
 
-    client = GitHubClient(runner=runner, https=https, timeout_seconds=17, retry_delay_seconds=0)
+    client = GitHubClient(
+        runner=runner,
+        https=https,
+        timeout_seconds=17,
+        retry_delay_seconds=0,
+        transient_retries=retries,
+    )
     return gh_calls, gets, client
 
 
@@ -4207,18 +4228,19 @@ def test_the_identity_read_through_gh_and_the_exact_read_differ_only_by_the_sani
         (429, {}, GitHubUnavailableError),
         (403, {"x-ratelimit-remaining": "0"}, GitHubUnavailableError),
         (403, {"retry-after": "60"}, GitHubUnavailableError),
-        (401, {}, GitHubError),
-        (403, {}, GitHubError),
-        (404, {}, GitHubNotFoundError),
+        (401, {}, GitHubCredentialError),
+        (403, {}, GitHubCredentialError),
+        (404, {}, GitHubUnavailableError),
         (301, {"location": "https://evil.example/"}, GitHubError),
         (302, {}, GitHubError),
         (201, {}, GitHubError),
     ],
 )
 def test_an_exact_read_classifies_github_s_status(status, headers, expected):
-    """A 5xx, a 429 or a rate-limited 403 is inconclusive (read again later); a 404 is
-    not found; anything else that is not 200 (401, a plain 403, a redirect, which is
-    never followed) is conclusive. No message quotes the token."""
+    """A 5xx, a 429 or a rate-limited 403 is inconclusive (read again later), and so is
+    a 404 of the object `gh` had just returned (#329); a 401 or a plain 403 is the
+    credential refused; anything else that is not 200 (a redirect, which is never
+    followed) is conclusive. No message quotes the token."""
     _, _, client = _exact_client(_json_reply(_rest_pr(42), status, **headers))
     with pytest.raises(GitHubError) as info:
         client.get_pr_exact(_EXACT_PR_URL)
@@ -4237,8 +4259,8 @@ def test_an_exact_read_classifies_github_s_status(status, headers, expected):
             GitHubUnavailableError,
         ),
         (b'{"message": "API rate limit exceeded for user ID 1."}', GitHubUnavailableError),
-        (b'{"message": "Resource not accessible by integration"}', GitHubError),
-        (b"", GitHubError),
+        (b'{"message": "Resource not accessible by integration"}', GitHubCredentialError),
+        (b"", GitHubCredentialError),
     ],
     ids=["secondary-limit", "primary-limit", "refused", "no-body"],
 )
@@ -4335,27 +4357,33 @@ def test_an_exact_read_classifies_a_transport_failure_and_redacts_it(raised, exp
     [
         (
             _raw("", exit_code=1, stderr="You are not logged into any GitHub hosts."),
-            GitHubError,
+            GitHubCredentialError,
             "not logged",
         ),
         (_raw("", exit_code=1, stderr="HTTP 502: Bad Gateway"), GitHubUnavailableError, "502"),
         (replace(_raw(""), timed_out=True, exit_code=-9), GitHubUnavailableError, "timed out"),
-        (_raw("\n"), GitHubError, "no usable credential"),
-        (_raw("gho_one gho_two\n"), GitHubError, "no usable credential"),
-        (_raw("gho_x\r\nX-Injected: 1\n"), GitHubError, "no usable credential"),
-        (replace(_raw(_EXACT_TOKEN), stdout_truncated=True), GitHubError, "no usable credential"),
+        (_raw("\n"), GitHubCredentialError, "no usable credential"),
+        (_raw("gho_one gho_two\n"), GitHubCredentialError, "no usable credential"),
+        (_raw("gho_x\r\nX-Injected: 1\n"), GitHubCredentialError, "no usable credential"),
+        (
+            replace(_raw(_EXACT_TOKEN), stdout_truncated=True),
+            GitHubCredentialError,
+            "no usable credential",
+        ),
     ],
     ids=["unauthenticated", "transient", "timeout", "empty", "two-words", "header-split", "cut"],
 )
 def test_an_exact_read_without_a_usable_credential_sends_nothing(token, expected, needle):
     """`gh auth token` failing, or printing anything but one visible token, ends the read
-    before any request: the failure classified as `gh`'s are, what it printed unquoted."""
+    before any request: a transient failure is unavailable, any other the credential
+    (#329), naming what to check; what it printed is never quoted."""
     _, gets, client = _exact_client(_json_reply(_rest_pr(42)), token=token)
     with pytest.raises(GitHubError, match=needle) as info:
         client.get_pr_exact(_EXACT_PR_URL)
     assert type(info.value) is expected
     assert gets == []
     assert "gho_one" not in str(info.value) and "X-Injected" not in str(info.value)
+    assert (EXACT_READ_CREDENTIAL_REMEDY in str(info.value)) == (expected is GitHubCredentialError)
 
 
 def test_an_exact_read_refuses_a_url_outside_github_before_any_request():
@@ -4365,6 +4393,110 @@ def test_an_exact_read_refuses_a_url_outside_github_before_any_request():
         with pytest.raises((GitHubError, ConfigurationError)):
             client.get_pr_exact(url)
     assert gh_calls == [] and gets == []
+
+
+_NOT_FOUND = HttpsReply(404, {"content-type": "application/json"}, b'{"message": "Not Found"}')
+
+
+@pytest.mark.parametrize(("read", "url", "row", "path"), _EXACT_READS)
+def test_an_exact_read_answered_404_reads_again_and_takes_the_object_github_then_sends(
+    read, url, row, path
+):
+    """#329: the exact read is the second read of an object `gh` has just returned, so a
+    404 is GitHub's REST read not seeing it yet, never its absence. It is read again,
+    as a transient answer is, and the object the second GET returns is the answer."""
+    _, gets, client = _exact_client(replies=[_NOT_FOUND, _json_reply(row)])
+    obj = getattr(client, read)(url)
+
+    assert obj.body == _EXACT_TEXT
+    assert [g.url for g in gets] == [EXACT_READ_ROOT + path] * 2
+
+
+@pytest.mark.parametrize(("read", "url", "row", "path"), _EXACT_READS)
+def test_an_exact_read_still_404_after_its_bound_is_inconclusive_never_not_found(
+    read, url, row, path
+):
+    """A 404 at every read of the bound is GitHubUnavailableError: nothing is decided on
+    it, and `resume` reads the listing again, where an object really deleted is absent.
+    Never GitHubNotFoundError, which a caller could take for the object's absence."""
+    _, gets, client = _exact_client(_NOT_FOUND, retries=2)
+    with pytest.raises(GitHubError) as info:
+        getattr(client, read)(url)
+
+    assert type(info.value) is GitHubUnavailableError
+    assert "HTTP 404" in str(info.value) and "inconclusive" in str(info.value)
+    assert "read 3 times" in str(info.value)
+    assert len(gets) == 3
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        HttpsReply(502, {}, b""),
+        HttpsReply(403, {"x-ratelimit-remaining": "0"}, b""),
+        urllib.error.URLError(ConnectionResetError(104, "reset")),
+    ],
+    ids=["5xx", "rate-limited", "reset"],
+)
+def test_an_exact_read_reads_a_transient_failure_again_within_the_client_s_bound(first):
+    """The exact read keeps the transient retry `gh`'s reads have: one more GET (with a
+    fresh `gh auth token`) after an inconclusive answer, the same bound."""
+    gh_calls, gets, client = _exact_client(replies=[first, _json_reply(_rest_pr(42))])
+    assert client.get_pr_exact(_EXACT_PR_URL).number == 42
+    assert len(gets) == 2 and len(gh_calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        (HttpsReply(401, {"content-type": "application/json"}, b"{}"), GitHubCredentialError),
+        (HttpsReply(403, {"content-type": "application/json"}, b"{}"), GitHubCredentialError),
+        (HttpsReply(200, {"content-type": "text/html"}, b"<html>"), GitHubError),
+        (HttpsReply(301, {"location": "https://evil.example/"}, b""), GitHubError),
+    ],
+    ids=["401", "403", "not-json", "redirect"],
+)
+def test_an_exact_read_never_reads_a_conclusive_answer_again(reply, expected):
+    """A refused credential, a redirect or a reply that is not GitHub's JSON reads the
+    same the next time: raised at once, after one GET."""
+    _, gets, client = _exact_client(reply, retries=3)
+    with pytest.raises(GitHubError) as info:
+        client.get_pr_exact(_EXACT_PR_URL)
+    assert type(info.value) is expected
+    assert len(gets) == 1
+
+
+def test_the_exact_read_probe_makes_one_get_of_the_rate_limit_and_returns_nothing():
+    """`doctor`'s probe (#329): the exact read's credential, transport and bounds, on
+    `/rate_limit`, which names no repository. The reply is checked and dropped."""
+    gh_calls, gets, client = _exact_client(_json_reply({"rate": {"limit": 5000}}), retries=3)
+    assert client.probe_exact_read() is None
+
+    (request,) = gets
+    assert request.url == "https://api.github.com/rate_limit"
+    assert dict(request.headers)["Authorization"] == f"Bearer {_EXACT_TOKEN}"
+    assert request.timeout_seconds == 17 and request.max_bytes == EXACT_READ_MAX_BYTES
+    assert len(gh_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        (_NOT_FOUND, GitHubNotFoundError),
+        (HttpsReply(401, {"content-type": "application/json"}, b"{}"), GitHubCredentialError),
+        (HttpsReply(503, {}, b""), GitHubUnavailableError),
+        (_json_reply([1, 2]), GitHubError),
+    ],
+    ids=["404", "401", "5xx", "array"],
+)
+def test_the_exact_read_probe_classifies_as_the_exact_read_and_reads_once(reply, expected):
+    """The probe is no read-back of a listed object: a 404 stays not-found, and nothing
+    is read again, so doctor reports the one answer it got."""
+    _, gets, client = _exact_client(reply, retries=3)
+    with pytest.raises(GitHubError) as info:
+        client.probe_exact_read()
+    assert type(info.value) is expected
+    assert len(gets) == 1
 
 
 # -- the exact read's transport, against a loopback server ---------------------------------

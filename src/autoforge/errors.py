@@ -481,6 +481,23 @@ class GitHubChecksAccessError(GitHubError):
         self.credential = credential
 
 
+class GitHubCredentialError(GitHubError):
+    """The exact read had no credential GitHub accepts (conclusive, #329).
+
+    The exact read (:meth:`autoforge.github.GitHubClient.get_pr_exact` and
+    its siblings) sends the token ``gh auth token --hostname github.com``
+    prints to GitHub's REST API itself. This is that path failing on the
+    credential, not on the object: ``gh auth token`` failed or printed
+    anything but one visible token, or GitHub answered 401, or a 403 that is
+    no rate limit. Never transient (a retry reads the same refusal) and
+    never a not-found. It says nothing about what the read-back was judging,
+    so a caller whose conclusive failures are final (K7, the replacement PR
+    of a replan) leaves its phase for ``resume`` once the operator has fixed
+    ``gh auth`` rather than refuse for good; every other caller blocks on it
+    as on any conclusive read, and ``unblock`` reads again.
+    """
+
+
 class GitHubPlanLimitedError(GitHubError):
     """GitHub's plan for the repository does not offer what was read (conclusive, #289).
 

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import autoforge.github as github_module
 from autoforge import cli
 from autoforge.auto_recovery import StepKey
 from autoforge.engine import ControllerEngine, StepOutcome
@@ -24,7 +25,7 @@ from autoforge.errors import (
     StateError,
 )
 from autoforge.executor import ExecutionResult, execute
-from autoforge.github import GitHubClient
+from autoforge.github import GitHubClient, HttpsReply
 from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
 from autoforge.memory import Action, Actor, Kind, MemoryScope
 from autoforge.provenance import MAX_PATH_CHARS
@@ -2577,11 +2578,18 @@ def test_a_refused_prompt_version_prints_nothing_written_under_it(
 def test_doctor_reports_an_unreadable_branch_rule_as_skipped(tmp_path, capsys, monkeypatch):
     """Issue #41: a token that cannot read rulesets is SKIP, and doctor still exits 0."""
     monkeypatch.chdir(tmp_path)
+    # The exact-read row (#329): `gh auth token` prints a stand-in, and GitHub's rate
+    # limit answers from a stand-in transport, never the network.
+    token = "gho_" + "C" * 36
+    rate_limit = HttpsReply(200, {"content-type": "application/json"}, b'{"rate": {}}')
+    monkeypatch.setattr(github_module, "https_get", lambda request: rate_limit)
 
     def runner(req):
         if is_shell_probe(req):  # the launch preflight's shell startup probe: real shells
             return execute(req)
         argv = req.command
+        if argv == ["gh", "auth", "token", "--hostname", "github.com"]:
+            return ExecutionResult(argv, req.cwd, 0, token + "\n", "", "t", "t")
         if argv[:3] == ["git", "remote", "get-url"]:
             return ExecutionResult(argv, req.cwd, 0, "git@github.com:o/r.git\n", "", "t", "t")
         if argv[:3] == ["gh", "repo", "view"]:

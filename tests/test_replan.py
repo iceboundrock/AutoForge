@@ -12,10 +12,12 @@ import pytest
 
 from autoforge.claims import render_implementation_marker
 from autoforge.config import ReplanConfig
+from autoforge.effect_ops import EffectPending
 from autoforge.effects import LABEL_AGENT_PUBLISHES, replacement_pr_body
 from autoforge.errors import (
     ControlResultValidationError,
     ExecutionError,
+    GitHubCredentialError,
     GitHubError,
     GitHubUnavailableError,
     StateError,
@@ -58,7 +60,7 @@ from autoforge.result_parser import (
     parse_control_result,
 )
 from autoforge.state import load_state
-from autoforge.stop_classification import StopReasonCode
+from autoforge.stop_classification import StopOutcome, StopReasonCode, classify_exception
 from autoforge.transitions import Phase, edges_for
 from tests.conftest import (
     BRANCH,
@@ -7760,6 +7762,121 @@ def test_a_create_lost_in_flight_is_reconciled_and_issued_once_more_on_resume(tm
     assert eng2.provider.calls == []
     assert _assert_replacement_active(eng, gh, txn_id) == pushed
     assert len(_creates(gh)) == 2  # the lost one, then exactly one more
+
+
+# A replacement body `gh` could print from another text (a ``^``), so its read-back
+# reads the PR exactly (#327), past `gh`.
+REPLAN_CARET_TEXT = REPLAN_TEXT + "\n\nInterrupt with ^C."
+
+
+def _exact_read_back_fails(tmp_state_dir, error):
+    """The replan's plan pushed and its PR created, the PR's exact read-back raising ``error``.
+
+    Returns the engine, the fake and what ``step`` raised (``None`` when it returned).
+    """
+    gh = FakeGitHub()
+    eng = _parked_and_decided(
+        tmp_state_dir, gh, _replan_agent(gh, payload_over={"pr_body": REPLAN_CARET_TEXT})
+    )
+    gh.exact_read_error = error
+    try:
+        outcome = eng.step()
+    except GitHubError as raised:
+        return eng, gh, raised, None
+    return eng, gh, None, outcome
+
+
+def _resumed_after_the_read_back_is_fixed(eng, gh) -> None:
+    """``resume`` once the exact read works: the plan is reconciled, nothing sent twice."""
+    txn_id = _persisted_txn_id(eng)
+    gh.exact_read_error = None
+    eng2 = _restart(eng, gh, save=False)
+    assert eng2.step().next_phase == "REVIEW"
+    assert eng2.provider.calls == []
+    assert len(_creates(gh)) == 1
+    assert ("get_pr_exact", REPLACEMENT_PR) in gh.calls
+    replacement = gh.prs[REPLACEMENT_PR]
+    assert replacement.body == _controller_body(
+        eng, _published_marker(eng, txn_id), REPLAN_CARET_TEXT
+    )
+    state = load_state(eng.paths.state_file)
+    assert state.phase is Phase.REVIEW and state.current_pr_url == REPLACEMENT_PR
+    assert gh.prs[PR].state == "CLOSED"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        GitHubCredentialError(
+            "exact read of owner/repo#43: GitHub answered HTTP 401; `gh auth status` and "
+            "`gh auth token --hostname github.com` must work for the user running AutoForge"
+        ),
+        GitHubCredentialError(
+            "exact read of owner/repo#43: `gh auth token` printed no usable credential"
+        ),
+    ],
+    ids=["401", "no-token"],
+)
+def test_a_credential_failure_of_the_replacement_s_exact_read_back_is_no_rejection(
+    tmp_state_dir, error
+):
+    """#329: the exact read's credential says nothing about the replacement, and a replan
+    block is final (no unblock enters REPLAN_REEXECUTE). So it is no refusal: the command
+    ends with the phase, the transaction (PREPARED) and the records as persisted, the
+    error saying the replan is not rejected and what to fix, classified as a resumable
+    stop. Once the credential works, 'resume' reconciles the attempted create, observes
+    the PR it made and activates it: one create in all."""
+    eng, gh, raised, _ = _exact_read_back_fails(tmp_state_dir, error)
+
+    assert raised is error
+    assert "The replan is not rejected and nothing was sent again" in str(raised)
+    assert "then 'resume'" in str(raised)
+    assert classify_exception(raised).outcome is StopOutcome.RESUMABLE_ERROR
+    state = load_state(eng.paths.state_file)
+    assert state.phase is Phase.REPLAN_REEXECUTE and state.stop_code == ""
+    txn = ReplanTransaction.from_dict(state.replan_transaction)
+    assert txn.stage is ReplanStage.PREPARED and txn.rejection_reason == ""
+    assert _plan_stages(eng) == [("push", "observed"), ("replacement_pr", "attempted")]
+    assert len(_creates(gh)) == 1 and gh.prs[PR].state == "OPEN"
+
+    _resumed_after_the_read_back_is_fixed(eng, gh)
+
+
+def test_a_404_of_the_replacement_s_exact_read_back_is_pending_for_resume(tmp_state_dir):
+    """#329: a 404 of the PR the listing just returned is GitHub's REST read lagging the
+    listing; the client reads it again and then calls it inconclusive. The create is
+    pending (attempted), the replan is not rejected, and 'resume' observes the PR."""
+    error = GitHubUnavailableError(
+        "exact read of owner/repo#43: GitHub answered HTTP 404, for an object `gh` had just "
+        "returned: GitHub's REST read does not see it yet, so this read is inconclusive "
+        "(read 2 times)"
+    )
+    eng, gh, raised, _ = _exact_read_back_fails(tmp_state_dir, error)
+
+    assert isinstance(raised, EffectPending)
+    txn = ReplanTransaction.from_dict(load_state(eng.paths.state_file).replan_transaction)
+    assert txn.stage is ReplanStage.PREPARED
+    assert _plan_stages(eng) == [("push", "observed"), ("replacement_pr", "attempted")]
+
+    _resumed_after_the_read_back_is_fixed(eng, gh)
+
+
+def test_any_other_conclusive_failure_of_the_replacement_s_exact_read_back_still_rejects(
+    tmp_state_dir,
+):
+    """Only the credential is set apart (#329): an answer that is not GitHub's JSON, a
+    redirect or a certificate that does not verify is about what answered, and rejects
+    the replan as every conclusive read of K7 does, the PR named in the reason."""
+    error = GitHubError("exact read of owner/repo#43: the reply is not UTF-8 JSON")
+    eng, gh, raised, outcome = _exact_read_back_fails(tmp_state_dir, error)
+
+    assert raised is None and outcome is not None and outcome.next_phase == "BLOCKED"
+    state = load_state(eng.paths.state_file)
+    assert state.stop_code == StopReasonCode.REPLAN_REFUSED.value
+    txn = ReplanTransaction.from_dict(state.replan_transaction)
+    assert txn.stage is ReplanStage.REJECTED
+    assert "the reply is not UTF-8 JSON" in txn.rejection_reason
+    assert len(_creates(gh)) == 1
 
 
 def test_a_create_that_landed_before_a_crash_is_observed_not_repeated(tmp_state_dir):
