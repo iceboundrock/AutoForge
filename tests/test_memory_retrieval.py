@@ -3410,6 +3410,154 @@ def test_a_hit_past_a_hits_bound_showing_anything_but_its_excerpt_is_still_a_lea
         assert c["correction_old_text_served"] == (shown == "earlier"), name
 
 
+# The benchmark's conditions, and those that serve every record of the launch.
+_CONDITIONS = ("synced", "stale", "stale_without_tail", "no_fts5", "rebuilt")
+_SERVING = ("synced", "stale", "rebuilt")
+
+
+def _record(fixture: dict, key: str) -> dict:
+    return next(record for record in fixture["records"] if record["key"] == key)
+
+
+def _oracle_agrees_with_the_store(fixture: dict) -> dict[str, tuple[str, str]]:
+    """The oracle's verdicts on ``fixture``, each checked against the store's."""
+    world = bench.build(fixture)
+    truth = bench.oracle(fixture)
+    for key, record in world.ids.items():
+        state, text = truth[key]
+        assert world.store.visibility(record, world.request) is Visibility(state), key
+        if state == "current":
+            assert world.store.text_of(record) == text, key
+    return truth
+
+
+def _copy_of(fixture: dict, key: str, **declared) -> None:
+    """``fixture`` with a record ``m26`` added: a copy of ``key``'s text, as ``declared``."""
+    original = _record(fixture, key)
+    fixture["records"].append(
+        dict(key="m26", issue="main", actor="agent", kind="note", text=original["text"]) | declared
+    )
+
+
+def _old_candidates_copy_of_m10_retracted(fixture: dict) -> dict:
+    _copy_of(fixture, "m10", kind="candidate-finding", range="exact", candidate="old")
+    fixture["operations"].append({"op": "retract", "key": "m26", "reason": "not on old"})
+    return {"m10": "current", "m26": "inapplicable"}
+
+
+def _m10_corrected_beside_its_copy(fixture: dict) -> dict:
+    _copy_of(fixture, "m10", kind="candidate-finding", range="exact", candidate="current")
+    restated = "On a list ending in a comma and a newline the tokenizer drops the last element."
+    fixture["operations"].append(
+        {"op": "correct", "key": "m10", "text": restated, "reason": "restated"}
+    )
+    return {"m10": "current", "m26": "withheld"}
+
+
+def _agents_copy_of_the_seed_retracted(fixture: dict) -> dict:
+    _copy_of(fixture, "m19")
+    fixture["operations"].append({"op": "retract", "key": "m26", "reason": "a copy"})
+    return {"m19": "current", "m26": "retracted"}
+
+
+def _the_seed_retracted_beside_an_agents_copy(fixture: dict) -> dict:
+    _copy_of(fixture, "m19")
+    fixture["operations"].append({"op": "retract", "key": "m19", "reason": "obsolete"})
+    return {"m19": "retracted", "m26": "withheld"}
+
+
+def _m15_corrected_then_retracted_beside_a_copy_of_its_correction(fixture: dict) -> dict:
+    # m15's correction is the fixture's own: m26 holds the text it was
+    # corrected to, which the retraction after it withdraws.
+    corrected = next(op["text"] for op in fixture["operations"] if op["key"] == "m15")
+    _copy_of(fixture, "m15", text=corrected)
+    fixture["operations"].append({"op": "retract", "key": "m15", "reason": "moved again"})
+    return {"m15": "retracted", "m26": "withheld"}
+
+
+@needs_fts5
+@pytest.mark.parametrize(
+    "variant",
+    [
+        _old_candidates_copy_of_m10_retracted,
+        _m10_corrected_beside_its_copy,
+        _agents_copy_of_the_seed_retracted,
+        _the_seed_retracted_beside_an_agents_copy,
+        _m15_corrected_then_retracted_beside_a_copy_of_its_correction,
+    ],
+)
+def test_the_oracle_withholds_a_text_only_where_its_withdrawal_applies(variant):
+    """R13-F2 of PR #537: the oracle withheld every record whose declared
+    text a retraction withdrew, whatever the withdrawal's scope, and no
+    correction withdrew anything. Retracting an old-candidate copy of m10
+    left the current m10 served and the oracle counted it a stale leak, 2
+    of 56 synced; correcting m10 withheld its same-scope copy in the store
+    while the oracle judged the copy current. The oracle now replays each
+    withdrawal of the fixture, a correction's too, with the text it
+    withdrew then, and withholds by it only where the withdrawn record's
+    scope takes the launch and the copy's author is no higher than its.
+    It agrees with the store record by record, and no condition reports a
+    leak of what the store rightly serves."""
+    fixture = bench.read_fixture().data()
+    expected = variant(fixture)
+    truth = _oracle_agrees_with_the_store(fixture)
+    assert {key: truth[key][0] for key in expected} == expected
+    report = bench.correctness(bench.Fixture(json.dumps(fixture).encode()))
+    for name in _CONDITIONS:
+        c = report[name]
+        assert (c["stale_leak_rate"], c["permission_leak_rate"]) == (0.0, 0.0), name
+        assert c["correction_old_text_served"] == 0, name
+    current = [key for key, state in expected.items() if state == "current"]
+    for name in _SERVING:
+        served = {key for ranked in report[name]["ranked"] for key in ranked}
+        assert set(current) <= served, name
+
+
+@needs_fts5
+def test_a_withheld_copy_of_a_corrected_text_is_judged_by_the_oracle_never_the_store(
+    monkeypatch,
+):
+    """R13-F2 of PR #537, the converse: correcting m10 withholds its
+    same-scope copy, and the oracle judged the copy current, so a search
+    serving it would have counted no leak. A store made to call the copy
+    current serves it; the oracle, which never asks the store, counts each
+    of its hits a stale leak and the correction probe's hit of it the
+    earlier text served."""
+    fixture = bench.read_fixture().data()
+    _m10_corrected_beside_its_copy(fixture)
+    fixture["corrections"].append(
+        {"key": "m10", "new_query": "last element", "old_query": "tokenizer final element"}
+    )
+    source = bench.Fixture(json.dumps(fixture).encode())
+    copy = bench.build(fixture).ids["m26"]
+    honest = bench.correctness(source)
+    for name in _CONDITIONS:
+        c = honest[name]
+        assert (c["stale_leak_rate"], c["permission_leak_rate"]) == (0.0, 0.0), name
+        assert c["correction_old_text_served"] == 0, name
+    for name in _SERVING:
+        assert honest[name]["correction_new_text_visible"] == 1.0, name
+        assert not any("m26" in ranked for ranked in honest[name]["ranked"]), name
+
+    real = MemoryStore.visibilities
+
+    def visibilities(self, request):
+        # Only a verdict of withheld is changed: the store before the
+        # correction holds the copy current, and the empty store has none.
+        verdicts = real(self, request)
+        if verdicts.get(copy) is Visibility.WITHHELD:
+            verdicts[copy] = Visibility.CURRENT
+        return verdicts
+
+    monkeypatch.setattr(MemoryStore, "visibilities", visibilities)
+    tampered = bench.correctness(source)
+    for name in _SERVING:
+        c = tampered[name]
+        assert any("m26" in ranked for ranked in c["ranked"]), name
+        assert c["stale_leak_rate"] > 0.0 and c["permission_leak_rate"] == 0.0, name
+        assert c["correction_old_text_served"] == 1, name
+
+
 @needs_fts5
 def test_the_benchmarks_cost_half_runs_on_a_small_corpus():
     # Corpora below the update sample included: the sampler indexed twenty

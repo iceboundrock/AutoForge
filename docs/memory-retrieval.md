@@ -834,14 +834,34 @@ candidate and one bound to a base's descendants. There are 15 queries with
 hand-judged relevant records (21 judgments), six adversarial negatives
 whose terms appear only in records the launch must not be served, and one
 correction probe. Each served hit is checked against an oracle derived from
-the fixture's declarations, not from `MemoryStore.visibility`. A hit is a
+the fixture's declarations, not from `MemoryStore.visibility`. The oracle
+replays the fixture's operations in order. A retraction and a correction
+each withdraw their record's text as it is at that operation: the declared
+text, or an earlier correction's. A withdrawal withholds another record of
+the same issue that carries that very text, by an author no higher than
+the withdrawn record's, and only when the withdrawn record's own scope
+takes the benchmark's launch: retracting a copy bound to another candidate
+leaves the launch's own record current. A hit is a
 stale leak when the oracle judges its record retracted, withheld or
 superseded, or when its summary is anything but the excerpt a hit shows of
 the text the oracle judges current: that text redacted, then cut to 512
 bytes with an omission marker. "Old text served" counts a probe search
 with a hit that shows the earlier text whole, or its excerpt where that
-differs from what the hit's record now shows. Until the twelfth review
-round both judged a summary by whole texts,
+differs from what the hit's record now shows.
+
+Until the thirteenth review round the oracle withdrew only retracted
+texts, by their declared text and whatever their scope. Retracting an
+old-candidate copy of `m10` made it count the current `m10` as a stale
+leak (2 of 56 in the synced condition), and correcting `m10` beside a copy
+of it left the copy current to the oracle, though the store withholds it,
+so serving the copy would have gone uncounted
+(`test_the_oracle_withholds_a_text_only_where_its_withdrawal_applies`,
+`test_a_withheld_copy_of_a_corrected_text_is_judged_by_the_oracle_never_the_store`).
+The pinned fixture has neither case, and its correctness report is
+unchanged, byte for byte.
+
+Until the twelfth review
+round the stale-leak check and the probe judged a summary by whole texts,
 so a correct excerpt of a current record longer than 512 bytes counted as
 a stale leak: the fixture with only `m10` lengthened to 691 bytes gave
 2 of 56 in the synced condition. The pinned fixture's longest record is

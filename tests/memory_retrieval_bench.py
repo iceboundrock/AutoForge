@@ -16,9 +16,12 @@ back from its JSON (in this same process: it shows the rebuild is
 deterministic, not that a restart was observed), and an empty store. Each
 served hit is checked against an oracle derived from the fixture's own
 declarations, never from :meth:`MemoryStore.visibility`, so a stale or
-permission leak is counted however the code decides. A hit's summary is
-judged against the excerpt a hit of the oracle's text shows (:func:`excerpt`),
-never the whole text, which may be longer than a hit shows.
+permission leak is counted however the code decides. It replays the
+fixture's retractions and corrections, each withholding the text it
+withdrew where the withdrawn record's scope takes the launch
+(:func:`oracle`). A hit's summary is judged against the excerpt a hit of
+the oracle's text shows (:func:`excerpt`), never the whole text, which may
+be longer than a hit shows.
 
 **Performance** times the same index on the fixture's store, on a store at
 Memory's record bound, and on synthetic corpora of the backend alone, which
@@ -208,33 +211,84 @@ def apply_operations(world: World) -> None:
     world.store = store
 
 
+# Whose copies of a withdrawn text a withdrawal withholds: those of records
+# whose author is at most the withdrawn record's (an agent's text withdrawn
+# withholds agents' copies only, the controller's any). The operator, who
+# makes every withdrawal of the fixture (:func:`apply_operations`), may act
+# on any record.
+AUTHORITY = {"agent": 0, "operator": 1, "controller": 2}
+
+
+def applies(fixture: dict, record: dict) -> bool:
+    """Whether ``record``'s declared scope takes the benchmark's launch, from the fixture alone.
+
+    The launch (:func:`build`'s request) is issue ``main``'s, at the phase
+    every record of the fixture is scoped to, on the ``current`` candidate,
+    a descendant of ``base``: another issue's record does not apply, nor one
+    bound exactly to another candidate; one bound to ``base``'s descendants
+    (:func:`_scope` anchors every such record there) does.
+    """
+    if record["issue"] != "main":
+        return False
+    if record.get("range", "any") == "exact":
+        candidates = fixture["candidates"]
+        return candidates[record["candidate"]] == candidates["current"]
+    return True
+
+
 def oracle(fixture: dict) -> dict[str, tuple[str, str]]:
-    """Each record's expected state and text, from the fixture's declarations alone."""
-    ops = fixture["operations"]
-    retracted = {op["key"] for op in ops if op["op"] == "retract"}
-    superseded = {op["key"] for op in ops if op["op"] == "supersede"}
-    corrected = {op["key"]: op["text"] for op in ops if op["op"] == "correct"}
-    original = {r["key"]: r["text"] for r in fixture["records"]}
-    withdrawn_texts = {original[k] for k in retracted}
-    current = fixture["candidates"]["current"]
+    """Each record's expected state and text, from the fixture's declarations alone.
+
+    The fixture's operations are replayed in order on the records' declared
+    texts. A retraction and a correction each withdraw their record's text
+    as it is at that operation: the declared one, or an earlier correction's.
+    A withdrawal withholds a record of the same issue that carries that very
+    text, by an author no higher than the withdrawn record's
+    (:data:`AUTHORITY`), only when the withdrawn record's own scope takes
+    the launch (:func:`applies`): a withdrawal on another candidate leaves
+    the launch's copy current. Nothing here asks the store. Until the
+    thirteenth review round only retractions withdrew, each withholding
+    every record that declared its text whatever its scope: a retracted copy
+    of ``m10`` on the old candidate counted the current ``m10`` as a stale
+    leak, and a duplicate of a corrected text was judged current (R13-F2 of
+    PR #537).
+    """
+    records = {record["key"]: record for record in fixture["records"]}
+    text = {key: record["text"] for key, record in records.items()}
+    retracted: set[str] = set()
+    superseded: set[str] = set()
+    withdrawals: list[tuple[dict, str]] = []  # the withdrawn record, and its text then
+    for op in fixture["operations"]:
+        key = op["key"]
+        if op["op"] == "supersede":
+            superseded.add(key)
+            continue
+        withdrawals.append((records[key], text[key]))
+        if op["op"] == "retract":
+            retracted.add(key)
+        else:
+            text[key] = op["text"]
     result = {}
-    for record in fixture["records"]:
-        key = record["key"]
+    for key, record in records.items():
         if record["issue"] != "main":
             state = "foreign"
-        elif (
-            record.get("range") == "exact" and fixture["candidates"][record["candidate"]] != current
-        ):
+        elif not applies(fixture, record):
             state = "inapplicable"
         elif key in retracted:
             state = "retracted"
-        elif original[key] in withdrawn_texts:
+        elif any(
+            withdrawn == text[key]
+            and source["issue"] == record["issue"]
+            and AUTHORITY[record["actor"]] <= AUTHORITY[source["actor"]]
+            and applies(fixture, source)
+            for source, withdrawn in withdrawals
+        ):
             state = "withheld"
         elif key in superseded:
             state = "superseded"
         else:
             state = "current"
-        result[key] = (state, corrected.get(key, original[key]))
+        result[key] = (state, text[key])
     return result
 
 
