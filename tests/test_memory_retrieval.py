@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import socket
+import sqlite3
 import tracemalloc
 from dataclasses import astuple, replace
 from pathlib import Path
@@ -48,6 +49,8 @@ from autoforge.memory_retrieval import (
     MemoryRetriever,
     RetrievalBackendError,
     RetrievalError,
+    RetrievalIntegrityError,
+    UndecodableText,
     fts5_available,
     query_terms,
     render_hits,
@@ -69,6 +72,10 @@ STEP = StepKey(Phase.ANALYZE_EXECUTE, ISSUE, "", 0, 1)
 SCOPE = MemoryScope(STEP)
 # The next launch of a store at launch_seq 128 (``empty()``), on candidate SHA.
 REQ = ProjectionRequest(RUN, STEP, 129, SHA, ancestors=(BASE,))
+
+# TEXT that is not UTF-8: SQLite stores the bytes as they are, and Python's
+# sqlite3 cannot decode them (R10-F1 of PR #537).
+NOT_UTF8 = b"\xff\xfe" * 32
 
 # A test that reads a real FTS5 index, or a store the benchmark indexes,
 # skips where this interpreter's SQLite lacks FTS5; every other test runs
@@ -2325,26 +2332,74 @@ def test_writes_outside_the_scope_leave_no_gap_in_any_sequence_a_launch_is_told(
 
 @pytest.mark.parametrize(
     ("column", "value"),
-    [("revision", "abc"), ("revision", 2.5), ("digest", 7), ("body", "xzz")],
+    [
+        ("revision", "abc"),
+        ("revision", 2.5),
+        ("digest", 7),
+        ("body", "xzz"),
+        # TEXT whose bytes are not UTF-8, in each column (R10-F1 of PR #537).
+        pytest.param("revision", NOT_UTF8, id="revision-not-utf8"),
+        pytest.param("digest", NOT_UTF8, id="digest-not-utf8"),
+        pytest.param("body", NOT_UTF8, id="body-not-utf8"),
+    ],
 )
 @needs_fts5
 def test_a_malformed_fts5_row_is_an_integrity_failure_never_an_exception(column, value):
     w = corpus()
     retriever = retriever_for(w)
     retriever.sync()
+    # Bytes are stored as TEXT, as they are: no conversion makes them UTF-8.
+    cell = "CAST(? AS TEXT)" if value == NOT_UTF8 else "?"
     db, table = retriever.backend._db, retriever.backend._tables[ISSUE]
-    db.execute(f"UPDATE {table} SET {column} = ? WHERE rowid = ?", (value, w.ids["uv"]))
+    db.execute(f"UPDATE {table} SET {column} = {cell} WHERE rowid = ?", (value, w.ids["uv"]))
     status = retriever.verify()
     assert (status.state, status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
     assert retriever.sync().state is IndexState.CURRENT
     # The same row met by a search: the search answers from the tail at once.
     db, table = retriever.backend._db, retriever.backend._tables[ISSUE]
-    db.execute(f"UPDATE {table} SET {column} = ? WHERE rowid = ?", (value, w.ids["uv"]))
+    db.execute(f"UPDATE {table} SET {column} = {cell} WHERE rowid = ?", (value, w.ids["uv"]))
     result = retriever.search_memory(REQ, "uv pytest interpreter")
     # A body no sync wrote, which no term matches, is a served match the
     # answer omits (R3-F3 of PR #537): found by the search itself too.
     assert ids(result) == [w.ids["uv"]] and result.degraded and result.backend == TAIL_BACKEND
     assert (result.status.state, result.status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
+
+
+@needs_fts5
+def test_text_that_is_not_utf8_is_a_malformed_value_of_its_row_never_a_query_error():
+    """R10-F1 of PR #537: Python's sqlite3 raises inside ``fetchall()`` for a
+    TEXT value that is not UTF-8, so one such row failed the whole search,
+    whichever record it was of, before the retriever could tell. FTS5's
+    connection reads it as an :class:`UndecodableText` of that row instead,
+    which the retriever judges like any malformed column, and decodes every
+    other value exactly as sqlite3 itself does."""
+    plain = sqlite3.connect(":memory:")
+    with pytest.raises(sqlite3.Error):
+        plain.execute("SELECT CAST(? AS TEXT)", (NOT_UTF8,)).fetchall()
+    w = corpus()
+    retriever = retriever_for(w)
+    retriever.sync()
+    backend = retriever.backend
+    db, table = backend._db, backend._tables[ISSUE]
+    for column in ("revision", "digest"):
+        db.execute(
+            f"UPDATE {table} SET {column} = CAST(? AS TEXT) WHERE rowid = ?",
+            (NOT_UTF8, w.ids["uv"]),
+        )
+    (found,) = backend.search(ISSUE, query_terms("uv pytest"), (w.ids["uv"],), 64)
+    assert found.id == w.ids["uv"] and found.rank == 1
+    assert found.revision == found.digest == UndecodableText(NOT_UTF8)
+    # verify's read-back still finds it: a malformed row, the index failed.
+    with pytest.raises(RetrievalIntegrityError):
+        backend.entries()
+    assert retriever.verify().reason is IndexReason.INTEGRITY
+    # Strict UTF-8, as sqlite3's own: an encoded surrogate is not text either.
+    for raw in (NOT_UTF8, b"\xed\xa0\x80", b"caf\xe9"):
+        assert db.execute("SELECT CAST(? AS TEXT)", (raw,)).fetchone() == (UndecodableText(raw),)
+    for text in ("", "plain", "naïve café", "日本語の文", "\U0001f600 emoji"):
+        assert db.execute("SELECT ?", (text,)).fetchone() == (text,)
+        assert plain.execute("SELECT ?", (text,)).fetchone() == (text,)
+    plain.close()
 
 
 # -- verify reads the tokens; a contradiction falls back at once (R2-F4 of PR #537) ------
@@ -2734,15 +2789,30 @@ def _unserved(kind, word):
 def _damage(retriever, record, damage):
     """One row damaged as ``damage`` says, the same whatever text it was indexed by."""
     db, table = retriever.backend._db, retriever.backend._tables[ISSUE]
+    if damage.endswith("-not-utf8"):
+        # A column SQLite holds as TEXT whose bytes are not UTF-8: the
+        # default sqlite3 raised for it inside fetchall(), before anything
+        # could tell whose row it was (R10-F1 of PR #537).
+        column = damage.removesuffix("-not-utf8")
+        db.execute(
+            f"UPDATE {table} SET {column} = CAST(? AS TEXT) WHERE rowid = ?", (NOT_UTF8, record)
+        )
+        (kind,) = db.execute(f"SELECT typeof({column}) FROM {table} WHERE rowid = ?", (record,))
+        assert kind == ("text",)
+        return
     column, value = {
         # Matched by the term whatever its record's text holds: the reviewer's case.
         "body": ("body", UNREAD),
         # A digest no sync wrote, the row still indexed by its own text.
         "digest": ("digest", "0" * 64),
-        # A malformed column, which FTS5's search raises on when it reads it.
+        # A malformed column, which FTS5's search answers as the row holds it.
         "revision": ("revision", "abc"),
     }[damage]
     db.execute(f"UPDATE {table} SET {column} = ? WHERE rowid = ?", (value, record))
+
+
+# Every way ``_damage`` damages a row.
+DAMAGES = ["body", "digest", "revision", "digest-not-utf8", "revision-not-utf8"]
 
 
 def _told(w, retriever):
@@ -2760,7 +2830,7 @@ def _told(w, retriever):
     )
 
 
-@pytest.mark.parametrize("damage", ["body", "digest", "revision"])
+@pytest.mark.parametrize("damage", DAMAGES)
 @pytest.mark.parametrize(
     "kind", ["earlier-candidate", "superseded-since", "retracted-since", "corrected-since"]
 )
@@ -2796,7 +2866,7 @@ def test_a_damaged_row_of_text_the_launch_cannot_read_moves_nothing_it_is_told(k
 
 
 @pytest.mark.parametrize(
-    ("damage", "query"), [("body", UNREAD), ("digest", "zebra"), ("revision", "zebra")]
+    ("damage", "query"), [(d, UNREAD if d == "body" else "zebra") for d in DAMAGES]
 )
 @needs_fts5
 def test_the_same_damage_to_a_row_the_launch_is_served_falls_back_on_that_search(damage, query):
@@ -2864,7 +2934,7 @@ def _withdrawn_inside(kind, word, when, **kwargs):
 
 
 @pytest.mark.parametrize("when", ["before-reading", "after-reading"])
-@pytest.mark.parametrize("damage", ["body", "digest", "revision"])
+@pytest.mark.parametrize("damage", DAMAGES)
 @pytest.mark.parametrize("kind", ["retracted", "superseded", "corrected"])
 @needs_fts5
 def test_a_damaged_row_of_a_record_withdrawn_while_the_index_answers_moves_nothing(
@@ -2903,7 +2973,7 @@ def test_a_damaged_row_of_a_record_withdrawn_while_the_index_answers_moves_nothi
 @pytest.mark.parametrize("when", ["before-reading", "after-reading"])
 @pytest.mark.parametrize("fallback", [False, True], ids=["tail", "fts5-fallback"])
 @pytest.mark.parametrize(
-    ("damage", "query"), [("body", UNREAD), ("digest", "zebra"), ("revision", "zebra")]
+    ("damage", "query"), [(d, UNREAD if d == "body" else "zebra") for d in DAMAGES]
 )
 @needs_fts5
 def test_damage_to_a_row_still_served_falls_back_on_the_search_that_withdrew_another(

@@ -95,16 +95,19 @@ answers: the answer is judged only once the store has been loaded after
 it, and only about the records asked about that the store still serves as
 the index saw them, so a row of one withdrawn meanwhile, malformed or
 not, fails nothing either (R9-F1). For that, a backend answers each row it
-matched as the row holds it, never raising for one. A search proves its
-index's coverage before it says ``complete``: every record it asked about
-that the store still serves and that holds a query term must be among the
-candidates. An index whose answer about those records is not a projection
-of the store (a malformed row, two rows of one record, a candidate the
-store contradicts, a match it omits, or, by ``verify``, any row no sync
-through the watermark wrote) is ``failed`` (``integrity``) until it is
-rebuilt, and the search that found it answers from the fallback or the
-tail instead. Since the index is in memory, a crash loses it and the next
-process rebuilds it from the checkpoint, deterministically.
+matched as the row holds it, never raising for one, and FTS5's connection
+reads TEXT that is not UTF-8 as a malformed value of its row
+(:class:`UndecodableText`), never an error of the query (R10-F1). A
+search proves its index's coverage before it says ``complete``: every
+record it asked about that the store still serves and that holds a query
+term must be among the candidates. An index whose answer about those
+records is not a projection of the store (a malformed row, two rows of one
+record, a candidate the store contradicts, a match it omits, or, by
+``verify``, any row no sync through the watermark wrote) is ``failed``
+(``integrity``) until it is rebuilt, and the search that found it answers
+from the fallback or the tail instead. Since the index is in memory, a
+crash loses it and the next process rebuilds it from the checkpoint,
+deterministically.
 
 **Backends** implement :class:`IndexBackend` and return candidates only:
 record ids with the revision and content digest they indexed, checked and
@@ -301,6 +304,9 @@ class IndexCandidate:
     ``score`` and ``rank`` are checked (:func:`_candidates`, for a record
     the store still serves as the index saw it) and never used: a hit's
     place is computed over the launch's own records (:func:`_scores`).
+    FTS5's candidates are its rows as they hold them, so a field may hold
+    any value a column can, :class:`UndecodableText` included, until it is
+    checked.
     """
 
     id: int
@@ -349,7 +355,9 @@ class IndexBackend(Protocol):
     for one: the store may withdraw a record while the backend answers, and
     only the retriever, once it has loaded the store after the answer, can
     tell whether a malformed row is of a record the launch is still served
-    (R9-F1 of PR #537). ``entries`` raises
+    (R9-F1 of PR #537). That includes a value the backend cannot even
+    decode: FTS5 answers TEXT that is not UTF-8 as an
+    :class:`UndecodableText` (R10-F1). ``entries`` raises
     :class:`RetrievalIntegrityError` for a row it finds malformed, and must
     return exactly a list. An answer that is not exactly a list or a tuple
     (never a subclass) of at most :data:`MAX_CANDIDATES` candidates is
@@ -399,17 +407,53 @@ def fts5_available() -> bool:
     return True
 
 
+@dataclass(frozen=True)
+class UndecodableText:
+    """A TEXT value a row holds whose bytes are not UTF-8: malformed, never an error.
+
+    SQLite stores TEXT as the bytes it is given, and Python's ``sqlite3``
+    decodes each value it reads as UTF-8. By default it raises for one it
+    cannot decode, inside ``fetchall()``: an error of the whole query,
+    whichever row held it, met before anything can say whose row it was or
+    whether the launch is still served that record. So this module's
+    connection decodes each value alone (:func:`_decoded`), and one that is
+    not UTF-8 is this value of its own row, malformed like a revision that
+    is not an integer: the retriever judges it against the store after the
+    retrieval, and :meth:`MemoryRetriever.verify` finds it wherever it is
+    (R10-F1 of PR #537). ``raw`` is the bytes as SQLite holds them.
+    """
+
+    raw: bytes
+
+
+def _decoded(raw: bytes) -> str | UndecodableText:
+    """A TEXT value SQLite returns, as ``sqlite3`` decodes it, or :class:`UndecodableText`.
+
+    Strict UTF-8, as ``sqlite3``'s own default: every value it decodes is
+    the same ``str``. It never raises, so no value fails the query it is
+    read by.
+    """
+    try:
+        return raw.decode()
+    except UnicodeDecodeError:
+        return UndecodableText(raw)
+
+
 def _open_memory_database() -> sqlite3.Connection | None:
     """An in-memory SQLite database with FTS5, or ``None`` when there is none.
 
     ``:memory:`` names no file, ``temp_store`` keeps every temporary table
     and sort in memory too, and no database can be attached: nothing of this
     connection ever reaches the file system (ADR 0015 D10's note for #324).
+    Each TEXT value it reads is decoded alone (:func:`_decoded`), so one
+    that is not UTF-8 is a malformed value of its row, never an error of
+    the query (R10-F1 of PR #537).
     """
     try:
         db = sqlite3.connect(":memory:", isolation_level=None)
     except sqlite3.Error:
         return None
+    db.text_factory = _decoded
     try:
         db.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)
         db.execute("PRAGMA temp_store = MEMORY")
@@ -581,7 +625,9 @@ class Fts5Backend:
         # row was of, before anything could say whether the launch is still
         # served that record. A column no sync wrote (a revision that is not
         # an integer, a digest that is not text) is the retriever's to judge,
-        # against the store after the retrieval (R9-F1 of PR #537).
+        # against the store after the retrieval (R9-F1 of PR #537); so is
+        # TEXT that is not UTF-8, which the connection reads as an
+        # UndecodableText rather than failing fetchall() (R10-F1).
         found = []
         for n, (rowid, revision, digest, score) in enumerate(rows, 1):
             # bm25() is lower for a better match; the score is its negation,
