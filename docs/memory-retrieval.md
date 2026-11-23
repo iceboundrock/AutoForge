@@ -867,7 +867,12 @@ whose new-text search has a hit of the corrected record that shows it as
 it is now: a record the oracle judges current, whose summary is exactly
 the excerpt of its current text. A hit of it that shows anything else,
 its earlier text's excerpt included, shows no correction, and neither does
-any hit of it while the oracle does not judge it current.
+any hit of it while the oracle does not judge it current. Nor does a hit
+whose excerpt any earlier text of the record shows too: the declared text,
+or an earlier correction's. Finding the current record is not showing its
+correction, and a correction that only changes what lies past the 512-byte
+excerpt is not visible in any hit. Such a hit still shows the record as it
+is now, so it is neither a stale leak nor old text served.
 
 Until the fourteenth review round "new text visible" counted any hit of
 the corrected record on the new-text search, whatever it showed: on the
@@ -875,7 +880,15 @@ pinned fixture, `m15`'s hit made to show its original excerpt on that
 search still gave 1 of 1, while the stale-leak rate rose to 1 of 56
 (`test_a_corrected_record_shown_with_other_text_is_no_new_text_visible`,
 `test_a_corrected_record_the_oracle_does_not_judge_current_is_no_new_text_visible`).
-The pinned fixture's correctness report is unchanged, byte for byte.
+Until the fifteenth it counted a hit showing the corrected text's excerpt
+even where that excerpt was its earlier text's too. With `m15` lengthened
+past 512 bytes and its correction appending a term past that bound, which
+the new-text query asked for, it gave 1 of 1 in every condition that
+served `m15` (synced, stale with the tail, without FTS5, rebuilt), though
+each hit showed exactly the excerpt it had shown before the correction
+(`test_a_correction_past_a_hits_bound_finds_its_record_but_shows_no_new_text`).
+The pinned fixture's correctness report is unchanged by either, byte for
+byte: its correction of `m15` rewrites the excerpt itself.
 
 Until the thirteenth review round the oracle withdrew only retracted
 texts, by their declared text and whatever their scope. Retracting an

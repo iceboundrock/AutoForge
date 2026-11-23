@@ -3687,6 +3687,82 @@ def test_a_corrected_record_the_oracle_does_not_judge_current_is_no_new_text_vis
     assert hit.summary == bench.excerpt(truth["m15"][1])
 
 
+# No FTS5 needed: the benchmark judges what the tail serves alike.
+@pytest.mark.parametrize("corrections", ["once", "twice"])
+def test_a_correction_past_a_hits_bound_finds_its_record_but_shows_no_new_text(
+    corrections, monkeypatch
+):
+    """R15-F2 of PR #537: finding the corrected record is not showing its
+    correction. m15's text is lengthened past a hit's 512-byte bound and
+    its correction appends a term past it, which the new-text query asks
+    for: once, from its declared text, or twice, the pinned correction
+    lengthened and then appended to. Every condition that serves m15 finds
+    it by that term and shows it exactly as it is now, which is exactly
+    what it showed before: its excerpt is its earlier text's. Until the
+    fifteenth review round that gave a new text visible of 1 in each of
+    them. It is 0 now, and the hit, the record as it is, is no stale leak
+    and no old text served; the pinned fixture's report is unchanged
+    (``test_the_pinned_fixture_serves_nothing_stale_or_foreign_in_any_condition``)."""
+    fixture = bench.read_fixture().data()
+    (probe,) = fixture["corrections"]
+    (correction,) = [op for op in fixture["operations"] if op["op"] == "correct"]
+    assert probe["key"] == correction["key"] == "m15"
+    if corrections == "once":
+        m15 = _record(fixture, "m15")
+        m15["text"] = _past_a_hits_bound(m15["text"], "sandwort", 600)
+        earlier = m15["text"]
+        correction["text"] = f"{earlier} Its zygomorph lists are covered too."
+    else:
+        correction["text"] = _past_a_hits_bound(correction["text"], "sandwort", 600)
+        earlier = correction["text"]
+        fixture["operations"].append(
+            {
+                "op": "correct",
+                "key": "m15",
+                "text": f"{earlier} Its zygomorph lists are covered too.",
+                "reason": "a case was added",
+            }
+        )
+    probe["new_query"] = "zygomorph"
+    # The probe's term is m15's alone, and the new-text search changes no
+    # other figure of the report.
+    assert not any("zygomorph" in record["text"] for record in fixture["records"])
+    assert "zygomorph" not in [q["query"] for q in fixture["queries"] + fixture["negatives"]]
+    truth = _oracle_agrees_with_the_store(fixture)
+    state, current = truth["m15"]
+    assert state == "current" and current != earlier
+    assert bench.earlier_texts(fixture, "m15")[-1] == earlier
+    assert bench.excerpt(current) == bench.excerpt(earlier)
+    source = bench.Fixture(json.dumps(fixture).encode())
+
+    report = bench.correctness(source)
+    for name in _CONDITIONS:
+        c = report[name]
+        assert c["correction_new_text_visible"] == 0.0, name
+        assert (c["stale_leak_rate"], c["permission_leak_rate"]) == (0.0, 0.0), name
+        assert c["correction_old_text_served"] == 0, name
+
+    # The record is found and shown as it is now: with no earlier text to
+    # compare its excerpt with, as until the fifteenth review round, every
+    # condition that serves m15 counts it, and nothing else of the report
+    # moves.
+    monkeypatch.setattr(bench, "earlier_texts", lambda fixture, key: [])
+    found = bench.correctness(source)
+    serving = ("synced", "stale", "no_fts5", "rebuilt")
+    for name in _CONDITIONS:
+        c, before = found[name], report[name]
+        assert c["correction_new_text_visible"] == (name in serving), name
+        assert {k: v for k, v in c.items() if k != "correction_new_text_visible"} == {
+            k: v for k, v in before.items() if k != "correction_new_text_visible"
+        }, name
+    world = bench.build(fixture)
+    retriever = MemoryRetriever(fixture["repository"], fixture["run_id"], lambda: world.store)
+    retriever.sync()
+    result = retriever.search_memory(world.request, "zygomorph")
+    (hit,) = (hit for hit in result.hits if hit.id == world.ids["m15"])
+    assert hit.summary == bench.excerpt(current) == bench.excerpt(earlier)
+
+
 def _copy_of(fixture: dict, key: str, **declared) -> None:
     """``fixture`` with a record ``m26`` added: a copy of ``key``'s text, as ``declared``."""
     original = _record(fixture, key)

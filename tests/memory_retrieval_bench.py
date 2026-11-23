@@ -23,7 +23,9 @@ withdrew where the withdrawn record's scope takes the launch
 the oracle's text shows (:func:`excerpt`), never the whole text, which may
 be longer than a hit shows. A correction probe's new text is visible only
 on a hit of the corrected record the oracle judges current, showing that
-excerpt of its corrected text (:func:`_shows_corrected_text`).
+excerpt of its corrected text, and only when that excerpt is not one any
+earlier text of the record shows too (:func:`_shows_corrected_text`):
+finding the current record is not showing its correction.
 
 **Performance** times the same index on the fixture's store, on a store at
 Memory's record bound, and on synthetic corpora of the backend alone, which
@@ -340,20 +342,52 @@ def _shows_earlier_text(summary: str, earlier: str, state: str, text: str) -> bo
     return earlier in summary or summary == excerpt(earlier)
 
 
+def earlier_texts(fixture: dict, key: str) -> list[str]:
+    """Every text ``key`` held before its current one, from the fixture's declarations alone.
+
+    Its declared text, then each correction's in order but the last's, which
+    is the text it holds now (:func:`oracle`). A record no operation
+    corrected has held only its declared text, so that is the whole list:
+    it shows no correction, whatever its hit shows.
+    """
+    declared = next(record["text"] for record in fixture["records"] if record["key"] == key)
+    corrections = [
+        op["text"] for op in fixture["operations"] if op["op"] == "correct" and op["key"] == key
+    ]
+    return [declared, *corrections[:-1]]
+
+
 def _shows_corrected_text(
-    hits: Sequence[tuple[str, str]], target: str, truth: dict[str, tuple[str, str]]
+    hits: Sequence[tuple[str, str]],
+    target: str,
+    truth: dict[str, tuple[str, str]],
+    earlier: Sequence[str],
 ) -> bool:
     """Whether a correction probe's new-text search shows its ``target`` as corrected.
 
-    ``hits`` are the search's ``(key, summary)`` pairs. A hit of ``target``
-    counts only when it shows the record as the oracle judges it now
-    (:func:`_shows_record_as_it_is`): current, with the excerpt of the
-    corrected text. Until the fourteenth review round any hit of ``target``
-    counted, whatever it showed, so ``m15``'s hit shown with its original
-    text on the pinned fixture's new-text query still gave a new text
-    visible of 1 of 1, while the stale-leak rate rose to 1 of 56 (R14-F1 of
-    PR #537).
+    ``hits`` are the search's ``(key, summary)`` pairs, ``earlier`` the
+    texts ``target`` held before its current one (:func:`earlier_texts`). A
+    hit of ``target`` counts only when it shows the record as the oracle
+    judges it now (:func:`_shows_record_as_it_is`): current, with the
+    excerpt of the corrected text. And that excerpt must show the
+    correction: when an earlier text's excerpt is the same bytes, a
+    correction that only changed what lies past a hit's 512-byte bound, no
+    hit shows it, however the record was found. Such a hit is no stale
+    leak and no old text served: it shows the record as it is now.
+
+    Until the fourteenth review round any hit of ``target`` counted,
+    whatever it showed, so ``m15``'s hit shown with its original text on
+    the pinned fixture's new-text query still gave a new text visible of 1
+    of 1, while the stale-leak rate rose to 1 of 56 (R14-F1 of PR #537).
+    Until the fifteenth, a hit showing the corrected text's excerpt counted
+    even where that excerpt was also its earlier text's: a term appended to
+    ``m15`` past the bound, the new-text query asking for it, gave 1 of 1 in
+    every condition that found the record, though its hit showed exactly
+    what it had shown before the correction (R15-F2 of PR #537).
     """
+    text = truth[target][1]
+    if any(excerpt(before) == excerpt(text) for before in earlier):
+        return False
     return any(
         key == target and _shows_record_as_it_is(summary, *truth[key]) for key, summary in hits
     )
@@ -415,6 +449,7 @@ def _condition(world: World, retriever: MemoryRetriever, *, k: int = K) -> dict:
             [(key, hit.summary) for hit, key in zip(result.hits, keys, strict=True)],
             correction["key"],
             truth,
+            earlier_texts(fixture, correction["key"]),
         )
         result, keys = search(correction["old_query"])
         old_served += any(
