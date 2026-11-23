@@ -43,8 +43,9 @@ position in the store's audit table, so a write outside the scope leaves no
 gap in it; the catalog's digest numbers the records the launch is served
 in that sequence too, and holds nothing of a record it is not served.
 Record ids stay the run's, which a fetch and a citation need. A hit's place
-is BM25 over the store's text with its statistics over the records the
-launch is served alone (:func:`_scores`): what the launch is not served
+is Okapi BM25 over the store's text, its statistics (the record count, each
+term's record count and the mean length) over every record the launch is
+served and nothing else (:func:`_scores`): what the launch is not served
 moves no hit. Answers carry the launch's binding (:class:`ReadScope`, which
 leaves out the ancestry the controller proved) and each record's
 applicability (:class:`Applicability`). The reasons are counted in
@@ -54,9 +55,10 @@ applicability (:class:`Applicability`). The reasons are counted in
 no temporary file (``temp_store`` is memory), no attached database,
 partitioned by issue. It finds the candidates; it ranks nothing a launch
 sees. A SQLite built without FTS5 makes the backend ``unavailable``; the
-search then reads only the bounded hot tail below and says so
-(``degraded``, and ``complete`` only when the tail held every current
-record of the scope), never anything broader.
+search then looks for matches only in the bounded hot tail below and says
+so (``degraded``, and ``complete`` only when the tail held every current
+record of the scope), never anything broader; its ranking's statistics
+are still those of every record the launch is served, as at every search.
 
 **One tokenizer.** The index, the hot tail, a query and the ranking are
 tokenized by :func:`text_tokens` alone. FTS5 is given its tokens encoded as
@@ -106,7 +108,7 @@ import re
 import sqlite3
 import unicodedata
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
@@ -594,18 +596,32 @@ def query_terms(query: object) -> tuple[str, ...]:
     Nothing else of the query is kept, so no query is FTS5 syntax, a column
     filter or a scope. A term past :data:`MAX_TERM_CHARS` is dropped, and
     the terms past :data:`MAX_QUERY_TERMS`. A query that is not a string, or
-    is longer than :data:`MAX_QUERY_BYTES`, is refused.
+    is longer than :data:`MAX_QUERY_BYTES` in UTF-8, is refused.
+
+    The bound holds before any work: a character is at least one byte in
+    UTF-8, so a query of more characters than the bound is refused before
+    anything of it is copied or encoded, and only a query within it is
+    encoded to be measured exactly (R6-F2 of PR #537). Only ``str``'s own
+    methods are called: a subclass's ``__len__``, ``encode`` or
+    ``__str__`` would be the caller's code, so the query is measured by
+    ``str.__len__`` and read as the exact string ``str.__str__`` copies.
     """
-    if not isinstance(query, str):
+    # The type itself first, so ``isinstance`` (which narrows ``query``)
+    # never reads an attribute of an object that only claims to be a string.
+    if not issubclass(type(query), str) or not isinstance(query, str):
         raise RetrievalError("a memory query is text")
+    too_long = f"a memory query is at most {MAX_QUERY_BYTES} bytes"
+    if str.__len__(query) > MAX_QUERY_BYTES:
+        raise RetrievalError(too_long)
+    text = str.__str__(query)
     try:
-        size = len(query.encode())
+        size = len(text.encode())
     except UnicodeError:
         raise RetrievalError("a memory query is text") from None
     if size > MAX_QUERY_BYTES:
-        raise RetrievalError(f"a memory query is at most {MAX_QUERY_BYTES} bytes")
+        raise RetrievalError(too_long)
     terms: list[str] = []
-    for token in text_tokens(query):
+    for token in text_tokens(text):
         if len(token) <= MAX_TERM_CHARS and token not in terms:
             terms.append(token)
             if len(terms) == MAX_QUERY_TERMS:
@@ -766,12 +782,15 @@ class RetrievalMetrics:
 class ScoreProvenance:
     """How a hit's place was computed: never a reason it may be served.
 
-    ``score`` is Okapi BM25 over the store's own text of the record, its
-    statistics over the records the launch is served alone (:func:`_scores`),
-    so nothing the launch is not served moves it; a backend's own score and
-    rank are never used. ``backend`` names what found the record: the index
-    that answered, or the store's hot tail. ``generation`` and
-    ``indexed_through_seq`` (in the scope's sequence) are that index's.
+    ``score`` is Okapi BM25 (k1 1.2, b 0.75, Lucene's non-negative IDF)
+    over the store's own text of the record, its statistics (the record
+    count, each term's record count, the mean length) over every record
+    the launch is served and nothing else (:func:`_scores`), so nothing the
+    launch is not served moves it, nor which backend found the record; a
+    backend's own score and rank are never used. ``backend`` names what
+    found the record: the index that answered, or the store's hot tail.
+    ``generation`` and ``indexed_through_seq`` (in the scope's sequence)
+    are that index's.
     """
 
     backend: str
@@ -1127,33 +1146,43 @@ def _applicability(fact: MemoryFact) -> Applicability:
     )
 
 
-def _scores(found: dict[int, list[str]], terms: Sequence[str], corpus: int) -> dict[int, float]:
-    """Okapi BM25 of each found record's tokens for ``terms``, over the launch's records alone.
+def _scores(
+    found: Sequence[int], terms: Sequence[str], corpus: Mapping[int, Sequence[str]]
+) -> dict[int, float]:
+    """Okapi BM25 of each record of ``found`` for ``terms``, over the launch's corpus alone.
 
-    ``found`` holds the tokens of the store's own text of every record the
-    search found and the launch is served; ``corpus`` is how many records
-    the launch is served. A term's IDF is ``ln(1 + (N - n + 0.5) / (n +
-    0.5))``, with N that count and n the found records holding it (every
-    served record holding a query term is found, when the search is
-    complete); a record's length is normalized by the found records' mean.
-    k1 = 1.2 and b = 0.75. Nothing here counts a record the launch is not
-    served (another issue's, candidate's or environment's, retracted,
-    withheld or superseded), so none moves a score or a place.
+    ``corpus`` holds the tokens of the store's own text of every record the
+    launch is served, and ``found`` the ids of those the search found.
+    Every statistic is the corpus's, as Okapi BM25 defines them: N is how
+    many records it holds, a term's n how many of them hold it, and a
+    record's length is normalized by their mean length, ``avgdl`` (R6-F1
+    of PR #537: it was the found records' mean, which let a long record the
+    query does not match leave the order of the matches unmoved). A
+    term's IDF is the non-negative form Lucene uses, ``ln(1 + (N - n +
+    0.5) / (n + 0.5))``, not the Robertson-Spärck Jones weight, which is
+    negative for a term most records hold. k1 = 1.2 and b = 0.75, FTS5's.
+    Nothing here counts a record the launch is not served (another issue's,
+    candidate's or environment's, retracted, withheld or superseded), so
+    none moves a score or a place; nor does which backend found a record.
     """
-    if not found:
+    if not found or not corpus:
         return {}
-    held = {record: set(tokens) for record, tokens in found.items()}
+    held = {record: set(tokens) for record, tokens in corpus.items()}
     frequency = {t: sum(t in tokens for tokens in held.values()) for t in terms}
-    mean = math.fsum(len(tokens) for tokens in found.values()) / len(found)
+    size = len(corpus)
+    # Positive whenever a record is found, since it holds a query term; a
+    # corpus of empty texts alone has no length to normalize by.
+    avgdl = math.fsum(len(tokens) for tokens in corpus.values()) / size or 1.0
     scores = {}
-    for record, tokens in found.items():
+    for record in found:
+        tokens = corpus[record]
         counts = Counter(tokens)
-        norm = BM25_K1 * (1 - BM25_B + BM25_B * len(tokens) / mean)
+        norm = BM25_K1 * (1 - BM25_B + BM25_B * len(tokens) / avgdl)
         score = 0.0
         for term in terms:
             if tf := counts.get(term, 0):
                 n = frequency[term]
-                idf = math.log(1 + (corpus - n + 0.5) / (n + 0.5))
+                idf = math.log(1 + (size - n + 0.5) / (n + 0.5))
                 score += idf * tf * (BM25_K1 + 1) / (tf + norm)
         scores[record] = score
     return scores
@@ -1240,7 +1269,11 @@ class MemoryRetriever:
         opt-out: a row past it or a later launch ordinal, which no
         checkpoint from before the opt-out can have. Without that proof
         only the controller can say Memory is on again (:meth:`rebind`);
-        until it does, every read is refused (R5-F1 of PR #537).
+        until it does, every read of such a snapshot is refused, the
+        index's status, sync, rebuild and verify included (R5-F1 of PR
+        #537). The opted-out snapshot itself is read: those four still
+        answer from it, and search, fetch and catalog, which bind a launch,
+        refuse it as :func:`~autoforge.memory.bind_request` does (R6-F3).
 
         The very store object read last is that snapshot again: a store is
         never changed once made (a write makes a new one), and the
@@ -1719,11 +1752,11 @@ class MemoryRetriever:
         read, unsearched = tail_facts[: self.tail], max(len(tail_facts) - self.tail, 0)
         tail = [f.id for f in read if not wanted.isdisjoint(tokens(f.id))]
         # One ranking for what the index and the tail found, over the store's
-        # text and the launch's served records alone.
+        # text, its statistics over every record the launch is served.
         scores = _scores(
-            {record: tokens(record) for record in (*indexed, *tail)},
+            (*indexed, *tail),
             terms,
-            sum(scope.served(record) for record in scope.verdicts),
+            {f.id: tokens(f.id) for f in facts.values() if scope.served(f.id)},
         )
         ranked = sorted(scores, key=lambda record: (-scores[record], record))
         index_name = used.name if used is not None else TAIL_BACKEND

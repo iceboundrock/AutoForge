@@ -3,7 +3,9 @@
 import ast
 import hashlib
 import json
+import math
 import socket
+import tracemalloc
 from dataclasses import astuple, replace
 from pathlib import Path
 
@@ -463,6 +465,79 @@ def test_query_and_result_bounds_are_refused_or_kept():
     assert len(item.text.encode()) <= MAX_TEXT_BYTES and not item.text.endswith("[omitted]")
 
 
+class _HostileQuery(str):
+    """A query whose own methods are the caller's code: none may run."""
+
+    def __len__(self):
+        return 1
+
+    def __str__(self):
+        raise AssertionError("the query's own __str__ ran")
+
+    def __iter__(self):
+        raise AssertionError("the query's own __iter__ ran")
+
+    def encode(self, *args, **kwargs):
+        raise AssertionError("the query's own encode ran")
+
+    def isascii(self):
+        raise AssertionError("the query's own isascii ran")
+
+    def lower(self):
+        raise AssertionError("the query's own lower ran")
+
+
+class _ClaimsToBeText:
+    """Not a string, though ``isinstance`` would take its word for it."""
+
+    @property
+    def __class__(self):
+        raise AssertionError("the query's __class__ was read")
+
+
+def test_a_query_past_the_byte_bound_is_refused_before_it_is_encoded():
+    """R6-F2 of PR #537: a character is at least one byte, so a query of
+    more characters than the bound is refused before any copy of it is
+    made, and one within it is measured exactly in UTF-8. Only ``str``'s
+    own methods measure and read it, never a subclass's."""
+    huge = "é" * (1 << 20)  # 1 Mi characters, 2 MiB in UTF-8
+    tracing = tracemalloc.is_tracing()
+    if not tracing:
+        tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        before, _ = tracemalloc.get_traced_memory()
+        with pytest.raises(RetrievalError, match=f"at most {MAX_QUERY_BYTES} bytes"):
+            query_terms(huge)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        if not tracing:
+            tracemalloc.stop()
+    assert peak - before < 64 * 1024, peak - before  # its UTF-8 copy alone is 2 MiB
+    # A subclass that misreports its length is measured by str's own.
+    with pytest.raises(RetrievalError, match=f"at most {MAX_QUERY_BYTES} bytes"):
+        query_terms(_HostileQuery("x" * (1 << 20)))
+    assert query_terms(_HostileQuery("Tokenizer TRAILING tokenizer")) == ("tokenizer", "trailing")
+    assert query_terms(_HostileQuery("Éclair")) == ("eclair",)
+    # Exactly the bound, in characters and in bytes.
+    assert query_terms("x" * MAX_QUERY_BYTES) == ()  # one term, past MAX_TERM_CHARS
+    with pytest.raises(RetrievalError, match=f"at most {MAX_QUERY_BYTES} bytes"):
+        query_terms("x" * (MAX_QUERY_BYTES + 1))
+    # Within the bound in characters, past it in bytes: two bytes each.
+    accepted = "é " * (MAX_QUERY_BYTES // 3)
+    assert len(accepted.encode()) <= MAX_QUERY_BYTES and query_terms(accepted) == ("e",)
+    assert query_terms("é" * (MAX_QUERY_BYTES // 2)) == ()
+    over = "é" * (MAX_QUERY_BYTES // 2 + 1)
+    assert len(over) <= MAX_QUERY_BYTES < len(over.encode())
+    with pytest.raises(RetrievalError, match=f"at most {MAX_QUERY_BYTES} bytes"):
+        query_terms(over)
+    # A character UTF-8 cannot encode, and what only claims to be text.
+    with pytest.raises(RetrievalError, match="is text"):
+        query_terms("tokenizer \ud800")
+    with pytest.raises(RetrievalError, match="is text"):
+        query_terms(_ClaimsToBeText())
+
+
 def test_the_catalog_is_labels_and_counts_within_its_bound():
     w = Writer(empty())
     for kind in (Kind.HYPOTHESIS, Kind.NOTE, Kind.FAILED_APPROACH, Kind.CONSTRAINT, Kind.HANDOFF):
@@ -750,7 +825,8 @@ def test_an_older_snapshot_is_refused_even_where_the_index_watermark_matches_it(
         1,
         saved.revision,
     )
-    # A new process's retriever starts from whatever the checkpoint holds.
+    # A fresh retriever, as a new process would make, starts from whatever the
+    # checkpoint holds.
     fresh = retriever_for(Writer(saved))
     assert fresh.sync().indexed_through_seq == saved.revision
 
@@ -1870,10 +1946,14 @@ def test_a_checkpoint_from_before_an_opt_out_never_reopens_the_read_path():
     state.issue_memory = state.memory_setting(False)
     off = state.memory()
     assert (off.enabled, off.revision, off.launch_seq) == (False, w.store.revision, 128)
-    # Memory off: no launch is bound to read for, and the index is still told of.
-    with pytest.raises(StateError):
-        retriever.fetch_memory(REQ, record)
-    assert retriever.status().state is IndexState.CURRENT
+    # Memory off: no launch is bound to read for, so search, fetch and catalog
+    # refuse the disabled snapshot itself; the controller's index operations
+    # still read it (R6-F3 of PR #537).
+    for read in _every_read(retriever, record)[4:]:
+        with pytest.raises(StateError):
+            read()
+    for read in _every_read(retriever, record)[:4]:
+        assert read().state is IndexState.CURRENT
     # The checkpoint from before the opt-out: the same rows, the same ordinal.
     state.issue_memory = saved
     for read in _every_read(retriever, record):
@@ -1987,6 +2067,62 @@ def test_records_the_launch_is_not_served_move_no_hit_place_or_score():
     # The retracted and the withheld records are of the scope, if not served:
     # their changes are counted in its sequence, and nothing else of them is.
     assert retriever.search_memory(REQ, "zebra quokka").status.source_seq == 5
+
+
+def _okapi(tf, length, n, corpus, avgdl):
+    """Okapi BM25 of one term, written out: k1 = 1.2, b = 0.75, Lucene's IDF."""
+    idf = math.log(1 + (corpus - n + 0.5) / (n + 0.5))
+    return idf * tf * (1.2 + 1) / (tf + 1.2 * (1 - 0.75 + 0.75 * length / avgdl))
+
+
+def test_bm25_normalizes_lengths_by_every_record_the_launch_is_served():
+    """R6-F1 of PR #537: a record's length is normalized by the mean length
+    of the launch's whole corpus, its served records, not of the records
+    the query matched. A long record the query does not match raises that
+    mean, and so turns a short, one-mention record and a longer one that
+    says the term twice around; once it is retracted it counts no more."""
+    corpus = {1: ["zebra"], 2: ["zebra", "zebra", "a", "b", "c"]}
+    assert memory_retrieval._scores([1, 2], ["zebra"], corpus) == pytest.approx(
+        {1: _okapi(1, 1, 2, 2, 3.0), 2: _okapi(2, 5, 2, 2, 3.0)}
+    )
+    # The reviewer's check: a third, unmatched record of 30 tokens.
+    corpus[3] = [f"w{i}" for i in range(30)]
+    assert memory_retrieval._scores([1, 2], ["zebra"], corpus) == pytest.approx(
+        {1: _okapi(1, 1, 2, 3, 12.0), 2: _okapi(2, 5, 2, 3, 12.0)}
+    )
+    w = Writer(empty())
+    short = w.add("short", "Zebra.")
+    long_ = w.add("long", "Zebra zebra alpha beta gamma.")
+    retriever = retriever_for(w)
+    retriever.sync()
+
+    def told():
+        result = retriever.search_memory(REQ, "zebra")
+        assert result.complete
+        return [(h.id, h.provenance.score) for h in result.hits]
+
+    # The corpus is the two matches: lengths 1 and 5, a mean of 3.
+    two = [(short, 0.250692), (long_, 0.211109)]
+    assert two == [
+        (short, round(_okapi(1, 1, 2, 2, 3.0), 6)),
+        (long_, round(_okapi(2, 5, 2, 2, 3.0), 6)),
+    ]
+    assert told() == two
+    # A served record of 30 words, none of them the query's: N = 3 and a
+    # mean of 12, which the found records' own mean (3) would not move.
+    filler = w.add("filler", " ".join(f"word{i}" for i in range(30)))
+    assert len(text_tokens(w.store.text_of(filler))) == 30
+    three = [(long_, 0.77309), (short, 0.752006)]
+    assert three == [
+        (long_, round(_okapi(2, 5, 2, 3, 12.0), 6)),
+        (short, round(_okapi(1, 1, 2, 3, 12.0), 6)),
+    ]
+    assert told() == three  # the filler is the tail's, unsynced
+    retriever.sync()
+    assert told() == three  # and the index's
+    # Retracted, it is not served, and the corpus is the two matches again.
+    w.revise(Action.RETRACT, "filler")
+    assert told() == two
 
 
 def _sequences(retriever, w, request=REQ):

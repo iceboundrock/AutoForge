@@ -35,8 +35,8 @@ A failed rebuild keeps the index it would have replaced until the next
 sync makes it.
 The index, the hot tail and a query share one Unicode tokenizer, so a
 record in any script is found alike before and after the index syncs it.
-Where the interpreter's SQLite lacks FTS5, a search reads only the eight
-newest records and says it is degraded. LTSearch was evaluated as an
+Where the interpreter's SQLite lacks FTS5, a search looks for matches only
+in the eight newest records and says it is degraded. LTSearch was evaluated as an
 optional hybrid backend and is a no-go from its source: it has no license,
 its filters run after retrieval, and it needs three HTTP processes. The
 maintainer narrowed #324's LTSearch criterion to that source-based no-go:

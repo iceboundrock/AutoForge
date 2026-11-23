@@ -11,7 +11,9 @@ rates to zero and the quality figures to the values the fixture pins::
 corpus.json``) against the real store and the real FTS5 index under six
 conditions: the index synced, the index synced before the fixture's
 retractions, supersession and correction (stale, with and without the hot
-tail), no FTS5 at all, a fresh process's rebuild, and an empty store. Each
+tail), no FTS5 at all, a fresh retriever's rebuild from the checkpoint read
+back from its JSON (in this same process: it shows the rebuild is
+deterministic, not that a restart was observed), and an empty store. Each
 served hit is checked against an oracle derived from the fixture's own
 declarations, never from :meth:`MemoryStore.visibility`, so a stale or
 permission leak is counted however the code decides.
@@ -301,7 +303,9 @@ def correctness(fixture: dict | None = None) -> dict:
     no_index.sync()
     report["no_fts5"] = _condition(world, no_index)
 
-    # A new process: the checkpoint read back from its JSON, the index rebuilt.
+    # A fresh retriever over the checkpoint read back from its JSON, its index
+    # rebuilt, in this same process: what a new process would start from,
+    # though no other interpreter is started (R6-F4 of PR #537).
     reloaded = MemoryStore(repo, run, LAUNCH_SEQ, json.loads(json.dumps(world.store.encode())))
     rebuilt = MemoryRetriever(repo, run, lambda: reloaded)
     rebuilt.rebuild()

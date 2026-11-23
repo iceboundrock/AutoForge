@@ -174,15 +174,27 @@ checkpoint from before an opt-out continues the opted-out one row for row,
 at the same ordinal. The fifth review round found a retriever that refused
 the opted-out snapshot (no launch binds with Memory off) and then read the
 older one again and served its records. The retriever now keeps whether
-Memory was on in the newest snapshot it read. After it reads an opt-out, a
-snapshot with Memory on is read only with proof that it is newer than the
-opt-out: a row past it or a later launch ordinal, which no checkpoint from
-before the opt-out can have. Without that proof every read is refused
-(`RetrievalError`) until the controller calls `MemoryRetriever.rebind()`,
-once it has turned Memory on itself. The controller's own opt-in gives back
-the very value the checkpoint from before the opt-out held, so only the
-controller can tell the two apart. A rebind still requires a snapshot that
-continues the newest one read, with Memory on
+Memory was on in the newest snapshot it read, and two snapshots are refused,
+differently:
+
+- **The opted-out snapshot itself**, Memory off, binds no launch, so
+  search, fetch and catalog refuse it (`StateError`, from `bind_request`).
+  The controller's own operations on the index, `status()`, `sync()`,
+  `rebuild()` and `verify()`, still read it, since they serve no record:
+  they report on the index and keep it, and the regression checks that
+  they do.
+- **A snapshot with Memory on that nothing proves newer than the
+  opt-out.** After the retriever has read an opt-out, such a snapshot is
+  read only with that proof: a row past the opt-out or a later launch
+  ordinal, which no checkpoint from before the opt-out can have. Without
+  it, every operation refuses it, the four above included
+  (`RetrievalError`), until the controller calls
+  `MemoryRetriever.rebind()`, once it has turned Memory on itself.
+
+The controller's own opt-in gives back the very value the checkpoint from
+before the opt-out held, so only the controller can tell the two apart. A
+rebind still requires a snapshot that continues the newest one read, with
+Memory on
 (`test_a_checkpoint_from_before_an_opt_out_never_reopens_the_read_path`,
 `test_a_snapshot_proven_newer_than_an_opt_out_is_read_without_a_rebind`).
 
@@ -267,16 +279,36 @@ counts the issue's inapplicable records in its header.
 
 ### One ranking, over the records the launch is served
 
-A hit's place is Okapi BM25 over the store's own text of the records the
-search found, with k1 = 1.2 and b = 0.75 (FTS5's constants). A term's IDF
-is ln(1 + (N − n + 0.5) / (n + 0.5)). N is the number of records the launch
-is served, and n is the number of found records holding the term: every
-served record holding a query term is found, when the search is complete.
-Lengths are normalized by the found records' mean. Ties go to the lower id.
-The index's and the tail's records are scored by this one function, so a
-record's place does not depend on whether the index has synced it. With
-the tail on, a stale index ranks every query of the pinned fixture exactly
-as the synced index does.
+A hit's place is Okapi BM25 (Robertson and others, "Okapi at TREC-3")
+over the store's own text of the records the search found, with k1 = 1.2
+and b = 0.75 (FTS5's constants). Its statistics are the launch's corpus:
+every record the launch is served, and nothing else. N is how many records
+that is, a term's n is how many of them hold it, and a record's length is
+normalized by their mean length (avgdl). A term's IDF is the non-negative
+form Lucene uses, ln(1 + (N − n + 0.5) / (n + 0.5)), rather than the
+Robertson–Spärck Jones weight ln((N − n + 0.5) / (n + 0.5)), which is
+negative for a term more than half the records hold. Ties go to the lower
+id. The index's and the tail's records are scored by this one function,
+over one corpus whichever of them found a record, so a record's place does
+not depend on whether the index has synced it. With the tail on, a stale
+index ranks every query of the pinned fixture exactly as the synced index
+does.
+
+The sixth review round found the lengths normalized by the mean of the
+records the search found, not of the corpus, so a long record the query
+does not match left the matches' order as it was. Of two records of one
+word and of five, holding the term once and twice, the shorter ranks
+first; a served record of 30 words that does not hold it raises the mean
+from 3 to 12, and the longer then ranks first, as Okapi BM25 orders them.
+The regression holds each score to the formula written out, through the
+index and through the tail, and the first order again once the long record
+is retracted
+(`test_bm25_normalizes_lengths_by_every_record_the_launch_is_served`). The
+corpus is at most Memory's 64 records, and a search at a synced index
+already reads the text of every one the index has seen, for the coverage
+check. On the pinned fixture the change moved one pair of places: in the
+no-FTS5 condition, the third and fourth hits of one query traded places;
+every figure of the table below is as it was.
 
 *Rejected: FTS5's own `bm25()`.* Its statistics are over the issue's whole
 table, which also holds the issue's records of other candidates and
@@ -425,8 +457,10 @@ of its own in D10.
 FTS5 is a compile-time option of the SQLite library an interpreter links,
 so a supported interpreter may lack it (ADR 0015 D10). `fts5_available()`
 probes for it. Without it, the backend reports `unavailable`
-(`fts5-unavailable`). A search then reads only the hot tail, which with no
-index is the scope's eight newest current records. It is `degraded`, and
+(`fts5-unavailable`). A search then looks for matches only in the hot
+tail, which with no index is the scope's eight newest current records
+(its ranking's statistics are still those of every record the launch is
+served, as at every search). It is `degraded`, and
 `complete` only when the scope has no more current records than that. The
 excerpts still pass the store's check. Nothing broader is ever read, and no
 launch fails for it, since none uses retrieval. `doctor` has no row for it,
