@@ -1578,8 +1578,10 @@ credential, not the object. A redirect, a certificate that does not verify,
 a reply that is not one `application/json` object within the bound, or an
 answer naming another object is a conclusive `GitHubError`. The phase
 blocks on any conclusive failure with nothing sent again, except in K7
-(below). No message quotes the reply; an error reply is read only to tell a
-rate limit from a refusal.
+(below). No message quotes the reply, not even a header of it (a
+Content-Type that is not JSON is named as such, never repeated), nor the
+text of an `http.client` failure, which can quote the server's status
+line; an error reply is read only to tell a rate limit from a refusal.
 
 **When it runs, and what stays strict.** In a create's completion
 read-back (K2 implementation PR, K4 review comment, K5 follow-up issue,
@@ -1734,6 +1736,20 @@ the remedy; `WARN` on a transient one (no connection, a timeout, a 5xx, a
 rate limit), naming the proxy variables, since a host where `gh` works
 through a proxy but this direct read does not would otherwise find out
 only when a read-back needs it.
+
+The row shows nothing anyone but the controller wrote (R1-F1 of PR #539).
+`probe_exact_read` returns the failure as a `github.ExactReadFailure`:
+its class, a cause built from the controller's own words and numbers (an
+HTTP status, `gh auth token`'s exit code, the transport failure's classes
+and errno name, the status a proxy refused the tunnel with) and a fixed
+remedy. The row shows those alone. A response header or body, a proxy's
+reason phrase, a certificate error's text and `gh`'s stderr can hold a
+credential of any shape, and redaction recognizes only the shapes it
+knows, so they never reach the row, redacted or not. The operator reads
+`gh`'s own words by running the commands the remedy names. The exact read
+of a read-back keeps `gh`'s stderr and the transport's message, redacted
+and bounded, in the reason it raises, as before; the reply's headers and
+an `http.client` failure's text stay out of it too.
 
 **Troubleshooting.** A create that blocks with *"… carries its identity
 but is not the object the controller intended (another body, title, head

@@ -69,6 +69,8 @@ then one ``GET https://api.github.com/rate_limit`` through
 :func:`autoforge.github.https_get` with it, never showing the reply. It
 catches a host where `gh` works but that direct read does not (a proxy,
 a trust store, a token the REST API refuses) before a read-back needs it.
+A failure is shown in the controller's own words and numbers only: no
+header, body, proxy text or `gh` stderr reaches the row.
 
 Every run shows the parallel EPIC scheduler's settings (``scheduler.*``,
 bounded by the configuration loader). ``doctor --epic <url>`` adds the
@@ -130,6 +132,7 @@ from .executor import (
     orphan_containment_available,
 )
 from .github import (
+    EXACT_READ_PROBE_WHAT,
     EXACT_READ_ROOT,
     GH_MIN_VERSION,
     GitHubClient,
@@ -985,6 +988,15 @@ class Doctor:
         transient failure (no connection, a timeout, a 5xx or a rate limit)
         WARNs: it may pass on the next run, and if it does not, the proxy or
         the network between this machine and the API is to check.
+
+        The row shows the failure's :meth:`~autoforge.github.ExactReadFailure.
+        summary` and nothing else of it: the controller's own words and
+        numbers (an HTTP status, an exit code, a transport failure's class
+        and errno name). It never shows a response header or body, a
+        proxy's text or `gh`'s stderr, whatever they hold, so no credential
+        in them reaches the row whether or not redaction would recognize it
+        (R1-F1 of PR #539). The operator reads `gh`'s own words by running
+        the commands the remedy names.
         """
         name = EXACT_READ_ROW
         client = GitHubClient(
@@ -995,38 +1007,35 @@ class Doctor:
             https=self._https,
         )
         try:
-            client.probe_exact_read()
+            failure = client.probe_exact_read()
         except ExecutionError as exc:
             return _gh_not_started(name, exc)
-        except GitHubCredentialError as exc:
-            return CheckResult(name, False, redact(f"no credential GitHub accepts: {exc}"))
-        except GitHubUnavailableError as exc:
+        if failure is None:
             return CheckResult(
                 name,
-                False,
-                redact(
-                    f"{EXACT_READ_ROOT} could not be read over HTTPS from this machine ({exc}); "
-                    "run doctor again, and if it persists while `gh` works, check the proxy "
-                    "variables (HTTPS_PROXY, NO_PROXY) and the network path to the API: a "
-                    "read-back that needs this read would stop until it works"
-                ),
-                required=False,
+                True,
+                f"`gh auth token` printed a token and {EXACT_READ_ROOT} answered with it over "
+                "verified HTTPS (the token and the reply are not shown)",
             )
-        except GitHubError as exc:
+        summary = failure.summary(EXACT_READ_PROBE_WHAT)
+        if issubclass(failure.error, GitHubCredentialError):
+            return CheckResult(name, False, f"no credential GitHub accepts: {summary}")
+        if issubclass(failure.error, GitHubUnavailableError):
             return CheckResult(
                 name,
                 False,
-                redact(
-                    f"{exc}; a read-back that needs this read would block. A certificate that "
-                    "does not verify means this machine's trust store does not hold the CA of "
-                    "whatever answered (a TLS-inspecting proxy, for one)"
-                ),
+                f"{EXACT_READ_ROOT} could not be read over HTTPS from this machine ({summary}); "
+                "run doctor again, and if it persists while `gh` works, check the proxy "
+                "variables (HTTPS_PROXY, NO_PROXY) and the network path to the API: a "
+                "read-back that needs this read would stop until it works",
+                required=False,
             )
         return CheckResult(
             name,
-            True,
-            f"`gh auth token` printed a token and {EXACT_READ_ROOT} answered with it over "
-            "verified HTTPS (the token and the reply are not shown)",
+            False,
+            f"{summary}; a read-back that needs this read would block. A certificate that "
+            "does not verify means this machine's trust store does not hold the CA of "
+            "whatever answered (a TLS-inspecting proxy, for one)",
         )
 
     def sandbox_checks(self) -> list[CheckResult]:

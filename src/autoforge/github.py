@@ -40,6 +40,7 @@ started, and nothing it is asked here needs a local repository.
 
 from __future__ import annotations
 
+import errno
 import functools
 import http.client
 import io
@@ -796,6 +797,12 @@ EXACT_READ_CREDENTIAL_REMEDY = (
 # The endpoint `doctor` reads to prove the exact read works (#329): it names no
 # repository, and GitHub does not count it against the rate limit.
 EXACT_READ_PROBE_PATH = "rate_limit"
+# What the probe's failures name as the read that failed.
+EXACT_READ_PROBE_WHAT = "exact read probe (GET /rate_limit)"
+# The status a proxy refused a tunnel with: `http.client` raises the refusal as
+# ``OSError("Tunnel connection failed: <status> <the proxy's reason phrase>")``.
+# Only the three digits are taken; the reason phrase is the proxy's own text.
+_TUNNEL_REFUSED_RE = re.compile(r"Tunnel connection failed: ([1-5][0-9]{2})(?![0-9])")
 
 
 # What `gh` prints of a text, without reading it again: the sanitizer's rewrites are
@@ -1032,22 +1039,103 @@ def https_get(request: HttpsRequest) -> HttpsReply:
             return HttpsReply(exc.code, headers, body)
 
 
-def _exact_transport_failure(exc: Exception, what: str) -> GitHubError:
+@dataclass(frozen=True)
+class ExactReadFailure:
+    """Why one exact read failed, as classified before it is raised (#329).
+
+    ``error`` is the class the read raises, which is its classification.
+    ``cause`` says what failed in the controller's own words and numbers
+    alone: an HTTP status, an exit code, a timeout, a transport failure's
+    class and errno name, a proxy's tunnel status. It never holds text that
+    GitHub, a proxy or `gh` sent: no header, body, reason phrase or stderr.
+    So it is safe to show without recognizing any credential format in it.
+    ``remedy`` is fixed text naming what to check. ``detail`` is the rest,
+    redacted and bounded: `gh`'s stderr, the transport's own message. Only
+    :meth:`error_for` adds it, for the controller's reasons and the run log.
+    ``doctor`` shows :meth:`summary`, never ``detail``
+    (:meth:`GitHubClient.probe_exact_read`).
+    """
+
+    error: type[GitHubError]
+    cause: str
+    remedy: str = ""
+    detail: str = field(default="", repr=False)
+
+    def summary(self, what: str) -> str:
+        """``what``, the cause and the remedy: nothing anyone but the controller wrote."""
+        remedy = f"; {self.remedy}" if self.remedy else ""
+        return f"{what}: {self.cause}{remedy}"
+
+    def error_for(self, what: str) -> GitHubError:
+        """The exception the exact read raises: the summary with the redacted detail."""
+        detail = f": {self.detail}" if self.detail else ""
+        remedy = f"; {self.remedy}" if self.remedy else ""
+        return self.error(f"{what}: {self.cause}{detail}{remedy}")
+
+
+class _ExactReadFailed(Exception):
+    """Carries an :class:`ExactReadFailure` out of the exact read's steps.
+
+    Raised and caught inside :class:`GitHubClient` alone: :meth:`GitHubClient.
+    _exact_object` raises the failure's :meth:`ExactReadFailure.error_for`,
+    and :meth:`GitHubClient.probe_exact_read` returns it.
+    """
+
+    def __init__(self, failure: ExactReadFailure) -> None:
+        super().__init__(failure.cause)
+        self.failure = failure
+
+
+def _transport_cause(exc: BaseException) -> str:
+    """A transport failure in the controller's words: its classes, an errno's name and a
+    tunnel's status. Never its message, which can quote what a proxy or server sent
+    (a reason phrase, a status line)."""
+    names = [type(exc).__name__]
+    inner = exc
+    if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, BaseException):
+        inner = exc.reason
+        names.append(type(inner).__name__)
+    code = getattr(inner, "errno", None)
+    if isinstance(code, int) and code in errno.errorcode:
+        names.append(errno.errorcode[code])
+    tunnel = _TUNNEL_REFUSED_RE.match(str(inner)) if type(inner) is OSError else None
+    if tunnel:
+        names.append(f"the proxy refused the tunnel with HTTP {tunnel.group(1)}")
+    return ", ".join(names)
+
+
+def _exact_transport_failure(exc: Exception) -> ExactReadFailure:
     """What a failure the exact read's transport raised means; no reply was read.
 
     A certificate that does not verify is conclusive (whoever answered is
     not known to be GitHub); a connection that failed or broke is
-    inconclusive, as `gh`'s own are; anything else is conclusive.
+    inconclusive, as `gh`'s own are; anything else is conclusive. The
+    exception's text, redacted and bounded, is the failure's ``detail``
+    alone, and not even that for an ``http.client.HTTPException``, whose
+    text can quote what the server sent (``BadStatusLine`` its status line).
     """
     reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
     if isinstance(reason, ssl.SSLCertVerificationError):
-        return GitHubError(
-            f"{what}: the TLS certificate did not verify ({redact(str(reason)):.200})"
+        code = getattr(reason, "verify_code", None)
+        verify = f" (OpenSSL verify code {code})" if isinstance(code, int) else ""
+        return ExactReadFailure(
+            GitHubError,
+            f"the TLS certificate did not verify{verify}",
+            detail=f"{redact(str(reason)):.200}",
         )
-    detail = f"{type(exc).__name__}: {redact(str(exc)):.200}"
+    quotes_reply = isinstance(exc, http.client.HTTPException) or isinstance(
+        reason, http.client.HTTPException
+    )
+    detail = "" if quotes_reply else f"{redact(str(exc)):.200}"
     if isinstance(exc, (OSError, http.client.HTTPException)):
-        return GitHubUnavailableError(f"{what}: GitHub could not be read ({detail})")
-    return GitHubError(f"{what}: the exact read failed ({detail})")
+        return ExactReadFailure(
+            GitHubUnavailableError,
+            f"GitHub could not be read ({_transport_cause(exc)})",
+            detail=detail,
+        )
+    return ExactReadFailure(
+        GitHubError, f"the exact read failed ({_transport_cause(exc)})", detail=detail
+    )
 
 
 # The PR identity read (:meth:`GitHubClient.get_pr`): everything a caller
@@ -2126,31 +2214,42 @@ class GitHubClient:
                 )
         return [item for page in data for item in page]
 
-    def _api_token(self, what: str) -> str:
+    def _api_token(self) -> str:
         """The credential `gh` holds for github.com, for one exact read.
 
         ``gh auth token`` prints the token `gh` itself would send (``GH_TOKEN``
         or ``GITHUB_TOKEN`` when set, else the login's). It stays in memory for
-        the one request: never in argv, a file or a message. A failure names
-        the command and `gh`'s redacted stderr, never what it printed. A
-        timeout or a transient exit is GitHubUnavailableError; any other
-        exit, or a print that is not one visible token, is
+        the one request: never in argv, a file or a message. A failure raises
+        :class:`_ExactReadFailed`: its cause names the command and its exit
+        code, its detail `gh`'s redacted stderr, and nothing names what it
+        printed. A timeout or a transient exit is GitHubUnavailableError;
+        any other exit, or a print that is not one visible token, is
         GitHubCredentialError (#329).
         """
         args = ["auth", "token", "--hostname", "github.com"]
         res = self._invoke(args)
         if res.timed_out:
-            raise GitHubUnavailableError(f"{what}: {self._timeout_message(args)}")
+            raise _ExactReadFailed(
+                ExactReadFailure(GitHubUnavailableError, self._timeout_message(args))
+            )
         if res.exit_code != 0:
-            message, transient = self._exit_failure(args, res)
-            if transient:
-                raise GitHubUnavailableError(f"{what}: {message}")
-            raise GitHubCredentialError(f"{what}: {message}; {EXACT_READ_CREDENTIAL_REMEDY}")
+            _, transient = self._exit_failure(args, res)
+            raise _ExactReadFailed(
+                ExactReadFailure(
+                    GitHubUnavailableError if transient else GitHubCredentialError,
+                    f"`gh {' '.join(args)}` failed (exit {res.exit_code})",
+                    remedy="" if transient else EXACT_READ_CREDENTIAL_REMEDY,
+                    detail=redact(res.stderr.strip()[-1000:]),
+                )
+            )
         token = "" if res.truncated else res.stdout.strip()
         if not _API_TOKEN_RE.fullmatch(token):
-            raise GitHubCredentialError(
-                f"{what}: `gh auth token` printed no usable credential; "
-                f"{EXACT_READ_CREDENTIAL_REMEDY}"
+            raise _ExactReadFailed(
+                ExactReadFailure(
+                    GitHubCredentialError,
+                    "`gh auth token` printed no usable credential",
+                    remedy=EXACT_READ_CREDENTIAL_REMEDY,
+                )
             )
         return token
 
@@ -2158,32 +2257,47 @@ class GitHubClient:
         """One REST object as GitHub holds it, past `gh`'s sanitizer (the exact read).
 
         ``path`` is relative to :data:`EXACT_READ_ROOT`, built by a typed
-        caller from a parsed URL (or :data:`EXACT_READ_PROBE_PATH`), so the
-        read reaches GitHub's API and nothing else. It sends one GET with the
-        credential `gh` holds, follows no redirect and reads a bounded reply.
-        Failures are classified as `gh`'s are: no connection, a 5xx, a 429 or
-        a rate-limited 403 (by its headers or GitHub's message) is
-        GitHubUnavailableError (inconclusive), a 404 GitHubNotFoundError
-        (which :meth:`_exact_reread` reads as inconclusive), a credential
-        `gh auth token` cannot print, a 401 or any other 403
-        GitHubCredentialError, and any other status, a redirect, a
-        certificate that does not verify, or a reply that is not one JSON
-        object within the bound a conclusive GitHubError. No message quotes
-        the reply.
+        caller from a parsed URL, so the read reaches GitHub's API and
+        nothing else. A failure raises its :class:`ExactReadFailure`'s
+        exception (:meth:`_exact_attempt`), named by ``what``.
+        """
+        try:
+            return self._exact_attempt(path)
+        except _ExactReadFailed as exc:
+            raise exc.failure.error_for(what) from None
+
+    def _exact_attempt(self, path: str) -> dict:
+        """One GET of the exact read; a failure raises :class:`_ExactReadFailed`.
+
+        It sends one GET with the credential `gh` holds, follows no redirect
+        and reads a bounded reply. Failures are classified as `gh`'s are: no
+        connection, a 5xx, a 429 or a rate-limited 403 (by its headers or
+        GitHub's message) is GitHubUnavailableError (inconclusive), a 404
+        GitHubNotFoundError (which :meth:`_exact_reread` reads as
+        inconclusive), a credential `gh auth token` cannot print, a 401 or
+        any other 403 GitHubCredentialError, and any other status, a
+        redirect, a certificate that does not verify, or a reply that is not
+        one JSON object within the bound a conclusive GitHubError. No
+        failure quotes the reply, not even a header of it: a cause is built
+        from the status and fixed words alone.
         """
         assert_shared_git_lock_free("call GitHub")
         # The credential goes straight into the request, whose repr leaves the
         # headers out: no local of this frame holds it on its own.
         request = HttpsRequest(
             url=EXACT_READ_ROOT + path,
-            headers=(*_EXACT_READ_HEADERS, ("Authorization", "Bearer " + self._api_token(what))),
+            headers=(*_EXACT_READ_HEADERS, ("Authorization", "Bearer " + self._api_token())),
             timeout_seconds=self.timeout_seconds,
             max_bytes=EXACT_READ_MAX_BYTES,
         )
         try:
             reply = self._https(request)
         except Exception as exc:  # every transport failure is classified, none escapes
-            raise _exact_transport_failure(exc, what) from None
+            raise _ExactReadFailed(_exact_transport_failure(exc)) from None
+
+        def failed(error: type[GitHubError], cause: str, remedy: str = "") -> NoReturn:
+            raise _ExactReadFailed(ExactReadFailure(error, cause, remedy=remedy))
+
         status = reply.status
         # A primary limit sends its headers; a secondary limit may send neither,
         # only GitHub's message, which is read for this and never quoted.
@@ -2193,30 +2307,32 @@ class GitHubClient:
             or b"rate limit" in reply.body[:EXACT_READ_ERROR_BYTES].lower()
         )
         if status >= 500 or status == 429 or (status == 403 and rate_limited):
-            raise GitHubUnavailableError(f"{what}: GitHub answered HTTP {status}")
+            failed(GitHubUnavailableError, f"GitHub answered HTTP {status}")
         if status == 404:
-            raise GitHubNotFoundError(f"{what}: GitHub answered HTTP 404")
+            failed(GitHubNotFoundError, "GitHub answered HTTP 404")
         if status in (401, 403):
             # A 403 that is a rate limit was classified above: what is left is
             # the credential refused (a bad or expired token, a scope or SSO
             # authorization it lacks), not the object (#329).
-            raise GitHubCredentialError(
-                f"{what}: GitHub answered HTTP {status}; {EXACT_READ_CREDENTIAL_REMEDY}"
+            failed(
+                GitHubCredentialError,
+                f"GitHub answered HTTP {status}",
+                remedy=EXACT_READ_CREDENTIAL_REMEDY,
             )
         if status != 200:
             redirect = " (a redirect, which is never followed)" if 300 <= status < 400 else ""
-            raise GitHubError(f"{what}: GitHub answered HTTP {status}{redirect}")
-        content_type = reply.headers.get("content-type", "")
-        if not _JSON_CONTENT_TYPE_RE.match(content_type):
-            raise GitHubError(f"{what}: GitHub answered {content_type[:80]!r}, not JSON")
+            failed(GitHubError, f"GitHub answered HTTP {status}{redirect}")
+        # The header is matched, never quoted: whoever answered wrote it (R1-F1 of PR #539).
+        if not _JSON_CONTENT_TYPE_RE.match(reply.headers.get("content-type", "")):
+            failed(GitHubError, "the reply's Content-Type is not JSON (application/json)")
         if len(reply.body) > EXACT_READ_MAX_BYTES:
-            raise GitHubError(f"{what}: the reply is over {EXACT_READ_MAX_BYTES} bytes")
+            failed(GitHubError, f"the reply is over {EXACT_READ_MAX_BYTES} bytes")
         try:
             data = json.loads(reply.body.decode("utf-8"))
         except ValueError:
-            raise GitHubError(f"{what}: the reply is not UTF-8 JSON") from None
+            failed(GitHubError, "the reply is not UTF-8 JSON")
         if not isinstance(data, dict):
-            raise GitHubError(f"{what}: the reply is not a JSON object")
+            failed(GitHubError, "the reply is not a JSON object")
         return data
 
     def _exact_reread(self, path: str, what: str) -> dict:
@@ -2254,16 +2370,23 @@ class GitHubClient:
             raise last
         raise GitHubUnavailableError(f"{last} (read {attempts} times)")
 
-    def probe_exact_read(self) -> None:
+    def probe_exact_read(self) -> ExactReadFailure | None:
         """Whether the exact read can work from this machine: one GET of GitHub's rate limit.
 
         ``doctor``'s row (#329). The same credential, transport, bounds and
-        classification as an exact read (:meth:`_exact_object`), on
-        :data:`EXACT_READ_PROBE_PATH`, which names no repository. Returns
-        nothing: the reply is checked to be one JSON object and dropped,
-        never shown; a failure raises as the exact read's does. Read-only.
+        classification as an exact read (:meth:`_exact_attempt`), on
+        :data:`EXACT_READ_PROBE_PATH`, which names no repository, read once.
+        ``None`` when GitHub answered one JSON object, which is dropped,
+        never shown; else the :class:`ExactReadFailure`, for the row to
+        show its :meth:`~ExactReadFailure.summary`, which holds nothing
+        GitHub, a proxy or `gh` sent (R1-F1 of PR #539). A `gh` that cannot
+        be started raises ExecutionError. Read-only.
         """
-        self._exact_object(EXACT_READ_PROBE_PATH, "exact read probe (GET /rate_limit)")
+        try:
+            self._exact_attempt(EXACT_READ_PROBE_PATH)
+        except _ExactReadFailed as exc:
+            return exc.failure
+        return None
 
     # -- environment / doctor --------------------------------------------
     def version(self) -> str:
@@ -3689,6 +3812,7 @@ __all__ = [
     "EXACT_READ_ERROR_BYTES",
     "EXACT_READ_MAX_BYTES",
     "EXACT_READ_PROBE_PATH",
+    "EXACT_READ_PROBE_WHAT",
     "EXACT_READ_ROOT",
     "MAX_BODY_CHARS",
     "MAX_TITLE_CHARS",
@@ -3697,6 +3821,7 @@ __all__ = [
     "CommentInfo",
     "CommitPerson",
     "CreatedObject",
+    "ExactReadFailure",
     "GitHubClient",
     "GitHubIssueRef",
     "GitHubPullRequestRef",

@@ -1567,7 +1567,7 @@ def test_the_exact_read_row_makes_one_get_of_the_rate_limit_and_shows_neither_to
         (
             {"gh_token": (1, "You are not logged into any GitHub hosts. Run gh auth login")},
             None,
-            "not logged",
+            "`gh auth token --hostname github.com` failed (exit 1)",
         ),
         ({"gh_token": "gho_one gho_two"}, None, "printed no usable credential"),
         ({}, HttpsReply(401, {"content-type": "application/json"}, _REPLY_SECRET), "HTTP 401"),
@@ -1597,7 +1597,7 @@ def test_the_exact_read_row_fails_a_credential_github_does_not_accept_with_its_r
     assert needle in row.detail and "no credential GitHub accepts" in row.detail
     assert "gh auth token --hostname github.com" in row.detail
     assert len(gets) == (0 if "gh_token" in kwargs else 1)
-    assert "SAML" not in row.detail
+    assert "SAML" not in row.detail and "not logged" not in row.detail
     _no_secret_in(row)
 
 
@@ -1647,6 +1647,108 @@ def test_the_exact_read_row_fails_any_other_conclusive_answer_without_quoting_it
     assert not row.ok and row.required and row.label == "FAIL"
     assert needle in row.detail and "would block" in row.detail
     assert "elsewhere.example" not in row.detail
+    _no_secret_in(row)
+
+
+# A value no redaction pattern recognizes (R1-F1 of PR #539): a proxy, a server or `gh`
+# may echo a credential in any shape, so only never quoting what they sent keeps it out.
+_ECHOED = "zq7-synthetic-echo-4f19c2-not-a-known-format"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "reply", "raises", "label", "cause"),
+    [
+        (
+            {},
+            HttpsReply(200, {"content-type": f"text/plain; echo={_ECHOED}"}, b"{}"),
+            None,
+            "FAIL",
+            "the reply's Content-Type is not JSON (application/json)",
+        ),
+        (
+            {},
+            # The answer echoes the very token the request sent, too.
+            HttpsReply(
+                200,
+                {"content-type": f"application/{_ECHOED}; t={EXACT_READ_TOKEN}"},
+                _REPLY_SECRET,
+            ),
+            None,
+            "FAIL",
+            "the reply's Content-Type is not JSON (application/json)",
+        ),
+        (
+            {},
+            HttpsReply(
+                401,
+                {"content-type": "application/json", "www-authenticate": f"Bearer {_ECHOED}"},
+                f'{{"message": "{_ECHOED}"}}'.encode(),
+            ),
+            None,
+            "FAIL",
+            "GitHub answered HTTP 401",
+        ),
+        (
+            {"gh_token": (1, f"failed to read the token from the keyring: {_ECHOED}")},
+            None,
+            None,
+            "FAIL",
+            "`gh auth token --hostname github.com` failed (exit 1)",
+        ),
+        (
+            {"gh_token": (1, f"HTTP 503: Service Unavailable {_ECHOED}")},
+            None,
+            None,
+            "WARN",
+            "`gh auth token --hostname github.com` failed (exit 1)",
+        ),
+        (
+            {},
+            None,
+            urllib.error.URLError(OSError(f"Tunnel connection failed: 407 {_ECHOED}")),
+            "WARN",
+            "GitHub could not be read (URLError, OSError, the proxy refused the tunnel with "
+            "HTTP 407)",
+        ),
+        (
+            {},
+            None,
+            urllib.error.URLError(ssl.SSLCertVerificationError(1, _ECHOED)),
+            "FAIL",
+            "the TLS certificate did not verify",
+        ),
+    ],
+    ids=[
+        "content-type",
+        "content-type-subtype",
+        "401-headers",
+        "token-stderr",
+        "token-stderr-transient",
+        "proxy-reason-phrase",
+        "certificate",
+    ],
+)
+def test_the_exact_read_row_never_shows_what_github_a_proxy_or_gh_sent(
+    tmp_path, kwargs, reply, raises, label, cause
+):
+    """R1-F1 of PR #539: a stand-in answer echoed a credential in its Content-Type, and
+    the row repeated it; `gh auth token`'s stderr was repeated too, redacted, which
+    misses a credential of a shape it does not know. The row now holds the controller's
+    own words and numbers alone (the status, the exit code, the transport's classes, a
+    proxy's tunnel status) and keeps the classification and the remedy."""
+    assert redact(_ECHOED) == _ECHOED  # nothing but not quoting it helps
+    row, _, _ = _exact_read(tmp_path, reply, raises=raises, **kwargs)
+
+    assert not row.ok and row.label == label
+    assert f"exact read probe (GET /rate_limit): {cause}" in row.detail
+    assert _ECHOED not in row.detail
+    if label == "WARN":
+        assert "HTTPS_PROXY" in row.detail
+    elif (reply is not None and reply.status == 401) or "gh_token" in kwargs:
+        assert "no credential GitHub accepts" in row.detail
+        assert "gh auth token --hostname github.com` must work" in row.detail
+    else:
+        assert "would block" in row.detail
     _no_secret_in(row)
 
 

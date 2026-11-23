@@ -32,6 +32,7 @@ from autoforge.github import (
     EXACT_READ_CREDENTIAL_REMEDY,
     EXACT_READ_ERROR_BYTES,
     EXACT_READ_MAX_BYTES,
+    EXACT_READ_PROBE_WHAT,
     EXACT_READ_ROOT,
     GH_WORKDIR_PREFIX,
     MAX_BODY_CHARS,
@@ -40,6 +41,7 @@ from autoforge.github import (
     STRICT_PR_LIST_LIMIT,
     ActionsRunRef,
     ChangedFile,
+    ExactReadFailure,
     GitHubClient,
     HttpsReply,
     HttpsRequest,
@@ -52,6 +54,7 @@ from autoforge.github import (
     is_plan_limited_gh_failure,
     parse_actions_run_url,
 )
+from autoforge.redaction import redact
 from autoforge.validation import parse_pr_url
 from tests.conftest import (
     gh_sanitized,
@@ -4330,7 +4333,7 @@ def test_an_exact_read_answered_with_another_object_is_conclusive(read, url, row
     [
         (urllib.error.URLError(ConnectionRefusedError(111, "refused")), GitHubUnavailableError, ""),
         (TimeoutError("timed out"), GitHubUnavailableError, "timed out"),
-        (http.client.RemoteDisconnected("closed"), GitHubUnavailableError, "closed"),
+        (http.client.RemoteDisconnected("closed"), GitHubUnavailableError, "RemoteDisconnected"),
         (
             urllib.error.URLError(ssl.SSLCertVerificationError(1, "self-signed certificate")),
             GitHubError,
@@ -4468,7 +4471,8 @@ def test_an_exact_read_never_reads_a_conclusive_answer_again(reply, expected):
 
 def test_the_exact_read_probe_makes_one_get_of_the_rate_limit_and_returns_nothing():
     """`doctor`'s probe (#329): the exact read's credential, transport and bounds, on
-    `/rate_limit`, which names no repository. The reply is checked and dropped."""
+    `/rate_limit`, which names no repository. The reply is checked and dropped: no
+    failure is returned."""
     gh_calls, gets, client = _exact_client(_json_reply({"rate": {"limit": 5000}}), retries=3)
     assert client.probe_exact_read() is None
 
@@ -4491,12 +4495,154 @@ def test_the_exact_read_probe_makes_one_get_of_the_rate_limit_and_returns_nothin
 )
 def test_the_exact_read_probe_classifies_as_the_exact_read_and_reads_once(reply, expected):
     """The probe is no read-back of a listed object: a 404 stays not-found, and nothing
-    is read again, so doctor reports the one answer it got."""
+    is read again, so doctor reports the one answer it got. The failure is returned,
+    classified by the class the exact read would raise, never raised."""
     _, gets, client = _exact_client(reply, retries=3)
-    with pytest.raises(GitHubError) as info:
-        client.probe_exact_read()
-    assert type(info.value) is expected
+    failure = client.probe_exact_read()
+    assert isinstance(failure, ExactReadFailure)
+    assert failure.error is expected
+    assert type(failure.error_for(EXACT_READ_PROBE_WHAT)) is expected
     assert len(gets) == 1
+
+
+# A value no redaction pattern recognizes, so only never quoting it keeps it out (R1-F1
+# of PR #539): a proxy or a server may echo a credential in any shape.
+_UNRECOGNIZED = "zq7-synthetic-echo-4f19c2-not-a-known-format"
+
+
+@pytest.mark.parametrize(
+    ("token", "reply", "raises", "error", "cause"),
+    [
+        (
+            None,
+            HttpsReply(200, {"content-type": f"text/plain; x={_UNRECOGNIZED}"}, b"{}"),
+            None,
+            GitHubError,
+            "the reply's Content-Type is not JSON (application/json)",
+        ),
+        (
+            None,
+            HttpsReply(200, {"content-type": f"application/{_UNRECOGNIZED}"}, b"{}"),
+            None,
+            GitHubError,
+            "the reply's Content-Type is not JSON (application/json)",
+        ),
+        (
+            None,
+            HttpsReply(
+                401,
+                {"content-type": "application/json", "www-authenticate": _UNRECOGNIZED},
+                f'{{"message": "{_UNRECOGNIZED}"}}'.encode(),
+            ),
+            None,
+            GitHubCredentialError,
+            "GitHub answered HTTP 401",
+        ),
+        (
+            None,
+            HttpsReply(302, {"location": f"https://{_UNRECOGNIZED}.example/"}, b""),
+            None,
+            GitHubError,
+            "GitHub answered HTTP 302 (a redirect, which is never followed)",
+        ),
+        (
+            None,
+            None,
+            urllib.error.URLError(
+                OSError(f"Tunnel connection failed: 407 Proxy says {_UNRECOGNIZED}")
+            ),
+            GitHubUnavailableError,
+            "GitHub could not be read (URLError, OSError, the proxy refused the tunnel with "
+            "HTTP 407)",
+        ),
+        (
+            None,
+            None,
+            http.client.BadStatusLine(f"HTTP/1.1 200 {_UNRECOGNIZED}"),
+            GitHubUnavailableError,
+            "GitHub could not be read (BadStatusLine)",
+        ),
+        (
+            None,
+            None,
+            urllib.error.URLError(ConnectionRefusedError(111, _UNRECOGNIZED)),
+            GitHubUnavailableError,
+            "GitHub could not be read (URLError, ConnectionRefusedError, ECONNREFUSED)",
+        ),
+        (
+            None,
+            None,
+            urllib.error.URLError(ssl.SSLCertVerificationError(1, _UNRECOGNIZED)),
+            GitHubError,
+            "the TLS certificate did not verify",
+        ),
+        (
+            None,
+            None,
+            ValueError(_UNRECOGNIZED),
+            GitHubError,
+            "the exact read failed (ValueError)",
+        ),
+        (
+            _raw("", exit_code=1, stderr=f"gh: could not read the keyring: {_UNRECOGNIZED}"),
+            None,
+            None,
+            GitHubCredentialError,
+            "`gh auth token --hostname github.com` failed (exit 1)",
+        ),
+        (
+            _raw("", exit_code=1, stderr=f"HTTP 502: Bad Gateway {_UNRECOGNIZED}"),
+            None,
+            None,
+            GitHubUnavailableError,
+            "`gh auth token --hostname github.com` failed (exit 1)",
+        ),
+        (
+            _raw(f"two {_UNRECOGNIZED}\n"),
+            None,
+            None,
+            GitHubCredentialError,
+            "`gh auth token` printed no usable credential",
+        ),
+    ],
+    ids=[
+        "content-type",
+        "content-type-subtype",
+        "401-headers-and-body",
+        "redirect-location",
+        "proxy-reason-phrase",
+        "bad-status-line",
+        "refused",
+        "certificate",
+        "other",
+        "token-stderr",
+        "token-stderr-transient",
+        "token-printed",
+    ],
+)
+def test_the_exact_read_probe_s_summary_holds_nothing_the_answer_or_gh_sent(
+    token, reply, raises, error, cause
+):
+    """R1-F1 of PR #539: doctor shows the probe's summary, so it holds only the
+    controller's own words and numbers (the status, an exit code, the transport's
+    classes, an errno name, a proxy's tunnel status), never a header, a body, a reason
+    phrase, a status line or `gh`'s stderr. A value no redaction pattern recognizes in
+    any of them stays out of it; only the exact read's raised message keeps `gh`'s
+    stderr and the transport's text, redacted, for the run's reasons."""
+    assert redact(_UNRECOGNIZED) == _UNRECOGNIZED  # nothing but not quoting it helps
+    _, _, client = _exact_client(reply, token=token, raises=raises)
+    failure = client.probe_exact_read()
+
+    assert isinstance(failure, ExactReadFailure) and failure.error is error
+    assert failure.cause == cause
+    summary = failure.summary(EXACT_READ_PROBE_WHAT)
+    assert summary.startswith(f"{EXACT_READ_PROBE_WHAT}: {cause}")
+    assert _UNRECOGNIZED not in summary and _UNRECOGNIZED not in repr(failure)
+    assert (EXACT_READ_CREDENTIAL_REMEDY in summary) == (error is GitHubCredentialError)
+    # Nothing of a reply (a header, the body, a status line) is in the raised message
+    # either.
+    if reply is not None or isinstance(raises, http.client.HTTPException):
+        assert _UNRECOGNIZED not in str(failure.error_for(EXACT_READ_PROBE_WHAT))
 
 
 # -- the exact read's transport, against a loopback server ---------------------------------

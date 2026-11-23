@@ -23,7 +23,10 @@ Now the command stops with the phase and the transaction unchanged, and
 conclusive failure still rejects it. `doctor` has a new `exact read
 (api.github.com)` row. It runs `gh auth token` and makes one
 `GET https://api.github.com/rate_limit` with the token, showing neither
-the token nor the reply. It fails on a credential or another conclusive
+the token nor the reply. A failure is named by its HTTP status, the exit
+code of `gh auth token` or the kind of connection failure, never by a
+response header, a proxy's text or `gh`'s stderr: run the commands it
+names to see those. It fails on a credential or another conclusive
 answer, and warns when `api.github.com` cannot be reached over HTTPS.
 That is the case of a host where `gh` works through a proxy and this
 direct read does not. No state protocol or default changes.

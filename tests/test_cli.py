@@ -2575,6 +2575,53 @@ def test_a_refused_prompt_version_prints_nothing_written_under_it(
     assert fakes["provider"].calls == [] and fakes["gh"].effect_writes == []
 
 
+@pytest.mark.parametrize("echo_in", ["token-stderr", "content-type"])
+def test_doctor_s_exact_read_row_never_prints_what_github_or_gh_sent(
+    tmp_path, capsys, monkeypatch, echo_in
+):
+    """R1-F1 of PR #539: `gh auth token`'s stderr and a response header held a value no
+    redaction pattern recognizes, and doctor printed it. Neither output mode prints it
+    now: the row names the exit code or what the header is not, and the remedy."""
+    monkeypatch.chdir(tmp_path)
+    echoed = "zq7-synthetic-echo-4f19c2-not-a-known-format"
+    assert redact(echoed) == echoed  # nothing but not quoting it helps
+    token_argv = ["gh", "auth", "token", "--hostname", "github.com"]
+    header = HttpsReply(200, {"content-type": f"text/plain; echo={echoed}"}, b"{}")
+    gets: list = []
+    monkeypatch.setattr(github_module, "https_get", lambda request: gets.append(request) or header)
+
+    def runner(req):
+        argv = req.command
+        if argv == token_argv and echo_in == "token-stderr":
+            stderr = f"failed to read the token from the keyring: {echoed}"
+            return ExecutionResult(argv, req.cwd, 1, "", stderr, "t", "t")
+        if argv == token_argv:
+            return ExecutionResult(argv, req.cwd, 0, "gho_" + "E" * 36 + "\n", "", "t", "t")
+        if argv[:3] == ["git", "remote", "get-url"]:
+            return ExecutionResult(argv, req.cwd, 0, "git@github.com:o/r.git\n", "", "t", "t")
+        return ExecutionResult(argv, req.cwd, 0, "ok 1.0\n", "", "t", "t")
+
+    monkeypatch.setattr(cli, "_doctor_runner", lambda: runner)
+    sd = str(tmp_path / ".autoforge")
+    cause = (
+        "`gh auth token --hostname github.com` failed (exit 1)"
+        if echo_in == "token-stderr"
+        else "the reply's Content-Type is not JSON (application/json)"
+    )
+    assert cli.main(["--state-dir", sd, "doctor"]) == 1
+    out = capsys.readouterr()
+    assert "[FAIL] exact read (api.github.com): " in out.out and cause in out.out
+    assert echoed not in out.out + out.err
+    assert cli.main(["--state-dir", sd, "doctor", "--json"]) == 1
+    out = capsys.readouterr()
+    row = next(
+        c for c in json.loads(out.out)["checks"] if c["name"] == "exact read (api.github.com)"
+    )
+    assert not row["ok"] and row["required"] and cause in row["detail"]
+    assert echoed not in out.out + out.err
+    assert len(gets) == (0 if echo_in == "token-stderr" else 2)
+
+
 def test_doctor_reports_an_unreadable_branch_rule_as_skipped(tmp_path, capsys, monkeypatch):
     """Issue #41: a token that cannot read rulesets is SKIP, and doctor still exits 0."""
     monkeypatch.chdir(tmp_path)

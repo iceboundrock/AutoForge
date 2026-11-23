@@ -1733,7 +1733,13 @@ a stated reason it has none. The coverage that must keep working:
   one `GET /rate_limit` with the token `gh auth token` printed, none
   without one, never shows the token or the reply, FAILs a credential or
   another conclusive answer with its remedy, WARNs a transient one naming
-  the proxy variables, and SKIPs a `gh` that cannot start
+  the proxy variables, and SKIPs a `gh` that cannot start; a value no
+  redaction pattern recognizes, echoed in a Content-Type, a 401's headers
+  and body, a proxy's reason phrase, a certificate error or `gh auth
+  token`'s stderr, is not in the row, which keeps its status, exit code
+  and remedy, and the Content-Type's and the stderr's are in neither of
+  `doctor`'s output modes (R1-F1 of PR #539, `tests/test_doctor.py`,
+  `tests/test_cli.py`, `tests/test_github.py`)
 - text the controller writes back or verifies (#328, `tests/test_effects.py`,
   `tests/test_engine.py`, `tests/test_operator_actions.py`): for K3 and K6
   a base holding escape text, control characters or caret text is written
