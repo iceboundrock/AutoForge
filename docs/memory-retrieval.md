@@ -852,7 +852,20 @@ excerpt of its current text. That hit shows the record as it is now, which
 may still hold the earlier text: a correction that only appends to it, or
 a long text whose excerpt the correction left unchanged. Every other hit
 showing the earlier text counts: the corrected record's earlier text or
-its excerpt, and a withheld copy of it.
+its excerpt, and a withheld copy of it. "New text visible" counts a probe
+whose new-text search has a hit of the corrected record that shows it as
+it is now: a record the oracle judges current, whose summary is exactly
+the excerpt of its current text. A hit of it that shows anything else,
+its earlier text's excerpt included, shows no correction, and neither does
+any hit of it while the oracle does not judge it current.
+
+Until the fourteenth review round "new text visible" counted any hit of
+the corrected record on the new-text search, whatever it showed: on the
+pinned fixture, `m15`'s hit made to show its original excerpt on that
+search still gave 1 of 1, while the stale-leak rate rose to 1 of 56
+(`test_a_corrected_record_shown_with_other_text_is_no_new_text_visible`,
+`test_a_corrected_record_the_oracle_does_not_judge_current_is_no_new_text_visible`).
+The pinned fixture's correctness report is unchanged, byte for byte.
 
 Until the thirteenth review round the oracle withdrew only retracted
 texts, by their declared text and whatever their scope. Retracting an

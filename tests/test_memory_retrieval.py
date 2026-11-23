@@ -3408,6 +3408,9 @@ def test_a_hit_past_a_hits_bound_showing_anything_but_its_excerpt_is_still_a_lea
         assert c["served"] == before["served"] and c["ranked"] == before["ranked"], name
         assert c["stale_leak_rate"] > 0.0 and c["permission_leak_rate"] == 0.0, name
         assert c["correction_old_text_served"] == (shown == "earlier"), name
+        # Nor is any of it m10's corrected text shown: of the two probes,
+        # only the pinned m15's shows its correction (R14-F1 of PR #537).
+        assert c["correction_new_text_visible"] == 0.5, name
 
 
 # The benchmark's conditions, and those that serve every record of the launch.
@@ -3443,7 +3446,10 @@ def test_an_append_only_correction_shown_as_it_is_now_is_never_old_text(shown, m
     stale excerpt still is too
     (``test_a_hit_past_a_hits_bound_showing_anything_but_its_excerpt_is_still_a_leak``),
     and so is a withheld copy
-    (``test_a_withheld_copy_of_a_corrected_text_is_judged_by_the_oracle_never_the_store``)."""
+    (``test_a_withheld_copy_of_a_corrected_text_is_judged_by_the_oracle_never_the_store``).
+    Such a search shows no new text either: until the fourteenth review
+    round its hit of m10, showing the earlier text, counted as the new text
+    visible (R14-F1 of PR #537)."""
     fixture = bench.read_fixture().data()
     earlier = _record(fixture, "m10")["text"]
     current = earlier + " Verified again on the current candidate by its bracken test."
@@ -3476,9 +3482,119 @@ def test_an_append_only_correction_shown_as_it_is_now_is_never_old_text(shown, m
     for name in _CONDITIONS:
         c = report[name]
         judged = shown is not None and name in serving
-        assert c["correction_new_text_visible"] == (name in serving), name
+        # Two probes: the pinned m15's, shown as corrected wherever it is
+        # served, and m10's, shown as corrected only by the honest search.
+        visible = (name in serving) + (name in serving and shown is None)
+        assert c["correction_new_text_visible"] == visible / 2, name
         assert (c["stale_leak_rate"] > 0.0) is judged and c["permission_leak_rate"] == 0.0, name
         assert c["correction_old_text_served"] == judged, name
+
+
+# No FTS5 needed: the benchmark judges what the tail serves alike.
+@pytest.mark.parametrize("shown", ["original", "another"])
+def test_a_corrected_record_shown_with_other_text_is_no_new_text_visible(shown, monkeypatch):
+    """R14-F1 of PR #537: the correction probe counted the new text visible
+    whenever its new-text search had a hit of the corrected record, whatever
+    the hit showed. On the pinned fixture, m15's hit on the new-text query
+    made to show its original excerpt still gave 1 of 1, while the
+    stale-leak rate rose to 1 of 56. Only a hit the oracle judges current,
+    showing the excerpt of the corrected text, counts now; this one is a
+    stale leak and no new text visible in every condition that serves m15,
+    and nothing else of the report moves."""
+    fixture = bench.read_fixture().data()
+    (correction,) = fixture["corrections"]
+    assert correction["key"] == "m15"
+    probe = correction["new_query"]
+    # The tampering below changes the new-text search alone.
+    assert probe not in [q["query"] for q in fixture["queries"] + fixture["negatives"]]
+    assert probe != correction["old_query"]
+    summary = bench.excerpt(_record(fixture, {"original": "m15", "another": "m1"}[shown])["text"])
+    truth = bench.oracle(fixture)
+    assert truth["m15"][0] == "current" and summary != bench.excerpt(truth["m15"][1])
+    pinned = bench.read_fixture()
+    record = bench.build(fixture).ids["m15"]
+
+    honest = bench.correctness(pinned)
+    # Every condition serves m15 as corrected but the stale index without
+    # its tail, which reads no record changed since its watermark.
+    serving = ("synced", "stale", "no_fts5", "rebuilt")
+    for name in _CONDITIONS:
+        assert honest[name]["correction_new_text_visible"] == (name in serving), name
+
+    real = MemoryRetriever.search_memory
+
+    def search(self, request, query, **kwargs):
+        result = real(self, request, query, **kwargs)
+        if query != probe:
+            return result
+        hits = tuple(
+            replace(hit, summary=summary) if hit.id == record else hit for hit in result.hits
+        )
+        return replace(result, hits=hits)
+
+    monkeypatch.setattr(MemoryRetriever, "search_memory", search)
+    tampered = bench.correctness(pinned)
+    for name in _CONDITIONS:
+        c, before = tampered[name], honest[name]
+        if name not in serving:
+            assert c == before, name
+            continue
+        assert c["served"] == before["served"] and c["ranked"] == before["ranked"], name
+        assert c["correction_new_text_visible"] == 0.0, name
+        assert c["stale_leak_rate"] == 1 / c["served"] and before["stale_leak_rate"] == 0.0, name
+        assert c["permission_leak_rate"] == 0.0 and c["correction_old_text_served"] == 0, name
+        unchanged = ("stale_leak_rate", "correction_new_text_visible")
+        assert {k: v for k, v in c.items() if k not in unchanged} == {
+            k: v for k, v in before.items() if k not in unchanged
+        }, name
+
+
+# No FTS5 needed: the benchmark judges what the tail serves alike.
+def test_a_corrected_record_the_oracle_does_not_judge_current_is_no_new_text_visible(
+    monkeypatch,
+):
+    """R14-F1 of PR #537, the oracle's half: the new text is visible only on a
+    hit the oracle judges current. m15, corrected, is then superseded, and a
+    store made to call it current serves it with the excerpt of its
+    corrected text. The oracle, which never asks the store, counts each of
+    its hits a stale leak, and its hit on the new-text query no new text
+    visible; until the fourteenth review round that hit counted as one."""
+    fixture = bench.read_fixture().data()
+    fixture["operations"].append(
+        {"op": "supersede", "key": "m15", "by": "m20", "reason": "folded into m20"}
+    )
+    truth = _oracle_agrees_with_the_store(fixture)
+    assert truth["m15"][0] == "superseded"
+    source = bench.Fixture(json.dumps(fixture).encode())
+    record = bench.build(fixture).ids["m15"]
+    honest = bench.correctness(source)
+    for name in _CONDITIONS:
+        c = honest[name]
+        assert (c["stale_leak_rate"], c["permission_leak_rate"]) == (0.0, 0.0), name
+        assert c["correction_new_text_visible"] == 0.0, name
+
+    real = MemoryStore.visibilities
+
+    def visibilities(self, request):
+        verdicts = real(self, request)
+        if verdicts.get(record) is Visibility.SUPERSEDED:
+            verdicts[record] = Visibility.CURRENT
+        return verdicts
+
+    monkeypatch.setattr(MemoryStore, "visibilities", visibilities)
+    tampered = bench.correctness(source)
+    for name in _SERVING:
+        c = tampered[name]
+        assert any("m15" in ranked for ranked in c["ranked"]), name
+        assert c["stale_leak_rate"] > 0.0 and c["permission_leak_rate"] == 0.0, name
+        assert c["correction_new_text_visible"] == 0.0, name
+    # The hit shows the corrected text exactly as a current record's would.
+    world = bench.build(fixture)
+    retriever = MemoryRetriever(fixture["repository"], fixture["run_id"], lambda: world.store)
+    retriever.sync()
+    result = retriever.search_memory(world.request, fixture["corrections"][0]["new_query"])
+    (hit,) = (hit for hit in result.hits if hit.id == record)
+    assert hit.summary == bench.excerpt(truth["m15"][1])
 
 
 def _copy_of(fixture: dict, key: str, **declared) -> None:

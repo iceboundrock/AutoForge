@@ -21,7 +21,9 @@ fixture's retractions and corrections, each withholding the text it
 withdrew where the withdrawn record's scope takes the launch
 (:func:`oracle`). A hit's summary is judged against the excerpt a hit of
 the oracle's text shows (:func:`excerpt`), never the whole text, which may
-be longer than a hit shows.
+be longer than a hit shows. A correction probe's new text is visible only
+on a hit of the corrected record the oracle judges current, showing that
+excerpt of its corrected text (:func:`_shows_corrected_text`).
 
 **Performance** times the same index on the fixture's store, on a store at
 Memory's record bound, and on synthetic corpora of the backend alone, which
@@ -307,24 +309,54 @@ def excerpt(text: str) -> str:
     return bounded_text(text, MAX_SUMMARY_BYTES)
 
 
+def _shows_record_as_it_is(summary: str, state: str, text: str) -> bool:
+    """Whether a hit shows its record as the oracle judges it now.
+
+    Its record is ``current`` to the oracle and its summary is exactly the
+    excerpt of the ``text`` the oracle judges current. Any other hit shows
+    something else: a record the launch may not be served, or bytes other
+    than that excerpt, an earlier text's included.
+    """
+    return state == "current" and summary == excerpt(text)
+
+
 def _shows_earlier_text(summary: str, earlier: str, state: str, text: str) -> bool:
     """Whether a correction probe's hit shows a corrected record's ``earlier`` text.
 
     A hit shows it when its summary holds that text whole, or is its excerpt
     (a text past a hit's bound is never whole in a summary: R12-F1 of PR
-    #537). A hit of a record the oracle judges ``current`` whose summary is
-    exactly the excerpt of the ``text`` the oracle judges current shows what
-    its record is now, which may hold the earlier text: a correction that
-    only appends to it, or a long text whose excerpt the correction left
-    unchanged. Until the thirteenth review round such a hit was counted, so
-    an append-only correction of ``m10`` gave one old text served in every
-    condition that served it (R13-F1 of PR #537). Any other hit is judged:
-    the earlier text of a record now corrected, a withheld or retracted
-    copy of it, or its excerpt where the record now shows another.
+    #537). A hit that shows its record as the oracle judges it now
+    (:func:`_shows_record_as_it_is`) shows what its record is, which may
+    hold the earlier text: a correction that only appends to it, or a long
+    text whose excerpt the correction left unchanged. Until the thirteenth
+    review round such a hit was counted, so an append-only correction of
+    ``m10`` gave one old text served in every condition that served it
+    (R13-F1 of PR #537). Any other hit is judged: the earlier text of a
+    record now corrected, a withheld or retracted copy of it, or its excerpt
+    where the record now shows another.
     """
-    if state == "current" and summary == excerpt(text):
+    if _shows_record_as_it_is(summary, state, text):
         return False
     return earlier in summary or summary == excerpt(earlier)
+
+
+def _shows_corrected_text(
+    hits: Sequence[tuple[str, str]], target: str, truth: dict[str, tuple[str, str]]
+) -> bool:
+    """Whether a correction probe's new-text search shows its ``target`` as corrected.
+
+    ``hits`` are the search's ``(key, summary)`` pairs. A hit of ``target``
+    counts only when it shows the record as the oracle judges it now
+    (:func:`_shows_record_as_it_is`): current, with the excerpt of the
+    corrected text. Until the fourteenth review round any hit of ``target``
+    counted, whatever it showed, so ``m15``'s hit shown with its original
+    text on the pinned fixture's new-text query still gave a new text
+    visible of 1 of 1, while the stale-leak rate rose to 1 of 56 (R14-F1 of
+    PR #537).
+    """
+    return any(
+        key == target and _shows_record_as_it_is(summary, *truth[key]) for key, summary in hits
+    )
 
 
 def _dcg(gains: Sequence[int]) -> float:
@@ -378,7 +410,12 @@ def _condition(world: World, retriever: MemoryRetriever, *, k: int = K) -> dict:
     new_visible = old_served = 0
     for correction in fixture["corrections"]:
         old_text = next(r["text"] for r in fixture["records"] if r["key"] == correction["key"])
-        new_visible += correction["key"] in search(correction["new_query"])[1]
+        result, keys = search(correction["new_query"])
+        new_visible += _shows_corrected_text(
+            [(key, hit.summary) for hit, key in zip(result.hits, keys, strict=True)],
+            correction["key"],
+            truth,
+        )
         result, keys = search(correction["old_query"])
         old_served += any(
             _shows_earlier_text(hit.summary, old_text, *truth[key])
