@@ -427,7 +427,7 @@ def held_issue(github: GitHubClient, url: str) -> IssueInfo:
 def _comment_found(
     github: GitHubClient, record: EffectRecord, holders: Iterable[Holder[CommentInfo, Any]]
 ) -> list[Found]:
-    """A comment create's holders (K4, K8, K9): in the end state when bodied as the payload.
+    """A comment create's holders (K4, K8, K9, K13): in the end state when bodied as the payload.
 
     The holders come from the complete listing of the comment's parent, so a
     comment has no condition but its body; one whose body `gh` printed

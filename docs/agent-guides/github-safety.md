@@ -1590,9 +1590,10 @@ line; an error reply is read only to tell a rate limit from a refusal.
 
 **When it runs, and what stays strict.** In a create's completion
 read-back (K2 implementation PR, K4 review comment, K5 follow-up issue,
-K7 replacement PR, K8 progress comment, K9 acceptance comment), and only
-when exactly one object carries the identity, every condition other than
-its text holds on `gh`'s read (for a PR: open, on the planned head branch
+K7 replacement PR, K8 progress comment, K9 acceptance comment, K13
+recovery-audit comment), and only when exactly one object carries the
+identity, every condition other than its text holds on `gh`'s read (for a
+PR: open, on the planned head branch
 of the run's repository, onto the planned base, among the head's PRs and
 above the watermark where there is one; for a follow-up issue: open, above
 the watermark, in the repository, not the run's issue; for a comment: on
@@ -1696,11 +1697,12 @@ the object the read-back judges, so neither may end a replan. The decision:
   (replica lag), not that the object is gone. `GitHubClient._exact_reread`
   reads it again within the transient bound above; still 404, it is
   `GitHubUnavailableError`. That classification holds for every caller of
-  the exact read (the create read-backs, the bodies of #328 and K11 and
-  K12, the PR body FIX's entry digests, REVIEW's operator evidence and
-  `status`'s review provenance), since each reads exactly only an object
-  `gh` had just returned; what each does with it is its own (below). In a
-  create's read-back nothing is saved or sent, the record stays as it was
+  the exact read (the create read-backs, K13's audit comment included, the
+  bodies of #328 and K11 and K12, the PR body FIX's entry digests, REVIEW's
+  operator evidence and `status`'s review provenance), since each reads
+  exactly only an object `gh` had just returned; what each does with it is
+  its own (below). In a create's read-back nothing is saved or sent, the
+  record stays as it was
   (`attempted` after a write, `EffectPending`), and the command ends for
   `resume`, which reads the listing again. An object really deleted in
   between (a comment, an issue) is then absent from that listing, and the
@@ -1711,10 +1713,11 @@ the object the read-back judges, so neither may end a replan. The decision:
   token` that fails or prints no usable token, a 401 and a 403 that is no
   rate limit are `GitHubCredentialError`, whose text names what to check
   (`gh auth status`, `gh auth token --hostname github.com`). Every write
-  path but K7 handles it as any conclusive failure: a create's read-back
-  blocks (`github-read-failed`) with nothing sent again, and once the
-  operator has fixed the credential, `unblock` re-enters the phase, which
-  reconciles the record again (K10 keeps it as a failed verification). The
+  path but K7 and K13 handles it as any conclusive failure: a create's
+  read-back blocks (`github-read-failed`) with nothing sent again, and once
+  the operator has fixed the credential, `unblock` re-enters the phase, which
+  reconciles the record again (K10 keeps it as a failed verification).
+  K13's audit comment has a path of its own (below). The
   callers that write nothing do not block on it (below): REVIEW's operator
   evidence and `status` report it, and FIX's entry offers no PR-body
   update. K7 cannot block without ending the replan, so
@@ -1741,6 +1744,29 @@ is the caller's, and not every caller stops or blocks:
   or sent, for `resume`. It blocks on a conclusive failure with nothing
   sent again, except in K7, where a credential failure ends the command for
   `resume` and any other conclusive failure rejects the replan (above).
+- *A recovery-audit comment's read-back* (K13) judges the one comment
+  carrying the decision's marker as K4's is judged
+  (`RecoveryAuditCommentOp.reconcile` through `effect_ops._comment_found`),
+  so a sole such comment whose `gh` print is not the controller's text
+  takes an exact read, as it does when that text holds a `^`. It is driven
+  at two points, and neither is K7's handling. Right after automatic
+  recovery saves a
+  decision (`engine._recovery_audit_problem`), every failure, unavailable or
+  conclusive, a credential failure included, is caught: the record stays as
+  last persisted, the audit pending, nothing is relaunched, and the step's
+  own stop stands. Before the next `run`, `resume` or `step` executes
+  anything (`engine._settle_recovery_decisions`), the pending audit is
+  driven again: `GitHubUnavailableError`, a persistent 404 included, ends
+  that command with the phase unchanged, for `resume`; any conclusive
+  failure, a credential failure included, enters `BLOCKED`
+  (`github-read-failed`) with nothing sent again. The block's reason says to
+  fix the cause and `unblock`, and outside a replan `unblock` re-enters the
+  phase, whose next command settles the audit first. A run holding a replan
+  journal is not one `unblock` can re-enter: it refuses every such run,
+  since REVIEW is the transaction's only entry, so this block ends a
+  replan's run where K7's own credential failure only ends the command.
+  After a K7 credential stop, whose audit comment needs the same
+  credential, fix the credential before `resume`.
 - *The paths that write back or verify a body read exactly* (#328's K3
   and K6 bases, K10, K11, K12, the `UPDATE_EPIC` roadmap) handle a failure
   of the exact read as they handle a failed `gh` read of the same object:
