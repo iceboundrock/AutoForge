@@ -56,17 +56,28 @@ revision the index claims to have seen. That covers an id the issue does
 not hold, a record retracted or superseded before the watermark (the sync
 deleted its row), another revision or content digest, one record answered
 with two revisions or digests, and a record whose text holds none of the
-query's terms, since a search matches by term. An answer can also be wrong
-by what it leaves out: a record the launch is served, unchanged since the
-watermark, whose text holds a query term, must be among the candidates.
-Any one of these means the index is not a projection of the store. The
-search discards that backend's whole answer, marks the index `failed`
-(`integrity`) and answers the same call from the fallback, or from the tail
-alone, reported `degraded`. The index stays `failed` until a sync rebuilds
-it (`test_a_row_that_contradicts_its_revision_marks_the_index_failed_and_is_never_served`,
+query's terms, since a search matches by term. A record changed after the
+watermark keeps the row that sync wrote until the next one, and the search
+drops it as stale, for the store's reason. It is stale only if it is the
+record as the sync left it: added by then, at the revision and content
+digest it had then (replayed from the audit table), and holding a query
+term wherever the store still holds that text. A row of a record first
+added after the watermark, or at a revision past it, is a row no such sync
+wrote. An earlier revision skipped every candidate whose record had changed
+since the watermark, so such a row passed as ordinary staleness. An answer
+can also be wrong by what it leaves out: a record the launch is served,
+unchanged since the watermark, whose text holds a query term, must be among
+the candidates. Any one of these means the index is not a projection of the
+store. The search discards that backend's whole answer, marks the index
+`failed` (`integrity`) and answers the same call from the fallback, or from
+the tail alone, reported `degraded`. The index stays `failed` until a sync
+rebuilds it (`test_a_row_that_contradicts_its_revision_marks_the_index_failed_and_is_never_served`,
 `test_a_contradicted_primary_answer_goes_to_the_fts5_fallback_on_the_same_call`,
 `test_a_served_match_the_index_omits_falls_back_on_the_same_search`,
-`test_one_record_answered_with_two_rows_is_an_integrity_failure`).
+`test_one_record_answered_with_two_rows_is_an_integrity_failure`,
+`test_a_row_no_sync_through_the_watermark_wrote_falls_back_on_the_search_that_meets_it`,
+`test_an_optional_backend_answering_past_its_watermark_goes_to_the_fallback`,
+`test_a_row_the_sync_left_is_stale_however_its_record_changed_since`).
 
 Rank is never authority. A backend that answers with ids of another
 issue's records, a retracted record or an id the store has never held gets
@@ -113,6 +124,23 @@ status, after the last load: a retraction made during that call left the
 search serving the record, which the next fetch refused
 (`test_no_backend_is_called_after_a_reads_last_load_of_the_store`,
 `test_a_retraction_while_a_backend_reports_its_health_is_never_served`).
+
+Reading a backend's attribute is a call too: a property, or a
+`__getattribute__` of the backend's own, runs its code. So what a read
+reports of a backend is captured when the retriever is made: its name, read
+once and checked (lower-case words joined by hyphens, at most 32
+characters, never `store-tail`), and whether it is FTS5, decided from its
+type, since an instance check can read an object's own `__class__`. The
+fourth review round found the status and the result still reading the name
+after the last load: a backend whose name retracted a record had the search
+and the fetch serve it. Now every read of a backend's attributes, for a call
+or for its metadata, comes before the read's last load
+(`test_a_retraction_while_a_backend_name_is_read_is_never_served`,
+`test_no_attribute_of_a_backend_is_read_after_a_reads_last_load`,
+`test_a_backend_name_is_checked_once_when_the_retriever_is_made`). The
+guarantee covers what a read runs. Code a backend starts on its own, a
+thread or a finalizer, runs outside any read's order.
+
 The rejected alternative was a lock held across the retrieval. Nothing in
 the controller holds one around a read, and a lock would only prove what
 reloading shows directly.
@@ -293,17 +321,30 @@ before; the status reports the attempt (`failed` 1, `sync-failed`). An
 earlier revision marked the index unbuilt before trying, so a failed
 rebuild turned a healthy index `empty` at watermark 0, and searches fell
 back to the eight-record tail. An index already found `failed` stays
-unreadable through a failed rebuild. The next sync or rebuild tries again
-(`test_a_failed_rebuild_keeps_the_index_it_would_replace_in_service`).
+unreadable through a failed rebuild. A rebuild asked for stays owed until
+one commits, as does one asked for while the backend could not run: the
+next sync makes it, even of an index still current, and only its commit
+clears the failure. An earlier revision left that to the index's state, so
+a sync of a current index after a failed rebuild did nothing, and `failed`
+1 and `sync-failed` stayed until another rebuild was asked for
+(`test_a_failed_rebuild_keeps_the_index_it_would_replace_in_service`,
+`test_a_rebuild_that_failed_or_could_not_run_is_made_by_the_next_sync`).
 The index lives in memory, so a crash loses it, and the next process
 rebuilds it from the checkpoint. Given the same snapshot, the rebuild gives
 the same rows, the same backend scores and the same answers
 (`test_a_new_process_rebuilds_the_same_index_and_answers_identically`).
-`verify` reads every row back and compares it with the store at the
-watermark. Each row whose record has not changed since must have the
-record's revision, its content digest and the tokens of its text, decoded
-from what FTS5 holds. Each record indexable then must have exactly one row.
-It also runs FTS5's own integrity check, which proves FTS5's inverted index
+`verify` reads every row back and compares it with what a sync through the
+watermark wrote, replayed from the store's audit table: one row for each
+record indexable then, of its issue, at the revision and content digest it
+had then, indexed by the tokens of that text, decoded from what FTS5 holds.
+A record changed since keeps that row, stale, until the next sync. A row of
+a record added after the watermark, at a revision past it or at a digest
+the record did not have then, a missing or second row, and a row indexed by
+other tokens are each an integrity failure. The store keeps only the texts
+of live records, so the stale row of a corrected or retracted record is
+checked by its revision and digest alone
+(`test_verify_finds_a_row_no_sync_through_the_watermark_wrote`). `verify`
+also runs FTS5's own integrity check, which proves FTS5's inverted index
 matches the rows it holds. Once `verify` marks the index `failed`, searches
 answer from the tail or the fallback until a sync rebuilds it
 (`test_verify_finds_a_row_indexed_by_other_tokens_and_a_rebuild_restores_it`).
@@ -482,8 +523,12 @@ Run with `uv run python -m tests.memory_retrieval_bench --sizes
 SQLite 3.54.1. These are single runs of a local benchmark, not a
 comparison across hosts. The figures below were measured again after the
 third review round's changes (the coverage check, the health check read
-before the store, the rebuild that keeps the old index). No embedding of any kind is computed, so nothing
-below is evidence about semantic retrieval.
+before the store, the rebuild that keeps the old index). The fourth
+round's changes left the correctness figures identical and moved the
+store-sized search figures within run-to-run noise (0.68 ms at the
+fixture's median before them, 0.69 and 0.70 ms in two runs after), so the
+cost table was not measured again. No embedding of any kind is computed, so
+nothing below is evidence about semantic retrieval.
 
 ### Correctness on the pinned fixture
 

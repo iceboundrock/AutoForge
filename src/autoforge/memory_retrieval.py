@@ -21,11 +21,13 @@ backend that cannot run, never an error of the read. A search loads the
 snapshot again after each backend answers, so the snapshot that judges the
 candidates, gives the excerpts, picks the hot tail and reports the
 freshness is the store as it is after the retrieval, and nothing calls a
-backend after that load; a fetch and the catalog read no backend's answer
-and load it once. A snapshot that does not continue the newest one the
-retriever has read (an older checkpoint, a saved copy, another history, an
-earlier launch ordinal) is refused, so no read is ever judged by a snapshot
-a later write or launch replaced.
+backend after that load or reads any attribute of one: what a read reports
+of a backend, its name included, was captured when the retriever was made.
+A fetch and the catalog read no backend's answer and load it once. A
+snapshot that does not continue the newest one the retriever has read (an
+older checkpoint, a saved copy, another history, an earlier launch
+ordinal) is refused, so no read is ever judged by a snapshot a later write
+or launch replaced.
 
 **The launch's scope.** What a launch is told is computed from its scope
 alone: its issue's records that apply to it (neither ``foreign`` nor
@@ -58,20 +60,23 @@ index finds exactly what the tail finds in any script.
 
 **Freshness.** The index is eventually consistent with the store. It records
 the Memory revision it was synced through (``indexed_through_seq``). An
-index row whose record changed after the watermark is dropped as ``stale``;
-a bounded hot tail (:data:`MAX_TAIL` of the scope's current records changed
-after the watermark, newest first) is searched on the store itself. A sync
-is one SQLite transaction, and so is a rebuild: a failure leaves the index
-as it was, at its old watermark and generation, and is counted. A search
-proves its index's coverage before it says ``complete``: every record the
-launch is served that the index has seen and that holds a query term must
-be among the candidates. An index found not to be a projection of the store
-(a malformed row, two rows of one record, a candidate the store
-contradicts, a served match it omits, or, by :meth:`MemoryRetriever.verify`,
-a row whose tokens are not its record's) is ``failed`` (``integrity``) until
-it is rebuilt, and the search that found it answers from the fallback or
-the tail instead. Since the index is in memory, a crash loses it and the
-next process rebuilds it from the checkpoint, deterministically.
+index row whose record changed after the watermark is dropped as ``stale``
+when it is the record as that sync left it (:func:`_indexed_at`); a bounded
+hot tail (:data:`MAX_TAIL` of the scope's current records changed after
+the watermark, newest first) is searched on the store itself. A sync is one
+SQLite transaction, and so is a rebuild: a failure leaves the index as it
+was, at its old watermark and generation, and is counted, and a rebuild
+that failed is owed to the next sync. A search proves its index's coverage
+before it says ``complete``: every record the launch is served that the
+index has seen and that holds a query term must be among the candidates.
+An index found not to be a projection of the store (a malformed row, two
+rows of one record, a candidate the store contradicts, a row of a record
+added after the watermark or at a revision past it, a served match it
+omits, or, by :meth:`MemoryRetriever.verify`, a row whose tokens are not
+its record's) is ``failed`` (``integrity``) until it is rebuilt, and the
+search that found it answers from the fallback or the tail instead. Since
+the index is in memory, a crash loses it and the next process rebuilds it
+from the checkpoint, deterministically.
 
 **Backends** implement :class:`IndexBackend` and return candidates only:
 record ids with the revision and content digest they indexed, checked and
@@ -147,6 +152,10 @@ MAX_INTEGER_SCORE = 2**53
 
 FTS5_BACKEND = "sqlite-fts5"
 TAIL_BACKEND = "store-tail"
+# A backend's name: lower-case words joined by hyphens, read once, when a
+# retriever is made (:func:`_slot`).
+MAX_BACKEND_NAME = 32
+_BACKEND_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 # FTS5 is given ASCII words separated by spaces (:func:`_fts5_token`), so
 # its tokenizer only splits them: it folds, joins or drops nothing.
 FTS5_TOKENIZER = "ascii"
@@ -302,6 +311,11 @@ class IndexBackend(Protocol):
     :class:`RetrievalBackendError`, and a row the backend finds malformed
     :class:`RetrievalIntegrityError`; an answer that is not a bounded list
     of well-formed candidates is treated as an error (:func:`_candidates`).
+
+    ``name`` is read once, when a retriever is made, and must be lower-case
+    words joined by hyphens, at most :data:`MAX_BACKEND_NAME` characters,
+    and not ``store-tail``. A read never looks it up again: what it reports
+    of the backend is the name it captured then.
     """
 
     name: str
@@ -655,10 +669,6 @@ def _candidates(answer: object, limit: int) -> list[IndexCandidate]:
     return list(kept.values())
 
 
-def _events(store: MemoryStore) -> list:
-    return store.encode().get("events", [])
-
-
 def _prefix_digest(events: list, through: int) -> str:
     rows = json.dumps(events[:through], sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(rows.encode()).hexdigest()
@@ -666,6 +676,30 @@ def _prefix_digest(events: list, through: int) -> str:
 
 def _indexable(fact: MemoryFact) -> bool:
     return not fact.withdrawn and not fact.replacement
+
+
+def _indexed_at(events: list, through: int) -> dict[int, tuple[int, str]]:
+    """What a sync through audit position ``through`` indexed: each record's revision, digest.
+
+    Replayed from the store's audit table, whose rows the store validated,
+    as :func:`_indexable` decides: an add indexes its record at its own
+    position, a correction re-indexes a record still indexed with its new
+    digest, and a retraction or a supersession deletes its row for good.
+    Every record's text is non-empty, so each record held here had a row
+    (:func:`_document`). No record added after ``through`` is here, and no
+    revision past it: a row of either is one no such sync wrote.
+    """
+    held: dict[int, tuple[int, str]] = {}
+    for n, row in enumerate(events[:through], 1):
+        action = row["action"]
+        if action == Action.ADD.value:
+            held[n] = (n, row["content"])
+        elif action == Action.CORRECT.value:
+            if row["target"] in held:
+                held[row["target"]] = (n, row["value"])
+        else:
+            held.pop(row["target"], None)
+    return held
 
 
 def _document(store: MemoryStore, fact: MemoryFact) -> IndexDocument | None:
@@ -912,21 +946,58 @@ class MemoryCatalog:
 
 @dataclass
 class _Slot:
+    """One configured backend and what the retriever knows of its index.
+
+    ``name`` and ``fts5`` were read from the backend when the retriever was
+    made (:func:`_slot`), so a read that reports them runs none of its code.
+    ``owed`` is a rebuild asked for that has not committed: the next sync
+    makes it, however current the index it would replace.
+    """
+
     backend: IndexBackend
+    name: str
+    fts5: bool
     generation: int = 0
     through: int = 0
     built: bool = False
     failures: int = 0
     broken: IndexReason = IndexReason.NONE
+    owed: bool = False
+
+
+def _slot(backend: IndexBackend) -> _Slot:
+    """``backend``'s slot, its metadata read once, now, and checked.
+
+    Every read of a backend's attribute can run its code (a property, or a
+    ``__getattribute__`` of its own), and a write that code makes after a
+    read's last load of the store would escape the snapshot that judges the
+    read (R4-F1 of PR #537). So the name is read here, before any read, and
+    whether the backend is FTS5 is decided from its type alone: an instance
+    check can read the object's own ``__class__``.
+    """
+    name = getattr(backend, "name", None)
+    if (
+        type(name) is not str
+        or len(name) > MAX_BACKEND_NAME
+        or _BACKEND_NAME.fullmatch(name) is None
+        or name == TAIL_BACKEND
+    ):
+        raise ConfigurationError(
+            "a memory retrieval backend is named by lower-case words joined by hyphens, "
+            f"at most {MAX_BACKEND_NAME} characters, other than {TAIL_BACKEND}"
+        )
+    return _Slot(backend, name, issubclass(type(backend), Fts5Backend))
 
 
 @dataclass
 class _Snapshot:
-    """One read's canonical snapshot, as the source gave it, and its rows' digests."""
+    """One read's canonical snapshot, as the source gave it: its rows, its texts by digest."""
 
     store: MemoryStore
     events: list
+    texts: dict[str, str]
     _prefixes: dict[int, str] = field(default_factory=dict)
+    _indexed: dict[int, dict[int, tuple[int, str]]] = field(default_factory=dict)
 
     @property
     def revision(self) -> int:
@@ -936,6 +1007,12 @@ class _Snapshot:
         if through not in self._prefixes:
             self._prefixes[through] = _prefix_digest(self.events, through)
         return self._prefixes[through]
+
+    def indexed_at(self, through: int) -> dict[int, tuple[int, str]]:
+        """:func:`_indexed_at` of this snapshot's rows: what an index synced through it holds."""
+        if through not in self._indexed:
+            self._indexed[through] = _indexed_at(self.events, through)
+        return self._indexed[through]
 
 
 # A record of another issue, or of the launch's issue that does not apply to
@@ -1070,11 +1147,12 @@ class MemoryRetriever:
     ``AutoForgeState.memory``). Every read, sync and status reads each
     backend's health first (:meth:`_health`), then calls it, a search once
     more after each backend answers, and answers from the snapshot it
-    loaded last alone, calling no backend after that load; one of another
-    repository or run, or one that does not continue the newest snapshot
-    read before, is refused (:class:`RetrievalError`). ``backend`` defaults
-    to :class:`Fts5Backend`; ``fallback``, when given, must be one, and is
-    used only when the primary cannot answer.
+    loaded last alone, calling no backend and reading nothing of one after
+    that load (its name and kind are its slot's, read once, here). A
+    snapshot of another repository or run, or one that does not continue
+    the newest snapshot read before, is refused (:class:`RetrievalError`).
+    ``backend`` defaults to :class:`Fts5Backend`; ``fallback``, when given,
+    must be one, and is used only when the primary cannot answer.
     """
 
     def __init__(
@@ -1092,7 +1170,7 @@ class MemoryRetriever:
         if not callable(source):
             raise ConfigurationError("a memory retriever reads the canonical store's source")
         if fallback is not None and (
-            not isinstance(fallback, Fts5Backend) or backend is None or fallback is backend
+            not issubclass(type(fallback), Fts5Backend) or backend is None or fallback is backend
         ):
             raise ConfigurationError(
                 "a memory retrieval fallback is a separate SQLite FTS5 index behind another backend"
@@ -1100,9 +1178,9 @@ class MemoryRetriever:
         if type(tail) is not int or not 0 <= tail <= MAX_TAIL:
             raise ConfigurationError(f"the memory retrieval tail is 0 to {MAX_TAIL} records")
         self._source = source
-        self._slots = [_Slot(backend if backend is not None else Fts5Backend())]
+        self._slots = [_slot(backend if backend is not None else Fts5Backend())]
         if fallback is not None:
-            self._slots.append(_Slot(fallback))
+            self._slots.append(_slot(fallback))
         self.tail = tail
         self.metrics = RetrievalMetrics()
         # The newest snapshot read: its revision, the digest of its rows and
@@ -1144,7 +1222,8 @@ class MemoryRetriever:
             self.run_id,
         ):
             raise RetrievalError("this memory index projects another store")
-        snap = _Snapshot(store, _events(store))
+        encoded = store.encode()
+        snap = _Snapshot(store, encoded.get("events", []), encoded.get("texts", {}))
         revision, digest, launch = self._seen
         if snap.revision < revision or snap.prefix(revision) != digest or store.launch_seq < launch:
             raise RetrievalError(
@@ -1194,16 +1273,16 @@ class MemoryRetriever:
     def _status(
         self, slot: _Slot, up: bool, snap: _Snapshot, scope: _Scope | None = None
     ) -> IndexStatus:
-        """``slot``'s freshness against ``snap``, its health ``up`` as :meth:`_health` read it."""
-        backend, reason = slot.backend, slot.broken
+        """``slot``'s freshness against ``snap``, its health ``up`` as :meth:`_health` read it.
+
+        Built from the slot's captured values alone: nothing of the backend
+        is read, so a read may report it after its last load.
+        """
+        reason = slot.broken
         state: IndexState | None = None
         if not up:
             state = IndexState.UNAVAILABLE
-            reason = (
-                IndexReason.FTS5_UNAVAILABLE
-                if isinstance(backend, Fts5Backend)
-                else IndexReason.UNAVAILABLE
-            )
+            reason = IndexReason.FTS5_UNAVAILABLE if slot.fts5 else IndexReason.UNAVAILABLE
         elif reason:
             state = IndexState.FAILED
         elif not slot.built:
@@ -1223,7 +1302,7 @@ class MemoryRetriever:
         if not reason and slot.failures:
             reason = IndexReason.SYNC_FAILED
         return IndexStatus(
-            backend.name,
+            slot.name,
             state,
             slot.generation,
             source,
@@ -1251,7 +1330,9 @@ class MemoryRetriever:
         """Bring every index up to the canonical store: incrementally, or rebuilt when it must be.
 
         Each backend's update is one atomic unit. A failure keeps the index
-        where it was and counts the failure; the next sync tries again.
+        where it was and counts the failure; the next sync tries again, a
+        rebuild included: one asked for and not yet committed is made here,
+        however current the index it replaces.
         """
         health = self._health()
         return self._sync_all(health, self._load(), rebuild=False)
@@ -1263,8 +1344,10 @@ class MemoryRetriever:
         stays in service, at its watermark and generation, until the new one
         commits. A rebuild that fails is counted, ``failed`` and
         ``sync-failed`` in the status, and leaves the old index readable if
-        it was, and unreadable if it was already ``failed``; the next sync or
-        rebuild tries again.
+        it was, and unreadable if it was already ``failed``. The rebuild stays
+        owed, as does one asked for while the backend could not run: the next
+        sync or rebuild makes it, even of an index still current, and only
+        its commit clears the failure.
         """
         health = self._health()
         return self._sync_all(health, self._load(), rebuild=True)
@@ -1276,12 +1359,16 @@ class MemoryRetriever:
         return self._status(self._slots[0], health[0], snap)
 
     def _sync(self, slot: _Slot, up: bool, snap: _Snapshot, *, rebuild: bool) -> None:
+        # A rebuild asked for is owed until one commits: a current index's
+        # incremental sync is a no-op, which would leave a failed rebuild
+        # failed for good (R4-F2 of PR #537).
+        slot.owed = slot.owed or rebuild
         if not up:
             return
         store = snap.store
         status = self._status(slot, up, snap)
         try:
-            if rebuild or status.state in (IndexState.EMPTY, IndexState.FAILED):
+            if slot.owed or status.state in (IndexState.EMPTY, IndexState.FAILED):
                 docs = [d for f in store.facts() if (d := _document(store, f)) is not None]
                 slot.backend.apply(docs, (), clear=True)
                 slot.generation += 1
@@ -1297,19 +1384,23 @@ class MemoryRetriever:
             slot.failures = min(slot.failures + 1, MAX_COUNTER)
             self.metrics.count("sync_failures")
             return
-        slot.built, slot.broken, slot.failures = True, IndexReason.NONE, 0
+        slot.built, slot.broken, slot.failures, slot.owed = True, IndexReason.NONE, 0, False
         slot.through = snap.revision
 
     def verify(self) -> IndexStatus:
         """Compare every row of the primary index with the canonical store at its watermark.
 
-        Each row the store can vouch for (its record unchanged since the
-        watermark) must be the record's revision, content digest and the
-        tokens of its text, and every record indexable at or before the
-        watermark must have one. A row the store does not hold as indexable
-        at the revision it names, a missing row, a row indexed by other
-        tokens than its text's, a malformed row or a failed backend check
-        marks the index ``failed`` (``integrity``) until it is rebuilt.
+        The index must hold exactly what a sync through its watermark wrote
+        (:func:`_indexed_at`): one row for each record indexable then, of
+        its issue, at the revision and content digest it had then, and
+        indexed by the tokens of that text wherever the store still holds
+        it. A record changed since keeps that row until the next sync
+        replaces it, a stale row the store vouches for. A row of a record
+        added after the watermark, at a revision past it, at another
+        revision or digest than the record had then, or of a record not
+        indexable then; a missing or second row; a row indexed by other
+        tokens; a malformed row or a failed backend check: each marks the
+        index ``failed`` (``integrity``) until it is rebuilt.
         """
         health = self._health()
         snap = self._load()
@@ -1317,32 +1408,30 @@ class MemoryRetriever:
         status = self._status(slot, health[0], snap)
         if not status.readable:
             return status
-        expected = {
-            IndexEntry(d.partition, d.id, d.revision, d.digest, tokens_digest(text_tokens(d.text)))
-            for f in store.facts()
-            if f.revision <= slot.through and (d := _document(store, f)) is not None
-        }
-        facts = {f.id: f for f in store.facts()}
-
-        def vouched(row: IndexEntry) -> bool:
-            # A row of a record changed since the watermark is the next sync's
-            # to replace: the store no longer holds the text it was indexed from.
-            fact = facts.get(row.id)
-            return not (
-                fact is not None
-                and fact.scope.step.issue_url == row.partition
-                and fact.revision > slot.through
-            )
-
+        issues = {f.id: f.scope.step.issue_url for f in store.facts()}
+        # Each row a sync through the watermark wrote, and the digest of its
+        # tokens, or ``None`` where the store no longer holds that text.
+        expected: dict[tuple[str, int, int, str], str | None] = {}
+        for record, (revision, digest) in snap.indexed_at(slot.through).items():
+            text = snap.texts.get(digest)
+            tokens = None if text is None else tokens_digest(text_tokens(text))
+            expected[(issues[record], record, revision, digest)] = tokens
         try:
             rows = slot.backend.entries()
             healthy = slot.backend.check() is True
         except RetrievalBackendError:
             rows, healthy = [], False
         if healthy and isinstance(rows, list) and all(_well_formed_entry(r) for r in rows):
-            kept = [row for row in rows if vouched(row)]
-            # One row per record, each as the store says it must be, and no other.
-            healthy = len(set(kept)) == len(kept) and set(kept) == expected
+            keys = [(row.partition, row.id, row.revision, row.digest) for row in rows]
+            # One row per record, each as the store says it was, and no other.
+            healthy = (
+                len(set(keys)) == len(keys)
+                and set(keys) == expected.keys()
+                and all(
+                    expected[(r.partition, r.id, r.revision, r.digest)] in (None, r.tokens)
+                    for r in rows
+                )
+            )
         else:
             healthy = False
         if not healthy:
@@ -1380,8 +1469,10 @@ class MemoryRetriever:
         found: Sequence[IndexCandidate],
         facts: dict[int, MemoryFact],
         scope: _Scope,
+        indexed: Callable[[int], dict[int, tuple[int, str]]],
         through: int,
         tokens: Callable[[int], list[str]],
+        held: Callable[[str], list[str] | None],
         wanted: set[str],
     ) -> int:
         """How many of ``found`` no index synced through ``through`` could hold.
@@ -1392,18 +1483,27 @@ class MemoryRetriever:
         watermark, whose row the sync deleted); another revision or content
         digest; or a text that holds none of the query's terms, which a
         search matches by. A candidate whose record changed after the
-        watermark contradicts nothing: its row is stale, and the tail reads
-        the record.
+        watermark is a stale row only if it is the record as the sync left
+        it (``indexed``, :func:`_indexed_at`): added by then, at the
+        revision and digest it had then, and, where the store still holds
+        that text, matched by a term of it. Then the tail reads the record;
+        any other is a row no sync wrote, an id added after the watermark
+        or a revision past it included (R4-F3 of PR #537).
         """
         count = 0
         for candidate in found:
             fact = facts.get(candidate.id)
+            row = (candidate.revision, candidate.digest)
             if fact is not None and fact.scope.step.issue_url == scope.issue:
                 if fact.revision > through:
-                    continue
-                if (
+                    then = held(candidate.digest)
+                    if indexed(through).get(fact.id) == row and (
+                        then is None or not wanted.isdisjoint(then)
+                    ):
+                        continue
+                elif (
                     _indexable(fact)
-                    and (fact.revision, fact.content) == (candidate.revision, candidate.digest)
+                    and (fact.revision, fact.content) == row
                     and not wanted.isdisjoint(tokens(fact.id))
                 ):
                     continue
@@ -1479,16 +1579,21 @@ class MemoryRetriever:
         facts = {f.id: f for f in snap.store.facts()}
         cache: dict[str, list[str]] = {}
 
+        def held(digest: str) -> list[str] | None:
+            # The tokens of the text the store holds by ``digest``, or ``None``
+            # when it holds none: one text, one tokenization.
+            if digest not in cache:
+                text = snap.texts.get(digest)
+                if text is None:
+                    return None
+                cache[digest] = text_tokens(text)
+            return cache[digest]
+
         def tokens(record: int) -> list[str]:
-            # The store's own text, by its content digest: one text, one
-            # tokenization. A record with no live text has no tokens.
-            text = snap.store.text_of(record)
-            if not text:
+            # The store's own live text: a record with none has no tokens.
+            if not snap.store.text_of(record):
                 return []
-            content = facts[record].content
-            if content not in cache:
-                cache[content] = text_tokens(text)
-            return cache[content]
+            return held(facts[record].content) or []
 
         used: _Slot | None = None
         found: list[IndexCandidate] = []
@@ -1506,7 +1611,9 @@ class MemoryRetriever:
                 facts = {f.id: f for f in snap.store.facts()}
             if answer is None:
                 continue
-            bad = self._contradicted(answer, facts, scope, slot.through, tokens, wanted)
+            bad = self._contradicted(
+                answer, facts, scope, snap.indexed_at, slot.through, tokens, held, wanted
+            )
             missed = self._omitted(answer, facts, scope, slot.through, tokens, wanted)
             if bad or missed:
                 slot.broken = IndexReason.INTEGRITY
@@ -1551,7 +1658,7 @@ class MemoryRetriever:
             sum(scope.served(record) for record in scope.verdicts),
         )
         ranked = sorted(scores, key=lambda record: (-scores[record], record))
-        index_name = used.backend.name if used is not None else TAIL_BACKEND
+        index_name = used.name if used is not None else TAIL_BACKEND
         generation = used.generation if used is not None else 0
         from_index = set(indexed)
         context = scope.read_scope()

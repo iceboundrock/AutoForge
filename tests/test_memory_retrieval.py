@@ -585,7 +585,8 @@ def test_a_failed_rebuild_keeps_the_index_it_would_replace_in_service():
     """R3-F4 of PR #537: a rebuild is one transaction. One that fails leaves
     the old index readable at its watermark and generation, says it failed,
     and keeps a search complete past the tail's bound; an index already
-    known to be broken stays unreadable through it; the retry succeeds."""
+    known to be broken stays unreadable through it; the next sync makes the
+    rebuild it owes (R4-F2)."""
     w = Writer(empty())
     for i in range(MAX_TAIL + 4):
         w.add(f"r{i}", f"The scanner lesson number {i}.")
@@ -608,9 +609,10 @@ def test_a_failed_rebuild_keeps_the_index_it_would_replace_in_service():
     assert (again.hits, again.complete, again.degraded) == (whole.hits, True, False)
     assert again.status == retriever.catalog(REQ).status and again.status.failed == 1
     assert retriever.metrics.snapshot()["sync_failures"] == 1
-    # The retry replaces it: a new generation, nothing failed.
+    # The next sync makes the rebuild it owes, with no store write between:
+    # a new generation, nothing failed.
     backend.fail_on = 0
-    rebuilt = retriever.rebuild()
+    rebuilt = retriever.sync()
     assert (rebuilt.state, rebuilt.generation, rebuilt.failed, rebuilt.reason) == (
         IndexState.CURRENT,
         synced.generation + 1,
@@ -639,6 +641,49 @@ def test_a_failed_rebuild_keeps_the_index_it_would_replace_in_service():
     backend.fail_on = 0
     assert retriever.rebuild().state is IndexState.CURRENT
     assert retriever.verify().state is IndexState.CURRENT
+
+
+def test_a_rebuild_that_failed_or_could_not_run_is_made_by_the_next_sync():
+    """R4-F2 of PR #537: a rebuild asked for is owed until one commits. The
+    index it would replace is still current, so with no store write between,
+    an incremental sync would have nothing to do and leave the failure for
+    good. The sync makes the rebuild instead, and only its commit clears the
+    failure; the old index serves until then."""
+    w = corpus()
+    backend = FailingFts5()
+    retriever = retriever_for(w, backend=backend)
+    synced = retriever.sync()
+    backend.fail_on = 1
+    for failed in (1, 2, 3):
+        status = retriever.rebuild() if failed == 1 else retriever.sync()
+        assert (status.state, status.generation, status.failed, status.reason) == (
+            IndexState.CURRENT,
+            synced.generation,
+            failed,
+            IndexReason.SYNC_FAILED,
+        )
+        result = retriever.search_memory(REQ, "tokenizer trailing comma")
+        assert result.backend == "sqlite-fts5" and not result.degraded and result.complete
+    backend.fail_on = 0
+    rebuilt = retriever.sync()
+    assert (rebuilt.state, rebuilt.generation, rebuilt.failed, rebuilt.reason) == (
+        IndexState.CURRENT,
+        synced.generation + 1,
+        0,
+        IndexReason.NONE,
+    )
+    # Nothing is owed once it committed: the next sync has nothing to do.
+    assert retriever.sync() == rebuilt
+    assert retriever.metrics.snapshot()["rebuilds"] == 2
+    # A rebuild asked for while the backend cannot run is owed alike.
+    unwell = Unwell(health=True)
+    owed = retriever_for(w, backend=unwell)
+    first = owed.sync()
+    unwell.health = False
+    assert owed.rebuild().state is IndexState.UNAVAILABLE
+    unwell.health = True
+    assert owed.sync().generation == first.generation + 1
+    assert owed.sync().generation == first.generation + 1
 
 
 def test_every_read_loads_the_canonical_snapshot_so_a_change_between_search_and_fetch_counts():
@@ -1492,6 +1537,137 @@ def test_a_backend_whose_health_check_fails_is_unavailable_and_the_fallback_answ
     assert alone.search_memory(REQ, "tokenizer trailing comma").backend == "scripted"
 
 
+# -- nothing of a backend is read after a read's last load (R4-F1 of PR #537) ----------
+
+
+class Named(Fts5Backend):
+    """FTS5 whose name is computed each time it is read, and runs ``during``
+    then: a write while a read looks up a backend's metadata, not a method."""
+
+    def __init__(self):
+        super().__init__()
+        self.during, self.reads = None, 0
+
+    @property
+    def name(self):
+        self.reads += 1
+        if self.during is not None:
+            during, self.during = self.during, None
+            during()
+        return "named-fts5"
+
+
+def test_a_retraction_while_a_backend_name_is_read_is_never_served():
+    """The case R4-F1 reproduced: a backend whose name runs code, armed to
+    retract a record. An earlier revision read the name after a read's last
+    load, so the search and the fetch served the record it retracted. The
+    name is read once, when the retriever is made: no read runs it, and
+    every read reports the name read then."""
+    w = corpus()
+    backend = Named()
+    retriever = retriever_for(w, backend=backend)
+    retriever.sync()
+    tokenizer = w.ids["tokenizer"]
+    backend.during = lambda: w.revise(Action.RETRACT, "tokenizer")
+    result = retriever.search_memory(REQ, "tokenizer trailing comma")
+    fetched = retriever.fetch_memory(REQ, tokenizer)
+    catalog = retriever.catalog(REQ)
+    status = retriever.status()
+    assert backend.reads == 1 and backend.during is not None
+    assert ids(result)[0] == tokenizer and fetched.item is not None
+    for hit in result.hits:
+        assert w.store.visibility(hit.id, REQ) is Visibility.CURRENT
+    told = {result.backend, result.status.backend, fetched.status.backend, catalog.status.backend}
+    assert told | {status.backend} | {h.provenance.backend for h in result.hits} == {"named-fts5"}
+
+
+class Renamed(Fts5Backend):
+    def __init__(self, name):
+        super().__init__()
+        self.name = name
+
+
+class Text(str):
+    """A name that is a subclass of text: refused for its type."""
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["", "Sqlite", "two words", "under_score", "-lead", "trail-", "a--b", "x" * 33, "store-tail"]
+    + [7, None, Text("named")],
+)
+def test_a_backend_name_is_checked_once_when_the_retriever_is_made(name):
+    w = corpus()
+    for kwargs in (
+        dict(backend=Renamed(name)),
+        dict(backend=ScriptedBackend(), fallback=Renamed(name)),
+    ):
+        with pytest.raises(ConfigurationError, match="named by lower-case words"):
+            retriever_for(w, **kwargs)
+    assert retriever_for(w, backend=Renamed("x" * 32)).status().backend == "x" * 32
+
+
+class Noting:
+    """A backend that notes in ``log`` each read of any of its attributes:
+    its methods, its name, its own state and its ``__class__`` alike."""
+
+    def __getattribute__(self, attr):
+        log = object.__getattribute__(self, "__dict__").get("log")
+        if log is not None:
+            log.append("backend")
+        return object.__getattribute__(self, attr)
+
+
+class NotedFts5(Noting, Fts5Backend):
+    def __init__(self, log):
+        super().__init__()
+        self.log = log
+
+
+class NotedUnwell(Noting, Unwell):
+    """An optional backend that cannot run, each read of its attributes noted."""
+
+    def __init__(self, log):
+        super().__init__(health=False)
+        self.log = log
+
+
+def _reads(retriever, record):
+    return (
+        lambda: retriever.search_memory(REQ, "tokenizer trailing comma"),
+        lambda: retriever.search_memory(REQ, "   "),
+        lambda: retriever.fetch_memory(REQ, record),
+        lambda: retriever.catalog(REQ),
+        retriever.status,
+    )
+
+
+def test_no_attribute_of_a_backend_is_read_after_a_reads_last_load():
+    """R4-F1 of PR #537: a read reports a backend by what the retriever
+    captured when it was made. Every read of any attribute of a backend,
+    for a call or for its metadata, comes before the read's last load of
+    the store, whether the primary answers or cannot run behind its
+    fallback: an instance check of an optional backend reads its
+    ``__class__``, and its name is a lookup like any other. Sync, rebuild
+    and verify call their backend after their load, by design: they write
+    or read back the index and serve no record."""
+    w = corpus()
+    log: list[str] = []
+
+    def source():
+        log.append("load")
+        return w.store
+
+    for primary, fallback in ((NotedFts5(log), None), (NotedUnwell(log), NotedFts5(log))):
+        retriever = MemoryRetriever(REPO, RUN, source, backend=primary, fallback=fallback)
+        retriever.sync()
+        for read in _reads(retriever, w.ids["uv"]):
+            log.clear()
+            read()
+            last = len(log) - 1 - log[::-1].index("load")
+            assert "backend" in log[:last] and log[last + 1 :] == []
+
+
 def test_a_checkpoint_from_before_a_launch_is_refused_once_the_launch_was_read():
     """R3-F1 of PR #537: a launch adds no row to the audit table, so a
     checkpoint from before it has the same rows. Once the retriever has read
@@ -1795,6 +1971,154 @@ def test_one_record_answered_with_two_rows_is_an_integrity_failure(conflict):
 
 
 # -- an answer says whose it is (R2-F5 of PR #537) -------------------------------------
+
+
+# -- a stale row is the record as the sync left it (R4-F3 of PR #537) ------------------
+
+
+def _body(text):
+    """The body a sync writes for ``text``: its tokens in FTS5's form."""
+    return " ".join(memory_retrieval._fts5_token(token) for token in text_tokens(text))
+
+
+def _changed_since_the_watermark(w):
+    """Every way a record changes after a sync while its row stays legitimately stale."""
+    w.revise(Action.CORRECT, "ruff", text="Lint is ruff with an 88 character line limit.")
+    w.revise(Action.RETRACT, "uv")
+    w.add("replacement", "The tokenizer keeps a trailing comma's final element.")
+    w.revise(Action.SUPERSEDE, "tokenizer", replacement=w.ids["replacement"])
+
+
+def _write_impossible_row(kind, w, retriever):
+    """Write into the index a row no sync through its watermark wrote; the query that meets it."""
+    db, table = retriever.backend._db, retriever.backend._tables[ISSUE]
+    record = w.ids[
+        {
+            "added-after": "replacement",
+            "revision-past": "ruff",
+            "digest-then": "uv",
+            "term-it-lacks": "tokenizer",
+            "missing": "uv",
+        }[kind]
+    ]
+    fact = next(f for f in w.store.facts() if f.id == record)
+    if kind == "added-after":
+        # The record was first added after the watermark: no sync through it saw it.
+        db.execute(
+            f"INSERT INTO {table}(rowid, body, revision, digest) VALUES (?, ?, ?, ?)",
+            (record, _body(w.store.text_of(record)), fact.revision, fact.content),
+        )
+        return "keeps"
+    if kind == "revision-past":
+        # The row claims the correction made after the watermark.
+        db.execute(
+            f"UPDATE {table} SET revision = ?, digest = ?, body = ? WHERE rowid = ?",
+            (fact.revision, fact.content, _body(w.store.text_of(record)), record),
+        )
+        return "88 character"
+    if kind == "digest-then":
+        # A digest the record never had at the watermark, of a record retracted since.
+        db.execute(f"UPDATE {table} SET digest = ? WHERE rowid = ?", ("0" * 64, record))
+        return "uv pytest"
+    if kind == "term-it-lacks":
+        # A superseded record's text is still held: the row must be indexed by it.
+        db.execute(f"UPDATE {table} SET body = ? WHERE rowid = ?", ("zebra", record))
+        return "zebra"
+    # A row the sync through the watermark wrote, of a record retracted since, gone.
+    db.execute(f"DELETE FROM {table} WHERE rowid = ?", (record,))
+    return ""
+
+
+def test_a_row_the_sync_left_is_stale_however_its_record_changed_since():
+    """R4-F3 of PR #537: rows a sync through the watermark wrote, of records
+    corrected, retracted or superseded since, are stale, never a failure.
+    Verify accepts them, and a search drops each for the store's reason while
+    the tail serves what the store does, on the index's answer."""
+    w = corpus()
+    retriever = retriever_for(w)
+    retriever.sync()
+    rows = retriever.backend.entries()
+    _changed_since_the_watermark(w)
+    assert retriever.backend.entries() == rows
+    status = retriever.verify()
+    assert (status.state, status.reason, status.pending) == (IndexState.STALE, IndexReason.NONE, 4)
+    result = retriever.search_memory(REQ, "ruff character line uv pytest tokenizer trailing comma")
+    assert result.backend == "sqlite-fts5" and not result.degraded and result.complete
+    assert sorted(ids(result)) == sorted([w.ids["ruff"], w.ids["replacement"]])
+    assert {hit.provenance.backend for hit in result.hits} == {TAIL_BACKEND}
+    assert dropped(retriever) == {"stale": 1, "retracted": 1, "superseded": 1}
+
+
+@pytest.mark.parametrize(
+    "kind", ["added-after", "revision-past", "digest-then", "term-it-lacks", "missing"]
+)
+def test_verify_finds_a_row_no_sync_through_the_watermark_wrote(kind):
+    """R4-F3 of PR #537: the index must hold exactly what a sync through its
+    watermark wrote. A row of a record first added after it, a row at a
+    revision past it or at a digest the record did not have then, a row
+    not indexed by a text the store still holds, and a missing row of a
+    record changed since are each an integrity failure, not staleness."""
+    w = corpus()
+    retriever = retriever_for(w)
+    retriever.sync()
+    _changed_since_the_watermark(w)
+    assert retriever.verify().state is IndexState.STALE
+    _write_impossible_row(kind, w, retriever)
+    status = retriever.verify()
+    assert (status.state, status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
+    assert retriever.sync().state is IndexState.CURRENT
+    assert retriever.verify().state is IndexState.CURRENT
+
+
+@pytest.mark.parametrize(
+    ("kind", "served"),
+    [
+        ("added-after", ["replacement"]),
+        ("revision-past", ["ruff"]),
+        ("digest-then", []),
+        ("term-it-lacks", []),
+    ],
+)
+def test_a_row_no_sync_through_the_watermark_wrote_falls_back_on_the_search_that_meets_it(
+    kind, served
+):
+    """R4-F3 of PR #537: the search that meets such a row discards the
+    index's answer, marks the index ``failed`` (``integrity``) and answers
+    the same call from the tail, ``degraded``, never dropping the row as
+    ordinary staleness."""
+    w = corpus()
+    retriever = retriever_for(w)
+    retriever.sync()
+    _changed_since_the_watermark(w)
+    query = _write_impossible_row(kind, w, retriever)
+    result = retriever.search_memory(REQ, query)
+    assert result.degraded and result.backend == TAIL_BACKEND and result.complete
+    assert (result.status.state, result.status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
+    assert dropped(retriever) == {"integrity": 1}
+    assert ids(result) == [w.ids[name] for name in served]
+    for hit in result.hits:
+        assert hit.provenance.backend == TAIL_BACKEND
+        assert w.store.visibility(hit.id, REQ) is Visibility.CURRENT
+
+
+@pytest.mark.parametrize("name", ["scanner", "ruff"], ids=["added-after", "revision-past"])
+def test_an_optional_backend_answering_past_its_watermark_goes_to_the_fallback(name):
+    """R4-F3 of PR #537 for an optional backend: a candidate of a record
+    added after the backend's watermark, or at a revision past it, is a row
+    no sync wrote. The FTS5 fallback answers the same search, degraded."""
+    w = corpus()
+    scripted = ScriptedBackend()
+    retriever = retriever_for(w, backend=scripted, fallback=Fts5Backend())
+    retriever.sync()
+    w.add("scanner", "The scanner keeps quotes intact.")
+    w.revise(Action.CORRECT, "ruff", text="Lint is ruff with an 88 character line limit.")
+    scripted.answer = [valid(w.store, w.ids[name])]
+    result = retriever.search_memory(REQ, "scanner quotes ruff 88 character")
+    assert result.degraded and result.backend == "sqlite-fts5" and result.complete
+    assert sorted(ids(result)) == sorted([w.ids["scanner"], w.ids["ruff"]])
+    assert {hit.provenance.backend for hit in result.hits} == {TAIL_BACKEND}
+    assert dropped(retriever) == {"integrity": 1, "stale": 1}
+    assert retriever.status().reason is IndexReason.INTEGRITY
 
 
 def test_answers_carry_the_launch_binding_and_each_records_applicability():

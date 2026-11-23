@@ -276,9 +276,10 @@ docs/test-suite-performance-audit.md   EPIC #338's exit audit: the suite at the 
                                        main, measured on one host; each exit criterion and invariant
                                        with its verdict and tests; what only GitHub holds
 docs/memory-retrieval.md               Memory's retrieval read path (#324): the store decides what is
-                                       served and the FTS5 index only ranks, freshness and failure,
-                                       the in-memory index, the measured BM25 baseline, LTSearch's
-                                       go/no-go (no-go)
+                                       served, the FTS5 index only finds candidates and the retriever
+                                       ranks the records the launch is served by their store text;
+                                       freshness and failure, the in-memory index, the measured BM25
+                                       baseline, LTSearch's go/no-go (no-go)
 docs/recovery-mvp-evaluation.md        EPIC #354's deterministic recovery MVP evaluated (#375): the
                                        before/after matrix of 17 real-engine stops, each gold
                                        resolution held by the controller's read-back, the safety

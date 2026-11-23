@@ -26,7 +26,8 @@ count, so no record outside the scope moves a hit or leaves a gap. Every
 answer names the launch it is for and each record's applicability. An index
 found not to match the store, by a row it returns or a match it leaves out,
 is marked failed, and the search that found it answers from the fallback or
-the store at once; a failed rebuild keeps the index it would have replaced.
+the store at once; a failed rebuild keeps the index it would have replaced
+until the next sync makes it.
 The index, the hot tail and a query share one Unicode tokenizer, so a
 record in any script is found alike before and after the index syncs it.
 Where the interpreter's SQLite lacks FTS5, a search reads only the eight
