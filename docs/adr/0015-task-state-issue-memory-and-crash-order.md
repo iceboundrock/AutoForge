@@ -46,7 +46,7 @@
     candidates' refs coexist, as D7.7 relies on
     (`test_adr_0015_a_candidates_ref_is_created_and_never_moved`);
     and what D10 says of SQLite holds
-    (`test_the_package_opens_sqlite_only_for_the_opencode_probe`).
+    (`test_sqlite_is_only_for_the_read_only_probe_and_disposable_index`).
   - *Revised* on 2026-11-18, after review round 1 of PR #512: an
     attempt's identity is a run-wide launch ordinal, not `state.attempt`
     (D2.1); a result passes through receipt, parse, verification and
@@ -1269,10 +1269,12 @@ its rollback journal, WAL and shared-memory files by pathname, through
 none of the controller's descriptors, so a link or a replaced directory
 between two opens can redirect them; and with the journal turned off or
 kept in memory, a crash can corrupt the database. It inherits none of
-`SafeRoot`'s guarantees, and nothing in the package shows otherwise. The
-package opens SQLite once, read-only: OpenCode's organization probe
-(`providers.py:2113`). Planning FTS5 as the search backend does not change
-this: a search index is a projection (D12), never the store.
+`SafeRoot`'s guarantees, and nothing in the package shows otherwise.
+OpenCode's organization probe opens its database read-only. The #324
+retrieval projection opens only `:memory:`, keeps temporary storage in
+memory and disables attached databases. Its disposable generations are not
+checkpoints. The rejection of pathname-based SQLite as authoritative storage
+still stands.
 
 *Rejected: a separate `memory.json` beside `state.json`.* Two files make a
 crash window between them and a rule for it (the checkpoint naming the
@@ -1400,7 +1402,9 @@ D5.3): a crash after it re-verifies the receipt and launches nothing.
   is current, is not retracted, applies) before it is rendered. An index
   behind the snapshot can miss a new record, and can never show a
   retracted one. Rank is never authority, and an index never decides what
-  is visible.
+  is visible. [#324's read library](../memory-retrieval.md) implements that
+  separation with one disposable FTS5 generation per launch binding. It
+  is not wired into launch delivery. LTSearch remains out of the runtime.
 - **No agent-callable search in the MVP.** An agent's only channels to the
   controller are the files it is given and its reply. A `search_memory` or
   `fetch_memory` call would be a new channel; if #319 or #324 adds one, it

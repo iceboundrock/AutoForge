@@ -1,0 +1,678 @@
+"""Optional controller-side retrieval over one launch's Issue Working Memory.
+
+The store authorizes prose. An index supplies only lexical membership, never
+text, scope, revision or rank. No launcher or agent transport calls this module.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import unicodedata
+from collections import Counter
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from enum import StrEnum
+from typing import Protocol
+
+from .auto_recovery import StepKey
+from .errors import StateError
+from .memory import (
+    MAX_EVENTS,
+    MAX_FACTS,
+    MAX_TEXT_BYTES,
+    Actor,
+    EvidenceRef,
+    Kind,
+    MemoryScope,
+    MemoryStore,
+    ProjectionRequest,
+    Retention,
+    RetrievalRecord,
+)
+from .redaction import redact
+
+MAX_QUERY_BYTES = 512
+MAX_HITS = 16
+TAIL_RECORDS = 8
+SUMMARY_BYTES = 512
+OMISSION = "\n[omitted]"
+
+
+class BackendError(RuntimeError):
+    """An index operation failed; message contents are not reported."""
+
+
+class IndexUnavailable(BackendError):
+    """Temporary unavailability, or this interpreter does not provide FTS5."""
+
+
+class IntegrityError(BackendError):
+    """The projection does not agree with the generation that was built."""
+
+
+class IndexState(StrEnum):
+    EMPTY = "empty"
+    CURRENT = "current"
+    STALE = "stale"
+    FAILED = "failed"
+    UNAVAILABLE = "unavailable"
+    DISABLED = "disabled"
+
+
+class Backend(StrEnum):
+    FTS5 = "fts5"
+    OPTIONAL = "optional"
+
+
+class IndexProblem(StrEnum):
+    INTEGRITY = "integrity"
+    SEARCH = "search-failed"
+    BUILD = "build-failed"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class IndexStatus:
+    """Audit positions in maintenance; observed corpus revisions in launch answers."""
+
+    backend: Backend
+    state: IndexState
+    source_seq: int
+    indexed_through_seq: int | None
+    pending: int
+    generation: int | None
+    problem: IndexProblem | None
+
+    @property
+    def is_current(self) -> bool:
+        return self.state is IndexState.CURRENT
+
+    @property
+    def lag(self) -> int | None:
+        if self.indexed_through_seq is None:
+            return None
+        return self.source_seq - self.indexed_through_seq
+
+    @property
+    def failed(self) -> int:
+        return int(self.problem not in (None, IndexProblem.UNAVAILABLE))
+
+
+@dataclass(frozen=True)
+class ReadScope:
+    repository: str
+    run_id: str
+    step: StepKey
+    launch: int
+    candidate: str
+    environment: str
+
+
+@dataclass(frozen=True)
+class MemoryItem:
+    id: int
+    kind: Kind
+    author: Actor
+    applicability: MemoryScope
+    evidence: EvidenceRef | None
+    retention: Retention | None
+    text: str
+
+
+@dataclass(frozen=True)
+class MemoryHit:
+    item: MemoryItem
+    score: float
+    scorer: str = "okapi-bm25/authorized-corpus"
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    scope: ReadScope
+    hits: tuple[MemoryHit, ...]
+    index: IndexStatus
+    complete: bool
+    degraded: bool
+    tail_used: bool
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    scope: ReadScope
+    item: MemoryItem | None
+    index: IndexStatus
+    degraded: bool
+
+
+@dataclass(frozen=True)
+class MemoryCatalog:
+    scope: ReadScope
+    topics: tuple[tuple[Kind, int], ...]
+    fingerprint: str
+    index: IndexStatus
+    degraded: bool
+
+    def render(self) -> str:
+        """Static labels only; no record titles, text, receipts or internal proofs."""
+        topics = ", ".join(f"{kind.value}: {count}" for kind, count in self.topics) or "(none)"
+        return (
+            "Issue Working Memory catalog (advisory, untrusted)\n"
+            f"Topics: {topics}\n"
+            f"Revision: {self.index.source_seq}; fingerprint: {self.fingerprint}\n"
+            f"Index: {self.index.state.value}; degraded: {str(self.degraded).lower()}\n"
+        )
+
+
+@dataclass(frozen=True)
+class ReadMetrics:
+    """Bounded controller counters; deliberately no arguments, identifiers or prose."""
+
+    searches: int = 0
+    fetches: int = 0
+    hits: int = 0
+    degraded_reads: int = 0
+
+
+@dataclass(frozen=True)
+class Checkpoint:
+    """One committed store and its current citation inputs from the same authority read."""
+
+    store: MemoryStore
+    validation_records: tuple[dict, ...] = ()
+    retained: tuple[EvidenceRef, ...] = ()
+
+
+@dataclass(frozen=True)
+class IndexDocument:
+    id: int
+    terms: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DocumentSeal:
+    id: int
+    size: int
+    digest: bytes
+
+
+class CandidateIndex(Protocol):
+    """One immutable generation; implementations must bound work to the supplied corpus.
+
+    Return an exact tuple of IDs (at most MAX_FACTS), for OR of exact terms.
+    The controller checks the answer, and never consumes backend properties or
+    rankings. Raise BackendError for operational failures, and IndexUnavailable
+    for transient query failure. Adapters are trusted controller code, not plugins.
+    """
+
+    def search(self, terms: tuple[str, ...]) -> tuple[int, ...]: ...
+
+    def verify(self, manifest: tuple[DocumentSeal, ...]) -> None: ...
+
+
+IndexFactory = Callable[[tuple[IndexDocument, ...]], CandidateIndex]
+
+
+def _words(text: str) -> tuple[str, ...]:
+    # One tokenizer, used for FTS keys, in-store ranking and the coverage proof.
+    normalized = unicodedata.normalize("NFC", unicodedata.normalize("NFKC", text).casefold())
+    words: list[str] = []
+    current: list[str] = []
+    for char in normalized:
+        category = unicodedata.category(char)[0]
+        if category in "LN" or (category == "M" and current):
+            current.append(char)
+        elif current:
+            words.append("".join(current))
+            current = []
+    if current:
+        words.append("".join(current))
+    return tuple(words)
+
+
+def _key(word: str) -> str:
+    return "t" + word.encode().hex()
+
+
+def _query(text: str, k: int) -> tuple[str, ...]:
+    if type(k) is not int or not 1 <= k <= MAX_HITS:
+        raise ValueError("invalid memory result limit")
+    if type(text) is not str or len(text) > MAX_QUERY_BYTES:
+        raise ValueError("invalid memory query")
+    try:
+        if len(text.encode()) <= MAX_QUERY_BYTES:
+            return tuple(dict.fromkeys(_words(text)))
+    except UnicodeError:
+        pass
+    raise ValueError("invalid memory query")
+
+
+def _excerpt(text: str, limit: int) -> str:
+    text = redact(text)
+    data = text.encode()
+    if len(data) > limit:
+        if limit < len(OMISSION):
+            return ""
+        text = data[: limit - len(OMISSION)].decode(errors="ignore") + OMISSION
+    if redact(text) == text:
+        return text
+    return "[details omitted]" if limit >= len("[details omitted]") else ""
+
+
+def _item(record: RetrievalRecord, bound: int) -> MemoryItem:
+    fact = record.fact
+    return MemoryItem(
+        fact.id,
+        fact.kind,
+        fact.author,
+        fact.scope,
+        fact.evidence,
+        record.retention,
+        _excerpt(record.text, bound),
+    )
+
+
+def _fts5(documents: tuple[IndexDocument, ...]) -> CandidateIndex:
+    from .memory_fts5 import Fts5Index
+
+    return Fts5Index(documents)
+
+
+@dataclass(frozen=True)
+class _View:
+    store: MemoryStore
+    records: tuple[RetrievalRecord, ...]
+    scope: ReadScope | None
+    revision: int
+
+    @property
+    def versions(self) -> frozenset[tuple[int, int]]:
+        return frozenset((r.fact.id, r.fact.revision) for r in self.records)
+
+
+@dataclass(frozen=True)
+class _Generation:
+    index: CandidateIndex
+    versions: frozenset[tuple[int, int]]
+    manifest: tuple[DocumentSeal, ...]
+    audit: int
+    revision: int
+    serial: int
+
+
+@dataclass(frozen=True)
+class _Slot:
+    backend: Backend
+    factory: IndexFactory
+    published: _Generation | None = None
+    problem: IndexProblem | None = None
+    broken: bool = False
+
+    def usable(self, view: _View) -> bool:
+        # Do not even query stale postings of a now-unauthorized document.
+        return (
+            self.published is not None
+            and not self.broken
+            and self.published.versions <= view.versions
+        )
+
+
+def _manifest(documents: tuple[IndexDocument, ...]) -> tuple[DocumentSeal, ...]:
+    result = []
+    for document in documents:
+        body = " ".join(document.terms).encode("ascii")
+        result.append(DocumentSeal(document.id, len(body), hashlib.sha256(body).digest()))
+    return tuple(result)
+
+
+def _status(slot: _Slot, view: _View, *, audit: bool) -> IndexStatus:
+    generation = slot.published
+    source = view.store.source_seq if audit else view.revision
+    through = None if generation is None else (generation.audit if audit else generation.revision)
+    if not view.store.enabled:
+        state = IndexState.DISABLED
+    elif slot.broken or (generation is None and slot.problem is IndexProblem.BUILD):
+        state = IndexState.FAILED
+    elif slot.problem is IndexProblem.UNAVAILABLE:
+        state = IndexState.UNAVAILABLE
+    elif through is None:
+        state = IndexState.EMPTY
+    elif source == through and generation is not None and generation.revision == view.revision:
+        state = IndexState.CURRENT
+    else:
+        state = IndexState.STALE
+    # Receipt retention can move the view without appending an audit row.
+    pending = max(source - (through or 0), int(state is IndexState.STALE))
+    return IndexStatus(
+        slot.backend,
+        state,
+        source,
+        through,
+        pending,
+        generation.serial if generation is not None else None,
+        slot.problem,
+    )
+
+
+class MemoryRetriever:
+    """An index and continuity guard for one controller-owned next-launch binding.
+
+    The loader returns the current validated checkpoint (not a caller-supplied
+    snapshot). As with launch projection, the controller holds the run lock and
+    serializes calls. Recreate this object on a new binding or an explicit
+    opt-in. Nothing writes to Memory or renders prose into the launch itself.
+    """
+
+    def __init__(
+        self,
+        load: Callable[[], Checkpoint],
+        request: ProjectionRequest,
+        *,
+        backend: IndexFactory | None = None,
+        fallback_to_fts5: bool = False,
+    ):
+        self._load = load
+        self._request = request
+        self._view: _View | None = None
+        self._opted_out = False
+        self._primary = (
+            _Slot(Backend.FTS5, _fts5) if backend is None else _Slot(Backend.OPTIONAL, backend)
+        )
+        self._fallback = (
+            _Slot(Backend.FTS5, _fts5) if backend is not None and fallback_to_fts5 else None
+        )
+        self._metrics = ReadMetrics()
+
+    @property
+    def metrics(self) -> ReadMetrics:
+        return self._metrics
+
+    def _read(self, *, serving: bool = True) -> _View:
+        checkpoint = self._load()
+        store = checkpoint.store
+        old = self._view
+        if old is not None and store is not old.store and not store.follows(old.store):
+            raise StateError("memory retrieval checkpoint did not continue this run")
+        if store.enabled and self._opted_out:
+            raise StateError("memory retrieval needs an explicit binding after opt-out")
+        if not store.enabled:
+            self._opted_out = True
+            view = _View(store, (), None, (old.revision + bool(old.records)) if old else 0)
+        else:
+            # Remember even a newer checkpoint that refuses this launch binding.
+            self._view = _View(store, old.records if old else (), None, old.revision if old else 0)
+            records = store.retrieval_records(
+                self._request,
+                validation_records=checkpoint.validation_records,
+                retained=checkpoint.retained,
+            )
+            request = self._request
+            scope = ReadScope(
+                store.repository,
+                request.run_id,
+                request.step,
+                request.attempt,
+                request.candidate,
+                request.environment,
+            )
+            view = _View(
+                store,
+                records,
+                scope,
+                (old.revision if old else 0) + (records != (old.records if old else ())),
+            )
+        self._view = view
+        if serving and view.scope is None:
+            raise StateError("memory retrieval is disabled")
+        return view
+
+    def status(self) -> IndexStatus:
+        """Controller diagnostic for the primary, with global audit positions."""
+        return _status(self._primary, self._read(serving=False), audit=True)
+
+    def _build(self, slot: _Slot, view: _View, *, force: bool) -> _Slot:
+        old = slot.published
+        if (
+            not force
+            and slot.problem is None
+            and not slot.broken
+            and old is not None
+            and old.revision == view.revision
+        ):
+            # Hidden writes don't create a new generation or trigger adapter work.
+            return replace(slot, published=replace(old, audit=view.store.source_seq))
+        documents = tuple(
+            IndexDocument(r.fact.id, tuple(_key(w) for w in _words(r.text))) for r in view.records
+        )
+        manifest = _manifest(documents)
+        try:
+            index = slot.factory(documents)
+            index.verify(manifest)
+        except IndexUnavailable:
+            problem = IndexProblem.UNAVAILABLE if old is None else IndexProblem.BUILD
+            return replace(slot, problem=problem)
+        except BackendError:
+            return replace(slot, problem=IndexProblem.BUILD)
+        generation = _Generation(
+            index,
+            view.versions,
+            manifest,
+            view.store.source_seq,
+            view.revision,
+            1 if old is None else old.serial + 1,
+        )
+        return _Slot(slot.backend, slot.factory, generation)
+
+    def _sync(self, *, force: bool) -> IndexStatus:
+        view = self._read(serving=False)
+        if view.store.enabled:
+            self._primary = self._build(self._primary, view, force=force)
+            if self._fallback is not None:
+                self._fallback = self._build(self._fallback, view, force=force)
+            view = self._read(serving=False)
+        return _status(self._primary, view, audit=True)
+
+    def sync(self) -> IndexStatus:
+        """Publish the complete bounded batch; retry a failed attempt even without writes."""
+        return self._sync(force=False)
+
+    def rebuild(self) -> IndexStatus:
+        """Replace the generation without mutating the current one."""
+        return self._sync(force=True)
+
+    @staticmethod
+    def _verify(slot: _Slot) -> _Slot:
+        if slot.published is not None:
+            try:
+                slot.published.index.verify(slot.published.manifest)
+            except BackendError:
+                return replace(slot, problem=IndexProblem.INTEGRITY, broken=True)
+        return slot
+
+    def verify(self) -> IndexStatus:
+        """Check the original generation, then report against the latest checkpoint."""
+        view = self._read(serving=False)
+        if view.store.enabled:
+            self._primary = self._verify(self._primary)
+            if self._fallback is not None:
+                self._fallback = self._verify(self._fallback)
+            view = self._read(serving=False)
+        return _status(self._primary, view, audit=True)
+
+    def _answers(self, view: _View) -> tuple[IndexStatus, bool]:
+        if self._primary.usable(view) and self._primary.problem is not IndexProblem.UNAVAILABLE:
+            return _status(self._primary, view, audit=False), False
+        fallback = self._fallback
+        if (
+            fallback is not None
+            and fallback.usable(view)
+            and fallback.problem is not IndexProblem.UNAVAILABLE
+        ):
+            return _status(fallback, view, audit=False), True
+        return _status(self._primary, view, audit=False), True
+
+    def fetch_memory(self, record: int) -> FetchResult:
+        view = self._read()
+        assert view.scope is not None
+        found = next((r for r in view.records if type(record) is int and r.fact.id == record), None)
+        index, degraded = self._answers(view)
+        self._count(fetch=True, hits=int(found is not None), degraded=degraded)
+        return FetchResult(
+            view.scope, _item(found, MAX_TEXT_BYTES) if found else None, index, degraded
+        )
+
+    def catalog(self) -> MemoryCatalog:
+        view = self._read()
+        assert view.scope is not None
+        kinds = Counter(r.fact.kind for r in view.records)
+        topics = tuple(sorted(kinds.items()))
+        index, degraded = self._answers(view)
+        # No record IDs, global positions, source ancestry, or withdrawn hashes.
+        fingerprint = hashlib.sha256(
+            json.dumps(sorted((r.fact.kind.value, r.text) for r in view.records)).encode()
+        ).hexdigest()
+        return MemoryCatalog(view.scope, topics, fingerprint, index, degraded)
+
+    def _lookup(
+        self, slot: _Slot, view: _View, terms: tuple[str, ...]
+    ) -> tuple[_Slot, _View, frozenset[tuple[int, int]], set[int]]:
+        generation = slot.published
+        if generation is None or not slot.usable(view):
+            return slot, view, frozenset(), set()
+        problem: IndexProblem | None = None
+        answer: object = ()
+        try:
+            answer = generation.index.search(tuple(_key(term) for term in terms))
+        except IndexUnavailable:
+            problem = IndexProblem.UNAVAILABLE
+        except IntegrityError:
+            problem = IndexProblem.INTEGRITY
+        except BackendError:
+            problem = IndexProblem.SEARCH
+        # Do not interpret even a raised backend error until we know all
+        # documents it searched remain authorized. Nothing calls it after this.
+        view = self._read()
+        if not slot.usable(view):
+            return slot, view, frozenset(), set()
+        if problem is None:
+            ids = {record for record, _ in generation.versions}
+            if (
+                type(answer) is not tuple
+                or len(answer) > MAX_FACTS
+                or any(
+                    type(i) is not int or not 1 <= i <= MAX_EVENTS or i not in ids for i in answer
+                )
+            ):
+                problem = IndexProblem.INTEGRITY
+            else:
+                matched = set(answer)
+                query = set(terms)
+                expected = {
+                    r.fact.id
+                    for r in view.records
+                    if (r.fact.id, r.fact.revision) in generation.versions
+                    and not query.isdisjoint(_words(r.text))
+                }
+                if matched == expected:
+                    if slot.problem is IndexProblem.UNAVAILABLE:
+                        slot = replace(slot, problem=None)
+                    return slot, view, generation.versions, matched
+                problem = IndexProblem.INTEGRITY
+        return (
+            replace(slot, problem=problem, broken=problem is not IndexProblem.UNAVAILABLE),
+            view,
+            frozenset(),
+            set(),
+        )
+
+    def search_memory(self, query: str, *, k: int = 5) -> SearchResult:
+        terms = _query(query, k)
+        view = self._read()
+        if not terms:
+            assert view.scope is not None
+            index, degraded = self._answers(view)
+            self._count(fetch=False, hits=0, degraded=degraded)
+            return SearchResult(view.scope, (), index, True, degraded, False)
+        primary, view, covered, matches = self._lookup(self._primary, view, terms)
+        used = primary
+        # A successful empty generation has no covered rows either.
+        answered = used.usable(view) and used.problem is not IndexProblem.UNAVAILABLE
+        if not answered and self._fallback is not None:
+            self._fallback, view, covered, matches = self._lookup(self._fallback, view, terms)
+            if (
+                self._fallback.usable(view)
+                and self._fallback.problem is not IndexProblem.UNAVAILABLE
+            ):
+                used = self._fallback
+                answered = True
+            if not self._primary.usable(view):
+                # The fallback's authority read can invalidate the primary's
+                # (so far unrecorded) diagnosis as well as its candidates.
+                if used is primary:
+                    used = self._primary
+                primary = self._primary
+        self._primary = primary
+        tail = sorted(
+            (r for r in view.records if (r.fact.id, r.fact.revision) not in covered),
+            key=lambda r: r.fact.revision,
+            reverse=True,
+        )
+        selected = tail[:TAIL_RECORDS]
+        hits = _rank(view.records, matches, selected, terms, k, self._request.max_bytes)
+        assert view.scope is not None
+        degraded = not answered or used is not self._primary
+        self._count(fetch=False, hits=len(hits), degraded=degraded)
+        return SearchResult(
+            view.scope,
+            hits,
+            _status(used, view, audit=False),
+            len(tail) <= TAIL_RECORDS,
+            degraded,
+            bool(selected),
+        )
+
+    def _count(self, *, fetch: bool, hits: int, degraded: bool) -> None:
+        cap = 2**31 - 1
+        old = self._metrics
+        self._metrics = ReadMetrics(
+            min(cap, old.searches + (not fetch)),
+            min(cap, old.fetches + fetch),
+            min(cap, old.hits + hits),
+            min(cap, old.degraded_reads + degraded),
+        )
+
+
+def _rank(
+    records: tuple[RetrievalRecord, ...],
+    matches: set[int],
+    tail: list[RetrievalRecord],
+    terms: tuple[str, ...],
+    k: int,
+    byte_budget: int,
+) -> tuple[MemoryHit, ...]:
+    if not terms or (not matches and not tail):
+        return ()
+    counts = {r.fact.id: Counter(_words(r.text)) for r in records}
+    lengths = {i: sum(c.values()) for i, c in counts.items()}
+    size = len(counts)
+    mean = sum(lengths.values()) / size or 1
+    df = {term: sum(term in c for c in counts.values()) for term in terms}
+    weights = {term: math.log1p((size - n + 0.5) / (n + 0.5)) for term, n in df.items()}
+    candidates = matches | {r.fact.id for r in tail}
+    ranked = []
+    for r in records:
+        i = r.fact.id
+        if i not in candidates:
+            continue
+        norm = 1.2 * (0.25 + 0.75 * lengths[i] / mean)
+        score = sum(weights[t] * f * 2.2 / (f + norm) for t in terms if (f := counts[i][t]))
+        if score:
+            ranked.append((score, r))
+    ranked.sort(key=lambda pair: (-pair[0], pair[1].fact.id))
+    # For byte-level tokenizers, encoded bytes bound the text tokens. The typed
+    # answer's metadata is separately bounded by the store and the result count.
+    if not ranked:
+        return ()
+    limit = min(SUMMARY_BYTES, byte_budget // min(k, len(ranked)))
+    return tuple(MemoryHit(_item(r, limit), score) for score, r in ranked[:k])

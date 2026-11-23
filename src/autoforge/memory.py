@@ -731,6 +731,44 @@ class MemoryStore:
         fact = self._facts.get(record) if type(record) is int else None
         return None if fact is None else fact.revision
 
+    @property
+    def source_seq(self) -> int:
+        """Controller-only audit position; not a revision for a scoped read."""
+        return len(self._events)
+
+    def follows(self, previous: MemoryStore) -> bool:
+        """Whether this validated checkpoint extends the same run's audit and launch clock."""
+        return (
+            self.repository == previous.repository
+            and self.run_id == previous.run_id
+            and self.launch_seq >= previous.launch_seq
+            and len(self._events) >= len(previous._events)
+            and self._events[: len(previous._events)] == previous._events
+        )
+
+    def retrieval_records(
+        self,
+        request: ProjectionRequest,
+        *,
+        validation_records: Sequence[dict] = (),
+        retained: Collection[EvidenceRef] = (),
+    ) -> tuple[RetrievalRecord, ...]:
+        """Current prose and citation retention for a controller-bound next launch.
+
+        D12's special rendering of superseded observations can preserve a
+        receipt's claim, but is not permission to retrieve their old prose.
+        """
+        request = _projection_binding(self, request)
+        receipts = _validation_facts(self, validation_records)
+        held = _retained_refs(retained)
+        return tuple(
+            RetrievalRecord(
+                fact, self._texts[fact.content], _resolve(fact, request, receipts, held)[0]
+            )
+            for fact in self._facts.values()
+            if not fact.replacement and _readable(self, request, fact)
+        )
+
     def range_bases(self, issue_url: str) -> tuple[str, ...]:
         """The distinct bases of ``issue_url``'s records that apply to a base's descendants.
 
@@ -1033,6 +1071,15 @@ class ProjectionRequest:
 
 
 @dataclass(frozen=True)
+class RetrievalRecord:
+    """Store-authorized prose; provenance and citation retention do not verify it."""
+
+    fact: MemoryFact
+    text: str
+    retention: Retention | None
+
+
+@dataclass(frozen=True)
 class MemoryFreshness:
     """What a projection was rendered from, and what it left out.
 
@@ -1252,6 +1299,34 @@ def _downgraded(fact: MemoryFact, retention: Retention | None) -> bool:
     return retention is Retention.UNAVAILABLE or fact.evidence.kind is Receipt.VALIDATION
 
 
+def _readable(store: MemoryStore, request: ProjectionRequest, fact: MemoryFact) -> bool:
+    return (
+        fact.scope.applies(request)
+        and not fact.withdrawn
+        and not any(w.binds(fact) and w.scope.applies(request) for w in store._withdrawals)
+    )
+
+
+def _projection_binding(store: MemoryStore, request: ProjectionRequest) -> ProjectionRequest:
+    _require(store.enabled and request.run_id == store.run_id)
+    step = _step(request.step.to_dict(), store.repository)
+    _require(step.phase is Phase.ANALYZE_EXECUTE)
+    # Only the next launch can receive this checkpoint's projection.
+    _require(_integer(request.attempt, 1, MAX_LAUNCH_SEQ) == store.launch_seq + 1)
+    _integer(request.max_chars, 1, MAX_PROJECTION_CHARS)
+    _integer(request.max_bytes, 1, MAX_PROJECTION_BYTES)
+    _require(
+        len(request.ancestors) <= MAX_FACTS and (bool(request.candidate) or not request.ancestors)
+    )
+    if request.candidate != "":
+        _sha(request.candidate)
+    for ancestor in request.ancestors:
+        _sha(ancestor)
+    if request.environment != "":
+        _match(request.environment, _DIGEST, 64)
+    return replace(request, step=step)
+
+
 def render_projection(
     store: MemoryStore,
     request: ProjectionRequest,
@@ -1280,24 +1355,8 @@ def render_projection(
     that establishes no claim never changes which claims are shown (only a
     withdrawal of the very text a record carries withholds that record).
     """
-    _require(store.enabled and request.run_id == store.run_id)
-    step = _step(request.step.to_dict(), store.repository)
-    _require(step.phase is Phase.ANALYZE_EXECUTE)
-    # The launch this snapshot is rendered for is the next one: an earlier
-    # ordinal would label later records as what that launch was shown.
-    _require(_integer(request.attempt, 1, MAX_LAUNCH_SEQ) == store.launch_seq + 1)
-    _integer(request.max_chars, 1, MAX_PROJECTION_CHARS)
-    _integer(request.max_bytes, 1, MAX_PROJECTION_BYTES)
-    _require(
-        len(request.ancestors) <= MAX_FACTS and (bool(request.candidate) or not request.ancestors)
-    )
-    if request.candidate != "":
-        _sha(request.candidate)
-    for ancestor in request.ancestors:
-        _sha(ancestor)
-    if request.environment != "":
-        _match(request.environment, _DIGEST, 64)
-    request = replace(request, step=step)
+    request = _projection_binding(store, request)
+    step = request.step
     receipts = _validation_facts(store, validation_records)
     held = _retained_refs(retained)
     resolved: dict[int, tuple[Retention | None, tuple | None]] = {}
@@ -1308,9 +1367,7 @@ def render_projection(
             continue
         if not fact.scope.applies(request):
             inapplicable += 1
-        elif fact.withdrawn or any(
-            w.binds(fact) and w.scope.applies(request) for w in store._withdrawals
-        ):
+        elif not _readable(store, request, fact):
             withheld += 1
         else:
             resolved[fact.id] = _resolve(fact, request, receipts, held)

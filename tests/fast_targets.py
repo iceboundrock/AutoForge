@@ -128,8 +128,15 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/interaction.py": LOOP,
     "src/autoforge/locking.py": LOOP,
     "src/autoforge/loop_guard.py": (*LOOP, "test_routing"),
-    "src/autoforge/memory.py": ("test_memory", "test_cli", "test_adr_0015"),
+    "src/autoforge/memory.py": (
+        "test_memory",
+        "test_memory_retrieval",
+        "test_cli",
+        "test_adr_0015",
+    ),
+    "src/autoforge/memory_fts5.py": ("test_memory_retrieval",),
     "src/autoforge/memory_handoff.py": (*LOOP, "test_memory_handoff", "test_validation_gates"),
+    "src/autoforge/memory_retrieval.py": ("test_memory_retrieval",),
     "src/autoforge/profiles.py": LOOP,
     "src/autoforge/progress.py": LOOP,
     "src/autoforge/read_context.py": LOOP,
@@ -216,6 +223,7 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/epic_cli.py": ("test_epic_recovery",),
     "tests/evaluation.py": ("test_evaluation_fixture",),
     "tests/evaluation_fixture.py": (),
+    "tests/memory_retrieval_bench.py": ("test_memory_retrieval_bench",),
     "tests/fast_targets.py": (),
     "tests/stop_corpus.py": (),
     "tests/live_pi.py": (),
@@ -229,6 +237,7 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/suite_comparison.py": (),
     # The evaluation protocol's pinned tasks, thresholds and fixtures (#318)
     "tests/fixtures/evaluation/": ("test_evaluation", "test_evaluation_fixture"),
+    "tests/fixtures/memory_retrieval/": ("test_memory_retrieval_bench",),
     # EPIC #338's exit audit: its runs' records, which its section 1 is held to
     "tests/fixtures/suite_performance_audit/": ("test_suite_performance_audit",),
 }
