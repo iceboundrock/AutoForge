@@ -2688,7 +2688,11 @@ def test_doctor_reports_an_unreadable_branch_rule_as_skipped(tmp_path, capsys, m
     # The exact-read row (#329): `gh auth token` prints a stand-in, and GitHub's rate
     # limit answers from a stand-in transport, never the network.
     token = "gho_" + "C" * 36
-    rate_limit = HttpsReply(200, {"content-type": "application/json"}, b'{"rate": {}}')
+    rate_limit = HttpsReply(
+        200,
+        {"content-type": "application/json"},
+        b'{"resources": {"core": {"limit": 5000, "remaining": 4999, "reset": 1700000000}}}',
+    )
     monkeypatch.setattr(github_module, "https_get", lambda request: rate_limit)
 
     def runner(req):

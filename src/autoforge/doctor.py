@@ -132,6 +132,7 @@ from .executor import (
     orphan_containment_available,
 )
 from .github import (
+    EXACT_READ_PROBE_PATH,
     EXACT_READ_PROBE_WHAT,
     EXACT_READ_ROOT,
     GH_MIN_VERSION,
@@ -982,7 +983,12 @@ class Doctor:
         token it printed. The token and the reply are never shown, stored or
         logged. Read-only.
 
-        OK when GitHub answered one JSON object. A credential failure (no
+        OK only when the answer is GitHub's rate-limit data (``resources.core``
+        holding integers ``limit``, ``remaining`` and ``reset``): evidence
+        that this endpoint answers this credential over verified HTTPS, and
+        the row says no more, since ``/rate_limit`` names no repository and
+        so proves no access to the run's pull requests, issues or comments
+        (R4-F1 of PR #539). A credential failure (no
         token, a 401, a 403 that is no rate limit), a certificate that does
         not verify and any other conclusive answer FAIL with their remedy,
         which the client chose for the failure and which asserts no cause
@@ -993,7 +999,13 @@ class Doctor:
         both the trust store and the path for any other code. A reply the
         read refuses (a redirect, a status it does not expect, one that is
         not one JSON object) names the proxy and the network path that may be
-        answering in GitHub's place. A transient failure (no connection, a
+        answering in GitHub's place, and so do the probe's own two refusals
+        (R4-F1 of PR #539): a JSON object that is not the rate-limit data,
+        `{}` included, and a 404, which on an endpoint GitHub serves every
+        token, read with no listing before it, is no lagging read; a
+        read-back whose exact read got a 404 would read it as
+        inconclusive and stop until it works, so the row says that, not that
+        it would block. A transient failure (no connection, a
         timeout, a 5xx or a rate limit) WARNs: it may pass on the next run,
         and if it does not, the proxy or the network between this machine
         and the API is to check. A probe that could not prepare its read (no
@@ -1025,11 +1037,15 @@ class Doctor:
         except ExecutionError as exc:
             return _gh_not_started(name, exc)
         if failure is None:
+            # Evidence for this endpoint alone (R4-F1 of PR #539): it names no repository.
             return CheckResult(
                 name,
                 True,
-                f"`gh auth token` printed a token and {EXACT_READ_ROOT} answered with it over "
-                "verified HTTPS (the token and the reply are not shown)",
+                f"`gh auth token` printed a token, and GET {EXACT_READ_ROOT}"
+                f"{EXACT_READ_PROBE_PATH} answered it with GitHub's rate-limit data over "
+                "verified HTTPS (the token and the reply are not shown); this endpoint names "
+                "no repository, so this does not show that the token can read the run's pull "
+                "requests, issues or comments",
             )
         summary = failure.summary(EXACT_READ_PROBE_WHAT)
         if issubclass(failure.error, GitHubCredentialError):
@@ -1043,6 +1059,15 @@ class Doctor:
                 "variables (HTTPS_PROXY, NO_PROXY) and the network path to the API: a "
                 "read-back that needs this read would stop until it works",
                 required=False,
+            )
+        if failure.error is GitHubNotFoundError:
+            # A read-back reads an exact read's 404 again and then as unavailable: it
+            # stops, it does not block (R4-F1 of PR #539). The remedy is the probe's own.
+            return CheckResult(
+                name,
+                False,
+                f"{summary}; a read-back whose exact read got this answer would read it as "
+                "inconclusive and stop until it works",
             )
         # The failure's own remedy says what to check (a certificate's by its verify
         # code, a refused reply's the proxy and the network path, no directory for `gh`

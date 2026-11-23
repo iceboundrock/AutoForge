@@ -1706,7 +1706,7 @@ the object the read-back judges, so neither may end a replan. The decision:
   between (a comment, an issue) is then absent from that listing, and the
   read-back decides on it as on any listing: the bounded attempts, never a
   blind second write. `probe_exact_read` (`doctor`, below) reads no listed
-  object and keeps a 404 as `GitHubNotFoundError`.
+  object and keeps a 404 as `GitHubNotFoundError`, with a remedy of its own.
 - *A credential failure blocks, and in K7 stops for `resume`.* A `gh auth
   token` that fails or prints no usable token, a 401 and a 403 that is no
   rate limit are `GitHubCredentialError`, whose text names what to check
@@ -1764,12 +1764,16 @@ github.com`, then, only with a token it printed, one `GET
 https://api.github.com/rate_limit` (which names no repository and does not
 count against the rate limit) through `https_get`, with the same
 credential handling, TLS, bounds and classification, and no second read.
-It never shows the token or the reply. `OK` when GitHub answered one JSON
-object; `FAIL` on a credential failure or another conclusive answer, with
-the remedy; `WARN` on a transient one (no connection, a timeout, a 5xx, a
-rate limit), naming the proxy variables, since a host where `gh` works
-through a proxy but this direct read does not would otherwise find out
-only when a read-back needs it.
+It never shows the token or the reply. `OK` only when the answer is
+GitHub's rate-limit data, `resources.core` holding integers `limit`,
+`remaining` and `reset` (R4-F1 of PR #539): evidence that this endpoint
+answers this credential over verified HTTPS, and the row claims no more,
+since `/rate_limit` names no repository and so shows no access to the run's
+pull requests, issues or comments. `FAIL` on a credential failure or another
+conclusive answer, with the remedy; `WARN` on a transient one (no
+connection, a timeout, a 5xx, a rate limit), naming the proxy variables,
+since a host where `gh` works through a proxy but this direct read does not
+would otherwise find out only when a read-back needs it.
 
 Every failure of the probe is one of these rows, never an exception that
 ends `doctor`'s report (R2-F1 of PR #539). No empty directory in which to
@@ -1799,6 +1803,15 @@ cause the failure does not show (R3-F1 of PR #539):
   and names the proxy variables, the proxy and the network
   path that may be substituting its own response; a certificate that
   verified rules a missing CA out, so the trust store is not named;
+- the probe refuses two answers of its own (R4-F1 of PR #539), each with
+  that path as its remedy and nothing of the reply quoted: a JSON object
+  that is not the rate-limit data, `{}` included, since GitHub answers
+  every token with that data; and a 404, which on an endpoint GitHub serves
+  every token, read with no listing before it, is no lagging read (it is
+  not read again, and its remedy adds `gh api rate_limit`, the same
+  endpoint through `gh`, to compare). The 404's row says a read-back
+  answered so would read it as inconclusive and stop until it works, not
+  that it would block;
 - no directory for `gh` names the temporary directory, and a credential
   failure names `gh auth status` and `gh auth token`.
 

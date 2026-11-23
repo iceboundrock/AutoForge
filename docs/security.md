@@ -448,7 +448,9 @@ and keeps the token in memory for the one request; it needs no permission
 beyond reading the object. `autoforge doctor` makes that read once the same
 way on `https://api.github.com/rate_limit`, which names no repository and
 needs no permission, to check that it works from your machine (#329); it
-shows neither the token nor the reply. Every other call AutoForge makes is about the run's repository: none reads
+shows neither the token nor the reply. Its `OK` means that endpoint answered
+the token with GitHub's rate-limit data, not that the token can read the
+repository's objects. Every other call AutoForge makes is about the run's repository: none reads
 the user, an organization, a team or a project. The one exception is a
 "blocked by" link of an EPIC's issue to an issue in another repository,
 which `autoforge epic` reads; a token that cannot read it keeps that issue

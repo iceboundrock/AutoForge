@@ -36,6 +36,10 @@ from autoforge.github import (
     EXACT_READ_CREDENTIAL_REMEDY,
     EXACT_READ_ERROR_BYTES,
     EXACT_READ_MAX_BYTES,
+    EXACT_READ_PROBE_NOT_FOUND_CAUSE,
+    EXACT_READ_PROBE_NOT_FOUND_REMEDY,
+    EXACT_READ_PROBE_REPLY_CAUSE,
+    EXACT_READ_PROBE_REPLY_REMEDY,
     EXACT_READ_PROBE_WHAT,
     EXACT_READ_REPLY_REMEDY,
     EXACT_READ_ROOT,
@@ -4475,11 +4479,22 @@ def test_an_exact_read_never_reads_a_conclusive_answer_again(reply, expected):
     assert len(gets) == 1
 
 
+# What GitHub answers `GET /rate_limit` with, abridged: `resources.core`, the other
+# resources, and the deprecated top-level `rate`.
+_RATE_LIMIT = {
+    "resources": {
+        "core": {"limit": 5000, "used": 1, "remaining": 4999, "reset": 1700000000},
+        "search": {"limit": 30, "used": 0, "remaining": 30, "reset": 1700000060},
+    },
+    "rate": {"limit": 5000, "used": 1, "remaining": 4999, "reset": 1700000000},
+}
+
+
 def test_the_exact_read_probe_makes_one_get_of_the_rate_limit_and_returns_nothing():
     """`doctor`'s probe (#329): the exact read's credential, transport and bounds, on
     `/rate_limit`, which names no repository. The reply is checked and dropped: no
     failure is returned."""
-    gh_calls, gets, client = _exact_client(_json_reply({"rate": {"limit": 5000}}), retries=3)
+    gh_calls, gets, client = _exact_client(_json_reply(_RATE_LIMIT), retries=3)
     assert client.probe_exact_read() is None
 
     (request,) = gets
@@ -4514,6 +4529,84 @@ def test_the_exact_read_probe_classifies_as_the_exact_read_and_reads_once(reply,
 # A value no redaction pattern recognizes, so only never quoting it keeps it out (R1-F1
 # of PR #539): a proxy or a server may echo a credential in any shape.
 _UNRECOGNIZED = "zq7-synthetic-echo-4f19c2-not-a-known-format"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {},
+        {"rate": {"limit": 5000, "remaining": 4999, "reset": 1700000000}},
+        {"resources": {}},
+        {"resources": [{"core": {"limit": 5000, "remaining": 4999, "reset": 1700000000}}]},
+        {"resources": {"core": {"limit": 5000, "remaining": 4999}}},
+        {"resources": {"core": {"limit": "5000", "remaining": 4999, "reset": 1700000000}}},
+        {"resources": {"core": {"limit": True, "remaining": 4999, "reset": 1700000000}}},
+        {"resources": {"core": {"limit": 5000, "remaining": 4999, "reset": 1.5}}},
+        {"message": _UNRECOGNIZED, _UNRECOGNIZED: {"core": _UNRECOGNIZED}},
+    ],
+    ids=[
+        "empty",
+        "rate-only",
+        "no-core",
+        "resources-not-an-object",
+        "no-reset",
+        "a-string",
+        "a-bool",
+        "a-float",
+        "echoed",
+    ],
+)
+def test_the_exact_read_probe_refuses_a_json_object_that_is_not_the_rate_limit(data):
+    """R4-F1 of PR #539: a stand-in answering `{}` passed the probe, which took any JSON
+    object. GitHub answers `GET /rate_limit` with `resources.core` holding integers
+    `limit`, `remaining` and `reset`, for every token, so any other object is refused as
+    an answer that may not be GitHub's: a conclusive failure naming the proxy and the
+    network path, after one GET, quoting nothing of the reply."""
+    gh_calls, gets, client = _exact_client(_json_reply(data), retries=3)
+    failure = client.probe_exact_read()
+
+    assert isinstance(failure, ExactReadFailure) and failure.error is GitHubError
+    assert failure.cause == EXACT_READ_PROBE_REPLY_CAUSE
+    assert failure.remedy == EXACT_READ_PROBE_REPLY_REMEDY
+    summary = failure.summary(EXACT_READ_PROBE_WHAT)
+    assert "HTTPS_PROXY" in summary and "trust store" not in summary
+    assert _UNRECOGNIZED not in summary
+    assert len(gets) == 1 and len(gh_calls) == 1
+
+
+def test_only_the_probe_asks_for_the_rate_limit_data():
+    """R4-F1 of PR #539: the check is the probe's. An exact read of an object takes any
+    one JSON object for its typed caller to judge, as before."""
+    _, gets, client = _exact_client(_json_reply(_rest_pr(42)))
+    assert client.get_pr_exact(_EXACT_PR_URL).number == 42
+    assert len(gets) == 1
+
+
+def test_the_exact_read_probe_s_404_names_the_path_not_a_lagging_read():
+    """R4-F1 of PR #539: the probe's 404 FAILed with no remedy. Unlike an exact read's,
+    it follows no listing, on an endpoint GitHub serves every token, so it is never
+    read again and is no lagging read: it stays not-found, names its status as
+    `api.github.com`'s, and points at the proxy and the network path and at
+    `gh api rate_limit` to compare, quoting nothing of the reply."""
+    reply = HttpsReply(
+        404,
+        {"content-type": "application/json", "x-echo": _UNRECOGNIZED},
+        f'{{"message": "{_UNRECOGNIZED}"}}'.encode(),
+    )
+    gh_calls, gets, client = _exact_client(reply, retries=3)
+    failure = client.probe_exact_read()
+
+    assert isinstance(failure, ExactReadFailure) and failure.error is GitHubNotFoundError
+    assert failure.cause == EXACT_READ_PROBE_NOT_FOUND_CAUSE
+    assert failure.remedy == EXACT_READ_PROBE_NOT_FOUND_REMEDY
+    summary = failure.summary(EXACT_READ_PROBE_WHAT)
+    assert summary == (
+        "exact read probe (GET /rate_limit): api.github.com answered HTTP 404 to an endpoint "
+        f"GitHub serves every token; {EXACT_READ_PROBE_NOT_FOUND_REMEDY}"
+    )
+    assert "HTTPS_PROXY" in summary and "`gh api rate_limit`" in summary
+    assert "trust store" not in summary and _UNRECOGNIZED not in summary
+    assert len(gets) == 1 and len(gh_calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -4759,7 +4852,7 @@ def test_an_exact_read_with_no_directory_for_gh_auth_token_sends_nothing(monkeyp
         "`gh auth token --hostname github.com` was not started: no empty working directory "
         "could be made for it (PermissionError, EACCES)"
     )
-    gh_calls, gets, client = _exact_client(_json_reply({"rate": {}}), retries=3)
+    gh_calls, gets, client = _exact_client(_json_reply(_RATE_LIMIT), retries=3)
     with pytest.raises(GitHubError) as info:
         client.get_pr_exact(_EXACT_PR_URL)
     assert type(info.value) is GitHubError

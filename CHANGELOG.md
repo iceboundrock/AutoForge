@@ -44,7 +44,14 @@ issued the certificate; the proxy and how `api.github.com` resolves for a
 hostname mismatch, which a trusted CA can issue; the clock for one
 outside its dates. A redirect, an unexpected status or a reply that is not
 one JSON object points to the proxy and the network path that may be
-answering in GitHub's place; a read-back's error names the same. No state
+answering in GitHub's place; a read-back's error names the same. The row is
+`OK` only when the answer is GitHub's rate-limit data (`resources.core`
+with integer `limit`, `remaining` and `reset`), which shows that this
+endpoint answers the token, not that the token can read the repository's
+objects. Any other JSON object, `{}` included, fails as an answer that may
+not be GitHub's, and so does a 404, since GitHub serves `/rate_limit` to
+every token and the probe follows no listing; both name the proxy and the
+network path, and the 404 suggests `gh api rate_limit` to compare. No state
 protocol or default changes.
 
 ### Optional Issue Working Memory retrieval (#324)

@@ -159,11 +159,15 @@ CLAUDE_HELP = (
 # The token the fake `gh auth token --hostname github.com` prints (#329): a stand-in.
 EXACT_READ_TOKEN = "gho_" + "D" * 36
 GH_AUTH_TOKEN = ["gh", "auth", "token", "--hostname", "github.com"]
-# What GitHub answers `GET /rate_limit` with: one JSON object.
+# What GitHub answers `GET /rate_limit` with, abridged: its rate-limit data, which the
+# probe asks for (R4-F1 of PR #539).
+RATE_LIMIT_DATA = (
+    b'{"resources": {"core": {"limit": 5000, "used": 1, "remaining": 4999, '
+    b'"reset": 1700000000}}, "rate": {"limit": 5000, "used": 1, "remaining": 4999, '
+    b'"reset": 1700000000}}'
+)
 RATE_LIMIT_REPLY = HttpsReply(
-    200,
-    {"content-type": "application/json; charset=utf-8"},
-    b'{"resources": {"core": {"limit": 5000, "remaining": 4999}}, "rate": {"limit": 5000}}',
+    200, {"content-type": "application/json; charset=utf-8"}, RATE_LIMIT_DATA
 )
 
 
@@ -1553,17 +1557,25 @@ def _no_secret_in(row) -> None:
 def test_the_exact_read_row_makes_one_get_of_the_rate_limit_and_shows_neither_token_nor_reply(
     tmp_path,
 ):
-    """OK: `gh auth token --hostname github.com` printed a token and GitHub answered one
-    JSON object to one GET of `/rate_limit`, which names no repository. The token goes
-    in the Authorization header alone; neither it nor the reply is in the row."""
+    """OK: `gh auth token --hostname github.com` printed a token and GitHub answered its
+    rate-limit data to one GET of `/rate_limit`, which names no repository. The token
+    goes in the Authorization header alone; neither it nor the reply is in the row,
+    which claims that endpoint alone, not access to the run's objects (R4-F1 of PR
+    #539)."""
     reply = HttpsReply(
         200,
         {"content-type": "application/json"},
-        b'{"rate": {"limit": 5000}, "note": "' + _REPLY_SECRET + b'"}',
+        RATE_LIMIT_DATA[:-1] + b', "note": "' + _REPLY_SECRET + b'"}',
     )
     row, calls, gets = _exact_read(tmp_path, reply)
 
     assert row.ok and row.required and row.label == "OK  "
+    assert row.detail == (
+        "`gh auth token` printed a token, and GET https://api.github.com/rate_limit answered "
+        "it with GitHub's rate-limit data over verified HTTPS (the token and the reply are "
+        "not shown); this endpoint names no repository, so this does not show that the "
+        "token can read the run's pull requests, issues or comments"
+    )
     assert [argv for argv in calls if "token" in argv] == [GH_AUTH_TOKEN]
     (request,) = gets
     assert request.url == "https://api.github.com/rate_limit"
@@ -1924,6 +1936,64 @@ def test_the_exact_read_row_points_a_refused_reply_at_the_proxy_and_the_network_
     _no_secret_in(row)
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"{}",
+        b'{"rate": {"limit": 5000, "remaining": 4999, "reset": 1700000000}}',
+        b'{"resources": {"core": {"limit": "5000", "remaining": 1, "reset": 2}}}',
+        b'{"message": "' + _ECHOED.encode() + b'", "token": "' + _REPLY_SECRET + b'"}',
+    ],
+    ids=["empty", "rate-only", "not-integers", "echoed"],
+)
+def test_the_exact_read_row_fails_a_json_object_that_is_not_the_rate_limit(tmp_path, body):
+    """R4-F1 of PR #539: a stand-in answering `{}` with HTTP 200 was OK, since the row
+    took any JSON object. GitHub answers `GET /rate_limit` with its rate-limit data for
+    every token, so another object FAILs as an answer that may not be GitHub's, naming
+    the proxy and the network path, after one GET, nothing of it shown."""
+    row, _, gets = _exact_read(
+        tmp_path, HttpsReply(200, {"content-type": "application/json"}, body)
+    )
+
+    assert not row.ok and row.required and row.label == "FAIL"
+    assert row.detail == _blocking_row(
+        github_module.EXACT_READ_PROBE_REPLY_CAUSE, github_module.EXACT_READ_PROBE_REPLY_REMEDY
+    )
+    assert "may not be GitHub's" in row.detail and "HTTPS_PROXY" in row.detail
+    assert "trust store" not in row.detail
+    assert len(gets) == 1
+    assert _ECHOED not in row.detail
+    _no_secret_in(row)
+
+
+def test_the_exact_read_row_gives_a_404_of_the_rate_limit_its_remedy(tmp_path):
+    """R4-F1 of PR #539: a 404 FAILed with no remedy. GitHub serves `GET /rate_limit` to
+    every token and the probe follows no listing, so the 404 is no lagging read: the row
+    names the status as `api.github.com`'s, points at the proxy and the network path
+    and at `gh api rate_limit` to compare, and says a read-back answered so would stop
+    as inconclusive (an exact read's 404 is read again, then unavailable), not block.
+    One GET; nothing of the reply is shown."""
+    reply = HttpsReply(
+        404,
+        {"content-type": "application/json", "x-echo": _ECHOED},
+        b'{"message": "' + _ECHOED.encode() + b" " + _REPLY_SECRET + b'"}',
+    )
+    row, _, gets = _exact_read(tmp_path, reply)
+
+    assert not row.ok and row.required and row.label == "FAIL"
+    assert row.detail == (
+        "exact read probe (GET /rate_limit): api.github.com answered HTTP 404 to an endpoint "
+        f"GitHub serves every token; {github_module.EXACT_READ_PROBE_NOT_FOUND_REMEDY}; a "
+        "read-back whose exact read got this answer would read it as inconclusive and stop "
+        "until it works"
+    )
+    assert "HTTPS_PROXY" in row.detail and "`gh api rate_limit`" in row.detail
+    assert "trust store" not in row.detail and "would block" not in row.detail
+    assert len(gets) == 1
+    assert _ECHOED not in row.detail
+    _no_secret_in(row)
+
+
 # A certificate valid for `other.example` alone, self-signed, so that a trust store can
 # hold it as its CA: `openssl req` reads every setting from this file, which LibreSSL's
 # `openssl` reads as OpenSSL's does.
@@ -1949,7 +2019,7 @@ class _RateLimitStandIn(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self.server.seen.append(self.path)
-        body = b'{"rate": {"limit": 5000}}'
+        body = RATE_LIMIT_DATA
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

@@ -846,15 +846,19 @@ _CERTIFICATE_FAILURES: dict[int, tuple[str, str]] = {
     62: ("a hostname mismatch", EXACT_READ_CERTIFICATE_NAME_REMEDY),
     64: ("an IP address mismatch", EXACT_READ_CERTIFICATE_NAME_REMEDY),
 }
+# Whoever answered a refused reply passed TLS verification for api.github.com, but that
+# is GitHub or a host this machine's trust store lets stand in for it (a TLS-inspecting
+# proxy): the path to it is what to check.
+_SUBSTITUTED = (
+    "a proxy, a captive portal or another host on the network path may be substituting "
+    "its own response (a TLS-inspecting proxy whose CA this machine trusts passes the "
+    f"certificate check); check {_PROXY_PATH}"
+)
 # What a reply the exact read refuses tells the operator to check (R3-F1 of PR #539):
 # a status it does not expect, a redirect, or a reply that is not one JSON object.
-# Whoever answered passed TLS verification for api.github.com, but that is GitHub or
-# a host this machine's trust store lets stand in for it (a TLS-inspecting proxy).
 EXACT_READ_REPLY_REMEDY = (
     "the exact read expects one JSON object and follows no redirect, and an answer other "
-    "than that may not be GitHub's: a proxy, a captive portal or another host on the "
-    "network path may be substituting its own response (a TLS-inspecting proxy whose CA "
-    f"this machine trusts passes the certificate check); check {_PROXY_PATH}"
+    f"than that may not be GitHub's: {_SUBSTITUTED}"
 )
 # What an exact read that could not start `gh auth token` tells the operator to
 # check (R2-F1 of PR #539): every `gh` the controller runs needs an empty
@@ -869,6 +873,28 @@ EXACT_READ_WORKDIR_REMEDY = (
 EXACT_READ_PROBE_PATH = "rate_limit"
 # What the probe's failures name as the read that failed.
 EXACT_READ_PROBE_WHAT = "exact read probe (GET /rate_limit)"
+# The probe's own refusals (R4-F1 of PR #539). GitHub answers GET /rate_limit, for
+# every token, with its rate-limit data: `resources.core` holding the integers below.
+# Another JSON object, `{}` included, is not that answer, and a 404 there follows no
+# listing, so unlike an exact read's 404 it is no read lagging behind one: both say
+# what answered may not be GitHub's API, and neither quotes the reply.
+_RATE_LIMIT_CORE_FIELDS = ("limit", "remaining", "reset")
+EXACT_READ_PROBE_REPLY_CAUSE = (
+    "the reply is one JSON object, but not GitHub's rate-limit data (no resources.core "
+    "holding integers limit, remaining and reset)"
+)
+EXACT_READ_PROBE_REPLY_REMEDY = (
+    "GitHub answers GET /rate_limit with its rate-limit data for every token, so another "
+    f"answer may not be GitHub's: {_SUBSTITUTED}"
+)
+EXACT_READ_PROBE_NOT_FOUND_CAUSE = (
+    "api.github.com answered HTTP 404 to an endpoint GitHub serves every token"
+)
+EXACT_READ_PROBE_NOT_FOUND_REMEDY = (
+    "this read followed no listing, so the 404 is no read lagging behind one: the request "
+    f"may not have reached GitHub's REST API, and {_SUBSTITUTED}; `gh api rate_limit` "
+    "reads the same endpoint through `gh`, to compare"
+)
 # The status a proxy refused a tunnel with: `http.client` raises the refusal as
 # ``OSError("Tunnel connection failed: <status> <the proxy's reason phrase>")``.
 # Only the three digits are taken; the reason phrase is the proxy's own text.
@@ -1198,6 +1224,21 @@ def _exact_workdir_failure(exc: GitHubError, command: str) -> ExactReadFailure:
         f"({', '.join(names)})",
         remedy=EXACT_READ_WORKDIR_REMEDY,
         detail=f"{redact(str(exc)):.200}",
+    )
+
+
+def _is_rate_limit(data: dict) -> bool:
+    """Whether ``data`` is GitHub's answer to ``GET /rate_limit`` (R4-F1 of PR #539).
+
+    ``resources.core`` holding integers ``limit``, ``remaining`` and
+    ``reset`` (a ``bool`` is no such integer): what GitHub answers every
+    token with. The deprecated top-level ``rate`` is not required, nor
+    any other resource. Read, never quoted.
+    """
+    resources = data.get("resources")
+    core = resources.get("core") if isinstance(resources, dict) else None
+    return isinstance(core, dict) and all(
+        type(core.get(key)) is int for key in _RATE_LIMIT_CORE_FIELDS
     )
 
 
@@ -2384,7 +2425,8 @@ class GitHubClient:
         connection, a 5xx, a 429 or a rate-limited 403 (by its headers or
         GitHub's message) is GitHubUnavailableError (inconclusive), a 404
         GitHubNotFoundError (which :meth:`_exact_reread` reads as
-        inconclusive), a credential `gh auth token` cannot print, a 401 or
+        inconclusive, and :meth:`probe_exact_read` keeps with its own
+        remedy), a credential `gh auth token` cannot print, a 401 or
         any other 403 GitHubCredentialError, and any other status, a
         redirect, a certificate that does not verify, a reply that is not
         one JSON object within the bound (one nested deeper than the JSON
@@ -2507,20 +2549,38 @@ class GitHubClient:
         ``doctor``'s row (#329). The same credential, transport, bounds and
         classification as an exact read (:meth:`_exact_attempt`), on
         :data:`EXACT_READ_PROBE_PATH`, which names no repository, read once.
-        ``None`` when GitHub answered one JSON object, which is dropped,
-        never shown; else the :class:`ExactReadFailure`, for the row to
-        show its :meth:`~ExactReadFailure.summary`, which holds nothing
-        GitHub, a proxy or `gh` sent (R1-F1 of PR #539). A failure to
-        prepare the read (no empty directory for `gh auth token`) and a reply
-        no decoder follows are such failures too, never an exception that
-        would end ``doctor``'s report (R2-F1 of PR #539); no GET is sent
-        without a token. A `gh` that cannot be started raises
-        ExecutionError. Read-only.
+        ``None`` when the answer is GitHub's rate-limit data
+        (``resources.core`` holding integers ``limit``, ``remaining`` and
+        ``reset``), which is dropped, never shown: evidence that this
+        endpoint answers this credential, not that the credential can read
+        any repository's objects. Else the :class:`ExactReadFailure`, for
+        the row to show its :meth:`~ExactReadFailure.summary`, which holds
+        nothing GitHub, a proxy or `gh` sent (R1-F1 of PR #539). The probe
+        refuses two answers an exact read would not (R4-F1 of PR #539): a
+        JSON object that is not that data, `{}` included, is a conclusive
+        GitHubError, and a 404 stays GitHubNotFoundError, never read again;
+        both carry a remedy naming the path that may be answering in
+        GitHub's place, since the endpoint exists for every token and the
+        read followed no listing. A failure to prepare the read (no empty
+        directory for `gh auth token`) and a reply no decoder follows are
+        such failures too, never an exception that would end ``doctor``'s
+        report (R2-F1 of PR #539); no GET is sent without a token. A `gh`
+        that cannot be started raises ExecutionError. Read-only.
         """
         try:
-            self._exact_attempt(EXACT_READ_PROBE_PATH)
+            data = self._exact_attempt(EXACT_READ_PROBE_PATH)
         except _ExactReadFailed as exc:
+            if exc.failure.error is GitHubNotFoundError:
+                return ExactReadFailure(
+                    GitHubNotFoundError,
+                    EXACT_READ_PROBE_NOT_FOUND_CAUSE,
+                    remedy=EXACT_READ_PROBE_NOT_FOUND_REMEDY,
+                )
             return exc.failure
+        if not _is_rate_limit(data):
+            return ExactReadFailure(
+                GitHubError, EXACT_READ_PROBE_REPLY_CAUSE, remedy=EXACT_READ_PROBE_REPLY_REMEDY
+            )
         return None
 
     # -- environment / doctor --------------------------------------------

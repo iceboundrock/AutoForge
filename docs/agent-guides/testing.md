@@ -1748,7 +1748,15 @@ a stated reason it has none. The coverage that must keep working:
   redirect, an unexpected status, one that is not one JSON object) names
   the proxy and the network path and not the trust store, the row being
   the controller's words alone (R3-F1 of PR #539, `tests/test_doctor.py`,
-  `tests/test_github.py`)
+  `tests/test_github.py`); the probe is `OK` only on `resources.core` with
+  integer `limit`, `remaining` and `reset`, and the row says that shows the
+  endpoint, not access to the run's objects, while any other JSON object
+  (`{}`, `rate` alone, a string, a bool or a float where an integer
+  belongs) FAILs naming the proxy and the network path, and a 404 FAILs,
+  read once, with its own remedy (the path and `gh api rate_limit`) and a
+  read-back said to stop as inconclusive, not block, nothing of either
+  reply shown; an object's exact read does not ask for that data (R4-F1
+  of PR #539, `tests/test_doctor.py`, `tests/test_github.py`)
 - text the controller writes back or verifies (#328, `tests/test_effects.py`,
   `tests/test_engine.py`, `tests/test_operator_actions.py`): for K3 and K6
   a base holding escape text, control characters or caret text is written
