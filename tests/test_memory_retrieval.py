@@ -1242,6 +1242,46 @@ def test_damage_to_the_searched_issues_row_of_the_table_map_falls_back_on_that_s
 
 
 @needs_fts5
+@pytest.mark.parametrize("damage", sorted(MAP_DAMAGES))
+def test_a_failure_another_issues_search_found_is_every_issues_until_a_rebuild(damage):
+    """R19-F2 of PR #537: what a search reads is its own issue's, but the
+    index's failure is the run's. A search of this issue never reads
+    another issue's row of the map, so that row's damage alone moves
+    nothing it is told (the first regression above). Once the other
+    issue's own search meets the damage, the index is failed for every
+    issue: this issue's next search answers from the tail, ``failed``
+    (``integrity``) and degraded, and its fetch and catalog say so, with no
+    ``verify`` or other maintenance between. The tail's hits are those the
+    index gave, and a rebuild returns both issues to the index."""
+    w = corpus()
+    backend = Fts5Backend()
+    retriever = retriever_for(w, backend=backend)
+    retriever.sync()
+    other = replace(REQ, step=StepKey(Phase.ANALYZE_EXECUTE, OTHER, "", 0, 1))
+    whole = retriever.search_memory(REQ, "trailing comma tokenizer")
+    _damage_map(backend, OTHER, damage)
+    assert retriever.search_memory(REQ, "trailing comma tokenizer") == whole
+    assert retriever.catalog(REQ).status.state is IndexState.CURRENT
+    found = retriever.search_memory(other, "HTTP")
+    assert found.degraded and found.backend == TAIL_BACKEND
+    assert (found.status.state, found.status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
+    result = retriever.search_memory(REQ, "trailing comma tokenizer")
+    assert result.degraded and result.backend == TAIL_BACKEND
+    assert (result.status.state, result.status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
+    assert [(h.id, h.summary) for h in result.hits] == [(h.id, h.summary) for h in whole.hits]
+    assert retriever.catalog(REQ).status.reason is IndexReason.INTEGRITY
+    fetched = retriever.fetch_memory(REQ, w.ids["tokenizer"])
+    assert fetched.item is not None and fetched.degraded
+    assert fetched.status.reason is IndexReason.INTEGRITY
+    # Found once, by the other issue's search: this issue's met nothing.
+    assert retriever.metrics.snapshot()["integrity"] == 1
+    assert retriever.rebuild().state is IndexState.CURRENT
+    for request, query in ((REQ, "trailing comma tokenizer"), (other, "HTTP")):
+        again = retriever.search_memory(request, query)
+        assert again.backend == "sqlite-fts5" and again.complete and not again.degraded
+
+
+@needs_fts5
 def test_a_rebuild_that_failed_or_could_not_run_is_made_by_the_next_sync():
     """R4-F2 of PR #537: a rebuild asked for is owed until one commits. The
     index it would replace is still current, so with no store write between,
@@ -3742,6 +3782,7 @@ def test_the_pinned_fixture_serves_nothing_stale_or_foreign_in_any_condition():
         assert (c["stale_leak_rate"], c["permission_leak_rate"]) == (0.0, 0.0), name
         assert c["adversarial_negative_hit_rate"] == 0.0, name
         assert c["correction_old_text_served"] == 0, name
+        assert c["duplicate_hits"] == 0, name
     for name in ("synced", "stale", "rebuilt"):
         c = report[name]
         assert (c["recall_at_5"], c["mrr"]) == (1.0, 1.0), name
@@ -3797,6 +3838,74 @@ def test_a_correctness_report_names_the_bytes_it_measured_never_the_pinned_fixtu
     assert reserialized.data() == pinned.data()
     assert bench.correctness(reserialized)["fixture_sha256"] == reserialized.sha256
     assert reserialized.sha256 != PINNED_FIXTURE_SHA256
+
+
+# The pinned query whose relevant records are m5 and m23, m5 ranked first.
+_RUFF_QUERY = "ruff line length lint"
+
+
+@pytest.mark.parametrize("copies", [2, 5])
+def test_a_record_ranked_twice_earns_its_relevance_once(copies):
+    """R19-F1 of PR #537: ``quality`` credited every place of a ranking, so
+    a relevant record repeated stood in for one it pushed out. For the
+    pinned query ``ruff line length lint``, relevant ``m5`` and ``m23``,
+    ``[m5, m5]`` gave Recall@5 and nDCG@5 of 1.0 though ``m23`` was
+    missing, and five copies of ``m5`` gave 2.5 and 1.8078. A record now
+    earns its gain once, at its first place: either ranking finds half of
+    what is relevant, at the first place, like ``[m5]`` alone."""
+    relevant = {"m5", "m23"}
+    alone = bench.quality([(["m5"], relevant)])
+    assert alone == {"precision_at_5": 0.2, "recall_at_5": 0.5, "mrr": 1.0, "ndcg_at_5": 0.6131}
+    assert bench.quality([(["m5"] * copies, relevant)]) == alone
+    # Only a repeat is passed over: a relevant record after it still counts.
+    assert bench.quality([(["m5", "m5", "m23"], relevant)])["recall_at_5"] == 1.0
+    assert bench.duplicates(["m5"] * copies) == copies - 1
+    assert bench.duplicates(["m5", "m23", "m6"]) == 0
+
+
+@needs_fts5
+@pytest.mark.parametrize("copies", [2, 5])
+def test_a_search_giving_a_record_twice_is_a_deduplication_failure_never_recall(
+    copies, monkeypatch
+):
+    """R19-F1 of PR #537, through the benchmark: a search made to give the
+    pinned query's first hit, ``m5``, ``copies`` times and nothing else
+    leaves ``m23`` out. Until the nineteenth review round synced Recall@5
+    stayed 1.0 with two copies and rose to 1.1 with five, and nothing
+    counted the repeat. Now that query's recall is 0.5, the condition's
+    mean falls by its half, and every repeat is a deduplication failure.
+    The honest run gives none in any condition, and its figures are the
+    pinned ones."""
+    pinned = bench.read_fixture()
+    honest = bench.correctness(pinned)
+    queries = [q["query"] for q in pinned.data()["queries"]]
+    at = queries.index(_RUFF_QUERY)
+    for name in _CONDITIONS:
+        assert honest[name]["duplicate_hits"] == 0, name
+    for name in _SERVING:
+        assert honest[name]["ranked"][at] == ["m5", "m23", "m6", "m9"], name
+        assert honest[name]["recall_at_5"] == 1.0, name
+    real = MemoryRetriever.search_memory
+
+    def search(self, request, query, **kwargs):
+        result = real(self, request, query, **kwargs)
+        if query != _RUFF_QUERY or not result.hits:
+            return result
+        return replace(result, hits=(result.hits[0],) * copies)
+
+    monkeypatch.setattr(MemoryRetriever, "search_memory", search)
+    tampered = bench.correctness(pinned)
+    for name in _SERVING:
+        c, before = tampered[name], honest[name]
+        assert c["ranked"][at] == ["m5"] * copies, name
+        assert c["duplicate_hits"] == copies - 1, name
+        assert c["recall_at_5"] == round((len(queries) - 0.5) / len(queries), 4), name
+        assert c["recall_at_5"] < before["recall_at_5"] and c["ndcg_at_5"] < before["ndcg_at_5"]
+        # The repeat is the current m5, so no leak, and the other queries
+        # are ranked as before.
+        assert (c["stale_leak_rate"], c["permission_leak_rate"]) == (0.0, 0.0), name
+        assert c["ranked"][:at] == before["ranked"][:at], name
+        assert c["ranked"][at + 1 :] == before["ranked"][at + 1 :], name
 
 
 def _past_a_hits_bound(text: str, word: str, size: int) -> str:

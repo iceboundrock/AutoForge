@@ -87,8 +87,8 @@ latest change at or before the watermark), whose rows hold text the launch
 may read. Nothing the index holds of any other record, another
 candidate's, a retracted or superseded one's, or an earlier text of a
 record corrected since, is read by a launch's search, so no row of one,
-damaged or not, moves the answer, its status or whether it is degraded
-(R8-F1 of PR #537): such records are the tail's or no one's, and
+damaged or not, by itself moves the answer, its status or whether it is
+degraded (R8-F1 of PR #537): such records are the tail's or no one's, and
 :meth:`MemoryRetriever.verify`, the controller's, checks their rows. The
 same holds of a record the store withdraws or corrects while the backend
 answers: the answer is judged only once the store has been loaded after
@@ -105,7 +105,12 @@ records is not a projection of the store (a malformed row, two rows of one
 record, a candidate the store contradicts, a match it omits, or, by
 ``verify``, any row no sync through the watermark wrote) is ``failed``
 (``integrity``) until it is rebuilt, and the search that found it answers
-from the fallback or the tail instead. Since the index is in memory, a
+from the fallback or the tail instead. That failure is the whole index's,
+not the issue's or the launch's whose search found it: until the rebuild
+every search of the run answers so, and every fetch and catalog reports
+it. A launch never meets damage outside its scope itself, but it sees a
+failure another search or ``verify`` has found (R19-F2 of PR #537).
+Since the index is in memory, a
 crash loses it and the next process rebuilds it from the checkpoint,
 deterministically.
 
@@ -633,9 +638,11 @@ class Fts5Backend:
 
         Only that partition's row of the map is read, and checked as
         :meth:`_table_map` checks every row: a name this backend never gives
-        is :class:`RetrievalIntegrityError`. So damage to another
-        partition's row moves no search of this one;
-        :meth:`MemoryRetriever.verify`'s read-back finds it. Until the
+        is :class:`RetrievalIntegrityError`. So no search of this partition
+        meets damage to another partition's row;
+        :meth:`MemoryRetriever.verify`'s read-back finds it, and so does a
+        search of that partition, either of which fails the retriever's
+        index for every partition until a rebuild (R19-F2). Until the
         eighteenth review round a search read and checked the whole map,
         and a malformed name of another issue's table failed every search
         of every issue (R18-F2 of PR #537).
@@ -1972,10 +1979,12 @@ class MemoryRetriever:
         (another candidate's, environment's or issue's, retracted, withheld,
         superseded) and one changed after the watermark, whose row holds an
         earlier text. Their rows hold text the launch may not read, so no
-        search of the launch's reads them, and a damaged one moves nothing
-        it is told: the tail reads the records changed since, and
+        search of the launch's reads them, and by itself a damaged one moves
+        nothing it is told: the tail reads the records changed since, and
         :meth:`verify`, the controller's, checks every row (R8-F1 of PR
-        #537). At most :data:`~autoforge.memory.MAX_FACTS` ids.
+        #537). A failure another launch's search or :meth:`verify` finds is
+        the whole index's, though, and every launch sees it (R19-F2). At
+        most :data:`~autoforge.memory.MAX_FACTS` ids.
         """
         return frozenset(
             f.id for f in facts.values() if f.revision <= through and scope.served(f.id)

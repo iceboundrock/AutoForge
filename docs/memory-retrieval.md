@@ -90,9 +90,12 @@ failure. So the same damaged row, over the same served records, made a
 search `current` or `failed` and `degraded`, and the next catalog said so,
 by whether the text of a record bound to an earlier candidate held the
 query's term: a channel, through the status and the fallback, to text the
-launch cannot read. Now no row of a record the launch is not served, and
-no row holding an earlier text, damaged or not, moves an answer, a status,
-a flag or a catalog. The regression keeps everything the launch is
+launch cannot read. Now no search of the launch's reads a row of a record
+the launch is not served, or a row holding an earlier text, so by itself
+no such row, damaged or not, moves an answer, a status, a flag or a
+catalog. A failure that another launch's search, or `verify`, finds in
+one is the whole index's, and every launch sees it ("A launch is told
+only of its scope" below). The regression keeps everything the launch is
 served the same, varies only that text (another candidate's record, one
 superseded or retracted since the sync, the earlier text of one corrected
 since), damages its row five ways (a body the query matches, a wrong
@@ -321,14 +324,23 @@ check. Until the eighteenth review round a search read and checked the
 whole map, so with two issues synced, another issue's row made to name a
 table the backend never makes turned a search of this issue from
 `current` on FTS5 to `failed` (`integrity`) on the tail, and the next
-catalog said so too. Now such damage moves no answer of this issue's
-launch, `verify` still finds it, and a rebuild repairs it. The same damage
-to the searched issue's own row still fails that search safely: a name the
-backend never gives is `integrity`, a row gone leaves the served matches
-omitted, which the coverage check finds, and the tail answers on the same
-search, `degraded`
+catalog said so too. Now no search of this issue meets such damage, so by
+itself it moves no answer of this issue's launch; `verify` still finds it,
+and a rebuild repairs it. The same damage to the searched issue's own row
+still fails that search safely: a name the backend never gives is
+`integrity`, a row gone leaves the served matches omitted, which the
+coverage check finds, and the tail answers on the same search, `degraded`
 (`test_damage_to_another_issues_row_of_the_table_map_moves_no_search_of_this_one`,
 `test_damage_to_the_searched_issues_row_of_the_table_map_falls_back_on_that_search`).
+What either finding fails is the whole index, though, not the damaged
+issue's part of it. Once a search of the damaged issue has met its row, a
+search of the healthy issue answers from the tail too, `failed`
+(`integrity`), and its fetch and catalog say so, with no `verify` or other
+maintenance between, until a rebuild
+(`test_a_failure_another_issues_search_found_is_every_issues_until_a_rebuild`).
+The healthy issue never meets the damage itself; it sees the failure
+another search, or maintenance, has already found ("A launch is told only
+of its scope" below).
 
 ### A launch is told only of its scope
 
@@ -374,9 +386,29 @@ launch gets, before or after the index syncs it
   served, so a record it is not served moves neither
   (`test_records_the_launch_is_not_served_move_no_hit_place_or_score`).
   It asks the index only about records the launch is served ("The store
-  decides" above), so no row of any other record, damaged or not, moves
-  its status, whether it is `complete` or `degraded`, or a later catalog
+  decides" above), so it never meets a row of any other record, and no
+  such row, damaged or not, by itself moves its status, whether it is
+  `complete` or `degraded`, or a later catalog
   (`test_a_damaged_row_of_text_the_launch_cannot_read_moves_nothing_it_is_told`).
+
+What a launch's own reads meet is of its scope; the index's failure is
+not. The index has one state for the whole run. Once any search meets
+damage in what it reads (a search of another issue, or of another launch
+whose scope serves the damaged row), or maintenance finds damage anywhere
+(`verify`), the index is `failed` until a rebuild, and from then on every
+search of every launch answers from the fallback or the tail, `degraded`,
+and every fetch and catalog reports the failure. So damage outside a
+launch's scope never reaches it through its own reads, but a failure
+another search or maintenance has already found does: with two issues
+synced and the other issue's row of the map damaged, this issue's answers
+are unchanged until the other issue is searched, and from that search on
+this issue's next search answers from the tail, `failed` (`integrity`),
+with no `verify` between
+(`test_a_failure_another_issues_search_found_is_every_issues_until_a_rebuild`).
+What moves is availability and the status, never what may be served: the
+tail reads the store's own text of the records the launch is served, so
+its hits are still only those, though it may find fewer than the index
+would, and `complete` says when.
 
 Why each record was refused is counted in `RetrievalMetrics` (`dropped_*`),
 the controller's in-process diagnostic, which no read returns. A fetch
@@ -559,7 +591,10 @@ missing or malformed is a typed `RetrievalIntegrityError` of `documents`
 too, and an update that would leave it below zero fails whole
 (`test_a_damaged_document_count_is_found_by_verify_and_made_anew_by_a_rebuild`,
 `test_an_update_refuses_to_count_fewer_than_no_documents`). No search reads
-the count, so its damage moves no answer.
+the count, so no search meets its damage. Once `verify` has found it, the
+index is `failed` for every issue's search, fetch and catalog until the
+rebuild, as for any damage found ("A launch is told only of its scope"
+above).
 
 A rebuild asked for explicitly is one transaction too, and the index it
 would replace stays in service until the new one commits. If it fails,
@@ -951,7 +986,25 @@ record is not showing its correction, and a correction that only changes
 what lies past the prefix a hit shows is not visible in any hit, whether
 its excerpt is an earlier one's exactly or differs from it only by where
 it is cut. Such a hit still shows the record as it is now, so it is
-neither a stale leak nor old text served.
+neither a stale leak nor old text served. P@5, R@5, MRR and nDCG@5 credit
+a relevant record once, at the first place a search gives it. A place
+repeating a record an earlier place of the same search gave earns
+nothing, and each such place, in any search of a condition, is counted as
+a deduplication failure (`duplicate_hits`).
+
+Until the nineteenth review round every place was credited, so a repeat
+stood in for the relevant record it pushed out. For the pinned query
+`ruff line length lint`, relevant `m5` and `m23`, `[m5, m5]` scored R@5
+and nDCG@5 of 1.0 though `m23` was missing, and five copies of `m5`
+scored 2.5 and 1.8078. Through the benchmark, the pinned fixture with
+that query's search made to give `m5` twice and nothing else kept synced
+R@5 at 1.00 and nDCG@5 at 0.990, the honest figures; five copies raised
+them to 1.10 and 1.044. Now the same rankings score 0.5 and 0.6131 alone,
+and the condition 0.967 and 0.964, with 1 and 4 deduplication failures
+(`test_a_record_ranked_twice_earns_its_relevance_once`,
+`test_a_search_giving_a_record_twice_is_a_deduplication_failure_never_recall`).
+The honest run gives none in any condition, and its report is unchanged
+but for that count, 0 in each.
 
 Until the fourteenth review round "new text visible" counted any hit of
 the corrected record on the new-text search, whatever it showed: on the
@@ -1050,7 +1103,9 @@ in-memory index, over a store decoded from the checkpoint's JSON. That
 shows the rebuild is deterministic from the checkpoint alone, which is
 what a new process would start from; no other interpreter is started, so
 it is not an observed restart. An empty store gives no hit, `complete`.
-The test holds the safety columns at zero in every condition. It also
+The test holds the safety columns at zero in every condition, and the
+deduplication failures too, which no column shows: no search gave a
+record twice in any condition. It also
 holds R@5 and MRR at 1.00 wherever the search is complete, and the stale
 and rebuilt rankings equal to the synced one. It does not hold the
 quality figures of the degraded conditions, which only show what each

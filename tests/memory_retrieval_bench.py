@@ -33,7 +33,9 @@ text's, nor one changed only by where it is cut, nor one that ends with the
 omission marker, cut or not, after what an earlier text holds. Its old
 text is served by any other hit showing a text the
 record held before, its declared text or an earlier correction's
-(:func:`_shows_earlier_text`).
+(:func:`_shows_earlier_text`). A record one search gives twice earns its
+relevance once (:func:`quality`), and each repeat is counted as a
+deduplication failure (``duplicate_hits``).
 
 **Performance** times the same index on the fixture's store, on a store at
 Memory's record bound, and on synthetic corpora of the backend alone, which
@@ -512,12 +514,41 @@ def _dcg(gains: Sequence[int]) -> float:
     return sum(g / math.log2(i + 2) for i, g in enumerate(gains))
 
 
+def _credited(top: Sequence[str], relevant: set[str]) -> list[bool]:
+    """Which places of ``top`` earn a relevant record's gain: each record's first, only."""
+    seen: set[str] = set()
+    found = []
+    for key in top:
+        found.append(key in relevant and key not in seen)
+        seen.add(key)
+    return found
+
+
+def duplicates(keys: Sequence[str]) -> int:
+    """How many of ``keys`` repeat a key an earlier one of them gave."""
+    return len(keys) - len(set(keys))
+
+
 def quality(results: Sequence[tuple[Sequence[str], set[str]]], k: int = K) -> dict:
-    """Precision@K, Recall@K, MRR and nDCG@K (binary gains) over ranked keys."""
+    """Precision@K, Recall@K, MRR and nDCG@K (binary gains) over ranked keys.
+
+    A relevant record earns its gain once, at the first place it holds
+    (:func:`_credited`). A place repeating a key an earlier place of the
+    same ranking gave earns nothing, so a duplicate neither stands in for a
+    relevant record it pushed out of the top ``k`` nor lifts a figure past
+    its ceiling; the benchmark counts every such place as a deduplication
+    failure of the answer (``duplicate_hits``, :func:`_condition`).
+
+    Until the nineteenth review round each place was credited: for the
+    pinned query ``ruff line length lint``, relevant ``m5`` and ``m23``,
+    ``[m5, m5]`` gave Recall@5 and nDCG@5 of 1.0 though ``m23`` was
+    missing, and five copies of ``m5`` gave 2.5 and 1.8078 (R19-F1 of PR
+    #537). Each now gives 0.5 and 0.6131.
+    """
     precision, recall, rr, ndcg = [], [], [], []
     for ranked, relevant in results:
         top = list(ranked)[:k]
-        found = [key in relevant for key in top]
+        found = _credited(top, relevant)
         precision.append(sum(found) / k)
         recall.append(sum(found) / len(relevant))
         rr.append(next((1 / (i + 1) for i, hit in enumerate(found) if hit), 0.0))
@@ -533,14 +564,17 @@ def quality(results: Sequence[tuple[Sequence[str], set[str]]], k: int = K) -> di
 
 def _condition(world: World, retriever: MemoryRetriever, *, k: int = K) -> dict:
     fixture, truth = world.fixture, oracle(world.fixture)
-    served = stale = permission = 0
+    served = stale = permission = repeated = 0
     ranked: list[tuple[list[str], set[str]]] = []
     complete = []
 
     def search(query: str) -> tuple[SearchResult, list[str]]:
-        nonlocal served, stale, permission
+        nonlocal served, stale, permission, repeated
         result = retriever.search_memory(world.request, query, k=k)
         keys = [world.key(hit.id) for hit in result.hits]
+        # A record given twice by one search is a deduplication failure,
+        # wherever it is; :func:`quality` credits it once.
+        repeated += duplicates(keys)
         for hit, key in zip(result.hits, keys, strict=True):
             state, text = truth[key]
             served += 1
@@ -576,6 +610,7 @@ def _condition(world: World, retriever: MemoryRetriever, *, k: int = K) -> dict:
         **quality(ranked, k),
         "queries": len(ranked),
         "served": served,
+        "duplicate_hits": repeated,
         "stale_leak_rate": stale / served if served else 0.0,
         "permission_leak_rate": permission / served if served else 0.0,
         "adversarial_negative_hit_rate": negative_hits / len(fixture["negatives"]),
