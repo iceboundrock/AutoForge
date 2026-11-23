@@ -70,10 +70,16 @@ SCOPE = MemoryScope(STEP)
 # The next launch of a store at launch_seq 128 (``empty()``), on candidate SHA.
 REQ = ProjectionRequest(RUN, STEP, 129, SHA, ancestors=(BASE,))
 
-# Every test but the import check reads a real FTS5 index, or a store the
-# benchmark indexes; an interpreter whose SQLite lacks FTS5 has neither.
-pytestmark = pytest.mark.skipif(
+# A test that reads a real FTS5 index, or a store the benchmark indexes,
+# skips where this interpreter's SQLite lacks FTS5; every other test runs
+# there too, the no-FTS5 regression included (R9-F2 of PR #537).
+needs_fts5 = pytest.mark.skipif(
     not fts5_available(), reason="this interpreter's SQLite has no FTS5"
+)
+# The no-FTS5 regression's case on a build that really lacks it; elsewhere
+# its simulated case covers the same path.
+lacks_fts5 = pytest.mark.skipif(
+    fts5_available(), reason="this interpreter's SQLite has FTS5; the simulated case runs here"
 )
 
 PINNED_FIXTURE_SHA256 = "ececa5575e9326972ebfe5d7f3365c8e6c913f7d42623deac250ef7d38a89125"
@@ -173,6 +179,7 @@ def dropped(retriever):
 # -- the default backend ---------------------------------------------------------------
 
 
+@needs_fts5
 def test_the_fts5_index_answers_a_small_corpus_in_memory_without_a_file_or_the_network(
     tmp_path, monkeypatch
 ):
@@ -212,6 +219,7 @@ def test_the_fts5_index_answers_a_small_corpus_in_memory_without_a_file_or_the_n
     retriever.close()
 
 
+@needs_fts5
 def test_partitions_keep_one_issues_scores_and_rows_apart():
     """Each issue is its own FTS5 table: another issue's records neither
     reach a search nor move its BM25 scores."""
@@ -238,6 +246,7 @@ def test_partitions_keep_one_issues_scores_and_rows_apart():
 # -- the authority barrier -------------------------------------------------------------
 
 
+@needs_fts5
 def test_a_corrected_record_is_served_only_as_it_is_now_even_before_the_index_catches_up():
     w = corpus()
     retriever = retriever_for(w)
@@ -259,6 +268,7 @@ def test_a_corrected_record_is_served_only_as_it_is_now_even_before_the_index_ca
     assert retriever.search_memory(REQ, "system interpreter").hits == ()
 
 
+@needs_fts5
 def test_a_retracted_record_is_unservable_at_once_and_a_failed_sync_never_reopens_it():
     w = corpus()
     backend = FailingFts5()
@@ -377,6 +387,7 @@ def test_a_store_of_another_repository_or_run_is_refused_by_every_read(field):
         MemoryRetriever(REPO, RUN, w.store)
 
 
+@needs_fts5
 def test_candidate_drift_ranges_and_environments_decide_applicability_not_the_index():
     w = Writer(empty())
     w.add(
@@ -454,6 +465,7 @@ def test_query_syntax_never_reaches_fts5_and_indexed_text_stays_fenced(query):
     assert redact(rendered) == rendered
 
 
+@needs_fts5
 def test_query_and_result_bounds_are_refused_or_kept():
     with pytest.raises(RetrievalError):
         query_terms("x" * (MAX_QUERY_BYTES + 1))
@@ -553,6 +565,7 @@ def test_a_query_past_the_byte_bound_is_refused_before_it_is_encoded():
         query_terms(_ClaimsToBeText())
 
 
+@needs_fts5
 def test_the_catalog_is_labels_and_counts_within_its_bound():
     w = Writer(empty())
     for kind in (Kind.HYPOTHESIS, Kind.NOTE, Kind.FAILED_APPROACH, Kind.CONSTRAINT, Kind.HANDOFF):
@@ -625,6 +638,7 @@ class FailingFts5(Fts5Backend):
         super()._insert(db, table, doc)
 
 
+@needs_fts5
 def test_freshness_reports_its_watermark_pending_and_failures_truthfully():
     w = corpus()
     backend = FailingFts5()
@@ -672,6 +686,7 @@ def test_freshness_reports_its_watermark_pending_and_failures_truthfully():
     )
 
 
+@needs_fts5
 def test_a_failed_rebuild_keeps_the_index_it_would_replace_in_service():
     """R3-F4 of PR #537: a rebuild is one transaction. One that fails leaves
     the old index readable at its watermark and generation, says it failed,
@@ -734,6 +749,7 @@ def test_a_failed_rebuild_keeps_the_index_it_would_replace_in_service():
     assert retriever.verify().state is IndexState.CURRENT
 
 
+@needs_fts5
 def test_a_rebuild_that_failed_or_could_not_run_is_made_by_the_next_sync():
     """R4-F2 of PR #537: a rebuild asked for is owed until one commits. The
     index it would replace is still current, so with no store write between,
@@ -777,6 +793,7 @@ def test_a_rebuild_that_failed_or_could_not_run_is_made_by_the_next_sync():
     assert owed.sync().generation == first.generation + 1
 
 
+@needs_fts5
 def test_every_read_loads_the_canonical_snapshot_so_a_change_between_search_and_fetch_counts():
     """R1-F1 of PR #537: no read is handed a snapshot. A retraction or a
     correction made after a search is what the next fetch is judged by."""
@@ -800,6 +817,7 @@ def test_every_read_loads_the_canonical_snapshot_so_a_change_between_search_and_
     assert retriever.catalog(REQ).revision == item.revision
 
 
+@needs_fts5
 def test_an_older_snapshot_is_refused_even_where_the_index_watermark_matches_it():
     """R1-F1 of PR #537: the snapshot an index was synced through, saved
     before a retraction, matches the index's watermark exactly; once the
@@ -846,6 +864,7 @@ def test_an_older_snapshot_is_refused_even_where_the_index_watermark_matches_it(
     assert fresh.sync().indexed_through_seq == saved.revision
 
 
+@needs_fts5
 def test_a_row_that_contradicts_its_revision_marks_the_index_failed_and_is_never_served():
     """R2-F4 of PR #537: the search that meets the contradiction discards the
     index's answer and answers from the tail on that same call, degraded."""
@@ -882,6 +901,7 @@ def test_a_row_that_contradicts_its_revision_marks_the_index_failed_and_is_never
     assert retriever.sync().state is IndexState.CURRENT
 
 
+@needs_fts5
 def test_a_retriever_rebuilt_from_a_json_round_tripped_checkpoint_answers_identically():
     """R6-F4 and R7-F2 of PR #537: two retrievers in this one process, the
     second over a store decoded from the first's checkpoint after a JSON
@@ -909,8 +929,16 @@ def test_a_retriever_rebuilt_from_a_json_round_tripped_checkpoint_answers_identi
         assert (a.hits, a.status, a.complete) == (b.hits, b.status, b.complete)
 
 
-def test_without_fts5_only_the_bounded_tail_is_searched_and_the_result_says_so(monkeypatch):
-    monkeypatch.setattr(memory_retrieval, "_open_memory_database", lambda: None)
+@pytest.mark.parametrize("absence", ["simulated", pytest.param("this-build", marks=lacks_fts5)])
+def test_without_fts5_only_the_bounded_tail_is_searched_and_the_result_says_so(
+    absence, monkeypatch
+):
+    """The bounded tail and the scope's isolation where SQLite has no FTS5.
+    Simulated on an interpreter whose SQLite has it, and run as it is on one
+    whose SQLite lacks it, where this test must not be skipped (R9-F2 of PR
+    #537): it is that interpreter's whole read path."""
+    if absence == "simulated":
+        monkeypatch.setattr(memory_retrieval, "_open_memory_database", lambda: None)
     assert not fts5_available()
     w = Writer(empty())
     for i in range(MAX_TAIL + 3):
@@ -975,6 +1003,7 @@ class ScriptedBackend:
         pass
 
 
+@needs_fts5
 def test_an_optional_backend_falls_back_only_to_fts5_and_never_across_permissions():
     w = corpus()
     w.revise(Action.RETRACT, "ruff")
@@ -1088,6 +1117,7 @@ def test_text_tokens_folds_every_script_alike_and_ascii_takes_the_same_path():
 
 
 @pytest.mark.parametrize(("name", "text", "query"), SCRIPTS, ids=[s[0] for s in SCRIPTS])
+@needs_fts5
 def test_non_latin_text_is_found_alike_by_the_index_the_tail_and_a_rebuild(name, text, query):
     w = corpus()
     retriever = retriever_for(w)
@@ -1180,6 +1210,7 @@ def test_a_backend_repeating_a_candidate_fills_one_place():
         pytest.param(lambda c: [replace(c, rank=1 + n % 64) for n in range(65)], id="over-limit"),
     ],
 )
+@needs_fts5
 def test_a_malformed_backend_answer_is_a_backend_failure_and_falls_back(malformed):
     w = corpus()
     answer = malformed(valid(w.store, w.ids["ruff"]))
@@ -1234,6 +1265,7 @@ class Pair(tuple):
         pytest.param(lambda c: Pair((c,)), id="a-tuple-subclass"),
     ],
 )
+@needs_fts5
 def test_a_backend_answers_container_is_checked_before_anything_iterates_it(container):
     """R5-F3 of PR #537: a list subclass's length and iteration are the
     backend's code. One that reports one candidate while it holds 65 was
@@ -1279,6 +1311,7 @@ class ReadBack(Fts5Backend):
         pytest.param(lambda rows: rows[1:], id="a-row-short"),
     ],
 )
+@needs_fts5
 def test_verify_checks_the_read_backs_container_and_size_before_it_iterates_it(wrap):
     """R5-F3 of PR #537, for ``verify``: the rows read back must be exactly
     a list of one row per record a sync through the watermark wrote, checked
@@ -1300,6 +1333,7 @@ def test_verify_checks_the_read_backs_container_and_size_before_it_iterates_it(w
 # -- nothing outside the launch's scope is told (R1-F4 of PR #537) ----------------------
 
 
+@needs_fts5
 def test_fetch_gives_one_answer_for_every_record_it_does_not_serve():
     w = corpus()
     w.add(
@@ -1338,6 +1372,7 @@ def test_fetch_gives_one_answer_for_every_record_it_does_not_serve():
     }
 
 
+@needs_fts5
 def test_records_outside_the_scope_move_nothing_a_launch_is_told():
     """Adding, correcting and retracting another issue's, another candidate's
     and another environment's records changes no fetch, catalog or search
@@ -1389,6 +1424,7 @@ def test_records_outside_the_scope_move_nothing_a_launch_is_told():
     assert after.scope_digest != before[0].scope_digest
 
 
+@needs_fts5
 def test_the_catalog_says_nothing_of_text_the_store_refuses_to_serve():
     """R5-F2 of PR #537: two stores alike but for the text of a retracted, a
     withheld and a superseded record give the same catalog, its digest and
@@ -1497,6 +1533,7 @@ def test_the_projections_own_binding_tells_no_base_of_a_record_the_launch_is_not
 # -- what a fetch says of the index (R1-F5 of PR #537) -----------------------------------
 
 
+@needs_fts5
 def test_fetch_reports_the_index_freshness_of_its_scope():
     w = corpus()
     retriever = retriever_for(w)
@@ -1534,6 +1571,7 @@ def test_fetch_reports_the_index_freshness_of_its_scope():
     assert retriever.fetch_memory(REQ, w.ids["uv"]).status.is_current
 
 
+@needs_fts5
 def test_fetch_reports_a_failed_backend_and_its_fallback():
     w = corpus()
     down = ScriptedBackend(fail=True)
@@ -1578,6 +1616,7 @@ class Meddling(Fts5Backend):
         return answer
 
 
+@needs_fts5
 def test_a_retraction_while_the_index_answers_is_judged_by_the_store_after_it():
     w = corpus()
     backend = Meddling()
@@ -1601,6 +1640,7 @@ def test_a_retraction_while_the_index_answers_is_judged_by_the_store_after_it():
     assert retriever.fetch_memory(REQ, w.ids["tokenizer"]).item is None
 
 
+@needs_fts5
 def test_a_correction_while_the_index_answers_is_served_as_the_store_holds_it_after():
     w = corpus()
     backend = Meddling()
@@ -1637,6 +1677,7 @@ def test_a_scripted_backend_that_retracts_before_it_answers_gets_nothing_served(
     assert retriever.fetch_memory(REQ, w.ids["tokenizer"]).item is None
 
 
+@needs_fts5
 def test_a_launch_counted_while_a_backend_answers_refuses_the_search():
     """The request is bound again to the store after the retrieval: a launch
     spent meanwhile makes it an earlier launch's, refused like any other."""
@@ -1674,6 +1715,7 @@ class Logged(Fts5Backend):
         return super().search(partition, terms, records, limit)
 
 
+@needs_fts5
 def test_no_backend_is_called_after_a_reads_last_load_of_the_store():
     """R3-F1 of PR #537: every backend's health is read before the store is
     loaded, and a search loads it again after its backend answers. Nothing
@@ -1713,6 +1755,7 @@ def test_no_backend_is_called_after_a_reads_last_load_of_the_store():
     assert log == ["available", "load", "load", "search", "load"]
 
 
+@needs_fts5
 def test_a_retraction_while_a_backend_reports_its_health_is_never_served():
     """The case R3-F1 reproduced: a retraction during the health check that
     used to follow the search's last load. The search serves only what the
@@ -1749,6 +1792,7 @@ class Unwell(ScriptedBackend):
 
 
 @pytest.mark.parametrize("health", [None, False, 1, "yes"], ids=["raises", "false", "one", "text"])
+@needs_fts5
 def test_a_backend_whose_health_check_fails_is_unavailable_and_the_fallback_answers(health):
     """R3-F1 of PR #537: a typed failure of ``available`` is a backend that
     cannot run, never an error of the read; only ``True`` is health."""
@@ -1784,6 +1828,7 @@ def test_a_backend_whose_health_check_fails_is_unavailable_and_the_fallback_answ
     [(Fts5Backend, "sqlite-fts5"), (None, TAIL_BACKEND)],
     ids=["fts5-fallback", "no-fallback"],
 )
+@needs_fts5
 def test_an_unavailable_primary_is_asked_again_and_a_failed_one_waits_for_a_rebuild(
     fallback, answered
 ):
@@ -1851,6 +1896,7 @@ class Named(Fts5Backend):
         return "named-fts5"
 
 
+@needs_fts5
 def test_a_retraction_while_a_backend_name_is_read_is_never_served():
     """The case R4-F1 reproduced: a backend whose name runs code, armed to
     retract a record. An earlier revision read the name after a read's last
@@ -2009,6 +2055,7 @@ def _every_read(retriever, record):
     )
 
 
+@needs_fts5
 def test_a_checkpoint_from_before_an_opt_out_never_reopens_the_read_path():
     """R5-F1 of PR #537: the controller turns Memory off
     (``AutoForgeState.memory_setting``) without changing the audit rows or
@@ -2101,6 +2148,7 @@ def test_a_snapshot_proven_newer_than_an_opt_out_is_read_without_a_rebind(proof)
 # -- nothing the launch is not served moves a hit (R2-F2 of PR #537) ---------------------
 
 
+@needs_fts5
 def test_records_the_launch_is_not_served_move_no_hit_place_or_score():
     """Two hits that compete for one place: another candidate's, another
     issue's, a withheld and a retracted record holding the query's terms
@@ -2233,6 +2281,7 @@ def _sequences(retriever, w, request=REQ):
     }
 
 
+@needs_fts5
 def test_writes_outside_the_scope_leave_no_gap_in_any_sequence_a_launch_is_told():
     """Interleaved writes in and out of the scope: every revision, watermark
     and lag a launch is told is the scope's own count, the same as in a
@@ -2278,6 +2327,7 @@ def test_writes_outside_the_scope_leave_no_gap_in_any_sequence_a_launch_is_told(
     ("column", "value"),
     [("revision", "abc"), ("revision", 2.5), ("digest", 7), ("body", "xzz")],
 )
+@needs_fts5
 def test_a_malformed_fts5_row_is_an_integrity_failure_never_an_exception(column, value):
     w = corpus()
     retriever = retriever_for(w)
@@ -2300,6 +2350,7 @@ def test_a_malformed_fts5_row_is_an_integrity_failure_never_an_exception(column,
 # -- verify reads the tokens; a contradiction falls back at once (R2-F4 of PR #537) ------
 
 
+@needs_fts5
 def test_verify_finds_a_row_indexed_by_other_tokens_and_a_rebuild_restores_it():
     w = corpus()
     retriever = retriever_for(w)
@@ -2331,6 +2382,7 @@ def test_verify_finds_a_row_indexed_by_other_tokens_and_a_rebuild_restores_it():
     assert retriever.verify().reason is IndexReason.INTEGRITY
 
 
+@needs_fts5
 def test_a_row_matched_by_a_term_its_text_lacks_falls_back_on_the_first_search():
     w = corpus()
     retriever = retriever_for(w)
@@ -2343,6 +2395,7 @@ def test_a_row_matched_by_a_term_its_text_lacks_falls_back_on_the_first_search()
     assert dropped(retriever) == {"integrity": 1} and result.complete
 
 
+@needs_fts5
 def test_a_contradicted_primary_answer_goes_to_the_fts5_fallback_on_the_same_call():
     w = corpus()
     wrong = replace(valid(w.store, w.ids["uv"]), digest="0" * 64)
@@ -2356,6 +2409,7 @@ def test_a_contradicted_primary_answer_goes_to_the_fts5_fallback_on_the_same_cal
     assert retriever.metrics.snapshot()["integrity"] == 1
 
 
+@needs_fts5
 def test_a_served_match_the_index_omits_falls_back_on_the_same_search():
     """R3-F3 of PR #537: a search proves its index's coverage before it says
     ``complete``. A body altered so that the only match is gone, and an
@@ -2406,6 +2460,7 @@ def test_a_served_match_the_index_omits_falls_back_on_the_same_search():
         pytest.param(lambda c: [c, replace(c, revision=c.revision + 1)], id="revision"),
     ],
 )
+@needs_fts5
 def test_one_record_answered_with_two_rows_is_an_integrity_failure(conflict):
     """R3-F3 of PR #537: a record answered twice with different revisions or
     digests is two rows of it, which no sync writes. It is found before the
@@ -2481,6 +2536,7 @@ def _write_impossible_row(kind, w, retriever):
     return ""
 
 
+@needs_fts5
 def test_a_row_the_sync_left_is_stale_however_its_record_changed_since():
     """R4-F3 of PR #537: rows a sync through the watermark wrote, of records
     corrected, retracted or superseded since, are stale, never a failure.
@@ -2505,6 +2561,7 @@ def test_a_row_the_sync_left_is_stale_however_its_record_changed_since():
 @pytest.mark.parametrize(
     "kind", ["added-after", "revision-past", "digest-then", "term-it-lacks", "missing"]
 )
+@needs_fts5
 def test_verify_finds_a_row_no_sync_through_the_watermark_wrote(kind):
     """R4-F3 of PR #537: the index must hold exactly what a sync through its
     watermark wrote. A row of a record first added after it, a row at a
@@ -2537,6 +2594,7 @@ def test_verify_finds_a_row_no_sync_through_the_watermark_wrote(kind):
         pytest.param("revision", MAX_COUNTER + 1, id="revision-past-the-counter"),
     ],
 )
+@needs_fts5
 def test_verify_rejects_a_malformed_stale_row_whose_text_the_store_no_longer_holds(field, value):
     """R7-F1 of PR #537: the stale row of a record corrected since the
     watermark, whose earlier text the store no longer holds, has tokens
@@ -2583,6 +2641,7 @@ def test_verify_rejects_a_malformed_stale_row_whose_text_the_store_no_longer_hol
         ("term-it-lacks", []),
     ],
 )
+@needs_fts5
 def test_a_row_no_sync_through_the_watermark_wrote_is_read_by_no_search_and_verify_finds_it(
     kind, served
 ):
@@ -2705,6 +2764,7 @@ def _told(w, retriever):
 @pytest.mark.parametrize(
     "kind", ["earlier-candidate", "superseded-since", "retracted-since", "corrected-since"]
 )
+@needs_fts5
 def test_a_damaged_row_of_text_the_launch_cannot_read_moves_nothing_it_is_told(kind, damage):
     """R8-F1 of PR #537: two stores alike in everything the launch is served,
     the one difference the text of a record it may not read: whether it holds
@@ -2738,6 +2798,7 @@ def test_a_damaged_row_of_text_the_launch_cannot_read_moves_nothing_it_is_told(k
 @pytest.mark.parametrize(
     ("damage", "query"), [("body", UNREAD), ("digest", "zebra"), ("revision", "zebra")]
 )
+@needs_fts5
 def test_the_same_damage_to_a_row_the_launch_is_served_falls_back_on_that_search(damage, query):
     """R8-F1 of PR #537, its other half: a failure that affects what the launch
     is served is still found by the search that meets it, which answers from
@@ -2805,6 +2866,7 @@ def _withdrawn_inside(kind, word, when, **kwargs):
 @pytest.mark.parametrize("when", ["before-reading", "after-reading"])
 @pytest.mark.parametrize("damage", ["body", "digest", "revision"])
 @pytest.mark.parametrize("kind", ["retracted", "superseded", "corrected"])
+@needs_fts5
 def test_a_damaged_row_of_a_record_withdrawn_while_the_index_answers_moves_nothing(
     kind, damage, when
 ):
@@ -2843,6 +2905,7 @@ def test_a_damaged_row_of_a_record_withdrawn_while_the_index_answers_moves_nothi
 @pytest.mark.parametrize(
     ("damage", "query"), [("body", UNREAD), ("digest", "zebra"), ("revision", "zebra")]
 )
+@needs_fts5
 def test_damage_to_a_row_still_served_falls_back_on_the_search_that_withdrew_another(
     damage, query, fallback, when
 ):
@@ -2896,6 +2959,7 @@ class Withdrawing(ScriptedBackend):
         pytest.param(lambda c: replace(c, rank=0), id="rank-zero"),
     ],
 )
+@needs_fts5
 def test_an_optional_backends_malformed_candidate_of_a_record_withdrawn_meanwhile_is_set_aside(
     malformed,
 ):
@@ -2956,6 +3020,7 @@ class Writing(Fts5Backend):
 
 
 @pytest.mark.parametrize("operation", ["first-sync", "incremental-sync", "rebuild", "verify"])
+@needs_fts5
 def test_a_write_while_maintenance_runs_the_backend_is_reported_pending(operation):
     """R8-F2 of PR #537: a sync, a rebuild and a verify computed the status
     they return against the snapshot they loaded before calling the backend.
@@ -3056,6 +3121,7 @@ def test_answers_carry_the_launch_binding_and_each_records_applicability():
 # -- the pinned benchmark --------------------------------------------------------------
 
 
+@needs_fts5
 def test_the_pinned_fixture_serves_nothing_stale_or_foreign_in_any_condition():
     """#324's correctness benchmark on its pinned fixture
     (``tests/memory_retrieval_bench.py``, ``docs/memory-retrieval.md``)."""
@@ -3109,6 +3175,7 @@ def test_the_pinned_fixture_serves_nothing_stale_or_foreign_in_any_condition():
     }
 
 
+@needs_fts5
 def test_the_benchmarks_cost_half_runs_on_a_small_corpus():
     report = bench.performance(sizes=(200,), rounds=1)
     assert report["ingestion_to_visibility"]["tail_served"] == [TAIL_BACKEND]
@@ -3132,3 +3199,19 @@ def test_no_package_module_imports_the_retrieval_path():
             elif isinstance(node, ast.Import):
                 names = [a.name for a in node.names]
             assert not any("memory_retrieval" in n for n in names), path
+
+
+def test_only_the_tests_that_read_a_real_index_skip_without_fts5():
+    """R9-F2 of PR #537: the skip is each test's that reads a real index,
+    never the module's. A module-wide marker skipped the no-FTS5 regression
+    on the very interpreters it covers, and the import check above with it."""
+    assert "pytestmark" not in globals()
+    for test in (
+        test_without_fts5_only_the_bounded_tail_is_searched_and_the_result_says_so,
+        test_no_package_module_imports_the_retrieval_path,
+        test_text_tokens_folds_every_script_alike_and_ascii_takes_the_same_path,
+        test_a_store_of_another_repository_or_run_is_refused_by_every_read,
+    ):
+        assert needs_fts5.mark not in getattr(test, "pytestmark", []), test.__name__
+    indexed = test_the_fts5_index_answers_a_small_corpus_in_memory_without_a_file_or_the_network
+    assert needs_fts5.mark in indexed.pytestmark
