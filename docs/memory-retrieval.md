@@ -314,6 +314,22 @@ read refuses a snapshot of another. Inside a run, each issue is its own
 FTS5 table, so no row of another issue can come back from a search
 (`test_partitions_keep_one_issues_scores_and_rows_apart`).
 
+A search reads only its own issue's row of the map naming each issue's
+table, and checks that row's name before it builds a statement with it;
+the whole map is maintenance's, read by a sync, `verify` and the backend's
+check. Until the eighteenth review round a search read and checked the
+whole map, so with two issues synced, another issue's row made to name a
+table the backend never makes turned a search of this issue from
+`current` on FTS5 to `failed` (`integrity`) on the tail, and the next
+catalog said so too. Now such damage moves no answer of this issue's
+launch, `verify` still finds it, and a rebuild repairs it. The same damage
+to the searched issue's own row still fails that search safely: a name the
+backend never gives is `integrity`, a row gone leaves the served matches
+omitted, which the coverage check finds, and the tail answers on the same
+search, `degraded`
+(`test_damage_to_another_issues_row_of_the_table_map_moves_no_search_of_this_one`,
+`test_damage_to_the_searched_issues_row_of_the_table_map_falls_back_on_that_search`).
+
 ### A launch is told only of its scope
 
 A launch's scope is its issue's records that apply to it: neither
@@ -527,6 +543,24 @@ rebuild, and only its commit clears the failure
 `test_an_interrupt_after_an_incremental_syncs_commit_is_settled_and_rebuilt`,
 `test_an_interrupt_that_stops_a_rollback_leaves_it_to_the_next_call`).
 
+The map and the count are part of the index, so a rebuild makes them anew
+in its transaction, whatever they held, and `verify` checks the count
+(below). Until the eighteenth review round a rebuild only emptied the map
+and updated the count's one row: with that row gone the update changed
+nothing, and nothing read the count but the next incremental sync. So
+`verify` and `rebuild` both reported `current`, every incremental sync
+after the next store write failed (`sync-failed`), and the backend's
+`documents` raised `TypeError`. Now a count missing, doubled, of another
+type, outside 0 to 100,000 or not the number of rows the tables hold
+fails the backend's check, so `verify` reports `failed` (`integrity`). The
+rebuild, asked for at once or after `verify`, makes the count with the
+rows, and the next incremental sync on the same retriever commits. A count
+missing or malformed is a typed `RetrievalIntegrityError` of `documents`
+too, and an update that would leave it below zero fails whole
+(`test_a_damaged_document_count_is_found_by_verify_and_made_anew_by_a_rebuild`,
+`test_an_update_refuses_to_count_fewer_than_no_documents`). No search reads
+the count, so its damage moves no answer.
+
 A rebuild asked for explicitly is one transaction too, and the index it
 would replace stays in service until the new one commits. If it fails,
 SQLite keeps the old rows, and the retriever keeps the old index's
@@ -577,7 +611,10 @@ a lost text lets `verify` check, so such a row stays stale
 (`test_verify_rejects_a_malformed_stale_row_whose_text_the_store_no_longer_holds`).
 `verify`
 also runs FTS5's own integrity check, which proves FTS5's inverted index
-matches the rows it holds. Once `verify` marks the index `failed`, searches
+matches the rows it holds, and checks that the count of documents is one
+well-formed row equal to the number of rows the tables hold. Its read-back
+reads the whole table map, every partition's row checked before any
+statement is built with it. Once `verify` marks the index `failed`, searches
 answer from the tail or the fallback until a sync rebuilds it
 (`test_verify_finds_a_row_indexed_by_other_tokens_and_a_rebuild_restores_it`).
 

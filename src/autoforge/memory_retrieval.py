@@ -549,6 +549,15 @@ class Fts5Backend:
     failed dropping them again (R17-F1 of PR #537). A transaction an
     interrupt left open, one stopped before its rollback ran, is rolled back
     before any later call reads the connection (:meth:`_require`).
+
+    A rebuild makes all of it again, the map and the count included, so it
+    repairs whatever damage they hold; :meth:`check` finds a count that is
+    missing, malformed or not the number of rows the tables hold. Until the
+    eighteenth review round a rebuild only updated the count's row, which
+    changed nothing once that row was gone, and nothing checked it: the
+    index was reported ``current`` while every incremental sync failed
+    (R18-F1 of PR #537). A search reads only the map's row of the partition
+    it searches (:meth:`_table_of`); the whole map is maintenance's.
     """
 
     name = FTS5_BACKEND
@@ -557,16 +566,21 @@ class Fts5Backend:
         db = _open_memory_database()
         if db is not None:
             try:
-                db.execute(
-                    "CREATE TABLE partitions(partition TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE)"
-                )
-                db.execute("CREATE TABLE counts(documents INTEGER NOT NULL)")
-                db.execute("INSERT INTO counts(documents) VALUES (0)")
+                self._make_metadata(db, 0)
             except sqlite3.Error:
                 db.close()
                 db = None
         self._db = db
         self._serial = 0
+
+    @staticmethod
+    def _make_metadata(db: sqlite3.Connection, count: int) -> None:
+        """The map and the count made anew, empty and holding ``count``, whatever was there."""
+        db.execute("DROP TABLE IF EXISTS partitions")
+        db.execute("DROP TABLE IF EXISTS counts")
+        db.execute("CREATE TABLE partitions(partition TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE)")
+        db.execute("CREATE TABLE counts(documents INTEGER NOT NULL)")
+        db.execute("INSERT INTO counts(documents) VALUES (?)", (count,))
 
     def available(self) -> bool:
         return self._db is not None
@@ -591,10 +605,12 @@ class Fts5Backend:
 
     @staticmethod
     def _table_map(db: sqlite3.Connection) -> dict[str, str]:
-        """Each partition's table, as the database names it.
+        """Each partition's table, as the database names it: maintenance's whole map.
 
         A name is checked to be one this backend gives before any statement
         is built with it: anything else is :class:`RetrievalIntegrityError`.
+        An update, the read-back and :meth:`check` read it; a search reads
+        only its own partition's row (:meth:`_table_of`).
         """
         try:
             rows = db.execute("SELECT partition, name FROM partitions").fetchall()
@@ -610,6 +626,51 @@ class Fts5Backend:
                 raise RetrievalIntegrityError("the FTS5 index names a table it never made")
             tables[partition] = name
         return tables
+
+    @staticmethod
+    def _table_of(db: sqlite3.Connection, partition: str) -> str | None:
+        """``partition``'s table, as the database names it; ``None`` when it has none.
+
+        Only that partition's row of the map is read, and checked as
+        :meth:`_table_map` checks every row: a name this backend never gives
+        is :class:`RetrievalIntegrityError`. So damage to another
+        partition's row moves no search of this one;
+        :meth:`MemoryRetriever.verify`'s read-back finds it. Until the
+        eighteenth review round a search read and checked the whole map,
+        and a malformed name of another issue's table failed every search
+        of every issue (R18-F2 of PR #537).
+        """
+        try:
+            rows = db.execute(
+                "SELECT name FROM partitions WHERE partition = ?", (partition,)
+            ).fetchmany(2)
+        except sqlite3.Error:
+            raise RetrievalBackendError("the FTS5 index could not be read") from None
+        if not rows:
+            return None
+        ((name,), *more) = rows
+        if more or type(name) is not str or not _TABLE_NAME.fullmatch(name):
+            raise RetrievalIntegrityError("the FTS5 index names a table it never made")
+        return name
+
+    @staticmethod
+    def _document_count(db: sqlite3.Connection) -> int:
+        """The count of documents the database holds, as its one row of ``counts`` says.
+
+        Anything else, no row, a second one, or a value that is not an
+        integer from 0 to :data:`MAX_INDEX_DOCUMENTS`, is
+        :class:`RetrievalIntegrityError` (R18-F1 of PR #537). Whether the
+        count is the number of rows the tables hold is :meth:`check`'s.
+        """
+        try:
+            rows = db.execute("SELECT documents FROM counts").fetchmany(2)
+        except sqlite3.Error:
+            raise RetrievalBackendError("the FTS5 index could not be read") from None
+        if len(rows) != 1 or type(count := rows[0][0]) is not int:
+            raise RetrievalIntegrityError("the FTS5 index holds a malformed document count")
+        if not 0 <= count <= MAX_INDEX_DOCUMENTS:
+            raise RetrievalIntegrityError("the FTS5 index holds a malformed document count")
+        return count
 
     @property
     def _tables(self) -> dict[str, str]:
@@ -642,18 +703,20 @@ class Fts5Backend:
             db.execute("BEGIN IMMEDIATE")
             if clear:
                 # Every partition table the database holds, whatever the map
-                # names: a rebuild replaces the whole index.
+                # names, and the map and the count themselves: a rebuild
+                # replaces the whole index, so it repairs them whatever
+                # damage they hold (R18-F1 of PR #537).
                 for (old,) in db.execute(
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 ).fetchall():
                     if type(old) is str and _TABLE_NAME.fullmatch(old):
                         db.execute(f"DROP TABLE {old}")
-                db.execute("DELETE FROM partitions")
+                self._make_metadata(db, 0)
                 tables: dict[str, str] = {}
                 count = 0
             else:
                 tables = self._table_map(db)
-                (count,) = db.execute("SELECT documents FROM counts").fetchone()
+                count = self._document_count(db)
             for partition, record in deletes:
                 if (gone := tables.get(partition)) is not None:
                     count -= db.execute(f"DELETE FROM {gone} WHERE rowid = ?", (record,)).rowcount
@@ -674,6 +737,9 @@ class Fts5Backend:
                 count -= db.execute(f"DELETE FROM {table} WHERE rowid = ?", (doc.id,)).rowcount
                 self._insert(db, table, doc)
                 count += 1
+            if count < 0:
+                # More rows deleted than the count held: it was not their number.
+                raise RetrievalIntegrityError("the FTS5 index's document count is inconsistent")
             if count > MAX_INDEX_DOCUMENTS:
                 raise RetrievalBackendError("the index is past its document bound")
             db.execute("UPDATE counts SET documents = ?", (count,))
@@ -697,7 +763,7 @@ class Fts5Backend:
         self, partition: str, terms: Sequence[str], records: Sequence[int], limit: int
     ) -> list[IndexCandidate]:
         db = self._require()
-        table = self._table_map(db).get(partition)
+        table = self._table_of(db, partition)
         if len(records) > limit or not all(type(r) is int for r in records):
             raise RetrievalBackendError("an FTS5 search is asked about at most its limit of ids")
         if table is None or not terms or not records:
@@ -773,13 +839,25 @@ class Fts5Backend:
         return sorted(found)
 
     def check(self) -> bool:
+        """Whether FTS5's integrity check passes on every table and the count is their rows'.
+
+        The count of documents must be its one well-formed row
+        (:meth:`_document_count`) and the number of rows the map's tables
+        hold. Until the eighteenth review round nothing checked it, so a
+        count gone or wrong was reported ``current`` by every ``verify``
+        (R18-F1 of PR #537). Any failure, a map naming a table this backend
+        never made included, is ``False``; nothing is raised.
+        """
         db = self._require()
         try:
+            held = 0
             for table in self._table_map(db).values():
                 db.execute(f"INSERT INTO {table}({table}) VALUES ('integrity-check')")
+                (rows,) = db.execute(f"SELECT count(*) FROM {table}").fetchone()
+                held += rows
+            return self._document_count(db) == held
         except (sqlite3.Error, RetrievalBackendError):
             return False
-        return True
 
     def size_bytes(self) -> int:
         db = self._require()
@@ -788,14 +866,15 @@ class Fts5Backend:
 
     @property
     def documents(self) -> int:
-        """How many documents the index holds, as its database counts them; 0 without FTS5."""
+        """How many documents the index holds, as its database counts them; 0 without FTS5.
+
+        A count missing or malformed is :class:`RetrievalIntegrityError`
+        (:meth:`_document_count`), never the ``TypeError`` it was until the
+        eighteenth review round (R18-F1 of PR #537).
+        """
         if self._db is None:
             return 0
-        try:
-            (count,) = self._require().execute("SELECT documents FROM counts").fetchone()
-        except sqlite3.Error:
-            raise RetrievalBackendError("the FTS5 index could not be read") from None
-        return int(count)
+        return self._document_count(self._require())
 
     def close(self) -> None:
         if self._db is not None:
@@ -1813,8 +1892,11 @@ class MemoryRetriever:
         (:func:`_well_formed_entry`, checked of every row before any is
         compared, a stale row's token digest included where its text is gone);
         a read-back that is not exactly a list of as many rows as expected,
-        checked before anything iterates it; or a failed backend check: each
-        marks the index ``failed`` (``integrity``) until it is rebuilt.
+        checked before anything iterates it; or a failed backend check
+        (FTS5's: its own integrity check, and a count of documents that is
+        one well-formed row and the number of rows held, R18-F1 of PR
+        #537): each marks the index ``failed`` (``integrity``) until it is
+        rebuilt.
         Each is reported in the status returned, never raised: a
         :class:`RetrievalBackendError` of the read-back or the check, the
         :class:`RetrievalIntegrityError` ``entries`` raises for a row it

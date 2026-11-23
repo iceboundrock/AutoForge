@@ -1055,6 +1055,192 @@ def test_an_interrupt_that_stops_a_rollback_leaves_it_to_the_next_call():
     assert [c.revision for c in backend.search(ISSUE, ["replacement"], [1], 8)] == [2]
 
 
+# Each way the FTS5 backend's count of documents is damaged: the statement
+# and its parameters (R18-F1 of PR #537). The corpus indexes four records.
+COUNT_DAMAGES = {
+    "missing": ("DELETE FROM counts", ()),
+    "second-row": ("INSERT INTO counts(documents) VALUES (4)", ()),
+    "not-an-integer": ("UPDATE counts SET documents = 'four'", ()),
+    "not-utf8": ("UPDATE counts SET documents = CAST(? AS TEXT)", (NOT_UTF8,)),
+    "negative": ("UPDATE counts SET documents = -1", ()),
+    "not-the-rows": ("UPDATE counts SET documents = 3", ()),
+    "table-dropped": ("DROP TABLE counts", ()),
+}
+
+
+@needs_fts5
+@pytest.mark.parametrize("verified", [True, False], ids=["verified-first", "rebuilt-at-once"])
+@pytest.mark.parametrize("damage", sorted(COUNT_DAMAGES))
+def test_a_damaged_document_count_is_found_by_verify_and_made_anew_by_a_rebuild(damage, verified):
+    """R18-F1 of PR #537: the FTS5 backend's count of documents is part of
+    the index, so ``verify`` checks it and a rebuild makes it anew. Until
+    the eighteenth review round a rebuild only updated the count's row, so
+    with that row gone it changed nothing, and nothing checked the count:
+    ``verify`` and ``rebuild`` both reported ``current``, every incremental
+    sync after the next store write failed, and ``documents`` raised
+    ``TypeError``. Now the backend's check finds a count missing, doubled,
+    malformed, out of bounds or not the number of rows the tables hold, so
+    ``verify`` reports ``failed`` (``integrity``); the rebuild, asked for at
+    once or after it, makes the count anew with the rows; and an
+    incremental sync after a store write commits on the same retriever.
+    Searches never read the count, so none moves meanwhile."""
+    w = corpus()
+    backend = Fts5Backend()
+    retriever = retriever_for(w, backend=backend)
+    synced = retriever.sync()
+    rows = backend.entries()
+    whole = retriever.search_memory(REQ, "trailing comma tokenizer")
+    assert whole.backend == "sqlite-fts5" and whole.complete and backend.documents == 4
+    statement, args = COUNT_DAMAGES[damage]
+    backend._db.execute(statement, args)
+    assert retriever.search_memory(REQ, "trailing comma tokenizer") == whole
+    if damage == "not-the-rows":
+        assert backend.documents == 3
+    else:
+        # Typed, never the TypeError it was: a table gone cannot be read at all.
+        typed = RetrievalBackendError if damage == "table-dropped" else RetrievalIntegrityError
+        with pytest.raises(typed):
+            _ = backend.documents
+    assert backend.check() is False
+    if verified:
+        checked = retriever.verify()
+        assert (checked.state, checked.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
+    rebuilt = retriever.rebuild()
+    assert (rebuilt.state, rebuilt.generation, rebuilt.failed, rebuilt.reason) == (
+        IndexState.CURRENT,
+        synced.generation + 1,
+        0,
+        IndexReason.NONE,
+    )
+    assert backend.documents == 4 and backend.check() and backend.entries() == rows
+    assert retriever.verify().state is IndexState.CURRENT
+    added = w.add("scanner", "The scanner keeps a trailing comma's quotes intact.")
+    after = retriever.sync()
+    assert (after.state, after.generation, after.failed, after.reason) == (
+        IndexState.CURRENT,
+        synced.generation + 1,
+        0,
+        IndexReason.NONE,
+    )
+    assert backend.documents == 5 and retriever.verify().state is IndexState.CURRENT
+    found = retriever.search_memory(REQ, "trailing comma")
+    (hit,) = (h for h in found.hits if h.id == added)
+    assert hit.provenance.backend == "sqlite-fts5" and found.complete and not found.degraded
+    assert retriever.metrics.snapshot()["sync_failures"] == 0
+
+
+@needs_fts5
+def test_an_update_refuses_to_count_fewer_than_no_documents():
+    """R18-F1 of PR #537, the count's arithmetic: an update that would leave a
+    count below zero, its rows having outnumbered it, fails whole as the
+    backend's typed failure rather than write that count."""
+    digest = "a" * 64
+    backend = Fts5Backend()
+    backend.apply([memory_retrieval.IndexDocument(ISSUE, 1, 1, digest, "the original")], [])
+    before = backend.entries()
+    backend._db.execute("UPDATE counts SET documents = 0")
+    with pytest.raises(RetrievalBackendError, match="could not be updated"):
+        backend.apply([], [(ISSUE, 1)])
+    assert backend.entries() == before and backend.documents == 0 and not backend.check()
+
+
+# Each way one partition's row of the FTS5 backend's table map is damaged:
+# the value written in place of its table's name, and how (R18-F2 of PR #537).
+MAP_DAMAGES = {
+    "missing": None,
+    "never-given": ("?", "p0"),
+    "not-an-identifier": ("?", "p1; DROP TABLE p1"),
+    "a-blob": ("?", b"p9"),
+    "not-utf8": ("CAST(? AS TEXT)", NOT_UTF8),
+    "the-count": ("?", "counts"),
+}
+
+
+def _damage_map(backend, partition, damage):
+    """``partition``'s row of ``backend``'s table map, damaged ``damage``'s way."""
+    db = backend._db
+    if MAP_DAMAGES[damage] is None:
+        db.execute("DELETE FROM partitions WHERE partition = ?", (partition,))
+        return
+    cell, value = MAP_DAMAGES[damage]
+    db.execute(f"UPDATE partitions SET name = {cell} WHERE partition = ?", (value, partition))
+
+
+@needs_fts5
+@pytest.mark.parametrize("damage", sorted(MAP_DAMAGES))
+def test_damage_to_another_issues_row_of_the_table_map_moves_no_search_of_this_one(damage):
+    """R18-F2 of PR #537: a search reads only its own partition's row of the
+    FTS5 backend's table map. Until the eighteenth review round it read and
+    checked the whole map, so with two issues synced, another issue's row
+    made to name a table the backend never made turned a search of this
+    one from ``current`` on FTS5 to ``failed`` (``integrity``) on the tail,
+    and the next catalog said so too. Now every answer of this issue's
+    launch is the same before verification (the missing row moved nothing
+    before either); the controller's ``verify``, which reads the whole map,
+    still finds the damage, and a rebuild repairs it for both issues."""
+    w = corpus()
+    backend = Fts5Backend()
+    retriever = retriever_for(w, backend=backend)
+    retriever.sync()
+    other = replace(REQ, step=StepKey(Phase.ANALYZE_EXECUTE, OTHER, "", 0, 1))
+
+    def told():
+        first = retriever.search_memory(REQ, "trailing comma tokenizer")
+        return (
+            first,
+            render_hits(first),
+            retriever.fetch_memory(REQ, w.ids["tokenizer"]),
+            retriever.catalog(REQ),
+            retriever.catalog(REQ).render(),
+            retriever.search_memory(REQ, "ruff line limit"),
+        )
+
+    before = told()
+    assert before[0].backend == "sqlite-fts5" and before[0].complete and not before[0].degraded
+    assert ids(before[0]) and ids(before[-1])
+    _damage_map(backend, OTHER, damage)
+    assert told() == before
+    assert retriever.metrics.snapshot()["integrity"] == 0
+    checked = retriever.verify()
+    assert (checked.state, checked.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
+    assert retriever.catalog(REQ).status.reason is IndexReason.INTEGRITY
+    assert retriever.rebuild().state is IndexState.CURRENT
+    assert retriever.verify().state is IndexState.CURRENT
+    for request, query, record in ((REQ, "tokenizer", "tokenizer"), (other, "HTTP", "other")):
+        result = retriever.search_memory(request, query)
+        assert ids(result) == [w.ids[record]] and result.backend == "sqlite-fts5"
+        assert result.complete and not result.degraded
+
+
+@needs_fts5
+@pytest.mark.parametrize("damage", sorted(MAP_DAMAGES))
+def test_damage_to_the_searched_issues_row_of_the_table_map_falls_back_on_that_search(damage):
+    """R18-F2 of PR #537, its other half: damage to the row of the partition a
+    search reads still fails that search safely. A name the backend never
+    gives is an integrity failure before any statement is built with it,
+    and a row gone leaves the served matches omitted, which the coverage
+    check finds. Either way the tail answers the same search, degraded,
+    with every record as the store serves it and nothing else, the catalog
+    reports the failure, and a rebuild repairs the index."""
+    w = corpus()
+    backend = Fts5Backend()
+    retriever = retriever_for(w, backend=backend)
+    retriever.sync()
+    whole = retriever.search_memory(REQ, "trailing comma tokenizer")
+    _damage_map(backend, ISSUE, damage)
+    result = retriever.search_memory(REQ, "trailing comma tokenizer")
+    assert result.degraded and result.backend == TAIL_BACKEND
+    assert (result.status.state, result.status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
+    assert [(h.id, h.summary) for h in result.hits] == [(h.id, h.summary) for h in whole.hits]
+    assert {h.provenance.backend for h in result.hits} == {TAIL_BACKEND}
+    assert retriever.catalog(REQ).status.reason is IndexReason.INTEGRITY
+    assert retriever.verify().reason is IndexReason.INTEGRITY
+    assert retriever.rebuild().state is IndexState.CURRENT
+    again = retriever.search_memory(REQ, "trailing comma tokenizer")
+    assert again.backend == "sqlite-fts5" and again.complete and not again.degraded
+    assert [(h.id, h.summary) for h in again.hits] == [(h.id, h.summary) for h in whole.hits]
+
+
 @needs_fts5
 def test_a_rebuild_that_failed_or_could_not_run_is_made_by_the_next_sync():
     """R4-F2 of PR #537: a rebuild asked for is owed until one commits. The
