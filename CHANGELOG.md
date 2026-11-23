@@ -19,7 +19,10 @@ carries a content fingerprint that no withheld record moves; search and
 fetch also carry an identity revision that changes when a record is
 replaced by one of the same text. A configured FTS5 fallback answers,
 marked degraded, whenever the optional backend cannot or a failed refresh
-left it holding fewer records. No launch wiring or default changes.
+left it holding fewer records. A failed refresh and a lookup outage are
+reported separately: a failed refresh never makes an unavailable generation
+answer, and a recovered lookup never cancels the refresh's retry. No launch
+wiring or default changes.
 See the [retrieval guide](docs/memory-retrieval.md) for freshness and
 fallback behavior, fixture results and the LTSearch no-go.
 

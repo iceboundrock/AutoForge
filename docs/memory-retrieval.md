@@ -150,6 +150,21 @@ reports an error without making a healthy old generation unreadable;
 stays unreadable until replaced. A process restart loses only derived data;
 the controller rebuilds from the committed ledger.
 
+Each backend reports two diagnostics, and neither ever writes the other.
+`problem` is the published generation's condition, from its last lookup or
+`verify()`: `unavailable` is transient, and the next search asks that
+generation again; `integrity` and `search-failed` mark it damaged.
+`refresh` is the last refresh's failure: `build-failed`, or `unavailable`
+when the backend could not build and nothing is published. A failed refresh
+keeps the old generation with its condition. An unavailable lookup stays
+unavailable, so a configured fallback keeps answering in its place, marked
+degraded, and a damaged generation stays damaged. A lookup that succeeds
+again clears only its own unavailability: the failed refresh is still
+reported, and `sync()` still retries it, even over an unchanged corpus. A
+lookup outage alone is not a refresh failure, and `sync()` does not rebuild
+for it. Only a published replacement clears both. `failed` counts the
+failures among them, so it is 0, 1 or 2; unavailability is not a failure.
+
 There is no mutable partition map or separately maintained document count.
 The native verifier checks the whole schema (including unexpected tables),
 row count, IDs, bounded byte bodies against that generation's seals, and

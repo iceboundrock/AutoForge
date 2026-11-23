@@ -68,10 +68,26 @@ class Backend(StrEnum):
 
 
 class IndexProblem(StrEnum):
+    """A diagnosis, reported on one of two independent channels (R5-F1 of PR #538).
+
+    ``problem`` is the published generation's condition, from its last lookup
+    or ``verify()``: ``unavailable`` (transient, retried by the next search),
+    or ``integrity`` or ``search-failed`` (known damaged, unreadable until
+    replaced). ``refresh`` is the last refresh's failure: ``build-failed``,
+    or ``unavailable`` when the backend could not build and nothing is
+    published. Neither channel ever writes the other.
+    """
+
     INTEGRITY = "integrity"
     SEARCH = "search-failed"
     BUILD = "build-failed"
     UNAVAILABLE = "unavailable"
+
+
+def _failures(problem: IndexProblem | None, refresh: IndexProblem | None) -> int:
+    # Unavailability is not a failure; a damaged generation and a failed
+    # refresh are independent, and each counts.
+    return sum(p not in (None, IndexProblem.UNAVAILABLE) for p in (problem, refresh))
 
 
 @dataclass(frozen=True)
@@ -84,9 +100,12 @@ class IndexStatus:
     or the published one is known damaged, which verifies no coverage.
     ``pending`` is the number of audit rows after it (all of them when it is
     ``None``), whichever records they touch. Only ``state`` says whether the
-    generation is current. Only ``status``, ``sync``, ``rebuild`` and
-    ``verify`` return one; launch answers carry :class:`ScopeFreshness`,
-    which has no audit position.
+    generation is current. ``problem`` is the published generation's
+    condition and ``refresh`` the last refresh's failure, independently
+    (:class:`IndexProblem`); ``failed`` counts those that are failures, not
+    unavailability. Only ``status``, ``sync``, ``rebuild`` and ``verify``
+    return one; launch answers carry :class:`ScopeFreshness`, which has no
+    audit position.
     """
 
     backend: Backend
@@ -96,6 +115,7 @@ class IndexStatus:
     pending: int
     generation: int | None
     problem: IndexProblem | None
+    refresh: IndexProblem | None
 
     @property
     def is_current(self) -> bool:
@@ -109,7 +129,7 @@ class IndexStatus:
 
     @property
     def failed(self) -> int:
-        return int(self.problem not in (None, IndexProblem.UNAVAILABLE))
+        return _failures(self.problem, self.refresh)
 
 
 @dataclass(frozen=True)
@@ -136,7 +156,9 @@ class ScopeFreshness:
     current: a current one has nothing pending, but nothing pending does not
     make one current (an index never built, or damaged, over an empty corpus
     has nothing pending). ``generation`` counts this reader's publications
-    and is not comparable across readers.
+    and is not comparable across readers. ``problem`` and ``refresh`` are
+    the answering generation's condition and its last refresh's failure, as
+    in :class:`IndexStatus`.
     """
 
     backend: Backend
@@ -145,6 +167,7 @@ class ScopeFreshness:
     pending: int
     generation: int | None
     problem: IndexProblem | None
+    refresh: IndexProblem | None
 
     @property
     def is_current(self) -> bool:
@@ -152,7 +175,7 @@ class ScopeFreshness:
 
     @property
     def failed(self) -> int:
-        return int(self.problem not in (None, IndexProblem.UNAVAILABLE))
+        return _failures(self.problem, self.refresh)
 
 
 @dataclass(frozen=True)
@@ -409,11 +432,27 @@ class _Generation:
 
 @dataclass(frozen=True)
 class _Slot:
+    """One backend's published generation and its two diagnostics (R5-F1 of PR #538).
+
+    ``problem`` belongs to the published generation: a lookup or
+    ``verify()`` sets it, and a lookup that succeeds clears only its
+    unavailability. ``refresh`` belongs to the refresh: a failed one sets it
+    and keeps the generation, ``problem`` included, so it neither makes an
+    unavailable generation answer nor repairs a damaged one; and ``sync()``
+    retries while it is set, whatever lookups do meanwhile. Only a published
+    replacement clears both.
+    """
+
     backend: Backend
     factory: IndexFactory
     published: _Generation | None = None
     problem: IndexProblem | None = None
-    broken: bool = False
+    refresh: IndexProblem | None = None
+
+    @property
+    def broken(self) -> bool:
+        # Known damaged: unreadable until a replacement is published.
+        return self.problem in (IndexProblem.INTEGRITY, IndexProblem.SEARCH)
 
     def usable(self, view: _View) -> bool:
         # Do not even query stale postings of a now-unauthorized document.
@@ -443,12 +482,19 @@ def _manifest(documents: tuple[IndexDocument, ...]) -> tuple[DocumentSeal, ...]:
 def _state(slot: _Slot, view: _View, *, current: bool) -> IndexState:
     if not view.store.enabled:
         return IndexState.DISABLED
-    if slot.broken or (slot.published is None and slot.problem is IndexProblem.BUILD):
+    if slot.broken:
         return IndexState.FAILED
+    if slot.published is None:
+        # Nothing to answer from: the last refresh says why.
+        if slot.refresh is IndexProblem.BUILD:
+            return IndexState.FAILED
+        if slot.refresh is IndexProblem.UNAVAILABLE:
+            return IndexState.UNAVAILABLE
+        return IndexState.EMPTY
+    # A failed refresh kept this generation; only its own lookup says
+    # whether it can answer.
     if slot.problem is IndexProblem.UNAVAILABLE:
         return IndexState.UNAVAILABLE
-    if slot.published is None:
-        return IndexState.EMPTY
     return IndexState.CURRENT if current else IndexState.STALE
 
 
@@ -470,6 +516,7 @@ def _status(slot: _Slot, view: _View) -> IndexStatus:
         source - (through or 0),
         None if generation is None else generation.serial,
         slot.problem,
+        slot.refresh,
     )
 
 
@@ -490,6 +537,7 @@ def _freshness(slot: _Slot, view: _View) -> ScopeFreshness:
         pending,
         None if generation is None else generation.serial,
         slot.problem,
+        slot.refresh,
     )
 
 
@@ -568,12 +616,14 @@ class MemoryRetriever:
         old = slot.published
         if (
             not force
-            and slot.problem is None
+            and slot.refresh is None
             and not slot.broken
             and old is not None
             and old.versions == view.versions
         ):
-            # Hidden writes don't create a new generation or trigger adapter work.
+            # Hidden writes don't create a new generation or trigger adapter
+            # work, and neither does a lookup's unavailability: the next
+            # search retries that lookup. A failed refresh is retried.
             return replace(slot, published=replace(old, audit=view.store.source_seq))
         documents = tuple(
             IndexDocument(r.fact.id, tuple(_key(w) for w in _words(r.text))) for r in view.records
@@ -583,10 +633,11 @@ class MemoryRetriever:
             index = slot.factory(documents)
             index.verify(manifest)
         except IndexUnavailable:
-            problem = IndexProblem.UNAVAILABLE if old is None else IndexProblem.BUILD
-            return replace(slot, problem=problem)
+            failure = IndexProblem.UNAVAILABLE if old is None else IndexProblem.BUILD
+            # The old generation keeps its own condition, unavailable or not.
+            return replace(slot, refresh=failure)
         except BackendError:
-            return replace(slot, problem=IndexProblem.BUILD)
+            return replace(slot, refresh=IndexProblem.BUILD)
         generation = _Generation(
             index,
             view.versions,
@@ -619,7 +670,7 @@ class MemoryRetriever:
             try:
                 slot.published.index.verify(slot.published.manifest)
             except BackendError:
-                return replace(slot, problem=IndexProblem.INTEGRITY, broken=True)
+                return replace(slot, problem=IndexProblem.INTEGRITY)
         return slot
 
     def verify(self) -> IndexStatus:
@@ -721,16 +772,13 @@ class MemoryRetriever:
                     and not query.isdisjoint(_words(r.text))
                 }
                 if matched == expected:
+                    # The lookup is available again; a failed refresh is
+                    # still failed, and still to be retried.
                     if slot.problem is IndexProblem.UNAVAILABLE:
                         slot = replace(slot, problem=None)
                     return slot, view, generation.versions, matched
                 problem = IndexProblem.INTEGRITY
-        return (
-            replace(slot, problem=problem, broken=problem is not IndexProblem.UNAVAILABLE),
-            view,
-            frozenset(),
-            set(),
-        )
+        return replace(slot, problem=problem), view, frozenset(), set()
 
     def search_memory(self, query: str, *, k: int = 5) -> SearchResult:
         """At most ``k`` ranked hits; their excerpts together fit the binding's budget.

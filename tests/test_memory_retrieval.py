@@ -533,7 +533,8 @@ def left_behind(before_refresh=lambda: None, **kwargs):
     before_refresh()
     status = reader.sync()
     # Controller status reports the primary, whichever slot answers launches.
-    assert status.backend is Backend.OPTIONAL and status.problem is IndexProblem.BUILD
+    assert status.backend is Backend.OPTIONAL and status.refresh is IndexProblem.BUILD
+    assert status.problem is None and status.failed == 1
     assert status.state is IndexState.STALE and status.pending == 9
     return fail, reader
 
@@ -550,7 +551,7 @@ def test_a_current_fallback_answers_for_a_primary_a_failed_refresh_left_behind(f
     assert fetched.index == catalog.index == result.index
     assert "degraded: true" in catalog.render()
     assert reader.metrics == retrieval.ReadMetrics(1, 1, 10, 2)
-    assert reader.status().problem is IndexProblem.BUILD
+    assert reader.status().refresh is IndexProblem.BUILD
     fail[0] = False
     assert reader.sync().is_current
     recovered = reader.search_memory("match", k=16)
@@ -565,7 +566,7 @@ def test_the_older_generation_still_answers_when_no_better_fallback_can(fts5, mo
     assert len(expected.hits) == 8 and not expected.complete and expected.tail_used
     assert not expected.degraded and expected.index.backend is Backend.OPTIONAL
     assert expected.index.state is IndexState.STALE
-    assert expected.index.problem is IndexProblem.BUILD
+    assert expected.index.refresh is IndexProblem.BUILD and expected.index.problem is None
 
     # The better fallback is unavailable on this call: the primary answers it.
     _, reader = left_behind(fallback_to_fts5=True)
@@ -597,6 +598,153 @@ def test_the_older_generation_still_answers_when_no_better_fallback_can(fts5, mo
     held = both.search_memory("match", k=16)
     assert held.hits == expected.hits and held.index == expected.index and not held.degraded
     assert not both.fetch_memory(2).degraded and not both.catalog().degraded
+
+
+def lookup_down(terms):
+    raise IndexUnavailable("transient")
+
+
+def flaky(**kwargs):
+    """An optional backend over two matches, whose refresh fails on demand."""
+    builds = {"fail": False, "calls": 0}
+
+    def factory(docs):
+        builds["calls"] += 1
+        if builds["fail"]:
+            raise BackendError("refresh failed")
+        return ScriptedIndex(docs)
+
+    store = apply(proposal(empty(), "match one", n=1))
+    store = apply(proposal(store, "match two", n=2))
+    _, reader = instance(store, backend=factory, **kwargs)
+    assert reader.sync().is_current
+    return builds, reader
+
+
+def test_a_failed_refresh_does_not_make_an_unavailable_lookup_answer(fts5):
+    """R5-F1 of PR #538: a lookup outage, then a failed refresh.
+
+    The failed refresh keeps the generation, whose lookup is still
+    unavailable: the current FTS5 fallback keeps answering, degraded.
+    """
+    builds, reader = flaky(fallback_to_fts5=True)
+    index = index_of(reader)
+    index.lookup = lookup_down
+    outage = reader.search_memory("match")
+    assert texts(outage) == ["match one", "match two"] and outage.complete
+    assert outage.degraded and outage.index.backend is Backend.FTS5 and outage.index.is_current
+    assert reader.fetch_memory(1).degraded and reader.catalog().degraded
+    builds["fail"] = True
+    status = reader.rebuild()
+    assert index_of(reader) is index and status.generation == 1
+    assert status.state is IndexState.UNAVAILABLE
+    assert (status.problem, status.refresh) == (IndexProblem.UNAVAILABLE, IndexProblem.BUILD)
+    assert status.failed == 1
+    # Fetch and catalog still report the fallback that answers, degraded.
+    fetched, catalog = reader.fetch_memory(1), reader.catalog()
+    assert fetched.item.id == 1 and fetched.degraded and catalog.degraded
+    assert fetched.index == catalog.index
+    assert fetched.index.backend is Backend.FTS5 and fetched.index.is_current
+    assert "degraded: true" in catalog.render()
+    # As they should: the next search asks the optional lookup, still down.
+    asked = []
+
+    def still_down(terms):
+        asked.append(terms)
+        lookup_down(terms)
+
+    index.lookup = still_down
+    again = reader.search_memory("match")
+    assert asked and again.degraded and again.hits == outage.hits
+    assert again.index == fetched.index
+    # Once it recovers, the old generation answers, and still reports the
+    # failed refresh, which sync() retries over the unchanged corpus.
+    index.lookup = index.match
+    recovered = reader.search_memory("match")
+    assert recovered.hits == outage.hits and not recovered.degraded
+    assert recovered.index.backend is Backend.OPTIONAL and recovered.index.is_current
+    assert (recovered.index.problem, recovered.index.refresh) == (None, IndexProblem.BUILD)
+    assert not reader.fetch_memory(1).degraded and not reader.catalog().degraded
+    builds["fail"] = False
+    status = reader.sync()
+    assert status.is_current and status.generation == 2
+    assert (status.problem, status.refresh, status.failed) == (None, None, 0)
+
+
+def test_a_recovered_lookup_keeps_the_failed_refresh_and_its_retry():
+    """R5-F1 of PR #538: a failed refresh, then a lookup outage it recovers from.
+
+    The lookup's recovery clears only its own unavailability: the failed
+    refresh stays reported, and ``sync()`` retries it over the unchanged
+    corpus.
+    """
+    builds, reader = flaky()
+    builds["fail"] = True
+    failed = reader.rebuild()
+    assert failed.is_current and failed.generation == 1
+    assert (failed.problem, failed.refresh, failed.failed) == (None, IndexProblem.BUILD, 1)
+    index = index_of(reader)
+    index.lookup = lookup_down
+    outage = reader.search_memory("match")
+    assert outage.degraded and outage.tail_used and outage.complete
+    assert outage.index.state is IndexState.UNAVAILABLE
+    assert (outage.index.problem, outage.index.refresh) == (
+        IndexProblem.UNAVAILABLE,
+        IndexProblem.BUILD,
+    )
+    assert reader.status().refresh is IndexProblem.BUILD
+    index.lookup = index.match
+    recovered = reader.search_memory("match")
+    assert not recovered.degraded and not recovered.tail_used and recovered.index.is_current
+    assert (recovered.index.problem, recovered.index.refresh) == (None, IndexProblem.BUILD)
+    assert reader.status() == failed
+    # The corpus is unchanged. A retry that fails again stays recorded...
+    calls = builds["calls"]
+    status = reader.sync()
+    assert builds["calls"] == calls + 1 and status == failed
+    # ...and one that succeeds publishes a replacement.
+    builds["fail"] = False
+    status = reader.sync()
+    assert builds["calls"] == calls + 2 and status.generation == 2
+    assert status.is_current and (status.problem, status.refresh, status.failed) == (None, None, 0)
+
+
+def test_a_lookup_outage_alone_is_retried_by_search_not_by_sync():
+    """R5-F1 of PR #538: lookup availability sets no refresh retry either."""
+    builds, reader = flaky()
+    index = index_of(reader)
+    index.lookup = lookup_down
+    assert reader.search_memory("match").index.state is IndexState.UNAVAILABLE
+    calls = builds["calls"]
+    status = reader.sync()
+    assert builds["calls"] == calls and index_of(reader) is index
+    assert status.state is IndexState.UNAVAILABLE and status.refresh is None
+    assert (status.problem, status.failed) == (IndexProblem.UNAVAILABLE, 0)
+    index.lookup = index.match
+    assert reader.search_memory("match").index.is_current and reader.status().is_current
+
+
+def test_a_failed_refresh_keeps_a_damaged_generation_damaged():
+    """Each diagnostic counts once in ``failed``; neither hides the other."""
+    builds, reader = flaky()
+
+    def damage():
+        raise BackendError("damaged")
+
+    index_of(reader).check = damage
+    assert reader.verify().problem is IndexProblem.INTEGRITY
+    builds["fail"] = True
+    status = reader.rebuild()
+    assert status.state is IndexState.FAILED and status.indexed_through_seq is None
+    assert (status.problem, status.refresh, status.failed) == (
+        IndexProblem.INTEGRITY,
+        IndexProblem.BUILD,
+        2,
+    )
+    answer = reader.search_memory("match")
+    assert answer.degraded and answer.tail_used and answer.index.failed == 2
+    builds["fail"] = False
+    assert reader.sync().is_current and reader.status().failed == 0
 
 
 def test_maintenance_reports_freshness_after_backend_work():
