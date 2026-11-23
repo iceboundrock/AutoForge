@@ -543,13 +543,16 @@ class Fts5Backend:
             raise RetrievalBackendError("an FTS5 search is asked about at most its limit of ids")
         if table is None or not terms or not records:
             return []
-        # Only the rows of the records asked about are read: a row of any
-        # other record, however damaged, is never a result (R8-F1 of PR #537).
+        # Only the rows of the records asked about are results: a row of any
+        # other record, however damaged, never reaches this code (R8-F1 of PR
+        # #537). The unary plus keeps the filter out of FTS5's own rowid
+        # lookups: one MATCH scan, which SQLite filters before it computes a
+        # column or bm25() of a row, rather than one full-text query per id.
         marks = ", ".join("?" * len(records))
         try:
             rows = db.execute(
                 f"SELECT rowid, revision, digest, bm25({table}) FROM {table} "
-                f"WHERE {table} MATCH ? AND rowid IN ({marks}) "
+                f"WHERE {table} MATCH ? AND +rowid IN ({marks}) "
                 f"ORDER BY bm25({table}), rowid LIMIT ?",
                 (_match_expression(terms), *records, limit),
             ).fetchall()
