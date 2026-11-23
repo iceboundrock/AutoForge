@@ -1,7 +1,7 @@
 # Memory retrieval: the FTS5 read path and the LTSearch feasibility (#324)
 
 Written after the implementation, for #324 (EPIC #331), at `main`
-`5cad948`, and revised after three review rounds on PR #537. It records what
+`5cad948`, and revised after five review rounds on PR #537. It records what
 the read path decides and why, what was measured on one host, and the
 go/no-go on LTSearch, on which the maintainer narrowed #324's acceptance to
 the source-based no-go recorded here. ADR 0015 is the
@@ -167,13 +167,32 @@ before a launch has the same rows and an earlier ordinal; it would bind
 that launch's request again, after the launch had been counted. It is
 refused alike
 (`test_a_checkpoint_from_before_a_launch_is_refused_once_the_launch_was_read`).
+
+Turning Memory off changes neither. `AutoForgeState.memory_setting` flips
+the store's `enabled` and keeps its rows and the launch ordinal, so a
+checkpoint from before an opt-out continues the opted-out one row for row,
+at the same ordinal. The fifth review round found a retriever that refused
+the opted-out snapshot (no launch binds with Memory off) and then read the
+older one again and served its records. The retriever now keeps whether
+Memory was on in the newest snapshot it read. After it reads an opt-out, a
+snapshot with Memory on is read only with proof that it is newer than the
+opt-out: a row past it or a later launch ordinal, which no checkpoint from
+before the opt-out can have. Without that proof every read is refused
+(`RetrievalError`) until the controller calls `MemoryRetriever.rebind()`,
+once it has turned Memory on itself. The controller's own opt-in gives back
+the very value the checkpoint from before the opt-out held, so only the
+controller can tell the two apart. A rebind still requires a snapshot that
+continues the newest one read, with Memory on
+(`test_a_checkpoint_from_before_an_opt_out_never_reopens_the_read_path`,
+`test_a_snapshot_proven_newer_than_an_opt_out_is_read_without_a_rebind`).
+
 A rollback of the checkpoint is therefore a new retriever's to read. That
 means a new process's, since the index is in memory. A source that kept
 returning one stale value from the start is beyond any check: the source is
 the definition of current, which is why it is the controller's state and
 not a value a caller hands in.
 
-Loading costs what reconstructing the store costs: about 8.5 ms at the
+Loading costs what reconstructing the store costs: about 8.6 ms at the
 fixture's 29 records and 21 ms at Memory's 64-record bound on this host,
 and a search under a source that reconstructs it pays that twice (see the
 cost table below). It is the same load the projection pays before every
@@ -204,10 +223,18 @@ launch gets, before or after the index syncs it
   record, and a retracted, withheld or superseded one are
   indistinguishable (`test_fetch_gives_one_answer_for_every_record_it_does_not_serve`).
 - **The catalog** counts the scope's current records by kind. It names the
-  scope's revision and a digest of the scope's records, never the store's
-  revision or digest. The digest numbers each record by its add's place in
-  the scope's sequence, not by its run id, so it too is what a store that
-  never had the writes outside the scope would give.
+  scope's revision and a digest of what the launch is served, never the
+  store's revision or digest. The digest covers the scope's revision and,
+  for each record the launch is served, its add's and its latest change's
+  place in the scope's sequence (not its run id) and its content digest,
+  which a fetch gives. So it too is what a store that never had the writes
+  outside the scope would give. A retracted, withheld or superseded record
+  of the scope adds its changes to the revision and nothing else. An
+  earlier revision put every scope record's content digest and verdict in
+  it: the hash of text the store refuses to serve, which a reader could
+  test a guess at that text against, and which refusal it was, which a
+  fetch does not tell
+  (`test_the_catalog_says_nothing_of_text_the_store_refuses_to_serve`).
 - **Every sequence number a launch is told is the scope's own.** The
   scope's records' changes are numbered 1, 2, ... in the order the store
   made them. The scope's revision is how many there are. A hit's or a
@@ -340,9 +367,12 @@ had then, indexed by the tokens of that text, decoded from what FTS5 holds.
 A record changed since keeps that row, stale, until the next sync. A row of
 a record added after the watermark, at a revision past it or at a digest
 the record did not have then, a missing or second row, and a row indexed by
-other tokens are each an integrity failure. The store keeps only the texts
-of live records, so the stale row of a corrected or retracted record is
-checked by its revision and digest alone
+other tokens are each an integrity failure. So is a read-back that is not
+exactly a list of one row per record expected, which is checked before
+anything iterates it, as a search's answer is
+(`test_verify_checks_the_read_backs_container_and_size_before_it_iterates_it`).
+The store keeps only the texts of live records, so the stale row of a
+corrected or retracted record is checked by its revision and digest alone
 (`test_verify_finds_a_row_no_sync_through_the_watermark_wrote`). `verify`
 also runs FTS5's own integrity check, which proves FTS5's inverted index
 matches the rows it holds. Once `verify` marks the index `failed`, searches
@@ -385,8 +415,8 @@ can open one either. The test that held D10's "one SQLite connection" now
 holds exactly these two connections, and checks this one's arguments
 (`test_the_package_opens_sqlite_only_for_the_opencode_probe_and_the_memory_index`).
 
-The cost is a rebuild per process. On this host that is 1.6 ms for the
-fixture's 29 records and 3.2 ms at Memory's 64-record bound. A persisted
+The cost is a rebuild per process. On this host that is 1.5 ms for the
+fixture's 29 records and 3.1 ms at Memory's 64-record bound. A persisted
 index, for #325's repository-wide layer for example, would need a decision
 of its own in D10.
 
@@ -410,8 +440,15 @@ fallback does: the result is `degraded` and names the backend that
 answered, and the primary is rebuilt by the next sync. Either way, the
 same check of the store applies to every candidate.
 
-A backend's answer is checked before it is used. It must be a list of at
-most 64 candidates, each exactly an `IndexCandidate` (not a subclass, whose
+A backend's answer is checked before it is used. It must be exactly a
+list or a tuple, never a subclass, of at most 64 candidates. Its type and
+length are checked before anything iterates it, because a subclass's
+`__len__` and `__iter__` are the backend's code: the fifth review round
+found one that reported one candidate while it yielded 65, read whole with
+its backend reported healthy, and one whose iteration raised a `ValueError`
+that escaped the fallback
+(`test_a_backend_answers_container_is_checked_before_anything_iterates_it`).
+Each candidate must be exactly an `IndexCandidate` (not a subclass, whose
 fields could be computed when read), with a positive integer id and
 revision, a content digest, a finite score and a rank from 1 to 64. A
 score is checked without converting it: an integer is compared with 2^53,
@@ -521,14 +558,15 @@ a record's text or a prompt.
 Run with `uv run python -m tests.memory_retrieval_bench --sizes
 1000,10000,50000` on one host: x86_64, 8 CPUs, Linux 7.0.14, Python 3.14.10,
 SQLite 3.54.1. These are single runs of a local benchmark, not a
-comparison across hosts. The figures below were measured again after the
-third review round's changes (the coverage check, the health check read
-before the store, the rebuild that keeps the old index). The fourth
-round's changes left the correctness figures identical and moved the
-store-sized search figures within run-to-run noise (0.68 ms at the
-fixture's median before them, 0.69 and 0.70 ms in two runs after), so the
-cost table was not measured again. No embedding of any kind is computed, so
-nothing below is evidence about semantic retrieval.
+comparison across hosts. Every figure below is from one full run after
+the fifth review round's changes (the opt-out check, the catalog digest
+over what the launch is served, the exact containers), except the coverage
+check's cost, which is labelled with the third round's session it comes
+from. The correctness figures are identical to those measured after the
+third and fourth rounds, and the store-sized search figures are within
+run-to-run noise of them (0.69 ms at the fixture's median after the third
+round, 0.70 ms now). No embedding of any kind is computed, so nothing below
+is evidence about semantic retrieval.
 
 ### Correctness on the pinned fixture
 
@@ -568,11 +606,11 @@ or foreign.
 
 | Corpus | Build | Search p50 / p95, snapshot held | Search p50 / p95, snapshot loaded per read | Index size |
 |---|---|---|---|---|
-| the fixture's store, 29 records (the whole read path) | 1.6 ms | 0.69 / 1.27 ms | 19.1 / 20.0 ms | 44 KiB |
-| a store at Memory's bound, 64 records (the whole read path) | 3.2 ms | 1.12 / 1.65 ms | 45.1 / 48.0 ms | 76 KiB |
-| 1,000 synthetic documents (the backend alone) | 27 ms | 0.22 / 0.49 ms | | 0.8 MiB |
-| 10,000 synthetic documents (the backend alone) | 269 ms | 0.76 / 3.09 ms | | 7.3 MiB |
-| 50,000 synthetic documents (the backend alone) | 1,410 ms | 2.22 / 10.5 ms | | 32.8 MiB |
+| the fixture's store, 29 records (the whole read path) | 1.5 ms | 0.70 / 1.28 ms | 19.6 / 21.6 ms | 44 KiB |
+| a store at Memory's bound, 64 records (the whole read path) | 3.1 ms | 1.16 / 1.67 ms | 45.6 / 46.8 ms | 76 KiB |
+| 1,000 synthetic documents (the backend alone) | 27 ms | 0.22 / 0.50 ms | | 0.8 MiB |
+| 10,000 synthetic documents (the backend alone) | 276 ms | 0.78 / 3.15 ms | | 7.3 MiB |
+| 50,000 synthetic documents (the backend alone) | 1,424 ms | 2.25 / 10.3 ms | | 32.8 MiB |
 
 Notes on the table:
 
@@ -582,7 +620,7 @@ Notes on the table:
   read" is a source that reconstructs and validates the store from the
   checkpoint's value at every call, as `AutoForgeState.memory` does. A
   search calls it twice, before and after its backend answers. That
-  reconstruction alone is 8.5 / 8.9 ms at 29 records and 20.6 / 21.7 ms
+  reconstruction alone is 8.6 / 9.0 ms at 29 records and 21.0 / 22.4 ms
   at 64, so it dominates. It is Memory's own fold, the same load the
   projection pays before every launch. A caller that searches several
   times between two writes could keep the store object and hand back the
@@ -592,15 +630,15 @@ Notes on the table:
   larger, repository-wide layer would cost the backend. A build tokenizes
   every document in Python (`text_tokens`) before FTS5 indexes it, which
   is most of the build time at these sizes.
-- **The coverage check.** Run in the same session, the reviewed head
-  before it (`11f15bb`) searched in 0.63 / 1.17 ms on the fixture's store
-  and 0.75 / 1.31 ms at the bound with the snapshot held. Reading the
-  store's text of every served record the index has seen, to prove its
-  answer left none out, adds about 0.06 ms at 29 records and 0.37 ms at 64
-  at the median.
+- **The coverage check.** Measured in the third review round's session,
+  not in this run: there the head before the check (`11f15bb`) searched
+  in 0.63 / 1.17 ms on the fixture's store and 0.75 / 1.31 ms at the
+  bound with the snapshot held. Reading the store's text of every served
+  record the index has seen, to prove its answer left none out, added
+  about 0.06 ms at 29 records and 0.37 ms at 64 at the median.
 - **Updates.** Updating one document is 0.06 ms at the median at every
-  size. The 95th percentile is 1.7 ms at 1,000 documents, 14.0 ms at
-  10,000 and 27.2 ms at 50,000, where FTS5 merges its segments.
+  size. The 95th percentile is 1.7 ms at 1,000 documents, 13.8 ms at
+  10,000 and 27.4 ms at 50,000, where FTS5 merges its segments.
 - **Where the time goes.** At the store's sizes, with the snapshot held,
   most of a search is Python: binding the request, the snapshot's verdict
   on every record, the scope's sequence, tokenizing the served records to
@@ -612,7 +650,7 @@ Notes on the table:
   at 24 KiB, a figure that excludes SQLite's heap. CPU time per search,
   snapshot held, is 0.8 ms on the fixture's store and 1.2 ms at the bound.
 - **Ingestion to visibility.** A record written after the last sync is
-  served at the next search, from the tail, in 1.3 ms. An incremental sync
+  served at the next search, from the tail, in 1.5 ms. An incremental sync
   takes 0.1 ms, and the index then serves the record itself. Each is one
   sample.
 - **Context.** Eight hits rendered by `render_hits` came to at most 1,917
@@ -622,7 +660,7 @@ Notes on the table:
 
 Against the evaluation protocol's `memory_overhead` ceiling of 1,000 ms of
 latency per launch, the read path at the store's bound costs under 1.7 ms
-per search at p95 with the snapshot held, and about 48 ms at p95 loading it
+per search at p95 with the snapshot held, and about 47 ms at p95 loading it
 twice per search.
 
 ## LTSearch feasibility: no-go
@@ -707,7 +745,7 @@ default branch's head when this was written. Paths below are in that tree.
 backend.** The measurement half of the go/no-go is the native baseline
 above. At Memory's scale of 64 records per run, BM25 serves every relevant
 record of the fixture within five places, at under 1.7 ms per search
-(about 48 ms loading the snapshot twice per search), with nothing stale or
+(about 47 ms loading the snapshot twice per search), with nothing stale or
 foreign. That leaves no measured gap for a hybrid backend to close.
 
 ### What this report does not settle, and the maintainer's decision

@@ -228,7 +228,8 @@ memory_retrieval.py Memory's retrieval read path (#324, ADR 0015 D8 layer 4, D12
                     fetch and catalog over an in-memory FTS5 index partitioned by issue,
                     the canonical snapshot loaded from the store's source at every read
                     (a search's again after its backend answers) and refused when it
-                    does not continue the last, every hit judged by the store, never the
+                    does not continue the last or nothing proves it newer than an
+                    opt-out read before, every hit judged by the store, never the
                     index; a launch told only of its scope, ranked by BM25 over its own
                     served records, in the scope's own sequence, its binding and each
                     record's applicability in the answer; one tokenizer for index, tail

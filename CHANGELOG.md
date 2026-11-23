@@ -18,16 +18,21 @@ loaded at every read, and by a search again after its index answers, with
 the projection's own checks. So a corrected, retracted, withheld,
 superseded, inapplicable or other issue's record is never served from a
 stale index, an older snapshot or a write made while the index answered,
-and a search says when it could not read every current record. What a
+and a search says when it could not read every current record. Once a
+retriever has read Memory turned off, a checkpoint from before that
+opt-out never serves again: only a newer snapshot or the controller's
+rebind reopens the read path. What a
 launch is told is of its own scope only: hits are ranked by BM25 over the
 records the launch is served, a fetch answers alike for every record it
-does not serve, and every revision and freshness figure is the scope's own
+does not serve, the catalog's digest covers only what the launch is
+served, and every revision and freshness figure is the scope's own
 count, so no record outside the scope moves a hit or leaves a gap. Every
 answer names the launch it is for and each record's applicability. An index
 found not to match the store, by a row it returns or a match it leaves out,
 is marked failed, and the search that found it answers from the fallback or
-the store at once; a failed rebuild keeps the index it would have replaced
-until the next sync makes it.
+the store at once; so is an answer that is not exactly a list or a tuple.
+A failed rebuild keeps the index it would have replaced until the next
+sync makes it.
 The index, the hot tail and a query share one Unicode tokenizer, so a
 record in any script is found alike before and after the index syncs it.
 Where the interpreter's SQLite lacks FTS5, a search reads only the eight
