@@ -3344,7 +3344,7 @@ def test_a_current_record_past_a_hits_bound_is_judged_by_its_excerpt_never_its_w
     assert m10["text"].startswith(hit.summary.removesuffix("\n[omitted]"))
 
 
-@needs_fts5
+# No FTS5 needed: the benchmark judges what the tail serves alike.
 @pytest.mark.parametrize("shown", ["unbounded", "earlier", "another"])
 def test_a_hit_past_a_hits_bound_showing_anything_but_its_excerpt_is_still_a_leak(
     shown, monkeypatch
