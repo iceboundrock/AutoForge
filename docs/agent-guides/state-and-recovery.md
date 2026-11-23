@@ -1543,9 +1543,11 @@ known and the retry path is bounded. Current cases include:
 - the exact read past `gh` (#327, #329): a transient answer, or a 404 of
   the object a listing or `gh` read had just returned (GitHub's REST read
   lagging its listing), is read once more, as `gh`'s reads are
-  (`GitHubClient.transient_retries`), then `GitHubUnavailableError` for
-  `resume`; a
-  credential failure (`GitHubCredentialError`) is never read again
+  (`GitHubClient.transient_retries`), then `GitHubUnavailableError`, which
+  a create's read-back leaves for `resume` (what other callers do with it is
+  theirs: [github-safety.md](github-safety.md), "What a caller does with a
+  failed exact read"); a credential failure (`GitHubCredentialError`) is
+  never read again
 - a read-back right after the controller's own push that still shows the
   PR headed at the commit the push replaced (GitHub moves a PR's head
   asynchronously, #403): the PR is read again after each pause of

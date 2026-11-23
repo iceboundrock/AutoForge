@@ -493,8 +493,12 @@ class GitHubCredentialError(GitHubError):
     never a not-found. It says nothing about what the read-back was judging,
     so a caller whose conclusive failures are final (K7, the replacement PR
     of a replan) leaves its phase for ``resume`` once the operator has fixed
-    ``gh auth`` rather than refuse for good; every other caller blocks on it
-    as on any conclusive read, and ``unblock`` reads again.
+    ``gh auth`` rather than refuse for good; every other create read-back
+    blocks on it as on any conclusive read, and ``unblock`` reads again.
+    Callers that write nothing go on: FIX's entry offers no PR-body update,
+    REVIEW's operator evidence and ``status`` report the read as failed
+    (``docs/agent-guides/github-safety.md``, "What a caller does with a
+    failed exact read").
     """
 
 

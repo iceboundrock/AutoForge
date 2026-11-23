@@ -11,12 +11,17 @@ The exact read is the one read the controller makes past `gh`, of a PR,
 issue or comment whose text `gh`'s print cannot prove (#327). A 404 there
 now means the REST read has not caught up with the listing that returned
 the object a moment earlier. It is read again, as a transient failure
-is, and then reported as GitHub unavailable: nothing is saved or sent,
-and `resume` reads the listing again. It no longer counts as a missing
-object. A failed `gh auth token`, a 401, and a 403 that is not a rate limit
-now name what to check (`gh auth status`, `gh auth token --hostname
-github.com`). Outside a replan they block as before, and `unblock` reads
-again once the credential works. In `REPLAN_REEXECUTE` such a failure
+is, and then reported as GitHub unavailable. It no longer counts as a
+missing object. What follows depends on the caller: a create's read-back
+saves and sends nothing and the command ends for `resume`, which reads the
+listing again; FIX's entry ends the command before it launches anything;
+REVIEW's operator evidence and `status`'s review provenance report the
+read as failed and go on. A failed `gh auth token`, a 401, and a 403 that
+is not a rate limit now name what to check (`gh auth status`, `gh auth
+token --hostname github.com`). Outside a replan a create's read-back blocks
+on them as before, and `unblock` reads again once the credential works;
+FIX's entry offers no PR-body update, and REVIEW's operator evidence and
+`status` report them. In `REPLAN_REEXECUTE` such a failure
 while reading back the replacement PR used to reject the replan for good.
 Now the command stops with the phase and the transaction unchanged, and
 `resume` finishes the replacement once the credential works. Any other
@@ -29,7 +34,11 @@ response header, a proxy's text or `gh`'s stderr: run the commands it
 names to see those. It fails on a credential or another conclusive
 answer, and warns when `api.github.com` cannot be reached over HTTPS.
 That is the case of a host where `gh` works through a proxy and this
-direct read does not. No state protocol or default changes.
+direct read does not. A probe that cannot make the empty directory `gh auth
+token` runs in fails naming the temporary directory, sending nothing, and a
+reply that nests deeper than the JSON decoder follows fails as a reply
+that is not JSON; neither ends `doctor`'s report any more. No state
+protocol or default changes.
 
 ### Optional Issue Working Memory retrieval (#324)
 

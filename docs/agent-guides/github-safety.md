@@ -1565,9 +1565,9 @@ PR.
 Its failures are classified as `gh`'s are, and none of them is ever a
 reason to write. No connection, a timeout, a 5xx, a 429 or a rate-limited
 403 (by its headers, or by GitHub's message, which a secondary limit may
-send alone) is `GitHubUnavailableError`: nothing is saved or sent and `resume`
-reads again (after a write, `EffectPending`, the record still
-`attempted`). Like a `gh` read, the exact read is made once more after
+send alone) is `GitHubUnavailableError`: in a create's read-back nothing is
+saved or sent and `resume` reads again (after a write, `EffectPending`, the
+record still `attempted`). Like a `gh` read, the exact read is made once more after
 such an answer, 2 s later (the client's transient bound,
 `GitHubClient.transient_retries` and `retry_delay_seconds`), before it
 raises. A 404 is inconclusive too,
@@ -1575,10 +1575,15 @@ read again the same way and then `GitHubUnavailableError` (#329, below). A
 `gh auth token` that fails (other than transiently) or prints anything but
 one visible token, a 401, and any other 403 are `GitHubCredentialError`: the
 credential, not the object. A redirect, a certificate that does not verify,
-a reply that is not one `application/json` object within the bound, or an
-answer naming another object is a conclusive `GitHubError`. The phase
-blocks on any conclusive failure with nothing sent again, except in K7
-(below). No message quotes the reply, not even a header of it (a
+a reply that is not one `application/json` object within the bound (one
+that nests deeper than the JSON decoder follows included, R2-F1 of PR
+#539), an answer naming another object, or no empty directory in which to
+start `gh auth token` is a conclusive `GitHubError`. These are the client's
+classes, the same for every caller; what follows from one is the caller's
+("What a caller does with a failed exact read", below). A create's
+read-back blocks on a conclusive failure with nothing sent again, except in
+K7 (below); the callers that only report, or only decide whether to offer
+something, go on. No message quotes the reply, not even a header of it (a
 Content-Type that is not JSON is named as such, never repeated), nor the
 text of an `http.client` failure, which can quote the server's status
 line; an error reply is read only to tell a rate limit from a refusal.
@@ -1690,16 +1695,18 @@ the object the read-back judges, so neither may end a replan. The decision:
   plausibly means GitHub's REST read does not see yet what its listing did
   (replica lag), not that the object is gone. `GitHubClient._exact_reread`
   reads it again within the transient bound above; still 404, it is
-  `GitHubUnavailableError`: nothing is saved or sent, the record stays as it
-  was (`attempted` after a write, `EffectPending`), and `resume` reads the
-  listing again. An object really deleted in between (a comment, an issue)
-  is then absent from that listing, and the read-back decides on it as on
-  any listing: the bounded attempts, never a blind second write. This holds
-  for every caller of the exact read (the create read-backs, the bodies of
-  #328 and K11 and K12, the PR body FIX's entry digests, REVIEW's operator
-  evidence and `status`'s review provenance), since each reads exactly only
-  an object `gh` had just returned. `probe_exact_read` (`doctor`, below)
-  reads no listed object and keeps a 404 as `GitHubNotFoundError`.
+  `GitHubUnavailableError`. That classification holds for every caller of
+  the exact read (the create read-backs, the bodies of #328 and K11 and
+  K12, the PR body FIX's entry digests, REVIEW's operator evidence and
+  `status`'s review provenance), since each reads exactly only an object
+  `gh` had just returned; what each does with it is its own (below). In a
+  create's read-back nothing is saved or sent, the record stays as it was
+  (`attempted` after a write, `EffectPending`), and the command ends for
+  `resume`, which reads the listing again. An object really deleted in
+  between (a comment, an issue) is then absent from that listing, and the
+  read-back decides on it as on any listing: the bounded attempts, never a
+  blind second write. `probe_exact_read` (`doctor`, below) reads no listed
+  object and keeps a 404 as `GitHubNotFoundError`.
 - *A credential failure blocks, and in K7 stops for `resume`.* A `gh auth
   token` that fails or prints no usable token, a 401 and a 403 that is no
   rate limit are `GitHubCredentialError`, whose text names what to check
@@ -1707,9 +1714,10 @@ the object the read-back judges, so neither may end a replan. The decision:
   path but K7 handles it as any conclusive failure: a create's read-back
   blocks (`github-read-failed`) with nothing sent again, and once the
   operator has fixed the credential, `unblock` re-enters the phase, which
-  reconciles the record again (K10 keeps it as a failed verification; the
-  reads that only report, REVIEW's operator evidence and `status`, report
-  it). K7 cannot block without ending the replan, so
+  reconciles the record again (K10 keeps it as a failed verification). The
+  callers that write nothing do not block on it (below): REVIEW's operator
+  evidence and `status` report it, and FIX's entry offers no PR-body
+  update. K7 cannot block without ending the replan, so
   `_complete_replan` lets the error end the command instead: the phase stays
   `REPLAN_REEXECUTE`, the transaction `PREPARED`, the records as persisted,
   the stop classified `resumable_error` (`github-error`), and `resume`
@@ -1721,8 +1729,34 @@ the object the read-back judges, so neither may end a replan. The decision:
 Every other conclusive failure of the exact read (a redirect, a
 certificate that does not verify, a reply that is not GitHub's JSON, an
 answer naming another object) is about what answered, and still rejects in
-K7 and blocks elsewhere. `gh`'s own conclusive failures in K7 are
-unchanged: they reject as before.
+K7 and blocks the other create read-backs. `gh`'s own conclusive failures
+in K7 are unchanged: they reject as before.
+
+**What a caller does with a failed exact read.** The classes above are the
+client's (`GitHubClient`), the same for every caller. What follows from one
+is the caller's, and not every caller stops or blocks:
+
+- *A create's read-back* (K2, K4, K5, K7, K8, K9) ends the command on
+  `GitHubUnavailableError`, a persistent 404 included, with nothing saved
+  or sent, for `resume`. It blocks on a conclusive failure with nothing
+  sent again, except in K7, where a credential failure ends the command for
+  `resume` and any other conclusive failure rejects the replan (above).
+- *The paths that write back or verify a body read exactly* (#328's K3
+  and K6 bases, K10, K11, K12, the `UPDATE_EPIC` roadmap) handle a failure
+  of the exact read as they handle a failed `gh` read of the same object:
+  the two reads share one handler.
+- *FIX's entry*, digesting the PR body it offers to replace
+  (`_pr_body_at_entry`), lets `GitHubUnavailableError`, a persistent 404
+  included, end the command; no agent has been launched yet. Any
+  conclusive failure, a credential failure included, only means this FIX
+  entry offers no PR-body update (`pr_body_update`): the phase goes on
+  without the offer.
+- *REVIEW's operator-evidence collection* (#243) marks the evidence of
+  that action unreadable, naming the error's class, on any failure (an
+  unavailable GitHub, a persistent 404, a credential failure, a conclusive
+  answer), and the review goes on.
+- *`status`'s review-provenance report* records that the comment's exact
+  read failed, with its problem, on any failure, and the report goes on.
 
 **`doctor`'s exact-read row.** `exact read (api.github.com)` makes the
 exact read once from the operator's machine: `gh auth token --hostname
@@ -1736,6 +1770,16 @@ the remedy; `WARN` on a transient one (no connection, a timeout, a 5xx, a
 rate limit), naming the proxy variables, since a host where `gh` works
 through a proxy but this direct read does not would otherwise find out
 only when a read-back needs it.
+
+Every failure of the probe is one of these rows, never an exception that
+ends `doctor`'s report (R2-F1 of PR #539). No empty directory in which to
+start `gh auth token` (#283) is a `FAIL` naming the OS error's class and
+errno name and, as the remedy, the temporary directory (`TMPDIR`, else
+`/tmp`), with no GET sent. A reply within the byte bound that nests deeper
+than the JSON decoder follows, where `json.loads` raises `RecursionError`
+rather than `ValueError`, is a `FAIL` like any reply that is not GitHub's
+JSON. Each remedy travels with the failure it applies to: the trust store
+is named for a certificate that does not verify, and for nothing else.
 
 The row shows nothing anyone but the controller wrote (R1-F1 of PR #539).
 `probe_exact_read` returns the failure as a `github.ExactReadFailure`:

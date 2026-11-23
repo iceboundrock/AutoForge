@@ -794,6 +794,19 @@ EXACT_READ_CREDENTIAL_REMEDY = (
     "`gh auth status` and `gh auth token --hostname github.com` must work for the user "
     "running AutoForge, and the token must be accepted by GitHub's REST API"
 )
+# What a certificate the exact read cannot verify tells the operator to check (#329).
+EXACT_READ_CERTIFICATE_REMEDY = (
+    "this machine's trust store does not hold the CA of whatever answered for "
+    "api.github.com (a TLS-inspecting proxy, for one)"
+)
+# What an exact read that could not start `gh auth token` tells the operator to
+# check (R2-F1 of PR #539): every `gh` the controller runs needs an empty
+# directory of its own (:func:`gh_workdir`).
+EXACT_READ_WORKDIR_REMEDY = (
+    "Python's temporary directory (TMPDIR when set, else /tmp) must exist and be writable "
+    "by the user running AutoForge, with free space and inodes left; every `gh` the "
+    "controller runs needs an empty directory there"
+)
 # The endpoint `doctor` reads to prove the exact read works (#329): it names no
 # repository, and GitHub does not count it against the rate limit.
 EXACT_READ_PROBE_PATH = "rate_limit"
@@ -1086,6 +1099,12 @@ class _ExactReadFailed(Exception):
         self.failure = failure
 
 
+def _errno_name(exc: BaseException) -> list[str]:
+    """``exc``'s errno as its symbolic name (``ENOSPC``), when it has a known one."""
+    code = getattr(exc, "errno", None)
+    return [errno.errorcode[code]] if isinstance(code, int) and code in errno.errorcode else []
+
+
 def _transport_cause(exc: BaseException) -> str:
     """A transport failure in the controller's words: its classes, an errno's name and a
     tunnel's status. Never its message, which can quote what a proxy or server sent
@@ -1095,13 +1114,32 @@ def _transport_cause(exc: BaseException) -> str:
     if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, BaseException):
         inner = exc.reason
         names.append(type(inner).__name__)
-    code = getattr(inner, "errno", None)
-    if isinstance(code, int) and code in errno.errorcode:
-        names.append(errno.errorcode[code])
+    names.extend(_errno_name(inner))
     tunnel = _TUNNEL_REFUSED_RE.match(str(inner)) if type(inner) is OSError else None
     if tunnel:
         names.append(f"the proxy refused the tunnel with HTTP {tunnel.group(1)}")
     return ", ".join(names)
+
+
+def _exact_workdir_failure(exc: GitHubError, command: str) -> ExactReadFailure:
+    """``command`` (`gh auth token`) was never started: no empty directory could be made for it.
+
+    :func:`gh_workdir` raised ``exc`` before `gh` ran, so nothing was sent
+    (R2-F1 of PR #539). Conclusive, as for every `gh` call of the
+    controller: the same directory fails the next attempt alike. The cause
+    names the OS error's class and errno name; its text, which names a
+    path, is the ``detail`` alone.
+    """
+    names = [type(exc).__name__]
+    if isinstance(exc.__cause__, OSError):
+        names = [type(exc.__cause__).__name__, *_errno_name(exc.__cause__)]
+    return ExactReadFailure(
+        GitHubError,
+        f"{command} was not started: no empty working directory could be made for it "
+        f"({', '.join(names)})",
+        remedy=EXACT_READ_WORKDIR_REMEDY,
+        detail=f"{redact(str(exc)):.200}",
+    )
 
 
 def _exact_transport_failure(exc: Exception) -> ExactReadFailure:
@@ -1121,6 +1159,7 @@ def _exact_transport_failure(exc: Exception) -> ExactReadFailure:
         return ExactReadFailure(
             GitHubError,
             f"the TLS certificate did not verify{verify}",
+            remedy=EXACT_READ_CERTIFICATE_REMEDY,
             detail=f"{redact(str(reason)):.200}",
         )
     quotes_reply = isinstance(exc, http.client.HTTPException) or isinstance(
@@ -2224,10 +2263,16 @@ class GitHubClient:
         code, its detail `gh`'s redacted stderr, and nothing names what it
         printed. A timeout or a transient exit is GitHubUnavailableError;
         any other exit, or a print that is not one visible token, is
-        GitHubCredentialError (#329).
+        GitHubCredentialError (#329). No empty directory for `gh` (the one
+        GitHubError :meth:`_invoke` raises, before `gh` runs) is a
+        conclusive GitHubError naming the temporary directory
+        (:func:`_exact_workdir_failure`).
         """
         args = ["auth", "token", "--hostname", "github.com"]
-        res = self._invoke(args)
+        try:
+            res = self._invoke(args)
+        except GitHubError as exc:
+            raise _ExactReadFailed(_exact_workdir_failure(exc, f"`gh {' '.join(args)}`")) from None
         if res.timed_out:
             raise _ExactReadFailed(
                 ExactReadFailure(GitHubUnavailableError, self._timeout_message(args))
@@ -2276,10 +2321,15 @@ class GitHubClient:
         GitHubNotFoundError (which :meth:`_exact_reread` reads as
         inconclusive), a credential `gh auth token` cannot print, a 401 or
         any other 403 GitHubCredentialError, and any other status, a
-        redirect, a certificate that does not verify, or a reply that is not
-        one JSON object within the bound a conclusive GitHubError. No
-        failure quotes the reply, not even a header of it: a cause is built
-        from the status and fixed words alone.
+        redirect, a certificate that does not verify, a reply that is not
+        one JSON object within the bound (one nested deeper than the JSON
+        decoder follows included), or no empty directory to start `gh auth
+        token` in a conclusive GitHubError. No failure quotes the reply, not
+        even a header of it: a cause is built from the status and fixed
+        words alone. Every failure of these steps is so classified, so none
+        escapes as anything but :class:`_ExactReadFailed` (R2-F1 of PR
+        #539), save a `gh` that cannot be started at all (ExecutionError)
+        and a controller bug (LockOrderError).
         """
         assert_shared_git_lock_free("call GitHub")
         # The credential goes straight into the request, whose repr leaves the
@@ -2331,6 +2381,10 @@ class GitHubClient:
             data = json.loads(reply.body.decode("utf-8"))
         except ValueError:
             failed(GitHubError, "the reply is not UTF-8 JSON")
+        except RecursionError:
+            # A reply within the byte bound can still nest deeper than the decoder
+            # follows: an answer no GitHub object is, never a crash (R2-F1 of PR #539).
+            failed(GitHubError, "the reply nests deeper than the JSON decoder follows")
         if not isinstance(data, dict):
             failed(GitHubError, "the reply is not a JSON object")
         return data
@@ -2345,9 +2399,11 @@ class GitHubClient:
         is gone (#329), so it is inconclusive like a 5xx: the read is made
         again, up to :attr:`transient_retries` more times after
         :attr:`retry_delay_seconds`, as `gh`'s reads are, and one still
-        unanswered is GitHubUnavailableError, for ``resume`` to read the
-        listing again. An object really deleted is then absent from it, and
-        the read-back decides on that listing as on any. Every conclusive
+        unanswered is GitHubUnavailableError. A create's read-back leaves it
+        for ``resume`` to read the listing again; an object really deleted is
+        then absent from it, and the read-back decides on that listing as on
+        any. Other callers do with it what they do with any unavailable read
+        (REVIEW's operator evidence and ``status`` report it). Every conclusive
         failure (the credential included) is raised at once, never read
         again.
         """
@@ -2379,8 +2435,12 @@ class GitHubClient:
         ``None`` when GitHub answered one JSON object, which is dropped,
         never shown; else the :class:`ExactReadFailure`, for the row to
         show its :meth:`~ExactReadFailure.summary`, which holds nothing
-        GitHub, a proxy or `gh` sent (R1-F1 of PR #539). A `gh` that cannot
-        be started raises ExecutionError. Read-only.
+        GitHub, a proxy or `gh` sent (R1-F1 of PR #539). A failure to
+        prepare the read (no empty directory for `gh auth token`) and a reply
+        no decoder follows are such failures too, never an exception that
+        would end ``doctor``'s report (R2-F1 of PR #539); no GET is sent
+        without a token. A `gh` that cannot be started raises
+        ExecutionError. Read-only.
         """
         try:
             self._exact_attempt(EXACT_READ_PROBE_PATH)
@@ -3808,12 +3868,14 @@ class GitHubClient:
 
 
 __all__ = [
+    "EXACT_READ_CERTIFICATE_REMEDY",
     "EXACT_READ_CREDENTIAL_REMEDY",
     "EXACT_READ_ERROR_BYTES",
     "EXACT_READ_MAX_BYTES",
     "EXACT_READ_PROBE_PATH",
     "EXACT_READ_PROBE_WHAT",
     "EXACT_READ_ROOT",
+    "EXACT_READ_WORKDIR_REMEDY",
     "MAX_BODY_CHARS",
     "MAX_TITLE_CHARS",
     "MERGE_METHODS",

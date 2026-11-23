@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -25,7 +26,7 @@ from autoforge.errors import (
     StateError,
 )
 from autoforge.executor import ExecutionResult, execute
-from autoforge.github import GitHubClient, HttpsReply
+from autoforge.github import GH_WORKDIR_PREFIX, GitHubClient, HttpsReply
 from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
 from autoforge.memory import Action, Actor, Kind, MemoryScope
 from autoforge.provenance import MAX_PATH_CHARS
@@ -2620,6 +2621,65 @@ def test_doctor_s_exact_read_row_never_prints_what_github_or_gh_sent(
     assert not row["ok"] and row["required"] and cause in row["detail"]
     assert echoed not in out.out + out.err
     assert len(gets) == (0 if echo_in == "token-stderr" else 2)
+
+
+@pytest.mark.parametrize("failure", ["no-gh-workdir", "too-deep"])
+def test_doctor_prints_its_whole_report_when_the_exact_read_probe_fails(
+    tmp_path, capsys, monkeypatch, failure
+):
+    """R2-F1 of PR #539: no empty directory in which to start `gh auth token`, and a
+    reply below the byte bound that nests deeper than the JSON decoder follows, escaped
+    the exact-read row and ended `doctor` with a traceback and no report. Both output
+    modes print every row now, the exact-read row a FAIL with its classified cause;
+    no GET is sent without a token, and nothing of the reply is printed."""
+    monkeypatch.chdir(tmp_path)
+    reply_text = "reply-only-text-5e0b91"
+    deep = HttpsReply(
+        200,
+        {"content-type": "application/json"},
+        b"[" * 500_000 + f'"{reply_text}"'.encode() + b"]" * 500_000,
+    )
+    gets: list = []
+    monkeypatch.setattr(github_module, "https_get", lambda request: gets.append(request) or deep)
+    if failure == "no-gh-workdir":
+        real = tempfile.mkdtemp
+
+        def mkdtemp(suffix=None, prefix=None, dir=None):
+            if prefix == GH_WORKDIR_PREFIX:
+                raise OSError(28, "No space left on device")
+            return real(suffix, prefix, dir)
+
+        monkeypatch.setattr(tempfile, "mkdtemp", mkdtemp)
+
+    def runner(req):
+        argv = req.command
+        if argv == ["gh", "auth", "token", "--hostname", "github.com"]:
+            return ExecutionResult(argv, req.cwd, 0, "gho_" + "F" * 36 + "\n", "", "t", "t")
+        if argv[:3] == ["git", "remote", "get-url"]:
+            return ExecutionResult(argv, req.cwd, 0, "git@github.com:o/r.git\n", "", "t", "t")
+        return ExecutionResult(argv, req.cwd, 0, "ok 1.0\n", "", "t", "t")
+
+    monkeypatch.setattr(cli, "_doctor_runner", lambda: runner)
+    sd = str(tmp_path / ".autoforge")
+    cause = (
+        "`gh auth token --hostname github.com` was not started: no empty working directory "
+        "could be made for it (OSError, ENOSPC)"
+        if failure == "no-gh-workdir"
+        else "the reply nests deeper than the JSON decoder follows"
+    )
+    assert cli.main(["--state-dir", sd, "doctor"]) == 1
+    out = capsys.readouterr()
+    assert "[FAIL] exact read (api.github.com): " in out.out and cause in out.out
+    assert "state dir writable" in out.out and "Traceback" not in out.err
+    assert reply_text not in out.out + out.err
+    assert cli.main(["--state-dir", sd, "doctor", "--json"]) == 1
+    out = capsys.readouterr()
+    checks = {c["name"]: c for c in json.loads(out.out)["checks"]}
+    row = checks["exact read (api.github.com)"]
+    assert not row["ok"] and row["required"] and cause in row["detail"]
+    assert "state dir writable" in checks
+    assert reply_text not in out.out + out.err
+    assert len(gets) == (0 if failure == "no-gh-workdir" else 2)
 
 
 def test_doctor_reports_an_unreadable_branch_rule_as_skipped(tmp_path, capsys, monkeypatch):

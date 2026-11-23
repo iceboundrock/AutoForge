@@ -987,7 +987,12 @@ class Doctor:
         not verify and any other conclusive answer FAIL with their remedy. A
         transient failure (no connection, a timeout, a 5xx or a rate limit)
         WARNs: it may pass on the next run, and if it does not, the proxy or
-        the network between this machine and the API is to check.
+        the network between this machine and the API is to check. A probe
+        that could not prepare its read (no empty directory in which to start
+        `gh auth token`) FAILs naming the temporary directory, with no GET
+        sent, and a reply that nests deeper than the JSON decoder follows
+        FAILs as any reply that is not GitHub's JSON: the client classifies
+        both, so neither ends the report (R2-F1 of PR #539).
 
         The row shows the failure's :meth:`~autoforge.github.ExactReadFailure.
         summary` and nothing else of it: the controller's own words and
@@ -1030,13 +1035,10 @@ class Doctor:
                 "read-back that needs this read would stop until it works",
                 required=False,
             )
-        return CheckResult(
-            name,
-            False,
-            f"{summary}; a read-back that needs this read would block. A certificate that "
-            "does not verify means this machine's trust store does not hold the CA of "
-            "whatever answered (a TLS-inspecting proxy, for one)",
-        )
+        # The failure's own remedy says what to check (a certificate's names the
+        # trust store, no directory for `gh` the temporary directory): nothing
+        # is added that applies to another failure (R2-F1 of PR #539).
+        return CheckResult(name, False, f"{summary}; a read-back that needs this read would block")
 
     def sandbox_checks(self) -> list[CheckResult]:
         """The outer sandbox's rows (ADR 0005 D12.4, D14.1; :mod:`autoforge.doctor_sandbox`)."""

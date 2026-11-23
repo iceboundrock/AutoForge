@@ -1,10 +1,12 @@
 """Doctor: read-only checks with a fake command runner."""
 
+import errno
 import json
 import os
 import shutil
 import ssl
 import subprocess
+import tempfile
 import urllib.error
 from pathlib import Path
 
@@ -1647,6 +1649,8 @@ def test_the_exact_read_row_fails_any_other_conclusive_answer_without_quoting_it
     assert not row.ok and row.required and row.label == "FAIL"
     assert needle in row.detail and "would block" in row.detail
     assert "elsewhere.example" not in row.detail
+    # The trust store is the remedy of a certificate alone (R2-F1 of PR #539).
+    assert ("trust store" in row.detail) == (needle == "did not verify")
     _no_secret_in(row)
 
 
@@ -1765,6 +1769,98 @@ def test_the_exact_read_row_is_unread_when_gh_cannot_be_started(tmp_path):
     row = d.check_exact_read("gh")
     assert row.skipped and row.label == "SKIP" and "'gh available' row" in row.detail
     assert gets == []
+
+
+# R2-F1 of PR #539: two probe failures escaped the row and ended doctor's whole report.
+# A reply within the byte bound that nests deeper than the JSON decoder follows (it
+# raised RecursionError), holding text the row must not repeat.
+_TOO_DEEP_REPLY = HttpsReply(
+    200,
+    {"content-type": "application/json"},
+    b"[" * 500_000 + b'"' + _REPLY_SECRET + b'"' + b"]" * 500_000,
+)
+_TOO_DEEP_CAUSE = "the reply nests deeper than the JSON decoder follows"
+# The path the OS error names: local text, which the exact-read row does not quote either.
+_WORKDIR_PATH = "/tmp/autoforge-gh-path-marker-7c1e"
+_NO_WORKDIR_CAUSE = (
+    "`gh auth token --hostname github.com` was not started: no empty working directory "
+    "could be made for it (OSError, ENOSPC)"
+)
+
+
+def _refuse_gh_workdirs(monkeypatch) -> None:
+    """No empty directory can be made for a `gh` (#283): the temporary directory is full.
+    Every other temporary directory is made as usual."""
+    real = tempfile.mkdtemp
+
+    def mkdtemp(suffix=None, prefix=None, dir=None):
+        if prefix == GH_WORKDIR_PREFIX:
+            raise OSError(errno.ENOSPC, "No space left on device", _WORKDIR_PATH)
+        return real(suffix, prefix, dir)
+
+    monkeypatch.setattr(tempfile, "mkdtemp", mkdtemp)
+
+
+def test_the_exact_read_row_fails_a_reply_nested_deeper_than_the_decoder_follows(tmp_path):
+    """The decoder's nesting limit, reached by a reply below the byte bound, is a FAIL
+    like any reply that is not GitHub's JSON: one GET, nothing of the reply shown, and
+    no remedy of another failure (the trust store is a certificate's)."""
+    assert len(_TOO_DEEP_REPLY.body) < github_module.EXACT_READ_MAX_BYTES
+    row, _, gets = _exact_read(tmp_path, _TOO_DEEP_REPLY)
+
+    assert not row.ok and row.required and row.label == "FAIL"
+    assert f"exact read probe (GET /rate_limit): {_TOO_DEEP_CAUSE}" in row.detail
+    assert "would block" in row.detail and "trust store" not in row.detail
+    assert len(gets) == 1
+    _no_secret_in(row)
+
+
+def test_the_exact_read_row_fails_a_probe_that_cannot_start_gh_and_sends_no_get(
+    tmp_path, monkeypatch
+):
+    """No empty directory in which to start `gh auth token` is a FAIL naming the cause
+    in the controller's words (the OS error's class and errno name, never its text) and
+    the temporary directory as the remedy. `gh` never starts, and no GET is sent."""
+    _refuse_gh_workdirs(monkeypatch)
+    row, calls, gets = _exact_read(tmp_path)
+
+    assert not row.ok and row.required and row.label == "FAIL"
+    assert f"exact read probe (GET /rate_limit): {_NO_WORKDIR_CAUSE}" in row.detail
+    assert github_module.EXACT_READ_WORKDIR_REMEDY in row.detail
+    assert "trust store" not in row.detail and _WORKDIR_PATH not in row.detail
+    assert GH_AUTH_TOKEN not in calls and gets == []
+    _no_secret_in(row)
+
+
+@pytest.mark.parametrize("failure", ["no-gh-workdir", "too-deep"])
+def test_a_failed_exact_read_probe_leaves_doctor_s_report_whole(tmp_path, monkeypatch, failure):
+    """R2-F1 of PR #539: either failure escaped `check_exact_read` and ended `run_all`,
+    so no row at all was reported. Every row is reported now, the exact-read row a FAIL
+    with its cause; with no directory for `gh`, the other `gh` rows fail as well and no
+    GET is sent."""
+    gets: list[HttpsRequest] = []
+    if failure == "no-gh-workdir":
+        _refuse_gh_workdirs(monkeypatch)
+    reply = _TOO_DEEP_REPLY if failure == "too-deep" else RATE_LIMIT_REPLY
+    d = Doctor(
+        cwd=str(tmp_path),
+        runner=_runner_factory(),
+        https=lambda request: gets.append(request) or reply,
+    )
+    results = d.run_all()
+
+    rows = {r.name: r for r in results}
+    for expected in ("gh authenticated", EXACT_READ_ROW, "GitHub remote", "state dir writable"):
+        assert expected in rows
+    row = rows[EXACT_READ_ROW]
+    assert not row.ok and row.label == "FAIL"
+    assert (_NO_WORKDIR_CAUSE if failure == "no-gh-workdir" else _TOO_DEEP_CAUSE) in row.detail
+    assert len(gets) == (0 if failure == "no-gh-workdir" else 1)
+    assert _WORKDIR_PATH not in row.detail
+    if failure == "no-gh-workdir":
+        assert not rows["gh authenticated"].ok
+    for r in results:
+        assert _REPLY_SECRET.decode() not in r.detail, r
 
 
 def test_premerge_verification_reported_and_never_run(tmp_path):

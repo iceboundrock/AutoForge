@@ -29,11 +29,13 @@ from autoforge.errors import (
 )
 from autoforge.executor import ExecutionResult
 from autoforge.github import (
+    EXACT_READ_CERTIFICATE_REMEDY,
     EXACT_READ_CREDENTIAL_REMEDY,
     EXACT_READ_ERROR_BYTES,
     EXACT_READ_MAX_BYTES,
     EXACT_READ_PROBE_WHAT,
     EXACT_READ_ROOT,
+    EXACT_READ_WORKDIR_REMEDY,
     GH_WORKDIR_PREFIX,
     MAX_BODY_CHARS,
     MAX_TITLE_CHARS,
@@ -4643,6 +4645,87 @@ def test_the_exact_read_probe_s_summary_holds_nothing_the_answer_or_gh_sent(
     # either.
     if reply is not None or isinstance(raises, http.client.HTTPException):
         assert _UNRECOGNIZED not in str(failure.error_for(EXACT_READ_PROBE_WHAT))
+
+
+# A JSON reply well within the byte bound that nests deeper than the decoder follows
+# (R2-F1 of PR #539): `json.loads` raises RecursionError on it, no ValueError.
+_TOO_DEEP_REPLY = HttpsReply(
+    200,
+    {"content-type": "application/json"},
+    b"[" * 500_000 + f'"{_UNRECOGNIZED}"'.encode() + b"]" * 500_000,
+)
+
+
+def test_an_exact_read_classifies_a_reply_nested_deeper_than_the_json_decoder_follows():
+    """R2-F1 of PR #539: a reply below the byte bound whose nesting the decoder cannot
+    follow raised RecursionError, outside every typed failure, so a read-back stopped on
+    an exception nothing classifies and doctor lost its whole report. It is a conclusive
+    GitHubError now, as any reply that is not GitHub's JSON: never read again, never
+    quoted."""
+    assert len(_TOO_DEEP_REPLY.body) < EXACT_READ_MAX_BYTES
+    with pytest.raises(RecursionError):
+        json.loads(_TOO_DEEP_REPLY.body)
+    _, gets, client = _exact_client(_TOO_DEEP_REPLY, retries=3)
+    with pytest.raises(GitHubError) as info:
+        client.get_pr_exact(_EXACT_PR_URL)
+    assert type(info.value) is GitHubError
+    assert "the reply nests deeper than the JSON decoder follows" in str(info.value)
+    assert _UNRECOGNIZED not in str(info.value)
+    assert len(gets) == 1
+
+    _, gets, client = _exact_client(_TOO_DEEP_REPLY, retries=3)
+    failure = client.probe_exact_read()
+    assert isinstance(failure, ExactReadFailure) and failure.error is GitHubError
+    assert failure.cause == "the reply nests deeper than the JSON decoder follows"
+    assert _UNRECOGNIZED not in failure.summary(EXACT_READ_PROBE_WHAT)
+    assert len(gets) == 1
+
+
+def test_an_exact_read_with_no_directory_for_gh_auth_token_sends_nothing(monkeypatch):
+    """R2-F1 of PR #539: `gh auth token` runs in an empty directory of its own (#283).
+    One that cannot be made raised `gh_workdir`'s GitHubError past the probe, which
+    doctor's row did not handle. The exact read classifies it now: conclusive, as for
+    every `gh` call, its cause the OS error's class and errno name and its remedy the
+    temporary directory; `gh` never starts and no GET is sent. The OS error's text, which
+    names a path, stays out of the probe's summary."""
+    real = tempfile.mkdtemp
+
+    def mkdtemp(suffix=None, prefix=None, dir=None):
+        if prefix == GH_WORKDIR_PREFIX:
+            raise PermissionError(13, "Permission denied", f"/tmp/{_UNRECOGNIZED}")
+        return real(suffix, prefix, dir)
+
+    monkeypatch.setattr(tempfile, "mkdtemp", mkdtemp)
+    cause = (
+        "`gh auth token --hostname github.com` was not started: no empty working directory "
+        "could be made for it (PermissionError, EACCES)"
+    )
+    gh_calls, gets, client = _exact_client(_json_reply({"rate": {}}), retries=3)
+    with pytest.raises(GitHubError) as info:
+        client.get_pr_exact(_EXACT_PR_URL)
+    assert type(info.value) is GitHubError
+    assert cause in str(info.value) and EXACT_READ_WORKDIR_REMEDY in str(info.value)
+    assert gh_calls == [] and gets == []
+
+    failure = client.probe_exact_read()
+    assert isinstance(failure, ExactReadFailure) and failure.error is GitHubError
+    assert failure.cause == cause and failure.remedy == EXACT_READ_WORKDIR_REMEDY
+    assert _UNRECOGNIZED not in failure.summary(EXACT_READ_PROBE_WHAT)
+    assert gh_calls == [] and gets == []
+
+
+def test_a_certificate_the_exact_read_cannot_verify_names_the_trust_store():
+    """The remedy travels with the failure it applies to (R2-F1 of PR #539): the trust
+    store is named for a certificate that does not verify, and for nothing else."""
+    _, _, client = _exact_client(
+        raises=urllib.error.URLError(ssl.SSLCertVerificationError(1, "self-signed"))
+    )
+    failure = client.probe_exact_read()
+    assert isinstance(failure, ExactReadFailure)
+    assert failure.remedy == EXACT_READ_CERTIFICATE_REMEDY
+    _, _, client = _exact_client(_json_reply([1]))
+    failure = client.probe_exact_read()
+    assert isinstance(failure, ExactReadFailure) and failure.remedy == ""
 
 
 # -- the exact read's transport, against a loopback server ---------------------------------
