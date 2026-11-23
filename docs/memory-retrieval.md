@@ -766,10 +766,16 @@ Vietnamese, accented Latin and full-width forms
 A query becomes its tokens only: deduplicated, at most 16 terms of at most
 64 characters, from a query of at most 512 bytes. A search checks that
 bound once it has read every backend's health, loaded the store and bound
-the request, as every read does first, and before it asks any backend. One
-of more than 512 characters is refused before anything of it is copied or
-encoded, so a query past the bound costs those reads and nothing more
-(`test_no_backend_is_called_after_a_reads_last_load_of_the_store`).
+the request, as every read does first, and before it asks any backend. It
+checks in two steps. A query of more than 512 characters is past the bound
+whatever its encoding, since a character is at least one byte in UTF-8: it
+is refused before anything of it is copied or encoded, so it costs those
+reads and nothing more. A query of at most 512 characters is copied as its
+exact `str` value and encoded, and refused if its UTF-8 is longer than 512
+bytes: 257 copies of `é` are 257 characters and 514 bytes, refused at the
+byte check. Neither refusal reaches a backend's search
+(`test_a_query_past_the_byte_bound_is_refused_before_it_is_encoded`,
+`test_no_backend_is_called_after_a_reads_last_load_of_the_store`).
 Each term is quoted
 before it reaches FTS5, so no query is FTS5 syntax, a column filter or a
 scope. `render_hits` fences every excerpt with a backtick run longer than
