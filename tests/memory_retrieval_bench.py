@@ -20,7 +20,9 @@ permission leak is counted however the code decides.
 
 **Performance** times the same index on the fixture's store, on a store at
 Memory's record bound, and on synthetic corpora of the backend alone, which
-no store reaches (a store holds at most 64 records). Only BM25 is measured:
+no store reaches (a store holds at most 64 records); there each search is
+asked about 64 records drawn at random, as a launch's asks about at most
+the records it is served. Only BM25 is measured:
 no embedding of any kind is computed here, so nothing of this is evidence
 for semantic retrieval.
 """
@@ -491,14 +493,18 @@ def performance(
         docs, vocab = synthetic(n)
         rng = random.Random(n)
         probes = [" ".join(rng.sample(vocab[:500], 3)) for _ in range(200)]
+        # A launch's search asks about at most a store's records, those it is
+        # served: each probe asks about 64 of the corpus's, drawn at random.
+        limit = memory_retrieval.MAX_CANDIDATES
+        asked = [tuple(sorted(rng.sample(range(1, n + 1), min(limit, n)))) for _ in probes]
         backend = Fts5Backend()
         build_ns, _ = _timed(lambda b=backend, d=docs: b.apply(d, (), clear=True))
         cpu = time.process_time()
         samples = []
-        for probe in probes:
+        for probe, records in zip(probes, asked, strict=True):
             terms = query_terms(probe)
             ns, _ = _timed(
-                lambda t=terms, b=backend: b.search("corpus", t, memory_retrieval.MAX_CANDIDATES)
+                lambda t=terms, r=records, b=backend, k=limit: b.search("corpus", t, r, k)
             )
             samples.append(ns)
         search_cpu = (time.process_time() - cpu) * 1000 / len(samples)

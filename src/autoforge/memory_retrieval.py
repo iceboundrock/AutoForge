@@ -67,23 +67,33 @@ index finds exactly what the tail finds in any script.
 
 **Freshness.** The index is eventually consistent with the store. It records
 the Memory revision it was synced through (``indexed_through_seq``). An
-index row whose record changed after the watermark is dropped as ``stale``
-when it is the record as that sync left it (:func:`_indexed_at`); a bounded
-hot tail (:data:`MAX_TAIL` of the scope's current records changed after
-the watermark, newest first) is searched on the store itself. A sync is one
+index row whose record changed after the watermark is stale, and kept
+until the next sync when it is the record as that sync left it
+(:func:`_indexed_at`); a search never asks about such a record, and a
+bounded hot tail (:data:`MAX_TAIL` of the scope's current records changed
+after the watermark, newest first) is searched on the store itself. A sync is one
 SQLite transaction, and so is a rebuild: a failure leaves the index as it
 was, at its old watermark and generation, and is counted, and a rebuild
-that failed is owed to the next sync. A search proves its index's coverage
-before it says ``complete``: every record the launch is served that the
-index has seen and that holds a query term must be among the candidates.
-An index found not to be a projection of the store (a malformed row, two
-rows of one record, a candidate the store contradicts, a row of a record
-added after the watermark or at a revision past it, a served match it
-omits, or, by :meth:`MemoryRetriever.verify`, a row whose tokens are not
-its record's) is ``failed`` (``integrity``) until it is rebuilt, and the
-search that found it answers from the fallback or the tail instead. Since
-the index is in memory, a crash loses it and the next process rebuilds it
-from the checkpoint, deterministically.
+that failed is owed to the next sync.
+
+**What a search asks.** A search asks a backend only about the records the
+launch is served that the index has seen as they are now (each one's
+latest change at or before the watermark), whose rows hold text the launch
+may read. Nothing the index holds of any other record, another
+candidate's, a retracted or superseded one's, or an earlier text of a
+record corrected since, is read by a launch's search, so no row of one,
+damaged or not, moves the answer, its status or whether it is degraded
+(R8-F1 of PR #537): such records are the tail's or no one's, and
+:meth:`MemoryRetriever.verify`, the controller's, checks their rows. A
+search proves its index's coverage before it says ``complete``: every
+record it asked about that holds a query term must be among the
+candidates. An index whose answer about those records is not a projection
+of the store (a malformed row, two rows of one record, a candidate the
+store contradicts, a match it omits, or, by ``verify``, any row no sync
+through the watermark wrote) is ``failed`` (``integrity``) until it is
+rebuilt, and the search that found it answers from the fallback or the
+tail instead. Since the index is in memory, a crash loses it and the next
+process rebuilds it from the checkpoint, deterministically.
 
 **Backends** implement :class:`IndexBackend` and return candidates only:
 record ids with the revision and content digest they indexed, checked and
@@ -309,20 +319,24 @@ class IndexBackend(Protocol):
 
     ``apply`` is atomic: every upsert and delete, or none, and ``clear``
     empties the index first in the same unit. A document is indexed as its
-    :func:`text_tokens`, and ``search`` returns every record of one
-    partition holding any of the ``terms`` (the same tokenizer's, from
-    :func:`query_terms`, never query syntax), up to ``limit``: a partition
-    holds at most one store's records, :data:`MAX_CANDIDATES`, so the
+    :func:`text_tokens`, and ``search`` returns every row of one partition
+    whose record is one of ``records`` and holds any of the ``terms`` (the
+    same tokenizer's, from :func:`query_terms`, never query syntax), up to
+    ``limit``. ``records`` is at most ``limit`` ids, those a launch is
+    served that the index has seen as they are now: the backend reads no
+    other row for a launch's search, so nothing it holds of a record the
+    launch is not served moves the answer (R8-F1 of PR #537), and the
     candidates never depend on a backend's own ranking. Each search checks
-    that: an answer that omits a record the launch is served, the index has
-    seen and a term matches is an integrity failure. ``entries`` reads
-    every row back. ``available`` answers ``True`` when the backend can run;
-    anything else, or an error, is a backend that cannot. Errors are
+    that: an answer that omits a record it asked about that a term matches
+    is an integrity failure. ``entries`` reads every row back.
+    ``available`` answers ``True`` when the backend can run; anything else,
+    or an error, is a backend that cannot. Errors are
     :class:`RetrievalBackendError`, and a row the backend finds malformed
     :class:`RetrievalIntegrityError`; an answer that is not exactly a list
     or a tuple (never a subclass) of at most :data:`MAX_CANDIDATES`
     well-formed candidates is treated as an error (:func:`_candidates`),
-    and ``entries`` must return exactly a list.
+    and ``entries`` must return exactly a list. A candidate naming a record
+    the search did not ask about is set aside, unread.
 
     ``name`` is read once, when a retriever is made, and must be lower-case
     words joined by hyphens, at most :data:`MAX_BACKEND_NAME` characters,
@@ -342,7 +356,9 @@ class IndexBackend(Protocol):
         clear: bool = False,
     ) -> None: ...
 
-    def search(self, partition: str, terms: Sequence[str], limit: int) -> list[IndexCandidate]: ...
+    def search(
+        self, partition: str, terms: Sequence[str], records: Sequence[int], limit: int
+    ) -> list[IndexCandidate]: ...
 
     def entries(self) -> list[IndexEntry]: ...
 
@@ -515,16 +531,24 @@ class Fts5Backend:
             raise RetrievalBackendError("the FTS5 index could not be updated") from None
         self._tables, self._documents = tables, count
 
-    def search(self, partition: str, terms: Sequence[str], limit: int) -> list[IndexCandidate]:
+    def search(
+        self, partition: str, terms: Sequence[str], records: Sequence[int], limit: int
+    ) -> list[IndexCandidate]:
         db = self._require()
         table = self._tables.get(partition)
-        if table is None or not terms:
+        if len(records) > limit or not all(type(r) is int for r in records):
+            raise RetrievalBackendError("an FTS5 search is asked about at most its limit of ids")
+        if table is None or not terms or not records:
             return []
+        # Only the rows of the records asked about are read: a row of any
+        # other record, however damaged, is never a result (R8-F1 of PR #537).
+        marks = ", ".join("?" * len(records))
         try:
             rows = db.execute(
                 f"SELECT rowid, revision, digest, bm25({table}) FROM {table} "
-                f"WHERE {table} MATCH ? ORDER BY bm25({table}), rowid LIMIT ?",
-                (_match_expression(terms), limit),
+                f"WHERE {table} MATCH ? AND rowid IN ({marks}) "
+                f"ORDER BY bm25({table}), rowid LIMIT ?",
+                (_match_expression(terms), *records, limit),
             ).fetchall()
         except sqlite3.Error:
             raise RetrievalBackendError("the FTS5 index could not be searched") from None
@@ -664,7 +688,9 @@ def _candidate(raw: object, limit: int) -> IndexCandidate:
     return raw
 
 
-def _candidates(answer: object, limit: int) -> list[IndexCandidate]:
+def _candidates(
+    answer: object, limit: int, asked: frozenset[int]
+) -> tuple[list[IndexCandidate], int]:
     """A backend's answer checked, bounded and deduplicated, in its rank order.
 
     Exactly a list or a tuple, never a subclass, of at most ``limit``
@@ -679,24 +705,38 @@ def _candidates(answer: object, limit: int) -> list[IndexCandidate]:
     no sync writes: :class:`RetrievalIntegrityError`, found before anything
     is deduplicated. Ordered by rank, then id, the first of each id kept:
     one record fills one place, whatever the backend repeats.
+
+    A candidate whose id is not one of ``asked``, the records the search
+    asked about, says nothing of them: it is set aside once its type and
+    id are read, and counted (the second value), so nothing a backend
+    answers of a record the launch is not served moves what it is told,
+    not even a malformed field of one (R8-F1 of PR #537).
     """
     if type(answer) is not list and type(answer) is not tuple:
         raise RetrievalBackendError("a backend's answer is a list of candidates")
     if len(answer) > limit:
         raise RetrievalBackendError("a backend answered past its bound")
-    checked = sorted(
-        (_candidate(raw, limit) for raw in answer),
-        key=lambda c: (c.rank, c.id, c.revision, c.digest),
-    )
+    kept: list[IndexCandidate] = []
+    unasked = 0
+    for raw in answer:
+        if type(raw) is not IndexCandidate:
+            raise RetrievalBackendError("a backend answered with something other than a candidate")
+        if type(raw.id) is not int or not 1 <= raw.id <= MAX_COUNTER:
+            raise RetrievalBackendError("a backend answered with a malformed candidate")
+        if raw.id in asked:
+            kept.append(_candidate(raw, limit))
+        else:
+            unasked += 1
+    checked = sorted(kept, key=lambda c: (c.rank, c.id, c.revision, c.digest))
     rows: dict[int, tuple[int, str]] = {}
     for candidate in checked:
         row = (candidate.revision, candidate.digest)
         if rows.setdefault(candidate.id, row) != row:
             raise RetrievalIntegrityError("a backend answered one record with two rows")
-    kept: dict[int, IndexCandidate] = {}
+    first: dict[int, IndexCandidate] = {}
     for candidate in checked:
-        kept.setdefault(candidate.id, candidate)
-    return list(kept.values())
+        first.setdefault(candidate.id, candidate)
+    return list(first.values()), unasked
 
 
 def _prefix_digest(events: list, through: int) -> str:
@@ -755,6 +795,7 @@ _METRICS = (
     "incomplete",
     "integrity",
     "omitted",
+    "unasked",
     "unavailable",
     "search_failures",
     "invalid_answers",
@@ -1550,10 +1591,32 @@ class MemoryRetriever:
 
     # -- reads ----------------------------------------------------------------
 
-    def _ask(self, slot: _Slot, issue: str, terms: Sequence[str]) -> list[IndexCandidate] | None:
-        """``slot``'s checked candidates, or ``None`` when it failed, marked so until rebuilt."""
+    @staticmethod
+    def _asked(facts: dict[int, MemoryFact], scope: _Scope, through: int) -> frozenset[int]:
+        """The records a search asks an index synced through ``through`` about.
+
+        Those the launch is served whose latest change is at or before the
+        watermark: the index saw each as it is now, so its row, if the index
+        is a projection of the store, holds the text the launch is served.
+        Every other record is left out: one the launch is not served
+        (another candidate's, environment's or issue's, retracted, withheld,
+        superseded) and one changed after the watermark, whose row holds an
+        earlier text. Their rows hold text the launch may not read, so no
+        search of the launch's reads them, and a damaged one moves nothing
+        it is told: the tail reads the records changed since, and
+        :meth:`verify`, the controller's, checks every row (R8-F1 of PR
+        #537). At most :data:`~autoforge.memory.MAX_FACTS` ids.
+        """
+        return frozenset(
+            f.id for f in facts.values() if f.revision <= through and scope.served(f.id)
+        )
+
+    def _ask(
+        self, slot: _Slot, issue: str, terms: Sequence[str], asked: frozenset[int]
+    ) -> list[IndexCandidate] | None:
+        """``slot``'s checked candidates among ``asked``, or ``None`` when it failed, marked so."""
         try:
-            answer = slot.backend.search(issue, terms, MAX_CANDIDATES)
+            answer = slot.backend.search(issue, terms, tuple(sorted(asked)), MAX_CANDIDATES)
         except RetrievalIntegrityError:
             slot.broken = IndexReason.INTEGRITY
             self.metrics.count("integrity")
@@ -1563,7 +1626,7 @@ class MemoryRetriever:
             self.metrics.count("search_failures")
             return None
         try:
-            return _candidates(answer, MAX_CANDIDATES)
+            found, unasked = _candidates(answer, MAX_CANDIDATES, asked)
         except RetrievalIntegrityError:
             slot.broken = IndexReason.INTEGRITY
             self.metrics.count("integrity")
@@ -1572,51 +1635,40 @@ class MemoryRetriever:
             slot.broken = IndexReason.INVALID_ANSWER
             self.metrics.count("invalid_answers")
             return None
+        self.metrics.count("unasked", unasked)
+        return found
 
     @staticmethod
     def _contradicted(
         found: Sequence[IndexCandidate],
         facts: dict[int, MemoryFact],
         scope: _Scope,
-        indexed: Callable[[int], dict[int, tuple[int, str]]],
         through: int,
         tokens: Callable[[int], list[str]],
-        held: Callable[[str], list[str] | None],
         wanted: set[str],
     ) -> int:
-        """How many of ``found`` no index synced through ``through`` could hold.
+        """How many of ``found``, all asked about, no index synced through ``through`` could hold.
 
-        A candidate the snapshot contradicts at a revision the index claims
-        to have seen: no record of the partition's issue by that id; a
-        record not indexable then (retracted or superseded at or before the
-        watermark, whose row the sync deleted); another revision or content
-        digest; or a text that holds none of the query's terms, which a
-        search matches by. A candidate whose record changed after the
-        watermark is a stale row only if it is the record as the sync left
-        it (``indexed``, :func:`_indexed_at`): added by then, at the
-        revision and digest it had then, and, where the store still holds
-        that text, matched by a term of it. Then the tail reads the record;
-        any other is a row no sync wrote, an id added after the watermark
-        or a revision past it included (R4-F3 of PR #537).
+        Each was a record the launch is served, unchanged since the
+        watermark (:meth:`_asked`). If the store after the retrieval still
+        says so, the row must be the record as it is: at its revision and
+        content digest, and holding a query term in the store's text, which
+        the launch is served, since a search matches by term. Anything else
+        is a row no sync wrote. A record corrected, retracted or withheld
+        while the backend answered is not judged here: the store's verdict
+        and the tail decide it, as for any record changed since the
+        watermark. Only the text the launch is served is ever read.
         """
         count = 0
         for candidate in found:
-            fact = facts.get(candidate.id)
-            row = (candidate.revision, candidate.digest)
-            if fact is not None and fact.scope.step.issue_url == scope.issue:
-                if fact.revision > through:
-                    then = held(candidate.digest)
-                    if indexed(through).get(fact.id) == row and (
-                        then is None or not wanted.isdisjoint(then)
-                    ):
-                        continue
-                elif (
-                    _indexable(fact)
-                    and (fact.revision, fact.content) == row
-                    and not wanted.isdisjoint(tokens(fact.id))
-                ):
-                    continue
-            count += 1
+            fact = facts[candidate.id]
+            if fact.revision > through or not scope.served(fact.id):
+                continue
+            if (fact.revision, fact.content) != (
+                candidate.revision,
+                candidate.digest,
+            ) or wanted.isdisjoint(tokens(fact.id)):
+                count += 1
         return count
 
     @staticmethod
@@ -1624,30 +1676,31 @@ class MemoryRetriever:
         found: Sequence[IndexCandidate],
         facts: dict[int, MemoryFact],
         scope: _Scope,
+        asked: frozenset[int],
         through: int,
         tokens: Callable[[int], list[str]],
         wanted: set[str],
     ) -> int:
-        """How many records the launch is served that ``found`` should hold and does not.
+        """How many records the search asked about that ``found`` should hold and does not.
 
-        A backend returns every record of the partition that holds a query
-        term (:class:`IndexBackend`). A record whose latest change is at or
-        before ``through`` was indexed as it is now, so each such record the
-        launch is served that holds a term must be a candidate. One missing
-        means the index is no projection of the store, and a search that
-        read it could not say it is complete. This is the coverage a search
-        proves before it does: it reads the store's text of every such
-        record, at most :data:`~autoforge.memory.MAX_FACTS`. A record changed
-        after the watermark is the tail's.
+        A backend returns every record it is asked about that holds a query
+        term (:class:`IndexBackend`). Each record asked about was indexed as
+        it is now, so each one the store after the retrieval still serves,
+        unchanged, that holds a term must be a candidate. One missing means
+        the index is no projection of the store, and a search that read it
+        could not say it is complete. This is the coverage a search proves
+        before it does: it reads the store's text of every record asked
+        about, at most :data:`~autoforge.memory.MAX_FACTS`, and of no other.
+        A record changed after the watermark is the tail's.
         """
         returned = {candidate.id for candidate in found}
         return sum(
             1
-            for fact in facts.values()
-            if fact.revision <= through
-            and fact.id not in returned
-            and scope.served(fact.id)
-            and not wanted.isdisjoint(tokens(fact.id))
+            for record in asked
+            if record not in returned
+            and facts[record].revision <= through
+            and scope.served(record)
+            and not wanted.isdisjoint(tokens(record))
         )
 
     def search_memory(
@@ -1666,9 +1719,12 @@ class MemoryRetriever:
         judges the candidates, gives the excerpts, picks the tail and
         reports the freshness, and no backend is called after that load: a
         record corrected or retracted while a backend answered or reported
-        its health is served as it is now, or not at all. An answer the
-        snapshot contradicts, or one that omits a record the launch is
-        served that the index has seen and that holds a query term, is
+        its health is served as it is now, or not at all. An index is asked
+        only about the records the launch is served that it saw as they are
+        now (:meth:`_asked`), so nothing it holds of any other record, nor
+        any text the launch may not read, moves the answer, its status or
+        whether it is degraded. An answer the snapshot contradicts, or one
+        that omits a record asked about that holds a query term, is
         discarded, its index marked ``failed`` (``integrity``), and the
         fallback, else the tail alone, answers the same search, reported
         ``degraded``.
@@ -1688,31 +1744,28 @@ class MemoryRetriever:
         facts = {f.id: f for f in snap.store.facts()}
         cache: dict[str, list[str]] = {}
 
-        def held(digest: str) -> list[str] | None:
-            # The tokens of the text the store holds by ``digest``, or ``None``
-            # when it holds none: one text, one tokenization.
+        def tokens(record: int) -> list[str]:
+            # The store's own live text of a record the launch is served, the
+            # only text read: one text, one tokenization.
+            text = snap.store.text_of(record)
+            if not text:
+                return []
+            digest = facts[record].content
             if digest not in cache:
-                text = snap.texts.get(digest)
-                if text is None:
-                    return None
                 cache[digest] = text_tokens(text)
             return cache[digest]
-
-        def tokens(record: int) -> list[str]:
-            # The store's own live text: a record with none has no tokens.
-            if not snap.store.text_of(record):
-                return []
-            return held(facts[record].content) or []
 
         used: _Slot | None = None
         found: list[IndexCandidate] = []
         for slot, up in zip(self._slots, health, strict=True):
             if not self._readable(slot, up):
                 continue
-            if not terms:
+            asked = self._asked(facts, scope, slot.through)
+            if not terms or not asked:
+                # Nothing to ask it: whatever it holds, the tail reads the rest.
                 used = slot
                 break
-            answer = self._ask(slot, scope.issue, terms)
+            answer = self._ask(slot, scope.issue, terms, asked)
             # The authority is the store as it is after the retrieval: the
             # same snapshot, bound as it was, when the source has not moved.
             if (after := self._load()) is not snap:
@@ -1720,10 +1773,8 @@ class MemoryRetriever:
                 facts = {f.id: f for f in snap.store.facts()}
             if answer is None:
                 continue
-            bad = self._contradicted(
-                answer, facts, scope, snap.indexed_at, slot.through, tokens, held, wanted
-            )
-            missed = self._omitted(answer, facts, scope, slot.through, tokens, wanted)
+            bad = self._contradicted(answer, facts, scope, slot.through, tokens, wanted)
+            missed = self._omitted(answer, facts, scope, asked, slot.through, tokens, wanted)
             if bad or missed:
                 slot.broken = IndexReason.INTEGRITY
                 self.metrics.count("integrity")

@@ -156,6 +156,11 @@ def retriever_for(w, **kwargs):
     return MemoryRetriever(REPO, RUN, lambda: w.store, **kwargs)
 
 
+def of_issue(store, issue=ISSUE):
+    """Every record id of ``issue``, as a backend search is asked about them."""
+    return tuple(f.id for f in store.facts() if f.scope.step.issue_url == issue)
+
+
 def dropped(retriever):
     """The reasons a retriever counted, the controller's diagnostic alone."""
     return {
@@ -222,7 +227,10 @@ def test_partitions_keep_one_issues_scores_and_rows_apart():
     b = two.search_memory(REQ, "trailing commas legal HTTP")
     assert a.hits == b.hits and a.status == b.status
     terms = query_terms("trailing commas legal HTTP")
-    assert one.backend.search(ISSUE, terms, 64) == two.backend.search(ISSUE, terms, 64)
+    asked = of_issue(alone.store)
+    assert one.backend.search(ISSUE, terms, asked, 64) == two.backend.search(
+        ISSUE, terms, asked, 64
+    )
     assert w.ids["other"] not in ids(a)
     assert {e.partition for e in one.backend.entries()} == {ISSUE, OTHER}
 
@@ -238,7 +246,9 @@ def test_a_corrected_record_is_served_only_as_it_is_now_even_before_the_index_ca
     stale = retriever.status()
     assert (stale.state, stale.pending, stale.lag) == (IndexState.STALE, 1, 1)
     old = retriever.search_memory(REQ, "system interpreter")
-    assert ids(old) == [] and dropped(retriever) == {"stale": 1}
+    # The index is never asked about a record changed since its watermark:
+    # its row holds the earlier text, which the launch is not served.
+    assert ids(old) == [] and dropped(retriever) == {}
     new = retriever.search_memory(REQ, "make check pins")
     assert ids(new) == [w.ids["uv"]] and new.hits[0].provenance.backend == TAIL_BACKEND
     assert new.hits[0].summary == "Run the suite through make check, which pins the lock."
@@ -256,7 +266,8 @@ def test_a_retracted_record_is_unservable_at_once_and_a_failed_sync_never_reopen
     retriever.sync()
     w.revise(Action.RETRACT, "tokenizer")
     result = retriever.search_memory(REQ, "tokenizer trailing comma")
-    assert w.ids["tokenizer"] not in ids(result) and dropped(retriever) == {"retracted": 1}
+    # Nor about a record retracted since: the store refuses it before the index is read.
+    assert w.ids["tokenizer"] not in ids(result) and dropped(retriever) == {}
     assert retriever.fetch_memory(REQ, w.ids["tokenizer"]).item is None
     w.add("later", "A later lesson, so that the sync inserts a row and fails there.")
     backend.fail_on = 1
@@ -297,7 +308,7 @@ def test_withheld_duplicates_and_superseded_records_are_never_served():
     assert retriever.fetch_memory(REQ, w.ids["b"]).item is None
     assert retriever.fetch_memory(REQ, w.ids["old"]).item is None
     after = dropped(retriever)
-    assert after["withheld"] == before["withheld"] + 1
+    assert after["withheld"] == before.get("withheld", 0) + 1
     assert after["superseded"] == before.get("superseded", 0) + 1
 
 
@@ -395,9 +406,11 @@ def test_candidate_drift_ranges_and_environments_decide_applicability_not_the_in
     assert found(replace(REQ, candidate=OLD, ancestors=())) == {"exact"}
     assert found(replace(REQ, environment=ENV)) == {"descendant", "env"}
     assert found(replace(REQ, ancestors=())) == set()
-    before = dropped(retriever)["inapplicable"]
+    unasked = retriever.metrics.snapshot()["unasked"]
     result = retriever.search_memory(replace(REQ, ancestors=()), "scanner")
-    assert dropped(retriever)["inapplicable"] - before == 3
+    # The index is asked about none of the three, so it answers none of them.
+    assert result.hits == () and dropped(retriever) == {}
+    assert retriever.metrics.snapshot()["unasked"] == unasked
     # Nothing of the three records the launch's scope does not hold is told.
     assert (result.status.source_seq, result.status.pending, result.unsearched) == (0, 0, 0)
     assert result.complete and result.status.is_current
@@ -886,7 +899,10 @@ def test_a_retriever_rebuilt_from_a_json_round_tripped_checkpoint_answers_identi
     second.rebuild()
     assert first.backend.entries() == second.backend.entries()
     terms = query_terms("trailing comma ruff format")
-    assert first.backend.search(ISSUE, terms, 64) == second.backend.search(ISSUE, terms, 64)
+    asked = of_issue(w.store)
+    assert first.backend.search(ISSUE, terms, asked, 64) == second.backend.search(
+        ISSUE, terms, asked, 64
+    )
     for query in queries:
         a = first.search_memory(REQ, query)
         b = second.search_memory(REQ, query)
@@ -941,7 +957,7 @@ class ScriptedBackend:
     def apply(self, upserts, deletes, *, clear=False):
         pass
 
-    def search(self, partition, terms, limit):
+    def search(self, partition, terms, records, limit):
         if self.fail:
             raise RetrievalBackendError("the optional backend is down")
         return self.answer
@@ -980,13 +996,19 @@ def test_an_optional_backend_falls_back_only_to_fts5_and_never_across_permission
     )
     liar = retriever_for(w, backend=lying, fallback=Fts5Backend())
     liar.sync()
-    # The first search that meets the lie discards the whole answer: another
-    # issue's record, one retracted before the sync and an unknown id are
-    # rows no sync of this store wrote. The fallback answers it, degraded.
+    # Another issue's record, one retracted before the sync and an unknown id
+    # are no records the search asked about (R8-F1 of PR #537): each is set
+    # aside unread, counted for the controller, and decides nothing.
+    result = liar.search_memory(REQ, "lint ruff HTTP")
+    assert result.hits == () and result.complete
+    assert not result.degraded and result.backend == "scripted"
+    assert liar.metrics.snapshot()["unasked"] == 3 and dropped(liar) == {}
+    # The same answer to a search whose served match it leaves out is found by
+    # that search, and the fallback answers it, degraded.
     result = liar.search_memory(REQ, "lint ruff HTTP tokenizer")
     assert ids(result) == [w.ids["tokenizer"]] and result.complete
     assert result.degraded and result.backend == "sqlite-fts5"
-    assert dropped(liar) == {"integrity": 3}
+    assert liar.metrics.snapshot()["omitted"] == 1 and dropped(liar) == {}
     assert liar.status().reason is IndexReason.INTEGRITY
     for fallback in (ScriptedBackend(), None):
         with pytest.raises(ConfigurationError):
@@ -1548,8 +1570,8 @@ class Meddling(Fts5Backend):
         super().__init__()
         self.during = None
 
-    def search(self, partition, terms, limit):
-        answer = super().search(partition, terms, limit)
+    def search(self, partition, terms, records, limit):
+        answer = super().search(partition, terms, records, limit)
         if self.during is not None:
             during, self.during = self.during, None
             during()
@@ -1563,7 +1585,7 @@ def test_a_retraction_while_the_index_answers_is_judged_by_the_store_after_it():
     retriever.sync()
     # The index's answer names the tokenizer's record at the revision it saw.
     terms = query_terms("tokenizer trailing comma")
-    assert w.ids["tokenizer"] in [c.id for c in backend.search(ISSUE, terms, 64)]
+    assert w.ids["tokenizer"] in [c.id for c in backend.search(ISSUE, terms, of_issue(w.store), 64)]
     backend.during = lambda: w.revise(Action.RETRACT, "tokenizer")
     result = retriever.search_memory(REQ, "tokenizer trailing comma")
     assert backend.during is None  # the retraction ran inside the retrieval
@@ -1603,7 +1625,7 @@ def test_a_scripted_backend_that_retracts_before_it_answers_gets_nothing_served(
     answer = [valid(w.store, w.ids["tokenizer"])]
 
     class Retracting(ScriptedBackend):
-        def search(self, partition, terms, limit):
+        def search(self, partition, terms, records, limit):
             w.revise(Action.RETRACT, "tokenizer")
             return self.answer
 
@@ -1647,9 +1669,9 @@ class Logged(Fts5Backend):
         self.log.append("available")
         return super().available()
 
-    def search(self, partition, terms, limit):
+    def search(self, partition, terms, records, limit):
         self.log.append("search")
-        return super().search(partition, terms, limit)
+        return super().search(partition, terms, records, limit)
 
 
 def test_no_backend_is_called_after_a_reads_last_load_of_the_store():
@@ -2100,7 +2122,8 @@ def test_records_the_launch_is_not_served_move_no_hit_place_or_score():
         ]
 
     def partition_order():
-        order = [c.id for c in retriever.backend.search(ISSUE, terms, 64)]
+        pair = (w.ids["zebra"], w.ids["quokka"])
+        order = [c.id for c in retriever.backend.search(ISSUE, terms, pair, 64)]
         return order.index(w.ids["zebra"]) < order.index(w.ids["quokka"])
 
     before = told()
@@ -2461,8 +2484,9 @@ def _write_impossible_row(kind, w, retriever):
 def test_a_row_the_sync_left_is_stale_however_its_record_changed_since():
     """R4-F3 of PR #537: rows a sync through the watermark wrote, of records
     corrected, retracted or superseded since, are stale, never a failure.
-    Verify accepts them, and a search drops each for the store's reason while
-    the tail serves what the store does, on the index's answer."""
+    Verify accepts them. A search never asks the index about those records,
+    whose rows hold text the launch is not served (R8-F1): the tail serves
+    what the store does."""
     w = corpus()
     retriever = retriever_for(w)
     retriever.sync()
@@ -2475,7 +2499,7 @@ def test_a_row_the_sync_left_is_stale_however_its_record_changed_since():
     assert result.backend == "sqlite-fts5" and not result.degraded and result.complete
     assert sorted(ids(result)) == sorted([w.ids["ruff"], w.ids["replacement"]])
     assert {hit.provenance.backend for hit in result.hits} == {TAIL_BACKEND}
-    assert dropped(retriever) == {"stale": 1, "retracted": 1, "superseded": 1}
+    assert dropped(retriever) == {}
 
 
 @pytest.mark.parametrize(
@@ -2559,33 +2583,45 @@ def test_verify_rejects_a_malformed_stale_row_whose_text_the_store_no_longer_hol
         ("term-it-lacks", []),
     ],
 )
-def test_a_row_no_sync_through_the_watermark_wrote_falls_back_on_the_search_that_meets_it(
+def test_a_row_no_sync_through_the_watermark_wrote_is_read_by_no_search_and_verify_finds_it(
     kind, served
 ):
-    """R4-F3 of PR #537: the search that meets such a row discards the
-    index's answer, marks the index ``failed`` (``integrity``) and answers
-    the same call from the tail, ``degraded``, never dropping the row as
-    ordinary staleness."""
+    """R4-F3 and R8-F1 of PR #537: such a row is of a record changed since the
+    watermark, which no search asks the index about: the tail reads the
+    record as the store holds it, and the index's answer about the records
+    it was asked about stands. The row is the controller's to find, by
+    ``verify``, after which searches read the tail until a rebuild."""
     w = corpus()
+    steady = w.add(
+        "steady", "The steady lesson: it keeps the zebra, 88 character lines, uv pytest."
+    )
     retriever = retriever_for(w)
     retriever.sync()
     _changed_since_the_watermark(w)
     query = _write_impossible_row(kind, w, retriever)
-    result = retriever.search_memory(REQ, query)
-    assert result.degraded and result.backend == TAIL_BACKEND and result.complete
-    assert (result.status.state, result.status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
-    assert dropped(retriever) == {"integrity": 1}
-    assert ids(result) == [w.ids[name] for name in served]
+    result = retriever.search_memory(REQ, f"{query} steady")
+    assert not result.degraded and result.backend == "sqlite-fts5" and result.complete
+    assert (result.status.state, result.status.reason) == (IndexState.STALE, IndexReason.NONE)
+    assert sorted(ids(result)) == sorted([steady, *(w.ids[name] for name in served)])
     for hit in result.hits:
-        assert hit.provenance.backend == TAIL_BACKEND
+        assert hit.provenance.backend == ("sqlite-fts5" if hit.id == steady else TAIL_BACKEND)
         assert w.store.visibility(hit.id, REQ) is Visibility.CURRENT
+    assert dropped(retriever) == {} and retriever.metrics.snapshot()["integrity"] == 0
+    status = retriever.verify()
+    assert (status.state, status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
+    after = retriever.search_memory(REQ, f"{query} steady")
+    assert after.degraded and after.backend == TAIL_BACKEND and after.complete
+    assert sorted(ids(after)) == sorted(ids(result))
+    assert {hit.provenance.backend for hit in after.hits} == {TAIL_BACKEND}
 
 
 @pytest.mark.parametrize("name", ["scanner", "ruff"], ids=["added-after", "revision-past"])
-def test_an_optional_backend_answering_past_its_watermark_goes_to_the_fallback(name):
-    """R4-F3 of PR #537 for an optional backend: a candidate of a record
-    added after the backend's watermark, or at a revision past it, is a row
-    no sync wrote. The FTS5 fallback answers the same search, degraded."""
+def test_an_optional_backend_answering_past_its_watermark_is_set_aside(name):
+    """R4-F3 and R8-F1 of PR #537 for an optional backend: a candidate of a
+    record added after the backend's watermark, or at a revision past it,
+    names a record the search did not ask about. It is set aside unread and
+    counted for the controller, and the tail serves the record as the store
+    holds it."""
     w = corpus()
     scripted = ScriptedBackend()
     retriever = retriever_for(w, backend=scripted, fallback=Fts5Backend())
@@ -2594,11 +2630,125 @@ def test_an_optional_backend_answering_past_its_watermark_goes_to_the_fallback(n
     w.revise(Action.CORRECT, "ruff", text="Lint is ruff with an 88 character line limit.")
     scripted.answer = [valid(w.store, w.ids[name])]
     result = retriever.search_memory(REQ, "scanner quotes ruff 88 character")
-    assert result.degraded and result.backend == "sqlite-fts5" and result.complete
+    assert not result.degraded and result.backend == "scripted" and result.complete
     assert sorted(ids(result)) == sorted([w.ids["scanner"], w.ids["ruff"]])
     assert {hit.provenance.backend for hit in result.hits} == {TAIL_BACKEND}
-    assert dropped(retriever) == {"integrity": 1, "stale": 1}
-    assert retriever.status().reason is IndexReason.INTEGRITY
+    assert dropped(retriever) == {} and retriever.metrics.snapshot()["unasked"] == 1
+    assert retriever.status().reason is IndexReason.NONE
+
+
+# -- a row of what the launch is not served moves nothing it is told (R8-F1 of PR #537) --
+
+# The term a launch searches for, which only the text it is not served may hold.
+UNREAD = "quagga"
+
+
+def _unserved(kind, word):
+    """A synced store, then one record's text the launch may not read made to hold ``word``.
+
+    ``earlier-candidate``: a record bound to another candidate, inapplicable
+    to the launch. ``superseded-since``, ``retracted-since``: a record of
+    the scope superseded or retracted after the sync. ``corrected-since``:
+    a record the launch is served, corrected after the sync, whose earlier
+    text, the one its row was indexed by, holds ``word``. Everything the
+    launch is served is the same whatever ``word`` is.
+    """
+    w = Writer(empty())
+    w.add("zebra", "The zebra lesson, which the launch is served.")
+    w.add("steady", "A steady lesson about separators.")
+    scope = (
+        replace(SCOPE, range=Range.EXACT, candidate=OLD) if kind == "earlier-candidate" else SCOPE
+    )
+    w.add("hidden", f"The hidden note about the {word} parser.", scope=scope)
+    retriever = retriever_for(w)
+    retriever.sync()
+    if kind == "superseded-since":
+        w.add("replacement", "The hidden note's replacement.")
+        w.revise(Action.SUPERSEDE, "hidden", replacement=w.ids["replacement"])
+    elif kind == "retracted-since":
+        w.revise(Action.RETRACT, "hidden")
+    elif kind == "corrected-since":
+        w.revise(Action.CORRECT, "hidden", text="The hidden note, corrected.")
+    return w, retriever
+
+
+def _damage(retriever, record, damage):
+    """One row damaged as ``damage`` says, the same whatever text it was indexed by."""
+    db, table = retriever.backend._db, retriever.backend._tables[ISSUE]
+    column, value = {
+        # Matched by the term whatever its record's text holds: the reviewer's case.
+        "body": ("body", UNREAD),
+        # A digest no sync wrote, the row still indexed by its own text.
+        "digest": ("digest", "0" * 64),
+        # A malformed column, which FTS5's search raises on when it reads it.
+        "revision": ("revision", "abc"),
+    }[damage]
+    db.execute(f"UPDATE {table} SET {column} = ? WHERE rowid = ?", (value, record))
+
+
+def _told(w, retriever):
+    """Everything a launch is told, in the order a launch could ask it."""
+    first = retriever.search_memory(REQ, f"{UNREAD} zebra")
+    return (
+        first,
+        render_hits(first),
+        retriever.search_memory(REQ, UNREAD),
+        retriever.fetch_memory(REQ, w.ids["hidden"]),
+        retriever.fetch_memory(REQ, w.ids["zebra"]),
+        retriever.catalog(REQ),
+        retriever.catalog(REQ).render(),
+        retriever.search_memory(REQ, f"{UNREAD} zebra"),
+    )
+
+
+@pytest.mark.parametrize("damage", ["body", "digest", "revision"])
+@pytest.mark.parametrize(
+    "kind", ["earlier-candidate", "superseded-since", "retracted-since", "corrected-since"]
+)
+def test_a_damaged_row_of_text_the_launch_cannot_read_moves_nothing_it_is_told(kind, damage):
+    """R8-F1 of PR #537: two stores alike in everything the launch is served,
+    the one difference the text of a record it may not read: whether it holds
+    the query's term. The same damage to that record's row. A search used to
+    test that text, the canonical one or the one the row was indexed by,
+    before it asked whether the launch is served it, and a row the backend
+    matched by it was a contradiction or a malformed answer: the same corpus
+    was ``current`` or ``failed`` and ``degraded`` by that text alone, and
+    the next catalog said so too. No search asks the index about such a
+    record now, so every answer, status, flag and catalog is the same, and
+    nothing is degraded. The damage is the controller's to find: ``verify``
+    finds it wherever the store still holds a text to compare, and the same
+    damage to a row the launch is served still falls back on that search."""
+    told = []
+    for word in (UNREAD, "walrus"):
+        w, retriever = _unserved(kind, word)
+        _damage(retriever, w.ids["hidden"], damage)
+        told.append(_told(w, retriever))
+        first = told[-1][0]
+        assert ids(first) == [w.ids["zebra"]] and first.hits[0].provenance.backend == "sqlite-fts5"
+        assert not first.degraded and first.complete and first.status.reason is IndexReason.NONE
+        assert retriever.metrics.snapshot()["integrity"] == 0
+        # The controller's verify reads every row: a lost text leaves only the
+        # body of a stale row unchecked (R7-F1), as the guide says.
+        lost = damage == "body" and kind in ("retracted-since", "corrected-since")
+        verified = retriever.verify()
+        assert verified.reason is (IndexReason.NONE if lost else IndexReason.INTEGRITY)
+    assert told[0] == told[1]
+
+
+@pytest.mark.parametrize(
+    ("damage", "query"), [("body", UNREAD), ("digest", "zebra"), ("revision", "zebra")]
+)
+def test_the_same_damage_to_a_row_the_launch_is_served_falls_back_on_that_search(damage, query):
+    """R8-F1 of PR #537, its other half: a failure that affects what the launch
+    is served is still found by the search that meets it, which answers from
+    the tail on the same call, degraded."""
+    w, retriever = _unserved("earlier-candidate", "walrus")
+    _damage(retriever, w.ids["zebra"], damage)
+    result = retriever.search_memory(REQ, query)
+    assert result.degraded and result.backend == TAIL_BACKEND
+    assert (result.status.state, result.status.reason) == (IndexState.FAILED, IndexReason.INTEGRITY)
+    assert ids(result) == ([] if damage == "body" else [w.ids["zebra"]])
+    assert retriever.catalog(REQ).status.reason is IndexReason.INTEGRITY
 
 
 def test_answers_carry_the_launch_binding_and_each_records_applicability():
