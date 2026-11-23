@@ -7,11 +7,13 @@ import shlex
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from autoforge import cli
+from autoforge import github as github_module
 from autoforge.auto_recovery import StepKey
 from autoforge.engine import ControllerEngine, StepOutcome
 from autoforge.errors import (
@@ -24,7 +26,7 @@ from autoforge.errors import (
     StateError,
 )
 from autoforge.executor import ExecutionResult, execute
-from autoforge.github import GitHubClient
+from autoforge.github import GitHubClient, HttpsReply
 from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
 from autoforge.memory import Action, Actor, Kind, MemoryScope
 from autoforge.provenance import MAX_PATH_CHARS
@@ -2533,6 +2535,90 @@ def test_doctor_without_gh_reports_every_row(tmp_path, capsys, monkeypatch):
     assert "[OK  ] state dir writable" in out
 
 
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize(
+    ("failure", "remedy", "get_count"),
+    [
+        ("token", "gh auth status", 0),
+        ("workdir", "TMPDIR", 0),
+        ("content-type", "network path", 1),
+        ("deep-json", "nests too deeply", 1),
+        ("wrong-object", "core rate-limit data", 1),
+        ("404", "unexpected HTTP 404", 1),
+    ],
+)
+def test_exact_read_probe_failures_render_the_whole_doctor_report(
+    tmp_path, capsys, monkeypatch, failure, remedy, get_count, json_output
+):
+    monkeypatch.chdir(tmp_path)
+    sample = "synthetic-echo-material"
+    sample_body = f'{{"example": "{sample}"}}'.encode()
+    calls = []
+    # Only the client's token command uses this binding. The other doctor
+    # rows still get their temporary directories.
+    if failure == "workdir":
+        workdir = github_module.gh_workdir
+        fail_next = True
+
+        @contextmanager
+        def fail_workdir():
+            nonlocal fail_next
+            if fail_next:
+                fail_next = False
+                with monkeypatch.context() as m:
+
+                    def refuse(**kwargs):
+                        raise PermissionError(sample)
+
+                    m.setattr(github_module.tempfile, "mkdtemp", refuse)
+                    with workdir() as cwd:
+                        yield cwd
+            else:
+                with workdir() as cwd:
+                    yield cwd
+
+        monkeypatch.setattr(github_module, "gh_workdir", fail_workdir)
+
+    def runner(req):
+        if req.command == ["gh", "auth", "token", "--hostname", "github.com"]:
+            calls.append("token")
+            assert req.env["GIT_DIR"] == req.cwd and not list(Path(req.cwd).iterdir())
+            code = 1 if failure == "token" else 0
+            return ExecutionResult(req.command, req.cwd, code, sample, sample, "t", "t")
+        if req.command[:3] == ["git", "remote", "get-url"]:
+            return ExecutionResult(req.command, req.cwd, 0, "git@github.com:o/r.git", "", "t", "t")
+        return ExecutionResult(req.command, req.cwd, 0, "ok 1.0\n", "", "t", "t")
+
+    def get(req):
+        calls.append("get")
+        assert req.url == "https://api.github.com/rate_limit"
+        assert dict(req.headers)["Authorization"] == f"Bearer {sample}"
+        status = 404 if failure == "404" else 200
+        content_type = sample if failure == "content-type" else "application/json"
+        body = (
+            b"[" * 200_000 + sample_body + b"]" * 200_000 if failure == "deep-json" else sample_body
+        )
+        return HttpsReply(status, {"content-type": content_type}, body)
+
+    monkeypatch.setattr(cli, "_doctor_runner", lambda: runner)
+    monkeypatch.setattr(github_module, "https_get", get)
+    args = ["--state-dir", str(tmp_path / ".autoforge"), "doctor"]
+    assert cli.main([*args, *(["--json"] if json_output else [])]) == 1
+    out = capsys.readouterr()
+    assert sample not in out.out + out.err
+    assert calls == ([] if failure == "workdir" else ["token", *(["get"] * get_count)])
+    if json_output:
+        checks = {row["name"]: row for row in json.loads(out.out)["checks"]}
+        row = checks["exact read (api.github.com)"]
+        assert not row["ok"] and row["required"] and not row["skipped"]
+        assert remedy in row["detail"]
+        assert checks["state dir writable"]["ok"]
+    else:
+        line = next(line for line in out.out.splitlines() if "exact read (api.github.com)" in line)
+        assert line.lstrip().startswith("[FAIL]") and remedy in line
+        assert "[OK  ] state dir writable" in out.out
+
+
 def test_a_refused_prompt_version_prints_nothing_written_under_it(
     tmp_path, capsys, monkeypatch, fakes
 ):
@@ -2589,6 +2675,8 @@ def test_doctor_reports_an_unreadable_branch_rule_as_skipped(tmp_path, capsys, m
             return ExecutionResult(argv, req.cwd, 0, out, "", "t", "t")
         if argv[:2] == ["gh", "api"]:
             return ExecutionResult(argv, req.cwd, 1, "", "gh: Not Found (HTTP 404)", "t", "t")
+        if argv[:3] == ["gh", "auth", "token"]:
+            return ExecutionResult(argv, req.cwd, 0, "synthetic-doctor-token", "", "t", "t")
         if argv == ["gh", "--version"]:
             return ExecutionResult(
                 argv, req.cwd, 0, "gh version 2.48.0 (2024-04-09)\n", "", "t", "t"
@@ -2603,6 +2691,15 @@ def test_doctor_reports_an_unreadable_branch_rule_as_skipped(tmp_path, capsys, m
         return ExecutionResult(argv, req.cwd, 0, "ok 1.0\n", "", "t", "t")
 
     monkeypatch.setattr(cli, "_doctor_runner", lambda: runner)
+    monkeypatch.setattr(
+        github_module,
+        "https_get",
+        lambda req: HttpsReply(
+            200,
+            {"content-type": "application/json"},
+            b'{"resources":{"core":{"limit":5,"remaining":4,"reset":123}}}',
+        ),
+    )
     assert cli.main(["--state-dir", str(tmp_path / ".autoforge"), "doctor"]) == 0
     out = capsys.readouterr().out
     assert "[SKIP] default branch requires checks: this token cannot read the branch rules" in out

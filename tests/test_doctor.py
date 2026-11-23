@@ -3,18 +3,21 @@
 import json
 import os
 import shutil
+import ssl
 import subprocess
+import urllib.error
 from pathlib import Path
 
 import pytest
 
 import autoforge.doctor as doctor_module
 import autoforge.executor as executor_module
+import autoforge.github as github_module
 from autoforge.config import default_config
-from autoforge.doctor import Doctor
+from autoforge.doctor import EXACT_READ_ROW, Doctor
 from autoforge.errors import ExecutionError
 from autoforge.executor import ExecutionResult, execute
-from autoforge.github import GH_WORKDIR_PREFIX
+from autoforge.github import GH_WORKDIR_PREFIX, HttpsReply
 from autoforge.redaction import redact
 from tests.conftest import (
     DOTDOT_SPELLINGS,
@@ -139,6 +142,26 @@ CLAUDE_HELP = (
     "  --setting-sources <sources>           Comma-separated list of setting sources\n"
     "  --strict-mcp-config                   Only use MCP servers from --mcp-config\n"
 )
+SAMPLE_DOCTOR_TOKEN = "synthetic-healthy-doctor-value"
+
+
+@pytest.fixture(autouse=True)
+def _healthy_exact_read_for_the_shared_runner(monkeypatch, _no_network_exact_read):
+    offline = github_module.https_get
+
+    def https(req):
+        if (
+            req.url == "https://api.github.com/rate_limit"
+            and dict(req.headers).get("Authorization") == f"Bearer {SAMPLE_DOCTOR_TOKEN}"
+        ):
+            return HttpsReply(
+                200,
+                {"content-type": "application/json"},
+                b'{"resources":{"core":{"limit":60,"remaining":59,"reset":123}}}',
+            )
+        return offline(req)
+
+    monkeypatch.setattr(github_module, "https_get", https)
 
 
 def _runner_factory(
@@ -226,6 +249,8 @@ def _runner_factory(
             out = json.dumps([payload] if paginated else payload)
         elif argv == ["gh", "--version"]:
             out = gh_version + "\nhttps://github.com/cli/cli/releases/tag/v2.48.0"
+        elif argv == ["gh", "auth", "token", "--hostname", "github.com"]:
+            out = SAMPLE_DOCTOR_TOKEN
         elif argv == ["claude", "--help"]:
             out = claude_help
         elif argv[0] in OPENCODE_COMMANDS and argv[1:] == ["--version"]:
@@ -291,6 +316,7 @@ def test_all_checks_pass(tmp_path):
         "git available",
         "gh available",
         "gh authenticated",
+        EXACT_READ_ROW,
         "agent 'claude' available (analyze_execute, fix)",
         "agent 'claude' keeps integrations off (analyze_execute, fix)",
         CLAUDE_CONFIGURATION_ROW,
@@ -661,6 +687,82 @@ def test_a_missing_gh_is_reported_as_before(tmp_path):
     d = Doctor(cwd=str(tmp_path), runner=_runner_factory(fail=("gh --version",)))
     result = {r.name: r for r in d.run_all()}["gh available"]
     assert not result.ok and "boom" in result.detail
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "label", "detail"),
+    [
+        (
+            200,
+            {"resources": {"core": {"limit": 60, "remaining": 0, "reset": 123}}},
+            "OK",
+            "GET /rate_limit returned core rate-limit data",
+        ),
+        (200, {}, "FAIL", "core rate-limit data"),
+        (
+            200,
+            {"resources": {"core": {"limit": 60, "remaining": True, "reset": 123}}},
+            "FAIL",
+            "core rate-limit data",
+        ),
+        (
+            200,
+            {"resources": {"core": {"limit": 60, "remaining": 0}}},
+            "FAIL",
+            "core rate-limit data",
+        ),
+        (401, {}, "FAIL", "gh auth status"),
+        (403, {}, "FAIL", "gh auth status"),
+        (404, {}, "FAIL", "HTTPS_PROXY"),
+        (429, {}, "WARN", "retry after the rate limit resets"),
+        (503, {}, "WARN", "network path"),
+    ],
+)
+def test_exact_read_probe_samples_only_the_fixed_endpoint(monkeypatch, status, body, label, detail):
+    sample = "synthetic-probe-material"
+    calls = []
+
+    def runner(req):
+        calls.append(req.command)
+        return ExecutionResult(req.command, req.cwd, 0, sample, "", "t", "t")
+
+    def https(req):
+        calls.append(req.url)
+        return HttpsReply(
+            status,
+            {"content-type": "application/json", "x-echo": sample},
+            json.dumps({**body, **({"message": sample} if body else {})}).encode(),
+        )
+
+    monkeypatch.setattr(github_module, "https_get", https)
+    row = Doctor(runner=runner).check_exact_read("custom-gh")
+    assert row.name == EXACT_READ_ROW and row.label.strip() == label and detail in row.detail
+    assert sample not in row.detail
+    assert calls == [
+        ["custom-gh", "auth", "token", "--hostname", "github.com"],
+        "https://api.github.com/rate_limit",
+    ]
+
+
+def test_exact_read_probe_does_not_assume_a_certificate_hostname_mismatch_is_a_missing_ca(
+    monkeypatch,
+):
+    sample = "synthetic-certificate-detail"
+    gets = []
+
+    def https(req):
+        gets.append(req.url)
+        raise urllib.error.URLError(ssl.SSLCertVerificationError(1, f"hostname mismatch: {sample}"))
+
+    def runner(req):
+        return ExecutionResult(req.command, req.cwd, 0, "synthetic-probe-material", "", "t", "t")
+
+    monkeypatch.setattr(github_module, "https_get", https)
+    row = Doctor(runner=runner).check_exact_read("gh")
+    assert row.label == "FAIL" and "did not verify" in row.detail
+    assert "hostname and trust store" in row.detail and "network path" in row.detail
+    assert sample not in row.detail
+    assert gets == ["https://api.github.com/rate_limit"]
 
 
 def test_doctors_gh_rows_run_gh_outside_the_checkout(tmp_path, monkeypatch):
@@ -1310,7 +1412,7 @@ TOKEN = "ghp_" + "Q" * 36
 
 
 def _checks_read(tmp_path, *, gate_open=False, **kwargs):
-    """The checks-read row of a full doctor run, and every argv the run made."""
+    """The checks-read row and its argv, apart from doctor's other probes."""
     calls: list = []
     config = None
     if gate_open:
@@ -1318,7 +1420,9 @@ def _checks_read(tmp_path, *, gate_open=False, **kwargs):
         cfg.write_text('{"version": 1, "safety": {"allow_merge": true}}')
         config = str(cfg)
     d = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory(calls=calls, **kwargs))
-    return {r.name: r for r in d.run_all()}[CHECKS_READ_ROW], calls
+    d.check_config()
+    d.check_remote()
+    return d.check_checks_read("gh"), calls
 
 
 def _pr_views(calls):

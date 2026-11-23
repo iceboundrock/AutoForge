@@ -539,6 +539,7 @@ EXCEPTION_CLASSES: dict[type[errors.AutoForgeError], tuple[StopOutcome, StopReas
     errors.GitHubError: (_O.RESUMABLE_ERROR, _C.GITHUB_ERROR),
     errors.GitHubUnavailableError: (_O.RESUMABLE_ERROR, _C.GITHUB_UNAVAILABLE),
     errors.GitHubNotFoundError: (_O.RESUMABLE_ERROR, _C.GITHUB_ERROR),
+    errors.ExactReadCredentialError: (_O.RESUMABLE_ERROR, _C.GITHUB_ERROR),
     errors.GitHubChecksAccessError: (_O.RESUMABLE_ERROR, _C.GITHUB_CHECKS_REFUSED),
     errors.GitHubPlanLimitedError: (_O.RESUMABLE_ERROR, _C.GITHUB_ERROR),
     errors.GitHubWrongTargetError: (_O.RESUMABLE_ERROR, _C.GITHUB_ERROR),

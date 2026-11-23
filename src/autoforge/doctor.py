@@ -6,6 +6,7 @@ protocols it reads (#265, :mod:`autoforge.provenance`). It never fails and
 reads no state.
 
 Every check is non-destructive: version queries, `gh auth status`,
+one exact REST read of `/rate_limit`,
 `git rev-parse`, `pi auth check --no-refresh`, reading the config, and
 creating/removing one temp file in the state directory to prove it is
 writable.
@@ -188,6 +189,7 @@ REMOTE_POST_MERGE_PROFILES = ["update_epic"]
 REQUIRED_CHECKS_ROW = "default branch requires checks"
 # Name of the `doctor` row that tries the merge gate's checks read (#291).
 CHECKS_READ_ROW = "pull request check runs readable"
+EXACT_READ_ROW = "exact read (api.github.com)"
 # How many candidate PRs that row reads before it gives up on finding a check
 # run: each is one `gh pr view`, and a candidate whose results are commit
 # statuses only proves nothing about check runs.
@@ -946,6 +948,18 @@ class Doctor:
     def check_gh_auth(self, gh: str) -> CheckResult:
         ok, detail = self._run_gh([gh, "auth", "status"])
         return CheckResult("gh authenticated", ok, detail)
+
+    def check_exact_read(self, gh: str) -> CheckResult:
+        client = GitHubClient(gh, timeout_seconds=self.timeout, runner=self.runner)
+        # The probe's GitHubErrors are constructed from fixed diagnostics.
+        # It never returns the token, subprocess output or reply to doctor.
+        try:
+            client.probe_exact_read()
+        except GitHubUnavailableError as exc:
+            return CheckResult(EXACT_READ_ROW, False, str(exc), required=False)
+        except GitHubError as exc:
+            return CheckResult(EXACT_READ_ROW, False, str(exc))
+        return CheckResult(EXACT_READ_ROW, True, "GET /rate_limit returned core rate-limit data")
 
     def sandbox_checks(self) -> list[CheckResult]:
         """The outer sandbox's rows (ADR 0005 D12.4, D14.1; :mod:`autoforge.doctor_sandbox`)."""
@@ -1980,6 +1994,7 @@ class Doctor:
         results.append(self._version_check("git available", ["git", "--version"]))
         results.append(self.check_gh_version(gh))
         results.append(self.check_gh_auth(gh))
+        results.append(self.check_exact_read(gh))
         results.extend(self._remote_agent_checks(cfg))
         results.append(self.check_git_repo())
         results.append(self.check_remote())

@@ -461,6 +461,10 @@ class GitHubNotFoundError(GitHubError):
     """
 
 
+class ExactReadCredentialError(GitHubError):
+    """No usable credential for the direct REST read, or the REST read refused it (#329)."""
+
+
 class GitHubChecksAccessError(GitHubError):
     """GitHub refused this credential a pull request's check results (conclusive, #291).
 

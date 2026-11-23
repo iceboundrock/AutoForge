@@ -390,9 +390,9 @@ def _exactly(
     text, so none is read again; neither is an object whose other conditions
     fail, which no sanitizer explains, nor one that matched a payload with
     no ``^``, which only its own bytes print as. An exact read that fails
-    raises as every identity read does (GitHubUnavailableError: nothing
-    persisted or sent; GitHubError: the caller blocks), so a text that could
-    not be read exactly is never a reason to write.
+    raises before deciding whether the object matches, so a text that
+    could not be read exactly is never a reason to write. The caller
+    decides how to stop (K7 can resume after a credential failure).
     """
     if len(found) != 1 or not placed(objects[0]):
         return found
@@ -427,7 +427,7 @@ def held_issue(github: GitHubClient, url: str) -> IssueInfo:
 def _comment_found(
     github: GitHubClient, record: EffectRecord, holders: Iterable[Holder[CommentInfo, Any]]
 ) -> list[Found]:
-    """A comment create's holders (K4, K8, K9): in the end state when bodied as the payload.
+    """A comment create's holders (K4, K8, K9, K13): complete if the body matches the payload.
 
     The holders come from the complete listing of the comment's parent, so a
     comment has no condition but its body; one whose body `gh` printed
