@@ -2751,6 +2751,81 @@ def test_the_same_damage_to_a_row_the_launch_is_served_falls_back_on_that_search
     assert retriever.catalog(REQ).status.reason is IndexReason.INTEGRITY
 
 
+# -- maintenance reports freshness against the store after it (R8-F2 of PR #537) --------
+
+
+class Writing(Fts5Backend):
+    """FTS5 that runs ``during`` once its next ``on`` call (``apply`` or ``check``)
+    has done its own work: a write to the store while maintenance runs the
+    backend."""
+
+    def __init__(self):
+        super().__init__()
+        self.on, self.during = "", None
+
+    def _then(self, call):
+        if call == self.on and self.during is not None:
+            during, self.during = self.during, None
+            during()
+
+    def apply(self, upserts, deletes, *, clear=False):
+        super().apply(upserts, deletes, clear=clear)
+        self._then("apply")
+
+    def check(self):
+        healthy = super().check()
+        self._then("check")
+        return healthy
+
+
+@pytest.mark.parametrize("operation", ["first-sync", "incremental-sync", "rebuild", "verify"])
+def test_a_write_while_maintenance_runs_the_backend_is_reported_pending(operation):
+    """R8-F2 of PR #537: a sync, a rebuild and a verify computed the status
+    they return against the snapshot they loaded before calling the backend.
+    A record written while it ran was reported ``current``, source and index
+    at the same revision and nothing pending, while ``status()`` at once said
+    ``stale``. The status is now the store's after the backend's work, while
+    the watermark stays the snapshot indexed, so the next sync indexes it."""
+    w = Writer(empty())
+    w.add("first", "The first lesson.")
+    backend = Writing()
+    retriever = retriever_for(w, backend=backend)
+    if operation != "first-sync":
+        retriever.sync()
+    if operation == "incremental-sync":
+        w.add("middle", "The middle lesson, before the sync.")
+    indexed = w.store.revision
+    backend.on = "check" if operation == "verify" else "apply"
+    backend.during = lambda: w.add("late", "The late lesson, written meanwhile.")
+    status = {
+        "first-sync": retriever.sync,
+        "incremental-sync": retriever.sync,
+        "rebuild": retriever.rebuild,
+        "verify": retriever.verify,
+    }[operation]()
+    assert backend.during is None  # the write ran inside the backend's work
+    assert status == retriever.status()
+    assert (status.state, status.source_seq, status.indexed_through_seq, status.pending) == (
+        IndexState.STALE,
+        indexed + 1,
+        indexed,
+        1,
+    )
+    assert not status.is_current and status.reason is IndexReason.NONE
+    # A launch is told the same, in its scope's sequence, and served the
+    # write from the tail.
+    result = retriever.search_memory(REQ, "late meanwhile")
+    assert (result.status.state, result.status.pending) == (IndexState.STALE, 1)
+    assert ids(result) == [w.ids["late"]] and result.hits[0].provenance.backend == TAIL_BACKEND
+    synced = retriever.sync()
+    assert (synced.state, synced.indexed_through_seq, synced.pending) == (
+        IndexState.CURRENT,
+        indexed + 1,
+        0,
+    )
+    assert retriever.verify() == synced
+
+
 def test_answers_carry_the_launch_binding_and_each_records_applicability():
     w = Writer(empty())
     w.add("any", "The scanner lesson for every candidate.")

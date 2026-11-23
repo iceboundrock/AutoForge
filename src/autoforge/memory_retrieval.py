@@ -74,7 +74,10 @@ bounded hot tail (:data:`MAX_TAIL` of the scope's current records changed
 after the watermark, newest first) is searched on the store itself. A sync is one
 SQLite transaction, and so is a rebuild: a failure leaves the index as it
 was, at its old watermark and generation, and is counted, and a rebuild
-that failed is owed to the next sync.
+that failed is owed to the next sync. What a sync, a rebuild or a verify
+reports is the freshness against the store as it is after its backend
+work, loaded again, while the watermark stays the snapshot it indexed: a
+write made meanwhile is reported ``stale``, never taken as indexed.
 
 **What a search asks.** A search asks a backend only about the records the
 launch is served that the index has seen as they are now (each one's
@@ -1467,7 +1470,9 @@ class MemoryRetriever:
         Each backend's update is one atomic unit. A failure keeps the index
         where it was and counts the failure; the next sync tries again, a
         rebuild included: one asked for and not yet committed is made here,
-        however current the index it replaces.
+        however current the index it replaces. The watermark is the
+        snapshot the update indexed; the status returned is the primary's
+        against the store loaded again after the update (:meth:`_sync_all`).
         """
         health = self._health()
         return self._sync_all(health, self._load(), rebuild=False)
@@ -1488,10 +1493,20 @@ class MemoryRetriever:
         return self._sync_all(health, self._load(), rebuild=True)
 
     def _sync_all(self, health: tuple[bool, ...], snap: _Snapshot, *, rebuild: bool) -> IndexStatus:
+        """Update every slot from ``snap``; the primary's status against the store after it.
+
+        A backend's update is its own code, and the store may be written
+        while it runs: the index then holds ``snap``, whose revision is its
+        watermark, and the canonical store is already past it. So the status
+        is computed against the snapshot loaded again once every update has
+        returned, never against ``snap``: a record written meanwhile is
+        ``pending`` and the index ``stale``, as :meth:`status` would say at
+        once (R8-F2 of PR #537). No backend is called after that load.
+        """
         for slot, up in zip(self._slots, health, strict=True):
             self._sync(slot, up, snap, rebuild=rebuild)
         self.metrics.count("syncs")
-        return self._status(self._slots[0], health[0], snap)
+        return self._status(self._slots[0], health[0], self._load())
 
     def _sync(self, slot: _Slot, up: bool, snap: _Snapshot, *, rebuild: bool) -> None:
         # A rebuild asked for is owed until one commits: a current index's
@@ -1540,6 +1555,11 @@ class MemoryRetriever:
         a read-back that is not exactly a list of as many rows as expected,
         checked before anything iterates it; or a failed backend check: each
         marks the index ``failed`` (``integrity``) until it is rebuilt.
+
+        The rows are compared with the snapshot loaded before the backend
+        read them back; the status returned is against the store loaded
+        again after that, so a write made while the backend answered is
+        reported ``pending``, never taken as verified (R8-F2 of PR #537).
         """
         health = self._health()
         snap = self._load()
@@ -1587,7 +1607,8 @@ class MemoryRetriever:
         if not healthy:
             slot.broken = IndexReason.INTEGRITY
             self.metrics.count("integrity")
-        return self._status(slot, health[0], snap)
+        # The backend ran: the store as it is now is what the status is of.
+        return self._status(slot, health[0], self._load())
 
     # -- reads ----------------------------------------------------------------
 
