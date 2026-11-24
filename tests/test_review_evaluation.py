@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import ast
 import copy
+import dataclasses
 import json
 import re
 from datetime import datetime
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -124,7 +126,9 @@ def test_an_oracle_runs_isolated_from_the_hosts_environment(tmp_path, monkeypatc
     source = (
         "import os\nassert 'GH_TOKEN' not in os.environ\nassert not os.environ.get('PYTHONPATH')\n"
     )
-    assert rv.run_oracle(source, {"x.py": ""}, tmp_path) == "pass"
+    (tmp_path / "tree").mkdir()
+    (tmp_path / "tree" / "x.py").write_text("", encoding="utf-8")
+    assert rv.run_oracle(source, tmp_path / "tree", tmp_path) == "pass"
 
 
 def test_verify_replays_every_case_whether_or_not_a_run_holds_it(tmp_path):
@@ -189,6 +193,61 @@ def test_verify_runs_the_oracles_of_trusted_inputs_alone(tmp_path, capsys):
     assert rv.main([*custom, "verify", "--trust-oracles"]) == 0
     assert "pins and oracles" in capsys.readouterr().out
     assert marker.exists()
+
+
+def test_two_inputs_that_build_one_commit_give_its_oracles_one_tree(tmp_path):
+    """An oracle reads the tree of the commit it runs at, as the controller's byte-exact
+    materializer writes and proves it, never the files that built the commit. Here a
+    file the case's base ignores is added to its candidate: git leaves it out, so both
+    inputs build the very same commits, and an oracle that looks for the file finds it in
+    neither. The input whose files are not its commits' trees is reported."""
+    prereg, corpus, runs = _files()
+    case = _case(corpus, "retry-attempt-bound")
+    corpus["cases"] = [case]
+    none = {"schema": runs["schema"], "runs": []}
+    case["commits"][0]["files"][".gitignore"] = "notes.txt\n"
+    ev = rv.check(prereg, corpus, none)
+    (tmp_path / "pin").mkdir()
+    pinned = rv.build(ev.cases[case["id"]].commits, ev.commit_date, case["id"], tmp_path / "pin")
+    for commit in case["commits"]:
+        commit["sha"] = pinned.shas[commit["name"]]
+    noted = copy.deepcopy(corpus)
+    _case(noted, case["id"])["commits"][1]["files"]["notes.txt"] = "Not in any commit.\n"
+
+    looks = "import os\nassert not os.path.exists('notes.txt'), 'the oracle saw notes.txt'\n"
+    trees = []
+    for name, files in (("as-pinned", corpus), ("noted", noted)):
+        root = tmp_path / name
+        root.mkdir()
+        checked = rv.check(prereg, files, none)
+        built = rv.build(checked.cases[case["id"]].commits, checked.commit_date, case["id"], root)
+        assert built.shas == pinned.shas
+        assert rv.oracle_at(looks, built, "candidate", root) == "pass"
+        listing = rv._tree_blobs(built.repo, checked.commit_date, built.shas["candidate"])
+        trees.append(listing)
+        (root / "verify").mkdir()
+        problems = rv.verify(checked, root / "verify", oracles=True)
+        if name == "as-pinned":
+            assert problems == []
+        else:
+            assert problems == [
+                f"case {case['id']!r}: commit {commit!r}'s tree is not the files that built "
+                "it, at ['notes.txt']: git left out or rewrote what the files hold"
+                for commit in ("candidate", "reference")
+            ]
+    assert trees[0] == trees[1] and "notes.txt" not in trees[0]
+    # A file's bytes are held too: an attribute that makes git rewrite them on commit
+    # leaves a tree that is not the files.
+    rewritten = copy.deepcopy(corpus)
+    base = _case(rewritten, case["id"])["commits"][0]["files"]
+    base[".gitattributes"] = "*.txt ident\n"
+    base["id.txt"] = "$Id: not what git commits $\n"
+    checked = rv.check(prereg, rewritten, none)
+    (tmp_path / "ident").mkdir()
+    built = rv.build(
+        checked.cases[case["id"]].commits, checked.commit_date, "ident", tmp_path / "ident"
+    )
+    assert built.unfaithful == {name: ("id.txt",) for name in ("base", "candidate", "reference")}
 
 
 # -- the fixture's scores -----------------------------------------------------------------
@@ -435,6 +494,7 @@ def test_the_scorer_holds_no_engine_github_client_or_provider():
         "autoforge.executor",
         "autoforge.git_transport",
         "autoforge.loop_guard",
+        "autoforge.materialize",
         "autoforge.profiles",
         "autoforge.result_parser",
     }
@@ -515,6 +575,57 @@ def test_a_defect_is_one_the_change_introduced():
     _refused(prereg, corpus, runs, "no commit it may be introduced at")
 
 
+def test_a_fix_follows_the_defect_it_fixes():
+    """A commit that fixes a defect strictly descends from the commit that introduced it
+    and finds it at its parent. Put the retry regression's fix at its parent candidate
+    and C2 would be nowhere, its introduction included: every oracle outcome a pass, an
+    always-passing oracle verified, the fix still harmful and the regression gone from
+    the escapes. Each such record is refused, a case's and a run's alike."""
+    # (whose defect: the case's or the run's, the defect's fixed_at), and a run commit
+    # that fixes what it introduced.
+    for owner, fixed_at in (
+        ("run", ["candidate"]),
+        ("run", ["fix-1"]),
+        ("case", ["base"]),
+        ("case", ["candidate"]),
+    ):
+        prereg, corpus, runs = _files()
+        record = (
+            _run(runs, "retry-attempt-bound")
+            if owner == "run"
+            else _case(corpus, "retry-attempt-bound")
+        )
+        record["defects"][0]["fixed_at"] = fixed_at
+        _refused(prereg, corpus, runs, "does not descend from")
+    prereg, corpus, runs = _files()
+    _run(runs, "retry-attempt-bound")["commits"][0]["fixes"] = ["C1", "C2"]
+    _refused(prereg, corpus, runs, "'fix-1' is said to fix C2 and does not descend from 'fix-1'")
+    # A second fix of a line its first already fixed finds nothing at its parent.
+    prereg, corpus, runs = _files()
+    _run(runs, "page-count-partial-page")["commits"].append(
+        {"name": "fix-2", "parent": "fix-1", "sha": "2" * 40, "fixes": ["A1"], "files": {"x": ""}}
+    )
+    _refused(prereg, corpus, runs, "which its parent 'fix-1' does not hold")
+
+
+def test_an_oracle_expected_to_both_fail_and_pass_is_refused():
+    """The failure at a defect's introduction is what shows the defect at all, so an
+    expectation that contradicts it is refused, never settled as a pass."""
+    holds = "which holds it, so it would both fail and pass there"
+    prereg, corpus, runs = _files()
+    _run(runs, "retry-attempt-bound")["defects"][0]["evidence"]["passes_at"].append("fix-1")
+    _refused(prereg, corpus, runs, holds)
+    prereg, corpus, runs = _files()
+    _case(corpus, "page-count-partial-page")["defects"][0]["evidence"]["passes_at"] = ["candidate"]
+    _refused(prereg, corpus, runs, holds)
+    # The replay holds the same line whatever reached it: a fix at the introduction.
+    case = rv.load().cases["retry-attempt-bound"]
+    (c1,) = case.defects.values()
+    at_introduction = dataclasses.replace(c1, fixed_at=("candidate",))
+    with pytest.raises(rv.ReviewEvaluationError, match="both fail and pass at 'candidate'"):
+        rv._expectations("case", [at_introduction], case.commits, ("candidate",))
+
+
 # A defect of rename-slug-pattern's candidate, discovered only after the cutoff.
 _LATE = {
     "id": "E1",
@@ -585,6 +696,7 @@ def test_a_review_result_the_controller_would_refuse_is_refused():
     sha = run["reviews"][0]["result"]["reviewed_head_sha"]
     run["reviews"][1]["result"]["reviewed_head_sha"] = sha
     run["reviews"][1]["controller"]["validated_sha"] = sha
+    run["reviews"][1]["controller"]["certified_as"]["reviewed_head_sha"] = sha
     _refused(prereg, corpus, runs, "the run's line says 'fix-1'")
 
 
@@ -619,19 +731,31 @@ def test_a_launch_is_bound_to_a_round_of_its_run():
     _refused(prereg, corpus, runs, "precedes every round")
 
 
-def test_a_launch_ordinal_is_spent_once_and_within_the_runs_range():
+def test_a_launch_ordinal_is_spent_once_and_within_the_runs_window():
     prereg, corpus, runs = _files()
     _run(runs, "rename-slug-pattern")["launches"][1]["ordinal"] = 1
     _refused(prereg, corpus, runs, "the controller spends each ordinal on one launch")
     prereg, corpus, runs = _files()
     _run(runs, "rename-slug-pattern")["launches"][1]["ordinal"] = 3
-    _refused(prereg, corpus, runs, "outside the ordinals 1 to 2 the controller spent")
+    _refused(prereg, corpus, runs, "past the last ordinal 2 the controller spent")
     prereg, corpus, runs = _files()
-    del _run(runs, "rename-slug-pattern")["launch_ordinals"]
+    del _run(runs, "rename-slug-pattern")["launch_window"]
     _refused(prereg, corpus, runs, "is missing")
     prereg, corpus, runs = _files()
     del _run(runs, "rename-slug-pattern")["launches"][0]["ordinal"]
     _refused(prereg, corpus, runs, "is missing")
+    # The state's launch_seq is the run's last ordinal only at a stop the evaluation
+    # ended it at; DONE follows a merge, which no evaluation makes; and a start is the
+    # run's creation or unrecorded, never an ordinal a record names.
+    for change, needle in (
+        ({"end": "unrecorded"}, "records no end and names a last ordinal"),
+        ({"end": "DONE"}, "end must be one of"),
+        ({"start": 2}, "start must be one of"),
+        ({"first": 1}, "unregistered field"),
+    ):
+        prereg, corpus, runs = _files()
+        _run(runs, "rename-slug-pattern")["launch_window"].update(change)
+        _refused(prereg, corpus, runs, needle)
 
 
 def test_a_planned_run_is_not_repeated():
@@ -651,11 +775,128 @@ def test_an_unregistered_field_is_refused_wherever_it_appears():
     _refused(prereg, corpus, runs, "unregistered field")
 
 
+def _del(path: str):
+    def edit(prereg: dict) -> None:
+        *parents, last = path.split(".")
+        node = prereg
+        for key in parents:
+            node = node[key]
+        del node[last]
+
+    return edit
+
+
+def _set(path: str, value: object):
+    def edit(prereg: dict) -> None:
+        *parents, last = path.split(".")
+        node = prereg
+        for key in parents:
+            node = node[key]
+        node[last] = value
+
+    return edit
+
+
+# A preregistration short of a decision criterion, or holding one the scorer cannot
+# use, and what the check says of it.
+_UNUSABLE_CRITERIA = {
+    "no cost margin": (_del("decision.margins.cost_per_validated_success"), "is missing"),
+    "no precision margin": (_del("decision.margins.precision"), "is missing"),
+    "a margin on the primary": (
+        _set("decision.margins.weighted_recall", {"direction": "higher_is_better", "margin": 0}),
+        "unregistered field",
+    ),
+    "a margin as text": (_set("decision.margins.precision.margin", "0.05"), "must be a number"),
+    "a negative margin": (_set("decision.margins.precision.margin", -0.05), "must be a number"),
+    "a margin past 1": (_set("decision.margins.duplicate_ratio.margin", 1.5), "must be a number"),
+    "a boolean margin": (
+        _set("decision.margins.cost_per_validated_success.margin", True),
+        "must be a number",
+    ),
+    "a turned direction": (
+        _set("decision.margins.harmful_fix_rate.direction", "higher_is_better"),
+        "must be lower_is_better",
+    ),
+    "no direction": (_del("decision.margins.clean_negative_fpr.direction"), "is missing"),
+    "no primary effect": (_del("decision.primary.min_difference"), "is missing"),
+    "a primary effect of 0": (_set("decision.primary.min_difference", 0), "must be a number"),
+    "a lower-is-better primary": (
+        _set("decision.primary.metric", "duplicate_ratio"),
+        "is lower-is-better",
+    ),
+    "no minimum of clean negatives": (
+        _del("minimum_sample.clean_negative_cases"),
+        "is missing",
+    ),
+    "a minimum of 0 defect cases": (_set("minimum_sample.defect_cases", 0), "integer >= 1"),
+    "no excluded share": (_del("decision.max_excluded_case_share"), "is missing"),
+    "an excluded share past 1": (
+        _set("decision.max_excluded_case_share", 2),
+        "must be a number",
+    ),
+    "no label-uncertainty limit": (_del("max_label_uncertainty"), "is missing"),
+    "a label-uncertainty limit of null": (
+        _set("max_label_uncertainty", None),
+        "must be a number",
+    ),
+    "no severity blocking a success": (
+        _set("success_blocking_severities", []),
+        "at least one entry",
+    ),
+    "no critical severity": (
+        _set("severity_weights", {"major": 4, "minor": 2}),
+        "weighing `critical`",
+    ),
+    "another fix verdict": (
+        _set("fix_verdicts", ["harmful", "harmless", "unknown"]),
+        "the scorer reads these names",
+    ),
+    "another usage provenance": (
+        _set("usage_provenance", ["measured", "unknown"]),
+        "the scorer reads these names",
+    ),
+}
+
+
+@pytest.mark.parametrize("criterion", sorted(_UNUSABLE_CRITERIA))
+def test_a_preregistration_short_of_a_usable_criterion_is_refused(criterion):
+    """Every criterion the decision reads is required, typed and in range: a file without
+    one is refused, never read as the criterion waived. Only an amendment changes a
+    criterion, by registering another value."""
+    edit, needle = _UNUSABLE_CRITERIA[criterion]
+    prereg, corpus, runs = _files()
+    edit(prereg)
+    _refused(prereg, corpus, runs, needle)
+
+
+def test_an_omitted_cost_margin_never_turns_an_open_cost_into_go():
+    """With a treatment run's launch record short of a launch, the registered margins
+    leave the cost open, INCONCLUSIVE. Read without the cost margin, the same arms are a
+    GO, which is why the check refuses that preregistration."""
+    corpus, runs = _sample()
+    treatment = _real(_catching(runs), "treatment")
+    (short,) = [r for r in treatment if r["case"] == "page-count-partial-page~0"]
+    del short["launches"][2]
+    p, _, r = _files()
+    ev = rv.check(p, corpus, {"schema": r["schema"], "runs": _real(runs, "baseline") + treatment})
+    assert rv.decide(ev, "baseline", "treatment") == {
+        "decision": rv.INCONCLUSIVE,
+        "reasons": ["cost_per_validated_success is not measured on both arms"],
+    }
+    waived = copy.deepcopy(p)
+    del waived["decision"]["margins"]["cost_per_validated_success"]
+    unchecked = dataclasses.replace(ev, preregistration=waived)
+    assert rv.decide(unchecked, "baseline", "treatment")["decision"] == rv.GO
+    with pytest.raises(rv.ReviewEvaluationError, match="is missing"):
+        _decide(_real(runs, "baseline"), treatment, corpus, waived)
+
+
 # -- the pre-registered decision ----------------------------------------------------------
 
 
 def _real(runs: list[dict], arm: str) -> list[dict]:
-    """The runs as one real arm's, every launch measured and numbered in the order listed."""
+    """The runs as one real arm's, every launch measured and numbered in the order listed,
+    and the controller's record of the run's launches ending at the last of them."""
     out = copy.deepcopy(runs)
     for run in out:
         run["arm"] = arm
@@ -664,8 +905,28 @@ def _real(runs: list[dict], arm: str) -> list[dict]:
         for ordinal, launch in enumerate(run["launches"], 1):
             launch["provenance"] = "measured"
             launch["ordinal"] = ordinal
-        run["launch_ordinals"] = {"first": 1, "last": len(run["launches"])}
+        run["launch_window"]["last"] = len(run["launches"])
     return out
+
+
+def _issued(review: dict) -> None:
+    """``review``'s round as one the controller issued its certificate for."""
+    review["controller"].update(
+        disposition="clean",
+        certificate="issued",
+        certified_as={
+            "review_round": review["round"],
+            "reviewed_head_sha": review["result"]["reviewed_head_sha"],
+        },
+    )
+
+
+def _none_issued(review: dict, disposition: str = "needs_fix") -> None:
+    """``review``'s round as one the controller recorded ``disposition`` and certified
+    nothing for."""
+    review["controller"].update(
+        disposition=disposition, certificate="not_issued", certified_as=None
+    )
 
 
 def _resolve_unknowns(runs: list[dict]) -> list[dict]:
@@ -709,7 +970,7 @@ def _catching(runs: list[dict]) -> list[dict]:
         if run["case"].startswith("retry-attempt-bound"):
             second = run["reviews"][1]
             second["result"]["needs_fix_round"] = True
-            second["controller"]["disposition"] = "needs_fix"
+            _none_issued(second)
             second["result"]["findings"] = [
                 {
                     "id": "R2-F1",
@@ -757,11 +1018,8 @@ def _catching(runs: list[dict]) -> list[dict]:
             third["result"].update(
                 round=3, reviewed_head_sha="2" * 40, needs_fix_round=False, findings=[]
             )
-            third["controller"] = {
-                "disposition": "clean",
-                "validation": "passed",
-                "validated_sha": "2" * 40,
-            }
+            third["controller"] = {"validation": "passed", "validated_sha": "2" * 40}
+            _issued(third)
             run["reviews"].append(third)
             run["launches"] += [
                 {**run["launches"][2], "round": 2},
@@ -893,7 +1151,7 @@ def test_a_margin_worse_on_its_whole_interval_is_no_go():
         if run["case"].startswith("rename-slug-pattern"):
             review = run["reviews"][0]
             review["result"]["needs_fix_round"] = True
-            review["controller"]["disposition"] = "needs_fix"
+            _none_issued(review)
             review["result"]["findings"] = [
                 {
                     "id": "R1-F1",
@@ -920,7 +1178,7 @@ def test_a_margin_worse_on_its_whole_interval_is_no_go():
             second = copy.deepcopy(review)
             second.update(round=2)
             second["result"].update(round=2, needs_fix_round=False, findings=[])
-            second["controller"]["disposition"] = "clean"
+            _issued(second)
             run["reviews"].append(second)
             review_launch = run["launches"][1]
             run["launches"] += [
@@ -990,6 +1248,58 @@ def test_a_cost_no_launch_measured_rules_out_go():
     }
 
 
+def test_the_cost_criterion_is_decided_on_unrounded_values():
+    """The cost per validated success is compared with its margin exactly: the baseline at
+    $1.00 a success, a treatment at exactly +50% is within it and a millionth of a dollar
+    over it is not, though the report shows both as 1.5."""
+    corpus, runs = _sample()
+    baseline, treatment = _real(runs, "baseline"), _real(_catching(runs), "treatment")
+    for run in baseline + treatment:
+        for launch in run["launches"]:
+            launch["cost_usd"] = 0.0
+    p, _, r = _files()
+
+    def decided(base_cost: float, treatment_cost: float) -> tuple[dict, dict]:
+        baseline[0]["launches"][0]["cost_usd"] = base_cost
+        treatment[0]["launches"][0]["cost_usd"] = treatment_cost
+        ev = rv.check(p, corpus, {"schema": r["schema"], "runs": baseline + treatment})
+        arms = rv.report(ev)["arms"]
+        return rv.decide(ev, "baseline", "treatment"), {
+            arm: arms[arm]["metrics"]["cost_per_validated_success"] for arm in arms
+        }
+
+    _, cost = decided(1.0, 1.0)
+    successes = {arm: cost[arm]["validated_successes"] for arm in cost}
+    assert successes["treatment"] > 2  # so a millionth over the limit rounds to it
+    limit = Fraction(3, 2) * successes["treatment"]
+    decision, cost = decided(float(successes["baseline"]), float(limit))
+    assert decision == {
+        "decision": rv.GO,
+        "reasons": ["weighted_recall rose by +0.1 or more and every bound held"],
+    }
+    assert (cost["baseline"]["value"], cost["treatment"]["value"]) == (1.0, 1.5)
+    decision, cost = decided(float(successes["baseline"]), float(limit + Fraction(1, 10**6)))
+    assert decision == {
+        "decision": rv.NO_GO,
+        "reasons": ["cost_per_validated_success rose past +50% of the baseline's"],
+    }
+    assert cost["treatment"]["value"] == 1.5  # shown rounded, decided exactly
+
+
+def test_a_label_band_at_its_limit_is_decided_exactly():
+    """A band exactly as wide as the registered 0.1 is not wider than it. In binary
+    floats 4/10 - 3/10 is wider, and would leave the rate unknown."""
+    assert 0.4 - 0.3 > 0.1  # what an inexact comparison would read
+    prereg = rv.read_json(rv.PREREGISTRATION)
+    (score,) = [rv.score_run(run, prereg) for run in rv.load().runs[:1]]
+    at_limit = dataclasses.replace(score, confirmed=3, false=6, unknown=1)
+    precision = rv.arm_metrics([at_limit], prereg, None)["precision"]
+    assert precision["label_bounds"] == [0.3, 0.4]
+    assert precision["status"] == "known"
+    wider = dataclasses.replace(score, confirmed=3, false=5, unknown=1)
+    assert rv.arm_metrics([wider], prereg, None)["precision"]["status"] == "unknown"
+
+
 # What one treatment run's launch record keeps, and what it then misses. Its launches
 # are ordinals 1 to 4 of the controller's: ANALYZE_EXECUTE, REVIEW 1, FIX 1, REVIEW 2.
 _GAPS = {
@@ -1015,9 +1325,9 @@ _GAPS = {
         lambda launch: launch["phase"] != "FIX",
         ["the launch of ordinal 3", "FIX of round 1"],
     ),
-    "no record of the controller's launch ordinals": (
+    "no record of the controller's launch window": (
         None,
-        ["the controller's record of its launch ordinals"],
+        ["the controller's record of its launch window"],
     ),
 }
 
@@ -1033,7 +1343,7 @@ def test_a_run_whose_launch_record_is_incomplete_has_no_measured_cost(gap):
     treatment = _real(_catching(runs), "treatment")
     (short,) = [r for r in treatment if r["case"] == "page-count-partial-page~0"]
     if kept is None:
-        short["launch_ordinals"] = None
+        short["launch_window"] = None
     else:
         short["launches"] = [launch for launch in short["launches"] if kept(launch)]
     p, _, r = _files()
@@ -1067,7 +1377,7 @@ def test_an_omitted_retry_leaves_the_cost_unknown():
     retried["launches"].insert(1, {**retried["launches"][1], "cost_usd": 200.0})
     for ordinal, launch in enumerate(retried["launches"], 1):
         launch["ordinal"] = ordinal
-    retried["launch_ordinals"] = {"first": 1, "last": 5}
+    retried["launch_window"]["last"] = 5
     assert _decide(baseline, treatment, corpus) == {
         "decision": rv.NO_GO,
         "reasons": ["cost_per_validated_success rose past +50% of the baseline's"],
@@ -1089,6 +1399,115 @@ def test_an_omitted_retry_leaves_the_cost_unknown():
     (row,) = [row for row in arm["runs"] if row["run"] == retried["id"]]
     assert row["missing_launches"] == ["the launch of ordinal 2"]
     assert arm["metrics"]["total_cost_usd"]["value"] is None
+
+
+def test_an_omitted_leading_attempt_leaves_the_cost_unknown():
+    """The state's launch_seq is a high-water mark: it ends a run's ordinals and never
+    starts them. A run the controller created for its case started at launch_seq 0, so
+    its first launch spent ordinal 1, and a $200 first attempt that failed before the
+    ANALYZE_EXECUTE that counted breaks the cost margin. A record that leaves it out is
+    short of ordinal 1, and one that cannot show where the run's launches start is short
+    of that record: either way its cost is unknown, never the cheaper total."""
+    corpus, runs = _sample()
+    baseline = _real(runs, "baseline")
+    treatment = _real(_catching(runs), "treatment")
+    (retried,) = [r for r in treatment if r["case"] == "page-count-partial-page~0"]
+    retried["launches"].insert(0, {**retried["launches"][0], "cost_usd": 200.0})
+    for ordinal, launch in enumerate(retried["launches"], 1):
+        launch["ordinal"] = ordinal
+    retried["launch_window"]["last"] = 5
+    assert _decide(baseline, treatment, corpus) == {
+        "decision": rv.NO_GO,
+        "reasons": ["cost_per_validated_success rose past +50% of the baseline's"],
+    }
+    del retried["launches"][0]
+    assert [launch["ordinal"] for launch in retried["launches"]] == [2, 3, 4, 5]
+    p, _, r = _files()
+    open_cost = {
+        "decision": rv.INCONCLUSIVE,
+        "reasons": ["cost_per_validated_success is not measured on both arms"],
+    }
+    ev = rv.check(p, corpus, {"schema": r["schema"], "runs": baseline + treatment})
+    assert rv.decide(ev, "baseline", "treatment") == open_cost
+    (row,) = [
+        row for row in rv.report(ev)["arms"]["treatment"]["runs"] if row["run"] == retried["id"]
+    ]
+    assert row["missing_launches"] == ["the launch of ordinal 1"]
+    # Without the record of the run's creation, nothing shows where its ordinals start.
+    retried["launch_window"]["start"] = "unrecorded"
+    ev = rv.check(p, corpus, {"schema": r["schema"], "runs": baseline + treatment})
+    assert rv.decide(ev, "baseline", "treatment") == open_cost
+    (row,) = [
+        row for row in rv.report(ev)["arms"]["treatment"]["runs"] if row["run"] == retried["id"]
+    ]
+    assert row["missing_launches"] == [
+        "the controller's record of where its launches start: no record shows it created "
+        "the run for this case"
+    ]
+
+
+def _stale_at_the_end(runs: list[dict], went_on: int | None) -> list[dict]:
+    """The redact runs with their final round stale. With ``went_on`` the controller
+    spent that many ordinals after it, on the moved revision no record holds; with
+    ``None`` no record shows where its launches ended."""
+    out = copy.deepcopy(runs)
+    for run in out:
+        if run["case"].startswith("redact"):
+            _none_issued(run["reviews"][-1], "stale")
+            run["stopped"] = "the revision moved during round 2's review"
+            if went_on is None:
+                run["launch_window"].update(end="unrecorded", last=None)
+            else:
+                run["launch_window"].update(end="READY_FOR_MERGE")
+                run["launch_window"]["last"] += went_on
+    return out
+
+
+def test_a_run_that_goes_on_past_a_stale_round_has_no_known_outcome_or_cost():
+    """A stale round ends what a run record can hold, never the run: the controller
+    reviews the moved revision next. Where it spent ordinals after the stale round, the
+    run went on, so the stale round decides neither its certificate nor its cost: B1,
+    at the stale candidate, may have escaped, and the cost is unknown. Where no record
+    shows where its launches ended, the same holds. Only a run whose record shows it
+    stopped at the stale round ends there
+    (test_a_clean_reply_alone_cannot_trigger_the_hard_gate)."""
+    corpus, runs = _sample()
+    caught = _catching(runs)
+    baseline = _real(
+        [
+            copy.deepcopy(c) if c["case"].startswith("redact") else copy.deepcopy(r)
+            for r, c in zip(runs, caught, strict=True)
+        ],
+        "baseline",
+    )
+    for run in caught:
+        if run["case"].startswith("redact"):
+            run["commits"][0]["fixes"] = ["B2"]  # B1 is still there at the stale round
+    caught = _real(caught, "treatment")
+    for went_on in (2, None):
+        treatment = _stale_at_the_end(caught, went_on)
+        decision = _decide(baseline, treatment, corpus)
+        assert decision["decision"] == rv.INCONCLUSIVE, went_on
+        assert "cost_per_validated_success is not measured on both arms" in decision["reasons"]
+        assert [r for r in decision["reasons"] if "critical defect" in r] == [
+            f"critical defect B1 of run 'treatment/redact-authorization-header~{k}' may have "
+            "escaped the treatment's review: the controller's record does not settle the "
+            "run's outcome"
+            for k in range(7)
+        ]
+        p, _, r = _files()
+        ev = rv.check(p, corpus, {"schema": r["schema"], "runs": baseline + treatment})
+        arm = rv.report(ev)["arms"]["treatment"]
+        (row,) = [row for row in arm["runs"] if row["case"] == "redact-authorization-header~0"]
+        assert (row["ended"], row["validated_success"]) == ("unknown", False)  # B1 is critical
+        missing = row["missing_launches"]
+        if went_on is None:
+            assert missing == [
+                "the controller's record of where its launches end: the run was not found "
+                "at a stop the evaluation ended it at"
+            ]
+        else:
+            assert missing == ["the launches of ordinals 5 to 6"]
 
 
 def _beside_a1(runs: list[dict], verdict: str, count: int = 1) -> list[dict]:
@@ -1173,27 +1592,41 @@ def _redact_final(mutate) -> tuple[dict, dict]:
     return report["metrics"], row
 
 
+# The redact run's final round, a clean reply over a passing validation of its own
+# candidate, with the controller's record of what it certified changed.
+_ROUND_1_SHA = "06398f9ea48e0f466fe9234deb58980a0d74752b"
+_NONE_ISSUED = {"certificate": "not_issued", "certified_as": None}
 _NOT_CERTIFIED = {
-    "the controller found the round stale": {"disposition": "stale"},
-    "a failed validation": {"disposition": "unrecorded", "validation": "failed"},
-    "another candidate's validation": {
-        "disposition": "unrecorded",
-        "validated_sha": "06398f9ea48e0f466fe9234deb58980a0d74752b",  # the round-1 candidate
+    "the controller found the round stale": {**_NONE_ISSUED, "disposition": "stale"},
+    "a clean round it issued no certificate for": _NONE_ISSUED,
+    "a clean round over a failed validation": {**_NONE_ISSUED, "validation": "failed"},
+    "a clean round over another candidate's validation": {
+        **_NONE_ISSUED,
+        "validated_sha": _ROUND_1_SHA,
+    },
+    "a failed validation, the certificate unrecorded": {
+        "certificate": "unrecorded",
+        "certified_as": None,
+        "validation": "failed",
     },
 }
 
 
 @pytest.mark.parametrize("record", sorted(_NOT_CERTIFIED))
 def test_a_clean_reply_the_controller_would_not_certify_escapes_nothing(record):
-    """An escape is a registered defect at the candidate the controller would certify. B1
-    sits at the redact run's clean reply either way; over a stale round, a failed
-    validation or another candidate's, the controller certifies nothing, and nothing
-    escapes. The run did not end on a certificate, so it says why it stopped."""
+    """An escape is a registered defect at a candidate the controller certified. B1 sits
+    at the redact run's clean reply whatever its record says. The controller records a
+    clean round before it issues its certificate, and can block with none: over a round
+    it records issued none for, a clean round over its own passing validation included,
+    over a stale round, a failed validation or another candidate's, it certified nothing,
+    and nothing escapes. The run did not end on a certificate, so it says why it stopped,
+    and it stopped short of READY_FOR_MERGE."""
     change = _NOT_CERTIFIED[record]
 
     def mutate(run, controller):
         controller.update(change)
-        run["stopped"] = "BLOCKED before a certificate"
+        run["stopped"] = "BLOCKED: no review certificate was issued"
+        run["launch_window"]["end"] = "BLOCKED"
 
     metrics, row = _redact_final(mutate)
     assert metrics["escaped_critical_defects"] == {"value": 0, "defects": [], "possible": []}
@@ -1201,32 +1634,45 @@ def test_a_clean_reply_the_controller_would_not_certify_escapes_nothing(record):
     assert (row["ended"], row["validated_success"]) == ("stopped", False)
     assert row["claims"]["final_reply_clean"] is True
     prereg, corpus, runs = _files()
-    _run(runs, "redact-authorization-header")["reviews"][-1]["controller"].update(change)
+    run = _run(runs, "redact-authorization-header")
+    run["reviews"][-1]["controller"].update(change)
+    run["launch_window"]["end"] = "BLOCKED"
     _refused(prereg, corpus, runs, "stopped must be a non-empty string")
+    prereg, corpus, runs = _files()
+    run = _run(runs, "redact-authorization-header")
+    run["reviews"][-1]["controller"].update(change)
+    run["stopped"] = "BLOCKED: no review certificate was issued"
+    _refused(prereg, corpus, runs, "enters READY_FOR_MERGE only over")
 
 
 def test_a_clean_reply_over_a_missing_record_decides_no_escape():
-    """With the controller's disposition unrecorded, B1 may have escaped: the count is
-    unknown and never read as zero. A run whose success that record would decide leaves
+    """A clean history entry and a passing validation of the candidate are what issuance
+    needs, not proof that it happened. With no record of the round's certificate, B1 may
+    have escaped: the count is unknown and never read as zero, whatever else the
+    controller recorded of the round. A run whose success that record would decide leaves
     the cost per validated success unknown too; the redact run is no success either way,
     since B1 is critical."""
-    metrics, row = _redact_final(lambda run, c: c.update(disposition="unrecorded"))
-    escapes = metrics["escaped_critical_defects"]
-    assert (escapes["value"], escapes["known_part"], escapes["defects"]) == (None, 0, [])
-    assert escapes["possible"] == [
-        {"case": "redact-authorization-header", "defect": "B1", "belongs_to": "case"}
-    ]
-    assert "is incomplete" in escapes["why_unknown"]
-    assert (row["ended"], row["validated_success"], row["escaped"]) == ("unrecorded", False, [])
-    assert metrics["cost_per_validated_success"]["value"] == 3.666667
-    metrics, _ = _redact_final(lambda run, c: c.update(validation="unrecorded", validated_sha=None))
-    assert metrics["escaped_critical_defects"]["value"] is None
+    unrecorded = {"certificate": "unrecorded", "certified_as": None}
+    for also in (
+        {},
+        {"disposition": "unrecorded"},
+        {"validation": "unrecorded", "validated_sha": None},
+    ):
+        metrics, row = _redact_final(lambda run, c, also=also: c.update(unrecorded, **also))
+        escapes = metrics["escaped_critical_defects"]
+        assert (escapes["value"], escapes["known_part"], escapes["defects"]) == (None, 0, [])
+        assert escapes["possible"] == [
+            {"case": "redact-authorization-header", "defect": "B1", "belongs_to": "case"}
+        ]
+        assert "does not settle the outcome" in escapes["why_unknown"]
+        assert (row["ended"], row["validated_success"], row["escaped"]) == ("unknown", False, [])
+        assert metrics["cost_per_validated_success"]["value"] == 3.666667
 
     prereg, corpus, runs = _files()
-    _run(runs, "page-count-partial-page")["reviews"][-1]["controller"]["disposition"] = "unrecorded"
+    _run(runs, "page-count-partial-page")["reviews"][-1]["controller"].update(unrecorded)
     arm = rv.report(rv.check(prereg, corpus, runs))["arms"][ARM]
     (row,) = [row for row in arm["runs"] if row["case"] == "page-count-partial-page"]
-    assert (row["ended"], row["validated_success"]) == ("unrecorded", None)
+    assert (row["ended"], row["validated_success"]) == ("unknown", None)
     per_success = arm["metrics"]["cost_per_validated_success"]
     assert per_success["value"] is None
     assert per_success["validated_successes"] == 2
@@ -1242,9 +1688,31 @@ def test_a_deliberately_empty_validation_set_certifies_and_validates_nothing():
 
 
 def test_the_controller_record_is_held_to_what_the_controller_does():
+    """A record the controller would never write is refused: a certificate issued over a
+    round it certifies nothing for, or one of another round or revision, which this round
+    did not get (the controller keeps an earlier round's when it issues none)."""
+    issued_elsewhere = "a certificate certifies only the round and revision it was issued for"
     cases = [
-        ({"validation": "failed"}, "ADR 0006 D9.4"),
-        ({"validated_sha": "06398f9ea48e0f466fe9234deb58980a0d74752b"}, "ADR 0006 D5.5"),
+        ({"validation": "failed"}, "ADR 0006 D12.2"),
+        ({"validated_sha": _ROUND_1_SHA}, "ADR 0006 D12.2"),
+        ({"validation": "unrecorded", "validated_sha": None}, "ADR 0006 D12.2"),
+        ({"disposition": "unrecorded"}, "ADR 0006 D12.2"),
+        (
+            {"certified_as": {"review_round": 1, "reviewed_head_sha": _ROUND_1_SHA}},
+            issued_elsewhere,
+        ),
+        (
+            {
+                "certified_as": {
+                    "review_round": 1,
+                    "reviewed_head_sha": "6d81b1a41cd7675912df07e8d43501e5976dc9a0",
+                }
+            },
+            issued_elsewhere,
+        ),
+        ({"certified_as": None}, "certified_as must be an object"),
+        ({"certificate": "not_issued"}, "records no issued certificate and names one"),
+        ({"certificate": "probably"}, "certificate must be one of"),
         ({"disposition": "needs_fix"}, "needs a fix over a clean reply"),
         ({"validation": "unrecorded"}, "records no validation and names a validated SHA"),
         ({"validated_sha": None}, "validated_sha must be a full"),
@@ -1266,8 +1734,9 @@ def test_a_clean_reply_alone_cannot_trigger_the_hard_gate():
     """The treatment confirms B1 and its fix leaves it in place, so B1 sits at the clean
     reply of its last round, where the baseline fixed it. Certified, that is a new
     critical escape and NO_GO, over the empty validation set too. Over a stale round the
-    controller certified nothing, so nothing escaped and the gate does not stand in the
-    way; over a record nobody found it decides nothing either way."""
+    run stopped at, or a clean round it issued no certificate for, the controller
+    certified nothing, so nothing escaped and the gate does not stand in the way; with no
+    record of the certificate it decides nothing either way."""
     corpus, runs = _sample()
     caught = _catching(runs)
     baseline = [
@@ -1283,6 +1752,7 @@ def test_a_clean_reply_alone_cannot_trigger_the_hard_gate():
                 run["reviews"][-1]["controller"].update(change)
                 if stopped:
                     run["stopped"] = stopped
+                    run["launch_window"]["end"] = "BLOCKED"
         return _real(out, "treatment")
 
     certified = _decide(_real(baseline, "baseline"), treatment({}), corpus)
@@ -1294,21 +1764,24 @@ def test_a_clean_reply_alone_cannot_trigger_the_hard_gate():
     ]
     empty = _decide(_real(baseline, "baseline"), treatment({"validation": "empty_set"}), corpus)
     assert empty == certified
-    stale = _decide(
-        _real(baseline, "baseline"), treatment({"disposition": "stale"}, "BLOCKED"), corpus
-    )
-    assert stale == {
+    go = {
         "decision": rv.GO,
         "reasons": ["weighted_recall rose by +0.1 or more and every bound held"],
     }
+    # The controller found the round stale, or recorded it clean over its own passing
+    # validation and issued no certificate, and the run stopped there: nothing escaped.
+    for change in ({**_NONE_ISSUED, "disposition": "stale"}, _NONE_ISSUED):
+        assert _decide(_real(baseline, "baseline"), treatment(change, "BLOCKED"), corpus) == go
     unrecorded = _decide(
-        _real(baseline, "baseline"), treatment({"disposition": "unrecorded"}), corpus
+        _real(baseline, "baseline"),
+        treatment({"certificate": "unrecorded", "certified_as": None}),
+        corpus,
     )
     assert unrecorded["decision"] == rv.INCONCLUSIVE
     assert [r for r in unrecorded["reasons"] if "critical defect" in r] == [
         f"critical defect B1 of run 'treatment/redact-authorization-header~{k}' may have "
-        "escaped the treatment's review: the controller's record of its final round is "
-        "incomplete"
+        "escaped the treatment's review: the controller's record does not settle the "
+        "run's outcome"
         for k in range(7)
     ]
     # A certified escape is new only when the baseline's run is known to have held it
@@ -1316,7 +1789,7 @@ def test_a_clean_reply_alone_cannot_trigger_the_hard_gate():
     unknown_before = copy.deepcopy(runs)
     for run in unknown_before:
         if run["case"].startswith("redact"):
-            run["reviews"][-1]["controller"]["disposition"] = "unrecorded"
+            run["reviews"][-1]["controller"].update(certificate="unrecorded", certified_as=None)
     decision = _decide(_real(unknown_before, "baseline"), treatment({}), corpus)
     assert [r for r in decision["reasons"] if "critical defect" in r] == [
         f"critical defect B1 of case 'redact-authorization-header~{k}' escaped the "
@@ -1355,6 +1828,20 @@ def test_the_baseline_facts_are_the_codes():
     from autoforge.certificate import CLEAN
 
     assert base["certificate_clean"] == CLEAN
+
+
+def test_a_launch_window_is_read_in_the_controllers_terms():
+    """A run record's launch window is read in the controller's own terms: a run it
+    creates starts at launch_seq 0, so its first launch spends ordinal 1; a window ends
+    at a phase the run stops at with the merge gate closed, never at DONE, which follows
+    a merge; and a record's launches are of the phases that launch an agent before one,
+    which UPDATE_EPIC follows."""
+    from autoforge.state import AutoForgeState
+    from autoforge.transitions import AGENT_PHASES, STOP_PHASES
+
+    assert AutoForgeState.__dataclass_fields__["launch_seq"].default == 0
+    assert set(rv.WINDOW_ENDS) - {"unrecorded"} == {p.value for p in STOP_PHASES} - {"DONE"}
+    assert set(rv.LAUNCH_PHASES) == {p.value for p in AGENT_PHASES} - {"UPDATE_EPIC"}
 
 
 def test_every_fixture_review_is_one_the_current_routing_and_parser_accept():

@@ -30,7 +30,9 @@
           "controller": {
             "disposition": "needs_fix",
             "validation": "passed",
-            "validated_sha": "a8b89805dd452f8a330c5e1bd3f116dc2bfff97e"
+            "validated_sha": "a8b89805dd452f8a330c5e1bd3f116dc2bfff97e",
+            "certificate": "not_issued",
+            "certified_as": null
           },
           "result": {
             "phase": "REVIEW",
@@ -75,7 +77,12 @@
           "controller": {
             "disposition": "clean",
             "validation": "passed",
-            "validated_sha": "6737721b7c05f350483b8403dbcdfd92a02a78cf"
+            "validated_sha": "6737721b7c05f350483b8403dbcdfd92a02a78cf",
+            "certificate": "issued",
+            "certified_as": {
+              "review_round": 2,
+              "reviewed_head_sha": "6737721b7c05f350483b8403dbcdfd92a02a78cf"
+            }
           },
           "result": {
             "phase": "REVIEW",
@@ -188,8 +195,9 @@
           "round": 2
         }
       ],
-      "launch_ordinals": {
-        "first": 1,
+      "launch_window": {
+        "start": "run_created",
+        "end": "READY_FOR_MERGE",
         "last": 4
       }
     },
@@ -220,7 +228,9 @@
           "controller": {
             "disposition": "needs_fix",
             "validation": "passed",
-            "validated_sha": "06398f9ea48e0f466fe9234deb58980a0d74752b"
+            "validated_sha": "06398f9ea48e0f466fe9234deb58980a0d74752b",
+            "certificate": "not_issued",
+            "certified_as": null
           },
           "result": {
             "phase": "REVIEW",
@@ -265,7 +275,12 @@
           "controller": {
             "disposition": "clean",
             "validation": "passed",
-            "validated_sha": "6d81b1a41cd7675912df07e8d43501e5976dc9a0"
+            "validated_sha": "6d81b1a41cd7675912df07e8d43501e5976dc9a0",
+            "certificate": "issued",
+            "certified_as": {
+              "review_round": 2,
+              "reviewed_head_sha": "6d81b1a41cd7675912df07e8d43501e5976dc9a0"
+            }
           },
           "result": {
             "phase": "REVIEW",
@@ -378,8 +393,9 @@
           "round": 2
         }
       ],
-      "launch_ordinals": {
-        "first": 1,
+      "launch_window": {
+        "start": "run_created",
+        "end": "READY_FOR_MERGE",
         "last": 4
       }
     },
@@ -436,7 +452,9 @@
           "controller": {
             "disposition": "needs_fix",
             "validation": "passed",
-            "validated_sha": "4e1e338478c0d7c7e3bebfdd7db88fb63d2a461e"
+            "validated_sha": "4e1e338478c0d7c7e3bebfdd7db88fb63d2a461e",
+            "certificate": "not_issued",
+            "certified_as": null
           },
           "result": {
             "phase": "REVIEW",
@@ -467,7 +485,12 @@
           "controller": {
             "disposition": "clean",
             "validation": "passed",
-            "validated_sha": "7004fd723813413029409f0e7babdcb5ff4e0d6d"
+            "validated_sha": "7004fd723813413029409f0e7babdcb5ff4e0d6d",
+            "certificate": "issued",
+            "certified_as": {
+              "review_round": 2,
+              "reviewed_head_sha": "7004fd723813413029409f0e7babdcb5ff4e0d6d"
+            }
           },
           "result": {
             "phase": "REVIEW",
@@ -554,8 +577,9 @@
           "round": 2
         }
       ],
-      "launch_ordinals": {
-        "first": 1,
+      "launch_window": {
+        "start": "run_created",
+        "end": "READY_FOR_MERGE",
         "last": 4
       }
     },
@@ -574,7 +598,12 @@
           "controller": {
             "disposition": "clean",
             "validation": "passed",
-            "validated_sha": "a13c2e5284c425fddd3b0bbf1f64083cfe09596f"
+            "validated_sha": "a13c2e5284c425fddd3b0bbf1f64083cfe09596f",
+            "certificate": "issued",
+            "certified_as": {
+              "review_round": 1,
+              "reviewed_head_sha": "a13c2e5284c425fddd3b0bbf1f64083cfe09596f"
+            }
           },
           "result": {
             "phase": "REVIEW",
@@ -613,8 +642,9 @@
           "round": 1
         }
       ],
-      "launch_ordinals": {
-        "first": 1,
+      "launch_window": {
+        "start": "run_created",
+        "end": "READY_FOR_MERGE",
         "last": 2
       }
     },
@@ -633,7 +663,9 @@
           "controller": {
             "disposition": "needs_fix",
             "validation": "passed",
-            "validated_sha": "e2980bd0f844c3ea7f18a328f961c3664e50b4d0"
+            "validated_sha": "e2980bd0f844c3ea7f18a328f961c3664e50b4d0",
+            "certificate": "not_issued",
+            "certified_as": null
           },
           "result": {
             "phase": "REVIEW",
@@ -664,7 +696,12 @@
           "controller": {
             "disposition": "clean",
             "validation": "passed",
-            "validated_sha": "e2980bd0f844c3ea7f18a328f961c3664e50b4d0"
+            "validated_sha": "e2980bd0f844c3ea7f18a328f961c3664e50b4d0",
+            "certificate": "issued",
+            "certified_as": {
+              "review_round": 2,
+              "reviewed_head_sha": "e2980bd0f844c3ea7f18a328f961c3664e50b4d0"
+            }
           },
           "result": {
             "phase": "REVIEW",
@@ -742,8 +779,9 @@
           "round": 2
         }
       ],
-      "launch_ordinals": {
-        "first": 1,
+      "launch_window": {
+        "start": "run_created",
+        "end": "READY_FOR_MERGE",
         "last": 4
       }
     },
@@ -762,7 +800,9 @@
           "controller": {
             "disposition": "needs_fix",
             "validation": "passed",
-            "validated_sha": "77e000ba809f09742bc32ee244f752188421eed6"
+            "validated_sha": "77e000ba809f09742bc32ee244f752188421eed6",
+            "certificate": "not_issued",
+            "certified_as": null
           },
           "result": {
             "phase": "REVIEW",
@@ -793,7 +833,9 @@
           "controller": {
             "disposition": "needs_fix",
             "validation": "passed",
-            "validated_sha": "77e000ba809f09742bc32ee244f752188421eed6"
+            "validated_sha": "77e000ba809f09742bc32ee244f752188421eed6",
+            "certificate": "not_issued",
+            "certified_as": null
           },
           "result": {
             "phase": "REVIEW",
@@ -892,8 +934,9 @@
           "round": 2
         }
       ],
-      "launch_ordinals": {
-        "first": 1,
+      "launch_window": {
+        "start": "run_created",
+        "end": "BLOCKED",
         "last": 4
       }
     }

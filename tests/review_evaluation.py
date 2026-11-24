@@ -21,9 +21,11 @@ files of ``tests/fixtures/review_evaluation/``:
 ``check`` refuses a file the contract does not allow, ``verify`` replays the
 corpus (it builds every case's commits, whether or not a run holds the case, and
 every run's own, in temporary repositories at a fixed date, holds each pinned SHA
-to what it builds, and runs every oracle where the ground truth says it must fail
-or pass), ``score`` prints the report, and ``decide`` applies the pre-registered
-decision to two arms.
+to what it builds and each commit's tree to the files that built it, and runs
+every oracle where the ground truth says it must fail or pass, on that commit's
+tree as the controller's byte-exact materializer writes and proves it),
+``score`` prints the report, and ``decide`` applies the pre-registered decision
+to two arms.
 
 It launches no agent, reads no credential and writes to no GitHub, and git runs
 with every transport refused. An oracle is Python from the corpus or run file,
@@ -38,8 +40,11 @@ nothing they hold.
 A label comes from an adjudicator's record or an oracle, never from what an
 agent said of its own work: the reviewer's classification, its prose, its clean
 reply and the fixer's resolution kinds are reported as claims and read by no
-metric. Which candidate the controller would certify is the controller's own
-record of the round, its disposition and the validation it presented.
+metric. Whether the controller certified a round's candidate is its own record
+of the certificate it issued for that round and revision; which launches a run
+made is its own record of the ordinals it spent, from the run's creation to the
+stop the evaluation ended it at. Every comparison with a registered threshold
+is made in exact arithmetic on unrounded values; a report rounds for display.
 """
 
 from __future__ import annotations
@@ -59,9 +64,10 @@ from fractions import Fraction
 from pathlib import Path
 
 from autoforge.errors import AutoForgeError
-from autoforge.executor import select_environment
+from autoforge.executor import execute, select_environment
 from autoforge.git_transport import NO_AUTO_MAINTENANCE
 from autoforge.loop_guard import RESULTS
+from autoforge.materialize import materialize, read_object_format
 from autoforge.profiles import review_profile_name
 from autoforge.result_parser import FIX_RESOLUTIONS, ReviewResult
 
@@ -84,11 +90,21 @@ DISPOSITIONS = (*RESULTS, "unrecorded")
 # deliberately empty set (no validation command configured), a record not PASS,
 # or ``unrecorded`` when no record of it was found.
 VALIDATION_OUTCOMES = ("passed", "empty_set", "failed", "unrecorded")
-# Whether the controller would certify a round's candidate (section 3).
+# The controller's record of a round's certificate: one issued for this round and
+# revision, none issued for it, or ``unrecorded`` when no record of it was found.
+CERTIFICATE_RECORDS = ("issued", "not_issued", "unrecorded")
+# Whether the controller certified a round's candidate (section 3).
 CERTIFIED = "certified"
 NOT_CERTIFIED = "not_certified"
 CERTIFICATION_UNKNOWN = "unknown"
 LAUNCH_PHASES = ("ANALYZE_EXECUTE", "REVIEW", "FIX", "REPLAN_REEXECUTE")
+# Where a run's launch ordinals start: the controller created the run for the case's
+# issue, at ``launch_seq`` 0, so its first launch spent ordinal 1; or no record says.
+WINDOW_STARTS = ("run_created", "unrecorded")
+# Where they end: the stop phase the evaluation ended the run at, after which it
+# launched nothing more for the case's issue; or no record says. DONE is none of
+# them: it follows a merge, and an evaluation merges nothing.
+WINDOW_ENDS = ("READY_FOR_MERGE", "BLOCKED", "FAILED", "unrecorded")
 # The metrics a margin or the primary may name, in the order a report shows them.
 RATE_METRICS = (
     "weighted_recall",
@@ -97,6 +113,16 @@ RATE_METRICS = (
     "harmful_fix_rate",
     "duplicate_ratio",
 )
+# The direction every decision criterion is registered in: a preregistration that
+# turns one round is refused, since it would invert what the criterion protects.
+CRITERION_DIRECTIONS = {
+    "weighted_recall": "higher_is_better",
+    "precision": "higher_is_better",
+    "clean_negative_fpr": "lower_is_better",
+    "harmful_fix_rate": "lower_is_better",
+    "duplicate_ratio": "lower_is_better",
+    "cost_per_validated_success": "lower_is_better",
+}
 NOT_EVIDENCE = (
     "a fixture run is scripted: its numbers check the scorer and say nothing about any "
     "reviewer, model or configuration"
@@ -176,6 +202,31 @@ def _number(value: object, where: str) -> float | None:
     if not math.isfinite(value):
         raise ReviewEvaluationError(f"{where} must be finite")
     return float(value)
+
+
+def _bounded(
+    value: object, where: str, low: float, high: float, *, low_open: bool = False
+) -> float:
+    """A finite number in ``[low, high]``, or ``(low, high]`` with ``low_open``."""
+    if (
+        not isinstance(value, int | float)
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or not (low < value if low_open else low <= value)
+        or not value <= high
+    ):
+        span = f"{'(' if low_open else '['}{low}, {high}]"
+        raise ReviewEvaluationError(f"{where} must be a number in {span}, not {value!r}")
+    return float(value)
+
+
+def exact(value: float) -> Fraction:
+    """``value`` as the decimal a file wrote it as: what a threshold is compared with.
+
+    A JSON number is read as the nearest binary float, whose shortest repr is the
+    decimal written, for any number of up to 15 significant digits.
+    """
+    return Fraction(repr(value))
 
 
 def _one_of(value: object, choices: Sequence[str], where: str) -> str:
@@ -281,29 +332,34 @@ class Review:
     # Whether the validation presented was the reviewed candidate's: None when no
     # validation was recorded.
     validated_at_candidate: bool | None
+    # The controller's record of this round's certificate (CERTIFICATE_RECORDS).
+    certificate: str
     findings: tuple[Finding, ...]
 
     @property
     def certification(self) -> str:
-        """Whether the controller would certify this round's candidate (section 3).
+        """Whether the controller certified this round's candidate (section 3).
 
-        Certified: a clean reply the controller recorded ``clean``, over a validation
-        set it presented for this very candidate, every record ``PASS`` or the set
-        deliberately empty. A reply that needs a fix, a round the controller sent to a
-        fix or found stale, a failed validation and another candidate's validation each
-        rule a certificate out. Otherwise a missing record leaves it unknown: a clean
-        reply alone is never a certificate.
+        Certified only on the controller's record of a certificate issued for this
+        round and this revision (the check holds it to both). A record that it issued
+        none rules one out, and so does what the controller never certifies: a reply
+        that needs a fix, a round it sent to a fix or found stale, a failed validation
+        and another candidate's validation. Otherwise no record of the certificate was
+        found and it is unknown: a clean reply, a ``clean`` disposition and a passing
+        validation of the candidate are what issuance needs, never proof that it
+        happened, since the controller records the round before it issues.
         """
+        if self.certificate == "issued":
+            return CERTIFIED
         if (
-            not self.clean
+            self.certificate == "not_issued"
+            or not self.clean
             or self.disposition in ("needs_fix", "stale")
             or self.validation == "failed"
             or self.validated_at_candidate is False
         ):
             return NOT_CERTIFIED
-        if "unrecorded" in (self.disposition, self.validation):
-            return CERTIFICATION_UNKNOWN
-        return CERTIFIED
+        return CERTIFICATION_UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -324,6 +380,22 @@ class Launch:
     wall_clock_seconds: float | None
     context_tokens: float | None
     provenance: str
+
+
+@dataclass(frozen=True)
+class LaunchWindow:
+    """The controller's record of the launch ordinals a run spent (``launch_seq``).
+
+    ``start`` and ``end`` are how each boundary is known (WINDOW_STARTS,
+    WINDOW_ENDS); ``last`` is the state's ``launch_seq`` at that end, the last
+    ordinal the run spent, and ``None`` when the end is unrecorded. The state's
+    ``launch_seq`` is a high-water mark: it gives the end of a run's ordinals, and
+    only the run's creation gives their start.
+    """
+
+    start: str
+    end: str
+    last: int | None
 
 
 def _ancestors(commits: Mapping[str, Commit], name: str) -> frozenset[str]:
@@ -357,9 +429,9 @@ class Run:
     reviews: tuple[Review, ...]
     fixes: tuple[Fix, ...]
     launches: tuple[Launch, ...]
-    # The first and last launch ordinal the controller spent on the run, read from its
-    # state file, not from the launches; None when that record was not found.
-    launch_ordinals: tuple[int, int] | None
+    # The controller's record of the launch ordinals it spent on the run, read from
+    # its state and run log, not from the launches; None when it was not found.
+    launch_window: LaunchWindow | None
     stopped: str
     excluded: str
     oracles: Mapping[str, str]
@@ -371,26 +443,71 @@ class Run:
         """``case`` for a defect of the case's commits, ``run`` for one this run introduced."""
         return "case" if defect in self.case.defects else "run"
 
+    def went_on(self) -> bool | None:
+        """Whether the run went on past its record: ``None`` when that is unknown.
+
+        True when the controller spent an ordinal after the record's last launch: a
+        launch the record does not hold followed its last round, so that round is not
+        where the run's outcome was decided. Unknown when the record's last round is
+        stale and no recorded end shows the run stopped there: the controller fixes no
+        stale round and reviews the moved revision next, so a stale round ends what a
+        record can hold, never the run by itself.
+        """
+        w = self.launch_window
+        held = max((launch.ordinal for launch in self.launches), default=0)
+        if w is not None and w.last is not None and w.last > held:
+            return True
+        if self.reviews[-1].disposition == "stale" and (w is None or w.last is None):
+            return None
+        return False
+
+    def certification(self) -> str:
+        """Whether the controller certified the candidate the run ended on (section 3).
+
+        The final round's, when the run ended on it; unknown when the run went on
+        past its record, or may have.
+        """
+        if self.went_on() is not False:
+            return CERTIFICATION_UNKNOWN
+        return self.reviews[-1].certification
+
     def missing_launches(self) -> tuple[str, ...]:
         """The launches a complete record of this run holds and its own does not.
 
         Which launches the run made is the controller's record, not the launch list:
         the controller spends one launch ordinal (``launch_seq``) in the save before
         every launch, a relaunch and a failed attempt included, so the run made one
-        launch for each ordinal of its range. A record without that range has no
-        evidence of what it should hold, and one without a launch of an ordinal of the
-        range lost a launch, whatever phase and round the others cover. It also holds
-        an ANALYZE_EXECUTE launch, a REVIEW launch of each round and a FIX launch of
-        each fix. A record short of any of these is incomplete, so no sum over its
-        launches is the run's.
+        launch for each ordinal from the first it spent to the last. The state's
+        ``launch_seq`` gives only the last; the first is 1 when the controller
+        created the run for the case's issue, which then held ``launch_seq`` 0, and
+        unknown otherwise, so a record that cannot show the run's creation is
+        incomplete whatever its launches cover. So is one whose end is not a stop
+        the evaluation ended the run at. One without a launch of an ordinal of the
+        window lost a launch, whatever phase and round the others cover, a leading
+        or a trailing one included. It also holds an ANALYZE_EXECUTE launch, a REVIEW
+        launch of each round and a FIX launch of each fix. A record short of any of
+        these is incomplete, so no sum over its launches is the run's.
         """
         missing: list[str] = []
-        if self.launch_ordinals is None:
-            missing.append("the controller's record of its launch ordinals")
+        ordinals = sorted(launch.ordinal for launch in self.launches)
+        w = self.launch_window
+        if w is None:
+            missing.append("the controller's record of its launch window")
         else:
-            first, last = self.launch_ordinals
+            if w.start != "run_created":
+                missing.append(
+                    "the controller's record of where its launches start: no record shows "
+                    "it created the run for this case"
+                )
+            if w.last is None:
+                missing.append(
+                    "the controller's record of where its launches end: the run was not "
+                    "found at a stop the evaluation ended it at"
+                )
+            first = 1 if w.start == "run_created" else (ordinals[0] if ordinals else 1)
+            last = w.last if w.last is not None else (ordinals[-1] if ordinals else 0)
             expected = first
-            for ordinal in [*sorted(launch.ordinal for launch in self.launches), last + 1]:
+            for ordinal in [*ordinals, last + 1]:
                 if ordinal - 1 == expected:
                     missing.append(f"the launch of ordinal {expected}")
                 elif ordinal > expected:
@@ -415,7 +532,24 @@ class Evaluation:
     digests: Mapping[str, str]
 
 
+def _registered_names(p: Mapping, key: str, expected: Sequence[str]) -> None:
+    """The registered vocabulary ``key`` the scorer's code reads by name, exactly."""
+    if p[key] != list(expected):
+        raise ReviewEvaluationError(
+            f"preregistration {key} must be {list(expected)}: the scorer reads these names"
+        )
+
+
 def check_preregistration(prereg: object) -> dict:
+    """The preregistration, every value the scorer reads present, typed and in range.
+
+    The decision's criteria are all required: the primary and its effect, a margin
+    for every metric of section 6 but the primary and for the cost per validated
+    success, each in its registered direction, the hard gate, the minimum sample,
+    the excluded share and the label-uncertainty limit. A file without one is
+    refused, never read as a criterion waived: only an amendment changes them, and
+    it changes them by registering other values, never by leaving one out.
+    """
     p = _obj(
         prereg,
         "preregistration",
@@ -444,19 +578,34 @@ def check_preregistration(prereg: object) -> dict:
     )
     if p["schema"] != PREREGISTRATION_SCHEMA:
         raise ReviewEvaluationError(f"preregistration schema must be {PREREGISTRATION_SCHEMA!r}")
-    if tuple(p["label_verdicts"]) != ("confirmed", "false", "unknown"):
-        raise ReviewEvaluationError(
-            "preregistration label_verdicts must be confirmed/false/unknown"
-        )
+    _registered_names(p, "label_verdicts", ("confirmed", "false", "unknown"))
+    _registered_names(p, "fix_verdicts", ("harmful", "not_harmful", "unknown"))
+    _registered_names(p, "evidence_kinds", ("oracle", "adjudication"))
+    _registered_names(p, "usage_provenance", ("measured", "estimated", "synthetic", "unknown"))
+    _registered_names(p, "run_provenance", ("fixture", "real"))
     weights = p["severity_weights"]
-    if not isinstance(weights, dict) or not weights:
-        raise ReviewEvaluationError("preregistration severity_weights must be an object")
+    if not isinstance(weights, dict) or "critical" not in weights:
+        raise ReviewEvaluationError(
+            "preregistration severity_weights must be an object weighing `critical`, the "
+            "severity the hard gate reads"
+        )
     for severity, weight in weights.items():
         _int(weight, f"preregistration severity_weights.{severity}", 1)
+    for key in (
+        "success_blocking_severities",
+        "defect_classes",
+        "discovered_by",
+        "adjudicator_roles",
+        "refused_adjudicator_roles",
+        "refused_label_fields",
+    ):
+        if not _names(p[key], f"preregistration {key}"):
+            raise ReviewEvaluationError(f"preregistration {key} must name at least one entry")
     if not set(p["success_blocking_severities"]) <= set(weights):
         raise ReviewEvaluationError("a success-blocking severity is not a registered severity")
     if set(p["adjudicator_roles"]) & set(p["refused_adjudicator_roles"]):
         raise ReviewEvaluationError("an adjudicator role is both allowed and refused")
+    _bounded(p["max_label_uncertainty"], "preregistration max_label_uncertainty", 0, 1)
     u = _obj(
         p["uncertainty"],
         "preregistration uncertainty",
@@ -468,19 +617,48 @@ def check_preregistration(prereg: object) -> dict:
     _int(u["seed"], "preregistration uncertainty.seed")
     if not isinstance(u["confidence"], float) or not 0 < u["confidence"] < 1:
         raise ReviewEvaluationError("preregistration uncertainty.confidence must be in (0, 1)")
+    minimum = _obj(
+        p["minimum_sample"],
+        "preregistration minimum_sample",
+        ("defect_cases", "clean_negative_cases"),
+    )
+    _int(minimum["defect_cases"], "preregistration minimum_sample.defect_cases", 1)
+    _int(minimum["clean_negative_cases"], "preregistration minimum_sample.clean_negative_cases", 1)
     d = _obj(
         p["decision"],
         "preregistration decision",
         ("primary", "margins", "hard_gates", "max_excluded_case_share"),
     )
     primary = _obj(d["primary"], "preregistration decision.primary", ("metric", "min_difference"))
-    _one_of(primary["metric"], RATE_METRICS, "preregistration decision.primary.metric")
-    for metric, margin in d["margins"].items():
-        _one_of(metric, (*RATE_METRICS, "cost_per_validated_success"), "a margin's metric")
-        _obj(margin, f"preregistration margin {metric}", ("direction", "margin"))
-        _one_of(margin["direction"], ("higher_is_better", "lower_is_better"), f"{metric} direction")
+    metric = _one_of(primary["metric"], RATE_METRICS, "preregistration decision.primary.metric")
+    if CRITERION_DIRECTIONS[metric] != "higher_is_better":
+        raise ReviewEvaluationError(
+            f"preregistration decision.primary.metric {metric!r} is lower-is-better: the "
+            "primary is a rise of a metric that is better higher"
+        )
+    _bounded(
+        primary["min_difference"],
+        "preregistration decision.primary.min_difference",
+        0,
+        1,
+        low_open=True,
+    )
+    required = [m for m in (*RATE_METRICS, "cost_per_validated_success") if m != metric]
+    margins = _obj(d["margins"], "preregistration decision.margins", required)
+    for name in required:
+        margin = _obj(margins[name], f"preregistration margin {name}", ("direction", "margin"))
+        if margin["direction"] != CRITERION_DIRECTIONS[name]:
+            raise ReviewEvaluationError(
+                f"preregistration margin {name} must be {CRITERION_DIRECTIONS[name]}, "
+                f"not {margin['direction']!r}"
+            )
+        high = math.inf if name == "cost_per_validated_success" else 1
+        _bounded(margin["margin"], f"preregistration margin {name}.margin", 0, high)
     if d["hard_gates"] != ["no_new_escaped_critical_defect"]:
         raise ReviewEvaluationError("preregistration hard_gates is not one this scorer has")
+    _bounded(d["max_excluded_case_share"], "preregistration decision.max_excluded_case_share", 0, 1)
+    if not isinstance(p["baseline"], dict):
+        raise ReviewEvaluationError("preregistration baseline must be an object")
     return p
 
 
@@ -619,6 +797,40 @@ def _defects(
     return out
 
 
+def _check_ground_truth(
+    where: str, commits: Mapping[str, Commit], defects: Mapping[str, Defect]
+) -> None:
+    """Every fix of a defect follows its introduction, and every oracle pass is consistent.
+
+    A defect's ``fixed_at`` and a run commit's ``fixes`` each name a commit that fixes
+    it: one that strictly descends from the commit it was introduced at and whose parent
+    still holds it. A fix at or before the introduction, on another line, or after an
+    earlier fix of the same line would leave the defect nowhere, its introduction
+    included, and so erase the failure its oracle must show there. An oracle's
+    ``passes_at`` names commits that do not hold the defect: one that does, the
+    introduction included, contradicts it.
+    """
+    for d in defects.values():
+        for name in _fixed_at(commits, d):
+            parent = commits[name].parent
+            if name == d.introduced_at or d.introduced_at not in _ancestors(commits, name):
+                raise ReviewEvaluationError(
+                    f"{where}: {name!r} is said to fix {d.id} and does not descend from "
+                    f"{d.introduced_at!r}, where it was introduced"
+                )
+            if parent is None or not _present(commits, d, parent):
+                raise ReviewEvaluationError(
+                    f"{where}: {name!r} is said to fix {d.id}, which its parent {parent!r} "
+                    "does not hold: an earlier commit of its line fixed it"
+                )
+        for name in d.passes_at:
+            if _present(commits, d, name):
+                raise ReviewEvaluationError(
+                    f"{where}: {d.id}'s oracle is said to pass at {name!r}, which holds it, "
+                    "so it would both fail and pass there"
+                )
+
+
 def _oracles(raw: object, where: str) -> dict[str, str]:
     if not isinstance(raw, dict):
         raise ReviewEvaluationError(f"{where} must be an object of name: source")
@@ -659,6 +871,7 @@ def check_corpus(corpus: object, prereg: Mapping) -> tuple[dict[str, Case], date
         defects = _defects(
             k["defects"], f"case {cid!r} defects", prereg, commits, after_base, oracles, cutoff
         )
+        _check_ground_truth(at, commits, defects)
         if kind == "clean_negative" and defects:
             raise ReviewEvaluationError(
                 f"{at} is a clean negative with defects: it is a defect case, and only an "
@@ -685,19 +898,29 @@ def check_corpus(corpus: object, prereg: Mapping) -> tuple[dict[str, Case], date
 
 
 def _controller(
-    raw: object, at: str, result: ReviewResult, sha: str
-) -> tuple[str, str, bool | None]:
-    """The controller's record of a round: (disposition, validation, validated at it).
+    raw: object, at: str, result: ReviewResult, rnd: int, sha: str
+) -> tuple[str, str, bool | None, str]:
+    """The controller's record of a round: (disposition, validation, validated at it,
+    certificate).
 
     It is read from the controller's state, never from the reply, and has to agree
-    with what the controller does: it records ``clean`` only for a clean reply and
-    ``needs_fix`` only for one that needs a fix, refuses a clean result over a
-    validation record that is not ``PASS`` (ADR 0006 D9.4), and presents a round the
-    validation of its own candidate (D5.5).
+    with what the controller does. It records ``clean`` only for a clean reply and
+    ``needs_fix`` only for one that needs a fix. It records the round before it
+    issues the round's certificate, so a ``clean`` round over a failed validation,
+    or over a binding of another round or candidate, is one it blocked on with no
+    certificate (ADR 0006 D12.2), and is kept. It issues a certificate only for a
+    ``clean`` round presented its own candidate's validation, every record ``PASS``
+    or the set deliberately empty (D9.4, D5.5, D12.2), and a certificate names the
+    round and the revision it was issued for: an issued one is held to both.
     """
-    c = _obj(raw, at, ("disposition", "validation", "validated_sha"))
+    c = _obj(
+        raw,
+        at,
+        ("disposition", "validation", "validated_sha", "certificate", "certified_as"),
+    )
     disposition = _one_of(c["disposition"], DISPOSITIONS, f"{at}.disposition")
     validation = _one_of(c["validation"], VALIDATION_OUTCOMES, f"{at}.validation")
+    certificate = _one_of(c["certificate"], CERTIFICATE_RECORDS, f"{at}.certificate")
     at_candidate: bool | None = None
     if validation == "unrecorded":
         if c["validated_sha"] is not None:
@@ -708,24 +931,36 @@ def _controller(
         raise ReviewEvaluationError(f"{at} is clean over a reply that needs a fix")
     if disposition == "needs_fix" and not result.needs_fix_round:
         raise ReviewEvaluationError(f"{at} needs a fix over a clean reply")
-    if disposition == "clean" and validation == "failed":
+    if certificate != "issued":
+        if c["certified_as"] is not None:
+            raise ReviewEvaluationError(f"{at} records no issued certificate and names one")
+        return disposition, validation, at_candidate, certificate
+    if disposition != "clean" or validation not in ("passed", "empty_set") or not at_candidate:
         raise ReviewEvaluationError(
-            f"{at} is clean over a failed validation: the controller refuses a clean result "
-            "over a record that is not PASS (ADR 0006 D9.4)"
+            f"{at} records a certificate issued over a round the controller certifies "
+            "nothing for: it issues one only for a clean round presented its own "
+            "candidate's validation, every record PASS or the set empty (ADR 0006 D12.2)"
         )
-    if disposition == "clean" and at_candidate is False:
+    issued = _obj(c["certified_as"], f"{at}.certified_as", ("review_round", "reviewed_head_sha"))
+    bound = (
+        _int(issued["review_round"], f"{at}.certified_as.review_round", 1),
+        _sha(issued["reviewed_head_sha"], f"{at}.certified_as.reviewed_head_sha"),
+    )
+    if bound != (rnd, sha):
         raise ReviewEvaluationError(
-            f"{at} is clean over another candidate's validation: the controller presents a "
-            "round the validation of its own candidate (ADR 0006 D5.5)"
+            f"{at} records a certificate of round {bound[0]} at {bound[1]}, not of round "
+            f"{rnd} at the revision it reviewed: a certificate certifies only the round and "
+            "revision it was issued for, and the controller keeps an earlier round's when it "
+            "issues none, so this round's is not_issued"
         )
-    return disposition, validation, at_candidate
+    return disposition, validation, at_candidate, certificate
 
 
 def _review(
     raw: object,
     at: str,
     commits: Mapping[str, Commit],
-) -> tuple[int, str, ReviewResult, tuple[str, str, bool | None]]:
+) -> tuple[int, str, ReviewResult, tuple[str, str, bool | None, str]]:
     r = _obj(raw, at, ("round", "commit", "controller", "result"))
     rnd = _int(r["round"], f"{at}.round", 1)
     commit = r["commit"]
@@ -748,7 +983,7 @@ def _review(
         raise ReviewEvaluationError(f"{at}.result is of round {result.round}, not {rnd}")
     if result.reviewed_head_sha != commits[commit].sha:
         raise ReviewEvaluationError(f"{at}.result reviewed another HEAD than commit {commit!r}")
-    controller = _controller(r["controller"], f"{at}.controller", result, commits[commit].sha)
+    controller = _controller(r["controller"], f"{at}.controller", result, rnd, commits[commit].sha)
     return rnd, commit, result, controller
 
 
@@ -849,7 +1084,7 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
             "fixes",
             "labels",
             "launches",
-            "launch_ordinals",
+            "launch_window",
         ),
         ("stopped", "excluded"),
     )
@@ -877,6 +1112,7 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
         for did in made.fixes:
             if did not in defects:
                 raise ReviewEvaluationError(f"{at} commit {made.name!r} fixes no defect {did!r}")
+    _check_ground_truth(at, commits, defects)
     labels = _labels(r["labels"], f"{at} labels", prereg, cutoff)
 
     if not isinstance(r["reviews"], list) or not r["reviews"]:
@@ -898,7 +1134,9 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
     expected_commit = case.candidate
     for i, item in enumerate(r["reviews"]):
         where = f"{at} review[{i}]"
-        rnd, commit, result, (disposition, validation, at_candidate) = _review(item, where, commits)
+        rnd, commit, result, (disposition, validation, at_candidate, certificate) = _review(
+            item, where, commits
+        )
         if rnd != i + 1:
             raise ReviewEvaluationError(f"{where} is round {rnd}; rounds run 1, 2, ... in order")
         if commit != expected_commit:
@@ -938,6 +1176,7 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
             disposition=disposition,
             validation=validation,
             validated_at_candidate=at_candidate,
+            certificate=certificate,
             findings=tuple(findings),
         )
         reviews.append(review)
@@ -1034,11 +1273,24 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
                 f"{at} launch[{i}] is a {launch.phase} launch of round {launch.round}, "
                 "a round the run does not have"
             )
-    launch_ordinals: tuple[int, int] | None = None
-    if r["launch_ordinals"] is not None:
-        o = _obj(r["launch_ordinals"], f"{at}.launch_ordinals", ("first", "last"))
-        first = _int(o["first"], f"{at}.launch_ordinals.first", 1)
-        launch_ordinals = (first, _int(o["last"], f"{at}.launch_ordinals.last", first))
+    window: LaunchWindow | None = None
+    if r["launch_window"] is not None:
+        w = _obj(r["launch_window"], f"{at}.launch_window", ("start", "end", "last"))
+        end = _one_of(w["end"], WINDOW_ENDS, f"{at}.launch_window.end")
+        if end == "unrecorded":
+            if w["last"] is not None:
+                raise ReviewEvaluationError(
+                    f"{at}.launch_window records no end and names a last ordinal: the "
+                    "state's launch_seq is the run's last ordinal only at its end"
+                )
+            last_ordinal = None
+        else:
+            last_ordinal = _int(w["last"], f"{at}.launch_window.last")
+        window = LaunchWindow(
+            start=_one_of(w["start"], WINDOW_STARTS, f"{at}.launch_window.start"),
+            end=end,
+            last=last_ordinal,
+        )
     spent: dict[int, int] = {}
     for i, launch in enumerate(launches):
         if launch.ordinal in spent:
@@ -1047,10 +1299,10 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
                 f"{launch.ordinal}: the controller spends each ordinal on one launch"
             )
         spent[launch.ordinal] = i
-        if launch_ordinals and not launch_ordinals[0] <= launch.ordinal <= launch_ordinals[1]:
+        if window and window.last is not None and launch.ordinal > window.last:
             raise ReviewEvaluationError(
-                f"{at} launch[{i}] names ordinal {launch.ordinal}, outside the ordinals "
-                f"{launch_ordinals[0]} to {launch_ordinals[1]} the controller spent on the run"
+                f"{at} launch[{i}] names ordinal {launch.ordinal}, past the last ordinal "
+                f"{window.last} the controller spent on the run"
             )
     run = Run(
         id=rid,
@@ -1062,11 +1314,21 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
         reviews=tuple(reviews),
         fixes=tuple(fixes),
         launches=launches,
-        launch_ordinals=launch_ordinals,
+        launch_window=window,
         stopped=stopped,
         excluded=excluded,
         oracles=oracles,
     )
+    if (
+        window is not None
+        and window.end == "READY_FOR_MERGE"
+        and run.went_on() is False
+        and ending == NOT_CERTIFIED
+    ):
+        raise ReviewEvaluationError(
+            f"{at} ended at READY_FOR_MERGE on a round the controller certified nothing "
+            "for: it enters READY_FOR_MERGE only over the completed round's certificate"
+        )
     for review in run.reviews:
         for finding in review.findings:
             if finding.defect is not None and not run.present(
@@ -1178,41 +1440,101 @@ def tree_at(commits: Mapping[str, Commit], name: str) -> dict[str, str]:
     return files
 
 
-def build_shas(commits: Mapping[str, Commit], date: str, label: str, root: Path) -> dict[str, str]:
-    """The SHA each commit builds to, made in ``root`` at the fixed ``date``."""
+@dataclass(frozen=True)
+class Built:
+    """The commits of one line built in ``repo``: what each built to, and how faithfully."""
+
+    repo: Path
+    object_format: str
+    shas: Mapping[str, str]
+    # The commits whose tree is not byte for byte the files that built them, each with
+    # the paths that differ: a file git ignored or normalized, or one it added.
+    unfaithful: Mapping[str, tuple[str, ...]]
+
+
+def _blob_id(data: bytes) -> str:
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _tree_blobs(repo: Path, date: str, sha: str) -> dict[str, str]:
+    """``path: blob id`` of every entry of ``sha``'s tree; a non-file entry reads as its mode."""
+    entries: dict[str, str] = {}
+    for record in _git(repo, date, "ls-tree", "-r", "-z", "--full-tree", sha).split("\0"):
+        if not record:
+            continue
+        meta, _, path = record.partition("\t")
+        mode, kind, oid = meta.split(" ")
+        entries[path] = oid if (mode, kind) == ("100644", "blob") else f"{mode} {kind}"
+    return entries
+
+
+def build(commits: Mapping[str, Commit], date: str, label: str, root: Path) -> Built:
+    """Every commit of ``commits`` made in ``root`` at the fixed ``date``.
+
+    Each commit's tree is then held to the files that built it, byte for byte: git
+    leaves out an ignored file and may rewrite a file's bytes as an attribute says,
+    and the pinned SHA is of what git committed, never of the files.
+    """
     repo = root / "repo"
     repo.mkdir()
     _git(repo, date, "init", "-q")
     built: dict[str, str] = {}
+    unfaithful: dict[str, tuple[str, ...]] = {}
     for commit in commits.values():
         if commit.parent is None:
             _git(repo, date, "checkout", "-q", "--orphan", f"line-{len(built)}")
         else:
             _git(repo, date, "checkout", "-q", "--detach", built[commit.parent])
         _git(repo, date, "rm", "-rq", "--ignore-unmatch", ".")
-        for relpath, text in tree_at(commits, commit.name).items():
+        files = tree_at(commits, commit.name)
+        for relpath, text in files.items():
             path = repo / relpath
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8", newline="\n")
         _git(repo, date, "add", "-A")
         _git(repo, date, "commit", "-q", "--allow-empty", "-m", f"{label}: {commit.name}")
-        built[commit.name] = _git(repo, date, "rev-parse", "HEAD")
-    return built
+        sha = _git(repo, date, "rev-parse", "HEAD")
+        built[commit.name] = sha
+        wanted = {path: _blob_id(text.encode("utf-8")) for path, text in files.items()}
+        held = _tree_blobs(repo, date, sha)
+        differ = sorted(p for p in wanted.keys() | held.keys() if wanted.get(p) != held.get(p))
+        if differ:
+            unfaithful[commit.name] = tuple(differ)
+    return Built(
+        repo=repo,
+        object_format=read_object_format(execute, str(repo)),
+        shas=built,
+        unfaithful=unfaithful,
+    )
 
 
-def run_oracle(source: str, files: Mapping[str, str], root: Path) -> str:
+def oracle_at(source: str, built: Built, name: str, root: Path) -> str:
+    """:func:`run_oracle` on the tree of the commit ``name`` built to, and nothing else.
+
+    The tree is the controller's byte-exact export (ADR 0006 D6.2, D6.3): every blob
+    of exactly that commit written as its committed bytes, the directory proven to
+    hash back to the commit's tree before the oracle runs. So the oracle reads what
+    the SHA names: two inputs that build the same commit give it the same bytes,
+    whatever files built it.
+    """
+    try:
+        with materialize(
+            execute, str(built.repo), built.shas[name], built.object_format, prefix="review-tree-"
+        ) as tree:
+            return run_oracle(source, tree.root, root)
+    except AutoForgeError as exc:
+        return f"error: the tree of {name!r} was not materialized: {exc}"
+
+
+def run_oracle(source: str, tree: Path, root: Path) -> str:
     """``pass``, ``fail`` (an ``AssertionError``) or ``error: <last line>``.
 
-    ``source`` and ``files`` are executed as the caller: ``python -I`` and the
-    locale-only environment keep the host's variables, user site and working
-    directory out, and nothing here confines what the code reads, writes or
-    connects to. Run only what the caller trusts (:func:`registered_inputs`).
+    ``source`` runs in the directory ``tree``, which it imports from, as the caller:
+    ``python -I`` and the locale-only environment keep the host's variables, user
+    site and working directory out, and nothing here confines what the code reads,
+    writes or connects to. Run only what the caller trusts (:func:`registered_inputs`).
+    ``verify`` gives it a commit's tree (:func:`oracle_at`).
     """
-    tree = Path(tempfile.mkdtemp(prefix="tree-", dir=root))
-    for relpath, text in files.items():
-        path = tree / relpath
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
     script_dir = Path(tempfile.mkdtemp(prefix="oracle-", dir=root))
     script = script_dir / "oracle.py"
     script.write_text("import sys\nsys.path.insert(0, sys.argv[1])\n" + source, encoding="utf-8")
@@ -1242,16 +1564,32 @@ def _expectations(
     commits: Mapping[str, Commit],
     decided: Iterable[str],
 ) -> list[tuple[str, str, str]]:
+    """(defect, commit, pass|fail) wherever ``defects``' ground truth decides an oracle.
+
+    It fails where the defect was introduced and at every ``decided`` commit that
+    holds it, and passes at every commit that fixes it, every other its evidence
+    names and every ``decided`` commit of its line that does not hold it. A commit
+    given both is a contradiction, refused rather than settled either way: the
+    failure at the introduction is what shows the defect at all.
+    """
     out: list[tuple[str, str, str]] = []
     for d in defects:
         if d.oracle is None:
             continue
-        expected: dict[str, str] = {d.introduced_at: "fail"}
+        expected: dict[str, str] = {}
+
+        def expect(name: str, outcome: str, d: Defect = d, expected: dict = expected) -> None:
+            if expected.setdefault(name, outcome) != outcome:
+                raise ReviewEvaluationError(
+                    f"{owner}: {d.id}'s oracle is expected to both fail and pass at {name!r}"
+                )
+
+        expect(d.introduced_at, "fail")
         for name in (*d.passes_at, *_fixed_at(commits, d)):
-            expected[name] = "pass"
+            expect(name, "pass")
         for name in sorted(decided):
             if d.introduced_at in _ancestors(commits, name):
-                expected[name] = "fail" if _present(commits, d, name) else "pass"
+                expect(name, "fail" if _present(commits, d, name) else "pass")
         for name, outcome in expected.items():
             if outcome == "pass" and _present(commits, d, name):
                 raise ReviewEvaluationError(
@@ -1274,37 +1612,46 @@ def oracle_expectations(run: Run) -> list[tuple[str, str, str]]:
     return _expectations(f"run {run.id!r}", run.defects.values(), run.commits, reviewed)
 
 
-def _pins(owner: str, commits: Mapping[str, Commit], built: Mapping[str, str]) -> list[str]:
-    return [
-        f"{owner}: commit {name!r} is pinned at {commit.sha} and builds as {built[name]}"
-        for name, commit in commits.items()
-        if built[name] != commit.sha
-    ]
+def _pins(owner: str, commits: Mapping[str, Commit], built: Built) -> list[str]:
+    problems: list[str] = []
+    for name, commit in commits.items():
+        if built.shas[name] != commit.sha:
+            problems.append(
+                f"{owner}: commit {name!r} is pinned at {commit.sha} and builds as "
+                f"{built.shas[name]}"
+            )
+        if name in built.unfaithful:
+            problems.append(
+                f"{owner}: commit {name!r}'s tree is not the files that built it, at "
+                f"{list(built.unfaithful[name])}: git left out or rewrote what the files hold"
+            )
+    return problems
 
 
 def verify(ev: Evaluation, root: Path, *, oracles: bool) -> list[str]:
     """Replay every case of the corpus, then every run, under ``root``; the problems found.
 
     Each case is replayed on its own, whether or not a run holds it: its commits are
-    held to their pins and its oracles run at its commits. A run adds what only it
-    holds: its own commits and the oracles at them. An empty list of runs still
-    replays the whole corpus. Building a commit runs nothing the files hold; with
-    ``oracles`` false no oracle runs either, so only the pins are replayed. The
-    caller passes ``oracles`` true only for inputs it trusts (:func:`run_oracle`).
+    held to their pins and their trees to the files that built them, and its oracles
+    run at its commits. A run adds what only it holds: its own commits and the oracles
+    at them. An empty list of runs still replays the whole corpus. Every oracle reads
+    the tree of the commit it runs at (:func:`oracle_at`), never the files. Building a
+    commit runs nothing the files hold; with ``oracles`` false no oracle runs either,
+    so only the pins are replayed. The caller passes ``oracles`` true only for inputs
+    it trusts (:func:`run_oracle`).
     """
     problems: list[str] = []
     for index, case in enumerate(ev.cases.values()):
         where = Path(tempfile.mkdtemp(prefix=f"case-{index}-", dir=root))
         owner = f"case {case.id!r}"
-        problems += _pins(
-            owner, case.commits, build_shas(case.commits, ev.commit_date, case.id, where)
-        )
+        built = build(case.commits, ev.commit_date, case.id, where)
+        problems += _pins(owner, case.commits, built)
         expectations = case_oracle_expectations(case)
         if not oracles:
             continue
         for did, name, outcome in expectations:
             source = case.oracles[str(case.defects[did].oracle)]
-            got = run_oracle(source, tree_at(case.commits, name), where)
+            got = oracle_at(source, built, name, where)
             if got != outcome:
                 problems.append(
                     f"{owner}: {did}'s oracle should {outcome} at {name!r} and gave {got}"
@@ -1319,13 +1666,11 @@ def verify(ev: Evaluation, root: Path, *, oracles: bool) -> list[str]:
         if not own and not expectations:
             continue
         where = Path(tempfile.mkdtemp(prefix=f"run-{index}-", dir=root))
-        if own:
-            problems += _pins(
-                owner, own, build_shas(run.commits, ev.commit_date, run.case.id, where)
-            )
+        built = build(run.commits, ev.commit_date, run.case.id, where)
+        problems += _pins(owner, own, built)
         for did, name, outcome in expectations:
             source = run.oracles[str(run.defects[did].oracle)]
-            got = run_oracle(source, tree_at(run.commits, name), where)
+            got = oracle_at(source, built, name, where)
             if got != outcome:
                 problems.append(
                     f"{owner}: {did}'s oracle should {outcome} at {name!r} and gave {got}"
@@ -1363,10 +1708,11 @@ class RunScore:
     harmful: int
     not_harmful: int
     harm_unknown: int
-    # Whether the controller would certify the final round's candidate.
+    # Whether the controller certified the candidate the run ended on.
     certification: str
     # Registered defects at the final round's candidate when it is certified, and when
-    # its certification is unknown.
+    # its certification is unknown (no record of its certificate, or a run that went on
+    # past its record).
     escaped: tuple[tuple[str, str], ...]
     possible_escapes: tuple[tuple[str, str], ...]
     success: bool | None
@@ -1477,7 +1823,7 @@ def score_run(run: Run, prereg: Mapping) -> RunScore:
     fix_verdicts = [fix.verdict for fix in run.fixes if fix.commit is not None]
     final = run.reviews[-1]
     at_final = tuple(sorted((d.id, d.severity) for d in registered if run.present(d, final.commit)))
-    certification = final.certification
+    certification = run.certification()
     blocking = set(prereg["success_blocking_severities"])
     return RunScore(
         run=run,
@@ -1503,11 +1849,12 @@ def score_run(run: Run, prereg: Mapping) -> RunScore:
     )
 
 
-def _ratio(num: float, den: float) -> float | None:
-    return num / den if den else None
+def _ratio(num: int, den: int) -> Fraction | None:
+    """``num / den`` exactly, or ``None`` over an empty denominator."""
+    return Fraction(num, den) if den else None
 
 
-def _duplicate_upper(scores: Sequence[RunScore]) -> float | None:
+def _duplicate_upper(scores: Sequence[RunScore]) -> Fraction | None:
     """The highest duplicate ratio any settlement of the unknown labels allows.
 
     A settlement is one the check accepts: an unknown finding becomes ``false``, or
@@ -1525,18 +1872,19 @@ def _duplicate_upper(scores: Sequence[RunScore]) -> float | None:
     dup = sum(x.duplicates + x.unknown_beside_confirmed for x in scores)
     confirmed = sum(x.confirmed + x.unknown_beside_confirmed for x in scores)
     for k in sorted((k for x in scores for k in x.unknown_groups), reverse=True):
-        if confirmed and (k - 1) / k <= dup / confirmed:
+        if confirmed and Fraction(k - 1, k) <= Fraction(dup, confirmed):
             break
         dup, confirmed = dup + k - 1, confirmed + k
     if confirmed == 0 and any(x.unknown_confirmable for x in scores):
-        return 0.0  # a single unknown finding confirmed alone: no duplicate of one finding
+        return Fraction(0)  # a single unknown finding confirmed alone: no duplicate of one
     return _ratio(dup, confirmed)
 
 
 def _bands(
     scores: Sequence[RunScore],
-) -> dict[str, tuple[float | None, float | None, float | None]]:
-    """Each rate metric's (point, lower, upper): the bounds put every unknown label each way."""
+) -> dict[str, tuple[Fraction | None, Fraction | None, Fraction | None]]:
+    """Each rate metric's (point, lower, upper), exactly: the bounds put every unknown
+    label each way."""
     s = {
         key: sum(getattr(x, key) for x in scores)
         for key in (
@@ -1589,31 +1937,36 @@ def _bands(
     }
 
 
-def _terms(scores: Sequence[RunScore], metric: str) -> tuple[list[float], list[float]]:
+def _terms(scores: Sequence[RunScore], metric: str) -> tuple[list[int], list[int]]:
     """Each run's numerator and denominator of ``metric``'s point estimate, in order."""
-    pick: dict[str, Callable[[RunScore], tuple[float, float]]] = {
+    pick: dict[str, Callable[[RunScore], tuple[int, int]]] = {
         "weighted_recall": lambda x: (x.recall_hit, x.recall_weight),
         "precision": lambda x: (x.confirmed, x.confirmed + x.false),
         "clean_negative_fpr": lambda x: (
-            float(x.cn_outcome == "false_positive"),
-            float(x.cn_outcome in ("false_positive", "true_negative")),
+            int(x.cn_outcome == "false_positive"),
+            int(x.cn_outcome in ("false_positive", "true_negative")),
         ),
         "harmful_fix_rate": lambda x: (x.harmful, x.harmful + x.not_harmful),
         "duplicate_ratio": lambda x: (x.duplicates, x.confirmed),
     }
     pairs = [pick[metric](x) for x in scores]
-    return [float(n) for n, _ in pairs], [float(d) for _, d in pairs]
+    return [n for n, _ in pairs], [d for _, d in pairs]
 
 
 def _resampled(
-    terms: tuple[list[float], list[float]], indices: list[list[int]]
-) -> list[float | None]:
-    """The pooled point estimate on every resample: ``None`` where its denominator is empty."""
+    terms: tuple[list[int], list[int]], indices: list[list[int]], *, exactly: bool = False
+) -> list:
+    """The pooled point estimate on every resample: ``None`` where its denominator is empty.
+
+    A float for a report's interval, which is shown rounded; with ``exactly``, the
+    :class:`~fractions.Fraction` a decision compares with its registered threshold.
+    """
     nums, dens = terms
-    out: list[float | None] = []
+    out: list = []
     for sample in indices:
         den = sum(map(dens.__getitem__, sample))
-        out.append(sum(map(nums.__getitem__, sample)) / den if den else None)
+        num = sum(map(nums.__getitem__, sample))
+        out.append(None if not den else Fraction(num, den) if exactly else num / den)
     return out
 
 
@@ -1624,7 +1977,7 @@ def bootstrap_indices(n: int, prereg: Mapping) -> list[list[int]]:
     return [[rng.randrange(n) for _ in range(n)] for _ in range(u["resamples"])]
 
 
-def percentile_interval(values: list[float], confidence: float) -> tuple[float, float] | None:
+def percentile_interval(values: list, confidence: float) -> tuple | None:
     """Nearest-rank percentile interval of ``values``, or ``None`` with none to rank.
 
     Each end is the value of one-based rank ``ceil(p * n)`` among the ``n`` ordered
@@ -1642,8 +1995,22 @@ def percentile_interval(values: list[float], confidence: float) -> tuple[float, 
     return ordered[low - 1], ordered[high - 1]
 
 
-def _rounded(value: float | None) -> float | None:
-    return None if value is None else round(value, 6)
+def _rounded(value: float | Fraction | None) -> float | None:
+    """A value as a report shows it: six decimals. No decision reads a rounded value."""
+    return None if value is None else round(float(value), 6)
+
+
+def exact_sum(scores: Sequence[RunScore], attr: str) -> Fraction:
+    """The sum of ``attr`` over the launches that recorded it, as the decimals written."""
+    return sum(
+        (
+            exact(v)
+            for x in scores
+            for launch in x.run.launches
+            if (v := getattr(launch, attr)) is not None
+        ),
+        Fraction(0),
+    )
 
 
 def _usage(scores: Sequence[RunScore], attr: str) -> dict:
@@ -1655,7 +2022,7 @@ def _usage(scores: Sequence[RunScore], attr: str) -> dict:
     """
     values = [getattr(launch, attr) for x in scores for launch in x.run.launches]
     provenances = {launch.provenance for x in scores for launch in x.run.launches}
-    known = sum((v for v in values if v is not None), 0.0)
+    known = exact_sum(scores, attr)
     incomplete = sorted(x.run.id for x in scores if x.run.missing_launches())
     why = ""
     if not values:
@@ -1677,22 +2044,33 @@ def _usage(scores: Sequence[RunScore], attr: str) -> dict:
     return {"value": _rounded(known), "provenance": "measured"}
 
 
-def arm_metrics(scores: Sequence[RunScore], prereg: Mapping, indices: list[list[int]]) -> dict:
+def arm_metrics(
+    scores: Sequence[RunScore], prereg: Mapping, indices: list[list[int]] | None
+) -> dict:
+    """An arm's metrics as a report shows them, every status decided exactly.
+
+    With ``indices`` ``None`` no interval is computed: what a decision reads of an
+    arm's own metrics is their status and provenance, never an interval or a
+    rounded value.
+    """
     limit = prereg["max_label_uncertainty"]
     confidence = prereg["uncertainty"]["confidence"]
     bands = _bands(scores)
     metrics: dict[str, dict] = {}
     for metric in RATE_METRICS:
         point, lower, upper = bands[metric]
-        resampled = _resampled(_terms(scores, metric), indices)
-        values = [v for v in resampled if v is not None]
-        dropped = len(resampled) - len(values)
-        interval = percentile_interval(values, confidence)
+        interval = None
+        dropped = None
+        if indices is not None:
+            resampled = _resampled(_terms(scores, metric), indices)
+            values = [v for v in resampled if v is not None]
+            dropped = len(resampled) - len(values)
+            interval = percentile_interval(values, confidence)
         status = "known"
         why = ""
         if point is None:
             status, why = "unknown", "its denominator is empty"
-        elif lower is not None and upper is not None and upper - lower > limit:
+        elif lower is not None and upper is not None and upper - lower > exact(limit):
             status, why = "unknown", f"unknown labels leave a band wider than {limit}"
         metrics[metric] = {
             "value": _rounded(point),
@@ -1720,8 +2098,10 @@ def arm_metrics(scores: Sequence[RunScore], prereg: Mapping, indices: list[list[
         escapes.update(
             value=None,
             known_part=len(escaped),
-            why_unknown=f"the controller's record of the final round of run(s) {unrecorded} "
-            "is incomplete, so whether it would certify their candidates is unknown",
+            why_unknown=f"the controller's record does not settle the outcome of run(s) "
+            f"{unrecorded}: no record of the certificate of the round each ended on, or a "
+            "run that went on past its record, so whether a candidate was certified is "
+            "unknown",
         )
     successes = sum(1 for x in scores if x.success)
     open_successes = sorted(x.run.id for x in scores if x.success is None)
@@ -1731,7 +2111,7 @@ def arm_metrics(scores: Sequence[RunScore], prereg: Mapping, indices: list[list[
         per_success.update(
             value=None,
             why_unknown=f"whether run(s) {open_successes} are validated successes is unknown: "
-            "the controller's record of their final round is incomplete",
+            "the controller's record does not settle their outcome",
         )
     elif successes == 0:
         per_success.update(value=None, why_unknown="no validated success")
@@ -1740,7 +2120,7 @@ def arm_metrics(scores: Sequence[RunScore], prereg: Mapping, indices: list[list[
             value=None, why_unknown=f"the total cost is unknown: {cost['why_unknown']}"
         )
     else:
-        per_success.update(value=_rounded(cost["value"] / successes))
+        per_success.update(value=_rounded(exact_sum(scores, "cost_usd") / successes))
     metrics["escaped_critical_defects"] = escapes
     metrics["cost_per_validated_success"] = per_success
     metrics["total_cost_usd"] = cost
@@ -1767,9 +2147,7 @@ def _run_row(x: RunScore) -> dict:
         "profiles": [review_profile_name(review.round) for review in run.reviews],
         "fix_rounds": len(run.fixes),
         "fix_commits": sum(1 for fix in run.fixes if fix.commit is not None),
-        "ended": {CERTIFIED: "certified", NOT_CERTIFIED: "stopped"}.get(
-            x.certification, "unrecorded"
-        ),
+        "ended": {CERTIFIED: "certified", NOT_CERTIFIED: "stopped"}.get(x.certification, "unknown"),
         "stopped": run.stopped or None,
         "validated_success": x.success,
         "findings": {
@@ -1871,9 +2249,10 @@ def _paired(
     metric: str,
     indices: list[list[int]],
     confidence: float,
-) -> tuple[float, float] | None:
-    b = _resampled(_terms(base, metric), indices)
-    t = _resampled(_terms(treat, metric), indices)
+) -> tuple[Fraction, Fraction] | None:
+    """The paired interval of treatment minus baseline, its ends exact."""
+    b = _resampled(_terms(base, metric), indices, exactly=True)
+    t = _resampled(_terms(treat, metric), indices, exactly=True)
     values = [tv - bv for bv, tv in zip(b, t, strict=True) if bv is not None and tv is not None]
     return percentile_interval(values, confidence)
 
@@ -1887,16 +2266,25 @@ def _margin(
     indices: list[list[int]],
     confidence: float,
 ) -> tuple[str, str]:
-    """(harm, open): why ``metric`` is shown worse than its margin, or not shown within it."""
+    """(harm, open): why ``metric`` is shown worse than its margin, or not shown within it.
+
+    Every comparison is exact, on unrounded values: the cost per validated success
+    as the decimals the launches wrote over the count of successes, the margin as the
+    decimal registered, and a rate's interval ends as the ratios they are.
+    """
     b, t = metrics[0][metric], metrics[1][metric]
-    bound = margin["margin"]
+    bound = exact(margin["margin"])
     if metric == "cost_per_validated_success":
         if b["provenance"] != "measured" or t["provenance"] != "measured":
             return "", f"{metric} is not measured on both arms"
-        if b["value"] is None or t["value"] is None or b["value"] == 0:
+        if b["value"] is None or t["value"] is None:
             return "", f"{metric} has no relative change to judge"
-        if t["value"] > b["value"] * (1 + bound):
-            return f"{metric} rose past +{bound:.0%} of the baseline's", ""
+        before = exact_sum(base, "cost_usd") / b["validated_successes"]
+        after = exact_sum(treat, "cost_usd") / t["validated_successes"]
+        if before == 0:
+            return "", f"{metric} has no relative change to judge"
+        if after > before * (1 + bound):
+            return f"{metric} rose past +{margin['margin']:.0%} of the baseline's", ""
         return "", ""
     if "unknown" in (b["status"], t["status"]):
         return "", f"{metric} is unknown on an arm"
@@ -1908,10 +2296,17 @@ def _margin(
         interval if margin["direction"] == "higher_is_better" else (-interval[1], -interval[0])
     )
     if best < -bound:
-        return f"{metric}'s whole interval is worse than its margin {bound}", ""
+        return f"{metric}'s whole interval is worse than its margin {margin['margin']}", ""
     if worst < -bound:
-        return "", f"{metric}'s interval reaches past its margin {bound}"
+        return "", f"{metric}'s interval reaches past its margin {margin['margin']}"
     return "", ""
+
+
+def _point(scores: Sequence[RunScore], metric: str) -> Fraction:
+    """``metric``'s point estimate exactly, on an arm where it is known."""
+    point = _bands(scores)[metric][0]
+    assert point is not None
+    return point
 
 
 def escape_identity(run: Run, defect: str) -> tuple[str, str, str]:
@@ -1951,8 +2346,8 @@ def decide(ev: Evaluation, baseline: str, treatment: str) -> dict:
     confidence = prereg["uncertainty"]["confidence"]
 
     # Measured harm first: the gate reads every treatment run, paired or not. An
-    # escape is at a candidate the controller certified; where its record of the
-    # final round is incomplete, an escape is possible and decides nothing either way.
+    # escape is at a candidate the controller certified; where its record does not
+    # settle that, an escape is possible and decides nothing either way.
     harm: list[str] = []
     open_: list[str] = []
     for case_id, run in sorted(held[treatment].items()):
@@ -1989,10 +2384,10 @@ def decide(ev: Evaluation, baseline: str, treatment: str) -> dict:
                 continue
             open_.append(
                 f"critical defect {did} of run {run.id!r} may have escaped the treatment's "
-                "review: the controller's record of its final round is incomplete"
+                "review: the controller's record does not settle the run's outcome"
             )
     if paired:
-        metrics = (arm_metrics(base, prereg, indices), arm_metrics(treat, prereg, indices))
+        metrics = (arm_metrics(base, prereg, None), arm_metrics(treat, prereg, None))
         for metric, margin in rule["margins"].items():
             shown, left = _margin(metric, margin, base, treat, metrics, indices, confidence)
             if shown:
@@ -2026,12 +2421,13 @@ def decide(ev: Evaluation, baseline: str, treatment: str) -> dict:
         open_.append(f"{metric} is unknown on an arm")
     else:
         interval = _paired(base, treat, metric, indices, confidence)
-        if interval is not None and interval[1] < effect:
+        if interval is not None and interval[1] < exact(effect):
             return {
                 "decision": NO_GO,
                 "reasons": [f"{metric}'s interval lies wholly below +{effect}"],
             }
-        if interval is None or t["value"] - b["value"] < effect or interval[0] <= 0:
+        gain = _point(treat, metric) - _point(base, metric)
+        if interval is None or gain < exact(effect) or interval[0] <= 0:
             open_.append(f"{metric} does not show +{effect} with its interval above 0")
     if open_:
         return {"decision": INCONCLUSIVE, "reasons": open_}

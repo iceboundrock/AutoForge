@@ -300,8 +300,10 @@ read it before adding tests for a listed area.
   `docs/review-evaluation-protocol.md` (#355), which checks adjudicated labels of
   review findings and fixes against `tests/fixtures/review_evaluation/`, replays
   the corpus (its commits built at a fixed date with git's configuration and
-  transports off, each oracle in a `python -I` that sees only the locale), scores
-  it and decides between two arms. It launches no agent and holds no engine. An
+  transports off, each held to its pin and to the files that built it, each
+  oracle run on its commit's tree as `autoforge.materialize` exports it, in a
+  `python -I` that sees only the locale), scores it and decides between two arms
+  in exact arithmetic. It launches no agent and holds no engine. An
   oracle is code that runs as the caller, which `python -I` does not confine:
   `verify` runs only the registered files' oracles unless told `--trust-oracles`,
   and a test that replays changed files passes `oracles=True` for its own.

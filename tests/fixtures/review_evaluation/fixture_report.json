@@ -379,7 +379,7 @@
   "digests": {
     "corpus": "3e94841c82a0f4b6ed734915c4e002d29aefefd64bd2f44f475e5b1da4a5da63",
     "preregistration": "9245a89ce21d2a21a9571b0f6d34b49984e6349b14d4fd772f9e415521348cf0",
-    "runs": "e72aaf93851bb9f5f5ff82344681664fd41761d08f0b88db4d7e719d6119d0db"
+    "runs": "203b49dbfb350b690b2da955d07fa504b9c6e5ee10f38c937457d6878ceb23e6"
   },
   "not_evidence": "a fixture run is scripted: its numbers check the scorer and say nothing about any reviewer, model or configuration",
   "schema": "autoforge.review-evaluation.report/1"
