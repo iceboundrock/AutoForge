@@ -301,7 +301,10 @@ read it before adding tests for a listed area.
   review findings and fixes against `tests/fixtures/review_evaluation/`, replays
   the corpus (its commits built at a fixed date with git's configuration and
   transports off, each oracle in a `python -I` that sees only the locale), scores
-  it and decides between two arms. It launches no agent and holds no engine.
+  it and decides between two arms. It launches no agent and holds no engine. An
+  oracle is code that runs as the caller, which `python -I` does not confine:
+  `verify` runs only the registered files' oracles unless told `--trust-oracles`,
+  and a test that replays changed files passes `oracles=True` for its own.
   `tests/test_review_evaluation.py` holds it to the protocol; a change to a
   registered file moves a digest its section 13 records, and a change to
   `fixture_runs.json` or the scorer moves `fixture_report.json`, which

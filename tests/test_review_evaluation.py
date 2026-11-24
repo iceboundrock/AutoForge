@@ -14,6 +14,7 @@ import ast
 import copy
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PROTOCOL = REPO_ROOT / "docs" / "review-evaluation-protocol.md"
 ARM = "current_review"
 LABELED = "2026-11-24T12:00:00+00:00"
+LABELED_AT = datetime.fromisoformat(LABELED)
 AUTHOR = {"id": "review-fixture-author", "role": "fixture_author"}
 
 
@@ -82,7 +84,7 @@ def test_the_corpus_replays_as_pinned(tmp_path):
     """Every commit builds to its pinned SHA, and every oracle fails where the ground
     truth holds its defect and passes where it does not."""
     ev = rv.load()
-    assert rv.verify(ev, tmp_path) == []
+    assert rv.verify(ev, tmp_path, oracles=True) == []
     expectations = [e for run in ev.runs for e in rv.oracle_expectations(run)]
     assert ("B1", "fix-1", "fail") in expectations  # the escaped critical, at the clean HEAD
     assert ("C2", "fix-1", "fail") in expectations  # the harmful fix's regression
@@ -93,7 +95,7 @@ def test_the_corpus_replays_as_pinned(tmp_path):
 def test_a_commit_that_does_not_build_to_its_pin_is_reported(tmp_path):
     prereg, corpus, runs = _files()
     _case(corpus, "rename-slug-pattern")["commits"][1]["files"]["slug.py"] += "\n"
-    problems = rv.verify(rv.check(prereg, corpus, runs), tmp_path)
+    problems = rv.verify(rv.check(prereg, corpus, runs), tmp_path, oracles=True)
     assert len(problems) == 1
     assert "'candidate' is pinned at" in problems[0] and "builds as" in problems[0]
 
@@ -104,7 +106,7 @@ def test_an_oracle_that_does_not_show_its_defect_is_reported(tmp_path):
     prereg, corpus, runs = _files()
     candidate = _case(corpus, "page-count-partial-page")["commits"][1]["files"]
     candidate["pages.py"] = candidate["pages.py"].replace("total // size", "-(-total // size)")
-    problems = rv.verify(rv.check(prereg, corpus, runs), tmp_path)
+    problems = rv.verify(rv.check(prereg, corpus, runs), tmp_path, oracles=True)
     assert any("A1's oracle should fail at 'candidate' and gave pass" in p for p in problems)
 
 
@@ -113,7 +115,7 @@ def test_an_oracle_that_crashes_shows_no_defect(tmp_path):
     prereg, corpus, runs = _files()
     oracles = _case(corpus, "retry-attempt-bound")["oracles"]
     oracles["attempt_count"] = "from retry import no_such_name\n"
-    problems = rv.verify(rv.check(prereg, corpus, runs), tmp_path)
+    problems = rv.verify(rv.check(prereg, corpus, runs), tmp_path, oracles=True)
     assert any("gave error: ImportError" in p for p in problems)
 
 
@@ -131,13 +133,13 @@ def test_verify_replays_every_case_whether_or_not_a_run_holds_it(tmp_path):
     prereg, corpus, runs = _files()
     none = {"schema": runs["schema"], "runs": []}
     (tmp_path / "intact").mkdir()
-    assert rv.verify(rv.check(prereg, corpus, none), tmp_path / "intact") == []
+    assert rv.verify(rv.check(prereg, corpus, none), tmp_path / "intact", oracles=True) == []
 
     _case(corpus, "rename-slug-pattern")["commits"][1]["files"]["slug.py"] += "\n"
     candidate = _case(corpus, "page-count-partial-page")["commits"][1]["files"]
     candidate["pages.py"] = candidate["pages.py"].replace("total // size", "-(-total // size)")
     (tmp_path / "no-runs").mkdir()
-    problems = rv.verify(rv.check(prereg, corpus, none), tmp_path / "no-runs")
+    problems = rv.verify(rv.check(prereg, corpus, none), tmp_path / "no-runs", oracles=True)
     assert any(
         p.startswith("case 'rename-slug-pattern': commit 'candidate' is pinned at")
         for p in problems
@@ -153,12 +155,40 @@ def test_verify_replays_every_case_whether_or_not_a_run_holds_it(tmp_path):
         "from retry import no_such_name\n"
     )
     (tmp_path / "unrepresented").mkdir()
-    problems = rv.verify(rv.check(prereg, corpus, runs), tmp_path / "unrepresented")
+    problems = rv.verify(rv.check(prereg, corpus, runs), tmp_path / "unrepresented", oracles=True)
     assert problems
     assert all(
         p.startswith("case 'retry-attempt-bound': C1's oracle") and "gave error: ImportError" in p
         for p in problems
     )
+
+
+def test_verify_runs_the_oracles_of_trusted_inputs_alone(tmp_path, capsys):
+    """An oracle is code that runs as the caller, with the caller's files and network:
+    ``python -I`` keeps the host's variables out and confines nothing. ``verify`` runs the
+    oracles of the registered files, and another file's only when the caller trusts it;
+    ``--pins-only`` replays any file's pins and runs nothing it holds."""
+    assert rv.registered_inputs(rv.load())
+    _, corpus, runs = _files()
+    marker = tmp_path / "an-oracle-ran"
+    corpus["cases"] = [_case(corpus, "retry-attempt-bound")]
+    oracles = corpus["cases"][0]["oracles"]
+    oracles["attempt_count"] = f"open({str(marker)!r}, 'a').close()\n" + oracles["attempt_count"]
+    runs["runs"] = [_run(runs, "retry-attempt-bound")]
+    custom = ["--corpus", str(tmp_path / "corpus.json"), "--runs", str(tmp_path / "runs.json")]
+    (tmp_path / "corpus.json").write_text(json.dumps(corpus), encoding="utf-8")
+    (tmp_path / "runs.json").write_text(json.dumps(runs), encoding="utf-8")
+    assert not rv.registered_inputs(rv.load(rv.PREREGISTRATION, *map(Path, custom[1::2])))
+
+    assert rv.main([*custom, "verify"]) == 2
+    assert "--trust-oracles" in capsys.readouterr().err
+    assert not marker.exists()
+    assert rv.main([*custom, "verify", "--pins-only"]) == 0
+    assert "the pins alone, no oracle" in capsys.readouterr().out
+    assert not marker.exists()
+    assert rv.main([*custom, "verify", "--trust-oracles"]) == 0
+    assert "pins and oracles" in capsys.readouterr().out
+    assert marker.exists()
 
 
 # -- the fixture's scores -----------------------------------------------------------------
@@ -187,16 +217,17 @@ def test_the_fixture_scores_are_the_ones_the_protocol_states():
     assert m["clean_negative_fpr"]["label_bounds"] == [0.333333, 0.666667]
     assert m["harmful_fix_rate"]["value"] == 0.333333
     # A1 confirmed twice in one round: 1 duplicate of 5 confirmed. B's unknown finding sits
-    # beside B2 and could be a second report of it (2 of 6); every unknown confirmed of a
-    # defect its round names nowhere else gives 1 of 8.
+    # beside B2 and could be a second report of it (2 of 6), or the first of B1 (1 of 6);
+    # type-hint's are on a clean negative, where no label can confirm anything.
     assert m["duplicate_ratio"]["value"] == 0.2
-    assert m["duplicate_ratio"]["label_bounds"] == [0.125, 0.333333]
+    assert m["duplicate_ratio"]["label_bounds"] == [0.166667, 0.333333]
     for metric in ("weighted_recall", "precision", "clean_negative_fpr", "duplicate_ratio"):
         assert m[metric]["status"] == "unknown", metric
     assert m["harmful_fix_rate"]["status"] == "known"
     assert m["escaped_critical_defects"] == {
         "value": 1,
         "defects": [{"case": "redact-authorization-header", "defect": "B1", "belongs_to": "case"}],
+        "possible": [],
     }
     assert m["cost_per_validated_success"] == {
         "provenance": "synthetic",
@@ -216,6 +247,7 @@ def test_the_fixture_scores_are_the_ones_the_protocol_states():
     ]
     assert all(row["missing_launches"] == [] for row in rows.values())
     assert rows["type-hint-cache-key"]["ended"] == "stopped"
+    assert arm["loops"]["ended"] == {"certified": 5, "stopped": 1}
     assert arm["loops"]["rounds_by_profile"] == {"review_round_1": 6, "review_round_2_5": 5}
 
 
@@ -226,6 +258,19 @@ def test_every_interval_is_reproducible_from_its_registered_seed():
     other["uncertainty"]["seed"] += 1
     assert rv.bootstrap_indices(6, other) != rv.bootstrap_indices(6, prereg)
     assert len(rv.bootstrap_indices(6, prereg)) == prereg["uncertainty"]["resamples"]
+
+
+def test_an_interval_ends_at_nearest_rank_order_statistics():
+    """Each end is the value of one-based rank ``ceil(p * n)``: ranks 1 and 39 of 40 at
+    95%, not 40, which one more rank would give."""
+    ranked = [float(v) for v in range(1, 41)]
+    assert rv.percentile_interval(ranked, 0.95) == (1.0, 39.0)
+    assert rv.percentile_interval(ranked[::-1], 0.95) == (1.0, 39.0)
+    assert rv.percentile_interval([*ranked, 41.0], 0.95) == (2.0, 40.0)
+    assert rv.percentile_interval([float(v) for v in range(1, 21)], 0.9) == (1.0, 19.0)
+    assert rv.percentile_interval([float(v) for v in range(1, 10001)], 0.95) == (250.0, 9750.0)
+    assert rv.percentile_interval([3.0], 0.95) == (3.0, 3.0)
+    assert rv.percentile_interval([], 0.95) is None
 
 
 def test_a_late_defect_counts_only_once_an_amendment_moves_the_cutoff():
@@ -240,28 +285,88 @@ def test_a_late_defect_counts_only_once_an_amendment_moves_the_cutoff():
     assert after["cost_per_validated_success"]["validated_successes"] == 3
 
 
+def _more_unknowns(run: dict, round: int, count: int) -> None:
+    """``count`` more findings in ``round`` of ``run``, each a copy of its first and
+    labeled ``unknown``."""
+    review = run["reviews"][round - 1]
+    findings = review["result"]["findings"]
+    template = copy.deepcopy(findings[0])
+    for _ in range(count):
+        fid = f"R{round}-F{len(findings) + 1}"
+        findings.append({**copy.deepcopy(template), "id": fid})
+        run["labels"].append(
+            {
+                "finding": fid,
+                "round": round,
+                "candidate_sha": review["result"]["reviewed_head_sha"],
+                "verdict": "unknown",
+                "adjudicator": AUTHOR,
+                "labeled_at": LABELED,
+                "reason": "Not settled.",
+            }
+        )
+        for fix in run["fixes"]:
+            if fix["round"] == round:
+                fix["resolutions"][fid] = "no_change_with_rationale"
+
+
 def test_unknown_findings_that_could_be_duplicates_bound_the_duplicate_ratio():
     """A duplicate is a later confirmed finding of a round naming a defect an earlier one
     of that round names. An unknown finding could be one, or a first report of another
-    defect: the bounds put every unknown finding each way."""
+    defect, but only as the check would accept its label: confirmed of a registered defect
+    at its round's commit. The fixture's band is 1 of 6 (B's unknown finding the first
+    report of B1) to 2 of 6 (a second report of B2)."""
     prereg, corpus, runs = _files()
-    run = _run(runs, "type-hint-cache-key")
-    review = run["reviews"][0]
-    second = {**copy.deepcopy(review["result"]["findings"][0]), "id": "R1-F2"}
-    review["result"]["findings"].append(second)
-    run["labels"].append({**copy.deepcopy(_label(run, "R1-F1")), "finding": "R1-F2"})
-    run["fixes"][0]["resolutions"]["R1-F2"] = "no_change_with_rationale"
+    assert _metrics(prereg, corpus, runs)["duplicate_ratio"]["label_bounds"] == [
+        0.166667,
+        0.333333,
+    ]
+    # A clean-negative round holds no registered defect: two unknown findings there can
+    # be neither duplicates nor first reports, and leave the band where it was.
+    _more_unknowns(_run(runs, "type-hint-cache-key"), 1, 1)
     m = _metrics(prereg, corpus, runs)["duplicate_ratio"]
     assert m["value"] == 0.2  # 1 of 5: no unknown label counts in the point estimate
-    # Lower: the 4 unknown findings each a first report, 1 of 9. Upper: B's unknown finding
-    # a duplicate of B2 (2 of 6), then type-hint's two in round 1 one defect reported twice,
-    # which raises it (3 of 8); type-hint's lone finding in round 2 is put false.
-    assert m["label_bounds"] == [round(1 / 9, 6), 0.375]
+    assert m["label_bounds"] == [0.166667, 0.333333]
+    # Three unknown findings in a round whose only unnamed registered defect is B1: one of
+    # them at most is a first report (1 of 6), all three could restate B2 (4 of 8).
+    _more_unknowns(_run(runs, "redact-authorization-header"), 1, 2)
+    m = _metrics(prereg, corpus, runs)["duplicate_ratio"]
+    assert m["label_bounds"] == [0.166667, 0.5]
     assert m["status"] == "unknown"
     # Settling every unknown label removes the band.
     m = _metrics(prereg, corpus, {**runs, "runs": _resolve_unknowns(runs["runs"])})
     assert m["duplicate_ratio"]["label_bounds"] == [0.2, 0.2]
     assert m["duplicate_ratio"]["status"] == "known"
+
+
+def test_unknown_findings_bound_recall_one_registered_defect_each():
+    """An unknown finding could confirm one defect, a registered one present at its
+    round's commit: recall's upper bound is the heaviest set of undetected defects the
+    unknown findings could name, one each."""
+    prereg, corpus, runs = _files()
+    lab = _label(_run(runs, "redact-authorization-header"), "R1-F1")
+    lab.update(verdict="false", reason="Settled false for this test.")
+    del lab["defect"]
+    m = _metrics(prereg, corpus, runs)["weighted_recall"]
+    # A1, A2 and C1 detected (10 of 24). B's one unknown finding could name B1 (8) or B2
+    # (2), not both: 18 of 24, not 20.
+    assert m["value"] == round(10 / 24, 6)
+    assert m["label_bounds"] == [round(10 / 24, 6), 0.75]
+    _more_unknowns(_run(runs, "redact-authorization-header"), 1, 1)
+    assert _metrics(prereg, corpus, runs)["weighted_recall"]["label_bounds"] == [
+        round(10 / 24, 6),
+        round(20 / 24, 6),
+    ]
+    # Across rounds, a finding that could name either of two defects leaves the one only
+    # it could name to the other round's finding.
+    d1 = rv.Defect(
+        "D1", "critical", 8, "correctness", "c", (), LABELED_AT, "seeded", True, None, ()
+    )
+    d2 = rv.Defect("D2", "major", 4, "correctness", "c", (), LABELED_AT, "seeded", True, None, ())
+    rounds = [(1, frozenset({"D1", "D2"})), (1, frozenset({"D1"}))]
+    assert rv._nameable_weight(rounds, [d1, d2]) == 12
+    assert rv._nameable_weight([(1, frozenset({"D1", "D2"}))], [d1, d2]) == 8
+    assert rv._nameable_weight([(2, frozenset())], [d1, d2]) == 0
 
 
 # -- what is never a label ----------------------------------------------------------------
@@ -329,6 +434,7 @@ def test_the_scorer_holds_no_engine_github_client_or_provider():
         "autoforge.errors",
         "autoforge.executor",
         "autoforge.git_transport",
+        "autoforge.loop_guard",
         "autoforge.profiles",
         "autoforge.result_parser",
     }
@@ -409,6 +515,49 @@ def test_a_defect_is_one_the_change_introduced():
     _refused(prereg, corpus, runs, "no commit it may be introduced at")
 
 
+# A defect of rename-slug-pattern's candidate, discovered only after the cutoff.
+_LATE = {
+    "id": "E1",
+    "defect_class": "correctness",
+    "severity": "critical",
+    "location": "slug.py",
+    "introduced_at": "candidate",
+    "fixed_at": [],
+    "discovered_at": "2026-11-25T09:00:00+00:00",
+    "discovered_by": "post_merge",
+    "summary": "Found after the cutoff.",
+    "evidence": {"kind": "adjudication", "rationale": "Reported after the cutoff."},
+    "adjudicator": AUTHOR,
+}
+
+
+def test_a_defect_case_holds_a_registered_defect_at_its_candidate():
+    """A defect case counts toward the minimum sample because a review of its candidate has
+    a registered defect to find. One whose only defect was discovered after the cutoff, or
+    is confined to another commit, has none: it is refused, never counted."""
+    prereg, corpus, runs = _files()
+    _case(corpus, "rename-slug-pattern").update(kind="defect", defects=[copy.deepcopy(_LATE)])
+    _refused(prereg, corpus, runs, "no registered defect present at its candidate")
+    prereg, corpus, runs = _files()
+    (c1,) = _case(corpus, "retry-attempt-bound")["defects"]
+    c1.update(
+        introduced_at="reference",
+        fixed_at=[],
+        evidence={"kind": "adjudication", "rationale": "Only the reference holds it."},
+    )
+    _refused(prereg, corpus, runs, "no registered defect present at its candidate")
+    # 18 defect cases and 12 clean negatives are short of the minimum. Two clean negatives
+    # relabeled defect cases on a late defect add no defect to find, and are refused.
+    corpus, runs = _sample(6, 4)
+    decision = _decide(_real(runs, "baseline"), _real(_catching(runs), "treatment"), corpus)
+    assert decision["decision"] == rv.INCONCLUSIVE
+    assert any("pairs 18 defect case(s) and 12 clean" in r for r in decision["reasons"])
+    for cid in ("rename-slug-pattern~0", "rename-slug-pattern~1"):
+        _case(corpus, cid).update(kind="defect", defects=[copy.deepcopy(_LATE)])
+    with pytest.raises(rv.ReviewEvaluationError, match="no registered defect present at its"):
+        _decide(_real(runs, "baseline"), _real(_catching(runs), "treatment"), corpus)
+
+
 def test_a_harmful_fix_is_exactly_one_that_introduced_a_defect():
     prereg, corpus, runs = _files()
     _run(runs, "retry-attempt-bound")["fixes"][0]["label"]["verdict"] = "not_harmful"
@@ -433,9 +582,9 @@ def test_a_review_result_the_controller_would_refuse_is_refused():
     prereg, corpus, runs = _files()
     run = _run(runs, "page-count-partial-page")
     run["reviews"][1]["commit"] = "candidate"
-    run["reviews"][1]["result"]["reviewed_head_sha"] = run["reviews"][0]["result"][
-        "reviewed_head_sha"
-    ]
+    sha = run["reviews"][0]["result"]["reviewed_head_sha"]
+    run["reviews"][1]["result"]["reviewed_head_sha"] = sha
+    run["reviews"][1]["controller"]["validated_sha"] = sha
     _refused(prereg, corpus, runs, "the run's line says 'fix-1'")
 
 
@@ -470,6 +619,21 @@ def test_a_launch_is_bound_to_a_round_of_its_run():
     _refused(prereg, corpus, runs, "precedes every round")
 
 
+def test_a_launch_ordinal_is_spent_once_and_within_the_runs_range():
+    prereg, corpus, runs = _files()
+    _run(runs, "rename-slug-pattern")["launches"][1]["ordinal"] = 1
+    _refused(prereg, corpus, runs, "the controller spends each ordinal on one launch")
+    prereg, corpus, runs = _files()
+    _run(runs, "rename-slug-pattern")["launches"][1]["ordinal"] = 3
+    _refused(prereg, corpus, runs, "outside the ordinals 1 to 2 the controller spent")
+    prereg, corpus, runs = _files()
+    del _run(runs, "rename-slug-pattern")["launch_ordinals"]
+    _refused(prereg, corpus, runs, "is missing")
+    prereg, corpus, runs = _files()
+    del _run(runs, "rename-slug-pattern")["launches"][0]["ordinal"]
+    _refused(prereg, corpus, runs, "is missing")
+
+
 def test_a_planned_run_is_not_repeated():
     prereg, corpus, runs = _files()
     again = copy.deepcopy(_run(runs, "rename-slug-pattern"))
@@ -491,13 +655,16 @@ def test_an_unregistered_field_is_refused_wherever_it_appears():
 
 
 def _real(runs: list[dict], arm: str) -> list[dict]:
+    """The runs as one real arm's, every launch measured and numbered in the order listed."""
     out = copy.deepcopy(runs)
     for run in out:
         run["arm"] = arm
         run["id"] = f"{arm}/{run['case']}"
         run["provenance"] = "real"
-        for launch in run["launches"]:
+        for ordinal, launch in enumerate(run["launches"], 1):
             launch["provenance"] = "measured"
+            launch["ordinal"] = ordinal
+        run["launch_ordinals"] = {"first": 1, "last": len(run["launches"])}
     return out
 
 
@@ -542,6 +709,7 @@ def _catching(runs: list[dict]) -> list[dict]:
         if run["case"].startswith("retry-attempt-bound"):
             second = run["reviews"][1]
             second["result"]["needs_fix_round"] = True
+            second["controller"]["disposition"] = "needs_fix"
             second["result"]["findings"] = [
                 {
                     "id": "R2-F1",
@@ -589,6 +757,11 @@ def _catching(runs: list[dict]) -> list[dict]:
             third["result"].update(
                 round=3, reviewed_head_sha="2" * 40, needs_fix_round=False, findings=[]
             )
+            third["controller"] = {
+                "disposition": "clean",
+                "validation": "passed",
+                "validated_sha": "2" * 40,
+            }
             run["reviews"].append(third)
             run["launches"] += [
                 {**run["launches"][2], "round": 2},
@@ -720,6 +893,7 @@ def test_a_margin_worse_on_its_whole_interval_is_no_go():
         if run["case"].startswith("rename-slug-pattern"):
             review = run["reviews"][0]
             review["result"]["needs_fix_round"] = True
+            review["controller"]["disposition"] = "needs_fix"
             review["result"]["findings"] = [
                 {
                     "id": "R1-F1",
@@ -746,6 +920,7 @@ def test_a_margin_worse_on_its_whole_interval_is_no_go():
             second = copy.deepcopy(review)
             second.update(round=2)
             second["result"].update(round=2, needs_fix_round=False, findings=[])
+            second["controller"]["disposition"] = "clean"
             run["reviews"].append(second)
             review_launch = run["launches"][1]
             run["launches"] += [
@@ -815,21 +990,35 @@ def test_a_cost_no_launch_measured_rules_out_go():
     }
 
 
-# What one treatment run's launch record keeps, and what it then misses.
+# What one treatment run's launch record keeps, and what it then misses. Its launches
+# are ordinals 1 to 4 of the controller's: ANALYZE_EXECUTE, REVIEW 1, FIX 1, REVIEW 2.
 _GAPS = {
     "no launch at all": (
         lambda launch: False,
-        ["ANALYZE_EXECUTE", "REVIEW of round 1", "REVIEW of round 2", "FIX of round 1"],
+        [
+            "the launches of ordinals 1 to 4",
+            "ANALYZE_EXECUTE",
+            "REVIEW of round 1",
+            "REVIEW of round 2",
+            "FIX of round 1",
+        ],
     ),
     "no ANALYZE_EXECUTE launch": (
         lambda launch: launch["phase"] != "ANALYZE_EXECUTE",
-        ["ANALYZE_EXECUTE"],
+        ["the launch of ordinal 1", "ANALYZE_EXECUTE"],
     ),
     "no REVIEW launch of round 2": (
         lambda launch: (launch["phase"], launch.get("round")) != ("REVIEW", 2),
-        ["REVIEW of round 2"],
+        ["the launch of ordinal 4", "REVIEW of round 2"],
     ),
-    "no FIX launch": (lambda launch: launch["phase"] != "FIX", ["FIX of round 1"]),
+    "no FIX launch": (
+        lambda launch: launch["phase"] != "FIX",
+        ["the launch of ordinal 3", "FIX of round 1"],
+    ),
+    "no record of the controller's launch ordinals": (
+        None,
+        ["the controller's record of its launch ordinals"],
+    ),
 }
 
 
@@ -843,7 +1032,10 @@ def test_a_run_whose_launch_record_is_incomplete_has_no_measured_cost(gap):
     corpus, runs = _sample()
     treatment = _real(_catching(runs), "treatment")
     (short,) = [r for r in treatment if r["case"] == "page-count-partial-page~0"]
-    short["launches"] = [launch for launch in short["launches"] if kept(launch)]
+    if kept is None:
+        short["launch_ordinals"] = None
+    else:
+        short["launches"] = [launch for launch in short["launches"] if kept(launch)]
     p, _, r = _files()
     ev = rv.check(p, corpus, {"schema": r["schema"], "runs": _real(runs, "baseline") + treatment})
     assert rv.decide(ev, "baseline", "treatment") == {
@@ -860,6 +1052,43 @@ def test_a_run_whose_launch_record_is_incomplete_has_no_measured_cost(gap):
     assert arm["metrics"]["cost_per_validated_success"]["value"] is None
     (row,) = [row for row in arm["runs"] if row["run"] == short["id"]]
     assert row["missing_launches"] == missing
+
+
+def test_an_omitted_retry_leaves_the_cost_unknown():
+    """Which launches a run made is the controller's record, not its launch list: the
+    controller spends one launch ordinal before every launch, a failed attempt included.
+    A $200 REVIEW attempt that failed before round 1's breaks the cost margin. A record
+    that leaves only that attempt out still covers every phase and round, and is short of
+    ordinal 2: its cost is unknown, never the cheaper total."""
+    corpus, runs = _sample()
+    baseline = _real(runs, "baseline")
+    treatment = _real(_catching(runs), "treatment")
+    (retried,) = [r for r in treatment if r["case"] == "page-count-partial-page~0"]
+    retried["launches"].insert(1, {**retried["launches"][1], "cost_usd": 200.0})
+    for ordinal, launch in enumerate(retried["launches"], 1):
+        launch["ordinal"] = ordinal
+    retried["launch_ordinals"] = {"first": 1, "last": 5}
+    assert _decide(baseline, treatment, corpus) == {
+        "decision": rv.NO_GO,
+        "reasons": ["cost_per_validated_success rose past +50% of the baseline's"],
+    }
+    del retried["launches"][1]
+    assert {(launch["phase"], launch.get("round")) for launch in retried["launches"]} == {
+        ("ANALYZE_EXECUTE", None),
+        ("REVIEW", 1),
+        ("FIX", 1),
+        ("REVIEW", 2),
+    }
+    p, _, r = _files()
+    ev = rv.check(p, corpus, {"schema": r["schema"], "runs": baseline + treatment})
+    assert rv.decide(ev, "baseline", "treatment") == {
+        "decision": rv.INCONCLUSIVE,
+        "reasons": ["cost_per_validated_success is not measured on both arms"],
+    }
+    arm = rv.report(ev)["arms"]["treatment"]
+    (row,) = [row for row in arm["runs"] if row["run"] == retried["id"]]
+    assert row["missing_launches"] == ["the launch of ordinal 2"]
+    assert arm["metrics"]["total_cost_usd"]["value"] is None
 
 
 def _beside_a1(runs: list[dict], verdict: str, count: int = 1) -> list[dict]:
@@ -915,9 +1144,11 @@ def test_unknown_findings_that_could_be_duplicates_rule_out_go():
     }
     metrics = rv.report(ev)["arms"]["treatment"]["metrics"]
     assert metrics["precision"]["status"] == "known"
-    # 7 duplicates of 49 confirmed; 14 of 56 if all 7 restate A1, 7 of 56 if none does.
+    # 7 duplicates of 49 confirmed; 14 of 56 if all 7 restate A1. A1 and A2 are the only
+    # registered defects of that round and both are named, so an unknown finding there is
+    # a duplicate or false, never a first report: the lower bound stays 7 of 49.
     assert metrics["duplicate_ratio"]["value"] == round(7 / 49, 6)
-    assert metrics["duplicate_ratio"]["label_bounds"] == [0.125, 0.25]
+    assert metrics["duplicate_ratio"]["label_bounds"] == [round(7 / 49, 6), 0.25]
     # Three of them at every copy are enough to decide the margin: settled as reports of
     # A1 they break it on its whole interval, and unsettled they leave it open.
     settled = _beside_a1(_catching(runs), "confirmed", 3)
@@ -929,6 +1160,170 @@ def test_unknown_findings_that_could_be_duplicates_rule_out_go():
     decision = _decide(_real(runs, "baseline"), _real(open_, "treatment"), corpus)
     assert decision["decision"] == rv.INCONCLUSIVE
     assert "duplicate_ratio is unknown on an arm" in decision["reasons"]
+
+
+def _redact_final(mutate) -> tuple[dict, dict]:
+    """The fixture's metrics and redact run's row, its final round's controller record and
+    run changed by ``mutate(run, controller)``. As registered, B1 escapes there."""
+    prereg, corpus, runs = _files()
+    run = _run(runs, "redact-authorization-header")
+    mutate(run, run["reviews"][-1]["controller"])
+    report = rv.report(rv.check(prereg, corpus, runs))["arms"][ARM]
+    (row,) = [row for row in report["runs"] if row["case"] == run["case"]]
+    return report["metrics"], row
+
+
+_NOT_CERTIFIED = {
+    "the controller found the round stale": {"disposition": "stale"},
+    "a failed validation": {"disposition": "unrecorded", "validation": "failed"},
+    "another candidate's validation": {
+        "disposition": "unrecorded",
+        "validated_sha": "06398f9ea48e0f466fe9234deb58980a0d74752b",  # the round-1 candidate
+    },
+}
+
+
+@pytest.mark.parametrize("record", sorted(_NOT_CERTIFIED))
+def test_a_clean_reply_the_controller_would_not_certify_escapes_nothing(record):
+    """An escape is a registered defect at the candidate the controller would certify. B1
+    sits at the redact run's clean reply either way; over a stale round, a failed
+    validation or another candidate's, the controller certifies nothing, and nothing
+    escapes. The run did not end on a certificate, so it says why it stopped."""
+    change = _NOT_CERTIFIED[record]
+
+    def mutate(run, controller):
+        controller.update(change)
+        run["stopped"] = "BLOCKED before a certificate"
+
+    metrics, row = _redact_final(mutate)
+    assert metrics["escaped_critical_defects"] == {"value": 0, "defects": [], "possible": []}
+    assert (row["escaped"], row["possible_escapes"]) == ([], [])
+    assert (row["ended"], row["validated_success"]) == ("stopped", False)
+    assert row["claims"]["final_reply_clean"] is True
+    prereg, corpus, runs = _files()
+    _run(runs, "redact-authorization-header")["reviews"][-1]["controller"].update(change)
+    _refused(prereg, corpus, runs, "stopped must be a non-empty string")
+
+
+def test_a_clean_reply_over_a_missing_record_decides_no_escape():
+    """With the controller's disposition unrecorded, B1 may have escaped: the count is
+    unknown and never read as zero. A run whose success that record would decide leaves
+    the cost per validated success unknown too; the redact run is no success either way,
+    since B1 is critical."""
+    metrics, row = _redact_final(lambda run, c: c.update(disposition="unrecorded"))
+    escapes = metrics["escaped_critical_defects"]
+    assert (escapes["value"], escapes["known_part"], escapes["defects"]) == (None, 0, [])
+    assert escapes["possible"] == [
+        {"case": "redact-authorization-header", "defect": "B1", "belongs_to": "case"}
+    ]
+    assert "is incomplete" in escapes["why_unknown"]
+    assert (row["ended"], row["validated_success"], row["escaped"]) == ("unrecorded", False, [])
+    assert metrics["cost_per_validated_success"]["value"] == 3.666667
+    metrics, _ = _redact_final(lambda run, c: c.update(validation="unrecorded", validated_sha=None))
+    assert metrics["escaped_critical_defects"]["value"] is None
+
+    prereg, corpus, runs = _files()
+    _run(runs, "page-count-partial-page")["reviews"][-1]["controller"]["disposition"] = "unrecorded"
+    arm = rv.report(rv.check(prereg, corpus, runs))["arms"][ARM]
+    (row,) = [row for row in arm["runs"] if row["case"] == "page-count-partial-page"]
+    assert (row["ended"], row["validated_success"]) == ("unrecorded", None)
+    per_success = arm["metrics"]["cost_per_validated_success"]
+    assert per_success["value"] is None
+    assert per_success["validated_successes"] == 2
+    assert "is unknown" in per_success["why_unknown"]
+
+
+def test_a_deliberately_empty_validation_set_certifies_and_validates_nothing():
+    """No validation command configured is a set the controller presents, not missing
+    evidence: B1 escapes the certified candidate, and the run is no validated success."""
+    metrics, row = _redact_final(lambda run, c: c.update(validation="empty_set"))
+    assert metrics["escaped_critical_defects"]["value"] == 1
+    assert (row["ended"], row["validated_success"]) == ("certified", False)
+
+
+def test_the_controller_record_is_held_to_what_the_controller_does():
+    cases = [
+        ({"validation": "failed"}, "ADR 0006 D9.4"),
+        ({"validated_sha": "06398f9ea48e0f466fe9234deb58980a0d74752b"}, "ADR 0006 D5.5"),
+        ({"disposition": "needs_fix"}, "needs a fix over a clean reply"),
+        ({"validation": "unrecorded"}, "records no validation and names a validated SHA"),
+        ({"validated_sha": None}, "validated_sha must be a full"),
+        ({"disposition": "approved"}, "disposition must be one of"),
+    ]
+    for change, needle in cases:
+        prereg, corpus, runs = _files()
+        _run(runs, "redact-authorization-header")["reviews"][-1]["controller"].update(change)
+        _refused(prereg, corpus, runs, needle)
+    prereg, corpus, runs = _files()
+    _run(runs, "redact-authorization-header")["reviews"][0]["controller"]["disposition"] = "clean"
+    _refused(prereg, corpus, runs, "is clean over a reply that needs a fix")
+    prereg, corpus, runs = _files()
+    _run(runs, "page-count-partial-page")["reviews"][0]["controller"]["disposition"] = "stale"
+    _refused(prereg, corpus, runs, "a run's record ends at a stale round")
+
+
+def test_a_clean_reply_alone_cannot_trigger_the_hard_gate():
+    """The treatment confirms B1 and its fix leaves it in place, so B1 sits at the clean
+    reply of its last round, where the baseline fixed it. Certified, that is a new
+    critical escape and NO_GO, over the empty validation set too. Over a stale round the
+    controller certified nothing, so nothing escaped and the gate does not stand in the
+    way; over a record nobody found it decides nothing either way."""
+    corpus, runs = _sample()
+    caught = _catching(runs)
+    baseline = [
+        copy.deepcopy(c) if c["case"].startswith("redact") else copy.deepcopy(r)
+        for r, c in zip(runs, caught, strict=True)
+    ]
+
+    def treatment(change: dict, stopped: str = "") -> list[dict]:
+        out = copy.deepcopy(caught)
+        for run in out:
+            if run["case"].startswith("redact"):
+                run["commits"][0]["fixes"] = ["B2"]
+                run["reviews"][-1]["controller"].update(change)
+                if stopped:
+                    run["stopped"] = stopped
+        return _real(out, "treatment")
+
+    certified = _decide(_real(baseline, "baseline"), treatment({}), corpus)
+    assert certified["decision"] == rv.NO_GO
+    assert certified["reasons"] == [
+        f"critical defect B1 of case 'redact-authorization-header~{k}' escaped the "
+        "treatment's review"
+        for k in range(7)
+    ]
+    empty = _decide(_real(baseline, "baseline"), treatment({"validation": "empty_set"}), corpus)
+    assert empty == certified
+    stale = _decide(
+        _real(baseline, "baseline"), treatment({"disposition": "stale"}, "BLOCKED"), corpus
+    )
+    assert stale == {
+        "decision": rv.GO,
+        "reasons": ["weighted_recall rose by +0.1 or more and every bound held"],
+    }
+    unrecorded = _decide(
+        _real(baseline, "baseline"), treatment({"disposition": "unrecorded"}), corpus
+    )
+    assert unrecorded["decision"] == rv.INCONCLUSIVE
+    assert [r for r in unrecorded["reasons"] if "critical defect" in r] == [
+        f"critical defect B1 of run 'treatment/redact-authorization-header~{k}' may have "
+        "escaped the treatment's review: the controller's record of its final round is "
+        "incomplete"
+        for k in range(7)
+    ]
+    # A certified escape is new only when the baseline's run is known to have held it
+    # back: where the baseline's record is the incomplete one, it decides nothing either.
+    unknown_before = copy.deepcopy(runs)
+    for run in unknown_before:
+        if run["case"].startswith("redact"):
+            run["reviews"][-1]["controller"]["disposition"] = "unrecorded"
+    decision = _decide(_real(unknown_before, "baseline"), treatment({}), corpus)
+    assert [r for r in decision["reasons"] if "critical defect" in r] == [
+        f"critical defect B1 of case 'redact-authorization-header~{k}' escaped the "
+        "treatment's review, and whether it escaped the baseline's is unknown"
+        for k in range(7)
+    ]
+    assert decision["decision"] != rv.GO
 
 
 # -- the baseline the protocol captured ---------------------------------------------------

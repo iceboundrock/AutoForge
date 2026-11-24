@@ -27,7 +27,11 @@
         {
           "round": 1,
           "commit": "candidate",
-          "validation": "passed",
+          "controller": {
+            "disposition": "needs_fix",
+            "validation": "passed",
+            "validated_sha": "a8b89805dd452f8a330c5e1bd3f116dc2bfff97e"
+          },
           "result": {
             "phase": "REVIEW",
             "status": "success",
@@ -68,7 +72,11 @@
         {
           "round": 2,
           "commit": "fix-1",
-          "validation": "passed",
+          "controller": {
+            "disposition": "clean",
+            "validation": "passed",
+            "validated_sha": "6737721b7c05f350483b8403dbcdfd92a02a78cf"
+          },
           "result": {
             "phase": "REVIEW",
             "status": "success",
@@ -146,6 +154,7 @@
       "launches": [
         {
           "phase": "ANALYZE_EXECUTE",
+          "ordinal": 1,
           "cost_usd": 1.2,
           "wall_clock_seconds": 420,
           "context_tokens": null,
@@ -153,6 +162,7 @@
         },
         {
           "phase": "REVIEW",
+          "ordinal": 2,
           "cost_usd": 0.6,
           "wall_clock_seconds": 300,
           "context_tokens": null,
@@ -161,6 +171,7 @@
         },
         {
           "phase": "FIX",
+          "ordinal": 3,
           "cost_usd": 0.5,
           "wall_clock_seconds": 240,
           "context_tokens": null,
@@ -169,13 +180,18 @@
         },
         {
           "phase": "REVIEW",
+          "ordinal": 4,
           "cost_usd": 0.4,
           "wall_clock_seconds": 200,
           "context_tokens": null,
           "provenance": "synthetic",
           "round": 2
         }
-      ]
+      ],
+      "launch_ordinals": {
+        "first": 1,
+        "last": 4
+      }
     },
     {
       "id": "current_review/redact-authorization-header",
@@ -201,7 +217,11 @@
         {
           "round": 1,
           "commit": "candidate",
-          "validation": "passed",
+          "controller": {
+            "disposition": "needs_fix",
+            "validation": "passed",
+            "validated_sha": "06398f9ea48e0f466fe9234deb58980a0d74752b"
+          },
           "result": {
             "phase": "REVIEW",
             "status": "success",
@@ -242,7 +262,11 @@
         {
           "round": 2,
           "commit": "fix-1",
-          "validation": "passed",
+          "controller": {
+            "disposition": "clean",
+            "validation": "passed",
+            "validated_sha": "6d81b1a41cd7675912df07e8d43501e5976dc9a0"
+          },
           "result": {
             "phase": "REVIEW",
             "status": "success",
@@ -320,6 +344,7 @@
       "launches": [
         {
           "phase": "ANALYZE_EXECUTE",
+          "ordinal": 1,
           "cost_usd": 1.1,
           "wall_clock_seconds": 400,
           "context_tokens": null,
@@ -327,6 +352,7 @@
         },
         {
           "phase": "REVIEW",
+          "ordinal": 2,
           "cost_usd": 0.7,
           "wall_clock_seconds": 330,
           "context_tokens": null,
@@ -335,6 +361,7 @@
         },
         {
           "phase": "FIX",
+          "ordinal": 3,
           "cost_usd": 0.3,
           "wall_clock_seconds": 150,
           "context_tokens": null,
@@ -343,13 +370,18 @@
         },
         {
           "phase": "REVIEW",
+          "ordinal": 4,
           "cost_usd": 0.4,
           "wall_clock_seconds": 210,
           "context_tokens": null,
           "provenance": "synthetic",
           "round": 2
         }
-      ]
+      ],
+      "launch_ordinals": {
+        "first": 1,
+        "last": 4
+      }
     },
     {
       "id": "current_review/retry-attempt-bound",
@@ -401,7 +433,11 @@
         {
           "round": 1,
           "commit": "candidate",
-          "validation": "passed",
+          "controller": {
+            "disposition": "needs_fix",
+            "validation": "passed",
+            "validated_sha": "4e1e338478c0d7c7e3bebfdd7db88fb63d2a461e"
+          },
           "result": {
             "phase": "REVIEW",
             "status": "success",
@@ -428,7 +464,11 @@
         {
           "round": 2,
           "commit": "fix-1",
-          "validation": "passed",
+          "controller": {
+            "disposition": "clean",
+            "validation": "passed",
+            "validated_sha": "7004fd723813413029409f0e7babdcb5ff4e0d6d"
+          },
           "result": {
             "phase": "REVIEW",
             "status": "success",
@@ -480,6 +520,7 @@
       "launches": [
         {
           "phase": "ANALYZE_EXECUTE",
+          "ordinal": 1,
           "cost_usd": 0.9,
           "wall_clock_seconds": 380,
           "context_tokens": null,
@@ -487,6 +528,7 @@
         },
         {
           "phase": "REVIEW",
+          "ordinal": 2,
           "cost_usd": 0.5,
           "wall_clock_seconds": 260,
           "context_tokens": null,
@@ -495,6 +537,7 @@
         },
         {
           "phase": "FIX",
+          "ordinal": 3,
           "cost_usd": 0.4,
           "wall_clock_seconds": 200,
           "context_tokens": null,
@@ -503,13 +546,18 @@
         },
         {
           "phase": "REVIEW",
+          "ordinal": 4,
           "cost_usd": 0.45,
           "wall_clock_seconds": 230,
           "context_tokens": null,
           "provenance": "synthetic",
           "round": 2
         }
-      ]
+      ],
+      "launch_ordinals": {
+        "first": 1,
+        "last": 4
+      }
     },
     {
       "id": "current_review/rename-slug-pattern",
@@ -523,7 +571,11 @@
         {
           "round": 1,
           "commit": "candidate",
-          "validation": "passed",
+          "controller": {
+            "disposition": "clean",
+            "validation": "passed",
+            "validated_sha": "a13c2e5284c425fddd3b0bbf1f64083cfe09596f"
+          },
           "result": {
             "phase": "REVIEW",
             "status": "success",
@@ -545,6 +597,7 @@
       "launches": [
         {
           "phase": "ANALYZE_EXECUTE",
+          "ordinal": 1,
           "cost_usd": 0.5,
           "wall_clock_seconds": 200,
           "context_tokens": null,
@@ -552,13 +605,18 @@
         },
         {
           "phase": "REVIEW",
+          "ordinal": 2,
           "cost_usd": 0.3,
           "wall_clock_seconds": 150,
           "context_tokens": null,
           "provenance": "synthetic",
           "round": 1
         }
-      ]
+      ],
+      "launch_ordinals": {
+        "first": 1,
+        "last": 2
+      }
     },
     {
       "id": "current_review/document-empty-chunks",
@@ -572,7 +630,11 @@
         {
           "round": 1,
           "commit": "candidate",
-          "validation": "passed",
+          "controller": {
+            "disposition": "needs_fix",
+            "validation": "passed",
+            "validated_sha": "e2980bd0f844c3ea7f18a328f961c3664e50b4d0"
+          },
           "result": {
             "phase": "REVIEW",
             "status": "success",
@@ -599,7 +661,11 @@
         {
           "round": 2,
           "commit": "candidate",
-          "validation": "passed",
+          "controller": {
+            "disposition": "clean",
+            "validation": "passed",
+            "validated_sha": "e2980bd0f844c3ea7f18a328f961c3664e50b4d0"
+          },
           "result": {
             "phase": "REVIEW",
             "status": "success",
@@ -642,6 +708,7 @@
       "launches": [
         {
           "phase": "ANALYZE_EXECUTE",
+          "ordinal": 1,
           "cost_usd": 0.4,
           "wall_clock_seconds": 180,
           "context_tokens": null,
@@ -649,6 +716,7 @@
         },
         {
           "phase": "REVIEW",
+          "ordinal": 2,
           "cost_usd": 0.35,
           "wall_clock_seconds": 170,
           "context_tokens": null,
@@ -657,6 +725,7 @@
         },
         {
           "phase": "FIX",
+          "ordinal": 3,
           "cost_usd": 0.2,
           "wall_clock_seconds": 90,
           "context_tokens": null,
@@ -665,13 +734,18 @@
         },
         {
           "phase": "REVIEW",
+          "ordinal": 4,
           "cost_usd": 0.3,
           "wall_clock_seconds": 150,
           "context_tokens": null,
           "provenance": "synthetic",
           "round": 2
         }
-      ]
+      ],
+      "launch_ordinals": {
+        "first": 1,
+        "last": 4
+      }
     },
     {
       "id": "current_review/type-hint-cache-key",
@@ -685,7 +759,11 @@
         {
           "round": 1,
           "commit": "candidate",
-          "validation": "passed",
+          "controller": {
+            "disposition": "needs_fix",
+            "validation": "passed",
+            "validated_sha": "77e000ba809f09742bc32ee244f752188421eed6"
+          },
           "result": {
             "phase": "REVIEW",
             "status": "success",
@@ -712,7 +790,11 @@
         {
           "round": 2,
           "commit": "candidate",
-          "validation": "passed",
+          "controller": {
+            "disposition": "needs_fix",
+            "validation": "passed",
+            "validated_sha": "77e000ba809f09742bc32ee244f752188421eed6"
+          },
           "result": {
             "phase": "REVIEW",
             "status": "success",
@@ -776,6 +858,7 @@
       "launches": [
         {
           "phase": "ANALYZE_EXECUTE",
+          "ordinal": 1,
           "cost_usd": 0.45,
           "wall_clock_seconds": 190,
           "context_tokens": null,
@@ -783,6 +866,7 @@
         },
         {
           "phase": "REVIEW",
+          "ordinal": 2,
           "cost_usd": 0.4,
           "wall_clock_seconds": 200,
           "context_tokens": null,
@@ -791,6 +875,7 @@
         },
         {
           "phase": "FIX",
+          "ordinal": 3,
           "cost_usd": 0.25,
           "wall_clock_seconds": 100,
           "context_tokens": null,
@@ -799,13 +884,18 @@
         },
         {
           "phase": "REVIEW",
+          "ordinal": 4,
           "cost_usd": 0.4,
           "wall_clock_seconds": 190,
           "context_tokens": null,
           "provenance": "synthetic",
           "round": 2
         }
-      ]
+      ],
+      "launch_ordinals": {
+        "first": 1,
+        "last": 4
+      }
     }
   ]
 }

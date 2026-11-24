@@ -25,10 +25,21 @@ to what it builds, and runs every oracle where the ground truth says it must fai
 or pass), ``score`` prints the report, and ``decide`` applies the pre-registered
 decision to two arms.
 
-It launches no agent, reads no credential, contacts no network and writes to no
-GitHub. A label comes from an adjudicator's record or an oracle, never from what
-an agent said of its own work: the reviewer's classification, its prose and the
-fixer's resolution kinds are reported as claims and read by no metric.
+It launches no agent, reads no credential and writes to no GitHub, and git runs
+with every transport refused. An oracle is Python from the corpus or run file,
+run against the case's own code: ``verify`` runs it as the caller, with the
+caller's files and network, in a ``python -I`` that sees only the locale, which
+keeps the host's variables and packages out and enforces no boundary. So it
+runs the oracles of the registered files alone, the bytes of this checkout's
+``corpus.json`` and ``fixture_runs.json``, unless the caller passes
+``--trust-oracles``; ``--pins-only`` replays the pins of any files and runs
+nothing they hold.
+
+A label comes from an adjudicator's record or an oracle, never from what an
+agent said of its own work: the reviewer's classification, its prose, its clean
+reply and the fixer's resolution kinds are reported as claims and read by no
+metric. Which candidate the controller would certify is the controller's own
+record of the round, its disposition and the validation it presented.
 """
 
 from __future__ import annotations
@@ -44,11 +55,13 @@ import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from fractions import Fraction
 from pathlib import Path
 
 from autoforge.errors import AutoForgeError
 from autoforge.executor import select_environment
 from autoforge.git_transport import NO_AUTO_MAINTENANCE
+from autoforge.loop_guard import RESULTS
 from autoforge.profiles import review_profile_name
 from autoforge.result_parser import FIX_RESOLUTIONS, ReviewResult
 
@@ -64,7 +77,17 @@ RUNS_SCHEMA = "autoforge.review-evaluation.runs/1"
 REPORT_SCHEMA = "autoforge.review-evaluation.report/1"
 
 CASE_KINDS = ("defect", "clean_negative")
-VALIDATION_STATUSES = ("passed", "failed", "absent", "not_configured")
+# The controller's own record of a round, never the reviewer's reply: the result
+# ``review_history`` keeps for it, or ``unrecorded`` when no record of it was found.
+DISPOSITIONS = (*RESULTS, "unrecorded")
+# The validation set the controller presented to the round: every record PASS, the
+# deliberately empty set (no validation command configured), a record not PASS,
+# or ``unrecorded`` when no record of it was found.
+VALIDATION_OUTCOMES = ("passed", "empty_set", "failed", "unrecorded")
+# Whether the controller would certify a round's candidate (section 3).
+CERTIFIED = "certified"
+NOT_CERTIFIED = "not_certified"
+CERTIFICATION_UNKNOWN = "unknown"
 LAUNCH_PHASES = ("ANALYZE_EXECUTE", "REVIEW", "FIX", "REPLAN_REEXECUTE")
 # The metrics a margin or the primary may name, in the order a report shows them.
 RATE_METRICS = (
@@ -251,9 +274,36 @@ class Finding:
 class Review:
     round: int
     commit: str
+    # The reviewer's reply: a claim, read only through what the controller decided.
     clean: bool
+    disposition: str
     validation: str
+    # Whether the validation presented was the reviewed candidate's: None when no
+    # validation was recorded.
+    validated_at_candidate: bool | None
     findings: tuple[Finding, ...]
+
+    @property
+    def certification(self) -> str:
+        """Whether the controller would certify this round's candidate (section 3).
+
+        Certified: a clean reply the controller recorded ``clean``, over a validation
+        set it presented for this very candidate, every record ``PASS`` or the set
+        deliberately empty. A reply that needs a fix, a round the controller sent to a
+        fix or found stale, a failed validation and another candidate's validation each
+        rule a certificate out. Otherwise a missing record leaves it unknown: a clean
+        reply alone is never a certificate.
+        """
+        if (
+            not self.clean
+            or self.disposition in ("needs_fix", "stale")
+            or self.validation == "failed"
+            or self.validated_at_candidate is False
+        ):
+            return NOT_CERTIFIED
+        if "unrecorded" in (self.disposition, self.validation):
+            return CERTIFICATION_UNKNOWN
+        return CERTIFIED
 
 
 @dataclass(frozen=True)
@@ -268,6 +318,8 @@ class Fix:
 class Launch:
     phase: str
     round: int | None
+    # The controller's launch ordinal the launch spent (``launch_seq``).
+    ordinal: int
     cost_usd: float | None
     wall_clock_seconds: float | None
     context_tokens: float | None
@@ -305,6 +357,9 @@ class Run:
     reviews: tuple[Review, ...]
     fixes: tuple[Fix, ...]
     launches: tuple[Launch, ...]
+    # The first and last launch ordinal the controller spent on the run, read from its
+    # state file, not from the launches; None when that record was not found.
+    launch_ordinals: tuple[int, int] | None
     stopped: str
     excluded: str
     oracles: Mapping[str, str]
@@ -319,13 +374,29 @@ class Run:
     def missing_launches(self) -> tuple[str, ...]:
         """The launches a complete record of this run holds and its own does not.
 
-        A run made at least one ANALYZE_EXECUTE launch, one REVIEW launch for each of
-        its rounds and one FIX launch for each of its fixes. Failed attempts add
-        launches and are never missing; a record without one of these is incomplete,
-        so no sum over its launches is the run's.
+        Which launches the run made is the controller's record, not the launch list:
+        the controller spends one launch ordinal (``launch_seq``) in the save before
+        every launch, a relaunch and a failed attempt included, so the run made one
+        launch for each ordinal of its range. A record without that range has no
+        evidence of what it should hold, and one without a launch of an ordinal of the
+        range lost a launch, whatever phase and round the others cover. It also holds
+        an ANALYZE_EXECUTE launch, a REVIEW launch of each round and a FIX launch of
+        each fix. A record short of any of these is incomplete, so no sum over its
+        launches is the run's.
         """
-        held = {(launch.phase, launch.round) for launch in self.launches}
         missing: list[str] = []
+        if self.launch_ordinals is None:
+            missing.append("the controller's record of its launch ordinals")
+        else:
+            first, last = self.launch_ordinals
+            expected = first
+            for ordinal in [*sorted(launch.ordinal for launch in self.launches), last + 1]:
+                if ordinal - 1 == expected:
+                    missing.append(f"the launch of ordinal {expected}")
+                elif ordinal > expected:
+                    missing.append(f"the launches of ordinals {expected} to {ordinal - 1}")
+                expected = ordinal + 1
+        held = {(launch.phase, launch.round) for launch in self.launches}
         if not any(launch.phase == "ANALYZE_EXECUTE" for launch in self.launches):
             missing.append("ANALYZE_EXECUTE")
         missing += [
@@ -593,8 +664,15 @@ def check_corpus(corpus: object, prereg: Mapping) -> tuple[dict[str, Case], date
                 f"{at} is a clean negative with defects: it is a defect case, and only an "
                 "amendment moves it"
             )
-        if kind == "defect" and not defects:
-            raise ReviewEvaluationError(f"{at} is a defect case with no defect")
+        if kind == "defect" and not any(
+            d.registered and _present(commits, d, candidate) for d in defects.values()
+        ):
+            raise ReviewEvaluationError(
+                f"{at} is a defect case with no registered defect present at its candidate: "
+                "one discovered after the cutoff, or confined to another commit, gives a "
+                "review of the candidate nothing to find, so the case counts toward no "
+                "minimum and only an amendment moves it"
+            )
         cases[cid] = Case(
             id=cid,
             kind=kind,
@@ -606,17 +684,53 @@ def check_corpus(corpus: object, prereg: Mapping) -> tuple[dict[str, Case], date
     return cases, cutoff, commit_date
 
 
+def _controller(
+    raw: object, at: str, result: ReviewResult, sha: str
+) -> tuple[str, str, bool | None]:
+    """The controller's record of a round: (disposition, validation, validated at it).
+
+    It is read from the controller's state, never from the reply, and has to agree
+    with what the controller does: it records ``clean`` only for a clean reply and
+    ``needs_fix`` only for one that needs a fix, refuses a clean result over a
+    validation record that is not ``PASS`` (ADR 0006 D9.4), and presents a round the
+    validation of its own candidate (D5.5).
+    """
+    c = _obj(raw, at, ("disposition", "validation", "validated_sha"))
+    disposition = _one_of(c["disposition"], DISPOSITIONS, f"{at}.disposition")
+    validation = _one_of(c["validation"], VALIDATION_OUTCOMES, f"{at}.validation")
+    at_candidate: bool | None = None
+    if validation == "unrecorded":
+        if c["validated_sha"] is not None:
+            raise ReviewEvaluationError(f"{at} records no validation and names a validated SHA")
+    else:
+        at_candidate = _sha(c["validated_sha"], f"{at}.validated_sha") == sha
+    if disposition == "clean" and result.needs_fix_round:
+        raise ReviewEvaluationError(f"{at} is clean over a reply that needs a fix")
+    if disposition == "needs_fix" and not result.needs_fix_round:
+        raise ReviewEvaluationError(f"{at} needs a fix over a clean reply")
+    if disposition == "clean" and validation == "failed":
+        raise ReviewEvaluationError(
+            f"{at} is clean over a failed validation: the controller refuses a clean result "
+            "over a record that is not PASS (ADR 0006 D9.4)"
+        )
+    if disposition == "clean" and at_candidate is False:
+        raise ReviewEvaluationError(
+            f"{at} is clean over another candidate's validation: the controller presents a "
+            "round the validation of its own candidate (ADR 0006 D5.5)"
+        )
+    return disposition, validation, at_candidate
+
+
 def _review(
     raw: object,
     at: str,
     commits: Mapping[str, Commit],
-) -> tuple[int, str, ReviewResult, str]:
-    r = _obj(raw, at, ("round", "commit", "validation", "result"))
+) -> tuple[int, str, ReviewResult, tuple[str, str, bool | None]]:
+    r = _obj(raw, at, ("round", "commit", "controller", "result"))
     rnd = _int(r["round"], f"{at}.round", 1)
     commit = r["commit"]
     if commit not in commits or commits[commit].parent is None:
         raise ReviewEvaluationError(f"{at}.commit {commit!r} is no reviewable commit of this run")
-    validation = _one_of(r["validation"], VALIDATION_STATUSES, f"{at}.validation")
     payload = r["result"]
     if (
         not isinstance(payload, dict)
@@ -634,7 +748,8 @@ def _review(
         raise ReviewEvaluationError(f"{at}.result is of round {result.round}, not {rnd}")
     if result.reviewed_head_sha != commits[commit].sha:
         raise ReviewEvaluationError(f"{at}.result reviewed another HEAD than commit {commit!r}")
-    return rnd, commit, result, validation
+    controller = _controller(r["controller"], f"{at}.controller", result, commits[commit].sha)
+    return rnd, commit, result, controller
 
 
 def _labels(
@@ -691,7 +806,7 @@ def _launch(raw: object, at: str, prereg: Mapping, run_provenance: str) -> Launc
     lc = _obj(
         raw,
         at,
-        ("phase", "cost_usd", "wall_clock_seconds", "context_tokens", "provenance"),
+        ("phase", "ordinal", "cost_usd", "wall_clock_seconds", "context_tokens", "provenance"),
         ("round",),
     )
     provenance = _one_of(lc["provenance"], prereg["usage_provenance"], f"{at}.provenance")
@@ -710,6 +825,7 @@ def _launch(raw: object, at: str, prereg: Mapping, run_provenance: str) -> Launc
     return Launch(
         phase=phase,
         round=rnd,
+        ordinal=_int(lc["ordinal"], f"{at}.ordinal", 1),
         cost_usd=_number(lc["cost_usd"], f"{at}.cost_usd"),
         wall_clock_seconds=_number(lc["wall_clock_seconds"], f"{at}.wall_clock_seconds"),
         context_tokens=_number(lc["context_tokens"], f"{at}.context_tokens"),
@@ -733,6 +849,7 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
             "fixes",
             "labels",
             "launches",
+            "launch_ordinals",
         ),
         ("stopped", "excluded"),
     )
@@ -781,7 +898,7 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
     expected_commit = case.candidate
     for i, item in enumerate(r["reviews"]):
         where = f"{at} review[{i}]"
-        rnd, commit, result, validation = _review(item, where, commits)
+        rnd, commit, result, (disposition, validation, at_candidate) = _review(item, where, commits)
         if rnd != i + 1:
             raise ReviewEvaluationError(f"{where} is round {rnd}; rounds run 1, 2, ... in order")
         if commit != expected_commit:
@@ -818,12 +935,24 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
             round=rnd,
             commit=commit,
             clean=not result.needs_fix_round,
+            disposition=disposition,
             validation=validation,
+            validated_at_candidate=at_candidate,
             findings=tuple(findings),
         )
         reviews.append(review)
         last = i == len(r["reviews"]) - 1
         fix_raw = fixes_by_round.pop(rnd, None)
+        if disposition == "stale":
+            # The controller fixes no stale round and reviews the moved revision next,
+            # which no commit of a run record is: the record ends there.
+            if not last:
+                raise ReviewEvaluationError(
+                    f"{where} is stale: the controller reviews the moved revision next, "
+                    "which this record does not hold, so a run's record ends at a stale round"
+                )
+            if fix_raw is not None:
+                raise ReviewEvaluationError(f"{where} is stale, so no fix follows it")
         if review.clean:
             if not last:
                 raise ReviewEvaluationError(f"{where} is clean, so no round follows it")
@@ -875,9 +1004,12 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
     if unused:
         raise ReviewEvaluationError(f"{at} labels finding(s) no review raised: {unused}")
     stopped = r.get("stopped", "")
-    if reviews[-1].clean and stopped:
-        raise ReviewEvaluationError(f"{at} ended on a clean round and says it was stopped")
-    if not reviews[-1].clean:
+    ending = reviews[-1].certification
+    if ending == CERTIFIED and stopped:
+        raise ReviewEvaluationError(
+            f"{at} ended on a round the controller certified and says it was stopped"
+        )
+    if ending == NOT_CERTIFIED:
         _str(stopped, f"{at}.stopped")
     excluded = r.get("excluded", "")
     if excluded:
@@ -902,6 +1034,24 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
                 f"{at} launch[{i}] is a {launch.phase} launch of round {launch.round}, "
                 "a round the run does not have"
             )
+    launch_ordinals: tuple[int, int] | None = None
+    if r["launch_ordinals"] is not None:
+        o = _obj(r["launch_ordinals"], f"{at}.launch_ordinals", ("first", "last"))
+        first = _int(o["first"], f"{at}.launch_ordinals.first", 1)
+        launch_ordinals = (first, _int(o["last"], f"{at}.launch_ordinals.last", first))
+    spent: dict[int, int] = {}
+    for i, launch in enumerate(launches):
+        if launch.ordinal in spent:
+            raise ReviewEvaluationError(
+                f"{at} launch[{spent[launch.ordinal]}] and launch[{i}] name ordinal "
+                f"{launch.ordinal}: the controller spends each ordinal on one launch"
+            )
+        spent[launch.ordinal] = i
+        if launch_ordinals and not launch_ordinals[0] <= launch.ordinal <= launch_ordinals[1]:
+            raise ReviewEvaluationError(
+                f"{at} launch[{i}] names ordinal {launch.ordinal}, outside the ordinals "
+                f"{launch_ordinals[0]} to {launch_ordinals[1]} the controller spent on the run"
+            )
     run = Run(
         id=rid,
         arm=arm,
@@ -912,6 +1062,7 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
         reviews=tuple(reviews),
         fixes=tuple(fixes),
         launches=launches,
+        launch_ordinals=launch_ordinals,
         stopped=stopped,
         excluded=excluded,
         oracles=oracles,
@@ -963,18 +1114,29 @@ def check(prereg: object, corpus: object, runs: object) -> Evaluation:
 def load(
     preregistration: Path = PREREGISTRATION, corpus: Path = CORPUS, runs: Path = FIXTURE_RUNS
 ) -> Evaluation:
-    ev = check(read_json(preregistration), read_json(corpus), read_json(runs))
+    """The checked files, each digested from the very bytes that were checked."""
+    raw = {
+        name: path.read_bytes()
+        for name, path in (("preregistration", preregistration), ("corpus", corpus), ("runs", runs))
+    }
+    ev = check(*(json.loads(data.decode("utf-8")) for data in raw.values()))
     return Evaluation(
         preregistration=ev.preregistration,
         cases=ev.cases,
         runs=ev.runs,
         commit_date=ev.commit_date,
-        digests={
-            "preregistration": file_digest(preregistration),
-            "corpus": file_digest(corpus),
-            "runs": file_digest(runs),
-        },
+        digests={name: hashlib.sha256(data).hexdigest() for name, data in raw.items()},
     )
+
+
+def registered_inputs(ev: Evaluation) -> bool:
+    """Whether ``ev`` was loaded from the registered corpus and fixture runs.
+
+    Their oracles are code reviewed with this repository; another file's are not,
+    and ``verify`` runs those only when the caller says it trusts them.
+    """
+    registered = {"corpus": file_digest(CORPUS), "runs": file_digest(FIXTURE_RUNS)}
+    return all(ev.digests.get(name) == digest for name, digest in registered.items())
 
 
 # -- replay -------------------------------------------------------------------------------
@@ -1039,7 +1201,13 @@ def build_shas(commits: Mapping[str, Commit], date: str, label: str, root: Path)
 
 
 def run_oracle(source: str, files: Mapping[str, str], root: Path) -> str:
-    """``pass``, ``fail`` (an ``AssertionError``) or ``error: <last line>``, run isolated."""
+    """``pass``, ``fail`` (an ``AssertionError``) or ``error: <last line>``.
+
+    ``source`` and ``files`` are executed as the caller: ``python -I`` and the
+    locale-only environment keep the host's variables, user site and working
+    directory out, and nothing here confines what the code reads, writes or
+    connects to. Run only what the caller trusts (:func:`registered_inputs`).
+    """
     tree = Path(tempfile.mkdtemp(prefix="tree-", dir=root))
     for relpath, text in files.items():
         path = tree / relpath
@@ -1114,13 +1282,15 @@ def _pins(owner: str, commits: Mapping[str, Commit], built: Mapping[str, str]) -
     ]
 
 
-def verify(ev: Evaluation, root: Path) -> list[str]:
+def verify(ev: Evaluation, root: Path, *, oracles: bool) -> list[str]:
     """Replay every case of the corpus, then every run, under ``root``; the problems found.
 
     Each case is replayed on its own, whether or not a run holds it: its commits are
     held to their pins and its oracles run at its commits. A run adds what only it
     holds: its own commits and the oracles at them. An empty list of runs still
-    replays the whole corpus.
+    replays the whole corpus. Building a commit runs nothing the files hold; with
+    ``oracles`` false no oracle runs either, so only the pins are replayed. The
+    caller passes ``oracles`` true only for inputs it trusts (:func:`run_oracle`).
     """
     problems: list[str] = []
     for index, case in enumerate(ev.cases.values()):
@@ -1129,7 +1299,10 @@ def verify(ev: Evaluation, root: Path) -> list[str]:
         problems += _pins(
             owner, case.commits, build_shas(case.commits, ev.commit_date, case.id, where)
         )
-        for did, name, outcome in case_oracle_expectations(case):
+        expectations = case_oracle_expectations(case)
+        if not oracles:
+            continue
+        for did, name, outcome in expectations:
             source = case.oracles[str(case.defects[did].oracle)]
             got = run_oracle(source, tree_at(case.commits, name), where)
             if got != outcome:
@@ -1140,7 +1313,9 @@ def verify(ev: Evaluation, root: Path) -> list[str]:
         owner = f"run {run.id!r}"
         replayed = {(did, name) for did, name, _ in case_oracle_expectations(run.case)}
         own = {name: c for name, c in run.commits.items() if name not in run.case.commits}
-        expectations = [e for e in oracle_expectations(run) if (e[0], e[1]) not in replayed]
+        expectations = [
+            e for e in oracle_expectations(run) if oracles and (e[0], e[1]) not in replayed
+        ]
         if not own and not expectations:
             continue
         where = Path(tempfile.mkdtemp(prefix=f"run-{index}-", dir=root))
@@ -1175,15 +1350,73 @@ class RunScore:
     duplicates: int
     # Unknown findings of rounds with a confirmed one: each could be a duplicate.
     unknown_beside_confirmed: int
-    # The unknown findings of each round with two or more and no confirmed one: all but
-    # one of them could be duplicates of the first.
+    # The unknown findings of each round with two or more, no confirmed one and a
+    # registered defect at its commit: all but one could be duplicates of the first.
     unknown_groups: tuple[int, ...]
+    # Unknown findings that could each be the first report of a registered defect at
+    # their round's commit that no other finding of the round names.
+    unknown_first_reports: int
+    # Unknown findings of rounds whose commit holds a registered defect: the only ones
+    # a label the check accepts could confirm.
+    unknown_confirmable: int
     cn_outcome: str  # "", "true_negative", "false_positive", "unknown"
     harmful: int
     not_harmful: int
     harm_unknown: int
+    # Whether the controller would certify the final round's candidate.
+    certification: str
+    # Registered defects at the final round's candidate when it is certified, and when
+    # its certification is unknown.
     escaped: tuple[tuple[str, str], ...]
-    success: bool
+    possible_escapes: tuple[tuple[str, str], ...]
+    success: bool | None
+
+
+def _augment(
+    defect: str, rounds: Sequence[tuple[int, frozenset[str]]], taken: list[list[str]], seen: set
+) -> bool:
+    """Give ``defect`` an unknown finding of a round that could name it, moving others."""
+    for i, (capacity, names) in enumerate(rounds):
+        if defect not in names or i in seen:
+            continue
+        seen.add(i)
+        if len(taken[i]) < capacity:
+            taken[i].append(defect)
+            return True
+        for j, other in enumerate(taken[i]):
+            if _augment(other, rounds, taken, seen):
+                taken[i][j] = defect
+                return True
+    return False
+
+
+def _nameable_weight(
+    rounds: Sequence[tuple[int, frozenset[str]]], defects: Sequence[Defect]
+) -> int:
+    """The heaviest set of ``defects`` the unknown findings could confirm, one each.
+
+    ``rounds`` holds each round's unknown-finding count and the defects a label of
+    that round could name. A finding names one defect, so this is a maximum-weight
+    matching; the sets a matching can cover form a matroid, where taking the
+    heaviest defect first while one still fits is optimal.
+    """
+    taken: list[list[str]] = [[] for _ in rounds]
+    total = 0
+    for d in sorted(defects, key=lambda d: (-d.weight, d.id)):
+        if _augment(d.id, rounds, taken, set()):
+            total += d.weight
+    return total
+
+
+def _success(
+    certification: str, validation: str, escapes: Iterable[tuple[str, str]], blocking: set
+) -> bool | None:
+    """A validated success, or ``None`` while the controller's record leaves it open."""
+    if certification == NOT_CERTIFIED:
+        return False
+    if validation == "empty_set" or any(severity in blocking for _, severity in escapes):
+        return False
+    return True if certification == CERTIFIED else None
 
 
 def score_run(run: Run, prereg: Mapping) -> RunScore:
@@ -1193,26 +1426,36 @@ def score_run(run: Run, prereg: Mapping) -> RunScore:
     detected = {
         f.defect for review in run.reviews for f in review.findings if f.verdict == "confirmed"
     }
-    uncertain_commits = {
-        review.commit
-        for review in run.reviews
-        if any(f.verdict == "unknown" for f in review.findings)
-    }
     hit = sum(d.weight for d in exposed if d.id in detected)
     weight = sum(d.weight for d in exposed)
-    upper = hit + sum(
-        d.weight
-        for d in exposed
-        if d.id not in detected and any(run.present(d, c) for c in uncertain_commits)
+    # A label the check accepts confirms a registered defect present at its round's
+    # commit, one per finding: the bounds settle unknown findings no other way.
+    eligible = [
+        frozenset(d.id for d in registered if run.present(d, review.commit))
+        for review in run.reviews
+    ]
+    undetected = [d for d in exposed if d.id not in detected]
+    upper = hit + _nameable_weight(
+        [
+            (sum(1 for f in review.findings if f.verdict == "unknown"), names)
+            for review, names in zip(run.reviews, eligible, strict=True)
+        ],
+        undetected,
     )
     verdicts = [f.verdict for review in run.reviews for f in review.findings]
     duplicates = 0
     unknown_beside_confirmed = 0
     unknown_groups: list[int] = []
-    for review in run.reviews:
+    unknown_first_reports = 0
+    unknown_confirmable = 0
+    for review, names in zip(run.reviews, eligible, strict=True):
         named = [f.defect for f in review.findings if f.verdict == "confirmed"]
         duplicates += len(named) - len(set(named))
         undecided = sum(1 for f in review.findings if f.verdict == "unknown")
+        if not names:
+            continue  # nothing registered at this commit: an unknown finding is false here
+        unknown_confirmable += undecided
+        unknown_first_reports += min(undecided, len(names - set(named)))
         if named:
             unknown_beside_confirmed += undecided
         elif undecided >= 2:
@@ -1233,17 +1476,9 @@ def score_run(run: Run, prereg: Mapping) -> RunScore:
             cn_outcome = "unknown"
     fix_verdicts = [fix.verdict for fix in run.fixes if fix.commit is not None]
     final = run.reviews[-1]
-    escaped: tuple[tuple[str, str], ...] = ()
-    if final.clean:
-        escaped = tuple(
-            sorted((d.id, d.severity) for d in registered if run.present(d, final.commit))
-        )
+    at_final = tuple(sorted((d.id, d.severity) for d in registered if run.present(d, final.commit)))
+    certification = final.certification
     blocking = set(prereg["success_blocking_severities"])
-    success = (
-        final.clean
-        and final.validation == "passed"
-        and not any(severity in blocking for _, severity in escaped)
-    )
     return RunScore(
         run=run,
         recall_hit=hit,
@@ -1255,12 +1490,16 @@ def score_run(run: Run, prereg: Mapping) -> RunScore:
         duplicates=duplicates,
         unknown_beside_confirmed=unknown_beside_confirmed,
         unknown_groups=tuple(unknown_groups),
+        unknown_first_reports=unknown_first_reports,
+        unknown_confirmable=unknown_confirmable,
         cn_outcome=cn_outcome,
         harmful=fix_verdicts.count("harmful"),
         not_harmful=fix_verdicts.count("not_harmful"),
         harm_unknown=fix_verdicts.count("unknown"),
-        escaped=escaped,
-        success=success,
+        certification=certification,
+        escaped=at_final if certification == CERTIFIED else (),
+        possible_escapes=at_final if certification == CERTIFICATION_UNKNOWN else (),
+        success=_success(certification, final.validation, at_final, blocking),
     )
 
 
@@ -1271,13 +1510,17 @@ def _ratio(num: float, den: float) -> float | None:
 def _duplicate_upper(scores: Sequence[RunScore]) -> float | None:
     """The highest duplicate ratio any settlement of the unknown labels allows.
 
-    A duplicate is a later confirmed finding of a round naming the defect an earlier
-    one of that round names. An unknown finding beside a confirmed one could be a
-    duplicate of it, which adds one to both counts and so always raises the ratio
-    (it is below 1). A round of ``k`` unknown findings and no confirmed one could
-    hold ``k - 1`` duplicates of ``k`` confirmed findings: such rounds are taken,
-    the highest ``(k - 1) / k`` first, while each raises the ratio, which is where
-    the maximum of a ratio of sums lies. Every other unknown finding is put false.
+    A settlement is one the check accepts: an unknown finding becomes ``false``, or
+    ``confirmed`` of a registered defect present at its round's commit. A duplicate
+    is a later confirmed finding of a round naming the defect an earlier one of that
+    round names. An unknown finding beside a confirmed one could be a duplicate of
+    it, which adds one to both counts and so always raises the ratio (it is below 1).
+    A round of ``k`` unknown findings, no confirmed one and a registered defect at
+    its commit could hold ``k - 1`` duplicates of ``k`` confirmed findings: such
+    rounds are taken, the highest ``(k - 1) / k`` first, while each raises the
+    ratio, which is where the maximum of a ratio of sums lies. Every other unknown
+    finding is put false; one of a round whose commit holds no registered defect can
+    be nothing else. ``None`` when no settlement confirms any finding.
     """
     dup = sum(x.duplicates + x.unknown_beside_confirmed for x in scores)
     confirmed = sum(x.confirmed + x.unknown_beside_confirmed for x in scores)
@@ -1285,7 +1528,7 @@ def _duplicate_upper(scores: Sequence[RunScore]) -> float | None:
         if confirmed and (k - 1) / k <= dup / confirmed:
             break
         dup, confirmed = dup + k - 1, confirmed + k
-    if confirmed == 0 and any(x.unknown for x in scores):
+    if confirmed == 0 and any(x.unknown_confirmable for x in scores):
         return 0.0  # a single unknown finding confirmed alone: no duplicate of one finding
     return _ratio(dup, confirmed)
 
@@ -1304,6 +1547,7 @@ def _bands(
             "false",
             "unknown",
             "duplicates",
+            "unknown_first_reports",
             "harmful",
             "not_harmful",
             "harm_unknown",
@@ -1334,11 +1578,12 @@ def _bands(
             _ratio(s["harmful"], fixes),
             _ratio(s["harmful"] + s["harm_unknown"], fixes),
         ),
-        # Lower: every unknown finding confirmed of a defect no other finding of its
-        # round names, which adds to the confirmed count alone.
+        # Lower: as many unknown findings as there are registered defects at their
+        # round's commit that no finding of the round names, each confirmed the first
+        # report of one, which adds to the confirmed count alone; the rest put false.
         "duplicate_ratio": (
             _ratio(s["duplicates"], s["confirmed"]),
-            _ratio(s["duplicates"], labeled - s["false"]),
+            _ratio(s["duplicates"], s["confirmed"] + s["unknown_first_reports"]),
             _duplicate_upper(scores),
         ),
     }
@@ -1380,13 +1625,21 @@ def bootstrap_indices(n: int, prereg: Mapping) -> list[list[int]]:
 
 
 def percentile_interval(values: list[float], confidence: float) -> tuple[float, float] | None:
-    """Nearest-rank percentile interval of ``values``, or ``None`` with none to rank."""
+    """Nearest-rank percentile interval of ``values``, or ``None`` with none to rank.
+
+    Each end is the value of one-based rank ``ceil(p * n)`` among the ``n`` ordered
+    values, ``p`` being ``(1 - confidence) / 2`` for the lower end and ``1 - p`` for
+    the upper: ranks 1 and 39 of 40 at 95%. ``p * n`` is computed exactly, from the
+    confidence as written, so no rounding of a binary fraction moves a rank.
+    """
     if not values:
         return None
     ordered = sorted(values)
-    tail = (1 - confidence) / 2
-    last = len(ordered) - 1
-    return ordered[math.floor(tail * last)], ordered[math.ceil((1 - tail) * last)]
+    n = len(ordered)
+    tail = (1 - Fraction(repr(confidence))) / 2
+    low = max(1, math.ceil(tail * n))
+    high = max(1, math.ceil((1 - tail) * n))
+    return ordered[low - 1], ordered[high - 1]
 
 
 def _rounded(value: float | None) -> float | None:
@@ -1449,16 +1702,38 @@ def arm_metrics(scores: Sequence[RunScore], prereg: Mapping, indices: list[list[
             "status": status,
             "why_unknown": why,
         }
-    critical = [
-        {"case": x.run.case.id, "defect": did, "belongs_to": x.run.belongs_to(did)}
-        for x in scores
-        for did, sev in x.escaped
-        if sev == "critical"
-    ]
+
+    def critical(attr: str) -> list[dict]:
+        return [
+            {"case": x.run.case.id, "defect": did, "belongs_to": x.run.belongs_to(did)}
+            for x in scores
+            for did, sev in getattr(x, attr)
+            if sev == "critical"
+        ]
+
+    escaped, possible = critical("escaped"), critical("possible_escapes")
+    unrecorded = sorted(
+        {x.run.id for x in scores for _, sev in x.possible_escapes if sev == "critical"}
+    )
+    escapes: dict = {"value": len(escaped), "defects": escaped, "possible": possible}
+    if possible:
+        escapes.update(
+            value=None,
+            known_part=len(escaped),
+            why_unknown=f"the controller's record of the final round of run(s) {unrecorded} "
+            "is incomplete, so whether it would certify their candidates is unknown",
+        )
     successes = sum(1 for x in scores if x.success)
+    open_successes = sorted(x.run.id for x in scores if x.success is None)
     cost = _usage(scores, "cost_usd")
     per_success: dict = {"provenance": cost["provenance"], "validated_successes": successes}
-    if successes == 0:
+    if open_successes:
+        per_success.update(
+            value=None,
+            why_unknown=f"whether run(s) {open_successes} are validated successes is unknown: "
+            "the controller's record of their final round is incomplete",
+        )
+    elif successes == 0:
         per_success.update(value=None, why_unknown="no validated success")
     elif cost["value"] is None:
         per_success.update(
@@ -1466,7 +1741,7 @@ def arm_metrics(scores: Sequence[RunScore], prereg: Mapping, indices: list[list[
         )
     else:
         per_success.update(value=_rounded(cost["value"] / successes))
-    metrics["escaped_critical_defects"] = {"value": len(critical), "defects": critical}
+    metrics["escaped_critical_defects"] = escapes
     metrics["cost_per_validated_success"] = per_success
     metrics["total_cost_usd"] = cost
     metrics["launch_wall_clock_seconds"] = _usage(scores, "wall_clock_seconds")
@@ -1492,7 +1767,9 @@ def _run_row(x: RunScore) -> dict:
         "profiles": [review_profile_name(review.round) for review in run.reviews],
         "fix_rounds": len(run.fixes),
         "fix_commits": sum(1 for fix in run.fixes if fix.commit is not None),
-        "ended": "clean" if run.reviews[-1].clean else "stopped",
+        "ended": {CERTIFIED: "certified", NOT_CERTIFIED: "stopped"}.get(
+            x.certification, "unrecorded"
+        ),
         "stopped": run.stopped or None,
         "validated_success": x.success,
         "findings": {
@@ -1507,11 +1784,16 @@ def _run_row(x: RunScore) -> dict:
             {"defect": did, "severity": sev, "belongs_to": run.belongs_to(did)}
             for did, sev in x.escaped
         ],
+        "possible_escapes": [
+            {"defect": did, "severity": sev, "belongs_to": run.belongs_to(did)}
+            for did, sev in x.possible_escapes
+        ],
         "missing_launches": list(run.missing_launches()),
         "late_defects": sorted(d.id for d in run.defects.values() if not d.registered),
-        # What the agents said, shown as claims: no metric reads either.
+        # What the agents said, shown as claims: no metric reads any of them.
         "claims": {
             "reviewer_classifications": dict(sorted(classifications.items())),
+            "final_reply_clean": run.reviews[-1].clean,
             "fixer_resolutions": dict(sorted(resolutions.items())),
         },
     }
@@ -1668,28 +1950,47 @@ def decide(ev: Evaluation, baseline: str, treatment: str) -> dict:
     indices = bootstrap_indices(len(paired), prereg) if paired else []
     confidence = prereg["uncertainty"]["confidence"]
 
-    # Measured harm first: the gate reads every treatment run, paired or not.
+    # Measured harm first: the gate reads every treatment run, paired or not. An
+    # escape is at a candidate the controller certified; where its record of the
+    # final round is incomplete, an escape is possible and decides nothing either way.
     harm: list[str] = []
     open_: list[str] = []
     for case_id, run in sorted(held[treatment].items()):
         counterpart = held[baseline].get(case_id)
-        before = (
-            {escape_identity(counterpart, did) for did, _ in score_run(counterpart, prereg).escaped}
-            if counterpart
-            else set()
-        )
-        for did, severity in score_run(run, prereg).escaped:
-            if severity != "critical" or escape_identity(run, did) in before:
+        escaped_before: set[tuple[str, str, str]] = set()
+        possible_before: set[tuple[str, str, str]] = set()
+        if counterpart is not None:
+            before = score_run(counterpart, prereg)
+            escaped_before = {escape_identity(counterpart, did) for did, _ in before.escaped}
+            possible_before = {
+                escape_identity(counterpart, did) for did, _ in before.possible_escapes
+            }
+        after = score_run(run, prereg)
+        for did, severity in after.escaped:
+            identity = escape_identity(run, did)
+            if severity != "critical" or identity in escaped_before:
                 continue
-            if run.belongs_to(did) == "case":
-                harm.append(
-                    f"critical defect {did} of case {case_id!r} escaped the treatment's review"
+            what = (
+                f"critical defect {did} of case {case_id!r}"
+                if run.belongs_to(did) == "case"
+                else f"critical defect {did} that treatment run {run.id!r} introduced"
+            )
+            if identity in possible_before:
+                open_.append(
+                    f"{what} escaped the treatment's review, and whether it escaped the "
+                    "baseline's is unknown"
                 )
+            elif run.belongs_to(did) == "case":
+                harm.append(f"{what} escaped the treatment's review")
             else:
-                harm.append(
-                    f"critical defect {did} that treatment run {run.id!r} introduced escaped "
-                    "its review"
-                )
+                harm.append(f"{what} escaped its review")
+        for did, severity in after.possible_escapes:
+            if severity != "critical" or escape_identity(run, did) in escaped_before:
+                continue
+            open_.append(
+                f"critical defect {did} of run {run.id!r} may have escaped the treatment's "
+                "review: the controller's record of its final round is incomplete"
+            )
     if paired:
         metrics = (arm_metrics(base, prereg, indices), arm_metrics(treat, prereg, indices))
         for metric, margin in rule["margins"].items():
@@ -1747,7 +2048,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--runs", type=Path, default=FIXTURE_RUNS)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("check")
-    sub.add_parser("verify")
+    replay = sub.add_parser("verify")
+    trust = replay.add_mutually_exclusive_group()
+    trust.add_argument(
+        "--trust-oracles",
+        action="store_true",
+        help="run the oracles of files other than the registered ones; they run as you, "
+        "with your files and network, and nothing confines them",
+    )
+    trust.add_argument(
+        "--pins-only",
+        action="store_true",
+        help="build the commits and hold them to their pins, running no oracle",
+    )
     score = sub.add_parser("score")
     score.add_argument("--out", type=Path)
     dec = sub.add_parser("decide")
@@ -1757,12 +2070,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "verify":
             ev = load(args.preregistration, args.corpus, args.runs)
+            if not (args.pins_only or args.trust_oracles or registered_inputs(ev)):
+                print(
+                    "refused: these are not the registered corpus and fixture runs, and an "
+                    "oracle is code that runs as you, with your files and network: pass "
+                    "--trust-oracles to run it, or --pins-only to run nothing they hold",
+                    file=sys.stderr,
+                )
+                return 2
             with tempfile.TemporaryDirectory(prefix="review-eval-") as root:
-                problems = verify(ev, Path(root))
+                problems = verify(ev, Path(root), oracles=not args.pins_only)
             for problem in problems:
                 print(problem, file=sys.stderr)
             if not problems:
-                print(f"verified {len(ev.runs)} run(s) over {len(ev.cases)} case(s)")
+                ran = "the pins alone, no oracle" if args.pins_only else "pins and oracles"
+                print(f"verified {len(ev.runs)} run(s) over {len(ev.cases)} case(s): {ran}")
             return 1 if problems else 0
         ev = load(args.preregistration, args.corpus, args.runs)
     except (ReviewEvaluationError, json.JSONDecodeError, OSError) as exc:

@@ -32,15 +32,27 @@ nothing, and changes no controller behaviour: no state field, prompt, phase, gat
 ```bash
 uv run python -m tests.review_evaluation check    # refuse what the contract does not allow
 uv run python -m tests.review_evaluation verify   # replay the commits and the oracles
+uv run python -m tests.review_evaluation verify --pins-only       # the commits alone, any files
+uv run python -m tests.review_evaluation verify --trust-oracles   # other files' oracles too
 uv run python -m tests.review_evaluation score [--out FILE]
 uv run python -m tests.review_evaluation decide --baseline ARM --treatment ARM
 ```
 
-It launches no agent, holds no credential, contacts no network and writes nothing to GitHub. `verify`
-builds every case's commits, whether or not a run holds the case, and then each run's own commits,
-in temporary repositories with git's configuration, hooks, credential helpers and transports
-switched off, at the corpus's fixed date, and runs each oracle in a separate interpreter
-(`python -I`) that sees only the locale variables.
+It launches no agent, holds no credential and writes nothing to GitHub. `verify` builds every case's
+commits, whether or not a run holds the case, and then each run's own commits, in temporary
+repositories with git's configuration, hooks, credential helpers and transports switched off, at
+the corpus's fixed date; building a commit runs nothing the files hold. It then runs each oracle in
+a separate interpreter (`python -I`) that sees only the locale variables.
+
+**An oracle is code, and nothing confines it.** It is Python from `corpus.json` or a run file, and
+it imports the case's own code. `python -I` and the reduced environment keep the host's variables,
+user site directory and working directory out of it; they enforce no boundary. The oracle runs as
+the caller, reads and writes what the caller can and reaches whatever network the caller can. So
+`verify` runs the oracles of the registered files alone, the bytes of this checkout's `corpus.json`
+and `fixture_runs.json`, reviewed with the repository. Any other file is refused unless the caller
+passes `--trust-oracles`, which says the caller accepts running that code as themselves, or
+`--pins-only`, which replays its commits and pins and runs nothing it holds. `check`, `score` and
+`decide` never execute anything a file holds.
 
 ## 2. Review today: the baseline
 
@@ -103,17 +115,44 @@ controller would certify can hold a registered defect: that is exactly what
 `redact-authorization-header` and that of `retry-attempt-bound` are certifiable, and each candidate
 still holds a defect (B1, C2).
 
+Which candidate the controller would certify is the controller's own record of the round, never the
+reviewer's reply. Each round of a run record carries it, as the collector of section 2 reads it from
+the run's state:
+
+- **`disposition`**: what the controller recorded for the round in `review_history`, `clean`,
+  `needs_fix` or `stale` (the revision moved during the review), or `unrecorded` when no record of
+  it was found.
+- **`validation`**: the validation set the controller presented to the round: `passed` (one record
+  per definition, every one `PASS`), `empty_set` (the deliberately empty set: no validation command
+  is configured), `failed` (a record that is not `PASS`), or `unrecorded`.
+- **`validated_sha`**: the candidate those records are bound to, `null` only when `unrecorded`.
+
+The round's candidate is **certified** when the reply is clean, the disposition `clean`, the set
+`passed` or `empty_set` and `validated_sha` the reviewed commit's SHA. A reply that needs a fix, a
+disposition `needs_fix` or `stale`, a `failed` set or another candidate's records **rule a
+certificate out**. Otherwise a record is missing, and whether the candidate would be certified is
+**unknown**. A clean reply alone is never a certificate. The check refuses a record the controller
+would never write: `clean` over a reply that needs a fix or `needs_fix` over a clean one, `clean`
+over a failed set (ADR 0006 D9.4) or over another candidate's (D5.5).
+
 ## 4. The labeling taxonomy
 
 ### 4.1 Units
 
 - A **case** is a pinned base and candidate, and usually a reference commit holding a known-good
-  change. A `defect` case holds at least one ground-truth defect; a `clean_negative` holds none.
+  change. A `defect` case holds at least one registered defect present at its candidate; a
+  `clean_negative` holds none. A case whose only defects were discovered after the cutoff, or lie at
+  another commit than the candidate, gives a review of the candidate nothing to find: it is refused
+  as a defect case, so it never counts toward the minimum sample (section 8).
 - A **run** is one arm's review of one case: its rounds, its fixes and their commits, its launches.
   A REVIEW or FIX launch names the round it served, which must be a round of the run (for FIX, one
-  that needed a fix); an ANALYZE_EXECUTE launch precedes every round and names none.
+  that needed a fix); an ANALYZE_EXECUTE launch precedes every round and names none. Every launch
+  names the controller's launch ordinal it spent, and the run names the range of them the
+  controller spent on it (section 5).
   An arm has at most one run per case; a planned run is not repeated, so a second one is refused
-  rather than allowed to replace the first.
+  rather than allowed to replace the first. A run that did not end on a certified round says why it
+  stopped. A stale round ends a run's record: the controller fixes no stale round and reviews the
+  moved revision next, which is no commit a run record holds.
 - A **finding** is one entry of a round's `REVIEW` result, held to the controller's own parser.
 - A **defect** is ground truth: a defect the change introduced, at a commit, shown by evidence.
 - A **fix** is a FIX round. One that made a commit is labeled; one that made none has nothing to
@@ -182,14 +221,16 @@ Nothing an agent says of its own work is a label, and no gate reads it:
 - the fixer's resolution kinds and rationales;
 - the certificate, a passing validation set or a green CI run (section 3).
 
-A round's `needs_fix_round` is read only for what it decides, which round the controller would
-certify: that is the outcome under test, not a judgment of the code. A label carrying `confidence`,
-`self_reported`, `reviewer_confidence`, `agent_verdict` or `classification` is refused, and every
-case, defect, label and fix is held to its registered fields, so no such value can ride along under
-another name. The report prints the classifications and
-resolution kinds as claims, apart from every metric, and
-`test_review_evaluation.py::test_what_the_agents_say_of_their_own_work_moves_no_score` rewrites all
-of them, with a claim of certainty, and finds every metric unchanged.
+A round's `needs_fix_round` is read only beside the controller's record of the round, for what they
+decide together: whether the controller would certify its candidate (section 3). That is the
+outcome under test, not a judgment of the code, and a clean reply alone decides nothing. A label
+carrying `confidence`, `self_reported`, `reviewer_confidence`, `agent_verdict` or `classification`
+is refused, and every case, defect, label and fix is held to its registered fields, so no such
+value can ride along under another name. The report prints the classifications, whether the final
+reply was clean and the resolution kinds as claims, apart from every metric, and
+`test_review_evaluation.py::test_what_the_agents_say_of_their_own_work_moves_no_score` rewrites the
+classifications, prose and resolution kinds, with a claim of certainty, and finds every metric
+unchanged.
 
 ## 5. Evidence and its provenance
 
@@ -208,11 +249,17 @@ whatever it looks like. A launch's usage values carry #318's provenance: `measur
 `synthetic` or `unknown`. A fixture launch may not say `measured`, only a `measured` total can pass a
 criterion, and an `unknown` launch value makes the total `unknown`, with the known part shown apart.
 
-A run's launch record is **complete** when it holds at least an ANALYZE_EXECUTE launch, a REVIEW
-launch of every round and a FIX launch of every fix. Failed attempts add launches and are never
-required; a record short of any of these is incomplete. A launch nobody recorded is not a launch
-that cost nothing, so one incomplete run makes every usage total of its arm `unknown`, with the known
-part shown apart and the runs named, and the report lists what each run's record misses.
+Which launches a run made is the controller's record, not its launch list. The controller spends
+one launch ordinal (`launch_seq` in the run's state file) in the save before every launch, a
+relaunch and a failed attempt included. A run record names the first and last ordinal the
+controller spent on the run (`launch_ordinals`, read from the state file, `null` when that record
+was not found), and each launch the ordinal it spent; an ordinal named twice, or outside the range,
+is refused. A run's launch record is **complete** when it holds a launch of every ordinal of its
+range, an ANALYZE_EXECUTE launch, a REVIEW launch of every round and a FIX launch of every fix. A
+record without the range, or short of any of these, is incomplete: one that covers every phase and
+round but lost a failed attempt is short of that attempt's ordinal. A launch nobody recorded is not
+a launch that cost nothing, so one incomplete run makes every usage total of its arm `unknown`, with
+the known part shown apart and the runs named, and the report lists what each run's record misses.
 
 ## 6. Metric formulas
 
@@ -222,32 +269,47 @@ count. Excluded runs (an infrastructure failure, with its reason) are listed and
 
 - **`weighted_recall`** = Σ w(d) over detected d in E / Σ w(d) over d in E, where E is every
   registered defect present at a commit the run reviewed, w is the severity weight, and d is
-  detected when a `confirmed` label names it. Its upper label bound also counts every undetected d
-  in E present at a commit whose round raised an `unknown` finding.
+  detected when a `confirmed` label names it. Its upper label bound also counts the heaviest set of
+  undetected d in E the run's `unknown` findings could name, one defect per finding, each present
+  at the commit its finding's round reviewed (a maximum-weight matching).
 - **`precision`** = C / (C + F), with C `confirmed` and F `false` findings; its label bounds are
   C / (C + F + U) and (C + U) / (C + F + U), with U `unknown`.
 - **`clean_negative_fpr`** = FP / (FP + TN) over clean-negative runs, judged on the findings of
   rounds that reviewed the case's own commits: TN raised none, FP raised at least one `false`, and a
   run whose findings there are all `unknown` is in neither, but widens the bounds to FP / N and
   (FP + U) / N.
-- **`escaped_critical_defects`**: registered `critical` defects present at the commit of a run's
-  final round when that round was clean, which is the candidate the controller would certify. The
-  report lists every escape, of any severity.
+- **`escaped_critical_defects`**: registered `critical` defects present at the candidate of a run's
+  final round when the controller certified it (section 3). A clean reply the controller did not
+  certify lets nothing escape. Where its record of the final round is missing, the defects there are
+  listed as possible escapes and the count is `unknown`, its known part shown apart. The report
+  lists every escape, of any severity.
 - **`harmful_fix_rate`** = H / (H + N) over fixes that made a commit, with `unknown` fixes widening
   the bounds as for precision.
 - **`duplicate_ratio`** = D / C, with D the duplicate confirmed findings (section 4.3). An `unknown`
-  finding could be a duplicate or a first report of another defect, so its label bounds put each
-  one both ways. The lower is D / (C + U): every unknown finding a first report. The upper is the
-  highest ratio a settlement allows: an unknown finding of a round with a confirmed one could be a
-  duplicate of it, and a round of k ≥ 2 unknown findings and no confirmed one could hold k - 1
-  duplicates of k confirmed findings; the scorer takes the first kind always (each raises the
-  ratio, which is below 1) and rounds of the second, the largest first, while each raises it. An
-  unknown finding alone in a round with no confirmed one is put false there.
-- **Validated success**: the run's final round is clean, its validation `passed`, and no registered
-  `critical` or `major` defect escaped.
+  finding could be a duplicate or a first report of another defect, but only as the check would
+  accept its label: `false`, or `confirmed` of a registered defect present at its round's commit. An
+  unknown finding of a round whose commit holds no registered defect, every round of a clean
+  negative's own commits included, is therefore `false` in both bounds. The lower is D / (C + R),
+  with R, in each round, the unknown findings up to the number of its registered defects no finding
+  of the round names: each of those a first report, the rest false. The upper is the highest ratio
+  a settlement allows: an unknown finding of a round with a confirmed one could be a duplicate of
+  it, and a round of k ≥ 2 unknown findings, no confirmed one and a registered defect at its commit
+  could hold k - 1 duplicates of k confirmed findings; the scorer takes the first kind always (each
+  raises the ratio, which is below 1) and rounds of the second, the largest first, while each
+  raises it. Every other unknown finding is put false.
+- Recall and the duplicate ratio count defects by identity, which only the frozen corpus gives, so
+  their bounds settle an unknown finding against it. Precision, the clean-negative false-positive
+  rate and the harmful-fix rate ask whether a finding or a fix is false or harmful, not which defect
+  it is: their bounds put each `unknown` both ways, whether or not a registered defect could name
+  it. A finding about a defect at the base in a scope the issue leaves open (section 4.2) would not
+  be false and names nothing the corpus can hold. The band is the wider for it, never narrower than
+  a settlement allows.
+- **Validated success**: the controller certified the run's final round over a validation set that
+  `passed` (not the empty set), and no registered `critical` or `major` defect is at its candidate.
+  It is `unknown` where the controller's record of that round is missing and would decide it.
 - **`cost_per_validated_success`** = the cost of every launch of every run (analysis, review, fix,
-  failed attempts included) / validated successes. It has no value without a success, and none
-  while a run's launch record is incomplete (section 5).
+  failed attempts included) / validated successes. It has no value without a success, none while a
+  run's success is `unknown`, and none while a run's launch record is incomplete (section 5).
 - **`launch_wall_clock_seconds`** and **`context_tokens`**: sums over launches, with provenance,
   `unknown` while a run's launch record is incomplete. The first leaves out the controller's time
   between launches; a run's end-to-end time is #318's measure.
@@ -260,9 +322,11 @@ Two kinds are reported and neither is folded into the other.
   rate whose band is wider than 0.1 (`max_label_uncertainty`) is `unknown`: settle the labels
   before reading it.
 - **Sampling uncertainty** is a 95% percentile interval from a bootstrap that resamples cases,
-  10,000 resamples with seed 355, ranked by nearest rank. A resample with an empty denominator has no
-  value and is counted, not filled. A comparison resamples the same cases for both arms and takes
-  the treatment minus the baseline on each.
+  10,000 resamples with seed 355, ranked by nearest rank: of the n resamples with a value, the lower
+  end is the one of one-based rank ⌈0.025 n⌉ and the upper the one of rank ⌈0.975 n⌉, computed in
+  exact arithmetic, so ranks 1 and 39 of 40. A resample with an empty denominator has no value and
+  is counted, not filled. A comparison resamples the same cases for both arms and takes the
+  treatment minus the baseline on each.
 
 ## 8. The pre-registered decision
 
@@ -283,7 +347,9 @@ the baseline's is a `NO_GO`, whatever else is shown. The gate reads every treatm
 excluded, paired or not. It compares defects by identity, not by id: a case's defect is the same
 defect in both arms' runs of the case, and a defect a treatment run introduced is that run's alone
 (section 4.2), so the baseline never held it and its critical escape is always a new one, even when
-a baseline run's regression of the same id escaped too.
+a baseline run's regression of the same id escaped too. An escape is at a certified candidate
+(section 3): a possible escape, where either arm's record of the final round is missing, decides
+neither `NO_GO` nor `GO` and leaves the comparison open.
 
 A later issue that needs another primary from section 6 says so in an amendment before its first
 real run; otherwise this one applies.
@@ -298,7 +364,8 @@ Decided in this order:
    cases excluded, or fewer cases than the minimum.
 4. `NO_GO` when the primary's interval lies wholly below +0.1.
 5. `INCONCLUSIVE` while anything is open: a metric `unknown`, an interval reaching past a margin,
-   a cost not measured on both arms (an incomplete launch record included), or a primary not shown.
+   a cost not measured on both arms (an incomplete launch record included), a possible critical
+   escape, or a primary not shown.
 6. `GO`.
 
 The minimum is a floor, not a power calculation. The variance of a real review is unknown until
@@ -329,12 +396,14 @@ holds, check the scorer and say nothing about any reviewer, model or configurati
 | `precision` | 0.714286 | 0.5 to 0.8 | `unknown` |
 | `clean_negative_fpr` | 0.5 | 0.333333 to 0.666667 | `unknown` |
 | `harmful_fix_rate` | 0.333333 | none | known |
-| `duplicate_ratio` | 0.2 | 0.125 to 0.333333 | `unknown` |
+| `duplicate_ratio` | 0.2 | 0.166667 to 0.333333 | `unknown` |
 
-B's `unknown` finding sits in a round beside its confirmed B2 and could be a second report of it,
-which is what widens the duplicate ratio's band. One critical defect escaped (B1), and three runs
-are validated successes, at a synthetic $11.00 in all, $3.67 per success; every run's launch record
-is complete. `decide` on these runs is `NOT_EVALUATED`.
+B's `unknown` finding sits in a round beside its confirmed B2 and could be a second report of it or
+the first of B1, which is what widens the duplicate ratio's band; `type-hint-cache-key`'s are on a
+clean negative, where no label can confirm anything, and move neither bound. One critical defect
+escaped (B1), and three runs are validated successes, at a synthetic $11.00 in all, $3.67 per
+success. Every round carries the controller's record, five runs end on a certified round, and
+every run's launch record is complete. `decide` on these runs is `NOT_EVALUATED`.
 
 The fixture is replayable: `verify` rebuilds every commit from `corpus.json` and `fixture_runs.json`
 at their pinned SHAs and runs every oracle where the ground truth says it fails or passes, and
@@ -344,8 +413,9 @@ at their pinned SHAs and runs every oracle where the ground truth says it fails 
 
 ## 10. Tests that hold this
 
-All in `tests/test_review_evaluation.py`, offline, in `make check`: 61 tests, which took 19 to 25
-seconds on one shared host at a load average of about 10 on 8 cores.
+All in `tests/test_review_evaluation.py`, offline, in `make check`: 75 tests, which took 41 to 53
+seconds run serially on one shared host at a load average of 10 to 14 on 8 cores, and 15 seconds on
+4 workers.
 
 - The contract's files: `test_the_registered_files_pass_the_check`,
   `test_the_corpus_replays_as_pinned`,
@@ -353,7 +423,8 @@ seconds on one shared host at a load average of about 10 on 8 cores.
   `test_a_commit_that_does_not_build_to_its_pin_is_reported`,
   `test_an_oracle_that_does_not_show_its_defect_is_reported`,
   `test_an_oracle_that_crashes_shows_no_defect`,
-  `test_an_oracle_runs_isolated_from_the_hosts_environment`.
+  `test_an_oracle_runs_isolated_from_the_hosts_environment`,
+  `test_verify_runs_the_oracles_of_trusted_inputs_alone`.
 - No agent's word is a label: `test_what_the_agents_say_of_their_own_work_moves_no_score`,
   `test_a_label_carrying_an_agents_confidence_or_verdict_is_refused`,
   `test_an_agent_is_no_adjudicator`, `test_an_agent_adjudicating_a_defect_or_a_fix_is_refused`,
@@ -362,11 +433,22 @@ seconds on one shared host at a load average of about 10 on 8 cores.
   `test_a_label_is_bound_to_the_candidate_it_judged`, `test_labels_are_frozen_at_the_discovery_cutoff`,
   `test_a_confirmed_label_names_a_defect_its_candidate_holds`, `test_a_clean_negative_holds_no_defect`,
   `test_a_defect_is_one_the_change_introduced`,
+  `test_a_defect_case_holds_a_registered_defect_at_its_candidate`,
   `test_a_harmful_fix_is_exactly_one_that_introduced_a_defect`,
   `test_a_review_result_the_controller_would_refuse_is_refused`,
   `test_a_fixture_run_may_not_say_it_measured_anything`,
-  `test_a_launch_is_bound_to_a_round_of_its_run`, `test_a_planned_run_is_not_repeated`.
-- The label bounds: `test_unknown_findings_that_could_be_duplicates_bound_the_duplicate_ratio`.
+  `test_a_launch_is_bound_to_a_round_of_its_run`,
+  `test_a_launch_ordinal_is_spent_once_and_within_the_runs_range`,
+  `test_the_controller_record_is_held_to_what_the_controller_does`,
+  `test_a_planned_run_is_not_repeated`.
+- The label bounds and intervals:
+  `test_unknown_findings_that_could_be_duplicates_bound_the_duplicate_ratio`,
+  `test_unknown_findings_bound_recall_one_registered_defect_each`,
+  `test_an_interval_ends_at_nearest_rank_order_statistics`.
+- What the controller would certify:
+  `test_a_clean_reply_the_controller_would_not_certify_escapes_nothing`,
+  `test_a_clean_reply_over_a_missing_record_decides_no_escape`,
+  `test_a_deliberately_empty_validation_set_certifies_and_validates_nothing`.
 - The decision, on synthetic real arms of 33 copied cases:
   `test_fixture_runs_reach_no_decision_however_good_they_look`,
   `test_go_needs_the_primary_effect_every_bound_and_the_registered_sample`,
@@ -377,7 +459,9 @@ seconds on one shared host at a load average of about 10 on 8 cores.
   `test_a_sample_below_the_registered_minimum_reaches_no_primary_conclusion`,
   `test_a_case_with_no_pair_or_too_many_exclusions_is_inconclusive_but_harm_still_decides`,
   `test_a_cost_no_launch_measured_rules_out_go`,
-  `test_a_run_whose_launch_record_is_incomplete_has_no_measured_cost`.
+  `test_a_run_whose_launch_record_is_incomplete_has_no_measured_cost`,
+  `test_an_omitted_retry_leaves_the_cost_unknown`,
+  `test_a_clean_reply_alone_cannot_trigger_the_hard_gate`.
 - This page and the code: `test_the_baseline_facts_are_the_codes`,
   `test_the_protocol_registers_the_digests_of_its_files`,
   `test_the_protocol_names_every_case_metric_and_registered_value`,
@@ -388,7 +472,13 @@ seconds on one shared host at a load average of about 10 on 8 cores.
 Decided on and left open:
 
 - **No real run can be scored yet.** The collector of section 2 is owed; the protocol registers what
-  it must produce, not the code that produces it.
+  it must produce, not the code that produces it: the labels, and from the controller's own state
+  each round's disposition, validation and validated candidate, and the launch ordinals it spent.
+- **An oracle runs as its caller.** `verify` confines no oracle (section 1); it runs the registered
+  files' alone unless told to trust others. A real evaluation that needs to replay oracles it did
+  not write, or did not review, needs a boundary this harness does not have.
+- **A stale round ends a run's record.** The record has no place for the revision a human pushed
+  during a review, so a real run whose revision moved can be scored only up to that round.
 - **Matching a finding to a defect is judgment.** An oracle shows that a defect is there, not that a
   finding describes it. A real evaluation's labels are as good as its adjudicators, and the fixture's
   are its author's.
@@ -411,9 +501,10 @@ Decided on and left open:
   amendment discipline. Its outcomes are runs (`verified_success`, `lost_success`), these are
   findings; a later evaluation may report both on the same runs.
 - **#170 to #175 (ADR 0006):** the certificate keeps its meaning (section 3). Nothing here issues,
-  reads or relaxes one.
-- **#338:** the new tests took 19 to 25 seconds on one loaded host (section 10), most of it the
-  case bootstrap of the decision tests; `verify` runs about 150 git commands and twelve oracle
+  reads or relaxes one; a run record reads, through the collector, the controller's record of each
+  round that decides whether it would issue one.
+- **#338:** the new tests took 41 to 53 seconds serially on one loaded host (section 10), most of it
+  the case bootstrap of the decision tests; `verify` runs about 150 git commands and twelve oracle
   processes.
 - **#23:** no state protocol, ADR or controller change is made, so no migration or crash-replay
   coverage is owed. Controller authority, exact-candidate validation, reviewer independence, the
