@@ -72,7 +72,19 @@
       "stagnation_identical_rounds": 2,
       "stagnation_unchanged_count_rounds": 3
     },
-    "replan": {"soft_threshold": 12, "hard_threshold": 20, "stagnation_window": 3},
+    "replan": {
+      "enabled": true,
+      "soft_threshold": 12,
+      "hard_threshold": 20,
+      "stagnation_window": 3,
+      "max_findings_per_round": 2,
+      "max_replans_per_issue": 2
+    },
+    "launch_cost": {
+      "summary_field": "cost_micro_usd",
+      "providers": ["claude", "claude-sdk"],
+      "claude_output_format": "stream-json"
+    },
     "certificate_clean": {"actionable_findings": 0, "needs_fix_round": false}
   }
 }

@@ -16,6 +16,7 @@ import dataclasses
 import json
 import re
 from datetime import datetime
+from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
 
@@ -474,6 +475,50 @@ def test_an_agent_adjudicating_a_defect_or_a_fix_is_refused():
     prereg, corpus, runs = _files()
     _run(runs, "retry-attempt-bound")["fixes"][0]["label"]["adjudicator"]["role"] = "fixer"
     _refused(prereg, corpus, runs, "self-reported correctness is refused")
+
+
+# Where an adjudicator appears: a finding's label, a defect and a fix's label.
+_ADJUDICATORS = {
+    "a finding's label": lambda corpus, runs: _label(
+        _run(runs, "redact-authorization-header"), "R1-F2"
+    )["adjudicator"],
+    "a defect": lambda corpus, runs: _case(corpus, "retry-attempt-bound")["defects"][0][
+        "adjudicator"
+    ],
+    "a fix's label": lambda corpus, runs: _run(runs, "retry-attempt-bound")["fixes"][0]["label"][
+        "adjudicator"
+    ],
+}
+
+
+@pytest.mark.parametrize("where", sorted(_ADJUDICATORS))
+def test_no_preregistration_makes_an_agent_an_adjudicator(where, monkeypatch):
+    """Only a human adjudicates (section 4.3), and the scorer holds that rule itself: a
+    preregistration that moves `agent` from the refused roles to the allowed ones, drops
+    it from the refused ones or invents another allowed role is refused, and an agent's
+    label is refused all the same where the preregistration's own check is bypassed.
+    A preregistration may narrow who adjudicates; whether a declared human is one is the
+    record's word."""
+    prereg, corpus, runs = _files()
+    _ADJUDICATORS[where](corpus, runs)["role"] = "agent"
+    relaxed = copy.deepcopy(prereg)
+    relaxed["refused_adjudicator_roles"].remove("agent")
+    relaxed["adjudicator_roles"].append("agent")
+    _refused(relaxed, corpus, runs, "only a human adjudicates")
+    dropped = copy.deepcopy(prereg)
+    dropped["refused_adjudicator_roles"].remove("agent")
+    _refused(dropped, corpus, runs, r"leaves out \['agent'\]")
+    invented = copy.deepcopy(prereg)
+    invented["adjudicator_roles"].append("copilot")
+    _refused(invented, corpus, runs, "only a human adjudicates")
+    monkeypatch.setattr(rv, "check_preregistration", lambda p: p)
+    _refused(relaxed, corpus, runs, "self-reported correctness is refused")
+    _ADJUDICATORS[where](corpus, runs)["role"] = "copilot"
+    _refused(invented, corpus, runs, "is no human adjudicator's")
+    monkeypatch.undo()
+    narrowed = copy.deepcopy(prereg)
+    narrowed["adjudicator_roles"] = ["fixture_author"]
+    assert rv.check(narrowed, *_files()[1:]).runs
 
 
 def test_the_scorer_holds_no_engine_github_client_or_provider():
@@ -1142,6 +1187,93 @@ def test_a_regression_a_run_introduced_is_its_own_whatever_its_id():
     assert all("that treatment run" in reason for reason in decision["reasons"])
 
 
+def test_a_shared_defect_with_no_usable_baseline_run_is_no_proven_new_escape():
+    """A case's defect is a new escape only against a baseline run of the case whose
+    record settles that it did not escape there. Both arms let B1 escape, and the
+    treatment, which also catches C2, is a GO. Where the baseline has no run of one redact
+    case, has only an excluded one, or has one whose record does not show where it ended,
+    the treatment's B1 escape there proves nothing new: it leaves the comparison open and
+    never decides NO_GO. A regression a treatment run introduced is that run's alone, which
+    no baseline run could share: its escape is NO_GO whether or not the case is paired."""
+    corpus, runs = _sample()
+    caught = _catching(runs)
+    treatment = _real(
+        [
+            copy.deepcopy(r) if r["case"].startswith("redact") else c
+            for r, c in zip(runs, caught, strict=True)
+        ],
+        "treatment",
+    )
+    baseline = _real(runs, "baseline")
+    assert _decide(baseline, treatment, corpus)["decision"] == rv.GO
+    lone = "redact-authorization-header~0"
+
+    def without(change) -> list[dict]:
+        out = []
+        for run in copy.deepcopy(baseline):
+            if run["case"] == lone:
+                run = change(run)
+            if run is not None:
+                out.append(run)
+        return out
+
+    def opened(why: str) -> str:
+        return (
+            f"critical defect B1 of case '{lone}' escaped the treatment's review, and whether "
+            f"it escaped the baseline's is unknown: {why}"
+        )
+
+    def exclude(run: dict) -> dict:
+        run["excluded"] = "the provider was unavailable"
+        return run
+
+    def unsettle(run: dict) -> dict:
+        run["launch_window"] = None
+        return run
+
+    for change, reasons in (
+        (
+            lambda run: None,
+            [
+                f"case(s) ['{lone}'] have no pair of runs",
+                opened("the baseline has no run of the case"),
+            ],
+        ),
+        (exclude, [opened("the baseline's run of the case is excluded")]),
+        (
+            unsettle,
+            [
+                opened("the controller's record does not settle the baseline run's outcome"),
+                "cost_per_validated_success is not measured on both arms",
+            ],
+        ),
+    ):
+        assert _decide(without(change), treatment, corpus) == {
+            "decision": rv.INCONCLUSIVE,
+            "reasons": reasons,
+        }
+
+    # A treatment run's own critical regression, unpaired or paired with an excluded run.
+    regressions = _critical_regressions(runs)
+    lone = "retry-attempt-bound~0"
+    better = _real(
+        [
+            copy.deepcopy(r) if r["case"] == lone else c
+            for r, c in zip(regressions, _catching(regressions), strict=True)
+        ],
+        "treatment",
+    )
+    baseline = _real(regressions, "baseline")
+    for change in (lambda run: None, exclude):
+        assert _decide(without(change), better, corpus) == {
+            "decision": rv.NO_GO,
+            "reasons": [
+                f"critical defect C2 that treatment run 'treatment/{lone}' introduced "
+                "escaped its review"
+            ],
+        }
+
+
 def test_a_margin_worse_on_its_whole_interval_is_no_go():
     """Every clean negative gains a false finding: the false-positive rate rises past its
     margin whatever the treatment gains elsewhere."""
@@ -1237,6 +1369,88 @@ def test_a_case_with_no_pair_or_too_many_exclusions_is_inconclusive_but_harm_sti
     assert decision["decision"] == rv.NO_GO
 
 
+def _excluded_before_review(run: dict) -> dict:
+    """``run`` as one an infrastructure failure stopped before its first review result:
+    its ANALYZE_EXECUTE launch and no round, fix, label or commit of its own."""
+    out = copy.deepcopy(run)
+    out.update(
+        commits=[],
+        defects=[],
+        oracles={},
+        reviews=[],
+        fixes=[],
+        labels=[],
+        launches=out["launches"][:1],
+        launch_window={**out["launch_window"], "end": "BLOCKED", "last": 1},
+        excluded="the provider was unavailable before the first review result",
+    )
+    out.pop("stopped", None)
+    return out
+
+
+def test_a_run_excluded_before_its_first_review_is_an_exclusion():
+    """An infrastructure failure can stop a planned run before any review result. Its
+    record holds no round, no review invented for it, and it is neither dropped nor a case
+    with no run: it is an exclusion with its reason, shown in the report, also for an arm
+    whose every run is excluded, and counted in the excluded share. A run with no round
+    and no exclusion is refused, and so is one naming a round it does not have or saying
+    it reached READY_FOR_MERGE."""
+    prereg, corpus, runs = _files()
+    case = "page-count-partial-page"
+    runs["runs"] = [_excluded_before_review(r) if r["case"] == case else r for r in runs["runs"]]
+    lone = _excluded_before_review(_run(rv.read_json(rv.FIXTURE_RUNS), case))
+    runs["runs"].append({**lone, "arm": "infra", "id": "infra/page-count-partial-page"})
+    arms = rv.report(rv.check(prereg, corpus, runs))["arms"]
+    reason = "the provider was unavailable before the first review result"
+    assert arms[ARM]["excluded"] == [{"run": f"{ARM}/{case}", "case": case, "reason": reason}]
+    assert (arms[ARM]["cases"], arms[ARM]["missing_cases"]) == (5, [])
+    infra = arms["infra"]
+    assert infra["excluded"] == [
+        {"run": "infra/page-count-partial-page", "case": case, "reason": reason}
+    ]
+    assert infra["cases"] == 0 and case not in infra["missing_cases"]
+    assert len(infra["missing_cases"]) == 5 and infra["runs"] == []
+    assert infra["metrics"]["weighted_recall"]["value"] is None
+    assert infra["loops"]["mean_review_rounds"] is None
+
+    corpus, sample = _sample()
+    baseline = _real(sample, "baseline")
+    treatment = _real(_catching(sample), "treatment")
+    stopped = [r["case"] for r in treatment[:4]]
+    treatment[:4] = [_excluded_before_review(r) for r in treatment[:4]]
+    decision = _decide(baseline, treatment, corpus)
+    assert decision["decision"] == rv.INCONCLUSIVE
+    assert decision["reasons"] == [
+        "4 excluded case(s) pass the registered share",
+        "the sample pairs 17 defect case(s) and 12 clean negative(s), below the registered "
+        "20 and 10",
+    ]
+    only = [r for r in treatment if r["case"] in stopped]
+    decision = _decide(baseline, only, corpus)
+    assert decision["decision"] == rv.INCONCLUSIVE
+    assert "4 excluded case(s) pass the registered share" in decision["reasons"]
+    assert not any(reason.startswith("arm ") for reason in decision["reasons"])
+    assert not any(any(c in reason for c in stopped) for reason in decision["reasons"])
+
+    for change, needle in (
+        (lambda run: run.pop("excluded"), "only a run excluded for an infrastructure failure"),
+        (
+            lambda run: run["launches"].append(
+                {**run["launches"][0], "phase": "REVIEW", "round": 1, "ordinal": 2}
+            ),
+            "a round the run does not have",
+        ),
+        (lambda run: run["launch_window"].update(end="READY_FOR_MERGE"), "or on no round"),
+    ):
+        prereg, corpus, runs = _files()
+        (run,) = [r for r in runs["runs"] if r["case"] == case]
+        runs["runs"] = [r for r in runs["runs"] if r["case"] != case]
+        run = _excluded_before_review(run)
+        change(run)
+        runs["runs"].append(run)
+        _refused(prereg, corpus, runs, needle)
+
+
 def test_a_cost_no_launch_measured_rules_out_go():
     corpus, runs = _sample()
     treatment = _real(_catching(runs), "treatment")
@@ -1286,6 +1500,102 @@ def test_the_cost_criterion_is_decided_on_unrounded_values():
     assert cost["treatment"]["value"] == 1.5  # shown rounded, decided exactly
 
 
+def _written(tmp_path: Path, prereg: dict, corpus: dict, runs: dict, literals: dict) -> tuple:
+    """The three files written under ``tmp_path``, each number of ``literals`` (a value
+    ``runs`` holds once) replaced by the decimal text it maps to."""
+    text = json.dumps(runs)
+    for value, literal in literals.items():
+        assert text.count(json.dumps(value)) == 1, value
+        text = text.replace(json.dumps(value), literal)
+    paths = []
+    for name, content in (
+        ("preregistration.json", json.dumps(prereg)),
+        ("corpus.json", json.dumps(corpus)),
+        ("runs.json", text),
+    ):
+        (tmp_path / name).write_text(content, encoding="utf-8")
+        paths.append(tmp_path / name)
+    return tuple(paths)
+
+
+def test_a_file_is_decided_on_the_decimals_it_wrote(tmp_path, capsys):
+    """A run file's cost is the decimal it wrote, never the binary float nearest it. The
+    baseline costs $1.00 a success and the treatment is within its +50% margin at exactly
+    1.5 times its successes. A treatment total written a ten-quadrillionth of a dollar
+    over that is over it, though a float parse reads it as the limit itself, and `decide`
+    from the files says so."""
+    corpus, runs = _sample()
+    baseline, treatment = _real(runs, "baseline"), _real(_catching(runs), "treatment")
+    for run in baseline + treatment:
+        for launch in run["launches"]:
+            launch["cost_usd"] = 0
+    p, _, r = _files()
+    everything = {"schema": r["schema"], "runs": baseline + treatment}
+    cost = rv.report(rv.check(p, corpus, everything))["arms"]
+    successes = {arm: cost[arm]["metrics"]["cost_per_validated_success"] for arm in cost}
+    successes = {arm: successes[arm]["validated_successes"] for arm in successes}
+    baseline[0]["launches"][0]["cost_usd"] = successes["baseline"]
+    treatment[0]["launches"][0]["cost_usd"] = 7777.25  # replaced by each literal below
+    limit = Decimal(3) * successes["treatment"] / 2
+    over = limit + Decimal("1e-16")
+    assert float(str(over)) == float(limit)  # what a float parse would decide on
+    for literal, decision in (
+        (
+            str(limit),
+            {
+                "decision": rv.GO,
+                "reasons": ["weighted_recall rose by +0.1 or more and every bound held"],
+            },
+        ),
+        (
+            str(over),
+            {
+                "decision": rv.NO_GO,
+                "reasons": ["cost_per_validated_success rose past +50% of the baseline's"],
+            },
+        ),
+    ):
+        paths = _written(tmp_path, p, corpus, everything, {7777.25: literal})
+        assert rv.decide(rv.load(*paths), "baseline", "treatment") == decision, literal
+        argv = ["--preregistration", str(paths[0]), "--corpus", str(paths[1])]
+        argv += ["--runs", str(paths[2]), "decide", "--baseline", "baseline"]
+        assert rv.main([*argv, "--treatment", "treatment"]) == 0
+        assert json.loads(capsys.readouterr().out) == decision, literal
+
+
+def test_an_excluded_share_at_its_limit_is_decided_exactly(tmp_path):
+    """58 excluded cases of 100 are not more than a registered share of 0.58, whether the
+    share is read from a file or given as a float, and 59 are. In binary floats
+    0.58 * 100 is below 58, which read 58 exclusions as past the share."""
+    assert 0.58 * 100 < 58  # what an inexact comparison would read
+    _, corpus, raw = _files()
+    corpus, runs = _replicated(corpus, _resolve_unknowns(raw["runs"]), 17, 17)
+    corpus["cases"] = corpus["cases"][:100]
+    kept = {case["id"] for case in corpus["cases"]}
+    runs = [run for run in runs if run["case"] in kept]
+    prereg = rv.read_json(rv.PREREGISTRATION)
+    prereg["decision"]["max_excluded_case_share"] = 0.58
+    prereg["uncertainty"]["resamples"] = 20  # the share is all this reads
+    baseline = _real(runs, "baseline")
+
+    def past_the_share(excluded: int, from_files: bool) -> bool:
+        treatment = _real(runs, "treatment")
+        for run in treatment[:excluded]:
+            run["excluded"] = "the provider was unavailable"
+        everything = {"schema": rv.RUNS_SCHEMA, "runs": baseline + treatment}
+        if from_files:
+            ev = rv.load(*_written(tmp_path, prereg, corpus, everything, {}))
+            assert isinstance(ev.preregistration["decision"]["max_excluded_case_share"], Decimal)
+        else:
+            ev = rv.check(prereg, corpus, everything)
+        reasons = rv.decide(ev, "baseline", "treatment")["reasons"]
+        return f"{excluded} excluded case(s) pass the registered share" in reasons
+
+    for from_files in (False, True):
+        assert not past_the_share(58, from_files), from_files
+        assert past_the_share(59, from_files), from_files
+
+
 def test_a_label_band_at_its_limit_is_decided_exactly():
     """A band exactly as wide as the registered 0.1 is not wider than it. In binary
     floats 4/10 - 3/10 is wider, and would leave the rate unknown."""
@@ -1300,8 +1610,9 @@ def test_a_label_band_at_its_limit_is_decided_exactly():
     assert rv.arm_metrics([wider], prereg, None)["precision"]["status"] == "unknown"
 
 
-# What one treatment run's launch record keeps, and what it then misses. Its launches
-# are ordinals 1 to 4 of the controller's: ANALYZE_EXECUTE, REVIEW 1, FIX 1, REVIEW 2.
+# What one treatment run's launch record keeps, what it then misses, and whether it
+# still shows the run stopped right after its final round. Its launches are ordinals 1
+# to 4 of the controller's: ANALYZE_EXECUTE, REVIEW 1, FIX 1, REVIEW 2.
 _GAPS = {
     "no launch at all": (
         lambda launch: False,
@@ -1312,22 +1623,27 @@ _GAPS = {
             "REVIEW of round 2",
             "FIX of round 1",
         ],
+        False,
     ),
     "no ANALYZE_EXECUTE launch": (
         lambda launch: launch["phase"] != "ANALYZE_EXECUTE",
         ["the launch of ordinal 1", "ANALYZE_EXECUTE"],
+        True,
     ),
     "no REVIEW launch of round 2": (
         lambda launch: (launch["phase"], launch.get("round")) != ("REVIEW", 2),
         ["the launch of ordinal 4", "REVIEW of round 2"],
+        False,
     ),
     "no FIX launch": (
         lambda launch: launch["phase"] != "FIX",
         ["the launch of ordinal 3", "FIX of round 1"],
+        True,
     ),
     "no record of the controller's launch window": (
         None,
         ["the controller's record of its launch window"],
+        False,
     ),
 }
 
@@ -1336,9 +1652,11 @@ _GAPS = {
 def test_a_run_whose_launch_record_is_incomplete_has_no_measured_cost(gap):
     """A launch nobody recorded is not a launch that cost nothing: one treatment run short
     of its whole record, or of one launch of it, leaves every usage sum unknown, its known
-    part shown apart, and the cost criterion open. With the whole record the same arms are
-    a GO (test_go_needs_the_primary_effect_every_bound_and_the_registered_sample)."""
-    kept, missing = _GAPS[gap]
+    part shown apart, and the cost criterion open. A record that no longer shows the run
+    stopped right after its final round leaves its outcome open as well. With the whole
+    record the same arms are a GO
+    (test_go_needs_the_primary_effect_every_bound_and_the_registered_sample)."""
+    kept, missing, settled = _GAPS[gap]
     corpus, runs = _sample()
     treatment = _real(_catching(runs), "treatment")
     (short,) = [r for r in treatment if r["case"] == "page-count-partial-page~0"]
@@ -1348,9 +1666,18 @@ def test_a_run_whose_launch_record_is_incomplete_has_no_measured_cost(gap):
         short["launches"] = [launch for launch in short["launches"] if kept(launch)]
     p, _, r = _files()
     ev = rv.check(p, corpus, {"schema": r["schema"], "runs": _real(runs, "baseline") + treatment})
+    unsettled = (
+        []
+        if settled
+        else [
+            "the controller's record does not settle the outcome of treatment run "
+            "'treatment/page-count-partial-page~0': no recorded stop shows it ended at its "
+            "record's final round"
+        ]
+    )
     assert rv.decide(ev, "baseline", "treatment") == {
         "decision": rv.INCONCLUSIVE,
-        "reasons": ["cost_per_validated_success is not measured on both arms"],
+        "reasons": [*unsettled, "cost_per_validated_success is not measured on both arms"],
     }
     arm = rv.report(ev)["arms"]["treatment"]
     why = "the launch record of run(s) ['treatment/page-count-partial-page~0'] is incomplete"
@@ -1362,6 +1689,9 @@ def test_a_run_whose_launch_record_is_incomplete_has_no_measured_cost(gap):
     assert arm["metrics"]["cost_per_validated_success"]["value"] is None
     (row,) = [row for row in arm["runs"] if row["run"] == short["id"]]
     assert row["missing_launches"] == missing
+    assert (row["ended"], row["validated_success"]) == (
+        ("certified", True) if settled else ("unknown", None)
+    )
 
 
 def test_an_omitted_retry_leaves_the_cost_unknown():
@@ -1466,10 +1796,10 @@ def _stale_at_the_end(runs: list[dict], went_on: int | None) -> list[dict]:
 def test_a_run_that_goes_on_past_a_stale_round_has_no_known_outcome_or_cost():
     """A stale round ends what a run record can hold, never the run: the controller
     reviews the moved revision next. Where it spent ordinals after the stale round, the
-    run went on, so the stale round decides neither its certificate nor its cost: B1,
-    at the stale candidate, may have escaped, and the cost is unknown. Where no record
-    shows where its launches ended, the same holds. Only a run whose record shows it
-    stopped at the stale round ends there
+    run went on, so the stale round decides neither its certificate, its success nor its
+    cost: B1, at the stale candidate, may have escaped, and the cost is unknown. Where no
+    record shows where its launches ended, the same holds. Only a run whose record shows
+    it stopped at the stale round ends there
     (test_a_clean_reply_alone_cannot_trigger_the_hard_gate)."""
     corpus, runs = _sample()
     caught = _catching(runs)
@@ -1499,7 +1829,9 @@ def test_a_run_that_goes_on_past_a_stale_round_has_no_known_outcome_or_cost():
         ev = rv.check(p, corpus, {"schema": r["schema"], "runs": baseline + treatment})
         arm = rv.report(ev)["arms"]["treatment"]
         (row,) = [row for row in arm["runs"] if row["case"] == "redact-authorization-header~0"]
-        assert (row["ended"], row["validated_success"]) == ("unknown", False)  # B1 is critical
+        # B1 is critical, and still no reason to call the run no success: the candidate
+        # it ended on is not the stale one.
+        assert (row["ended"], row["validated_success"]) == ("unknown", None)
         missing = row["missing_launches"]
         if went_on is None:
             assert missing == [
@@ -1508,6 +1840,99 @@ def test_a_run_that_goes_on_past_a_stale_round_has_no_known_outcome_or_cost():
             ]
         else:
             assert missing == ["the launches of ordinals 5 to 6"]
+
+
+# Ways a treatment run's record can lose the stop that ties its outcome to its final
+# round: no launch window, a window whose end was not found, an ordinal spent after the
+# last launch it holds, or a last launch that is no fix of the final round.
+_LOST_STOPS = {
+    "no launch window": lambda run: run.update(launch_window=None),
+    "no recorded end": lambda run: run["launch_window"].update(end="unrecorded", last=None),
+    "an ordinal after the record": lambda run: run["launch_window"].update(
+        last=run["launch_window"]["last"] + 1
+    ),
+    "a replan after the final round": lambda run: (
+        run["launches"].append(
+            {
+                **run["launches"][0],
+                "phase": "REPLAN_REEXECUTE",
+                "ordinal": run["launch_window"]["last"] + 1,
+            }
+        ),
+        run["launch_window"].update(last=run["launch_window"]["last"] + 1),
+    ),
+}
+
+
+@pytest.mark.parametrize("lost", sorted(_LOST_STOPS))
+def test_a_missing_stop_leaves_an_issued_certificate_undecided(lost):
+    """A certificate the controller issued is the outcome of its round, and the run's
+    only on the controller's record that the run stopped right after it: it can resume a
+    certified run once the revision moves, and certify another candidate or none. The
+    treatment's B1 sits at a candidate the controller certified, a new critical escape
+    with the stop recorded. With the stop lost the run's outcome is open: B1 may have
+    escaped, the run's success is unknown, and the gate decides nothing."""
+    corpus, runs = _sample()
+    caught = _catching(runs)
+    baseline = _real(
+        [
+            copy.deepcopy(c) if c["case"].startswith("redact") else copy.deepcopy(r)
+            for r, c in zip(runs, caught, strict=True)
+        ],
+        "baseline",
+    )
+    treatment = _real(caught, "treatment")
+    for run in treatment:
+        if run["case"].startswith("redact"):
+            run["commits"][0]["fixes"] = ["B2"]
+    assert _decide(baseline, treatment, corpus)["decision"] == rv.NO_GO
+    for run in treatment:
+        if run["case"].startswith("redact"):
+            _LOST_STOPS[lost](run)
+    decision = _decide(baseline, treatment, corpus)
+    assert decision["decision"] == rv.INCONCLUSIVE
+    assert [r for r in decision["reasons"] if "critical defect" in r] == [
+        f"critical defect B1 of run 'treatment/redact-authorization-header~{k}' may have "
+        "escaped the treatment's review: the controller's record does not settle the "
+        "run's outcome"
+        for k in range(7)
+    ]
+    p, _, r = _files()
+    ev = rv.check(p, corpus, {"schema": r["schema"], "runs": baseline + treatment})
+    arm = rv.report(ev)["arms"]["treatment"]
+    (row,) = [row for row in arm["runs"] if row["case"] == "redact-authorization-header~0"]
+    assert (row["ended"], row["validated_success"], row["escaped"]) == ("unknown", None, [])
+    assert arm["metrics"]["escaped_critical_defects"]["value"] is None
+
+
+def test_a_run_that_went_on_past_a_defective_candidate_has_no_known_success():
+    """The controller spent an ordinal after the record's last launch: the run went on
+    past its final round, so the candidate it ended on is another. The major C2 at
+    retry-attempt-bound's final candidate, or a deliberately empty validation set
+    there, rules out a success only at the candidate the run ended on, so neither does:
+    the run's success is unknown, and so are the arm's cost per validated success and
+    its escape count, whatever the final round holds."""
+
+    def went_on(case: str, also: dict):
+        def mutate(run, controller):
+            controller.update(also)
+            run["launch_window"]["last"] += 1
+
+        return _final_of(case, mutate)
+
+    for case, also in (
+        ("retry-attempt-bound", {}),
+        ("page-count-partial-page", {"validation": "empty_set"}),
+    ):
+        metrics, row = went_on(case, also)
+        assert (row["ended"], row["validated_success"]) == ("unknown", None), case
+        assert metrics["cost_per_validated_success"]["value"] is None
+        escapes = metrics["escaped_critical_defects"]
+        assert (escapes["value"], escapes["known_part"]) == (None, 1)
+        assert f"'{ARM}/{case}'" in escapes["why_unknown"]
+        # Stopped where the record does, the same final round rules the success out.
+        metrics, row = _final_of(case, lambda run, c, also=also: c.update(also))
+        assert (row["ended"], row["validated_success"]) == ("certified", False), case
 
 
 def _beside_a1(runs: list[dict], verdict: str, count: int = 1) -> list[dict]:
@@ -1581,15 +2006,20 @@ def test_unknown_findings_that_could_be_duplicates_rule_out_go():
     assert "duplicate_ratio is unknown on an arm" in decision["reasons"]
 
 
-def _redact_final(mutate) -> tuple[dict, dict]:
-    """The fixture's metrics and redact run's row, its final round's controller record and
-    run changed by ``mutate(run, controller)``. As registered, B1 escapes there."""
+def _final_of(case: str, mutate) -> tuple[dict, dict]:
+    """The fixture's metrics and ``case``'s run row, its final round's controller record
+    and run changed by ``mutate(run, controller)``."""
     prereg, corpus, runs = _files()
-    run = _run(runs, "redact-authorization-header")
+    run = _run(runs, case)
     mutate(run, run["reviews"][-1]["controller"])
     report = rv.report(rv.check(prereg, corpus, runs))["arms"][ARM]
     (row,) = [row for row in report["runs"] if row["case"] == run["case"]]
     return report["metrics"], row
+
+
+def _redact_final(mutate) -> tuple[dict, dict]:
+    """:func:`_final_of` the redact run. As registered, B1 escapes there."""
+    return _final_of("redact-authorization-header", mutate)
 
 
 # The redact run's final round, a clean reply over a passing validation of its own
@@ -1828,6 +2258,49 @@ def test_the_baseline_facts_are_the_codes():
     from autoforge.certificate import CLEAN
 
     assert base["certificate_clean"] == CLEAN
+
+
+def test_the_baseline_cost_facts_are_the_codes():
+    """Section 2's cost fact. A launch's provider summary carries ``cost_micro_usd`` from
+    the Claude stream reducer alone, which Claude Code reads its reply through with its
+    default ``stream-json`` output, and the Claude Agent SDK provider through its helper;
+    no other provider, and Claude Code with ``output_format: text``, records a cost. The
+    reducer turns a result's ``total_cost_usd`` into it, and the SDK's value through the
+    real helper is held by test_claude_sdk.py::test_a_completed_session_through_the_real_helper.
+    """
+    from autoforge import providers
+    from autoforge.claude_stream import ClaudeStream
+    from autoforge.config import KNOWN_PROVIDERS
+
+    base = rv.read_json(rv.PREREGISTRATION)["baseline"]["launch_cost"]
+    src = REPO_ROOT / "src" / "autoforge"
+    field = base["summary_field"]
+    writers = sorted(p.name for p in src.rglob("*.py") if f'"{field}"' in p.read_text("utf-8"))
+    assert writers == ["claude_stream.py"]
+    built_in: dict[str, set[str]] = {}
+    for path in src.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for cls in (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)):
+            for node in ast.walk(cls):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "ClaudeStream"
+                ):
+                    built_in.setdefault(path.name, set()).add(cls.name)
+    assert built_in == {
+        "providers.py": {"ClaudeCodeProvider"},
+        "claude_sdk.py": {"ClaudeSdkSession"},
+    }
+    assert set(base["providers"]) <= set(KNOWN_PROVIDERS)
+    assert providers._REGISTRY["claude"] is providers.ClaudeCodeProvider
+    assert providers._REGISTRY["claude-sdk"] is providers.ClaudeSdkProvider
+    assert providers.CLAUDE_DEFAULT_OUTPUT_FORMAT == base["claude_output_format"]
+    stream = ClaudeStream(cwd="/work")
+    record = {"type": "result", "subtype": "success", "is_error": False, "result": "done"}
+    stream.feed(json.dumps({**record, "total_cost_usd": 0.0125}).encode())
+    stream.stream_ended()
+    assert stream.summary()[field] == 12_500
 
 
 def test_a_launch_window_is_read_in_the_controllers_terms():

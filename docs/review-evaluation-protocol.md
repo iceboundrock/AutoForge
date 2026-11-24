@@ -63,8 +63,9 @@ passes `--trust-oracles`, which says the caller accepts running that code as the
 
 What follows is what the code on `main` does at registration. `preregistration.json` keeps the
 same facts under `baseline`, and
-`tests/test_review_evaluation.py::test_the_baseline_facts_are_the_codes` fails when the code moves
-away from them: a change to any of them is a change to the baseline every comparison is made
+`tests/test_review_evaluation.py::test_the_baseline_facts_are_the_codes` and
+`tests/test_review_evaluation.py::test_the_baseline_cost_facts_are_the_codes` fail when the code
+moves away from them: a change to any of them is a change to the baseline every comparison is made
 against, and is recorded in section 13.
 
 - **Routing.** Round 1 runs under profile `review_round_1`, rounds 2 to 5 under `review_round_2_5`
@@ -84,16 +85,31 @@ against, and is recorded in section 13.
   state keeps only the last FIX round's resolutions; each FIX step's `control-result.json` keeps its
   own. The controller verifies the commits and follow-up issues a resolution names, not that a
   `fixed` finding is fixed: the kind is the fixer's claim.
-- **Loops.** A PR gets at most `workflow.max_review_rounds` rounds (default 20). Two rounds with
-  the same required resolutions, or three with the same count while a resolution recurs, are
-  stagnant (`stagnation_identical_rounds` 2, `stagnation_unchanged_count_rounds` 3): before round 12
-  the run stops `BLOCKED`; from round 12 the controller may replace the implementation instead, and
-  findings at round 20 force a replan (`review.replan`). A stale round counts against the cap.
+- **Loops.** A PR gets at most `workflow.max_review_rounds` rounds (default 20); a round at the cap
+  that still has findings stops the run `BLOCKED` instead of starting a FIX. Two rounds with the
+  same required resolutions, or three with the same count while a resolution recurs, are stagnant
+  (`stagnation_identical_rounds` 2, `stagnation_unchanged_count_rounds` 3), and a stagnant round
+  stops the run `BLOCKED` unless the replan policy routes it first. A stale round counts against
+  the cap.
+- **Replan.** After every round with findings, and before those loop bounds, the controller applies
+  `review.replan` (`src/autoforge/replan.py`, enabled by default). Below round 12
+  (`soft_threshold`) nothing triggers a replan. From round 12 a replan is triggered by stagnation,
+  or by 3 trailing rounds (`stagnation_window`) each with findings and at most 2 of them
+  (`max_findings_per_round`); findings at round 20 (`hard_threshold`) trigger one whatever else
+  holds. A trigger is not a replacement. While any recorded round's findings are truncated the run
+  stops `BLOCKED` (`replan_evidence_truncated`), and so it does once the issue has had 2 completed
+  replans (`max_replans_per_issue`, `replan_limit_exceeded`); only otherwise does it enter
+  `REPLAN_REEXECUTE`. With the policy disabled a round's findings meet the loop bounds alone.
 - **Risk.** No structured risk exists. The classification is the reviewer's own word and the
   `assessment` is free text; neither is read below.
-- **Cost, tokens, wall clock.** A launch's run-log `execution.json` carries its start and end and,
-  for Claude Code only, the provider summary's `cost_micro_usd`. No provider's run log reports
-  context tokens (#154).
+- **Cost, tokens, wall clock.** A launch's run-log `execution.json` carries its start and end and
+  the provider's summary. That summary holds `cost_micro_usd`, when the provider's result reports a
+  cost, for two providers, which both read their reply through the Claude stream reducer
+  (`src/autoforge/claude_stream.py`): Claude Code (`claude`) with its default `stream-json` output,
+  and the Claude Agent SDK provider (`claude-sdk`), whose value through the real helper
+  `test_claude_sdk.py::test_a_completed_session_through_the_real_helper` holds. Claude Code with
+  `output_format: text`, OpenCode, the OpenCode SDK provider and Pi record no cost. No provider's
+  run log reports context tokens (#154).
 
 | Baseline value | Today |
 |---|---|
@@ -153,8 +169,12 @@ a certificate `issued` over a round that is not `clean` or a set that is not `pa
 revision: this round did not get it. A `clean` round over a failed set, or over another candidate's,
 is kept: it is a round the controller blocked on with no certificate.
 
-The candidate a run **ended on** is its final round's, unless the run went on past its record
-(section 5): then whether the run ended on a certified candidate is unknown.
+The candidate a run **ended on** is its final round's only when the controller's record shows the
+run stopped right after that round (section 5). A certificate is the outcome of its round, not of
+the run: a certified run goes back to `REVIEW` when its revision moves after the clean review
+(`src/autoforge/transitions.py`), and the controller certifies another candidate or none. So where
+the record shows no such stop, whether the run ended on a certified candidate, and which candidate
+it ended on, are unknown, whatever its final round's certificate says.
 
 ## 4. The labeling taxonomy
 
@@ -172,10 +192,13 @@ The candidate a run **ended on** is its final round's, unless the run went on pa
   where those ordinals start and end (section 5).
   An arm has at most one run per case; a planned run is not repeated, so a second one is refused
   rather than allowed to replace the first. A run record that does not end on a certified round says
-  why it ends there. A stale round ends a run's record: the controller fixes no stale round and
-  reviews the moved revision next, which is no commit a run record holds. It does not end the run,
-  so unless the controller's record shows the run stopped there, the run's outcome and usage are
-  unknown (section 5).
+  why it ends there. A run an infrastructure failure stopped before its first review result is
+  recorded as it happened, with its launches, no round and its exclusion reason: no review is
+  invented for it, and it is an excluded run, not a case without one (section 6). A record with no
+  round that is not excluded is refused. A stale round ends a run's record: the controller fixes no
+  stale round and reviews the moved revision next, which is no commit a run record holds. It does
+  not end the run, so unless the controller's record shows the run stopped there, the run's outcome
+  and usage are unknown (section 5).
 - A **finding** is one entry of a round's `REVIEW` result, held to the controller's own parser.
 - A **defect** is ground truth: a defect the change introduced, at a commit, shown by evidence.
 - A **fix** is a FIX round. One that made a commit is labeled; one that made none has nothing to
@@ -238,8 +261,13 @@ cutoff counts it (`test_review_evaluation.py::test_a_late_defect_counts_only_onc
 
 **Adjudicators** are humans: `fixture_author`, `maintainer` or `human_adjudicator`. A
 `reviewer`, `fixer`, `agent`, `model` or `self` is refused wherever an adjudicator appears: on a
-defect, a label or a fix. A real adjudicator labels a finding without being told which arm raised
-it; the scorer cannot check that, so the record of who labeled what is part of the evidence.
+defect, a label or a fix. The scorer holds both lists itself, not only `preregistration.json`: a
+preregistration may narrow the human roles, and one that allows any other role, or refuses fewer
+than these five, is refused, and every adjudicator is held to the scorer's lists whatever a
+preregistration says (`test_review_evaluation.py::test_no_preregistration_makes_an_agent_an_adjudicator`).
+That an adjudicator declared human is one is the record's word, which the scorer cannot check. A
+real adjudicator labels a finding without being told which arm raised it; the scorer cannot check
+that either, so the record of who labeled what is part of the evidence.
 
 ### 4.4 What is never a label
 
@@ -306,19 +334,29 @@ ordinal, the first one included. A launch nobody recorded is not a launch that c
 incomplete run makes every usage total of its arm `unknown`, with the known part shown apart and
 the runs named, and the report lists what each run's record misses.
 
-The window also says whether a run ended where its record does. When the controller spent an
-ordinal past the record's last launch, the run **went on past its record**: a launch the record
-does not hold followed its last round, so that round is not where the run's outcome was decided,
-and whether the run ended on a certified candidate is unknown. The same holds when the record ends
-at a stale round and no recorded end shows the run stopped there. A record whose run stopped on a
-round the controller certified nothing for, and says it ended at `READY_FOR_MERGE`, is refused: the
-controller enters `READY_FOR_MERGE` only with the completed round's certificate.
+The window also says whether a run ended where its record does, and only the window does: a record
+listing no later round is no evidence that none followed. The run **ended at its record's final
+round** when its window ends at a recorded stop and every ordinal after that round's last REVIEW
+launch, up to `last`, is held by a FIX launch of that round: nothing the record does not hold came
+after it. When the controller spent an ordinal past every launch the record holds, the run **went on
+past its record**. Anything else leaves open whether it did: no window, an `unrecorded` end, no
+REVIEW launch of the final round, or an ordinal after it that is missing or spent on another launch,
+any of which could be a later round on a moved revision. A stale final round is no exception.
+Unless the run ended at its record's final round, that round is not where its outcome was decided:
+whether it ended on a certified candidate, which defects escaped and whether it is a validated
+success are all unknown, whatever that round holds (sections 3 and 6). A record whose run stopped on
+a round the controller certified nothing for, or on no round, and says it ended at
+`READY_FOR_MERGE`, is refused: the controller enters `READY_FOR_MERGE` only with the completed
+round's certificate.
 
 ## 6. Metric formulas
 
 Every rate is pooled over an arm's runs, the sum of their numerators over the sum of their
 denominators, not a mean of per-case rates. Only registered defects, those discovered by the cutoff,
-count. Excluded runs (an infrastructure failure, with its reason) are listed and left out.
+count. Excluded runs (an infrastructure failure, with its reason, one stopped before its first
+review result included) are listed with their reasons and left out. The report shows every arm that
+holds a run, one whose every run is excluded too, and a case an arm excluded is not among the cases
+it has no run of; the decision counts it in the excluded share (section 8).
 
 - **`weighted_recall`** = Σ w(d) over detected d in E / Σ w(d) over d in E, where E is every
   registered defect present at a commit the run reviewed, w is the severity weight, and d is
@@ -334,9 +372,11 @@ count. Excluded runs (an infrastructure failure, with its reason) are listed and
 - **`escaped_critical_defects`**: registered `critical` defects present at the candidate a run
   ended on when the controller certified it (section 3). A clean reply the controller did not
   certify lets nothing escape. Where its record does not settle that (no record of the final round's
-  certificate, or a run that went on past its record), the defects at the final round's candidate
-  are listed as possible escapes and the count is `unknown`, its known part shown apart. The report
-  lists every escape, of any severity.
+  certificate, or no record that the run ended at its final round, section 5), the defects at the
+  final round's candidate are listed as possible escapes and the count is `unknown`, its known part
+  shown apart. A run whose record does not show where it ended leaves the count `unknown` even when
+  its final round holds no critical defect: the candidate it ended on is another. The report lists
+  every escape, of any severity.
 - **`harmful_fix_rate`** = H / (H + N) over fixes that made a commit, with `unknown` fixes widening
   the bounds as for precision.
 - **`duplicate_ratio`** = D / C, with D the duplicate confirmed findings (section 4.3). An `unknown`
@@ -360,7 +400,9 @@ count. Excluded runs (an infrastructure failure, with its reason) are listed and
   a settlement allows.
 - **Validated success**: the controller certified the candidate the run ended on over a validation
   set that `passed` (not the empty set), and no registered `critical` or `major` defect is at it. It
-  is `unknown` where the controller's record does not settle that and would decide it.
+  is `unknown` where the controller's record does not settle that and would decide it, and always
+  for a run whose record does not show it ended at its final round: neither that round's defects nor
+  its validation set are the candidate's it ended on, so they rule a success neither in nor out.
 - **`cost_per_validated_success`** = the cost of every launch of every run (analysis, review, fix,
   failed attempts included) / validated successes. It has no value without a success, none while a
   run's success is `unknown`, and none while a run's launch record is incomplete (section 5).
@@ -384,10 +426,14 @@ Two kinds are reported and neither is folded into the other.
 
 Every comparison with a registered threshold is exact and reads unrounded values: a label band
 against `max_label_uncertainty`, an interval end or a point estimate against a margin or the
-primary's effect, the cost per validated success against its margin. Counts and weights are
-integers, a launch's cost and a registered value are the decimals their file wrote, and each rate
-is the ratio it is. A report rounds a value to six decimals for display, and no decision reads a
-rounded one.
+primary's effect, the cost per validated success against its margin, the excluded cases' share of
+the planned ones against `max_excluded_case_share`. Counts and weights are integers, each rate and
+share is the ratio it is, and a launch's cost and a registered value are the decimals their file
+wrote: the scorer reads every JSON number with a fraction or an exponent as that decimal, digit for
+digit, never as the binary float nearest it, which can round it onto a limit
+(`test_review_evaluation.py::test_a_file_is_decided_on_the_decimals_it_wrote`,
+`test_review_evaluation.py::test_an_excluded_share_at_its_limit_is_decided_exactly`). A report
+rounds a value to six decimals for display, and no decision reads a rounded one.
 
 ## 8. The pre-registered decision
 
@@ -408,9 +454,13 @@ the baseline's is a `NO_GO`, whatever else is shown. The gate reads every treatm
 excluded, paired or not. It compares defects by identity, not by id: a case's defect is the same
 defect in both arms' runs of the case, and a defect a treatment run introduced is that run's alone
 (section 4.2), so the baseline never held it and its critical escape is always a new one, even when
-a baseline run's regression of the same id escaped too. An escape is at a certified candidate
-(section 3): a possible escape, where either arm's record does not settle the outcome, decides
-neither `NO_GO` nor `GO` and leaves the comparison open.
+a baseline run's regression of the same id escaped too, and even when the baseline has no run of
+the case. An escape is at a certified candidate (section 3): a possible escape, where either arm's
+record does not settle the outcome, decides neither `NO_GO` nor `GO` and leaves the comparison open.
+So an escape of a case's defect is new only against a baseline run of the case whose record settles
+that it did not escape there: where the baseline has no run of the case, only an excluded one, or
+one whose record does not show where it ended, whether it escaped the baseline's review is unknown,
+and the treatment's escape leaves the comparison open.
 
 A later issue that needs another primary from section 6 says so in an amendment before its first
 real run; otherwise this one applies.
@@ -430,11 +480,13 @@ Decided in this order:
    the cost criterion broken. Harm is decided on whatever pairs exist, so a missing pair never
    excuses it.
 3. `INCONCLUSIVE` when the sample is incomplete: a case with no pair of runs, more than 10% of the
-   cases excluded, or fewer cases than the minimum.
+   cases excluded on either arm, or fewer cases than the minimum.
 4. `NO_GO` when the primary's interval lies wholly below +0.1.
 5. `INCONCLUSIVE` while anything is open: a metric `unknown`, an interval reaching past a margin,
    a cost not measured on both arms (an incomplete launch record included, a run that went on past
-   its record among them), a possible critical escape, or a primary not shown.
+   its record among them), a possible critical escape, a critical escape whose novelty the baseline
+   does not settle, a treatment run whose record does not show where it ended, or a primary not
+   shown.
 6. `GO`.
 
 The minimum is a floor, not a power calculation. The variance of a real review is unknown until
@@ -473,8 +525,9 @@ clean negative, where no label can confirm anything, and move neither bound. One
 escaped (B1), and three runs are validated successes, at a synthetic $11.00 in all, $3.67 per
 success. Every round carries the controller's record, its certificate included, and five runs end
 on a round it issued a certificate for. Every run's launch window starts at the run's creation and
-ends at its stop, `READY_FOR_MERGE` or, for the stagnant run, `BLOCKED`, so every launch record is
-complete. `decide` on these runs is `NOT_EVALUATED`.
+ends at its stop, `READY_FOR_MERGE` or, for the stagnant run, `BLOCKED`, right after its final
+round's REVIEW launch, so every launch record is complete and every run ended at its record's final
+round. `decide` on these runs is `NOT_EVALUATED`.
 
 The fixture is replayable: `verify` rebuilds every commit from `corpus.json` and `fixture_runs.json`
 at their pinned SHAs and runs every oracle where the ground truth says it fails or passes, and
@@ -484,8 +537,8 @@ at their pinned SHAs and runs every oracle where the ground truth says it fails 
 
 ## 10. Tests that hold this
 
-All in `tests/test_review_evaluation.py`, offline, in `make check`: 108 tests, which took 49 to 52
-seconds run serially on one shared host at a load average of 7 to 13 on 8 cores, and 16 seconds on
+All in `tests/test_review_evaluation.py`, offline, in `make check`: 121 tests, which took 49 to 50
+seconds run serially on one shared host at a load average of 1 to 1.5 on 8 cores, and 16 seconds on
 4 workers.
 
 - The contract's files: `test_the_registered_files_pass_the_check`,
@@ -500,6 +553,7 @@ seconds run serially on one shared host at a load average of 7 to 13 on 8 cores,
 - No agent's word is a label: `test_what_the_agents_say_of_their_own_work_moves_no_score`,
   `test_a_label_carrying_an_agents_confidence_or_verdict_is_refused`,
   `test_an_agent_is_no_adjudicator`, `test_an_agent_adjudicating_a_defect_or_a_fix_is_refused`,
+  `test_no_preregistration_makes_an_agent_an_adjudicator`,
   `test_the_scorer_holds_no_engine_github_client_or_provider`.
 - What the check refuses: `test_every_finding_has_exactly_one_label`,
   `test_a_label_is_bound_to_the_candidate_it_judged`, `test_labels_are_frozen_at_the_discovery_cutoff`,
@@ -514,6 +568,7 @@ seconds run serially on one shared host at a load average of 7 to 13 on 8 cores,
   `test_a_launch_ordinal_is_spent_once_and_within_the_runs_window`,
   `test_the_controller_record_is_held_to_what_the_controller_does`,
   `test_a_planned_run_is_not_repeated`,
+  `test_a_run_excluded_before_its_first_review_is_an_exclusion`,
   `test_a_preregistration_short_of_a_usable_criterion_is_refused`.
 - The label bounds and intervals:
   `test_unknown_findings_that_could_be_duplicates_bound_the_duplicate_ratio`,
@@ -523,18 +578,24 @@ seconds run serially on one shared host at a load average of 7 to 13 on 8 cores,
 - What the controller certified:
   `test_a_clean_reply_the_controller_would_not_certify_escapes_nothing`,
   `test_a_clean_reply_over_a_missing_record_decides_no_escape`,
-  `test_a_deliberately_empty_validation_set_certifies_and_validates_nothing`.
-- The decision, on synthetic real arms of 33 copied cases:
+  `test_a_deliberately_empty_validation_set_certifies_and_validates_nothing`,
+  `test_a_missing_stop_leaves_an_issued_certificate_undecided`,
+  `test_a_run_that_went_on_past_a_defective_candidate_has_no_known_success`.
+- The decision, on synthetic real arms of 33 copied cases (100 for the excluded share at its
+  limit):
   `test_fixture_runs_reach_no_decision_however_good_they_look`,
   `test_go_needs_the_primary_effect_every_bound_and_the_registered_sample`,
   `test_a_new_critical_escape_is_no_go_however_large_the_benefit`,
   `test_a_regression_a_run_introduced_is_its_own_whatever_its_id`,
+  `test_a_shared_defect_with_no_usable_baseline_run_is_no_proven_new_escape`,
   `test_a_margin_worse_on_its_whole_interval_is_no_go`, `test_no_effect_is_no_go_on_a_complete_sample`,
   `test_unknown_labels_rule_out_go`, `test_unknown_findings_that_could_be_duplicates_rule_out_go`,
   `test_a_sample_below_the_registered_minimum_reaches_no_primary_conclusion`,
   `test_a_case_with_no_pair_or_too_many_exclusions_is_inconclusive_but_harm_still_decides`,
   `test_a_cost_no_launch_measured_rules_out_go`,
   `test_the_cost_criterion_is_decided_on_unrounded_values`,
+  `test_a_file_is_decided_on_the_decimals_it_wrote`,
+  `test_an_excluded_share_at_its_limit_is_decided_exactly`,
   `test_a_run_whose_launch_record_is_incomplete_has_no_measured_cost`,
   `test_an_omitted_retry_leaves_the_cost_unknown`,
   `test_an_omitted_leading_attempt_leaves_the_cost_unknown`,
@@ -542,6 +603,7 @@ seconds run serially on one shared host at a load average of 7 to 13 on 8 cores,
   `test_an_omitted_cost_margin_never_turns_an_open_cost_into_go`,
   `test_a_clean_reply_alone_cannot_trigger_the_hard_gate`.
 - This page and the code: `test_the_baseline_facts_are_the_codes`,
+  `test_the_baseline_cost_facts_are_the_codes`,
   `test_a_launch_window_is_read_in_the_controllers_terms`,
   `test_the_protocol_registers_the_digests_of_its_files`,
   `test_the_protocol_names_every_case_metric_and_registered_value`,
@@ -565,6 +627,10 @@ Decided on and left open:
 - **A stale round ends a run's record.** The record has no place for the revision a human pushed
   during a review, so a real run whose revision moved can be scored only up to that round, and,
   unless it stopped there, its outcome and cost stay `unknown`.
+- **A run's outcome needs its recorded stop.** Only the controller's record of where a run stopped
+  ties its outcome to its record's final round. A collector that cannot read that stop, or a run
+  the controller resumed after its last recorded round, leaves the run's certificate, escapes and
+  success `unknown`, and a decision on such runs `INCONCLUSIVE`.
 - **Matching a finding to a defect is judgment.** An oracle shows that a defect is there, not that a
   finding describes it. A real evaluation's labels are as good as its adjudicators, and the fixture's
   are its author's.
@@ -591,7 +657,7 @@ Decided on and left open:
   certificate it issued for each round, and of what that round was presented. Oracles read a
   commit's tree through the same byte-exact materializer the controller exports a candidate with
   (D6.2, D6.3).
-- **#338:** the new tests took 49 to 52 seconds serially on one loaded host (section 10), most of it
+- **#338:** the new tests took 49 to 50 seconds serially on one shared host (section 10), most of it
   the case bootstrap of the decision tests; `verify` runs 228 git commands, its builds and the
   materializer's exports of each oracle's tree, and twelve oracle processes.
 - **#23:** no state protocol, ADR or controller change is made, so no migration or crash-replay
@@ -603,9 +669,11 @@ Decided on and left open:
 
 An amendment changes the registered files and these digests in one reviewed change, with its
 reason, and states whether any real run had been made before it. A change to the code that moves a
-baseline fact of section 2 is an amendment too.
+baseline fact of section 2 is an amendment too. The files and digests below are those #355's own
+pull request registers: what changed in them while it was under review, before any real run, is
+part of the registration and no amendment.
 
-- `preregistration.json`: `9245a89ce21d2a21a9571b0f6d34b49984e6349b14d4fd772f9e415521348cf0`
+- `preregistration.json`: `4faf1fc3b833867814dc9c9231b3684fd95b0e6aaa41aa404f3cb22a6a58cae8`
 - `corpus.json`: `3e94841c82a0f4b6ed734915c4e002d29aefefd64bd2f44f475e5b1da4a5da63`
 
 | Date | Change | Why | Real runs before it |

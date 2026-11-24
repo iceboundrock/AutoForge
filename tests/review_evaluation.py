@@ -43,8 +43,10 @@ reply and the fixer's resolution kinds are reported as claims and read by no
 metric. Whether the controller certified a round's candidate is its own record
 of the certificate it issued for that round and revision; which launches a run
 made is its own record of the ordinals it spent, from the run's creation to the
-stop the evaluation ended it at. Every comparison with a registered threshold
-is made in exact arithmetic on unrounded values; a report rounds for display.
+stop the evaluation ended it at, and the run ended at its record's final round
+only on that record of its stop. A file's numbers are read as the decimals it
+wrote, and every comparison with a registered threshold is made in exact
+arithmetic on unrounded values; a report rounds for display.
 """
 
 from __future__ import annotations
@@ -60,6 +62,7 @@ import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
 
@@ -83,6 +86,12 @@ RUNS_SCHEMA = "autoforge.review-evaluation.runs/1"
 REPORT_SCHEMA = "autoforge.review-evaluation.report/1"
 
 CASE_KINDS = ("defect", "clean_negative")
+# Who may adjudicate (section 4.3): a human, never an agent on its own work. The scorer
+# holds both lists itself, so that no preregistration can admit an agent's word as a
+# label: one that allows a role outside the first or refuses less than the second is
+# refused, and every adjudicator is held to them whatever the preregistration says.
+HUMAN_ADJUDICATOR_ROLES = ("fixture_author", "maintainer", "human_adjudicator")
+REFUSED_ADJUDICATOR_ROLES = ("reviewer", "fixer", "agent", "model", "self")
 # The controller's own record of a round, never the reviewer's reply: the result
 # ``review_history`` keeps for it, or ``unrecorded`` when no record of it was found.
 DISPOSITIONS = (*RESULTS, "unrecorded")
@@ -162,7 +171,19 @@ class ReviewEvaluationError(Exception):
 
 
 def read_json(path: Path) -> dict:
+    """The file as Python values, a fraction read as a float: what a test edits.
+
+    Nothing that decides reads a file this way: :func:`load` parses it with
+    :func:`parse`, which keeps every decimal exactly as the file wrote it.
+    """
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def parse(text: str) -> object:
+    """A JSON document, every number with a fraction or exponent the exact
+    :class:`~decimal.Decimal` written: a binary float would round one before any
+    comparison could read it."""
+    return json.loads(text, parse_float=Decimal)
 
 
 def file_digest(path: Path) -> str:
@@ -194,39 +215,52 @@ def _int(value: object, where: str, minimum: int = 0) -> int:
     return value
 
 
-def _number(value: object, where: str) -> float | None:
+def _exact_or_none(value: object) -> Fraction | None:
+    """``value`` as the exact finite number it is, or ``None`` when it is none."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | Fraction):
+        return Fraction(value)
+    if isinstance(value, Decimal):
+        return Fraction(value) if value.is_finite() else None
+    if isinstance(value, float):
+        return Fraction(repr(value)) if math.isfinite(value) else None
+    return None
+
+
+def exact(value: object) -> Fraction:
+    """``value`` exactly, as the decimal it was written as: what a threshold compares.
+
+    :func:`load` reads a file's fractions as the :class:`~decimal.Decimal` written
+    (:func:`parse`), which is taken digit for digit, whatever its length. A float
+    reaches here only from a caller's own Python, which has no file text left to
+    read: it is taken as its shortest repr, the literal that gives it.
+    """
+    number = _exact_or_none(value)
+    if number is None:
+        raise ReviewEvaluationError(f"{value!r} is no finite number")
+    return number
+
+
+def _number(value: object, where: str) -> Fraction | None:
+    """A non-negative finite number, exactly as written, or ``None`` for null."""
     if value is None:
         return None
-    if not isinstance(value, int | float) or isinstance(value, bool) or not value >= 0:
-        raise ReviewEvaluationError(f"{where} must be a non-negative number or null")
-    if not math.isfinite(value):
-        raise ReviewEvaluationError(f"{where} must be finite")
-    return float(value)
+    number = _exact_or_none(value)
+    if number is None or number < 0:
+        raise ReviewEvaluationError(f"{where} must be a finite non-negative number or null")
+    return number
 
 
 def _bounded(
     value: object, where: str, low: float, high: float, *, low_open: bool = False
-) -> float:
-    """A finite number in ``[low, high]``, or ``(low, high]`` with ``low_open``."""
-    if (
-        not isinstance(value, int | float)
-        or isinstance(value, bool)
-        or not math.isfinite(value)
-        or not (low < value if low_open else low <= value)
-        or not value <= high
-    ):
+) -> Fraction:
+    """A finite number in ``[low, high]``, or ``(low, high]`` with ``low_open``, exactly."""
+    number = _exact_or_none(value)
+    if number is None or not (low < number if low_open else low <= number) or not number <= high:
         span = f"{'(' if low_open else '['}{low}, {high}]"
         raise ReviewEvaluationError(f"{where} must be a number in {span}, not {value!r}")
-    return float(value)
-
-
-def exact(value: float) -> Fraction:
-    """``value`` as the decimal a file wrote it as: what a threshold is compared with.
-
-    A JSON number is read as the nearest binary float, whose shortest repr is the
-    decimal written, for any number of up to 15 significant digits.
-    """
-    return Fraction(repr(value))
+    return number
 
 
 def _one_of(value: object, choices: Sequence[str], where: str) -> str:
@@ -376,9 +410,10 @@ class Launch:
     round: int | None
     # The controller's launch ordinal the launch spent (``launch_seq``).
     ordinal: int
-    cost_usd: float | None
-    wall_clock_seconds: float | None
-    context_tokens: float | None
+    # Each exactly as the run file wrote it (:func:`exact`).
+    cost_usd: Fraction | None
+    wall_clock_seconds: Fraction | None
+    context_tokens: Fraction | None
     provenance: str
 
 
@@ -446,26 +481,40 @@ class Run:
     def went_on(self) -> bool | None:
         """Whether the run went on past its record: ``None`` when that is unknown.
 
-        True when the controller spent an ordinal after the record's last launch: a
-        launch the record does not hold followed its last round, so that round is not
-        where the run's outcome was decided. Unknown when the record's last round is
-        stale and no recorded end shows the run stopped there: the controller fixes no
-        stale round and reviews the moved revision next, so a stale round ends what a
-        record can hold, never the run by itself.
+        The record's final round is where the run ended only on the controller's own
+        record of the stop, never because no later round is listed. False when the
+        window ends at a stop the evaluation ended the run at and every ordinal after
+        the final round's last REVIEW launch, up to the window's last, is held by a FIX
+        launch of that round: nothing the record does not hold came after it. True
+        when the controller spent an ordinal past every launch the record holds: a
+        launch it does not hold followed. Otherwise unknown: no stop is recorded (no
+        window, or one whose end is unrecorded), the record holds no REVIEW launch of
+        its final round, or an ordinal after it is missing or spent on another launch,
+        any of which could be a later round on another revision. A stale final round is
+        no exception: the controller reviews the moved revision next, and the run ended
+        there only on a stop recorded right after it.
         """
         w = self.launch_window
-        held = max((launch.ordinal for launch in self.launches), default=0)
-        if w is not None and w.last is not None and w.last > held:
-            return True
-        if self.reviews[-1].disposition == "stale" and (w is None or w.last is None):
+        if w is None or w.last is None or not self.reviews:
             return None
+        by_ordinal = {launch.ordinal: launch for launch in self.launches}
+        if w.last > max(by_ordinal, default=0):
+            return True
+        final = self.reviews[-1].round
+        reviewed = [o for o, x in by_ordinal.items() if (x.phase, x.round) == ("REVIEW", final)]
+        if not reviewed:
+            return None
+        for ordinal in range(max(reviewed) + 1, w.last + 1):
+            launch = by_ordinal.get(ordinal)
+            if launch is None or (launch.phase, launch.round) != ("FIX", final):
+                return None
         return False
 
     def certification(self) -> str:
         """Whether the controller certified the candidate the run ended on (section 3).
 
-        The final round's, when the run ended on it; unknown when the run went on
-        past its record, or may have.
+        The final round's, when the controller's record shows the run ended on it;
+        unknown when the run went on past its record, or may have.
         """
         if self.went_on() is not False:
             return CERTIFICATION_UNKNOWN
@@ -605,6 +654,19 @@ def check_preregistration(prereg: object) -> dict:
         raise ReviewEvaluationError("a success-blocking severity is not a registered severity")
     if set(p["adjudicator_roles"]) & set(p["refused_adjudicator_roles"]):
         raise ReviewEvaluationError("an adjudicator role is both allowed and refused")
+    admitted = sorted(set(p["adjudicator_roles"]) - set(HUMAN_ADJUDICATOR_ROLES))
+    if admitted:
+        raise ReviewEvaluationError(
+            f"preregistration adjudicator_roles admits {admitted}: only a human "
+            f"adjudicates ({list(HUMAN_ADJUDICATOR_ROLES)}), and no preregistration "
+            "relaxes that"
+        )
+    unrefused = sorted(set(REFUSED_ADJUDICATOR_ROLES) - set(p["refused_adjudicator_roles"]))
+    if unrefused:
+        raise ReviewEvaluationError(
+            f"preregistration refused_adjudicator_roles leaves out {unrefused}: an agent's "
+            "word on its own work is never a label, and no preregistration relaxes that"
+        )
     _bounded(p["max_label_uncertainty"], "preregistration max_label_uncertainty", 0, 1)
     u = _obj(
         p["uncertainty"],
@@ -615,7 +677,8 @@ def check_preregistration(prereg: object) -> dict:
         raise ReviewEvaluationError("preregistration uncertainty.method is not one this scorer has")
     _int(u["resamples"], "preregistration uncertainty.resamples", 1)
     _int(u["seed"], "preregistration uncertainty.seed")
-    if not isinstance(u["confidence"], float) or not 0 < u["confidence"] < 1:
+    confidence = _exact_or_none(u["confidence"])
+    if isinstance(u["confidence"], int) or confidence is None or not 0 < confidence < 1:
         raise ReviewEvaluationError("preregistration uncertainty.confidence must be in (0, 1)")
     minimum = _obj(
         p["minimum_sample"],
@@ -663,14 +726,27 @@ def check_preregistration(prereg: object) -> dict:
 
 
 def _adjudicator(value: object, where: str, prereg: Mapping) -> str:
+    """The adjudicator's id, held to the scorer's own human-only rule first.
+
+    The preregistration can narrow who adjudicates, never widen it: a role the
+    scorer refuses, or one outside its human roles, is refused whatever the
+    preregistration lists. That an id names a human is the record's word, which
+    the scorer cannot check (section 4.3).
+    """
     a = _obj(value, where, ("id", "role"))
     _str(a["id"], f"{where}.id")
-    if a["role"] in prereg["refused_adjudicator_roles"]:
+    role = a["role"]
+    if role in REFUSED_ADJUDICATOR_ROLES or role in prereg["refused_adjudicator_roles"]:
         raise ReviewEvaluationError(
-            f"{where} is a {a['role']}: an agent's word on its own work is no label "
+            f"{where} is a {role}: an agent's word on its own work is no label "
             "(self-reported correctness is refused)"
         )
-    _one_of(a["role"], prereg["adjudicator_roles"], f"{where}.role")
+    if role not in HUMAN_ADJUDICATOR_ROLES:
+        raise ReviewEvaluationError(
+            f"{where}.role {role!r} is no human adjudicator's: only "
+            f"{list(HUMAN_ADJUDICATOR_ROLES)} adjudicate"
+        )
+    _one_of(role, prereg["adjudicator_roles"], f"{where}.role")
     return str(a["id"])
 
 
@@ -1115,8 +1191,16 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
     _check_ground_truth(at, commits, defects)
     labels = _labels(r["labels"], f"{at} labels", prereg, cutoff)
 
-    if not isinstance(r["reviews"], list) or not r["reviews"]:
-        raise ReviewEvaluationError(f"{at}.reviews must be a non-empty list")
+    excluded = r.get("excluded", "")
+    if excluded:
+        _str(excluded, f"{at}.excluded")
+    if not isinstance(r["reviews"], list):
+        raise ReviewEvaluationError(f"{at}.reviews must be a list")
+    if not r["reviews"] and not excluded:
+        raise ReviewEvaluationError(
+            f"{at}.reviews must be a non-empty list: only a run excluded for an "
+            "infrastructure failure before its first review result holds no round"
+        )
     raw_fixes = r["fixes"]
     if not isinstance(raw_fixes, list):
         raise ReviewEvaluationError(f"{at}.fixes must be a list")
@@ -1243,16 +1327,15 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
     if unused:
         raise ReviewEvaluationError(f"{at} labels finding(s) no review raised: {unused}")
     stopped = r.get("stopped", "")
-    ending = reviews[-1].certification
+    # A run excluded before its first review result ended on no round: its exclusion
+    # says why it ends there.
+    ending = reviews[-1].certification if reviews else NOT_CERTIFIED
     if ending == CERTIFIED and stopped:
         raise ReviewEvaluationError(
             f"{at} ended on a round the controller certified and says it was stopped"
         )
-    if ending == NOT_CERTIFIED:
+    if (reviews and ending == NOT_CERTIFIED) or stopped:
         _str(stopped, f"{at}.stopped")
-    excluded = r.get("excluded", "")
-    if excluded:
-        _str(excluded, f"{at}.excluded")
     if not isinstance(r["launches"], list):
         raise ReviewEvaluationError(f"{at}.launches must be a list")
     launches = tuple(
@@ -1322,12 +1405,12 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
     if (
         window is not None
         and window.end == "READY_FOR_MERGE"
-        and run.went_on() is False
-        and ending == NOT_CERTIFIED
+        and (not reviews or (run.went_on() is False and ending == NOT_CERTIFIED))
     ):
         raise ReviewEvaluationError(
             f"{at} ended at READY_FOR_MERGE on a round the controller certified nothing "
-            "for: it enters READY_FOR_MERGE only over the completed round's certificate"
+            "for, or on no round: it enters READY_FOR_MERGE only over the completed "
+            "round's certificate"
         )
     for review in run.reviews:
         for finding in review.findings:
@@ -1381,7 +1464,7 @@ def load(
         name: path.read_bytes()
         for name, path in (("preregistration", preregistration), ("corpus", corpus), ("runs", runs))
     }
-    ev = check(*(json.loads(data.decode("utf-8")) for data in raw.values()))
+    ev = check(*(parse(data.decode("utf-8")) for data in raw.values()))
     return Evaluation(
         preregistration=ev.preregistration,
         cases=ev.cases,
@@ -1708,6 +1791,10 @@ class RunScore:
     harmful: int
     not_harmful: int
     harm_unknown: int
+    # Whether the controller's record shows the run ended at its record's final round
+    # (:meth:`Run.went_on` is False). When it does not, the candidate the run ended on
+    # is unknown, and so are its certificate, its escapes and its success.
+    settled: bool
     # Whether the controller certified the candidate the run ended on.
     certification: str
     # Registered defects at the final round's candidate when it is certified, and when
@@ -1755,9 +1842,20 @@ def _nameable_weight(
 
 
 def _success(
-    certification: str, validation: str, escapes: Iterable[tuple[str, str]], blocking: set
+    settled: bool,
+    certification: str,
+    validation: str,
+    escapes: Iterable[tuple[str, str]],
+    blocking: set,
 ) -> bool | None:
-    """A validated success, or ``None`` while the controller's record leaves it open."""
+    """A validated success, or ``None`` while the controller's record leaves it open.
+
+    Only the candidate the run ended on decides it. When the record does not show
+    the run ended at its final round, that candidate is unknown, and nothing of the
+    final round, its defects and its validation set included, decides it either way.
+    """
+    if not settled:
+        return None
     if certification == NOT_CERTIFIED:
         return False
     if validation == "empty_set" or any(severity in blocking for _, severity in escapes):
@@ -1823,6 +1921,7 @@ def score_run(run: Run, prereg: Mapping) -> RunScore:
     fix_verdicts = [fix.verdict for fix in run.fixes if fix.commit is not None]
     final = run.reviews[-1]
     at_final = tuple(sorted((d.id, d.severity) for d in registered if run.present(d, final.commit)))
+    settled = run.went_on() is False
     certification = run.certification()
     blocking = set(prereg["success_blocking_severities"])
     return RunScore(
@@ -1842,10 +1941,11 @@ def score_run(run: Run, prereg: Mapping) -> RunScore:
         harmful=fix_verdicts.count("harmful"),
         not_harmful=fix_verdicts.count("not_harmful"),
         harm_unknown=fix_verdicts.count("unknown"),
+        settled=settled,
         certification=certification,
         escaped=at_final if certification == CERTIFIED else (),
         possible_escapes=at_final if certification == CERTIFICATION_UNKNOWN else (),
-        success=_success(certification, final.validation, at_final, blocking),
+        success=_success(settled, certification, final.validation, at_final, blocking),
     )
 
 
@@ -1977,7 +2077,7 @@ def bootstrap_indices(n: int, prereg: Mapping) -> list[list[int]]:
     return [[rng.randrange(n) for _ in range(n)] for _ in range(u["resamples"])]
 
 
-def percentile_interval(values: list, confidence: float) -> tuple | None:
+def percentile_interval(values: list, confidence: object) -> tuple | None:
     """Nearest-rank percentile interval of ``values``, or ``None`` with none to rank.
 
     Each end is the value of one-based rank ``ceil(p * n)`` among the ``n`` ordered
@@ -1989,7 +2089,7 @@ def percentile_interval(values: list, confidence: float) -> tuple | None:
         return None
     ordered = sorted(values)
     n = len(ordered)
-    tail = (1 - Fraction(repr(confidence))) / 2
+    tail = (1 - exact(confidence)) / 2
     low = max(1, math.ceil(tail * n))
     high = max(1, math.ceil((1 - tail) * n))
     return ordered[low - 1], ordered[high - 1]
@@ -2004,7 +2104,7 @@ def exact_sum(scores: Sequence[RunScore], attr: str) -> Fraction:
     """The sum of ``attr`` over the launches that recorded it, as the decimals written."""
     return sum(
         (
-            exact(v)
+            v
             for x in scores
             for launch in x.run.launches
             if (v := getattr(launch, attr)) is not None
@@ -2090,18 +2190,22 @@ def arm_metrics(
         ]
 
     escaped, possible = critical("escaped"), critical("possible_escapes")
-    unrecorded = sorted(
+    # A run whose record leaves a critical defect at a candidate that may have been
+    # certified, and one whose record does not show where it ended, whatever its final
+    # round holds: either leaves the count open.
+    unsettled = sorted(
         {x.run.id for x in scores for _, sev in x.possible_escapes if sev == "critical"}
+        | {x.run.id for x in scores if not x.settled}
     )
     escapes: dict = {"value": len(escaped), "defects": escaped, "possible": possible}
-    if possible:
+    if unsettled:
         escapes.update(
             value=None,
             known_part=len(escaped),
             why_unknown=f"the controller's record does not settle the outcome of run(s) "
-            f"{unrecorded}: no record of the certificate of the round each ended on, or a "
-            "run that went on past its record, so whether a candidate was certified is "
-            "unknown",
+            f"{unsettled}: no record of the certificate of the round each ended on, or no "
+            "recorded stop showing the run ended at its record's final round, so whether "
+            "it ended on a certified candidate is unknown",
         )
     successes = sum(1 for x in scores if x.success)
     open_successes = sorted(x.run.id for x in scores if x.success is None)
@@ -2187,29 +2291,38 @@ def _scores_by_arm(ev: Evaluation) -> dict[str, list[RunScore]]:
     return out
 
 
+def _mean(values: Sequence[int]) -> float | None:
+    return _rounded(Fraction(sum(values), len(values))) if values else None
+
+
 def report(ev: Evaluation) -> dict:
-    """The deterministic report of every arm: same files, same bytes."""
+    """The deterministic report of every arm: same files, same bytes.
+
+    Every arm that holds a run is shown, one whose every run is excluded too: its
+    exclusions, each with its reason, are part of the record, and a case it excluded
+    is not a case it has no run of.
+    """
     prereg = ev.preregistration
+    by_arm = _scores_by_arm(ev)
     arms: dict[str, dict] = {}
-    for arm, scores in sorted(_scores_by_arm(ev).items()):
-        indices = bootstrap_indices(len(scores), prereg)
-        provenances = sorted({x.run.provenance for x in scores})
+    for arm in sorted({run.arm for run in ev.runs}):
+        scores = by_arm.get(arm, [])
+        runs = sorted((r for r in ev.runs if r.arm == arm), key=lambda r: r.id)
+        indices = bootstrap_indices(len(scores), prereg) if scores else None
+        provenances = sorted({r.provenance for r in runs})
         rows = [_run_row(x) for x in scores]
-        planned = sorted(ev.cases)
-        held = {x.run.case.id for x in scores}
+        held = {r.case.id for r in runs}
         arms[arm] = {
             "provenance": provenances[0] if len(provenances) == 1 else "mixed",
             "cases": len(scores),
-            "missing_cases": [c for c in planned if c not in held],
+            "missing_cases": [c for c in sorted(ev.cases) if c not in held],
             "excluded": [
-                {"run": r.id, "case": r.case.id, "reason": r.excluded}
-                for r in sorted(ev.runs, key=lambda r: r.id)
-                if r.arm == arm and r.excluded
+                {"run": r.id, "case": r.case.id, "reason": r.excluded} for r in runs if r.excluded
             ],
             "metrics": arm_metrics(scores, prereg, indices),
             "loops": {
-                "mean_review_rounds": _rounded(sum(r["review_rounds"] for r in rows) / len(rows)),
-                "mean_fix_rounds": _rounded(sum(r["fix_rounds"] for r in rows) / len(rows)),
+                "mean_review_rounds": _mean([r["review_rounds"] for r in rows]),
+                "mean_fix_rounds": _mean([r["fix_rounds"] for r in rows]),
                 "rounds_by_profile": _count(p for r in rows for p in r["profiles"]),
                 "ended": _count(r["ended"] for r in rows),
             },
@@ -2248,7 +2361,7 @@ def _paired(
     treat: Sequence[RunScore],
     metric: str,
     indices: list[list[int]],
-    confidence: float,
+    confidence: object,
 ) -> tuple[Fraction, Fraction] | None:
     """The paired interval of treatment minus baseline, its ends exact."""
     b = _resampled(_terms(base, metric), indices, exactly=True)
@@ -2264,7 +2377,7 @@ def _margin(
     treat: Sequence[RunScore],
     metrics: tuple[Mapping, Mapping],
     indices: list[list[int]],
-    confidence: float,
+    confidence: object,
 ) -> tuple[str, str]:
     """(harm, open): why ``metric`` is shown worse than its margin, or not shown within it.
 
@@ -2347,44 +2460,69 @@ def decide(ev: Evaluation, baseline: str, treatment: str) -> dict:
 
     # Measured harm first: the gate reads every treatment run, paired or not. An
     # escape is at a candidate the controller certified; where its record does not
-    # settle that, an escape is possible and decides nothing either way.
+    # settle that, an escape is possible and decides nothing either way. A case's
+    # defect is a new escape only against a baseline run of the case whose record
+    # settles that it did not escape there: with no such run (none, an excluded one,
+    # or one whose record leaves its outcome open) its novelty is unknown. A defect a
+    # treatment run introduced is its own, which no baseline run can share, so its
+    # escape is new whether or not the case is paired.
     harm: list[str] = []
     open_: list[str] = []
+    excluded_before = {r.case.id for r in by_arm[baseline] if r.excluded}
     for case_id, run in sorted(held[treatment].items()):
         counterpart = held[baseline].get(case_id)
         escaped_before: set[tuple[str, str, str]] = set()
         possible_before: set[tuple[str, str, str]] = set()
-        if counterpart is not None:
+        if counterpart is None:
+            unsettled_before = (
+                "the baseline's run of the case is excluded"
+                if case_id in excluded_before
+                else "the baseline has no run of the case"
+            )
+        else:
             before = score_run(counterpart, prereg)
             escaped_before = {escape_identity(counterpart, did) for did, _ in before.escaped}
             possible_before = {
                 escape_identity(counterpart, did) for did, _ in before.possible_escapes
             }
+            unsettled_before = (
+                ""
+                if before.settled
+                else "the controller's record does not settle the baseline run's outcome"
+            )
         after = score_run(run, prereg)
         for did, severity in after.escaped:
             identity = escape_identity(run, did)
             if severity != "critical" or identity in escaped_before:
                 continue
-            what = (
-                f"critical defect {did} of case {case_id!r}"
-                if run.belongs_to(did) == "case"
-                else f"critical defect {did} that treatment run {run.id!r} introduced"
-            )
-            if identity in possible_before:
-                open_.append(
-                    f"{what} escaped the treatment's review, and whether it escaped the "
-                    "baseline's is unknown"
+            if run.belongs_to(did) == "run":
+                harm.append(
+                    f"critical defect {did} that treatment run {run.id!r} introduced "
+                    "escaped its review"
                 )
-            elif run.belongs_to(did) == "case":
-                harm.append(f"{what} escaped the treatment's review")
+                continue
+            what = f"critical defect {did} of case {case_id!r} escaped the treatment's review"
+            if unsettled_before:
+                open_.append(
+                    f"{what}, and whether it escaped the baseline's is unknown: {unsettled_before}"
+                )
+            elif identity in possible_before:
+                open_.append(f"{what}, and whether it escaped the baseline's is unknown")
             else:
-                harm.append(f"{what} escaped its review")
+                harm.append(what)
+        flagged = False
         for did, severity in after.possible_escapes:
             if severity != "critical" or escape_identity(run, did) in escaped_before:
                 continue
+            flagged = True
             open_.append(
                 f"critical defect {did} of run {run.id!r} may have escaped the treatment's "
                 "review: the controller's record does not settle the run's outcome"
+            )
+        if not after.settled and not flagged:
+            open_.append(
+                f"the controller's record does not settle the outcome of treatment run "
+                f"{run.id!r}: no recorded stop shows it ended at its record's final round"
             )
     if paired:
         metrics = (arm_metrics(base, prereg, None), arm_metrics(treat, prereg, None))
@@ -2401,7 +2539,7 @@ def decide(ev: Evaluation, baseline: str, treatment: str) -> dict:
     missing = [c for c in sorted(ev.cases) if c not in paired and c not in excluded]
     if missing:
         incomplete.append(f"case(s) {missing} have no pair of runs")
-    if len(excluded) > rule["max_excluded_case_share"] * len(ev.cases):
+    if Fraction(len(excluded), len(ev.cases)) > exact(rule["max_excluded_case_share"]):
         incomplete.append(f"{len(excluded)} excluded case(s) pass the registered share")
     defect_cases = sum(1 for c in paired if ev.cases[c].kind == "defect")
     negatives = len(paired) - defect_cases
