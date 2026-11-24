@@ -15,6 +15,7 @@ from autoforge.config import ReplanConfig
 from autoforge.effects import LABEL_AGENT_PUBLISHES, replacement_pr_body
 from autoforge.errors import (
     ControlResultValidationError,
+    ExactReadCredentialError,
     ExecutionError,
     GitHubError,
     GitHubUnavailableError,
@@ -7787,6 +7788,58 @@ def test_a_create_that_landed_before_a_crash_is_observed_not_repeated(tmp_state_
     assert eng2.provider.calls == []
     _assert_replacement_active(eng, gh, txn_id)
     assert len(_creates(gh)) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ExactReadCredentialError("credential refused"),
+        GitHubUnavailableError("HTTP 404"),
+        GitHubError("reply is not JSON"),
+    ],
+    ids=["credential", "listed-404", "invalid-reply"],
+)
+def test_k7_exact_read_failure_after_create_preserves_or_rejects_the_journal(
+    tmp_state_dir, monkeypatch, failure
+):
+    gh = FakeGitHub()
+    gh.gh_sanitizes = True
+    body = REPLAN_TEXT + "\n\nEscape text: `\\u001b[0m`."
+    eng = _parked_and_decided(tmp_state_dir, gh, _replan_agent(gh, payload_over={"pr_body": body}))
+
+    with monkeypatch.context() as m:
+        m.setattr(gh, "exact_read_error", failure)
+        if type(failure) is GitHubError:
+            assert eng.step().next_phase == "BLOCKED"
+        else:
+            with pytest.raises(type(failure)) as caught:
+                eng.step()
+            if isinstance(failure, ExactReadCredentialError):
+                assert "Restore exact-read access before running 'resume'" in str(caught.value)
+
+    assert ("get_pr_exact", REPLACEMENT_PR) in gh.calls
+    state = load_state(eng.paths.state_file)
+    txn = ReplanTransaction.from_dict(state.replan_transaction)
+    assert gh.prs[PR].state == "OPEN" and not gh.closed_prs
+    assert len(_creates(gh)) == 1
+    assert _plan_stages(eng) == [("push", "observed"), ("replacement_pr", "attempted")]
+    assert state.effect_records[1]["attempts"] == 1
+    if type(failure) is GitHubError:
+        assert state.phase is Phase.BLOCKED and txn.stage is ReplanStage.REJECTED
+        assert "reply is not JSON" in state.block_reason
+        return
+
+    assert state.phase is Phase.REPLAN_REEXECUTE and txn.stage is ReplanStage.PREPARED
+    eng2 = _restart(eng, gh, save=False)
+    (out,) = eng2.run(max_steps=1)
+    assert out.next_phase == "REVIEW"
+    assert eng2.provider.calls == [] and len(_creates(gh)) == 1
+    state = load_state(eng2.paths.state_file)
+    assert state.current_pr_url == REPLACEMENT_PR and not state.replan_transaction
+    assert gh.prs[REPLACEMENT_PR].body == _controller_body(
+        eng, _published_marker(eng, txn.transaction_id), body
+    )
+    assert gh.prs[PR].state == "CLOSED" and len(gh.closed_prs) == 1
 
 
 def test_a_replacement_closed_by_a_human_after_a_crash_is_never_bound(tmp_state_dir):

@@ -17,6 +17,15 @@ laundered decision.
 
 ---
 
+**K7 exact-read credentials (#329).** A credential failure in the direct
+REST read that verifies the replacement PR stops the command without
+rejecting the transaction. Restore access, then `resume`; the attempted
+create is read back from the journal before another write can be considered.
+The conclusive-rejection rule below still applies to ordinary `gh`
+failures and other conclusive read failures. This is not an `unblock`
+route. See [GitHub safety](github-safety.md#ghs-sanitizer-and-the-exact-read-327)
+for the separate recovery-audit (K13) handling.
+
 ## Invariants
 
 - A replan discards the PR that holds the untruncated findings, so it requires complete evidence. `review_history` entries are bounded (`MAX_PERSISTED_FINDINGS_PER_ROUND`, `MAX_REQUIRED_RESOLUTION_CHARS`) and mark any round whose findings were dropped or clipped. A marked round blocks for a human, in the policy and again at the `REPLAN_REEXECUTE` checkpoint, rather than letting a replacement be accepted against a reduced acknowledgement count. No round the controller accepted is ever marked. The parser bounds the review payload ([control-result-protocol.md](control-result-protocol.md), "Review payload bounds"): an oversized review is refused whole and re-emitted within the bounds, so the evidence a replan collects is always the reviews' own complete finding list. The persisted resolution bound absorbs the growth redaction can add to an accepted text. A marked round can therefore only come from state persisted before the parser bounds existed, or edited outside the controller. There is no machine-readable copy of such a round's findings on GitHub to recover it from (the review comment's marker carries only the finding ids, and the controller never parses the comment's prose), so that case stays fail-closed by design rather than being reconstructed from prose. The replacement is also re-read and re-verified at its checkpointed HEAD immediately before the old PR is closed, because the checkpoint that authorised the close may be a crash and a `resume` older than the close itself.

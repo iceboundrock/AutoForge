@@ -215,6 +215,7 @@ def test_an_agent_status_is_the_controller_applied_outcome(status, outcome, code
         (errors.GitHubUnavailableError("502"), Out.RESUMABLE_ERROR, C.GITHUB_UNAVAILABLE),
         (errors.GitHubChecksAccessError("403"), Out.RESUMABLE_ERROR, C.GITHUB_CHECKS_REFUSED),
         (errors.GitHubNotFoundError("404"), Out.RESUMABLE_ERROR, C.GITHUB_ERROR),
+        (errors.ExactReadCredentialError("401"), Out.RESUMABLE_ERROR, C.GITHUB_ERROR),
         (errors.CheckoutDriftError("d"), Out.RESUMABLE_ERROR, C.CHECKOUT_DRIFT),
         # #414: a step blocks on it; it ends a command only from outside a step.
         (errors.PROwnerError("o"), Out.RESUMABLE_ERROR, C.PR_OWNER),

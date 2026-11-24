@@ -360,6 +360,7 @@ from .errors import (
     ControlResultError,
     ControlResultValidationError,
     EpicRebindError,
+    ExactReadCredentialError,
     ExecutionError,
     ExecutionTimeoutError,
     GitHubChecksAccessError,
@@ -21962,8 +21963,9 @@ class ControllerEngine:
         every predicate binding always had, headed at exactly the pushed
         candidate and attesting the saved counts, and the source is
         superseded. A conflict or a conclusive failure rejects with the
-        records as persisted; an unavailable GitHub, or a write whose
-        outcome is not readable yet, propagates for 'resume'.
+        records as persisted; an unavailable GitHub, an exact-read
+        credential failure, or a write whose outcome is not readable yet
+        propagates for 'resume'.
         """
         state = self._require_state()
         effects = state.phase_effects()
@@ -22021,6 +22023,11 @@ class ControllerEngine:
                 )
                 driven = drive(record, op, self._persist_effect)
             except GitHubUnavailableError:
+                raise
+            except ExactReadCredentialError as exc:
+                # K7 may already have created the PR. Keep its attempt and
+                # the journal; resume must prove the payload before binding.
+                _add_line(exc, "Restore exact-read access before running 'resume'.")
                 raise
             except GitHubError as exc:
                 return self._reject_replan(

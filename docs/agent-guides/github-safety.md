@@ -1539,45 +1539,51 @@ PR.
 **The exact read.** `GitHubClient.get_pr_exact`, `get_issue_exact` and
 `get_comment_exact` read one object with GitHub's REST API directly:
 
-- one `GET` of `https://api.github.com/repos/<owner>/<repo>/pulls/<n>`,
+- a `GET` of `https://api.github.com/repos/<owner>/<repo>/pulls/<n>`,
   `.../issues/<n>` or `.../issues/comments/<id>`, the path built from a
   parsed `github.com` URL (`_repository_path`), so no other host,
   repository or path is reachable;
 - the credential is the one `gh` holds for `github.com`, printed by
   `gh auth token --hostname github.com` and sent as a bearer token. It
-  stays in memory for the one request: never in argv, a file, the state,
+  stays in memory for the bounded read: never in argv, a file, the state,
   a log or an error, and `HttpsRequest`'s repr leaves the headers out;
 - TLS that verifies the chain and the host name against the system's
   trust store, with no key log (`SSLKEYLOGFILE` is ignored: it would write
   the secrets of the connection that carries the credential to a file); no
-  redirect followed (a 3xx would carry the credential elsewhere; it is a
-  conclusive error); the client's `timeout_seconds` on each socket
+  redirect followed or its `Location` parsed (a 3xx is a conclusive
+  error); the client's `timeout_seconds` on each socket
   operation of connecting (the TCP connection, the TLS handshake, sending
   the request), and on reading the whole reply from the start of the call:
   the status line, the headers, a chunked body's framing and trailers, and
   the body, every receive waiting at most until that deadline, so a server
   that trickles any of it cannot hold the controller (a proxy's answer to
-  the tunnel is read the same way); at most
-  `EXACT_READ_MAX_BYTES` (2 MiB) of a body and `EXACT_READ_ERROR_BYTES`
-  (4 KiB) of an error reply read;
+  the tunnel is read the same way); `EXACT_READ_MAX_BYTES` (2 MiB) of a
+  body, with one extra byte to detect overflow, and at most
+  `EXACT_READ_ERROR_BYTES` (4 KiB) of an error body;
 - read-only: no other method exists, and nothing on GitHub changes.
 
-Its failures are classified as `gh`'s are, and none of them is ever a
-reason to write. No connection, a timeout, a 5xx, a 429 or a rate-limited
-403 (by its headers, or by GitHub's message, which a secondary limit may
-send alone) is `GitHubUnavailableError`: nothing is saved or sent and `resume`
-reads again (after a write, `EffectPending`, the record still
-`attempted`). A 404 is `GitHubNotFoundError`; a 401, any other 403, a
-redirect, a certificate that does not verify, a reply that is not one
-`application/json` object within the bound, an answer naming another
-object, or a `gh auth token` that fails or prints anything but one visible
-token is a conclusive `GitHubError`, and the phase blocks with nothing
-sent again. No message quotes the reply; an error reply is read only to
-tell a rate limit from a refusal.
+**Failure classification (#329).** A `gh` read or complete listing has
+already returned the object these accessors read. A 404 on the exact GET
+could be lag, deletion or a REST access gap; it proves neither absence nor
+that the observed object matches. The client retries the GET under its
+ordinary transient retry bound (one retry by default, with a new reply
+deadline per request). A persistent 404 is `GitHubUnavailableError`, as
+are connection failures, timeouts, 5xx, 429, and rate-limited 403 (by
+headers or the message). Other statuses are not retried.
+
+A 401, a 403 that is not rate limited, or `gh auth token` exiting with a
+non-transient failure or printing no usable token is an
+`ExactReadCredentialError`. A timeout or transient token-command failure is
+unavailable, without a GET. A redirect, failed TLS verification, malformed
+or oversized JSON reply, wrong object or invalid local setup is a
+conclusive `GitHubError`, not a credential refusal. The transport and
+token diagnostics never quote a header, body, proxy setting or command
+output. No failed exact read is proof that a write should go ahead.
 
 **When it runs, and what stays strict.** In a create's completion
 read-back (K2 implementation PR, K4 review comment, K5 follow-up issue,
-K7 replacement PR, K8 progress comment, K9 acceptance comment), and only
+K7 replacement PR, K8 progress comment, K9 acceptance comment, K13 recovery
+audit comment), and only
 when exactly one object carries the identity, every condition other than
 its text holds on `gh`'s read (for a PR: open, on the planned head branch
 of the run's repository, onto the planned base, among the head's PRs and
@@ -1621,10 +1627,8 @@ holding `\u001b` text or a control character is therefore written back
 byte for byte. An operator comment holding a payload with escape text is
 `exact`, and one holding `\x03` where the payload says `^C` is a
 conflict. Two comments with one marker, a misplaced payload and an
-unreadable marker are conflicts without the read. A failed exact read is
-classified as above: unavailable propagates with nothing persisted or
-sent, and conclusive blocks (K10 keeps it on the record as a failed
-verification). The `bound` digest stays on `gh`'s print. It is taken from
+unreadable marker are conflicts without the read. The `bound` digest
+stays on `gh`'s print. It is taken from
 a print when the operator binds a comment and compared with later prints
 of that comment, so it is consistent, and moving it to the exact text
 would invalidate bindings already saved.
@@ -1669,9 +1673,47 @@ the print of the exact text the controller judges (above). A body
 the controller writes back is the one exception by design: it goes to
 GitHub as GitHub held it.
 
-**Not covered yet.** The open points of the exact read itself (#329): how
-a 404 or a credential failure of the exact read is classified in K7, where
-any conclusive failure ends the replan, and a `doctor` row for it.
+**What callers do with those failures.** Client classification is not a
+phase decision:
+
+- **Create read-back (K2, K4, K5, K7, K8, K9):** An unavailable read
+  makes no reconciliation decision. After a create it leaves the record
+  `attempted` (`EffectPending`); `resume` reconciles from a fresh listing.
+  A conclusive failure normally blocks, and, where the phase permits it,
+  `unblock` re-enters the plan without clearing the attempt.
+- **K7 credential failure:** `REPLAN_REEXECUTE` stops without rejecting
+  its journal. Restore the credential or its REST permissions, then
+  `resume`. The controller reconciles the recorded attempt before any
+  further write and still needs proof of the replacement before closing
+  the source. Other conclusive failures, including ordinary `gh` errors,
+  still reject the replan. `unblock` does not re-enter a journaled replan.
+- **K13 audit read-back:** A sole matching comment with differing printed
+  text can require an exact read. An immediate failure leaves the audit
+  pending and does not relaunch the agent. The next command settles the
+  audit first: unavailable propagates for `resume`, and a conclusive
+  failure blocks. This is separate from K7; restore access before
+  resuming a replan with an audit pending, since a blocked run with a
+  replan journal cannot be unblocked.
+- **Body writes and verification (K3, K6, K10, K11, K12, and the
+  `UPDATE_EPIC` roadmap):** The caller handles a failed exact read as a
+  failed read of that object; K10 records a conclusive verification
+  failure. At **FIX entry**, an unavailable PR-body read stops before
+  launch; a conclusive failure only suppresses the PR-body update offer.
+- **Reporting:** REVIEW marks unreadable operator evidence and continues.
+  `status`'s review-provenance report records the failed exact read and
+  continues. These paths do not treat unreadable evidence as verified.
+
+**Doctor.** The `exact read (api.github.com)` row runs the same token
+command in an empty temporary directory and, if it gets a usable token,
+makes one `GET https://api.github.com/rate_limit` through the same HTTPS
+transport, without retries. OK requires a JSON response with the expected
+`resources.core` rate-limit fields and says nothing about repository
+permissions. A 404 here is an unexpected endpoint response, not an
+inconclusive object read. Temporary unavailability gives a warning;
+authentication, configuration and rejected replies fail the row without
+interrupting the report. The remedy may point to the credential, system
+temporary directory, TLS hostname and trust store, or `HTTPS_PROXY`,
+`NO_PROXY` and the network path. Neither the token nor the reply is shown.
 
 **Troubleshooting.** A create that blocks with *"… carries its identity
 but is not the object the controller intended (another body, title, head
@@ -1683,9 +1725,8 @@ an earlier version, on an object whose body holds `\u001b`-like text,
 recovers with `unblock`: the conflict reopens with its attempt count kept,
 the read-back runs again with the exact read and observes the object, and
 nothing is written again. An exact read that keeps failing names its cause
-in the reason: `gh auth status` and `gh auth token --hostname github.com`
-must work for the user running AutoForge, and `api.github.com` must be
-reachable (the proxy variables apply, as they do to `gh`).
+in the reason. Use `autoforge doctor` to test the token command and the
+network path to `api.github.com` without printing the token.
 
 Work an earlier version left part done on such a body (#328) finishes
 without writing `gh`'s rewrite. An append it planned on `gh`'s print is

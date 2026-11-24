@@ -36,6 +36,7 @@ from autoforge.engine import MAX_TRANSIENT_RETRIES, PUSHED_HEAD_WAIT_SECONDS
 from autoforge.errors import (
     ConfigurationError,
     ControlResultValidationError,
+    ExactReadCredentialError,
     ExecutionError,
     ExecutionTimeoutError,
     GitHubError,
@@ -1644,6 +1645,37 @@ def test_analyze_a_conflict_from_gh_s_rewritten_body_unblocks_into_review_withou
     )
     data = json.loads(eng2.paths.state_file.read_text(encoding="utf-8"))
     assert data["phase"] == "REVIEW"
+
+
+def test_k2_exact_read_credential_failure_blocks_and_unblock_reconciles_without_writes(
+    tmp_state_dir, fake_github
+):
+    fake_github.gh_sanitizes = True
+    fake_github.exact_read_error = ExactReadCredentialError("credential refused")
+    eng = make_engine(
+        tmp_state_dir,
+        lambda req: implement(req, pr_body=ESCAPE_BODY),
+        github=fake_github,
+        origin=True,
+    )
+    pushes = _logs_pushes(eng.origin)
+    assert _analyzed(eng).next_phase == "BLOCKED"
+    state = load_state(eng.paths.state_file)
+    assert state.stop_code == "github-read-failed" and "credential refused" in state.block_reason
+    assert [(r["stage"], r["attempts"]) for r in state.effect_records] == [
+        ("observed", 1),
+        ("attempted", 1),
+    ]
+    assert ("get_pr_exact", PR) in fake_github.calls
+
+    fake_github.exact_read_error = None
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    assert eng2.unblock("REST credential renewed").unblocked
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert eng2.provider.calls == [] and eng2.state.current_pr_url == PR
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+    assert _pushes(pushes) == [f"refs/heads/autoforge/2 {eng2.state.current_head_sha}"]
 
 
 # A body a human wrote on the branch's PR, holding the text of an escape and the control

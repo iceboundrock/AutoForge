@@ -95,7 +95,7 @@ from typing import TYPE_CHECKING
 
 import autoforge
 from autoforge.config import ProfileConfig, load_config_file
-from autoforge.doctor import CHECKS_READ_ROW, REQUIRED_CHECKS_ROW
+from autoforge.doctor import CHECKS_READ_ROW, EXACT_READ_ROW, REQUIRED_CHECKS_ROW
 from autoforge.engine import ControllerEngine
 from autoforge.errors import VerificationError
 from autoforge.git_transport import NO_AUTO_MAINTENANCE
@@ -191,7 +191,13 @@ REMOTE_MODE = (
 # The doctor rows that need GitHub. The stand-in's `gh` answers nothing, so
 # in the REMOTE flow they fail or skip by construction: reported as a fact,
 # never counted against step 3.
-DOCTOR_GITHUB_ROWS = ("gh available", "gh authenticated", REQUIRED_CHECKS_ROW, CHECKS_READ_ROW)
+DOCTOR_GITHUB_ROWS = (
+    "gh available",
+    "gh authenticated",
+    REQUIRED_CHECKS_ROW,
+    CHECKS_READ_ROW,
+    EXACT_READ_ROW,
+)
 
 
 # -- credential-shaped strings (step 5) ---------------------------------------------

@@ -1540,6 +1540,10 @@ known and the retry path is bounded. Current cases include:
   the corrections, each after the phase-entry reconciliation, and none while
   a process the failed launch started may still be running
 - temporary GitHub/network error
+- a direct REST exact read of an object `gh` has already returned (#329):
+  retry an inconclusive GET within the client's ordinary read retry
+  bound, including HTTP 404; never treat it as proof of absence. See
+  [caller handling](github-safety.md#ghs-sanitizer-and-the-exact-read-327).
 - a read-back right after the controller's own push that still shows the
   PR headed at the commit the push replaced (GitHub moves a PR's head
   asynchronously, #403): the PR is read again after each pause of

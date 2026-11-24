@@ -17,8 +17,10 @@ from pathlib import Path
 import pytest
 
 import autoforge.github as github_module
+from autoforge.doctor import Doctor
 from autoforge.errors import (
     ConfigurationError,
+    ExactReadCredentialError,
     GitHubChecksAccessError,
     GitHubError,
     GitHubNotFoundError,
@@ -4207,26 +4209,52 @@ def test_the_identity_read_through_gh_and_the_exact_read_differ_only_by_the_sani
         (429, {}, GitHubUnavailableError),
         (403, {"x-ratelimit-remaining": "0"}, GitHubUnavailableError),
         (403, {"retry-after": "60"}, GitHubUnavailableError),
-        (401, {}, GitHubError),
-        (403, {}, GitHubError),
-        (404, {}, GitHubNotFoundError),
+        (401, {}, ExactReadCredentialError),
+        (403, {}, ExactReadCredentialError),
+        (404, {}, GitHubUnavailableError),
         (301, {"location": "https://evil.example/"}, GitHubError),
         (302, {}, GitHubError),
         (201, {}, GitHubError),
     ],
 )
 def test_an_exact_read_classifies_github_s_status(status, headers, expected):
-    """A 5xx, a 429 or a rate-limited 403 is inconclusive (read again later); a 404 is
-    not found; anything else that is not 200 (401, a plain 403, a redirect, which is
-    never followed) is conclusive. No message quotes the token."""
-    _, _, client = _exact_client(_json_reply(_rest_pr(42), status, **headers))
+    """A 404 for a listed object and transient failures retry; credentials and other
+    refusals do not. No message quotes the token."""
+    _, gets, client = _exact_client(_json_reply(_rest_pr(42), status, **headers))
     with pytest.raises(GitHubError) as info:
         client.get_pr_exact(_EXACT_PR_URL)
     assert type(info.value) is expected
+    assert len(gets) == (2 if expected is GitHubUnavailableError else 1)
     assert f"HTTP {status}" in str(info.value)
     assert _EXACT_TOKEN not in str(info.value)
     if 300 <= status < 400:
         assert "never followed" in str(info.value)
+
+
+@pytest.mark.parametrize(("read", "url", "row", "path"), _EXACT_READS)
+@pytest.mark.parametrize("recovers", [True, False], ids=["visible-on-retry", "still-inconclusive"])
+def test_exact_read_retries_the_same_listed_object_after_a_404(
+    read, url, row, path, recovers, monkeypatch
+):
+    sleeps = []
+    requests = []
+    missing = HttpsReply(404, {}, b"")
+    replies = iter([missing, _json_reply(row) if recovers else missing])
+    gh_calls, _, client = _exact_client()
+
+    def https(request):
+        requests.append(request.url)
+        return next(replies)
+
+    monkeypatch.setattr(client, "_https", https)
+    monkeypatch.setattr(github_module.time, "sleep", sleeps.append)
+    if recovers:
+        assert getattr(client, read)(url).body == _EXACT_TEXT
+    else:
+        with pytest.raises(GitHubUnavailableError, match="HTTP 404 for an object already seen"):
+            getattr(client, read)(url)
+    assert requests == [EXACT_READ_ROOT + path] * 2
+    assert len(gh_calls) == len(sleeps) == 1
 
 
 @pytest.mark.parametrize(
@@ -4237,8 +4265,8 @@ def test_an_exact_read_classifies_github_s_status(status, headers, expected):
             GitHubUnavailableError,
         ),
         (b'{"message": "API rate limit exceeded for user ID 1."}', GitHubUnavailableError),
-        (b'{"message": "Resource not accessible by integration"}', GitHubError),
-        (b"", GitHubError),
+        (b'{"message": "Resource not accessible by integration"}', ExactReadCredentialError),
+        (b"", ExactReadCredentialError),
     ],
     ids=["secondary-limit", "primary-limit", "refused", "no-body"],
 )
@@ -4308,7 +4336,7 @@ def test_an_exact_read_answered_with_another_object_is_conclusive(read, url, row
     [
         (urllib.error.URLError(ConnectionRefusedError(111, "refused")), GitHubUnavailableError, ""),
         (TimeoutError("timed out"), GitHubUnavailableError, "timed out"),
-        (http.client.RemoteDisconnected("closed"), GitHubUnavailableError, "closed"),
+        (http.client.RemoteDisconnected("closed"), GitHubUnavailableError, "could not be read"),
         (
             urllib.error.URLError(ssl.SSLCertVerificationError(1, "self-signed certificate")),
             GitHubError,
@@ -4319,9 +4347,9 @@ def test_an_exact_read_answered_with_another_object_is_conclusive(read, url, row
     ],
     ids=["refused", "timeout", "disconnected", "certificate", "other", "credential-in-error"],
 )
-def test_an_exact_read_classifies_a_transport_failure_and_redacts_it(raised, expected, needle):
+def test_an_exact_read_classifies_a_transport_failure_without_quoting_it(raised, expected, needle):
     """No connection, a timeout or a broken reply is inconclusive; a certificate that
-    does not verify, or anything else, conclusive. The text is redacted."""
+    does not verify, or anything else, conclusive. The exception text is omitted."""
     _, _, client = _exact_client(raises=raised)
     with pytest.raises(GitHubError) as info:
         client.get_pr_exact(_EXACT_PR_URL)
@@ -4335,15 +4363,23 @@ def test_an_exact_read_classifies_a_transport_failure_and_redacts_it(raised, exp
     [
         (
             _raw("", exit_code=1, stderr="You are not logged into any GitHub hosts."),
-            GitHubError,
-            "not logged",
+            ExactReadCredentialError,
+            r"failed \(exit 1\)",
         ),
-        (_raw("", exit_code=1, stderr="HTTP 502: Bad Gateway"), GitHubUnavailableError, "502"),
+        (
+            _raw("", exit_code=1, stderr="HTTP 502: Bad Gateway"),
+            GitHubUnavailableError,
+            "failed temporarily",
+        ),
         (replace(_raw(""), timed_out=True, exit_code=-9), GitHubUnavailableError, "timed out"),
-        (_raw("\n"), GitHubError, "no usable credential"),
-        (_raw("gho_one gho_two\n"), GitHubError, "no usable credential"),
-        (_raw("gho_x\r\nX-Injected: 1\n"), GitHubError, "no usable credential"),
-        (replace(_raw(_EXACT_TOKEN), stdout_truncated=True), GitHubError, "no usable credential"),
+        (_raw("\n"), ExactReadCredentialError, "no usable credential"),
+        (_raw("gho_one gho_two\n"), ExactReadCredentialError, "no usable credential"),
+        (_raw("gho_x\r\nX-Injected: 1\n"), ExactReadCredentialError, "no usable credential"),
+        (
+            replace(_raw(_EXACT_TOKEN), stdout_truncated=True),
+            ExactReadCredentialError,
+            "no usable credential",
+        ),
     ],
     ids=["unauthenticated", "transient", "timeout", "empty", "two-words", "header-split", "cut"],
 )
@@ -4355,7 +4391,8 @@ def test_an_exact_read_without_a_usable_credential_sends_nothing(token, expected
         client.get_pr_exact(_EXACT_PR_URL)
     assert type(info.value) is expected
     assert gets == []
-    assert "gho_one" not in str(info.value) and "X-Injected" not in str(info.value)
+    for fragment in ("gho_one", "X-Injected", "not logged", "Bad Gateway"):
+        assert fragment not in str(info.value)
 
 
 def test_an_exact_read_refuses_a_url_outside_github_before_any_request():
@@ -4380,9 +4417,12 @@ class _Loopback(http.server.BaseHTTPRequestHandler):
         self.server.seen.append((self.path, dict(self.headers.items())))
         if self.path == "/ok":
             self._answer(200, b'{"ok": true}')
-        elif self.path == "/redirect":
+        elif self.path in ("/redirect", "/rate_limit"):
             self.send_response(302)
-            self.send_header("Location", "/ok")
+            location = (
+                "https://[synthetic-location.invalid/ok" if self.path == "/rate_limit" else "/ok"
+            )
+            self.send_header("Location", location)
             self.send_header("Content-Length", "0")
             self.end_headers()
         elif self.path == "/big":
@@ -4486,6 +4526,45 @@ def test_the_transport_never_follows_a_redirect(loopback):
     reply = _get(loopback, "/redirect")
     assert reply.status == 302 and reply.body == b""
     assert [path for path, _ in loopback.seen] == ["/redirect"]
+
+
+def test_doctor_preserves_redirect_status_without_parsing_its_location(loopback, monkeypatch):
+    monkeypatch.setattr(github_module, "https_get", https_get)
+    monkeypatch.setattr(
+        github_module, "EXACT_READ_ROOT", f"http://127.0.0.1:{loopback.server_port}/"
+    )
+    monkeypatch.setenv("no_proxy", "*")
+    doctor = Doctor(runner=lambda _: _raw(_EXACT_TOKEN))
+
+    row = doctor.check_exact_read("gh")
+    assert row.label == "FAIL"
+    assert "HTTP 302" in row.detail and "never followed" in row.detail
+    assert "HTTPS_PROXY" in row.detail and "network path" in row.detail
+    assert "synthetic-location" not in row.detail and _EXACT_TOKEN not in row.detail
+    assert [path for path, _ in loopback.seen] == ["/rate_limit"]
+
+
+@pytest.mark.parametrize(
+    "proxy",
+    [
+        "http:/synthetic-proxy-value",
+        "http://synthetic-proxy-value:bad",
+        "http://",
+        "http://[synthetic-proxy-value",
+    ],
+)
+def test_doctor_names_an_invalid_proxy_setting_without_its_value(monkeypatch, loopback, proxy):
+    monkeypatch.setattr(github_module, "https_get", https_get)
+    monkeypatch.setenv("HTTPS_PROXY", proxy)
+
+    def no_connection(*args, **kwargs):
+        pytest.fail("a malformed proxy should be rejected before connecting")
+
+    monkeypatch.setattr("socket.create_connection", no_connection)
+    row = Doctor(runner=lambda _: _raw(_EXACT_TOKEN)).check_exact_read("gh")
+    assert row.label == "FAIL"
+    assert "invalid proxy configuration" in row.detail and "HTTPS_PROXY" in row.detail
+    assert "synthetic-proxy-value" not in row.detail and _EXACT_TOKEN not in row.detail
 
 
 def test_the_transport_reads_one_byte_past_the_bound_and_no_more(loopback):
