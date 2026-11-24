@@ -624,6 +624,9 @@ the evaluation protocol (#318)        test_evaluation.py (the pins, what arms ho
                                       runs in CI; the protocol held to its files),
                                       test_evaluation_fixture.py (the baseline on the real engine,
                                       its reproducibility, the negative fixtures, the oracle)
+review evaluation (#355)              test_review_evaluation.py (pinned controller facts, Git
+                                      snapshots and data-only oracles, terminal and launch
+                                      evidence, exact paired decisions and synthetic replay)
 troubleshooting guide (#260)          test_troubleshooting_guide.py (every scenario row names
                                       a test that exists; the guide's links and the links
                                       into it resolve)

@@ -272,6 +272,8 @@ docs/evaluation-protocol.md            the pre-registered evaluation of Issue Me
                                        execution (#318): arms, pinned tasks, what is held equal and
                                        measured, the go/no-go decision, the control-plane test list,
                                        fixture mode and the opt-in real-run procedure; no result yet
+docs/review-evaluation-protocol.md     the review baseline, independent label and evidence contract,
+                                       preregistered metrics and synthetic replay (#355)
 docs/test-suite-performance-audit.md   EPIC #338's exit audit: the suite at the EPIC's baseline and on
                                        main, measured on one host; each exit criterion and invariant
                                        with its verdict and tests; what only GitHub holds
@@ -372,6 +374,9 @@ matches none of them needs only this file and the scoped `AGENTS.md`.
   an arm needs, or adding a top-level configuration section, read
   `docs/evaluation-protocol.md`. A threshold, task or setting changes only by
   its section 11.
+- If changing the REV-R0 scorer, fixture, or the review and FIX contracts
+  pinned by it, read `docs/review-evaluation-protocol.md`. Change a
+  registered criterion or evidence rule only by an amendment.
 
 ## Scope discipline
 

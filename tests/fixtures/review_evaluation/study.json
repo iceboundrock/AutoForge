@@ -1,0 +1,1158 @@
+{
+  "cases": [
+    {
+      "defects": [
+        {
+          "class": "correctness",
+          "evidence": {
+            "adjudicator": "Fixture adjudicator",
+            "at": "2026-01-01T00:00:00Z",
+            "role": "independent_human",
+            "source": "fixture"
+          },
+          "id": "D",
+          "introduced": "518017d75493eee0c6d61fd58cc0234404760883",
+          "oracle": {
+            "expected": "ok\n",
+            "path": "result.txt"
+          },
+          "severity": "critical"
+        }
+      ],
+      "id": "repaired",
+      "kind": "defect",
+      "risk": "high",
+      "snapshots": [
+        {
+          "files": {
+            "result.txt": "ok\n"
+          },
+          "resolves": [],
+          "sha": "4334d72476b045150abaa821805ef3fa7122a156"
+        },
+        {
+          "files": {
+            "case.txt": "repaired",
+            "result.txt": "wrong\n"
+          },
+          "resolves": [],
+          "sha": "518017d75493eee0c6d61fd58cc0234404760883"
+        }
+      ]
+    },
+    {
+      "defects": [
+        {
+          "class": "correctness",
+          "evidence": {
+            "adjudicator": "Fixture adjudicator",
+            "at": "2026-01-01T00:00:00Z",
+            "role": "independent_human",
+            "source": "fixture"
+          },
+          "id": "D",
+          "introduced": "ca062327be6163ef94a7fb5f7f6bbe68fff860a7",
+          "oracle": {
+            "expected": "ok\n",
+            "path": "result.txt"
+          },
+          "severity": "critical"
+        }
+      ],
+      "id": "missed",
+      "kind": "defect",
+      "risk": "high",
+      "snapshots": [
+        {
+          "files": {
+            "result.txt": "ok\n"
+          },
+          "resolves": [],
+          "sha": "4334d72476b045150abaa821805ef3fa7122a156"
+        },
+        {
+          "files": {
+            "case.txt": "missed",
+            "result.txt": "wrong\n"
+          },
+          "resolves": [],
+          "sha": "ca062327be6163ef94a7fb5f7f6bbe68fff860a7"
+        }
+      ]
+    },
+    {
+      "defects": [
+        {
+          "class": "correctness",
+          "evidence": {
+            "adjudicator": "Fixture adjudicator",
+            "at": "2026-01-01T00:00:00Z",
+            "role": "independent_human",
+            "source": "fixture"
+          },
+          "id": "D",
+          "introduced": "a5f49c68ff903fae6bcadf623d35bcb8d4d40b49",
+          "oracle": {
+            "expected": "ok\n",
+            "path": "result.txt"
+          },
+          "severity": "critical"
+        }
+      ],
+      "id": "stagnant",
+      "kind": "defect",
+      "risk": "standard",
+      "snapshots": [
+        {
+          "files": {
+            "result.txt": "ok\n"
+          },
+          "resolves": [],
+          "sha": "4334d72476b045150abaa821805ef3fa7122a156"
+        },
+        {
+          "files": {
+            "case.txt": "stagnant",
+            "result.txt": "wrong\n"
+          },
+          "resolves": [],
+          "sha": "a5f49c68ff903fae6bcadf623d35bcb8d4d40b49"
+        }
+      ]
+    },
+    {
+      "defects": [],
+      "id": "quiet",
+      "kind": "clean_negative",
+      "risk": "low",
+      "snapshots": [
+        {
+          "files": {
+            "result.txt": "ok\n"
+          },
+          "resolves": [],
+          "sha": "4334d72476b045150abaa821805ef3fa7122a156"
+        },
+        {
+          "files": {
+            "case.txt": "quiet",
+            "result.txt": "ok\n"
+          },
+          "resolves": [],
+          "sha": "c94b0be4108dab420f601893795af8ea379826e7"
+        }
+      ]
+    },
+    {
+      "defects": [],
+      "id": "false_alarm",
+      "kind": "clean_negative",
+      "risk": "low",
+      "snapshots": [
+        {
+          "files": {
+            "result.txt": "ok\n"
+          },
+          "resolves": [],
+          "sha": "4334d72476b045150abaa821805ef3fa7122a156"
+        },
+        {
+          "files": {
+            "case.txt": "false_alarm",
+            "result.txt": "ok\n"
+          },
+          "resolves": [],
+          "sha": "8aca9900314168fe756da0a22ca4c883dd5d7bb2"
+        }
+      ]
+    },
+    {
+      "defects": [],
+      "id": "unsettled",
+      "kind": "clean_negative",
+      "risk": "low",
+      "snapshots": [
+        {
+          "files": {
+            "result.txt": "ok\n"
+          },
+          "resolves": [],
+          "sha": "4334d72476b045150abaa821805ef3fa7122a156"
+        },
+        {
+          "files": {
+            "case.txt": "unsettled",
+            "result.txt": "ok\n"
+          },
+          "resolves": [],
+          "sha": "04a334e87ba7166526d3d95f50922830b778d980"
+        }
+      ]
+    }
+  ],
+  "cutoff": "2026-01-01T00:00:00Z",
+  "mode": "fixture",
+  "runs": [
+    {
+      "arm": "baseline",
+      "attempts": [
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "ANALYZE_EXECUTE",
+          "round": 0,
+          "seconds": 10,
+          "seq": 1,
+          "source": "fixture attempt",
+          "usd": 1
+        },
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 1,
+          "seconds": 10,
+          "seq": 2,
+          "source": "fixture attempt",
+          "usd": 1
+        },
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "FIX",
+          "round": 1,
+          "seconds": 10,
+          "seq": 3,
+          "source": "fixture attempt",
+          "usd": 1
+        },
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 2,
+          "seconds": 10,
+          "seq": 4,
+          "source": "fixture attempt",
+          "usd": 1
+        }
+      ],
+      "case": "repaired",
+      "defects": [],
+      "id": "repaired-baseline",
+      "reviews": [
+        {
+          "disposition": "accepted",
+          "findings": [
+            {
+              "claim": "illustrative reviewer text",
+              "id": "F1",
+              "label": {
+                "defect": {
+                  "id": "D",
+                  "scope": "case"
+                },
+                "evidence": {
+                  "adjudicator": "Fixture adjudicator",
+                  "at": "2026-01-01T00:00:00Z",
+                  "role": "independent_human",
+                  "source": "fixture"
+                },
+                "sha": "518017d75493eee0c6d61fd58cc0234404760883",
+                "verdict": "confirmed"
+              }
+            },
+            {
+              "claim": "illustrative reviewer text",
+              "id": "F2",
+              "label": {
+                "defect": {
+                  "id": "D",
+                  "scope": "case"
+                },
+                "evidence": {
+                  "adjudicator": "Fixture adjudicator",
+                  "at": "2026-01-01T00:00:00Z",
+                  "role": "independent_human",
+                  "source": "fixture"
+                },
+                "sha": "518017d75493eee0c6d61fd58cc0234404760883",
+                "verdict": "confirmed"
+              }
+            },
+            {
+              "claim": "illustrative reviewer text",
+              "id": "F3",
+              "label": {
+                "evidence": {
+                  "adjudicator": "Fixture adjudicator",
+                  "at": "2026-01-01T00:00:00Z",
+                  "role": "independent_human",
+                  "source": "fixture"
+                },
+                "sha": "518017d75493eee0c6d61fd58cc0234404760883",
+                "verdict": "unknown"
+              }
+            }
+          ],
+          "reply": "needs_fix",
+          "revision": {
+            "base": "main",
+            "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+            "pr": "fixture-pr",
+            "round": 1,
+            "sha": "518017d75493eee0c6d61fd58cc0234404760883"
+          },
+          "seq": 2,
+          "source": "fixture controller review observation"
+        },
+        {
+          "certificate": {
+            "id": "issued",
+            "policy": "fixture policy",
+            "revision": {
+              "base": "main",
+              "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+              "pr": "fixture-pr",
+              "round": 2,
+              "sha": "03cbbd3a276e728c67474914d857c9e9f8960197"
+            },
+            "set": "fixture set passed",
+            "source": "fixture issuance"
+          },
+          "disposition": "accepted",
+          "findings": [],
+          "reply": "clean",
+          "revision": {
+            "base": "main",
+            "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+            "pr": "fixture-pr",
+            "round": 2,
+            "sha": "03cbbd3a276e728c67474914d857c9e9f8960197"
+          },
+          "seq": 4,
+          "source": "fixture controller review observation",
+          "validation": {
+            "policy": "fixture policy",
+            "result": "passed",
+            "revision": {
+              "base": "main",
+              "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+              "pr": "fixture-pr",
+              "round": 2,
+              "sha": "03cbbd3a276e728c67474914d857c9e9f8960197"
+            },
+            "set": "fixture set passed",
+            "source": "fixture validation"
+          }
+        }
+      ],
+      "snapshots": [
+        {
+          "action": "fix",
+          "files": {
+            "case.txt": "repaired",
+            "result.txt": "ok\n"
+          },
+          "label": {
+            "evidence": {
+              "adjudicator": "Fixture adjudicator",
+              "at": "2026-01-01T00:00:00Z",
+              "role": "independent_human",
+              "source": "fixture"
+            },
+            "sha": "03cbbd3a276e728c67474914d857c9e9f8960197",
+            "verdict": "not_harmful"
+          },
+          "resolves": [
+            {
+              "id": "D",
+              "scope": "case"
+            }
+          ],
+          "seq": 3,
+          "sha": "03cbbd3a276e728c67474914d857c9e9f8960197"
+        }
+      ],
+      "start": {
+        "initial_seq": 0,
+        "run": "repaired-baseline",
+        "source": "fixture run creation"
+      },
+      "stop": {
+        "certificate": "issued",
+        "outcome": "certified",
+        "phase": "READY_FOR_MERGE",
+        "reason": "closed fixture observation window",
+        "revision": {
+          "base": "main",
+          "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+          "pr": "fixture-pr",
+          "round": 2,
+          "sha": "03cbbd3a276e728c67474914d857c9e9f8960197"
+        },
+        "source": "fixture controller stop",
+        "through": 4
+      }
+    },
+    {
+      "arm": "treatment",
+      "attempts": [
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "ANALYZE_EXECUTE",
+          "round": 0,
+          "seconds": 10,
+          "seq": 1,
+          "source": "fixture attempt",
+          "usd": 1
+        },
+        {
+          "context_tokens": 50,
+          "outcome": "failed",
+          "phase": "REVIEW",
+          "round": 1,
+          "seconds": 10,
+          "seq": 2,
+          "source": "fixture attempt",
+          "usd": 1
+        },
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 1,
+          "seconds": 10,
+          "seq": 3,
+          "source": "fixture attempt",
+          "usd": 1
+        },
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "FIX",
+          "round": 1,
+          "seconds": 10,
+          "seq": 4,
+          "source": "fixture attempt",
+          "usd": 1
+        },
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 2,
+          "seconds": 10,
+          "seq": 5,
+          "source": "fixture attempt",
+          "usd": 1
+        }
+      ],
+      "case": "repaired",
+      "defects": [
+        {
+          "class": "correctness",
+          "evidence": {
+            "adjudicator": "Fixture adjudicator",
+            "at": "2026-01-01T00:00:00Z",
+            "role": "independent_human",
+            "source": "fixture"
+          },
+          "id": "D",
+          "introduced": "a443412c4a5975e6dc0af2383f0b32286a855c2c",
+          "oracle": {
+            "expected": null,
+            "path": "new.txt"
+          },
+          "severity": "critical"
+        }
+      ],
+      "id": "repaired-treatment",
+      "reviews": [
+        {
+          "disposition": "accepted",
+          "findings": [
+            {
+              "claim": "illustrative reviewer text",
+              "id": "F1",
+              "label": {
+                "defect": {
+                  "id": "D",
+                  "scope": "case"
+                },
+                "evidence": {
+                  "adjudicator": "Fixture adjudicator",
+                  "at": "2026-01-01T00:00:00Z",
+                  "role": "independent_human",
+                  "source": "fixture"
+                },
+                "sha": "518017d75493eee0c6d61fd58cc0234404760883",
+                "verdict": "confirmed"
+              }
+            },
+            {
+              "claim": "illustrative reviewer text",
+              "id": "F2",
+              "label": {
+                "defect": {
+                  "id": "D",
+                  "scope": "case"
+                },
+                "evidence": {
+                  "adjudicator": "Fixture adjudicator",
+                  "at": "2026-01-01T00:00:00Z",
+                  "role": "independent_human",
+                  "source": "fixture"
+                },
+                "sha": "518017d75493eee0c6d61fd58cc0234404760883",
+                "verdict": "confirmed"
+              }
+            },
+            {
+              "claim": "illustrative reviewer text",
+              "id": "F3",
+              "label": {
+                "evidence": {
+                  "adjudicator": "Fixture adjudicator",
+                  "at": "2026-01-01T00:00:00Z",
+                  "role": "independent_human",
+                  "source": "fixture"
+                },
+                "sha": "518017d75493eee0c6d61fd58cc0234404760883",
+                "verdict": "unknown"
+              }
+            }
+          ],
+          "reply": "needs_fix",
+          "revision": {
+            "base": "main",
+            "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+            "pr": "fixture-pr",
+            "round": 1,
+            "sha": "518017d75493eee0c6d61fd58cc0234404760883"
+          },
+          "seq": 3,
+          "source": "fixture controller review observation"
+        },
+        {
+          "certificate": {
+            "id": "issued",
+            "policy": "fixture policy",
+            "revision": {
+              "base": "main",
+              "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+              "pr": "fixture-pr",
+              "round": 2,
+              "sha": "a443412c4a5975e6dc0af2383f0b32286a855c2c"
+            },
+            "set": "fixture set empty",
+            "source": "fixture issuance"
+          },
+          "disposition": "accepted",
+          "findings": [],
+          "reply": "clean",
+          "revision": {
+            "base": "main",
+            "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+            "pr": "fixture-pr",
+            "round": 2,
+            "sha": "a443412c4a5975e6dc0af2383f0b32286a855c2c"
+          },
+          "seq": 5,
+          "source": "fixture controller review observation",
+          "validation": {
+            "policy": "fixture policy",
+            "result": "empty",
+            "revision": {
+              "base": "main",
+              "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+              "pr": "fixture-pr",
+              "round": 2,
+              "sha": "a443412c4a5975e6dc0af2383f0b32286a855c2c"
+            },
+            "set": "fixture set empty",
+            "source": "fixture validation"
+          }
+        }
+      ],
+      "snapshots": [
+        {
+          "action": "fix",
+          "files": {
+            "case.txt": "repaired",
+            "new.txt": "wrong\n",
+            "result.txt": "ok\n"
+          },
+          "label": {
+            "evidence": {
+              "adjudicator": "Fixture adjudicator",
+              "at": "2026-01-01T00:00:00Z",
+              "role": "independent_human",
+              "source": "fixture"
+            },
+            "sha": "a443412c4a5975e6dc0af2383f0b32286a855c2c",
+            "verdict": "harmful"
+          },
+          "resolves": [
+            {
+              "id": "D",
+              "scope": "case"
+            }
+          ],
+          "seq": 4,
+          "sha": "a443412c4a5975e6dc0af2383f0b32286a855c2c"
+        }
+      ],
+      "start": {
+        "initial_seq": 0,
+        "run": "repaired-treatment",
+        "source": "fixture run creation"
+      },
+      "stop": {
+        "certificate": "issued",
+        "outcome": "certified",
+        "phase": "READY_FOR_MERGE",
+        "reason": "closed fixture observation window",
+        "revision": {
+          "base": "main",
+          "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+          "pr": "fixture-pr",
+          "round": 2,
+          "sha": "a443412c4a5975e6dc0af2383f0b32286a855c2c"
+        },
+        "source": "fixture controller stop",
+        "through": 5
+      }
+    },
+    {
+      "arm": "baseline",
+      "attempts": [
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "ANALYZE_EXECUTE",
+          "round": 0,
+          "seconds": 10,
+          "seq": 1,
+          "source": "fixture attempt",
+          "usd": 1
+        },
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 1,
+          "seconds": 10,
+          "seq": 2,
+          "source": "fixture attempt",
+          "usd": 1
+        }
+      ],
+      "case": "missed",
+      "defects": [],
+      "id": "missed-baseline",
+      "reviews": [
+        {
+          "certificate": {
+            "id": "issued",
+            "policy": "fixture policy",
+            "revision": {
+              "base": "main",
+              "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+              "pr": "fixture-pr",
+              "round": 1,
+              "sha": "ca062327be6163ef94a7fb5f7f6bbe68fff860a7"
+            },
+            "set": "fixture set passed",
+            "source": "fixture issuance"
+          },
+          "disposition": "accepted",
+          "findings": [],
+          "reply": "clean",
+          "revision": {
+            "base": "main",
+            "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+            "pr": "fixture-pr",
+            "round": 1,
+            "sha": "ca062327be6163ef94a7fb5f7f6bbe68fff860a7"
+          },
+          "seq": 2,
+          "source": "fixture controller review observation",
+          "validation": {
+            "policy": "fixture policy",
+            "result": "passed",
+            "revision": {
+              "base": "main",
+              "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+              "pr": "fixture-pr",
+              "round": 1,
+              "sha": "ca062327be6163ef94a7fb5f7f6bbe68fff860a7"
+            },
+            "set": "fixture set passed",
+            "source": "fixture validation"
+          }
+        }
+      ],
+      "snapshots": [],
+      "start": {
+        "initial_seq": 0,
+        "run": "missed-baseline",
+        "source": "fixture run creation"
+      },
+      "stop": {
+        "certificate": "issued",
+        "outcome": "certified",
+        "phase": "READY_FOR_MERGE",
+        "reason": "closed fixture observation window",
+        "revision": {
+          "base": "main",
+          "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+          "pr": "fixture-pr",
+          "round": 1,
+          "sha": "ca062327be6163ef94a7fb5f7f6bbe68fff860a7"
+        },
+        "source": "fixture controller stop",
+        "through": 2
+      }
+    },
+    {
+      "arm": "baseline",
+      "attempts": [
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "ANALYZE_EXECUTE",
+          "round": 0,
+          "seconds": 10,
+          "seq": 1,
+          "source": "fixture attempt",
+          "usd": 1
+        },
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 1,
+          "seconds": 10,
+          "seq": 2,
+          "source": "fixture attempt",
+          "usd": 1
+        },
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "FIX",
+          "round": 1,
+          "seconds": 10,
+          "seq": 3,
+          "source": "fixture attempt",
+          "usd": 1
+        },
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 2,
+          "seconds": 10,
+          "seq": 4,
+          "source": "fixture attempt",
+          "usd": 1
+        }
+      ],
+      "case": "stagnant",
+      "defects": [],
+      "id": "stagnant-baseline",
+      "reviews": [
+        {
+          "disposition": "accepted",
+          "findings": [
+            {
+              "claim": "illustrative reviewer text",
+              "id": "F1",
+              "label": {
+                "defect": {
+                  "id": "D",
+                  "scope": "case"
+                },
+                "evidence": {
+                  "adjudicator": "Fixture adjudicator",
+                  "at": "2026-01-01T00:00:00Z",
+                  "role": "independent_human",
+                  "source": "fixture"
+                },
+                "sha": "a5f49c68ff903fae6bcadf623d35bcb8d4d40b49",
+                "verdict": "confirmed"
+              }
+            }
+          ],
+          "reply": "needs_fix",
+          "revision": {
+            "base": "main",
+            "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+            "pr": "fixture-pr",
+            "round": 1,
+            "sha": "a5f49c68ff903fae6bcadf623d35bcb8d4d40b49"
+          },
+          "seq": 2,
+          "source": "fixture controller review observation",
+          "validation": {
+            "policy": "fixture policy",
+            "result": "passed",
+            "revision": {
+              "base": "main",
+              "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+              "pr": "fixture-pr",
+              "round": 1,
+              "sha": "a5f49c68ff903fae6bcadf623d35bcb8d4d40b49"
+            },
+            "set": "fixture set passed",
+            "source": "fixture validation"
+          }
+        },
+        {
+          "disposition": "accepted",
+          "findings": [
+            {
+              "claim": "illustrative reviewer text",
+              "id": "F1",
+              "label": {
+                "defect": {
+                  "id": "D",
+                  "scope": "case"
+                },
+                "evidence": {
+                  "adjudicator": "Fixture adjudicator",
+                  "at": "2026-01-01T00:00:00Z",
+                  "role": "independent_human",
+                  "source": "fixture"
+                },
+                "sha": "a5f49c68ff903fae6bcadf623d35bcb8d4d40b49",
+                "verdict": "confirmed"
+              }
+            }
+          ],
+          "reply": "needs_fix",
+          "revision": {
+            "base": "main",
+            "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+            "pr": "fixture-pr",
+            "round": 2,
+            "sha": "a5f49c68ff903fae6bcadf623d35bcb8d4d40b49"
+          },
+          "seq": 4,
+          "source": "fixture controller review observation",
+          "validation": {
+            "policy": "fixture policy",
+            "result": "passed",
+            "revision": {
+              "base": "main",
+              "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+              "pr": "fixture-pr",
+              "round": 2,
+              "sha": "a5f49c68ff903fae6bcadf623d35bcb8d4d40b49"
+            },
+            "set": "fixture set passed",
+            "source": "fixture validation"
+          }
+        }
+      ],
+      "snapshots": [],
+      "start": {
+        "initial_seq": 0,
+        "run": "stagnant-baseline",
+        "source": "fixture run creation"
+      },
+      "stop": {
+        "outcome": "not_issued",
+        "phase": "BLOCKED",
+        "reason": "stagnation",
+        "revision": {
+          "base": "main",
+          "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+          "pr": "fixture-pr",
+          "round": 2,
+          "sha": "a5f49c68ff903fae6bcadf623d35bcb8d4d40b49"
+        },
+        "source": "fixture controller stop",
+        "through": 4
+      }
+    },
+    {
+      "arm": "baseline",
+      "attempts": [
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "ANALYZE_EXECUTE",
+          "round": 0,
+          "seconds": 10,
+          "seq": 1,
+          "source": "fixture attempt",
+          "usd": 1
+        },
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 1,
+          "seconds": 10,
+          "seq": 2,
+          "source": "fixture attempt",
+          "usd": 1
+        }
+      ],
+      "case": "quiet",
+      "defects": [],
+      "id": "quiet-baseline",
+      "reviews": [
+        {
+          "certificate": {
+            "id": "issued",
+            "policy": "fixture policy",
+            "revision": {
+              "base": "main",
+              "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+              "pr": "fixture-pr",
+              "round": 1,
+              "sha": "c94b0be4108dab420f601893795af8ea379826e7"
+            },
+            "set": "fixture set passed",
+            "source": "fixture issuance"
+          },
+          "disposition": "accepted",
+          "findings": [],
+          "reply": "clean",
+          "revision": {
+            "base": "main",
+            "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+            "pr": "fixture-pr",
+            "round": 1,
+            "sha": "c94b0be4108dab420f601893795af8ea379826e7"
+          },
+          "seq": 2,
+          "source": "fixture controller review observation",
+          "validation": {
+            "policy": "fixture policy",
+            "result": "passed",
+            "revision": {
+              "base": "main",
+              "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+              "pr": "fixture-pr",
+              "round": 1,
+              "sha": "c94b0be4108dab420f601893795af8ea379826e7"
+            },
+            "set": "fixture set passed",
+            "source": "fixture validation"
+          }
+        }
+      ],
+      "snapshots": [],
+      "start": {
+        "initial_seq": 0,
+        "run": "quiet-baseline",
+        "source": "fixture run creation"
+      },
+      "stop": {
+        "certificate": "issued",
+        "outcome": "certified",
+        "phase": "READY_FOR_MERGE",
+        "reason": "closed fixture observation window",
+        "revision": {
+          "base": "main",
+          "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+          "pr": "fixture-pr",
+          "round": 1,
+          "sha": "c94b0be4108dab420f601893795af8ea379826e7"
+        },
+        "source": "fixture controller stop",
+        "through": 2
+      }
+    },
+    {
+      "arm": "baseline",
+      "attempts": [
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "ANALYZE_EXECUTE",
+          "round": 0,
+          "seconds": 10,
+          "seq": 1,
+          "source": "fixture attempt",
+          "usd": 1
+        },
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 1,
+          "seconds": 10,
+          "seq": 2,
+          "source": "fixture attempt",
+          "usd": 1
+        }
+      ],
+      "case": "false_alarm",
+      "defects": [],
+      "id": "false_alarm-baseline",
+      "reviews": [
+        {
+          "disposition": "accepted",
+          "findings": [
+            {
+              "claim": "illustrative reviewer text",
+              "id": "F1",
+              "label": {
+                "evidence": {
+                  "adjudicator": "Fixture adjudicator",
+                  "at": "2026-01-01T00:00:00Z",
+                  "role": "independent_human",
+                  "source": "fixture"
+                },
+                "sha": "8aca9900314168fe756da0a22ca4c883dd5d7bb2",
+                "verdict": "false"
+              }
+            }
+          ],
+          "reply": "needs_fix",
+          "revision": {
+            "base": "main",
+            "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+            "pr": "fixture-pr",
+            "round": 1,
+            "sha": "8aca9900314168fe756da0a22ca4c883dd5d7bb2"
+          },
+          "seq": 2,
+          "source": "fixture controller review observation",
+          "validation": {
+            "policy": "fixture policy",
+            "result": "passed",
+            "revision": {
+              "base": "main",
+              "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+              "pr": "fixture-pr",
+              "round": 1,
+              "sha": "8aca9900314168fe756da0a22ca4c883dd5d7bb2"
+            },
+            "set": "fixture set passed",
+            "source": "fixture validation"
+          }
+        }
+      ],
+      "snapshots": [],
+      "start": {
+        "initial_seq": 0,
+        "run": "false_alarm-baseline",
+        "source": "fixture run creation"
+      },
+      "stop": {
+        "outcome": "not_issued",
+        "phase": "BLOCKED",
+        "reason": "closed fixture observation window",
+        "revision": {
+          "base": "main",
+          "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+          "pr": "fixture-pr",
+          "round": 1,
+          "sha": "8aca9900314168fe756da0a22ca4c883dd5d7bb2"
+        },
+        "source": "fixture controller stop",
+        "through": 2
+      }
+    },
+    {
+      "arm": "treatment",
+      "attempts": [
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "ANALYZE_EXECUTE",
+          "round": 0,
+          "seconds": 10,
+          "seq": 1,
+          "source": "fixture attempt",
+          "usd": 1
+        },
+        {
+          "context_tokens": 50,
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 1,
+          "seconds": 10,
+          "seq": 2,
+          "source": "fixture attempt",
+          "usd": 1
+        }
+      ],
+      "case": "unsettled",
+      "defects": [],
+      "id": "unsettled-treatment",
+      "reviews": [
+        {
+          "disposition": "accepted",
+          "findings": [
+            {
+              "claim": "illustrative reviewer text",
+              "id": "F1",
+              "label": {
+                "evidence": {
+                  "adjudicator": "Fixture adjudicator",
+                  "at": "2026-01-01T00:00:00Z",
+                  "role": "independent_human",
+                  "source": "fixture"
+                },
+                "sha": "04a334e87ba7166526d3d95f50922830b778d980",
+                "verdict": "unknown"
+              }
+            }
+          ],
+          "reply": "needs_fix",
+          "revision": {
+            "base": "main",
+            "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+            "pr": "fixture-pr",
+            "round": 1,
+            "sha": "04a334e87ba7166526d3d95f50922830b778d980"
+          },
+          "seq": 2,
+          "source": "fixture controller review observation",
+          "validation": {
+            "policy": "fixture policy",
+            "result": "passed",
+            "revision": {
+              "base": "main",
+              "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+              "pr": "fixture-pr",
+              "round": 1,
+              "sha": "04a334e87ba7166526d3d95f50922830b778d980"
+            },
+            "set": "fixture set passed",
+            "source": "fixture validation"
+          }
+        }
+      ],
+      "snapshots": [],
+      "start": {
+        "initial_seq": 0,
+        "run": "unsettled-treatment",
+        "source": "fixture run creation"
+      },
+      "stop": {
+        "outcome": "not_issued",
+        "phase": "BLOCKED",
+        "reason": "closed fixture observation window",
+        "revision": {
+          "base": "main",
+          "merge_base": "4334d72476b045150abaa821805ef3fa7122a156",
+          "pr": "fixture-pr",
+          "round": 1,
+          "sha": "04a334e87ba7166526d3d95f50922830b778d980"
+        },
+        "source": "fixture controller stop",
+        "through": 2
+      }
+    }
+  ],
+  "schema": 1
+}

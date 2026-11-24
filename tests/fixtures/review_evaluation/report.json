@@ -1,0 +1,484 @@
+{
+  "arms": {
+    "baseline": {
+      "context_tokens": "700.000000",
+      "cost_per_validated_success": "7.000000",
+      "escaped_critical_defects": 1,
+      "excluded": {},
+      "known_escapes": {
+        "critical": 1
+      },
+      "launch_wall_clock_seconds": "140.000000",
+      "missing": [
+        "unsettled"
+      ],
+      "planned_cases": 6,
+      "rates": {
+        "clean_negative_fpr": {
+          "high": "0.500000",
+          "low": "0.500000",
+          "point": "0.500000",
+          "usable": true
+        },
+        "duplicate_ratio": {
+          "high": "0.400000",
+          "low": "0.250000",
+          "point": "0.250000",
+          "usable": false
+        },
+        "harmful_fix_rate": {
+          "high": "0.000000",
+          "low": "0.000000",
+          "point": "0.000000",
+          "usable": true
+        },
+        "precision": {
+          "high": "0.833333",
+          "low": "0.666667",
+          "point": "0.800000",
+          "usable": false
+        },
+        "weighted_recall": {
+          "high": "0.666667",
+          "low": "0.666667",
+          "point": "0.666667",
+          "usable": true
+        }
+      }
+    },
+    "treatment": {
+      "context_tokens": "350.000000",
+      "cost_per_validated_success": null,
+      "escaped_critical_defects": 1,
+      "excluded": {},
+      "known_escapes": {
+        "critical": 1
+      },
+      "launch_wall_clock_seconds": "70.000000",
+      "missing": [
+        "false_alarm",
+        "missed",
+        "quiet",
+        "stagnant"
+      ],
+      "planned_cases": 6,
+      "rates": {
+        "clean_negative_fpr": {
+          "high": "1.000000",
+          "low": "0.000000",
+          "point": null,
+          "usable": false
+        },
+        "duplicate_ratio": {
+          "high": "0.666667",
+          "low": "0.500000",
+          "point": "0.500000",
+          "usable": false
+        },
+        "harmful_fix_rate": {
+          "high": "1.000000",
+          "low": "1.000000",
+          "point": "1.000000",
+          "usable": true
+        },
+        "precision": {
+          "high": "1.000000",
+          "low": "0.500000",
+          "point": "1.000000",
+          "usable": false
+        },
+        "weighted_recall": {
+          "high": "0.500000",
+          "low": "0.500000",
+          "point": "0.500000",
+          "usable": true
+        }
+      }
+    }
+  },
+  "case_count": 6,
+  "cases": {
+    "false_alarm": {
+      "candidate": "8aca9900314168fe756da0a22ca4c883dd5d7bb2",
+      "kind": "clean_negative",
+      "risk": "low"
+    },
+    "missed": {
+      "candidate": "ca062327be6163ef94a7fb5f7f6bbe68fff860a7",
+      "kind": "defect",
+      "risk": "high"
+    },
+    "quiet": {
+      "candidate": "c94b0be4108dab420f601893795af8ea379826e7",
+      "kind": "clean_negative",
+      "risk": "low"
+    },
+    "repaired": {
+      "candidate": "518017d75493eee0c6d61fd58cc0234404760883",
+      "kind": "defect",
+      "risk": "high"
+    },
+    "stagnant": {
+      "candidate": "a5f49c68ff903fae6bcadf623d35bcb8d4d40b49",
+      "kind": "defect",
+      "risk": "standard"
+    },
+    "unsettled": {
+      "candidate": "04a334e87ba7166526d3d95f50922830b778d980",
+      "kind": "clean_negative",
+      "risk": "low"
+    }
+  },
+  "decision": "NOT_EVALUATED",
+  "mode": "fixture",
+  "paired": {
+    "bootstrap": {
+      "clean_negative_fpr": {
+        "label_envelope": [
+          null,
+          null
+        ],
+        "point_interval": [
+          null,
+          null
+        ],
+        "undefined_draws": {
+          "high": 10000,
+          "low": 10000,
+          "point": 10000
+        }
+      },
+      "duplicate_ratio": {
+        "label_envelope": [
+          "-0.166667",
+          "0.166667"
+        ],
+        "point_interval": [
+          "0.000000",
+          "0.000000"
+        ],
+        "undefined_draws": {
+          "high": 0,
+          "low": 0,
+          "point": 0
+        }
+      },
+      "harmful_fix_rate": {
+        "label_envelope": [
+          "1.000000",
+          "1.000000"
+        ],
+        "point_interval": [
+          "1.000000",
+          "1.000000"
+        ],
+        "undefined_draws": {
+          "high": 0,
+          "low": 0,
+          "point": 0
+        }
+      },
+      "precision": {
+        "label_envelope": [
+          "-0.333333",
+          "0.333333"
+        ],
+        "point_interval": [
+          "0.000000",
+          "0.000000"
+        ],
+        "undefined_draws": {
+          "high": 0,
+          "low": 0,
+          "point": 0
+        }
+      },
+      "weighted_recall": {
+        "label_envelope": [
+          "-0.500000",
+          "-0.500000"
+        ],
+        "point_interval": [
+          "-0.500000",
+          "-0.500000"
+        ],
+        "undefined_draws": {
+          "high": 0,
+          "low": 0,
+          "point": 0
+        }
+      }
+    },
+    "critical_gate_unsettled": false,
+    "difference": {
+      "clean_negative_fpr": {
+        "high": null,
+        "low": null,
+        "point": null
+      },
+      "duplicate_ratio": {
+        "high": "0.166667",
+        "low": "-0.166667",
+        "point": "0.000000"
+      },
+      "harmful_fix_rate": {
+        "high": "1.000000",
+        "low": "1.000000",
+        "point": "1.000000"
+      },
+      "precision": {
+        "high": "0.333333",
+        "low": "-0.333333",
+        "point": "0.000000"
+      },
+      "weighted_recall": {
+        "high": "-0.500000",
+        "low": "-0.500000",
+        "point": "-0.500000"
+      }
+    },
+    "excluded_share": "0.000000",
+    "missing_cases": [
+      "false_alarm",
+      "missed",
+      "quiet",
+      "stagnant",
+      "unsettled"
+    ],
+    "new_critical_escapes": [
+      [
+        "repaired",
+        [
+          "repaired-treatment",
+          "D"
+        ]
+      ]
+    ],
+    "sizes": {
+      "defect": 1
+    }
+  },
+  "reason": "fixture or missing arm",
+  "runs": {
+    "false_alarm-baseline": {
+      "arm": "baseline",
+      "case": "false_alarm",
+      "complete_launch_window": true,
+      "escapes": [],
+      "evidence": "not_issued",
+      "excluded": null,
+      "launches": [
+        {
+          "outcome": "reply",
+          "phase": "ANALYZE_EXECUTE",
+          "round": 0,
+          "seq": 1
+        },
+        {
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 1,
+          "seq": 2
+        }
+      ],
+      "stop": "closed fixture observation window",
+      "validated_success": false
+    },
+    "missed-baseline": {
+      "arm": "baseline",
+      "case": "missed",
+      "complete_launch_window": true,
+      "escapes": [
+        [
+          null,
+          "D"
+        ]
+      ],
+      "evidence": "certified",
+      "excluded": null,
+      "launches": [
+        {
+          "outcome": "reply",
+          "phase": "ANALYZE_EXECUTE",
+          "round": 0,
+          "seq": 1
+        },
+        {
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 1,
+          "seq": 2
+        }
+      ],
+      "stop": "closed fixture observation window",
+      "validated_success": false
+    },
+    "quiet-baseline": {
+      "arm": "baseline",
+      "case": "quiet",
+      "complete_launch_window": true,
+      "escapes": [],
+      "evidence": "certified",
+      "excluded": null,
+      "launches": [
+        {
+          "outcome": "reply",
+          "phase": "ANALYZE_EXECUTE",
+          "round": 0,
+          "seq": 1
+        },
+        {
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 1,
+          "seq": 2
+        }
+      ],
+      "stop": "closed fixture observation window",
+      "validated_success": true
+    },
+    "repaired-baseline": {
+      "arm": "baseline",
+      "case": "repaired",
+      "complete_launch_window": true,
+      "escapes": [],
+      "evidence": "certified",
+      "excluded": null,
+      "launches": [
+        {
+          "outcome": "reply",
+          "phase": "ANALYZE_EXECUTE",
+          "round": 0,
+          "seq": 1
+        },
+        {
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 1,
+          "seq": 2
+        },
+        {
+          "outcome": "reply",
+          "phase": "FIX",
+          "round": 1,
+          "seq": 3
+        },
+        {
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 2,
+          "seq": 4
+        }
+      ],
+      "stop": "closed fixture observation window",
+      "validated_success": true
+    },
+    "repaired-treatment": {
+      "arm": "treatment",
+      "case": "repaired",
+      "complete_launch_window": true,
+      "escapes": [
+        [
+          "repaired-treatment",
+          "D"
+        ]
+      ],
+      "evidence": "certified",
+      "excluded": null,
+      "launches": [
+        {
+          "outcome": "reply",
+          "phase": "ANALYZE_EXECUTE",
+          "round": 0,
+          "seq": 1
+        },
+        {
+          "outcome": "failed",
+          "phase": "REVIEW",
+          "round": 1,
+          "seq": 2
+        },
+        {
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 1,
+          "seq": 3
+        },
+        {
+          "outcome": "reply",
+          "phase": "FIX",
+          "round": 1,
+          "seq": 4
+        },
+        {
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 2,
+          "seq": 5
+        }
+      ],
+      "stop": "closed fixture observation window",
+      "validated_success": false
+    },
+    "stagnant-baseline": {
+      "arm": "baseline",
+      "case": "stagnant",
+      "complete_launch_window": true,
+      "escapes": [],
+      "evidence": "not_issued",
+      "excluded": null,
+      "launches": [
+        {
+          "outcome": "reply",
+          "phase": "ANALYZE_EXECUTE",
+          "round": 0,
+          "seq": 1
+        },
+        {
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 1,
+          "seq": 2
+        },
+        {
+          "outcome": "reply",
+          "phase": "FIX",
+          "round": 1,
+          "seq": 3
+        },
+        {
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 2,
+          "seq": 4
+        }
+      ],
+      "stop": "stagnation",
+      "validated_success": false
+    },
+    "unsettled-treatment": {
+      "arm": "treatment",
+      "case": "unsettled",
+      "complete_launch_window": true,
+      "escapes": [],
+      "evidence": "not_issued",
+      "excluded": null,
+      "launches": [
+        {
+          "outcome": "reply",
+          "phase": "ANALYZE_EXECUTE",
+          "round": 0,
+          "seq": 1
+        },
+        {
+          "outcome": "reply",
+          "phase": "REVIEW",
+          "round": 1,
+          "seq": 2
+        }
+      ],
+      "stop": "closed fixture observation window",
+      "validated_success": false
+    }
+  }
+}
