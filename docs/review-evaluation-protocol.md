@@ -58,8 +58,10 @@ provider prompts or credentials.
   defect in one review are duplicates; cross-round repeat is a separate
   convergence observation. Preserve the original claim separately.
 - A **FIX label** says `harmful`, `not_harmful` or `unknown` at the exact
-  applied commit. A registered regression introduced at that commit makes
-  it harmful; a no-commit outcome is not a FIX commit in the denominator.
+  applied commit. An eligible registered regression introduced at that
+  commit makes it harmful: a label of `not_harmful` or `unknown` there, or
+  `harmful` without one, is refused as contradictory, not scored. A
+  no-commit outcome is not a FIX commit in the denominator.
   A declared resolution must find the defect at the parent and remove it
   at the child. Introduction always requires failing oracle evidence.
 - A label or defect attestation gives a named **independent human**, a source
@@ -203,9 +205,13 @@ The v1 input is a closed JSON object (`schema`, `mode`, `cutoff`, `cases`,
   subprocess, source execution or network access is needed by replay.
 - Run rows bind one arm to a case. They can extend the case's linear
   history with new snapshots and their own regression definitions; a FIX
-  snapshot carries its launch ordinal and adjudicated label. Review rows
-  bind the controller disposition, reviewer reply, findings and optional
-  validation and issuance receipts to the observed revision. Stop,
+  snapshot carries its launch ordinal and adjudicated label. That ordinal
+  must follow a review, belong to no review, and precede every review of
+  its commit or a later one; a launch row at it must be a FIX reply with
+  the preceding review's round. Admission refuses a contradiction; an
+  absent row is missing evidence and only leaves the window incomplete.
+  Review rows bind the controller disposition, reviewer reply, findings
+  and optional validation and issuance receipts to the observed revision. Stop,
   creation, launch and human evidence are projections with separate opaque
   `source` references, not derived from each other.
 

@@ -210,9 +210,12 @@ def extend(
             if action == "fix":
                 label = label_at(row.get("label"), commit, cutoff)
                 verdict = choice(label.get("verdict"), ("harmful", "not_harmful", "unknown"))
+                # An eligible regression introduced here makes the FIX harmful,
+                # so no other label can settle it (unknown included); without
+                # one, harmful is unsupported.
                 known_regression = any(introduced[key].eligible for key in new)
                 require(
-                    verdict == "unknown" or (verdict == "harmful") == known_regression,
+                    (verdict == "harmful") == known_regression,
                     "FIX verdict conflicts with frozen regressions",
                 )
                 seq = integer(row.get("seq"), 1)
@@ -337,6 +340,37 @@ def admit_reviews(rows: Any, history: History, attempts: dict[int, Json]) -> lis
     return reviews
 
 
+def bind_fixes(
+    fixes: dict[str, tuple[str, int]],
+    reviews: list[Review],
+    attempts: dict[int, Json],
+    history: History,
+) -> None:
+    """Launch order agrees with lineage: a review, then a FIX, then reviews of its commit.
+
+    An absent launch row is missing evidence (the window stays incomplete); a
+    present one, a shared ordinal or a reversed order is a contradiction.
+    """
+    order = {commit: index for index, commit in enumerate(history.files)}
+    for commit, (_, seq) in fixes.items():
+        require(
+            all(review.seq != seq for review in reviews),
+            "a FIX and a review share a launch ordinal",
+        )
+        earlier = [review for review in reviews if review.seq < seq]
+        require(earlier, "a FIX launch must follow a review")
+        if seq in attempts:
+            require(
+                (attempts[seq]["phase"], attempts[seq]["round"], attempts[seq]["outcome"])
+                == ("FIX", earlier[-1].revision.round, "reply"),
+                "launch contradicts its recorded FIX commit",
+            )
+        require(
+            all(review.seq > seq for review in reviews if order[review.commit] >= order[commit]),
+            "a review precedes the FIX launch that produced its commit",
+        )
+
+
 def label_reviews(
     rows: list, reviews: list[Review], history: History, owner: str, cutoff: datetime
 ) -> list[Review]:
@@ -459,11 +493,9 @@ class Run:
             return False  # Distinct positive ordinals with this count prove 1..through.
         if not self.attempts or self.attempts[1]["phase"] != "ANALYZE_EXECUTE":
             return False
+        # Admission refused any present row that contradicts its review or FIX.
         return all(review.seq in self.attempts for review in self.reviews) and all(
-            (attempt := self.attempts.get(seq)) is not None
-            and attempt["phase"] == "FIX"
-            and attempt["outcome"] == "reply"
-            for _, seq in self.fixes.values()
+            seq in self.attempts for _, seq in self.fixes.values()
         )
 
 
@@ -545,6 +577,7 @@ def admit(data: Any) -> tuple[str, dict[str, Case], list[Run]]:
         reviews = label_reviews(
             row["reviews"], admit_reviews(row["reviews"], history, attempts), history, rid, cutoff
         )
+        bind_fixes(fixes, reviews, attempts, history)
         excluded = text(row["exclusion"]) if "exclusion" in row else None
         if reviews:
             require(reviews[0].commit == case.candidate, "first review must start at the case pin")

@@ -219,6 +219,63 @@ def test_fix_cannot_remove_a_defect_at_or_before_introduction():
         admit(data)
 
 
+@pytest.mark.parametrize("logged", [True, False], ids=["logged", "unlogged"])
+@pytest.mark.parametrize(
+    ("seq", "error"),
+    [
+        (4, "share a launch ordinal"),  # Attempt 4 is the review of the FIX commit.
+        (1, "must follow a review"),
+        (5, "review precedes the FIX launch"),  # Its commit was reviewed at 4.
+    ],
+    ids=["collision", "before-any-review", "reviewed-first"],
+)
+def test_fix_ordinal_must_agree_with_review_chronology(seq, error, logged):
+    data = fixture()
+    run = data["runs"][0]  # Review 2, FIX 3, review 4 of the FIX commit, certified.
+    run["snapshots"][0]["seq"] = seq
+    if not logged:
+        run["attempts"].clear()  # Without launch rows the record still contradicts itself.
+    with pytest.raises(InvalidEvidence, match=error):
+        admit(data)
+
+
+@pytest.mark.parametrize(
+    "launch",
+    [
+        {"phase": "REVIEW"},
+        {"phase": "ANALYZE_EXECUTE", "round": 0},
+        {"round": 2},
+        {"outcome": "failed"},
+    ],
+    ids=["review", "analyze", "round", "failed"],
+)
+def test_fix_ordinal_cannot_name_a_different_launch(launch):
+    data = fixture()
+    data["runs"][0]["attempts"][2].update(launch)  # The FIX launch at ordinal 3.
+    with pytest.raises(InvalidEvidence, match="contradicts its recorded FIX"):
+        admit(data)
+
+
+@pytest.mark.parametrize(
+    ("index", "verdict"),
+    [(1, "unknown"), (1, "not_harmful"), (0, "harmful")],
+    ids=["unknown-regression", "not-harmful-regression", "harmful-without-regression"],
+)
+def test_fix_label_must_agree_with_its_frozen_regressions(index, verdict):
+    # Run 1's FIX introduces an eligible regression; run 0's introduces none.
+    data = fixture()
+    data["runs"][index]["snapshots"][0]["label"]["verdict"] = verdict
+    with pytest.raises(InvalidEvidence, match="conflicts with frozen regressions"):
+        admit(data)
+
+
+def test_unknown_fix_label_without_a_regression_stays_unknown():
+    data = fixture()
+    data["runs"][0]["snapshots"][0]["label"]["verdict"] = "unknown"
+    _, cases, runs = admit(data)
+    assert score.observations(runs[0], cases["repaired"]).harm == (0, 0, 1)
+
+
 @pytest.mark.parametrize("kind", ["finding", "fix", "defect"])
 def test_labels_cannot_be_written_by_agents(kind):
     data = fixture()
@@ -350,14 +407,16 @@ def test_certificate_is_not_proof_of_a_different_validation_basis(field):
         admit(study([a], [r]))
 
 
-@pytest.mark.parametrize("missing", ["leading", "retry", "entire", "start", "stale", "trailing"])
+@pytest.mark.parametrize(
+    "missing", ["leading", "retry", "fix", "entire", "start", "stale", "trailing"]
+)
 def test_lost_launch_evidence_cannot_become_measured(missing):
     data = fixture()
     treatment = data["runs"][1]
     _, _, accepted = admit(data)
     assert score.total_usage(accepted[:2], "usd", available=True) == 9
-    if missing in ("leading", "retry"):
-        del treatment["attempts"][int(missing == "retry")]
+    if missing in ("leading", "retry", "fix"):
+        del treatment["attempts"][{"leading": 0, "retry": 1, "fix": 3}[missing]]
     elif missing == "entire":
         treatment["attempts"].clear()
     elif missing == "start":
@@ -375,6 +434,8 @@ def test_lost_launch_evidence_cannot_become_measured(missing):
     assert score.cost(accepted[:2], available=True) is None
     if missing in ("stale", "trailing"):
         assert score.outcome(accepted[1]).success is None
+    if missing == "fix":  # Missing, not contradictory: the bound stop still settles it.
+        assert score.outcome(accepted[1]).evidence == "certified"
 
 
 def test_cannot_advance_the_start_boundary():
