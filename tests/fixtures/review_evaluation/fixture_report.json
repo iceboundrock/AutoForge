@@ -1,0 +1,363 @@
+{
+  "arms": {
+    "current_review": {
+      "cases": 6,
+      "excluded": [],
+      "loops": {
+        "ended": {
+          "clean": 5,
+          "stopped": 1
+        },
+        "mean_fix_rounds": 0.833333,
+        "mean_review_rounds": 1.833333,
+        "rounds_by_profile": {
+          "review_round_1": 6,
+          "review_round_2_5": 5
+        }
+      },
+      "metrics": {
+        "clean_negative_fpr": {
+          "interval": [
+            0.0,
+            1.0
+          ],
+          "label_bounds": [
+            0.333333,
+            0.666667
+          ],
+          "resamples_without_value": 891,
+          "status": "unknown",
+          "value": 0.5,
+          "why_unknown": "unknown labels leave a band wider than 0.1"
+        },
+        "context_tokens": {
+          "known_part": 0.0,
+          "provenance": "unknown",
+          "value": null
+        },
+        "cost_per_validated_success": {
+          "provenance": "synthetic",
+          "validated_successes": 3,
+          "value": 3.666667
+        },
+        "duplicate_ratio": {
+          "interval": [
+            0.0,
+            0.333333
+          ],
+          "label_bounds": [
+            0.2,
+            0.2
+          ],
+          "resamples_without_value": 160,
+          "status": "known",
+          "value": 0.2,
+          "why_unknown": ""
+        },
+        "escaped_critical_defects": {
+          "defects": [
+            {
+              "case": "redact-authorization-header",
+              "defect": "B1"
+            }
+          ],
+          "value": 1
+        },
+        "harmful_fix_rate": {
+          "interval": [
+            0.0,
+            1.0
+          ],
+          "label_bounds": [
+            0.333333,
+            0.333333
+          ],
+          "resamples_without_value": 160,
+          "status": "known",
+          "value": 0.333333,
+          "why_unknown": ""
+        },
+        "launch_wall_clock_seconds": {
+          "provenance": "synthetic",
+          "value": 4940.0
+        },
+        "precision": {
+          "interval": [
+            0.25,
+            1.0
+          ],
+          "label_bounds": [
+            0.5,
+            0.8
+          ],
+          "resamples_without_value": 24,
+          "status": "unknown",
+          "value": 0.714286,
+          "why_unknown": "unknown labels leave a band wider than 0.1"
+        },
+        "total_cost_usd": {
+          "provenance": "synthetic",
+          "value": 11.0
+        },
+        "weighted_recall": {
+          "interval": [
+            0.2,
+            1.0
+          ],
+          "label_bounds": [
+            0.5,
+            0.833333
+          ],
+          "resamples_without_value": 160,
+          "status": "unknown",
+          "value": 0.5,
+          "why_unknown": "unknown labels leave a band wider than 0.1"
+        }
+      },
+      "missing_cases": [],
+      "provenance": "fixture",
+      "runs": [
+        {
+          "case": "document-empty-chunks",
+          "claims": {
+            "fixer_resolutions": {
+              "no_change_with_rationale": 1
+            },
+            "reviewer_classifications": {
+              "nit": 1
+            }
+          },
+          "clean_negative": "false_positive",
+          "ended": "clean",
+          "escaped": [],
+          "findings": {
+            "confirmed": 0,
+            "duplicates": 0,
+            "false": 1,
+            "unknown": 0
+          },
+          "fix_commits": 0,
+          "fix_rounds": 1,
+          "fixes": {
+            "harmful": 0,
+            "not_harmful": 0,
+            "unknown": 0
+          },
+          "kind": "clean_negative",
+          "late_defects": [],
+          "profiles": [
+            "review_round_1",
+            "review_round_2_5"
+          ],
+          "review_rounds": 2,
+          "run": "current_review/document-empty-chunks",
+          "stopped": null,
+          "validated_success": true
+        },
+        {
+          "case": "page-count-partial-page",
+          "claims": {
+            "fixer_resolutions": {
+              "fixed": 3
+            },
+            "reviewer_classifications": {
+              "blocked": 1,
+              "nit": 1,
+              "non-blocked": 1
+            }
+          },
+          "clean_negative": null,
+          "ended": "clean",
+          "escaped": [],
+          "findings": {
+            "confirmed": 3,
+            "duplicates": 1,
+            "false": 0,
+            "unknown": 0
+          },
+          "fix_commits": 1,
+          "fix_rounds": 1,
+          "fixes": {
+            "harmful": 0,
+            "not_harmful": 1,
+            "unknown": 0
+          },
+          "kind": "defect",
+          "late_defects": [
+            "A3"
+          ],
+          "profiles": [
+            "review_round_1",
+            "review_round_2_5"
+          ],
+          "review_rounds": 2,
+          "run": "current_review/page-count-partial-page",
+          "stopped": null,
+          "validated_success": true
+        },
+        {
+          "case": "redact-authorization-header",
+          "claims": {
+            "fixer_resolutions": {
+              "fixed": 1,
+              "no_change_with_rationale": 2
+            },
+            "reviewer_classifications": {
+              "nit": 1,
+              "non-blocked": 2
+            }
+          },
+          "clean_negative": null,
+          "ended": "clean",
+          "escaped": [
+            {
+              "defect": "B1",
+              "severity": "critical"
+            }
+          ],
+          "findings": {
+            "confirmed": 1,
+            "duplicates": 0,
+            "false": 1,
+            "unknown": 1
+          },
+          "fix_commits": 1,
+          "fix_rounds": 1,
+          "fixes": {
+            "harmful": 0,
+            "not_harmful": 1,
+            "unknown": 0
+          },
+          "kind": "defect",
+          "late_defects": [],
+          "profiles": [
+            "review_round_1",
+            "review_round_2_5"
+          ],
+          "review_rounds": 2,
+          "run": "current_review/redact-authorization-header",
+          "stopped": null,
+          "validated_success": false
+        },
+        {
+          "case": "rename-slug-pattern",
+          "claims": {
+            "fixer_resolutions": {},
+            "reviewer_classifications": {}
+          },
+          "clean_negative": "true_negative",
+          "ended": "clean",
+          "escaped": [],
+          "findings": {
+            "confirmed": 0,
+            "duplicates": 0,
+            "false": 0,
+            "unknown": 0
+          },
+          "fix_commits": 0,
+          "fix_rounds": 0,
+          "fixes": {
+            "harmful": 0,
+            "not_harmful": 0,
+            "unknown": 0
+          },
+          "kind": "clean_negative",
+          "late_defects": [],
+          "profiles": [
+            "review_round_1"
+          ],
+          "review_rounds": 1,
+          "run": "current_review/rename-slug-pattern",
+          "stopped": null,
+          "validated_success": true
+        },
+        {
+          "case": "retry-attempt-bound",
+          "claims": {
+            "fixer_resolutions": {
+              "fixed": 1
+            },
+            "reviewer_classifications": {
+              "blocked": 1
+            }
+          },
+          "clean_negative": null,
+          "ended": "clean",
+          "escaped": [
+            {
+              "defect": "C2",
+              "severity": "major"
+            }
+          ],
+          "findings": {
+            "confirmed": 1,
+            "duplicates": 0,
+            "false": 0,
+            "unknown": 0
+          },
+          "fix_commits": 1,
+          "fix_rounds": 1,
+          "fixes": {
+            "harmful": 1,
+            "not_harmful": 0,
+            "unknown": 0
+          },
+          "kind": "defect",
+          "late_defects": [],
+          "profiles": [
+            "review_round_1",
+            "review_round_2_5"
+          ],
+          "review_rounds": 2,
+          "run": "current_review/retry-attempt-bound",
+          "stopped": null,
+          "validated_success": false
+        },
+        {
+          "case": "type-hint-cache-key",
+          "claims": {
+            "fixer_resolutions": {
+              "no_change_with_rationale": 1
+            },
+            "reviewer_classifications": {
+              "non-blocked": 2
+            }
+          },
+          "clean_negative": "unknown",
+          "ended": "stopped",
+          "escaped": [],
+          "findings": {
+            "confirmed": 0,
+            "duplicates": 0,
+            "false": 0,
+            "unknown": 2
+          },
+          "fix_commits": 0,
+          "fix_rounds": 1,
+          "fixes": {
+            "harmful": 0,
+            "not_harmful": 0,
+            "unknown": 0
+          },
+          "kind": "clean_negative",
+          "late_defects": [],
+          "profiles": [
+            "review_round_1",
+            "review_round_2_5"
+          ],
+          "review_rounds": 2,
+          "run": "current_review/type-hint-cache-key",
+          "stopped": "BLOCKED by stagnation: the same required resolution in two consecutive rounds (workflow.stagnation_identical_rounds: 2)",
+          "validated_success": false
+        }
+      ]
+    }
+  },
+  "digests": {
+    "corpus": "3e94841c82a0f4b6ed734915c4e002d29aefefd64bd2f44f475e5b1da4a5da63",
+    "preregistration": "9245a89ce21d2a21a9571b0f6d34b49984e6349b14d4fd772f9e415521348cf0",
+    "runs": "52338dfae022086d1eeacc1729f065c03aec1dfeba63b72f9b10d6e16771c960"
+  },
+  "not_evidence": "a fixture run is scripted: its numbers check the scorer and say nothing about any reviewer, model or configuration",
+  "schema": "autoforge.review-evaluation.report/1"
+}

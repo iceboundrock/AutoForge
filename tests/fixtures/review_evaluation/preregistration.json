@@ -1,0 +1,78 @@
+{
+  "schema": "autoforge.review-evaluation.preregistration/1",
+  "issue": 355,
+  "registered": "2026-11-24",
+  "label_verdicts": ["confirmed", "false", "unknown"],
+  "severity_weights": {"critical": 8, "major": 4, "minor": 2, "trivial": 1},
+  "success_blocking_severities": ["critical", "major"],
+  "defect_classes": [
+    "correctness",
+    "specification",
+    "security_safety",
+    "recovery",
+    "test_coverage",
+    "standards",
+    "documentation"
+  ],
+  "discovered_by": ["seeded", "review", "oracle", "adjudicator", "post_merge"],
+  "evidence_kinds": ["oracle", "adjudication"],
+  "adjudicator_roles": ["fixture_author", "maintainer", "human_adjudicator"],
+  "refused_adjudicator_roles": ["reviewer", "fixer", "agent", "model", "self"],
+  "refused_label_fields": [
+    "confidence",
+    "self_reported",
+    "reviewer_confidence",
+    "agent_verdict",
+    "classification"
+  ],
+  "fix_verdicts": ["harmful", "not_harmful", "unknown"],
+  "usage_provenance": ["measured", "estimated", "synthetic", "unknown"],
+  "run_provenance": ["fixture", "real"],
+  "max_label_uncertainty": 0.1,
+  "uncertainty": {
+    "method": "case_bootstrap_percentile",
+    "resamples": 10000,
+    "seed": 355,
+    "confidence": 0.95
+  },
+  "minimum_sample": {"defect_cases": 20, "clean_negative_cases": 10},
+  "decision": {
+    "primary": {"metric": "weighted_recall", "min_difference": 0.1},
+    "margins": {
+      "precision": {"direction": "higher_is_better", "margin": 0.05},
+      "clean_negative_fpr": {"direction": "lower_is_better", "margin": 0.05},
+      "harmful_fix_rate": {"direction": "lower_is_better", "margin": 0.05},
+      "duplicate_ratio": {"direction": "lower_is_better", "margin": 0.1},
+      "cost_per_validated_success": {"direction": "lower_is_better", "margin": 0.5}
+    },
+    "hard_gates": ["no_new_escaped_critical_defect"],
+    "max_excluded_case_share": 0.1
+  },
+  "baseline": {
+    "review_profiles": {
+      "1": "review_round_1",
+      "2": "review_round_2_5",
+      "5": "review_round_2_5",
+      "6": "review_round_6_plus"
+    },
+    "finding_classifications": ["blocked", "non-blocked", "nit"],
+    "fix_resolutions": [
+      "fixed",
+      "follow_up_created",
+      "no_change_with_rationale",
+      "acceptance_action",
+      "operator_acceptance",
+      "pr_body_update"
+    ],
+    "review_results": ["needs_fix", "clean", "stale"],
+    "persisted_finding_fields": ["classification", "id", "required_resolution"],
+    "max_findings_per_review": 50,
+    "workflow": {
+      "max_review_rounds": 20,
+      "stagnation_identical_rounds": 2,
+      "stagnation_unchanged_count_rounds": 3
+    },
+    "replan": {"soft_threshold": 12, "hard_threshold": 20, "stagnation_window": 3},
+    "certificate_clean": {"actionable_findings": 0, "needs_fix_round": false}
+  }
+}

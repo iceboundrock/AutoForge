@@ -1,0 +1,338 @@
+{
+  "schema": "autoforge.review-evaluation.corpus/1",
+  "commit_date": "2026-11-24T00:00:00+00:00",
+  "discovery_cutoff": "2026-11-24T18:00:00+00:00",
+  "cases": [
+    {
+      "id": "page-count-partial-page",
+      "kind": "defect",
+      "summary": "Add page_count(total, size); the candidate floors the quotient.",
+      "commits": [
+        {
+          "name": "base",
+          "parent": null,
+          "sha": "6860edb3b42216b36661e7c1a6fb5cee3d70e10a",
+          "files": {
+            "pages.py": "\"\"\"Paging helpers for listings.\"\"\"\n\n\ndef first_index(page, size):\n    \"\"\"The index of the first item on 1-based ``page`` of ``size`` items.\"\"\"\n    return (page - 1) * size\n",
+            "tests/test_pages.py": "from pages import first_index\n\n\ndef test_first_index():\n    assert first_index(1, 10) == 0\n    assert first_index(3, 10) == 20\n"
+          }
+        },
+        {
+          "name": "candidate",
+          "parent": "base",
+          "sha": "a8b89805dd452f8a330c5e1bd3f116dc2bfff97e",
+          "files": {
+            "pages.py": "\"\"\"Paging helpers for listings.\"\"\"\n\n\ndef first_index(page, size):\n    \"\"\"The index of the first item on 1-based ``page`` of ``size`` items.\"\"\"\n    return (page - 1) * size\n\n\ndef page_count(total, size):\n    \"\"\"How many pages of ``size`` items hold ``total`` items.\n\n    >>> page_count(10, 5)\n    2\n    \"\"\"\n    return total // size\n",
+            "tests/test_pages.py": "from pages import first_index, page_count\n\n\ndef test_first_index():\n    assert first_index(1, 10) == 0\n    assert first_index(3, 10) == 20\n\n\ndef test_page_count():\n    assert page_count(10, 5) == 2\n"
+          }
+        },
+        {
+          "name": "reference",
+          "parent": "candidate",
+          "sha": "65101a78682b3ae05910b7d4f86b951d03f34aa8",
+          "files": {
+            "pages.py": "\"\"\"Paging helpers for listings.\"\"\"\n\n\ndef first_index(page, size):\n    \"\"\"The index of the first item on 1-based ``page`` of ``size`` items.\"\"\"\n    return (page - 1) * size\n\n\ndef page_count(total, size):\n    \"\"\"How many pages of ``size`` items hold ``total`` items.\n\n    >>> page_count(10, 5)\n    2\n    \"\"\"\n    return -(-total // size)\n",
+            "tests/test_pages.py": "from pages import first_index, page_count\n\n\ndef test_first_index():\n    assert first_index(1, 10) == 0\n    assert first_index(3, 10) == 20\n\n\ndef test_page_count():\n    assert page_count(10, 5) == 2\n    assert page_count(11, 5) == 3\n    assert page_count(0, 5) == 0\n"
+          }
+        }
+      ],
+      "candidate": "candidate",
+      "oracles": {
+        "partial_page": "from pages import page_count\n\nassert page_count(11, 5) == 3, page_count(11, 5)\nassert page_count(0, 5) == 0\nassert page_count(10, 5) == 2\n"
+      },
+      "defects": [
+        {
+          "id": "A1",
+          "defect_class": "correctness",
+          "severity": "major",
+          "location": "pages.py:page_count",
+          "introduced_at": "candidate",
+          "fixed_at": [
+            "reference"
+          ],
+          "discovered_at": "2026-11-24T01:00:00+00:00",
+          "discovered_by": "seeded",
+          "summary": "A partial last page is not counted: page_count(11, 5) is 2, not 3.",
+          "evidence": {
+            "kind": "oracle",
+            "oracle": "partial_page",
+            "passes_at": []
+          },
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          }
+        },
+        {
+          "id": "A2",
+          "defect_class": "test_coverage",
+          "severity": "minor",
+          "location": "tests/test_pages.py",
+          "introduced_at": "candidate",
+          "fixed_at": [
+            "reference"
+          ],
+          "discovered_at": "2026-11-24T01:00:00+00:00",
+          "discovered_by": "seeded",
+          "summary": "The new test holds only a total that is a multiple of the size, so the rounding defect passes it.",
+          "evidence": {
+            "kind": "adjudication",
+            "rationale": "test_page_count asserts page_count(10, 5) alone; no total it checks has a partial page."
+          },
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          }
+        },
+        {
+          "id": "A3",
+          "defect_class": "correctness",
+          "severity": "minor",
+          "location": "pages.py:page_count",
+          "introduced_at": "candidate",
+          "fixed_at": [],
+          "discovered_at": "2026-11-25T09:00:00+00:00",
+          "discovered_by": "post_merge",
+          "summary": "page_count(5, 0) raises ZeroDivisionError rather than an error naming the size.",
+          "evidence": {
+            "kind": "adjudication",
+            "rationale": "Reported after the merge; the candidate divides by size without checking it."
+          },
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          }
+        }
+      ]
+    },
+    {
+      "id": "redact-authorization-header",
+      "kind": "defect",
+      "summary": "Mask Authorization headers too; the candidate's pattern misses the form HTTP uses.",
+      "commits": [
+        {
+          "name": "base",
+          "parent": null,
+          "sha": "2cf96fc75b504dfc0d773237f40e7573ebb0615b",
+          "files": {
+            "redact.py": "\"\"\"Masking of credentials in log text.\"\"\"\n\nimport re\n\n_TOKEN = re.compile(r\"(token=)\\S+\")\n\n\ndef redact(text):\n    \"\"\"``text`` with every ``token=`` value masked.\"\"\"\n    return _TOKEN.sub(r\"\\1[REDACTED]\", text)\n",
+            "tests/test_redact.py": "from redact import redact\n\n\ndef test_token_value_is_masked():\n    assert redact(\"token=abc123 ok\") == \"token=[REDACTED] ok\"\n",
+            "README.md": "# redact\n\nMasks `token=` values in log text.\n"
+          }
+        },
+        {
+          "name": "candidate",
+          "parent": "base",
+          "sha": "06398f9ea48e0f466fe9234deb58980a0d74752b",
+          "files": {
+            "redact.py": "\"\"\"Masking of credentials in log text.\"\"\"\n\nimport re\n\n_TOKEN = re.compile(r\"(token=)\\S+\")\n_HEADER = re.compile(r\"(authorization: )\\S+\")\n\n\ndef redact(text):\n    \"\"\"``text`` with every ``token=`` value and ``Authorization`` header masked.\"\"\"\n    text = _TOKEN.sub(r\"\\1[REDACTED]\", text)\n    return _HEADER.sub(r\"\\1[REDACTED]\", text)\n",
+            "tests/test_redact.py": "from redact import redact\n\n\ndef test_token_value_is_masked():\n    assert redact(\"token=abc123 ok\") == \"token=[REDACTED] ok\"\n\n\ndef test_authorization_header_is_masked():\n    assert redact(\"authorization: abc123\") == \"authorization: [REDACTED]\"\n",
+            "README.md": "# redact\n\nMasks `token=` values and Authorizaton headers in log text.\n"
+          }
+        },
+        {
+          "name": "reference",
+          "parent": "candidate",
+          "sha": "9929a5958c7f359b8396651661ebb829e6220d19",
+          "files": {
+            "redact.py": "\"\"\"Masking of credentials in log text.\"\"\"\n\nimport re\n\n_TOKEN = re.compile(r\"(token=)\\S+\")\n_HEADER = re.compile(r\"(authorization:\\s*)(?:\\w+\\s+)?\\S+\", re.IGNORECASE)\n\n\ndef redact(text):\n    \"\"\"``text`` with every ``token=`` value and ``Authorization`` header masked.\"\"\"\n    text = _TOKEN.sub(r\"\\1[REDACTED]\", text)\n    return _HEADER.sub(r\"\\1[REDACTED]\", text)\n",
+            "tests/test_redact.py": "from redact import redact\n\n\ndef test_token_value_is_masked():\n    assert redact(\"token=abc123 ok\") == \"token=[REDACTED] ok\"\n\n\ndef test_authorization_header_is_masked():\n    assert redact(\"authorization: abc123\") == \"authorization: [REDACTED]\"\n    assert redact(\"Authorization: Bearer s3cr3t\") == \"Authorization: [REDACTED]\"\n",
+            "README.md": "# redact\n\nMasks `token=` values and Authorization headers in log text.\n"
+          }
+        }
+      ],
+      "candidate": "candidate",
+      "oracles": {
+        "bearer_token_masked": "from redact import redact\n\nfor header in (\"Authorization: Bearer s3cr3t\", \"authorization: Bearer s3cr3t\"):\n    out = redact(header)\n    assert \"s3cr3t\" not in out, out\n"
+      },
+      "defects": [
+        {
+          "id": "B1",
+          "defect_class": "security_safety",
+          "severity": "critical",
+          "location": "redact.py:_HEADER",
+          "introduced_at": "candidate",
+          "fixed_at": [
+            "reference"
+          ],
+          "discovered_at": "2026-11-24T01:00:00+00:00",
+          "discovered_by": "seeded",
+          "summary": "An Authorization header as HTTP writes it keeps its credential: the pattern is lower-case only, and it masks a scheme word such as Bearer instead of the token after it.",
+          "evidence": {
+            "kind": "oracle",
+            "oracle": "bearer_token_masked",
+            "passes_at": []
+          },
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          }
+        },
+        {
+          "id": "B2",
+          "defect_class": "documentation",
+          "severity": "minor",
+          "location": "README.md",
+          "introduced_at": "candidate",
+          "fixed_at": [
+            "reference"
+          ],
+          "discovered_at": "2026-11-24T01:00:00+00:00",
+          "discovered_by": "seeded",
+          "summary": "The README misspells Authorization as Authorizaton.",
+          "evidence": {
+            "kind": "adjudication",
+            "rationale": "The candidate's README line reads 'Authorizaton headers'."
+          },
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          }
+        }
+      ]
+    },
+    {
+      "id": "retry-attempt-bound",
+      "kind": "defect",
+      "summary": "Add retry(call, attempts); the candidate calls once too often.",
+      "commits": [
+        {
+          "name": "base",
+          "parent": null,
+          "sha": "dc1d257e1e5b00bb17c0d8fed255b3c19ea115f7",
+          "files": {
+            "retry.py": "\"\"\"Retrying a call that may fail transiently.\"\"\"\n\nTRANSIENT = (OSError,)\n",
+            "tests/test_retry.py": "from retry import TRANSIENT\n\n\ndef test_transient_errors():\n    assert OSError in TRANSIENT\n"
+          }
+        },
+        {
+          "name": "candidate",
+          "parent": "base",
+          "sha": "4e1e338478c0d7c7e3bebfdd7db88fb63d2a461e",
+          "files": {
+            "retry.py": "\"\"\"Retrying a call that may fail transiently.\"\"\"\n\nTRANSIENT = (OSError,)\n\n\ndef retry(call, attempts):\n    \"\"\"The value of ``call()``, calling it at most ``attempts`` times.\n\n    A transient error on the last attempt is raised.\n    \"\"\"\n    for attempt in range(attempts + 1):\n        try:\n            return call()\n        except TRANSIENT:\n            if attempt == attempts:\n                raise\n",
+            "tests/test_retry.py": "from retry import TRANSIENT, retry\n\n\ndef test_transient_errors():\n    assert OSError in TRANSIENT\n\n\ndef test_retry_returns_the_first_value():\n    assert retry(lambda: 7, 3) == 7\n"
+          }
+        },
+        {
+          "name": "reference",
+          "parent": "candidate",
+          "sha": "60c81b45f7ec5f402edb476a015ef06b3cc9766a",
+          "files": {
+            "retry.py": "\"\"\"Retrying a call that may fail transiently.\"\"\"\n\nTRANSIENT = (OSError,)\n\n\ndef retry(call, attempts):\n    \"\"\"The value of ``call()``, calling it at most ``attempts`` times.\n\n    A transient error on the last attempt is raised.\n    \"\"\"\n    for attempt in range(1, attempts + 1):\n        try:\n            return call()\n        except TRANSIENT:\n            if attempt == attempts:\n                raise\n"
+          }
+        }
+      ],
+      "candidate": "candidate",
+      "oracles": {
+        "attempt_count": "from retry import retry\n\ncalls = []\n\n\ndef failing():\n    calls.append(1)\n    raise OSError(\"down\")\n\n\ntry:\n    retry(failing, 3)\nexcept OSError:\n    pass\nassert len(calls) == 3, len(calls)\n"
+      },
+      "defects": [
+        {
+          "id": "C1",
+          "defect_class": "correctness",
+          "severity": "major",
+          "location": "retry.py:retry",
+          "introduced_at": "candidate",
+          "fixed_at": [
+            "reference"
+          ],
+          "discovered_at": "2026-11-24T01:00:00+00:00",
+          "discovered_by": "seeded",
+          "summary": "retry calls attempts + 1 times: three attempts make four calls.",
+          "evidence": {
+            "kind": "oracle",
+            "oracle": "attempt_count",
+            "passes_at": []
+          },
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rename-slug-pattern",
+      "kind": "clean_negative",
+      "summary": "Rename a private pattern; behaviour is unchanged.",
+      "commits": [
+        {
+          "name": "base",
+          "parent": null,
+          "sha": "8a5bc19700034b3d523abfccd94ff028682a502e",
+          "files": {
+            "slug.py": "\"\"\"URL slugs.\"\"\"\n\nimport re\n\n_NON_WORD = re.compile(r\"[^a-z0-9]+\")\n\n\ndef slug(title):\n    \"\"\"``title`` lower-cased, each run of other characters one hyphen, none at either end.\"\"\"\n    return _NON_WORD.sub(\"-\", title.lower()).strip(\"-\")\n",
+            "tests/test_slug.py": "from slug import slug\n\n\ndef test_slug():\n    assert slug(\"Hello, World!\") == \"hello-world\"\n"
+          }
+        },
+        {
+          "name": "candidate",
+          "parent": "base",
+          "sha": "a13c2e5284c425fddd3b0bbf1f64083cfe09596f",
+          "files": {
+            "slug.py": "\"\"\"URL slugs.\"\"\"\n\nimport re\n\n_SEPARATORS = re.compile(r\"[^a-z0-9]+\")\n\n\ndef slug(title):\n    \"\"\"``title`` lower-cased, each run of other characters one hyphen, none at either end.\"\"\"\n    return _SEPARATORS.sub(\"-\", title.lower()).strip(\"-\")\n"
+          }
+        }
+      ],
+      "candidate": "candidate",
+      "oracles": {},
+      "defects": []
+    },
+    {
+      "id": "document-empty-chunks",
+      "kind": "clean_negative",
+      "summary": "Document what an empty list gives, and test it; behaviour is unchanged.",
+      "commits": [
+        {
+          "name": "base",
+          "parent": null,
+          "sha": "ecdf3a4322092fed65281f2e228c99d0b89b8ba3",
+          "files": {
+            "chunks.py": "\"\"\"Splitting a list into chunks.\"\"\"\n\n\ndef chunks(items, size):\n    \"\"\"Consecutive lists of at most ``size`` items of ``items``, in order.\"\"\"\n    return [items[i : i + size] for i in range(0, len(items), size)]\n",
+            "tests/test_chunks.py": "from chunks import chunks\n\n\ndef test_chunks():\n    assert chunks([1, 2, 3], 2) == [[1, 2], [3]]\n"
+          }
+        },
+        {
+          "name": "candidate",
+          "parent": "base",
+          "sha": "e2980bd0f844c3ea7f18a328f961c3664e50b4d0",
+          "files": {
+            "chunks.py": "\"\"\"Splitting a list into chunks.\"\"\"\n\n\ndef chunks(items, size):\n    \"\"\"Consecutive lists of at most ``size`` items of ``items``, in order.\n\n    An empty ``items`` gives no chunk at all.\n    \"\"\"\n    return [items[i : i + size] for i in range(0, len(items), size)]\n",
+            "tests/test_chunks.py": "from chunks import chunks\n\n\ndef test_chunks():\n    assert chunks([1, 2, 3], 2) == [[1, 2], [3]]\n\n\ndef test_no_chunk_of_nothing():\n    assert chunks([], 2) == []\n"
+          }
+        }
+      ],
+      "candidate": "candidate",
+      "oracles": {},
+      "defects": []
+    },
+    {
+      "id": "type-hint-cache-key",
+      "kind": "clean_negative",
+      "summary": "Add type hints to cache_key; behaviour is unchanged.",
+      "commits": [
+        {
+          "name": "base",
+          "parent": null,
+          "sha": "7a0165fd9c7e0c278e1f21f3b3f96e894d8930fc",
+          "files": {
+            "cache_key.py": "\"\"\"Keys for cached query results.\"\"\"\n\n\ndef cache_key(params):\n    \"\"\"A key for the query ``params`` that does not depend on their order.\"\"\"\n    return \"&\".join(f\"{name}={params[name]}\" for name in sorted(params))\n",
+            "tests/test_cache_key.py": "from cache_key import cache_key\n\n\ndef test_order_does_not_matter():\n    assert cache_key({\"b\": \"2\", \"a\": \"1\"}) == cache_key({\"a\": \"1\", \"b\": \"2\"})\n"
+          }
+        },
+        {
+          "name": "candidate",
+          "parent": "base",
+          "sha": "77e000ba809f09742bc32ee244f752188421eed6",
+          "files": {
+            "cache_key.py": "\"\"\"Keys for cached query results.\"\"\"\n\n\ndef cache_key(params: dict[str, str]) -> str:\n    \"\"\"A key for the query ``params`` that does not depend on their order.\"\"\"\n    return \"&\".join(f\"{name}={params[name]}\" for name in sorted(params))\n"
+          }
+        }
+      ],
+      "candidate": "candidate",
+      "oracles": {},
+      "defects": []
+    }
+  ]
+}

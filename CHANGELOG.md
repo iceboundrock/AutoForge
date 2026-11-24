@@ -5,6 +5,22 @@ so.
 
 ## Unreleased
 
+### A contract for judging review quality, registered before any real run (#355)
+
+[`docs/review-evaluation-protocol.md`](docs/review-evaluation-protocol.md)
+fixes, before anyone has seen an outcome, how a review finding is labeled
+(`confirmed`, `false` or `unknown`, against the exact candidate SHA, by a named
+human adjudicator, frozen at a discovery cutoff), which numbers come from the
+labels (severity-weighted recall, precision, the false-positive rate on clean
+negatives, escaped critical defects, the harmful-fix rate, the duplicate ratio,
+cost per validated success), how uncertain each may be, and what would count as
+a change to review earning its cost. It records what review does today and that
+a review certificate is not a correctness label. No agent's classification,
+confidence or resolution claim is a label or reaches a score. A replayable
+fixture of six cases, three of them clean negatives, checks the scorer and says
+nothing about any model. No real run has been made, and nothing about a run of
+AutoForge changes.
+
 ### Optional Issue Working Memory retrieval (#324)
 
 The controller-side `MemoryRetriever` offers bounded search, fetch and a

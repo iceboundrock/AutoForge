@@ -1,0 +1,811 @@
+{
+  "schema": "autoforge.review-evaluation.runs/1",
+  "runs": [
+    {
+      "id": "current_review/page-count-partial-page",
+      "arm": "current_review",
+      "case": "page-count-partial-page",
+      "provenance": "fixture",
+      "commits": [
+        {
+          "name": "fix-1",
+          "parent": "candidate",
+          "sha": "6737721b7c05f350483b8403dbcdfd92a02a78cf",
+          "fixes": [
+            "A1",
+            "A2"
+          ],
+          "files": {
+            "pages.py": "\"\"\"Paging helpers for listings.\"\"\"\n\n\ndef first_index(page, size):\n    \"\"\"The index of the first item on 1-based ``page`` of ``size`` items.\"\"\"\n    return (page - 1) * size\n\n\ndef page_count(total, size):\n    \"\"\"How many pages of ``size`` items hold ``total`` items.\n\n    >>> page_count(10, 5)\n    2\n    \"\"\"\n    return (total + size - 1) // size\n",
+            "tests/test_pages.py": "from pages import first_index, page_count\n\n\ndef test_first_index():\n    assert first_index(1, 10) == 0\n    assert first_index(3, 10) == 20\n\n\ndef test_page_count():\n    assert page_count(10, 5) == 2\n    assert page_count(11, 5) == 3\n"
+          }
+        }
+      ],
+      "defects": [],
+      "oracles": {},
+      "reviews": [
+        {
+          "round": 1,
+          "commit": "candidate",
+          "validation": "passed",
+          "result": {
+            "phase": "REVIEW",
+            "status": "success",
+            "round": 1,
+            "reviewed_head_sha": "a8b89805dd452f8a330c5e1bd3f116dc2bfff97e",
+            "needs_fix_round": true,
+            "findings": [
+              {
+                "id": "R1-F1",
+                "classification": "blocked",
+                "title": "A partial last page is not counted",
+                "location": "pages.py:page_count",
+                "required_resolution": "Round the quotient up, so that a total that is not a multiple of the size counts its last, partial page, and test such a total."
+              },
+              {
+                "id": "R1-F2",
+                "classification": "non-blocked",
+                "title": "page_count(11, 5) returns 2",
+                "location": "pages.py:12",
+                "required_resolution": "Return 3 for 11 items at 5 per page."
+              },
+              {
+                "id": "R1-F3",
+                "classification": "nit",
+                "title": "No test covers a partial page",
+                "location": "tests/test_pages.py",
+                "required_resolution": "Add a test whose total is not a multiple of the size."
+              }
+            ],
+            "spec": "Read against the issue's acceptance criteria.",
+            "standards": "Read against the repository's conventions.",
+            "assessment": "See the findings.",
+            "observations": "None.",
+            "verification": "Read the diff and ran the tests.",
+            "summary": "See the findings."
+          }
+        },
+        {
+          "round": 2,
+          "commit": "fix-1",
+          "validation": "passed",
+          "result": {
+            "phase": "REVIEW",
+            "status": "success",
+            "round": 2,
+            "reviewed_head_sha": "6737721b7c05f350483b8403dbcdfd92a02a78cf",
+            "needs_fix_round": false,
+            "findings": [],
+            "spec": "Read against the issue's acceptance criteria.",
+            "standards": "Read against the repository's conventions.",
+            "assessment": "See the findings.",
+            "observations": "None.",
+            "verification": "Read the diff and ran the tests.",
+            "summary": "See the findings."
+          }
+        }
+      ],
+      "fixes": [
+        {
+          "round": 1,
+          "commit": "fix-1",
+          "resolutions": {
+            "R1-F1": "fixed",
+            "R1-F2": "fixed",
+            "R1-F3": "fixed"
+          },
+          "label": {
+            "verdict": "not_harmful",
+            "adjudicator": {
+              "id": "review-fixture-author",
+              "role": "fixture_author"
+            },
+            "labeled_at": "2026-11-24T12:00:00+00:00",
+            "reason": "The commit rounds up and tests a partial page; it introduces no defect, and A1's oracle passes at it."
+          }
+        }
+      ],
+      "labels": [
+        {
+          "finding": "R1-F1",
+          "round": 1,
+          "candidate_sha": "a8b89805dd452f8a330c5e1bd3f116dc2bfff97e",
+          "verdict": "confirmed",
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          },
+          "labeled_at": "2026-11-24T12:00:00+00:00",
+          "defect": "A1"
+        },
+        {
+          "finding": "R1-F2",
+          "round": 1,
+          "candidate_sha": "a8b89805dd452f8a330c5e1bd3f116dc2bfff97e",
+          "verdict": "confirmed",
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          },
+          "labeled_at": "2026-11-24T12:00:00+00:00",
+          "defect": "A1"
+        },
+        {
+          "finding": "R1-F3",
+          "round": 1,
+          "candidate_sha": "a8b89805dd452f8a330c5e1bd3f116dc2bfff97e",
+          "verdict": "confirmed",
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          },
+          "labeled_at": "2026-11-24T12:00:00+00:00",
+          "defect": "A2"
+        }
+      ],
+      "launches": [
+        {
+          "phase": "ANALYZE_EXECUTE",
+          "cost_usd": 1.2,
+          "wall_clock_seconds": 420,
+          "context_tokens": null,
+          "provenance": "synthetic"
+        },
+        {
+          "phase": "REVIEW",
+          "cost_usd": 0.6,
+          "wall_clock_seconds": 300,
+          "context_tokens": null,
+          "provenance": "synthetic",
+          "round": 1
+        },
+        {
+          "phase": "FIX",
+          "cost_usd": 0.5,
+          "wall_clock_seconds": 240,
+          "context_tokens": null,
+          "provenance": "synthetic",
+          "round": 1
+        },
+        {
+          "phase": "REVIEW",
+          "cost_usd": 0.4,
+          "wall_clock_seconds": 200,
+          "context_tokens": null,
+          "provenance": "synthetic",
+          "round": 2
+        }
+      ]
+    },
+    {
+      "id": "current_review/redact-authorization-header",
+      "arm": "current_review",
+      "case": "redact-authorization-header",
+      "provenance": "fixture",
+      "commits": [
+        {
+          "name": "fix-1",
+          "parent": "candidate",
+          "sha": "6d81b1a41cd7675912df07e8d43501e5976dc9a0",
+          "fixes": [
+            "B2"
+          ],
+          "files": {
+            "README.md": "# redact\n\nMasks `token=` values and Authorization headers in log text.\n"
+          }
+        }
+      ],
+      "defects": [],
+      "oracles": {},
+      "reviews": [
+        {
+          "round": 1,
+          "commit": "candidate",
+          "validation": "passed",
+          "result": {
+            "phase": "REVIEW",
+            "status": "success",
+            "round": 1,
+            "reviewed_head_sha": "06398f9ea48e0f466fe9234deb58980a0d74752b",
+            "needs_fix_round": true,
+            "findings": [
+              {
+                "id": "R1-F1",
+                "classification": "nit",
+                "title": "Typo in the README",
+                "location": "README.md",
+                "required_resolution": "Spell Authorization correctly."
+              },
+              {
+                "id": "R1-F2",
+                "classification": "non-blocked",
+                "title": "Compile the patterns once",
+                "location": "redact.py:redact",
+                "required_resolution": "Compile both patterns once at module level instead of on every call."
+              },
+              {
+                "id": "R1-F3",
+                "classification": "non-blocked",
+                "title": "A header value with non-ASCII bytes may stay visible",
+                "location": "redact.py:_HEADER",
+                "required_resolution": "Mask a header value whatever characters it holds, and test a non-ASCII one."
+              }
+            ],
+            "spec": "Read against the issue's acceptance criteria.",
+            "standards": "Read against the repository's conventions.",
+            "assessment": "See the findings.",
+            "observations": "None.",
+            "verification": "Read the diff and ran the tests.",
+            "summary": "See the findings."
+          }
+        },
+        {
+          "round": 2,
+          "commit": "fix-1",
+          "validation": "passed",
+          "result": {
+            "phase": "REVIEW",
+            "status": "success",
+            "round": 2,
+            "reviewed_head_sha": "6d81b1a41cd7675912df07e8d43501e5976dc9a0",
+            "needs_fix_round": false,
+            "findings": [],
+            "spec": "Read against the issue's acceptance criteria.",
+            "standards": "Read against the repository's conventions.",
+            "assessment": "See the findings.",
+            "observations": "None.",
+            "verification": "Read the diff and ran the tests.",
+            "summary": "See the findings."
+          }
+        }
+      ],
+      "fixes": [
+        {
+          "round": 1,
+          "commit": "fix-1",
+          "resolutions": {
+            "R1-F1": "fixed",
+            "R1-F2": "no_change_with_rationale",
+            "R1-F3": "no_change_with_rationale"
+          },
+          "label": {
+            "verdict": "not_harmful",
+            "adjudicator": {
+              "id": "review-fixture-author",
+              "role": "fixture_author"
+            },
+            "labeled_at": "2026-11-24T12:00:00+00:00",
+            "reason": "The commit corrects one word of the README and nothing else."
+          }
+        }
+      ],
+      "labels": [
+        {
+          "finding": "R1-F1",
+          "round": 1,
+          "candidate_sha": "06398f9ea48e0f466fe9234deb58980a0d74752b",
+          "verdict": "confirmed",
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          },
+          "labeled_at": "2026-11-24T12:00:00+00:00",
+          "defect": "B2"
+        },
+        {
+          "finding": "R1-F2",
+          "round": 1,
+          "candidate_sha": "06398f9ea48e0f466fe9234deb58980a0d74752b",
+          "verdict": "false",
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          },
+          "labeled_at": "2026-11-24T12:00:00+00:00",
+          "reason": "Both patterns are compiled once, at import; the finding misreads the module."
+        },
+        {
+          "finding": "R1-F3",
+          "round": 1,
+          "candidate_sha": "06398f9ea48e0f466fe9234deb58980a0d74752b",
+          "verdict": "unknown",
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          },
+          "labeled_at": "2026-11-24T12:00:00+00:00",
+          "reason": "The pattern's \\S+ matches non-ASCII characters, but the issue does not say whether a header can reach this function undecoded, so a leak can be neither shown nor ruled out."
+        }
+      ],
+      "launches": [
+        {
+          "phase": "ANALYZE_EXECUTE",
+          "cost_usd": 1.1,
+          "wall_clock_seconds": 400,
+          "context_tokens": null,
+          "provenance": "synthetic"
+        },
+        {
+          "phase": "REVIEW",
+          "cost_usd": 0.7,
+          "wall_clock_seconds": 330,
+          "context_tokens": null,
+          "provenance": "synthetic",
+          "round": 1
+        },
+        {
+          "phase": "FIX",
+          "cost_usd": 0.3,
+          "wall_clock_seconds": 150,
+          "context_tokens": null,
+          "provenance": "synthetic",
+          "round": 1
+        },
+        {
+          "phase": "REVIEW",
+          "cost_usd": 0.4,
+          "wall_clock_seconds": 210,
+          "context_tokens": null,
+          "provenance": "synthetic",
+          "round": 2
+        }
+      ]
+    },
+    {
+      "id": "current_review/retry-attempt-bound",
+      "arm": "current_review",
+      "case": "retry-attempt-bound",
+      "provenance": "fixture",
+      "commits": [
+        {
+          "name": "fix-1",
+          "parent": "candidate",
+          "sha": "7004fd723813413029409f0e7babdcb5ff4e0d6d",
+          "fixes": [
+            "C1"
+          ],
+          "files": {
+            "retry.py": "\"\"\"Retrying a call that may fail transiently.\"\"\"\n\nTRANSIENT = (OSError,)\n\n\ndef retry(call, attempts):\n    \"\"\"The value of ``call()``, calling it at most ``attempts`` times.\n\n    A transient error on the last attempt is raised.\n    \"\"\"\n    for attempt in range(attempts):\n        try:\n            return call()\n        except TRANSIENT:\n            if attempt == attempts:\n                raise\n"
+          }
+        }
+      ],
+      "defects": [
+        {
+          "id": "C2",
+          "defect_class": "correctness",
+          "severity": "major",
+          "location": "retry.py:retry",
+          "introduced_at": "fix-1",
+          "fixed_at": [],
+          "discovered_at": "2026-11-24T11:00:00+00:00",
+          "discovered_by": "oracle",
+          "summary": "After the fix a call that fails on every attempt returns None: attempt never equals attempts, so the last transient error is swallowed.",
+          "evidence": {
+            "kind": "oracle",
+            "oracle": "last_error_raised",
+            "passes_at": [
+              "candidate",
+              "reference"
+            ]
+          },
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          }
+        }
+      ],
+      "oracles": {
+        "last_error_raised": "from retry import retry\n\n\ndef failing():\n    raise OSError(\"down\")\n\n\ntry:\n    retry(failing, 2)\nexcept OSError:\n    pass\nelse:\n    raise AssertionError(\"the last transient error was swallowed\")\n"
+      },
+      "reviews": [
+        {
+          "round": 1,
+          "commit": "candidate",
+          "validation": "passed",
+          "result": {
+            "phase": "REVIEW",
+            "status": "success",
+            "round": 1,
+            "reviewed_head_sha": "4e1e338478c0d7c7e3bebfdd7db88fb63d2a461e",
+            "needs_fix_round": true,
+            "findings": [
+              {
+                "id": "R1-F1",
+                "classification": "blocked",
+                "title": "retry calls one time too many",
+                "location": "retry.py:retry",
+                "required_resolution": "Call at most `attempts` times: three attempts are three calls, and the last error is raised."
+              }
+            ],
+            "spec": "Read against the issue's acceptance criteria.",
+            "standards": "Read against the repository's conventions.",
+            "assessment": "See the findings.",
+            "observations": "None.",
+            "verification": "Read the diff and ran the tests.",
+            "summary": "See the findings."
+          }
+        },
+        {
+          "round": 2,
+          "commit": "fix-1",
+          "validation": "passed",
+          "result": {
+            "phase": "REVIEW",
+            "status": "success",
+            "round": 2,
+            "reviewed_head_sha": "7004fd723813413029409f0e7babdcb5ff4e0d6d",
+            "needs_fix_round": false,
+            "findings": [],
+            "spec": "Read against the issue's acceptance criteria.",
+            "standards": "Read against the repository's conventions.",
+            "assessment": "See the findings.",
+            "observations": "None.",
+            "verification": "Read the diff and ran the tests.",
+            "summary": "See the findings."
+          }
+        }
+      ],
+      "fixes": [
+        {
+          "round": 1,
+          "commit": "fix-1",
+          "resolutions": {
+            "R1-F1": "fixed"
+          },
+          "label": {
+            "verdict": "harmful",
+            "adjudicator": {
+              "id": "review-fixture-author",
+              "role": "fixture_author"
+            },
+            "labeled_at": "2026-11-24T12:00:00+00:00",
+            "reason": "The loop now stops after `attempts` calls, but `attempt == attempts` can no longer hold, so the last error is swallowed (C2, whose oracle fails at fix-1)."
+          }
+        }
+      ],
+      "labels": [
+        {
+          "finding": "R1-F1",
+          "round": 1,
+          "candidate_sha": "4e1e338478c0d7c7e3bebfdd7db88fb63d2a461e",
+          "verdict": "confirmed",
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          },
+          "labeled_at": "2026-11-24T12:00:00+00:00",
+          "defect": "C1"
+        }
+      ],
+      "launches": [
+        {
+          "phase": "ANALYZE_EXECUTE",
+          "cost_usd": 0.9,
+          "wall_clock_seconds": 380,
+          "context_tokens": null,
+          "provenance": "synthetic"
+        },
+        {
+          "phase": "REVIEW",
+          "cost_usd": 0.5,
+          "wall_clock_seconds": 260,
+          "context_tokens": null,
+          "provenance": "synthetic",
+          "round": 1
+        },
+        {
+          "phase": "FIX",
+          "cost_usd": 0.4,
+          "wall_clock_seconds": 200,
+          "context_tokens": null,
+          "provenance": "synthetic",
+          "round": 1
+        },
+        {
+          "phase": "REVIEW",
+          "cost_usd": 0.45,
+          "wall_clock_seconds": 230,
+          "context_tokens": null,
+          "provenance": "synthetic",
+          "round": 2
+        }
+      ]
+    },
+    {
+      "id": "current_review/rename-slug-pattern",
+      "arm": "current_review",
+      "case": "rename-slug-pattern",
+      "provenance": "fixture",
+      "commits": [],
+      "defects": [],
+      "oracles": {},
+      "reviews": [
+        {
+          "round": 1,
+          "commit": "candidate",
+          "validation": "passed",
+          "result": {
+            "phase": "REVIEW",
+            "status": "success",
+            "round": 1,
+            "reviewed_head_sha": "a13c2e5284c425fddd3b0bbf1f64083cfe09596f",
+            "needs_fix_round": false,
+            "findings": [],
+            "spec": "Read against the issue's acceptance criteria.",
+            "standards": "Read against the repository's conventions.",
+            "assessment": "See the findings.",
+            "observations": "None.",
+            "verification": "Read the diff and ran the tests.",
+            "summary": "See the findings."
+          }
+        }
+      ],
+      "fixes": [],
+      "labels": [],
+      "launches": [
+        {
+          "phase": "ANALYZE_EXECUTE",
+          "cost_usd": 0.5,
+          "wall_clock_seconds": 200,
+          "context_tokens": null,
+          "provenance": "synthetic"
+        },
+        {
+          "phase": "REVIEW",
+          "cost_usd": 0.3,
+          "wall_clock_seconds": 150,
+          "context_tokens": null,
+          "provenance": "synthetic",
+          "round": 1
+        }
+      ]
+    },
+    {
+      "id": "current_review/document-empty-chunks",
+      "arm": "current_review",
+      "case": "document-empty-chunks",
+      "provenance": "fixture",
+      "commits": [],
+      "defects": [],
+      "oracles": {},
+      "reviews": [
+        {
+          "round": 1,
+          "commit": "candidate",
+          "validation": "passed",
+          "result": {
+            "phase": "REVIEW",
+            "status": "success",
+            "round": 1,
+            "reviewed_head_sha": "e2980bd0f844c3ea7f18a328f961c3664e50b4d0",
+            "needs_fix_round": true,
+            "findings": [
+              {
+                "id": "R1-F1",
+                "classification": "nit",
+                "title": "The docstring contradicts the code for an empty list",
+                "location": "chunks.py:chunks",
+                "required_resolution": "Say that an empty list gives one empty chunk, as the code returns."
+              }
+            ],
+            "spec": "Read against the issue's acceptance criteria.",
+            "standards": "Read against the repository's conventions.",
+            "assessment": "See the findings.",
+            "observations": "None.",
+            "verification": "Read the diff and ran the tests.",
+            "summary": "See the findings."
+          }
+        },
+        {
+          "round": 2,
+          "commit": "candidate",
+          "validation": "passed",
+          "result": {
+            "phase": "REVIEW",
+            "status": "success",
+            "round": 2,
+            "reviewed_head_sha": "e2980bd0f844c3ea7f18a328f961c3664e50b4d0",
+            "needs_fix_round": false,
+            "findings": [],
+            "spec": "Read against the issue's acceptance criteria.",
+            "standards": "Read against the repository's conventions.",
+            "assessment": "See the findings.",
+            "observations": "None.",
+            "verification": "Read the diff and ran the tests.",
+            "summary": "See the findings."
+          }
+        }
+      ],
+      "fixes": [
+        {
+          "round": 1,
+          "commit": null,
+          "resolutions": {
+            "R1-F1": "no_change_with_rationale"
+          }
+        }
+      ],
+      "labels": [
+        {
+          "finding": "R1-F1",
+          "round": 1,
+          "candidate_sha": "e2980bd0f844c3ea7f18a328f961c3664e50b4d0",
+          "verdict": "false",
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          },
+          "labeled_at": "2026-11-24T12:00:00+00:00",
+          "reason": "chunks([], 2) returns [], no chunk, as the docstring says and the candidate's own test checks."
+        }
+      ],
+      "launches": [
+        {
+          "phase": "ANALYZE_EXECUTE",
+          "cost_usd": 0.4,
+          "wall_clock_seconds": 180,
+          "context_tokens": null,
+          "provenance": "synthetic"
+        },
+        {
+          "phase": "REVIEW",
+          "cost_usd": 0.35,
+          "wall_clock_seconds": 170,
+          "context_tokens": null,
+          "provenance": "synthetic",
+          "round": 1
+        },
+        {
+          "phase": "FIX",
+          "cost_usd": 0.2,
+          "wall_clock_seconds": 90,
+          "context_tokens": null,
+          "provenance": "synthetic",
+          "round": 1
+        },
+        {
+          "phase": "REVIEW",
+          "cost_usd": 0.3,
+          "wall_clock_seconds": 150,
+          "context_tokens": null,
+          "provenance": "synthetic",
+          "round": 2
+        }
+      ]
+    },
+    {
+      "id": "current_review/type-hint-cache-key",
+      "arm": "current_review",
+      "case": "type-hint-cache-key",
+      "provenance": "fixture",
+      "commits": [],
+      "defects": [],
+      "oracles": {},
+      "reviews": [
+        {
+          "round": 1,
+          "commit": "candidate",
+          "validation": "passed",
+          "result": {
+            "phase": "REVIEW",
+            "status": "success",
+            "round": 1,
+            "reviewed_head_sha": "77e000ba809f09742bc32ee244f752188421eed6",
+            "needs_fix_round": true,
+            "findings": [
+              {
+                "id": "R1-F1",
+                "classification": "non-blocked",
+                "title": "Values holding & or = can make two queries share a key",
+                "location": "cache_key.py:cache_key",
+                "required_resolution": "Escape `&` and `=` in names and values, or build the key from a structured encoding, so that distinct queries never share a key."
+              }
+            ],
+            "spec": "Read against the issue's acceptance criteria.",
+            "standards": "Read against the repository's conventions.",
+            "assessment": "See the findings.",
+            "observations": "None.",
+            "verification": "Read the diff and ran the tests.",
+            "summary": "See the findings."
+          }
+        },
+        {
+          "round": 2,
+          "commit": "candidate",
+          "validation": "passed",
+          "result": {
+            "phase": "REVIEW",
+            "status": "success",
+            "round": 2,
+            "reviewed_head_sha": "77e000ba809f09742bc32ee244f752188421eed6",
+            "needs_fix_round": true,
+            "findings": [
+              {
+                "id": "R2-F1",
+                "classification": "non-blocked",
+                "title": "Values holding & or = can make two queries share a key (carried from R1-F1)",
+                "location": "cache_key.py:cache_key",
+                "required_resolution": "Escape `&` and `=` in names and values, or build the key from a structured encoding, so that distinct queries never share a key."
+              }
+            ],
+            "spec": "Read against the issue's acceptance criteria.",
+            "standards": "Read against the repository's conventions.",
+            "assessment": "See the findings.",
+            "observations": "None.",
+            "verification": "Read the diff and ran the tests.",
+            "summary": "See the findings."
+          }
+        }
+      ],
+      "fixes": [
+        {
+          "round": 1,
+          "commit": null,
+          "resolutions": {
+            "R1-F1": "no_change_with_rationale"
+          }
+        }
+      ],
+      "labels": [
+        {
+          "finding": "R1-F1",
+          "round": 1,
+          "candidate_sha": "77e000ba809f09742bc32ee244f752188421eed6",
+          "verdict": "unknown",
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          },
+          "labeled_at": "2026-11-24T12:00:00+00:00",
+          "reason": "The collision is real and already at the base; the change only adds type hints, and its issue does not say whether a defect it did not introduce is in scope."
+        },
+        {
+          "finding": "R2-F1",
+          "round": 2,
+          "candidate_sha": "77e000ba809f09742bc32ee244f752188421eed6",
+          "verdict": "unknown",
+          "adjudicator": {
+            "id": "review-fixture-author",
+            "role": "fixture_author"
+          },
+          "labeled_at": "2026-11-24T12:00:00+00:00",
+          "reason": "The collision is real and already at the base; the change only adds type hints, and its issue does not say whether a defect it did not introduce is in scope."
+        }
+      ],
+      "stopped": "BLOCKED by stagnation: the same required resolution in two consecutive rounds (workflow.stagnation_identical_rounds: 2)",
+      "launches": [
+        {
+          "phase": "ANALYZE_EXECUTE",
+          "cost_usd": 0.45,
+          "wall_clock_seconds": 190,
+          "context_tokens": null,
+          "provenance": "synthetic"
+        },
+        {
+          "phase": "REVIEW",
+          "cost_usd": 0.4,
+          "wall_clock_seconds": 200,
+          "context_tokens": null,
+          "provenance": "synthetic",
+          "round": 1
+        },
+        {
+          "phase": "FIX",
+          "cost_usd": 0.25,
+          "wall_clock_seconds": 100,
+          "context_tokens": null,
+          "provenance": "synthetic",
+          "round": 1
+        },
+        {
+          "phase": "REVIEW",
+          "cost_usd": 0.4,
+          "wall_clock_seconds": 190,
+          "context_tokens": null,
+          "provenance": "synthetic",
+          "round": 2
+        }
+      ]
+    }
+  ]
+}

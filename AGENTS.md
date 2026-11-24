@@ -272,6 +272,9 @@ docs/evaluation-protocol.md            the pre-registered evaluation of Issue Me
                                        execution (#318): arms, pinned tasks, what is held equal and
                                        measured, the go/no-go decision, the control-plane test list,
                                        fixture mode and the opt-in real-run procedure; no result yet
+docs/review-evaluation-protocol.md     the pre-registered review evaluation (#355): today's review
+                                       baseline, the labeling taxonomy, what is never a label, metric
+                                       formulas, uncertainty, the go/no-go rule, the fixture; no result
 docs/test-suite-performance-audit.md   EPIC #338's exit audit: the suite at the EPIC's baseline and on
                                        main, measured on one host; each exit criterion and invariant
                                        with its verdict and tests; what only GitHub holds
@@ -372,6 +375,10 @@ matches none of them needs only this file and the scoped `AGENTS.md`.
   an arm needs, or adding a top-level configuration section, read
   `docs/evaluation-protocol.md`. A threshold, task or setting changes only by
   its section 11.
+- If changing `tests/review_evaluation.py` or `tests/fixtures/review_evaluation/`,
+  or what a REVIEW or FIX result reports, how a round is routed, kept or
+  bounded, or a review loop default, read `docs/review-evaluation-protocol.md`.
+  A registered value or baseline fact changes only by its section 13.
 
 ## Scope discipline
 

@@ -231,6 +231,7 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/parallel_bench.py": ("test_suite_performance_audit",),  # via suite_comparison
     "tests/pi_fake.py": (),
     "tests/remote_sandbox_prototype.py": (),  # ADR 0014's prototype (#276)
+    "tests/review_evaluation.py": (),  # its one test module imports it (#355)
     "tests/claude_sdk_fake.py": ("test_claude_sdk",),
     "tests/sandbox_host.py": (),
     "tests/scheduler_worker.py": ("test_scheduler", "test_epic_commands", "test_epic_recovery"),
@@ -238,6 +239,8 @@ COVERAGE: Mapping[str, Entry] = {
     # The evaluation protocol's pinned tasks, thresholds and fixtures (#318)
     "tests/fixtures/evaluation/": ("test_evaluation", "test_evaluation_fixture"),
     "tests/fixtures/memory_retrieval/": ("test_memory_retrieval_bench",),
+    # The review evaluation contract's registered files and fixture (#355)
+    "tests/fixtures/review_evaluation/": ("test_review_evaluation",),
     # EPIC #338's exit audit: its runs' records, which its section 1 is held to
     "tests/fixtures/suite_performance_audit/": ("test_suite_performance_audit",),
 }

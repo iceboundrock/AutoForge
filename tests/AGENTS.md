@@ -296,6 +296,16 @@ read it before adding tests for a listed area.
   holds one. `tests/test_evaluation.py` uses synthetic records and
   `tests/test_evaluation_fixture.py` the fixtures. A change to a pinned file moves
   a digest the protocol registers; see its section 11.
+- `tests/review_evaluation.py` is no test either: the scorer of
+  `docs/review-evaluation-protocol.md` (#355), which checks adjudicated labels of
+  review findings and fixes against `tests/fixtures/review_evaluation/`, replays
+  the corpus (its commits built at a fixed date with git's configuration and
+  transports off, each oracle in a `python -I` that sees only the locale), scores
+  it and decides between two arms. It launches no agent and holds no engine.
+  `tests/test_review_evaluation.py` holds it to the protocol; a change to a
+  registered file moves a digest its section 13 records, and a change to
+  `fixture_runs.json` or the scorer moves `fixture_report.json`, which
+  `uv run python -m tests.review_evaluation score --out` rewrites.
 - `watched_fifo(path)` makes a FIFO and yields the list of times
   something opened it to read (a watchdog releases the reader, so a read
   that follows a planted link records itself instead of hanging the
@@ -619,6 +629,12 @@ the recovery MVP evaluation (#375)    test_recovery_evaluation.py (the matrix of
                                       fork's marked PR and two unjournaled round comments
                                       followed through the next step, another run's comment
                                       never deleted, PR #511 R2)
+the review evaluation (#355)         test_review_evaluation.py (the corpus replayed as pinned,
+                                      every oracle failing and passing where its ground truth
+                                      says; no agent's word a label and none moving a score;
+                                      what the check refuses; the decision's order on synthetic
+                                      real arms; the baseline facts held to the code; the
+                                      protocol held to its files)
 the evaluation protocol (#318)        test_evaluation.py (the pins, what arms hold equal, the
                                       statistics and decision on synthetic records, what never
                                       runs in CI; the protocol held to its files),
