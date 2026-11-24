@@ -19,10 +19,11 @@ files of ``tests/fixtures/review_evaluation/``:
     uv run python -m tests.review_evaluation decide --baseline ARM --treatment ARM
 
 ``check`` refuses a file the contract does not allow, ``verify`` replays the
-corpus (it builds every commit in a temporary repository at a fixed date, holds
-each pinned SHA to what it builds, and runs every oracle where the ground truth
-says it must fail or pass), ``score`` prints the report, and ``decide`` applies
-the pre-registered decision to two arms.
+corpus (it builds every case's commits, whether or not a run holds the case, and
+every run's own, in temporary repositories at a fixed date, holds each pinned SHA
+to what it builds, and runs every oracle where the ground truth says it must fail
+or pass), ``score`` prints the report, and ``decide`` applies the pre-registered
+decision to two arms.
 
 It launches no agent, reads no credential, contacts no network and writes to no
 GitHub. A label comes from an adjudicator's record or an oracle, never from what
@@ -266,10 +267,31 @@ class Fix:
 @dataclass(frozen=True)
 class Launch:
     phase: str
+    round: int | None
     cost_usd: float | None
     wall_clock_seconds: float | None
     context_tokens: float | None
     provenance: str
+
+
+def _ancestors(commits: Mapping[str, Commit], name: str) -> frozenset[str]:
+    seen: list[str] = []
+    current: str | None = name
+    while current is not None:
+        seen.append(current)
+        current = commits[current].parent
+    return frozenset(seen)
+
+
+def _fixed_at(commits: Mapping[str, Commit], defect: Defect) -> tuple[str, ...]:
+    """Where ``defect`` stops: the case's commits that fix it and any run commit that does."""
+    by_run = tuple(c.name for c in commits.values() if defect.id in c.fixes)
+    return defect.fixed_at + by_run
+
+
+def _present(commits: Mapping[str, Commit], defect: Defect, commit: str) -> bool:
+    line = _ancestors(commits, commit)
+    return defect.introduced_at in line and not any(f in line for f in _fixed_at(commits, defect))
 
 
 @dataclass(frozen=True)
@@ -287,22 +309,30 @@ class Run:
     excluded: str
     oracles: Mapping[str, str]
 
-    def ancestors(self, name: str) -> frozenset[str]:
-        seen: list[str] = []
-        current: str | None = name
-        while current is not None:
-            seen.append(current)
-            current = self.commits[current].parent
-        return frozenset(seen)
-
-    def fixed_at(self, defect: Defect) -> tuple[str, ...]:
-        """Where ``defect`` stops: the case's commits that fix it and this run's."""
-        by_run = tuple(c.name for c in self.commits.values() if defect.id in c.fixes)
-        return defect.fixed_at + by_run
-
     def present(self, defect: Defect, commit: str) -> bool:
-        line = self.ancestors(commit)
-        return defect.introduced_at in line and not any(f in line for f in self.fixed_at(defect))
+        return _present(self.commits, defect, commit)
+
+    def belongs_to(self, defect: str) -> str:
+        """``case`` for a defect of the case's commits, ``run`` for one this run introduced."""
+        return "case" if defect in self.case.defects else "run"
+
+    def missing_launches(self) -> tuple[str, ...]:
+        """The launches a complete record of this run holds and its own does not.
+
+        A run made at least one ANALYZE_EXECUTE launch, one REVIEW launch for each of
+        its rounds and one FIX launch for each of its fixes. Failed attempts add
+        launches and are never missing; a record without one of these is incomplete,
+        so no sum over its launches is the run's.
+        """
+        held = {(launch.phase, launch.round) for launch in self.launches}
+        missing: list[str] = []
+        if not any(launch.phase == "ANALYZE_EXECUTE" for launch in self.launches):
+            missing.append("ANALYZE_EXECUTE")
+        missing += [
+            f"REVIEW of round {r.round}" for r in self.reviews if ("REVIEW", r.round) not in held
+        ]
+        missing += [f"FIX of round {f.round}" for f in self.fixes if ("FIX", f.round) not in held]
+        return tuple(missing)
 
 
 @dataclass(frozen=True)
@@ -667,8 +697,19 @@ def _launch(raw: object, at: str, prereg: Mapping, run_provenance: str) -> Launc
     provenance = _one_of(lc["provenance"], prereg["usage_provenance"], f"{at}.provenance")
     if run_provenance == "fixture" and provenance == "measured":
         raise ReviewEvaluationError(f"{at}: a fixture run may not say it measured anything")
+    phase = _one_of(lc["phase"], LAUNCH_PHASES, f"{at}.phase")
+    rnd = lc.get("round")
+    if rnd is not None:
+        rnd = _int(rnd, f"{at}.round", 1)
+    if phase in ("REVIEW", "FIX") and rnd is None:
+        raise ReviewEvaluationError(f"{at} is a {phase} launch and names no round")
+    if phase == "ANALYZE_EXECUTE" and rnd is not None:
+        raise ReviewEvaluationError(
+            f"{at} is an ANALYZE_EXECUTE launch, which precedes every round"
+        )
     return Launch(
-        phase=_one_of(lc["phase"], LAUNCH_PHASES, f"{at}.phase"),
+        phase=phase,
+        round=rnd,
         cost_usd=_number(lc["cost_usd"], f"{at}.cost_usd"),
         wall_clock_seconds=_number(lc["wall_clock_seconds"], f"{at}.wall_clock_seconds"),
         context_tokens=_number(lc["context_tokens"], f"{at}.context_tokens"),
@@ -847,6 +888,20 @@ def _check_run(raw: object, prereg: Mapping, cases: Mapping[str, Case], cutoff: 
         _launch(item, f"{at} launch[{i}]", prereg, provenance)
         for i, item in enumerate(r["launches"])
     )
+    rounds = {review.round for review in reviews}
+    needing_fix = {review.round for review in reviews if not review.clean}
+    for i, launch in enumerate(launches):
+        if launch.round is None:
+            continue
+        if launch.phase == "FIX" and launch.round not in needing_fix:
+            raise ReviewEvaluationError(
+                f"{at} launch[{i}] is a FIX launch of round {launch.round}, which needed no fix"
+            )
+        if launch.round not in rounds:
+            raise ReviewEvaluationError(
+                f"{at} launch[{i}] is a {launch.phase} launch of round {launch.round}, "
+                "a round the run does not have"
+            )
     run = Run(
         id=rid,
         arm=arm,
@@ -1013,46 +1068,92 @@ def run_oracle(source: str, files: Mapping[str, str], root: Path) -> str:
     return f"error: {last or f'exit {res.returncode}'}"
 
 
-def oracle_expectations(run: Run) -> list[tuple[str, str, str]]:
-    """(defect, commit, pass|fail): every place the ground truth says an oracle decides."""
+def _expectations(
+    owner: str,
+    defects: Iterable[Defect],
+    commits: Mapping[str, Commit],
+    decided: Iterable[str],
+) -> list[tuple[str, str, str]]:
     out: list[tuple[str, str, str]] = []
-    reviewed = {review.commit for review in run.reviews}
-    for d in run.defects.values():
+    for d in defects:
         if d.oracle is None:
             continue
         expected: dict[str, str] = {d.introduced_at: "fail"}
-        for name in (*d.passes_at, *run.fixed_at(d)):
+        for name in (*d.passes_at, *_fixed_at(commits, d)):
             expected[name] = "pass"
-        for name in sorted(reviewed):
-            if d.introduced_at in run.ancestors(name):
-                expected[name] = "fail" if run.present(d, name) else "pass"
+        for name in sorted(decided):
+            if d.introduced_at in _ancestors(commits, name):
+                expected[name] = "fail" if _present(commits, d, name) else "pass"
         for name, outcome in expected.items():
-            if outcome == "pass" and run.present(d, name):
+            if outcome == "pass" and _present(commits, d, name):
                 raise ReviewEvaluationError(
-                    f"run {run.id!r}: {d.id} is said to pass at {name!r}, which holds it"
+                    f"{owner}: {d.id} is said to pass at {name!r}, which holds it"
                 )
             out.append((d.id, name, outcome))
     return sorted(out)
 
 
+def case_oracle_expectations(case: Case) -> list[tuple[str, str, str]]:
+    """(defect, commit, pass|fail) at the case's own commits, whether or not a run holds it."""
+    return _expectations(
+        f"case {case.id!r}", case.defects.values(), case.commits, (case.candidate,)
+    )
+
+
+def oracle_expectations(run: Run) -> list[tuple[str, str, str]]:
+    """(defect, commit, pass|fail): every place the ground truth says an oracle decides."""
+    reviewed = {review.commit for review in run.reviews}
+    return _expectations(f"run {run.id!r}", run.defects.values(), run.commits, reviewed)
+
+
+def _pins(owner: str, commits: Mapping[str, Commit], built: Mapping[str, str]) -> list[str]:
+    return [
+        f"{owner}: commit {name!r} is pinned at {commit.sha} and builds as {built[name]}"
+        for name, commit in commits.items()
+        if built[name] != commit.sha
+    ]
+
+
 def verify(ev: Evaluation, root: Path) -> list[str]:
-    """Replay the corpus and the runs under ``root``; the problems found, or ``[]``."""
+    """Replay every case of the corpus, then every run, under ``root``; the problems found.
+
+    Each case is replayed on its own, whether or not a run holds it: its commits are
+    held to their pins and its oracles run at its commits. A run adds what only it
+    holds: its own commits and the oracles at them. An empty list of runs still
+    replays the whole corpus.
+    """
     problems: list[str] = []
-    for index, run in enumerate(ev.runs):
-        where = Path(tempfile.mkdtemp(prefix=f"run-{index}-", dir=root))
-        built = build_shas(run.commits, ev.commit_date, run.case.id, where)
-        for name, commit in run.commits.items():
-            if built[name] != commit.sha:
+    for index, case in enumerate(ev.cases.values()):
+        where = Path(tempfile.mkdtemp(prefix=f"case-{index}-", dir=root))
+        owner = f"case {case.id!r}"
+        problems += _pins(
+            owner, case.commits, build_shas(case.commits, ev.commit_date, case.id, where)
+        )
+        for did, name, outcome in case_oracle_expectations(case):
+            source = case.oracles[str(case.defects[did].oracle)]
+            got = run_oracle(source, tree_at(case.commits, name), where)
+            if got != outcome:
                 problems.append(
-                    f"run {run.id!r}: commit {name!r} is pinned at {commit.sha} and builds "
-                    f"as {built[name]}"
+                    f"{owner}: {did}'s oracle should {outcome} at {name!r} and gave {got}"
                 )
-        for did, name, outcome in oracle_expectations(run):
+    for index, run in enumerate(ev.runs):
+        owner = f"run {run.id!r}"
+        replayed = {(did, name) for did, name, _ in case_oracle_expectations(run.case)}
+        own = {name: c for name, c in run.commits.items() if name not in run.case.commits}
+        expectations = [e for e in oracle_expectations(run) if (e[0], e[1]) not in replayed]
+        if not own and not expectations:
+            continue
+        where = Path(tempfile.mkdtemp(prefix=f"run-{index}-", dir=root))
+        if own:
+            problems += _pins(
+                owner, own, build_shas(run.commits, ev.commit_date, run.case.id, where)
+            )
+        for did, name, outcome in expectations:
             source = run.oracles[str(run.defects[did].oracle)]
             got = run_oracle(source, tree_at(run.commits, name), where)
             if got != outcome:
                 problems.append(
-                    f"run {run.id!r}: {did}'s oracle should {outcome} at {name!r} and gave {got}"
+                    f"{owner}: {did}'s oracle should {outcome} at {name!r} and gave {got}"
                 )
     return problems
 
@@ -1072,6 +1173,11 @@ class RunScore:
     false: int
     unknown: int
     duplicates: int
+    # Unknown findings of rounds with a confirmed one: each could be a duplicate.
+    unknown_beside_confirmed: int
+    # The unknown findings of each round with two or more and no confirmed one: all but
+    # one of them could be duplicates of the first.
+    unknown_groups: tuple[int, ...]
     cn_outcome: str  # "", "true_negative", "false_positive", "unknown"
     harmful: int
     not_harmful: int
@@ -1101,9 +1207,16 @@ def score_run(run: Run, prereg: Mapping) -> RunScore:
     )
     verdicts = [f.verdict for review in run.reviews for f in review.findings]
     duplicates = 0
+    unknown_beside_confirmed = 0
+    unknown_groups: list[int] = []
     for review in run.reviews:
         named = [f.defect for f in review.findings if f.verdict == "confirmed"]
         duplicates += len(named) - len(set(named))
+        undecided = sum(1 for f in review.findings if f.verdict == "unknown")
+        if named:
+            unknown_beside_confirmed += undecided
+        elif undecided >= 2:
+            unknown_groups.append(undecided)
     cn_outcome = ""
     if run.case.kind == "clean_negative":
         on_candidate = [
@@ -1140,6 +1253,8 @@ def score_run(run: Run, prereg: Mapping) -> RunScore:
         false=verdicts.count("false"),
         unknown=verdicts.count("unknown"),
         duplicates=duplicates,
+        unknown_beside_confirmed=unknown_beside_confirmed,
+        unknown_groups=tuple(unknown_groups),
         cn_outcome=cn_outcome,
         harmful=fix_verdicts.count("harmful"),
         not_harmful=fix_verdicts.count("not_harmful"),
@@ -1151,6 +1266,28 @@ def score_run(run: Run, prereg: Mapping) -> RunScore:
 
 def _ratio(num: float, den: float) -> float | None:
     return num / den if den else None
+
+
+def _duplicate_upper(scores: Sequence[RunScore]) -> float | None:
+    """The highest duplicate ratio any settlement of the unknown labels allows.
+
+    A duplicate is a later confirmed finding of a round naming the defect an earlier
+    one of that round names. An unknown finding beside a confirmed one could be a
+    duplicate of it, which adds one to both counts and so always raises the ratio
+    (it is below 1). A round of ``k`` unknown findings and no confirmed one could
+    hold ``k - 1`` duplicates of ``k`` confirmed findings: such rounds are taken,
+    the highest ``(k - 1) / k`` first, while each raises the ratio, which is where
+    the maximum of a ratio of sums lies. Every other unknown finding is put false.
+    """
+    dup = sum(x.duplicates + x.unknown_beside_confirmed for x in scores)
+    confirmed = sum(x.confirmed + x.unknown_beside_confirmed for x in scores)
+    for k in sorted((k for x in scores for k in x.unknown_groups), reverse=True):
+        if confirmed and (k - 1) / k <= dup / confirmed:
+            break
+        dup, confirmed = dup + k - 1, confirmed + k
+    if confirmed == 0 and any(x.unknown for x in scores):
+        return 0.0  # a single unknown finding confirmed alone: no duplicate of one finding
+    return _ratio(dup, confirmed)
 
 
 def _bands(
@@ -1197,10 +1334,12 @@ def _bands(
             _ratio(s["harmful"], fixes),
             _ratio(s["harmful"] + s["harm_unknown"], fixes),
         ),
+        # Lower: every unknown finding confirmed of a defect no other finding of its
+        # round names, which adds to the confirmed count alone.
         "duplicate_ratio": (
             _ratio(s["duplicates"], s["confirmed"]),
-            _ratio(s["duplicates"], s["confirmed"]),
-            _ratio(s["duplicates"], s["confirmed"]),
+            _ratio(s["duplicates"], labeled - s["false"]),
+            _duplicate_upper(scores),
         ),
     }
 
@@ -1255,11 +1394,30 @@ def _rounded(value: float | None) -> float | None:
 
 
 def _usage(scores: Sequence[RunScore], attr: str) -> dict:
+    """The sum of ``attr`` over every launch of every run, or ``None`` with why.
+
+    The sum is unknown when a launch's value or provenance is, and when a run's
+    launch record is incomplete (:meth:`Run.missing_launches`): a launch nobody
+    recorded is no launch that cost nothing. The known part is shown apart.
+    """
     values = [getattr(launch, attr) for x in scores for launch in x.run.launches]
     provenances = {launch.provenance for x in scores for launch in x.run.launches}
     known = sum((v for v in values if v is not None), 0.0)
-    if not values or any(v is None for v in values) or "unknown" in provenances:
-        return {"value": None, "known_part": _rounded(known), "provenance": "unknown"}
+    incomplete = sorted(x.run.id for x in scores if x.run.missing_launches())
+    why = ""
+    if not values:
+        why = "no launch is recorded"
+    elif incomplete:
+        why = f"the launch record of run(s) {incomplete} is incomplete"
+    elif any(v is None for v in values) or "unknown" in provenances:
+        why = "a launch's value is unknown"
+    if why:
+        return {
+            "value": None,
+            "known_part": _rounded(known),
+            "provenance": "unknown",
+            "why_unknown": why,
+        }
     for weakest in ("synthetic", "estimated"):
         if weakest in provenances:
             return {"value": _rounded(known), "provenance": weakest}
@@ -1292,7 +1450,7 @@ def arm_metrics(scores: Sequence[RunScore], prereg: Mapping, indices: list[list[
             "why_unknown": why,
         }
     critical = [
-        {"case": x.run.case.id, "defect": did}
+        {"case": x.run.case.id, "defect": did, "belongs_to": x.run.belongs_to(did)}
         for x in scores
         for did, sev in x.escaped
         if sev == "critical"
@@ -1303,7 +1461,9 @@ def arm_metrics(scores: Sequence[RunScore], prereg: Mapping, indices: list[list[
     if successes == 0:
         per_success.update(value=None, why_unknown="no validated success")
     elif cost["value"] is None:
-        per_success.update(value=None, why_unknown="a launch's cost is unknown")
+        per_success.update(
+            value=None, why_unknown=f"the total cost is unknown: {cost['why_unknown']}"
+        )
     else:
         per_success.update(value=_rounded(cost["value"] / successes))
     metrics["escaped_critical_defects"] = {"value": len(critical), "defects": critical}
@@ -1343,7 +1503,11 @@ def _run_row(x: RunScore) -> dict:
         },
         "clean_negative": x.cn_outcome or None,
         "fixes": {"harmful": x.harmful, "not_harmful": x.not_harmful, "unknown": x.harm_unknown},
-        "escaped": [{"defect": did, "severity": sev} for did, sev in x.escaped],
+        "escaped": [
+            {"defect": did, "severity": sev, "belongs_to": run.belongs_to(did)}
+            for did, sev in x.escaped
+        ],
+        "missing_launches": list(run.missing_launches()),
         "late_defects": sorted(d.id for d in run.defects.values() if not d.registered),
         # What the agents said, shown as claims: no metric reads either.
         "claims": {
@@ -1468,6 +1632,14 @@ def _margin(
     return "", ""
 
 
+def escape_identity(run: Run, defect: str) -> tuple[str, str, str]:
+    """Which defect an escape is: one of the case's, the same in every arm's run of the
+    case, or one the run introduced, which is that run's alone whatever its id."""
+    if run.belongs_to(defect) == "case":
+        return ("case", run.case.id, defect)
+    return ("run", run.id, defect)
+
+
 def decide(ev: Evaluation, baseline: str, treatment: str) -> dict:
     """The pre-registered decision for ``treatment`` against ``baseline``, with its reasons.
 
@@ -1502,12 +1674,21 @@ def decide(ev: Evaluation, baseline: str, treatment: str) -> dict:
     for case_id, run in sorted(held[treatment].items()):
         counterpart = held[baseline].get(case_id)
         before = (
-            {did for did, _ in score_run(counterpart, prereg).escaped} if counterpart else set()
+            {escape_identity(counterpart, did) for did, _ in score_run(counterpart, prereg).escaped}
+            if counterpart
+            else set()
         )
         for did, severity in score_run(run, prereg).escaped:
-            if severity == "critical" and did not in before:
+            if severity != "critical" or escape_identity(run, did) in before:
+                continue
+            if run.belongs_to(did) == "case":
                 harm.append(
                     f"critical defect {did} of case {case_id!r} escaped the treatment's review"
+                )
+            else:
+                harm.append(
+                    f"critical defect {did} that treatment run {run.id!r} introduced escaped "
+                    "its review"
                 )
     if paired:
         metrics = (arm_metrics(base, prereg, indices), arm_metrics(treat, prereg, indices))

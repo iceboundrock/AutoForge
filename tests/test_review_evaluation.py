@@ -125,6 +125,42 @@ def test_an_oracle_runs_isolated_from_the_hosts_environment(tmp_path, monkeypatc
     assert rv.run_oracle(source, {"x.py": ""}, tmp_path) == "pass"
 
 
+def test_verify_replays_every_case_whether_or_not_a_run_holds_it(tmp_path):
+    """The corpus is replayed case by case: a case no run holds, and a list of no runs at
+    all, still have every pin built and every oracle run at the case's commits."""
+    prereg, corpus, runs = _files()
+    none = {"schema": runs["schema"], "runs": []}
+    (tmp_path / "intact").mkdir()
+    assert rv.verify(rv.check(prereg, corpus, none), tmp_path / "intact") == []
+
+    _case(corpus, "rename-slug-pattern")["commits"][1]["files"]["slug.py"] += "\n"
+    candidate = _case(corpus, "page-count-partial-page")["commits"][1]["files"]
+    candidate["pages.py"] = candidate["pages.py"].replace("total // size", "-(-total // size)")
+    (tmp_path / "no-runs").mkdir()
+    problems = rv.verify(rv.check(prereg, corpus, none), tmp_path / "no-runs")
+    assert any(
+        p.startswith("case 'rename-slug-pattern': commit 'candidate' is pinned at")
+        for p in problems
+    )
+    assert any(
+        p == "case 'page-count-partial-page': A1's oracle should fail at 'candidate' and gave pass"
+        for p in problems
+    )
+
+    prereg, corpus, runs = _files()
+    runs["runs"] = [r for r in runs["runs"] if r["case"] != "retry-attempt-bound"]
+    _case(corpus, "retry-attempt-bound")["oracles"]["attempt_count"] = (
+        "from retry import no_such_name\n"
+    )
+    (tmp_path / "unrepresented").mkdir()
+    problems = rv.verify(rv.check(prereg, corpus, runs), tmp_path / "unrepresented")
+    assert problems
+    assert all(
+        p.startswith("case 'retry-attempt-bound': C1's oracle") and "gave error: ImportError" in p
+        for p in problems
+    )
+
+
 # -- the fixture's scores -----------------------------------------------------------------
 
 
@@ -150,14 +186,17 @@ def test_the_fixture_scores_are_the_ones_the_protocol_states():
     assert m["clean_negative_fpr"]["value"] == 0.5
     assert m["clean_negative_fpr"]["label_bounds"] == [0.333333, 0.666667]
     assert m["harmful_fix_rate"]["value"] == 0.333333
+    # A1 confirmed twice in one round: 1 duplicate of 5 confirmed. B's unknown finding sits
+    # beside B2 and could be a second report of it (2 of 6); every unknown confirmed of a
+    # defect its round names nowhere else gives 1 of 8.
     assert m["duplicate_ratio"]["value"] == 0.2
-    for metric in ("weighted_recall", "precision", "clean_negative_fpr"):
+    assert m["duplicate_ratio"]["label_bounds"] == [0.125, 0.333333]
+    for metric in ("weighted_recall", "precision", "clean_negative_fpr", "duplicate_ratio"):
         assert m[metric]["status"] == "unknown", metric
-    for metric in ("harmful_fix_rate", "duplicate_ratio"):
-        assert m[metric]["status"] == "known", metric
+    assert m["harmful_fix_rate"]["status"] == "known"
     assert m["escaped_critical_defects"] == {
         "value": 1,
-        "defects": [{"case": "redact-authorization-header", "defect": "B1"}],
+        "defects": [{"case": "redact-authorization-header", "defect": "B1", "belongs_to": "case"}],
     }
     assert m["cost_per_validated_success"] == {
         "provenance": "synthetic",
@@ -172,7 +211,10 @@ def test_the_fixture_scores_are_the_ones_the_protocol_states():
         "rename-slug-pattern",
     ]
     assert rows["page-count-partial-page"]["late_defects"] == ["A3"]
-    assert rows["retry-attempt-bound"]["escaped"] == [{"defect": "C2", "severity": "major"}]
+    assert rows["retry-attempt-bound"]["escaped"] == [
+        {"defect": "C2", "severity": "major", "belongs_to": "run"}
+    ]
+    assert all(row["missing_launches"] == [] for row in rows.values())
     assert rows["type-hint-cache-key"]["ended"] == "stopped"
     assert arm["loops"]["rounds_by_profile"] == {"review_round_1": 6, "review_round_2_5": 5}
 
@@ -196,6 +238,30 @@ def test_a_late_defect_counts_only_once_an_amendment_moves_the_cutoff():
     assert after["weighted_recall"]["value"] == round(12 / 26, 6)
     # A minor escape blocks no success.
     assert after["cost_per_validated_success"]["validated_successes"] == 3
+
+
+def test_unknown_findings_that_could_be_duplicates_bound_the_duplicate_ratio():
+    """A duplicate is a later confirmed finding of a round naming a defect an earlier one
+    of that round names. An unknown finding could be one, or a first report of another
+    defect: the bounds put every unknown finding each way."""
+    prereg, corpus, runs = _files()
+    run = _run(runs, "type-hint-cache-key")
+    review = run["reviews"][0]
+    second = {**copy.deepcopy(review["result"]["findings"][0]), "id": "R1-F2"}
+    review["result"]["findings"].append(second)
+    run["labels"].append({**copy.deepcopy(_label(run, "R1-F1")), "finding": "R1-F2"})
+    run["fixes"][0]["resolutions"]["R1-F2"] = "no_change_with_rationale"
+    m = _metrics(prereg, corpus, runs)["duplicate_ratio"]
+    assert m["value"] == 0.2  # 1 of 5: no unknown label counts in the point estimate
+    # Lower: the 4 unknown findings each a first report, 1 of 9. Upper: B's unknown finding
+    # a duplicate of B2 (2 of 6), then type-hint's two in round 1 one defect reported twice,
+    # which raises it (3 of 8); type-hint's lone finding in round 2 is put false.
+    assert m["label_bounds"] == [round(1 / 9, 6), 0.375]
+    assert m["status"] == "unknown"
+    # Settling every unknown label removes the band.
+    m = _metrics(prereg, corpus, {**runs, "runs": _resolve_unknowns(runs["runs"])})
+    assert m["duplicate_ratio"]["label_bounds"] == [0.2, 0.2]
+    assert m["duplicate_ratio"]["status"] == "known"
 
 
 # -- what is never a label ----------------------------------------------------------------
@@ -388,6 +454,22 @@ def test_a_fixture_run_may_not_say_it_measured_anything():
     _refused(prereg, corpus, runs, "may not say it measured")
 
 
+def test_a_launch_is_bound_to_a_round_of_its_run():
+    prereg, corpus, runs = _files()
+    del _run(runs, "page-count-partial-page")["launches"][1]["round"]
+    _refused(prereg, corpus, runs, "is a REVIEW launch and names no round")
+    prereg, corpus, runs = _files()
+    _run(runs, "rename-slug-pattern")["launches"][1]["round"] = 2
+    _refused(prereg, corpus, runs, "a round the run does not have")
+    prereg, corpus, runs = _files()
+    run = _run(runs, "rename-slug-pattern")
+    run["launches"].append({**run["launches"][1], "phase": "FIX"})
+    _refused(prereg, corpus, runs, "which needed no fix")
+    prereg, corpus, runs = _files()
+    _run(runs, "rename-slug-pattern")["launches"][0]["round"] = 1
+    _refused(prereg, corpus, runs, "precedes every round")
+
+
 def test_a_planned_run_is_not_repeated():
     prereg, corpus, runs = _files()
     again = copy.deepcopy(_run(runs, "rename-slug-pattern"))
@@ -577,6 +659,58 @@ def test_a_new_critical_escape_is_no_go_however_large_the_benefit():
     assert all("critical defect B1" in reason for reason in decision["reasons"])
 
 
+def _critical_regressions(runs: list[dict]) -> list[dict]:
+    """The runs with the fixer's regression at retry-attempt-bound (C2) made critical."""
+    out = copy.deepcopy(runs)
+    for run in out:
+        for defect in run["defects"]:
+            defect["severity"] = "critical"
+    return out
+
+
+def test_a_regression_a_run_introduced_is_its_own_whatever_its_id():
+    """Both arms' fixers introduce a critical regression at retry-attempt-bound, both
+    called C2, and both let it escape. The id is shared and the defect is not: each is its
+    own run's, so the baseline's escape excuses none of the treatment's, and the
+    treatment, better everywhere else, is NO_GO."""
+    corpus, as_registered = _sample()
+    runs = _critical_regressions(as_registered)
+    better = _catching(runs)
+    treatment = [
+        copy.deepcopy(b) if b["case"].startswith("retry-attempt-bound") else c
+        for b, c in zip(runs, better, strict=True)
+    ]
+    for run in treatment:
+        if run["case"].startswith("retry-attempt-bound"):
+            (regression,) = run["defects"]
+            regression["summary"] = "Another fixer's change, which drops the backoff delay."
+            regression["location"] = "retry.py:backoff"
+    decision = _decide(_real(runs, "baseline"), _real(treatment, "treatment"), corpus)
+    assert decision == {
+        "decision": rv.NO_GO,
+        "reasons": [
+            f"critical defect C2 that treatment run 'treatment/retry-attempt-bound~{k}' "
+            "introduced escaped its review"
+            for k in range(7)
+        ],
+    }
+    # The gate is all that stands in the way: a treatment that catches its own C2 is a GO.
+    decision = _decide(_real(runs, "baseline"), _real(better, "treatment"), corpus)
+    assert decision["decision"] == rv.GO
+    # A case's defect is the same defect in both arms' runs: B1 escaping both is no new
+    # escape, and only the primary decides.
+    decision = _decide(_real(as_registered, "baseline"), _real(as_registered, "treatment"), corpus)
+    assert decision == {
+        "decision": rv.NO_GO,
+        "reasons": ["weighted_recall's interval lies wholly below +0.1"],
+    }
+    # A regression is never: identical arms whose fixers each let a critical one escape
+    # are NO_GO on the gate, since the baseline never held the treatment run's.
+    decision = _decide(_real(runs, "baseline"), _real(runs, "treatment"), corpus)
+    assert decision["decision"] == rv.NO_GO
+    assert all("that treatment run" in reason for reason in decision["reasons"])
+
+
 def test_a_margin_worse_on_its_whole_interval_is_no_go():
     """Every clean negative gains a false finding: the false-positive rate rises past its
     margin whatever the treatment gains elsewhere."""
@@ -613,6 +747,11 @@ def test_a_margin_worse_on_its_whole_interval_is_no_go():
             second.update(round=2)
             second["result"].update(round=2, needs_fix_round=False, findings=[])
             run["reviews"].append(second)
+            review_launch = run["launches"][1]
+            run["launches"] += [
+                {**review_launch, "phase": "FIX", "round": 1},
+                {**review_launch, "round": 2},
+            ]
     decision = _decide(_real(runs, "baseline"), _real(treatment, "treatment"), corpus)
     assert decision["decision"] == rv.NO_GO
     assert decision["reasons"] == [
@@ -674,6 +813,122 @@ def test_a_cost_no_launch_measured_rules_out_go():
         "decision": rv.INCONCLUSIVE,
         "reasons": ["cost_per_validated_success is not measured on both arms"],
     }
+
+
+# What one treatment run's launch record keeps, and what it then misses.
+_GAPS = {
+    "no launch at all": (
+        lambda launch: False,
+        ["ANALYZE_EXECUTE", "REVIEW of round 1", "REVIEW of round 2", "FIX of round 1"],
+    ),
+    "no ANALYZE_EXECUTE launch": (
+        lambda launch: launch["phase"] != "ANALYZE_EXECUTE",
+        ["ANALYZE_EXECUTE"],
+    ),
+    "no REVIEW launch of round 2": (
+        lambda launch: (launch["phase"], launch.get("round")) != ("REVIEW", 2),
+        ["REVIEW of round 2"],
+    ),
+    "no FIX launch": (lambda launch: launch["phase"] != "FIX", ["FIX of round 1"]),
+}
+
+
+@pytest.mark.parametrize("gap", sorted(_GAPS))
+def test_a_run_whose_launch_record_is_incomplete_has_no_measured_cost(gap):
+    """A launch nobody recorded is not a launch that cost nothing: one treatment run short
+    of its whole record, or of one launch of it, leaves every usage sum unknown, its known
+    part shown apart, and the cost criterion open. With the whole record the same arms are
+    a GO (test_go_needs_the_primary_effect_every_bound_and_the_registered_sample)."""
+    kept, missing = _GAPS[gap]
+    corpus, runs = _sample()
+    treatment = _real(_catching(runs), "treatment")
+    (short,) = [r for r in treatment if r["case"] == "page-count-partial-page~0"]
+    short["launches"] = [launch for launch in short["launches"] if kept(launch)]
+    p, _, r = _files()
+    ev = rv.check(p, corpus, {"schema": r["schema"], "runs": _real(runs, "baseline") + treatment})
+    assert rv.decide(ev, "baseline", "treatment") == {
+        "decision": rv.INCONCLUSIVE,
+        "reasons": ["cost_per_validated_success is not measured on both arms"],
+    }
+    arm = rv.report(ev)["arms"]["treatment"]
+    why = "the launch record of run(s) ['treatment/page-count-partial-page~0'] is incomplete"
+    for usage in ("total_cost_usd", "launch_wall_clock_seconds"):
+        assert arm["metrics"][usage]["value"] is None, usage
+        assert arm["metrics"][usage]["provenance"] == "unknown", usage
+        assert arm["metrics"][usage]["why_unknown"] == why, usage
+    assert arm["metrics"]["total_cost_usd"]["known_part"] > 0
+    assert arm["metrics"]["cost_per_validated_success"]["value"] is None
+    (row,) = [row for row in arm["runs"] if row["run"] == short["id"]]
+    assert row["missing_launches"] == missing
+
+
+def _beside_a1(runs: list[dict], verdict: str, count: int = 1) -> list[dict]:
+    """The runs with ``count`` more findings at page-count-partial-page's round 1, beside
+    its two reports of A1, each labeled ``verdict`` (``confirmed`` names A1)."""
+    out = copy.deepcopy(runs)
+    for run in out:
+        if not run["case"].startswith("page-count-partial-page"):
+            continue
+        review = run["reviews"][0]
+        for n in range(4, 4 + count):
+            review["result"]["findings"].append(
+                {
+                    "id": f"R1-F{n}",
+                    "classification": "non-blocked",
+                    "title": "The page count is wrong for a partial last page",
+                    "location": "pages.py:page_count",
+                    "required_resolution": "Count a partial last page as a page.",
+                }
+            )
+            label = {
+                "finding": f"R1-F{n}",
+                "round": 1,
+                "candidate_sha": review["result"]["reviewed_head_sha"],
+                "verdict": verdict,
+                "adjudicator": AUTHOR,
+                "labeled_at": LABELED,
+            }
+            if verdict == "confirmed":
+                label["defect"] = "A1"
+            else:
+                label["reason"] = "Not settled: it may restate A1 or describe another rounding."
+            run["labels"].append(label)
+            run["fixes"][0]["resolutions"][f"R1-F{n}"] = "fixed"
+    return out
+
+
+def test_unknown_findings_that_could_be_duplicates_rule_out_go():
+    """Unknown findings beside reports of A1 could each be one more report of A1. Until
+    they are settled the duplicate ratio is unknown, so its margin is never accepted on
+    them, even where the precision band stays under its limit."""
+    corpus, runs = _sample()
+    p, _, r = _files()
+    one_each = _beside_a1(_catching(runs), "unknown")
+    ev = rv.check(
+        p,
+        corpus,
+        {"schema": r["schema"], "runs": _real(runs, "baseline") + _real(one_each, "treatment")},
+    )
+    assert rv.decide(ev, "baseline", "treatment") == {
+        "decision": rv.INCONCLUSIVE,
+        "reasons": ["duplicate_ratio is unknown on an arm"],
+    }
+    metrics = rv.report(ev)["arms"]["treatment"]["metrics"]
+    assert metrics["precision"]["status"] == "known"
+    # 7 duplicates of 49 confirmed; 14 of 56 if all 7 restate A1, 7 of 56 if none does.
+    assert metrics["duplicate_ratio"]["value"] == round(7 / 49, 6)
+    assert metrics["duplicate_ratio"]["label_bounds"] == [0.125, 0.25]
+    # Three of them at every copy are enough to decide the margin: settled as reports of
+    # A1 they break it on its whole interval, and unsettled they leave it open.
+    settled = _beside_a1(_catching(runs), "confirmed", 3)
+    assert _decide(_real(runs, "baseline"), _real(settled, "treatment"), corpus) == {
+        "decision": rv.NO_GO,
+        "reasons": ["duplicate_ratio's whole interval is worse than its margin 0.1"],
+    }
+    open_ = _beside_a1(_catching(runs), "unknown", 3)
+    decision = _decide(_real(runs, "baseline"), _real(open_, "treatment"), corpus)
+    assert decision["decision"] == rv.INCONCLUSIVE
+    assert "duplicate_ratio is unknown on an arm" in decision["reasons"]
 
 
 # -- the baseline the protocol captured ---------------------------------------------------

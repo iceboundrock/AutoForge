@@ -37,9 +37,10 @@ uv run python -m tests.review_evaluation decide --baseline ARM --treatment ARM
 ```
 
 It launches no agent, holds no credential, contacts no network and writes nothing to GitHub. `verify`
-builds each run's commits in a temporary repository with git's configuration, hooks, credential
-helpers and transports switched off, at the corpus's fixed date, and runs each oracle in a separate
-interpreter (`python -I`) that sees only the locale variables.
+builds every case's commits, whether or not a run holds the case, and then each run's own commits,
+in temporary repositories with git's configuration, hooks, credential helpers and transports
+switched off, at the corpus's fixed date, and runs each oracle in a separate interpreter
+(`python -I`) that sees only the locale variables.
 
 ## 2. Review today: the baseline
 
@@ -109,6 +110,8 @@ still holds a defect (B1, C2).
 - A **case** is a pinned base and candidate, and usually a reference commit holding a known-good
   change. A `defect` case holds at least one ground-truth defect; a `clean_negative` holds none.
 - A **run** is one arm's review of one case: its rounds, its fixes and their commits, its launches.
+  A REVIEW or FIX launch names the round it served, which must be a round of the run (for FIX, one
+  that needed a fix); an ANALYZE_EXECUTE launch precedes every round and names none.
   An arm has at most one run per case; a planned run is not repeated, so a second one is refused
   rather than allowed to replace the first.
 - A **finding** is one entry of a round's `REVIEW` result, held to the controller's own parser.
@@ -137,7 +140,8 @@ registered against it, and a finding about one is `false` or, when the issue lea
 `unknown` (the fixture's `type-hint-cache-key`). A defect at a case's commits belongs to the case,
 so every arm is scored against the same ground truth: one an arm's reviewer was the first to find is
 added to the case and counts for every arm. A defect at a commit only one run made, a fixer's
-regression, belongs to that run. A defect is present at a commit when that commit descends from
+regression, belongs to that run: it is that run's alone, whatever its id, and never the same defect
+as another run's of the same id. A defect is present at a commit when that commit descends from
 where it was introduced and from none of the commits that fix it.
 
 ### 4.3 Labels
@@ -204,6 +208,12 @@ whatever it looks like. A launch's usage values carry #318's provenance: `measur
 `synthetic` or `unknown`. A fixture launch may not say `measured`, only a `measured` total can pass a
 criterion, and an `unknown` launch value makes the total `unknown`, with the known part shown apart.
 
+A run's launch record is **complete** when it holds at least an ANALYZE_EXECUTE launch, a REVIEW
+launch of every round and a FIX launch of every fix. Failed attempts add launches and are never
+required; a record short of any of these is incomplete. A launch nobody recorded is not a launch
+that cost nothing, so one incomplete run makes every usage total of its arm `unknown`, with the known
+part shown apart and the runs named, and the report lists what each run's record misses.
+
 ## 6. Metric formulas
 
 Every rate is pooled over an arm's runs, the sum of their numerators over the sum of their
@@ -225,14 +235,22 @@ count. Excluded runs (an infrastructure failure, with its reason) are listed and
   report lists every escape, of any severity.
 - **`harmful_fix_rate`** = H / (H + N) over fixes that made a commit, with `unknown` fixes widening
   the bounds as for precision.
-- **`duplicate_ratio`** = duplicate confirmed findings (section 4.3) / C.
+- **`duplicate_ratio`** = D / C, with D the duplicate confirmed findings (section 4.3). An `unknown`
+  finding could be a duplicate or a first report of another defect, so its label bounds put each
+  one both ways. The lower is D / (C + U): every unknown finding a first report. The upper is the
+  highest ratio a settlement allows: an unknown finding of a round with a confirmed one could be a
+  duplicate of it, and a round of k ≥ 2 unknown findings and no confirmed one could hold k - 1
+  duplicates of k confirmed findings; the scorer takes the first kind always (each raises the
+  ratio, which is below 1) and rounds of the second, the largest first, while each raises it. An
+  unknown finding alone in a round with no confirmed one is put false there.
 - **Validated success**: the run's final round is clean, its validation `passed`, and no registered
   `critical` or `major` defect escaped.
 - **`cost_per_validated_success`** = the cost of every launch of every run (analysis, review, fix,
-  failed attempts included) / validated successes. It has no value without a success.
-- **`launch_wall_clock_seconds`** and **`context_tokens`**: sums over launches, with provenance. The
-  first leaves out the controller's time between launches; a run's end-to-end time is #318's
-  measure.
+  failed attempts included) / validated successes. It has no value without a success, and none
+  while a run's launch record is incomplete (section 5).
+- **`launch_wall_clock_seconds`** and **`context_tokens`**: sums over launches, with provenance,
+  `unknown` while a run's launch record is incomplete. The first leaves out the controller's time
+  between launches; a run's end-to-end time is #318's measure.
 
 ## 7. Uncertainty
 
@@ -262,7 +280,10 @@ cases. Its sample needs at least **20 defect cases and 10 clean negatives** pair
 
 **Hard gate:** a registered critical defect that escapes the treatment's review and did not escape
 the baseline's is a `NO_GO`, whatever else is shown. The gate reads every treatment run that is not
-excluded, paired or not.
+excluded, paired or not. It compares defects by identity, not by id: a case's defect is the same
+defect in both arms' runs of the case, and a defect a treatment run introduced is that run's alone
+(section 4.2), so the baseline never held it and its critical escape is always a new one, even when
+a baseline run's regression of the same id escaped too.
 
 A later issue that needs another primary from section 6 says so in an amendment before its first
 real run; otherwise this one applies.
@@ -277,7 +298,7 @@ Decided in this order:
    cases excluded, or fewer cases than the minimum.
 4. `NO_GO` when the primary's interval lies wholly below +0.1.
 5. `INCONCLUSIVE` while anything is open: a metric `unknown`, an interval reaching past a margin,
-   a cost not measured on both arms, or a primary not shown.
+   a cost not measured on both arms (an incomplete launch record included), or a primary not shown.
 6. `GO`.
 
 The minimum is a floor, not a power calculation. The variance of a real review is unknown until
@@ -308,10 +329,12 @@ holds, check the scorer and say nothing about any reviewer, model or configurati
 | `precision` | 0.714286 | 0.5 to 0.8 | `unknown` |
 | `clean_negative_fpr` | 0.5 | 0.333333 to 0.666667 | `unknown` |
 | `harmful_fix_rate` | 0.333333 | none | known |
-| `duplicate_ratio` | 0.2 | none | known |
+| `duplicate_ratio` | 0.2 | 0.125 to 0.333333 | `unknown` |
 
-One critical defect escaped (B1), and three runs are validated successes, at a synthetic $11.00 in
-all, $3.67 per success. `decide` on these runs is `NOT_EVALUATED`.
+B's `unknown` finding sits in a round beside its confirmed B2 and could be a second report of it,
+which is what widens the duplicate ratio's band. One critical defect escaped (B1), and three runs
+are validated successes, at a synthetic $11.00 in all, $3.67 per success; every run's launch record
+is complete. `decide` on these runs is `NOT_EVALUATED`.
 
 The fixture is replayable: `verify` rebuilds every commit from `corpus.json` and `fixture_runs.json`
 at their pinned SHAs and runs every oracle where the ground truth says it fails or passes, and
@@ -321,11 +344,13 @@ at their pinned SHAs and runs every oracle where the ground truth says it fails 
 
 ## 10. Tests that hold this
 
-All in `tests/test_review_evaluation.py`, offline, in `make check`: 52 tests, which took 7.9 seconds
-on one shared, loaded host.
+All in `tests/test_review_evaluation.py`, offline, in `make check`: 61 tests, which took 19 to 25
+seconds on one shared host at a load average of about 10 on 8 cores.
 
 - The contract's files: `test_the_registered_files_pass_the_check`,
-  `test_the_corpus_replays_as_pinned`, `test_a_commit_that_does_not_build_to_its_pin_is_reported`,
+  `test_the_corpus_replays_as_pinned`,
+  `test_verify_replays_every_case_whether_or_not_a_run_holds_it`,
+  `test_a_commit_that_does_not_build_to_its_pin_is_reported`,
   `test_an_oracle_that_does_not_show_its_defect_is_reported`,
   `test_an_oracle_that_crashes_shows_no_defect`,
   `test_an_oracle_runs_isolated_from_the_hosts_environment`.
@@ -339,16 +364,20 @@ on one shared, loaded host.
   `test_a_defect_is_one_the_change_introduced`,
   `test_a_harmful_fix_is_exactly_one_that_introduced_a_defect`,
   `test_a_review_result_the_controller_would_refuse_is_refused`,
-  `test_a_fixture_run_may_not_say_it_measured_anything`, `test_a_planned_run_is_not_repeated`.
+  `test_a_fixture_run_may_not_say_it_measured_anything`,
+  `test_a_launch_is_bound_to_a_round_of_its_run`, `test_a_planned_run_is_not_repeated`.
+- The label bounds: `test_unknown_findings_that_could_be_duplicates_bound_the_duplicate_ratio`.
 - The decision, on synthetic real arms of 33 copied cases:
   `test_fixture_runs_reach_no_decision_however_good_they_look`,
   `test_go_needs_the_primary_effect_every_bound_and_the_registered_sample`,
   `test_a_new_critical_escape_is_no_go_however_large_the_benefit`,
+  `test_a_regression_a_run_introduced_is_its_own_whatever_its_id`,
   `test_a_margin_worse_on_its_whole_interval_is_no_go`, `test_no_effect_is_no_go_on_a_complete_sample`,
-  `test_unknown_labels_rule_out_go`,
+  `test_unknown_labels_rule_out_go`, `test_unknown_findings_that_could_be_duplicates_rule_out_go`,
   `test_a_sample_below_the_registered_minimum_reaches_no_primary_conclusion`,
   `test_a_case_with_no_pair_or_too_many_exclusions_is_inconclusive_but_harm_still_decides`,
-  `test_a_cost_no_launch_measured_rules_out_go`.
+  `test_a_cost_no_launch_measured_rules_out_go`,
+  `test_a_run_whose_launch_record_is_incomplete_has_no_measured_cost`.
 - This page and the code: `test_the_baseline_facts_are_the_codes`,
   `test_the_protocol_registers_the_digests_of_its_files`,
   `test_the_protocol_names_every_case_metric_and_registered_value`,
@@ -383,8 +412,9 @@ Decided on and left open:
   findings; a later evaluation may report both on the same runs.
 - **#170 to #175 (ADR 0006):** the certificate keeps its meaning (section 3). Nothing here issues,
   reads or relaxes one.
-- **#338:** the new tests took 7.9 seconds on one host (section 10); `verify` runs about a hundred
-  git commands and twelve oracle processes.
+- **#338:** the new tests took 19 to 25 seconds on one loaded host (section 10), most of it the
+  case bootstrap of the decision tests; `verify` runs about 150 git commands and twelve oracle
+  processes.
 - **#23:** no state protocol, ADR or controller change is made, so no migration or crash-replay
   coverage is owed. Controller authority, exact-candidate validation, reviewer independence, the
   certificate and merge gate, and GitHub effect authorization are untouched, and default behaviour

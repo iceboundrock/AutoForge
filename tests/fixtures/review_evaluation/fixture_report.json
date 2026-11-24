@@ -33,7 +33,8 @@
         "context_tokens": {
           "known_part": 0.0,
           "provenance": "unknown",
-          "value": null
+          "value": null,
+          "why_unknown": "a launch's value is unknown"
         },
         "cost_per_validated_success": {
           "provenance": "synthetic",
@@ -46,17 +47,18 @@
             0.333333
           ],
           "label_bounds": [
-            0.2,
-            0.2
+            0.125,
+            0.333333
           ],
           "resamples_without_value": 160,
-          "status": "known",
+          "status": "unknown",
           "value": 0.2,
-          "why_unknown": ""
+          "why_unknown": "unknown labels leave a band wider than 0.1"
         },
         "escaped_critical_defects": {
           "defects": [
             {
+              "belongs_to": "case",
               "case": "redact-authorization-header",
               "defect": "B1"
             }
@@ -145,6 +147,7 @@
           },
           "kind": "clean_negative",
           "late_defects": [],
+          "missing_launches": [],
           "profiles": [
             "review_round_1",
             "review_round_2_5"
@@ -186,6 +189,7 @@
           "late_defects": [
             "A3"
           ],
+          "missing_launches": [],
           "profiles": [
             "review_round_1",
             "review_round_2_5"
@@ -211,6 +215,7 @@
           "ended": "clean",
           "escaped": [
             {
+              "belongs_to": "case",
               "defect": "B1",
               "severity": "critical"
             }
@@ -230,6 +235,7 @@
           },
           "kind": "defect",
           "late_defects": [],
+          "missing_launches": [],
           "profiles": [
             "review_round_1",
             "review_round_2_5"
@@ -263,6 +269,7 @@
           },
           "kind": "clean_negative",
           "late_defects": [],
+          "missing_launches": [],
           "profiles": [
             "review_round_1"
           ],
@@ -285,6 +292,7 @@
           "ended": "clean",
           "escaped": [
             {
+              "belongs_to": "run",
               "defect": "C2",
               "severity": "major"
             }
@@ -304,6 +312,7 @@
           },
           "kind": "defect",
           "late_defects": [],
+          "missing_launches": [],
           "profiles": [
             "review_round_1",
             "review_round_2_5"
@@ -341,6 +350,7 @@
           },
           "kind": "clean_negative",
           "late_defects": [],
+          "missing_launches": [],
           "profiles": [
             "review_round_1",
             "review_round_2_5"
