@@ -298,8 +298,7 @@ def bound_receipt(row: Any, bound: Revision, field: str) -> tuple[str, str, str]
 def admit_reviews(
     rows: Any, history: History, attempts: dict[int, Json], case: Case
 ) -> list[Review]:
-    reviews = []
-    rounds = set()
+    reviews: list[Review] = []
     lineage = list(history.files)
     for row in items(rows):
         shape(row, "revision reply disposition findings seq source", "validation certificate")
@@ -313,9 +312,15 @@ def admit_reviews(
         # diff (one that may already hold the defect). R0 supports no base change.
         require(bound.merge_base == case.base, "review merge base is not the case's base")
         text(row["source"])
-        round_key = bound.pr, bound.round
-        require(round_key not in rounds, "duplicate completed PR round")
-        rounds.add(round_key)
+        if reviews:
+            # R0 observes one PR against one base branch: a retarget is a base
+            # change, and a takeover or a replacement is another PR. On one PR
+            # the controller's completed rounds only advance (`review_round`);
+            # a skipped round is a missing row, a repeated or earlier one is not.
+            last = reviews[-1].revision
+            require(bound.pr == last.pr, "R0 observes one PR per run")
+            require(bound.base == last.base, "R0 supports no base branch retarget")
+            require(bound.round > last.round, "completed review rounds must advance")
         disposition = choice(row["disposition"], ("accepted", "stale", "unknown"))
         reply = choice(row["reply"], ("clean", "needs_fix"))
         seq = integer(row["seq"], 1)
@@ -333,11 +338,12 @@ def admit_reviews(
             validation = choice(result, ("passed", "empty", "failed"))
             basis = set_id, policy
         # The controller refuses a clean reply over presented validation that
-        # did not pass, before publication (engine `_check_review_evidence`):
-        # such a reply is a `refused` launch, never an accepted round.
+        # did not pass, before publication (engine `_check_review_evidence`);
+        # only an accepted reply can be found stale afterwards. Such a reply is
+        # a `refused` launch, never a completed round of any disposition.
         require(
-            not (reply == "clean" and disposition == "accepted" and validation == "failed"),
-            "an accepted clean review conflicts with its failed validation",
+            not (reply == "clean" and validation == "failed"),
+            "a completed clean review conflicts with its failed validation",
         )
         certificate = None
         if row.get("certificate") is not None:
@@ -401,6 +407,66 @@ def bind_fixes(
                 "launch contradicts its recorded FIX commit",
             )
     return bound
+
+
+def check_lifecycle(
+    attempts: dict[int, Json], reviews: list[Review], fixes: dict[str, tuple[str, int]]
+) -> None:
+    """Replay the controller's completed-round count over the recorded ordinals.
+
+    A launch row, a review row (an accepted REVIEW reply) or a FIX commit (a
+    FIX reply of its source's round) records an ordinal's phase, round and
+    outcome; admission already refused any two of them that disagree. A
+    REVIEW of round r runs after r - 1 completed rounds and completes round r
+    only with a `reply` (`unknown` may have). A FIX or REPLAN_REEXECUTE of
+    round r runs after r, right after the REVIEW of round r or a retry of
+    itself; ANALYZE_EXECUTE runs before any round, first or after itself.
+    Only a replacement can return the count to zero. Between consecutive
+    recorded ordinals the count changes only as the earlier launch allows.
+    Across an unrecorded ordinal any legal launches may have run: a gap is
+    missing evidence, never a contradiction, and constrains nothing here.
+    """
+    events = {seq: (row["phase"], row["round"], row["outcome"]) for seq, row in attempts.items()}
+    rows = {review.seq: review for review in reviews}
+    for review in reviews:
+        events.setdefault(review.seq, ("REVIEW", review.revision.round, "reply"))
+    for _, seq in fixes.values():
+        source = [review for review in reviews if review.seq < seq][-1]  # By `bind_fixes`.
+        events.setdefault(seq, ("FIX", source.revision.round, "reply"))
+    origin: Review | None = None  # The review row a FIX or replan chain follows, if recorded.
+    for seq in sorted(events):
+        phase, rnd, _ = events[seq]
+        if seq - 1 not in events:
+            origin = None
+            continue
+        was, prior, outcome = events[seq - 1]
+        ran = prior - (was == "REVIEW")  # Completed rounds when the earlier launch ran.
+        if outcome not in ("reply", "unknown"):
+            completed = {ran}  # Refused, failed or abandoned: it completed nothing.
+        elif was == "REVIEW":
+            completed = {prior} if outcome == "reply" else {ran, prior}
+        elif was == "REPLAN_REEXECUTE":
+            # An accepted replan activates a replacement: its fresh round 1 is next.
+            completed = {0} if outcome == "reply" else {ran, 0}
+        else:
+            completed = {ran}
+        require(
+            rnd - (phase == "REVIEW") in completed,
+            "launch rounds contradict the controller's completed-round count",
+        )
+        if phase == "ANALYZE_EXECUTE":
+            require(was == phase, "ANALYZE_EXECUTE follows no other launch")
+        elif phase in ("FIX", "REPLAN_REEXECUTE"):
+            require(
+                was in ("REVIEW", phase) and prior == rnd,
+                f"{phase} must follow the review of its round or retry itself",
+            )
+            if was == "REVIEW":
+                origin = rows.get(seq - 1)
+            require(
+                origin is None or (origin.reply == "needs_fix" and origin.disposition != "stale"),
+                f"{phase} must follow a needs-fix review the controller accepted",
+            )
 
 
 def label_reviews(
@@ -501,11 +567,24 @@ class Run:
         if not self.reviews or self.reviews[-1].revision != stop.revision:
             return "unbound_stop", None
         review = self.reviews[-1]
-        # Even an unlogged trailing reservation leaves this review historical.
-        if stop.through != review.seq:
-            return "unbound_stop", None
         if review.disposition != "accepted":
             return "unbound_stop", None
+        if stop.through != review.seq:
+            # Only the write of a REVIEW round issues a certificate, so even an
+            # unlogged trailing reservation leaves that review's historical.
+            # Non-issuance can still bind past it, across FIX launches of its
+            # round, each recorded, that applied no commit (a held or failed
+            # FIX blocks without publishing): they change neither the bound
+            # revision nor issuance. The lifecycle replay tied them to it.
+            held = not any(seq > review.seq for _, seq in self.fixes.values()) and all(
+                self.attempts.get(seq, {}).get("phase") == "FIX"
+                for seq in range(review.seq + 1, stop.through + 1)
+            )
+            if not held or review.certificate is not None:
+                return "unbound_stop", None
+            if stop.phase in ("BLOCKED", "FAILED") and stop.outcome == "not_issued":
+                return "not_issued", review
+            return "unresolved_stop", None
         if (
             stop.phase == "READY_FOR_MERGE"
             and stop.outcome == "certified"
@@ -542,7 +621,10 @@ def admit_attempts(rows: Any) -> dict[int, Json]:
         seq = integer(row["seq"], 1)
         require(seq not in attempts, "duplicate launch ordinal")
         phase = choice(row["phase"], PHASES)
-        integer(row["round"], int(phase in ("REVIEW", "FIX")))
+        # The round is `review_round` at the launch, or the one a REVIEW
+        # reviews: ANALYZE_EXECUTE runs before any, every other phase in one.
+        rnd = integer(row["round"], int(phase != "ANALYZE_EXECUTE"))
+        require(phase != "ANALYZE_EXECUTE" or rnd == 0, "ANALYZE_EXECUTE runs at round zero")
         # `refused`: a reply the controller refused before accepting it; a
         # correction launch follows, and no review row binds the refused one.
         choice(row["outcome"], ("reply", "refused", "failed", "abandoned", "unknown"))
@@ -588,6 +670,7 @@ def admit(data: Any) -> tuple[str, dict[str, Case], list[Run]]:
     runs = []
     ids = set()
     assignments = set()
+    targets: dict[str, str] = {}  # The base branch every review of a case names.
     for row in items(data["runs"]):
         shape(
             row,
@@ -620,9 +703,16 @@ def admit(data: Any) -> tuple[str, dict[str, Case], list[Run]]:
             cutoff,
         )
         fixes_bound = bind_fixes(fixes, reviews, attempts, history)
+        check_lifecycle(attempts, reviews, fixes)
         excluded = text(row["exclusion"]) if "exclusion" in row else None
         if reviews:
             require(reviews[0].commit == case.candidate, "first review must start at the case pin")
+            # Within a run `admit_reviews` refused a retarget; across the arms
+            # one base branch too, so both review one diff against one target.
+            target = reviews[0].revision.base
+            require(
+                targets.setdefault(cid, target) == target, "arms review different base branches"
+            )
         start = row.get("start")
         if start is not None:
             shape(start, "source run initial_seq")

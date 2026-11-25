@@ -285,6 +285,111 @@ def test_fix_from_a_review_of_unknown_disposition_leaves_the_outcome_unresolved(
     assert not runs[0].complete_window()
 
 
+@pytest.mark.parametrize("logged", [True, False], ids=["logged", "unlogged"])
+def test_completed_rounds_only_advance_on_the_pr(logged):
+    data = fixture()
+    run = data["runs"][0]  # Review 2 needs a fix, FIX 3 applies it, review 4 certifies.
+    first, final = run["reviews"]
+    # Completed round 2, its FIX, then a completed round 1 of the same PR.
+    first["revision"] = {**first["revision"], "round": 2}
+    for row in (final, final["validation"], final["certificate"], run["stop"]):
+        row["revision"]["round"] = 1
+    run["attempts"][1]["round"] = run["attempts"][2]["round"] = 2
+    run["attempts"][3]["round"] = 1
+    if not logged:
+        run["attempts"].clear()  # The review rows alone contradict the controller.
+    with pytest.raises(InvalidEvidence, match="rounds must advance"):
+        admit(data)
+    # A skipped round across an unrecorded ordinal is missing, not contradictory.
+    data = fixture()
+    run = data["runs"][0]
+    final = run["reviews"][1]
+    for row in (final, final["validation"], final["certificate"], run["stop"]):
+        row["revision"]["round"] = 3
+    final["seq"] = run["stop"]["through"] = 5
+    run["attempts"][3].update(seq=5, round=3)
+    _, _, runs = admit(data)
+    assert not runs[0].complete_window()
+    assert score.outcome(runs[0]).evidence == "certified"
+    run["attempts"].insert(3, attempt(4, "REVIEW", 2, "failed"))  # Round 2 never completed.
+    with pytest.raises(InvalidEvidence, match="completed-round count"):
+        admit(data)
+
+
+@pytest.mark.parametrize("dropped", [None, 1, 3], ids=["logged", "no-first-row", "no-third-row"])
+def test_launch_rows_follow_the_controller_lifecycle(dropped):
+    data = fixture()
+    run = data["runs"][0]
+    first, final = run["reviews"]
+    run["snapshots"][0]["seq"] = 4
+    final["seq"] = run["stop"]["through"] = 5
+
+    def launches(*rows):
+        run["attempts"] = [attempt(seq, *row) for seq, row in enumerate(rows, 1) if seq != dropped]
+
+    # A FIX that failed and was retried: valid, and complete when all are logged.
+    launches(("ANALYZE_EXECUTE",), ("REVIEW", 1), ("FIX", 1, "failed"), ("FIX", 1), ("REVIEW", 2))
+    _, _, runs = admit(data)
+    assert runs[0].complete_window() == (dropped is None)
+    assert score.outcome(runs[0]).evidence == "certified"
+    # The same failed FIX before any REVIEW launch: no controller runs that,
+    # whatever an unlogged ordinal held, since round 1 is reviewed after it.
+    first["seq"] = 3
+    launches(("ANALYZE_EXECUTE",), ("FIX", 1, "failed"), ("REVIEW", 1), ("FIX", 1), ("REVIEW", 2))
+    with pytest.raises(InvalidEvidence, match="completed-round count"):
+        admit(data)
+
+
+@pytest.mark.parametrize(
+    ("launches", "error"),
+    [
+        ([("FIX", 1, "failed"), ("FIX", 1)], None),  # A retried, then held, FIX.
+        ([("REVIEW", 2, "refused"), ("REVIEW", 2)], None),  # A re-review, corrected.
+        ([("REPLAN_REEXECUTE", 1), ("REVIEW", 1, "failed")], None),  # A replacement's round 1.
+        ([("REVIEW", 1, "failed")], "completed-round count"),  # Round 1 is complete.
+        ([("REVIEW", 3, "failed")], "completed-round count"),  # Round 2 is not.
+        ([("FIX", 2, "failed")], "completed-round count"),
+        ([("ANALYZE_EXECUTE",)], "completed-round count"),
+        ([("REVIEW", 2, "failed"), ("FIX", 1)], "review of its round"),
+        ([("FIX", 1, "failed"), ("REPLAN_REEXECUTE", 1)], "review of its round"),
+    ],
+)
+def test_launch_rows_replay_the_completed_round_count(launches, error):
+    a = case("a")
+    cand = a["snapshots"][-1]["sha"]
+    r = review(a, cand, 1, 2, findings=[finding("F1", cand, "unknown")])
+    rows = [attempt(1, "ANALYZE_EXECUTE"), attempt(2, "REVIEW", 1)]
+    rows += [attempt(seq, *row) for seq, row in enumerate(launches, 3)]
+    blocked = stop(r, phase="BLOCKED", outcome="not_issued") | {"through": len(rows)}
+    data = study([a], [runner(a, reviews=[r], attempts=rows, stop=blocked)])
+    if error is None:
+        _, _, [run] = admit(data)
+        assert run.complete_window()
+    else:
+        with pytest.raises(InvalidEvidence, match=error):
+            admit(data)
+
+
+@pytest.mark.parametrize(
+    ("launches", "error"),
+    [
+        ([("ANALYZE_EXECUTE", 0, "failed"), ("ANALYZE_EXECUTE",), ("REVIEW", 1, "failed")], None),
+        ([("ANALYZE_EXECUTE",), ("REVIEW", 1, "failed"), ("ANALYZE_EXECUTE",)], "no other launch"),
+        ([("ANALYZE_EXECUTE", 1)], "round zero"),
+        ([("ANALYZE_EXECUTE",), ("FIX", 1, "failed")], "completed-round count"),
+    ],
+)
+def test_launch_rows_without_a_review_follow_the_lifecycle(launches, error):
+    a = case("a")
+    rows = [attempt(seq, *row) for seq, row in enumerate(launches, 1)]
+    data = study([a], [runner(a, attempts=rows)])
+    if error is None:
+        admit(data)
+    else:
+        with pytest.raises(InvalidEvidence, match=error):
+            admit(data)
+
+
 def test_fix_commit_applies_to_the_candidate_its_review_saw():
     data = fixture()
     repaired, run = data["cases"][0], data["runs"][0]
@@ -416,6 +521,65 @@ def test_old_certificate_does_not_bind_a_missing_or_drifted_stop(mutation, evide
     assert score.critical_gate({}, {"a": accepted}) == ([], True)
 
 
+def held_fix(case_, arm="baseline", outcome="reply"):
+    """A needs-fix review, then a FIX that blocks at its revision without publishing (#433)."""
+    cand = case_["snapshots"][-1]["sha"]
+    r = review(case_, cand, 1, 2, findings=[finding("F1", cand, "confirmed", defect=ref())])
+    return runner(
+        case_,
+        arm,
+        reviews=[r],
+        stop=stop(r, phase="BLOCKED", outcome="not_issued") | {"through": 3},
+        attempts=[
+            attempt(1, "ANALYZE_EXECUTE"),
+            attempt(2, "REVIEW", 1),
+            attempt(3, "FIX", 1, outcome),
+        ],
+    )
+
+
+@pytest.mark.parametrize("outcome", ["reply", "failed"], ids=["held", "failed"])
+def test_held_fix_keeps_explicit_non_issuance_for_the_critical_gate(outcome):
+    a = case("a")
+    old, new = held_fix(a, outcome=outcome), certified(a, "treatment")
+    _, _, [held, _] = admit(study([a], [old, new], mode="recorded"))
+    assert held.complete_window()
+    assert score.outcome(held) == score.Outcome("not_issued", frozenset(), False)
+    # The baseline establishes no escape, so the treatment's shared one is new.
+    result = score.report(study([a], [old, new], mode="recorded"))
+    assert result["paired"]["new_critical_escapes"] == [("a", (None, "D"))]
+    assert (result["decision"], result["reason"]) == ("NO_GO", "new certified critical escape")
+
+
+@pytest.mark.parametrize("mutation", ["unlogged", "applied", "review", "certificate"])
+def test_non_issuance_binds_past_its_review_only_across_recorded_fix_launches(mutation):
+    a = case("a")
+    run = held_fix(a)
+    if mutation == "unlogged":
+        run["attempts"].pop()  # Ordinal 3 could have been anything.
+    elif mutation == "applied":  # A FIX commit after the review is a newer candidate.
+        cand = a["snapshots"][-1]
+        fixed = snapshot(
+            {**cand["files"], "result.txt": "ok\n"}, cand["sha"], [ref()], action="fix", seq=3
+        )
+        fixed["label"] = label(fixed["sha"], "not_harmful")
+        run["snapshots"] = [fixed]
+    elif mutation == "review":
+        run["attempts"][-1] = attempt(3, "REVIEW", 2, "failed")
+    else:  # A certificate a later launch leaves historical stays unbound.
+        run = certified(a)
+        run["attempts"].append(attempt(3, "REVIEW", 2, "failed"))
+        run["stop"] = stop(run["reviews"][0], phase="BLOCKED", outcome="not_issued")
+        run["stop"]["through"] = 3
+    _, _, [admitted] = admit(study([a], [run]))
+    assert score.outcome(admitted) == score.Outcome("unbound_stop", None, None)
+    assert score.critical_gate({}, {"a": admitted}) == ([], True)
+    run = held_fix(a)
+    run["stop"]["outcome"] = "unresolved"
+    _, _, [admitted] = admit(study([a], [run]))
+    assert score.outcome(admitted).evidence == "unresolved_stop"
+
+
 @pytest.mark.parametrize("validation", ["passed", None])
 def test_clean_reply_does_not_prove_issuance_or_turn_unknown_into_false(validation):
     # An accepted clean round that blocks for another reason; over failed
@@ -473,6 +637,36 @@ def test_clean_reply_over_failed_validation_is_a_refused_launch_not_a_true_negat
         admit(study([a], [r]))
 
 
+@pytest.mark.parametrize("disposition", ["stale", "unknown"])
+def test_refused_clean_reply_cannot_become_a_completed_round_of_any_disposition(disposition):
+    a = case("a")
+    cand = a["snapshots"][-1]
+    moved = snapshot({**cand["files"], "note.txt": "pushed\n"}, cand["sha"], action="other")
+
+    def record(first, seq, refused, **reply):
+        # Round `first` at the pin, then the next round certifies the moved HEAD.
+        early = review(a, cand["sha"], first, seq, validation="failed", **reply)
+        final = review(a, moved["sha"], first + 1, seq + 1, validation="passed", certificate="c")
+        launches = [attempt(1, "ANALYZE_EXECUTE")]
+        launches += [attempt(2, "REVIEW", 1, "refused")] if refused else []
+        launches += [attempt(seq, "REVIEW", first), attempt(seq + 1, "REVIEW", first + 1)]
+        run = runner(a, snapshots=[moved], reviews=[early, final], stop=stop(final))
+        return study([a], [run | {"attempts": launches}])
+
+    # The controller refused the clean reply before publication: no round.
+    with pytest.raises(InvalidEvidence, match="conflicts with its failed validation"):
+        admit(record(1, 2, False, disposition=disposition))
+    # As it happened: a refused launch, then a corrected reply that completed round 1.
+    corrected = {"disposition": disposition, "findings": [finding("F1", cand["sha"], "unknown")]}
+    _, _, [run] = admit(record(1, 3, True, **corrected))
+    assert run.complete_window()
+    assert [r.revision.round for r in run.reviews] == [1, 2]
+    assert score.outcome(run).evidence == "certified"
+    # The refused launch consumed no round, so the corrected reply is not round 2.
+    with pytest.raises(InvalidEvidence, match="completed-round count"):
+        admit(record(2, 3, True, **corrected))
+
+
 def test_wrong_round_or_candidate_receipt_is_refused():
     a = case("a")
     r = certified(a)
@@ -516,6 +710,27 @@ def test_every_review_diffs_the_registered_change_from_its_merge_base():
         row["revision"]["merge_base"] = data["cases"][0]["snapshots"][-1]["sha"]
     with pytest.raises(InvalidEvidence, match="not the case's base"):
         admit(data)
+
+
+def test_a_base_branch_retarget_is_a_refused_base_change():
+    data = fixture()
+    repaired = data["runs"][0]
+    final = repaired["reviews"][1]
+    # The same pinned merge base, another base branch, every receipt matching.
+    for row in (final, final["validation"], final["certificate"], repaired["stop"]):
+        row["revision"]["base"] = "release"
+    with pytest.raises(InvalidEvidence, match="no base branch retarget"):
+        admit(data)
+    # Nor do the two arms of a case review against different branches.
+    a = case("a")
+    new = certified(a, "treatment")
+    rows = [new["stop"], new["reviews"][0]]
+    rows += [new["reviews"][0][key] for key in ("validation", "certificate")]
+    for row in rows:
+        row["revision"]["base"] = "release"
+    admit(study([a], [new]))  # Alone, its target is the case's.
+    with pytest.raises(InvalidEvidence, match="different base branches"):
+        admit(study([a], [certified(a), new]))
 
 
 @pytest.mark.parametrize("field", ["set", "policy"])

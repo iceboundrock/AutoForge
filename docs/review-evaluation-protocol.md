@@ -84,11 +84,13 @@ evidence does not prove issuance. The controller can record a clean round
 then block without issuing a certificate. It never accepts a clean reply
 while a validation record presented to the reviewer did not pass: it refuses
 the reply before anything is published (`_check_review_evidence` in
-`engine.py`) and asks again. An accepted clean review over a failed
-validation receipt is therefore refused as contradictory, never scored as a
-true negative. Record the refused reply as a REVIEW launch with outcome
-`refused`, which completes no round, and the corrected reply as the review
-row. The certificate is neither defect
+`engine.py`) and asks again; only an accepted reply can be found stale
+afterwards. A completed clean review over a failed validation receipt, of
+any disposition (`stale` and `unknown` included), is therefore refused as
+contradictory, never scored as a true negative or a consumed round. Record
+the refused reply as a REVIEW launch with outcome `refused`, which completes
+no round, and the corrected reply as the review row of that same round. The
+certificate is neither defect
 truth nor permission to merge; live applicability, exact-candidate validation,
 merge permission, CI checks, live GitHub reads and effect authorization remain
 controller concerns (ADR 0006, #170–#175 and #338).
@@ -100,9 +102,16 @@ ordinal and certificate identity of the accepted review, plus the bound
 validation receipt for the same set and policy. At a bound
 `BLOCKED`/`FAILED` stop with explicit
 non-issuance and no certificate on that review, no certificate escaped and
-validated success is false. Otherwise keep certification, escapes and
-success unknown. In particular, preserve a historical certificate when drift
-causes a same-ordinal block. No stop is missing evidence, not proof of
+validated success is false. Only the write of a REVIEW round issues a
+certificate, so a certified stop binds its review's own ordinal: any later
+one, even an unlogged reservation, leaves the certificate historical.
+Non-issuance can also bind past the review, across FIX launches of its
+round that applied no commit, each recorded (a held or failed FIX blocks at
+the reviewed revision without publishing, #433): they change neither the
+revision nor issuance. An unlogged ordinal, a FIX commit or any other
+launch there leaves the stop unbound. Otherwise keep certification, escapes
+and success unknown. In particular, preserve a historical certificate when
+drift causes a same-ordinal block. No stop is missing evidence, not proof of
 continuation; a later observed ordinal beyond a stop proves continuation.
 A stale prefix on its own establishes neither closure nor cost.
 
@@ -226,8 +235,13 @@ The v1 input is a closed JSON object (`schema`, `mode`, `cutoff`, `cases`,
   later one. A review that names another merge base is refused, as is a
   review of a commit before the pin. Otherwise one arm could start from a
   base that already holds the defect while the other reviews the change
-  that introduced it. R0 supports no base change (a rebase or a moved base
-  branch); defining its effect on exposure needs an amendment.
+  that introduced it. R0 supports no base change: not a rebase, a moved
+  base branch, or a retarget to another branch, even at the same merge
+  base. A run's reviews name one PR and one base branch, and both arms of a
+  case name the same branch. The controller records a round stale when its
+  base moves under the reviewer, then reviews the new revision, which R0
+  refuses. Defining a base change's effect on exposure and comparability
+  needs an amendment.
 - Run rows bind one arm to a case. They can extend the case's linear
   history with new snapshots and their own regression definitions; a FIX
   snapshot carries its launch ordinal and adjudicated label. That ordinal
@@ -241,6 +255,20 @@ The v1 input is a closed JSON object (`schema`, `mode`, `cutoff`, `cases`,
   not launch rows are present. An absent row is missing evidence and only
   leaves the window incomplete. A source of unknown disposition leaves the
   terminal outcome unresolved.
+  Launch rows, review rows and FIX commits give each recorded ordinal a
+  phase, round and outcome, replayed against the controller's count of
+  completed rounds (`review_round`). A REVIEW of round r runs after r − 1
+  and completes round r with an accepted reply; a refused, failed or
+  abandoned launch completes nothing, and an `unknown` one may have. A FIX
+  or REPLAN_REEXECUTE of round r runs after r, right after the REVIEW of
+  round r (a needs-fix reply that was not stale) or a retry of itself.
+  ANALYZE_EXECUTE runs at round 0, first or after itself, and only an
+  accepted replan returns the count to zero. Completed review rows advance
+  strictly in round. Admission refuses consecutive recorded ordinals no
+  controller produces, such as a FIX before any REVIEW, and round 1 after
+  round 2. Across an unrecorded ordinal any legal launches may have run:
+  such a gap leaves the window incomplete and contradicts nothing, and a
+  round the review rows skip is a missing row.
   Review rows bind the controller disposition, reviewer reply, findings
   and optional validation and issuance receipts to the observed revision. Stop,
   creation, launch and human evidence are projections with separate opaque
