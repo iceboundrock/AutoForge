@@ -4989,7 +4989,10 @@ class ControllerEngine:
         ADR 0015 D12's 1,000 ms ceiling; each read still answers as
         :meth:`GitTransport.read_local_commit` does, and a commit the
         process cannot return exactly is read by a process of its own
-        (see :class:`~autoforge.git_transport.LocalCommitReader`).
+        (see :class:`~autoforge.git_transport.LocalCommitReader`). The
+        reader's default budget bounds the bytes and processes of the whole
+        walk, fallback reads included (R3-F1 of PR #586): one it refuses
+        ends the walk, and the bases not reached stay unproved.
         """
         made: list[LocalCommitReader] = []
 

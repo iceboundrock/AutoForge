@@ -103,10 +103,14 @@ MAX_PROPOSALS = 8
 # The most commits a projection's ancestry walk reads (:func:`local_ancestors`,
 # R3-F1 of PR #536). A candidate is the base plus the commits the step's
 # launches made on it, a handful; the engine normally reads them all through
-# one local git process (#541), and the bound is also what bounds the walk's
-# share of a launch's latency. A base further below is not proved by the walk, and a
-# record bound to it is omitted, but on the very commit a retained validation
-# record names it is proved by that record, with no walk (R4-F2).
+# one local git process (#541). The bound counts reads, not what they cost:
+# the engine's reader (:class:`~autoforge.git_transport.LocalCommitReader`)
+# also bounds the bytes it takes and the git processes it starts across the
+# walk (R3-F1 of PR #586), and together they bound the walk's share of a
+# launch's latency. A base further below, or past where the reader's budget
+# ends the walk, is not proved by the walk, and a record bound to it is
+# omitted, but on the very commit a retained validation record names it is
+# proved by that record, with no walk (R4-F2).
 MAX_ANCESTRY_COMMITS = 64
 # What an agent may add: the kinds that are neither the controller's
 # observations nor the operator's seed, and need no exact candidate.
@@ -252,7 +256,9 @@ def local_ancestors(
     at most ``max_commits`` commits below the candidate can be; the walk
     ends when every base is reached, after ``max_commits`` reads, or when
     nothing is left to read, and a commit the store does not hold ends its
-    path. A read that fails ends the walk. A base not reached is not
+    path. A read that fails ends the walk, as does one the engine's reader
+    refuses once the walk has taken all the bytes or started all the git
+    processes it may (R3-F1 of PR #586). A base not reached is not
     proved, so a record bound to it is omitted as not applicable, never
     shown as current; the bases reached before the walk ended stay proved,
     each by a chain of parents read from bytes that hash to their ids.
