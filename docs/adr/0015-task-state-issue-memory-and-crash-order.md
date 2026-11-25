@@ -1724,16 +1724,28 @@ since the producer gate validates only a candidate whose range from that
 base the controller proved; so a retry on a failed commit is shown its
 failure however long its history (R4-F2). Any other base is proved by a
 breadth-first walk from the candidate through commits read as their own
-bytes and re-hashed, at most 64 of them; a base neither proves is not
-proved and its record is omitted. `HEAD` is read through the admin dir the
+bytes and re-hashed, at most 64 of them. A base named by a parent link
+must also be present as a local commit; this check does not read its
+body or consume a walk slot. A base neither source proves is omitted
+along with the records bound to it. `HEAD` is read through the admin dir the
 registry binds and the common dir, never through the worktree's `.git`
 file, which an earlier launch of the step can rewrite before a correction
 or a retry, and only its id is read there: the commit is read from the
 shared store's objects through the controller's private git directory,
 which names no promisor remote, so no git version fetches a commit the
-store lacks (R4-F1). A binding the registry does not confirm, a `HEAD`
-naming no commit the store holds, and a launch that seeds, bind no
-candidate. The prompt names the file in a section rendered only while the
+store lacks (R4-F1). For #541, one private `git cat-file --batch-command`
+child serves both the input and the walk, reusing the input's authenticated
+parents at the start of the walk. An `info` request must admit each commit
+before a `contents` request is sent. The shared allowance is 16 MiB of raw
+commit bytes; commit headers before the message are limited to 256 KiB to
+bound the work of parsing parent links. The executor reads stdout only on
+demand (up to 128 bytes per reply header, including any read-ahead, and the
+admitted body with its terminating LF). A read failure or a spent budget ends
+the walk without another child, and does not invalidate proofs already made.
+The child has a 750 ms runtime limit before executor cleanup. A binding the
+registry does not confirm, a `HEAD` naming no commit the store can authenticate
+within those limits, and a launch that seeds, bind no candidate. The prompt
+names the file in a section rendered only while the
 run keeps Memory. The prompt label moves to `v19`, an evaluation amendment, as D19
 says, and that move is the one exception to §4.2's byte-identical
 Memory-off prompt: against what the release before rendered and saved for
@@ -1746,7 +1758,7 @@ Memory off keeps its ledger. The run log records
 what each launch was shown (sizes, counts, digests, the commit it started
 from, or none when it could not be read, the commits the walk read, and
 the time of Memory's whole preparation, the ledger's reconstruction from
-the checkpoint, the candidate read and the walk included (R4-F4), with the
+the checkpoint, the candidate read, the walk and Git cleanup included, with the
 render's share), never a record's text. Two writers exist. The controller's
 `validation-failure` record of a failed candidate cites its validation
 record and is added by the producer's failure counter, in the save that

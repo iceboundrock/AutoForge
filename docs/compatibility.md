@@ -117,6 +117,11 @@ passed on that interpreter on one machine, and claims nothing about 3.14.
 | 2.55.0, 2.56.0 | **supported** | Recorded runs on the maintainer's host (Fedora 44): the measurements of [ADR 0004](adr/0004-authority-boundary-and-typed-external-effects.md), [ADR 0005](adr/0005-outer-sandbox-and-host-resource-capability-model.md) and [ADR 0006](adr/0006-candidate-validation-evidence-and-review-certificates.md), and `make check`. |
 | any other | untested | No minimum is enforced or known: `doctor` checks only that `git --version` runs (`git available`). |
 
+Issue Working Memory's launch-input and ancestry reads use
+`git cat-file --batch-command` (available since Git 2.36). If Git does not
+support this command, Memory leaves the input unknown rather than falling
+back to a separate process per commit. Other Git operations are unchanged.
+
 ## GitHub CLI (`gh`)
 
 | Version | Status | Evidence or reason |

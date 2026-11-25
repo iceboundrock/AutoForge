@@ -420,7 +420,8 @@ it is held to the same contract:
   the handle stays protocol-free (Pi tolerates an oversize `agent_end` or
   `turn_end` by it, #144). An unterminated fragment at EOF is reported as
   `Fragment`, never as a record;
-- both pipes are drained continuously whether or not the caller reads.
+- in record or capture mode, both pipes are drained continuously whether
+  or not the caller reads.
   Records wait in a queue bounded by `max_pending_records` and
   `max_pending_bytes`, and exceeding it is `Overflow`, which ends the
   invocation (a child still running is killed at `finish()`). stderr goes
@@ -471,6 +472,14 @@ it is held to the same contract:
 The handle knows no JSON, no provider and no workflow. A server child that
 takes no input (#126) uses it with `stdin_pipe=False` and
 `stdout_mode=StdoutMode.CAPTURE`.
+
+For a caller that must approve how much stdout to read, `StdoutMode.PULL`
+replaces the stdout reader thread with deadline-bound `read_stdout` calls.
+Each call reads no more than its byte allowance from the pipe; a read
+through LF retains only the suffix already read within that allowance.
+Stderr still drains, and neither finishing nor stopping drains pull stdout.
+Memory uses this mode to separate request admission from object framing and
+authentication, which belong to Git transport (#541).
 
 The kill is complete only when no process is left in the group, not merely
 when the child is reaped and its pipes closed: a descendant that closed its

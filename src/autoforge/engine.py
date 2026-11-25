@@ -437,6 +437,7 @@ from .git_transport import (
     CommitRecord,
     GitRemote,
     GitTransport,
+    MemoryCommitReader,
     local_git_request,
     published_range_problem,
     valid_branch_name,
@@ -4924,7 +4925,7 @@ class ControllerEngine:
         none otherwise. The bases of the store's range-bound records the
         candidate descends from are proved by the controller's own retained
         validation record of that very commit or by a bounded walk of the
-        shared store's own commits (:meth:`_memory_parents`,
+        shared store's own commits (:meth:`GitTransport.memory_commits`,
         :func:`~autoforge.memory_handoff.local_ancestors`), never by asking
         GitHub or fetching (R3-F1, R4-F2): one neither proves is left out,
         so a record bound to it is omitted, never shown as current. The
@@ -4939,56 +4940,33 @@ class ControllerEngine:
         if not memory_supported(phase) or not state.issue_memory.get("enabled"):
             return None
         entry = self._analyze_entry
-        transport = self._memory_transport()
-        return prepare_launch_projection(
-            state.memory,
-            self._memory_step(phase),
-            base=entry.base_sha if entry is not None else "",
-            read_head=lambda: self._memory_candidate(cwd, transport),
-            read_parents=self._memory_parents(transport),
-            validation_records=state.validation_records,
-            clock=self._memory_clock,
-        )
+        started = self._memory_clock()
+        with ExitStack() as scope:
+            reader: MemoryCommitReader | None = None
 
-    def _memory_transport(self) -> Callable[[], GitTransport]:
-        """One projection's reader of the shared store, made on its first use (R4-F1 of PR #536).
+            def commits(sha: str) -> MemoryCommitReader:
+                nonlocal reader
+                if reader is None:
+                    reader = scope.enter_context(self._git_transport().memory_commits(sha))
+                return reader
 
-        The controller's git transport (:meth:`_git_transport`), whose reads
-        run in a private git directory over the shared store's objects: no
-        promisor remote, no network protocol, so a missing object is never
-        fetched. Made once for the candidate's read and the ancestry walk,
-        and not at all by a projection that reads neither.
-        """
-        made: list[GitTransport] = []
+            def parents(sha: str) -> tuple[str, ...] | None:
+                return commits(sha).parents(sha)
 
-        def transport() -> GitTransport:
-            if not made:
-                made.append(self._git_transport())
-            return made[0]
-
-        return transport
-
-    def _memory_parents(
-        self, transport: Callable[[], GitTransport] | None = None
-    ) -> Callable[[str], tuple[str, ...] | None]:
-        """A reader of a commit's parents for the projection's ancestry walk (R3-F1 of PR #536).
-
-        Each commit is read as its own bytes from the shared store, re-hashed
-        and never substituted (:meth:`GitTransport.read_local_commit`): one
-        the store does not hold is ``None``, never fetched, and nothing asks
-        GitHub, so Memory adds no network call to a launch. The transport is
-        ``transport``'s (:meth:`_memory_transport`), made on the first read.
-        """
-        store = transport or self._memory_transport()
-
-        def parents(sha: str) -> tuple[str, ...] | None:
-            record = store().read_local_commit(sha)
-            return None if record is None else record.parents
-
-        return parents
+            launch = prepare_launch_projection(
+                state.memory,
+                self._memory_step(phase),
+                base=entry.base_sha if entry is not None else "",
+                read_head=lambda: self._memory_candidate(cwd, parents),
+                read_parents=parents,
+                has_base=lambda sha: commits(sha).has_commit(sha),
+                validation_records=state.validation_records,
+                clock=self._memory_clock,
+            )
+        return replace(launch, projection_ms=(self._memory_clock() - started) * 1000.0)
 
     def _memory_candidate(
-        self, cwd: str, transport: Callable[[], GitTransport] | None = None
+        self, cwd: str, read_parents: Callable[[str], tuple[str, ...] | None] | None = None
     ) -> str:
         """The commit a Memory launch in ``cwd`` starts from, or "" for none (R1-F1 of PR #536).
 
@@ -5003,8 +4981,8 @@ class ControllerEngine:
         can name a promisor remote git would fetch a missing object from
         (R4-F1): ``HEAD``'s id is read alone
         (:func:`~autoforge.agent_worktree.read_head_id`), and the commit it
-        names is read as its own bytes and re-hashed through ``transport``
-        (:meth:`_memory_transport`), which cannot fetch. A binding the
+        names is read as its own bytes and re-hashed through the local
+        commit reader, which cannot fetch. A binding the
         registry no longer confirms, a ``HEAD`` that is attached, not a
         regular file, or naming no commit the shared store holds, and a read
         that fails bind no candidate, which omits every record bound to one,
@@ -5023,11 +5001,14 @@ class ControllerEngine:
             )
             if read.attached or read.problem or not read.head:
                 return ""
-            if (transport or self._memory_transport())().read_local_commit(read.head) is None:
-                return ""
+            if read_parents is not None:
+                parents = read_parents(read.head)
+            else:
+                with self._git_transport().memory_commits(read.head) as reader:
+                    parents = reader.parents(read.head)
         except (AutoForgeError, OSError):
             return ""
-        return read.head
+        return "" if parents is None else read.head
 
     def _admit_memory(self, phase: Phase) -> None:
         """Admit an accepted result's proposals into the run's Memory, for the caller's save.

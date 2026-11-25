@@ -5,6 +5,15 @@ so.
 
 ## Unreleased
 
+### Bound the Issue Working Memory ancestry walk (#541)
+
+Memory reads the launch input and up to 64 ancestry commits through one local
+Git process instead of spawning one per commit. It checks size before
+requesting contents, re-hashes the exact bytes, and stops the walk at a
+read failure or its shared 16 MiB budget, without fetching or starting
+fallback processes. Bases the walk could not prove stay out of the
+projection. `projection_ms` now includes Git cleanup.
+
 ### Optional Issue Working Memory retrieval (#324)
 
 The controller-side `MemoryRetriever` offers bounded search, fetch and a

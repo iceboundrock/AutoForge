@@ -74,13 +74,14 @@ import shutil
 import tempfile
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
 from .errors import ExecutionError, GitLockTimeout, GitTransportError, LockError
 from .executor import ExecutionRequest, ExecutionResult, execute
+from .executor_duplex import DuplexChild, DuplexRequest, StdoutMode, start_duplex
 from .redaction import redact
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
@@ -95,6 +96,15 @@ MAX_RANGE_COMMITS = 1000
 # A network operation may move a large pack; a local object read is small.
 NETWORK_TIMEOUT_SECONDS = 600
 LOCAL_TIMEOUT_SECONDS = 120
+
+# Memory's advisory read does not use the general Git timeout or text capture.
+# Admission counts raw bytes across the entire projection (the input included).
+_MEMORY_COMMIT_BYTES = 16 * 1024 * 1024
+# A pathological commit header could itself yield hundreds of thousands of
+# parent links. Give parsing/walking those links a smaller bound than the body.
+_MEMORY_HEADER_BYTES = 256 * 1024
+_BATCH_HEADER_BYTES = 128
+_MEMORY_READ_SECONDS = 0.75
 
 # Hooks and the file-system monitor are off at command-line precedence for
 # every controller git process (D7.3); replacement objects and the
@@ -690,6 +700,34 @@ class GitTransport:
         _object_format(sha)
         return self._read_once(sha)
 
+    @contextmanager
+    def memory_commits(self, sha: str) -> Iterator[MemoryCommitReader]:
+        """One local, budgeted Git session, in the starting SHA's object format."""
+        object_format = _object_format(sha)
+        with self._git_dir(object_format) as git_dir:
+            request = self._request(git_dir, ["cat-file", "--batch-command"], gh_path=None)
+            try:
+                child = start_duplex(
+                    DuplexRequest(
+                        request.command,
+                        cwd=request.cwd,
+                        env=request.env,
+                        env_allowlist=request.env_allowlist,
+                        max_runtime_seconds=_MEMORY_READ_SECONDS,
+                        max_stderr_bytes=4096,
+                        stdout_mode=StdoutMode.PULL,
+                    )
+                )
+            except ExecutionError as exc:
+                raise GitTransportError("cannot start the local Memory commit reader") from exc
+            try:
+                yield MemoryCommitReader(child, object_format)
+            finally:
+                # The executor still settles the child on stderr pipe errors.
+                # Cleanup diagnostics are not part of this optional proof.
+                with suppress(ExecutionError):
+                    child.finish()
+
     def read_commit(self, sha: str) -> CommitRecord:
         """Read ``sha`` as its own bytes: re-hashed, parsed, never substituted.
 
@@ -864,6 +902,89 @@ class GitTransport:
         return result(outcome, detail)
 
 
+class MemoryCommitReader:
+    """Local commit links for a single projection, with no restart or fallback.
+
+    An ``info`` reply establishes size and type before Git is asked for
+    contents. Only the latter's exact, re-hashed bytes can supply links.
+    """
+
+    def __init__(self, child: DuplexChild, object_format: str) -> None:
+        self._child = child
+        self._format = object_format
+        self._remaining = _MEMORY_COMMIT_BYTES
+        self._failed = False
+        self._last: tuple[str, tuple[str, ...]] | None = None
+
+    def _reply_header(self, command: bytes, sha: str) -> bytes:
+        if self._failed:
+            raise GitTransportError("the local Memory commit reader has failed")
+        if _object_format(sha) != self._format:
+            raise GitTransportError("unexpected object format in the Memory ancestry walk")
+        try:
+            self._child.send_line(command + b" " + sha.encode("ascii"))
+            return self._child.read_stdout(_BATCH_HEADER_BYTES, through_lf=True)
+        except (ExecutionError, OSError) as exc:
+            self._abort()
+            raise GitTransportError(f"reading Memory commit {sha} failed") from exc
+
+    def _abort(self) -> None:
+        self._failed = True
+        self._child.stop()
+
+    def _info(self, sha: str) -> tuple[bytes, int] | None:
+        header = self._reply_header(b"info", sha)
+        oid = sha.encode("ascii")
+        if header == oid + b" missing\n":
+            return None
+        match = re.fullmatch(rb"([0-9a-f]+) commit (0|[1-9][0-9]*)\n", header)
+        if match is None or match[1] != oid:
+            self._abort()
+            raise GitTransportError(f"unexpected reply checking for Memory commit {sha}")
+        return header, int(match[2])
+
+    def has_commit(self, sha: str) -> bool:
+        """Check that a base named by an authenticated link is locally present."""
+        return self._info(sha) is not None
+
+    def parents(self, sha: str) -> tuple[str, ...] | None:
+        """Read and authenticate a commit, or return None for a missing object."""
+        # The walk's first node is also the projection's already read input.
+        if not self._failed and self._last is not None and self._last[0] == sha:
+            return self._last[1]
+        info = self._info(sha)
+        if info is None:
+            return None
+        header, size = info
+        if size > self._remaining:
+            raise GitTransportError(f"Memory commit {sha} exceeds the remaining byte budget")
+        self._remaining -= size  # charge before sending anything that can emit a body
+        if self._reply_header(b"contents", sha) != header:
+            self._abort()
+            raise GitTransportError(f"contents reply disagrees with the size check for {sha}")
+        try:
+            reply = self._child.read_stdout(size + 1)
+        except (ExecutionError, OSError) as exc:
+            self._abort()
+            raise GitTransportError(f"reading the contents of Memory commit {sha} failed") from exc
+        raw = memoryview(reply)[:-1]
+        if reply[-1:] != b"\n":
+            self._abort()
+            raise GitTransportError(f"unterminated contents reply for Memory commit {sha}")
+        if _hash_commit(raw, self._format) != sha:
+            self._abort()
+            raise GitTransportError(f"commit {sha}: the stored bytes do not hash to its id")
+        end = reply.find(b"\n\n", 0, min(size, _MEMORY_HEADER_BYTES + 2))
+        if end < 0:
+            end = size
+        if end > _MEMORY_HEADER_BYTES:
+            raise GitTransportError(f"Memory commit {sha} exceeds the commit header budget")
+        # The projection needs links only; no splitting or decoding the message.
+        parents = _parse_commit(sha, reply[:end]).parents
+        self._last = (sha, parents)
+        return parents
+
+
 def _private_config(object_format: str) -> str:
     """The whole configuration of a private git directory."""
     lines = [
@@ -884,10 +1005,12 @@ def _private_config(object_format: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _hash_commit(raw: bytes, object_format: str) -> str:
+def _hash_commit(raw: bytes | memoryview, object_format: str) -> str:
     """The object id of a commit with content ``raw``."""
     algorithm = hashlib.sha256 if object_format == "sha256" else hashlib.sha1
-    return algorithm(b"commit %d\0" % len(raw) + raw).hexdigest()
+    digest = algorithm(b"commit %d\0" % len(raw))
+    digest.update(raw)
+    return digest.hexdigest()
 
 
 def _lossy(sha: str) -> str:

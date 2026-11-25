@@ -2614,18 +2614,28 @@ commit that failed is shown that failure whatever GitHub answers. On the
 very commit a validation record of the run names, that record proves its
 base: the controller validates a candidate only after proving it descends
 from that base, so a retry on a failed commit is shown its failure however
-many commits it holds. Any other base is proved by reading each commit
-from the candidate down as its own bytes, re-hashed, at most 64 of them.
-A base neither proves is not proved, and a record bound to it is left
-out. The controller never reads the file back. The launch's run log
+many commits it holds. For any other base, Memory walks up to 64 commits,
+re-hashing the exact bytes of each commit it follows and checking that
+a base named by a parent link is present locally. The input read and walk
+share one `git cat-file --batch-command` process. It asks for a commit's
+size before requesting its contents: at most 16 MiB of raw commit bytes
+are admitted across the projection, and a commit's pre-message header
+may be at most 256 KiB. Stdout is read on demand, with at most 128 bytes
+per reply header (including any read-ahead into an admitted body) and one
+terminator per body. The child has a 750 ms runtime limit before
+executor cleanup. A failed read or a spent budget ends the walk without
+retries or per-commit fallbacks; already proved bases stay proved. A base
+neither source proves is left out along with the records bound to it.
+The controller never reads the file back. The launch's run log
 records what it was shown in `request.json`'s `metadata.memory`: the
 revision and digests, the counts, the file's size and its SHA-256, the
 commit the launch started from (`input`, `null` when it could not be read:
 never the base in its place), how many commits the ancestry walk read
 (`ancestry_reads`), and how long Memory's preparation took, the ledger's
-reconstruction from the state file, the candidate's read, the walk and the
-render together (`projection_ms`, the per-launch latency the evaluation
-reads), with the render's share (`render_ms`), never a record's text.
+reconstruction from the state file, the candidate's read, the walk, Git
+cleanup and the render together (`projection_ms`, the per-launch latency
+the evaluation reads), with the render's share (`render_ms`), never a
+record's text.
 
 Two writers add to the store, each in a save the step already makes, so
 no crash leaves a record without what it rests on:

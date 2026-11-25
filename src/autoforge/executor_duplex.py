@@ -6,9 +6,8 @@
 what it is sent. An RPC transport needs a child it can keep writing records
 to while reading records back. This module is the narrowest primitive that
 does that and keeps every guarantee ``execute()`` gives (ADR 0002: nothing
-the child starts outlives the invocation). It deals in bytes and LF-framed
-records only: nothing here knows an encoding, a provider, a phase or
-controller state; decoding a record is the caller's.
+the child starts outlives the invocation). Nothing here knows an encoding,
+a provider, a phase or controller state; interpreting bytes is the caller's.
 
 Guarantees:
 
@@ -24,8 +23,8 @@ Guarantees:
   first :data:`OVERSIZE_HEAD_BYTES` bytes, so that the caller can tell what
   was dropped, and dropped through its LF; an unterminated fragment at EOF
   is reported as :class:`Fragment`, never as a record;
-- stdout and stderr are drained continuously on reader threads, whether or
-  not the caller reads, so the child never blocks on a full pipe. Complete
+- In record and capture modes stdout and stderr are drained continuously
+  on reader threads, so the child never blocks on a full pipe. Complete
   records wait in a queue bounded by ``max_pending_records`` and
   ``max_pending_bytes``; exceeding it is :class:`Overflow`, which ends the
   invocation. stderr goes to a bounded head/tail capture and never becomes
@@ -83,6 +82,12 @@ Guarantees:
 A server child that takes no input and is not spoken to over stdout (#126)
 uses the same handle with ``stdin_pipe=False`` and
 ``stdout_mode=StdoutMode.CAPTURE``.
+
+``StdoutMode.PULL`` is for a request/reply protocol with a byte budget.
+Only :meth:`DuplexChild.read_stdout` reads that pipe, without a reader
+thread. Neither waiting for exit nor teardown reads from it. Stderr still
+drains; the caller must settle with the child at a reply boundary or stop
+it if it could be blocked writing.
 """
 
 from __future__ import annotations
@@ -142,6 +147,8 @@ class StdoutMode(enum.Enum):
     RECORDS = "records"
     # Bounded head/tail capture, returned in :attr:`DuplexResult.stdout`.
     CAPTURE = "capture"
+    # Unframed bytes, read only on demand with :meth:`DuplexChild.read_stdout`.
+    PULL = "pull"
 
 
 @dataclass(frozen=True)
@@ -595,7 +602,7 @@ def _abort_start(
 
 
 class DuplexChild:
-    """A running child with a writable stdin and a framed stdout.
+    """A running child with a writable stdin and several stdout modes.
 
     ``send_line`` and ``read_line`` may be called from different threads;
     writes are serialized, so a record is never interleaved with another.
@@ -626,6 +633,7 @@ class DuplexChild:
         self._stdin_open = proc.stdin is not None
         self._queue: _RecordQueue | None = None
         self._capture: _BoundedReader | None = None
+        self._ahead = b""
         self._readers: tuple[_PipeDrain, ...] = ()
         # Set once the group has been dealt with: killed, or found empty after
         # the child's own exit.
@@ -647,18 +655,18 @@ class DuplexChild:
         assert proc.stdout is not None and proc.stderr is not None
         if proc.stdin is not None:
             os.set_blocking(proc.stdin.fileno(), False)
-        stdout_reader: _PipeDrain
         if req.stdout_mode is StdoutMode.RECORDS:
             self._queue = _RecordQueue(req.max_pending_records, req.max_pending_bytes)
-            stdout_reader = _RecordReader(
-                proc.stdout, req.max_record_bytes, self._queue, self._limits
+            self._readers = (
+                _RecordReader(proc.stdout, req.max_record_bytes, self._queue, self._limits),
             )
-        else:
+        elif req.stdout_mode is StdoutMode.CAPTURE:
             self._capture = _BoundedReader(
                 proc.stdout, req.max_stdout_bytes, "stdout", activity=self._limits
             )
-            stdout_reader = self._capture
-        self._readers = (stdout_reader,)
+            self._readers = (self._capture,)
+        else:
+            os.set_blocking(proc.stdout.fileno(), False)
         self._stderr = _BoundedReader(
             proc.stderr, req.max_stderr_bytes, "stderr", activity=self._limits
         )
@@ -786,7 +794,7 @@ class DuplexChild:
         exited by then is not, and is settled as :meth:`finish` settles it
         (see :meth:`_deadline_reached`)."""
         if self._queue is None:
-            raise ExecutionError("stdout is captured, not framed into records")
+            raise ExecutionError(self._unframed_stdout())
         if self._timed_out:
             return Timeout(deadline_exceeded=True)
         if self._closed:
@@ -805,6 +813,54 @@ class DuplexChild:
             now = time.monotonic()
             if give_up is not None and now >= give_up and now < self.deadline():
                 return Timeout(deadline_exceeded=False)
+
+    def read_stdout(self, size: int, *, through_lf: bool = False) -> bytes:
+        """In pull mode, read exactly ``size`` bytes or through LF (inclusive)
+        within ``size`` bytes. Do not strip or decode anything. At EOF,
+        raise if the requested bytes were not delivered. When no LF fits,
+        return all ``size`` bytes for the caller to reject.
+
+        The pipe is never read past this call's byte allowance. Any bytes
+        after an LF read within that allowance are kept for the next call.
+        Call from a single consumer, not concurrently with teardown.
+        """
+        if self._req.stdout_mode is not StdoutMode.PULL:
+            raise ExecutionError("stdout is not in pull mode")
+        if self._timed_out:
+            raise self._timeout_error()
+        if self._closed or self._left is not None or size <= 0:
+            raise ExecutionError("cannot read pull stdout on a closed child or with no allowance")
+        assert self._proc.stdout is not None
+        fd = self._proc.stdout.fileno()
+        data = bytearray()
+        with selectors.DefaultSelector() as sel:
+            sel.register(fd, selectors.EVENT_READ)
+            while len(data) < size:
+                remaining = self.deadline() - time.monotonic()
+                if remaining <= 0:
+                    if self.exited():
+                        raise ExecutionError("child exited before stdout could be read")
+                    self._expire()
+                    raise self._timeout_error()
+                allowance = size - len(data)
+                if self._ahead:
+                    chunk, self._ahead = self._ahead[:allowance], self._ahead[allowance:]
+                else:
+                    if not sel.select(remaining):
+                        continue
+                    try:
+                        chunk = os.read(fd, min(allowance, executor._READ_CHUNK_BYTES))
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        raise ExecutionError("unexpected EOF on pull stdout")
+                    self._limits.touch()
+                if through_lf and (lf := chunk.find(b"\n")) >= 0:
+                    self._ahead = chunk[lf + 1 :] + self._ahead
+                    data.extend(chunk[: lf + 1])
+                    break
+                data.extend(chunk)
+        return bytes(data)
 
     def _rest(self) -> ReadOutcome:
         """Torn down: every reader has ended, so the rest of stdout is queued
@@ -827,8 +883,12 @@ class DuplexChild:
         takes what it returns, so a second call returns nothing.
         """
         if self._queue is None:
-            raise ExecutionError("stdout is captured, not framed into records")
+            raise ExecutionError(self._unframed_stdout())
         return self._queue.take_unread()
+
+    def _unframed_stdout(self) -> str:
+        mode = "captured" if self._req.stdout_mode is StdoutMode.CAPTURE else "read on demand"
+        return f"stdout is {mode}, not framed into records"
 
     def _deadline_reached(self) -> ReadOutcome:
         """A read met the deadline. The child is looked at first, as

@@ -101,6 +101,69 @@ def _kill_quietly(pid: int) -> None:
 
 
 # -- framing -------------------------------------------------------------------
+def test_pull_stdout_never_drains_an_eager_writers_body(monkeypatch):
+    """The producer has passed the header before the consumer even starts."""
+    ready = threading.Event()
+    stdout_fd = None
+    total = 0
+    real_spawn = executor_duplex._spawn
+    real_read = os.read
+
+    def spawn(*args, **kwargs):
+        nonlocal stdout_fd
+        proc = real_spawn(*args, **kwargs)
+        stdout_fd = proc.stdout.fileno()
+        return proc
+
+    def read(fd, size):
+        nonlocal total
+        data = real_read(fd, size)
+        if fd == stdout_fd:
+            total += len(data)
+        elif data == b"ready\n":
+            ready.set()
+        return data
+
+    monkeypatch.setattr(executor_duplex, "_spawn", spawn)
+    monkeypatch.setattr(os, "read", read)
+    command = [
+        PY,
+        "-c",
+        "import os\n"
+        "os.write(1, b'header\\r\\n' + b'\\xff\\x00\\n\\r' * 100)\n"
+        "os.write(2, b'ready\\n')\n"
+        "while True: os.write(1, b'x' * 4096)\n",
+    ]
+    with start_duplex(
+        DuplexRequest(command, stdout_mode=StdoutMode.PULL, max_runtime_seconds=10)
+    ) as child:
+        assert ready.wait(5) and total == 0
+        assert child.read_stdout(128, through_lf=True) == b"header\r\n"
+        assert total == 128
+        assert child.read_stdout(4) == b"\xff\x00\n\r" and total == 128
+        assert child.stop()
+    assert total == 128 and child.exited()
+
+
+def test_pull_stdout_rejects_a_short_read_at_eof():
+    req = DuplexRequest(
+        [PY, "-c", "import os; os.write(1, b'abc')"],
+        stdout_mode=StdoutMode.PULL,
+        max_runtime_seconds=10,
+    )
+    with start_duplex(req) as child, pytest.raises(ExecutionError, match="unexpected EOF"):
+        child.read_stdout(4)
+    assert child.exited()
+
+
+def test_pull_stdout_read_obeys_the_deadline():
+    req = DuplexRequest([PY, "-c", "input()"], stdout_mode=StdoutMode.PULL, max_runtime_seconds=0.2)
+    with start_duplex(req) as child:
+        with pytest.raises(ExecutionTimeoutError):
+            child.read_stdout(4)
+    assert child.finish().timed_out and child.exited()
+
+
 def test_records_split_across_one_byte_writes():
     payload = b"first\nsecond record\n\nlast\n"
     got = _records_until_eof([bytes([b]) for b in payload], delay=0.001)

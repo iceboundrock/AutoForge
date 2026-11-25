@@ -18,6 +18,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import zlib
 from collections.abc import Callable
@@ -26,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from autoforge import executor_duplex, git_transport
 from autoforge.errors import ExecutionError, GitHubUnavailableError, GitTransportError
 from autoforge.executor import ExecutionRequest, ExecutionResult, execute
 from autoforge.git_transport import (
@@ -40,6 +42,7 @@ from autoforge.git_transport import (
     published_range_problem,
 )
 from autoforge.locking import SharedGitLock
+from autoforge.memory_handoff import local_ancestors
 
 IDENT = ("-c", "user.name=t", "-c", "user.email=t@example.com")
 CREDENTIAL = "fake-credential-0123456789"
@@ -415,6 +418,114 @@ def test_a_rewritten_loose_commit_fails_closed_on_its_id_without_a_refetch(world
 
 def _literal_commit(world: World, content: bytes) -> str:
     return world.g("hash-object", "-t", "commit", "-w", "--literally", "--stdin", input=content)
+
+
+def test_memory_reader_uses_exact_binary_commit_bytes_in_sha256(tmp_path):
+    world = make_world(tmp_path, object_format="sha256")
+    parent = world.commit("root")
+    sha = _literal_commit(
+        world,
+        (
+            f"tree {world.tree()}\nparent {parent}\nauthor t <t@e> 1 +0000\n"
+            "committer t <t@e> 1 +0000\n\n"
+        ).encode()
+        + b"binary \xff \x00 \r\ncommit message\n",
+    )
+    with world.transport().memory_commits(sha) as reader:
+        assert reader.parents(sha) == (parent,)
+        assert reader.parents(parent) == ()
+    assert not world.requests and not world.questions
+
+
+def test_memory_walk_does_not_count_a_missing_endpoint_even_with_a_replacement(world):
+    missing = world.commit("missing base")
+    present = world.commit("present base")
+    tip = world.commit("merge", missing, present)
+    world.publish(missing, "refs/heads/side")
+    world.drop(missing)
+    world.g("update-ref", f"refs/replace/{missing}", present)
+    with world.transport().memory_commits(tip) as reader:
+        assert reader.parents(tip) == (missing, present)
+        assert reader.parents(missing) is None
+        proof = local_ancestors(tip, [missing, present], reader.parents, has_base=reader.has_commit)
+        assert proof == ((present,), 2)
+    assert not world.requests and not world.questions
+
+
+@pytest.mark.parametrize("size", [16 * 1024 * 1024, 24 * 1024 * 1024])
+def test_memory_admits_raw_commit_bytes_before_reading_stdout_body(world, monkeypatch, size):
+    header = f"tree {world.tree()}\nauthor t <t@e> 1 +0000\ncommitter t <t@e> 1 +0000\n\n".encode()
+    sha = _literal_commit(world, header + b"x" * (size - len(header)))
+    calls = []
+    stdout_fd = None
+    actual = 0
+    spawn = executor_duplex._spawn
+    read = os.read
+
+    def record_spawn(*args, **kwargs):
+        nonlocal stdout_fd
+        calls.append(args[0])
+        proc = spawn(*args, **kwargs)
+        stdout_fd = proc.stdout.fileno()
+        return proc
+
+    def record_read(fd, requested):
+        nonlocal actual
+        data = read(fd, requested)
+        if fd == stdout_fd:
+            actual += len(data)
+        return data
+
+    monkeypatch.setattr(executor_duplex, "_spawn", record_spawn)
+    monkeypatch.setattr(os, "read", record_read)
+    started = os.times()
+    budget = 16 * 1024 * 1024
+    with world.transport().memory_commits(sha) as reader:
+        if size == budget:
+            assert reader.parents(sha) == ()
+        else:
+            with pytest.raises(GitTransportError, match="remaining byte budget"):
+                reader.parents(sha)
+    ended = os.times()
+    cpu_ms = sum(b - a for a, b in zip(started[:4], ended[:4], strict=True)) * 1000.0
+    line = f"{sha} commit {size}\n".encode()
+    assert actual == (2 * len(line) + size + 1 if size == budget else len(line))
+    assert cpu_ms < 1000.0
+    assert len(calls) == 1 and calls[0][-2:] == ["cat-file", "--batch-command"]
+    assert private_leftovers(world) == []
+    assert not world.requests and not world.questions
+
+
+def test_memory_reader_ends_on_eof_without_fallback(world, monkeypatch):
+    base = world.commit("root")
+    tip = world.commit("tip", base)
+    requests = []
+    start = git_transport.start_duplex
+
+    def end_after_input(req):
+        requests.append(req)
+        req.command = [sys.executable, "-c", "input()"]
+        return start(req)
+
+    monkeypatch.setattr(git_transport, "start_duplex", end_after_input)
+    with world.transport().memory_commits(tip) as reader:
+        assert local_ancestors(tip, [base], reader.parents, has_base=reader.has_commit) == ((), 1)
+        with pytest.raises(GitTransportError, match="reader has failed"):
+            reader.parents(base)
+    assert len(requests) == 1 and private_leftovers(world) == []
+    assert not world.requests and not world.questions
+
+
+def test_memory_reader_bounds_commit_header_parsing(world):
+    sha = _literal_commit(
+        world,
+        (f"tree {world.tree()}\nauthor t <t@e> 1 +0000\ncommitter t <t@e> 1 +0000\n").encode()
+        + b"extra header\n" * 25_000
+        + b"\nmessage\n",
+    )
+    with world.transport().memory_commits(sha) as reader:
+        with pytest.raises(GitTransportError, match="commit header budget"):
+            reader.parents(sha)
 
 
 def test_a_commit_that_is_not_utf8_fails_closed(world):
