@@ -264,6 +264,7 @@
       "arm": "baseline",
       "case": "false_alarm",
       "complete_launch_window": true,
+      "complete_review_record": true,
       "escapes": [],
       "evidence": "not_issued",
       "excluded": null,
@@ -288,6 +289,7 @@
       "arm": "baseline",
       "case": "missed",
       "complete_launch_window": true,
+      "complete_review_record": true,
       "escapes": [
         [
           null,
@@ -317,6 +319,7 @@
       "arm": "baseline",
       "case": "quiet",
       "complete_launch_window": true,
+      "complete_review_record": true,
       "escapes": [],
       "evidence": "certified",
       "excluded": null,
@@ -341,6 +344,7 @@
       "arm": "baseline",
       "case": "repaired",
       "complete_launch_window": true,
+      "complete_review_record": true,
       "escapes": [],
       "evidence": "certified",
       "excluded": null,
@@ -377,6 +381,7 @@
       "arm": "treatment",
       "case": "repaired",
       "complete_launch_window": true,
+      "complete_review_record": true,
       "escapes": [
         [
           "repaired-treatment",
@@ -424,6 +429,7 @@
       "arm": "baseline",
       "case": "stagnant",
       "complete_launch_window": true,
+      "complete_review_record": true,
       "escapes": [],
       "evidence": "not_issued",
       "excluded": null,
@@ -460,6 +466,7 @@
       "arm": "treatment",
       "case": "unsettled",
       "complete_launch_window": true,
+      "complete_review_record": true,
       "escapes": [],
       "evidence": "not_issued",
       "excluded": null,

@@ -29,6 +29,7 @@ MARGINS = {
 }
 RESAMPLES = 10_000
 SEED = 355
+FINDING_RATES = ("weighted_recall", "precision", "duplicate_ratio")
 
 
 def ratio(n: int | Fraction, d: int) -> Fraction | None:
@@ -91,6 +92,7 @@ class Counts:
     harm: tuple[int, int, int] = (0, 0, 0)
     duplicates: tuple[int, int, int, int] = (0, 0, 0, 0)  # D, C, possible new, possible repeats
     groups: Counter[int] = field(default_factory=Counter)
+    complete: bool = True  # Every completed review has its row (`Run.complete_reviews`).
 
 
 def observations(run: Run, case: Case) -> Counts:
@@ -136,8 +138,12 @@ def observations(run: Run, case: Case) -> Counts:
             offset = slots.stop
     detected = sum(weights[key] for key in seen)
     harm = Counter(verdict for verdict, _ in run.fixes.values())
+    complete = run.complete_reviews()
+    # A recorded false alarm stands. A clean record settles a true negative
+    # only if it holds every review the run completed: a later clean round
+    # does not show that a review without its row raised no false finding.
     fp = int(bool(negative["false"]))
-    unset = int(not fp and (not negative_reviews or bool(negative["unknown"])))
+    unset = int(not fp and (not complete or not negative_reviews or bool(negative["unknown"])))
     return Counts(
         (detected, detected + recall_ceiling(edges, weights), sum(weights.values())),
         (precision["confirmed"], precision["false"], precision["unknown"]),
@@ -145,6 +151,7 @@ def observations(run: Run, case: Case) -> Counts:
         (harm["harmful"], harm["not_harmful"], harm["unknown"]),
         (duplicate, precision["confirmed"], new, repeat),
         groups,
+        complete,
     )
 
 
@@ -164,7 +171,7 @@ def bands(counts: list[Counts]) -> dict[str, Band]:
         if not den or (size - 1) * den > num * size:
             num += (size - 1) * count
             den += size * count
-    return {
+    rates = {
         "weighted_recall": Band(
             ratio(hits, exposed), ratio(hits, exposed), ratio(possible, exposed)
         ),
@@ -179,6 +186,12 @@ def bands(counts: list[Counts]) -> dict[str, Band]:
             ratio(dup, confirmed), ratio(dup, confirmed + new), ratio(num, den)
         ),
     }
+    if not all(c.complete for c in counts):
+        # A review without its row has findings and exposure nobody counted:
+        # pooled over it, these rates have no bounds. FIX commits are lineage,
+        # and `observations` settles each clean negative on its own.
+        rates.update(dict.fromkeys(FINDING_RATES, Band(None, None, None)))
+    return rates
 
 
 def rate_record(band: Band) -> dict:
@@ -468,6 +481,7 @@ def report(data: dict) -> dict:
                     for seq in sorted(run.attempts)
                 ],
                 "complete_launch_window": run.complete_window(),
+                "complete_review_record": run.complete_reviews(),
             }
             for run in runs
         },

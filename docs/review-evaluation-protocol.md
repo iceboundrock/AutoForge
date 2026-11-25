@@ -136,6 +136,23 @@ only. Report excluded and missing cases separately. Decision rates use
 matched, non-excluded case pairs. A case counts toward the sample minimum
 only if each arm accepted a review at the pinned candidate.
 
+Finding rates need every review a run completed, not only the rows present.
+A run's **review record** is complete when the stop is observed, nothing is
+recorded past it, the review rows hold rounds 1 to n without a gap, each with
+a known disposition, and nothing shows or allows a completed review without a
+row: no REVIEW launch completed without one, no launch ran after or may have
+completed a round past n, and no ordinal after the last row is unrecorded.
+Each completed review consumes the next round of the run's one PR, so an
+unrecorded ordinal before the last row cannot hide one. This is separate from
+the launch window, which accounts for usage: a run can log every launch and
+still lack a review row, or lose a launch row and no review. The report gives
+both per run. A later clean round does not show what a missing review found.
+So in an arm, or a bootstrap draw, holding a run with an incomplete review
+record, weighted recall, precision and the duplicate ratio are unknown, with
+no point and no bounds. The clean-negative rate keeps that run's recorded
+false alarm and otherwise counts it unsettled. The harmful-fix rate reads
+FIX commits, which the lineage records whatever review rows are lost.
+
 An exclusion keeps a run out of the rates, the paired bootstrap, the sample
 floor, cost, usage and the per-arm escape totals. It never removes evidenced
 harm. The report keeps each run's escapes, an excluded run's included, and
@@ -148,7 +165,7 @@ representable without blocking the gate.
 |---|---|
 | Severity-weighted recall | Sum of weights of distinct detected eligible defects divided by the weight of distinct eligible defects exposed to review, counted separately per run. The lower bound uses confirmations. The upper assigns each unknown finding at most one as-yet-undetected defect eligible at that commit, maximizing weight across the run. |
 | Precision | Confirmed findings / (confirmed + false). Bounds use all findings, assigning unknowns first to false, then to true. This estimates classification uncertainty, including defects outside frozen identity coverage; it does not add defects to the recall denominator. |
-| Clean-negative false-positive rate | Negative runs with ≥1 false finding on the case's own commits / label-settled negative runs. No findings means a true negative only on a completed accepted review. Other negative runs (only unknown findings, or no accepted eligible review) widen the bounds by counting first as true negatives, then false positives. |
+| Clean-negative false-positive rate | Negative runs with ≥1 false finding on the case's own commits / label-settled negative runs. No findings means a true negative only on a completed accepted review, in a complete review record. Other negative runs (only unknown findings, no accepted eligible review, or an incomplete review record without a recorded false finding) widen the bounds by counting first as true negatives, then false positives. |
 | Escaped critical defects | Count eligible critical defects still present at the certified stop. A bound non-issuance contributes zero; an unresolved ending leaves the total unknown, with known escapes reported separately. The report also lists known escapes of other severities. Arm totals cover included runs; each run's escapes are reported, an excluded run's included. |
 | Harmful-fix rate | Harmful FIX commits / adjudicated FIX commits. Use all FIX commits in the bounds, settling unknowns first as harmless, then harmful. |
 | Duplicate ratio | Duplicate confirmed findings / all confirmed findings. For the lower bound each unknown can name a distinct, unnamed eligible defect until those slots run out. For the upper, add all unknowns in rounds with a confirmation as repeats. A round with no confirmation and an eligible defect can add `k−1` repeats for `k` confirmations; include these groups by decreasing `k` while they improve the pooled ratio. A round without eligible defects can add neither first reports nor repeats. |
@@ -263,12 +280,25 @@ The v1 input is a closed JSON object (`schema`, `mode`, `cutoff`, `cases`,
   or REPLAN_REEXECUTE of round r runs after r, right after the REVIEW of
   round r (a needs-fix reply that was not stale) or a retry of itself.
   ANALYZE_EXECUTE runs at round 0, first or after itself, and only an
-  accepted replan returns the count to zero. Completed review rows advance
-  strictly in round. Admission refuses consecutive recorded ordinals no
-  controller produces, such as a FIX before any REVIEW, and round 1 after
-  round 2. Across an unrecorded ordinal any legal launches may have run:
-  such a gap leaves the window incomplete and contradicts nothing, and a
-  round the review rows skip is a missing row.
+  accepted replan returns the count to zero. A FIX commit is a published
+  revision: a completed FIX routes to REVIEW, and a published partial fix
+  blocks, then re-enters REVIEW at that revision (#433). The launch after
+  it is therefore a REVIEW, never another FIX of its round; before
+  publication a FIX can be retried, and a held FIX unblocked into FIX
+  again. Completed review rows advance strictly in round. Admission
+  refuses consecutive recorded ordinals no controller produces, such as a
+  FIX before any REVIEW, and round 1 after round 2. Unrecorded ordinals
+  between two recorded ones are missing evidence only while they can hold
+  the launches the controller needs between them: a REVIEW for each round
+  the count must rise by, a REVIEW of a FIX's or replan's round right
+  before it, and a replan after a completed REVIEW where the count must
+  fall. A creation receipt puts ordinal 0 before any launch, at zero
+  completed rounds; without one the count before the first record is
+  unknown. So a single unrecorded ordinal after the FIX of round 1 cannot
+  precede a review of round 20, while eighteen can. A gap large enough
+  leaves the window incomplete and contradicts nothing, and a round the
+  review rows skip is a missing row, which leaves the review record
+  incomplete.
   Review rows bind the controller disposition, reviewer reply, findings
   and optional validation and issuance receipts to the observed revision. Stop,
   creation, launch and human evidence are projections with separate opaque

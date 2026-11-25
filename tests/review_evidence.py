@@ -409,8 +409,78 @@ def bind_fixes(
     return bound
 
 
+class Step(NamedTuple):
+    """A recorded launch, as far as it constrains the launch after it."""
+
+    phase: str
+    round: int
+    outcome: str
+    origin: Review | None  # The review row a REVIEW is, or a FIX or replan chain follows.
+    published: bool  # A FIX commit: the controller's next launch reviews its revision.
+
+    def completed(self) -> set[int]:
+        """The controller's possible completed-round counts once this launch ended."""
+        ran = self.round - (self.phase == "REVIEW")  # Completed rounds when it ran.
+        if self.outcome not in ("reply", "unknown"):
+            return {ran}  # Refused, failed or abandoned: it completed nothing.
+        if self.phase == "REVIEW":
+            return {self.round} if self.outcome == "reply" else {ran, self.round}
+        if self.phase == "REPLAN_REEXECUTE":
+            # An accepted replan activates a replacement: its fresh round 1 is next.
+            return {0} if self.outcome == "reply" else {ran, 0}
+        return {ran}
+
+    def refuses(self, phase: str, rnd: int) -> str | None:
+        """Why no controller launches `phase` of round `rnd` right after this launch."""
+        if rnd - (phase == "REVIEW") not in self.completed():
+            return "launch rounds contradict the controller's completed-round count"
+        if self.published and phase != "REVIEW":
+            # A completed FIX routes to REVIEW. A published partial fix blocks,
+            # then re-enters REVIEW at that revision: the PR is past the HEAD
+            # the round's findings bind, so never another FIX of the round.
+            return "a published FIX commit is followed by the review of its revision"
+        if phase == "ANALYZE_EXECUTE" and self.phase != phase:
+            return "ANALYZE_EXECUTE follows no other launch"
+        if phase in ("FIX", "REPLAN_REEXECUTE"):
+            if self.phase not in ("REVIEW", phase) or self.round != rnd:
+                return f"{phase} must follow the review of its round or retry itself"
+            if self.origin is not None and (
+                self.origin.reply != "needs_fix" or self.origin.disposition == "stale"
+            ):
+                return f"{phase} must follow a needs-fix review the controller accepted"
+        return None
+
+    def fewest(self, phase: str, rnd: int) -> int | None:
+        """The fewest launches between this one and `phase` of `rnd` (None: never).
+
+        Any more fit as well: failed attempts of that launch right before it
+        change nothing a later launch depends on.
+        """
+        if self.refuses(phase, rnd) is None:
+            return 0
+        if phase == "ANALYZE_EXECUTE":
+            return None  # Only after itself, which needs nothing between.
+        # A FIX or replan of round r follows a completed REVIEW of round r;
+        # an unrecorded one may be the needs-fix source it needs.
+        return self.until(rnd - 1) + (phase != "REVIEW")
+
+    def until(self, target: int) -> int:
+        """The fewest launches after this one with `target` rounds complete (0: now)."""
+        counts = self.completed()
+        if target in counts:
+            return 0
+        # Each REVIEW completes at most one round. Only an accepted replan
+        # lowers the count, to zero, right after a completed REVIEW of its
+        # round: this launch, or one more REVIEW.
+        replan = 1 if self.refuses("REPLAN_REEXECUTE", self.round) is None else 2
+        return min([target - count for count in counts if count < target] + [replan + target])
+
+
 def check_lifecycle(
-    attempts: dict[int, Json], reviews: list[Review], fixes: dict[str, tuple[str, int]]
+    attempts: dict[int, Json],
+    reviews: list[Review],
+    fixes: dict[str, tuple[str, int]],
+    start: bool,
 ) -> None:
     """Replay the controller's completed-round count over the recorded ordinals.
 
@@ -420,53 +490,42 @@ def check_lifecycle(
     REVIEW of round r runs after r - 1 completed rounds and completes round r
     only with a `reply` (`unknown` may have). A FIX or REPLAN_REEXECUTE of
     round r runs after r, right after the REVIEW of round r or a retry of
-    itself; ANALYZE_EXECUTE runs before any round, first or after itself.
-    Only a replacement can return the count to zero. Between consecutive
-    recorded ordinals the count changes only as the earlier launch allows.
-    Across an unrecorded ordinal any legal launches may have run: a gap is
-    missing evidence, never a contradiction, and constrains nothing here.
+    itself, and a published FIX commit only before a REVIEW; ANALYZE_EXECUTE
+    runs before any round, first or after itself. Only a replacement can
+    return the count to zero. Between consecutive recorded ordinals the count
+    changes only as the earlier launch allows. Unrecorded ordinals between
+    two recorded ones are missing evidence, not a contradiction, only while
+    they can hold the launches the controller needs between those two. A
+    start receipt records ordinal zero, before any launch or round.
     """
     events = {seq: (row["phase"], row["round"], row["outcome"]) for seq, row in attempts.items()}
     rows = {review.seq: review for review in reviews}
     for review in reviews:
         events.setdefault(review.seq, ("REVIEW", review.revision.round, "reply"))
+    published = set()
     for _, seq in fixes.values():
         source = [review for review in reviews if review.seq < seq][-1]  # By `bind_fixes`.
         events.setdefault(seq, ("FIX", source.revision.round, "reply"))
-    origin: Review | None = None  # The review row a FIX or replan chain follows, if recorded.
+        published.add(seq)
+    # Ordinal zero: what a launch at ordinal one may follow (it may be a REVIEW).
+    before = Step("ANALYZE_EXECUTE", 0, "reply", None, False) if start else None
+    last = 0
     for seq in sorted(events):
-        phase, rnd, _ = events[seq]
-        if seq - 1 not in events:
-            origin = None
-            continue
-        was, prior, outcome = events[seq - 1]
-        ran = prior - (was == "REVIEW")  # Completed rounds when the earlier launch ran.
-        if outcome not in ("reply", "unknown"):
-            completed = {ran}  # Refused, failed or abandoned: it completed nothing.
-        elif was == "REVIEW":
-            completed = {prior} if outcome == "reply" else {ran, prior}
-        elif was == "REPLAN_REEXECUTE":
-            # An accepted replan activates a replacement: its fresh round 1 is next.
-            completed = {0} if outcome == "reply" else {ran, 0}
-        else:
-            completed = {ran}
-        require(
-            rnd - (phase == "REVIEW") in completed,
-            "launch rounds contradict the controller's completed-round count",
-        )
-        if phase == "ANALYZE_EXECUTE":
-            require(was == phase, "ANALYZE_EXECUTE follows no other launch")
-        elif phase in ("FIX", "REPLAN_REEXECUTE"):
+        phase, rnd, outcome = events[seq]
+        origin = rows.get(seq)
+        if before is not None and seq == last + 1:
+            problem = before.refuses(phase, rnd)
+            require(problem is None, problem or "")
+            if phase != "REVIEW":
+                origin = before.origin  # A FIX or replan chain keeps its source.
+        elif before is not None:
+            fewest = before.fewest(phase, rnd)
+            require(fewest is not None, before.refuses(phase, rnd) or "")
             require(
-                was in ("REVIEW", phase) and prior == rnd,
-                f"{phase} must follow the review of its round or retry itself",
+                fewest is not None and fewest < seq - last,
+                "too few unrecorded ordinals for the launches the controller needs between",
             )
-            if was == "REVIEW":
-                origin = rows.get(seq - 1)
-            require(
-                origin is None or (origin.reply == "needs_fix" and origin.disposition != "stale"),
-                f"{phase} must follow a needs-fix review the controller accepted",
-            )
+        before, last = Step(phase, rnd, outcome, origin, seq in published), seq
 
 
 def label_reviews(
@@ -613,6 +672,43 @@ class Run:
             seq in self.attempts for _, seq in self.fixes.values()
         )
 
+    def complete_reviews(self) -> bool:
+        """Every review the controller may have completed through the stop has its row.
+
+        This is not the launch window, which accounts for usage: a complete
+        window can lack a review row, and an incomplete one may lack none. On
+        the run's one PR each completed review consumes the next round, so
+        rows of rounds 1..n hold every review completed before the last of
+        them. One is missing, or may be, when a REVIEW launch completed with
+        no row, a launch ran after (or may have completed) a round past n, an
+        ordinal after the last row has no record, there is no stop, or
+        something is recorded past it. A row of unknown disposition may count
+        or not.
+        """
+        stop = self.stop
+        if stop is None:
+            return False
+        rows = {review.seq for review in self.reviews}
+        recorded = rows | self.attempts.keys() | {seq for _, seq in self.fixes.values()}
+        if any(seq > stop.through for seq in recorded):
+            return False
+        count = len(self.reviews)
+        if [review.revision.round for review in self.reviews] != list(range(1, count + 1)):
+            return False  # The round progression skips a completed review.
+        if any(review.disposition == "unknown" for review in self.reviews):
+            return False
+        for seq, row in self.attempts.items():
+            rnd = row["round"]
+            if row["phase"] == "REVIEW":
+                if row["outcome"] == "reply" and seq not in rows:
+                    return False
+                # One that completed nothing shows only that rnd - 1 had.
+                rnd -= row["outcome"] not in ("reply", "unknown")
+            if rnd > count:
+                return False
+        last = self.reviews[-1].seq if self.reviews else 0
+        return all(seq in recorded for seq in range(last + 1, stop.through + 1))
+
 
 def admit_attempts(rows: Any) -> dict[int, Json]:
     attempts = {}
@@ -702,8 +798,16 @@ def admit(data: Any) -> tuple[str, dict[str, Case], list[Run]]:
             rid,
             cutoff,
         )
+        start = row.get("start")
+        if start is not None:
+            shape(start, "source run initial_seq")
+            require(
+                start["run"] == rid and integer(start["initial_seq"]) == 0,
+                "start receipt must identify creation of this run at ordinal zero",
+            )
+            text(start["source"])
         fixes_bound = bind_fixes(fixes, reviews, attempts, history)
-        check_lifecycle(attempts, reviews, fixes)
+        check_lifecycle(attempts, reviews, fixes, start is not None)
         excluded = text(row["exclusion"]) if "exclusion" in row else None
         if reviews:
             require(reviews[0].commit == case.candidate, "first review must start at the case pin")
@@ -713,14 +817,6 @@ def admit(data: Any) -> tuple[str, dict[str, Case], list[Run]]:
             require(
                 targets.setdefault(cid, target) == target, "arms review different base branches"
             )
-        start = row.get("start")
-        if start is not None:
-            shape(start, "source run initial_seq")
-            require(
-                start["run"] == rid and integer(start["initial_seq"]) == 0,
-                "start receipt must identify creation of this run at ordinal zero",
-            )
-            text(start["source"])
         runs.append(
             Run(
                 rid,

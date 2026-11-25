@@ -340,10 +340,98 @@ def test_launch_rows_follow_the_controller_lifecycle(dropped):
         admit(data)
 
 
+def test_a_published_fix_is_followed_by_the_review_of_its_revision():
+    data = fixture()
+    run = data["runs"][0]  # Review 2 needs a fix, FIX 3 publishes it, review 4 certifies.
+    final = run["reviews"][1]
+
+    def later(seq, *fix):
+        final["seq"] = run["stop"]["through"] = seq
+        run["attempts"][3:] = [attempt(seq - 1, "FIX", 1, "failed")] if fix else []
+        run["attempts"].append(attempt(seq, "REVIEW", 2))
+        return admit(data)
+
+    # A completed FIX routes to REVIEW; a published partial fix blocks, then
+    # re-enters REVIEW at that revision. Neither runs another FIX of round 1.
+    with pytest.raises(InvalidEvidence, match="published FIX commit"):
+        later(5, "fix")
+    with pytest.raises(InvalidEvidence, match="too few unrecorded ordinals"):
+        later(6, "fix")  # Not even across ordinal 4: that would take a replacement.
+    _, _, runs = later(5)  # Ordinal 4 unrecorded: a failed review launch, say.
+    assert not runs[0].complete_window()
+    assert score.outcome(runs[0]).evidence == "certified"
+    # Before publication a FIX is retried (see the lifecycle test above).
+    run["snapshots"][0]["seq"] = 4
+    run["attempts"][3:] = [attempt(4, "FIX", 1), attempt(5, "REVIEW", 2)]
+    run["attempts"][2]["outcome"] = "failed"
+    _, _, runs = admit(data)
+    assert runs[0].complete_window()
+    assert score.outcome(runs[0]).evidence == "certified"
+
+
+def test_unrecorded_ordinals_must_hold_the_rounds_they_skip():
+    data = fixture()
+    run = data["runs"][0]  # FIX 3 publishes round 1's fix; the next review certifies.
+    final = run["reviews"][1]
+    for row in (final, final["validation"], final["certificate"], run["stop"]):
+        row["revision"]["round"] = 20
+
+    def at(seq):
+        final["seq"] = run["stop"]["through"] = seq
+        run["attempts"][3].update(seq=seq, round=20)
+        return admit(data)
+
+    # Rounds 2 to 19 each need a completed REVIEW launch between FIX 3 and round 20.
+    for seq in (5, 21):
+        with pytest.raises(InvalidEvidence, match="too few unrecorded ordinals"):
+            at(seq)
+    _, _, runs = at(22)
+    assert not runs[0].complete_window() and not runs[0].complete_reviews()
+    assert score.outcome(runs[0]).evidence == "certified"
+
+
+@pytest.mark.parametrize(
+    ("launches", "error"),
+    [
+        # Created at ordinal 0: rounds 1 and 2 complete before round 3 runs.
+        ([(2, "REVIEW", 3, "failed")], "too few unrecorded"),
+        ([(3, "REVIEW", 3, "failed")], None),
+        # A FIX follows a completed REVIEW of its round, here of round 2.
+        ([(1, "ANALYZE_EXECUTE"), (3, "FIX", 2, "failed")], "too few unrecorded"),
+        ([(1, "ANALYZE_EXECUTE"), (4, "FIX", 2, "failed")], None),
+        # The count falls only by a replan, right after a completed REVIEW.
+        ([(2, "REVIEW", 1), (3, "FIX", 1, "failed"), (5, "REVIEW", 1, "failed")], "too few"),
+        ([(2, "REVIEW", 1), (3, "FIX", 1, "failed"), (6, "REVIEW", 1, "failed")], None),
+        ([(2, "REVIEW", 1), (3, "REVIEW", 2), (5, "REVIEW", 1, "failed")], None),
+        ([(1, "ANALYZE_EXECUTE"), (3, "ANALYZE_EXECUTE")], None),
+        ([(2, "REVIEW", 1, "failed"), (9, "ANALYZE_EXECUTE")], "no other launch"),
+    ],
+)
+def test_gaps_hold_the_launches_the_controller_needs(launches, error):
+    a = case("a")
+    rows = [attempt(seq, *row) for seq, *row in launches]
+    data = study([a], [runner(a, attempts=rows)])
+    if error is None:
+        admit(data)
+    else:
+        with pytest.raises(InvalidEvidence, match=error):
+            admit(data)
+
+
+def test_only_a_creation_receipt_anchors_ordinal_zero():
+    a = case("a")
+    run = runner(a, attempts=[attempt(2, "REVIEW", 3, "failed")])
+    with pytest.raises(InvalidEvidence, match="too few unrecorded"):
+        admit(study([a], [run]))
+    del run["start"]  # Without one, the count before the first record is unknown.
+    admit(study([a], [run]))
+
+
 @pytest.mark.parametrize(
     ("launches", "error"),
     [
         ([("FIX", 1, "failed"), ("FIX", 1)], None),  # A retried, then held, FIX.
+        ([("FIX", 1), ("FIX", 1)], None),  # Held unpublished, then unblocked into FIX.
         ([("REVIEW", 2, "refused"), ("REVIEW", 2)], None),  # A re-review, corrected.
         ([("REPLAN_REEXECUTE", 1), ("REVIEW", 1, "failed")], None),  # A replacement's round 1.
         ([("REVIEW", 1, "failed")], "completed-round count"),  # Round 1 is complete.
@@ -460,7 +548,8 @@ def test_duplicate_bounds_only_allow_confirmations_supported_by_the_frozen_candi
     for c in (a, b):
         cand = c["snapshots"][-1]["sha"]
         r = review(c, cand, 1, 2, findings=[finding(f"F{i}", cand, "unknown") for i in range(3)])
-        runs.append(runner(c, reviews=[r]))
+        # The stop closes each record at its review: no other review was completed.
+        runs.append(runner(c, reviews=[r], stop=stop(r, phase="BLOCKED", outcome="not_issued")))
     _, cases, accepted = admit(study([a, b], runs))
     ac, bc = (score.observations(r, cases[r.case]) for r in accepted)
     assert bc.duplicates == (0, 0, 0, 0) and not bc.groups
@@ -665,6 +754,103 @@ def test_refused_clean_reply_cannot_become_a_completed_round_of_any_disposition(
     # The refused launch consumed no round, so the corrected reply is not round 2.
     with pytest.raises(InvalidEvidence, match="completed-round count"):
         admit(record(2, 3, True, **corrected))
+
+
+def test_a_missing_review_row_cannot_turn_a_false_alarm_into_a_true_negative():
+    a = case("a", clean=True)
+    cand = a["snapshots"][-1]["sha"]
+    alarm = review(a, cand, 1, 2, findings=[finding("F1", cand, "false")])
+    clean = review(a, cand, 2, 4, validation="passed", certificate="cert")
+    new = runner(
+        a,
+        "treatment",
+        reviews=[alarm, clean],
+        stop=stop(clean),
+        attempts=[
+            attempt(1, "ANALYZE_EXECUTE"),
+            attempt(2, "REVIEW", 1),
+            attempt(3, "FIX", 1),  # Resolved without a commit.
+            attempt(4, "REVIEW", 2),
+        ],
+    )
+    data = study([a], [certified(a), new], mode="recorded")
+    result = score.report(data)
+    assert result["arms"]["treatment"]["rates"]["clean_negative_fpr"]["point"] == 1
+    assert (result["decision"], result["reason"]) == ("NO_GO", "clean_negative_fpr beyond margin")
+    # Only the round-1 row is lost: every launch and the bound stop remain.
+    del new["reviews"][0]
+    result = score.report(data)
+    run = result["runs"][new["id"]]
+    assert run["complete_launch_window"] and not run["complete_review_record"]
+    assert (run["evidence"], run["validated_success"]) == ("certified", True)
+    # Round 1 completed, so its review is missing; the clean round 2 does
+    # not show that it raised no false alarm.
+    assert result["arms"]["treatment"]["rates"]["clean_negative_fpr"] == {
+        "point": None,
+        "low": 0,
+        "high": 1,
+        "usable": False,
+    }
+    assert result["decision"] == "INCONCLUSIVE"
+    # A recorded false alarm stands, but rates over a missing review have no bounds.
+    new["reviews"] = [alarm]
+    result = score.report(data)
+    _, cases, [_, admitted] = admit(data)
+    assert score.observations(admitted, cases["a"]).negative == (1, 0, 0)
+    rates = result["arms"]["treatment"]["rates"]
+    assert rates["clean_negative_fpr"]["point"] == 1
+    assert rates["precision"] == {"point": None, "low": None, "high": None, "usable": False}
+    assert (result["decision"], result["reason"]) == ("NO_GO", "clean_negative_fpr beyond margin")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "complete", "window"),
+    [
+        ("as-recorded", True, True),
+        ("no-first-launch-row", True, False),  # No review is missing before the last row.
+        ("failed-review-after", True, True),
+        ("skipped-row", False, True),
+        ("skipped-row-and-launch", False, False),  # The round progression alone shows it.
+        ("unknown-review-after", False, True),
+        ("unrecorded-ordinal-after", False, False),
+        ("unknown-disposition", False, True),
+        ("no-stop", False, False),
+        ("launch-past-stop", False, False),
+    ],
+)
+def test_review_record_holds_every_review_the_run_may_have_completed(mutation, complete, window):
+    a = case("a", clean=True)
+    cand = a["snapshots"][-1]["sha"]
+    first = review(a, cand, 1, 2, validation="passed")  # Clean, and blocked uncertified.
+    last = review(a, cand, 2, 3, validation="passed", certificate="cert")
+    run = runner(
+        a,
+        reviews=[first, last],
+        stop=stop(last),
+        attempts=[attempt(1, "ANALYZE_EXECUTE"), attempt(2, "REVIEW", 1), attempt(3, "REVIEW", 2)],
+    )
+    if mutation == "no-first-launch-row":
+        del run["attempts"][0]
+    elif mutation in ("failed-review-after", "unknown-review-after"):
+        run["attempts"].append(attempt(4, "REVIEW", 3, mutation.split("-")[0]))
+        run["stop"]["through"] = 4
+    elif mutation.startswith("skipped-row"):
+        del run["reviews"][0]
+        if mutation.endswith("launch"):
+            del run["attempts"][1]
+    elif mutation == "unrecorded-ordinal-after":
+        run["stop"]["through"] = 4
+    elif mutation == "unknown-disposition":
+        first["disposition"] = "unknown"
+    elif mutation == "no-stop":
+        del run["stop"]
+    elif mutation == "launch-past-stop":
+        run["attempts"].append(attempt(4, "REVIEW", 3, "failed"))
+    _, cases, [admitted] = admit(study([a], [run]))
+    assert admitted.complete_reviews() == complete
+    assert admitted.complete_window() == window  # A separate question: usage.
+    expected = (0, 1, 0) if complete else (0, 0, 1)
+    assert score.observations(admitted, cases["a"]).negative == expected
 
 
 def test_wrong_round_or_candidate_receipt_is_refused():
