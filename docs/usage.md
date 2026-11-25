@@ -2615,7 +2615,8 @@ very commit a validation record of the run names, that record proves its
 base: the controller validates a candidate only after proving it descends
 from that base, so a retry on a failed commit is shown its failure however
 many commits it holds. Any other base is proved by reading each commit
-from the candidate down as its own bytes, re-hashed, at most 64 of them.
+from the candidate down as its own bytes, re-hashed, at most 64 of them,
+all through one git process.
 A base neither proves is not proved, and a record bound to it is left
 out. The controller never reads the file back. The launch's run log
 records what it was shown in `request.json`'s `metadata.memory`: the

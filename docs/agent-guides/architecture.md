@@ -412,7 +412,10 @@ executor's spawn, environment selection, pipe draining and group kill, and
 it is held to the same contract:
 
 - stdout is split into records on LF (0x0A) only, one trailing CR stripped
-  per record; U+2028/U+2029, NUL and every other byte are record content.
+  per record unless the request keeps it (`strip_cr=False`: the git
+  transport's `LocalCommitReader` joins the records of `git cat-file
+  --batch` back into an object's exact bytes, #541); U+2028/U+2029, NUL and
+  every other byte are record content.
   Records are bytes and decoding them is the caller's. A record over
   `max_record_bytes` is reported as `Oversize` and dropped through its LF;
   the `Oversize` carries the record's first `OVERSIZE_HEAD_BYTES` bytes

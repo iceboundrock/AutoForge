@@ -46,6 +46,7 @@ from pathlib import Path
 import pytest
 
 import autoforge
+from autoforge import git_transport as git_transport_module
 from autoforge.agent_worktree import read_candidate
 from autoforge.auto_recovery import StepKey
 from autoforge.config import MemoryConfig, default_config
@@ -59,6 +60,7 @@ from autoforge.errors import (
 )
 from autoforge.evidence import MAX_FAILURE_COUNT, WorktreeProvenance, parse_record
 from autoforge.executor import execute
+from autoforge.executor_duplex import start_duplex
 from autoforge.git_transport import GitRemote, GitTransport
 from autoforge.memory import (
     MAX_FACTS,
@@ -1096,33 +1098,79 @@ def test_an_ancestry_walk_at_its_bound_costs_far_less_cpu_than_the_ceiling(tmp_p
     """ADR 0015 D12 holds Memory's work before a launch to the evaluation's
     1,000 ms ceiling, the ancestry walk included (R3-F1 of PR #536). Its
     worst case is a base it cannot prove: MAX_ANCESTRY_COMMITS real commits
-    read, each by one git process, and nothing proved. The cost is the CPU
-    time of this process and of the processes it waited for, never a wall
-    time, which other workers on the host stretch (tests/AGENTS.md)."""
+    read and nothing proved. They are read as the engine reads them, through
+    one git process (:class:`~autoforge.git_transport.LocalCommitReader`,
+    #541), never one per commit, which cost the hosted macOS runners 1.2 to
+    1.3 s. The cost is the CPU time of this process and of the
+    processes it waited for, the reader's own counted once it has ended,
+    never a wall time, which other workers on the host stretch
+    (tests/AGENTS.md)."""
     root = git_repo(tmp_path / "repo")
     base = git_out("-C", str(root), "rev-parse", "HEAD")
     tree = git_out("-C", str(root), "rev-parse", f"{base}^{{tree}}")
     tip = base
     for n in range(MAX_ANCESTRY_COMMITS + 1):
         tip = git_out("-C", str(root), *GIT_IDENT, "commit-tree", tree, "-p", tip, "-m", f"{n}")
+    sessions: list = []
+
+    def session(request):
+        sessions.append(request)
+        return start_duplex(request)
+
     transport = GitTransport(
         object_directory=root / ".git" / "objects",
         remote=GitRemote.https(REPO),
         in_base_history=lambda base, sha: pytest.fail("the walk asked GitHub"),
         git_lock=lambda operation: pytest.fail("the walk fetched"),
+        runner=lambda request: pytest.fail("the walk started a process per commit"),
+        duplex=session,
     )
-
-    def read(sha):
-        record = transport.read_local_commit(sha)
-        return None if record is None else record.parents
-
     started = os.times()
-    proved = local_ancestors(tip, [base], read)
+    with transport.local_commit_reader() as reader:
+
+        def read(sha):
+            record = reader.read_local_commit(sha)
+            return None if record is None else record.parents
+
+        proved = local_ancestors(tip, [base], read)
     ended = os.times()
     fields = ("user", "system", "children_user", "children_system")
     cpu_ms = sum(getattr(ended, f) - getattr(started, f) for f in fields) * 1000.0
     assert proved == ((), MAX_ANCESTRY_COMMITS)
+    assert len(sessions) == 1
     assert cpu_ms < 1000.0
+
+
+def test_the_engines_walk_reads_through_one_git_process_ended_with_the_projection(
+    tmp_state_dir, pi_home, monkeypatch
+):
+    """#541: the engine's projection walks through one git process of its
+    own (:meth:`_memory_reader`), started on the walk's first read and ended
+    before the projection is returned, never a process per commit read. C1
+    failed validation; the relaunch starts from C2, committed on it, which no
+    record names, so the walk reads C2 and C1 to prove the base."""
+    gh = FakeGitHub()
+    eng, _ = producing(tmp_state_dir, gh, scripted(implement), FAILS)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    (failed,) = saved(eng).validation_records
+    c1 = failed["candidate"]["commit"]
+    base = failed["candidate"]["provenance"]["base_revision"]
+    work = str(eng.agent_worktree_path())
+    git_out("-C", work, *GIT_IDENT, "commit", "-q", "--allow-empty", "-m", "C2 (#2)")
+    c2 = git_out("-C", work, "rev-parse", "HEAD")
+    children: list = []
+
+    def session(request):
+        children.append(start_duplex(request))
+        return children[-1]
+
+    monkeypatch.setattr(git_transport_module, "start_duplex", session)
+    launch = eng._launch_memory(Phase.ANALYZE_EXECUTE, work)
+    assert launch is not None and launch.request.candidate == c2 != c1
+    assert launch.request.ancestors == (base,) and launch.ancestry_reads == 2
+    (child,) = children
+    assert child.exited() and child.finish().exit_code == 0
+    eng.close()
 
 
 def test_an_observation_is_keyed_by_its_citation_and_passes_are_not_observed():

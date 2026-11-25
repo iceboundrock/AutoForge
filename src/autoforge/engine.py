@@ -437,6 +437,7 @@ from .git_transport import (
     CommitRecord,
     GitRemote,
     GitTransport,
+    LocalCommitReader,
     local_git_request,
     published_range_problem,
     valid_branch_name,
@@ -4928,7 +4929,10 @@ class ControllerEngine:
         :func:`~autoforge.memory_handoff.local_ancestors`), never by asking
         GitHub or fetching (R3-F1, R4-F2): one neither proves is left out,
         so a record bound to it is omitted, never shown as current. The
-        commit read is the launch's input, which keys its proposals (R3-F2);
+        walk reads its commits through one git process
+        (:class:`~autoforge.git_transport.LocalCommitReader`, #541), started
+        on its first read and ended before this returns, however it returns.
+        The commit read is the launch's input, which keys its proposals (R3-F2);
         when none could be read the input is unknown, never the base
         (R4-F3). The whole preparation is timed by :attr:`_memory_clock`,
         from the ledger's reconstruction on (R4-F4). A store that cannot be
@@ -4940,15 +4944,16 @@ class ControllerEngine:
             return None
         entry = self._analyze_entry
         transport = self._memory_transport()
-        return prepare_launch_projection(
-            state.memory,
-            self._memory_step(phase),
-            base=entry.base_sha if entry is not None else "",
-            read_head=lambda: self._memory_candidate(cwd, transport),
-            read_parents=self._memory_parents(transport),
-            validation_records=state.validation_records,
-            clock=self._memory_clock,
-        )
+        with ExitStack() as stack:
+            return prepare_launch_projection(
+                state.memory,
+                self._memory_step(phase),
+                base=entry.base_sha if entry is not None else "",
+                read_head=lambda: self._memory_candidate(cwd, transport),
+                read_parents=self._memory_parents(self._memory_reader(transport, stack)),
+                validation_records=state.validation_records,
+                clock=self._memory_clock,
+            )
 
     def _memory_transport(self) -> Callable[[], GitTransport]:
         """One projection's reader of the shared store, made on its first use (R4-F1 of PR #536).
@@ -4968,16 +4973,39 @@ class ControllerEngine:
 
         return transport
 
+    def _memory_reader(
+        self, transport: Callable[[], GitTransport], stack: ExitStack
+    ) -> Callable[[], LocalCommitReader]:
+        """One projection's walk reader, through one git process, made on its first use (#541).
+
+        ``transport``'s :meth:`~GitTransport.local_commit_reader`, entered on
+        ``stack``, which ends its process when the projection is made or
+        refused. Read a process per commit, a walk at its bound cost the
+        hosted macOS runners 1.2 to 1.3 s of CPU, past ADR 0015 D12's
+        1,000 ms ceiling; each read still answers as
+        :meth:`GitTransport.read_local_commit` does.
+        """
+        made: list[LocalCommitReader] = []
+
+        def reader() -> LocalCommitReader:
+            if not made:
+                made.append(stack.enter_context(transport().local_commit_reader()))
+            return made[0]
+
+        return reader
+
     def _memory_parents(
-        self, transport: Callable[[], GitTransport] | None = None
+        self, transport: Callable[[], GitTransport | LocalCommitReader] | None = None
     ) -> Callable[[str], tuple[str, ...] | None]:
         """A reader of a commit's parents for the projection's ancestry walk (R3-F1 of PR #536).
 
         Each commit is read as its own bytes from the shared store, re-hashed
         and never substituted (:meth:`GitTransport.read_local_commit`): one
         the store does not hold is ``None``, never fetched, and nothing asks
-        GitHub, so Memory adds no network call to a launch. The transport is
-        ``transport``'s (:meth:`_memory_transport`), made on the first read.
+        GitHub, so Memory adds no network call to a launch. The reads are
+        ``transport``'s, made on the first read: the projection's
+        :meth:`_memory_reader`, or by default a transport of its own
+        (:meth:`_memory_transport`), one process per read.
         """
         store = transport or self._memory_transport()
 

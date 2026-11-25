@@ -18,8 +18,10 @@ Guarantees:
   and so is a setup failure after the spawn (the group is killed first and
   nothing taken for the invocation is kept);
 - stdout is split into records on LF (0x0A) **only**, one trailing CR
-  stripped per record; no other byte or Unicode line separator (U+2028,
-  U+2029, NUL, VT, FF, NEL) is a boundary. A record longer than
+  stripped per record unless the request keeps it (``strip_cr=False``, for
+  a caller that reassembles a byte-exact stream from its records, #541);
+  no other byte or Unicode line separator (U+2028, U+2029, NUL, VT, FF,
+  NEL) is a boundary. A record longer than
   ``max_record_bytes`` is reported as :class:`Oversize` with at most its
   first :data:`OVERSIZE_HEAD_BYTES` bytes, so that the caller can tell what
   was dropped, and dropped through its LF; an unterminated fragment at EOF
@@ -146,7 +148,8 @@ class StdoutMode(enum.Enum):
 
 @dataclass(frozen=True)
 class Record:
-    """One complete record: the bytes before an LF, one trailing CR stripped."""
+    """One complete record: the bytes before an LF, one trailing CR stripped
+    unless the request keeps it (:attr:`DuplexRequest.strip_cr`)."""
 
     data: bytes
 
@@ -215,6 +218,9 @@ class DuplexRequest:
     # the limit falls due.
     wind_down_seconds: float = 0.0
     max_record_bytes: int = DEFAULT_MAX_RECORD_BYTES
+    # False: a record is every byte before its LF, a trailing CR included, so
+    # the records joined with LF are exactly what the child wrote (#541).
+    strip_cr: bool = True
     max_pending_records: int = DEFAULT_MAX_PENDING_RECORDS
     max_pending_bytes: int = DEFAULT_MAX_PENDING_BYTES
     max_stderr_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
@@ -290,11 +296,13 @@ class _LineFramer:
     that, the record is reported once as :class:`Oversize`, with its head,
     the moment it crosses the bound and its remaining bytes are counted out
     up to the next LF, so a stream with no LF at all costs the bound, not
-    its length.
+    its length. With ``strip_cr`` False a trailing CR is kept, and counts
+    towards the bound like any other byte.
     """
 
-    def __init__(self, limit: int) -> None:
+    def __init__(self, limit: int, *, strip_cr: bool = True) -> None:
         self._limit = limit
+        self._strip_cr = strip_cr
         self._head = min(OVERSIZE_HEAD_BYTES, limit)
         self._buf = bytearray()
         self._dropping = False
@@ -317,7 +325,7 @@ class _LineFramer:
             else:
                 record = bytes(self._buf)
                 self._buf.clear()
-                if record.endswith(b"\r"):
+                if self._strip_cr and record.endswith(b"\r"):
                     record = record[:-1]
                 if len(record) > self._limit:
                     out.append(Oversize(self._limit, record[: self._head]))
@@ -456,9 +464,11 @@ class _RecordReader(_PipeDrain):
         max_record_bytes: int,
         queue: _RecordQueue,
         activity: _Limits | None = None,
+        *,
+        strip_cr: bool = True,
     ) -> None:
         super().__init__(stream, "stdout", activity)
-        self.framer = _LineFramer(max_record_bytes)
+        self.framer = _LineFramer(max_record_bytes, strip_cr=strip_cr)
         self._queue = queue
 
     def _feed(self, chunk: bytes) -> None:
@@ -651,7 +661,11 @@ class DuplexChild:
         if req.stdout_mode is StdoutMode.RECORDS:
             self._queue = _RecordQueue(req.max_pending_records, req.max_pending_bytes)
             stdout_reader = _RecordReader(
-                proc.stdout, req.max_record_bytes, self._queue, self._limits
+                proc.stdout,
+                req.max_record_bytes,
+                self._queue,
+                self._limits,
+                strip_cr=req.strip_cr,
             )
         else:
             self._capture = _BoundedReader(

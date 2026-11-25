@@ -1468,7 +1468,11 @@ the marker first and launches no agent.
   explicit URL derived from the verified repository identity, never
   `origin`, and the credential comes from `gh auth git-credential`, never
   from argv, a URL, a log or state. A commit is read back as its own bytes
-  (re-hashed). Fetches write objects only and create or move no ref. The
+  (re-hashed). Many local reads in a row (Memory's ancestry walk) go
+  through one `git cat-file --batch` process in such a directory
+  (`LocalCommitReader`, #541), each reply re-hashed the same way; a reply
+  it cannot give byte for byte ends it, and the reads go on one process
+  each. Fetches write objects only and create or move no ref. The
   pre-merge evidence fetch runs on it, and every git process goes through
   the executor.
 - **Every controller `gh` process** (`github.gh_workdir`,

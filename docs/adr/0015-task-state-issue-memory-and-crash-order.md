@@ -1725,8 +1725,11 @@ base the controller proved; so a retry on a failed commit is shown its
 failure however long its history (R4-F2). Any other base is proved by a
 breadth-first walk from the candidate through commits read as their own
 bytes and re-hashed, at most 64 of them; a base neither proves is not
-proved and its record is omitted. `HEAD` is read through the admin dir the
-registry binds and the common dir, never through the worktree's `.git`
+proved and its record is omitted. The walk reads them all through one git
+process (#541): with a process per commit, a walk at its bound cost the
+hosted macOS runners 1.2 to 1.3 s of CPU, past D12's 1,000 ms ceiling.
+`HEAD` is read through the admin dir the registry binds and the common
+dir, never through the worktree's `.git`
 file, which an earlier launch of the step can rewrite before a correction
 or a retry, and only its id is read there: the commit is read from the
 shared store's objects through the controller's private git directory,

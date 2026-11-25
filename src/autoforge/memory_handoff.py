@@ -102,11 +102,11 @@ UNSUPPORTED_PHASES: dict[Phase, str] = {
 MAX_PROPOSALS = 8
 # The most commits a projection's ancestry walk reads (:func:`local_ancestors`,
 # R3-F1 of PR #536). A candidate is the base plus the commits the step's
-# launches made on it, a handful; each read is one local git process, so the
-# bound is also what bounds the walk's share of a launch's latency. A base
-# further below is not proved by the walk, and a record bound to it is
-# omitted, but on the very commit a retained validation record names it is
-# proved by that record, with no walk (R4-F2).
+# launches made on it, a handful; the engine reads them all through one local
+# git process (#541), so the bound is also what bounds the walk's share of a
+# launch's latency. A base further below is not proved by the walk, and a
+# record bound to it is omitted, but on the very commit a retained validation
+# record names it is proved by that record, with no walk (R4-F2).
 MAX_ANCESTRY_COMMITS = 64
 # What an agent may add: the kinds that are neither the controller's
 # observations nor the operator's seed, and need no exact candidate.

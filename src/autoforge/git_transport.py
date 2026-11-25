@@ -45,6 +45,9 @@ steering it.
   history, so nothing below the range is read and a rewritten ancestor of
   the base cannot shrink it. Every failure fails closed with
   :class:`GitTransportError`; nothing is ever read as "allowed".
+  :class:`LocalCommitReader` reads many local commits the same way through
+  one ``git cat-file --batch`` process instead of one process per commit
+  (#541).
 - **Pushes are compare-and-swap fast-forwards only (D6.1-D6.3).** An exact
   SHA to an exact ``refs/heads/<branch>``, never the default branch, with a
   lease on the expected old value ("absent" or a full SHA) and the
@@ -74,13 +77,15 @@ import shutil
 import tempfile
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from types import TracebackType
 
 from .errors import ExecutionError, GitLockTimeout, GitTransportError, LockError
-from .executor import ExecutionRequest, ExecutionResult, execute
+from .executor import DEFAULT_MAX_OUTPUT_BYTES, ExecutionRequest, ExecutionResult, execute
+from .executor_duplex import DuplexChild, DuplexRequest, Record, start_duplex
 from .redaction import redact
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
@@ -95,6 +100,14 @@ MAX_RANGE_COMMITS = 1000
 # A network operation may move a large pack; a local object read is small.
 NETWORK_TIMEOUT_SECONDS = 600
 LOCAL_TIMEOUT_SECONDS = 120
+
+# What one reply of a :class:`LocalCommitReader`'s git process may hold: the
+# object's size, the single read's capture bound, and how many of its lines,
+# each a record of the process's framed stdout, may wait to be read. A reply
+# past either is read by a process of its own instead, under that read's own
+# bound (#541).
+MAX_READER_OBJECT_BYTES = DEFAULT_MAX_OUTPUT_BYTES
+MAX_READER_LINES = 65536
 
 # Hooks and the file-system monitor are off at command-line precedence for
 # every controller git process (D7.3); replacement objects and the
@@ -426,7 +439,9 @@ class GitTransport:
     ``git_lock(operation)`` returns the shared-Git lock (L1) of the store's
     common dir, a context manager :meth:`fetch` holds around its git
     process (ADR 0008 D12.1); it is required, so no transport fetches
-    without it.
+    without it. ``runner`` runs every one-shot process and ``duplex``
+    starts the one process of a :class:`LocalCommitReader`; both default to
+    the executor's.
     """
 
     def __init__(
@@ -440,6 +455,7 @@ class GitTransport:
         runner: Runner | None = None,
         max_range_commits: int = MAX_RANGE_COMMITS,
         object_format: str = "sha1",
+        duplex: Callable[[DuplexRequest], DuplexChild] | None = None,
     ) -> None:
         if max_range_commits < 1:
             raise GitTransportError(f"max_range_commits must be >= 1, got {max_range_commits}")
@@ -451,6 +467,7 @@ class GitTransport:
         self._in_base_history = in_base_history
         self._git_lock = git_lock
         self._runner: Runner = runner or execute
+        self._duplex: Callable[[DuplexRequest], DuplexChild] = duplex or start_duplex
         self._max_range_commits = max_range_commits
         self._default_format = object_format
 
@@ -675,10 +692,7 @@ class GitTransport:
         if _hash_commit(raw, _object_format(sha)) != sha:
             if lossy:
                 raise GitTransportError(_lossy(sha))
-            raise GitTransportError(
-                f"commit {sha}: the stored bytes do not hash to its id (a rewritten or "
-                "substituted object); it is not used"
-            )
+            raise GitTransportError(_substituted(sha))
         return _parse_commit(sha, raw)
 
     def read_local_commit(self, sha: str) -> CommitRecord | None:
@@ -689,6 +703,14 @@ class GitTransport:
         """
         _object_format(sha)
         return self._read_once(sha)
+
+    def local_commit_reader(self) -> LocalCommitReader:
+        """A reader of many local commits through one git process, for a ``with`` block (#541).
+
+        Each read answers as :meth:`read_local_commit` does; see
+        :class:`LocalCommitReader`. Nothing is started until its first read.
+        """
+        return LocalCommitReader(self, self._duplex)
 
     def read_commit(self, sha: str) -> CommitRecord:
         """Read ``sha`` as its own bytes: re-hashed, parsed, never substituted.
@@ -864,6 +886,178 @@ class GitTransport:
         return result(outcome, detail)
 
 
+class _ReplyLost(Exception):
+    """A reader's git process cannot give this reply exactly; a single read will."""
+
+
+class LocalCommitReader:
+    """Many local commit reads through one ``git cat-file --batch`` process (#541).
+
+    :meth:`read_local_commit` answers as
+    :meth:`GitTransport.read_local_commit` does, one commit at a time in
+    the order asked: the commit as its own bytes from the shared store,
+    re-hashed in its object format and parsed, or ``None`` when the store
+    does not hold it; never fetched and never substituted. The process
+    runs in a private git directory of its own, with every switch, setting
+    and environment of a single read (:meth:`GitTransport._request`), so
+    no promisor remote, replacement object, commit-graph, graft or shallow
+    file reaches it that a single read would not see. What differs is the
+    cost: a single read starts a process per commit, and Memory's ancestry
+    walk of up to 64 commits before a launch, read that way, cost the hosted
+    macOS runners 1.2 to 1.3 s of CPU, past ADR 0015 D12's 1,000 ms ceiling,
+    where starting a process costs far more than on Linux.
+
+    The process starts on the first read, in that SHA's object format; a
+    SHA of the other format is a single read. Its stdout is framed into
+    records that keep every byte (``strip_cr=False``), so the commit hashed
+    is exactly what git wrote: unlike the single read, which captures text,
+    a commit that is not valid UTF-8 is authenticated too. A reply the
+    process cannot give exactly, whatever the reason (a malformed header,
+    an object past :data:`MAX_READER_OBJECT_BYTES`, more of its lines
+    waiting than :data:`MAX_READER_LINES`, a line past the record bound,
+    the process exiting or reaching its time limit, a spawn or a write that
+    fails), ends the process, and that read and every later one is a single
+    read, with that read's guarantees and refusals. A missing commit is a reply,
+    ``None``; a commit whose bytes do not hash to its id and an object that
+    is no commit raise :class:`GitTransportError` as a single read does,
+    and the process goes on to the next read.
+
+    The process is ended, and its private directory removed, when the
+    ``with`` block ends, however it ends; a closed reader refuses to read.
+    Nothing it served depends on how the process ended, so ending it
+    raises no :class:`ExecutionError`.
+    """
+
+    def __init__(
+        self, transport: GitTransport, start: Callable[[DuplexRequest], DuplexChild]
+    ) -> None:
+        self._transport = transport
+        self._start = start
+        self._dirs = ExitStack()
+        self._child: DuplexChild | None = None
+        self._format = ""
+        self._lost = False
+        self._closed = False
+
+    def __enter__(self) -> LocalCommitReader:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._closed = True
+        self._end(kill=exc_type is not None)
+
+    def close(self) -> None:
+        """End the process, if one runs, and refuse every later read. Idempotent."""
+        self.__exit__(None, None, None)
+
+    def read_local_commit(self, sha: str) -> CommitRecord | None:
+        """``sha`` as its own bytes when the shared store holds it; never fetched."""
+        object_format = _object_format(sha)
+        if self._closed:
+            raise GitTransportError(f"reading commit {sha}: the local commit reader is closed")
+        child = self._session(object_format)
+        if child is None:
+            return self._transport.read_local_commit(sha)
+        try:
+            reply = _reply(child, sha)
+        except _ReplyLost:
+            self._lost = True
+            self._end(kill=True)
+            return self._transport.read_local_commit(sha)
+        if reply is None:
+            return None
+        kind, raw = reply
+        if kind != "commit":
+            raise GitTransportError(f"object {sha} is a {kind}, not a commit")
+        if _hash_commit(raw, object_format) != sha:
+            raise GitTransportError(_substituted(sha))
+        return _parse_commit(sha, raw)
+
+    def _session(self, object_format: str) -> DuplexChild | None:
+        """The running process for a SHA of ``object_format``, started on first use;
+        None when the read is a single read."""
+        if self._lost:
+            return None
+        if self._child is not None:
+            return self._child if object_format == self._format else None
+        try:
+            git_dir = self._dirs.enter_context(self._transport._git_dir(object_format))
+            request = self._transport._request(git_dir, ["cat-file", "--batch"], gh_path=None)
+            self._child = self._start(
+                DuplexRequest(
+                    command=list(request.command),
+                    cwd=request.cwd,
+                    env=request.env,
+                    env_allowlist=request.env_allowlist,
+                    max_runtime_seconds=LOCAL_TIMEOUT_SECONDS,
+                    strip_cr=False,
+                    max_pending_records=MAX_READER_LINES,
+                )
+            )
+        except (ExecutionError, GitTransportError):
+            self._lost = True
+            self._end(kill=True)
+            return None
+        self._format = object_format
+        return self._child
+
+    def _end(self, *, kill: bool) -> None:
+        """End the process (at once with ``kill``, else on stdin EOF), remove its directory."""
+        child, self._child = self._child, None
+        try:
+            if child is not None:
+                if kill:
+                    child.stop()
+                child.finish()
+        except ExecutionError:
+            pass  # torn down whatever it reports; every reply stood on its own hash
+        finally:
+            self._dirs.close()
+
+
+def _reply(child: DuplexChild, sha: str) -> tuple[str, bytes] | None:
+    """``sha``'s object type and bytes from a ``git cat-file --batch`` process; None
+    when the store does not hold it. :class:`_ReplyLost` when no exact reply came."""
+    name = sha.encode("ascii")
+    try:
+        child.send_line(name)
+        header = _reply_line(child)
+        if header == name + b" missing":
+            return None
+        parts = header.split(b" ")
+        if len(parts) != 3 or parts[0] != name or not parts[2].isdigit():
+            raise _ReplyLost
+        size = int(parts[2])
+        if size > MAX_READER_OBJECT_BYTES:
+            raise _ReplyLost
+        # The object's bytes and the LF after them: their lines, joined
+        # again by the LFs the framing took, are exactly the object.
+        lines: list[bytes] = []
+        left = size + 1
+        while left > 0:
+            line = _reply_line(child)
+            lines.append(line)
+            left -= len(line) + 1
+        if left != 0:
+            raise _ReplyLost
+    except ExecutionError as exc:
+        raise _ReplyLost from exc
+    return parts[1].decode("ascii", errors="replace"), b"\n".join(lines)
+
+
+def _reply_line(child: DuplexChild) -> bytes:
+    """The next line of the reply; anything but a whole line is no exact reply."""
+    item = child.read_line()
+    if not isinstance(item, Record):
+        raise _ReplyLost
+    return item.data
+
+
 def _private_config(object_format: str) -> str:
     """The whole configuration of a private git directory."""
     lines = [
@@ -888,6 +1082,13 @@ def _hash_commit(raw: bytes, object_format: str) -> str:
     """The object id of a commit with content ``raw``."""
     algorithm = hashlib.sha256 if object_format == "sha256" else hashlib.sha1
     return algorithm(b"commit %d\0" % len(raw) + raw).hexdigest()
+
+
+def _substituted(sha: str) -> str:
+    return (
+        f"commit {sha}: the stored bytes do not hash to its id (a rewritten or "
+        "substituted object); it is not used"
+    )
 
 
 def _lossy(sha: str) -> str:

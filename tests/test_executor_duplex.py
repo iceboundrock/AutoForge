@@ -134,6 +134,26 @@ def test_crlf_endings_strip_exactly_one_cr():
     assert got == [Record(b"one"), Record(b"two\r"), Record(b""), Record(b"bare\rcr"), Eof()]
 
 
+def test_records_keep_every_cr_when_the_request_says_so():
+    """#541: with ``strip_cr=False`` a record is every byte before its LF, so
+    the records joined by LF are exactly the stream the child wrote, as the
+    git transport's reader of ``git cat-file --batch`` needs to hash an
+    object's bytes. A kept CR counts towards the record bound like any other
+    byte; the default still strips one."""
+    stream = b"one\r\ntwo\r\r\n\r\nbare\rcr\n"
+    got = _records_until_eof([stream], strip_cr=False)
+    assert got == [Record(b"one\r"), Record(b"two\r\r"), Record(b"\r"), Record(b"bare\rcr"), Eof()]
+    assert b"".join(record.data + b"\n" for record in got[:-1]) == stream
+    limit = 4
+    kept = _LineFramer(limit, strip_cr=False)
+    assert kept.feed(b"abcd\nabc\r\nabcd\r\n") == [
+        Record(b"abcd"),
+        Record(b"abc\r"),
+        Oversize(limit, b"abcd"),
+    ]
+    assert _LineFramer(limit).feed(b"abcd\r\n") == [Record(b"abcd")]
+
+
 def test_unicode_line_separators_and_nul_are_not_boundaries():
     """U+2028/U+2029, NEL, VT, FF, the C0 separators and NUL all survive inside
     one record; only LF ends it (Pi's RPC framing, ADR 0003 §2.8)."""

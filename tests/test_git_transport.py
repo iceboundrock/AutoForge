@@ -13,6 +13,7 @@ the controller's environment on purpose.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 import shutil
@@ -26,10 +27,13 @@ from pathlib import Path
 
 import pytest
 
+from autoforge import git_transport as git_transport_module
 from autoforge.errors import ExecutionError, GitHubUnavailableError, GitTransportError
 from autoforge.executor import ExecutionRequest, ExecutionResult, execute
+from autoforge.executor_duplex import DuplexChild, DuplexRequest, start_duplex
 from autoforge.git_transport import (
     LOCAL_GIT_ENV_ALLOWLIST,
+    LOCAL_TIMEOUT_SECONDS,
     MAX_RANGE_COMMITS,
     NETWORK_GIT_ENV_ALLOWLIST,
     CommitRecord,
@@ -525,6 +529,268 @@ def test_a_missing_commit_is_missing_even_when_the_commit_graph_lists_it(world):
     assert git_ok("-C", str(world.shared), "rev-list", "-1", sha)  # the graph answers for it
 
     assert not world.transport().has_commit(sha)
+
+
+# -- many local reads through one git process (#541) ----------------------------------------
+@dataclass
+class Sessions:
+    """A :class:`LocalCommitReader` process starter that keeps each request and child."""
+
+    requests: list[DuplexRequest] = field(default_factory=list)
+    children: list[DuplexChild] = field(default_factory=list)
+
+    def __call__(self, request: DuplexRequest) -> DuplexChild:
+        self.requests.append(request)
+        child = start_duplex(request)
+        self.children.append(child)
+        return child
+
+
+def test_a_local_commit_reader_answers_as_single_reads_through_one_process(world):
+    """Every read answers as :meth:`GitTransport.read_local_commit` does (a
+    merge, a root, messages with CRs and blank lines, a commit the store does
+    not hold although a replacement names it) through one git process,
+    started on the first read and ended with the ``with`` block: no single
+    read, no fetch, and no private directory left."""
+    root = world.commit("root")
+    side = world.commit("side\r\n\r\nends in CR\r", root)
+    merge = world.g(
+        "commit-tree", world.tree(), "-p", root, "-p", side, "-m", "subject", "-m", "body\r"
+    )
+    gone = world.commit("dropped", merge)
+    world.drop(gone)
+    world.g("update-ref", f"refs/replace/{gone}", root)
+    shas = [merge, side, root, gone, merge]
+    sessions = Sessions()
+    transport = world.transport(duplex=sessions)
+    with transport.local_commit_reader() as reader:
+        assert sessions.requests == [] and private_leftovers(world) == []
+        got = [reader.read_local_commit(sha) for sha in shas]
+        assert len(private_leftovers(world)) == 1  # the process's directory, while it runs
+    assert world.requests == []
+    (child,) = sessions.children
+    assert child.exited() and child.finish().exit_code == 0
+    assert private_leftovers(world) == []
+    assert got == [transport.read_local_commit(sha) for sha in shas]
+    assert got[0] is not None and got[0].parents == (root, side)
+    assert got[1] is not None and "\r" in got[1].message
+    assert got[3] is None
+
+
+def test_a_reader_authenticates_a_commit_a_single_read_cannot_capture(world):
+    """The reader hashes the bytes git wrote, not a text capture, so a commit
+    that is not valid UTF-8 is read as its own bytes, where the single read
+    refuses it for want of them."""
+    tree = world.tree()
+    content = (
+        f"tree {tree}\nauthor t <t@example.com> 0 +0000\n"
+        "committer t <t@example.com> 0 +0000\nencoding ISO-8859-1\n\n"
+    ).encode() + b"caf\xe9\n"
+    sha = _literal_commit(world, content)
+    with world.transport().local_commit_reader() as reader:
+        record = reader.read_local_commit(sha)
+    assert record is not None and (record.sha, record.tree, record.parents) == (sha, tree, ())
+    with pytest.raises(GitTransportError, match="not valid UTF-8"):
+        world.transport().read_local_commit(sha)
+
+
+def test_a_reader_refuses_what_a_single_read_refuses_and_its_process_reads_on(world):
+    """A rewritten commit, an object that is no commit (a blob holding CRs, LFs
+    and a NUL, a tree) and a malformed commit raise as a single read does, and
+    the same process serves the next read; a malformed SHA is refused before
+    anything is read."""
+    good = world.commit("good")
+    rewritten = world.commit("original message")
+    write_loose(
+        world.objects, rewritten, "commit", world.raw(rewritten).replace(b"original", b"forged")
+    )
+    blob = world.g("hash-object", "-w", "--stdin", input=b"data\r\n\x00\n\n")
+    tree = world.tree({"a.txt": "a\n"})
+    malformed = _literal_commit(world, b"author t <t@e> 0 +0000\n\nno tree\n")
+    sessions = Sessions()
+    with world.transport(duplex=sessions).local_commit_reader() as reader:
+        for sha, reason in (
+            (rewritten, "do not hash"),
+            (blob, "is a blob"),
+            (tree, "is a tree"),
+            (malformed, "tree line"),
+        ):
+            with pytest.raises(GitTransportError, match=reason):
+                reader.read_local_commit(sha)
+            record = reader.read_local_commit(good)
+            assert record is not None and record.message == "good\n"
+        with pytest.raises(GitTransportError, match="not a full"):
+            reader.read_local_commit("A" * 40)
+    assert len(sessions.children) == 1 and world.requests == []
+
+
+def test_a_reply_the_process_cannot_give_exactly_ends_it_and_single_reads_go_on(world, monkeypatch):
+    """An object past the reader's bound, lowered here so that one commit's
+    message passes it, is no exact reply: the process is ended at once, and
+    that read and every later one is a single read, with its answer."""
+    monkeypatch.setattr(git_transport_module, "MAX_READER_OBJECT_BYTES", 400)
+    small = world.commit("small")
+    large = world.commit("large " + "x" * 500, small)
+    after = world.commit("after", large)
+    sessions = Sessions()
+    with world.transport(duplex=sessions).local_commit_reader() as reader:
+        first = reader.read_local_commit(after)
+        assert first is not None and first.parents == (large,) and world.requests == []
+        second = reader.read_local_commit(large)
+        assert second is not None and second.parents == (small,)
+        (child,) = sessions.children
+        assert child.exited()
+        third = reader.read_local_commit(small)
+        assert third is not None and third.parents == ()
+    assert [len(world.reads_of(sha)) for sha in (after, large, small)] == [0, 1, 1]
+    assert len(sessions.children) == 1 and private_leftovers(world) == []
+
+
+def test_a_reader_whose_process_cannot_start_reads_each_commit_singly(world):
+    one = world.commit("one")
+    two = world.commit("two", one)
+    refusals: list[str] = []
+
+    def refused(request: DuplexRequest) -> DuplexChild:
+        assert Path(request.env["GIT_DIR"]).is_dir()
+        refusals.append(request.env["GIT_DIR"])
+        raise ExecutionError("spawn failed")
+
+    with world.transport(duplex=refused).local_commit_reader() as reader:
+        read = [reader.read_local_commit(sha) for sha in (two, one)]
+    assert [r.parents for r in read if r is not None] == [(one,), ()]
+    assert len(refusals) == 1
+    assert [len(world.reads_of(sha)) for sha in (two, one)] == [1, 1]
+    assert private_leftovers(world) == []
+
+
+def test_a_reader_starts_nothing_unread_ends_its_process_on_an_error_and_refuses_once_closed(
+    world,
+):
+    sha = world.commit("one")
+    sessions = Sessions()
+    reader = world.transport(duplex=sessions).local_commit_reader()
+    with reader:
+        pass
+    assert sessions.requests == [] and private_leftovers(world) == []
+    with pytest.raises(GitTransportError, match="closed"):
+        reader.read_local_commit(sha)
+    reader.close()
+    with pytest.raises(RuntimeError, match="interrupted"):
+        with world.transport(duplex=sessions).local_commit_reader() as reader:
+            assert reader.read_local_commit(sha) is not None
+            raise RuntimeError("interrupted")
+    (child,) = sessions.children
+    assert child.exited() and private_leftovers(world) == []
+
+
+def test_the_readers_process_is_hardened_as_a_single_read_is(world):
+    """The reader's git process gets what a single read gets: the same argv
+    (``cat-file --batch`` behind the same switches), allow-list and
+    environment, a private 0700 directory without hooks and with the same
+    configuration, no sandbox and no orphan containment, as for the
+    controller's other git plumbing, and one local read's time limit for the
+    whole process. Its stdout keeps every byte."""
+    sha = world.commit("one")
+    observed: list[tuple[int, bool, str]] = []
+    sessions = Sessions()
+
+    def inspecting(request: DuplexRequest) -> DuplexChild:
+        git_dir = Path(request.env["GIT_DIR"])
+        observed.append(
+            (
+                stat.S_IMODE(git_dir.stat().st_mode),
+                (git_dir / "hooks").exists(),
+                (git_dir / "config").read_text(),
+            )
+        )
+        return sessions(request)
+
+    transport = world.transport(duplex=inspecting)
+    with transport.local_commit_reader() as reader:
+        reader.read_local_commit(sha)
+    transport.read_local_commit(sha)
+    (single,) = world.requests
+    (session,) = sessions.requests
+    assert session.command == single.command
+    assert session.command[-2:] == ["cat-file", "--batch"]
+    assert session.env_allowlist == single.env_allowlist == LOCAL_GIT_ENV_ALLOWLIST
+
+    def without_dir(env: dict[str, str] | None) -> dict[str, str]:
+        return {k: v for k, v in (env or {}).items() if k != "GIT_DIR"}
+
+    assert without_dir(session.env) == without_dir(single.env)
+    assert session.cwd == session.env["GIT_DIR"]
+    assert session.max_runtime_seconds == single.timeout_seconds == LOCAL_TIMEOUT_SECONDS
+    assert session.idle_timeout_seconds is None and session.strip_cr is False
+    assert session.sandbox is None and not session.contain_orphans
+    ((mode, has_hooks, config),) = observed
+    assert mode == 0o700 and not has_hooks
+    for line in ("bare = true", "commitGraph = false", "auto = 0", "writeCommitGraph = false"):
+        assert line in config
+
+
+@pytest.mark.parametrize("mechanism", ["replace", "graft", "shallow", "commit-graph"])
+def test_a_reader_reads_each_commit_as_its_own_bytes_whatever_is_planted(world, mechanism):
+    """No substitution mechanism of D7.5 reaches the reader's process: the
+    planted commit is read with its own parents, as a single read reads it."""
+    base = world.commit("base")
+    below = world.commit("unrelated root")
+    tip = world.commit("unrelated", below)
+    if mechanism == "shallow":
+        _plant(world, mechanism, tip, ())
+    else:
+        _plant(world, mechanism, below, (base,))
+    with world.transport().local_commit_reader() as reader:
+        read = [reader.read_local_commit(sha) for sha in (tip, below)]
+    assert [r.parents for r in read if r is not None] == [(below,), ()]
+    assert world.requests == []
+
+
+def test_a_reader_never_tries_to_fetch_a_commit_the_store_lacks(world):
+    """As R4-F1 of PR #536 holds the single read: the shared repository names
+    a promisor remote, and the reader's process, traced, reads a commit the
+    store lacks as missing and tries no fetch, since its private directory
+    names no remote."""
+    sha = world.commit("present")
+    for key, value in (
+        ("remote.promised.url", str(world.tmp / "nowhere")),
+        ("remote.promised.promisor", "true"),
+        ("extensions.partialClone", "promised"),
+    ):
+        world.g("config", key, value)
+    trace = world.tmp / "git.trace"
+
+    def traced(request: DuplexRequest) -> DuplexChild:
+        env = {**(request.env or {}), "GIT_TRACE": str(trace)}
+        return start_duplex(dataclasses.replace(request, env=env))
+
+    with world.transport(duplex=traced).local_commit_reader() as reader:
+        assert reader.read_local_commit("e" * 40) is None
+        assert reader.read_local_commit(sha) is not None
+    logged = trace.read_text()
+    assert "cat-file --batch" in logged and "fetch" not in logged
+
+
+def test_a_reader_reads_sha256_commits_in_their_own_format(tmp_path, monkeypatch):
+    private = tmp_path / "private-tmp"
+    private.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(private))
+    world = make_world(tmp_path, "sha256")
+    base = world.commit("base")
+    tip = world.commit("tip", base)
+    configs: list[str] = []
+
+    def inspecting(request: DuplexRequest) -> DuplexChild:
+        configs.append((Path(request.env["GIT_DIR"]) / "config").read_text())
+        return start_duplex(request)
+
+    with world.transport(duplex=inspecting).local_commit_reader() as reader:
+        record = reader.read_local_commit(tip)
+        assert record is not None and record.parents == (base,)
+        assert reader.read_local_commit(base) is not None
+    assert len(configs) == 1 and "objectFormat = sha256" in configs[0]
+    assert world.requests == []
 
 
 # -- the range walk -----------------------------------------------------------------------
