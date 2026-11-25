@@ -25,6 +25,9 @@ OUTCOMES = {
     "REVIEW": {"retry", "clean", "needs_fix", "stale_clean", "stale_needs_fix"},
     "FIX": {"retry", "held", "no_change", "published", "partial"},
 }
+# A held FIX and a published partial FIX stop the run until an operator acts:
+# the end of this first-stop slice, after which no further ordinal is admitted.
+STOPPED = {"HELD", "PARTIAL"}
 
 
 class EvidenceError(ValueError):
@@ -138,6 +141,27 @@ def starting_inventory(case) -> set:
     return set(case["snapshots"][case["start"]]["present"])
 
 
+def start_evidenced(case) -> bool:
+    """The starting candidate's inventory and oracle were evidenced by the cutoff."""
+    return source(case["snapshots"][case["start"]]["source"], case)
+
+
+def published_range(case, reviewed, endpoint) -> set:
+    """Commits after the reviewed revision up to a FIX's published endpoint."""
+    snaps = case["snapshots"]
+    require(
+        endpoint in snaps and endpoint != reviewed,
+        "FIX successor must descend from its reviewed candidate",
+    )
+    # check_case has proven every parent chain finite and rooted at the merge base.
+    commits, cursor = set(), endpoint
+    while cursor is not None and cursor != reviewed:
+        commits.add(cursor)
+        cursor = snaps[cursor]["parent"]
+    require(cursor == reviewed, "FIX successor must descend from its reviewed candidate")
+    return commits
+
+
 def validation(value):
     if value is None:
         return None
@@ -211,6 +235,7 @@ def check_binding(case, run, row) -> None:
 
 
 BINDING = "pr base_ref merge_base head tree"
+KNOWN_RECEIPT = ("scope", "set", "policy")
 RUN_FIELDS = "case seed arm pr actors creation launches stop exclusion"
 
 
@@ -254,6 +279,10 @@ def replay(case, run, *, synthetic: bool) -> dict:
     time_complete = True
     costs, tokens = [], []
     for ordinal, row in enumerate(slots, 1):
+        # Even a reserved ordinal with no record contradicts a proven stop.
+        require(
+            not (ledger_complete and expected in STOPPED), "launch after a FIX that stops the run"
+        )
         if row is None:
             ledger_complete = False
             time_complete = False
@@ -293,7 +322,12 @@ def replay(case, run, *, synthetic: bool) -> dict:
             if policy is not None:
                 fixed_policy = policy
             if first_review and ledger_complete:
-                require(row["head"] == case["start"], "first review candidate")
+                # The start stays pinned: a review of a moved revision needs an
+                # explicit drift and is never starting evidence (checked below).
+                require(
+                    row["head"] == case["start"] or row["transition"] == "drift",
+                    "first review candidate",
+                )
             first_review = False
             # Any retained receipt bound to the starting candidate states its
             # validation, including an accepted review after a retry that had
@@ -336,11 +370,9 @@ def replay(case, run, *, synthetic: bool) -> dict:
                 )
             new = row["published"]
             require((new is not None) == (outcome in ("published", "partial")), "FIX publication")
-            if new is not None:
-                require(
-                    new in case["snapshots"] and case["snapshots"][new]["parent"] == row["head"],
-                    "FIX successor must descend from its reviewed candidate",
-                )
+            # A FIX may publish several commits; each keeps its own place in
+            # the observed graph between the reviewed revision and the endpoint.
+            commits = published_range(case, row["head"], new) if new is not None else set()
             judgment = row["judgment"]
             if judgment is not None:
                 require(new is not None, "FIX judgment without publication")
@@ -348,12 +380,14 @@ def replay(case, run, *, synthetic: bool) -> dict:
                 require(judgment["status"] in ("safe", "harmful", "unknown"), "FIX judgment")
                 eligible = source(judgment["source"], case, run)
             if ledger_complete and new is not None:
-                defects = case["snapshots"][new]["present"]
+                endpoint = case["snapshots"][new]
+                # An eligible defect still present at the endpoint and introduced
+                # by any commit of the published range is this FIX's regression.
                 regressions = {
                     key
-                    for key in defects
-                    if source(case["snapshots"][new]["source"], case, run)
-                    and case["defects"][key]["introduced"] == new
+                    for key in endpoint["present"]
+                    if source(endpoint["source"], case, run)
+                    and case["defects"][key]["introduced"] in commits
                     and source(case["defects"][key]["source"], case, run)
                 }
                 fix_regressions.update(regressions)
@@ -386,10 +420,15 @@ def replay(case, run, *, synthetic: bool) -> dict:
                 )
                 if outcome not in (None, "retry"):
                     latest, latest_row, completed = ordinal, row, row["round"]
-                    review_details &= row["findings"] is not None and row["findings"]["complete"]
                     if outcome.startswith("stale_"):
+                        # A stale round consumes its number and its retained
+                        # payload was checked above, but it is never scored, so
+                        # its absence leaves accepted finding coverage intact.
                         head = row["next_head"]
                     else:
+                        review_details &= (
+                            row["findings"] is not None and row["findings"]["complete"]
+                        )
                         starting_accepted |= head == case["start"]
                         observations.extend(items)
                         expected = "FIX" if outcome == "needs_fix" else "CLEAN"
@@ -398,8 +437,12 @@ def replay(case, run, *, synthetic: bool) -> dict:
                     (row["source"], row["round"], row["head"]) == (latest, completed, head),
                     "FIX is not of the current review",
                 )
-                if outcome in ("no_change", "published", "partial"):
+                if outcome in ("no_change", "published"):
                     head, expected = row["published"] or head, "REVIEW"
+                elif outcome == "partial":
+                    # The controller publishes a partial fix, then stops BLOCKED
+                    # until an explicit unblock: the end of this first-stop slice.
+                    head, expected = row["published"], "PARTIAL"
                 elif outcome == "held":
                     expected = "HELD"
             ledger_complete &= outcome is not None
@@ -444,6 +487,12 @@ def replay(case, run, *, synthetic: bool) -> dict:
                 and proof["validation"]["result"] in ("pass", "empty"),
                 "certificate needs presented passing or empty FULL validation",
             )
+        if ledger_complete and expected in STOPPED:
+            require(stop["through"] == len(slots), "launch after a FIX that stops the run")
+            require(
+                expected != "PARTIAL" or stop["phase"] == "BLOCKED",
+                "a published partial FIX stops BLOCKED",
+            )
         if ledger_complete and stop["through"] == len(slots):
             require(
                 (stop["review"], stop["round"], stop["head"]) == (latest, completed, head),
@@ -457,14 +506,31 @@ def replay(case, run, *, synthetic: bool) -> dict:
                 )
                 require(proof["comment"] == latest_row["comment"], "certificate comment binding")
                 presented = latest_row["validation"]
+                # Known fields must agree. An unknown presented result leaves the
+                # certificate unproven; it never borrows the certificate's result.
                 require(
-                    presented is None or presented == proof["validation"],
+                    presented is None
+                    or (
+                        all(presented[key] == proof["validation"][key] for key in KNOWN_RECEIPT)
+                        and presented["result"] in (None, proof["validation"]["result"])
+                    ),
                     "certificate validation binding",
                 )
-                bound = presented is not None
+                bound = presented is not None and presented["result"] is not None
                 certified = bound or None
             elif bound:
                 certified = False
+    if run["exclusion"] == "skipped":
+        # A skip is documented by a pre-PR stop before ordinal one; any retained
+        # or reserved launch, or a later watermark, shows the run executed.
+        require(
+            not slots
+            and stop is not None
+            and stop["through"] == 0
+            and stop["head"] is None
+            and stop["phase"] != "READY_FOR_MERGE",
+            "skipped exclusion needs a documented pre-launch stop",
+        )
 
     launch_complete = (
         stop is not None and stop["through"] == len(slots) and all(row is not None for row in slots)
@@ -510,9 +576,7 @@ def replay(case, run, *, synthetic: bool) -> dict:
         (WEIGHT[case["defects"][key]["severity"]] for key in exposed - detected), reverse=True
     )
     alarm = True if counts["false"] else False if detail and not unknown else None
-    negative = case["clean_negative"] and source(
-        case["snapshots"][case["start"]]["source"], case, run
-    )
+    negative = case["clean_negative"] and start_evidenced(case)
     return {
         "exclusion": run["exclusion"],
         "launch_window_complete": launch_complete,
@@ -534,13 +598,15 @@ def replay(case, run, *, synthetic: bool) -> dict:
         "completed_rounds": completed if launch_complete and ledger_complete else None,
         "known_launch_ms": known_ms,
         "launch_ms": known_ms if launch_complete and time_complete else None,
-        "wall_ms": stop["wall_ms"] if launch_complete else None,
+        # The stop observation captures creation-to-stop time on its own clock,
+        # so a missing launch leaves it known; total launch duration is not.
+        "wall_ms": stop["wall_ms"] if stop else None,
         "cost_microusd": total_usage(costs, launch_complete, synthetic),
         "context_tokens": total_usage(tokens, launch_complete, synthetic),
         "counts": {
             # Tuples are (positive known, unsettled, total eligible).
             "recall": (detected_weight, sum(remaining_weights[:unknown]), weight)
-            if detail and source(case["snapshots"][case["start"]]["source"], case, run)
+            if detail and start_evidenced(case)
             else None,
             "precision": (counts["confirmed"], unknown, len(observations)) if detail else None,
             "false_positive_rate": (int(alarm is True), int(alarm is None), 1)
@@ -759,10 +825,13 @@ def score(packet) -> dict:
             "usable": usable,
         }
     arm_cost = {arm: cost_per_success([pair[arm] for pair in matched]) for arm in ARMS}
+    # A case enters the sample floor only with the cutoff-eligible starting
+    # evidence its recall or clean-negative FPR observations need.
     sample = Counter(
         "negative" if cases[key]["clean_negative"] else "defect"
         for key, seeds in by_case.items()
         if all(row["starting_review_accepted"] for pair in seeds for row in pair.values())
+        and start_evidenced(cases[key])
         and (
             cases[key]["clean_negative"]
             or any(

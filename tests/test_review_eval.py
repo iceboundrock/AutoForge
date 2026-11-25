@@ -43,6 +43,44 @@ def introduce_before_start(case, key):
     return introducing
 
 
+def add_stale_round(packet, index):
+    """Insert a completed stale round before a run's terminal clean review."""
+    run = packet["runs"][index]
+    case = packet["cases"][run["case"]]
+    final = run["launches"][-1]
+    moved, tree = "6" * 40, "7" * 40
+    case["snapshots"][moved] = dict(
+        case["snapshots"][final["head"]], parent=final["head"], tree=tree
+    )
+    stale = dict(
+        final,
+        outcome="stale_clean",
+        next_head=moved,
+        comment=final["comment"] + "/stale",
+        findings={"complete": True, "items": []},
+    )
+    clean = dict(final, round=final["round"] + 1, head=moved, tree=tree)
+    run["launches"][-1:] = [stale, clean]
+    size = len(run["launches"])
+    run["stop"].update(
+        through=size, review=size, round=clean["round"], head=moved, tree=tree, wall_ms=None
+    )
+    return stale, clean
+
+
+def pre_launch_stop(run):
+    run["launches"] = []
+    run["stop"].update(
+        phase="BLOCKED",
+        issuance="not_issued",
+        proof=None,
+        through=0,
+        round=0,
+        review=None,
+        **dict.fromkeys(("pr", "base_ref", "merge_base", "head", "tree")),
+    )
+
+
 def no_certificate(run, *, through, round_, review, at):
     run["stop"].update(
         phase="BLOCKED",
@@ -235,6 +273,44 @@ def test_retry_after_head_moves_still_reviews_round_one(packet):
     assert not got["starting_review_accepted"] and got["counts"]["recall"] is None
 
 
+@pytest.mark.parametrize("transition", ["drift", None])
+def test_first_review_of_a_moved_head_needs_an_explicit_drift(packet, transition):
+    run = packet["runs"][0]
+    final = run["launches"][-1]
+    run["launches"][1:] = [dict(final, round=1, transition=transition)]
+    run["stop"].update(through=2, round=1, review=2)
+    if transition is None:
+        with pytest.raises(EvidenceError, match="first review candidate"):
+            score(packet)
+        return
+    pair = next(row for row in score(packet)["pairs"] if row["case"] == "wrong-boundary")
+    got = pair["runs"]["baseline"]
+    assert got["completed_rounds"] == 1 and got["validated_success"]
+    # The registered start stays pinned: the moved revision's review and receipt
+    # are not starting evidence.
+    assert not got["starting_review_accepted"] and got["starting_validation"] is None
+    assert got["counts"]["recall"] is None and pair["status"] == "validation_unknown"
+
+
+def test_missing_stale_payload_keeps_accepted_finding_coverage(packet):
+    stale, clean = add_stale_round(packet, 0)
+    expected = score(packet)["rates"]
+    assert expected["recall"]["difference"] == "0"
+    stale["findings"] = None
+    report = score(packet)
+    assert report["rates"] == expected
+    got = report["pairs"][1]["runs"]["baseline"]
+    assert got["review_record_complete"] and got["completed_rounds"] == 3
+    # A retained stale payload is still checked.
+    stale["findings"] = deepcopy(packet["runs"][0]["launches"][1]["findings"])
+    with pytest.raises(EvidenceError, match="verdict"):
+        score(packet)
+    # A missing accepted payload still suppresses every finding rate.
+    stale["findings"], clean["findings"] = None, None
+    rates = score(packet)["rates"]
+    assert rates["recall"]["difference"] is None and rates["precision"]["difference"] is None
+
+
 def test_missing_finding_payload_does_not_change_false_alarm_to_true_negative(packet):
     recorded(packet, "clean-boundary")
     run = packet["runs"][1]
@@ -361,6 +437,108 @@ def test_exported_regression_overrides_an_unknown_fix_judgment_and_exclusion(pac
     assert score(packet)["decision"] == "NO_GO"
 
 
+def test_regression_from_the_first_of_two_fix_commits_belongs_to_the_fix(packet):
+    recorded(packet, "wrong-boundary")
+    expected = score(deepcopy(packet))
+    case = packet["cases"]["wrong-boundary"]
+    endpoint = case["snapshots"]["4" + "0" * 39]
+    first = "6" * 40
+    # reviewed start -> first FIX commit (introduces lost-data) -> certified endpoint
+    case["snapshots"][first] = dict(endpoint, tree="7" * 40)
+    endpoint["parent"] = first
+    case["defects"]["lost-data"]["introduced"] = first
+    report = score(packet)
+    assert report == expected  # The endpoint, not the commit count, is scored.
+    got = report["pairs"][0]["runs"]["treatment"]
+    assert got["fix_regressions"] == ["lost-data"] and got["known_harmful_fixes"] == 1
+    assert report["rates"]["harmful_fix_rate"]["treatment"]["point"] == "1"
+    assert got["certificate_issued"] and got["critical_escapes"] == {"lost-data": True}
+    assert report["new_critical_escapes"] == [["wrong-boundary", 0, "lost-data"]]
+    assert report["decision"] == "NO_GO"
+    # A defect the second commit repairs is no regression of the endpoint.
+    endpoint["present"] = []
+    got = result(packet, "wrong-boundary", "treatment")
+    assert got["fix_regressions"] == [] and got["critical_escapes"] == {"lost-data": False}
+
+
+@pytest.mark.parametrize("endpoint", ["reviewed", "sibling"])
+def test_fix_endpoint_must_descend_from_its_reviewed_revision(packet, endpoint):
+    case = packet["cases"]["wrong-boundary"]
+    fix = packet["runs"][0]["launches"][2]
+    if endpoint == "reviewed":
+        fix["published"] = fix["head"]
+    else:
+        sibling = "6" * 40
+        repaired = case["snapshots"]["3" + "0" * 39]
+        case["snapshots"][sibling] = dict(repaired, parent=case["merge_base"], tree="7" * 40)
+        fix["published"] = sibling
+    with pytest.raises(EvidenceError, match="FIX successor must descend"):
+        score(packet)
+
+
+def test_published_partial_fix_is_a_blocked_first_stop(packet):
+    recorded(packet, "wrong-boundary")
+    treatment = packet["runs"][1]
+    fix = treatment["launches"][2]
+    fix["outcome"] = "partial"
+    # The controller waits for an explicit unblock; the next REVIEW is not this slice.
+    with pytest.raises(EvidenceError, match="launch after a FIX that stops the run"):
+        score(packet)
+    treatment["launches"].pop()
+    # A certified stop at the published head is still not the BLOCKED partial stop.
+    treatment["stop"].update(through=3, round=1, review=2)
+    with pytest.raises(EvidenceError, match="partial FIX stops BLOCKED"):
+        score(packet)
+    endpoint = packet["cases"]["wrong-boundary"]["snapshots"][fix["published"]]
+    no_certificate(
+        treatment, through=3, round_=1, review=2, at={"head": fix["head"], "tree": fix["tree"]}
+    )
+    with pytest.raises(EvidenceError, match="stop disagrees"):
+        score(packet)
+    treatment["stop"].update(head=fix["published"], tree=endpoint["tree"])
+    report = score(packet)
+    got = report["pairs"][0]["runs"]["treatment"]
+    assert got["stop"] == "BLOCKED" and got["terminal_bound"]
+    assert got["certificate_issued"] is False and got["validated_success"] is False
+    assert got["completed_rounds"] == 1 and got["fix_launches"] == 1
+    # The published head keeps its harm evidence; a non-issuance certifies no escape.
+    assert got["fix_regressions"] == ["lost-data"] and got["known_harmful_fixes"] == 1
+    assert report["rates"]["harmful_fix_rate"]["treatment"]["point"] == "1"
+    assert got["critical_escapes"] == {"lost-data": False}
+    assert report["new_critical_escapes"] == []
+    treatment["stop"]["phase"] = "FAILED"
+    with pytest.raises(EvidenceError, match="partial FIX stops BLOCKED"):
+        score(packet)
+    treatment["stop"].update(phase="BLOCKED", through=4)
+    with pytest.raises(EvidenceError, match="launch after a FIX that stops the run"):
+        score(packet)
+    treatment["launches"].append(None)
+    with pytest.raises(EvidenceError, match="launch after a FIX that stops the run"):
+        score(packet)
+
+
+def test_pre_launch_skip_needs_a_documented_pre_launch_stop(packet):
+    recorded(packet, "wrong-boundary")
+    treatment = packet["runs"][1]
+    treatment["exclusion"] = "skipped"
+    # The four-launch run executed; calling it skipped would drop it from rates.
+    with pytest.raises(EvidenceError, match="skipped exclusion"):
+        score(packet)
+    pre_launch_stop(treatment)
+    report = score(packet)
+    assert report["pair_status"] == {"excluded": 1} and report["matched_pairs"] == 0
+    assert report["pairs"][0]["runs"]["treatment"]["launches_observed"] == {}
+    treatment["stop"]["through"] = 1
+    with pytest.raises(EvidenceError, match="skipped exclusion"):
+        score(packet)
+    treatment["launches"] = [None]
+    with pytest.raises(EvidenceError, match="skipped exclusion"):
+        score(packet)
+    treatment["launches"], treatment["stop"] = [], None
+    with pytest.raises(EvidenceError, match="skipped exclusion"):
+        score(packet)
+
+
 def test_excluded_failed_first_review_needs_no_completed_reply(packet):
     recorded(packet, "wrong-boundary")
     run = packet["runs"][1]
@@ -439,6 +617,23 @@ def test_starting_validation_is_any_receipt_of_the_starting_candidate(
     assert got["certificate_issued"] is (True if accepted else None)
 
 
+def test_unknown_presented_result_keeps_comparability_but_not_the_certificate(packet):
+    recorded(packet, "clean-boundary")
+    baseline = packet["runs"][0]
+    review = baseline["launches"][1]
+    review["validation"] = dict(review["validation"], result=None)
+    pair = score(packet)["pairs"][0]
+    assert pair["status"] == "matched"
+    got = pair["runs"]["baseline"]
+    assert got["starting_validation"] == pair["runs"]["treatment"]["starting_validation"]
+    # The certificate's passing result is not borrowed for the unknown receipt.
+    assert got["certificate_issued"] is None and not got["terminal_bound"]
+    assert got["validated_success"] is None
+    review["validation"]["policy"] = "c" * 64
+    with pytest.raises(EvidenceError, match="certificate validation binding"):
+        score(packet)
+
+
 def test_receipt_of_a_later_candidate_is_not_starting_validation(packet):
     run = packet["runs"][0]
     review, final = run["launches"][1], run["launches"][-1]
@@ -481,6 +676,20 @@ def test_label_cutoff_and_agent_independence(packet):
         score(packet)
 
 
+@pytest.mark.parametrize(
+    ("case_id", "floor", "metric"),
+    [("clean-boundary", "negative", "false_positive_rate"), ("wrong-boundary", "defect", "recall")],
+)
+def test_sample_floor_uses_the_cutoff_of_its_rates(packet, case_id, floor, metric):
+    assert score(packet)["sample"] == {"defect": 1, "negative": 1}
+    case = packet["cases"][case_id]
+    case["snapshots"][case["start"]]["source"]["discovered"] = "2026-11-21"
+    report = score(packet)
+    assert report["sample"][floor] == 0
+    assert report["rates"][metric]["baseline"]["point"] is None
+    assert report["rates"][metric]["treatment"]["point"] is None
+
+
 def test_repeated_assignment_refuses_cherry_picking(packet):
     packet["runs"].append(deepcopy(packet["runs"][0]))
     with pytest.raises(EvidenceError, match="unplanned or repeated"):
@@ -507,8 +716,21 @@ def test_missing_watermark_or_usage_does_not_invent_zero(packet):
     assert got["cost_microusd"] is None and got["launch_ms"] is None
     run["stop"]["through"] += 1
     got = result(packet, "wrong-boundary", "baseline")
-    assert not got["launch_window_complete"] and got["wall_ms"] is None
+    assert not got["launch_window_complete"] and got["launch_ms"] is None
     assert not got["terminal_bound"]
+    # The stop's own creation-to-stop clock is not a launch record.
+    assert got["wall_ms"] == 850
+
+
+def test_missing_launch_is_not_missing_wall_time(packet):
+    run = packet["runs"][0]
+    run["launches"][2] = None
+    got = result(packet, "wrong-boundary", "baseline")
+    assert not got["launch_window_complete"] and not got["terminal_bound"]
+    assert got["launch_ms"] is None and got["validated_success"] is None
+    assert got["wall_ms"] == 850
+    run["stop"]["wall_ms"] = None
+    assert result(packet, "wrong-boundary", "baseline")["wall_ms"] is None
 
 
 def test_cli_refuses_duplicate_json_keys_without_echoing_content(tmp_path, monkeypatch, capsys):

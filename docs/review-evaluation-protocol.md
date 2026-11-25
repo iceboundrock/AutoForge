@@ -28,6 +28,7 @@ retry consumes a launch, not a round. A completed stale round consumes its numbe
 findings forward and does not authorize FIX. A completed needs-fix round can enter FIX, block, or
 trigger replan. A completed FIX, including one with no new commit, goes to REVIEW; a published
 partial FIX blocks first and re-enters REVIEW on recovery, not another FIX of the old round.
+That `BLOCKED` stop waits for an explicit unblock, so it ends the first-stop slice replayed here.
 A held FIX can block without publication. Deferral, follow-up creation, and no change with
 rationale are dispositions, not proof that a defect was repaired. Failed producer validation
 does not publish a candidate; a clean reply over failed presented validation is refused
@@ -94,7 +95,10 @@ A clean negative requires an independent pass and no registered defect on the st
 candidate; lack of reviewer findings never labels a case clean. A published FIX with an
 eligible attributable regression is harmful even if its separate label says unknown.
 Otherwise a publication is independently adjudicated safe, harmful or unknown. In this
-version an applied publication is an endpoint, not a count of underlying commits.
+version an applied publication is an endpoint, not a count of underlying commits: the
+endpoint must descend from the reviewed revision, and a defect introduced by any commit of
+that published range and still present at the endpoint is the FIX's regression, keeping its
+actual introducing SHA.
 
 ## Registered comparison
 
@@ -115,10 +119,11 @@ reported as `validation_mismatch`; no receipt for the starting candidate is
 `validation_unknown`, never filled from a later candidate or the certificate. Neither
 enters paired rates. Exclusions are restricted to infrastructure, unavailable credentials,
 unavailable service, or a documented pre-launch skip; stop/validation failures are not
-exclusions. Keep both arms and report missing, incomparable and excluded assignments
-separately. Exclusions remove pairs from rates, cost and bootstrap, not independently
-evidenced treatment harm. Do not replace a failed or missing seed; duplicate assignments are
-refused.
+exclusions. A `skipped` run is documented by a pre-PR stop at watermark zero; any launch
+slot, retained or reserved, or a later watermark contradicts it and the packet is refused.
+Keep both arms and report missing, incomparable and excluded assignments separately.
+Exclusions remove pairs from rates, cost and bootstrap, not independently evidenced
+treatment harm. Do not replace a failed or missing seed; duplicate assignments are refused.
 
 ### Packet and replay
 
@@ -128,9 +133,10 @@ refused.
   snapshots (`parent`, `tree`, independent presence inventory, oracle status and provenance).
   Parents form a rooted graph at the pinned merge base. A defect present at the starting
   candidate is introduced by it or by an earlier registered commit of its lineage above the
-  merge base; one introduced by a published FIX endpoint is that FIX's regression. For a
-  FIX with several commits the parent of its published endpoint is the reviewed
-  predecessor in the **observed** graph.
+  merge base. A FIX's published range is every registered commit after its reviewed
+  revision up to its endpoint, which must descend from that revision; register each commit
+  of a multi-commit FIX with its real parent. A defect introduced in that range and present
+  at the endpoint is that FIX's regression.
   SHA/tree fields in the synthetic fixture are stand-ins, not Git objects.
 - Each `runs` entry has a case/seed/arm, one fresh PR identity, and producer/reviewer/fixer
   identities in that order. Its `creation` receipt identifies ordinal zero, before any
@@ -142,17 +148,25 @@ refused.
   are not the complete payload, even if review completion itself is proven. Validation
   receipts explicitly declare FULL scope; FAST is refused. A FIX source
   must be an earlier accepted needs-fix round at the same revision. `no_change` consumes
-  the FIX without publication. `held` is terminal in this replay. `partial` consumes the
-  FIX with publication. Same-scope head drift is represented by a completed stale review
-  with `next_head`, or an explicit `drift` at the next REVIEW before it begins.
+  the FIX without publication. `held` is terminal in this replay. `partial` publishes its
+  endpoint and is terminal at `BLOCKED`: the stop binds that published revision and keeps
+  its harm evidence, and any later ordinal or watermark is refused. Same-scope head drift
+  is represented by a completed stale review with `next_head`, or an explicit `drift` at the
+  next REVIEW before it begins, the first REVIEW included; a review of a moved revision is
+  never starting evidence, and one without an explicit drift is refused.
 - The separately captured `stop` states the launch high-water mark (`through`), phase,
   current revision, last completed round and its review ordinal (or zero/null before any
   completion). `issued` requires a terminal clean review at that ordinal with matching
-  comment and exact presented validation, and a separate certificate receipt reference.
+  comment and exact presented validation, and a separate certificate receipt reference. A
+  presented receipt whose scope, set and policy match but whose result is unknown leaves
+  issuance unproven (never filled from the certificate) while still stating starting
+  validation; a conflicting known field is refused.
   `not_issued` on a reconciled block/failure is explicit non-issuance, including after a
   held or failed FIX at the reviewed revision. An absent stop, unknown issuance, tail
   gap, or historical certificate is not treated as an issuance or as a clean negative.
-  Pre-PR stops use a null revision. Wall time comes from the stop observation.
+  Pre-PR stops use a null revision. Wall time comes from the stop observation and is
+  reported whenever the stop retains it, even with incomplete launch coverage; total
+  launch duration and terminal proof stay unresolved then.
 
 There is no search for a workflow that could explain a hole. Replay proves the known
 contiguous prefix, checks explicit bindings even in the suffix, and leaves a gapped
@@ -175,6 +189,8 @@ must be marked unknown, never reconstructed from a run's eventual success.
 Pool counts over matched runs by arm. Weighted recall is over the starting inventory only,
 counted once per run; later reviews can discover a surviving start defect. Track newly
 introduced regressions separately. Use accepted review findings; do not score stale replies.
+Finding coverage is that of accepted payloads only: a retained stale payload is still
+checked, but a missing one does not suppress a rate.
 
 | Metric | Formula |
 |---|---|
@@ -209,7 +225,8 @@ powered sample-size claim.
   difference, with bootstrap lower envelope above zero. Non-inferiority margins:
   precision −0.05, FPR +0.05, harmful FIX rate +0.05, duplicates +0.10, and cost per
   validated success +50% (point estimate). Sample floor: 20 paired defect cases and
-  10 paired negatives with accepted starting reviews; exclude at most 10% of planned pairs.
+  10 paired negatives with accepted starting reviews and the cutoff-eligible starting
+  evidence their recall or FPR observations need; exclude at most 10% of planned pairs.
 - **Safety first:** recorded new critical treatment escapes are `NO_GO` even from excluded
   runs. A proven FIX-introduced treatment escape needs no counterpart. For a shared
   starting defect require a non-excluded baseline, equal starting validation, and evidence
@@ -240,10 +257,14 @@ leads to a no-commit FIX. Tests check the deterministic report against hand-comp
 and mutate evidence to check refused or stale replies, FIX retries and publication order,
 missing launches/findings, one-PR scope, exact terminal bindings, exclusions, starting
 defects introduced before the starting tip, and policy comparability, including starting
-receipts across a retry. Existing controller tests (`test_routing.py`, `test_loop_guard.py`,
-`test_validation_gates.py`, `test_review_certificate.py`, `test_merge_certificate.py`,
-`test_partial_fix.py`, `test_replan.py`) verify runtime behavior with fakes; this replay
-does not verify or execute those effects. No model, candidate code, network, credentials,
+receipts across a retry. They also cover a regression from the first of two FIX commits,
+a published partial FIX as a `BLOCKED` stop, missing stale payloads, drift before the first
+review, documented and contradicted pre-launch skips, the cutoff of the sample floor, an
+unknown presented validation result, and wall time kept across a missing launch. Existing
+controller tests (`test_routing.py`, `test_loop_guard.py`, `test_validation_gates.py`,
+`test_review_certificate.py`, `test_merge_certificate.py`, `test_partial_fix.py`,
+`test_replan.py`) verify runtime behavior with fakes; this replay does not verify or
+execute those effects. No model, candidate code, network, credentials,
 or state writes are needed to replay the packet.
 
 Fixture SHA-256: `9139f6bae211ee372914c07c219b9fb18f511231bdb461970b0d41ad97f05527`.
