@@ -225,22 +225,30 @@ def cost(runs: list[Run], *, available: bool) -> Fraction | None:
 def critical_gate(
     baseline: dict[str, Run], treatment: dict[str, Run]
 ) -> tuple[list[tuple[str, DefectId]], bool]:
+    """New certified critical escapes of treatment runs, and whether one may be unseen.
+
+    An exclusion keeps a run out of the rates, never out of this gate: an
+    excluded treatment run's evidenced escape still counts, while what it
+    leaves unknown unsettles nothing. Only a non-excluded baseline record can
+    establish that a shared defect did not escape there.
+    """
     novel = []
     unsettled = False
     for cid, run in treatment.items():
+        counted = run.excluded is None
         escapes = outcome(run).escapes
         if escapes is None:
-            unsettled = True
+            unsettled = unsettled or counted
             continue
         other = baseline.get(cid)
-        previous = outcome(other).escapes if other else None
+        previous = outcome(other).escapes if other and other.excluded is None else None
         for key in sorted(escapes, key=lambda key: (key[0] or "", key[1])):
             if run.history.defects[key].severity != "critical":
                 continue
             if key[0] is not None or (previous is not None and key not in previous):
                 novel.append((cid, key))
             elif previous is None:
-                unsettled = True
+                unsettled = unsettled or counted
     return novel, unsettled
 
 
@@ -387,7 +395,10 @@ def report(data: dict) -> dict:
     pairs = [(counts[baseline[cid].id], counts[treatment[cid].id]) for cid in shared]
     old, new = (bands([pair[i] for pair in pairs]) for i in (0, 1))
     intervals = bootstrap(pairs)
-    critical, unsettled = critical_gate(baseline, treatment)
+    # Excluded treatment runs too: an exclusion never hides evidenced harm.
+    critical, unsettled = critical_gate(
+        baseline, {run.case: run for run in runs if run.arm == "treatment"}
+    )
     missing = sorted(set(chain.from_iterable(arm["missing"] for arm in per_arm.values())))
     exclusion_share = Fraction(
         len(set().union(*(arm["excluded"] for arm in per_arm.values()))), len(cases)
@@ -447,8 +458,9 @@ def report(data: dict) -> dict:
                 "excluded": run.excluded,
                 "stop": run.stop.reason if run.stop else None,
                 "evidence": outcome(run).evidence,
+                # Kept for an excluded run: evidenced escapes are safety evidence.
                 "escapes": sorted(escapes, key=lambda key: (key[0] or "", key[1]))
-                if (escapes := outcome(run).escapes) is not None and run.excluded is None
+                if (escapes := outcome(run).escapes) is not None
                 else None,
                 "validated_success": outcome(run).success if run.excluded is None else None,
                 "launches": [

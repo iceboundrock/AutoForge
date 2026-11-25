@@ -26,8 +26,10 @@ from tests.conftest import isolated_git
 from tests.review_evaluation_fixture import (
     attempt,
     case,
+    defect,
     finding,
     fixture,
+    label,
     ref,
     review,
     runner,
@@ -256,6 +258,48 @@ def test_fix_ordinal_cannot_name_a_different_launch(launch):
         admit(data)
 
 
+@pytest.mark.parametrize("logged", [True, False], ids=["logged", "unlogged"])
+@pytest.mark.parametrize("source", ["clean", "stale"])
+def test_fix_must_follow_a_needs_fix_review_the_controller_accepted(source, logged):
+    data = fixture()
+    run = data["runs"][0]  # Review 2 needs a fix, FIX 3 applies it, review 4 certifies.
+    first = run["reviews"][0]
+    if source == "clean":
+        first.update(reply="clean", findings=[])
+    else:
+        first["disposition"] = "stale"
+    if not logged:
+        run["attempts"].clear()  # The review rows alone contradict the FIX.
+    with pytest.raises(InvalidEvidence, match="needs-fix review the controller accepted"):
+        admit(data)
+
+
+def test_fix_from_a_review_of_unknown_disposition_leaves_the_outcome_unresolved():
+    data = fixture()
+    data["runs"][0]["reviews"][0]["disposition"] = "unknown"
+    _, _, runs = admit(data)
+    assert runs[0].complete_window()  # An unknown disposition is no missing launch.
+    assert score.outcome(runs[0]) == score.Outcome("unbound_fix", None, None)
+    data["runs"][0]["attempts"].pop(2)  # A missing FIX launch row is no contradiction.
+    _, _, runs = admit(data)
+    assert not runs[0].complete_window()
+
+
+def test_fix_commit_applies_to_the_candidate_its_review_saw():
+    data = fixture()
+    repaired, run = data["cases"][0], data["runs"][0]
+    cand = repaired["snapshots"][-1]
+    pushed = snapshot({**cand["files"], "note.txt": "pushed\n"}, cand["sha"], action="other")
+    fixed = snapshot(
+        {**pushed["files"], "result.txt": "ok\n"}, pushed["sha"], [ref()], action="fix", seq=3
+    )
+    fixed["label"] = label(fixed["sha"], "not_harmful")
+    final = review(repaired, fixed["sha"], 2, 4, validation="passed", certificate="issued")
+    run.update(snapshots=[pushed, fixed], reviews=[run["reviews"][0], final], stop=stop(final))
+    with pytest.raises(InvalidEvidence, match="candidate of the review it follows"):
+        admit(data)
+
+
 @pytest.mark.parametrize(
     ("index", "verdict"),
     [(1, "unknown"), (1, "not_harmful"), (0, "harmful")],
@@ -372,8 +416,10 @@ def test_old_certificate_does_not_bind_a_missing_or_drifted_stop(mutation, evide
     assert score.critical_gate({}, {"a": accepted}) == ([], True)
 
 
-@pytest.mark.parametrize("validation", ["passed", "failed", None])
+@pytest.mark.parametrize("validation", ["passed", None])
 def test_clean_reply_does_not_prove_issuance_or_turn_unknown_into_false(validation):
+    # An accepted clean round that blocks for another reason; over failed
+    # validation the reply is refused instead (the next test).
     a = case("a")
     r = certified(a)
     last = r["reviews"][-1]
@@ -390,12 +436,86 @@ def test_clean_reply_does_not_prove_issuance_or_turn_unknown_into_false(validati
     assert score.outcome(accepted) == score.Outcome("not_issued", frozenset(), False)
 
 
+def test_clean_reply_over_failed_validation_is_a_refused_launch_not_a_true_negative():
+    a = case("a", clean=True)
+    cand = a["snapshots"][-1]["sha"]
+    clean = review(a, cand, 1, 2, validation="failed")
+    r = runner(
+        a,
+        reviews=[clean],
+        stop=stop(clean, phase="BLOCKED", outcome="not_issued"),
+        attempts=[attempt(1, "ANALYZE_EXECUTE"), attempt(2, "REVIEW", 1)],
+    )
+    # The controller refuses this reply before publication; it is no round.
+    with pytest.raises(InvalidEvidence, match="conflicts with its failed validation"):
+        admit(study([a], [r]))
+    # Recorded as it happened: a refused launch, then the corrected reply.
+    corrected = review(
+        a, cand, 1, 3, validation="failed", findings=[finding("F1", cand, "unknown")]
+    )
+    r.update(
+        reviews=[corrected],
+        stop=stop(corrected, phase="BLOCKED", outcome="not_issued"),
+        attempts=[
+            attempt(1, "ANALYZE_EXECUTE"),
+            attempt(2, "REVIEW", 1, "refused"),
+            attempt(3, "REVIEW", 1),
+        ],
+    )
+    _, cases, [accepted] = admit(study([a], [r]))
+    assert accepted.complete_window()
+    assert score.outcome(accepted) == score.Outcome("not_issued", frozenset(), False)
+    assert score.observations(accepted, cases["a"]).negative == (0, 0, 1)  # Not settled.
+    corrected["seq"] = 2  # A review row cannot bind the refused launch.
+    r["stop"]["through"] = 2
+    del r["attempts"][2]
+    with pytest.raises(InvalidEvidence, match="contradicts its recorded review"):
+        admit(study([a], [r]))
+
+
 def test_wrong_round_or_candidate_receipt_is_refused():
     a = case("a")
     r = certified(a)
     r["reviews"][-1]["validation"]["revision"]["round"] += 1
     with pytest.raises(InvalidEvidence, match="does not bind"):
         admit(study([a], [r]))
+
+
+def test_every_review_diffs_the_registered_change_from_its_merge_base():
+    base = snapshot({"result.txt": "ok\n"})
+    introduced = snapshot({"result.txt": "wrong\n"}, base["sha"])
+    cand = snapshot({"result.txt": "wrong\n", "case.txt": "a"}, introduced["sha"])
+    a = {
+        "id": "a",
+        "kind": "defect",
+        "risk": "standard",
+        "snapshots": [base, introduced, cand],
+        "defects": [defect("D", introduced["sha"], "result.txt")],
+    }
+    old, new = certified(a), certified(a, "treatment")
+    _, _, runs = admit(study([a], [old, new]))
+    assert all(run.history.eligible_at(cand["sha"]) == {(None, "D")} for run in runs)
+    # From a merge base that already holds the defect, the treatment would
+    # review a diff without the change that introduced it.
+    rows = [new["stop"], *new["reviews"]]
+    for row in new["reviews"]:
+        rows += [row[key] for key in ("validation", "certificate") if key in row]
+    for row in rows:
+        row["revision"]["merge_base"] = introduced["sha"]
+    with pytest.raises(InvalidEvidence, match="not the case's base"):
+        admit(study([a], [old, new]))
+    early = certified(a, "treatment")
+    early["reviews"][0]["revision"]["sha"] = introduced["sha"]
+    with pytest.raises(InvalidEvidence, match="before the case pin"):
+        admit(study([a], [old, early]))
+    # A later review cannot move the base either: R0 supports no base change.
+    data = fixture()
+    repaired = data["runs"][0]
+    final = repaired["reviews"][1]  # Of the FIX commit, which descends from the pin.
+    for row in (final, final["validation"], final["certificate"], repaired["stop"]):
+        row["revision"]["merge_base"] = data["cases"][0]["snapshots"][-1]["sha"]
+    with pytest.raises(InvalidEvidence, match="not the case's base"):
+        admit(data)
 
 
 @pytest.mark.parametrize("field", ["set", "policy"])
@@ -484,6 +604,7 @@ def test_run_local_escape_not_cancelled_by_same_id_in_baseline():
     assert score.critical_gate({}, {"repaired": new_run}) == (expected, False)
 
 
+@pytest.mark.parametrize("arm", score.ARMS)
 @pytest.mark.parametrize(
     "attempts",
     [
@@ -495,10 +616,12 @@ def test_run_local_escape_not_cancelled_by_same_id_in_baseline():
         ],
     ],
 )
-def test_exclusion_preserves_no_reply_and_all_launches_even_if_arm_empty(attempts):
+def test_exclusion_preserves_no_reply_and_all_launches_even_if_arm_empty(attempts, arm):
     a = case("a")
-    old = runner(
+    other = "treatment" if arm == "baseline" else "baseline"
+    excluded = runner(
         a,
+        arm,
         attempts=attempts,
         exclusion="infrastructure failure",
         stop={
@@ -508,14 +631,42 @@ def test_exclusion_preserves_no_reply_and_all_launches_even_if_arm_empty(attempt
             "reason": "infra",
         },
     )
-    result = score.report(study([a], [old, certified(a, "treatment")], mode="recorded"))
+    result = score.report(study([a], [excluded, certified(a, other)], mode="recorded"))
     assert result["paired"]["excluded_share"] == 1
-    assert result["arms"]["baseline"]["excluded"] == {"a": "infrastructure failure"}
-    assert not result["arms"]["baseline"]["missing"]
-    assert result["runs"][old["id"]]["launches"] == [
+    assert result["arms"][arm]["excluded"] == {"a": "infrastructure failure"}
+    assert not result["arms"][arm]["missing"]
+    assert result["runs"][excluded["id"]]["launches"] == [
         {key: a[key] for key in ("seq", "phase", "round", "outcome")} for a in attempts
     ]
+    assert result["runs"][excluded["id"]]["escapes"] is None  # It evidenced nothing.
+    assert not result["paired"]["new_critical_escapes"]
     assert result["decision"] == "INCONCLUSIVE"
+
+
+def test_exclusion_keeps_an_evidenced_critical_escape_in_the_gate():
+    data = fixture()
+    data["mode"] = "recorded"
+    expected = [("repaired", ("repaired-treatment", "D"))]  # A certified run-local regression.
+    result = score.report(data)
+    assert result["paired"]["sizes"] == {"defect": 1}
+    assert result["paired"]["new_critical_escapes"] == expected
+    assert result["decision"] == "NO_GO"
+    data["runs"][1]["exclusion"] = "infrastructure"
+    result = score.report(data)
+    assert result["arms"]["treatment"]["excluded"] == {"repaired": "infrastructure"}
+    assert result["paired"]["sizes"] == {}  # Out of the paired rates and the sample.
+    assert result["paired"]["new_critical_escapes"] == expected
+    assert result["runs"]["repaired-treatment"]["escapes"] == [expected[0][1]]
+    assert (result["decision"], result["reason"]) == ("NO_GO", "new certified critical escape")
+    # A shared escape counts too, once a non-excluded baseline record shows none.
+    a = case("a")
+    old = certified(a)
+    del old["reviews"][0]["certificate"]
+    old["stop"] = stop(old["reviews"][0], phase="BLOCKED", outcome="not_issued")
+    new = certified(a, "treatment") | {"exclusion": "infrastructure"}
+    result = score.report(study([a], [old, new], mode="recorded"))
+    assert result["paired"]["new_critical_escapes"] == [("a", (None, "D"))]
+    assert result["decision"] == "NO_GO"
 
 
 def test_nearest_rank_endpoints_and_paired_samples():

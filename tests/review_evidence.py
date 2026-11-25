@@ -249,6 +249,7 @@ def label_at(row: Any, commit: str, cutoff: datetime, optional: str = "") -> Jso
 class Case:
     kind: str
     risk: str
+    base: str  # The registered merge base: every review of the case diffs from it.
     candidate: str
     history: History
 
@@ -265,6 +266,7 @@ class Revision(NamedTuple):
 class Review:
     revision: Revision
     disposition: str
+    reply: str
     findings: tuple[str | DefectId, ...]
     validation: str | None
     certificate: str | None
@@ -293,18 +295,23 @@ def bound_receipt(row: Any, bound: Revision, field: str) -> tuple[str, str, str]
     return text(row[field]), text(row["set"]), text(row["policy"])
 
 
-def admit_reviews(rows: Any, history: History, attempts: dict[int, Json]) -> list[Review]:
+def admit_reviews(
+    rows: Any, history: History, attempts: dict[int, Json], case: Case
+) -> list[Review]:
     reviews = []
     rounds = set()
+    lineage = list(history.files)
     for row in items(rows):
         shape(row, "revision reply disposition findings seq source", "validation certificate")
         bound = revision(row["revision"])
         require(bound.commit in history.files, "review names an unverified commit")
-        lineage = list(history.files)
         require(
-            bound.merge_base in lineage[: lineage.index(bound.commit)],
-            "review merge base is not on the verified lineage before its candidate",
+            lineage.index(bound.commit) >= lineage.index(case.candidate),
+            "review names a commit before the case pin",
         )
+        # Both arms review the registered change: another merge base is another
+        # diff (one that may already hold the defect). R0 supports no base change.
+        require(bound.merge_base == case.base, "review merge base is not the case's base")
         text(row["source"])
         round_key = bound.pr, bound.round
         require(round_key not in rounds, "duplicate completed PR round")
@@ -325,6 +332,13 @@ def admit_reviews(rows: Any, history: History, attempts: dict[int, Json]) -> lis
             result, set_id, policy = bound_receipt(row["validation"], bound, "result")
             validation = choice(result, ("passed", "empty", "failed"))
             basis = set_id, policy
+        # The controller refuses a clean reply over presented validation that
+        # did not pass, before publication (engine `_check_review_evidence`):
+        # such a reply is a `refused` launch, never an accepted round.
+        require(
+            not (reply == "clean" and disposition == "accepted" and validation == "failed"),
+            "an accepted clean review conflicts with its failed validation",
+        )
         certificate = None
         if row.get("certificate") is not None:
             certificate, set_id, policy = bound_receipt(row["certificate"], bound, "id")
@@ -336,7 +350,7 @@ def admit_reviews(rows: Any, history: History, attempts: dict[int, Json]) -> lis
                 "certificate conflicts with review or validation",
             )
         require(bool(items(row["findings"])) == (reply == "needs_fix"), "reply/finding mismatch")
-        reviews.append(Review(bound, disposition, (), validation, certificate, seq))
+        reviews.append(Review(bound, disposition, reply, (), validation, certificate, seq))
     return reviews
 
 
@@ -345,13 +359,20 @@ def bind_fixes(
     reviews: list[Review],
     attempts: dict[int, Json],
     history: History,
-) -> None:
+) -> bool:
     """Launch order agrees with lineage: a review, then a FIX, then reviews of its commit.
 
-    An absent launch row is missing evidence (the window stays incomplete); a
-    present one, a shared ordinal or a reversed order is a contradiction.
+    The review a FIX follows is its source: the controller launches a fixer
+    only from a needs-fix round it accepted, on that round's candidate. A
+    clean or stale source, a FIX commit on another parent, a present launch
+    row that disagrees, a shared ordinal or a reversed order is a
+    contradiction. An absent launch row is missing evidence (the window
+    stays incomplete). Returns False when a source's disposition is
+    unknown: nothing contradicts, but the FIX's provenance is unproven.
     """
-    order = {commit: index for index, commit in enumerate(history.files)}
+    lineage = list(history.files)
+    order = {commit: index for index, commit in enumerate(lineage)}
+    bound = True
     for commit, (_, seq) in fixes.items():
         require(
             all(review.seq != seq for review in reviews),
@@ -359,16 +380,27 @@ def bind_fixes(
         )
         earlier = [review for review in reviews if review.seq < seq]
         require(earlier, "a FIX launch must follow a review")
-        if seq in attempts:
-            require(
-                (attempts[seq]["phase"], attempts[seq]["round"], attempts[seq]["outcome"])
-                == ("FIX", earlier[-1].revision.round, "reply"),
-                "launch contradicts its recorded FIX commit",
-            )
         require(
             all(review.seq > seq for review in reviews if order[review.commit] >= order[commit]),
             "a review precedes the FIX launch that produced its commit",
         )
+        source = earlier[-1]
+        require(
+            source.reply == "needs_fix" and source.disposition != "stale",
+            "a FIX launch must follow a needs-fix review the controller accepted",
+        )
+        require(
+            lineage[order[commit] - 1] == source.commit,
+            "a FIX commit must apply to the candidate of the review it follows",
+        )
+        bound = bound and source.disposition == "accepted"
+        if seq in attempts:
+            require(
+                (attempts[seq]["phase"], attempts[seq]["round"], attempts[seq]["outcome"])
+                == ("FIX", source.revision.round, "reply"),
+                "launch contradicts its recorded FIX commit",
+            )
+    return bound
 
 
 def label_reviews(
@@ -404,6 +436,7 @@ def label_reviews(
             Review(
                 review.revision,
                 review.disposition,
+                review.reply,
                 tuple(findings),
                 review.validation,
                 review.certificate,
@@ -450,6 +483,7 @@ class Run:
     start: bool
     stop: Stop | None
     attempts: dict[int, Json]
+    fixes_bound: bool  # Every FIX's source review is known to be accepted.
 
     def terminal(self) -> tuple[str, Review | None]:
         """Select a terminal observation from a stop, never from review history alone."""
@@ -462,6 +496,8 @@ class Run:
             or (self.reviews and self.reviews[-1].seq > stop.through)
         ):
             return "continued", None
+        if not self.fixes_bound:
+            return "unbound_fix", None
         if not self.reviews or self.reviews[-1].revision != stop.revision:
             return "unbound_stop", None
         review = self.reviews[-1]
@@ -507,7 +543,9 @@ def admit_attempts(rows: Any) -> dict[int, Json]:
         require(seq not in attempts, "duplicate launch ordinal")
         phase = choice(row["phase"], PHASES)
         integer(row["round"], int(phase in ("REVIEW", "FIX")))
-        choice(row["outcome"], ("reply", "failed", "abandoned", "unknown"))
+        # `refused`: a reply the controller refused before accepting it; a
+        # correction launch follows, and no review row binds the refused one.
+        choice(row["outcome"], ("reply", "refused", "failed", "abandoned", "unknown"))
         text(row["source"])
         for key in ("usd", "seconds", "context_tokens"):
             value = row.get(key)
@@ -545,7 +583,7 @@ def admit(data: Any) -> tuple[str, dict[str, Case], list[Run]]:
             require(
                 not any(map(history.eligible_at, history.files)), "negative lineage has a defect"
             )
-        cases[key] = Case(kind, risk, candidate, history)
+        cases[key] = Case(kind, risk, next(iter(history.files)), candidate, history)
     require(cases, "empty case manifest")
     runs = []
     ids = set()
@@ -575,9 +613,13 @@ def admit(data: Any) -> tuple[str, dict[str, Case], list[Run]]:
         replay(history)
         attempts = admit_attempts(row["attempts"])
         reviews = label_reviews(
-            row["reviews"], admit_reviews(row["reviews"], history, attempts), history, rid, cutoff
+            row["reviews"],
+            admit_reviews(row["reviews"], history, attempts, case),
+            history,
+            rid,
+            cutoff,
         )
-        bind_fixes(fixes, reviews, attempts, history)
+        fixes_bound = bind_fixes(fixes, reviews, attempts, history)
         excluded = text(row["exclusion"]) if "exclusion" in row else None
         if reviews:
             require(reviews[0].commit == case.candidate, "first review must start at the case pin")
@@ -601,6 +643,7 @@ def admit(data: Any) -> tuple[str, dict[str, Case], list[Run]]:
                 start is not None,
                 admit_stop(row.get("stop")),
                 attempts,
+                fixes_bound,
             )
         )
     return mode, cases, runs

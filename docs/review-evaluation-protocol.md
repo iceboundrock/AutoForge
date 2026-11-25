@@ -81,7 +81,14 @@ revision, review round and SHA, from a clean accepted review and the
 bound validation set and policy. A deliberately empty configured set can
 produce a certificate; it does not say validation passed. Failed or missing
 evidence does not prove issuance. The controller can record a clean round
-then block without issuing a certificate. The certificate is neither defect
+then block without issuing a certificate. It never accepts a clean reply
+while a validation record presented to the reviewer did not pass: it refuses
+the reply before anything is published (`_check_review_evidence` in
+`engine.py`) and asks again. An accepted clean review over a failed
+validation receipt is therefore refused as contradictory, never scored as a
+true negative. Record the refused reply as a REVIEW launch with outcome
+`refused`, which completes no round, and the corrected reply as the review
+row. The certificate is neither defect
 truth nor permission to merge; live applicability, exact-candidate validation,
 merge permission, CI checks, live GitHub reads and effect authorization remain
 controller concerns (ADR 0006, #170–#175 and #338).
@@ -102,8 +109,9 @@ A stale prefix on its own establishes neither closure nor cost.
 Usage has a different boundary: a run-creation receipt identifying that
 run at ordinal **zero**, a separately observed stop high-water mark, and
 one independently sourced record per reserved ordinal, including failed
-attempts, abandoned reservations and retries. Log only measured values or
-explicit nulls: do not use zero for absent usage. A validated success also
+attempts, refused replies, abandoned reservations and retries. Log only
+measured values or explicit nulls: do not use zero for absent usage. A
+validated success also
 needs a resolved terminal outcome. Neither a set of distinct phases/rounds
 nor the greatest ordinal in a log proves completeness. An existing run that
 started before the evaluation window is not a fresh-run denominator.
@@ -119,12 +127,20 @@ only. Report excluded and missing cases separately. Decision rates use
 matched, non-excluded case pairs. A case counts toward the sample minimum
 only if each arm accepted a review at the pinned candidate.
 
+An exclusion keeps a run out of the rates, the paired bootstrap, the sample
+floor, cost, usage and the per-arm escape totals. It never removes evidenced
+harm. The report keeps each run's escapes, an excluded run's included, and
+the critical-escape gate reads excluded treatment runs as it reads the others
+(decision step 2). What an excluded run leaves unknown settles nothing and
+unsettles nothing, so an excluded first launch that produced no reply stays
+representable without blocking the gate.
+
 | Metric | Numerator / denominator and label uncertainty |
 |---|---|
 | Severity-weighted recall | Sum of weights of distinct detected eligible defects divided by the weight of distinct eligible defects exposed to review, counted separately per run. The lower bound uses confirmations. The upper assigns each unknown finding at most one as-yet-undetected defect eligible at that commit, maximizing weight across the run. |
 | Precision | Confirmed findings / (confirmed + false). Bounds use all findings, assigning unknowns first to false, then to true. This estimates classification uncertainty, including defects outside frozen identity coverage; it does not add defects to the recall denominator. |
 | Clean-negative false-positive rate | Negative runs with ≥1 false finding on the case's own commits / label-settled negative runs. No findings means a true negative only on a completed accepted review. Other negative runs (only unknown findings, or no accepted eligible review) widen the bounds by counting first as true negatives, then false positives. |
-| Escaped critical defects | Count eligible critical defects still present at the certified stop. A bound non-issuance contributes zero; an unresolved ending leaves the total unknown, with known escapes reported separately. The report also lists known escapes of other severities. |
+| Escaped critical defects | Count eligible critical defects still present at the certified stop. A bound non-issuance contributes zero; an unresolved ending leaves the total unknown, with known escapes reported separately. The report also lists known escapes of other severities. Arm totals cover included runs; each run's escapes are reported, an excluded run's included. |
 | Harmful-fix rate | Harmful FIX commits / adjudicated FIX commits. Use all FIX commits in the bounds, settling unknowns first as harmless, then harmful. |
 | Duplicate ratio | Duplicate confirmed findings / all confirmed findings. For the lower bound each unknown can name a distinct, unnamed eligible defect until those slots run out. For the upper, add all unknowns in rounds with a confirmation as repeats. A round with no confirmation and an eligible defect can add `k−1` repeats for `k` confirmations; include these groups by decreasing `k` while they improve the pooled ratio. A round without eligible defects can add neither first reports nor repeats. |
 | Total cost per validated success | Sum USD over **all** attempts (not only successful ones) in included runs / count of validated successes. A success requires certification over a nonempty passed validation set and no registered major or critical defect at the terminal candidate. Undefined if no success, unknown outcome, incomplete window or missing charge. Report launch wall seconds and context tokens separately as sums, each unknown if any constituent is unknown. |
@@ -158,7 +174,9 @@ At most **10%** of planned cases may be excluded (union across arms).
    cost above its margin. Compare shared case escapes only against a
    non-excluded baseline record that establishes no escape of that defect;
    a missing or unknown counterpart does not. A certified run-local
-   treatment regression is new even without a counterpart.
+   treatment regression is new even without a counterpart. An excluded
+   treatment run's escapes are judged the same way: an exclusion never
+   hides measured harm.
 3. **INCONCLUSIVE** if there is a missing pair (an exclusion is recorded,
    not missing), too many exclusions, or fewer than the sample floor.
 4. **NO_GO** if the usable recall envelope lies strictly below +0.10.
@@ -203,13 +221,26 @@ The v1 input is a closed JSON object (`schema`, `mode`, `cutoff`, `cases`,
   expected bytes (`null` means absence). It is evaluated on **the same map
   that was hashed**, at every relevant commit. No checkout, filters, shell,
   subprocess, source execution or network access is needed by replay.
+  The first snapshot is the case's registered merge base. Every review of
+  either arm diffs from it: the first at the pinned candidate and every
+  later one. A review that names another merge base is refused, as is a
+  review of a commit before the pin. Otherwise one arm could start from a
+  base that already holds the defect while the other reviews the change
+  that introduced it. R0 supports no base change (a rebase or a moved base
+  branch); defining its effect on exposure needs an amendment.
 - Run rows bind one arm to a case. They can extend the case's linear
   history with new snapshots and their own regression definitions; a FIX
   snapshot carries its launch ordinal and adjudicated label. That ordinal
   must follow a review, belong to no review, and precede every review of
-  its commit or a later one; a launch row at it must be a FIX reply with
-  the preceding review's round. Admission refuses a contradiction; an
-  absent row is missing evidence and only leaves the window incomplete.
+  its commit or a later one. The review it follows is its source. The
+  controller launches a fixer only from a needs-fix round it accepted, on
+  that round's candidate. So the source must be a needs-fix reply that was
+  not stale, and its candidate must be the FIX commit's parent. A launch row
+  at the ordinal must be a FIX reply with the source's round. Admission
+  refuses a contradiction, a clean or stale source included, whether or
+  not launch rows are present. An absent row is missing evidence and only
+  leaves the window incomplete. A source of unknown disposition leaves the
+  terminal outcome unresolved.
   Review rows bind the controller disposition, reviewer reply, findings
   and optional validation and issuance receipts to the observed revision. Stop,
   creation, launch and human evidence are projections with separate opaque
