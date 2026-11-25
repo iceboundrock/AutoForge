@@ -1730,11 +1730,25 @@ all through one `git cat-file --batch` process, each reply taken by the
 size its header declares (#541): with a process per commit, a walk at its
 bound cost the hosted macOS runners 1.2 to 1.3 s of CPU, past D12's
 1,000 ms ceiling, and with a record per line of a commit, the walk over 64
-commits of 20,000 short lines cost 3.3 s on Linux (R2-F1 of PR #586). One
+commits of 20,000 short lines cost 3.3 s on Linux (R2-F1 of PR #586).
+The read count does not bound what the reads cost: 64 commits of 12 MiB,
+each within what one reply may hold, cost 2.9 s through the one process. So
+the walk's reader also bounds its cost across the walk, fallback included
+(R3-F1 of PR #586): at most 16 MiB of commit bytes and 4 git processes in
+all. A read past either ends the walk there, and the bases it has not
+reached are not proved. The process counts a reply's bytes from its header
+before it takes them, so a commit past what is left is never read. One
 process is the normal path, not a bound: a commit that process cannot
-return exactly is read by a process of its own, and the next read starts a
-new shared process when the commit was only too large for it (past 16 MiB)
-and goes on one process per commit after any other failure of it.
+return exactly is read by a process of its own. When only more of the
+reply was waiting than the process's queue holds (65,536 chunks, or 16 MiB
+and a header's 256 bytes), the next read starts a new process; after any
+other failure (an exit, a time limit, a reply out of step with its header,
+a failed spawn or write) every later read is one of its own. Either way
+the walk starts at most 4 processes. The process's 16 MiB are raw object
+bytes; a single read's bound is on its captured stdout, header and LFs
+included, at most what is left plus 256 bytes and never past 16 MiB, so a
+commit of exactly 16 MiB that the process takes whole is past a single
+read.
 `HEAD` is read through the admin dir the registry binds and the common
 dir, never through the worktree's `.git`
 file, which an earlier launch of the step can rewrite before a correction

@@ -19,14 +19,24 @@ included in the preparation time the run log records (`projection_ms`).
 Each reply is taken by the size git declares for it, so a commit costs its
 bytes, however many lines it holds or however long they are. Each commit
 is still read as its own bytes and re-hashed, and never fetched, and a
-commit the store lacks still proves no ancestry. A commit too large for
-that process to hold (past 16 MiB, which a single read refuses too, or
-more of it waiting to be read than the process holds) is read by a process
-of its own and the next read starts a new shared one. If the shared
-process itself fails, the rest of the walk goes on with a process per
-commit, as before. A commit that is not valid UTF-8 no longer ends the
-walk, since its bytes are now hashed as git wrote them rather than through
-a text capture. No configuration, state, prompt or run-log field change.
+commit the store lacks still proves no ancestry.
+
+The walk is now bounded in what it costs as well as in how many commits it
+reads: it takes at most 16 MiB of commit bytes and starts at most 4 git
+processes in all. A commit past what is left of the 16 MiB, or a read that
+would start a fifth process, ends the walk, and a base it has not reached
+is not proved, so a record bound to it is left out, as one past the 64
+commits is. A commit the shared process cannot return exactly is read by a
+process of its own. When only more of it was waiting than that process
+holds, the next read starts a new shared process; after any other failure
+of it, each later read has a process of its own until the 4 are used. A
+process of its own captures at most what is left of the 16 MiB plus 256
+bytes of git's framing, so it refuses a commit the shared process takes
+whole, one of exactly 16 MiB for instance. A commit that is not valid UTF-8
+no longer ends the walk, since its bytes are now hashed as git wrote them
+rather than through a text capture. Reading a commit whose header holds
+many short lines no longer costs more than its bytes. No configuration,
+state, prompt or run-log field change.
 
 ### Optional Issue Working Memory retrieval (#324)
 

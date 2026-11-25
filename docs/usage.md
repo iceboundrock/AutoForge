@@ -2616,12 +2616,22 @@ base: the controller validates a candidate only after proving it descends
 from that base, so a retry on a failed commit is shown its failure however
 many commits it holds. Any other base is proved by reading each commit
 from the candidate down as its own bytes, re-hashed, at most 64 of them.
-Normally one git process reads them all. A commit that process cannot
-return exactly is read by a git process of its own. If the commit was
-only too large for the shared process (past 16 MiB), the next read starts
-a new shared process. After any other failure of the shared process
-(it exits, times out or answers out of step), the rest of the walk reads
-each commit through a process of its own, as before #541.
+Normally one git process reads them all. The walk is bounded in what it
+costs as well as in how many commits it reads: it takes at most 16 MiB of
+commit bytes and starts at most 4 git processes in all, every process
+below included. A commit past what is left of the 16 MiB ends the walk
+before its bytes are read, and so does a read that would start a fifth
+process. A commit the shared process cannot return exactly is read by a
+git process of its own. If only more of that commit was waiting than the
+shared process holds (65,536 pieces of its output, or 16 MiB and 256
+bytes), the next read starts a new shared process; that is the only case
+that does. After any other failure of the shared process (it exits, times
+out or answers out of step), each later read has a process of its own, as
+before #541, until the 4 processes are used. The shared process counts a
+commit's own bytes, so it takes a commit of exactly 16 MiB when nothing
+else was read; a process of its own captures git's whole output, header
+and line feeds included, up to what is left of the 16 MiB plus 256 bytes
+and never past 16 MiB, so it refuses that commit as cut short.
 A base neither proves is not proved, and a record bound to it is left
 out. The controller never reads the file back. The launch's run log
 records what it was shown in `request.json`'s `metadata.memory`: the

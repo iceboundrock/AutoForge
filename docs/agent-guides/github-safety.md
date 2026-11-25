@@ -1471,11 +1471,15 @@ the marker first and launches no agent.
   (re-hashed). Many local reads in a row (Memory's ancestry walk) normally
   go through one `git cat-file --batch` process in such a directory
   (`LocalCommitReader`, #541), each reply taken by its declared size and
-  re-hashed the same way; a reply it cannot give byte for byte ends it and
-  is read by a process of its own. After a reply too large for it (an
-  object past the single read's capture bound, or too much of it waiting)
-  the next read starts a new process; after any other failure the reads go
-  on one process each.
+  re-hashed the same way. The reader bounds what it costs across all its
+  reads, fallback included: at most `MAX_READER_BYTES` (16 MiB) of object
+  bytes, each reply's counted from its header before it is taken, and
+  `MAX_READER_PROCESSES` (4) git processes; a read past either is refused,
+  as is every later one. A reply it cannot give byte for byte ends the
+  process and is read by a process of its own, whose capture is lowered to
+  what is left of the bytes. After a queue overflow the next read starts a
+  new process; after any other failure the reads go on one process each,
+  within the 4.
   Fetches write objects only and create or move no ref. The
   pre-merge evidence fetch runs on it, and every git process goes through
   the executor.

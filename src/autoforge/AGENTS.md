@@ -182,7 +182,8 @@ effect_ops.py       per-kind effect operations: identity read, precondition, wri
 git_transport.py    controller git push: sanitized config, explicit URL, lease, no hooks;
                     the hardened request every local controller git process uses (#160);
                     LocalCommitReader, many local commit reads normally through one
-                    `cat-file --batch` duplex child, each re-hashed (#541)
+                    `cat-file --batch` duplex child, each re-hashed, its bytes and
+                    processes bounded across its reads (#541)
 claims.py           durable GitHub claims: marker schemas, renderers, scan, cardinality
 validation.py       typed GitHub URL parsing and run-argument validation
 run_binding.py      the EPIC a new standalone run records: the issue's native parent, else
