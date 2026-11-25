@@ -918,7 +918,7 @@ class MemoryCommitReader:
         self._remaining = _MEMORY_COMMIT_BYTES
         self._failed = False
         # Each commit authenticated so far, so that one read twice (the
-        # input, a base the walk goes on below) is read and charged once.
+        # input, which the walk starts from) is read and charged once.
         self._read: dict[str, tuple[str, ...]] = {}
 
     def _reply_header(self, command: bytes, sha: str) -> bytes:
@@ -948,19 +948,15 @@ class MemoryCommitReader:
             raise GitTransportError(f"unexpected reply checking for Memory commit {sha}")
         return header, int(match[2])
 
-    def has_commit(self, sha: str) -> bool:
-        """Authenticate a base named by an authenticated link, ``False`` when it is missing.
-
-        The base is read as :meth:`parents` reads a commit: its exact bytes,
-        re-hashed under ``sha``, charged to the shared byte allowance and
-        held to the header bound, and a walk that goes on below it reuses
-        that read. A base that cannot be authenticated within them raises,
-        so the walk ends with it unproved (R1-F1 of PR #587).
-        """
-        return self.parents(sha) is not None
-
     def parents(self, sha: str) -> tuple[str, ...] | None:
-        """Read and authenticate a commit, or return None for a missing object."""
+        """Read and authenticate a commit, or return None for a missing object.
+
+        Its exact bytes, re-hashed under ``sha``, charged to the shared byte
+        allowance and held to the header bound. A commit that cannot be
+        authenticated within them raises. The ancestry walk authenticates
+        each base a parent link names through this same read before it
+        counts (R1-F1, R2-F1 of PR #587).
+        """
         if not self._failed and (known := self._read.get(sha)) is not None:
             return known
         info = self._info(sha)

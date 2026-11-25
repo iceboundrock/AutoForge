@@ -1730,9 +1730,15 @@ check reads an object's header alone, and a loose object can carry a valid
 commit header over bytes that are not the commit's (R1-F1 of PR #587).
 That read is charged to the shared allowance below, is made once per base
 and reused if the walk goes on below it, and takes none of the 64 walk
-slots, so what the walk can prove is unchanged. A base whose bytes cannot
-be authenticated within those limits ends the walk and is not proved. A
-base neither source proves is omitted along with the records bound to it.
+slots, so the walk's maximum depth is unchanged. Which bases it proves is
+not. The helper makes that read itself, so no caller can leave it out
+(R2-F1 of PR #587). A base the store does not hold, or whose bytes cannot
+be authenticated within the allowance, the header bound and the reader's
+runtime limit below, is not proved, and neither is a base the walk has not
+reached when a failed read or one of those limits ends it. Each of these
+can leave unproved a base the walk before #541 accepted: that walk counted
+a base from the parent link alone and had no byte or time limit. A base
+neither source proves is omitted along with the records bound to it.
 `HEAD` is read through the admin dir the registry binds and the common
 dir, never through the worktree's `.git` file, which an earlier launch of
 the step can rewrite before a correction or a retry, and only its id is

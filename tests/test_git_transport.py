@@ -447,7 +447,7 @@ def test_memory_walk_does_not_count_a_missing_endpoint_even_with_a_replacement(w
     with world.transport().memory_commits(tip) as reader:
         assert reader.parents(tip) == (missing, present)
         assert reader.parents(missing) is None
-        proof = local_ancestors(tip, [missing, present], reader.parents, has_base=reader.has_commit)
+        proof = local_ancestors(tip, [missing, present], reader.parents)
         assert proof == ((present,), 2)
     assert not world.requests and not world.questions
 
@@ -463,7 +463,7 @@ def test_memory_walk_does_not_prove_a_rewritten_endpoint(world):
     rewritten = world.commit("rewritten base")
     tip = world.commit("merge", kept, rewritten)
     with world.transport().memory_commits(tip) as reader:
-        both = local_ancestors(tip, [kept, rewritten], reader.parents, has_base=reader.has_commit)
+        both = local_ancestors(tip, [kept, rewritten], reader.parents)
         assert both == ((kept, rewritten), 1)
     raw = world.raw(rewritten)
     forged = raw.replace(b"\n\nrewritten base\n", b"\n\nanother commit's message\n")
@@ -472,14 +472,14 @@ def test_memory_walk_does_not_prove_a_rewritten_endpoint(world):
     assert world.g("cat-file", "-t", rewritten) == "commit"
     assert world.g("cat-file", "-s", rewritten) == str(len(forged))
     with world.transport().memory_commits(tip) as reader:
-        proof = local_ancestors(tip, [kept, rewritten], reader.parents, has_base=reader.has_commit)
+        proof = local_ancestors(tip, [kept, rewritten], reader.parents)
         assert proof == ((kept,), 1)
         with pytest.raises(GitTransportError, match="reader has failed"):
-            reader.has_commit(kept)
+            reader.parents(kept)
     with world.transport().memory_commits(tip) as reader:
         assert reader.parents(tip) == (kept, rewritten)
         with pytest.raises(GitTransportError, match="do not hash to its id"):
-            reader.has_commit(rewritten)
+            reader.parents(rewritten)
     assert private_leftovers(world) == []
     assert not world.requests and not world.questions
 
@@ -508,7 +508,7 @@ def test_memory_walk_reads_a_reached_base_once(world, monkeypatch):
     monkeypatch.setattr(git_transport, "start_duplex", spy)
     with world.transport().memory_commits(tip) as reader:
         assert reader.parents(tip) == (mid,)
-        proof = local_ancestors(tip, [low, mid], reader.parents, has_base=reader.has_commit)
+        proof = local_ancestors(tip, [low, mid], reader.parents)
         assert proof == ((low, mid), 2)
     assert sent == [
         f"{command} {sha}".encode() for sha in (tip, mid, low) for command in ("info", "contents")
@@ -573,7 +573,7 @@ def test_memory_reader_ends_on_eof_without_fallback(world, monkeypatch):
 
     monkeypatch.setattr(git_transport, "start_duplex", end_after_input)
     with world.transport().memory_commits(tip) as reader:
-        assert local_ancestors(tip, [base], reader.parents, has_base=reader.has_commit) == ((), 1)
+        assert local_ancestors(tip, [base], reader.parents) == ((), 1)
         with pytest.raises(GitTransportError, match="reader has failed"):
             reader.parents(base)
     assert len(requests) == 1 and private_leftovers(world) == []

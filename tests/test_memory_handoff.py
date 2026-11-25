@@ -824,41 +824,81 @@ def parents_from(graph: dict, reads: list | None = None):
 
 
 def chain(length: int) -> tuple[list[str], dict]:
-    """A linear history of ``length`` commits, newest first, and its parent graph."""
+    """A linear history of ``length`` commits, newest first, and its parent graph.
+
+    The oldest commit is a root the store holds, so each commit of the
+    chain authenticates.
+    """
     commits = [sha_of(n) for n in range(length, 0, -1)]
-    return commits, {sha: (parent,) for sha, parent in itertools.pairwise(commits)}
+    graph = {sha: (parent,) for sha, parent in itertools.pairwise(commits)}
+    return commits, {**graph, commits[-1]: ()}
 
 
 def test_the_ancestry_walk_proves_a_base_it_reaches_and_no_other():
-    # The retry on a one-commit candidate: one read proves the base.
+    # The retry on a one-commit candidate: one walk read, and the base's own
+    # read authenticating it, which takes no walk slot, prove the base.
     reads: list = []
-    assert local_ancestors(C1, [BASE], parents_from({C1: (BASE,)}, reads)) == ((BASE,), 1)
-    assert reads == [C1]
+    held = {C1: (BASE,), BASE: ()}
+    assert local_ancestors(C1, [BASE], parents_from(held, reads)) == ((BASE,), 1)
+    assert reads == [C1, BASE]
     # No candidate, no base to prove, or only the candidate itself: nothing read.
     for candidate, bases in (("", [BASE]), (C1, []), (C1, [C1])):
         assert local_ancestors(candidate, bases, parents_from({})) == ((), 0)
-    # Two bases, one below the other: both proved, in the order asked.
+    # Two bases, one below the other: both proved, in the order asked, and
+    # each base read once though the walk goes on below the nearer one.
     commits, graph = chain(5)
-    assert local_ancestors(commits[0], [commits[4], commits[2]], parents_from(graph)) == (
+    reads = []
+    assert local_ancestors(commits[0], [commits[4], commits[2]], parents_from(graph, reads)) == (
         (commits[4], commits[2]),
         4,
     )
+    assert reads == commits
     # A commit the store does not hold ends its path; the other parent still proves.
-    merge = {C1: (C2, sha_of(7)), sha_of(7): (BASE,)}
+    merge = {C1: (C2, sha_of(7)), sha_of(7): (BASE,), BASE: ()}
     assert local_ancestors(C1, [BASE], parents_from(merge)) == ((BASE,), 3)
     # A base that is no ancestor is never proved, whatever is read.
     commits, graph = chain(4)
     assert local_ancestors(commits[0], [BASE], parents_from(graph)) == ((), 4)
-    # A read that fails ends the walk; what was reached before it stays proved.
-    failing = {C1: (C2,), C2: GitTransportError("cannot read")}
-    assert local_ancestors(C1, [C2, BASE], parents_from(failing)) == ((C2,), 2)
+    # A read that fails ends the walk; what was proved before it stays proved.
+    failing = {C1: (C2,), C2: (sha_of(7),), sha_of(7): GitTransportError("cannot read")}
+    assert local_ancestors(C1, [C2, BASE], parents_from(failing)) == ((C2,), 3)
+
+
+def test_the_ancestry_walk_never_proves_a_base_that_does_not_authenticate():
+    """R2-F1 of PR #587. A parent link only names a base: the walk proves it
+    only once the base's own read authenticates it, and no caller can leave
+    that read out. A base the store does not hold is not proved and ends its
+    path, whatever link names it; one whose read fails ends the walk, and
+    the bases proved before it stay proved."""
+    reads: list = []
+    assert local_ancestors(C1, [BASE], parents_from({C1: (BASE,)}, reads)) == ((), 1)
+    assert reads == [C1, BASE]
+    # The other parent of a merge still proves its own base.
+    merge = {C1: (BASE, C2), C2: ()}
+    assert local_ancestors(C1, [BASE, C2], parents_from(merge)) == ((C2,), 2)
+    # A base whose own read fails ends the walk with it unproved.
+    failing = {C1: (C2, BASE), C2: (), BASE: GitTransportError("does not hash to its id")}
+    assert local_ancestors(C1, [C2, BASE], parents_from(failing)) == ((C2,), 1)
+    failing = {C1: (BASE, C2), C2: (), BASE: OSError("cannot read")}
+    assert local_ancestors(C1, [C2, BASE], parents_from(failing)) == ((), 1)
 
 
 def test_the_ancestry_walk_proves_a_base_at_most_its_bound_below_the_candidate():
+    """The base's own read takes no walk slot: one ``MAX_ANCESTRY_COMMITS``
+    commits below the candidate, a parent of the last commit the walk may
+    read, is proved when it authenticates (R2-F1 of PR #587), and only
+    then; one further below is not reached."""
     commits, graph = chain(MAX_ANCESTRY_COMMITS + 2)
     tip, near, far = commits[0], commits[MAX_ANCESTRY_COMMITS], commits[-1]
-    assert local_ancestors(tip, [near], parents_from(graph)) == ((near,), MAX_ANCESTRY_COMMITS)
+    reads: list = []
+    assert local_ancestors(tip, [near], parents_from(graph, reads)) == (
+        (near,),
+        MAX_ANCESTRY_COMMITS,
+    )
+    assert reads == commits[: MAX_ANCESTRY_COMMITS + 1]
     assert local_ancestors(tip, [far], parents_from(graph)) == ((), MAX_ANCESTRY_COMMITS)
+    missing = {sha: parents for sha, parents in graph.items() if sha != near}
+    assert local_ancestors(tip, [near], parents_from(missing)) == ((), MAX_ANCESTRY_COMMITS)
 
 
 def prepared(store, head, graph, receipts, reads=None):
@@ -980,7 +1020,8 @@ def test_the_projection_time_covers_the_ledger_the_candidate_read_and_the_walk()
     the candidate's read and the ancestry walk with the render;
     ``render_ms`` is the render's share. C2 is built on C1, whose failure is
     bound to BASE; C2 has no record of its own, so the walk proves the base,
-    reading C2 and then C1."""
+    reading C2 and then C1, and authenticating the base by its own read,
+    which takes no walk slot (R2-F1 of PR #587)."""
     rec = failing_record()
     store = observe_validation_failure(
         enabled(), STEP, parse_record(rec), attempt=1, text="definition [0] failed"
@@ -997,7 +1038,7 @@ def test_the_projection_time_covers_the_ledger_the_candidate_read_and_the_walk()
 
     def parents(sha):
         now[0] += 0.25
-        return {C2: (C1,), C1: (BASE,)}.get(sha)
+        return {C2: (C1,), C1: (BASE,), BASE: ()}.get(sha)
 
     launch = prepare_launch_projection(
         load,
@@ -1011,9 +1052,9 @@ def test_the_projection_time_covers_the_ledger_the_candidate_read_and_the_walk()
     assert (launch.request.candidate, launch.request.ancestors) == (C2, (BASE,))
     assert f"Source candidate: {C1}" in launch.text and "needs revalidation 01" in launch.text
     assert (launch.input_sha, launch.ancestry_reads) == (C2, 2)
-    assert (launch.projection_ms, launch.render_ms) == (687.5, 0.0)
+    assert (launch.projection_ms, launch.render_ms) == (937.5, 0.0)
     meta = launch.metadata()
-    assert (meta["projection_ms"], meta["render_ms"], meta["ancestry_reads"]) == (687.5, 0.0, 2)
+    assert (meta["projection_ms"], meta["render_ms"], meta["ancestry_reads"]) == (937.5, 0.0, 2)
     assert meta["input"] == meta["candidate"] == C2
 
 
@@ -1248,7 +1289,7 @@ def test_an_ancestry_walk_at_its_bound_costs_far_less_cpu_than_the_ceiling(
 
     started = os.times()
     with transport.memory_commits(tip) as reader:
-        proved = local_ancestors(tip, [base], reader.parents, has_base=reader.has_commit)
+        proved = local_ancestors(tip, [base], reader.parents)
     cpu_ms = _cpu_ms_since(started)
     assert proved == ((), MAX_ANCESTRY_COMMITS)
     assert cpu_ms < 1000.0
@@ -1271,7 +1312,7 @@ def test_large_commits_spend_one_shared_ancestry_budget(tmp_path, mib):
     started = os.times()
     with _local_memory_walk(root).memory_commits(tip) as reader:
         assert reader.parents(tip) == (parent,)
-        proof = local_ancestors(tip, [base, parent], reader.parents, has_base=reader.has_commit)
+        proof = local_ancestors(tip, [base, parent], reader.parents)
     assert proof == (((base, parent), 2) if mib == 6 else ((), 1))
     assert _cpu_ms_since(started) < 1000.0
 

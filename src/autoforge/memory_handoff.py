@@ -240,7 +240,6 @@ def local_ancestors(
     read_parents: Callable[[str], Sequence[str] | None],
     *,
     max_commits: int = MAX_ANCESTRY_COMMITS,
-    has_base: Callable[[str], bool] | None = None,
 ) -> tuple[tuple[str, ...], int]:
     """The ``bases`` that ``candidate`` descends from, proved in the local store alone.
 
@@ -252,20 +251,23 @@ def local_ancestors(
     re-hashes each commit, never fetches one and never asks GitHub
     (R3-F1 of PR #536), so Memory adds no network call to a launch and a
     retry on the commit that failed sees its failure whatever GitHub
-    answers. A base is proved when it is a parent of a commit read, so one
-    at most ``max_commits`` commits below the candidate can be. A real-store
-    caller supplies ``has_base``, which authenticates a base a parent link
-    names before it counts: it reads the base's own bytes and re-hashes
-    them, is false for a base the store does not hold and raises for one it
-    cannot authenticate (R1-F1 of PR #587). That read takes none of the
-    ``max_commits`` reads, so what the walk can prove is unchanged; it is
-    made at most once per base. The walk ends when every base is reached,
-    after ``max_commits`` reads, or when nothing is left to read. A missing
-    commit ends its path; a read that fails ends the walk, a base's
-    authentication included. A base not reached is not proved, so a record
-    bound to it is omitted as not applicable, never shown as current; the
-    bases reached before the walk ended stay proved, each by a chain of
-    parents read from bytes that hash to their ids.
+    answers. A base is proved when it is a parent of a commit read and its
+    own bytes authenticate: a parent link only names it, so before it
+    counts the walk reads it through ``read_parents`` as well, always, with
+    no caller able to leave that out (R1-F1, R2-F1 of PR #587). A base the
+    store does not hold (``None``) is not proved and ends its path; one
+    whose read fails ends the walk unproved. That read takes none of the
+    ``max_commits`` reads, so a base at most ``max_commits`` commits below
+    the candidate can still be reached; whether it is proved also depends
+    on its own read, and on the reader's limits, which the engine's reader
+    holds to a shared byte allowance and a runtime bound. It is made at
+    most once per base, and a walk that goes on below the base reuses it.
+    The walk ends when every base is proved, after ``max_commits`` reads,
+    or when nothing is left to read. A missing commit ends its path; a read
+    that fails ends the walk. A base not proved is omitted with the records
+    bound to it, never shown as current; the bases proved before the walk
+    ended stay proved, each by a chain of parents read from bytes that hash
+    to their ids and by its own bytes.
     """
     wanted = set(bases) - {candidate}
     if not candidate or not wanted:
@@ -273,19 +275,24 @@ def local_ancestors(
     reached: set[str] = set()
     seen = {candidate}
     pending = deque([candidate])
+    # Each proved base's own parents, read to authenticate it, for the walk to reuse.
+    own: dict[str, Sequence[str]] = {}
     reads = 0
     while pending and reached != wanted and reads < max_commits:
         sha = pending.popleft()
         reads += 1
         try:
-            parents = read_parents(sha)
+            parents = own.pop(sha) if sha in own else read_parents(sha)
             for parent in parents or ():
                 if parent in seen:
                     continue
                 seen.add(parent)
                 if parent in wanted:
-                    if has_base is not None and not has_base(parent):
+                    # Authenticate the base by its own bytes before it counts.
+                    held = read_parents(parent)
+                    if held is None:
                         continue
+                    own[parent] = held
                     reached.add(parent)
                 pending.append(parent)
         except (AutoForgeError, OSError):
@@ -359,7 +366,6 @@ def prepare_launch_projection(
     validation_records: Sequence[dict],
     clock: Callable[[], float] = time.perf_counter,
     max_commits: int = MAX_ANCESTRY_COMMITS,
-    has_base: Callable[[str], bool] | None = None,
 ) -> LaunchProjection:
     """The next launch's projection, from its ledger's load to its render, timed whole (D12).
 
@@ -373,7 +379,8 @@ def prepare_launch_projection(
     that very commit (:func:`~autoforge.memory.established_bases`, R4-F2),
     so a retry on the commit that failed is shown its failure however long
     its history, and the rest by :func:`local_ancestors` through
-    ``read_parents`` and ``has_base``, at most ``max_commits`` commits read. ``input_sha``
+    ``read_parents``, at most ``max_commits`` commits read and each base
+    authenticated by its own bytes (R2-F1 of PR #587). ``input_sha``
     is the commit read, the base included when the launch starts there,
     and "" when none could be read: the input is then unknown, never
     guessed, so no ``add`` of the launch is keyed by it (R3-F2, R4-F3,
@@ -400,7 +407,6 @@ def prepare_launch_projection(
             [b for b in bases if b not in held],
             read_parents,
             max_commits=max_commits,
-            has_base=has_base,
         )
         ancestors = tuple(b for b in bases if b in held or b in walked)
     request = projection_request(store, step, candidate=candidate, ancestors=ancestors)

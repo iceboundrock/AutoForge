@@ -4959,7 +4959,6 @@ class ControllerEngine:
                 base=entry.base_sha if entry is not None else "",
                 read_head=lambda: self._memory_candidate(cwd, parents),
                 read_parents=parents,
-                has_base=lambda sha: commits(sha).has_commit(sha),
                 validation_records=state.validation_records,
                 clock=self._memory_clock,
             )
