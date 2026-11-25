@@ -452,6 +452,70 @@ def test_memory_walk_does_not_count_a_missing_endpoint_even_with_a_replacement(w
     assert not world.requests and not world.questions
 
 
+def test_memory_walk_does_not_prove_a_rewritten_endpoint(world):
+    """R1-F1 of PR #587. The tip's own bytes authenticate and name ``kept``
+    and ``rewritten`` as its parents. ``rewritten``'s loose object then
+    holds a valid commit header over other bytes, so git still reads it as
+    a commit, of the forged size, and a size check alone would count it.
+    Its bytes do not hash to its id: the walk ends with it unproved and the
+    reader spent, and ``kept``, authenticated before it, stays proved."""
+    kept = world.commit("kept base")
+    rewritten = world.commit("rewritten base")
+    tip = world.commit("merge", kept, rewritten)
+    with world.transport().memory_commits(tip) as reader:
+        both = local_ancestors(tip, [kept, rewritten], reader.parents, has_base=reader.has_commit)
+        assert both == ((kept, rewritten), 1)
+    raw = world.raw(rewritten)
+    forged = raw.replace(b"\n\nrewritten base\n", b"\n\nanother commit's message\n")
+    assert forged != raw
+    write_loose(world.objects, rewritten, "commit", forged)
+    assert world.g("cat-file", "-t", rewritten) == "commit"
+    assert world.g("cat-file", "-s", rewritten) == str(len(forged))
+    with world.transport().memory_commits(tip) as reader:
+        proof = local_ancestors(tip, [kept, rewritten], reader.parents, has_base=reader.has_commit)
+        assert proof == ((kept,), 1)
+        with pytest.raises(GitTransportError, match="reader has failed"):
+            reader.has_commit(kept)
+    with world.transport().memory_commits(tip) as reader:
+        assert reader.parents(tip) == (kept, rewritten)
+        with pytest.raises(GitTransportError, match="do not hash to its id"):
+            reader.has_commit(rewritten)
+    assert private_leftovers(world) == []
+    assert not world.requests and not world.questions
+
+
+def test_memory_walk_reads_a_reached_base_once(world, monkeypatch):
+    """R1-F1 of PR #587. A base is authenticated when a parent link names it,
+    and the walk that goes on below it reuses that read, as it reuses the
+    input's: each commit is asked for once, its body once."""
+    low = world.commit("low")
+    mid = world.commit("mid", low)
+    tip = world.commit("tip", mid)
+    sent: list[bytes] = []
+    start = git_transport.start_duplex
+
+    def spy(req):
+        child = start(req)
+        send = child.send_line
+
+        def record(line):
+            sent.append(line)
+            return send(line)
+
+        monkeypatch.setattr(child, "send_line", record)
+        return child
+
+    monkeypatch.setattr(git_transport, "start_duplex", spy)
+    with world.transport().memory_commits(tip) as reader:
+        assert reader.parents(tip) == (mid,)
+        proof = local_ancestors(tip, [low, mid], reader.parents, has_base=reader.has_commit)
+        assert proof == ((low, mid), 2)
+    assert sent == [
+        f"{command} {sha}".encode() for sha in (tip, mid, low) for command in ("info", "contents")
+    ]
+    assert not world.requests and not world.questions
+
+
 @pytest.mark.parametrize("size", [16 * 1024 * 1024, 24 * 1024 * 1024])
 def test_memory_admits_raw_commit_bytes_before_reading_stdout_body(world, monkeypatch, size):
     header = f"tree {world.tree()}\nauthor t <t@e> 1 +0000\ncommitter t <t@e> 1 +0000\n\n".encode()

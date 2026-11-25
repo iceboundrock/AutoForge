@@ -906,7 +906,10 @@ class MemoryCommitReader:
     """Local commit links for a single projection, with no restart or fallback.
 
     An ``info`` reply establishes size and type before Git is asked for
-    contents. Only the latter's exact, re-hashed bytes can supply links.
+    contents. Only the latter's exact, re-hashed bytes can supply links or
+    prove a commit present: ``info`` reads the object's header alone, and a
+    loose object can carry a valid commit header over bytes that are not
+    the commit's (R1-F1 of PR #587).
     """
 
     def __init__(self, child: DuplexChild, object_format: str) -> None:
@@ -914,7 +917,9 @@ class MemoryCommitReader:
         self._format = object_format
         self._remaining = _MEMORY_COMMIT_BYTES
         self._failed = False
-        self._last: tuple[str, tuple[str, ...]] | None = None
+        # Each commit authenticated so far, so that one read twice (the
+        # input, a base the walk goes on below) is read and charged once.
+        self._read: dict[str, tuple[str, ...]] = {}
 
     def _reply_header(self, command: bytes, sha: str) -> bytes:
         if self._failed:
@@ -944,14 +949,20 @@ class MemoryCommitReader:
         return header, int(match[2])
 
     def has_commit(self, sha: str) -> bool:
-        """Check that a base named by an authenticated link is locally present."""
-        return self._info(sha) is not None
+        """Authenticate a base named by an authenticated link, ``False`` when it is missing.
+
+        The base is read as :meth:`parents` reads a commit: its exact bytes,
+        re-hashed under ``sha``, charged to the shared byte allowance and
+        held to the header bound, and a walk that goes on below it reuses
+        that read. A base that cannot be authenticated within them raises,
+        so the walk ends with it unproved (R1-F1 of PR #587).
+        """
+        return self.parents(sha) is not None
 
     def parents(self, sha: str) -> tuple[str, ...] | None:
         """Read and authenticate a commit, or return None for a missing object."""
-        # The walk's first node is also the projection's already read input.
-        if not self._failed and self._last is not None and self._last[0] == sha:
-            return self._last[1]
+        if not self._failed and (known := self._read.get(sha)) is not None:
+            return known
         info = self._info(sha)
         if info is None:
             return None
@@ -981,7 +992,7 @@ class MemoryCommitReader:
             raise GitTransportError(f"Memory commit {sha} exceeds the commit header budget")
         # The projection needs links only; no splitting or decoding the message.
         parents = _parse_commit(sha, reply[:end]).parents
-        self._last = (sha, parents)
+        self._read[sha] = parents
         return parents
 
 

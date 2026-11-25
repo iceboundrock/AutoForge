@@ -1085,6 +1085,48 @@ def test_the_engines_projection_time_includes_reader_teardown(tmp_state_dir, pi_
     eng.close()
 
 
+def test_a_base_whose_object_was_rewritten_proves_nothing_and_its_failure_is_omitted(
+    tmp_state_dir, pi_home
+):
+    """R1-F1 of PR #587. Launch 1's one commit C1 fails validation, and C2 is
+    committed on it, so the walk alone decides whether the failure's base
+    applies. Untouched, the walk reads C2 and C1, authenticates the base C1
+    names and shows the failure as needing revalidation on C2. Then the
+    base's loose object is rewritten:
+    a valid commit header over other bytes, which git still reads as a
+    commit. C1's authenticated link still names the base, but the base's
+    own bytes do not hash to its id, so the base is not proved and the
+    failure bound to it is omitted as inapplicable, never shown. Nothing
+    asks GitHub."""
+    gh = FakeGitHub()
+    eng, _ = producing(tmp_state_dir, gh, scripted(implement), FAILS)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    (failed,) = saved(eng).validation_records
+    c1 = failed["candidate"]["commit"]
+    base = failed["candidate"]["provenance"]["base_revision"]
+    work = str(eng.agent_worktree_path())
+    c2 = commit_in(work)
+    since = len(gh.calls)
+    shown = eng._launch_memory(Phase.ANALYZE_EXECUTE, work)
+    assert shown is not None and shown.input_sha == c2
+    assert shown.request.ancestors == (base,) and shown.ancestry_reads == 2
+    assert "Shown 01;" in shown.text and "inapplicable 00" in shown.text
+    assert "needs revalidation 01" in shown.text and f"Source candidate: {c1}" in shown.text
+    raw = git_out("-C", work, "cat-file", "commit", base).encode() + b"\n"
+    forged = raw + b"\nThis is not the base's message.\n"
+    common = (Path(work) / git_out("-C", work, "rev-parse", "--git-common-dir")).resolve()
+    rewrite_loose_object(common / "objects", base, "commit", forged)
+    assert git_out("-C", work, "cat-file", "-t", base) == "commit"
+    assert git_out("-C", work, "cat-file", "-s", base) == str(len(forged))
+    omitted = eng._launch_memory(Phase.ANALYZE_EXECUTE, work)
+    assert omitted is not None and omitted.input_sha == c2
+    assert omitted.request.ancestors == () and omitted.ancestry_reads == 2
+    assert "Shown 00;" in omitted.text and "inapplicable 01" in omitted.text
+    assert f"Source candidate: {c1}" not in omitted.text
+    assert history_calls(gh, since) == []
+    eng.close()
+
+
 @pytest.mark.parametrize(
     "head, candidate, input_sha",
     [(BASE, "", BASE), ("", "", ""), (C1, C1, C1)],
@@ -1214,17 +1256,23 @@ def test_an_ancestry_walk_at_its_bound_costs_far_less_cpu_than_the_ceiling(
     assert rehashed == dict(list(bodies.items())[1:])
 
 
-def test_large_commits_spend_one_shared_ancestry_budget(tmp_path):
+@pytest.mark.parametrize("mib", [6, 12])
+def test_large_commits_spend_one_shared_ancestry_budget(tmp_path, mib):
+    """The input, the walk and each base's authentication (R1-F1 of PR #587)
+    charge one 16 MiB allowance, each commit once. Two 6 MiB commits fit
+    it, each read once, so both bases are proved; a second read of either
+    would not fit. Two 12 MiB commits do not: the parent the input names
+    cannot be authenticated within what is left, so it is not proved, and
+    the walk ends there."""
     root = git_repo(tmp_path / "repo")
-    big = b"x" * (12 * 1024 * 1024)
+    big = b"x" * (mib * 1024 * 1024)
     base, tip, bodies = _memory_history(root, [big, big])
     parent, _ = bodies
     started = os.times()
     with _local_memory_walk(root).memory_commits(tip) as reader:
-        # The candidate read and its cached walk node charge the same bytes once.
         assert reader.parents(tip) == (parent,)
         proof = local_ancestors(tip, [base, parent], reader.parents, has_base=reader.has_commit)
-    assert proof == ((parent,), 2)
+    assert proof == (((base, parent), 2) if mib == 6 else ((), 1))
     assert _cpu_ms_since(started) < 1000.0
 
 

@@ -102,11 +102,12 @@ UNSUPPORTED_PHASES: dict[Phase, str] = {
 MAX_PROPOSALS = 8
 # The most commits a projection's ancestry walk reads (:func:`local_ancestors`,
 # R3-F1 of PR #536). A candidate is the base plus the commits the step's
-# launches made on it, a handful; each read is one local git process, so the
-# bound is also what bounds the walk's share of a launch's latency. A base
-# further below is not proved by the walk, and a record bound to it is
-# omitted, but on the very commit a retained validation record names it is
-# proved by that record, with no walk (R4-F2).
+# launches made on it, a handful; each read is one request to the
+# projection's one local git process (#541), so the bound is also what
+# bounds the walk's share of a launch's latency. A base further below is
+# not proved by the walk, and a record bound to it is omitted, but on the
+# very commit a retained validation record names it is proved by that
+# record, with no walk (R4-F2).
 MAX_ANCESTRY_COMMITS = 64
 # What an agent may add: the kinds that are neither the controller's
 # observations nor the operator's seed, and need no exact candidate.
@@ -155,7 +156,8 @@ class LaunchProjection:
     ``projection_ms`` everything Memory adds before the launch, the
     ledger's reconstruction, the candidate's read and the ancestry walk
     included (R3-F1, R4-F4), and ``ancestry_reads`` counts the commits that
-    walk read.
+    walk read through, its ``max_commits`` reads (a base's own
+    authentication is not one of them).
     """
 
     request: ProjectionRequest
@@ -242,7 +244,8 @@ def local_ancestors(
 ) -> tuple[tuple[str, ...], int]:
     """The ``bases`` that ``candidate`` descends from, proved in the local store alone.
 
-    Returns them, in ``bases``' order, with how many commits were read.
+    Returns them, in ``bases``' order, with how many of the ``max_commits``
+    reads were made.
     Breadth-first from the candidate through each commit's parents as
     ``read_parents`` reads them from the commit's own bytes in the shared
     store (``None`` when the store does not hold it): the engine's reader
@@ -251,13 +254,18 @@ def local_ancestors(
     retry on the commit that failed sees its failure whatever GitHub
     answers. A base is proved when it is a parent of a commit read, so one
     at most ``max_commits`` commits below the candidate can be. A real-store
-    caller supplies ``has_base`` to confirm a named endpoint is present
-    without reading its body. The walk ends when every base is reached,
+    caller supplies ``has_base``, which authenticates a base a parent link
+    names before it counts: it reads the base's own bytes and re-hashes
+    them, is false for a base the store does not hold and raises for one it
+    cannot authenticate (R1-F1 of PR #587). That read takes none of the
+    ``max_commits`` reads, so what the walk can prove is unchanged; it is
+    made at most once per base. The walk ends when every base is reached,
     after ``max_commits`` reads, or when nothing is left to read. A missing
-    commit ends its path; a read that fails ends the walk. A base not reached
-    is not proved, so a record bound to it is omitted as not applicable, never
-    shown as current; the bases reached before the walk ended stay proved,
-    each by a chain of parents read from bytes that hash to their ids.
+    commit ends its path; a read that fails ends the walk, a base's
+    authentication included. A base not reached is not proved, so a record
+    bound to it is omitted as not applicable, never shown as current; the
+    bases reached before the walk ended stay proved, each by a chain of
+    parents read from bytes that hash to their ids.
     """
     wanted = set(bases) - {candidate}
     if not candidate or not wanted:

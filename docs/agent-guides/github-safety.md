@@ -1472,8 +1472,9 @@ the marker first and launches no agent.
   pre-merge evidence fetch runs on it, and every git process goes through
   the executor. Memory's local reader uses the same private configuration
   with no promisor remote and all protocols denied. A Git size check only
-  admits or confirms presence of an object; ancestry links come from the
-  exact bytes re-hashed under the requested SHA.
+  admits an object's read and never proves a commit present: ancestry
+  links, and each base the walk reaches, count only from the exact bytes
+  re-hashed under the requested SHA.
 - **Every controller `gh` process** (`github.gh_workdir`,
   `github.gh_request`, #283) starts in a fresh empty directory the
   controller creates in the temporary directory (outside the checkout

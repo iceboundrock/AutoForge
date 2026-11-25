@@ -1725,13 +1725,19 @@ base the controller proved; so a retry on a failed commit is shown its
 failure however long its history (R4-F2). Any other base is proved by a
 breadth-first walk from the candidate through commits read as their own
 bytes and re-hashed, at most 64 of them. A base named by a parent link
-must also be present as a local commit; this check does not read its
-body or consume a walk slot. A base neither source proves is omitted
-along with the records bound to it. `HEAD` is read through the admin dir the
-registry binds and the common dir, never through the worktree's `.git`
-file, which an earlier launch of the step can rewrite before a correction
-or a retry, and only its id is read there: the commit is read from the
-shared store's objects through the controller's private git directory,
+counts only once its own bytes are read and re-hashed as well: Git's size
+check reads an object's header alone, and a loose object can carry a valid
+commit header over bytes that are not the commit's (R1-F1 of PR #587).
+That read is charged to the shared allowance below, is made once per base
+and reused if the walk goes on below it, and takes none of the 64 walk
+slots, so what the walk can prove is unchanged. A base whose bytes cannot
+be authenticated within those limits ends the walk and is not proved. A
+base neither source proves is omitted along with the records bound to it.
+`HEAD` is read through the admin dir the registry binds and the common
+dir, never through the worktree's `.git` file, which an earlier launch of
+the step can rewrite before a correction or a retry, and only its id is
+read there: the commit is read from the shared store's objects through
+the controller's private git directory,
 which names no promisor remote, so no git version fetches a commit the
 store lacks (R4-F1). For #541, one private `git cat-file --batch-command`
 child serves both the input and the walk, reusing the input's authenticated
@@ -1756,7 +1762,7 @@ label alone, in the first line of the prompt and in the checkpoint's
 created earlier keeps the label it was created with, and one that turns
 Memory off keeps its ledger. The run log records
 what each launch was shown (sizes, counts, digests, the commit it started
-from, or none when it could not be read, the commits the walk read, and
+from, or none when it could not be read, the walk slots it used, and
 the time of Memory's whole preparation, the ledger's reconstruction from
 the checkpoint, the candidate read, the walk and Git cleanup included, with the
 render's share), never a record's text. Two writers exist. The controller's
