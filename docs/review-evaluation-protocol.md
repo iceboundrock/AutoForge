@@ -108,13 +108,17 @@ provided here; later dataset and evidence work belongs to #356, #357 and #360.
 
 Match by case and seed. Each arm starts on the registered revision and uses the same base ref
 and merge base throughout. The same starting SHA against different bases is a different
-diff. A known unequal starting validation set or policy is reported as `validation_mismatch`;
-a missing receipt is `validation_unknown`. Neither enters paired rates. Exclusions are
-restricted to infrastructure, unavailable credentials, unavailable service, or a documented
-pre-launch skip; stop/validation failures are not exclusions. Keep both arms and report
-missing, incomparable and excluded assignments separately. Exclusions remove pairs from
-rates, cost and bootstrap, not independently evidenced treatment harm. Do not replace a failed
-or missing seed; duplicate assignments are refused.
+diff. The starting validation is the FULL receipt of any retained REVIEW launch bound to the
+starting candidate, including an accepted review after a retry that presented none; a run
+with conflicting receipts is refused. A known unequal starting validation set or policy is
+reported as `validation_mismatch`; no receipt for the starting candidate is
+`validation_unknown`, never filled from a later candidate or the certificate. Neither
+enters paired rates. Exclusions are restricted to infrastructure, unavailable credentials,
+unavailable service, or a documented pre-launch skip; stop/validation failures are not
+exclusions. Keep both arms and report missing, incomparable and excluded assignments
+separately. Exclusions remove pairs from rates, cost and bootstrap, not independently
+evidenced treatment harm. Do not replace a failed or missing seed; duplicate assignments are
+refused.
 
 ### Packet and replay
 
@@ -235,8 +239,8 @@ escape despite a certificate, duplicate findings, a clean negative, and a false 
 leads to a no-commit FIX. Tests check the deterministic report against hand-computed values
 and mutate evidence to check refused or stale replies, FIX retries and publication order,
 missing launches/findings, one-PR scope, exact terminal bindings, exclusions, starting
-defects introduced before the starting tip, and policy comparability. Existing
-controller tests (`test_routing.py`, `test_loop_guard.py`,
+defects introduced before the starting tip, and policy comparability, including starting
+receipts across a retry. Existing controller tests (`test_routing.py`, `test_loop_guard.py`,
 `test_validation_gates.py`, `test_review_certificate.py`, `test_merge_certificate.py`,
 `test_partial_fix.py`, `test_replan.py`) verify runtime behavior with fakes; this replay
 does not verify or execute those effects. No model, candidate code, network, credentials,

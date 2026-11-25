@@ -292,11 +292,15 @@ def replay(case, run, *, synthetic: bool) -> dict:
             )
             if policy is not None:
                 fixed_policy = policy
-            if first_review:
-                if ledger_complete:
-                    require(row["head"] == case["start"], "first review candidate")
-                    start_validation = policy
-                first_review = False
+            if first_review and ledger_complete:
+                require(row["head"] == case["start"], "first review candidate")
+            first_review = False
+            # Any retained receipt bound to the starting candidate states its
+            # validation, including an accepted review after a retry that had
+            # none. The check above refuses a conflicting receipt; nothing
+            # fills an absent one from a later candidate or the certificate.
+            if row["head"] == case["start"] and policy is not None:
+                start_validation = policy
             if outcome in ("clean", "stale_clean") and row["validation"] is not None:
                 require(row["validation"]["result"] != "fail", "clean reply over failed validation")
             if outcome in (None, "retry"):

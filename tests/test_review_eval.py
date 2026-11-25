@@ -401,6 +401,58 @@ def test_pairs_distinguish_validation_conflict_from_absence(packet, change, stat
         assert got["certificate_issued"] and got["validated_success"] is False
 
 
+@pytest.mark.parametrize(
+    ("retry", "accepted", "status"),
+    [
+        (None, "same", "matched"),
+        ("same", None, "matched"),
+        (None, None, "validation_unknown"),
+        ("other", "same", "changed validation set or policy"),
+    ],
+)
+def test_starting_validation_is_any_receipt_of_the_starting_candidate(
+    packet, retry, accepted, status
+):
+    run = packet["runs"][2]
+    review = run["launches"][1]
+    receipts = {
+        None: None,
+        "same": review["validation"],
+        "other": dict(review["validation"], policy="c" * 64),
+    }
+    run["launches"][1:2] = [
+        retry_review(review, validation=receipts[retry]),
+        dict(review, validation=receipts[accepted]),
+    ]
+    run["stop"].update(through=3, review=3, wall_ms=None)
+    if status not in ("matched", "validation_unknown"):
+        with pytest.raises(EvidenceError, match=status):
+            score(packet)
+        return
+    pair = next(row for row in score(packet)["pairs"] if row["case"] == "clean-boundary")
+    assert pair["status"] == status
+    got = pair["runs"]["baseline"]
+    # The certificate's receipt never stands in for an absent review receipt.
+    assert got["starting_validation"] == (
+        pair["runs"]["treatment"]["starting_validation"] if status == "matched" else None
+    )
+    assert got["certificate_issued"] is (True if accepted else None)
+
+
+def test_receipt_of_a_later_candidate_is_not_starting_validation(packet):
+    run = packet["runs"][0]
+    review, final = run["launches"][1], run["launches"][-1]
+    run["launches"][1:] = [
+        retry_review(review, validation=None),
+        dict(final, round=1, transition="drift"),
+    ]
+    run["stop"].update(through=3, round=1, review=3)
+    pair = next(row for row in score(packet)["pairs"] if row["case"] == "wrong-boundary")
+    assert pair["runs"]["baseline"]["validated_success"]
+    assert pair["runs"]["baseline"]["starting_validation"] is None
+    assert pair["status"] == "validation_unknown"
+
+
 @pytest.mark.parametrize("change", ["comment", "validation", "tree", "round", "fast"])
 def test_terminal_certificate_binds_every_input(packet, change):
     stop = packet["runs"][0]["stop"]
