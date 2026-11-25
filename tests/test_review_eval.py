@@ -33,6 +33,16 @@ def retry_review(row, **changes):
     return dict(row, outcome="retry", comment=None, findings=None, **changes)
 
 
+def introduce_before_start(case, key):
+    """Register merge base -> introducing commit -> starting tip for one starting defect."""
+    start = case["snapshots"][case["start"]]
+    introducing = "6" * 40
+    case["snapshots"][introducing] = dict(start, tree="7" * 40, present=[key])
+    start["parent"] = introducing
+    case["defects"][key]["introduced"] = introducing
+    return introducing
+
+
 def no_certificate(run, *, through, round_, review, at):
     run["stop"].update(
         phase="BLOCKED",
@@ -281,10 +291,38 @@ def test_accepted_clean_can_block_without_issuing_a_certificate(packet):
     assert got["certificate_issued"] is False and got["validated_success"] is False
 
 
+def test_starting_defect_keeps_an_introduction_before_the_starting_tip(packet):
+    expected = score(deepcopy(packet))
+    case = packet["cases"]["wrong-boundary"]
+    introducing = introduce_before_start(case, "off-by-one")
+    assert introducing not in (case["start"], case["merge_base"])
+    # The starting inventory, not the introducing SHA, decides exposure.
+    assert score(packet) == expected
+    for arm in ("baseline", "treatment"):
+        assert result(packet, "wrong-boundary", arm)["counts"]["recall"] == (4, 0, 4)
+
+
+@pytest.mark.parametrize("introduced", ["successor", "sibling"])
+def test_starting_defect_cannot_come_from_outside_the_starting_lineage(packet, introduced):
+    case = packet["cases"]["wrong-boundary"]
+    if introduced == "successor":
+        later = "3" + "0" * 39
+        case["snapshots"][later]["present"] = ["off-by-one"]
+    else:
+        later = "6" * 40
+        case["snapshots"][later] = dict(case["snapshots"][case["start"]], tree="7" * 40)
+    case["defects"]["off-by-one"]["introduced"] = later
+    with pytest.raises(EvidenceError, match="starting defect inventory"):
+        score(packet)
+
+
+@pytest.mark.parametrize("introduction", ["starting tip", "earlier lineage commit"])
 @pytest.mark.parametrize("held", ["held", "retry"])
-def test_bound_nonissuance_after_fix_can_establish_a_new_shared_escape(packet, held):
+def test_bound_nonissuance_after_fix_can_establish_a_new_shared_escape(packet, held, introduction):
     recorded(packet, "wrong-boundary")
     case = packet["cases"]["wrong-boundary"]
+    if introduction != "starting tip":
+        introduce_before_start(case, "off-by-one")
     case["defects"]["off-by-one"]["severity"] = "critical"
     baseline, treatment = packet["runs"]
     baseline["launches"].pop()

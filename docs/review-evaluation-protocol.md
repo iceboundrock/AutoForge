@@ -71,10 +71,13 @@ be a run's producer, reviewer, or fixer. A label cites an adjudicator, discovery
 protected oracle assertion, minimized input with expected/observed output, or an independently
 reviewed trace proving a contract violation. Bind each label to the exact reviewed candidate
 SHA/tree and finding ID, each defect to the SHA introducing it, and each FIX judgment to the
-published successor. A report after cutoff, absent evidence, disagreement without an
-independent resolution, or a match not settled by the cutoff is unknown. A real trial should
-retain original artifacts, document disagreements, and have a second independent adjudicator
-settle disputed or critical labels. A name or artifact string in a packet is not authentication.
+published successor. The starting inventory is every registered defect present at the
+starting candidate, whether the starting tip or an earlier commit of its lineage introduced
+it; the defect keeps that actual introducing SHA. A report after cutoff, absent evidence,
+disagreement without an independent resolution, or a match not settled by the cutoff is
+unknown. A real trial should retain original artifacts, document disagreements, and have a
+second independent adjudicator settle disputed or critical labels. A name or artifact string
+in a packet is not authentication.
 
 | Finding label | Meaning |
 |---|---|
@@ -119,8 +122,11 @@ or missing seed; duplicate assignments are refused.
 
 - `cases` registers case IDs, seeds, starting candidate, base, cutoff, defects, and observed
   snapshots (`parent`, `tree`, independent presence inventory, oracle status and provenance).
-  Parents form a rooted graph at the pinned merge base. For a FIX with several commits the
-  parent of its published endpoint is the reviewed predecessor in the **observed** graph.
+  Parents form a rooted graph at the pinned merge base. A defect present at the starting
+  candidate is introduced by it or by an earlier registered commit of its lineage above the
+  merge base; one introduced by a published FIX endpoint is that FIX's regression. For a
+  FIX with several commits the parent of its published endpoint is the reviewed
+  predecessor in the **observed** graph.
   SHA/tree fields in the synthetic fixture are stand-ins, not Git objects.
 - Each `runs` entry has a case/seed/arm, one fresh PR identity, and producer/reviewer/fixer
   identities in that order. Its `creation` receipt identifies ordinal zero, before any
@@ -228,8 +234,9 @@ The fixture has two matched cases, a repaired defect, a harmful publication with
 escape despite a certificate, duplicate findings, a clean negative, and a false alarm that
 leads to a no-commit FIX. Tests check the deterministic report against hand-computed values
 and mutate evidence to check refused or stale replies, FIX retries and publication order,
-missing launches/findings, one-PR scope, exact terminal bindings, exclusions and policy
-comparability. Existing controller tests (`test_routing.py`, `test_loop_guard.py`,
+missing launches/findings, one-PR scope, exact terminal bindings, exclusions, starting
+defects introduced before the starting tip, and policy comparability. Existing
+controller tests (`test_routing.py`, `test_loop_guard.py`,
 `test_validation_gates.py`, `test_review_certificate.py`, `test_merge_certificate.py`,
 `test_partial_fix.py`, `test_replan.py`) verify runtime behavior with fakes; this replay
 does not verify or execute those effects. No model, candidate code, network, credentials,

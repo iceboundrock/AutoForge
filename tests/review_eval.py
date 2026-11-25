@@ -103,14 +103,23 @@ def check_case(case) -> None:
             cursor = snaps[cursor]["parent"]
         require(base in seen, "snapshots must descend from the registered merge base")
     require(not snaps[base]["present"], "registered defects must be absent from the merge base")
+    # The starting tip and its registered ancestors above the merge base. The
+    # ancestry walk above has already proven this path finite and rooted.
+    lineage, cursor = set(), start
+    while cursor != base:
+        lineage.add(cursor)
+        cursor = snaps[cursor]["parent"]
     for key, defect in case["defects"].items():
         object_fields(defect, "severity class introduced source")
         require(defect["severity"] in WEIGHT and defect["class"] in CLASSES, "defect taxonomy")
         source(defect["source"], case)
         introduced = defect["introduced"]
         require(introduced in snaps and introduced != base, "defect introduction")
+        # A starting defect keeps the SHA that actually introduced it: the
+        # starting tip or any earlier commit of its registered lineage.
         require(
-            (key in snaps[start]["present"]) == (introduced == start), "starting defect inventory"
+            key not in snaps[start]["present"] or introduced in lineage,
+            "starting defect inventory",
         )
         for head, snap in snaps.items():
             if key not in snap["present"]:
@@ -122,6 +131,11 @@ def check_case(case) -> None:
         require(key in snaps[introduced]["present"], "defect missing at its introduction")
     if case["clean_negative"]:
         require(not snaps[start]["present"] and snaps[start]["oracle"] == "pass", "clean negative")
+
+
+def starting_inventory(case) -> set:
+    """Defects present at the starting candidate, whichever lineage commit introduced them."""
+    return set(case["snapshots"][case["start"]]["present"])
 
 
 def validation(value):
@@ -482,7 +496,7 @@ def replay(case, run, *, synthetic: bool) -> dict:
 
     counts = Counter(status for _, status, _ in observations)
     detected = {key for _, status, key in observations if status == "confirmed"}
-    exposed = {key for key in eligible if case["defects"][key]["introduced"] == case["start"]}
+    exposed = eligible & starting_inventory(case)
     weight = sum(WEIGHT[case["defects"][key]["severity"]] for key in exposed)
     detected_weight = sum(WEIGHT[case["defects"][key]["severity"]] for key in exposed & detected)
     # Ignoring candidate-specific eligibility only widens this outer bound.
@@ -660,7 +674,7 @@ def score(packet) -> dict:
         if t:
             for key, escaped in t["critical_escapes"].items():
                 fix_introduced = key in t["fix_regressions"]
-                shared = cases[case_id]["defects"][key]["introduced"] == cases[case_id]["start"]
+                shared = key in starting_inventory(cases[case_id])
                 comparable_baseline = (
                     b
                     and not b["exclusion"]
@@ -748,8 +762,8 @@ def score(packet) -> dict:
         and (
             cases[key]["clean_negative"]
             or any(
-                defect["introduced"] == cases[key]["start"] and source(defect["source"], cases[key])
-                for defect in cases[key]["defects"].values()
+                source(cases[key]["defects"][defect]["source"], cases[key])
+                for defect in starting_inventory(cases[key])
             )
         )
     )
