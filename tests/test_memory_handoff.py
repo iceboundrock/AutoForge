@@ -1257,17 +1257,29 @@ def test_a_walk_over_commits_of_many_short_lines_costs_far_less_cpu_than_the_cei
 def _loose_commit(objects: Path, tree: str, parent: str, message: bytes) -> str:
     """A valid commit of ``tree`` on ``parent``, written as git writes a loose
     object; far quicker than ``git commit-tree`` for a message of megabytes."""
-    content = (
+    return _loose_commit_of(objects, tree, parent, [message])
+
+
+def _loose_commit_of(objects: Path, tree: str, parent: str, pieces: list[bytes]) -> str:
+    """:func:`_loose_commit` of the message ``b"".join(pieces)``, never joined:
+    a commit of hundreds of MiB made of one repeated piece costs the test no
+    more memory than the piece."""
+    head = (
         f"tree {tree}\nparent {parent}\nauthor t <t@example.com> 0 +0000\n"
         "committer t <t@example.com> 0 +0000\n\n"
-    ).encode() + message
-    head = b"commit %d\0" % len(content)
-    digest = hashlib.sha1(head)
-    digest.update(content)
+    ).encode()
+    prefix = b"commit %d\0" % (len(head) + sum(len(piece) for piece in pieces))
+    digest = hashlib.sha1(prefix + head)
+    deflate = zlib.compressobj(1)
+    written = [deflate.compress(prefix + head)]
+    for piece in pieces:
+        digest.update(piece)
+        written.append(deflate.compress(piece))
+    written.append(deflate.flush())
     sha = digest.hexdigest()
     path = objects / sha[:2] / sha[2:]
     path.parent.mkdir(exist_ok=True)
-    path.write_bytes(zlib.compress(head + content, 1))
+    path.write_bytes(b"".join(written))
     return sha
 
 
@@ -1336,27 +1348,49 @@ def test_a_walk_over_large_valid_commits_ends_within_its_bytes_under_the_ceiling
     assert cpu_ms < 1000.0
 
 
-class _StdoutEnded:
-    """A reader's process whose stdout reads as ended, as one that exited does."""
+class _FirstEnded:
+    """A walk reader's process starter whose first process, its shared one,
+    fails at its first reply: its stdout reads as ended, as one that exited
+    does. Every later process, each a one-shot read, is left as it is. It
+    keeps each child and the SHAs each was asked for; :meth:`stdout_bytes`
+    is what all of them wrote on stdout, every byte the executor read."""
 
-    def __init__(self, child) -> None:
-        self._child = child
+    def __init__(self) -> None:
+        self.children: list = []
+        self.asked: list[list[str]] = []
 
-    def read_chunk(self, timeout=None):
-        return Eof()
+    def __call__(self, request):
+        child = start_duplex(request)
+        self.children.append(child)
+        self.asked.append([])
+        asked, ended = self.asked[-1], len(self.children) == 1
 
-    def __getattr__(self, name):
-        return getattr(self._child, name)
+        class Asked:
+            def send_line(self, data):
+                asked.append(data.decode())
+                child.send_line(data)
+
+            def read_chunk(self, timeout=None):
+                return Eof() if ended else child.read_chunk(timeout)
+
+            def __getattr__(self, name):
+                return getattr(child, name)
+
+        return Asked()
+
+    def stdout_bytes(self) -> int:
+        return sum(child.finish().stdout_bytes for child in self.children)
 
 
 def test_a_walk_whose_process_fails_starts_no_more_than_the_readers_processes(tmp_path):
     """R3-F1, R3-F2 of PR #586: the walk's process failed at its first reply,
     which left every read of a walk at its bound to a git process of its
-    own, 65 in all. Single reads now count against the reader's processes:
-    the walk reads on, each read answered as a single read answers it, until
-    MAX_READER_PROCESSES processes in all have been started, the failed one
-    included, and the next read is refused, which ends the walk with the base
-    unproved."""
+    own, 65 in all. One-shot reads now count against the reader's
+    processes: the walk reads on, each read answered as a single read
+    answers it, by a ``git cat-file --batch`` process of its own (R4-F1),
+    until MAX_READER_PROCESSES processes in all have been started, the
+    failed one included, and the next read is refused, which ends the walk
+    with the base unproved."""
     root = git_repo(tmp_path / "repo")
     base = git_out("-C", str(root), "rev-parse", "HEAD")
     tree = git_out("-C", str(root), "rev-parse", f"{base}^{{tree}}")
@@ -1365,25 +1399,14 @@ def test_a_walk_whose_process_fails_starts_no_more_than_the_readers_processes(tm
         chain.append(
             git_out("-C", str(root), *GIT_IDENT, "commit-tree", tree, "-p", chain[-1], "-m", f"{n}")
         )
-    children: list = []
-
-    def session(request):
-        children.append(start_duplex(request))
-        return _StdoutEnded(children[-1])
-
-    singles: list = []
-
-    def single(request):
-        singles.append(request)
-        return execute(request)
-
+    sessions = _FirstEnded()
     transport = GitTransport(
         object_directory=root / ".git" / "objects",
         remote=GitRemote.https(REPO),
         in_base_history=lambda base, sha: pytest.fail("the walk asked GitHub"),
         git_lock=lambda operation: pytest.fail("the walk fetched"),
-        runner=single,
-        duplex=session,
+        runner=lambda request: pytest.fail("the walk made a single read"),
+        duplex=sessions,
     )
     walked: list = []
     with transport.local_commit_reader() as reader:
@@ -1396,10 +1419,87 @@ def test_a_walk_whose_process_fails_starts_no_more_than_the_readers_processes(tm
         proved = local_ancestors(chain[-1], [base], parents)
     assert proved == ((), MAX_READER_PROCESSES)
     assert walked == [(sha,) for sha in reversed(chain[-MAX_READER_PROCESSES:-1])]
-    assert len(children) == 1 and len(singles) == MAX_READER_PROCESSES - 1
+    tip = chain[-1]
+    assert sessions.asked == [[tip], [tip], [chain[-2]], [chain[-3]]]
     assert reader.processes_left == 0
-    (child,) = children
-    assert child.exited()
+    assert all(child.exited() for child in sessions.children)
+
+
+def test_a_walk_whose_process_fails_reads_no_commit_past_its_bytes_under_the_ceiling(
+    tmp_path, monkeypatch
+):
+    """R4-F1 of PR #586: the walk's process failed at its first reply, and
+    the one-shot read of the candidate's parent, a valid commit of 512 MiB,
+    let git write it whole and kept only what fit what was left of
+    MAX_READER_BYTES: 536,870,971 bytes of stdout read to refuse it, 1.2 s
+    of CPU on a Linux host, past the ceiling. A one-shot read is now a
+    ``git cat-file --batch`` process of its own, read as the shared one is:
+    the parent is refused at its header, before git has written its
+    bytes, and its process is killed, so the walk ends there with the base
+    unproved. What the walk read from git, every process's stdout counted
+    as the executor read it, the bytes it dropped included, stays under
+    MAX_READER_BYTES, and so does its cost under the ceiling, measured as
+    the tests above measure it. Read as the engine reads it: the one commit
+    taken is re-hashed from all of its bytes to its own id, with no single
+    read and no fetch, and three processes of the reader's four."""
+    root = git_repo(tmp_path / "repo")
+    objects = root / ".git" / "objects"
+    base = git_out("-C", str(root), "rev-parse", "HEAD")
+    tree = git_out("-C", str(root), "rev-parse", f"{base}^{{tree}}")
+    piece = b"x" * (1 << 20)
+    parent = _loose_commit_of(objects, tree, base, [b"subject\n\n"] + [piece] * 512)
+    tip = git_out("-C", str(root), *GIT_IDENT, "commit-tree", tree, "-p", parent, "-m", "tip")
+    size = int(git_out("-C", str(root), "cat-file", "-s", parent))
+    assert (
+        size > 512 * len(piece) and git_out("-C", str(root), "cat-file", "-t", parent) == "commit"
+    )
+    hashed: list[tuple[str, int]] = []
+    rehash = git_transport_module._hash_commit
+
+    def counted(raw, object_format):
+        digest = rehash(raw, object_format)
+        hashed.append((digest, len(raw)))
+        return digest
+
+    monkeypatch.setattr(git_transport_module, "_hash_commit", counted)
+    singles: list = []
+
+    def single(request):
+        singles.append(execute(request))
+        return singles[-1]
+
+    sessions = _FirstEnded()
+    transport = GitTransport(
+        object_directory=objects,
+        remote=GitRemote.https(REPO),
+        in_base_history=lambda base, sha: pytest.fail("the walk asked GitHub"),
+        git_lock=lambda operation: pytest.fail("the walk fetched"),
+        runner=single,
+        duplex=sessions,
+    )
+    read: list[str] = []
+    started = os.times()
+    with transport.local_commit_reader() as reader:
+
+        def parents(sha):
+            read.append(sha)
+            record = reader.read_local_commit(sha)
+            return None if record is None else record.parents
+
+        proved = local_ancestors(tip, [base], parents)
+    ended = os.times()
+    fields = ("user", "system", "children_user", "children_system")
+    cpu_ms = sum(getattr(ended, f) - getattr(started, f) for f in fields) * 1000.0
+    drained = sessions.stdout_bytes() + sum(result.stdout_bytes for result in singles)
+    assert drained < MAX_READER_BYTES < size
+    assert cpu_ms < 1000.0
+    assert proved == ((), 2) and read == [tip, parent]
+    assert singles == [] and sessions.asked == [[tip], [tip], [parent]]
+    refused = sessions.children[-1].finish()
+    assert refused.stopped and refused.exit_code != 0
+    ((digest, taken),) = hashed
+    assert digest == tip and reader.bytes_left == MAX_READER_BYTES - taken
+    assert reader.processes_left == MAX_READER_PROCESSES - 3
 
 
 def test_a_candidate_with_a_line_past_the_record_default_leaves_the_walk_in_one_process(

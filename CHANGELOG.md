@@ -30,9 +30,11 @@ commits is. A commit the shared process cannot return exactly is read by a
 process of its own. When only more of it was waiting than that process
 holds, the next read starts a new shared process; after any other failure
 of it, each later read has a process of its own until the 4 are used. A
-process of its own captures at most what is left of the 16 MiB plus 256
-bytes of git's framing, so it refuses a commit the shared process takes
-whole, one of exactly 16 MiB for instance. A commit that is not valid UTF-8
+process of its own is read as the shared one is: each counts a commit's
+bytes from the header git writes before them, so a commit past what is
+left is refused from its header and its process is stopped at once rather
+than left to write the commit out. The walk thus never reads a whole
+oversized commit from git to refuse it. A commit that is not valid UTF-8
 no longer ends the walk, since its bytes are now hashed as git wrote them
 rather than through a text capture. Reading a commit whose header holds
 many short lines no longer costs more than its bytes. No configuration,

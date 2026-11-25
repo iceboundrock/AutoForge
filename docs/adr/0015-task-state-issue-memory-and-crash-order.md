@@ -1744,11 +1744,16 @@ reply was waiting than the process's queue holds (65,536 chunks, or 16 MiB
 and a header's 256 bytes), the next read starts a new process; after any
 other failure (an exit, a time limit, a reply out of step with its header,
 a failed spawn or write) every later read is one of its own. Either way
-the walk starts at most 4 processes. The process's 16 MiB are raw object
-bytes; a single read's bound is on its captured stdout, header and LFs
-included, at most what is left plus 256 bytes and never past 16 MiB, so a
-commit of exactly 16 MiB that the process takes whole is past a single
-read.
+the walk starts at most 4 processes. A process of its own is a
+`git cat-file --batch` process started for that read alone and read as
+the shared one is, so every process counts a reply's bytes from its header
+before it takes them and is killed at once when they are past what is left
+(R4-F1 of PR #586). A one-shot read that let git write its whole reply and
+kept only what fit read 512 MiB of stdout to refuse a commit that large,
+1.2 s of CPU on Linux, past D12's ceiling. What the walk reads from git is
+therefore its 16 MiB of object bytes at most, with each reply's header and
+LF and whatever git writes before a kill lands; the controller's own
+single read, which captures its stdout, is not used by the walk.
 `HEAD` is read through the admin dir the registry binds and the common
 dir, never through the worktree's `.git`
 file, which an earlier launch of the step can rewrite before a correction

@@ -89,6 +89,7 @@ from .executor_duplex import (
     Chunk,
     DuplexChild,
     DuplexRequest,
+    DuplexResult,
     Overflow,
     StdoutMode,
     start_duplex,
@@ -109,18 +110,21 @@ NETWORK_TIMEOUT_SECONDS = 600
 LOCAL_TIMEOUT_SECONDS = 120
 
 # What one :class:`LocalCommitReader` may cost in all, across every read it
-# makes, through its own process and by single reads alike (R3-F1 of PR #586):
-# the bytes of the objects it takes and the git processes it starts. Each
-# reply was bounded, but a walk's cost is the sum of its replies: 64 valid
-# commits of 12 MiB, each within the bound, cost a Linux host 2.9 s of CPU
-# through one process. 16 MiB in all is the single read's capture bound, a
-# quarter of a MiB for each of Memory's 64 reads, and took a Linux host 80
-# to 130 ms of CPU to take. 4 processes would cost the hosted macOS runners
-# about 80 ms at the 19 to 20 ms a process that #541 infers from their 1.2
-# to 1.3 s for 65. One process serves a normal walk; the rest let it go on
-# past a queue overflow (a single read and a new process) or a failed
-# process (single reads). A read past either is refused, and so is every
-# read after it: the reader is spent.
+# makes, through its shared process and by one-shot reads alike (R3-F1, R4-F1
+# of PR #586): the bytes of the objects it takes and the git processes it
+# starts. Each reply was bounded, but a walk's cost is the sum of its
+# replies: 64 valid commits of 12 MiB, each within the bound, cost a Linux
+# host 2.9 s of CPU through one process. 16 MiB in all is the single read's
+# capture bound, a quarter of a MiB for each of Memory's 64 reads, and took a
+# Linux host 80 to 130 ms of CPU to take. 4 processes would cost the hosted
+# macOS runners about 80 ms at the 19 to 20 ms a process that #541 infers
+# from their 1.2 to 1.3 s for 65. One process serves a normal walk; the rest
+# let it go on past a queue overflow (a one-shot read and a new shared
+# process) or a failed process (one-shot reads). A read past either is
+# refused, and so is every read after it: the reader is spent. Every process
+# counts its bytes from a reply's header before it takes them (R4-F1 of PR
+# #586): a one-shot read that let git write its whole reply and kept only
+# what fit drained a 512 MiB commit, 1.2 s of CPU on a Linux host.
 MAX_READER_BYTES = DEFAULT_MAX_OUTPUT_BYTES
 MAX_READER_PROCESSES = 4
 # How many chunks of a reader's process's stdout, read unframed, may wait to
@@ -129,8 +133,7 @@ MAX_READER_PROCESSES = 4
 # short ones (R2-F1 of PR #586) costs more than its bytes.
 MAX_READER_CHUNKS = 65536
 # The longest header line (``<id> <type> <size>``, under 100 bytes) a reply
-# may begin with; also the room beside the object's bytes in what waits, and
-# beside what is left of a reader's bytes in a single read's capture.
+# may begin with; also the room beside the object's bytes in what waits.
 READER_HEADER_BYTES = 256
 
 # Hooks and the file-system monitor are off at command-line precedence for
@@ -463,9 +466,9 @@ class GitTransport:
     ``git_lock(operation)`` returns the shared-Git lock (L1) of the store's
     common dir, a context manager :meth:`fetch` holds around its git
     process (ADR 0008 D12.1); it is required, so no transport fetches
-    without it. ``runner`` runs every one-shot process and ``duplex``
-    starts the one process of a :class:`LocalCommitReader`; both default to
-    the executor's.
+    without it. ``runner`` runs every one-shot process of the transport's
+    own and ``duplex`` starts every process of a :class:`LocalCommitReader`;
+    both default to the executor's.
     """
 
     def __init__(
@@ -539,13 +542,8 @@ class GitTransport:
         *,
         gh_path: str | None,
         stdin: bytes | None = None,
-        max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
     ) -> ExecutionRequest:
-        """One git process in ``git_dir``; a network one when ``gh_path`` is given.
-
-        ``max_output_bytes`` is its capture bound, lowered only for a
-        :class:`LocalCommitReader`'s single read, to what is left of the
-        reader's bytes (R3-F1 of PR #586)."""
+        """One git process in ``git_dir``; a network one when ``gh_path`` is given."""
         # No promisor remote can be configured in the private directory, so a
         # missing object is never fetched lazily behind this module's back.
         switches = [*LOCAL_GIT_SWITCHES, *NO_AUTO_MAINTENANCE]
@@ -581,7 +579,6 @@ class GitTransport:
             if gh_path is not None
             else LOCAL_TIMEOUT_SECONDS,
             stdin_data=stdin,
-            max_output_bytes=max_output_bytes,
         )
 
     def _run(self, request: ExecutionRequest, what: str) -> ExecutionResult:
@@ -655,23 +652,17 @@ class GitTransport:
             )
 
     # -- object reads --------------------------------------------------------------------
-    def _batch(
-        self, sha: str, mode: str, max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
-    ) -> ExecutionResult:
+    def _batch(self, sha: str, mode: str) -> ExecutionResult:
         """``git cat-file --batch`` / ``--batch-check`` for one SHA, in its own directory."""
         with self._git_dir(_object_format(sha)) as git_dir:
             request = self._request(
-                git_dir,
-                ["cat-file", mode],
-                gh_path=None,
-                stdin=f"{sha}\n".encode("ascii"),
-                max_output_bytes=max_output_bytes,
+                git_dir, ["cat-file", mode], gh_path=None, stdin=f"{sha}\n".encode("ascii")
             )
             result = self._run(request, f"reading object {sha} failed")
         if result.timed_out:
             raise GitTransportError(f"reading object {sha} timed out")
         if result.truncated:
-            raise _Truncated(
+            raise GitTransportError(
                 f"reading object {sha}: git's output was truncated at the capture bound"
             )
         return result
@@ -699,15 +690,7 @@ class GitTransport:
 
     def _read_once(self, sha: str) -> CommitRecord | None:
         """The authenticated commit, or None when the store does not hold ``sha``."""
-        return self._read_sized(sha)[0]
-
-    def _read_sized(
-        self, sha: str, max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
-    ) -> tuple[CommitRecord | None, int]:
-        """:meth:`_read_once`'s answer and the size of the object read (0 for
-        none), its stdout captured up to ``max_output_bytes``, header and LFs
-        included: a reply past it raises :class:`_Truncated`."""
-        result = self._batch(sha, "--batch", max_output_bytes)
+        result = self._batch(sha, "--batch")
         if result.exit_code != 0:
             # A loose object git cannot even inflate, for example. Not
             # "missing": it is not re-fetched, and it never reads as allowed.
@@ -716,7 +699,7 @@ class GitTransport:
             )
         header, newline, body = result.stdout.partition("\n")
         if header == f"{sha} missing":
-            return None, 0
+            return None
         parts = header.split(" ")
         if not newline or len(parts) != 3 or parts[0] != sha or not parts[2].isdigit():
             raise GitTransportError(f"unexpected reply reading commit {sha}")
@@ -737,7 +720,7 @@ class GitTransport:
             if lossy:
                 raise GitTransportError(_lossy(sha))
             raise GitTransportError(_substituted(sha))
-        return _parse_commit(sha, raw), size
+        return _parse_commit(sha, raw)
 
     def read_local_commit(self, sha: str) -> CommitRecord | None:
         """``sha`` as its own bytes when the shared store holds it; never fetched.
@@ -756,8 +739,8 @@ class GitTransport:
 
         Each read answers as :meth:`read_local_commit` does, until the reader
         has taken ``max_bytes`` of objects or started ``max_processes`` git
-        processes in all (R3-F1 of PR #586); see :class:`LocalCommitReader`.
-        Nothing is started until its first read.
+        processes in all (R3-F1, R4-F1 of PR #586); see
+        :class:`LocalCommitReader`. Nothing is started until its first read.
         """
         return LocalCommitReader(
             self, self._duplex, max_bytes=max_bytes, max_processes=max_processes
@@ -938,7 +921,7 @@ class GitTransport:
 
 
 class _ReplyLost(Exception):
-    """A reader's git process cannot give this reply exactly; a single read will."""
+    """A reader's git process cannot give this reply exactly; a one-shot read will."""
 
 
 class _ReplyOverflowed(_ReplyLost):
@@ -946,10 +929,6 @@ class _ReplyOverflowed(_ReplyLost):
 
     The process is no worse for it: the next read starts a new one (R1-F1
     of PR #586)."""
-
-
-class _Truncated(GitTransportError):
-    """A one-shot read's stdout past its capture bound."""
 
 
 class _Spent(GitTransportError):
@@ -992,58 +971,66 @@ class LocalCommitReader:
     :meth:`GitTransport.read_local_commit` does, one commit at a time in
     the order asked: the commit as its own bytes from the shared store,
     re-hashed in its object format and parsed, or ``None`` when the store
-    does not hold it; never fetched and never substituted. The process
-    runs in a private git directory of its own, with every switch, setting
-    and environment of a single read (:meth:`GitTransport._request`), so
-    no promisor remote, replacement object, commit-graph, graft or shallow
-    file reaches it that a single read would not see. What differs is the
-    cost: a single read starts a process per commit, and Memory's ancestry
-    walk of up to 64 commits before a launch, read that way, cost the hosted
-    macOS runners 1.2 to 1.3 s of CPU, past ADR 0015 D12's 1,000 ms ceiling,
-    where starting a process costs far more than on Linux.
+    does not hold it; never fetched and never substituted. Every process
+    it starts runs in a private git directory of its own, with every
+    switch, setting and environment of a single read
+    (:meth:`GitTransport._request`), so no promisor remote, replacement
+    object, commit-graph, graft or shallow file reaches it that a single
+    read would not see. What differs is the cost: a single read starts a
+    process per commit, and Memory's ancestry walk of up to 64 commits
+    before a launch, read that way, cost the hosted macOS runners 1.2 to
+    1.3 s of CPU, past ADR 0015 D12's 1,000 ms ceiling, where starting a
+    process costs far more than on Linux.
 
-    The process starts on the first read, in that SHA's object format; a
-    SHA of the other format is a single read. Its stdout is read unframed
-    (``StdoutMode.CHUNKS``): each reply is its header line and then exactly
-    the bytes the header declares, so the commit hashed is exactly what git
-    wrote, and what a reply costs is its size, however many lines it holds
-    or however long they are (R1-F1, R2-F1 of PR #586). Unlike the single
-    read, which captures text, a commit that is not valid UTF-8 is
-    authenticated too. A reply the process cannot give exactly ends the
-    process, and that read is a single read, with that read's guarantees
-    and refusals. When git gave the reply right but more of it waited than
-    the queue holds (:data:`MAX_READER_CHUNKS` chunks, or
+    The shared process starts on the first read, in that SHA's object
+    format. Its stdout is read unframed (``StdoutMode.CHUNKS``): each reply
+    is its header line and then exactly the bytes the header declares, so
+    the commit hashed is exactly what git wrote, and what a reply costs is
+    its size, however many lines it holds or however long they are (R1-F1,
+    R2-F1 of PR #586). Unlike the single read, which captures text, a
+    commit that is not valid UTF-8 is authenticated too. A missing commit
+    is a reply, ``None``; a commit whose bytes do not hash to its id and an
+    object that is no commit raise :class:`GitTransportError` as a single
+    read does, and the process goes on to the next read.
+
+    A read the shared process cannot serve is a one-shot read: a
+    ``git cat-file --batch`` process of its own, started for that read
+    alone, whose reply is read exactly as the shared process's are, and
+    which is ended once it is answered. A SHA of the other object format
+    is one, and the shared process stays. A reply the shared process
+    cannot give exactly ends that process, and the read is a one-shot
+    read. When git gave the reply right but more of it waited than the
+    queue holds (:data:`MAX_READER_CHUNKS` chunks, or
     :data:`MAX_READER_BYTES` and a header's room), the next read starts a
-    new process, so such a commit costs the reader the single read and one
-    process more, never a process for every later read (R1-F1 of PR #586);
-    this overflow is the only reply that restarts the process. Otherwise
-    (a malformed header, a reply longer than its header says, the process
-    exiting or reaching its time limit, a spawn or a write that fails) the
-    process is what failed, and every later read is a single read too. A missing
-    commit is a reply, ``None``; a commit whose bytes do not hash to its id
-    and an object that is no commit raise :class:`GitTransportError` as a
-    single read does, and the process goes on to the next read.
+    new shared process, so such a commit costs the reader the one-shot
+    read and one process more, never a process for every later read (R1-F1
+    of PR #586); this overflow is the only reply that restarts the shared
+    process. Otherwise (a malformed header, a reply longer than its header
+    says, the process exiting or reaching its time limit, a spawn or a
+    write that fails) the process is what failed, and every later read is
+    a one-shot read too. A one-shot read that gets no exact reply raises
+    :class:`GitTransportError`.
 
     What the reader costs is bounded across its reads, not only for each
     one (R3-F1 of PR #586): it takes at most ``max_bytes`` of objects in all
     (:data:`MAX_READER_BYTES`, also the most it may be given) and starts at
     most ``max_processes`` git processes in all
-    (:data:`MAX_READER_PROCESSES`), its own and single reads alike. A
-    reply's bytes are counted from its header before they are taken, so an
-    object past what is left is never read: the process is ended at once. A
-    single read counts one process, and its capture is lowered to what is
-    left of the bytes and room for git's framing, so a commit past what is
-    left is cut and refused, never taken; the single read of a reply that
-    overflowed counts its bytes again. What the process takes is the
-    object's bytes, a commit of exactly :data:`MAX_READER_BYTES` included;
-    what a single read captures is its stdout, header and LFs included, so a
-    commit that long is past a single read's own bound. A read past either
-    budget raises :class:`GitTransportError`, and so does every read after
-    it: the reader is spent, and nothing it read before is taken back.
+    (:data:`MAX_READER_PROCESSES`), the shared ones and one-shot reads
+    alike. Every process counts a reply's bytes from its header before it
+    takes them, so an object past what is left is never read: the process
+    is killed as soon as the header is read, never drained (R4-F1 of PR
+    #586). What a reader reads from git is therefore at most what it takes,
+    plus each reply's header and closing LF and what git writes before a
+    kill lands. git writes a reply's header before it reads the object, so
+    for a large commit that was the header alone: 58 bytes for one of 512
+    MiB on a Linux host. A one-shot read of a reply that overflowed counts
+    its bytes again. A read past either budget raises
+    :class:`GitTransportError`, and so does every read after it: the
+    reader is spent, and nothing it read before is taken back.
 
-    The process is ended, and its private directory removed, when the
-    ``with`` block ends, however it ends; a closed reader refuses to read.
-    Nothing it served depends on how the process ended, so ending it
+    The shared process is ended, and its private directory removed, when
+    the ``with`` block ends, however it ends; a closed reader refuses to
+    read. Nothing it served depends on how a process ended, so ending one
     raises no :class:`ExecutionError`.
     """
 
@@ -1084,7 +1071,7 @@ class LocalCommitReader:
         self._end(kill=exc_type is not None)
 
     def close(self) -> None:
-        """End the process, if one runs, and refuse every later read. Idempotent."""
+        """End the shared process, if one runs, and refuse every later read. Idempotent."""
         self.__exit__(None, None, None)
 
     @property
@@ -1109,8 +1096,8 @@ class LocalCommitReader:
         try:
             return self._read(sha, object_format)
         except _Spent as exc:
-            # Nothing more is read, so the process ends, at once: a reply
-            # refused for its size is still on its way (R3-F1 of PR #586).
+            # Nothing more is read, so the shared process ends, at once: a
+            # reply refused for its size is still on its way (R3-F1 of PR #586).
             self._spent = exc
             self._end(kill=True)
             raise
@@ -1118,7 +1105,7 @@ class LocalCommitReader:
     def _read(self, sha: str, object_format: str) -> CommitRecord | None:
         replies = self._session(sha, object_format)
         if replies is None:
-            return self._single(sha)
+            return self._one_shot(sha, object_format)
         try:
             reply = replies.reply(sha, self._budget)
         except _ReplyLost as exc:
@@ -1127,60 +1114,47 @@ class LocalCommitReader:
             # next read starts a new one (R1-F1 of PR #586); any other is.
             self._lost = not isinstance(exc, _ReplyOverflowed)
             self._end(kill=True)
-            return self._single(sha)
-        if reply is None:
-            return None
-        kind, raw = reply
-        if kind != "commit":
-            raise GitTransportError(f"object {sha} is a {kind}, not a commit")
-        if _hash_commit(raw, object_format) != sha:
-            raise GitTransportError(_substituted(sha))
-        return _parse_commit(sha, raw)
+            return self._one_shot(sha, object_format)
+        return _answer(sha, object_format, reply)
 
-    def _single(self, sha: str) -> CommitRecord | None:
-        """``sha`` read by a process of its own, as a single read, within what
-        is left of the reader: one process, and at most the bytes left."""
-        budget = self._budget
-        budget.take_process(sha)
-        capture = min(DEFAULT_MAX_OUTPUT_BYTES, budget.bytes_left + READER_HEADER_BYTES)
-        try:
-            record, size = self._transport._read_sized(sha, capture)
-        except _Truncated:
-            if capture == DEFAULT_MAX_OUTPUT_BYTES:
-                raise  # past the single read's own bound, which refuses it
-            budget.take_bytes(sha, None)
-            raise
-        budget.take_bytes(sha, size)
-        return record
+    def _one_shot(self, sha: str, object_format: str) -> CommitRecord | None:
+        """``sha`` read by a git process of its own, started for this read and
+        ended once it is answered: one process of the budget, and its reply
+        read as the shared process's are, its bytes counted from its header
+        before any is taken. An object past what is left kills the process
+        as soon as its header is read, never left to write the object out
+        (R4-F1 of PR #586): a one-shot read that let git write its whole
+        reply drained a 512 MiB commit to refuse it."""
+        self._budget.take_process(sha)
+        with ExitStack() as dirs:
+            try:
+                child = self._child(object_format, dirs)
+            except ExecutionError as exc:
+                raise GitTransportError(f"reading commit {sha} failed: {redact(str(exc))}") from exc
+            try:
+                reply = _Replies(child).reply(sha, self._budget)
+            except _ReplyLost as exc:
+                ended = _end_child(child, kill=True)
+                raise GitTransportError(
+                    f"reading commit {sha} failed: git gave no exact reply{_ended_detail(ended)}"
+                ) from exc
+            except BaseException:
+                _end_child(child, kill=True)
+                raise
+            _end_child(child, kill=False)
+        return _answer(sha, object_format, reply)
 
     def _session(self, sha: str, object_format: str) -> _Replies | None:
-        """The running process for a SHA of ``object_format``, started on first use
+        """The shared process for a SHA of ``object_format``, started on first use
         and after a reply that overflowed the last one's queue; None when the read
-        is a single read."""
+        is a one-shot read."""
         if self._lost:
             return None
         if self._replies is not None:
             return self._replies if object_format == self._format else None
         self._budget.take_process(sha)
         try:
-            git_dir = self._dirs.enter_context(self._transport._git_dir(object_format))
-            request = self._transport._request(git_dir, ["cat-file", "--batch"], gh_path=None)
-            child = self._start(
-                DuplexRequest(
-                    command=list(request.command),
-                    cwd=request.cwd,
-                    env=request.env,
-                    env_allowlist=request.env_allowlist,
-                    max_runtime_seconds=LOCAL_TIMEOUT_SECONDS,
-                    stdout_mode=StdoutMode.CHUNKS,
-                    # What waits to be read is one reply's at most: git
-                    # writes nothing it was not asked for, and the next
-                    # read is asked only once this reply is read whole.
-                    max_pending_records=MAX_READER_CHUNKS,
-                    max_pending_bytes=MAX_READER_BYTES + READER_HEADER_BYTES,
-                )
-            )
-            self._replies = _Replies(child)
+            self._replies = _Replies(self._child(object_format, self._dirs))
         except (ExecutionError, GitTransportError):
             self._lost = True
             self._end(kill=True)
@@ -1188,18 +1162,68 @@ class LocalCommitReader:
         self._format = object_format
         return self._replies
 
+    def _child(self, object_format: str, dirs: ExitStack) -> DuplexChild:
+        """A ``git cat-file --batch`` process in a private directory of
+        ``object_format`` entered on ``dirs``, hardened as a single read is."""
+        git_dir = dirs.enter_context(self._transport._git_dir(object_format))
+        request = self._transport._request(git_dir, ["cat-file", "--batch"], gh_path=None)
+        return self._start(
+            DuplexRequest(
+                command=list(request.command),
+                cwd=request.cwd,
+                env=request.env,
+                env_allowlist=request.env_allowlist,
+                max_runtime_seconds=LOCAL_TIMEOUT_SECONDS,
+                stdout_mode=StdoutMode.CHUNKS,
+                # What waits to be read is one reply's at most: git writes
+                # nothing it was not asked for, and the next read is asked
+                # only once this reply is read whole.
+                max_pending_records=MAX_READER_CHUNKS,
+                max_pending_bytes=MAX_READER_BYTES + READER_HEADER_BYTES,
+            )
+        )
+
     def _end(self, *, kill: bool) -> None:
-        """End the process (at once with ``kill``, else on stdin EOF), remove its directory."""
+        """End the shared process (at once with ``kill``, else on stdin EOF) and
+        remove its directory."""
         replies, self._replies = self._replies, None
         try:
             if replies is not None:
-                if kill:
-                    replies.child.stop()
-                replies.child.finish()
-        except ExecutionError:
-            pass  # torn down whatever it reports; every reply stood on its own hash
+                _end_child(replies.child, kill=kill)
         finally:
             self._dirs.close()
+
+
+def _end_child(child: DuplexChild, *, kill: bool) -> DuplexResult | None:
+    """End a reader's process: at once with ``kill``, else on stdin EOF. Its
+    result, or None when ending it raised: every reply stood on its own hash,
+    so how the process ended changes no answer."""
+    try:
+        if kill:
+            child.stop()
+        return child.finish()
+    except ExecutionError:
+        return None
+
+
+def _ended_detail(result: DuplexResult | None) -> str:
+    """How a one-shot read's process ended, redacted, for an error message."""
+    if result is None:
+        return ""
+    text = redact(result.stderr.strip()[-_DETAIL_CHARS:])
+    return f" (exit {result.exit_code}){': ' + text if text else ''}"
+
+
+def _answer(sha: str, object_format: str, reply: tuple[str, bytes] | None) -> CommitRecord | None:
+    """A reply's answer: None for a missing commit, else the commit re-hashed and parsed."""
+    if reply is None:
+        return None
+    kind, raw = reply
+    if kind != "commit":
+        raise GitTransportError(f"object {sha} is a {kind}, not a commit")
+    if _hash_commit(raw, object_format) != sha:
+        raise GitTransportError(_substituted(sha))
+    return _parse_commit(sha, raw)
 
 
 class _Replies:

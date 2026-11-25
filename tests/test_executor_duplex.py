@@ -189,6 +189,37 @@ def test_unframed_chunks_overflow_the_queue_as_records_do():
     assert sum(len(chunk.data) for chunk in got) <= 1000
 
 
+@pytest.mark.parametrize("mode", list(StdoutMode))
+def test_the_result_counts_every_stdout_byte_read_whatever_became_of_it(mode):
+    """R4-F1 of PR #586: :attr:`DuplexResult.stdout_bytes` is every byte the
+    handle read from stdout, as ``execute()``'s result counts its own: those
+    returned and those dropped past an overflow (chunks, records) or past
+    the capture (capture). 20,000 bytes are written against a bound of
+    1,000, so most of them are dropped in every mode. The child is let exit
+    first, so that every byte was written before the overflow ends it."""
+    script = "import sys; sys.stdout.buffer.write(b'z\\n' * 10000); sys.stdout.flush()"
+    with start_duplex(
+        DuplexRequest(
+            command=[PY, "-c", script],
+            max_runtime_seconds=30,
+            stdout_mode=mode,
+            max_record_bytes=1000,
+            max_pending_bytes=1000,
+            max_stdout_bytes=1000,
+        )
+    ) as child:
+        exit_by = time.monotonic() + 10
+        while not child.exited():
+            assert time.monotonic() < exit_by, "the child never exited"
+            time.sleep(0.01)
+        result = child.finish()
+    assert result.exit_code == 0 and result.stdout_bytes == 20000
+    if mode is StdoutMode.CAPTURE:
+        assert result.stdout_truncated and not result.records_overflowed
+    else:
+        assert result.records_overflowed
+
+
 def test_each_stdout_mode_has_its_own_read():
     """``read_line`` reads records and ``read_chunk`` chunks; each refuses a
     stdout of another mode, and nothing but records has unread records to

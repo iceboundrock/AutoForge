@@ -429,7 +429,10 @@ it is held to the same contract:
   Records (or chunks) wait in a queue bounded by `max_pending_records` and
   `max_pending_bytes`, and exceeding it is `Overflow`, which ends the
   invocation (a child still running is killed at `finish()`). stderr goes
-  to the same head/tail capture as `execute()` and is never a record;
+  to the same head/tail capture as `execute()` and is never a record.
+  `DuplexResult.stdout_bytes` counts every byte read from stdout in any
+  mode, those dropped after an overflow or during a kill included, as
+  `ExecutionResult.stdout_bytes` does (R4-F1 of PR #586);
 - `send_line` writes one whole record under one lock with non-blocking
   writes and a selector, so a child that stops reading stdin cannot hold
   the controller past the deadline. A child that closed its stdin raises

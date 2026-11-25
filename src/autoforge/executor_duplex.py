@@ -271,6 +271,12 @@ class DuplexResult:
     # ``StdoutMode.CAPTURE`` only: the bounded capture, as in ``execute()``.
     stdout: str = ""
     stdout_truncated: bool = False
+    # How many bytes the handle read from the child's stdout in any mode:
+    # those returned or still queued, and those dropped after an overflow
+    # or while the group was killed, as in
+    # :attr:`autoforge.executor.ExecutionResult.stdout_bytes` (R4-F1 of
+    # PR #586).
+    stdout_bytes: int = 0
     # The ADR 0002 facts, as in :class:`autoforge.executor.ExecutionResult`.
     descendants_killed: bool = False
     group_survived_kill: bool = False
@@ -481,8 +487,11 @@ class _RecordReader(_PipeDrain):
         super().__init__(stream, "stdout", activity)
         self.framer = _LineFramer(max_record_bytes)
         self._queue = queue
+        # Every byte read from the pipe, framed or dropped.
+        self.total = 0
 
     def _feed(self, chunk: bytes) -> None:
+        self.total += len(chunk)
         if self._queue.ended:
             return
         for item in self.framer.feed(chunk):
@@ -510,8 +519,11 @@ class _ChunkReader(_PipeDrain):
     ) -> None:
         super().__init__(stream, "stdout", activity)
         self._queue = queue
+        # Every byte read from the pipe, queued or dropped.
+        self.total = 0
 
     def _feed(self, chunk: bytes) -> None:
+        self.total += len(chunk)
         if not self._queue.ended:
             self._queue.put(Chunk(chunk))
 
@@ -977,6 +989,7 @@ class DuplexChild:
             records_overflowed=self._queue is not None and self._queue.overflowed,
             stdout=out.text if out is not None else "",
             stdout_truncated=out.truncated if out is not None else False,
+            stdout_bytes=self._stdout_bytes(out),
             descendants_killed=self._descendants_killed,
             group_survived_kill=self._left.group_survived,
             capture_abandoned=self._left.capture_abandoned,
@@ -989,6 +1002,13 @@ class DuplexChild:
             sandbox=facts,
         )
         return self._result
+
+    def _stdout_bytes(self, out: executor._Captured | None) -> int:
+        """Every byte read from stdout, whatever the mode made of it."""
+        if out is not None:
+            return out.total
+        reader = self._readers[0] if self._readers else None
+        return reader.total if isinstance(reader, _RecordReader | _ChunkReader) else 0
 
     def _timeout_error(self) -> ExecutionTimeoutError:
         if (self._timeout_limit or self._limits.limit()) == LIMIT_IDLE:

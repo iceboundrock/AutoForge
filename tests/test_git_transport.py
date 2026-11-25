@@ -567,16 +567,32 @@ def test_a_missing_commit_is_missing_even_when_the_commit_graph_lists_it(world):
 # -- many local reads through one git process (#541) ----------------------------------------
 @dataclass
 class Sessions:
-    """A :class:`LocalCommitReader` process starter that keeps each request and child."""
+    """A :class:`LocalCommitReader` process starter that keeps each request and
+    child, and the SHAs each child was asked for, in order: the reader's
+    shared process and its one-shot reads alike."""
 
     requests: list[DuplexRequest] = field(default_factory=list)
     children: list[DuplexChild] = field(default_factory=list)
+    asked: list[list[str]] = field(default_factory=list)
 
     def __call__(self, request: DuplexRequest) -> DuplexChild:
         self.requests.append(request)
         child = start_duplex(request)
         self.children.append(child)
-        return child
+        self.asked.append([])
+        return _Asked(child, self.asked[-1])  # type: ignore[return-value]
+
+
+class _Asked:
+    def __init__(self, child: DuplexChild, asked: list[str]) -> None:
+        self._child, self._asked = child, asked
+
+    def send_line(self, data: bytes) -> None:
+        self._asked.append(data.decode())
+        self._child.send_line(data)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._child, name)
 
 
 def test_a_local_commit_reader_answers_as_single_reads_through_one_process(world):
@@ -789,43 +805,49 @@ def test_a_reader_takes_no_more_than_its_bytes_across_its_reads_then_reads_no_mo
     assert private_leftovers(world) == []
 
 
-@pytest.mark.parametrize("short", [1, 1000], ids=["captured", "cut"])
-def test_a_single_read_takes_no_more_than_the_bytes_left(world, short):
-    """R3-F1 of PR #586. A single read counts against the reader's bytes too:
-    its capture is lowered to what is left and room for git's framing, so a
-    commit past what is left is refused, never taken, whether it still fit
-    the capture or was cut by it, and the reader is spent. One that fits is
-    read and counted. The reader's process could not start here, so every
-    read is a single read."""
+@pytest.mark.parametrize("short", [0, 1], ids=["all-that-is-left", "one-byte-past"])
+def test_a_one_shot_read_counts_its_bytes_from_its_header_and_is_killed_past_them(world, short):
+    """R4-F1 of PR #586. A one-shot read counts against the reader's bytes as
+    its shared process does, from the reply's header before a byte of the
+    object is taken: a commit of all that is left is taken, and one a byte
+    past it is refused at its header, its process stopped by the reader
+    rather than left to write the commit out, and the reader is spent. The
+    shared process failed at its first reply here, so every later read is a
+    one-shot read: a ``git cat-file --batch`` process of its own, never a
+    single read."""
     root = world.commit("root")
     fits = world.commit("fits", root)
     past = world.commit("past " + "x" * 2000, fits)
     budget = len(world.raw(fits)) + len(world.raw(past)) - short
-
-    def refused(request: DuplexRequest) -> DuplexChild:
-        raise ExecutionError("spawn failed")
-
-    with world.transport(duplex=refused).local_commit_reader(max_bytes=budget) as reader:
+    sessions = Interrupting(sha=fits, outcome=lambda sha: Eof())
+    with world.transport(duplex=sessions).local_commit_reader(max_bytes=budget) as reader:
         record = reader.read_local_commit(fits)
         assert record is not None and record.parents == (root,)
         left = reader.bytes_left
         assert left == len(world.raw(past)) - short
-        with pytest.raises(GitTransportError, match="a local commit reader may take"):
-            reader.read_local_commit(past)
-        with pytest.raises(GitTransportError, match="spent"):
-            reader.read_local_commit(root)
-    first, second = world.requests
-    assert first.max_output_bytes == budget + READER_HEADER_BYTES
-    assert second.max_output_bytes == left + READER_HEADER_BYTES
+        if short:
+            with pytest.raises(GitTransportError, match="a local commit reader may take"):
+                reader.read_local_commit(past)
+            with pytest.raises(GitTransportError, match="spent"):
+                reader.read_local_commit(root)
+        else:
+            record = reader.read_local_commit(past)
+            assert record is not None and record.parents == (fits,)
+    assert sessions.asked == [[fits], [fits], [past]]
+    assert reader.bytes_left == (left if short else 0)
     assert reader.processes_left == MAX_READER_PROCESSES - 3
+    answered, last = (child.finish() for child in sessions.children[1:])
+    assert answered.exit_code == 0 and not answered.stopped
+    assert last.stopped is bool(short) and (last.exit_code == 0) is not bool(short)
+    assert world.requests == [] and private_leftovers(world) == []
 
 
-def test_a_reader_starts_no_more_than_its_processes_single_reads_included(world):
-    """R3-F1 of PR #586. Every git process the reader starts counts, its own
-    and each single read's: past a process that failed at its first reply,
-    every read is a single read until the reader has started
-    ``max_processes``, and the next read is refused, as is every one after
-    it, with no process started for either."""
+def test_a_reader_starts_no_more_than_its_processes_one_shot_reads_included(world):
+    """R3-F1 of PR #586. Every git process the reader starts counts, its
+    shared one and each one-shot read's: past a shared process that failed at
+    its first reply, every read is a one-shot read until the reader has
+    started ``max_processes``, and the next read is refused, as is every one
+    after it, with no process started for either."""
     shas = [world.commit("root")]
     for n in range(4):
         shas.insert(0, world.commit(f"{n}", shas[0]))
@@ -838,25 +860,31 @@ def test_a_reader_starts_no_more_than_its_processes_single_reads_included(world)
             reader.read_local_commit(shas[2])
         with pytest.raises(GitTransportError, match="spent"):
             reader.read_local_commit(shas[3])
-    assert len(sessions.children) == 1
-    assert [len(world.reads_of(sha)) for sha in shas] == [1, 1, 0, 0, 0]
+    assert sessions.asked == [[shas[0]], [shas[0]], [shas[1]]]
+    assert world.requests == []
     assert all(child.exited() for child in sessions.children)
     assert private_leftovers(world) == []
 
 
 def test_a_reader_takes_a_commit_of_all_its_bytes_that_a_single_read_cannot_capture(world):
-    """R3-F2 of PR #586. What the reader's process takes is the object's
-    bytes, up to :data:`MAX_READER_BYTES`; what a single read captures is
-    its stdout, header and LFs included, up to the same bound. So a commit
-    of exactly that many bytes is read whole by the process, which then has
+    """R3-F2, R4-F1 of PR #586. What each of the reader's processes takes is
+    the object's bytes, up to :data:`MAX_READER_BYTES`, its shared process's
+    and a one-shot read's alike; what a single read captures is its stdout,
+    header and LFs included, up to the same bound. So a commit of exactly
+    that many bytes is read whole by the reader, either way, which then has
     no byte left, and is refused by a single read as cut at its capture."""
     head = (f"tree {world.tree()}\nauthor t <t@e> 0 +0000\ncommitter t <t@e> 0 +0000\n\n").encode()
     content = head + b"x" * (MAX_READER_BYTES - len(head) - 1) + b"\n"
     assert len(content) == MAX_READER_BYTES
     sha = _literal_commit(world, content)
-    with world.transport().local_commit_reader() as reader:
-        record = reader.read_local_commit(sha)
-        assert record is not None and record.parents == () and reader.bytes_left == 0
+    for sessions, asked in (
+        (Sessions(), [[sha]]),
+        (Interrupting(sha=sha, outcome=lambda sha: Eof()), [[sha], [sha]]),
+    ):
+        with world.transport(duplex=sessions).local_commit_reader() as reader:
+            record = reader.read_local_commit(sha)
+            assert record is not None and record.parents == () and reader.bytes_left == 0
+        assert sessions.asked == asked
     with pytest.raises(GitTransportError, match="truncated at the capture bound"):
         world.transport().read_local_commit(sha)
 
@@ -881,43 +909,63 @@ def test_a_reader_is_given_no_more_bytes_than_a_reply_may_hold(world):
 )
 def test_only_an_overflowed_reply_leaves_later_reads_to_a_new_process(world, outcome, restarts):
     """R1-F1 of PR #586. More of a reply waiting than the queue holds is a
-    reply git gave right: that read is a single read and the next read
-    starts a new process. The end of stdout, a time limit, a header longer
-    than any git writes, a reply for another object or more than the reply
-    asked for is the process failing: that read and every later one is a
-    single read. Each answer is the single read's either way, and each way
-    the reader has started three processes of its budget (R3-F1)."""
+    reply git gave right: that read is a one-shot read and the next read
+    starts a new shared process, which serves the read after it too. The end
+    of stdout, a time limit, a header longer than any git writes, a reply
+    for another object or more than the reply asked for is the process
+    failing: that read and every later one is a one-shot read. Each answer
+    is a single read's either way, no single read is made (R4-F1), and the
+    reader has started three processes of its budget, or four (R3-F1)."""
     one = world.commit("one")
     two = world.commit("two", one)
     three = world.commit("three", two)
+    shas = (three, two, one, three)
     sessions = Interrupting(sha=two, outcome=outcome)
     with world.transport(duplex=sessions).local_commit_reader() as reader:
-        read = [reader.read_local_commit(sha) for sha in (three, two, one)]
-    assert [r.parents for r in read if r is not None] == [(two,), (one,), ()]
-    assert [len(world.reads_of(sha)) for sha in (three, two)] == [0, 1]
-    assert len(sessions.children) == (2 if restarts else 1)
-    assert len(world.reads_of(one)) == (0 if restarts else 1)
-    assert reader.processes_left == MAX_READER_PROCESSES - 3
+        read = [reader.read_local_commit(sha) for sha in shas]
+    assert read == [world.transport().read_local_commit(sha) for sha in shas]
+    assert [r.parents for r in read if r is not None] == [(two,), (one,), (), (two,)]
+    assert len(world.requests) == len(shas)  # the single reads compared with
+    if restarts:
+        assert sessions.asked == [[three, two], [two], [one, three]]
+    else:
+        assert sessions.asked == [[three, two], [two], [one], [three]]
+    assert reader.processes_left == MAX_READER_PROCESSES - len(sessions.children)
     assert all(child.exited() for child in sessions.children)
     assert private_leftovers(world) == []
 
 
-def test_a_reader_whose_process_cannot_start_reads_each_commit_singly(world):
+def test_a_reader_whose_process_cannot_start_reads_each_commit_by_one_of_its_own(world):
+    """A shared process that cannot start leaves each read to a one-shot
+    read, within the reader's processes; a one-shot read that cannot start
+    either fails that read, which no single read takes over (R4-F1 of PR
+    #586), and a read past the processes is refused."""
     one = world.commit("one")
     two = world.commit("two", one)
     refusals: list[str] = []
+    sessions = Sessions()
 
     def refused(request: DuplexRequest) -> DuplexChild:
         assert Path(request.env["GIT_DIR"]).is_dir()
         refusals.append(request.env["GIT_DIR"])
         raise ExecutionError("spawn failed")
 
-    with world.transport(duplex=refused).local_commit_reader() as reader:
+    def first_refused(request: DuplexRequest) -> DuplexChild:
+        return sessions(request) if refusals else refused(request)
+
+    with world.transport(duplex=first_refused).local_commit_reader() as reader:
         read = [reader.read_local_commit(sha) for sha in (two, one)]
     assert [r.parents for r in read if r is not None] == [(one,), ()]
-    assert len(refusals) == 1
-    assert [len(world.reads_of(sha)) for sha in (two, one)] == [1, 1]
-    assert private_leftovers(world) == []
+    assert len(refusals) == 1 and sessions.asked == [[two], [one]]
+    assert reader.processes_left == MAX_READER_PROCESSES - 3
+    with world.transport(duplex=refused).local_commit_reader() as reader:
+        for sha in (two, one, two):
+            with pytest.raises(GitTransportError, match="spawn failed"):
+                reader.read_local_commit(sha)
+        with pytest.raises(GitTransportError, match="4 git processes"):
+            reader.read_local_commit(one)
+    assert len(refusals) == 1 + MAX_READER_PROCESSES
+    assert world.requests == [] and private_leftovers(world) == []
 
 
 def test_a_reader_starts_nothing_unread_ends_its_process_on_an_error_and_refuses_once_closed(

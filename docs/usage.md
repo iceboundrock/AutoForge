@@ -2626,12 +2626,15 @@ git process of its own. If only more of that commit was waiting than the
 shared process holds (65,536 pieces of its output, or 16 MiB and 256
 bytes), the next read starts a new shared process; that is the only case
 that does. After any other failure of the shared process (it exits, times
-out or answers out of step), each later read has a process of its own, as
-before #541, until the 4 processes are used. The shared process counts a
-commit's own bytes, so it takes a commit of exactly 16 MiB when nothing
-else was read; a process of its own captures git's whole output, header
-and line feeds included, up to what is left of the 16 MiB plus 256 bytes
-and never past 16 MiB, so it refuses that commit as cut short.
+out or answers out of step), each later read has a process of its own
+until the 4 processes are used. A process of its own reads its one commit
+as the shared process does: each counts a commit's own bytes from the
+header git writes before them, so a commit past what is left of the 16 MiB
+is refused from its header, and its process is stopped at once rather than
+left to write the commit out. The walk therefore reads from git at most
+its 16 MiB of commits, each reply's header and line feed, and what git
+writes before a stop lands, never a whole oversized commit; it takes a
+commit of exactly 16 MiB when nothing else was read.
 A base neither proves is not proved, and a record bound to it is left
 out. The controller never reads the file back. The launch's run log
 records what it was shown in `request.json`'s `metadata.memory`: the
