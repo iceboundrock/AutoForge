@@ -1,0 +1,240 @@
+# Review evaluation protocol (REV-R0)
+
+**Status: preregistration and offline fixture only.** No benchmark, paid run, or rollout is
+authorized or reported here. The baseline is `main` at `e86e606b0a21782d0d99308306c7d81206f27421`.
+This protocol complements [the #318 evaluation harness](evaluation-protocol.md): use its
+disposable repositories, isolation, protected checkers, and paired-run discipline for future
+approved trials. REV-R0 replays a normalized evidence packet, not a second run of that harness.
+
+## Controller baseline
+
+The controller binds REVIEW to one PR, HEAD, base ref and merge base. The reviewer is separate
+from the producer and fixer, reads the exact diff, and submits a structured result with the
+round, reviewed HEAD, verdict, findings, and review sections. `blocked`, `non-blocked` and
+`nit` describe whether and how the reviewer asks for action, not independent severity; every
+finding needs a resolution. Round-scoped IDs and `required_resolution` connect REVIEW to FIX.
+Observations are not findings. The controller, not the reviewer, validates the result, publishes
+and verifies the comment, and reads the revision again.
+
+| Launch | Default route (`profiles.py`, `config.py`) |
+|---|---|
+| ANALYZE_EXECUTE, FIX | Claude Code / Fable / high |
+| REVIEW 1 | OpenCode / GPT 5.6 Luna / high |
+| REVIEW 2–5 | OpenCode / GPT 5.6 Terra / high |
+| REVIEW 6+ | OpenCode / GPT 5.6 Sol / medium |
+
+`review_round` counts completed rounds on the current PR. A refused reply, correction, or
+retry consumes a launch, not a round. A completed stale round consumes its number, carries its
+findings forward and does not authorize FIX. A completed needs-fix round can enter FIX, block, or
+trigger replan. A completed FIX, including one with no new commit, goes to REVIEW; a published
+partial FIX blocks first and re-enters REVIEW on recovery, not another FIX of the old round.
+A held FIX can block without publication. Deferral, follow-up creation, and no change with
+rationale are dispositions, not proof that a defect was repaired. Failed producer validation
+does not publish a candidate; a clean reply over failed presented validation is refused
+before publication even if the revision subsequently drifts.
+
+`loop_guard.py` bounds the loop with a default cap of 20 completed rounds, two identical
+resolution fingerprints, or three unchanged finding counts with recurrence; stale and clean
+rounds break the streak. The default cumulative step cap is 300. Replan is checked before
+blocking: the configured defaults use soft/hard thresholds 12/20 and a trailing window of
+three rounds with at most two findings each and allow up to two replacements per issue.
+Replacement starts a different PR at round 1,
+not another round of this study's PR. These are controller settings, not outcome thresholds.
+See [workflow and recovery](agent-guides/workflow.md) for the complete routing.
+
+The current defaults route by round, not semantic risk. For a future trial, independently
+record pre-outcome risk strata from the starting diff: routine, elevated (public contract,
+persistence or concurrency), or critical surface (authorization, isolation, data integrity
+or external effects). Record the rationale and exact candidate; do not use the reviewer's
+confidence, the number of findings, or the final result to assign risk. Report strata
+separately without adapting routing or promotion on this fixture.
+
+### What counts as proof
+
+A [`ReviewCertificate`](adr/0006-candidate-validation-evidence-and-review-certificates.md)
+records that the controller completed a clean round, verified the comment's identity, and
+presented the bound FULL validation set and policy for that exact candidate. Its named
+records passed; an empty configured set also permits a certificate, but is not a validation
+pass. It does not establish correctness, independent defect truth, GitHub approval, CI
+status, permission to merge, or current applicability. Neither FAST checks (#338), an
+agent's `tests_passed`, nor similar trees from other commits are substitutes. The merge gate
+still reconciles exact revision, comment, validation, live checks and authorization. No
+prompts, defaults, state schema, controller decisions or GitHub effects change here. A
+future persisted field needs coordination with #23 and crash-replay coverage.
+
+## Independent labels
+
+Freeze the case set, starting snapshots, clean negatives, classification rubric, and
+discovery cutoff before comparing arms; adjudicators work blind to assignment and may not
+be a run's producer, reviewer, or fixer. A label cites an adjudicator, discovery date
+(UTC calendar day, inclusive cutoff), and an independently reproducible artifact such as a
+protected oracle assertion, minimized input with expected/observed output, or an independently
+reviewed trace proving a contract violation. Bind each label to the exact reviewed candidate
+SHA/tree and finding ID, each defect to the SHA introducing it, and each FIX judgment to the
+published successor. A report after cutoff, absent evidence, disagreement without an
+independent resolution, or a match not settled by the cutoff is unknown. A real trial should
+retain original artifacts, document disagreements, and have a second independent adjudicator
+settle disputed or critical labels. A name or artifact string in a packet is not authentication.
+
+| Finding label | Meaning |
+|---|---|
+| Confirmed | The finding identifies a registered, independently evidenced defect present at the reviewed candidate. |
+| False | Independent evidence disproves the actionable claim at that candidate. |
+| Unknown | Neither established; includes unmapped claims and evidence discovered after cutoff. |
+
+Severity weights: **critical 8** (severe integrity, safety or authority loss), **high 4**
+(major incorrect behavior), **medium 2** (limited correctness or reliability impact), **low 1**
+(small but actionable). Record class separately: correctness, security, reliability,
+specification, or maintainability. Use stable independent defect IDs to match repeats within
+a run; do not equate similar wording, severity, or agent IDs with the same root problem.
+A clean negative requires an independent pass and no registered defect on the starting
+candidate; lack of reviewer findings never labels a case clean. A published FIX with an
+eligible attributable regression is harmful even if its separate label says unknown.
+Otherwise a publication is independently adjudicated safe, harmful or unknown. In this
+version an applied publication is an endpoint, not a count of underlying commits.
+
+## Registered comparison
+
+Baseline is the existing controller with its independent reviewer. Treatment changes only
+the declared review intervention; neither side changes validation or safety policy. Future
+trial design must pin the intervention and effective settings before collection, including
+controller commit, prompts, providers and versions, tools, sandbox, budgets, validation policy
+and command set, and all case/seed assignments. Follow #318 for fresh paired sessions,
+ordering, preflight and separate cost approval. No production treatment or real manifest is
+provided here; later dataset and evidence work belongs to #356, #357 and #360.
+
+Match by case and seed. Each arm starts on the registered revision and uses the same base ref
+and merge base throughout. The same starting SHA against different bases is a different
+diff. A known unequal starting validation set or policy is reported as `validation_mismatch`;
+a missing receipt is `validation_unknown`. Neither enters paired rates. Exclusions are
+restricted to infrastructure, unavailable credentials, unavailable service, or a documented
+pre-launch skip; stop/validation failures are not exclusions. Keep both arms and report
+missing, incomparable and excluded assignments separately. Exclusions remove pairs from
+rates, cost and bootstrap, not independently evidenced treatment harm. Do not replace a failed
+or missing seed; duplicate assignments are refused.
+
+### Packet and replay
+
+`tests/fixtures/review_eval/synthetic.json` is the version 1 example. JSON fields are closed.
+
+- `cases` registers case IDs, seeds, starting candidate, base, cutoff, defects, and observed
+  snapshots (`parent`, `tree`, independent presence inventory, oracle status and provenance).
+  Parents form a rooted graph at the pinned merge base. For a FIX with several commits the
+  parent of its published endpoint is the reviewed predecessor in the **observed** graph.
+  SHA/tree fields in the synthetic fixture are stand-ins, not Git objects.
+- Each `runs` entry has a case/seed/arm, one fresh PR identity, and producer/reviewer/fixer
+  identities in that order. Its `creation` receipt identifies ordinal zero, before any
+  producer launch; no takeover or pre-existing journal is admitted. `launches[ordinal-1]` owns all facts for
+  that reservation: phase, disposition, and nullable usage. A missing reservation is a
+  `null` slot; a retained launch with unknown disposition has `outcome: null`. Neither is
+  a `retry`, which explicitly consumed no round or publication. REVIEW binds its exact
+  revision and round; `findings: null` or `complete: false` means the retained findings
+  are not the complete payload, even if review completion itself is proven. Validation
+  receipts explicitly declare FULL scope; FAST is refused. A FIX source
+  must be an earlier accepted needs-fix round at the same revision. `no_change` consumes
+  the FIX without publication. `held` is terminal in this replay. `partial` consumes the
+  FIX with publication. Same-scope head drift is represented by a completed stale review
+  with `next_head`, or an explicit `drift` at the next REVIEW before it begins.
+- The separately captured `stop` states the launch high-water mark (`through`), phase,
+  current revision, last completed round and its review ordinal (or zero/null before any
+  completion). `issued` requires a terminal clean review at that ordinal with matching
+  comment and exact presented validation, and a separate certificate receipt reference.
+  `not_issued` on a reconciled block/failure is explicit non-issuance, including after a
+  held or failed FIX at the reviewed revision. An absent stop, unknown issuance, tail
+  gap, or historical certificate is not treated as an issuance or as a clean negative.
+  Pre-PR stops use a null revision. Wall time comes from the stop observation.
+
+There is no search for a workflow that could explain a hole. Replay proves the known
+contiguous prefix, checks explicit bindings even in the suffix, and leaves a gapped
+terminal outcome unresolved. It distinguishes launch coverage, known lifecycle, findings
+coverage, and a bound stop: removing a finding payload cannot remove an independently
+bound certificate, nor can a later clean round make missing findings a true negative.
+Retargets, replacements, takeovers, other issue execution and merges are out of scope.
+Outside the supported first-stop slice, preserve the raw record and report the affected
+comparison unresolved rather than normalizing away an unsupported transition.
+
+The tool checks internal consistency, not the authenticity of SHA graphs, exported receipts,
+actor identities, completeness attestations or oracle artifacts. For recorded data these
+must come from independent read-back of exact objects, validation bindings and controller
+journals (including reserved ordinals) and blinded adjudication; not from a reviewer or
+fixer's prose. There is no live collector or oracle execution in REV-R0. Missing fields
+must be marked unknown, never reconstructed from a run's eventual success.
+
+### Metrics, uncertainty and decision
+
+Pool counts over matched runs by arm. Weighted recall is over the starting inventory only,
+counted once per run; later reviews can discover a surviving start defect. Track newly
+introduced regressions separately. Use accepted review findings; do not score stale replies.
+
+| Metric | Formula |
+|---|---|
+| Weighted recall | Weight of distinct confirmed starting defects / eligible starting defect weight. Lower bound is the confirmed share; the upper adds the heaviest undetected eligible start defects, at most one per unknown finding. This is an outer bound, not an attribution. |
+| Precision | Confirmed / (confirmed + false). Bounds assign unknown findings first to false, then to confirmed. |
+| Clean-negative FPR | Negative runs with at least one false finding / label-settled negative runs. An evidenced false finding survives missing details. Absence is settled only with a complete accepted review record and no unknown findings. Bounds assign unresolved negatives first to no alarm, then to false alarm. Incomplete matched review coverage prevents a usable pooled finding rate. |
+| Critical escapes | Independently evidenced eligible critical defects still present at a bound certified stop, even with an empty validation set. A bound non-issuance means no certified escapes; unresolved endings are counted separately. |
+| Harmful FIX rate | Harmful published FIX endpoints / adjudicated published FIX endpoints. Bounds divide by all such publications, assigning unknowns first to safe, then harmful. Held and no-change attempts do not enter this denominator. |
+| Duplicate ratio | Confirmed findings after the first confirmation of their defect in the run / all confirmed findings. Bounds add all unknown labels to the denominator, first as nonduplicates and then as duplicates; conservative even if individual assignments would be impossible. |
+| Total cost per validated success | Sum USD across **all** launches in matched runs, including retries and unsuccessful runs / count of validated successes. Success requires the current certificate, nonempty passed FULL validation, a passing independent oracle and no eligible high or critical defect remaining. Missing charges or unresolved success make the ratio unknown. |
+
+An empty denominator is undefined, not zero. The report also gives launch counts by phase,
+completed rounds, FIX launches, known launch duration, total launch duration, and wall time
+from run creation to stop. These are different clocks; the final wall time includes controller
+validation and time between launches. For future collection use controller run log ordinals,
+execution records (`started_at`/`finished_at`), stop state and timeline; missing bounds or
+durations cannot be measured as zero. Claude's stream can supply typed `cost_micro_usd`,
+but default mixed routing has no complete bill; no provider records complete context usage
+for this study. Both totals remain unknown in `recorded` mode until independently attributable
+accounting is available (#154, #321). Fixture amounts are synthetic arithmetic examples.
+
+Use a paired case bootstrap: 10,000 resamples, seed 355, all seeds of a sampled case included
+together. Drop cases with zero eligible observations on both arms for the given metric.
+Report nearest-rank 2.5th/97.5th percentiles of defined point differences, and a separate
+outer envelope (treatment-low minus baseline-high, treatment-high minus baseline-low).
+Report undefined draws; do not substitute zeros. For a usable contrast both arm label bands
+must be at most 0.10 wide, points must be defined, and no draw may be undefined. Use exact
+fractions, not rounded report values. This is label and sampling uncertainty, not a
+powered sample-size claim.
+
+- **Primary:** weighted recall improvement at least +0.10 on the pooled conservative
+  difference, with bootstrap lower envelope above zero. Non-inferiority margins:
+  precision −0.05, FPR +0.05, harmful FIX rate +0.05, duplicates +0.10, and cost per
+  validated success +50% (point estimate). Sample floor: 20 paired defect cases and
+  10 paired negatives with accepted starting reviews; exclude at most 10% of planned pairs.
+- **Safety first:** recorded new critical treatment escapes are `NO_GO` even from excluded
+  runs. A proven FIX-introduced treatment escape needs no counterpart. For a shared
+  starting defect require a non-excluded baseline, equal starting validation, and evidence
+  that it did not escape;
+  absent or unresolved baseline evidence is not that evidence. A later defect without
+  attributed FIX provenance is reported but not automatically new treatment harm.
+- **Other harm:** an entire usable envelope beyond a non-inferiority margin is `NO_GO`
+  when there are no missing or incomparable planned pairs. An upper recall envelope
+  below +0.10 is `NO_GO` only at the sample floor and exclusion budget. A measured cost
+  above margin would also be `NO_GO`, but this version cannot measure recorded cost.
+- **Otherwise:** synthetic data and a missing arm without measured safety harm are
+  `NOT_EVALUATED`. Any remaining recorded result is `INCONCLUSIVE` in this version.
+  A later `GO` requires the registered primary and all non-inferiority limits established,
+  no unresolved outcomes or safety results, complete comparable assignments within the
+  sample/exclusion rules, and independently measured cost. It is intentionally unreachable
+  here. A fixture result is never a rollout gate.
+
+## Replay and verification
+
+```sh
+uv run python -m tests.review_eval
+uv run pytest tests/test_review_eval.py tests/test_fast_targets.py
+```
+
+The fixture has two matched cases, a repaired defect, a harmful publication with a critical
+escape despite a certificate, duplicate findings, a clean negative, and a false alarm that
+leads to a no-commit FIX. Tests check the deterministic report against hand-computed values
+and mutate evidence to check refused or stale replies, FIX retries and publication order,
+missing launches/findings, one-PR scope, exact terminal bindings, exclusions and policy
+comparability. Existing controller tests (`test_routing.py`, `test_loop_guard.py`,
+`test_validation_gates.py`, `test_review_certificate.py`, `test_merge_certificate.py`,
+`test_partial_fix.py`, `test_replan.py`) verify runtime behavior with fakes; this replay
+does not verify or execute those effects. No model, candidate code, network, credentials,
+or state writes are needed to replay the packet.
+
+Fixture SHA-256: `9139f6bae211ee372914c07c219b9fb18f511231bdb461970b0d41ad97f05527`.
+Amend the protocol, packet version (for evidence-rule changes), fixture digest and tests in
+one reviewed change. State why the rule moved and whether any real runs preceded it.
