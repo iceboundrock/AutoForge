@@ -4931,7 +4931,9 @@ class ControllerEngine:
         so a record bound to it is omitted, never shown as current. The
         walk reads its commits through one git process
         (:class:`~autoforge.git_transport.LocalCommitReader`, #541), started
-        on its first read and ended before this returns, however it returns.
+        on its first read and ended before this returns, however it returns:
+        once the walk is done, inside the measurement below, so its
+        teardown is timed with the rest (R1-F2 of PR #586).
         The commit read is the launch's input, which keys its proposals (R3-F2);
         when none could be read the input is unknown, never the base
         (R4-F3). The whole preparation is timed by :attr:`_memory_clock`,
@@ -4953,6 +4955,7 @@ class ControllerEngine:
                 read_parents=self._memory_parents(self._memory_reader(transport, stack)),
                 validation_records=state.validation_records,
                 clock=self._memory_clock,
+                end_reads=stack.close,
             )
 
     def _memory_transport(self) -> Callable[[], GitTransport]:
@@ -4979,10 +4982,11 @@ class ControllerEngine:
         """One projection's walk reader, through one git process, made on its first use (#541).
 
         ``transport``'s :meth:`~GitTransport.local_commit_reader`, entered on
-        ``stack``, which ends its process when the projection is made or
-        refused. Read a process per commit, a walk at its bound cost the
-        hosted macOS runners 1.2 to 1.3 s of CPU, past ADR 0015 D12's
-        1,000 ms ceiling; each read still answers as
+        ``stack``, which the projection closes once its walk is done, inside
+        its measurement (R1-F2 of PR #586), and which ends the process
+        however else the projection ends. Read a process per commit, a walk
+        at its bound cost the hosted macOS runners 1.2 to 1.3 s of CPU, past
+        ADR 0015 D12's 1,000 ms ceiling; each read still answers as
         :meth:`GitTransport.read_local_commit` does.
         """
         made: list[LocalCommitReader] = []

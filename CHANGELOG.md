@@ -14,13 +14,18 @@ where starting a process is far dearer than on Linux, 1.2 to 1.3 s of CPU,
 past the 1,000 ms per-launch ceiling the evaluation protocol holds Memory's
 preparation to. The walk now reads every commit through one
 `git cat-file --batch` process in the controller's private git directory,
-started on its first read and ended before the launch. Each commit is still
-read as its own bytes and re-hashed, and never fetched, and a commit the
-store lacks still proves no ancestry. A reply that process cannot give byte
-for byte ends it, and the walk goes on with a process per commit, as before.
-A commit that is not valid UTF-8 no longer ends the walk, since its bytes
-are now hashed as git wrote them rather than through a text capture. No
-configuration, state, prompt or run-log change.
+started on its first read and ended before the launch, its teardown
+included in the preparation time the run log records (`projection_ms`).
+Each commit is still read as its own bytes and re-hashed, and never
+fetched, and a commit the store lacks still proves no ancestry. A line of a
+commit is read whole however long it is, up to the 16 MiB a single read
+captures. A commit too large for that process to hold (more than 65,536 of
+its lines waiting to be read, or past 16 MiB, which a single read refuses
+too) is read by a process of its own and the next read starts a new one,
+so the rest of the walk still shares one process. If the process itself fails, the walk goes on with a process per
+commit, as before. A commit that is not valid UTF-8 no longer ends the
+walk, since its bytes are now hashed as git wrote them rather than through
+a text capture. No configuration, state, prompt or run-log field change.
 
 ### Optional Issue Working Memory retrieval (#324)
 

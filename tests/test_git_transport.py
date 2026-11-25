@@ -30,11 +30,23 @@ import pytest
 from autoforge import git_transport as git_transport_module
 from autoforge.errors import ExecutionError, GitHubUnavailableError, GitTransportError
 from autoforge.executor import ExecutionRequest, ExecutionResult, execute
-from autoforge.executor_duplex import DuplexChild, DuplexRequest, start_duplex
+from autoforge.executor_duplex import (
+    DEFAULT_MAX_RECORD_BYTES,
+    DuplexChild,
+    DuplexRequest,
+    Eof,
+    Fragment,
+    Overflow,
+    Oversize,
+    Timeout,
+    start_duplex,
+)
 from autoforge.git_transport import (
     LOCAL_GIT_ENV_ALLOWLIST,
     LOCAL_TIMEOUT_SECONDS,
     MAX_RANGE_COMMITS,
+    MAX_READER_LINES,
+    MAX_READER_OBJECT_BYTES,
     NETWORK_GIT_ENV_ALLOWLIST,
     CommitRecord,
     GitRemote,
@@ -624,26 +636,122 @@ def test_a_reader_refuses_what_a_single_read_refuses_and_its_process_reads_on(wo
     assert len(sessions.children) == 1 and world.requests == []
 
 
-def test_a_reply_the_process_cannot_give_exactly_ends_it_and_single_reads_go_on(world, monkeypatch):
-    """An object past the reader's bound, lowered here so that one commit's
-    message passes it, is no exact reply: the process is ended at once, and
-    that read and every later one is a single read, with its answer."""
+@dataclass
+class Interrupting(Sessions):
+    """A starter whose first process, asked for ``sha``, reports ``outcome``
+    in place of the reply, as the duplex handle reports a queue that
+    overflowed, a line past its bound, an exit or a time limit; every later
+    process is left as it is."""
+
+    sha: str = ""
+    outcome: object = None
+
+    def __call__(self, request: DuplexRequest) -> DuplexChild:
+        child = super().__call__(request)
+        if len(self.children) > 1:
+            return child
+        return _Interrupted(child, self.sha.encode(), self.outcome)  # type: ignore[return-value]
+
+
+class _Interrupted:
+    def __init__(self, child: DuplexChild, name: bytes, outcome: object) -> None:
+        self._child, self._name, self._outcome, self._armed = child, name, outcome, False
+
+    def send_line(self, data: bytes) -> None:
+        self._armed = data == self._name
+        self._child.send_line(data)
+
+    def read_line(self, timeout: float | None = None) -> object:
+        if self._armed:
+            self._armed = False
+            return self._outcome
+        return self._child.read_line(timeout)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._child, name)
+
+
+def test_a_reader_reads_a_line_past_the_duplex_default_record_bound_in_its_one_process(world):
+    """R1-F1 of PR #586: a commit whose message holds a line longer than the
+    duplex handle's default record bound (4 MiB) cost the reader its process,
+    and every read after it a process of its own. Its records are now as long
+    as an object the reader takes, so the commit is read whole, re-hashed, by
+    the one process, which serves the reads after it too: no single read."""
+    root = world.commit("root")
+    message = world.tmp / "long-message"
+    message.write_bytes(b"subject\n\n" + b"x" * (DEFAULT_MAX_RECORD_BYTES + 1) + b"\r\n")
+    long = world.g("commit-tree", world.tree(), "-p", root, "-F", str(message))
+    tip = world.commit("tip", long)
+    sessions = Sessions()
+    with world.transport(duplex=sessions).local_commit_reader() as reader:
+        got = [reader.read_local_commit(sha) for sha in (tip, long, root)]
+    assert world.requests == [] and len(sessions.children) == 1
+    assert [r.parents for r in got if r is not None] == [(long,), (root,), ()]
+    assert got[1] == world.transport().read_local_commit(long)
+    assert got[1] is not None and len(got[1].message) > DEFAULT_MAX_RECORD_BYTES
+
+
+def test_a_reply_too_large_for_the_process_is_a_single_read_and_a_new_process_reads_on(
+    world, monkeypatch
+):
+    """R1-F1 of PR #586. An object past the reader's bound, lowered here so
+    that one commit's message passes it, is no exact reply: the process is
+    ended at once and that read is a single read, with its answer. It is no
+    failure of the process, so the next read starts a new one, which serves
+    every read after it, never a process per commit."""
     monkeypatch.setattr(git_transport_module, "MAX_READER_OBJECT_BYTES", 400)
     small = world.commit("small")
-    large = world.commit("large " + "x" * 500, small)
+    middle = world.commit("middle", small)
+    large = world.commit("large " + "x" * 500, middle)
     after = world.commit("after", large)
     sessions = Sessions()
     with world.transport(duplex=sessions).local_commit_reader() as reader:
         first = reader.read_local_commit(after)
         assert first is not None and first.parents == (large,) and world.requests == []
         second = reader.read_local_commit(large)
-        assert second is not None and second.parents == (small,)
-        (child,) = sessions.children
-        assert child.exited()
-        third = reader.read_local_commit(small)
-        assert third is not None and third.parents == ()
-    assert [len(world.reads_of(sha)) for sha in (after, large, small)] == [0, 1, 1]
-    assert len(sessions.children) == 1 and private_leftovers(world) == []
+        assert second is not None and second.parents == (middle,)
+        (ended,) = sessions.children
+        assert ended.exited() and len(world.reads_of(large)) == 1
+        later = [reader.read_local_commit(sha) for sha in (middle, small)]
+        assert [r.parents for r in later if r is not None] == [(small,), ()]
+    assert [len(world.reads_of(sha)) for sha in (after, large, middle, small)] == [0, 1, 0, 0]
+    ended, started = sessions.children
+    assert started.exited() and started.finish().exit_code == 0
+    assert len(sessions.requests) == 2 and private_leftovers(world) == []
+
+
+@pytest.mark.parametrize(
+    "outcome, restarts",
+    [
+        (Overflow(), True),
+        (Oversize(64, b"x" * 64), False),
+        (Fragment(b"partial"), False),
+        (Eof(), False),
+        (Timeout(deadline_exceeded=True), False),
+    ],
+    ids=["overflow", "oversize", "fragment", "eof", "timeout"],
+)
+def test_only_a_reply_too_large_for_the_process_leaves_later_reads_to_a_new_one(
+    world, outcome, restarts
+):
+    """R1-F1 of PR #586. More of a reply's lines waiting than the process
+    holds is a reply git gave right but too large for it: that read is a
+    single read and the next read starts a new process. A line past the
+    record bound, which is the object's, a fragment, an exit or a time
+    limit is the process failing, as before: that read and every later one
+    is a single read. Each answer is the single read's either way."""
+    one = world.commit("one")
+    two = world.commit("two", one)
+    three = world.commit("three", two)
+    sessions = Interrupting(sha=two, outcome=outcome)
+    with world.transport(duplex=sessions).local_commit_reader() as reader:
+        read = [reader.read_local_commit(sha) for sha in (three, two, one)]
+    assert [r.parents for r in read if r is not None] == [(two,), (one,), ()]
+    assert [len(world.reads_of(sha)) for sha in (three, two)] == [0, 1]
+    assert len(sessions.children) == (2 if restarts else 1)
+    assert len(world.reads_of(one)) == (0 if restarts else 1)
+    assert all(child.exited() for child in sessions.children)
+    assert private_leftovers(world) == []
 
 
 def test_a_reader_whose_process_cannot_start_reads_each_commit_singly(world):
@@ -723,6 +831,9 @@ def test_the_readers_process_is_hardened_as_a_single_read_is(world):
     assert session.cwd == session.env["GIT_DIR"]
     assert session.max_runtime_seconds == single.timeout_seconds == LOCAL_TIMEOUT_SECONDS
     assert session.idle_timeout_seconds is None and session.strip_cr is False
+    assert session.max_record_bytes == MAX_READER_OBJECT_BYTES  # R1-F1 of PR #586
+    assert session.max_pending_records == MAX_READER_LINES
+    assert session.max_record_bytes < session.max_pending_bytes <= MAX_READER_OBJECT_BYTES + 256
     assert session.sandbox is None and not session.contain_orphans
     ((mode, has_hooks, config),) = observed
     assert mode == 0o700 and not has_hooks

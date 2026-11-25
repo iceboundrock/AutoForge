@@ -85,7 +85,7 @@ from types import TracebackType
 
 from .errors import ExecutionError, GitLockTimeout, GitTransportError, LockError
 from .executor import DEFAULT_MAX_OUTPUT_BYTES, ExecutionRequest, ExecutionResult, execute
-from .executor_duplex import DuplexChild, DuplexRequest, Record, start_duplex
+from .executor_duplex import DuplexChild, DuplexRequest, Overflow, Record, start_duplex
 from .redaction import redact
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
@@ -103,11 +103,16 @@ LOCAL_TIMEOUT_SECONDS = 120
 
 # What one reply of a :class:`LocalCommitReader`'s git process may hold: the
 # object's size, the single read's capture bound, and how many of its lines,
-# each a record of the process's framed stdout, may wait to be read. A reply
-# past either is read by a process of its own instead, under that read's own
-# bound (#541).
+# each a record of the process's framed stdout, may wait to be read. A line
+# is framed whole up to the object's bound, so no line of an object within
+# it is ever too long to read (R1-F1 of PR #586). A reply past either bound
+# is read by a process of its own instead, under that read's own bound, and
+# the next read starts the reader a new process (#541).
 MAX_READER_OBJECT_BYTES = DEFAULT_MAX_OUTPUT_BYTES
 MAX_READER_LINES = 65536
+# Room beside the object's bytes, in the records waiting to be read, for the
+# reply's header line (``<id> <type> <size>``, under 100 bytes).
+READER_HEADER_BYTES = 256
 
 # Hooks and the file-system monitor are off at command-line precedence for
 # every controller git process (D7.3); replacement objects and the
@@ -890,6 +895,13 @@ class _ReplyLost(Exception):
     """A reader's git process cannot give this reply exactly; a single read will."""
 
 
+class _ReplyTooLarge(_ReplyLost):
+    """A reply git gives right but past what a reader's process holds of one.
+
+    The process is no worse for it: the next read starts a new one (R1-F1
+    of PR #586)."""
+
+
 class LocalCommitReader:
     """Many local commit reads through one ``git cat-file --batch`` process (#541).
 
@@ -911,16 +923,22 @@ class LocalCommitReader:
     SHA of the other format is a single read. Its stdout is framed into
     records that keep every byte (``strip_cr=False``), so the commit hashed
     is exactly what git wrote: unlike the single read, which captures text,
-    a commit that is not valid UTF-8 is authenticated too. A reply the
-    process cannot give exactly, whatever the reason (a malformed header,
-    an object past :data:`MAX_READER_OBJECT_BYTES`, more of its lines
-    waiting than :data:`MAX_READER_LINES`, a line past the record bound,
-    the process exiting or reaching its time limit, a spawn or a write that
-    fails), ends the process, and that read and every later one is a single
-    read, with that read's guarantees and refusals. A missing commit is a reply,
-    ``None``; a commit whose bytes do not hash to its id and an object that
-    is no commit raise :class:`GitTransportError` as a single read does,
-    and the process goes on to the next read.
+    a commit that is not valid UTF-8 is authenticated too. A record may be
+    as long as :data:`MAX_READER_OBJECT_BYTES`, so a line of an object
+    within that bound, however long, is read whole. A reply the process
+    cannot give exactly ends the process, and that read is a single read,
+    with that read's guarantees and refusals. When git gave the reply right
+    but it is too large for the process to hold (an object past
+    :data:`MAX_READER_OBJECT_BYTES`, or more of its lines waiting than
+    :data:`MAX_READER_LINES`), the next read starts a new process, so such
+    a commit costs the walk the single read and one process more, never a
+    process for every later read (R1-F1 of PR #586). Otherwise (a malformed
+    header, a reply longer than its header says, the process exiting or
+    reaching its time limit, a spawn or a write that fails) the process is
+    what failed, and every later read is a single read too. A missing
+    commit is a reply, ``None``; a commit whose bytes do not hash to its id
+    and an object that is no commit raise :class:`GitTransportError` as a
+    single read does, and the process goes on to the next read.
 
     The process is ended, and its private directory removed, when the
     ``with`` block ends, however it ends; a closed reader refuses to read.
@@ -965,8 +983,11 @@ class LocalCommitReader:
             return self._transport.read_local_commit(sha)
         try:
             reply = _reply(child, sha)
-        except _ReplyLost:
-            self._lost = True
+        except _ReplyLost as exc:
+            # The process is out of step with its replies, so it ends. One
+            # too large for it is no failure of the process, and the next
+            # read starts a new one (R1-F1 of PR #586); any other is.
+            self._lost = not isinstance(exc, _ReplyTooLarge)
             self._end(kill=True)
             return self._transport.read_local_commit(sha)
         if reply is None:
@@ -979,8 +1000,8 @@ class LocalCommitReader:
         return _parse_commit(sha, raw)
 
     def _session(self, object_format: str) -> DuplexChild | None:
-        """The running process for a SHA of ``object_format``, started on first use;
-        None when the read is a single read."""
+        """The running process for a SHA of ``object_format``, started on first use
+        and after a reply too large for the last one; None when the read is a single read."""
         if self._lost:
             return None
         if self._child is not None:
@@ -996,7 +1017,12 @@ class LocalCommitReader:
                     env_allowlist=request.env_allowlist,
                     max_runtime_seconds=LOCAL_TIMEOUT_SECONDS,
                     strip_cr=False,
+                    # No line of an object within its bound is longer than
+                    # the object, and the records waiting to be read are one
+                    # reply's at most: its header and the object's lines.
+                    max_record_bytes=MAX_READER_OBJECT_BYTES,
                     max_pending_records=MAX_READER_LINES,
+                    max_pending_bytes=MAX_READER_OBJECT_BYTES + READER_HEADER_BYTES,
                 )
             )
         except (ExecutionError, GitTransportError):
@@ -1034,7 +1060,7 @@ def _reply(child: DuplexChild, sha: str) -> tuple[str, bytes] | None:
             raise _ReplyLost
         size = int(parts[2])
         if size > MAX_READER_OBJECT_BYTES:
-            raise _ReplyLost
+            raise _ReplyTooLarge
         # The object's bytes and the LF after them: their lines, joined
         # again by the LFs the framing took, are exactly the object.
         lines: list[bytes] = []
@@ -1051,8 +1077,15 @@ def _reply(child: DuplexChild, sha: str) -> tuple[str, bytes] | None:
 
 
 def _reply_line(child: DuplexChild) -> bytes:
-    """The next line of the reply; anything but a whole line is no exact reply."""
+    """The next line of the reply; anything but a whole line is no exact reply.
+
+    An :class:`~autoforge.executor_duplex.Overflow` is more of the reply's
+    lines waiting than the process holds, a reply too large for it; an
+    ``Oversize`` cannot be a line of an object within the record bound,
+    which is the object's, so it is a reply other than its header says."""
     item = child.read_line()
+    if isinstance(item, Overflow):
+        raise _ReplyTooLarge
     if not isinstance(item, Record):
         raise _ReplyLost
     return item.data

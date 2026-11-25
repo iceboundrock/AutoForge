@@ -348,6 +348,7 @@ def prepare_launch_projection(
     validation_records: Sequence[dict],
     clock: Callable[[], float] = time.perf_counter,
     max_commits: int = MAX_ANCESTRY_COMMITS,
+    end_reads: Callable[[], None] = lambda: None,
 ) -> LaunchProjection:
     """The next launch's projection, from its ledger's load to its render, timed whole (D12).
 
@@ -365,10 +366,13 @@ def prepare_launch_projection(
     is the commit read, the base included when the launch starts there,
     and "" when none could be read: the input is then unknown, never
     guessed, so no ``add`` of the launch is keyed by it (R3-F2, R4-F3,
-    :func:`admit_proposals`). ``projection_ms`` covers all of it, so the
-    per-launch latency the run log records is Memory's whole cost before
-    the launch, never the render's alone. A store that cannot be rendered
-    raises as :func:`render_launch_projection` does.
+    :func:`admit_proposals`). ``end_reads`` is called once nothing more is
+    read, before the render: the engine ends its walk's git process there
+    (#541), so its teardown is measured too (R1-F2 of PR #586).
+    ``projection_ms`` covers all of it, so the per-launch latency the run
+    log records is Memory's whole cost before the launch, never the
+    render's alone. A store that cannot be rendered raises as
+    :func:`render_launch_projection` does.
     """
     started = clock()
     store = load_store()
@@ -390,6 +394,7 @@ def prepare_launch_projection(
             max_commits=max_commits,
         )
         ancestors = tuple(b for b in bases if b in held or b in walked)
+    end_reads()
     request = projection_request(store, step, candidate=candidate, ancestors=ancestors)
     launch = render_launch_projection(
         store, request, validation_records=validation_records, clock=clock

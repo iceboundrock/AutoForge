@@ -2624,9 +2624,10 @@ revision and digests, the counts, the file's size and its SHA-256, the
 commit the launch started from (`input`, `null` when it could not be read:
 never the base in its place), how many commits the ancestry walk read
 (`ancestry_reads`), and how long Memory's preparation took, the ledger's
-reconstruction from the state file, the candidate's read, the walk and the
-render together (`projection_ms`, the per-launch latency the evaluation
-reads), with the render's share (`render_ms`), never a record's text.
+reconstruction from the state file, the candidate's read, the walk (its
+git process ended) and the render together (`projection_ms`, the
+per-launch latency the evaluation reads), with the render's share
+(`render_ms`), never a record's text.
 
 Two writers add to the store, each in a save the step already makes, so
 no crash leaves a record without what it rests on:

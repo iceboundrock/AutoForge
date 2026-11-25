@@ -60,8 +60,8 @@ from autoforge.errors import (
 )
 from autoforge.evidence import MAX_FAILURE_COUNT, WorktreeProvenance, parse_record
 from autoforge.executor import execute
-from autoforge.executor_duplex import start_duplex
-from autoforge.git_transport import GitRemote, GitTransport
+from autoforge.executor_duplex import DEFAULT_MAX_RECORD_BYTES, start_duplex
+from autoforge.git_transport import GitRemote, GitTransport, LocalCommitReader
 from autoforge.memory import (
     MAX_FACTS,
     MAX_PROJECTION_BYTES,
@@ -1010,6 +1010,47 @@ def test_the_projection_time_covers_the_ledger_the_candidate_read_and_the_walk()
     assert meta["input"] == meta["candidate"] == C2
 
 
+@pytest.mark.parametrize("head", [C2, BASE], ids=["walked", "on-the-base"])
+def test_the_projection_ends_its_reads_inside_its_measurement_before_the_render(head):
+    """R1-F2 of PR #586: ``end_reads``, where the engine ends its walk's git
+    process, is called once, after the walk's last read (or with nothing
+    walked) and before the render, and the time it takes is in
+    ``projection_ms``. The clock is a fake that only it moves."""
+    rec = failing_record()
+    store = observe_validation_failure(
+        enabled(), STEP, parse_record(rec), attempt=1, text="definition [0] failed"
+    ).store
+    now = [10.0]
+    events: list[str] = []
+
+    def parents(sha):
+        events.append(sha)
+        return {C2: (C1,), C1: (BASE,)}.get(sha)
+
+    def end_reads():
+        events.append("end")
+        now[0] += 0.375
+
+    def clock():
+        events.append("clock")
+        return now[0]
+
+    launch = prepare_launch_projection(
+        lambda: store,
+        STEP,
+        base=BASE,
+        read_head=lambda: head,
+        read_parents=parents,
+        validation_records=[rec],
+        clock=clock,
+        end_reads=end_reads,
+    )
+    walked = [C2, C1] if head == C2 else []
+    assert events[: len(walked) + 2] == ["clock", *walked, "end"]
+    assert events.count("end") == 1 and events[-1] == "clock"
+    assert (launch.projection_ms, launch.render_ms) == (375.0, 0.0)
+
+
 def test_the_engines_projection_time_includes_the_ledgers_reconstruction(
     tmp_state_dir, pi_home, monkeypatch
 ):
@@ -1141,6 +1182,53 @@ def test_an_ancestry_walk_at_its_bound_costs_far_less_cpu_than_the_ceiling(tmp_p
     assert cpu_ms < 1000.0
 
 
+def test_a_candidate_with_a_line_past_the_record_default_leaves_the_walk_in_one_process(
+    tmp_path,
+):
+    """R1-F1 of PR #586: the candidate's message holds a line just past the
+    duplex handle's default record bound (4 MiB), which ended the reader's
+    process and left the walk at its bound to a git process per commit, 64
+    of them. Read as the engine reads it, the walk now reads every commit,
+    the candidate included, through one process, each re-hashed, starts no
+    process per commit and still proves nothing past its bound."""
+    root = git_repo(tmp_path / "repo")
+    base = git_out("-C", str(root), "rev-parse", "HEAD")
+    tree = git_out("-C", str(root), "rev-parse", f"{base}^{{tree}}")
+    tip = base
+    for n in range(MAX_ANCESTRY_COMMITS):
+        tip = git_out("-C", str(root), *GIT_IDENT, "commit-tree", tree, "-p", tip, "-m", f"{n}")
+    message = tmp_path / "message"
+    message.write_bytes(b"candidate\n\n" + b"x" * (DEFAULT_MAX_RECORD_BYTES + 1) + b"\n")
+    candidate = git_out(
+        "-C", str(root), *GIT_IDENT, "commit-tree", tree, "-p", tip, "-F", str(message)
+    )
+    sessions: list = []
+
+    def session(request):
+        sessions.append(request)
+        return start_duplex(request)
+
+    transport = GitTransport(
+        object_directory=root / ".git" / "objects",
+        remote=GitRemote.https(REPO),
+        in_base_history=lambda base, sha: pytest.fail("the walk asked GitHub"),
+        git_lock=lambda operation: pytest.fail("the walk fetched"),
+        runner=lambda request: pytest.fail("the walk started a process per commit"),
+        duplex=session,
+    )
+    read: list[str] = []
+    with transport.local_commit_reader() as reader:
+
+        def parents(sha):
+            read.append(sha)
+            record = reader.read_local_commit(sha)
+            return None if record is None else record.parents
+
+        proved = local_ancestors(candidate, [base], parents)
+    assert proved == ((), MAX_ANCESTRY_COMMITS)
+    assert read[:2] == [candidate, tip] and len(sessions) == 1
+
+
 def test_the_engines_walk_reads_through_one_git_process_ended_with_the_projection(
     tmp_state_dir, pi_home, monkeypatch
 ):
@@ -1170,6 +1258,41 @@ def test_the_engines_walk_reads_through_one_git_process_ended_with_the_projectio
     assert launch.request.ancestors == (base,) and launch.ancestry_reads == 2
     (child,) = children
     assert child.exited() and child.finish().exit_code == 0
+    eng.close()
+
+
+def test_the_engines_projection_time_includes_its_walk_readers_teardown(
+    tmp_state_dir, pi_home, monkeypatch
+):
+    """R1-F2 of PR #586: the walk's git process is ended, and its private
+    directory removed, inside the measurement the run log records, never
+    after it. The engine's clock is a fake that only the reader's teardown
+    moves, so the whole of ``projection_ms`` is the teardown's and none of
+    it the render's. The walk reads C2 and C1, as above."""
+    gh = FakeGitHub()
+    eng, _ = producing(tmp_state_dir, gh, scripted(implement), FAILS)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    (failed,) = saved(eng).validation_records
+    base = failed["candidate"]["provenance"]["base_revision"]
+    work = str(eng.agent_worktree_path())
+    git_out("-C", work, *GIT_IDENT, "commit", "-q", "--allow-empty", "-m", "C2 (#2)")
+    now = [100.0]
+    eng._memory_clock = lambda: now[0]
+    teardown = LocalCommitReader.__exit__
+    ended: list[tuple] = []
+
+    def timed_teardown(self, *exc_info):
+        ended.append(exc_info)
+        now[0] += 0.75
+        return teardown(self, *exc_info)
+
+    monkeypatch.setattr(LocalCommitReader, "__exit__", timed_teardown)
+    launch = eng._launch_memory(Phase.ANALYZE_EXECUTE, work)
+    assert launch is not None and launch.request.ancestors == (base,)
+    assert launch.ancestry_reads == 2 and ended == [(None, None, None)]
+    assert (launch.projection_ms, launch.render_ms) == (750.0, 0.0)
+    meta = launch.metadata()
+    assert (meta["projection_ms"], meta["render_ms"]) == (750.0, 0.0)
     eng.close()
 
 

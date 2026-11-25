@@ -1471,8 +1471,11 @@ the marker first and launches no agent.
   (re-hashed). Many local reads in a row (Memory's ancestry walk) go
   through one `git cat-file --batch` process in such a directory
   (`LocalCommitReader`, #541), each reply re-hashed the same way; a reply
-  it cannot give byte for byte ends it, and the reads go on one process
-  each. Fetches write objects only and create or move no ref. The
+  it cannot give byte for byte ends it and is read by a process of its
+  own. After a reply too large for it (an object past the single read's
+  capture bound, or too many lines waiting) the next read starts a new
+  process; after any other failure the reads go on one process each.
+  Fetches write objects only and create or move no ref. The
   pre-merge evidence fetch runs on it, and every git process goes through
   the executor.
 - **Every controller `gh` process** (`github.gh_workdir`,
