@@ -32,12 +32,12 @@ from autoforge.errors import ExecutionError, GitHubUnavailableError, GitTranspor
 from autoforge.executor import ExecutionRequest, ExecutionResult, execute
 from autoforge.executor_duplex import (
     DEFAULT_MAX_RECORD_BYTES,
+    Chunk,
     DuplexChild,
     DuplexRequest,
     Eof,
-    Fragment,
     Overflow,
-    Oversize,
+    StdoutMode,
     Timeout,
     start_duplex,
 )
@@ -45,9 +45,10 @@ from autoforge.git_transport import (
     LOCAL_GIT_ENV_ALLOWLIST,
     LOCAL_TIMEOUT_SECONDS,
     MAX_RANGE_COMMITS,
-    MAX_READER_LINES,
+    MAX_READER_CHUNKS,
     MAX_READER_OBJECT_BYTES,
     NETWORK_GIT_ENV_ALLOWLIST,
+    READER_HEADER_BYTES,
     CommitRecord,
     GitRemote,
     GitTransport,
@@ -638,19 +639,20 @@ def test_a_reader_refuses_what_a_single_read_refuses_and_its_process_reads_on(wo
 
 @dataclass
 class Interrupting(Sessions):
-    """A starter whose first process, asked for ``sha``, reports ``outcome``
-    in place of the reply, as the duplex handle reports a queue that
-    overflowed, a line past its bound, an exit or a time limit; every later
-    process is left as it is."""
+    """A starter whose first process, asked for ``sha``, reports
+    ``outcome(sha)`` in place of the reply, as the duplex handle reports a
+    queue that overflowed, an exit or a time limit, or as a process that
+    writes other than it was asked would; every later process is left as it
+    is."""
 
     sha: str = ""
-    outcome: object = None
+    outcome: Callable[[str], object] = lambda sha: None
 
     def __call__(self, request: DuplexRequest) -> DuplexChild:
         child = super().__call__(request)
         if len(self.children) > 1:
             return child
-        return _Interrupted(child, self.sha.encode(), self.outcome)  # type: ignore[return-value]
+        return _Interrupted(child, self.sha.encode(), self.outcome(self.sha))  # type: ignore[return-value]
 
 
 class _Interrupted:
@@ -661,22 +663,70 @@ class _Interrupted:
         self._armed = data == self._name
         self._child.send_line(data)
 
-    def read_line(self, timeout: float | None = None) -> object:
+    def read_chunk(self, timeout: float | None = None) -> object:
         if self._armed:
             self._armed = False
             return self._outcome
-        return self._child.read_line(timeout)
+        return self._child.read_chunk(timeout)
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._child, name)
 
 
+@dataclass
+class Rechunking(Sessions):
+    """A starter whose processes hand their stdout on ``size`` bytes at a
+    time, so a reply's header, body and closing LF each span chunks."""
+
+    size: int = 1
+
+    def __call__(self, request: DuplexRequest) -> DuplexChild:
+        return _Rechunked(super().__call__(request), self.size)  # type: ignore[return-value]
+
+
+class _Rechunked:
+    def __init__(self, child: DuplexChild, size: int) -> None:
+        self._child, self._size, self._held = child, size, b""
+
+    def read_chunk(self, timeout: float | None = None) -> object:
+        if not self._held:
+            item = self._child.read_chunk(timeout)
+            if not isinstance(item, Chunk):
+                return item
+            self._held = item.data
+        piece, self._held = self._held[: self._size], self._held[self._size :]
+        return Chunk(piece)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._child, name)
+
+
+@pytest.mark.parametrize("size", [1, 7, 41])
+def test_a_reader_takes_each_reply_by_its_declared_size_wherever_its_chunks_end(world, size):
+    """R2-F1 of PR #586: the reader's stdout is not framed into lines; each
+    reply is its header line and then the bytes it declares, read across
+    however many chunks the pipe gives them in, so a reply whose header, body
+    and closing LF are split anywhere, a commit of many short lines and CRs
+    included, answers as a single read does, through the one process."""
+    root = world.commit("root")
+    lines = world.commit("subject\n\n" + "ab\r\n" * 300, root)
+    tip = world.commit("tip\r", lines)
+    shas = [tip, lines, root, "f" * 40, tip]
+    sessions = Rechunking(size=size)
+    with world.transport(duplex=sessions).local_commit_reader() as reader:
+        got = [reader.read_local_commit(sha) for sha in shas]
+    assert got == [world.transport().read_local_commit(sha) for sha in shas]
+    assert got[3] is None and got[1] is not None and got[1].message.count("\r\n") == 300
+    assert len(sessions.children) == 1 and len(world.requests) == len(shas)
+
+
 def test_a_reader_reads_a_line_past_the_duplex_default_record_bound_in_its_one_process(world):
     """R1-F1 of PR #586: a commit whose message holds a line longer than the
     duplex handle's default record bound (4 MiB) cost the reader its process,
-    and every read after it a process of its own. Its records are now as long
-    as an object the reader takes, so the commit is read whole, re-hashed, by
-    the one process, which serves the reads after it too: no single read."""
+    and every read after it a process of its own. The reader's stdout is no
+    longer framed into lines, so the commit is read whole by its declared
+    size, re-hashed, by the one process, which serves the reads after it
+    too: no single read."""
     root = world.commit("root")
     message = world.tmp / "long-message"
     message.write_bytes(b"subject\n\n" + b"x" * (DEFAULT_MAX_RECORD_BYTES + 1) + b"\r\n")
@@ -723,23 +773,25 @@ def test_a_reply_too_large_for_the_process_is_a_single_read_and_a_new_process_re
 @pytest.mark.parametrize(
     "outcome, restarts",
     [
-        (Overflow(), True),
-        (Oversize(64, b"x" * 64), False),
-        (Fragment(b"partial"), False),
-        (Eof(), False),
-        (Timeout(deadline_exceeded=True), False),
+        (lambda sha: Overflow(), True),
+        (lambda sha: Eof(), False),
+        (lambda sha: Timeout(deadline_exceeded=True), False),
+        (lambda sha: Chunk(b"x" * (READER_HEADER_BYTES + 1)), False),
+        (lambda sha: Chunk(f"{'0' * len(sha)} commit 1\n".encode()), False),
+        (lambda sha: Chunk(f"{sha} missing\nunasked".encode()), False),
     ],
-    ids=["overflow", "oversize", "fragment", "eof", "timeout"],
+    ids=["overflow", "eof", "timeout", "overlong-header", "other-object", "more-than-asked"],
 )
 def test_only_a_reply_too_large_for_the_process_leaves_later_reads_to_a_new_one(
     world, outcome, restarts
 ):
-    """R1-F1 of PR #586. More of a reply's lines waiting than the process
-    holds is a reply git gave right but too large for it: that read is a
-    single read and the next read starts a new process. A line past the
-    record bound, which is the object's, a fragment, an exit or a time
-    limit is the process failing, as before: that read and every later one
-    is a single read. Each answer is the single read's either way."""
+    """R1-F1 of PR #586. More of a reply waiting than the process holds is a
+    reply git gave right but too large for it: that read is a single read
+    and the next read starts a new process. The end of stdout, a time limit,
+    a header longer than any git writes, a reply for another object or more
+    than the reply asked for is the process failing, as before: that read
+    and every later one is a single read. Each answer is the single read's
+    either way."""
     one = world.commit("one")
     two = world.commit("two", one)
     three = world.commit("three", two)
@@ -798,7 +850,7 @@ def test_the_readers_process_is_hardened_as_a_single_read_is(world):
     environment, a private 0700 directory without hooks and with the same
     configuration, no sandbox and no orphan containment, as for the
     controller's other git plumbing, and one local read's time limit for the
-    whole process. Its stdout keeps every byte."""
+    whole process. Its stdout is read unframed, every byte kept."""
     sha = world.commit("one")
     observed: list[tuple[int, bool, str]] = []
     sessions = Sessions()
@@ -830,10 +882,10 @@ def test_the_readers_process_is_hardened_as_a_single_read_is(world):
     assert without_dir(session.env) == without_dir(single.env)
     assert session.cwd == session.env["GIT_DIR"]
     assert session.max_runtime_seconds == single.timeout_seconds == LOCAL_TIMEOUT_SECONDS
-    assert session.idle_timeout_seconds is None and session.strip_cr is False
-    assert session.max_record_bytes == MAX_READER_OBJECT_BYTES  # R1-F1 of PR #586
-    assert session.max_pending_records == MAX_READER_LINES
-    assert session.max_record_bytes < session.max_pending_bytes <= MAX_READER_OBJECT_BYTES + 256
+    assert session.idle_timeout_seconds is None
+    assert session.stdout_mode is StdoutMode.CHUNKS  # R2-F1 of PR #586
+    assert session.max_pending_records == MAX_READER_CHUNKS
+    assert session.max_pending_bytes == MAX_READER_OBJECT_BYTES + READER_HEADER_BYTES
     assert session.sandbox is None and not session.contain_orphans
     ((mode, has_hooks, config),) = observed
     assert mode == 0o700 and not has_hooks

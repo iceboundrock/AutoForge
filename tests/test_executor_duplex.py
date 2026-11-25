@@ -24,6 +24,7 @@ from autoforge.executor import ExecutionRequest, execute
 from autoforge.executor_duplex import (
     MAX_DEADLINE_SECONDS,
     OVERSIZE_HEAD_BYTES,
+    Chunk,
     DuplexRequest,
     Eof,
     Fragment,
@@ -134,24 +135,79 @@ def test_crlf_endings_strip_exactly_one_cr():
     assert got == [Record(b"one"), Record(b"two\r"), Record(b""), Record(b"bare\rcr"), Eof()]
 
 
-def test_records_keep_every_cr_when_the_request_says_so():
-    """#541: with ``strip_cr=False`` a record is every byte before its LF, so
-    the records joined by LF are exactly the stream the child wrote, as the
-    git transport's reader of ``git cat-file --batch`` needs to hash an
-    object's bytes. A kept CR counts towards the record bound like any other
-    byte; the default still strips one."""
-    stream = b"one\r\ntwo\r\r\n\r\nbare\rcr\n"
-    got = _records_until_eof([stream], strip_cr=False)
-    assert got == [Record(b"one\r"), Record(b"two\r\r"), Record(b"\r"), Record(b"bare\rcr"), Eof()]
-    assert b"".join(record.data + b"\n" for record in got[:-1]) == stream
-    limit = 4
-    kept = _LineFramer(limit, strip_cr=False)
-    assert kept.feed(b"abcd\nabc\r\nabcd\r\n") == [
-        Record(b"abcd"),
-        Record(b"abc\r"),
-        Oversize(limit, b"abcd"),
-    ]
-    assert _LineFramer(limit).feed(b"abcd\r\n") == [Record(b"abcd")]
+# -- unframed stdout (#541) -----------------------------------------------------
+def _chunks_until_eof(chunks: list[bytes], delay: float = 0.0, **kw) -> tuple[list, list]:
+    """Read every chunk the writer produces, let it exit, then read to the end."""
+    with start_duplex(_writer(chunks, delay, stdout_mode=StdoutMode.CHUNKS, **kw)) as child:
+        expected = sum(len(chunk) for chunk in chunks)
+        got: list = []
+        while sum(len(item.data) for item in got) < expected:
+            item = child.read_chunk(timeout=10)
+            assert isinstance(item, Chunk), item
+            got.append(item)
+        child.close_stdin()
+        end = [child.read_chunk(timeout=10)]
+        res = child.finish()
+    assert res.exit_code == 0 and not res.timed_out, res
+    return got, end
+
+
+def test_an_unframed_stdout_is_every_byte_in_order_however_it_is_written():
+    """#541: in ``StdoutMode.CHUNKS`` nothing is framed: the chunks read in
+    order are exactly the stream, LFs, CRs, NULs and a tail with no LF
+    included, however the child wrote it, and then Eof. A caller that frames
+    by byte count (``git cat-file --batch``) reads a body of many short
+    lines in a few chunks, never a record per line."""
+    payload = b"head 12\r\n" + b"ab\n" * 3000 + b"\x00\r\rno lf at the end"
+    for chunks, delay in (([payload], 0.0), ([bytes([b]) for b in payload[:40]], 0.001)):
+        got, end = _chunks_until_eof(chunks, delay)
+        assert b"".join(item.data for item in got) == b"".join(chunks)
+        assert all(item.data for item in got) and end == [Eof()]
+    got, _ = _chunks_until_eof([payload])
+    assert len(got) < payload.count(b"\n") // 100
+
+
+def test_unframed_chunks_overflow_the_queue_as_records_do():
+    """What waits to be read is bounded by ``max_pending_bytes`` and, in
+    chunks, ``max_pending_records``; past either the invocation is over, as
+    for records: the chunks queued are returned, then a sticky Overflow."""
+    script = "import sys; sys.stdout.buffer.write(b'z' * 20000); sys.stdout.flush()"
+    with start_duplex(
+        DuplexRequest(
+            command=[PY, "-c", script],
+            max_runtime_seconds=30,
+            stdout_mode=StdoutMode.CHUNKS,
+            max_record_bytes=1000,
+            max_pending_bytes=1000,
+        )
+    ) as child:
+        assert child.finish().records_overflowed
+    got = []
+    while not isinstance(item := child.read_chunk(timeout=0), Eof | Overflow):
+        got.append(item)
+    assert item == Overflow() and child.read_chunk(timeout=0) == Overflow()
+    assert sum(len(chunk.data) for chunk in got) <= 1000
+
+
+def test_each_stdout_mode_has_its_own_read():
+    """``read_line`` reads records and ``read_chunk`` chunks; each refuses a
+    stdout of another mode, and nothing but records has unread records to
+    ask for."""
+    script = "print('x', flush=True)"
+    for mode, refused, reason in (
+        (StdoutMode.RECORDS, "read_chunk", "framed into records"),
+        (StdoutMode.CHUNKS, "read_line", "read in chunks"),
+        (StdoutMode.CAPTURE, "read_chunk", "captured"),
+    ):
+        with start_duplex(
+            DuplexRequest(command=[PY, "-c", script], max_runtime_seconds=30, stdout_mode=mode)
+        ) as child:
+            with pytest.raises(ExecutionError, match=reason):
+                getattr(child, refused)(timeout=0)
+            if mode is StdoutMode.CHUNKS:
+                with pytest.raises(ExecutionError, match="read in chunks"):
+                    child.unread_at_deadline()
+            child.finish()
 
 
 def test_unicode_line_separators_and_nul_are_not_boundaries():

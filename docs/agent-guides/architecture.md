@@ -412,10 +412,12 @@ executor's spawn, environment selection, pipe draining and group kill, and
 it is held to the same contract:
 
 - stdout is split into records on LF (0x0A) only, one trailing CR stripped
-  per record unless the request keeps it (`strip_cr=False`: the git
-  transport's `LocalCommitReader` joins the records of `git cat-file
-  --batch` back into an object's exact bytes, #541); U+2028/U+2029, NUL and
-  every other byte are record content.
+  per record; U+2028/U+2029, NUL and every other byte are record content.
+  A caller whose stream is framed by byte counts rather than lines asks for
+  `stdout_mode=StdoutMode.CHUNKS` and reads it unframed with `read_chunk`:
+  each `Chunk` is one read of the pipe, every byte kept in order (the git
+  transport's `LocalCommitReader` takes each `git cat-file --batch` reply
+  by the size its header declares, #541).
   Records are bytes and decoding them is the caller's. A record over
   `max_record_bytes` is reported as `Oversize` and dropped through its LF;
   the `Oversize` carries the record's first `OVERSIZE_HEAD_BYTES` bytes
@@ -424,7 +426,7 @@ it is held to the same contract:
   `turn_end` by it, #144). An unterminated fragment at EOF is reported as
   `Fragment`, never as a record;
 - both pipes are drained continuously whether or not the caller reads.
-  Records wait in a queue bounded by `max_pending_records` and
+  Records (or chunks) wait in a queue bounded by `max_pending_records` and
   `max_pending_bytes`, and exceeding it is `Overflow`, which ends the
   invocation (a child still running is killed at `finish()`). stderr goes
   to the same head/tail capture as `execute()` and is never a record;

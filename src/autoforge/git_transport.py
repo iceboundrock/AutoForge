@@ -45,9 +45,9 @@ steering it.
   history, so nothing below the range is read and a rewritten ancestor of
   the base cannot shrink it. Every failure fails closed with
   :class:`GitTransportError`; nothing is ever read as "allowed".
-  :class:`LocalCommitReader` reads many local commits the same way through
-  one ``git cat-file --batch`` process instead of one process per commit
-  (#541).
+  :class:`LocalCommitReader` reads many local commits the same way,
+  normally through one ``git cat-file --batch`` process instead of one
+  process per commit (#541).
 - **Pushes are compare-and-swap fast-forwards only (D6.1-D6.3).** An exact
   SHA to an exact ``refs/heads/<branch>``, never the default branch, with a
   lease on the expected old value ("absent" or a full SHA) and the
@@ -85,7 +85,14 @@ from types import TracebackType
 
 from .errors import ExecutionError, GitLockTimeout, GitTransportError, LockError
 from .executor import DEFAULT_MAX_OUTPUT_BYTES, ExecutionRequest, ExecutionResult, execute
-from .executor_duplex import DuplexChild, DuplexRequest, Overflow, Record, start_duplex
+from .executor_duplex import (
+    Chunk,
+    DuplexChild,
+    DuplexRequest,
+    Overflow,
+    StdoutMode,
+    start_duplex,
+)
 from .redaction import redact
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
@@ -102,16 +109,17 @@ NETWORK_TIMEOUT_SECONDS = 600
 LOCAL_TIMEOUT_SECONDS = 120
 
 # What one reply of a :class:`LocalCommitReader`'s git process may hold: the
-# object's size, the single read's capture bound, and how many of its lines,
-# each a record of the process's framed stdout, may wait to be read. A line
-# is framed whole up to the object's bound, so no line of an object within
-# it is ever too long to read (R1-F1 of PR #586). A reply past either bound
-# is read by a process of its own instead, under that read's own bound, and
-# the next read starts the reader a new process (#541).
+# object's size, the single read's capture bound, and how many chunks of the
+# process's stdout, read unframed, may wait to be read. The object's bytes
+# are taken by the count its header declares, never line by line, so neither
+# a long line (R1-F1 of PR #586) nor many short ones (R2-F1 of PR #586) costs
+# more than its bytes. A reply past either bound is read by a process of its
+# own instead, under that read's own bound, and the next read starts the
+# reader a new process (#541).
 MAX_READER_OBJECT_BYTES = DEFAULT_MAX_OUTPUT_BYTES
-MAX_READER_LINES = 65536
-# Room beside the object's bytes, in the records waiting to be read, for the
-# reply's header line (``<id> <type> <size>``, under 100 bytes).
+MAX_READER_CHUNKS = 65536
+# The longest header line (``<id> <type> <size>``, under 100 bytes) a reply
+# may begin with; also the room beside the object's bytes in what waits.
 READER_HEADER_BYTES = 256
 
 # Hooks and the file-system monitor are off at command-line precedence for
@@ -920,22 +928,23 @@ class LocalCommitReader:
     where starting a process costs far more than on Linux.
 
     The process starts on the first read, in that SHA's object format; a
-    SHA of the other format is a single read. Its stdout is framed into
-    records that keep every byte (``strip_cr=False``), so the commit hashed
-    is exactly what git wrote: unlike the single read, which captures text,
-    a commit that is not valid UTF-8 is authenticated too. A record may be
-    as long as :data:`MAX_READER_OBJECT_BYTES`, so a line of an object
-    within that bound, however long, is read whole. A reply the process
-    cannot give exactly ends the process, and that read is a single read,
-    with that read's guarantees and refusals. When git gave the reply right
-    but it is too large for the process to hold (an object past
-    :data:`MAX_READER_OBJECT_BYTES`, or more of its lines waiting than
-    :data:`MAX_READER_LINES`), the next read starts a new process, so such
-    a commit costs the walk the single read and one process more, never a
-    process for every later read (R1-F1 of PR #586). Otherwise (a malformed
-    header, a reply longer than its header says, the process exiting or
-    reaching its time limit, a spawn or a write that fails) the process is
-    what failed, and every later read is a single read too. A missing
+    SHA of the other format is a single read. Its stdout is read unframed
+    (``StdoutMode.CHUNKS``): each reply is its header line and then exactly
+    the bytes the header declares, so the commit hashed is exactly what git
+    wrote, and what a reply costs is its size, however many lines it holds
+    or however long they are (R1-F1, R2-F1 of PR #586). Unlike the single
+    read, which captures text, a commit that is not valid UTF-8 is
+    authenticated too. A reply the process cannot give exactly ends the
+    process, and that read is a single read, with that read's guarantees
+    and refusals. When git gave the reply right but it is too large for the
+    process to hold (an object past :data:`MAX_READER_OBJECT_BYTES`, or
+    more of its stdout waiting than :data:`MAX_READER_CHUNKS` chunks), the
+    next read starts a new process, so such a commit costs the walk the
+    single read and one process more, never a process for every later read
+    (R1-F1 of PR #586). Otherwise (a malformed header, a reply longer than
+    its header says, the process exiting or reaching its time limit, a
+    spawn or a write that fails) the process is what failed, and every
+    later read is a single read too. A missing
     commit is a reply, ``None``; a commit whose bytes do not hash to its id
     and an object that is no commit raise :class:`GitTransportError` as a
     single read does, and the process goes on to the next read.
@@ -952,7 +961,7 @@ class LocalCommitReader:
         self._transport = transport
         self._start = start
         self._dirs = ExitStack()
-        self._child: DuplexChild | None = None
+        self._replies: _Replies | None = None
         self._format = ""
         self._lost = False
         self._closed = False
@@ -978,11 +987,11 @@ class LocalCommitReader:
         object_format = _object_format(sha)
         if self._closed:
             raise GitTransportError(f"reading commit {sha}: the local commit reader is closed")
-        child = self._session(object_format)
-        if child is None:
+        replies = self._session(object_format)
+        if replies is None:
             return self._transport.read_local_commit(sha)
         try:
-            reply = _reply(child, sha)
+            reply = replies.reply(sha)
         except _ReplyLost as exc:
             # The process is out of step with its replies, so it ends. One
             # too large for it is no failure of the process, and the next
@@ -999,96 +1008,127 @@ class LocalCommitReader:
             raise GitTransportError(_substituted(sha))
         return _parse_commit(sha, raw)
 
-    def _session(self, object_format: str) -> DuplexChild | None:
+    def _session(self, object_format: str) -> _Replies | None:
         """The running process for a SHA of ``object_format``, started on first use
         and after a reply too large for the last one; None when the read is a single read."""
         if self._lost:
             return None
-        if self._child is not None:
-            return self._child if object_format == self._format else None
+        if self._replies is not None:
+            return self._replies if object_format == self._format else None
         try:
             git_dir = self._dirs.enter_context(self._transport._git_dir(object_format))
             request = self._transport._request(git_dir, ["cat-file", "--batch"], gh_path=None)
-            self._child = self._start(
+            child = self._start(
                 DuplexRequest(
                     command=list(request.command),
                     cwd=request.cwd,
                     env=request.env,
                     env_allowlist=request.env_allowlist,
                     max_runtime_seconds=LOCAL_TIMEOUT_SECONDS,
-                    strip_cr=False,
-                    # No line of an object within its bound is longer than
-                    # the object, and the records waiting to be read are one
-                    # reply's at most: its header and the object's lines.
-                    max_record_bytes=MAX_READER_OBJECT_BYTES,
-                    max_pending_records=MAX_READER_LINES,
+                    stdout_mode=StdoutMode.CHUNKS,
+                    # What waits to be read is one reply's at most: git
+                    # writes nothing it was not asked for, and the next
+                    # read is asked only once this reply is read whole.
+                    max_pending_records=MAX_READER_CHUNKS,
                     max_pending_bytes=MAX_READER_OBJECT_BYTES + READER_HEADER_BYTES,
                 )
             )
+            self._replies = _Replies(child)
         except (ExecutionError, GitTransportError):
             self._lost = True
             self._end(kill=True)
             return None
         self._format = object_format
-        return self._child
+        return self._replies
 
     def _end(self, *, kill: bool) -> None:
         """End the process (at once with ``kill``, else on stdin EOF), remove its directory."""
-        child, self._child = self._child, None
+        replies, self._replies = self._replies, None
         try:
-            if child is not None:
+            if replies is not None:
                 if kill:
-                    child.stop()
-                child.finish()
+                    replies.child.stop()
+                replies.child.finish()
         except ExecutionError:
             pass  # torn down whatever it reports; every reply stood on its own hash
         finally:
             self._dirs.close()
 
 
-def _reply(child: DuplexChild, sha: str) -> tuple[str, bytes] | None:
-    """``sha``'s object type and bytes from a ``git cat-file --batch`` process; None
-    when the store does not hold it. :class:`_ReplyLost` when no exact reply came."""
-    name = sha.encode("ascii")
-    try:
-        child.send_line(name)
-        header = _reply_line(child)
-        if header == name + b" missing":
-            return None
-        parts = header.split(b" ")
-        if len(parts) != 3 or parts[0] != name or not parts[2].isdigit():
+class _Replies:
+    """The replies of a ``git cat-file --batch`` process, read from its
+    unframed stdout (#541): a header line, then the bytes it declares.
+
+    What is held is the reply being read, plus what a chunk carried past
+    it: once a reply is read whole nothing more is held, since git writes
+    nothing it was not asked for."""
+
+    def __init__(self, child: DuplexChild) -> None:
+        self.child = child
+        self._held = bytearray()
+
+    def reply(self, sha: str) -> tuple[str, bytes] | None:
+        """``sha``'s object type and bytes; None when the store does not
+        hold it. :class:`_ReplyLost` when no exact reply came."""
+        name = sha.encode("ascii")
+        try:
+            self.child.send_line(name)
+            header = self._line()
+            if header == name + b" missing":
+                reply = None
+            else:
+                parts = header.split(b" ")
+                if len(parts) != 3 or parts[0] != name or not parts[2].isdigit():
+                    raise _ReplyLost
+                size = int(parts[2])
+                if size > MAX_READER_OBJECT_BYTES:
+                    raise _ReplyTooLarge
+                # The object's bytes, taken by their count, and the LF git
+                # writes after them.
+                body = self._exactly(size + 1)
+                if body[-1:] != b"\n":
+                    raise _ReplyLost
+                reply = parts[1].decode("ascii", errors="replace"), body[:-1]
+        except ExecutionError as exc:
+            raise _ReplyLost from exc
+        if self._held:
+            raise _ReplyLost  # more than the reply: a reply other than its header says
+        return reply
+
+    def _line(self) -> bytes:
+        """The header line, without its LF; at most :data:`READER_HEADER_BYTES`."""
+        seen = 0
+        while (end := self._held.find(b"\n", seen)) < 0:
+            if len(self._held) > READER_HEADER_BYTES:
+                raise _ReplyLost
+            seen = len(self._held)
+            self._more()
+        if end > READER_HEADER_BYTES:
             raise _ReplyLost
-        size = int(parts[2])
-        if size > MAX_READER_OBJECT_BYTES:
+        line = bytes(self._held[:end])
+        del self._held[: end + 1]
+        return line
+
+    def _exactly(self, size: int) -> bytes:
+        """The next ``size`` bytes of the reply."""
+        while len(self._held) < size:
+            self._more()
+        data = bytes(self._held[:size])
+        del self._held[:size]
+        return data
+
+    def _more(self) -> None:
+        """Hold the next chunk of stdout; anything but a chunk is no exact reply.
+
+        An :class:`~autoforge.executor_duplex.Overflow` is more of the reply
+        waiting than the process holds, a reply too large for it; the end of
+        stdout or a time limit is the process failing."""
+        item = self.child.read_chunk()
+        if isinstance(item, Overflow):
             raise _ReplyTooLarge
-        # The object's bytes and the LF after them: their lines, joined
-        # again by the LFs the framing took, are exactly the object.
-        lines: list[bytes] = []
-        left = size + 1
-        while left > 0:
-            line = _reply_line(child)
-            lines.append(line)
-            left -= len(line) + 1
-        if left != 0:
+        if not isinstance(item, Chunk):
             raise _ReplyLost
-    except ExecutionError as exc:
-        raise _ReplyLost from exc
-    return parts[1].decode("ascii", errors="replace"), b"\n".join(lines)
-
-
-def _reply_line(child: DuplexChild) -> bytes:
-    """The next line of the reply; anything but a whole line is no exact reply.
-
-    An :class:`~autoforge.executor_duplex.Overflow` is more of the reply's
-    lines waiting than the process holds, a reply too large for it; an
-    ``Oversize`` cannot be a line of an object within the record bound,
-    which is the object's, so it is a reply other than its header says."""
-    item = child.read_line()
-    if isinstance(item, Overflow):
-        raise _ReplyTooLarge
-    if not isinstance(item, Record):
-        raise _ReplyLost
-    return item.data
+        self._held += item.data
 
 
 def _private_config(object_format: str) -> str:

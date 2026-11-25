@@ -4929,7 +4929,7 @@ class ControllerEngine:
         :func:`~autoforge.memory_handoff.local_ancestors`), never by asking
         GitHub or fetching (R3-F1, R4-F2): one neither proves is left out,
         so a record bound to it is omitted, never shown as current. The
-        walk reads its commits through one git process
+        walk reads its commits normally through one git process
         (:class:`~autoforge.git_transport.LocalCommitReader`, #541), started
         on its first read and ended before this returns, however it returns:
         once the walk is done, inside the measurement below, so its
@@ -4979,7 +4979,7 @@ class ControllerEngine:
     def _memory_reader(
         self, transport: Callable[[], GitTransport], stack: ExitStack
     ) -> Callable[[], LocalCommitReader]:
-        """One projection's walk reader, through one git process, made on its first use (#541).
+        """One projection's walk reader, normally one git process, made on its first use (#541).
 
         ``transport``'s :meth:`~GitTransport.local_commit_reader`, entered on
         ``stack``, which the projection closes once its walk is done, inside
@@ -4987,7 +4987,9 @@ class ControllerEngine:
         however else the projection ends. Read a process per commit, a walk
         at its bound cost the hosted macOS runners 1.2 to 1.3 s of CPU, past
         ADR 0015 D12's 1,000 ms ceiling; each read still answers as
-        :meth:`GitTransport.read_local_commit` does.
+        :meth:`GitTransport.read_local_commit` does, and a commit the
+        process cannot return exactly is read by a process of its own
+        (see :class:`~autoforge.git_transport.LocalCommitReader`).
         """
         made: list[LocalCommitReader] = []
 

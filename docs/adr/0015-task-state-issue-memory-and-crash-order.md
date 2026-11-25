@@ -1725,9 +1725,16 @@ base the controller proved; so a retry on a failed commit is shown its
 failure however long its history (R4-F2). Any other base is proved by a
 breadth-first walk from the candidate through commits read as their own
 bytes and re-hashed, at most 64 of them; a base neither proves is not
-proved and its record is omitted. The walk reads them all through one git
-process (#541): with a process per commit, a walk at its bound cost the
-hosted macOS runners 1.2 to 1.3 s of CPU, past D12's 1,000 ms ceiling.
+proved and its record is omitted. On its normal path the walk reads them
+all through one `git cat-file --batch` process, each reply taken by the
+size its header declares (#541): with a process per commit, a walk at its
+bound cost the hosted macOS runners 1.2 to 1.3 s of CPU, past D12's
+1,000 ms ceiling, and with a record per line of a commit, the walk over 64
+commits of 20,000 short lines cost 3.3 s on Linux (R2-F1 of PR #586). One
+process is the normal path, not a bound: a commit that process cannot
+return exactly is read by a process of its own, and the next read starts a
+new shared process when the commit was only too large for it (past 16 MiB)
+and goes on one process per commit after any other failure of it.
 `HEAD` is read through the admin dir the registry binds and the common
 dir, never through the worktree's `.git`
 file, which an earlier launch of the step can rewrite before a correction

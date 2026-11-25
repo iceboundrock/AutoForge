@@ -62,7 +62,7 @@ executor.py         subprocess lifecycle, timeouts, a caller's stop, capture, op
                     sandbox (no workflow semantics)
 executor_duplex.py  duplex child handle for RPC transports: stdin records out, LF-framed
                     stdout records in, idle timeout and max runtime, ADR 0002 teardown;
-                    bytes only (#130, #193); a record keeps its CR on request (#541)
+                    bytes only (#130, #193); or stdout unframed, read in chunks (#541)
 sandbox.py          outer sandbox: the backend-neutral launch description, the policy
                     compiler (ADR 0005 D4.2, D4.3, D7.2) and the facts; executor layer,
                     no workflow semantics (#167)
@@ -181,7 +181,7 @@ effects.py          ADR 0004 effect records: kinds, stages, attempt bound, drive
 effect_ops.py       per-kind effect operations: identity read, precondition, write (#160)
 git_transport.py    controller git push: sanitized config, explicit URL, lease, no hooks;
                     the hardened request every local controller git process uses (#160);
-                    LocalCommitReader, many local commit reads through one
+                    LocalCommitReader, many local commit reads normally through one
                     `cat-file --batch` duplex child, each re-hashed (#541)
 claims.py           durable GitHub claims: marker schemas, renderers, scan, cardinality
 validation.py       typed GitHub URL parsing and run-argument validation

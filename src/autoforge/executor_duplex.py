@@ -7,8 +7,9 @@ what it is sent. An RPC transport needs a child it can keep writing records
 to while reading records back. This module is the narrowest primitive that
 does that and keeps every guarantee ``execute()`` gives (ADR 0002: nothing
 the child starts outlives the invocation). It deals in bytes and LF-framed
-records only: nothing here knows an encoding, a provider, a phase or
-controller state; decoding a record is the caller's.
+records only, or, for a caller that frames the stream itself, in the
+stream's bytes unframed: nothing here knows an encoding, a provider, a
+phase or controller state; decoding a record is the caller's.
 
 Guarantees:
 
@@ -18,19 +19,21 @@ Guarantees:
   and so is a setup failure after the spawn (the group is killed first and
   nothing taken for the invocation is kept);
 - stdout is split into records on LF (0x0A) **only**, one trailing CR
-  stripped per record unless the request keeps it (``strip_cr=False``, for
-  a caller that reassembles a byte-exact stream from its records, #541);
-  no other byte or Unicode line separator (U+2028, U+2029, NUL, VT, FF,
-  NEL) is a boundary. A record longer than
+  stripped per record; no other byte or Unicode line separator (U+2028,
+  U+2029, NUL, VT, FF, NEL) is a boundary. A record longer than
   ``max_record_bytes`` is reported as :class:`Oversize` with at most its
   first :data:`OVERSIZE_HEAD_BYTES` bytes, so that the caller can tell what
   was dropped, and dropped through its LF; an unterminated fragment at EOF
-  is reported as :class:`Fragment`, never as a record;
+  is reported as :class:`Fragment`, never as a record. With
+  ``stdout_mode=StdoutMode.CHUNKS`` stdout is not framed at all: each chunk
+  read from the pipe is a :class:`Chunk`, every byte kept in order, read
+  with :meth:`DuplexChild.read_chunk`, for a caller whose stream is framed
+  by byte counts rather than lines (``git cat-file --batch``, #541);
 - stdout and stderr are drained continuously on reader threads, whether or
   not the caller reads, so the child never blocks on a full pipe. Complete
-  records wait in a queue bounded by ``max_pending_records`` and
-  ``max_pending_bytes``; exceeding it is :class:`Overflow`, which ends the
-  invocation. stderr goes to a bounded head/tail capture and never becomes
+  records (or chunks) wait in a queue bounded by ``max_pending_records``
+  and ``max_pending_bytes``; exceeding it is :class:`Overflow`, which ends
+  the invocation. stderr goes to a bounded head/tail capture and never becomes
   a record. Memory is bounded by those limits plus a constant;
 - writes are whole records, serialized by one lock and non-blocking under a
   selector, so a child that stops reading stdin cannot hold the controller
@@ -142,14 +145,16 @@ class StdoutMode(enum.Enum):
 
     # LF-framed records, read with :meth:`DuplexChild.read_line`.
     RECORDS = "records"
+    # Not framed: each chunk read from the pipe, every byte kept in order,
+    # read with :meth:`DuplexChild.read_chunk` (#541).
+    CHUNKS = "chunks"
     # Bounded head/tail capture, returned in :attr:`DuplexResult.stdout`.
     CAPTURE = "capture"
 
 
 @dataclass(frozen=True)
 class Record:
-    """One complete record: the bytes before an LF, one trailing CR stripped
-    unless the request keeps it (:attr:`DuplexRequest.strip_cr`)."""
+    """One complete record: the bytes before an LF, one trailing CR stripped."""
 
     data: bytes
 
@@ -169,6 +174,14 @@ class Oversize:
 @dataclass(frozen=True)
 class Fragment:
     """Bytes after the last LF when stdout reached EOF: not a record."""
+
+    data: bytes
+
+
+@dataclass(frozen=True)
+class Chunk:
+    """Bytes of stdout as one read of the pipe returned them, never empty;
+    ``StdoutMode.CHUNKS`` only. The chunks in order are the stream."""
 
     data: bytes
 
@@ -194,6 +207,9 @@ class Timeout:
 
 
 ReadOutcome = Record | Oversize | Fragment | Eof | Overflow | Timeout
+# What :meth:`DuplexChild.read_chunk` returns: no record is framed, so there
+# is no record past a bound and no fragment, only the stream's bytes.
+ChunkOutcome = Chunk | Eof | Overflow | Timeout
 
 
 @dataclass
@@ -218,9 +234,8 @@ class DuplexRequest:
     # the limit falls due.
     wind_down_seconds: float = 0.0
     max_record_bytes: int = DEFAULT_MAX_RECORD_BYTES
-    # False: a record is every byte before its LF, a trailing CR included, so
-    # the records joined with LF are exactly what the child wrote (#541).
-    strip_cr: bool = True
+    # Records waiting to be read; in ``StdoutMode.CHUNKS``, chunks, each one
+    # read of the pipe (at most 64 KiB), and ``max_record_bytes`` is unused.
     max_pending_records: int = DEFAULT_MAX_PENDING_RECORDS
     max_pending_bytes: int = DEFAULT_MAX_PENDING_BYTES
     max_stderr_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
@@ -296,13 +311,11 @@ class _LineFramer:
     that, the record is reported once as :class:`Oversize`, with its head,
     the moment it crosses the bound and its remaining bytes are counted out
     up to the next LF, so a stream with no LF at all costs the bound, not
-    its length. With ``strip_cr`` False a trailing CR is kept, and counts
-    towards the bound like any other byte.
+    its length.
     """
 
-    def __init__(self, limit: int, *, strip_cr: bool = True) -> None:
+    def __init__(self, limit: int) -> None:
         self._limit = limit
-        self._strip_cr = strip_cr
         self._head = min(OVERSIZE_HEAD_BYTES, limit)
         self._buf = bytearray()
         self._dropping = False
@@ -325,7 +338,7 @@ class _LineFramer:
             else:
                 record = bytes(self._buf)
                 self._buf.clear()
-                if self._strip_cr and record.endswith(b"\r"):
+                if record.endswith(b"\r"):
                     record = record[:-1]
                 if len(record) > self._limit:
                     out.append(Oversize(self._limit, record[: self._head]))
@@ -370,7 +383,7 @@ class _RecordQueue:
     def __init__(self, max_items: int, max_bytes: int) -> None:
         self._max_items = max_items
         self._max_bytes = max_bytes
-        self._items: deque[Record | Oversize | Fragment] = deque()
+        self._items: deque[Record | Oversize | Fragment | Chunk] = deque()
         self._bytes = 0
         self._end: Eof | Overflow | None = None
         self._sealed = False
@@ -386,7 +399,7 @@ class _RecordQueue:
         with self._cond:
             return isinstance(self._end, Overflow)
 
-    def put(self, item: Record | Oversize | Fragment) -> bool:
+    def put(self, item: Record | Oversize | Fragment | Chunk) -> bool:
         """Queue ``item``; False once the queue has ended (overflow included) or is sealed."""
         size = _held_bytes(item)
         with self._cond:
@@ -407,7 +420,7 @@ class _RecordQueue:
                 self._end = Eof()
             self._cond.notify_all()
 
-    def get(self, until: float) -> Record | Oversize | Fragment | Eof | Overflow | None:
+    def get(self, until: float) -> Record | Oversize | Fragment | Chunk | Eof | Overflow | None:
         """The next item, or None when ``until`` (``time.monotonic()``) passes first."""
         with self._cond:
             while True:
@@ -434,10 +447,10 @@ class _RecordQueue:
             self._sealed = True
             return True
 
-    def take_unread(self) -> list[Record | Oversize | Fragment | Overflow]:
+    def take_unread(self) -> list[Record | Oversize | Fragment | Chunk | Overflow]:
         """What waits to be read, oldest first and an overflow last; never waits."""
         with self._cond:
-            unread: list[Record | Oversize | Fragment | Overflow] = list(self._items)
+            unread: list[Record | Oversize | Fragment | Chunk | Overflow] = list(self._items)
             self._items.clear()
             self._bytes = 0
             if isinstance(self._end, Overflow):
@@ -445,7 +458,7 @@ class _RecordQueue:
             return unread
 
 
-def _held_bytes(item: Record | Oversize | Fragment) -> int:
+def _held_bytes(item: Record | Oversize | Fragment | Chunk) -> int:
     """The bytes ``item`` holds while it waits in the queue."""
     return len(item.head) if isinstance(item, Oversize) else len(item.data)
 
@@ -464,11 +477,9 @@ class _RecordReader(_PipeDrain):
         max_record_bytes: int,
         queue: _RecordQueue,
         activity: _Limits | None = None,
-        *,
-        strip_cr: bool = True,
     ) -> None:
         super().__init__(stream, "stdout", activity)
-        self.framer = _LineFramer(max_record_bytes, strip_cr=strip_cr)
+        self.framer = _LineFramer(max_record_bytes)
         self._queue = queue
 
     def _feed(self, chunk: bytes) -> None:
@@ -483,6 +494,32 @@ class _RecordReader(_PipeDrain):
             for fragment in self.framer.finish():
                 self._queue.put(fragment)
         self._queue.end()
+
+
+class _ChunkReader(_PipeDrain):
+    """Drain stdout into a :class:`_RecordQueue` as it is read, unframed (#541).
+
+    Each chunk the pipe gives is queued as a :class:`Chunk`, so the chunks
+    read in order are the stream byte for byte. After an overflow the pipe
+    is still drained, and what it carries dropped, as :class:`_RecordReader`
+    does.
+    """
+
+    def __init__(
+        self, stream: IO[bytes], queue: _RecordQueue, activity: _Limits | None = None
+    ) -> None:
+        super().__init__(stream, "stdout", activity)
+        self._queue = queue
+
+    def _feed(self, chunk: bytes) -> None:
+        if not self._queue.ended:
+            self._queue.put(Chunk(chunk))
+
+    def _ended(self, eof: bool) -> None:
+        self._queue.end()
+
+
+_Outcome = Record | Oversize | Fragment | Chunk | Eof | Overflow | Timeout
 
 
 def _validate(req: DuplexRequest) -> None:
@@ -502,7 +539,8 @@ def _validate(req: DuplexRequest) -> None:
         value = getattr(req, name)
         if value <= 0:
             raise ExecutionError(f"{name} must be > 0, got {value}")
-    if req.max_record_bytes > req.max_pending_bytes:
+    # Unframed stdout has no record to fit in the queue.
+    if req.stdout_mode is not StdoutMode.CHUNKS and req.max_record_bytes > req.max_pending_bytes:
         raise ExecutionError(
             f"max_record_bytes ({req.max_record_bytes}) must not exceed "
             f"max_pending_bytes ({req.max_pending_bytes}): one record would overflow the queue"
@@ -661,12 +699,11 @@ class DuplexChild:
         if req.stdout_mode is StdoutMode.RECORDS:
             self._queue = _RecordQueue(req.max_pending_records, req.max_pending_bytes)
             stdout_reader = _RecordReader(
-                proc.stdout,
-                req.max_record_bytes,
-                self._queue,
-                self._limits,
-                strip_cr=req.strip_cr,
+                proc.stdout, req.max_record_bytes, self._queue, self._limits
             )
+        elif req.stdout_mode is StdoutMode.CHUNKS:
+            self._queue = _RecordQueue(req.max_pending_records, req.max_pending_bytes)
+            stdout_reader = _ChunkReader(proc.stdout, self._queue, self._limits)
         else:
             self._capture = _BoundedReader(
                 proc.stdout, req.max_stdout_bytes, "stdout", activity=self._limits
@@ -799,8 +836,34 @@ class DuplexChild:
         deadline comes, a child still running is an overrun; one that has
         exited by then is not, and is settled as :meth:`finish` settles it
         (see :meth:`_deadline_reached`)."""
-        if self._queue is None:
-            raise ExecutionError("stdout is captured, not framed into records")
+        self._framed(StdoutMode.RECORDS)
+        item = self._next(timeout)
+        assert not isinstance(item, Chunk)  # only StdoutMode.CHUNKS queues one
+        return item
+
+    def read_chunk(self, timeout: float | None = None) -> ChunkOutcome:
+        """The next chunk of an unframed stdout (``StdoutMode.CHUNKS``, #541),
+        or its end, under every rule of :meth:`read_line` (see
+        :data:`ChunkOutcome`)."""
+        self._framed(StdoutMode.CHUNKS)
+        item = self._next(timeout)
+        assert isinstance(item, Chunk | Eof | Overflow | Timeout)  # nothing is framed
+        return item
+
+    def _framed(self, mode: StdoutMode) -> None:
+        """Refuse a read of stdout in a mode other than the request's."""
+        if self._req.stdout_mode is not mode:
+            raise ExecutionError(
+                {
+                    StdoutMode.RECORDS: "stdout is framed into records, not read in chunks",
+                    StdoutMode.CHUNKS: "stdout is read in chunks, not framed into records",
+                    StdoutMode.CAPTURE: "stdout is captured, not framed into records",
+                }[self._req.stdout_mode]
+            )
+
+    def _next(self, timeout: float | None) -> _Outcome:
+        """:meth:`read_line` and :meth:`read_chunk`: the next item of the queue."""
+        assert self._queue is not None
         if self._timed_out:
             return Timeout(deadline_exceeded=True)
         if self._closed:
@@ -820,7 +883,7 @@ class DuplexChild:
             if give_up is not None and now >= give_up and now < self.deadline():
                 return Timeout(deadline_exceeded=False)
 
-    def _rest(self) -> ReadOutcome:
+    def _rest(self) -> _Outcome:
         """Torn down: every reader has ended, so the rest of stdout is queued
         up to its end item, and there is nothing left to wait for and no
         deadline left to enforce."""
@@ -840,11 +903,11 @@ class DuplexChild:
         it. Call it after a :class:`Timeout` with ``deadline_exceeded``; it
         takes what it returns, so a second call returns nothing.
         """
-        if self._queue is None:
-            raise ExecutionError("stdout is captured, not framed into records")
-        return self._queue.take_unread()
+        self._framed(StdoutMode.RECORDS)
+        assert self._queue is not None
+        return [item for item in self._queue.take_unread() if not isinstance(item, Chunk)]
 
-    def _deadline_reached(self) -> ReadOutcome:
+    def _deadline_reached(self) -> _Outcome:
         """A read met the deadline. The child is looked at first, as
         ``execute()``'s last look at it is at the deadline: one
         still running overran it, and the group is killed and the read is

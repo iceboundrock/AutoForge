@@ -2615,8 +2615,13 @@ very commit a validation record of the run names, that record proves its
 base: the controller validates a candidate only after proving it descends
 from that base, so a retry on a failed commit is shown its failure however
 many commits it holds. Any other base is proved by reading each commit
-from the candidate down as its own bytes, re-hashed, at most 64 of them,
-all through one git process.
+from the candidate down as its own bytes, re-hashed, at most 64 of them.
+Normally one git process reads them all. A commit that process cannot
+return exactly is read by a git process of its own. If the commit was
+only too large for the shared process (past 16 MiB), the next read starts
+a new shared process. After any other failure of the shared process
+(it exits, times out or answers out of step), the rest of the walk reads
+each commit through a process of its own, as before #541.
 A base neither proves is not proved, and a record bound to it is left
 out. The controller never reads the file back. The launch's run log
 records what it was shown in `request.json`'s `metadata.memory`: the

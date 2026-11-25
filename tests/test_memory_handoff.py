@@ -1182,6 +1182,71 @@ def test_an_ancestry_walk_at_its_bound_costs_far_less_cpu_than_the_ceiling(tmp_p
     assert cpu_ms < 1000.0
 
 
+def test_a_walk_over_commits_of_many_short_lines_costs_far_less_cpu_than_the_ceiling(
+    tmp_path, monkeypatch
+):
+    """R2-F1 of PR #586: the walk at its bound, over commits whose messages
+    hold 20,000 short lines each (about 80 KB), read through one process
+    whose stdout was framed into a record per line, cost 3.3 s of CPU on a
+    Linux host, where a process per commit cost 0.16 s. The reader now takes
+    each reply by the size its header declares, so a commit costs its bytes,
+    not its lines. Read as the engine reads them, the 64 commits go through
+    one process, each re-hashed from all of its bytes to its own id, with no
+    process per commit and no fetch, and the cost stays under the ceiling,
+    measured as the test above measures it."""
+    root = git_repo(tmp_path / "repo")
+    base = git_out("-C", str(root), "rev-parse", "HEAD")
+    tree = git_out("-C", str(root), "rev-parse", f"{base}^{{tree}}")
+    message = tmp_path / "message"
+    message.write_bytes(b"subject\n\n" + b"abc\n" * 20_000)
+    tip = base
+    for _ in range(MAX_ANCESTRY_COMMITS + 1):
+        tip = git_out(
+            "-C", str(root), *GIT_IDENT, "commit-tree", tree, "-p", tip, "-F", str(message)
+        )
+    sessions: list = []
+
+    def session(request):
+        sessions.append(request)
+        return start_duplex(request)
+
+    hashed: list[tuple[str, int]] = []
+    rehash = git_transport_module._hash_commit
+
+    def counted(raw, object_format):
+        digest = rehash(raw, object_format)
+        hashed.append((digest, len(raw)))
+        return digest
+
+    monkeypatch.setattr(git_transport_module, "_hash_commit", counted)
+    transport = GitTransport(
+        object_directory=root / ".git" / "objects",
+        remote=GitRemote.https(REPO),
+        in_base_history=lambda base, sha: pytest.fail("the walk asked GitHub"),
+        git_lock=lambda operation: pytest.fail("the walk fetched"),
+        runner=lambda request: pytest.fail("the walk started a process per commit"),
+        duplex=session,
+    )
+    read: list[str] = []
+    started = os.times()
+    with transport.local_commit_reader() as reader:
+
+        def parents(sha):
+            read.append(sha)
+            record = reader.read_local_commit(sha)
+            return None if record is None else record.parents
+
+        proved = local_ancestors(tip, [base], parents)
+    ended = os.times()
+    fields = ("user", "system", "children_user", "children_system")
+    cpu_ms = sum(getattr(ended, f) - getattr(started, f) for f in fields) * 1000.0
+    assert proved == ((), MAX_ANCESTRY_COMMITS) and len(read) == MAX_ANCESTRY_COMMITS
+    assert len(sessions) == 1
+    assert [digest for digest, _ in hashed] == read
+    assert all(size > 80_000 for _, size in hashed)
+    assert cpu_ms < 1000.0
+
+
 def test_a_candidate_with_a_line_past_the_record_default_leaves_the_walk_in_one_process(
     tmp_path,
 ):
