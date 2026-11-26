@@ -39,6 +39,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -1024,6 +1025,70 @@ def test_a_named_but_unauthenticated_base_does_not_make_memory_applicable(tmp_pa
     assert (damaged.input_sha, damaged.request.ancestors) == (tip, ())
     assert "Shown 00;" in damaged.text and "inapplicable 01" in damaged.text
     assert f"Source candidate: {source}" not in damaged.text
+
+
+# Stands in for a git older than 2.36, which has no ``cat-file --batch-command``:
+# it rejects that option as git rejects any unknown one, logs the attempt to
+# ``argv[0]``'s sibling ``refused``, and runs the real git for anything else.
+_GIT_WITHOUT_BATCH_COMMAND = """\
+import os, sys
+if "--batch-command" in sys.argv[1:]:
+    with open(os.path.join(os.path.dirname(sys.argv[0]), "refused"), "a") as log:
+        log.write(" ".join(sys.argv[1:]) + "\\n")
+    sys.stderr.write("error: unknown option `batch-command'\\n")
+    sys.exit(129)
+os.execv(REAL_GIT, [REAL_GIT, *sys.argv[1:]])
+"""
+
+
+def test_a_git_without_batch_command_leaves_the_launch_input_unknown(tmp_path, monkeypatch):
+    """R2-F3 of PR #588 (docs/compatibility.md): Memory's local commit reader
+    runs ``git cat-file --batch-command``, which Git 2.36 introduced. Where
+    git rejects the option, the reader fails closed with no fallback, and
+    the launch still gets its projection, with an unknown input: no
+    candidate, no proved base, ``input`` null in the run log."""
+    root = git_repo(tmp_path / "repo")
+    base = git_out("-C", str(root), "rev-parse", "HEAD")
+    tree = git_out("-C", str(root), "rev-parse", f"{base}^{{tree}}")
+    source = git_out("-C", str(root), *GIT_IDENT, "commit-tree", tree, "-p", base, "-m", "failed")
+    tip = git_out("-C", str(root), *GIT_IDENT, "commit-tree", tree, "-p", source, "-m", "retry")
+    transport = GitTransport(
+        object_directory=root / ".git" / "objects",
+        remote=GitRemote.https(REPO),
+        in_base_history=lambda base, sha: pytest.fail("the walk asked GitHub"),
+        git_lock=lambda operation: pytest.fail("the walk fetched"),
+    )
+    receipt = failing_record(commit=source, base=base)
+    store = observe_validation_failure(
+        enabled(), STEP, parse_record(receipt), attempt=1, text="failed"
+    ).store
+
+    def project():
+        return prepare_launch_projection(
+            lambda: store,
+            STEP,
+            base=base,
+            read_head=lambda: tip,
+            open_parents=transport.local_commit_parents,
+            validation_records=[receipt],
+        )
+
+    supported = project()
+    assert (supported.input_sha, supported.request.ancestors) == (tip, (base,))
+    real_git = shutil.which("git")
+    assert real_git is not None
+    bin_dir = tmp_path / "old-git"
+    bin_dir.mkdir()
+    fake = bin_dir / "git"
+    fake.write_text(f"#!{sys.executable}\nREAL_GIT = {real_git!r}\n{_GIT_WITHOUT_BATCH_COMMAND}")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    old = project()
+    refused = (bin_dir / "refused").read_text().splitlines()
+    assert len(refused) == 1 and refused[0].endswith("cat-file --batch-command")
+    assert old.input_sha == "" and old.metadata()["input"] is None
+    assert (old.request.candidate, old.request.ancestors, old.ancestry_reads) == ("", (), 0)
+    assert old.text and f"Source candidate: {source}" not in old.text
 
 
 def test_the_projection_time_covers_the_ledger_the_candidate_read_and_the_walk():

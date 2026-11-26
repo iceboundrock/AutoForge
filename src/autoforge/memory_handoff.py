@@ -155,8 +155,12 @@ class LaunchProjection:
     read, which keys none (R4-F3). ``render_ms`` times the render alone;
     ``projection_ms`` everything Memory adds before the launch, the
     ledger's reconstruction, the candidate's read and the ancestry walk
-    included (R3-F1, R4-F4), and ``ancestry_reads`` counts the commits that
-    walk read.
+    included (R3-F1, R4-F4), and ``ancestry_reads`` counts the walk slots
+    :func:`local_ancestors` spent, one per commit whose parents it
+    followed, at most its ``max_commits``. It is not the number of commits
+    read: authenticating a base the walk reaches reads a commit without
+    spending a slot, and a slot can reuse a commit already read (the
+    input's own read, or a reached base's).
     """
 
     request: ProjectionRequest
