@@ -1798,21 +1798,39 @@ def rewrite_loose_object(objects: Path, oid: str, kind: str, content: bytes) -> 
     path.write_bytes(zlib.compress(b"%s %d\0" % (kind.encode("ascii"), len(content)) + content))
 
 
-# The runtime limit a real-Git cost test gives Issue Working Memory's commit
-# reader in place of its production 750 ms (R3-F1 of PR #587). Such a test
-# measures CPU time, which a scheduling pause does not stretch, and asserts
-# that the walk or the read completes exactly; the limit is wall time, so
-# a worker paused past it would end the read early and fail the test with
-# almost no CPU spent. The production limit keeps a test of its own
-# (``test_memory_reader_stops_a_silent_child_at_its_runtime_limit``).
+# The runtime limit every test gives Issue Working Memory's commit reader in
+# place of its production 750 ms (R3-F1, R4-F1 of PR #587). A test that
+# reads real commits asserts what the read or the walk reaches: a parsed
+# commit, a budget or header refusal, a proved base, a rendered projection,
+# a count of reads. The limit is wall time, from the child's start, so a
+# worker the host pauses past it (pytest-xdist workers share the host, and
+# an 800 ms pause right after the child starts is enough) would get a
+# timeout instead, and the test would assert on the wrong outcome or, where
+# a timeout happens to prove nothing too, pass without reaching what it
+# tests. The production limit is :data:`MEMORY_READ_PRODUCTION_SECONDS`,
+# read from the module before any test patches it; the one test of it,
+# ``test_memory_reader_stops_a_silent_child_at_its_runtime_limit``, asks
+# for it through :func:`memory_read_production_limit`.
 MEMORY_READ_HEADROOM_SECONDS = 60.0
+MEMORY_READ_PRODUCTION_SECONDS = git_transport._MEMORY_READ_SECONDS
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def memory_read_headroom(monkeypatch) -> float:
     """Give every Memory commit reader the test opens :data:`MEMORY_READ_HEADROOM_SECONDS`."""
     monkeypatch.setattr(git_transport, "_MEMORY_READ_SECONDS", MEMORY_READ_HEADROOM_SECONDS)
     return MEMORY_READ_HEADROOM_SECONDS
+
+
+@pytest.fixture
+def memory_read_production_limit(memory_read_headroom, monkeypatch) -> float:
+    """Give the test's Memory commit readers the production limit back.
+
+    It runs after :func:`memory_read_headroom`, which it depends on, so the
+    production value is the one in force for the test.
+    """
+    monkeypatch.setattr(git_transport, "_MEMORY_READ_SECONDS", MEMORY_READ_PRODUCTION_SECONDS)
+    return MEMORY_READ_PRODUCTION_SECONDS
 
 
 # The git of an :class:`Origin`, of :func:`github_origin` and of the live

@@ -522,14 +522,12 @@ def test_memory_walk_reads_a_reached_base_once(world, monkeypatch):
 
 
 @pytest.mark.parametrize("size", [16 * 1024 * 1024, 24 * 1024 * 1024])
-def test_memory_admits_raw_commit_bytes_before_reading_stdout_body(
-    world, monkeypatch, memory_read_headroom, size
-):
+def test_memory_admits_raw_commit_bytes_before_reading_stdout_body(world, monkeypatch, size):
     """The size check admits a commit before its body is asked for, so no
-    stdout byte past the budget is read. The read runs under the test's
-    runtime limit, not its production one, so that the exact bytes read and
-    the CPU spent are measured whatever pause the host imposes (R3-F1 of
-    PR #587)."""
+    stdout byte past the budget is read. The read runs under conftest's
+    runtime limit for tests, not its production one, so that the exact bytes
+    read and the CPU spent are measured whatever pause the host imposes
+    (R3-F1 of PR #587)."""
     header = f"tree {world.tree()}\nauthor t <t@e> 1 +0000\ncommitter t <t@e> 1 +0000\n\n".encode()
     sha = _literal_commit(world, header + b"x" * (size - len(header)))
     calls = []
@@ -592,13 +590,15 @@ def test_memory_reader_ends_on_eof_without_fallback(world, monkeypatch):
     assert not world.requests and not world.questions
 
 
-def test_memory_reader_stops_a_silent_child_at_its_runtime_limit(world, monkeypatch):
-    """R3-F1 of PR #587. The real-Git cost tests give the reader a runtime
-    limit with headroom (conftest's ``memory_read_headroom``); this one
-    keeps the production 750 ms. A child that answers nothing is stopped
-    there, well before it would end by itself: the read fails as a timeout,
-    the reader is spent, the walk ends with nothing proved, and no second
-    child is started."""
+def test_memory_reader_stops_a_silent_child_at_its_runtime_limit(
+    world, monkeypatch, memory_read_production_limit
+):
+    """R3-F1, R4-F1 of PR #587. Every other test gives the reader a runtime
+    limit with headroom (conftest's autouse ``memory_read_headroom``); this
+    one asks for the production 750 ms back. A child that answers nothing
+    is stopped there, well before it would end by itself: the read fails as
+    a timeout, the reader is spent, the walk ends with nothing proved, and
+    no second child is started."""
     base = world.commit("root")
     tip = world.commit("tip", base)
     requests = []
@@ -615,12 +615,16 @@ def test_memory_reader_stops_a_silent_child_at_its_runtime_limit(world, monkeypa
             reader.parents(tip)
         assert isinstance(failed.value.__cause__, ExecutionTimeoutError)
         assert local_ancestors(tip, [base], reader.parents) == ((), 1)
-    assert [req.max_runtime_seconds for req in requests] == [0.75]
+    assert [req.max_runtime_seconds for req in requests] == [memory_read_production_limit] == [0.75]
     assert private_leftovers(world) == []
     assert not world.requests and not world.questions
 
 
 def test_memory_reader_bounds_commit_header_parsing(world):
+    """The refusal is the header budget's, never a timeout's: the reader runs
+    under conftest's runtime limit for tests, so a host that pauses the
+    worker after the child starts does not end the read first (R4-F1 of
+    PR #587)."""
     sha = _literal_commit(
         world,
         (f"tree {world.tree()}\nauthor t <t@e> 1 +0000\ncommitter t <t@e> 1 +0000\n").encode()

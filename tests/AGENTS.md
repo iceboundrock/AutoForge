@@ -39,7 +39,11 @@ read it before adding tests for a listed area.
   repository that `git commit`'s detached automatic maintenance could
   still write to (conftest's commits pass `NO_AUTO_MAINTENANCE`); an
   AF_UNIX path past `sun_path`'s 107 bytes, 103 on macOS (bind it with
-  `conftest.bind_unix`).
+  `conftest.bind_unix`). A production wall-clock limit is no bound for a
+  test of what the limited work reaches either: a worker paused past it
+  gets a timeout instead. Conftest's autouse `memory_read_headroom` gives
+  Memory's commit reader 60 s in every test, and the one test of its
+  750 ms limit asks for that back (`memory_read_production_limit`).
 - Never assume Linux. CI also runs the suite on macOS, Apple Silicon
   (`test-macos`, #501), which has no `/proc`, no child subreaper, no
   `O_TMPFILE`, `O_PATH`, `memfd_create`, `pidfd_open`, `listxattr`,

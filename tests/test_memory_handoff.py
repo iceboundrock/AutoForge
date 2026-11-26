@@ -1091,7 +1091,14 @@ def test_the_engines_projection_time_includes_the_ledgers_reconstruction(
     eng.close()
 
 
-def test_the_engines_projection_time_includes_reader_teardown(tmp_state_dir, pi_home, monkeypatch):
+def test_the_engines_projection_time_includes_reader_teardown(
+    tmp_state_dir, pi_home, monkeypatch, memory_read_headroom
+):
+    """The time a Memory launch records includes closing its commit reader.
+    The walk reads two commits through one child; it does so under
+    conftest's runtime limit for tests, so a host that pauses the worker
+    after the child starts does not end the walk with no read (R4-F1 of
+    PR #587)."""
     gh = FakeGitHub()
     eng, _ = producing(tmp_state_dir, gh, scripted(implement), FAILS)
     assert eng.step().next_phase == "ANALYZE_EXECUTE"
@@ -1121,6 +1128,7 @@ def test_the_engines_projection_time_includes_reader_teardown(tmp_state_dir, pi_
     launch = eng._launch_memory(Phase.ANALYZE_EXECUTE, work)
     assert launch is not None
     assert launch.ancestry_reads == 2 and len(requests) == 1
+    assert requests[0].max_runtime_seconds == memory_read_headroom
     assert not Path(requests[0].cwd).exists()
     assert (launch.projection_ms, launch.render_ms) == (375.0, 0.0)
     eng.close()
@@ -1263,10 +1271,10 @@ def test_an_ancestry_walk_at_its_bound_costs_far_less_cpu_than_the_ceiling(
     read through one git process, and nothing proved. The cost is the CPU
     time of this process and of the processes it waited for, never a wall
     time, which other workers on the host stretch (tests/AGENTS.md). For
-    the same reason the reader runs under the test's runtime limit, not
-    its production 750 ms: a worker paused past that would end the walk
-    after a few reads, and the walk would not reach its bound (R3-F1 of
-    PR #587)."""
+    the same reason the reader runs under conftest's runtime limit for
+    tests, not its production 750 ms: a worker paused past that would end
+    the walk after a few reads, and the walk would not reach its bound
+    (R3-F1 of PR #587)."""
     root = git_repo(tmp_path / "repo")
     messages = [b"abcd\n" if shape != "many-lines" else b"abc\n" * 20_000]
     messages *= MAX_ANCESTRY_COMMITS + 1
@@ -1303,15 +1311,15 @@ def test_an_ancestry_walk_at_its_bound_costs_far_less_cpu_than_the_ceiling(
 
 
 @pytest.mark.parametrize("mib", [6, 12])
-def test_large_commits_spend_one_shared_ancestry_budget(tmp_path, memory_read_headroom, mib):
+def test_large_commits_spend_one_shared_ancestry_budget(tmp_path, mib):
     """The input, the walk and each base's authentication (R1-F1 of PR #587)
     charge one 16 MiB allowance, each commit once. Two 6 MiB commits fit
     it, each read once, so both bases are proved; a second read of either
     would not fit. Two 12 MiB commits do not: the parent the input names
     cannot be authenticated within what is left, so it is not proved, and
     the walk ends there. The budget alone decides that: the reader runs
-    under the test's runtime limit, not its production one (R3-F1 of
-    PR #587)."""
+    under conftest's runtime limit for tests, not its production one
+    (R3-F1 of PR #587)."""
     root = git_repo(tmp_path / "repo")
     big = b"x" * (mib * 1024 * 1024)
     base, tip, bodies = _memory_history(root, [big, big])
