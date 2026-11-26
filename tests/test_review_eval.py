@@ -481,7 +481,20 @@ def test_regression_from_the_first_of_two_fix_commits_belongs_to_the_fix(packet)
     assert got["fix_regressions"] == [] and got["critical_escapes"] == {"lost-data": False}
 
 
-@pytest.mark.parametrize("branch_point", ["reviewed revision", "merge base"])
+def fork_point(case, branch_point):
+    """Where a side branch forks: a registered commit, or one below the merge base."""
+    if branch_point == "below the merge base":
+        # An older commit of the base branch, attested to lie in the merge
+        # base's history; the side commit keeps it as its real parent.
+        older = "8" * 40
+        case["base_ancestors"] = [older]
+        return older
+    return {"reviewed revision": case["start"], "merge base": case["merge_base"]}[branch_point]
+
+
+@pytest.mark.parametrize(
+    "branch_point", ["reviewed revision", "merge base", "below the merge base"]
+)
 def test_regression_from_a_merged_side_branch_belongs_to_the_fix(packet, branch_point):
     recorded(packet, "wrong-boundary")
     expected = score(deepcopy(packet))
@@ -489,7 +502,7 @@ def test_regression_from_a_merged_side_branch_belongs_to_the_fix(packet, branch_
     reviewed = case["start"]
     endpoint = case["snapshots"]["4" + "0" * 39]
     side = "6" * 40
-    fork = reviewed if branch_point == "reviewed revision" else case["merge_base"]
+    fork = fork_point(case, branch_point)
     # side-branch commit (introduces lost-data) -> FIX merge of reviewed revision and side
     case["snapshots"][side] = dict(endpoint, parents=[fork], tree="7" * 40)
     endpoint["parents"] = [reviewed, side]
@@ -500,23 +513,75 @@ def test_regression_from_a_merged_side_branch_belongs_to_the_fix(packet, branch_
     assert got["fix_regressions"] == ["lost-data"] and got["known_harmful_fixes"] == 1
     assert got["certificate_issued"] and got["critical_escapes"] == {"lost-data": True}
     assert report["new_critical_escapes"] == [["wrong-boundary", 0, "lost-data"]]
+    # The side commit keeps its introducing SHA and its real parent.
+    assert case["defects"]["lost-data"]["introduced"] == side
+    assert case["snapshots"][side]["parents"] == [fork]
     # A defect the merge resolves away is no regression of the endpoint.
     endpoint["present"] = []
     got = result(packet, "wrong-boundary", "treatment")
     assert got["fix_regressions"] == [] and got["critical_escapes"] == {"lost-data": False}
 
 
-def test_starting_defect_from_a_merged_side_branch_keeps_its_introduction(packet):
+@pytest.mark.parametrize("branch_point", ["merge base", "below the merge base"])
+def test_starting_defect_from_a_merged_side_branch_keeps_its_introduction(packet, branch_point):
     expected = score(deepcopy(packet))
     case = packet["cases"]["wrong-boundary"]
     start = case["snapshots"][case["start"]]
-    side, mainline = "6" * 40, "8" * 40
-    base = [case["merge_base"]]
-    case["snapshots"][side] = dict(start, parents=base, tree="7" * 40)
-    case["snapshots"][mainline] = dict(start, parents=base, tree="9" * 40, present=[])
+    side, mainline = "6" * 40, "9" * 40
+    case["snapshots"][side] = dict(start, parents=[fork_point(case, branch_point)], tree="7" * 40)
+    case["snapshots"][mainline] = dict(
+        start, parents=[case["merge_base"]], tree="a" * 40, present=[]
+    )
     start["parents"] = [mainline, side]
     case["defects"]["off-by-one"]["introduced"] = side
     assert score(packet) == expected
+
+
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        ("registered as a snapshot", "base ancestors"),
+        ("the merge base", "base ancestors"),
+        ("repeated", "base ancestors"),
+        ("unattested fork", "snapshot parent"),
+        ("orphan side commit", "history of the registered merge base"),
+        ("start below the merge base", "history of the registered merge base"),
+        ("review of the side commit", "exact candidate"),
+        ("stale move to the side commit", "different observed candidate"),
+        ("fix of the side commit", "exact candidate"),
+    ],
+)
+def test_a_base_ancestor_is_only_a_side_branch_boundary(packet, change, error):
+    case = packet["cases"]["wrong-boundary"]
+    snaps = case["snapshots"]
+    run = packet["runs"][0]
+    review, fix = run["launches"][1:3]
+    older, side = fork_point(case, "below the merge base"), "6" * 40
+    # A side commit forked below the merge base, merged by the published FIX.
+    repaired = snaps[fix["published"]]
+    snaps[side] = dict(repaired, parents=[older], tree="7" * 40)
+    repaired["parents"] = [fix["head"], side]
+    score(deepcopy(packet))
+    if change == "registered as a snapshot":
+        snaps[older] = dict(snaps[case["merge_base"]], tree="9" * 40)
+    elif change == "the merge base":
+        case["base_ancestors"].append(case["merge_base"])
+    elif change == "repeated":
+        case["base_ancestors"].append(older)
+    elif change == "unattested fork":
+        case["base_ancestors"] = []
+    elif change == "orphan side commit":
+        repaired["parents"] = [fix["head"]]
+    elif change == "start below the merge base":
+        snaps[case["start"]]["parents"] = [older]
+    elif change == "review of the side commit":
+        review.update(head=side, tree=snaps[side]["tree"])
+    elif change == "stale move to the side commit":
+        review.update(outcome="stale_needs_fix", next_head=side)
+    else:
+        fix.update(head=side, tree=snaps[side]["tree"])
+    with pytest.raises(EvidenceError, match=error):
+        score(packet)
 
 
 @pytest.mark.parametrize(
@@ -586,7 +651,7 @@ def test_published_partial_fix_is_a_blocked_first_stop(packet):
     assert got["critical_escapes"] == {"lost-data": False}
     assert report["new_critical_escapes"] == []
     treatment["stop"]["phase"] = "FAILED"
-    with pytest.raises(EvidenceError, match="partial FIX stops BLOCKED"):
+    with pytest.raises(EvidenceError, match="stop phase its first stop cannot enter"):
         score(packet)
     treatment["stop"].update(phase="BLOCKED", through=4)
     with pytest.raises(EvidenceError, match="launch after the first stop"):
@@ -617,12 +682,20 @@ def test_partial_fix_is_a_first_stop_across_a_gap_before_it(packet):
     with pytest.raises(EvidenceError, match="stop disagrees"):
         score(packet)
     treatment["stop"].update(head=fix["published"], tree=endpoint["tree"])
-    got = result(packet, "wrong-boundary", "treatment")
+    report = score(packet)
+    got = report["pairs"][0]["runs"]["treatment"]
     # The gap leaves the terminal outcome unproven, never contradicted.
     assert got["stop"] == "BLOCKED" and not got["terminal_bound"]
     assert got["certificate_issued"] is None and got["validated_success"] is None
+    # The unrelated gap does not erase the publication's own evidenced harm ...
+    assert got["fix_regressions"] == ["lost-data"] and got["known_harmful_fixes"] == 1
+    # ... while the pooled rate and the escape wait for the whole ledger.
+    assert got["counts"]["harmful_fix_rate"] is None
+    assert report["rates"]["harmful_fix_rate"]["treatment"]["point"] is None
+    assert got["critical_escapes"] == {"lost-data": None}
+    assert report["unresolved_critical_escapes"] == [["wrong-boundary", 0, "lost-data"]]
     treatment["stop"]["phase"] = "FAILED"
-    with pytest.raises(EvidenceError, match="partial FIX stops BLOCKED"):
+    with pytest.raises(EvidenceError, match="stop phase its first stop cannot enter"):
         score(packet)
     # A later watermark or a reserved ordinal contradicts the stop, gap or not.
     treatment["stop"].update(phase="BLOCKED", through=4)
@@ -631,6 +704,132 @@ def test_partial_fix_is_a_first_stop_across_a_gap_before_it(packet):
     treatment["launches"].append(None)
     with pytest.raises(EvidenceError, match="launch after the first stop"):
         score(packet)
+
+
+@pytest.mark.parametrize("missing", ["producer", "source review"])
+def test_an_unrelated_gap_keeps_a_published_fix_regression(packet, missing):
+    recorded(packet, "wrong-boundary")
+    expected = score(deepcopy(packet))["pairs"][0]["runs"]["treatment"]
+    assert expected["fix_regressions"] == ["lost-data"] and expected["known_harmful_fixes"] == 1
+    treatment = packet["runs"][1]
+    treatment["launches"][0 if missing == "producer" else 1] = None
+    report = score(packet)
+    got = report["pairs"][0]["runs"]["treatment"]
+    assert not got["lifecycle_complete"] and got["certificate_issued"] is None
+    assert got["critical_escapes"] == {"lost-data": None}
+    assert report["rates"]["harmful_fix_rate"]["treatment"]["point"] is None
+    assert report["new_critical_escapes"] == []
+    assert report["unresolved_critical_escapes"] == [["wrong-boundary", 0, "lost-data"]]
+    # The publication, its retained source review, its exact range and the
+    # endpoint's inventory are its own evidence; only without the review that
+    # binds its revision does the harm stay unknown with the rest.
+    harm = ["lost-data"] if missing == "producer" else []
+    assert got["fix_regressions"] == harm and got["known_harmful_fixes"] == len(harm)
+
+
+@pytest.mark.parametrize("gap", [False, True])
+@pytest.mark.parametrize("first_stop", ["clean", "held", "partial"])
+def test_a_first_stop_enters_only_its_own_stop_phases(packet, first_stop, gap):
+    if first_stop == "clean":
+        run = packet["runs"][2]  # The producer, then a clean round 1 of the start.
+        no_certificate(run, through=2, round_=1, review=2, at=run["launches"][1])
+        case, arm, permitted = "clean-boundary", "baseline", ("READY_FOR_MERGE", "BLOCKED")
+    else:
+        run = packet["runs"][1]
+        run["launches"].pop()
+        fix = run["launches"][-1]
+        at = fix
+        if first_stop == "held":
+            fix.update(outcome="held", published=None, judgment=None)
+        else:
+            fix["outcome"] = "partial"
+            endpoint = packet["cases"]["wrong-boundary"]["snapshots"][fix["published"]]
+            at = {"head": fix["published"], "tree": endpoint["tree"]}
+        no_certificate(run, through=3, round_=1, review=2, at=at)
+        case, arm, permitted = "wrong-boundary", "treatment", ("BLOCKED",)
+    if gap:
+        run["launches"][0] = None  # An unrelated earlier slot is missing.
+    got = result(packet, case, arm)
+    assert got["stop"] == "BLOCKED" and got["terminal_bound"] is not gap
+    assert got["certificate_issued"] is (None if gap else False)
+    # A retained first stop fixes the phases the stop can enter, gap or not.
+    run["stop"]["phase"] = "FAILED"
+    with pytest.raises(EvidenceError, match="stop phase its first stop cannot enter"):
+        score(packet)
+    run["stop"].update(phase="READY_FOR_MERGE", issuance=None)
+    if "READY_FOR_MERGE" in permitted:
+        assert result(packet, case, arm)["certificate_issued"] is None
+    else:
+        with pytest.raises(EvidenceError, match="certificate does not belong"):
+            score(packet)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "consistent",
+        "consistent next round",
+        "later completed round",
+        "named review missing",
+        "next round's launch",
+        "later fix of an earlier round",
+        "watermark revision",
+    ],
+)
+def test_a_retained_launch_contradicts_the_stop_across_a_gap(packet, record):
+    run = packet["runs"][0]
+    first, fix, second = run["launches"][1:]
+    second.update(outcome="needs_fix", findings={"complete": False, "items": []})
+    run["launches"][2] = None  # The FIX slot is missing.
+    # Each stop below keeps the revision the last retained launch leaves, so
+    # only the rule a case names is contradicted.
+    if record == "consistent":
+        no_certificate(run, through=4, round_=2, review=4, at=second)
+    elif record == "later completed round":
+        # Round 2 completed after the round 1 review the stop names as its last.
+        no_certificate(run, through=4, round_=1, review=2, at=second)
+    elif record == "named review missing":
+        run["launches"][1:3] = [None, fix]
+        no_certificate(run, through=4, round_=1, review=2, at=second)
+    elif record in ("consistent next round", "next round's launch"):
+        # A REVIEW launch after the named round is of the next one.
+        size = 2 if record == "consistent next round" else 3
+        run["launches"][3] = retry_review(second, round=size)
+        no_certificate(run, through=4, round_=1, review=2, at=second)
+    elif record == "later fix of an earlier round":
+        run["launches"].append(dict(fix, outcome="retry", published=None, judgment=None))
+        no_certificate(run, through=6, round_=2, review=4, at=second)
+    else:
+        # The retained last launch, a published FIX, leaves its endpoint current.
+        run["launches"][1:] = [None, first, dict(fix, source=3)]
+        no_certificate(run, through=4, round_=1, review=3, at=first)
+    if record.startswith("consistent"):
+        got = result(packet, "wrong-boundary", "baseline")
+        assert got["stop"] == "BLOCKED" and not got["terminal_bound"]
+        assert got["certificate_issued"] is None
+        return
+    with pytest.raises(EvidenceError, match="stop disagrees"):
+        score(packet)
+
+
+@pytest.mark.parametrize("gap", [False, True])
+@pytest.mark.parametrize("presented", ["fail", "pass", None])
+def test_ready_for_merge_refuses_a_named_review_over_failed_validation(packet, presented, gap):
+    run = packet["runs"][2]  # The producer, then a clean round 1 of the start.
+    review = run["launches"][1]
+    # The review's disposition and the stop's issuance are both unknown.
+    review.update(outcome=None, comment=None, findings=None)
+    review["validation"]["result"] = presented
+    run["stop"].update(issuance=None, proof=None)
+    if gap:
+        run["launches"][0] = None
+    if presented == "fail":
+        with pytest.raises(EvidenceError, match="passing or empty FULL validation"):
+            score(packet)
+        return
+    got = result(packet, "clean-boundary", "baseline")
+    assert got["stop"] == "READY_FOR_MERGE" and not got["terminal_bound"]
+    assert got["certificate_issued"] is None and got["validated_success"] is None
 
 
 @pytest.mark.parametrize("gap", [False, True])
@@ -973,6 +1172,21 @@ def test_a_cutoff_ineligible_case_drops_out_of_pooled_recall(packet):
         assert pair["runs"][arm]["counts"]["recall"] == (0, 0, 0)
     # ... so the pool and its draws are those of the eligible case alone.
     assert report["rates"]["recall"] == eligible_only["rates"]["recall"]
+    # The recall population is fixed before coverage is: deleting only the
+    # ineligible case's finding payloads changes neither recall nor its draws,
+    # nor the FPR of the clean negative, whose population it is not in either.
+    for run in packet["runs"]:
+        if run["case"] == "late-boundary":
+            run["launches"][1]["findings"] = None
+    report = score(packet)
+    for metric in ("recall", "false_positive_rate"):
+        assert report["rates"][metric] == eligible_only["rates"][metric]
+    # Precision observes whatever a review retained, so that gap is its own.
+    assert report["rates"]["precision"]["difference"] is None
+    # Missing coverage in an eligible case still suppresses the contrast.
+    packet["runs"][0]["launches"][1]["findings"] = None
+    recall = score(packet)["rates"]["recall"]
+    assert recall["difference"] is None and not recall["usable"]
 
 
 def test_repeated_assignment_refuses_cherry_picking(packet):

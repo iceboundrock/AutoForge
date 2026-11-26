@@ -103,7 +103,7 @@ version an applied publication is an endpoint, not a count of underlying commits
 endpoint must descend from the reviewed revision, and a defect introduced by any commit of
 that published range and still present at the endpoint is the FIX's regression, keeping its
 actual introducing SHA. The range follows every parent, so a side branch a FIX merges is
-part of it.
+part of it, wherever it forked.
 
 ## Registered comparison
 
@@ -137,13 +137,22 @@ treatment harm. Do not replace a failed or missing seed; duplicate assignments a
 - `cases` registers case IDs, seeds, starting candidate, base, cutoff, defects, and observed
   snapshots (`parents`, `tree`, independent presence inventory, oracle status and
   provenance). Each snapshot lists every parent once, a merge all of them; only the pinned
-  merge base lists none, and the graph is acyclic and rooted there. A defect present at the
-  starting candidate is introduced by it or by a registered ancestor above the merge base,
-  through any parent. A FIX's published range is every registered commit reachable from its
-  endpoint but not from its reviewed revision (`git rev-list reviewed..endpoint`), and the
-  endpoint must descend from that revision; register each commit of a multi-commit FIX,
-  side branches it merges included, with its real parents. A defect introduced in that range
-  and present at the endpoint is that FIX's regression.
+  merge base lists none, and the graph is acyclic. A side branch forked below the merge
+  base keeps its real parent: `base_ancestors` lists such parents, each attested like the
+  rest of the graph to lie in the merge base's own history. They are not snapshots, so never
+  a candidate or an introduction, and every range that ends above the merge base excludes
+  them, as `git rev-list` does. Every snapshot descends from the merge base or is a
+  side-branch commit in the history of one that does. The start and every revision a
+  launch, a stale move or the stop binds descends from the merge base and is not it. A
+  defect present at the starting candidate is introduced by it or by a registered ancestor
+  outside the merge base's history, through any parent. A FIX's published range is every
+  registered commit reachable from its endpoint but not from its reviewed revision
+  (`git rev-list reviewed..endpoint`), and the endpoint must descend from that revision;
+  register each commit of a multi-commit FIX, side branches it merges included, with its
+  real parents. A defect introduced in that range and present at the endpoint is that FIX's
+  regression. That harm is the publication's own evidence: it stays known across an
+  unrelated gap when the FIX's source review is retained, while the pooled harmful-FIX
+  rate and the terminal proof still wait for the whole ledger.
   SHA/tree fields in the synthetic fixture are stand-ins, not Git objects.
 - Each `runs` entry has a case/seed/arm, one fresh PR identity, and producer/reviewer/fixer
   identities in that order. Its `creation` receipt identifies ordinal zero, before any
@@ -158,9 +167,10 @@ treatment harm. Do not replace a failed or missing seed; duplicate assignments a
   the FIX without publication. A retained accepted `clean` review, a `held` FIX and a
   `partial` FIX are first stops whatever precedes them, a gap included: any later ordinal,
   retained or reserved, or a later watermark is refused, and the stop binds that launch's
-  round, review ordinal and revision. `partial` publishes its endpoint, which the stop binds,
-  stops at `BLOCKED` and keeps its harm evidence. A gap before a first stop still leaves the
-  terminal outcome unproven. Same-scope head drift
+  round, review ordinal and revision and the phases it can enter, `READY_FOR_MERGE` or
+  `BLOCKED` after the clean round and `BLOCKED` after either FIX. `partial` publishes its
+  endpoint, which the stop binds, and keeps its harm evidence. A gap before a first stop
+  still leaves the terminal outcome unproven. Same-scope head drift
   is represented by a completed stale review with `next_head`, or an explicit `drift` at the
   next REVIEW before it begins, the first REVIEW included; a review of a moved revision is
   never starting evidence, and one without an explicit drift is refused.
@@ -174,7 +184,12 @@ treatment harm. Do not replace a failed or missing seed; duplicate assignments a
   validation; a conflicting known field is refused. When the stop names a retained REVIEW,
   its round, and for `issued` its outcome, revision, comment and known validation fields,
   are cross-checked even across a gap elsewhere; a consistent gapped record leaves issuance
-  unproven, a contradicting field is refused.
+  unproven, a contradicting field is refused. Every other retained launch is checked against
+  the stop the same way: no review completes after the named one, a REVIEW launch before it
+  is of at most its round and one after it of the next, a FIX follows the named round or
+  precedes it as a FIX of an earlier one, and the launch at the watermark, retained with a
+  known disposition, leaves the stop's revision. A `READY_FOR_MERGE` or `issued` stop never
+  names a review whose presented validation failed, whatever its disposition.
   Issuance is recorded apart from the stop phase: `issued` stops at `READY_FOR_MERGE`, or at
   `BLOCKED` when D12.6 found the configuration changed after presentation, and `not_issued`
   never at `READY_FOR_MERGE`. Only a completed clean round enters `READY_FOR_MERGE` (D12.3),
@@ -198,6 +213,8 @@ bound certificate, nor can a later clean round make missing findings a true nega
 Findings coverage needs the stop's launch window reconciled with the ledger and complete
 accepted payloads, not proof of issuance: an unknown presented result or issuance leaves
 finding metrics intact.
+Known contradictions are refused wherever they lie; only what the whole ledger proves waits
+for it.
 Retargets, replacements, takeovers, other issue execution and merges are out of scope.
 Outside the supported first-stop slice, preserve the raw record and report the affected
 comparison unresolved rather than normalizing away an unsupported transition.
@@ -218,13 +235,17 @@ zero eligible recall observations; it drops out of the pool and its draws rather
 counting as incomplete coverage. Track newly introduced regressions separately. Use
 accepted review findings; do not score stale replies.
 Finding coverage is that of accepted payloads only: a retained stale payload is still
-checked, but a missing one does not suppress a rate.
+checked, but a missing one does not suppress a rate. A metric's population is fixed before
+coverage is checked: recall observes cases with eligible starting defects and FPR evidenced
+clean negatives, both known at registration, while precision and duplicates observe every
+matched case. Incomplete coverage in a case of the population suppresses that metric's
+contrast; a case outside it affects neither the pool nor its draws.
 
 | Metric | Formula |
 |---|---|
 | Weighted recall | Weight of distinct confirmed starting defects / eligible starting defect weight. Lower bound is the confirmed share; the upper adds the heaviest undetected eligible start defects, at most one per unknown finding. This is an outer bound, not an attribution. |
 | Precision | Confirmed / (confirmed + false). Bounds assign unknown findings first to false, then to confirmed. |
-| Clean-negative FPR | Negative runs with at least one false finding / label-settled negative runs. An evidenced false finding survives missing details. Absence is settled only with a complete accepted review record and no unknown findings. Bounds assign unresolved negatives first to no alarm, then to false alarm. Incomplete matched review coverage prevents a usable pooled finding rate. |
+| Clean-negative FPR | Negative runs with at least one false finding / label-settled negative runs. An evidenced false finding survives missing details. Absence is settled only with a complete accepted review record and no unknown findings. Bounds assign unresolved negatives first to no alarm, then to false alarm. Incomplete review coverage of a matched case in a finding metric's population prevents a usable pooled rate for that metric. |
 | Critical escapes | Independently evidenced eligible critical defects still present at a bound certified stop, even with an empty validation set. A bound non-issuance means no certified escapes; unresolved endings are counted separately. |
 | Harmful FIX rate | Harmful published FIX endpoints / adjudicated published FIX endpoints. Bounds divide by all such publications, assigning unknowns first to safe, then harmful. Held and no-change attempts do not enter this denominator. |
 | Duplicate ratio | Confirmed findings after the first confirmation of their defect in the run / all confirmed findings. Bounds add all unknown labels to the denominator, first as nonduplicates and then as duplicates; conservative even if individual assignments would be impossible. |
@@ -295,6 +316,11 @@ contradicts its retained review across a gap, unknown certificate evidence besid
 finding coverage, a cutoff-ineligible case beside an eligible one, a regression and a
 starting defect from a merged side branch, a cyclic or second-rooted graph, a
 `READY_FOR_MERGE` stop after a held FIX, and a certificate issued into `BLOCKED` (D12.6).
+They cover the stop phases each first stop can enter, complete or gapped, a stop that a
+later completed round, a launch's round, a FIX source or the watermark launch's revision
+contradicts across a gap, a `READY_FOR_MERGE` stop naming a review over failed validation,
+FIX harm kept across an unrelated gap, a cutoff-ineligible case whose payloads are missing,
+and a side branch forked below the merge base, with the limits of a base ancestor.
 Existing
 controller tests (`test_routing.py`, `test_loop_guard.py`, `test_validation_gates.py`,
 `test_review_certificate.py`, `test_merge_certificate.py`, `test_partial_fix.py`,
@@ -302,6 +328,6 @@ controller tests (`test_routing.py`, `test_loop_guard.py`, `test_validation_gate
 execute those effects. No model, candidate code, network, credentials,
 or state writes are needed to replay the packet.
 
-Fixture SHA-256: `336e5b437f19a7b8c6bce5dcd84a49896fa361a72ce40714d51c92c33ce1c5ec`.
+Fixture SHA-256: `d57351ac1fbe669548cec96c5026a6571def66058c608fe9879e35b6eec2fc5e`.
 Amend the protocol, packet version (for evidence-rule changes), fixture digest and tests in
 one reviewed change. State why the rule moved and whether any real runs preceded it.

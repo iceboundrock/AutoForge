@@ -25,13 +25,21 @@ OUTCOMES = {
     "REVIEW": {"retry", "clean", "needs_fix", "stale_clean", "stale_needs_fix"},
     "FIX": {"retry", "held", "no_change", "published", "partial"},
 }
-# Retained dispositions that end this first-stop slice whatever precedes them:
-# an accepted clean round enters READY_FOR_MERGE or BLOCKED (drift during the
-# review is recorded as stale instead), and a held or published partial FIX
-# blocks until an operator acts. No later ordinal, retained or reserved, is
-# admitted after one, even across a gap in the ledger before it.
-TERMINAL = {("REVIEW", "clean"), ("FIX", "held"), ("FIX", "partial")}
+COMPLETED_REVIEW = {"clean", "needs_fix", "stale_clean", "stale_needs_fix"}
+# Retained dispositions that end this first-stop slice whatever precedes them,
+# each with the stop phases it can enter: an accepted clean round enters
+# READY_FOR_MERGE or BLOCKED (drift during the review is recorded as stale
+# instead), and a held or published partial FIX blocks until an operator acts.
+# No later ordinal, retained or reserved, is admitted after one, and the stop
+# enters no other phase, even across a gap in the ledger before it.
+TERMINAL = {
+    ("REVIEW", "clean"): ("READY_FOR_MERGE", "BLOCKED"),
+    ("FIX", "held"): ("BLOCKED",),
+    ("FIX", "partial"): ("BLOCKED",),
+}
 FIRST_STOP = "launch after the first stop"
+FIRST_STOP_PHASE = "stop phase its first stop cannot enter"
+STOP_BINDING = "stop disagrees with completed round or live revision"
 # Issuance is recorded as observed, apart from where the run stopped. The write
 # completing a clean round issues the certificate and enters READY_FOR_MERGE,
 # or BLOCKED when the validation configuration in force differs from the one
@@ -74,21 +82,34 @@ def source(value, case, run=None) -> bool:
     return date.fromisoformat(value["discovered"]) <= date.fromisoformat(case["cutoff"])
 
 
-def snapshot(case, head, tree):
+def candidate(case, graph, head) -> bool:
+    """A revision this PR can bind: registered, above and descending from the merge base."""
+    base = case["merge_base"]
+    return head in case["snapshots"] and head != base and base in graph[head]
+
+
+def snapshot(case, graph, head, tree):
     snap = case["snapshots"].get(head)
     require(
-        snap is not None and snap["tree"] == tree and head != case["merge_base"], "exact candidate"
+        snap is not None and snap["tree"] == tree and candidate(case, graph, head),
+        "exact candidate",
     )
     return snap
 
 
-def ancestry(snaps) -> dict:
+def ancestry(case) -> dict:
     """Each registered commit's ancestors through every parent, itself included.
 
     Merge commits keep all their parents, so a side-branch commit keeps its
-    own place in the graph. A cycle is refused, never walked forever.
+    own place in the graph. A side branch forked below the merge base keeps
+    its real parent, an attested base ancestor: the merge base's history
+    holds every one, so a range ending at a revision above it excludes them,
+    as ``git rev-list`` does. A cycle is refused, never walked forever.
     """
-    ancestors, active = {}, set()
+    snaps, base = case["snapshots"], case["merge_base"]
+    below = frozenset(case["base_ancestors"])
+    ancestors = {commit: frozenset({commit}) for commit in below}
+    active = set()
     for root in snaps:
         stack = [(root, False)]
         while stack:
@@ -98,7 +119,8 @@ def ancestry(snaps) -> dict:
             parents = snaps[head]["parents"]
             if finished:
                 active.discard(head)
-                ancestors[head] = frozenset({head}).union(*(ancestors[p] for p in parents))
+                history = below if head == base else ()
+                ancestors[head] = frozenset({head}).union(history, *(ancestors[p] for p in parents))
                 continue
             active.add(head)
             stack.append((head, True))
@@ -110,8 +132,11 @@ def ancestry(snaps) -> dict:
     return ancestors
 
 
-def check_case(case) -> None:
-    object_fields(case, "base_ref merge_base start cutoff clean_negative seeds defects snapshots")
+def check_case(case) -> dict:
+    object_fields(
+        case,
+        "base_ref merge_base base_ancestors start cutoff clean_negative seeds defects snapshots",
+    )
     date.fromisoformat(case["cutoff"])
     require(
         nonempty(case["base_ref"]) and type(case["clean_negative"]) is bool, "case registration"
@@ -127,17 +152,30 @@ def check_case(case) -> None:
     base, start = case["merge_base"], case["start"]
     snaps = case["snapshots"]
     require(base in snaps and start in snaps and start != base, "registered start and merge base")
+    # Commits attested, like the rest of the graph, to lie in the merge base's
+    # own history: the boundary a side branch forked below it reaches. They
+    # are no snapshot, candidate or introduction, only a parent's real name.
+    below = case["base_ancestors"]
+    require(isinstance(below, list) and len(set(below)) == len(below), "base ancestors")
+    for commit in below:
+        sha(commit)
+        require(commit not in snaps, "base ancestors")
     for head, snap in snaps.items():
         sha(head)
         object_fields(snap, "parents tree present oracle source")
         sha(snap["tree"])
         parents = snap["parents"]
-        # The merge base is the graph's only root; any other commit, a merge
-        # included, lists each of its registered parents once.
+        # The merge base is the only snapshot without parents; any other, a
+        # merge included, lists each of its parents once, each registered or
+        # a base ancestor.
         require(
             isinstance(parents, list)
             and len(set(parents)) == len(parents)
-            and (not parents if head == base else parents and set(parents) <= snaps.keys()),
+            and (
+                not parents
+                if head == base
+                else parents and set(parents) <= snaps.keys() | set(below)
+            ),
             "snapshot parent",
         )
         require(snap["oracle"] in ("pass", "fail", None), "independent oracle outcome")
@@ -148,15 +186,18 @@ def check_case(case) -> None:
             "snapshot defect inventory",
         )
         source(snap["source"], case)
-    graph = ancestry(snaps)
+    graph = ancestry(case)
+    # Every snapshot descends from the merge base, or is a side-branch commit
+    # in the history of one that does; the start is a bindable candidate.
+    above = [head for head in snaps if base in graph[head]]
     require(
-        all(base in graph[head] for head in snaps),
-        "snapshots must descend from the registered merge base",
+        candidate(case, graph, start) and snaps.keys() <= set().union(*(graph[h] for h in above)),
+        "snapshots must lie in the history of the registered merge base's descendants",
     )
     require(not snaps[base]["present"], "registered defects must be absent from the merge base")
-    # The starting tip and every registered ancestor above the merge base,
-    # through each parent of a merge.
-    lineage = graph[start] - {base}
+    # The starting tip and every registered ancestor outside the merge base's
+    # history, through each parent of a merge.
+    lineage = graph[start] - graph[base]
     for key, defect in case["defects"].items():
         object_fields(defect, "severity class introduced source")
         require(defect["severity"] in WEIGHT and defect["class"] in CLASSES, "defect taxonomy")
@@ -177,6 +218,7 @@ def check_case(case) -> None:
         require(key in snaps[introduced]["present"], "defect missing at its introduction")
     if case["clean_negative"]:
         require(not snaps[start]["present"] and snaps[start]["oracle"] == "pass", "clean negative")
+    return graph
 
 
 def starting_inventory(case) -> set:
@@ -189,15 +231,26 @@ def start_evidenced(case) -> bool:
     return source(case["snapshots"][case["start"]]["source"], case)
 
 
-def published_range(case, reviewed, endpoint) -> set:
+def exposure(case) -> set:
+    """Eligible starting defects: the case's recall population, fixed at registration.
+
+    A starting snapshot evidenced after the cutoff makes none eligible, so the
+    case has no recall observation whatever its reviews retained.
+    """
+    if not start_evidenced(case):
+        return set()
+    return {key for key in starting_inventory(case) if source(case["defects"][key]["source"], case)}
+
+
+def published_range(case, graph, reviewed, endpoint) -> set:
     """Commits a FIX published: reachable from its endpoint but not from its reviewed revision.
 
     This is ``git rev-list reviewed..endpoint`` over the registered graph, so a
-    side branch merged by the FIX belongs to it, every parent walked.
+    side branch merged by the FIX belongs to it, every parent walked, and its
+    walk ends in the reviewed revision's history, the merge base's included.
     """
     snaps = case["snapshots"]
     require(endpoint in snaps, "FIX successor must descend from its reviewed candidate")
-    graph = ancestry(snaps)
     require(
         endpoint != reviewed and reviewed in graph[endpoint],
         "FIX successor must descend from its reviewed candidate",
@@ -268,13 +321,56 @@ def findings(case, run, row):
     return observed
 
 
-def check_binding(case, run, row) -> None:
+def check_binding(case, graph, run, row) -> None:
     require(row["pr"] == run["pr"], "outside one-PR scope")
     require(
         (row["base_ref"], row["merge_base"]) == (case["base_ref"], case["merge_base"]),
         "retarget or different merge base",
     )
-    snapshot(case, row["head"], row["tree"])
+    snapshot(case, graph, row["head"], row["tree"])
+
+
+def revision_after(row):
+    """The revision a retained launch leaves current, when its disposition says which."""
+    if row["phase"] == "ANALYZE_EXECUTE" or row["outcome"] is None:
+        return None
+    if row["phase"] == "REVIEW":
+        return row["next_head"] or row["head"]
+    return row["published"] or row["head"]
+
+
+def check_stop_against_launches(slots, stop) -> None:
+    """Refuse a stop that a retained launch directly contradicts, gap or not.
+
+    The stop names the last completed round and its review ordinal. Each
+    retained launch observes how far the run had come, so it is checked
+    against that naming on its own, whatever is missing around it: no round
+    completes after the named one, a REVIEW launch before it is of at most
+    its round and one after it of the next, and a FIX follows the named round
+    or precedes it as a FIX of an earlier one. The launch at the watermark,
+    when retained with a known disposition, leaves the stop's revision.
+    """
+    named, last = stop["review"], stop["round"]
+    for position, row in enumerate(slots, 1):
+        if row is None or position == named:
+            continue
+        after = named is None or position > named
+        if row["phase"] == "REVIEW":
+            if row["outcome"] in COMPLETED_REVIEW:
+                consistent = not after and row["round"] < last
+            else:
+                consistent = row["round"] == last + 1 if after else row["round"] <= last
+        elif row["phase"] == "FIX":
+            consistent = named is not None and (
+                (row["source"] == named and row["round"] == last)
+                or (row["source"] < named and row["round"] < last and not after)
+            )
+        else:
+            continue
+        require(consistent, STOP_BINDING)
+    if slots and stop["through"] == len(slots) and slots[-1] is not None:
+        live = revision_after(slots[-1])
+        require(live is None or stop["head"] == live, STOP_BINDING)
 
 
 BINDING = "pr base_ref merge_base head tree"
@@ -282,7 +378,7 @@ KNOWN_RECEIPT = ("scope", "set", "policy")
 RUN_FIELDS = "case seed arm pr actors creation launches stop exclusion"
 
 
-def replay(case, run, *, synthetic: bool) -> dict:
+def replay(case, graph, run, *, synthetic: bool) -> dict:
     object_fields(run, RUN_FIELDS)
     require(nonempty(run["creation"]), "fresh-run creation receipt")
     require(run["arm"] in ARMS and type(run["seed"]) is int and run["seed"] >= 0, "planned run key")
@@ -353,7 +449,7 @@ def replay(case, run, *, synthetic: bool) -> dict:
             values.append(value)
 
         if phase != "ANALYZE_EXECUTE":
-            check_binding(case, run, row)
+            check_binding(case, graph, run, row)
             require(type(row["round"]) is int and row["round"] > 0, "launch round")
         if phase == "REVIEW":
             policy = validation(row["validation"])
@@ -394,8 +490,7 @@ def replay(case, run, *, synthetic: bool) -> dict:
             )
             if row["next_head"] is not None:
                 require(
-                    row["next_head"] in case["snapshots"]
-                    and row["next_head"] not in (row["head"], case["merge_base"]),
+                    candidate(case, graph, row["next_head"]) and row["next_head"] != row["head"],
                     "stale review requires a different observed candidate",
                 )
         if phase == "FIX":
@@ -414,14 +509,18 @@ def replay(case, run, *, synthetic: bool) -> dict:
             require((new is not None) == (outcome in ("published", "partial")), "FIX publication")
             # A FIX may publish several commits; each keeps its own place in
             # the observed graph between the reviewed revision and the endpoint.
-            commits = published_range(case, row["head"], new) if new is not None else set()
+            commits = published_range(case, graph, row["head"], new) if new is not None else set()
             judgment = row["judgment"]
             if judgment is not None:
                 require(new is not None, "FIX judgment without publication")
                 object_fields(judgment, "status source")
                 require(judgment["status"] in ("safe", "harmful", "unknown"), "FIX judgment")
                 eligible = source(judgment["source"], case, run)
-            if ledger_complete and new is not None:
+            # A retained publication whose source review is retained too, and
+            # bound to it above, carries its own range and endpoint inventory:
+            # its harm stays known across an unrelated gap elsewhere, while the
+            # pooled rate and terminal proof still wait for the whole ledger.
+            if origin is not None and new is not None:
                 endpoint = case["snapshots"][new]
                 # An eligible defect still present at the endpoint and introduced
                 # by any commit of the published range is this FIX's regression.
@@ -520,7 +619,7 @@ def replay(case, run, *, synthetic: bool) -> dict:
         require(wall is None or (type(wall) is int and wall >= known_ms), "wall time")
         require(nonempty(stop["source"]), "controller stop provenance")
         if stop["head"] is not None:
-            check_binding(case, run, stop)
+            check_binding(case, graph, run, stop)
         else:
             require(all(stop[field] is None for field in BINDING.split()), "pre-PR stop binding")
         if issued:
@@ -549,7 +648,7 @@ def replay(case, run, *, synthetic: bool) -> dict:
                 named["phase"] == "REVIEW"
                 and named["outcome"] != "retry"
                 and named["round"] == stop["round"],
-                "stop disagrees with completed round or live revision",
+                STOP_BINDING,
             )
             if clean_stop:
                 require(
@@ -558,7 +657,15 @@ def replay(case, run, *, synthetic: bool) -> dict:
                 )
                 require(
                     (named["head"], named["tree"]) == (stop["head"], stop["tree"]),
-                    "stop disagrees with completed round or live revision",
+                    STOP_BINDING,
+                )
+                # A certificate needs presented passing or empty validation, so a
+                # known failure refutes the clean round a READY_FOR_MERGE stop or
+                # an issuance names, even when its disposition or the issuance is
+                # unknown.
+                require(
+                    named["validation"] is None or named["validation"]["result"] != "fail",
+                    "certificate needs presented passing or empty FULL validation",
                 )
             if issued:
                 require(
@@ -576,30 +683,28 @@ def replay(case, run, *, synthetic: bool) -> dict:
                     ),
                     "certificate validation binding",
                 )
+        # Every other retained launch is checked against the stop the same way.
+        check_stop_against_launches(slots, stop)
         if terminal is not None:
-            # A retained first stop binds the stop whatever precedes it.
+            # A retained first stop binds the stop whatever precedes it: its
+            # watermark, the phase its disposition enters, its round, review
+            # ordinal and revision.
             row = slots[terminal - 1]
             require(stop["through"] == terminal, FIRST_STOP)
             if row["phase"] == "FIX":
                 require(not clean_stop, "certificate does not belong to the terminal clean review")
-                require(
-                    row["outcome"] != "partial" or stop["phase"] == "BLOCKED",
-                    "a published partial FIX stops BLOCKED",
-                )
                 last = (row["source"], row["round"], row["published"] or row["head"])
             else:
                 last = (terminal, row["round"], row["head"])
-            require(
-                (stop["review"], stop["round"], stop["head"]) == last,
-                "stop disagrees with completed round or live revision",
-            )
+            require(stop["phase"] in TERMINAL[row["phase"], row["outcome"]], FIRST_STOP_PHASE)
+            require((stop["review"], stop["round"], stop["head"]) == last, STOP_BINDING)
         if ledger_complete and stop["through"] == len(slots):
             # The stop's launch window and the ledger reconcile: what finding
             # coverage needs, whether or not issuance is proven.
             reconciled = True
             require(
                 (stop["review"], stop["round"], stop["head"]) == (latest, completed, head),
-                "stop disagrees with completed round or live revision",
+                STOP_BINDING,
             )
             require(
                 not clean_stop or (expected == "CLEAN" and latest == len(slots)),
@@ -671,7 +776,7 @@ def replay(case, run, *, synthetic: bool) -> dict:
     # A starting snapshot evidenced after the cutoff makes no starting defect
     # eligible: the case has zero recall observations, which is not missing
     # coverage, so it drops out of the pool instead of making it undefined.
-    exposed = eligible & starting_inventory(case) if start_evidenced(case) else set()
+    exposed = exposure(case)
     weight = sum(WEIGHT[case["defects"][key]["severity"]] for key in exposed)
     detected_weight = sum(WEIGHT[case["defects"][key]["severity"]] for key in exposed & detected)
     # Ignoring candidate-specific eligibility only widens this outer bound.
@@ -810,6 +915,20 @@ def bootstrap(groups, *, recall):
     )
 
 
+def observes(metric, case) -> bool:
+    """Whether a case's registration admits observations of a finding metric.
+
+    Recall observes eligible starting defects and FPR an evidenced clean
+    negative, both fixed before any review; precision and duplicates observe
+    whatever an accepted review retained, so every case can hold some.
+    """
+    if metric == "recall":
+        return bool(exposure(case))
+    if metric == "false_positive_rate":
+        return case["clean_negative"] and start_evidenced(case)
+    return True
+
+
 def pool(parts):
     return (
         tuple(map(sum, zip(*parts, strict=True)))
@@ -826,10 +945,10 @@ def score(packet) -> dict:
     synthetic = packet["mode"] == "synthetic"
     cases = packet["cases"]
     require(isinstance(cases, dict) and cases, "registered cases")
-    planned = {}
+    planned, graphs = {}, {}
     for case_id, case in sorted(cases.items()):
         require(nonempty(case_id), "case identity")
-        check_case(case)
+        graphs[case_id] = check_case(case)
         for seed in sorted(case["seeds"]):
             planned[case_id, seed] = {}
     require(isinstance(packet["runs"], list), "run packets")
@@ -838,7 +957,7 @@ def score(packet) -> dict:
         object_fields(run, RUN_FIELDS)
         key, arm = (run["case"], run["seed"]), run["arm"]
         require(key in planned and arm not in planned[key], "unplanned or repeated run")
-        report = replay(cases[key[0]], run, synthetic=synthetic)
+        report = replay(cases[key[0]], graphs[key[0]], run, synthetic=synthetic)
         require(run["pr"] not in used_prs, "PR reused across runs")
         used_prs.add(run["pr"])
         planned[key][arm] = report
@@ -882,9 +1001,14 @@ def score(packet) -> dict:
 
     paired_rates, rate_harm = {}, []
     for metric in METRICS:
+        # The population comes first: a case the registration leaves without
+        # an observation of this metric neither enters its pool nor, through
+        # its own coverage, suppresses the contrast of the cases that do.
         finding_gap = metric in FINDING_METRICS and any(
             not (row["review_record_complete"] and row["starting_review_accepted"])
-            for pair in matched
+            for case_id, seeds in by_case.items()
+            if observes(metric, cases[case_id])
+            for pair in seeds
             for row in pair.values()
         )
         groups = (
@@ -937,13 +1061,8 @@ def score(packet) -> dict:
         "negative" if cases[key]["clean_negative"] else "defect"
         for key, seeds in by_case.items()
         if all(row["starting_review_accepted"] for pair in seeds for row in pair.values())
-        and start_evidenced(cases[key])
-        and (
-            cases[key]["clean_negative"]
-            or any(
-                source(cases[key]["defects"][defect]["source"], cases[key])
-                for defect in starting_inventory(cases[key])
-            )
+        and observes(
+            "false_positive_rate" if cases[key]["clean_negative"] else "recall", cases[key]
         )
     )
     covered = all(pair["status"] in ("matched", "excluded") for pair in pairs)
