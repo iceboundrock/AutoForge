@@ -115,7 +115,24 @@ passed on that interpreter on one machine, and claims nothing about 3.14.
 | the version `ubuntu-latest` ships | **supported** | `test (py3.11)`, `test (py3.12)` run real git (worktrees, bare origins, fetches and pushes over `file://`); `dist (py3.11)`, `dist (py3.12)` print the version they used. |
 | the git `macos-latest` puts first on its `PATH` | **supported** | `test-macos (py3.11)`, `test-macos (py3.12)` run real git as the Linux jobs do. The job does not record which git that is, Apple's or another build, or its version, so it is no evidence for Apple's git in particular; the parsing of the `unknown` scope Apple's git prints (#482) is tested on every platform from recorded output. |
 | 2.55.0, 2.56.0 | **supported** | Recorded runs on the maintainer's host (Fedora 44): the measurements of [ADR 0004](adr/0004-authority-boundary-and-typed-external-effects.md), [ADR 0005](adr/0005-outer-sandbox-and-host-resource-capability-model.md) and [ADR 0006](adr/0006-candidate-validation-evidence-and-review-certificates.md), and `make check`. |
-| any other | untested | No minimum is enforced or known: `doctor` checks only that `git --version` runs (`git available`). |
+| any other | untested | No minimum for the controller as a whole is enforced or known: `doctor` checks only that `git --version` runs (`git available`). Issue Working Memory needs 2.36 or later (below). |
+
+Issue Working Memory (`memory.enabled`, off by default) adds a
+requirement of its own. Its local commit reader, which reads a Memory
+launch's input and walks that commit's ancestry
+([Usage](usage.md#what-a-memory-runs-launches-are-shown-and-what-is-collected)),
+runs `git cat-file --batch-command`, which Git 2.36 introduced. An older
+git rejects the option. The reader then fails closed, with no fallback to
+one process per commit, and the launch goes on with an unknown Memory
+input: no candidate is bound, no base is proved, the records bound to
+either are left out, and the run log records `input` as `null`.
+`tests/test_memory_handoff.py` holds this with a stand-in git that
+rejects the option as an older git does. No other git operation of the
+controller uses the command, and nothing checks for it beforehand:
+`doctor`'s `git available` row runs only `git --version`, and a run with
+Memory off never starts the reader. The `test` and `test-macos` jobs run
+the reader against their real git, so a passing job also shows that its
+git has the command.
 
 ## GitHub CLI (`gh`)
 

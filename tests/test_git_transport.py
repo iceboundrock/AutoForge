@@ -18,16 +18,19 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import zlib
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pytest
 
+from autoforge import git_transport
 from autoforge.errors import ExecutionError, GitHubUnavailableError, GitTransportError
 from autoforge.executor import ExecutionRequest, ExecutionResult, execute
+from autoforge.executor_duplex import DuplexChild, start_duplex
 from autoforge.git_transport import (
     LOCAL_GIT_ENV_ALLOWLIST,
     MAX_RANGE_COMMITS,
@@ -375,6 +378,124 @@ def test_read_local_commit_reads_the_tree_from_the_store_and_never_fetches(world
     world.drop(sha)
     assert world.transport().read_local_commit(sha) is None
     assert not [r for r in world.requests if "fetch" in r.command]
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_local_commit_reader_authenticates_raw_bytes_and_can_read_after_a_miss(
+    tmp_path, object_format, memory_commit_read_headroom
+):
+    world = make_world(tmp_path, object_format)
+    parent = world.commit("parent")
+    ordinary = world.commit("ordinary", parent)
+    header = world.raw(ordinary).split(b"\n\n", 1)[0]
+    oid = _literal_commit(world, header + b"\n\nnon-UTF8 \xff\x00\r\nmessage")
+    missing = "0" * len(oid)
+    with world.transport().local_commit_parents(oid) as read:
+        assert read(oid) == (parent,)
+        assert read(missing) is None
+        assert read(parent) == ()
+    assert not world.requests
+    assert not world.questions
+
+
+def test_local_commit_reader_checks_the_shared_size_budget_before_requesting_contents(
+    world, monkeypatch, memory_commit_read_headroom
+):
+    limit = 16 * 1024 * 1024
+    assert git_transport.MEMORY_COMMIT_BYTES == limit
+    root = world.commit("root")
+    header = world.raw(root).split(b"\n\n", 1)[0] + b"\n\n"
+    bodies = [header + byte * (limit // 2 - len(header)) for byte in (b"x", b"\n")]
+    first, second = (_literal_commit(world, body) for body in bodies)
+    commands = []
+    send_line = DuplexChild.send_line
+
+    def sent(child, command):
+        commands.append(command.decode("ascii"))
+        send_line(child, command)
+
+    monkeypatch.setattr(DuplexChild, "send_line", sent)
+    with world.transport().local_commit_parents(first) as read:
+        assert read(first) == ()
+        assert read(second) == ()
+        with pytest.raises(GitTransportError, match="remaining byte budget"):
+            read(root)
+        with pytest.raises(GitTransportError, match="already failed"):
+            read(first)
+    assert commands == [
+        f"info {first}",
+        f"contents {first}",
+        f"info {second}",
+        f"contents {second}",
+        f"info {root}",
+    ]
+
+
+def test_local_commit_reader_limits_the_commit_headers_it_parses(
+    world, memory_commit_read_headroom
+):
+    root = world.commit("root")
+    header = world.raw(root).split(b"\n\n", 1)[0]
+    # A valid object id does not make a large header cheap to parse.
+    oid = _literal_commit(world, header + b"\nx " + b"x" * (256 * 1024) + b"\n\nlarge header\n")
+    with world.transport().local_commit_parents(oid) as read:
+        with pytest.raises(GitTransportError, match="header bound"):
+            read(oid)
+
+
+def test_local_commit_reader_does_not_drain_an_unterminated_metadata_reply(
+    world, monkeypatch, memory_commit_read_headroom
+):
+    root = world.commit("root")
+    children = []
+    pulled = []
+    read_stdout = DuplexChild.read_stdout
+
+    def start(req):
+        child = start_duplex(
+            replace(req, command=[sys.executable, "-c", "import os; os.write(1, b'x' * 1000000)"])
+        )
+        children.append(child)
+        return child
+
+    def read_chunk(child, limit):
+        chunk = read_stdout(child, limit)
+        pulled.extend(chunk)
+        return chunk
+
+    monkeypatch.setattr(git_transport, "start_duplex", start)
+    monkeypatch.setattr(DuplexChild, "read_stdout", read_chunk)
+    with world.transport().local_commit_parents(root) as read:
+        with pytest.raises(GitTransportError, match="invalid or incomplete.*metadata"):
+            read(root)
+    assert len(pulled) == 128
+    (child,) = children
+    assert child.finish().stopped
+
+
+def test_local_commit_reader_uses_the_production_deadline_and_reaps_a_silent_child(
+    world, monkeypatch
+):
+    root = world.commit("root")
+    children = []
+
+    def start(req):
+        assert req.max_runtime_seconds == 0.75
+        child = start_duplex(
+            replace(req, command=[sys.executable, "-c", "import time; time.sleep(5)"])
+        )
+        children.append((child, Path(req.cwd)))
+        return child
+
+    monkeypatch.setattr(git_transport, "start_duplex", start)
+    with world.transport().local_commit_parents(root) as read:
+        with pytest.raises(GitTransportError, match="maximum runtime"):
+            read(root)
+    ((child, private_dir),) = children
+    assert child.finish().timed_out
+    with pytest.raises(ChildProcessError):
+        os.waitpid(child.pid, os.WNOHANG)
+    assert not private_dir.exists()
 
 
 def test_a_commit_whose_tree_is_malformed_fails_closed(world):

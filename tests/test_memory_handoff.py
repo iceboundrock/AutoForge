@@ -39,6 +39,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -46,6 +47,7 @@ from pathlib import Path
 import pytest
 
 import autoforge
+from autoforge import git_transport
 from autoforge.agent_worktree import read_candidate
 from autoforge.auto_recovery import StepKey
 from autoforge.config import MemoryConfig, default_config
@@ -59,6 +61,7 @@ from autoforge.errors import (
 )
 from autoforge.evidence import MAX_FAILURE_COUNT, WorktreeProvenance, parse_record
 from autoforge.executor import execute
+from autoforge.executor_duplex import start_duplex
 from autoforge.git_transport import GitRemote, GitTransport
 from autoforge.memory import (
     MAX_FACTS,
@@ -115,6 +118,8 @@ from .conftest import (
     rewrite_loose_object,
     scripted,
 )
+
+pytestmark = pytest.mark.usefixtures("memory_commit_read_headroom")
 
 PY = sys.executable
 # Passes only on a tree holding ``fixed.txt``, and says why on both streams.
@@ -464,10 +469,11 @@ def test_a_binding_the_registry_does_not_confirm_binds_no_candidate(tmp_state_di
     assert eng.step().next_phase == "ANALYZE_EXECUTE"
     work = eng.agent_worktree_path()
     head = git_out("-C", str(work), "rev-parse", "HEAD")
-    assert eng._memory_candidate(str(work)) == head
+    launch = eng._launch_memory(Phase.ANALYZE_EXECUTE, str(work))
+    assert launch is not None and launch.input_sha == head
     eng._agent_admin_dirs.clear()
     (work / ".git").write_text(f"gitdir: {eng.workspace().git_dirs()[-1]}\n")
-    assert eng._memory_candidate(str(work)) == ""
+    assert eng._memory_head_id(str(work)) == ""
     launch = eng._launch_memory(Phase.ANALYZE_EXECUTE, str(work))
     assert launch is not None and launch.request.candidate == ""
     assert "Shown 00;" in launch.text and "inapplicable 01" in launch.text
@@ -487,7 +493,7 @@ def traced_git(runner, trace: Path):
 
 
 def test_a_head_the_store_lacks_binds_no_candidate_and_no_git_tries_to_fetch_it(
-    tmp_state_dir, pi_home, tmp_path
+    tmp_state_dir, pi_home, tmp_path, monkeypatch
 ):
     """R4-F1 of PR #536. The shared git directory names a promisor remote and
     the worktree's ``HEAD`` names a commit the store lacks, as a partial
@@ -519,14 +525,15 @@ def test_a_head_the_store_lacks_binds_no_candidate_and_no_git_tries_to_fetch_it(
     trace = tmp_path / "git.trace"
     runner = eng._runner
     eng._runner = traced_git(runner, trace)
+    monkeypatch.setattr(git_transport, "start_duplex", traced_git(start_duplex, trace))
     try:
-        assert eng._memory_candidate(work) == ""
+        assert eng._memory_head_id(work) == missing
         launch = eng._launch_memory(Phase.ANALYZE_EXECUTE, work)
         assert launch is not None and (launch.request.candidate, launch.input_sha) == ("", "")
         assert "Shown 00;" in launch.text and "inapplicable 01" in launch.text
         assert launch.metadata()["input"] is None
         logged = trace.read_text()
-        assert "rev-parse --verify -q worktrees/" in logged and "cat-file --batch" in logged
+        assert "rev-parse --verify -q worktrees/" in logged and "cat-file --batch-command" in logged
         assert "fetch" not in logged, "a git process Memory started tried a fetch"
         # The peeling read in the shared directory does try one: the trace
         # would have seen it.
@@ -821,14 +828,21 @@ def parents_from(graph: dict, reads: list | None = None):
 def chain(length: int) -> tuple[list[str], dict]:
     """A linear history of ``length`` commits, newest first, and its parent graph."""
     commits = [sha_of(n) for n in range(length, 0, -1)]
-    return commits, {sha: (parent,) for sha, parent in itertools.pairwise(commits)}
+    return commits, {
+        **{sha: (parent,) for sha, parent in itertools.pairwise(commits)},
+        commits[-1]: (),
+    }
 
 
 def test_the_ancestry_walk_proves_a_base_it_reaches_and_no_other():
-    # The retry on a one-commit candidate: one read proves the base.
+    # The retry on a one-commit candidate: one slot, both objects authenticated.
     reads: list = []
-    assert local_ancestors(C1, [BASE], parents_from({C1: (BASE,)}, reads)) == ((BASE,), 1)
-    assert reads == [C1]
+    assert local_ancestors(C1, [BASE], parents_from({C1: (BASE,), BASE: ()}, reads)) == (
+        (BASE,),
+        1,
+    )
+    assert reads == [C1, BASE]
+    assert local_ancestors(C1, [BASE], parents_from({C1: (BASE,)}), max_commits=1) == ((), 1)
     # No candidate, no base to prove, or only the candidate itself: nothing read.
     for candidate, bases in (("", [BASE]), (C1, []), (C1, [C1])):
         assert local_ancestors(candidate, bases, parents_from({})) == ((), 0)
@@ -839,14 +853,16 @@ def test_the_ancestry_walk_proves_a_base_it_reaches_and_no_other():
         4,
     )
     # A commit the store does not hold ends its path; the other parent still proves.
-    merge = {C1: (C2, sha_of(7)), sha_of(7): (BASE,)}
+    # Its dequeue spends a slot all the same: C1, the missing C2, then 7 (R3-F1).
+    merge = {C1: (C2, sha_of(7)), sha_of(7): (BASE,), BASE: ()}
     assert local_ancestors(C1, [BASE], parents_from(merge)) == ((BASE,), 3)
     # A base that is no ancestor is never proved, whatever is read.
     commits, graph = chain(4)
     assert local_ancestors(commits[0], [BASE], parents_from(graph)) == ((), 4)
     # A read that fails ends the walk; what was reached before it stays proved.
-    failing = {C1: (C2,), C2: GitTransportError("cannot read")}
-    assert local_ancestors(C1, [C2, BASE], parents_from(failing)) == ((C2,), 2)
+    # The failed read's slot counts: C1, C2 (authenticated, no slot, then dequeued), 7.
+    failing = {C1: (C2, sha_of(7)), C2: (), sha_of(7): GitTransportError("cannot read")}
+    assert local_ancestors(C1, [C2, BASE], parents_from(failing)) == ((C2,), 3)
 
 
 def test_the_ancestry_walk_proves_a_base_at_most_its_bound_below_the_candidate():
@@ -862,7 +878,7 @@ def prepared(store, head, graph, receipts, reads=None):
         STEP,
         base=BASE,
         read_head=lambda: head,
-        read_parents=parents_from(graph, reads),
+        open_parents=lambda _: contextlib.nullcontext(parents_from(graph, reads)),
         validation_records=list(receipts),
     )
 
@@ -885,7 +901,7 @@ def test_a_failure_past_the_walk_bound_is_proved_on_its_own_commit_by_its_receip
     assert local_ancestors(c, [BASE], parents_from(graph)) == ((), MAX_ANCESTRY_COMMITS)
     reads: list = []
     on_it = prepared(store, c, graph, [rec], reads)
-    assert on_it.request.ancestors == (BASE,) and (on_it.ancestry_reads, reads) == (0, [])
+    assert on_it.request.ancestors == (BASE,) and (on_it.ancestry_reads, reads) == (0, [c])
     assert f"Observed validation 1 ({rec['digest']}): FAIL on {c}" in on_it.text
     assert "inapplicable 00" in on_it.text
     child = sha_of(10**6)
@@ -933,7 +949,7 @@ def test_only_an_established_observation_on_the_candidate_proves_its_base():
 def test_the_engines_ancestry_reader_reads_commits_as_their_bytes_and_never_github(
     tmp_state_dir, pi_home
 ):
-    """The engine's reader (:meth:`_memory_parents`) reads a commit's parents
+    """The engine's transport reads a commit's parents
     from its own bytes in the shared store: a commit the store does not hold
     is no answer, never fetched, and an unrelated history whose root an
     agent rewrote in the store to claim the base as its parent proves
@@ -947,9 +963,10 @@ def test_the_engines_ancestry_reader_reads_commits_as_their_bytes_and_never_gith
     base = failed["candidate"]["provenance"]["base_revision"]
     work = str(eng.agent_worktree_path())
     since = len(gh.calls)
-    read = eng._memory_parents()
-    assert read(c1) == (base,)
-    assert read(sha_of(1)) is None
+    transport = eng._git_transport()
+    with transport.local_commit_parents(c1) as read:
+        assert read(c1) == (base,)
+        assert read(sha_of(1)) is None
     tree = git_out("-C", work, "rev-parse", f"{base}^{{tree}}")
     root = git_out("-C", work, *GIT_IDENT, "commit-tree", tree, "-m", "unrelated")
     tip = git_out("-C", work, *GIT_IDENT, "commit-tree", tree, "-p", root, "-m", "on it")
@@ -957,12 +974,123 @@ def test_the_engines_ancestry_reader_reads_commits_as_their_bytes_and_never_gith
     forged = f"{header}\nparent {base}\n{rest}\n".encode()
     common = (Path(work) / git_out("-C", work, "rev-parse", "--git-common-dir")).resolve()
     rewrite_loose_object(common / "objects", root, "commit", forged)
-    assert read(tip) == (root,)
-    with pytest.raises(GitTransportError, match="do not hash to its id"):
-        read(root)
-    assert local_ancestors(tip, [base], read) == ((), 2)
+    with transport.local_commit_parents(tip) as read:
+        assert read(tip) == (root,)
+        with pytest.raises(GitTransportError, match="do not hash to its id"):
+            read(root)
+    with transport.local_commit_parents(tip) as read:
+        assert local_ancestors(tip, [base], read) == ((), 2)
     assert history_calls(gh, since) == []
     eng.close()
+
+
+@pytest.mark.parametrize("damage", ["missing", "rewritten"])
+def test_a_named_but_unauthenticated_base_does_not_make_memory_applicable(tmp_path, damage):
+    root = git_repo(tmp_path / "repo")
+    base = git_out("-C", str(root), "rev-parse", "HEAD")
+    tree = git_out("-C", str(root), "rev-parse", f"{base}^{{tree}}")
+    source = git_out("-C", str(root), *GIT_IDENT, "commit-tree", tree, "-p", base, "-m", "failed")
+    tip = git_out("-C", str(root), *GIT_IDENT, "commit-tree", tree, "-p", source, "-m", "retry")
+    objects = root / ".git" / "objects"
+    transport = GitTransport(
+        object_directory=objects,
+        remote=GitRemote.https(REPO),
+        in_base_history=lambda base, sha: pytest.fail("the walk asked GitHub"),
+        git_lock=lambda operation: pytest.fail("the walk fetched"),
+    )
+    receipt = failing_record(commit=source, base=base)
+    store = observe_validation_failure(
+        enabled(), STEP, parse_record(receipt), attempt=1, text="failed"
+    ).store
+
+    def project():
+        return prepare_launch_projection(
+            lambda: store,
+            STEP,
+            base=base,
+            read_head=lambda: tip,
+            open_parents=transport.local_commit_parents,
+            validation_records=[receipt],
+        )
+
+    intact = project()
+    assert intact.request.ancestors == (base,)
+    assert f"Source candidate: {source}" in intact.text
+    if damage == "missing":
+        (objects / base[:2] / base[2:]).unlink()
+    else:
+        raw = git_out("-C", str(root), "cat-file", "commit", base).encode()
+        rewrite_loose_object(objects, base, "commit", raw + b"\nrewritten\n")
+        # Git still considers this a commit. Its metadata cannot prove it.
+        assert transport.has_commit(base)
+    damaged = project()
+    assert (damaged.input_sha, damaged.request.ancestors) == (tip, ())
+    assert "Shown 00;" in damaged.text and "inapplicable 01" in damaged.text
+    assert f"Source candidate: {source}" not in damaged.text
+
+
+# Stands in for a git older than 2.36, which has no ``cat-file --batch-command``:
+# it rejects that option as git rejects any unknown one, logs the attempt to
+# ``argv[0]``'s sibling ``refused``, and runs the real git for anything else.
+_GIT_WITHOUT_BATCH_COMMAND = """\
+import os, sys
+if "--batch-command" in sys.argv[1:]:
+    with open(os.path.join(os.path.dirname(sys.argv[0]), "refused"), "a") as log:
+        log.write(" ".join(sys.argv[1:]) + "\\n")
+    sys.stderr.write("error: unknown option `batch-command'\\n")
+    sys.exit(129)
+os.execv(REAL_GIT, [REAL_GIT, *sys.argv[1:]])
+"""
+
+
+def test_a_git_without_batch_command_leaves_the_launch_input_unknown(tmp_path, monkeypatch):
+    """R2-F3 of PR #588 (docs/compatibility.md): Memory's local commit reader
+    runs ``git cat-file --batch-command``, which Git 2.36 introduced. Where
+    git rejects the option, the reader fails closed with no fallback, and
+    the launch still gets its projection, with an unknown input: no
+    candidate, no proved base, ``input`` null in the run log."""
+    root = git_repo(tmp_path / "repo")
+    base = git_out("-C", str(root), "rev-parse", "HEAD")
+    tree = git_out("-C", str(root), "rev-parse", f"{base}^{{tree}}")
+    source = git_out("-C", str(root), *GIT_IDENT, "commit-tree", tree, "-p", base, "-m", "failed")
+    tip = git_out("-C", str(root), *GIT_IDENT, "commit-tree", tree, "-p", source, "-m", "retry")
+    transport = GitTransport(
+        object_directory=root / ".git" / "objects",
+        remote=GitRemote.https(REPO),
+        in_base_history=lambda base, sha: pytest.fail("the walk asked GitHub"),
+        git_lock=lambda operation: pytest.fail("the walk fetched"),
+    )
+    receipt = failing_record(commit=source, base=base)
+    store = observe_validation_failure(
+        enabled(), STEP, parse_record(receipt), attempt=1, text="failed"
+    ).store
+
+    def project():
+        return prepare_launch_projection(
+            lambda: store,
+            STEP,
+            base=base,
+            read_head=lambda: tip,
+            open_parents=transport.local_commit_parents,
+            validation_records=[receipt],
+        )
+
+    supported = project()
+    assert (supported.input_sha, supported.request.ancestors) == (tip, (base,))
+    real_git = shutil.which("git")
+    assert real_git is not None
+    bin_dir = tmp_path / "old-git"
+    bin_dir.mkdir()
+    fake = bin_dir / "git"
+    fake.write_text(f"#!{sys.executable}\nREAL_GIT = {real_git!r}\n{_GIT_WITHOUT_BATCH_COMMAND}")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    old = project()
+    refused = (bin_dir / "refused").read_text().splitlines()
+    assert len(refused) == 1 and refused[0].endswith("cat-file --batch-command")
+    assert old.input_sha == "" and old.metadata()["input"] is None
+    assert (old.request.candidate, old.request.ancestors, old.ancestry_reads) == ("", (), 0)
+    assert old.text and f"Source candidate: {source}" not in old.text
 
 
 def test_the_projection_time_covers_the_ledger_the_candidate_read_and_the_walk():
@@ -971,7 +1099,8 @@ def test_the_projection_time_covers_the_ledger_the_candidate_read_and_the_walk()
     the candidate's read and the ancestry walk with the render;
     ``render_ms`` is the render's share. C2 is built on C1, whose failure is
     bound to BASE; C2 has no record of its own, so the walk proves the base,
-    reading C2 and then C1."""
+    following C2 and C1, and authenticating BASE. Closing the reader must
+    count toward preparation time, not toward rendering."""
     rec = failing_record()
     store = observe_validation_failure(
         enabled(), STEP, parse_record(rec), attempt=1, text="definition [0] failed"
@@ -987,24 +1116,30 @@ def test_the_projection_time_covers_the_ledger_the_candidate_read_and_the_walk()
         return C2
 
     def parents(sha):
-        now[0] += 0.25
-        return {C2: (C1,), C1: (BASE,)}.get(sha)
+        now[0] += 0.125
+        return {C2: (C1,), C1: (BASE,), BASE: ()}[sha]
+
+    @contextlib.contextmanager
+    def reader(head):
+        assert head == C2
+        yield parents
+        now[0] += 0.0625
 
     launch = prepare_launch_projection(
         load,
         STEP,
         base=BASE,
         read_head=head,
-        read_parents=parents,
+        open_parents=reader,
         validation_records=[rec],
         clock=lambda: now[0],
     )
     assert (launch.request.candidate, launch.request.ancestors) == (C2, (BASE,))
     assert f"Source candidate: {C1}" in launch.text and "needs revalidation 01" in launch.text
     assert (launch.input_sha, launch.ancestry_reads) == (C2, 2)
-    assert (launch.projection_ms, launch.render_ms) == (687.5, 0.0)
+    assert (launch.projection_ms, launch.render_ms) == (625.0, 0.0)
     meta = launch.metadata()
-    assert (meta["projection_ms"], meta["render_ms"], meta["ancestry_reads"]) == (687.5, 0.0, 2)
+    assert (meta["projection_ms"], meta["render_ms"], meta["ancestry_reads"]) == (625.0, 0.0, 2)
     assert meta["input"] == meta["candidate"] == C2
 
 
@@ -1043,8 +1178,8 @@ def test_the_engines_projection_time_includes_the_ledgers_reconstruction(
 
 @pytest.mark.parametrize(
     "head, candidate, input_sha",
-    [(BASE, "", BASE), ("", "", ""), (C1, C1, C1)],
-    ids=["on-the-base", "unread", "on-a-candidate"],
+    [(BASE, "", BASE), ("", "", ""), (C1, "", ""), (C1, C1, C1)],
+    ids=["on-the-base", "no-head", "missing-head", "on-a-candidate"],
 )
 def test_a_launchs_input_is_the_commit_it_starts_from_and_never_a_guess(head, candidate, input_sha):
     """R3-F2, R4-F3 of PR #536: the input a launch's proposals are keyed by is
@@ -1053,14 +1188,22 @@ def test_a_launchs_input_is_the_commit_it_starts_from_and_never_a_guess(head, ca
     unknown, never the base: the run log says so (``None``), and the add the
     launch's result makes is refused and counted when it is admitted,
     keyed by nothing. Nothing is walked without a candidate."""
+    opened = []
+    reads = []
+
+    def reader(oid):
+        opened.append(oid)
+        return contextlib.nullcontext(parents_from({input_sha: ()}, reads))
+
     launch = prepare_launch_projection(
         enabled,
         STEP,
         base=BASE,
         read_head=lambda: head,
-        read_parents=lambda sha: pytest.fail("nothing to prove"),
+        open_parents=reader,
         validation_records=[],
     )
+    assert opened == reads == ([head] if head else [])
     assert (launch.request.candidate, launch.input_sha) == (candidate, input_sha)
     assert launch.metadata()["input"] == (input_sha or None)
     binding = launch.bind([add("note", "a lesson")], 2)
@@ -1092,36 +1235,63 @@ def test_a_launch_with_no_known_input_still_revises_what_it_was_shown():
     assert (row["text"], row["status"]) == ("lesson 1, checked", "current")
 
 
-def test_an_ancestry_walk_at_its_bound_costs_far_less_cpu_than_the_ceiling(tmp_path):
+def test_an_ancestry_walk_at_its_bound_costs_far_less_cpu_than_the_ceiling(tmp_path, monkeypatch):
     """ADR 0015 D12 holds Memory's work before a launch to the evaluation's
     1,000 ms ceiling, the ancestry walk included (R3-F1 of PR #536). Its
     worst case is a base it cannot prove: MAX_ANCESTRY_COMMITS real commits
-    read, each by one git process, and nothing proved. The cost is the CPU
+    read from one Git process, and nothing proved. The cost is the CPU
     time of this process and of the processes it waited for, never a wall
     time, which other workers on the host stretch (tests/AGENTS.md)."""
     root = git_repo(tmp_path / "repo")
     base = git_out("-C", str(root), "rev-parse", "HEAD")
     tree = git_out("-C", str(root), "rev-parse", f"{base}^{{tree}}")
+    commits = []
     tip = base
     for n in range(MAX_ANCESTRY_COMMITS + 1):
         tip = git_out("-C", str(root), *GIT_IDENT, "commit-tree", tree, "-p", tip, "-m", f"{n}")
+        commits.append(tip)
     transport = GitTransport(
         object_directory=root / ".git" / "objects",
         remote=GitRemote.https(REPO),
         in_base_history=lambda base, sha: pytest.fail("the walk asked GitHub"),
         git_lock=lambda operation: pytest.fail("the walk fetched"),
+        runner=lambda req: pytest.fail("the walk started a one-shot Git child"),
     )
+    receipt = failing_record(commit=commits[0], base=base)
+    store = observe_validation_failure(
+        enabled(), STEP, parse_record(receipt), attempt=1, text="failed"
+    ).store
+    children = []
+    hashes = []
+    hash_commit = git_transport._hash_commit
 
-    def read(sha):
-        record = transport.read_local_commit(sha)
-        return None if record is None else record.parents
+    def start(req):
+        child = start_duplex(req)
+        children.append(child.pid)
+        return child
 
+    def hashed(raw, object_format):
+        oid = hash_commit(raw, object_format)
+        hashes.append(oid)
+        return oid
+
+    monkeypatch.setattr(git_transport, "start_duplex", start)
+    monkeypatch.setattr(git_transport, "_hash_commit", hashed)
     started = os.times()
-    proved = local_ancestors(tip, [base], read)
+    launch = prepare_launch_projection(
+        lambda: store,
+        STEP,
+        base=base,
+        read_head=lambda: tip,
+        open_parents=transport.local_commit_parents,
+        validation_records=[receipt],
+    )
     ended = os.times()
     fields = ("user", "system", "children_user", "children_system")
     cpu_ms = sum(getattr(ended, f) - getattr(started, f) for f in fields) * 1000.0
-    assert proved == ((), MAX_ANCESTRY_COMMITS)
+    assert (launch.request.ancestors, launch.ancestry_reads) == ((), MAX_ANCESTRY_COMMITS)
+    assert launch.input_sha == tip and len(children) == 1
+    assert hashes == list(reversed(commits))[:MAX_ANCESTRY_COMMITS]
     assert cpu_ms < 1000.0
 
 

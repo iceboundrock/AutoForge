@@ -411,7 +411,7 @@ the duplex child handle in `src/autoforge/executor_duplex.py` instead:
 executor's spawn, environment selection, pipe draining and group kill, and
 it is held to the same contract:
 
-- stdout is split into records on LF (0x0A) only, one trailing CR stripped
+- in record mode, stdout is split on LF (0x0A) only, one trailing CR stripped
   per record; U+2028/U+2029, NUL and every other byte are record content.
   Records are bytes and decoding them is the caller's. A record over
   `max_record_bytes` is reported as `Oversize` and dropped through its LF;
@@ -420,11 +420,22 @@ it is held to the same contract:
   the handle stays protocol-free (Pi tolerates an oversize `agent_end` or
   `turn_end` by it, #144). An unterminated fragment at EOF is reported as
   `Fragment`, never as a record;
-- both pipes are drained continuously whether or not the caller reads.
+- in record and capture modes, both pipes are drained continuously whether
+  or not the caller reads.
   Records wait in a queue bounded by `max_pending_records` and
   `max_pending_bytes`, and exceeding it is `Overflow`, which ends the
   invocation (a child still running is killed at `finish()`). stderr goes
   to the same head/tail capture as `execute()` and is never a record;
+- a caller that must bound how much it reads before examining a reply
+  (Memory's local Git reader, #541) uses `StdoutMode.PULL`. `read_stdout`
+  returns at most the requested bytes, without framing or read-ahead.
+  Only stderr is drained in the background. Unread stdout can block the
+  child until the teardown, which hands stdout to a drain that discards
+  what is left and waits for its EOF as for the other pipes. A writer that
+  left the group and still holds stdout is therefore reported
+  (`descendants_killed`, then `capture_abandoned` or an orphan kill), never
+  taken for a clean exit. The mode accepts a runtime deadline,
+  not an idle timeout, because writes to unread stdout cannot be observed;
 - `send_line` writes one whole record under one lock with non-blocking
   writes and a selector, so a child that stops reading stdin cannot hold
   the controller past the deadline. A child that closed its stdin raises

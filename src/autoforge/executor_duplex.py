@@ -5,10 +5,10 @@
 (``ExecutionRequest.stdin_data``), and nothing the child writes back changes
 what it is sent. An RPC transport needs a child it can keep writing records
 to while reading records back. This module is the narrowest primitive that
-does that and keeps every guarantee ``execute()`` gives (ADR 0002: nothing
-the child starts outlives the invocation). It deals in bytes and LF-framed
-records only: nothing here knows an encoding, a provider, a phase or
-controller state; decoding a record is the caller's.
+does that and keeps the lifecycle guarantees of ``execute()`` (ADR 0002:
+nothing the child starts outlives the invocation). It deals in bytes and
+LF-framed records: nothing here knows an encoding, a provider, a phase or
+controller state; decoding a reply is the caller's.
 
 Guarantees:
 
@@ -17,19 +17,27 @@ Guarantees:
   the terminal never inherited, a spawn failure an :class:`ExecutionError`,
   and so is a setup failure after the spawn (the group is killed first and
   nothing taken for the invocation is kept);
-- stdout is split into records on LF (0x0A) **only**, one trailing CR
+- in record mode, stdout is split on LF (0x0A) **only**, one trailing CR
   stripped per record; no other byte or Unicode line separator (U+2028,
   U+2029, NUL, VT, FF, NEL) is a boundary. A record longer than
   ``max_record_bytes`` is reported as :class:`Oversize` with at most its
   first :data:`OVERSIZE_HEAD_BYTES` bytes, so that the caller can tell what
   was dropped, and dropped through its LF; an unterminated fragment at EOF
   is reported as :class:`Fragment`, never as a record;
-- stdout and stderr are drained continuously on reader threads, whether or
-  not the caller reads, so the child never blocks on a full pipe. Complete
+- in record and capture modes the pipes are drained on reader threads
+  whether or not the caller reads, so the child never blocks on a full pipe. Complete
   records wait in a queue bounded by ``max_pending_records`` and
   ``max_pending_bytes``; exceeding it is :class:`Overflow`, which ends the
   invocation. stderr goes to a bounded head/tail capture and never becomes
   a record. Memory is bounded by those limits plus a constant;
+- with ``StdoutMode.PULL`` only stderr is drained in the background.
+  :meth:`DuplexChild.read_stdout` reads raw bytes on demand, without
+  read-ahead. Unread stdout can block the child until the teardown, which
+  hands stdout to a drain that discards what is left, keeps none of it, and
+  waits for its EOF as for the other pipes, so a writer that left the group
+  and still holds stdout is reported below rather than missed. This mode
+  refuses an idle timeout: unread writes cannot be observed. The runtime
+  deadline still bounds reads, writes and shutdown;
 - writes are whole records, serialized by one lock and non-blocking under a
   selector, so a child that stops reading stdin cannot hold the controller
   past the deadline; a child that closed its stdin raises
@@ -142,6 +150,8 @@ class StdoutMode(enum.Enum):
     RECORDS = "records"
     # Bounded head/tail capture, returned in :attr:`DuplexResult.stdout`.
     CAPTURE = "capture"
+    # Raw bytes on demand, read with :meth:`DuplexChild.read_stdout`.
+    PULL = "pull"
 
 
 @dataclass(frozen=True)
@@ -203,6 +213,7 @@ class DuplexRequest:
     env_allowlist: tuple[str, ...] | None = None
     # Kill the child once it has written nothing on stdout or stderr for
     # this long (every chunk restarts it); ``None``: no idle limit.
+    # Must be None with ``StdoutMode.PULL``.
     idle_timeout_seconds: float | None = None
     # The wall-clock ceiling, measured from the spawn; ``None``:
     # :data:`MAX_DEADLINE_SECONDS`. With the idle limit it bounds every call
@@ -221,7 +232,7 @@ class DuplexRequest:
     # False: the child's stdin is ``/dev/null`` and ``send_line`` refuses.
     stdin_pipe: bool = True
     stdout_mode: StdoutMode = StdoutMode.RECORDS
-    # The capture bound in ``StdoutMode.CAPTURE``; unused for records.
+    # The capture bound in ``StdoutMode.CAPTURE`` only.
     max_stdout_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
     # As :attr:`autoforge.executor.ExecutionRequest.contain_orphans`.
     contain_orphans: bool = False
@@ -259,7 +270,8 @@ class DuplexResult:
     orphans_unchecked: bool = False
     # As in :class:`autoforge.executor.ExecutionResult`: the limit that
     # killed the child when ``timed_out`` (``"idle"`` or ``"max_runtime"``),
-    # and when it last wrote anything.
+    # and the last time the background readers saw output (stderr only in
+    # pull mode).
     timeout_limit: str = ""
     last_activity_at: str | None = None
     # The caller ended the invocation with :meth:`DuplexChild.stop` before
@@ -475,9 +487,61 @@ class _RecordReader(_PipeDrain):
         self._queue.end()
 
 
+class _TeardownDrain(_PipeDrain):
+    """Pull-mode stdout's drain: idle until the teardown arms it, then read to
+    EOF and discard every byte.
+
+    The caller owns the pipe while the child runs, so the thread does not
+    touch it until :meth:`arm`. It is started with the stderr reader, so the
+    teardown starts nothing that could fail. Once armed it is one more pipe
+    for :func:`_eof` and the group kill. A writer that left the group and
+    still holds stdout keeps EOF away and is reported as in the other modes
+    (ADR 0002: ``descendants_killed``, then ``capture_abandoned`` or an orphan
+    kill), never missed. It keeps nothing it reads, so a writer that never
+    stops costs one chunk, not read-ahead. Every wait and abandon arms it
+    first, so no teardown path can wait on a drain that never reads. A
+    launch that fails before the caller has the handle cancels a drain whose
+    start was interrupted before its thread could be joined, so that thread
+    returns as it starts instead of waiting for an arm that no teardown
+    will send.
+    """
+
+    def __init__(self, stream: IO[bytes]) -> None:
+        super().__init__(stream, "stdout")
+        self._armed = threading.Event()
+
+    @property
+    def armed(self) -> bool:
+        return self._armed.is_set()
+
+    def arm(self) -> None:
+        """Take the pipe from the caller and start discarding. Idempotent."""
+        self._armed.set()
+
+    def _read(self) -> None:
+        # Past the gate of run(), which a cancelled thread never passes, so
+        # the thread that waits here is one a teardown arms: wait() and
+        # abandon() do, on every path, the launch guard's included.
+        self._armed.wait()
+        super()._read()
+
+    def _feed(self, chunk: bytes) -> None:
+        pass  # the caller did not read it; the teardown keeps none of it
+
+    def wait(self, deadline: float | None) -> bool:
+        self.arm()
+        return super().wait(deadline)
+
+    def abandon(self) -> None:
+        self.arm()
+        super().abandon()
+
+
 def _validate(req: DuplexRequest) -> None:
     if not req.command:
         raise ExecutionError("empty command")
+    if req.stdout_mode is StdoutMode.PULL and req.idle_timeout_seconds is not None:
+        raise ExecutionError("pull-mode stdout does not support an idle timeout")
     check_limit("idle_timeout_seconds", req.idle_timeout_seconds)
     check_limit("max_runtime_seconds", req.max_runtime_seconds)
     if req.wind_down_seconds != 0:
@@ -575,10 +639,13 @@ def _abort_start(
 ) -> None:
     """The launch failed after the spawn: kill the group at once and release
     everything taken so far, since no teardown will run."""
-    # A reader whose thread never started has nothing to stop.
-    started = tuple(reader for reader in readers if reader.ident is not None)
+    # Only the readers that may read have anything to stop
+    # (_PipeDrain.cancel). A start interrupted before its thread set its
+    # ident leaves a thread that runs later; cancelled, it returns at once,
+    # never reading the pipes closed below and never waiting for an arm.
+    reading = tuple(reader for reader in readers if not reader.cancel())
     try:
-        _terminate_group(proc.pid, proc, started, contained)
+        _terminate_group(proc.pid, proc, reading, contained)
     finally:
         if contained is not None:
             contained.release()
@@ -595,7 +662,7 @@ def _abort_start(
 
 
 class DuplexChild:
-    """A running child with a writable stdin and a framed stdout.
+    """A running child with optional writable stdin and a choice of stdout modes.
 
     ``send_line`` and ``read_line`` may be called from different threads;
     writes are serialized, so a record is never interleaved with another.
@@ -626,6 +693,7 @@ class DuplexChild:
         self._stdin_open = proc.stdin is not None
         self._queue: _RecordQueue | None = None
         self._capture: _BoundedReader | None = None
+        self._stdout_drain: _TeardownDrain | None = None
         self._readers: tuple[_PipeDrain, ...] = ()
         # Set once the group has been dealt with: killed, or found empty after
         # the child's own exit.
@@ -647,18 +715,22 @@ class DuplexChild:
         assert proc.stdout is not None and proc.stderr is not None
         if proc.stdin is not None:
             os.set_blocking(proc.stdin.fileno(), False)
-        stdout_reader: _PipeDrain
         if req.stdout_mode is StdoutMode.RECORDS:
             self._queue = _RecordQueue(req.max_pending_records, req.max_pending_bytes)
-            stdout_reader = _RecordReader(
-                proc.stdout, req.max_record_bytes, self._queue, self._limits
+            self._readers = (
+                _RecordReader(proc.stdout, req.max_record_bytes, self._queue, self._limits),
             )
-        else:
+        elif req.stdout_mode is StdoutMode.CAPTURE:
             self._capture = _BoundedReader(
                 proc.stdout, req.max_stdout_bytes, "stdout", activity=self._limits
             )
-            stdout_reader = self._capture
-        self._readers = (stdout_reader,)
+            self._readers = (self._capture,)
+        else:
+            # Non-blocking: a read that finds its bytes taken by another
+            # (a stray caller read during the teardown) fails, never hangs.
+            os.set_blocking(proc.stdout.fileno(), False)
+            self._stdout_drain = _TeardownDrain(proc.stdout)
+            self._readers = (self._stdout_drain,)
         self._stderr = _BoundedReader(
             proc.stderr, req.max_stderr_bytes, "stderr", activity=self._limits
         )
@@ -777,6 +849,43 @@ class DuplexChild:
         """
         return self._proc.poll() is not None
 
+    def read_stdout(self, max_bytes: int) -> bytes:
+        """Read up to ``max_bytes`` raw bytes from pull-mode stdout, or b'' at EOF.
+
+        Only one caller may read stdout, and it must stop reading before
+        teardown: :meth:`stop`, :meth:`finish`, the end of the ``with`` or a
+        limit hands stdout to a drain that discards what is left and waits
+        for its EOF, and a read after that raises. A read can be short; the
+        caller supplies the framing and decides how much to admit. Past the
+        runtime deadline, raises :class:`ExecutionTimeoutError` even if
+        unread bytes are ready.
+        """
+        if self._req.stdout_mode is not StdoutMode.PULL:
+            raise ExecutionError("raw stdout reads require pull mode")
+        if max_bytes <= 0:
+            raise ExecutionError("a raw stdout read must request a positive byte count")
+        if self._timed_out:
+            raise self._timeout_error()
+        if self._closed:
+            raise ExecutionError("the child's stdout is closed")
+        assert self._stdout_drain is not None and self._proc.stdout is not None
+        if self._stdout_drain.armed:
+            raise ExecutionError("the child's stdout was handed to the teardown")
+        fd = self._proc.stdout.fileno()
+        with selectors.DefaultSelector() as sel:
+            sel.register(fd, selectors.EVENT_READ)
+            while (remaining := self.deadline() - time.monotonic()) > 0:
+                if not sel.select(remaining) or self._expired():
+                    continue
+                try:
+                    return os.read(fd, min(max_bytes, 64 * 1024))
+                except BlockingIOError:
+                    continue
+                except OSError as exc:
+                    raise ExecutionError(f"failed to read pull-mode stdout: {exc}") from exc
+        self._expire()
+        raise self._timeout_error()
+
     def read_line(self, timeout: float | None = None) -> ReadOutcome:
         """The next stdout outcome, waiting at most ``timeout`` seconds and
         never past the deadline (see :data:`ReadOutcome`). After a
@@ -786,7 +895,7 @@ class DuplexChild:
         exited by then is not, and is settled as :meth:`finish` settles it
         (see :meth:`_deadline_reached`)."""
         if self._queue is None:
-            raise ExecutionError("stdout is captured, not framed into records")
+            raise self._not_framed()
         if self._timed_out:
             return Timeout(deadline_exceeded=True)
         if self._closed:
@@ -827,8 +936,12 @@ class DuplexChild:
         takes what it returns, so a second call returns nothing.
         """
         if self._queue is None:
-            raise ExecutionError("stdout is captured, not framed into records")
+            raise self._not_framed()
         return self._queue.take_unread()
+
+    def _not_framed(self) -> ExecutionError:
+        mode = "captured" if self._req.stdout_mode is StdoutMode.CAPTURE else "raw"
+        return ExecutionError(f"stdout is {mode}, not framed into records")
 
     def _deadline_reached(self) -> ReadOutcome:
         """A read met the deadline. The child is looked at first, as
@@ -932,8 +1045,16 @@ class DuplexChild:
 
     def _kill(self) -> None:
         """Kill the group before the child exited on its own; caller holds the lock."""
+        self._drain_stdout()
         self._child_killed = self._proc.poll() is None
         self._left = _terminate_group(self._pgid, self._proc, self._readers, self._contained)
+
+    def _drain_stdout(self) -> None:
+        """Pull mode: take stdout from the caller for the teardown, so what it
+        left unread no longer blocks the child and stdout's EOF is checked
+        with the other pipes. Nothing in record and capture modes."""
+        if self._stdout_drain is not None:
+            self._stdout_drain.arm()
 
     def stop(self, *, once_read: bool = False) -> bool:
         """End the invocation now, for a reason of the caller's (#194's loop
@@ -1020,6 +1141,7 @@ class DuplexChild:
 
     def _settle(self, exit_by: float | None) -> None:
         """Deal with the group once: the exit grace, or the kill; caller holds the lock."""
+        self._drain_stdout()
         if self._left is None:
             overflowed = self._queue is not None and self._queue.overflowed
             if overflowed and self._proc.poll() is None:

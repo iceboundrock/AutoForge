@@ -53,10 +53,11 @@ import hashlib
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 
 from .auto_recovery import StepKey
-from .errors import AutoForgeError
+from .errors import AutoForgeError, GitTransportError, VerificationError
 from .evidence import Outcome, RecordView, WorktreeProvenance
 from .memory import (
     MAX_REASON_BYTES,
@@ -100,14 +101,16 @@ UNSUPPORTED_PHASES: dict[Phase, str] = {
 # The most entries one result's ``memory`` list may hold; each one past it is
 # refused and counted, never kept (D9.6).
 MAX_PROPOSALS = 8
-# The most commits a projection's ancestry walk reads (:func:`local_ancestors`,
-# R3-F1 of PR #536). A candidate is the base plus the commits the step's
-# launches made on it, a handful; each read is one local git process, so the
-# bound is also what bounds the walk's share of a launch's latency. A base
-# further below is not proved by the walk, and a record bound to it is
-# omitted, but on the very commit a retained validation record names it is
-# proved by that record, with no walk (R4-F2).
+# How many object IDs the walk can dequeue, one slot each, whether or not it
+# can read them (:func:`local_ancestors`). A reached base needs
+# authentication, which spends no slot, even if there is no slot left to
+# follow it.
+# An exact retained validation record can prove its base without the walk.
 MAX_ANCESTRY_COMMITS = 64
+
+_ReadParents = Callable[[str], Sequence[str] | None]
+_OpenParents = Callable[[str], AbstractContextManager[_ReadParents]]
+
 # What an agent may add: the kinds that are neither the controller's
 # observations nor the operator's seed, and need no exact candidate.
 AGENT_KINDS: tuple[Kind, ...] = (
@@ -154,8 +157,14 @@ class LaunchProjection:
     read, which keys none (R4-F3). ``render_ms`` times the render alone;
     ``projection_ms`` everything Memory adds before the launch, the
     ledger's reconstruction, the candidate's read and the ancestry walk
-    included (R3-F1, R4-F4), and ``ancestry_reads`` counts the commits that
-    walk read.
+    included (R3-F1, R4-F4), and ``ancestry_reads`` counts the walk slots
+    :func:`local_ancestors` spent, one per object ID it dequeued, at most
+    its ``max_commits``. The slot is charged before the cache or the reader
+    is consulted, so a missing or unreadable object spends one as a commit
+    whose parents are followed does. It is not the number of commits read:
+    authenticating a base the walk reaches reads a commit without spending
+    a slot, and a slot can reuse a commit already read (the input's own
+    read, or a reached base's).
     """
 
     request: ProjectionRequest
@@ -235,27 +244,25 @@ class LaunchBinding:
 def local_ancestors(
     candidate: str,
     bases: Sequence[str],
-    read_parents: Callable[[str], Sequence[str] | None],
+    read_parents: _ReadParents,
     *,
     max_commits: int = MAX_ANCESTRY_COMMITS,
 ) -> tuple[tuple[str, ...], int]:
     """The ``bases`` that ``candidate`` descends from, proved in the local store alone.
 
-    Returns them, in ``bases``' order, with how many commits were read.
-    Breadth-first from the candidate through each commit's parents as
-    ``read_parents`` reads them from the commit's own bytes in the shared
-    store (``None`` when the store does not hold it): the engine's reader
-    re-hashes each commit, never fetches one and never asks GitHub
-    (R3-F1 of PR #536), so Memory adds no network call to a launch and a
-    retry on the commit that failed sees its failure whatever GitHub
-    answers. A base is proved when it is a parent of a commit read, so one
-    at most ``max_commits`` commits below the candidate can be; the walk
-    ends when every base is reached, after ``max_commits`` reads, or when
-    nothing is left to read, and a commit the store does not hold ends its
-    path. A read that fails ends the walk. A base not reached is not
-    proved, so a record bound to it is omitted as not applicable, never
-    shown as current; the bases reached before the walk ended stay proved,
-    each by a chain of parents read from bytes that hash to their ids.
+    Returns them in ``bases``' order, with how many breadth-first walk
+    slots were spent. ``read_parents`` must authenticate a commit from its
+    exact local bytes, return None for a missing object, and never fetch.
+    Each object ID the walk dequeues spends one slot, charged before the
+    cache or the reader is consulted, so a missing or unreadable object
+    spends one too. A parent link names a possible base, not a proof: the
+    same reader authenticates that endpoint before it counts. That spends
+    no slot (the endpoint spends one only if the walk later dequeues it),
+    so the maximum depth remains ``max_commits``. Missing or unreadable
+    endpoints, or an exhausted reader budget, can still leave a base at
+    that depth unproved.
+    A missing commit ends its path; a read error ends the walk, preserving
+    the proofs already made.
     """
     wanted = set(bases) - {candidate}
     if not candidate or not wanted:
@@ -263,22 +270,24 @@ def local_ancestors(
     reached: set[str] = set()
     seen = {candidate}
     pending = deque([candidate])
+    endpoints: dict[str, Sequence[str] | None] = {}
     reads = 0
-    while pending and reached != wanted and reads < max_commits:
-        sha = pending.popleft()
-        reads += 1
-        try:
-            parents = read_parents(sha)
-        except (AutoForgeError, OSError):
-            break
-        for parent in parents or ():
-            # A parent read from authenticated bytes proves its ancestry; a
-            # base reached is walked on while another may lie below it.
-            if parent in wanted:
-                reached.add(parent)
-            if parent not in seen:
+    try:
+        while pending and reached != wanted and reads < max_commits:
+            sha = pending.popleft()
+            reads += 1
+            parents = endpoints.pop(sha) if sha in endpoints else read_parents(sha)
+            for parent in parents or ():
+                if parent in seen:
+                    continue
                 seen.add(parent)
+                if parent in wanted:
+                    verified = endpoints[parent] = read_parents(parent)
+                    if verified is not None:
+                        reached.add(parent)
                 pending.append(parent)
+    except (AutoForgeError, OSError):
+        pass
     return tuple(b for b in bases if b in reached), reads
 
 
@@ -344,7 +353,7 @@ def prepare_launch_projection(
     *,
     base: str,
     read_head: Callable[[], str],
-    read_parents: Callable[[str], Sequence[str] | None],
+    open_parents: _OpenParents,
     validation_records: Sequence[dict],
     clock: Callable[[], float] = time.perf_counter,
     max_commits: int = MAX_ANCESTRY_COMMITS,
@@ -353,15 +362,17 @@ def prepare_launch_projection(
 
     ``load_store`` reconstructs and validates the committed snapshot,
     inside the measurement: it runs before every Memory launch (R4-F4 of
-    PR #536). ``read_head`` reads the commit the launch starts from (""
-    when it cannot be read); it is the projection's candidate when it is
-    not the entry's ``base``, and none otherwise. Of the store's range-bound
-    records' bases, those the candidate descends from are proved, never
-    through GitHub (R3-F1): by the run's own retained validation record of
-    that very commit (:func:`~autoforge.memory.established_bases`, R4-F2),
+    PR #536). ``read_head`` identifies the launch's starting object;
+    ``open_parents`` opens its authenticated local reader, used for the input
+    itself and the walk and closed before rendering. An authenticated input
+    other than the entry's ``base`` is the projection's candidate. Of the
+    store's range-bound records' bases, those the candidate descends from
+    are proved, never through GitHub (R3-F1): by the run's own retained
+    validation record of that very commit
+    (:func:`~autoforge.memory.established_bases`, R4-F2),
     so a retry on the commit that failed is shown its failure however long
     its history, and the rest by :func:`local_ancestors` through
-    ``read_parents``, at most ``max_commits`` commits read. ``input_sha``
+    the same reader, at most ``max_commits`` walk slots. ``input_sha``
     is the commit read, the base included when the launch starts there,
     and "" when none could be read: the input is then unknown, never
     guessed, so no ``add`` of the launch is keyed by it (R3-F2, R4-F3,
@@ -372,24 +383,10 @@ def prepare_launch_projection(
     """
     started = clock()
     store = load_store()
-    head = read_head()
+    head, ancestors, reads = _launch_ancestry(
+        store, step, base, read_head(), open_parents, validation_records, max_commits
+    )
     candidate = head if head != base else ""
-    ancestors: tuple[str, ...] = ()
-    reads = 0
-    if candidate:
-        bases = store.range_bases(step.issue_url)
-        held = established_bases(
-            store,
-            projection_request(store, step, candidate=candidate),
-            validation_records=validation_records,
-        )
-        walked, reads = local_ancestors(
-            candidate,
-            [b for b in bases if b not in held],
-            read_parents,
-            max_commits=max_commits,
-        )
-        ancestors = tuple(b for b in bases if b in held or b in walked)
     request = projection_request(store, step, candidate=candidate, ancestors=ancestors)
     launch = render_launch_projection(
         store, request, validation_records=validation_records, clock=clock
@@ -400,6 +397,41 @@ def prepare_launch_projection(
         projection_ms=(clock() - started) * 1000.0,
         ancestry_reads=reads,
     )
+
+
+def _launch_ancestry(
+    store: MemoryStore,
+    step: StepKey,
+    base: str,
+    head: str,
+    open_parents: _OpenParents,
+    validation_records: Sequence[dict],
+    max_commits: int,
+) -> tuple[str, tuple[str, ...], int]:
+    if not head:
+        return "", (), 0
+    try:
+        with open_parents(head) as read:
+            head_parents = read(head)
+            if head_parents is None:
+                return "", (), 0
+            if head == base:
+                return head, (), 0
+            bases = store.range_bases(step.issue_url)
+            held = established_bases(
+                store,
+                projection_request(store, step, candidate=head),
+                validation_records=validation_records,
+            )
+            walked, reads = local_ancestors(
+                head,
+                [b for b in bases if b not in held],
+                lambda sha: head_parents if sha == head else read(sha),
+                max_commits=max_commits,
+            )
+            return head, tuple(b for b in bases if b in held or b in walked), reads
+    except (GitTransportError, VerificationError, OSError):
+        return "", (), 0
 
 
 # -- after the launch: the controller's observation (D8, D11 stage 4) --------------------
