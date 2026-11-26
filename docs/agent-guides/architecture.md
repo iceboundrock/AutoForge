@@ -430,7 +430,11 @@ it is held to the same contract:
   (Memory's local Git reader, #541) uses `StdoutMode.PULL`. `read_stdout`
   returns at most the requested bytes, without framing or read-ahead.
   Only stderr is drained in the background. Unread stdout can block the
-  child and is discarded at teardown. The mode accepts a runtime deadline,
+  child until the teardown, which hands stdout to a drain that discards
+  what is left and waits for its EOF as for the other pipes. A writer that
+  left the group and still holds stdout is therefore reported
+  (`descendants_killed`, then `capture_abandoned` or an orphan kill), never
+  taken for a clean exit. The mode accepts a runtime deadline,
   not an idle timeout, because writes to unread stdout cannot be observed;
 - `send_line` writes one whole record under one lock with non-blocking
   writes and a selector, so a child that stops reading stdin cannot hold

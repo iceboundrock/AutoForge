@@ -1244,6 +1244,140 @@ def test_setsid_escapee_gives_capture_abandoned(monkeypatch):
         _kill_quietly(pid)
 
 
+# Run by ``_STDOUT_ESCAPEE`` in a session of its own, holding the child's
+# stdout and nothing else. It waits until the child is gone (the gate pipe's
+# EOF), so the child's pid line is the first thing on stdout. ``writes``:
+# then writes to stdout without end; ``holds``: sleeps holding it.
+_ESCAPEE_BODY = (
+    "import os, sys, time\n"
+    "os.read(int(sys.argv[1]), 1)\n"
+    "while sys.argv[2] == 'writes':\n"
+    "    os.write(1, b'x' * 65536)\n"
+    "time.sleep(60)\n"
+)
+# Starts ``argv[1]`` as that escapee (``argv[2]`` its kind), prints its pid
+# and exits 0 on stdin EOF.
+_STDOUT_ESCAPEE = (
+    "import os, subprocess, sys\n"
+    "gate, held = os.pipe()\n"
+    "p = subprocess.Popen([sys.executable, '-c', sys.argv[1], str(gate), sys.argv[2]],\n"
+    "                     stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+    "                     start_new_session=True, pass_fds=(gate,))\n"
+    "print(p.pid, flush=True)\n"
+    "sys.stdin.buffer.read()\n"
+)
+
+
+def _pull_escapee(kind: str, contain: bool = False) -> DuplexRequest:
+    return DuplexRequest(
+        command=[PY, "-c", _STDOUT_ESCAPEE, _ESCAPEE_BODY, kind],
+        stdout_mode=StdoutMode.PULL,
+        max_runtime_seconds=30,
+        contain_orphans=contain,
+    )
+
+
+def _pull_line(child) -> bytes:
+    line = bytearray()
+    while not line.endswith(b"\n"):
+        chunk = child.read_stdout(1)
+        assert chunk, "stdout ended before a whole line"
+        line += chunk
+    return bytes(line)
+
+
+@pytest.mark.parametrize("kind", ["holds", "writes"])
+def test_pull_stdout_held_by_a_setsid_escapee_is_reported_not_clean(monkeypatch, kind):
+    """R1-F1 (#541), ADR 0002 §5: in pull mode stdout is not drained while the
+    child runs, but the teardown still waits for its EOF. A writer that left
+    the group and holds stdout alone (stderr closed, so stderr's EOF says
+    nothing) is out of the group kill's reach: the capture is abandoned after
+    the grace and reported, as in the other modes, never a clean exit. What
+    it keeps writing is discarded, not read ahead into memory."""
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    pid = None
+    try:
+        with start_duplex(_pull_escapee(kind)) as child:
+            pid = int(_pull_line(child))
+            started = time.monotonic()
+            res = child.finish()
+            elapsed = time.monotonic() - started
+        assert not res.timed_out and res.exit_code == 0
+        assert res.descendants_killed and res.capture_abandoned
+        assert not res.group_survived_kill
+        assert "outside its group" in res.leftovers
+        assert elapsed < 5, elapsed
+        if kind == "holds":
+            assert not _gone(pid, within=0.1)  # nothing here can kill it
+    finally:
+        if pid is not None:
+            _kill_quietly(pid)
+    assert _gone(pid, within=5)
+
+
+def test_pull_stdout_escapee_is_reported_when_the_caller_stops_the_child(monkeypatch):
+    """The kill path checks pull-mode stdout too: ``stop()`` while the child
+    runs kills the group, and the escapee that holds stdout is reported. A
+    read after the stop is refused, since the teardown owns the pipe."""
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    pid = None
+    try:
+        with start_duplex(_pull_escapee("holds")) as child:
+            pid = int(_pull_line(child))
+            assert child.stop()
+            with pytest.raises(ExecutionError, match="handed to the teardown"):
+                child.read_stdout(1)
+            res = child.finish()
+        assert res.stopped and res.exit_code == -1
+        assert res.capture_abandoned and not res.group_survived_kill
+        assert "outside its group" in res.leftovers
+        assert not _gone(pid, within=0.1)
+    finally:
+        if pid is not None:
+            _kill_quietly(pid)
+    assert _gone(pid, within=5)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux-only subreaper")
+def test_contained_pull_stdout_escapee_is_killed_and_reported(monkeypatch):
+    """With ``contain_orphans`` the escaped stdout writer is re-parented to the
+    controller, killed and reported, and stdout then reaches EOF, so nothing
+    is abandoned."""
+    monkeypatch.setattr(executor, "_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    pid = None
+    try:
+        with start_duplex(_pull_escapee("writes", contain=True)) as child:
+            pid = int(_pull_line(child))
+            res = child.finish()
+        assert not res.timed_out and res.exit_code == 0
+        assert res.orphans_killed and res.descendants_killed
+        assert not (res.capture_abandoned or res.group_survived_kill or res.orphan_survived_kill)
+        assert _gone(pid, within=1)
+    finally:
+        if pid is not None:
+            _kill_quietly(pid)
+
+
+def test_pull_stdout_left_unread_is_discarded_at_teardown_so_the_child_can_exit():
+    """What the caller never read does not keep the child from exiting once the
+    teardown begins: the drain discards it, the child sees stdin EOF and exits
+    on its own, and nothing is reported left over."""
+    script = "import os, sys\nos.write(1, b'x' * (4 << 20))\nsys.stdin.buffer.read()\n"
+    with start_duplex(
+        DuplexRequest(
+            command=[PY, "-c", script], stdout_mode=StdoutMode.PULL, max_runtime_seconds=20
+        )
+    ) as child:
+        assert child.read_stdout(1) == b"x"
+        started = time.monotonic()
+        res = child.finish()
+    assert time.monotonic() - started < 10
+    assert not res.timed_out and res.exit_code == 0
+    assert res.leftovers == ""
+
+
 def test_sigterm_ignoring_child_is_escalated_to_sigkill(monkeypatch):
     monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
     signalled: list[int] = []
