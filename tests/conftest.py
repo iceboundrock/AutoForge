@@ -26,6 +26,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from autoforge import git_transport  # noqa: E402
 from autoforge.certificate import Revision, remote_certificate  # noqa: E402
 from autoforge.child_env import credential_looking_word  # noqa: E402
 from autoforge.config import default_config  # noqa: E402
@@ -1795,6 +1796,23 @@ def rewrite_loose_object(objects: Path, oid: str, kind: str, content: bytes) -> 
     assert path.is_file(), f"{oid} is not a loose object of {objects}"
     path.chmod(0o644)
     path.write_bytes(zlib.compress(b"%s %d\0" % (kind.encode("ascii"), len(content)) + content))
+
+
+# The runtime limit a real-Git cost test gives Issue Working Memory's commit
+# reader in place of its production 750 ms (R3-F1 of PR #587). Such a test
+# measures CPU time, which a scheduling pause does not stretch, and asserts
+# that the walk or the read completes exactly; the limit is wall time, so
+# a worker paused past it would end the read early and fail the test with
+# almost no CPU spent. The production limit keeps a test of its own
+# (``test_memory_reader_stops_a_silent_child_at_its_runtime_limit``).
+MEMORY_READ_HEADROOM_SECONDS = 60.0
+
+
+@pytest.fixture
+def memory_read_headroom(monkeypatch) -> float:
+    """Give every Memory commit reader the test opens :data:`MEMORY_READ_HEADROOM_SECONDS`."""
+    monkeypatch.setattr(git_transport, "_MEMORY_READ_SECONDS", MEMORY_READ_HEADROOM_SECONDS)
+    return MEMORY_READ_HEADROOM_SECONDS
 
 
 # The git of an :class:`Origin`, of :func:`github_origin` and of the live

@@ -1255,14 +1255,18 @@ def _memory_history(root, messages):
 
 @pytest.mark.parametrize("shape", ["short", "many-lines", "long-line"])
 def test_an_ancestry_walk_at_its_bound_costs_far_less_cpu_than_the_ceiling(
-    tmp_path, monkeypatch, shape
+    tmp_path, monkeypatch, memory_read_headroom, shape
 ):
     """ADR 0015 D12 holds Memory's work before a launch to the evaluation's
     1,000 ms ceiling, the ancestry walk included (R3-F1 of PR #536). Its
     worst case is a base it cannot prove: MAX_ANCESTRY_COMMITS real commits
     read through one git process, and nothing proved. The cost is the CPU
     time of this process and of the processes it waited for, never a wall
-    time, which other workers on the host stretch (tests/AGENTS.md)."""
+    time, which other workers on the host stretch (tests/AGENTS.md). For
+    the same reason the reader runs under the test's runtime limit, not
+    its production 750 ms: a worker paused past that would end the walk
+    after a few reads, and the walk would not reach its bound (R3-F1 of
+    PR #587)."""
     root = git_repo(tmp_path / "repo")
     messages = [b"abcd\n" if shape != "many-lines" else b"abc\n" * 20_000]
     messages *= MAX_ANCESTRY_COMMITS + 1
@@ -1294,17 +1298,20 @@ def test_an_ancestry_walk_at_its_bound_costs_far_less_cpu_than_the_ceiling(
     assert proved == ((), MAX_ANCESTRY_COMMITS)
     assert cpu_ms < 1000.0
     assert len(calls) == 1 and calls[0].command[-2:] == ["cat-file", "--batch-command"]
+    assert calls[0].max_runtime_seconds == memory_read_headroom
     assert rehashed == dict(list(bodies.items())[1:])
 
 
 @pytest.mark.parametrize("mib", [6, 12])
-def test_large_commits_spend_one_shared_ancestry_budget(tmp_path, mib):
+def test_large_commits_spend_one_shared_ancestry_budget(tmp_path, memory_read_headroom, mib):
     """The input, the walk and each base's authentication (R1-F1 of PR #587)
     charge one 16 MiB allowance, each commit once. Two 6 MiB commits fit
     it, each read once, so both bases are proved; a second read of either
     would not fit. Two 12 MiB commits do not: the parent the input names
     cannot be authenticated within what is left, so it is not proved, and
-    the walk ends there."""
+    the walk ends there. The budget alone decides that: the reader runs
+    under the test's runtime limit, not its production one (R3-F1 of
+    PR #587)."""
     root = git_repo(tmp_path / "repo")
     big = b"x" * (mib * 1024 * 1024)
     base, tip, bodies = _memory_history(root, [big, big])

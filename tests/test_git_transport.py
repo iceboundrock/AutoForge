@@ -28,7 +28,12 @@ from pathlib import Path
 import pytest
 
 from autoforge import executor_duplex, git_transport
-from autoforge.errors import ExecutionError, GitHubUnavailableError, GitTransportError
+from autoforge.errors import (
+    ExecutionError,
+    ExecutionTimeoutError,
+    GitHubUnavailableError,
+    GitTransportError,
+)
 from autoforge.executor import ExecutionRequest, ExecutionResult, execute
 from autoforge.git_transport import (
     LOCAL_GIT_ENV_ALLOWLIST,
@@ -517,7 +522,14 @@ def test_memory_walk_reads_a_reached_base_once(world, monkeypatch):
 
 
 @pytest.mark.parametrize("size", [16 * 1024 * 1024, 24 * 1024 * 1024])
-def test_memory_admits_raw_commit_bytes_before_reading_stdout_body(world, monkeypatch, size):
+def test_memory_admits_raw_commit_bytes_before_reading_stdout_body(
+    world, monkeypatch, memory_read_headroom, size
+):
+    """The size check admits a commit before its body is asked for, so no
+    stdout byte past the budget is read. The read runs under the test's
+    runtime limit, not its production one, so that the exact bytes read and
+    the CPU spent are measured whatever pause the host imposes (R3-F1 of
+    PR #587)."""
     header = f"tree {world.tree()}\nauthor t <t@e> 1 +0000\ncommitter t <t@e> 1 +0000\n\n".encode()
     sha = _literal_commit(world, header + b"x" * (size - len(header)))
     calls = []
@@ -577,6 +589,34 @@ def test_memory_reader_ends_on_eof_without_fallback(world, monkeypatch):
         with pytest.raises(GitTransportError, match="reader has failed"):
             reader.parents(base)
     assert len(requests) == 1 and private_leftovers(world) == []
+    assert not world.requests and not world.questions
+
+
+def test_memory_reader_stops_a_silent_child_at_its_runtime_limit(world, monkeypatch):
+    """R3-F1 of PR #587. The real-Git cost tests give the reader a runtime
+    limit with headroom (conftest's ``memory_read_headroom``); this one
+    keeps the production 750 ms. A child that answers nothing is stopped
+    there, well before it would end by itself: the read fails as a timeout,
+    the reader is spent, the walk ends with nothing proved, and no second
+    child is started."""
+    base = world.commit("root")
+    tip = world.commit("tip", base)
+    requests = []
+    start = git_transport.start_duplex
+
+    def never_answer(req):
+        requests.append(req)
+        req.command = [sys.executable, "-c", "import time; time.sleep(60)"]
+        return start(req)
+
+    monkeypatch.setattr(git_transport, "start_duplex", never_answer)
+    with world.transport().memory_commits(tip) as reader:
+        with pytest.raises(GitTransportError, match=f"reading Memory commit {tip}") as failed:
+            reader.parents(tip)
+        assert isinstance(failed.value.__cause__, ExecutionTimeoutError)
+        assert local_ancestors(tip, [base], reader.parents) == ((), 1)
+    assert [req.max_runtime_seconds for req in requests] == [0.75]
+    assert private_leftovers(world) == []
     assert not world.requests and not world.questions
 
 

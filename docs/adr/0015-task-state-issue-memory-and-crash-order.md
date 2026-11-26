@@ -1737,8 +1737,11 @@ be authenticated within the allowance, the header bound and the reader's
 runtime limit below, is not proved, and neither is a base the walk has not
 reached when a failed read or one of those limits ends it. Each of these
 can leave unproved a base the walk before #541 accepted: that walk counted
-a base from the parent link alone and had no byte or time limit. A base
-neither source proves is omitted along with the records bound to it.
+a base from the parent link alone, and its limits were per read: each
+commit was its own one-shot git process with a 120-second timeout and a
+16 MiB output capture, and no byte budget or deadline was shared across
+the walk. A base neither source proves is omitted along with the records
+bound to it.
 `HEAD` is read through the admin dir the registry binds and the common
 dir, never through the worktree's `.git` file, which an earlier launch of
 the step can rewrite before a correction or a retry, and only its id is
