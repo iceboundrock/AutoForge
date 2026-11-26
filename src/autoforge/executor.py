@@ -642,6 +642,14 @@ class _PipeDrain(threading.Thread):
     each reader before it starts it, so its cleanup reaches every pipe
     taken, and a reader that fails while it is built (its buffer cannot be
     allocated, say) holds nothing for it to reach.
+
+    A launch that fails while it starts its readers asks each one to
+    :meth:`cancel` rather than looking at :attr:`ident`: a start interrupted
+    after Python created the thread but before the thread set its ident
+    (Ctrl-C while :meth:`start` waits for it) leaves a thread that runs
+    later and cannot be joined yet. The gate at the top of :meth:`run`
+    decides, under one lock with :meth:`cancel`, whether that thread reads
+    or returns at once.
     """
 
     def __init__(self, stream: IO[bytes], name: str, activity: _Limits | None = None) -> None:
@@ -651,6 +659,11 @@ class _PipeDrain(threading.Thread):
         # (read end, write end): opened by :meth:`start`, closed by :meth:`close`.
         self._wake: tuple[int, int] | None = None
         self.error: OSError | None = None
+        # :meth:`run`'s gate: ``_began`` once its thread is past it and may
+        # read, ``_cancelled`` once :meth:`cancel` closed it first.
+        self._gate = threading.Lock()
+        self._began = False
+        self._cancelled = False
 
     def start(self) -> None:
         """Open the wake pipe and start the thread. A thread that cannot be
@@ -658,7 +671,34 @@ class _PipeDrain(threading.Thread):
         self._wake = os.pipe()
         super().start()
 
+    def cancel(self) -> bool:
+        """For a launch that failed while starting its readers: True when
+        this reader's thread will never read, False when it may.
+
+        A thread that can be joined (its start returned, or it got far
+        enough to) is left to read: False, and it is stopped as any started
+        reader is, by EOF or :meth:`abandon`, before its pipes are closed.
+        True for a reader never started, one whose thread could not be
+        created, and one whose start was interrupted after Python created
+        the thread and before the thread could be joined: that thread
+        returns at the gate of :meth:`run` as soon as it runs, without
+        touching a descriptor, so the caller closes the pipes without
+        waiting for it.
+        """
+        with self._gate:
+            if not self._began and not self.is_alive():
+                self._cancelled = True
+            return self._cancelled
+
     def run(self) -> None:
+        with self._gate:
+            if self._cancelled:
+                return
+            self._began = True
+        self._read()
+
+    def _read(self) -> None:
+        """The thread's work once past the gate: drain to EOF or until woken."""
         assert self._wake is not None  # opened by start() before the thread began
         wake_r = self._wake[0]
         eof = False
@@ -1659,9 +1699,11 @@ def _execute(
                 descendants_killed = not group_settled
                 left = _terminate_group(pgid, proc, readers, contained)
     except BaseException:
-        # A reader whose thread never started has nothing to stop.
-        started_readers = tuple(reader for reader in readers if reader.ident is not None)
-        _terminate_group(pgid, proc, started_readers, contained)
+        # Only the readers that may read have anything to stop
+        # (_PipeDrain.cancel): a start interrupted before its thread set its
+        # ident leaves a thread that, cancelled, returns as soon as it runs.
+        reading = tuple(reader for reader in readers if not reader.cancel())
+        _terminate_group(pgid, proc, reading, contained)
         raise
     finally:
         if feeder is not None:

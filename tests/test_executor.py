@@ -1185,6 +1185,125 @@ def _refuse_setup_step(monkeypatch, step: str, thread: str, error: BaseException
     return refused
 
 
+class _InterruptedStartWait(threading.Event):
+    """A thread's ``_started`` event whose wait raises KeyboardInterrupt, as
+    Ctrl-C does when it lands while ``Thread.start()`` waits on it; set and
+    is_set are the event's own, so the thread starts and can be joined."""
+
+    def wait(self, timeout=None):
+        raise KeyboardInterrupt
+
+    def wait_set(self, timeout: float) -> bool:
+        return super().wait(timeout)
+
+
+class _HeldStart:
+    """A reader thread whose start was interrupted in the window after Python
+    created it and before it set its ident (R2-F1 of #541): held before its
+    bootstrap until released, recording each pass past the reader's gate in
+    :attr:`reads`."""
+
+    def __init__(self) -> None:
+        self.reader: executor._PipeDrain | None = None
+        self.reads: list[str] = []
+        self.ident_at_start: int | None = None
+        self.held = threading.Event()
+        self.started = _InterruptedStartWait()
+
+    def ended(self, timeout: float) -> bool:
+        """Release the thread, let it run, and wait for it to end; True once
+        it has. ``join()`` refuses a thread until it set ``_started``."""
+        self.held.set()
+        assert self.reader is not None
+        if not self.started.wait_set(timeout):
+            return False
+        self.reader.join(timeout)
+        return not self.reader.is_alive()
+
+
+def _interrupt_reader_start(monkeypatch, thread: str) -> _HeldStart:
+    """Interrupt the start of the reader thread named ``thread``, once, after
+    its thread is created and before it sets its ident.
+
+    This reaches into CPython's ``threading.Thread``: ``start()`` hands the
+    new thread ``_bootstrap``, which sets the ident and then the
+    ``_started`` event that ``start()`` waits on. The reader's ``_bootstrap``
+    first waits for :attr:`_HeldStart.held`, and its ``_started`` wait
+    raises, so ``start()`` raises KeyboardInterrupt with a live thread whose
+    ident is still unset, deterministically.
+    """
+    held = _HeldStart()
+    real_drain_start = executor._PipeDrain.start
+
+    def drain_start(self):
+        if self.name != thread or held.reader is not None:
+            return real_drain_start(self)
+        held.reader = self
+        bootstrap, read = self._bootstrap, self._read
+
+        def held_bootstrap():
+            held.held.wait(30)
+            bootstrap()
+
+        def recorded_read():
+            held.reads.append(self.name)
+            read()
+
+        self._bootstrap, self._read = held_bootstrap, recorded_read
+        self._started = held.started
+        try:
+            return real_drain_start(self)
+        finally:
+            held.ident_at_start = self.ident
+
+    monkeypatch.setattr(executor._PipeDrain, "start", drain_start)
+    return held
+
+
+def test_a_start_interrupted_before_the_reader_sets_its_ident_strands_nothing(monkeypatch):
+    """R2-F1 of #541, ``execute()``: Ctrl-C lands in the stdout reader's
+    start after its thread exists and before the thread set its ident. The
+    child is killed and reaped and the pipes closed as on any setup failure;
+    the thread, which runs only afterwards, returns at once without reading
+    the closed descriptors."""
+    spawned = []
+    real_spawn = executor._spawn
+
+    def spawn(*args, **kwargs):
+        spawned.append(real_spawn(*args, **kwargs))
+        return spawned[-1]
+
+    crashed: list[threading.ExceptHookArgs] = []
+    monkeypatch.setattr(threading, "excepthook", crashed.append)
+    fds, threads = _baseline_fds(), set(threading.enumerate())
+    monkeypatch.setattr(executor, "_spawn", spawn)
+    held = _interrupt_reader_start(monkeypatch, "autoforge-capture-stdout")
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            execute(
+                ExecutionRequest(
+                    command=[PY, "-c", "import time; time.sleep(60)"], timeout_seconds=30
+                )
+            )
+        (proc,) = spawned
+        assert proc.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.killpg(proc.pid, 0)
+        assert held.reader is not None and held.ident_at_start is None
+    finally:
+        held.held.set()
+        for proc in spawned:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+    assert held.ended(10), "the reader thread did not end"
+    assert held.reads == [] and held.reader.error is None
+    assert crashed == []
+    monkeypatch.undo()
+    assert set(threading.enumerate()) == threads
+    assert _open_fds() == fds
+
+
 @pytest.mark.parametrize(
     "contain",
     [

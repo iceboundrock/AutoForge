@@ -36,7 +36,13 @@ from autoforge.executor_duplex import (
     start_duplex,
 )
 
-from .test_executor import _baseline_fds, _gone, _open_fds, _refuse_setup_step
+from .test_executor import (
+    _baseline_fds,
+    _gone,
+    _interrupt_reader_start,
+    _open_fds,
+    _refuse_setup_step,
+)
 
 PY = sys.executable
 
@@ -1490,6 +1496,58 @@ def test_cwd_is_applied(tmp_path):
 def test_missing_binary_raises_execution_error():
     with pytest.raises(ExecutionError, match="not found"):
         start_duplex(DuplexRequest(command=["autoforge-definitely-missing-binary-xyz"]))
+
+
+@pytest.mark.parametrize("mode", list(StdoutMode), ids=[mode.value for mode in StdoutMode])
+def test_a_start_interrupted_before_the_stdout_reader_sets_its_ident_strands_nothing(
+    monkeypatch, mode
+):
+    """R2-F1 of #541: Ctrl-C lands in the stdout reader's start after Python
+    created its thread and before the thread set its ident. The launch
+    guard kills and reaps the child and closes the pipes; the thread, which
+    runs only afterwards, returns at once. It reads none of the closed
+    descriptors and, in pull mode, does not wait for an arm that no teardown
+    will send, so it ends instead of parking for good."""
+    spawned = []
+    real_spawn = executor_duplex._spawn
+
+    def spawn(*args, **kwargs):
+        spawned.append(real_spawn(*args, **kwargs))
+        return spawned[-1]
+
+    crashed: list[threading.ExceptHookArgs] = []
+    monkeypatch.setattr(threading, "excepthook", crashed.append)
+    fds, threads = _baseline_fds(), set(threading.enumerate())
+    monkeypatch.setattr(executor_duplex, "_spawn", spawn)
+    held = _interrupt_reader_start(monkeypatch, "autoforge-capture-stdout")
+    started = time.monotonic()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            start_duplex(
+                DuplexRequest(
+                    command=[PY, "-c", "import time; time.sleep(60)"],
+                    max_runtime_seconds=30,
+                    stdout_mode=mode,
+                )
+            )
+        (proc,) = spawned
+        assert proc.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.killpg(proc.pid, 0)
+        assert held.reader is not None and held.ident_at_start is None
+    finally:
+        held.held.set()
+        for proc in spawned:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+    assert held.ended(10), "the stdout reader thread did not end"
+    assert time.monotonic() - started < 10
+    assert held.reads == [] and held.reader.error is None
+    assert crashed == []
+    monkeypatch.undo()
+    assert set(threading.enumerate()) == threads
+    assert _open_fds() == fds
 
 
 @pytest.mark.parametrize(

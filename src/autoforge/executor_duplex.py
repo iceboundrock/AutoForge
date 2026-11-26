@@ -499,7 +499,11 @@ class _TeardownDrain(_PipeDrain):
     (ADR 0002: ``descendants_killed``, then ``capture_abandoned`` or an orphan
     kill), never missed. It keeps nothing it reads, so a writer that never
     stops costs one chunk, not read-ahead. Every wait and abandon arms it
-    first, so no teardown path can wait on a drain that never reads.
+    first, so no teardown path can wait on a drain that never reads. A
+    launch that fails before the caller has the handle cancels a drain whose
+    start was interrupted before its thread could be joined, so that thread
+    returns as it starts instead of waiting for an arm that no teardown
+    will send.
     """
 
     def __init__(self, stream: IO[bytes]) -> None:
@@ -514,9 +518,12 @@ class _TeardownDrain(_PipeDrain):
         """Take the pipe from the caller and start discarding. Idempotent."""
         self._armed.set()
 
-    def run(self) -> None:
+    def _read(self) -> None:
+        # Past the gate of run(), which a cancelled thread never passes, so
+        # the thread that waits here is one a teardown arms: wait() and
+        # abandon() do, on every path, the launch guard's included.
         self._armed.wait()
-        super().run()
+        super()._read()
 
     def _feed(self, chunk: bytes) -> None:
         pass  # the caller did not read it; the teardown keeps none of it
@@ -632,10 +639,13 @@ def _abort_start(
 ) -> None:
     """The launch failed after the spawn: kill the group at once and release
     everything taken so far, since no teardown will run."""
-    # A reader whose thread never started has nothing to stop.
-    started = tuple(reader for reader in readers if reader.ident is not None)
+    # Only the readers that may read have anything to stop
+    # (_PipeDrain.cancel). A start interrupted before its thread set its
+    # ident leaves a thread that runs later; cancelled, it returns at once,
+    # never reading the pipes closed below and never waiting for an arm.
+    reading = tuple(reader for reader in readers if not reader.cancel())
     try:
-        _terminate_group(proc.pid, proc, started, contained)
+        _terminate_group(proc.pid, proc, reading, contained)
     finally:
         if contained is not None:
             contained.release()
