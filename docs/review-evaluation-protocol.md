@@ -126,7 +126,8 @@ enters paired rates. Exclusions are restricted to infrastructure, unavailable cr
 unavailable service, or a documented pre-launch skip; stop/validation failures are not
 exclusions. A `skipped` run is documented by a pre-PR stop at watermark zero; any launch
 slot, retained or reserved, or a later watermark contradicts it and the packet is refused.
-Keep both arms and report missing, incomparable and excluded assignments separately.
+Keep both arms and report missing, incomparable, incomplete-ledger and excluded assignments
+separately.
 Exclusions remove pairs from rates, cost and bootstrap, not independently evidenced
 treatment harm. Do not replace a failed or missing seed; duplicate assignments are refused.
 
@@ -150,9 +151,7 @@ treatment harm. Do not replace a failed or missing seed; duplicate assignments a
   (`git rev-list reviewed..endpoint`), and the endpoint must descend from that revision;
   register each commit of a multi-commit FIX, side branches it merges included, with its
   real parents. A defect introduced in that range and present at the endpoint is that FIX's
-  regression. That harm is the publication's own evidence: it stays known across an
-  unrelated gap when the FIX's source review is retained, while the pooled harmful-FIX
-  rate and the terminal proof still wait for the whole ledger.
+  regression, reported only from a complete ledger (see *Incomplete ledgers*).
   SHA/tree fields in the synthetic fixture are stand-ins, not Git objects.
 - Each `runs` entry has a case/seed/arm, one fresh PR identity, and producer/reviewer/fixer
   identities in that order. Its `creation` receipt identifies ordinal zero, before any
@@ -162,29 +161,34 @@ treatment harm. Do not replace a failed or missing seed; duplicate assignments a
   a `retry`, which explicitly consumed no round or publication. REVIEW binds its exact
   revision and round; `findings: null` or `complete: false` means the retained findings
   are not the complete payload, even if review completion itself is proven. Validation
-  receipts explicitly declare FULL scope; FAST is refused. A FIX source
-  must be an earlier accepted needs-fix round at the same revision. `no_change` consumes
+  receipts explicitly declare FULL scope; FAST is refused. Round r needs an ordinal above
+  r, after the producer and each earlier round. A FIX source must be an earlier accepted
+  needs-fix round at the same revision, and only retries of that FIX lie between them: a
+  retained review or completed FIX in between supersedes the source. `no_change` consumes
   the FIX without publication. A retained accepted `clean` review, a `held` FIX and a
   `partial` FIX are first stops whatever precedes them, a gap included: any later ordinal,
   retained or reserved, or a later watermark is refused, and the stop binds that launch's
   round, review ordinal and revision and the phases it can enter, `READY_FOR_MERGE` or
   `BLOCKED` after the clean round and `BLOCKED` after either FIX. `partial` publishes its
-  endpoint, which the stop binds, and keeps its harm evidence. A gap before a first stop
-  still leaves the terminal outcome unproven. Same-scope head drift
+  endpoint, which the stop binds, and keeps its harm evidence in a complete ledger. A gap
+  before a first stop leaves the run unresolved. Same-scope head drift
   is represented by a completed stale review with `next_head`, or an explicit `drift` at the
   next REVIEW before it begins, the first REVIEW included; a review of a moved revision is
   never starting evidence, and one without an explicit drift is refused.
 - The separately captured `stop` states the launch high-water mark (`through`), phase,
   current revision, last completed round and its review ordinal (or zero/null before any
-  completion). `issued` requires a terminal clean review at that ordinal with matching
-  comment and exact presented validation, and a separate certificate receipt reference. It
-  is written when that round completes, so the ordinal is the stop's watermark. A
+  completion), an ordinal above that round. `issued` requires a terminal clean review at
+  that ordinal with matching comment and exact presented validation, and a separate
+  certificate receipt reference. It is written when that round completes, so the ordinal
+  is the stop's watermark. A
   presented receipt whose scope, set and policy match but whose result is unknown leaves
   issuance unproven (never filled from the certificate) while still stating starting
-  validation; a conflicting known field is refused. When the stop names a retained REVIEW,
+  validation; a conflicting known field is refused. The certificate presents the run's fixed
+  validation set and policy, which any retained FULL receipt fixes, even when the named
+  review's own receipt is missing. When the stop names a retained REVIEW,
   its round, and for `issued` its outcome, revision, comment and known validation fields,
-  are cross-checked even across a gap elsewhere; a consistent gapped record leaves issuance
-  unproven, a contradicting field is refused. Every other retained launch is checked against
+  are cross-checked even across a gap elsewhere; a consistent gapped record leaves the run
+  unresolved, a contradicting field is refused. Every other retained launch is checked against
   the stop the same way: no review completes after the named one, a REVIEW launch before it
   is of at most its round and one after it of the next, a FIX follows the named round or
   precedes it as a FIX of an earlier one, and the launch at the watermark, retained with a
@@ -201,20 +205,50 @@ treatment harm. Do not replace a failed or missing seed; duplicate assignments a
   `not_issued` on a reconciled block/failure is explicit non-issuance, including after a
   held or failed FIX at the reviewed revision. An absent stop, unknown issuance, tail
   gap, or historical certificate is not treated as an issuance or as a clean negative.
-  Pre-PR stops use a null revision. Wall time comes from the stop observation and is
+  Pre-PR stops use a null revision and name no round, and no retained launch may have
+  published or bound the PR before one. Wall time comes from the stop observation and is
   reported whenever the stop retains it, even with incomplete launch coverage; total
   launch duration and terminal proof stay unresolved then.
 
-There is no search for a workflow that could explain a hole. Replay proves the known
-contiguous prefix, checks explicit bindings even in the suffix, and leaves a gapped
-terminal outcome unresolved. It distinguishes launch coverage, known lifecycle, findings
-coverage, and a bound stop: removing a finding payload cannot remove an independently
-bound certificate, nor can a later clean round make missing findings a true negative.
-Findings coverage needs the stop's launch window reconciled with the ledger and complete
+#### Incomplete ledgers
+
+A complete ledger is a precondition for scoring, and the replay does not reason across a
+gap. A run has a gap when any ordinal up to and including its stop's watermark has no
+retained launch record and disposition (a `null` slot, `outcome: null`, or an ordinal the
+watermark reserves past the last slot), or when its stop is absent. Such a run is reported
+with `ledger: "unresolved: incomplete ledger"` and its `missing_ordinals`, and its pair as
+`incomplete_ledger`. It contributes to no metric (recall, precision, clean-negative FPR,
+harmful-FIX rate, duplicate ratio or cost per validated success), no bootstrap draw and no
+sample floor, and nothing in it is reported as a known finding, a false alarm or a harmful
+FIX (each is `null`), even when part of the evidence for one is retained. Like a missing
+or incomparable pair, it keeps the decision from relying on complete coverage. The one
+exception is the safety report, which reads every planned run: an unresolved run's
+critical defects stay listed, as unresolved escapes, and an escape its complete
+counterpart evidences still counts, as exclusions remove pairs from rates but not
+evidenced critical escapes. Wall time, launch counts and known launch time remain
+descriptive observations of the run.
+
+Structural refusal does not change. A malformed record, an ordinal out of order or one its
+round cannot fit, and any contradiction within a complete ledger are refused. Across a gap
+the replay checks each record on its own and the explicit bindings stated above: the run's
+fixed validation policy, a FIX's source and the retries between them, a first stop and the
+stop, the stop's named review, and each retained launch against the stop. It searches a gap
+for no other contradiction and infers no missing record or transition, so a run those
+checks do not refuse is unresolved. Unresolved marks missing evidence, never a detected
+contradiction.
+
+This rule has a cost. It discards real information that an incomplete run retains, such as
+an independently labeled false alarm or a FIX regression whose source review is retained,
+and how often real ledgers will have gaps is unknown. A maintainer decision on #355 set it
+before any real run: the issue never asked for inference across a missing record, and
+reasoning around every possible gap has no natural end. If a real corpus shows that gaps
+are common, a separate issue can revisit partial-ledger scoring with that evidence.
+
+Within a complete ledger the replay keeps findings coverage apart from a bound stop:
+removing a finding payload cannot remove an independently bound certificate, nor can a
+later clean round make missing findings a true negative. Findings coverage needs complete
 accepted payloads, not proof of issuance: an unknown presented result or issuance leaves
 finding metrics intact.
-Known contradictions are refused wherever they lie; only what the whole ledger proves waits
-for it.
 Retargets, replacements, takeovers, other issue execution and merges are out of scope.
 Outside the supported first-stop slice, preserve the raw record and report the affected
 comparison unresolved rather than normalizing away an unsupported transition.
@@ -234,7 +268,8 @@ starting snapshot, or each of whose starting defects, was evidenced after the cu
 zero eligible recall observations; it drops out of the pool and its draws rather than
 counting as incomplete coverage. Track newly introduced regressions separately. Use
 accepted review findings; do not score stale replies.
-Finding coverage is that of accepted payloads only: a retained stale payload is still
+Only pairs whose two ledgers are complete enter a metric. Within them, finding coverage is
+that of accepted payloads only: a retained stale payload is still
 checked, but a missing one does not suppress a rate. A metric's population is fixed before
 coverage is checked: recall observes cases with eligible starting defects and FPR evidenced
 clean negatives, both known at registration, while precision and duplicates observe every
@@ -245,7 +280,7 @@ contrast; a case outside it affects neither the pool nor its draws.
 |---|---|
 | Weighted recall | Weight of distinct confirmed starting defects / eligible starting defect weight. Lower bound is the confirmed share; the upper adds the heaviest undetected eligible start defects, at most one per unknown finding. This is an outer bound, not an attribution. |
 | Precision | Confirmed / (confirmed + false). Bounds assign unknown findings first to false, then to confirmed. |
-| Clean-negative FPR | Negative runs with at least one false finding / label-settled negative runs. An evidenced false finding survives missing details. Absence is settled only with a complete accepted review record and no unknown findings. Bounds assign unresolved negatives first to no alarm, then to false alarm. Incomplete review coverage of a matched case in a finding metric's population prevents a usable pooled rate for that metric. |
+| Clean-negative FPR | Negative runs with at least one false finding / label-settled negative runs. In a complete ledger an evidenced false finding survives missing finding details. Absence is settled only with a complete accepted review record and no unknown findings. Bounds assign unresolved negatives first to no alarm, then to false alarm. Incomplete review coverage of a matched case in a finding metric's population prevents a usable pooled rate for that metric. |
 | Critical escapes | Independently evidenced eligible critical defects still present at a bound certified stop, even with an empty validation set. A bound non-issuance means no certified escapes; unresolved endings are counted separately. |
 | Harmful FIX rate | Harmful published FIX endpoints / adjudicated published FIX endpoints. Bounds divide by all such publications, assigning unknowns first to safe, then harmful. Held and no-change attempts do not enter this denominator. |
 | Duplicate ratio | Confirmed findings after the first confirmation of their defect in the run / all confirmed findings. Bounds add all unknown labels to the denominator, first as nonduplicates and then as duplicates; conservative even if individual assignments would be impossible. |
@@ -283,9 +318,10 @@ powered sample-size claim.
   absent or unresolved baseline evidence is not that evidence. A later defect without
   attributed FIX provenance is reported but not automatically new treatment harm.
 - **Other harm:** an entire usable envelope beyond a non-inferiority margin is `NO_GO`
-  when there are no missing or incomparable planned pairs. An upper recall envelope
-  below +0.10 is `NO_GO` only at the sample floor and exclusion budget. A measured cost
-  above margin would also be `NO_GO`, but this version cannot measure recorded cost.
+  when there are no missing, incomparable or incomplete-ledger planned pairs. An upper
+  recall envelope below +0.10 is `NO_GO` only at the sample floor and exclusion budget. A
+  measured cost above margin would also be `NO_GO`, but this version cannot measure
+  recorded cost.
 - **Otherwise:** synthetic data and a missing arm without measured safety harm are
   `NOT_EVALUATED`. Any remaining recorded result is `INCONCLUSIVE` in this version.
   A later `GO` requires the registered primary and all non-inferiority limits established,
@@ -319,8 +355,14 @@ starting defect from a merged side branch, a cyclic or second-rooted graph, a
 They cover the stop phases each first stop can enter, complete or gapped, a stop that a
 later completed round, a launch's round, a FIX source or the watermark launch's revision
 contradicts across a gap, a `READY_FOR_MERGE` stop naming a review over failed validation,
-FIX harm kept across an unrelated gap, a cutoff-ineligible case whose payloads are missing,
-and a side branch forked below the merge base, with the limits of a base ancestor.
+a cutoff-ineligible case whose payloads are missing, and a side branch forked below the
+merge base, with the limits of a base ancestor. Each shape of incomplete ledger (a missing
+producer, review, disposition, reserved tail or stop) is an unresolved run whose pair
+changes no rate, draw, cost or sample floor and reports no finding, false alarm or harmful
+FIX, while the safety report keeps its critical defect; a retained false alarm and a FIX
+regression are among what a gap leaves unreported. A superseded FIX source, a round its
+ordinal cannot hold, a pre-PR stop after a publication and a certificate off the fixed
+validation policy are refused, gapped or complete.
 Existing
 controller tests (`test_routing.py`, `test_loop_guard.py`, `test_validation_gates.py`,
 `test_review_certificate.py`, `test_merge_certificate.py`, `test_partial_fix.py`,

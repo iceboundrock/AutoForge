@@ -144,8 +144,9 @@ def test_document_pins_the_fixture_bytes():
         ("source-before-review", "accepted needs-fix"),
         ("wrong-phase", "wrong phase"),
         ("fix-before-review", "accepted needs-fix"),
+        ("review-before-fix", "unexpected launch phase"),
         ("reversed-round", "next review round"),
-        ("post-publication-retry", "unexpected launch phase"),
+        ("post-publication-retry", "not of the current review"),
         ("round-jump", "next review round"),
         ("observed-replan", "outside registered launch phases"),
     ],
@@ -162,12 +163,14 @@ def test_one_pr_lifecycle_refuses_observed_contradictions(packet, change, error)
         fix["phase"] = "REVIEW"
     elif change == "fix-before-review":
         launches[1:3] = [dict(fix, source=1, outcome="retry", published=None, judgment=None)]
+    elif change == "review-before-fix":
+        launches[2] = retry_review(launches[3])
     elif change == "reversed-round":
         launches[-1]["round"] = 1
     elif change == "post-publication-retry":
         launches.insert(3, dict(fix, outcome="retry", published=None, judgment=None))
     elif change == "round-jump":
-        launches[-1]["round"] = 20
+        launches[-1]["round"] = 3  # A round its ordinal could hold, but not the next one.
     elif change == "observed-replan":
         launches[1] = None
         launches[2]["phase"] = "REPLAN_REEXECUTE"
@@ -188,23 +191,39 @@ def test_clean_or_stale_review_cannot_authorize_fix(packet, stale, error):
         score(packet)
 
 
-@pytest.mark.parametrize("gap", [1, 3, 37])
-def test_gap_does_not_fill_rounds_or_allow_a_replacement_reset(packet, gap):
+@pytest.mark.parametrize(
+    ("gap", "error"),
+    [
+        (1, "round its ordinal cannot hold"),
+        (3, "not of the current review"),
+        (37, None),
+    ],
+)
+def test_gap_does_not_fill_rounds_or_allow_a_replacement_reset(packet, gap, error):
     run = packet["runs"][0]
     fix = run["launches"][2]
     suffix = [None] * gap
     if gap == 3:
+        # A retry of the FIX that already published: its source is superseded.
         suffix.append(dict(fix, outcome="retry", published=None, judgment=None))
     else:
         run["launches"][-1]["round"] = 20
         run["stop"]["round"] = 20
     run["launches"][3:3] = suffix
     run["stop"].update(review=len(run["launches"]), through=len(run["launches"]), wall_ms=None)
+    if error is not None:
+        # Round 20 cannot complete at ordinal 5, after the producer and 19 rounds.
+        with pytest.raises(EvidenceError, match=error):
+            score(packet)
+        return
     got = result(packet, "wrong-boundary", "baseline")
+    assert got["ledger"] == "unresolved: incomplete ledger"
+    assert got["missing_ordinals"] == list(range(4, 4 + gap))
     assert not got["launch_window_complete"]
     assert not got["review_record_complete"]
-    assert got["validated_success"] is None
-    assert got["known_findings"] == {"R1-F1": "confirmed", "R1-F2": "confirmed"}
+    assert got["validated_success"] is None and got["completed_rounds"] is None
+    # The retained round 1 review is not reported as known findings across the gap.
+    assert got["known_findings"] is None
 
 
 def test_missing_launch_is_not_a_conflict_with_later_changed_head(packet):
@@ -345,7 +364,8 @@ def test_missing_review_disposition_is_not_a_report_of_no_findings(packet):
     run = packet["runs"][3]
     run["launches"][1].update(outcome=None, comment=None, findings=None)
     got = result(packet, "clean-boundary", "treatment")
-    assert got["launch_window_complete"] and not got["lifecycle_complete"]
+    assert got["launch_window_complete"] and got["missing_ordinals"] == [2]
+    assert got["ledger"] == "unresolved: incomplete ledger"
     assert not got["review_record_complete"] and got["clean_negative_false_alarm"] is None
     assert got["validated_success"] is None
 
@@ -683,15 +703,17 @@ def test_partial_fix_is_a_first_stop_across_a_gap_before_it(packet):
         score(packet)
     treatment["stop"].update(head=fix["published"], tree=endpoint["tree"])
     report = score(packet)
-    got = report["pairs"][0]["runs"]["treatment"]
-    # The gap leaves the terminal outcome unproven, never contradicted.
+    pair = report["pairs"][0]
+    got = pair["runs"]["treatment"]
+    # The gap leaves the run unresolved: its terminal outcome unproven, never contradicted ...
+    assert pair["status"] == "incomplete_ledger" and got["missing_ordinals"] == [1]
     assert got["stop"] == "BLOCKED" and not got["terminal_bound"]
     assert got["certificate_issued"] is None and got["validated_success"] is None
-    # The unrelated gap does not erase the publication's own evidenced harm ...
-    assert got["fix_regressions"] == ["lost-data"] and got["known_harmful_fixes"] == 1
-    # ... while the pooled rate and the escape wait for the whole ledger.
+    # ... and no harm reported, though the publication and its source review are retained.
+    assert got["fix_regressions"] is None and got["known_harmful_fixes"] is None
     assert got["counts"]["harmful_fix_rate"] is None
     assert report["rates"]["harmful_fix_rate"]["treatment"]["point"] is None
+    # The safety report still lists the critical defect, unresolved.
     assert got["critical_escapes"] == {"lost-data": None}
     assert report["unresolved_critical_escapes"] == [["wrong-boundary", 0, "lost-data"]]
     treatment["stop"]["phase"] = "FAILED"
@@ -707,7 +729,7 @@ def test_partial_fix_is_a_first_stop_across_a_gap_before_it(packet):
 
 
 @pytest.mark.parametrize("missing", ["producer", "source review"])
-def test_an_unrelated_gap_keeps_a_published_fix_regression(packet, missing):
+def test_a_gap_leaves_a_published_fix_regression_unresolved(packet, missing):
     recorded(packet, "wrong-boundary")
     expected = score(deepcopy(packet))["pairs"][0]["runs"]["treatment"]
     assert expected["fix_regressions"] == ["lost-data"] and expected["known_harmful_fixes"] == 1
@@ -715,16 +737,202 @@ def test_an_unrelated_gap_keeps_a_published_fix_regression(packet, missing):
     treatment["launches"][0 if missing == "producer" else 1] = None
     report = score(packet)
     got = report["pairs"][0]["runs"]["treatment"]
-    assert not got["lifecycle_complete"] and got["certificate_issued"] is None
-    assert got["critical_escapes"] == {"lost-data": None}
+    assert got["ledger"] == "unresolved: incomplete ledger"
+    assert got["missing_ordinals"] == ([1] if missing == "producer" else [2])
+    assert got["certificate_issued"] is None
+    # The replay does not reason across the gap: even with the publication, its
+    # source review, its range and the endpoint's inventory retained, no harm
+    # is reported and the pooled rate has no observation.
+    assert got["fix_regressions"] is None and got["known_harmful_fixes"] is None
+    assert report["pair_status"] == {"incomplete_ledger": 1}
     assert report["rates"]["harmful_fix_rate"]["treatment"]["point"] is None
+    # The safety report still lists the critical defect, as unresolved.
+    assert got["critical_escapes"] == {"lost-data": None}
     assert report["new_critical_escapes"] == []
     assert report["unresolved_critical_escapes"] == [["wrong-boundary", 0, "lost-data"]]
-    # The publication, its retained source review, its exact range and the
-    # endpoint's inventory are its own evidence; only without the review that
-    # binds its revision does the harm stay unknown with the rest.
-    harm = ["lost-data"] if missing == "producer" else []
-    assert got["fix_regressions"] == harm and got["known_harmful_fixes"] == len(harm)
+
+
+def remove_from_ledger(run, gap):
+    """Remove one piece of a valid run's ledger; return the ordinals it leaves missing."""
+    launches = run["launches"]
+    if gap == "producer":
+        launches[0] = None
+        return [1]
+    if gap == "review":
+        launches[1] = None
+        return [2]
+    if gap == "disposition":
+        launches[1].update(outcome=None, comment=None, findings=None)
+        return [2]
+    if gap == "tail":
+        launches.pop()  # The stop's watermark still reserves its ordinal.
+        return [run["stop"]["through"]]
+    run["stop"] = None
+    return []
+
+
+@pytest.mark.parametrize("gap", ["producer", "review", "disposition", "tail", "stop"])
+@pytest.mark.parametrize("arm", ["baseline", "treatment"])
+@pytest.mark.parametrize("case_id", ["wrong-boundary", "clean-boundary"])
+def test_an_incomplete_ledger_is_unresolved_and_contributes_nothing(packet, case_id, arm, gap):
+    expected = score(deepcopy(packet))
+    copy_case(packet, case_id, "gapped")
+    run = next(run for run in packet["runs"] if (run["case"], run["arm"]) == ("gapped", arm))
+    missing = remove_from_ledger(run, gap)
+    report = score(packet)
+    pair = next(row for row in report["pairs"] if row["case"] == "gapped")
+    got = pair["runs"][arm]
+    assert pair["status"] == "incomplete_ledger"
+    assert report["pair_status"] == {"matched": 2, "incomplete_ledger": 1}
+    assert got["ledger"] == "unresolved: incomplete ledger"
+    assert got["missing_ordinals"] == missing
+    assert (got["stop"] is None) is (gap == "stop")
+    # Nothing in it is reported as a known finding, a false alarm or a harmful
+    # FIX, even where the evidence for one is retained ...
+    assert got["known_findings"] is None and got["clean_negative_false_alarm"] is None
+    assert got["fix_regressions"] is None and got["known_harmful_fixes"] is None
+    assert set(got["counts"].values()) == {None}
+    assert got["terminal_bound"] is False and got["validated_success"] is None
+    # ... and the pair enters no rate, bootstrap draw, cost or sample floor.
+    for key in (
+        "rates",
+        "cost_usd_per_validated_success",
+        "sample",
+        "matched_pairs",
+        "critical_escape_totals",
+        "rate_harm",
+        "decision",
+    ):
+        assert report[key] == expected[key], key
+    # The safety report still lists the copy's critical defect: unresolved where
+    # the treatment is gapped, and established by the complete treatment's own
+    # FIX regression where only the baseline is.
+    copied = [["gapped", 0, "lost-data"]] if case_id == "wrong-boundary" else []
+    gapped_treatment = copied if arm == "treatment" else []
+    assert report["unresolved_critical_escapes"] == gapped_treatment
+    assert sorted(report["new_critical_escapes"]) == sorted(
+        expected["new_critical_escapes"] + [e for e in copied if e not in gapped_treatment]
+    )
+
+
+def test_a_gap_reports_no_false_alarm_though_its_label_is_retained(packet):
+    expected = result(deepcopy(packet), "clean-boundary", "treatment")
+    assert expected["known_findings"] == {"R1-F1": "false"}
+    assert expected["clean_negative_false_alarm"] is True
+    packet["runs"][3]["launches"][0] = None  # Only the producer's slot is missing.
+    report = score(packet)
+    pair = next(row for row in report["pairs"] if row["case"] == "clean-boundary")
+    got = pair["runs"]["treatment"]
+    # The accepted review and its independent label are retained, but a complete
+    # ledger is a precondition for scoring: no known finding and no false alarm,
+    # and the pair enters no rate, so the pooled FPR has no observation.
+    assert pair["status"] == "incomplete_ledger" and got["missing_ordinals"] == [1]
+    assert got["known_findings"] is None and got["clean_negative_false_alarm"] is None
+    assert got["counts"]["false_positive_rate"] is None
+    fpr = report["rates"]["false_positive_rate"]
+    assert fpr["treatment"]["point"] is None and not fpr["usable"]
+
+
+def superseding_round(run):
+    """Producer, round 1, no-change FIX, round 2, a FIX that publishes, clean round 3."""
+    produce, first, fix, clean = run["launches"]
+    no_change = dict(fix, outcome="no_change", published=None, judgment=None)
+    second = dict(
+        first, round=2, comment=first["comment"] + "/2", findings={"complete": False, "items": []}
+    )
+    publishing = dict(fix, round=2, source=4)
+    run["launches"] = [produce, first, no_change, second, publishing, dict(clean, round=3)]
+    run["stop"].update(through=6, review=6, round=3, wall_ms=None)
+    return publishing
+
+
+@pytest.mark.parametrize("gap", [False, True])
+def test_a_superseded_review_is_no_fix_source_even_across_a_gap(packet, gap):
+    recorded(packet, "wrong-boundary")
+    treatment = packet["runs"][1]
+    harmful = superseding_round(treatment)
+    if gap:
+        treatment["launches"][0] = None  # Only the producer's slot is missing.
+    got = result(packet, "wrong-boundary", "treatment")
+    if gap:
+        # A complete ledger is a precondition for crediting the FIX's harm ...
+        assert got["ledger"] == "unresolved: incomplete ledger" and got["missing_ordinals"] == [1]
+        assert got["fix_regressions"] is None and got["known_harmful_fixes"] is None
+    else:
+        assert got["ledger"] == "complete" and got["completed_rounds"] == 3
+        assert got["fix_regressions"] == ["lost-data"] and got["known_harmful_fixes"] == 1
+    # ... and the retained no-change FIX and round 2 review between them
+    # supersede round 1 as the source of a later FIX, gap or not.
+    harmful.update(source=2, round=1)
+    with pytest.raises(EvidenceError, match="not of the current review"):
+        score(packet)
+
+
+@pytest.mark.parametrize(
+    ("record", "error"),
+    [
+        ("stop round fits", None),
+        ("stop round past its review ordinal", "round its ordinal cannot hold"),
+        ("FIX round past its source", "round its ordinal cannot hold"),
+        ("pre-PR stop before a publication", None),
+        ("pre-PR stop after a publication", "stop disagrees"),
+        ("pre-PR stop after a publication, complete", "stop disagrees"),
+        ("pre-PR stop naming a round", "pre-PR stop binding"),
+    ],
+)
+def test_a_record_its_ordinals_or_publication_cannot_hold_is_refused(packet, record, error):
+    run = packet["runs"][0]
+    produce, _, fix, second = run["launches"]
+    if record.startswith("stop round"):
+        run["launches"][3] = None  # The named review is missing.
+        round_ = 2 if record == "stop round fits" else 4
+        no_certificate(run, through=4, round_=round_, review=4, at=second)
+    elif record == "FIX round past its source":
+        run["launches"][1] = None  # The FIX's source review is missing.
+        fix["round"] = 2  # Round 2's review cannot be at ordinal 2.
+    else:
+        pre_launch_stop(run)
+        if record != "pre-PR stop after a publication, complete":
+            run["launches"] = [produce, None]
+            run["stop"]["through"] = 2
+        else:
+            run["launches"] = [produce]
+            run["stop"]["through"] = 1
+        if record in ("pre-PR stop before a publication", "pre-PR stop naming a round"):
+            produce["outcome"] = "retry"
+        if record == "pre-PR stop naming a round":
+            run["stop"].update(round=1, review=2)
+    if error is not None:
+        with pytest.raises(EvidenceError, match=error):
+            score(packet)
+        return
+    got = result(packet, "wrong-boundary", "baseline")
+    assert got["ledger"] == "unresolved: incomplete ledger"
+    assert got["missing_ordinals"] == [4 if record == "stop round fits" else 2]
+
+
+@pytest.mark.parametrize("missing", ["receipt", "receipt and a launch", "named review"])
+@pytest.mark.parametrize("policy", ["fixed", "other"])
+def test_a_certificate_presents_the_fixed_validation_policy(packet, missing, policy):
+    run = packet["runs"][0]
+    if missing == "named review":
+        run["launches"][3] = None
+    else:
+        run["launches"][3]["validation"] = None
+        if missing == "receipt and a launch":
+            run["launches"][2] = None
+    if policy == "other":
+        # Round 1's retained FULL receipt fixes the run's policy.
+        run["stop"]["proof"]["validation"]["policy"] = "d" * 64
+        with pytest.raises(EvidenceError, match="certificate validation binding"):
+            score(packet)
+        return
+    got = result(packet, "wrong-boundary", "baseline")
+    # Without the named review's receipt the certificate stays unproven.
+    assert got["certificate_issued"] is None and not got["terminal_bound"]
+    complete = missing == "receipt"
+    assert got["ledger"] == ("complete" if complete else "unresolved: incomplete ledger")
+    assert got["review_record_complete"] is complete
 
 
 @pytest.mark.parametrize("gap", [False, True])
@@ -765,18 +973,19 @@ def test_a_first_stop_enters_only_its_own_stop_phases(packet, first_stop, gap):
 
 
 @pytest.mark.parametrize(
-    "record",
+    ("record", "error"),
     [
-        "consistent",
-        "consistent next round",
-        "later completed round",
-        "named review missing",
-        "next round's launch",
-        "later fix of an earlier round",
-        "watermark revision",
+        ("consistent", None),
+        ("consistent next round", None),
+        ("later completed round", "stop disagrees"),
+        ("named review missing", "stop disagrees"),
+        ("next round's launch", "stop disagrees"),
+        # Round 2's retained review also supersedes the FIX's round 1 source.
+        ("later fix of an earlier round", "not of the current review"),
+        ("watermark revision", "stop disagrees"),
     ],
 )
-def test_a_retained_launch_contradicts_the_stop_across_a_gap(packet, record):
+def test_a_retained_launch_contradicts_the_stop_across_a_gap(packet, record, error):
     run = packet["runs"][0]
     first, fix, second = run["launches"][1:]
     second.update(outcome="needs_fix", findings={"complete": False, "items": []})
@@ -803,12 +1012,13 @@ def test_a_retained_launch_contradicts_the_stop_across_a_gap(packet, record):
         # The retained last launch, a published FIX, leaves its endpoint current.
         run["launches"][1:] = [None, first, dict(fix, source=3)]
         no_certificate(run, through=4, round_=1, review=3, at=first)
-    if record.startswith("consistent"):
+    if error is None:
         got = result(packet, "wrong-boundary", "baseline")
+        assert got["ledger"] == "unresolved: incomplete ledger"
         assert got["stop"] == "BLOCKED" and not got["terminal_bound"]
         assert got["certificate_issued"] is None
         return
-    with pytest.raises(EvidenceError, match="stop disagrees"):
+    with pytest.raises(EvidenceError, match=error):
         score(packet)
 
 

@@ -40,6 +40,9 @@ TERMINAL = {
 FIRST_STOP = "launch after the first stop"
 FIRST_STOP_PHASE = "stop phase its first stop cannot enter"
 STOP_BINDING = "stop disagrees with completed round or live revision"
+# Round r is reviewed after the producer's launch and each earlier round's
+# review, each at an ordinal of its own, so it needs an ordinal above r.
+ROUND_ORDINAL = "round its ordinal cannot hold"
 # Issuance is recorded as observed, apart from where the run stopped. The write
 # completing a clean round issues the certificate and enters READY_FOR_MERGE,
 # or BLOCKED when the validation configuration in force differs from the one
@@ -348,10 +351,16 @@ def check_stop_against_launches(slots, stop) -> None:
     completes after the named one, a REVIEW launch before it is of at most
     its round and one after it of the next, and a FIX follows the named round
     or precedes it as a FIX of an earlier one. The launch at the watermark,
-    when retained with a known disposition, leaves the stop's revision.
+    when retained with a known disposition, leaves the stop's revision. A
+    pre-PR stop binds no PR, so no retained launch published or bound one.
     """
     named, last = stop["review"], stop["round"]
     for position, row in enumerate(slots, 1):
+        if row is not None and stop["head"] is None:
+            require(
+                row["phase"] == "ANALYZE_EXECUTE" and row["outcome"] != "published", STOP_BINDING
+            )
+            continue
         if row is None or position == named:
             continue
         after = named is None or position > named
@@ -452,6 +461,7 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
             check_binding(case, graph, run, row)
             require(type(row["round"]) is int and row["round"] > 0, "launch round")
         if phase == "REVIEW":
+            require(row["round"] < ordinal, ROUND_ORDINAL)
             policy = validation(row["validation"])
             require(
                 fixed_policy is None or policy is None or policy == fixed_policy,
@@ -505,6 +515,23 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
                     and (origin["round"], origin["head"]) == (row["round"], row["head"]),
                     "FIX requires an accepted needs-fix review of its revision",
                 )
+            # Its source review, of the same round, holds an ordinal of its own.
+            require(row["source"] > row["round"], ROUND_ORDINAL)
+            # Only retries of this FIX lie between its source review and it: a
+            # retained review or a completed FIX in between supersedes the
+            # source, whatever else is missing.
+            require(
+                all(
+                    between is None
+                    or (
+                        between["phase"] == "FIX"
+                        and between["source"] == row["source"]
+                        and between["outcome"] in ("retry", None)
+                    )
+                    for between in slots[row["source"] : ordinal - 1]
+                ),
+                "FIX is not of the current review",
+            )
             new = row["published"]
             require((new is not None) == (outcome in ("published", "partial")), "FIX publication")
             # A FIX may publish several commits; each keeps its own place in
@@ -516,31 +543,6 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
                 object_fields(judgment, "status source")
                 require(judgment["status"] in ("safe", "harmful", "unknown"), "FIX judgment")
                 eligible = source(judgment["source"], case, run)
-            # A retained publication whose source review is retained too, and
-            # bound to it above, carries its own range and endpoint inventory:
-            # its harm stays known across an unrelated gap elsewhere, while the
-            # pooled rate and terminal proof still wait for the whole ledger.
-            if origin is not None and new is not None:
-                endpoint = case["snapshots"][new]
-                # An eligible defect still present at the endpoint and introduced
-                # by any commit of the published range is this FIX's regression.
-                regressions = {
-                    key
-                    for key in endpoint["present"]
-                    if source(endpoint["source"], case, run)
-                    and case["defects"][key]["introduced"] in commits
-                    and source(case["defects"][key]["source"], case, run)
-                }
-                fix_regressions.update(regressions)
-                fixes.append(
-                    True
-                    if regressions
-                    else (
-                        None
-                        if judgment is None or not eligible or judgment["status"] == "unknown"
-                        else judgment["status"] == "harmful"
-                    )
-                )
 
         # Never invent transitions across a missing ordinal or disposition. Local
         # shape/binding checks above still apply to the suffix.
@@ -580,6 +582,28 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
                     (row["source"], row["round"], row["head"]) == (latest, completed, head),
                     "FIX is not of the current review",
                 )
+                if new is not None:
+                    endpoint = case["snapshots"][new]
+                    # An eligible defect still present at the endpoint and
+                    # introduced by any commit of the published range is this
+                    # FIX's regression. Only a complete ledger reports it.
+                    regressions = {
+                        key
+                        for key in endpoint["present"]
+                        if source(endpoint["source"], case, run)
+                        and case["defects"][key]["introduced"] in commits
+                        and source(case["defects"][key]["source"], case, run)
+                    }
+                    fix_regressions.update(regressions)
+                    fixes.append(
+                        True
+                        if regressions
+                        else (
+                            None
+                            if judgment is None or not eligible or judgment["status"] == "unknown"
+                            else judgment["status"] == "harmful"
+                        )
+                    )
                 if outcome in ("no_change", "published"):
                     head, expected = row["published"] or head, "REVIEW"
                 elif outcome == "partial":
@@ -615,17 +639,28 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
             and (ordinal is None or (type(ordinal) is int and 0 < ordinal <= stop["through"])),
             "stop review ordinal",
         )
+        require(ordinal is None or stop["round"] < ordinal, ROUND_ORDINAL)
         wall = stop["wall_ms"]
         require(wall is None or (type(wall) is int and wall >= known_ms), "wall time")
         require(nonempty(stop["source"]), "controller stop provenance")
         if stop["head"] is not None:
             check_binding(case, graph, run, stop)
         else:
-            require(all(stop[field] is None for field in BINDING.split()), "pre-PR stop binding")
+            # Before a PR exists no round has completed.
+            require(
+                all(stop[field] is None for field in BINDING.split()) and stop["round"] == 0,
+                "pre-PR stop binding",
+            )
         if issued:
             proof = stop["proof"]
             object_fields(proof, "validation comment receipt")
-            validation(proof["validation"])
+            # The certificate presents the run's one validation set and policy,
+            # which every retained receipt fixes, whichever review it names.
+            certified_policy = validation(proof["validation"])
+            require(
+                fixed_policy is None or certified_policy in (None, fixed_policy),
+                "certificate validation binding",
+            )
             require(nonempty(proof["receipt"]), "certificate receipt identity")
             require(
                 proof["validation"] is not None
@@ -732,6 +767,20 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
     launch_complete = (
         stop is not None and stop["through"] == len(slots) and all(row is not None for row in slots)
     )
+    # A complete ledger is a precondition for scoring: every ordinal up to the
+    # stop's watermark retains its launch and disposition, and the stop is
+    # retained. A gap leaves the run unresolved, contributing to no metric and
+    # reporting no finding, false alarm or harmful FIX, even where part of the
+    # evidence for one is retained: the replay does not reason across a gap.
+    window = stop["through"] if stop is not None else len(slots)
+    missing = [
+        position
+        for position in range(1, window + 1)
+        if position > len(slots)
+        or slots[position - 1] is None
+        or slots[position - 1]["outcome"] is None
+    ]
+    resolved = stop is not None and not missing
     # Finding coverage needs the stop's launch window reconciled with the
     # ledger and every accepted payload complete; proof of issuance is a
     # separate question and an unknown certificate leaves coverage intact.
@@ -787,10 +836,11 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
     )
     alarm = True if counts["false"] else False if detail and not unknown else None
     negative = case["clean_negative"] and start_evidenced(case)
-    return {
+    report = {
         "exclusion": run["exclusion"],
+        "ledger": "complete" if resolved else "unresolved: incomplete ledger",
+        "missing_ordinals": missing,
         "launch_window_complete": launch_complete,
-        "lifecycle_complete": launch_complete and ledger_complete,
         "review_record_complete": complete,
         "starting_review_accepted": starting_accepted,
         "starting_validation": start_validation,
@@ -806,7 +856,7 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
         "clean_negative_false_alarm": alarm if negative else None,
         "launches_observed": dict(known_phases),
         "fix_launches": known_phases["FIX"] if launch_complete else None,
-        "completed_rounds": completed if launch_complete and ledger_complete else None,
+        "completed_rounds": completed if resolved else None,
         "known_launch_ms": known_ms,
         "launch_ms": known_ms if launch_complete and time_complete else None,
         # The stop observation captures creation-to-stop time on its own clock,
@@ -823,9 +873,7 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
             "false_positive_rate": (int(alarm is True), int(alarm is None), 1)
             if negative
             else (0, 0, 0),
-            "harmful_fix_rate": (fixes.count(True), fixes.count(None), len(fixes))
-            if launch_complete and ledger_complete
-            else None,
+            "harmful_fix_rate": (fixes.count(True), fixes.count(None), len(fixes)),
             "duplicate_ratio": (
                 counts["confirmed"] - len(detected),
                 unknown,
@@ -835,6 +883,17 @@ def replay(case, graph, run, *, synthetic: bool) -> dict:
             else None,
         },
     }
+    if not resolved:
+        # An unresolved run is scored nowhere: only the safety report reads it,
+        # through its critical escapes, which a gap leaves unknown, not removed.
+        report.update(
+            fix_regressions=None,
+            known_findings=None,
+            known_harmful_fixes=None,
+            clean_negative_false_alarm=None,
+            counts=dict.fromkeys(report["counts"]),
+        )
+    return report
 
 
 def total_usage(values, complete, synthetic):
@@ -968,7 +1027,7 @@ def score(packet) -> dict:
         b, t = (arms.get(arm) for arm in ARMS)
         if t:
             for key, escaped in t["critical_escapes"].items():
-                fix_introduced = key in t["fix_regressions"]
+                fix_introduced = key in (t["fix_regressions"] or ())
                 shared = key in starting_inventory(cases[case_id])
                 comparable_baseline = (
                     b
@@ -989,6 +1048,11 @@ def score(packet) -> dict:
             status = "excluded"
         elif not b or not t:
             status = "missing"
+        elif b["ledger"] != "complete" or t["ledger"] != "complete":
+            # Neither arm of the pair enters a rate, cost, bootstrap draw or
+            # sample floor; like a missing or incomparable pair, it keeps the
+            # decision from relying on complete coverage.
+            status = "incomplete_ledger"
         elif b["starting_validation"] is None or t["starting_validation"] is None:
             status = "validation_unknown"
         elif b["starting_validation"] != t["starting_validation"]:
