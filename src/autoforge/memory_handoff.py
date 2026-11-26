@@ -101,8 +101,10 @@ UNSUPPORTED_PHASES: dict[Phase, str] = {
 # The most entries one result's ``memory`` list may hold; each one past it is
 # refused and counted, never kept (D9.6).
 MAX_PROPOSALS = 8
-# How many commits the walk can follow (:func:`local_ancestors`). A reached
-# base needs authentication even if there is no slot left to follow it.
+# How many object IDs the walk can dequeue, one slot each, whether or not it
+# can read them (:func:`local_ancestors`). A reached base needs
+# authentication, which spends no slot, even if there is no slot left to
+# follow it.
 # An exact retained validation record can prove its base without the walk.
 MAX_ANCESTRY_COMMITS = 64
 
@@ -156,11 +158,13 @@ class LaunchProjection:
     ``projection_ms`` everything Memory adds before the launch, the
     ledger's reconstruction, the candidate's read and the ancestry walk
     included (R3-F1, R4-F4), and ``ancestry_reads`` counts the walk slots
-    :func:`local_ancestors` spent, one per commit whose parents it
-    followed, at most its ``max_commits``. It is not the number of commits
-    read: authenticating a base the walk reaches reads a commit without
-    spending a slot, and a slot can reuse a commit already read (the
-    input's own read, or a reached base's).
+    :func:`local_ancestors` spent, one per object ID it dequeued, at most
+    its ``max_commits``. The slot is charged before the cache or the reader
+    is consulted, so a missing or unreadable object spends one as a commit
+    whose parents are followed does. It is not the number of commits read:
+    authenticating a base the walk reaches reads a commit without spending
+    a slot, and a slot can reuse a commit already read (the input's own
+    read, or a reached base's).
     """
 
     request: ProjectionRequest
@@ -249,11 +253,14 @@ def local_ancestors(
     Returns them in ``bases``' order, with how many breadth-first walk
     slots were spent. ``read_parents`` must authenticate a commit from its
     exact local bytes, return None for a missing object, and never fetch.
-    A parent link names a possible base, not a proof: the same reader
-    authenticates that endpoint before it counts. This uses no walk slot
-    unless the walk goes on to follow its parents, so the maximum depth
-    remains ``max_commits``. Missing or unreadable endpoints, or an
-    exhausted reader budget, can still leave a base at that depth unproved.
+    Each object ID the walk dequeues spends one slot, charged before the
+    cache or the reader is consulted, so a missing or unreadable object
+    spends one too. A parent link names a possible base, not a proof: the
+    same reader authenticates that endpoint before it counts. That spends
+    no slot (the endpoint spends one only if the walk later dequeues it),
+    so the maximum depth remains ``max_commits``. Missing or unreadable
+    endpoints, or an exhausted reader budget, can still leave a base at
+    that depth unproved.
     A missing commit ends its path; a read error ends the walk, preserving
     the proofs already made.
     """

@@ -853,12 +853,14 @@ def test_the_ancestry_walk_proves_a_base_it_reaches_and_no_other():
         4,
     )
     # A commit the store does not hold ends its path; the other parent still proves.
+    # Its dequeue spends a slot all the same: C1, the missing C2, then 7 (R3-F1).
     merge = {C1: (C2, sha_of(7)), sha_of(7): (BASE,), BASE: ()}
     assert local_ancestors(C1, [BASE], parents_from(merge)) == ((BASE,), 3)
     # A base that is no ancestor is never proved, whatever is read.
     commits, graph = chain(4)
     assert local_ancestors(commits[0], [BASE], parents_from(graph)) == ((), 4)
     # A read that fails ends the walk; what was reached before it stays proved.
+    # The failed read's slot counts: C1, C2 (authenticated, no slot, then dequeued), 7.
     failing = {C1: (C2, sha_of(7)), C2: (), sha_of(7): GitTransportError("cannot read")}
     assert local_ancestors(C1, [C2, BASE], parents_from(failing)) == ((C2,), 3)
 

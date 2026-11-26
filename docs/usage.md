@@ -2628,9 +2628,12 @@ shown in `request.json`'s `metadata.memory`: the revision and digests, the
 counts, the file's size and its SHA-256, the commit the launch started
 from (`input`, `null` when it could not be read: never the base in its
 place), how many of its 64 slots the ancestry walk spent
-(`ancestry_reads`, one per commit whose parents it followed; not the
-number of commits read, since reading a reached base spends no slot and a
-slot can reuse a commit already read, the candidate's or a base's), and
+(`ancestry_reads`, one per object id the walk takes from its queue,
+charged before anything is read for it, so an object the store does not
+hold or cannot read spends a slot as a commit whose parents are followed
+does; not the number of commits read, since authenticating a base the
+walk reaches reads it without spending a slot, and a slot can reuse a
+commit already read, the candidate's or a base's), and
 how long Memory's preparation took, the ledger's reconstruction from the
 state file, the candidate's read, the walk and the render together
 (`projection_ms`, the per-launch latency the evaluation reads), with the
