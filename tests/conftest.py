@@ -1784,6 +1784,14 @@ def git_out(*args: str) -> str:
     return res.stdout.strip()
 
 
+@pytest.fixture
+def memory_commit_read_headroom(monkeypatch):
+    """Functional and CPU tests must not race the production wall-clock limit."""
+    from autoforge import git_transport
+
+    monkeypatch.setattr(git_transport, "MEMORY_COMMIT_READ_SECONDS", 60.0)
+
+
 def rewrite_loose_object(objects: Path, oid: str, kind: str, content: bytes) -> None:
     """Overwrite the loose object file of ``oid`` in ``objects`` with ``content``, id kept.
 

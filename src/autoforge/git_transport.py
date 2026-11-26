@@ -58,7 +58,7 @@ lock (L1, ADR 0008 D12.1), taken inside :meth:`GitTransport.fetch` itself
 from the factory every transport is built with, so that no caller can miss
 it; a push writes nothing to the shared store and takes none.
 
-Every process runs through the executor (``runner``); this module has no
+Every process runs through the one-shot or duplex executor; this module has no
 workflow semantics beyond the rules above, and it never talks to the GitHub
 API itself: GitHub's ancestry answers arrive through ``in_base_history``,
 which the engine binds to a typed read of the GitHub client.
@@ -81,6 +81,7 @@ from pathlib import Path
 
 from .errors import ExecutionError, GitLockTimeout, GitTransportError, LockError
 from .executor import ExecutionRequest, ExecutionResult, execute
+from .executor_duplex import DuplexChild, DuplexRequest, StdoutMode, start_duplex
 from .redaction import redact
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
@@ -95,6 +96,12 @@ MAX_RANGE_COMMITS = 1000
 # A network operation may move a large pack; a local object read is small.
 NETWORK_TIMEOUT_SECONDS = 600
 LOCAL_TIMEOUT_SECONDS = 120
+# Memory's launch input and walk share these limits. The separate validation
+# and publication readers still use the one-shot per-read limits.
+MEMORY_COMMIT_READ_SECONDS = 0.75
+MEMORY_COMMIT_BYTES = 16 * 1024 * 1024
+_MAX_COMMIT_HEADER_BYTES = 256 * 1024
+_MAX_BATCH_HEADER_BYTES = 128
 
 # Hooks and the file-system monitor are off at command-line precedence for
 # every controller git process (D7.3); replacement objects and the
@@ -690,6 +697,32 @@ class GitTransport:
         _object_format(sha)
         return self._read_once(sha)
 
+    @contextmanager
+    def local_commit_parents(self, head: str) -> Iterator[Callable[[str], tuple[str, ...] | None]]:
+        """One bounded, no-fetch reader of authenticated local parent links.
+
+        For the launch input and its ancestry only. The input id fixes the
+        session's object format. Missing commits return None; other failures
+        end the session, with no fallback to separate processes.
+        """
+        object_format = _object_format(head)
+        with self._git_dir(object_format) as git_dir:
+            req = self._request(git_dir, ["cat-file", "--batch-command"], gh_path=None)
+            try:
+                with start_duplex(
+                    DuplexRequest(
+                        command=req.command,
+                        cwd=req.cwd,
+                        env=req.env,
+                        env_allowlist=req.env_allowlist,
+                        stdout_mode=StdoutMode.PULL,
+                        max_runtime_seconds=MEMORY_COMMIT_READ_SECONDS,
+                    )
+                ) as child:
+                    yield _LocalCommitParents(child, object_format).read
+            except ExecutionError as exc:
+                raise GitTransportError(f"local commit reader: {redact(str(exc))}") from exc
+
     def read_commit(self, sha: str) -> CommitRecord:
         """Read ``sha`` as its own bytes: re-hashed, parsed, never substituted.
 
@@ -864,6 +897,90 @@ class GitTransport:
         return result(outcome, detail)
 
 
+class _LocalCommitParents:
+    """The bounded Git frame reader, with no Git protocol in the executor."""
+
+    def __init__(self, child: DuplexChild, object_format: str) -> None:
+        self._child = child
+        self._format = object_format
+        self._remaining = MEMORY_COMMIT_BYTES
+        self._failed = False
+
+    def read(self, sha: str) -> tuple[str, ...] | None:
+        if self._failed:
+            raise GitTransportError("local commit reader has already failed")
+        try:
+            return self._read(sha)
+        except (ExecutionError, GitTransportError) as exc:
+            self._failed = True
+            # Don't wait for a child whose stdout we have chosen not to read.
+            self._child.stop()
+            if isinstance(exc, ExecutionError):
+                raise GitTransportError(f"reading commit {sha}: {redact(str(exc))}") from exc
+            raise
+
+    def _read(self, sha: str) -> tuple[str, ...] | None:
+        if _object_format(sha) != self._format:
+            raise GitTransportError("object id does not match the local reader's format")
+        oid = sha.encode("ascii")
+        self._child.send_line(b"info " + oid)
+        header = self._info_reply()
+        if header == oid + b" missing\n":
+            return None
+        parts = header[:-1].split(b" ")
+        if len(parts) != 3 or parts[0] != oid or not parts[2].isdigit():
+            raise GitTransportError(f"unexpected metadata reply reading commit {sha}")
+        if parts[1] != b"commit":
+            raise GitTransportError(f"object {sha} is not a commit")
+        size = int(parts[2])
+        if size > self._remaining:
+            raise GitTransportError(
+                f"commit {sha} exceeds the local reader's remaining byte budget"
+            )
+        self._remaining -= size
+
+        self._child.send_line(b"contents " + oid)
+        if self._exact(len(header)) != header:
+            raise GitTransportError(f"contents header changed reading commit {sha}")
+        raw = self._exact(size)
+        if self._exact(1) != b"\n":
+            raise GitTransportError(f"invalid contents terminator reading commit {sha}")
+        if _hash_commit(raw, self._format) != sha:
+            raise GitTransportError(f"commit {sha}: the stored bytes do not hash to its id")
+
+        end = raw.find(b"\n\n", 0, _MAX_COMMIT_HEADER_BYTES + 2)
+        if end < 0:
+            if len(raw) > _MAX_COMMIT_HEADER_BYTES:
+                raise GitTransportError(f"commit {sha} exceeds the local reader's header bound")
+            end = len(raw)
+        _, parents = _commit_links(sha, raw[:end])
+        return parents
+
+    def _info_reply(self) -> bytes:
+        # Only one reply can be pending: info never carries an object body.
+        # The fixed limit bounds pipe reads even if the child sends no LF.
+        data = bytearray()
+        while len(data) < _MAX_BATCH_HEADER_BYTES:
+            chunk = self._child.read_stdout(_MAX_BATCH_HEADER_BYTES - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+            if b"\n" in chunk:
+                if data.find(b"\n") == len(data) - 1:
+                    return bytes(data)
+                break
+        raise GitTransportError("invalid or incomplete local commit metadata reply")
+
+    def _exact(self, size: int) -> bytes:
+        data = bytearray()
+        while len(data) < size:
+            chunk = self._child.read_stdout(size - len(data))
+            if not chunk:
+                raise GitTransportError("incomplete local commit contents reply")
+            data.extend(chunk)
+        return bytes(data)
+
+
 def _private_config(object_format: str) -> str:
     """The whole configuration of a private git directory."""
     lines = [
@@ -887,7 +1004,9 @@ def _private_config(object_format: str) -> str:
 def _hash_commit(raw: bytes, object_format: str) -> str:
     """The object id of a commit with content ``raw``."""
     algorithm = hashlib.sha256 if object_format == "sha256" else hashlib.sha1
-    return algorithm(b"commit %d\0" % len(raw) + raw).hexdigest()
+    digest = algorithm(b"commit %d\0" % len(raw))
+    digest.update(raw)
+    return digest.hexdigest()
 
 
 def _lossy(sha: str) -> str:
@@ -898,14 +1017,22 @@ def _lossy(sha: str) -> str:
 
 
 def _parse_commit(sha: str, raw: bytes) -> CommitRecord:
-    """Parents and message from authenticated commit bytes, exactly as git reads them.
+    """Parents and message from authenticated commit bytes."""
+    header, _, message = raw.partition(b"\n\n")
+    tree, parents = _commit_links(sha, header)
+    return CommitRecord(
+        sha=sha, parents=parents, message=message.decode("utf-8", errors="replace"), tree=tree
+    )
+
+
+def _commit_links(sha: str, header: bytes) -> tuple[str, tuple[str, ...]]:
+    """Tree and parent links from authenticated commit headers, as git reads them.
 
     Git takes the parents only from the ``parent`` lines directly after the
     ``tree`` line; a ``parent`` header anywhere else is ignored by git and
     GitHub, so it is refused here rather than believed (believing it could
     prove an ancestry no one else sees).
     """
-    header, _, message = raw.partition(b"\n\n")
     lines = header.split(b"\n")
     width = len(sha)
     if not lines[0].startswith(b"tree ") or len(lines[0]) != 5 + width:
@@ -927,12 +1054,7 @@ def _parse_commit(sha: str, raw: bytes) -> CommitRecord:
         index += 1
     if any(line.startswith(b"parent ") for line in lines[index:]):
         raise GitTransportError(f"commit {sha} has a parent header out of place; it is not used")
-    return CommitRecord(
-        sha=sha,
-        parents=tuple(parents),
-        message=message.decode("utf-8", errors="replace"),
-        tree=tree,
-    )
+    return tree, tuple(parents)
 
 
 _PORCELAIN_REJECTED = "[rejected]"

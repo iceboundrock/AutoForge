@@ -93,6 +93,33 @@ def _records_until_eof(chunks: list[bytes], delay: float = 0.0, **kw) -> list:
     return got
 
 
+def test_pull_stdout_rejects_an_idle_timeout_before_spawning(monkeypatch):
+    def spawn(*args, **kwargs):
+        pytest.fail("invalid request reached spawn")
+
+    monkeypatch.setattr(executor_duplex, "_spawn", spawn)
+    with pytest.raises(ExecutionError, match="pull-mode stdout.*idle timeout"):
+        start_duplex(
+            _writer([b"pending reply"], stdout_mode=StdoutMode.PULL, idle_timeout_seconds=0.5)
+        )
+
+
+def test_pull_stdout_leaves_framing_to_the_caller_and_does_not_read_ahead():
+    payload = b"\xff\r\n\x00ok"
+    with start_duplex(_writer([payload], stdout_mode=StdoutMode.PULL)) as child:
+        assert child.read_stdout(1) == b"\xff"
+        with pytest.raises(ExecutionError, match="not framed"):
+            child.read_line()
+        # The same pipe still holds the rest, not a framer or capture buffer.
+        child.close_stdin()
+        remaining = bytearray()
+        while chunk := child.read_stdout(2):
+            assert len(chunk) <= 2
+            remaining.extend(chunk)
+        assert remaining == payload[1:]
+        assert child.finish().exit_code == 0
+
+
 def _kill_quietly(pid: int) -> None:
     try:
         os.kill(pid, signal.SIGKILL)

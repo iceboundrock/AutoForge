@@ -1723,15 +1723,33 @@ retained validation record of the run names, that record proves its base,
 since the producer gate validates only a candidate whose range from that
 base the controller proved; so a retry on a failed commit is shown its
 failure however long its history (R4-F2). Any other base is proved by a
-breadth-first walk from the candidate through commits read as their own
-bytes and re-hashed, at most 64 of them; a base neither proves is not
-proved and its record is omitted. `HEAD` is read through the admin dir the
+breadth-first walk from the candidate with at most 64 traversal slots. The
+walk authenticates a reached base before counting it, even if there are no
+slots left to follow its parents. Depth 64 is still reachable, but a missing
+or unreadable endpoint, or an exhausted reader budget, leaves the base
+unproved and its record omitted. `HEAD` is read through the admin dir the
 registry binds and the common dir, never through the worktree's `.git`
 file, which an earlier launch of the step can rewrite before a correction
 or a retry, and only its id is read there: the commit is read from the
 shared store's objects through the controller's private git directory,
 which names no promisor remote, so no git version fetches a commit the
-store lacks (R4-F1). A binding the registry does not confirm, a `HEAD`
+store lacks (R4-F1).
+
+**Local read cost (#541).** Previously each commit cost a process with its
+own 120-second timeout and 16 MiB capture cap; there was no shared byte
+budget or session deadline. Now one private `git cat-file --batch-command`
+child serves both the input and the walk. It checks type and size before
+requesting a body and re-hashes exact bytes before using any parent link.
+It shares a 16 MiB body budget and a 750 ms runtime limit before executor
+cleanup; the controller parses at most 256 KiB of commit headers per object.
+A read error ends the walk without retrying; bases already proved remain
+proved. If the command is unavailable or the input cannot be authenticated,
+the launch input is unknown. The run log's `projection_ms` includes
+closing the child and removing its private directory, not just the reads.
+The evaluation ceiling and the separate validation and publication readers
+are unchanged.
+
+A binding the registry does not confirm, a `HEAD`
 naming no commit the store holds, and a launch that seeds, bind no
 candidate. The prompt names the file in a section rendered only while the
 run keeps Memory. The prompt label moves to `v19`, an evaluation amendment, as D19

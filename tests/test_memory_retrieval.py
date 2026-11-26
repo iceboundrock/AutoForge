@@ -3,6 +3,7 @@
 import math
 import sqlite3
 import threading
+from contextlib import nullcontext
 from dataclasses import replace
 
 import pytest
@@ -166,7 +167,7 @@ def test_withdrawn_text_and_real_projection_ancestry_are_not_in_catalog(hidden_t
             STEP,
             base=BASE,
             read_head=lambda: SHA,
-            read_parents=lambda c: (base,) if c == SHA else (),
+            open_parents=lambda _: nullcontext(lambda c: (base,) if c == SHA else ()),
             validation_records=(),
         )
         reader = MemoryRetriever(
