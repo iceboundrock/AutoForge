@@ -1,0 +1,215 @@
+{
+  "version": 1,
+  "mode": "synthetic",
+  "cases": {
+    "wrong-boundary": {
+      "base_ref": "main",
+      "merge_base": "1000000000000000000000000000000000000000",
+      "base_ancestors": [],
+      "start": "2000000000000000000000000000000000000000",
+      "cutoff": "2026-11-20",
+      "seeds": [0],
+      "clean_negative": false,
+      "defects": {
+        "off-by-one": {
+          "severity": "high", "class": "correctness",
+          "introduced": "2000000000000000000000000000000000000000",
+          "source": {"adjudicator": "oracle-team", "artifact": "boundary-case", "discovered": "2026-11-19"}
+        },
+        "lost-data": {
+          "severity": "critical", "class": "reliability",
+          "introduced": "4000000000000000000000000000000000000000",
+          "source": {"adjudicator": "oracle-team", "artifact": "retention-case", "discovered": "2026-11-19"}
+        }
+      },
+      "snapshots": {
+        "1000000000000000000000000000000000000000": {
+          "parents": [], "tree": "1000000000000000000000000000000000000001",
+          "present": [], "oracle": "pass",
+          "source": {"adjudicator": "oracle-team", "artifact": "base-probe", "discovered": "2026-11-19"}
+        },
+        "2000000000000000000000000000000000000000": {
+          "parents": ["1000000000000000000000000000000000000000"], "tree": "2000000000000000000000000000000000000001",
+          "present": ["off-by-one"], "oracle": "fail",
+          "source": {"adjudicator": "oracle-team", "artifact": "starting-probe", "discovered": "2026-11-19"}
+        },
+        "3000000000000000000000000000000000000000": {
+          "parents": ["2000000000000000000000000000000000000000"], "tree": "3000000000000000000000000000000000000001",
+          "present": [], "oracle": "pass",
+          "source": {"adjudicator": "oracle-team", "artifact": "repaired-probe", "discovered": "2026-11-19"}
+        },
+        "4000000000000000000000000000000000000000": {
+          "parents": ["2000000000000000000000000000000000000000"], "tree": "4000000000000000000000000000000000000001",
+          "present": ["lost-data"], "oracle": "fail",
+          "source": {"adjudicator": "oracle-team", "artifact": "retention-probe", "discovered": "2026-11-19"}
+        }
+      }
+    },
+    "clean-boundary": {
+      "base_ref": "main",
+      "merge_base": "1000000000000000000000000000000000000000",
+      "base_ancestors": [],
+      "start": "5000000000000000000000000000000000000000",
+      "cutoff": "2026-11-20",
+      "seeds": [0],
+      "clean_negative": true,
+      "defects": {},
+      "snapshots": {
+        "1000000000000000000000000000000000000000": {
+          "parents": [], "tree": "1000000000000000000000000000000000000001",
+          "present": [], "oracle": "pass",
+          "source": {"adjudicator": "oracle-team", "artifact": "base-probe", "discovered": "2026-11-19"}
+        },
+        "5000000000000000000000000000000000000000": {
+          "parents": ["1000000000000000000000000000000000000000"], "tree": "5000000000000000000000000000000000000001",
+          "present": [], "oracle": "pass",
+          "source": {"adjudicator": "oracle-team", "artifact": "negative-probe", "discovered": "2026-11-19"}
+        }
+      }
+    }
+  },
+  "runs": [
+    {
+      "case": "wrong-boundary", "seed": 0, "arm": "baseline", "pr": "fixture/pr/1",
+      "actors": ["producer-1", "reviewer-1", "fixer-1"], "exclusion": null, "creation": "fixture/start/1",
+      "launches": [
+        {"phase": "ANALYZE_EXECUTE", "outcome": "published", "elapsed_ms": 100, "cost_microusd": 1000000, "context_tokens": 100},
+        {
+          "phase": "REVIEW", "round": 1, "outcome": "needs_fix", "elapsed_ms": 200, "cost_microusd": 500000, "context_tokens": 60,
+          "pr": "fixture/pr/1", "base_ref": "main", "merge_base": "1000000000000000000000000000000000000000",
+          "head": "2000000000000000000000000000000000000000", "tree": "2000000000000000000000000000000000000001",
+          "transition": null, "next_head": null, "comment": "fixture/comment/1",
+          "validation": {"scope": "full", "set": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "result": "pass"},
+          "findings": {"complete": true, "items": [
+            {"id": "R1-F1", "classification": "blocked", "label": {"status": "confirmed", "defect": "off-by-one", "source": {"adjudicator": "oracle-team", "artifact": "boundary-case", "discovered": "2026-11-19"}}},
+            {"id": "R1-F2", "classification": "non-blocked", "label": {"status": "confirmed", "defect": "off-by-one", "source": {"adjudicator": "oracle-team", "artifact": "boundary-case", "discovered": "2026-11-19"}}}
+          ]}
+        },
+        {
+          "phase": "FIX", "round": 1, "outcome": "published", "elapsed_ms": 300, "cost_microusd": 1000000, "context_tokens": 80,
+          "pr": "fixture/pr/1", "base_ref": "main", "merge_base": "1000000000000000000000000000000000000000",
+          "head": "2000000000000000000000000000000000000000", "tree": "2000000000000000000000000000000000000001",
+          "source": 2, "published": "3000000000000000000000000000000000000000",
+          "judgment": {"status": "safe", "source": {"adjudicator": "oracle-team", "artifact": "repaired-probe", "discovered": "2026-11-19"}}
+        },
+        {
+          "phase": "REVIEW", "round": 2, "outcome": "clean", "elapsed_ms": 200, "cost_microusd": 500000, "context_tokens": 60,
+          "pr": "fixture/pr/1", "base_ref": "main", "merge_base": "1000000000000000000000000000000000000000",
+          "head": "3000000000000000000000000000000000000000", "tree": "3000000000000000000000000000000000000001",
+          "transition": null, "next_head": null, "comment": "fixture/comment/2",
+          "validation": {"scope": "full", "set": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "result": "pass"},
+          "findings": {"complete": true, "items": []}
+        }
+      ],
+      "stop": {
+        "phase": "READY_FOR_MERGE", "through": 4, "round": 2, "review": 4, "issuance": "issued",
+        "pr": "fixture/pr/1", "base_ref": "main", "merge_base": "1000000000000000000000000000000000000000",
+        "head": "3000000000000000000000000000000000000000", "tree": "3000000000000000000000000000000000000001",
+        "proof": {"receipt": "fixture/certificate/1", "comment": "fixture/comment/2",
+          "validation": {"scope": "full", "set": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "result": "pass"}},
+        "wall_ms": 850, "source": "fixture/stop/1"
+      }
+    },
+    {
+      "case": "wrong-boundary", "seed": 0, "arm": "treatment", "pr": "fixture/pr/2",
+      "actors": ["producer-2", "reviewer-2", "fixer-2"], "exclusion": null, "creation": "fixture/start/2",
+      "launches": [
+        {"phase": "ANALYZE_EXECUTE", "outcome": "published", "elapsed_ms": 100, "cost_microusd": 1000000, "context_tokens": 100},
+        {
+          "phase": "REVIEW", "round": 1, "outcome": "needs_fix", "elapsed_ms": 200, "cost_microusd": 500000, "context_tokens": 60,
+          "pr": "fixture/pr/2", "base_ref": "main", "merge_base": "1000000000000000000000000000000000000000",
+          "head": "2000000000000000000000000000000000000000", "tree": "2000000000000000000000000000000000000001",
+          "transition": null, "next_head": null, "comment": "fixture/comment/3",
+          "validation": {"scope": "full", "set": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "result": "pass"},
+          "findings": {"complete": true, "items": [
+            {"id": "R1-F1", "classification": "blocked", "label": {"status": "confirmed", "defect": "off-by-one", "source": {"adjudicator": "oracle-team", "artifact": "boundary-case", "discovered": "2026-11-19"}}}
+          ]}
+        },
+        {
+          "phase": "FIX", "round": 1, "outcome": "published", "elapsed_ms": 300, "cost_microusd": 1000000, "context_tokens": 80,
+          "pr": "fixture/pr/2", "base_ref": "main", "merge_base": "1000000000000000000000000000000000000000",
+          "head": "2000000000000000000000000000000000000000", "tree": "2000000000000000000000000000000000000001",
+          "source": 2, "published": "4000000000000000000000000000000000000000", "judgment": null
+        },
+        {
+          "phase": "REVIEW", "round": 2, "outcome": "clean", "elapsed_ms": 200, "cost_microusd": 500000, "context_tokens": 60,
+          "pr": "fixture/pr/2", "base_ref": "main", "merge_base": "1000000000000000000000000000000000000000",
+          "head": "4000000000000000000000000000000000000000", "tree": "4000000000000000000000000000000000000001",
+          "transition": null, "next_head": null, "comment": "fixture/comment/4",
+          "validation": {"scope": "full", "set": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "result": "pass"},
+          "findings": {"complete": true, "items": []}
+        }
+      ],
+      "stop": {
+        "phase": "READY_FOR_MERGE", "through": 4, "round": 2, "review": 4, "issuance": "issued",
+        "pr": "fixture/pr/2", "base_ref": "main", "merge_base": "1000000000000000000000000000000000000000",
+        "head": "4000000000000000000000000000000000000000", "tree": "4000000000000000000000000000000000000001",
+        "proof": {"receipt": "fixture/certificate/2", "comment": "fixture/comment/4",
+          "validation": {"scope": "full", "set": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "result": "pass"}},
+        "wall_ms": 850, "source": "fixture/stop/2"
+      }
+    },
+    {
+      "case": "clean-boundary", "seed": 0, "arm": "baseline", "pr": "fixture/pr/3",
+      "actors": ["producer-3", "reviewer-3", "fixer-3"], "exclusion": null, "creation": "fixture/start/3",
+      "launches": [
+        {"phase": "ANALYZE_EXECUTE", "outcome": "published", "elapsed_ms": 100, "cost_microusd": 1000000, "context_tokens": 100},
+        {
+          "phase": "REVIEW", "round": 1, "outcome": "clean", "elapsed_ms": 200, "cost_microusd": 500000, "context_tokens": 60,
+          "pr": "fixture/pr/3", "base_ref": "main", "merge_base": "1000000000000000000000000000000000000000",
+          "head": "5000000000000000000000000000000000000000", "tree": "5000000000000000000000000000000000000001",
+          "transition": null, "next_head": null, "comment": "fixture/comment/5",
+          "validation": {"scope": "full", "set": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "result": "pass"},
+          "findings": {"complete": true, "items": []}
+        }
+      ],
+      "stop": {
+        "phase": "READY_FOR_MERGE", "through": 2, "round": 1, "review": 2, "issuance": "issued",
+        "pr": "fixture/pr/3", "base_ref": "main", "merge_base": "1000000000000000000000000000000000000000",
+        "head": "5000000000000000000000000000000000000000", "tree": "5000000000000000000000000000000000000001",
+        "proof": {"receipt": "fixture/certificate/3", "comment": "fixture/comment/5",
+          "validation": {"scope": "full", "set": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "result": "pass"}},
+        "wall_ms": 320, "source": "fixture/stop/3"
+      }
+    },
+    {
+      "case": "clean-boundary", "seed": 0, "arm": "treatment", "pr": "fixture/pr/4",
+      "actors": ["producer-4", "reviewer-4", "fixer-4"], "exclusion": null, "creation": "fixture/start/4",
+      "launches": [
+        {"phase": "ANALYZE_EXECUTE", "outcome": "published", "elapsed_ms": 100, "cost_microusd": 1000000, "context_tokens": 100},
+        {
+          "phase": "REVIEW", "round": 1, "outcome": "needs_fix", "elapsed_ms": 200, "cost_microusd": 500000, "context_tokens": 60,
+          "pr": "fixture/pr/4", "base_ref": "main", "merge_base": "1000000000000000000000000000000000000000",
+          "head": "5000000000000000000000000000000000000000", "tree": "5000000000000000000000000000000000000001",
+          "transition": null, "next_head": null, "comment": "fixture/comment/6",
+          "validation": {"scope": "full", "set": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "result": "pass"},
+          "findings": {"complete": true, "items": [
+            {"id": "R1-F1", "classification": "nit", "label": {"status": "false", "defect": null, "source": {"adjudicator": "oracle-team", "artifact": "negative-probe", "discovered": "2026-11-19"}}}
+          ]}
+        },
+        {
+          "phase": "FIX", "round": 1, "outcome": "no_change", "elapsed_ms": 150, "cost_microusd": 250000, "context_tokens": 40,
+          "pr": "fixture/pr/4", "base_ref": "main", "merge_base": "1000000000000000000000000000000000000000",
+          "head": "5000000000000000000000000000000000000000", "tree": "5000000000000000000000000000000000000001",
+          "source": 2, "published": null, "judgment": null
+        },
+        {
+          "phase": "REVIEW", "round": 2, "outcome": "clean", "elapsed_ms": 200, "cost_microusd": 500000, "context_tokens": 60,
+          "pr": "fixture/pr/4", "base_ref": "main", "merge_base": "1000000000000000000000000000000000000000",
+          "head": "5000000000000000000000000000000000000000", "tree": "5000000000000000000000000000000000000001",
+          "transition": null, "next_head": null, "comment": "fixture/comment/7",
+          "validation": {"scope": "full", "set": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "result": "pass"},
+          "findings": {"complete": true, "items": []}
+        }
+      ],
+      "stop": {
+        "phase": "READY_FOR_MERGE", "through": 4, "round": 2, "review": 4, "issuance": "issued",
+        "pr": "fixture/pr/4", "base_ref": "main", "merge_base": "1000000000000000000000000000000000000000",
+        "head": "5000000000000000000000000000000000000000", "tree": "5000000000000000000000000000000000000001",
+        "proof": {"receipt": "fixture/certificate/4", "comment": "fixture/comment/7",
+          "validation": {"scope": "full", "set": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "result": "pass"}},
+        "wall_ms": 700, "source": "fixture/stop/4"
+      }
+    }
+  ]
+}
